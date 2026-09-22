@@ -96,6 +96,26 @@ class EpochChangedError(RendezvousError):
         )
 
 
+class BootstrapFenceTimeoutError(RendezvousError):
+    """Not every admitted slot reached one bootstrap step before its deadline."""
+
+    def __init__(
+        self,
+        group_id: str,
+        lane_id: int,
+        missing: list[str],
+        waited_s: float,
+    ) -> None:
+        self.group_id = group_id
+        self.lane_id = lane_id
+        self.missing = missing
+        detail = ", ".join(missing[:8]) if missing else "no slot detail available"
+        super().__init__(
+            f"collective group {group_id} bootstrap fence {lane_id} did not release "
+            f"within {waited_s:.0f}s; still waiting on: {detail}"
+        )
+
+
 @dataclass(frozen=True)
 class LaneMembership:
     """This worker's placement in one lane."""
@@ -144,6 +164,11 @@ _KIND_TO_PROTO = {
     "RESHARD": pb.LANE_KIND_RESHARD,
     "BROADCAST": pb.LANE_KIND_BROADCAST,
 }
+_FENCE_PHASE_TO_PROTO = {
+    "PRE_BARRIER": pb.BOOTSTRAP_FENCE_PHASE_PRE_BARRIER,
+    "COMPLETE": pb.BOOTSTRAP_FENCE_PHASE_COMPLETE,
+}
+_RESERVED_SLOT_DELIMITERS = "\0\n\r|,"
 
 
 @dataclass(frozen=True)
@@ -180,6 +205,57 @@ def _positive_finite(value: float, name: str) -> float:
     if not math.isfinite(parsed) or parsed <= 0:
         raise ValueError(f"{name} must be a positive finite number, got {value}")
     return parsed
+
+
+def _required_identifier(value: str, name: str) -> str:
+    if not value.strip():
+        raise ValueError(f"{name} is required")
+    return value
+
+
+def _canonical_slot_list(slots: Sequence[str], name: str) -> tuple[str, ...]:
+    canonical = tuple(sorted(slots))
+    if len(set(canonical)) != len(canonical):
+        raise ValueError(f"{name} must not contain duplicates")
+    return _validated_slot_list(canonical, name)
+
+
+def _validated_slot_list(slots: Sequence[str], name: str) -> tuple[str, ...]:
+    validated = tuple(slots)
+    for slot in validated:
+        _required_identifier(slot, name)
+        if any(delimiter in slot for delimiter in _RESERVED_SLOT_DELIMITERS):
+            raise ValueError(f"{name} must not contain Redis record delimiters")
+    return validated
+
+
+def _collective_group_spec(
+    *,
+    model_name: str,
+    trainer_slots: Sequence[str],
+    generator_slots: Sequence[str],
+    lanes: Sequence[LaneDeclaration],
+) -> pb.CollectiveGroupSpec:
+    canonical_trainers = _canonical_slot_list(trainer_slots, "trainer_slots")
+    canonical_generators = _canonical_slot_list(generator_slots, "generator_slots")
+    return pb.CollectiveGroupSpec(
+        model_name=_required_identifier(model_name, "model_name"),
+        expected_trainer_slots=canonical_trainers,
+        expected_generator_slots=canonical_generators,
+        lanes=[
+            pb.LaneSpec(
+                lane_id=lane.lane_id,
+                kind=_KIND_TO_PROTO[lane.kind],
+                trainer_slots=_validated_slot_list(
+                    lane.trainer_slots, "lane trainer_slots"
+                ),
+                generator_slots=_validated_slot_list(
+                    lane.generator_slots, "lane generator_slots"
+                ),
+            )
+            for lane in lanes
+        ],
+    )
 
 
 def _expected_assignments(
@@ -230,7 +306,9 @@ def _validate_assignments(
     expected_leader: bool,
 ) -> tuple[LaneMembership, ...]:
     if not response.group_id or response.epoch <= 0:
-        raise RendezvousError("MX returned an invalid collective group identity or epoch")
+        raise RendezvousError(
+            "MX returned an invalid collective group identity or epoch"
+        )
 
     actual = tuple(
         LaneMembership(
@@ -292,7 +370,20 @@ class CollectiveRendezvous:
         self._registration: _WorkerRegistrationSpec | None = None
         self._closed = False
 
-    def _register_worker(self, registration: _WorkerRegistrationSpec) -> None:
+    def _bounded_rpc_timeout(self, deadline: float | None, operation: str) -> float:
+        if deadline is None:
+            return self._rpc_timeout_s
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            raise TimeoutError(f"{operation} exhausted its deadline")
+        return min(self._rpc_timeout_s, remaining_s)
+
+    def _register_worker(
+        self,
+        registration: _WorkerRegistrationSpec,
+        *,
+        deadline: float | None = None,
+    ) -> None:
         self._registration_stub.RegisterWorker(
             refit_pb2.RegisterWorkerRequest(
                 worker=refit_pb2.WorkerRegistration(
@@ -302,7 +393,9 @@ class CollectiveRendezvous:
                 ),
                 ttl_seconds=self._registration_ttl_s,
             ),
-            timeout=self._rpc_timeout_s,
+            timeout=self._bounded_rpc_timeout(
+                deadline, "collective worker registration"
+            ),
         )
 
     def _start_registration_renewal(self) -> None:
@@ -316,9 +409,26 @@ class CollectiveRendezvous:
         )
         self._registration_thread.start()
 
-    def _ensure_worker_registration(self, registration: _WorkerRegistrationSpec) -> None:
+    def _ensure_worker_registration(
+        self,
+        registration: _WorkerRegistrationSpec,
+        *,
+        deadline: float | None = None,
+    ) -> None:
         """Synchronously establish liveness before joining the collective group."""
-        with self._registration_lock:
+        if deadline is None:
+            acquired = self._registration_lock.acquire()
+        else:
+            acquired = self._registration_lock.acquire(
+                timeout=self._bounded_rpc_timeout(
+                    deadline, "collective worker registration lock"
+                )
+            )
+        if not acquired:
+            raise TimeoutError(
+                "collective worker registration lock exhausted its deadline"
+            )
+        try:
             if self._closed:
                 raise RendezvousError("the collective rendezvous is closed")
             if self._registration is not None and self._registration != registration:
@@ -329,9 +439,11 @@ class CollectiveRendezvous:
             # Refresh synchronously on every join. READY is allowed to depend on
             # this lease, so joining with only a best-effort background renewal
             # would race the server's liveness gate.
-            self._register_worker(registration)
+            self._register_worker(registration, deadline=deadline)
             if self._registration_thread is None:
                 self._start_registration_renewal()
+        finally:
+            self._registration_lock.release()
 
     def _renew_worker_registration(self) -> None:
         interval_s = max(self._registration_ttl_s / 3, 0.1)
@@ -388,6 +500,7 @@ class CollectiveRendezvous:
         index_in_role: int,
         plan_digest: str,
         plan_endpoint: str | None = None,
+        timeout_s: float | None = None,
     ) -> Membership:
         """Ask MX to admit this worker, and take the rank it assigns.
 
@@ -403,47 +516,39 @@ class CollectiveRendezvous:
         """
         if not isinstance(role, Role):
             raise ValueError(f"unsupported collective role {role!r}")
-        if len(set(trainer_slots)) != len(trainer_slots):
-            raise ValueError("trainer_slots must not contain duplicates")
-        if len(set(generator_slots)) != len(generator_slots):
-            raise ValueError("generator_slots must not contain duplicates")
-        if any(not slot for slot in trainer_slots + generator_slots):
-            raise ValueError("collective slot ids must not be empty")
-        role_slots = trainer_slots if role is Role.TRAINER else generator_slots
+        canonical_trainers = _canonical_slot_list(trainer_slots, "trainer_slots")
+        canonical_generators = _canonical_slot_list(generator_slots, "generator_slots")
+        role_slots = (
+            canonical_trainers if role is Role.TRAINER else canonical_generators
+        )
         if slot_id not in role_slots:
-            raise ValueError(f"slot_id {slot_id!r} is not declared for role {role.value}")
-        if index_in_role != role_slots.index(slot_id):
             raise ValueError(
-                f"index_in_role {index_in_role} does not match the declared position "
-                f"of slot {slot_id!r} in role {role.value}"
+                f"slot_id {slot_id!r} is not declared for role {role.value}"
             )
+        canonical_index = role_slots.index(slot_id)
         expected_assignments, expected_leader = _expected_assignments(
             lanes=lanes,
             slot_id=slot_id,
         )
-        if plan_endpoint is not None and not (role is Role.TRAINER and index_in_role == 0):
-            raise ValueError("only trainer index 0 may advertise the reshard plan endpoint")
+        if plan_endpoint is not None and not (
+            role is Role.TRAINER and canonical_index == 0
+        ):
+            raise ValueError(
+                "only trainer index 0 may advertise the reshard plan endpoint"
+            )
 
-        spec = pb.CollectiveGroupSpec(
+        spec = _collective_group_spec(
             model_name=model_name,
-            expected_trainer_slots=trainer_slots,
-            expected_generator_slots=generator_slots,
-            lanes=[
-                pb.LaneSpec(
-                    lane_id=lane.lane_id,
-                    kind=_KIND_TO_PROTO[lane.kind],
-                    trainer_slots=list(lane.trainer_slots),
-                    generator_slots=list(lane.generator_slots),
-                )
-                for lane in lanes
-            ],
+            trainer_slots=canonical_trainers,
+            generator_slots=canonical_generators,
+            lanes=lanes,
         )
         request = pb.JoinCollectiveGroupRequest(
             spec=spec,
             slot_id=slot_id,
             worker_id=worker_id,
             role=_ROLE_TO_PROTO[role],
-            index_in_role=index_in_role,
+            index_in_role=canonical_index,
             plan_digest=plan_digest,
         )
         if plan_endpoint is not None:
@@ -455,20 +560,76 @@ class CollectiveRendezvous:
                 )
             )
 
+        deadline = (
+            None
+            if timeout_s is None
+            else time.monotonic() + _positive_finite(timeout_s, "timeout_s")
+        )
         self._ensure_worker_registration(
             _WorkerRegistrationSpec(
                 worker_id=worker_id,
                 role=role,
                 model_name=model_name,
-            )
+            ),
+            deadline=deadline,
         )
-        response = self._stub.JoinCollectiveGroup(request, timeout=self._rpc_timeout_s)
-        assignments = _validate_assignments(response, expected_assignments, expected_leader)
+        response = self._stub.JoinCollectiveGroup(
+            request,
+            timeout=self._bounded_rpc_timeout(deadline, "collective group join"),
+        )
+        assignments = _validate_assignments(
+            response, expected_assignments, expected_leader
+        )
         return Membership(
             group_id=response.group_id,
             epoch=response.epoch,
             lanes=assignments,
             is_bootstrap_leader=response.is_bootstrap_leader,
+        )
+
+    def create_transfer(
+        self,
+        *,
+        model_name: str,
+        trainer_slots: list[str],
+        generator_slots: list[str],
+        lanes: Sequence[LaneDeclaration],
+        version_id: str,
+        idempotency_key: str,
+    ) -> pb.CollectiveTransfer:
+        """Create one idempotent transfer operation for an exact group spec."""
+        return self._stub.CreateCollectiveTransfer(
+            pb.CreateCollectiveTransferRequest(
+                spec=_collective_group_spec(
+                    model_name=model_name,
+                    trainer_slots=trainer_slots,
+                    generator_slots=generator_slots,
+                    lanes=lanes,
+                ),
+                version_id=_required_identifier(version_id, "version_id"),
+                idempotency_key=_required_identifier(
+                    idempotency_key, "idempotency_key"
+                ),
+            ),
+            timeout=self._rpc_timeout_s,
+        )
+
+    def get_transfer(self, operation_id: str) -> pb.CollectiveTransfer:
+        """Read the current state of one collective transfer operation."""
+        return self._stub.GetCollectiveTransfer(
+            pb.GetCollectiveTransferRequest(
+                operation_id=_required_identifier(operation_id, "operation_id")
+            ),
+            timeout=self._rpc_timeout_s,
+        )
+
+    def delete_transfer(self, operation_id: str) -> pb.CollectiveTransfer:
+        """Delete one terminal collective transfer operation."""
+        return self._stub.DeleteCollectiveTransfer(
+            pb.DeleteCollectiveTransferRequest(
+                operation_id=_required_identifier(operation_id, "operation_id")
+            ),
+            timeout=self._rpc_timeout_s,
         )
 
     def publish_bootstrap(
@@ -479,6 +640,7 @@ class CollectiveRendezvous:
         lane_id: int,
         worker_id: str,
         nccl_unique_id: bytes,
+        timeout_s: float | None = None,
     ) -> None:
         """Post one lane's identifier, stamped with the epoch it was made for.
 
@@ -491,6 +653,11 @@ class CollectiveRendezvous:
                 f"nccl_unique_id must be {NCCL_UNIQUE_ID_BYTES} bytes, "
                 f"got {len(nccl_unique_id)}"
             )
+        deadline = (
+            None
+            if timeout_s is None
+            else time.monotonic() + _positive_finite(timeout_s, "timeout_s")
+        )
         try:
             self._stub.PublishGroupBootstrap(
                 pb.PublishGroupBootstrapRequest(
@@ -500,7 +667,9 @@ class CollectiveRendezvous:
                     worker_id=worker_id,
                     nccl_unique_id=nccl_unique_id,
                 ),
-                timeout=self._rpc_timeout_s,
+                timeout=self._bounded_rpc_timeout(
+                    deadline, "collective bootstrap publication"
+                ),
             )
         except grpc.RpcError as error:
             if error.code() is grpc.StatusCode.FAILED_PRECONDITION:
@@ -509,12 +678,12 @@ class CollectiveRendezvous:
                 # Read the epoch back so a rejection that is not an epoch move
                 # keeps the server's own explanation instead of being relabelled
                 # -- and so the one that is names the epoch it moved to.
-                current = self._current_epoch(group_id)
+                current = self._current_epoch(group_id, deadline=deadline)
                 if current != epoch:
                     raise EpochChangedError(group_id, epoch, current) from error
             raise
 
-    def _current_epoch(self, group_id: str) -> int:
+    def _current_epoch(self, group_id: str, *, deadline: float | None = None) -> int:
         """The group's epoch now, or ``-1`` when it cannot be read.
 
         MX reports the epoch that rejected a publication in the status detail
@@ -525,9 +694,11 @@ class CollectiveRendezvous:
         try:
             return self._stub.GetCollectiveGroup(
                 pb.GetCollectiveGroupRequest(group_id=group_id),
-                timeout=self._rpc_timeout_s,
+                timeout=self._bounded_rpc_timeout(
+                    deadline, "collective epoch readback"
+                ),
             ).epoch
-        except grpc.RpcError:
+        except (grpc.RpcError, TimeoutError):
             return -1
 
     def await_ready(
@@ -588,9 +759,7 @@ class CollectiveRendezvous:
                         _missing_slots(group) if group is not None else [],
                         timeout_s,
                     ) from error
-                time.sleep(
-                    max(0.0, min(poll_interval_s, deadline - time.monotonic()))
-                )
+                time.sleep(max(0.0, min(poll_interval_s, deadline - time.monotonic())))
                 continue
             if group.epoch != epoch:
                 raise EpochChangedError(group_id, epoch, group.epoch)
@@ -604,6 +773,114 @@ class CollectiveRendezvous:
             if remaining <= 0:
                 raise GroupNotReadyError(group_id, _missing_slots(group), timeout_s)
             time.sleep(min(poll_interval_s, remaining))
+
+    def await_bootstrap_fence(
+        self,
+        *,
+        group_id: str,
+        epoch: int,
+        lane_id: int,
+        slot_id: str,
+        worker_id: str,
+        timeout_s: float,
+        phase: str = "PRE_BARRIER",
+        poll_interval_s: float | None = None,
+    ) -> None:
+        """Idempotently arrive and wait for every admitted slot at one step."""
+        timeout_s = _positive_finite(timeout_s, "timeout_s")
+        poll_interval_s = _positive_finite(
+            poll_interval_s
+            if poll_interval_s is not None
+            else envs.MX_NCCL_REFIT_POLL_INTERVAL_S,
+            "poll_interval_s",
+        )
+        deadline = time.monotonic() + timeout_s
+        try:
+            phase_proto = _FENCE_PHASE_TO_PROTO[phase]
+        except KeyError as error:
+            raise ValueError(f"unsupported bootstrap fence phase {phase!r}") from error
+        missing: list[str] = []
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BootstrapFenceTimeoutError(group_id, lane_id, missing, timeout_s)
+            try:
+                fence = self._stub.ReachCollectiveBootstrapFence(
+                    pb.ReachCollectiveBootstrapFenceRequest(
+                        group_id=group_id,
+                        epoch=epoch,
+                        lane_id=lane_id,
+                        slot_id=slot_id,
+                        worker_id=worker_id,
+                        phase=phase_proto,
+                    ),
+                    timeout=min(self._rpc_timeout_s, remaining),
+                )
+            except grpc.RpcError as error:
+                if error.code() is grpc.StatusCode.FAILED_PRECONDITION:
+                    current = self._current_epoch(group_id, deadline=deadline)
+                    if current != epoch:
+                        raise EpochChangedError(group_id, epoch, current) from error
+                if error.code() not in _RETRYABLE_POLL_CODES:
+                    raise
+            else:
+                if (
+                    fence.group_id != group_id
+                    or fence.epoch != epoch
+                    or fence.lane_id != lane_id
+                    or fence.phase != phase_proto
+                ):
+                    raise RendezvousError(
+                        "MX returned a bootstrap fence for a different group, "
+                        "epoch, or lane"
+                    )
+                missing = list(fence.missing_slots)
+                if missing != sorted(missing):
+                    raise RendezvousError(
+                        "MX returned non-deterministically ordered missing fence slots"
+                    )
+                if fence.released:
+                    if missing:
+                        raise RendezvousError(
+                            "MX released a bootstrap fence with missing slots"
+                        )
+                    return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BootstrapFenceTimeoutError(group_id, lane_id, missing, timeout_s)
+            time.sleep(min(poll_interval_s, remaining))
+
+    def abort_bootstrap(
+        self,
+        *,
+        group_id: str,
+        epoch: int,
+        slot_id: str,
+        worker_id: str,
+        message: str,
+        timeout_s: float,
+    ) -> pb.CollectiveGroup:
+        """Atomically fence a failed READY epoch before the cohort retries."""
+        deadline = time.monotonic() + _positive_finite(timeout_s, "timeout_s")
+        try:
+            return self._stub.AbortCollectiveBootstrap(
+                pb.AbortCollectiveBootstrapRequest(
+                    group_id=group_id,
+                    epoch=epoch,
+                    slot_id=slot_id,
+                    worker_id=worker_id,
+                    message=_required_identifier(message, "message"),
+                ),
+                timeout=self._bounded_rpc_timeout(
+                    deadline, "collective bootstrap abort"
+                ),
+            )
+        except grpc.RpcError as error:
+            if error.code() is grpc.StatusCode.FAILED_PRECONDITION:
+                current = self._current_epoch(group_id, deadline=deadline)
+                if current != epoch:
+                    raise EpochChangedError(group_id, epoch, current) from error
+            raise
 
     def report(
         self,
@@ -642,7 +919,8 @@ def _missing_slots(group: pb.CollectiveGroup) -> list[str]:
     # subsystem. Say what actually happened.
     if group.disagreeing_slots:
         return [
-            f"plan digest disagreement on slot {slot}" for slot in group.disagreeing_slots
+            f"plan digest disagreement on slot {slot}"
+            for slot in group.disagreeing_slots
         ]
 
     # The broadcast lane is the one place the full admitted set is visible in

@@ -79,6 +79,9 @@ Documentation = "https://github.com/ai-dynamo/modelexpress/tree/main/docs"
 [project.entry-points."vllm.general_plugins"]
 modelexpress = "modelexpress:register_modelexpress"
 
+[project.entry-points."sglang.srt.plugins"]
+modelexpress_miles_collective = "modelexpress_rl.collective.integrations.sglang_plugin:register_modelexpress_miles_collective"
+
 [tool.pytest.ini_options]
 markers = [
     "gpu: requires one or more CUDA GPUs",

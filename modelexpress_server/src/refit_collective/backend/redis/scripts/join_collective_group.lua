@@ -83,6 +83,12 @@ if not epoch then
   for i = 1, lane_count do
     redis.call('DEL', KEYS[4 + i])
   end
+  for line in string.gmatch(ARGV[3] .. '\n', '([^\n]*)\n') do
+    local lane_id = string.match(line, '^([^|]*)|')
+    if lane_id then
+      redis.call('DEL', KEYS[1] .. ':fence:' .. lane_id)
+    end
+  end
   redis.call('HSET', KEYS[1],
     'group_id', ARGV[1],
     'model_name', ARGV[2],
@@ -93,6 +99,8 @@ if not epoch then
     'plan_digest', ARGV[9],
     'epoch', epoch,
     'state', 'FORMING',
+    'bootstrap_complete_epoch', 0,
+    'active_operation_id', '',
     'plan_source_worker_id', '',
     'plan_source_endpoint', '',
     'plan_source_digest', '',
@@ -193,11 +201,19 @@ if changed then
     'epoch', epoch,
     'plan_digest', ARGV[9],
     'state', 'FORMING',
+    'bootstrap_complete_epoch', 0,
+    'active_operation_id', '',
     'plan_source_worker_id', '',
     'plan_source_endpoint', '',
     'plan_source_digest', '')
   for i = 1, lane_count do
     redis.call('DEL', KEYS[4 + i])
+  end
+  for line in string.gmatch(ARGV[3] .. '\n', '([^\n]*)\n') do
+    local lane_id = string.match(line, '^([^|]*)|')
+    if lane_id then
+      redis.call('DEL', KEYS[1] .. ':fence:' .. lane_id)
+    end
   end
 end
 

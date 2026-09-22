@@ -600,7 +600,9 @@ class TestTransferDeadline:
         half.publish_weights(0)
         half.finish_weight_update(1)
 
-        assert [op.comm._name for op in recorder.ops if op.kind == "reshard"] == ["lane0"]
+        assert [op.comm._name for op in recorder.ops if op.kind == "reshard"] == [
+            "lane0"
+        ]
         assert not any(lane.aborted for lane in cache._lanes.values())
 
     def test_the_deadline_is_rearmed_per_version_not_per_client(
@@ -638,6 +640,7 @@ class TestTransferDeadline:
         half, cache = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
 
         for key, live in list(cache._lanes.items()):
+
             def record(timeout_s=None, _live=live):
                 seen.append(timeout_s)
 
@@ -661,6 +664,7 @@ class TestTransferDeadline:
         half, cache = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
 
         for live in cache._lanes.values():
+
             def boom(timeout_s=None):
                 raise TimeoutError("stream never drained")
 
@@ -728,6 +732,28 @@ class TestBoundedSynchronizeFallback:
         live.synchronize()
 
         assert synced == [4242]
+
+    def test_an_implicit_lane_waits_on_the_cuda_default_stream(
+        self, recorder, monkeypatch
+    ):
+        import torch
+
+        synced = []
+
+        class DefaultStream:
+            def synchronize(self):
+                synced.append("default")
+
+        monkeypatch.setattr(
+            torch.cuda,
+            "default_stream",
+            lambda *, device: DefaultStream(),
+        )
+
+        live = lane(recorder, "lane0", stream=None)
+        live.synchronize()
+
+        assert synced == ["default"]
 
     def test_the_fallback_still_waits(self, recorder):
         live = lane(recorder, "lane0")

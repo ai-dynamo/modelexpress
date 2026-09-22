@@ -19,6 +19,7 @@ The sequencing is the contract, and two of its rules are load-bearing here:
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import Any
@@ -32,11 +33,63 @@ from .backend import (
 )
 from .comm import CommunicatorCache, LaneCommunicator, LaneKey, new_unique_id
 from .plan import DEFAULT_RECEIVER_PROTOCOL, plan_digest, validate_coverage
-from .rendezvous import CollectiveRendezvous, LaneDeclaration, Membership
+from .rendezvous import (
+    CollectiveRendezvous,
+    EpochChangedError,
+    GroupNotReadyError,
+    LaneDeclaration,
+    Membership,
+)
 from .spi import Loader, Publisher, resolve_specs
 from .types import ReshardPlan, Role
 
 logger = logging.getLogger("modelexpress_rl.collective.client")
+
+# Epoch invalidation is cleanup, not another formation attempt. It retains a
+# short independent bound so expiry of the shared formation deadline cannot
+# skip the server-side reset and leave released fence arrivals reusable.
+_BOOTSTRAP_ABORT_TIMEOUT_S = 1.0
+
+
+def build_partitioned_lanes(
+    trainer_slots: list[str],
+    generator_slots: list[str],
+    source_partition_count: int,
+) -> list[LaneDeclaration]:
+    """Build contiguous reshard lanes plus the all-participant broadcast lane."""
+    if (
+        isinstance(source_partition_count, bool)
+        or not isinstance(source_partition_count, int)
+        or source_partition_count <= 0
+    ):
+        raise ValueError("source_partition_count must be a positive integer")
+    if len(trainer_slots) % source_partition_count:
+        raise ValueError(
+            "source_partition_count must divide the trainer slot count: "
+            f"{len(trainer_slots)} trainer slots, "
+            f"{source_partition_count} source partitions"
+        )
+    trainers = tuple(trainer_slots)
+    generators = tuple(generator_slots)
+    per_lane = len(trainers) // source_partition_count
+    lanes = [
+        LaneDeclaration(
+            partition,
+            "RESHARD",
+            trainers[partition * per_lane : (partition + 1) * per_lane],
+            generators,
+        )
+        for partition in range(source_partition_count)
+    ]
+    lanes.append(
+        LaneDeclaration(
+            source_partition_count,
+            "BROADCAST",
+            trainers,
+            generators,
+        )
+    )
+    return lanes
 
 
 def _broadcast_barrier(
@@ -137,6 +190,7 @@ class _RefitClientBase:
         self._groupings: list[list[str]] | None = None
         self._round_started = False
         self._version: str | None = None
+        self._bootstrap_poisoned: BaseException | None = None
 
     @property
     def membership(self) -> Membership:
@@ -214,169 +268,250 @@ class _RefitClientBase:
         The split lives here and is never sent as a partition count: MX is
         handed the resulting membership and nothing about what produced it.
         """
-        if len(self._trainer_slots) % self._source_partition_count:
-            raise ValueError(
-                "source_partition_count must divide the trainer slot count: "
-                f"{len(self._trainer_slots)} trainer slots, "
-                f"{self._source_partition_count} source partitions"
-            )
-        per_lane = len(self._trainer_slots) // self._source_partition_count
-        lanes = [
-            LaneDeclaration(
-                partition,
-                "RESHARD",
-                tuple(self._trainer_slots[partition * per_lane : (partition + 1) * per_lane]),
-                tuple(self._generator_slots),
-            )
-            for partition in range(self._source_partition_count)
-        ]
-        lanes.append(
-            LaneDeclaration(
-                self._source_partition_count,
-                "BROADCAST",
-                tuple(self._trainer_slots),
-                tuple(self._generator_slots),
-            )
+        return build_partitioned_lanes(
+            self._trainer_slots,
+            self._generator_slots,
+            self._source_partition_count,
         )
-        return lanes
 
     def _join_and_bootstrap(
         self, role: Role, source_partition: int | None
     ) -> Membership:
+        if self._bootstrap_poisoned is not None:
+            raise RuntimeError(
+                "this refit client cannot bootstrap again because the previous "
+                "failed epoch could not be invalidated; construct a new client"
+            ) from self._bootstrap_poisoned
         if self._digest is None:
             raise RuntimeError("initialize must run before compute_plan")
         require_nccl_m2n()
 
         declared = self._declared_lanes()
-        membership = self._rendezvous.join(
-            model_name=self._model_name,
-            trainer_slots=self._trainer_slots,
-            generator_slots=self._generator_slots,
-            lanes=declared,
-            slot_id=self._slot_id,
-            worker_id=self._worker_id,
-            role=role,
-            index_in_role=self._index_in_role,
-            plan_digest=self._digest,
-        )
-        # Which reshard lanes this worker belongs on is a fact about what it
-        # just declared, not a re-derivation of a rule the server also applies.
         expected_reshard = {
             lane.lane_id
             for lane in declared
             if lane.kind == "RESHARD" and self._slot_id in lane.slots_in_rank_order()
         }
-        actual_reshard = {lane.lane_id for lane in membership.reshard_lanes}
-        if actual_reshard != expected_reshard:
-            raise RuntimeError(
-                "MX returned unexpected reshard-lane membership: "
-                f"expected {sorted(expected_reshard)}, got {sorted(actual_reshard)}"
-            )
         declared_broadcast = next(
             lane.lane_id for lane in declared if lane.kind == "BROADCAST"
         )
-        if membership.broadcast_lane.lane_id != declared_broadcast:
-            raise RuntimeError(
-                "MX returned an unexpected broadcast lane id: "
-                f"expected {declared_broadcast}, got "
-                f"{membership.broadcast_lane.lane_id}"
+        timeout_s = envs.MX_NCCL_REFIT_GROUP_TIMEOUT_S
+        deadline = time.monotonic() + timeout_s
+        # One replacement per expected slot can advance the epoch while a full
+        # cohort restarts. The initial attempt plus that many bounded retries
+        # lets all fresh workers converge without masking unbounded churn.
+        max_attempts = len(self._trainer_slots) + len(self._generator_slots) + 1
+
+        def remaining_budget(group_id: str) -> float:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                raise GroupNotReadyError(group_id, [], timeout_s)
+            return remaining_s
+
+        for attempt in range(max_attempts):
+            membership = self._rendezvous.join(
+                model_name=self._model_name,
+                trainer_slots=self._trainer_slots,
+                generator_slots=self._generator_slots,
+                lanes=declared,
+                slot_id=self._slot_id,
+                worker_id=self._worker_id,
+                role=role,
+                index_in_role=self._index_in_role,
+                plan_digest=self._digest,
+                timeout_s=remaining_budget(self._model_name),
             )
 
-        previous = self._membership
-        if previous is not None and previous.group_id != membership.group_id:
-            self._cache.abort_group(previous.group_id)
-        # An epoch move invalidates every cached communicator. The plan was
-        # freshly captured before this join and is guarded by its digest.
-        dropped = self._cache.invalidate_epoch(membership.group_id, membership.epoch)
-        if dropped:
-            logger.info(
-                "epoch moved to %s; dropped %s stale lane(s)", membership.epoch, dropped
-            )
-
-        if membership.is_bootstrap_leader:
-            for lane in membership.reshard_lanes:
-                if lane.rank_in_lane == 0:
-                    self._rendezvous.publish_bootstrap(
-                        group_id=membership.group_id,
-                        epoch=membership.epoch,
-                        lane_id=lane.lane_id,
-                        worker_id=self._worker_id,
-                        nccl_unique_id=new_unique_id(),
-                    )
-            broadcast = membership.broadcast_lane
-            if broadcast.rank_in_lane == 0:
-                self._rendezvous.publish_bootstrap(
-                    group_id=membership.group_id,
-                    epoch=membership.epoch,
-                    lane_id=broadcast.lane_id,
-                    worker_id=self._worker_id,
-                    nccl_unique_id=new_unique_id(),
+            # Which reshard lanes this worker belongs on is a fact about what it
+            # just declared, not a re-derivation of a rule the server also applies.
+            actual_reshard = {lane.lane_id for lane in membership.reshard_lanes}
+            if actual_reshard != expected_reshard:
+                raise RuntimeError(
+                    "MX returned unexpected reshard-lane membership: "
+                    f"expected {sorted(expected_reshard)}, got "
+                    f"{sorted(actual_reshard)}"
+                )
+            if membership.broadcast_lane.lane_id != declared_broadcast:
+                raise RuntimeError(
+                    "MX returned an unexpected broadcast lane id: "
+                    f"expected {declared_broadcast}, got "
+                    f"{membership.broadcast_lane.lane_id}"
                 )
 
-        group = self._rendezvous.await_ready(
-            group_id=membership.group_id, epoch=membership.epoch
-        )
-
-        by_lane_id = {lane.lane_id: lane for lane in group.lanes}
-        declared = self._declared_lanes()
-        all_lane_ids = {lane.lane_id for lane in declared}
-        missing = sorted(all_lane_ids - set(by_lane_id))
-        if missing:
-            raise RuntimeError(
-                f"READY group omitted lane(s) assigned to this worker: {missing}"
+            previous = self._membership
+            if previous is not None and previous.group_id != membership.group_id:
+                self._cache.abort_group(previous.group_id)
+            # An epoch move invalidates every cached communicator. The plan was
+            # freshly captured before this join and is guarded by its digest.
+            dropped = self._cache.invalidate_epoch(
+                membership.group_id, membership.epoch
             )
+            if dropped:
+                logger.info(
+                    "epoch moved to %s; dropped %s stale lane(s)",
+                    membership.epoch,
+                    dropped,
+                )
 
-        # All ranks create the broadcast communicator first. It then provides a
-        # full-group barrier after every reshard-lane init. Without those
-        # barriers, a PP-stage trainer can enter lane N+1 while generators are
-        # still initializing lane N; overlapping communicator creation can hang.
-        # Every rank walks the FULL declared lane set, including lanes it is
-        # not on, so the barriers line up; membership.lane raises for those.
-        lane_order = [membership.broadcast_lane.lane_id] + [
-            lane.lane_id for lane in declared if lane.kind == "RESHARD"
-        ]
-        try:
-            for lane_id in lane_order:
-                lane_record = by_lane_id[lane_id]
-                try:
-                    mine = membership.lane(lane_id)
-                except KeyError:
-                    mine = None
-                if mine is not None:
-                    self._cache.create(
+            try:
+                if membership.is_bootstrap_leader:
+                    for lane in membership.reshard_lanes:
+                        if lane.rank_in_lane == 0:
+                            self._rendezvous.publish_bootstrap(
+                                group_id=membership.group_id,
+                                epoch=membership.epoch,
+                                lane_id=lane.lane_id,
+                                worker_id=self._worker_id,
+                                nccl_unique_id=new_unique_id(),
+                                timeout_s=remaining_budget(membership.group_id),
+                            )
+                    broadcast = membership.broadcast_lane
+                    if broadcast.rank_in_lane == 0:
+                        self._rendezvous.publish_bootstrap(
+                            group_id=membership.group_id,
+                            epoch=membership.epoch,
+                            lane_id=broadcast.lane_id,
+                            worker_id=self._worker_id,
+                            nccl_unique_id=new_unique_id(),
+                            timeout_s=remaining_budget(membership.group_id),
+                        )
+
+                group = self._rendezvous.await_ready(
+                    group_id=membership.group_id,
+                    epoch=membership.epoch,
+                    timeout_s=remaining_budget(membership.group_id),
+                )
+            except EpochChangedError:
+                self._cache.abort_group(membership.group_id)
+                self._membership = None
+                if attempt + 1 >= max_attempts or time.monotonic() >= deadline:
+                    raise
+                logger.info(
+                    "collective group %s moved past epoch %s during formation; "
+                    "rejoining with worker %s (%s/%s)",
+                    membership.group_id,
+                    membership.epoch,
+                    self._worker_id,
+                    attempt + 2,
+                    max_attempts,
+                )
+                continue
+            # Every rank walks the full declared lane order. After its optional
+            # communicator creation it settles every local communicator, reaches
+            # a server-backed full-cohort fence, and only then enters the NCCL
+            # broadcast barrier. The control-plane fence closes the race where
+            # a fast nonmember could reuse broadcast while a lane member was
+            # still initializing. The broadcast step itself follows the same
+            # protocol so no rank can start the first reshard step early.
+            try:
+                by_lane_id = {lane.lane_id: lane for lane in group.lanes}
+                all_lane_ids = {lane.lane_id for lane in declared}
+                missing = sorted(all_lane_ids - set(by_lane_id))
+                if missing:
+                    raise RuntimeError(
+                        f"READY group omitted lane(s) assigned to this worker: {missing}"
+                    )
+                lane_order = [membership.broadcast_lane.lane_id] + [
+                    lane.lane_id for lane in declared if lane.kind == "RESHARD"
+                ]
+                for lane_id in lane_order:
+                    lane_record = by_lane_id[lane_id]
+                    try:
+                        mine = membership.lane(lane_id)
+                    except KeyError:
+                        mine = None
+                    if mine is not None:
+                        self._cache.create(
+                            LaneKey(
+                                group_id=membership.group_id,
+                                epoch=membership.epoch,
+                                lane_id=lane_id,
+                            ),
+                            rank=mine.rank_in_lane,
+                            world_size=mine.world_size,
+                            unique_id=bytes(lane_record.nccl_unique_id),
+                            device=self._device,
+                            stream=self._stream_for(lane_id),
+                            timeout_s=remaining_budget(membership.group_id),
+                        )
+
+                    self._cache.settle_group(
+                        membership.group_id,
+                        membership.epoch,
+                        timeout_s=remaining_budget(membership.group_id),
+                    )
+                    self._rendezvous.await_bootstrap_fence(
+                        group_id=membership.group_id,
+                        epoch=membership.epoch,
+                        lane_id=lane_id,
+                        slot_id=self._slot_id,
+                        worker_id=self._worker_id,
+                        timeout_s=remaining_budget(membership.group_id),
+                        phase="PRE_BARRIER",
+                    )
+
+                    broadcast = self._cache.get(
                         LaneKey(
                             group_id=membership.group_id,
                             epoch=membership.epoch,
-                            lane_id=lane_id,
-                        ),
-                        rank=mine.rank_in_lane,
-                        world_size=mine.world_size,
-                        unique_id=bytes(lane_record.nccl_unique_id),
-                        device=self._device,
-                        stream=self._stream_for(lane_id),
+                            lane_id=membership.broadcast_lane.lane_id,
+                        )
                     )
-
-                broadcast = self._cache.get(
-                    LaneKey(
+                    if broadcast is None:
+                        raise RuntimeError(
+                            "broadcast communicator was not initialized first"
+                        )
+                    _bootstrap_barrier(
+                        broadcast,
+                        self._device,
+                        timeout_s=remaining_budget(membership.group_id),
+                        alloc=self._barrier_alloc,
+                    )
+                self._rendezvous.await_bootstrap_fence(
+                    group_id=membership.group_id,
+                    epoch=membership.epoch,
+                    lane_id=lane_order[-1],
+                    slot_id=self._slot_id,
+                    worker_id=self._worker_id,
+                    timeout_s=remaining_budget(membership.group_id),
+                    phase="COMPLETE",
+                )
+            except BaseException as bootstrap_error:
+                self._cache.abort_group(membership.group_id)
+                self._membership = None
+                try:
+                    self._rendezvous.abort_bootstrap(
                         group_id=membership.group_id,
                         epoch=membership.epoch,
-                        lane_id=membership.broadcast_lane.lane_id,
+                        slot_id=self._slot_id,
+                        worker_id=self._worker_id,
+                        message=f"{type(bootstrap_error).__name__}: {bootstrap_error}",
+                        timeout_s=_BOOTSTRAP_ABORT_TIMEOUT_S,
                     )
+                except EpochChangedError:
+                    # Another rank fenced this same failed epoch first.
+                    pass
+                except BaseException as abort_error:
+                    self._bootstrap_poisoned = abort_error
+                    raise bootstrap_error from abort_error
+                if not isinstance(bootstrap_error, Exception):
+                    raise
+                if attempt + 1 >= max_attempts or time.monotonic() >= deadline:
+                    raise
+                logger.info(
+                    "collective group %s epoch %s failed during bootstrap; "
+                    "rejoining with worker %s (%s/%s)",
+                    membership.group_id,
+                    membership.epoch,
+                    self._worker_id,
+                    attempt + 2,
+                    max_attempts,
                 )
-                if broadcast is None:
-                    raise RuntimeError(
-                        "broadcast communicator was not initialized first"
-                    )
-                _bootstrap_barrier(
-                    broadcast, self._device, alloc=self._barrier_alloc
-                )
-        except BaseException:
-            self._cache.abort_group(membership.group_id)
-            self._membership = None
-            raise
+                continue
 
-        self._membership = membership
-        return membership
+            self._membership = membership
+            return membership
+        raise AssertionError("collective formation loop exhausted")  # pragma: no cover
 
     def cleanup(self) -> None:
         if self._membership is not None:

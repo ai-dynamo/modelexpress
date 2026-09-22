@@ -22,6 +22,7 @@ export PYTHONPATH=${PYTHONPATH:-$(cd "$(dirname "$0")" && pwd)}
 export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-WARNING}
 export MX_NCCL_REFIT_GROUP_TIMEOUT_S=${MX_NCCL_REFIT_GROUP_TIMEOUT_S:-900}
 mkdir -p "$OUT"
+rm -f "$OUT/generator.rc" "$OUT"/trainer*.rc
 echo "run=$RUN model=$MODEL trainer=$TRAINER dst=$DST trainers=$T generators=$G rounds=$ROUNDS out=$OUT"
 
 ( CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((G-1))) \
@@ -59,7 +60,35 @@ for rank in $(seq 0 $((T-1))); do
 done
 wait
 
-echo "=== generator rc $(cat "$OUT/generator.rc" 2>/dev/null) ==="
+status=0
+if [[ -s "$OUT/generator.rc" ]]; then
+  generator_rc=$(<"$OUT/generator.rc")
+else
+  generator_rc=1
+  status=1
+fi
+if (( generator_rc != 0 )); then
+  status=1
+fi
+
+trainer_rcs=()
+for rank in $(seq 0 $((T-1))); do
+  rc_file="$OUT/trainer$rank.rc"
+  if [[ -s "$rc_file" ]]; then
+    trainer_rc=$(<"$rc_file")
+  else
+    trainer_rc=1
+    status=1
+  fi
+  trainer_rcs+=("$trainer_rc")
+  if (( trainer_rc != 0 )); then
+    status=1
+  fi
+done
+
+echo "=== generator rc ${generator_rc} ==="
 grep -E "^\[gen\]|E2E|FAILED" "$OUT/generator.log" | grep -v "workers:" | tail -12
-echo "=== trainer rcs $(cat "$OUT"/trainer*.rc 2>/dev/null | tr '\n' ' ') ==="
+echo "=== trainer rcs ${trainer_rcs[*]} ==="
 grep -hE "^\[trainer 0\]" "$OUT/trainer0.log" | tail -8
+
+exit "$status"

@@ -236,8 +236,7 @@ stateDiagram-v2
     [*] --> FORMING
     FORMING --> READY: all expected slots joined,<br/>every lane bootstrapped,<br/>every registration live
     READY --> FORMING: membership change (epoch += 1)
-    READY --> RELEASING: DeleteCollectiveGroup
-    FORMING --> RELEASING: DeleteCollectiveGroup
+    READY --> FORMING: failed or expired transfer (epoch += 1)
   }
   state "CollectiveTransfer" as T {
     [*] --> PENDING
@@ -269,6 +268,8 @@ service RefitCollectiveService {
   rpc JoinCollectiveGroup(JoinCollectiveGroupRequest) returns (CollectiveGroupMembership);
   rpc GetCollectiveGroup(GetCollectiveGroupRequest) returns (CollectiveGroup);
   rpc PublishGroupBootstrap(PublishGroupBootstrapRequest) returns (CollectiveGroup);
+  rpc ReachCollectiveBootstrapFence(ReachCollectiveBootstrapFenceRequest) returns (CollectiveBootstrapFence);
+  rpc AbortCollectiveBootstrap(AbortCollectiveBootstrapRequest) returns (CollectiveGroup);
   rpc ReportCollectiveTransfer(ReportCollectiveTransferRequest) returns (CollectiveTransfer);
 }
 
@@ -412,6 +413,7 @@ failure.
 | A participant joined then died before the collective | Its `WorkerRegistration` TTL expires; re-checked at the `READY` transition | Group returns to `FORMING`, epoch bumps; nobody entered the collective |
 | A worker restarts and rejoins | New `worker_id` for the same slot | Admitted as a *different generation*; epoch bumps; cached communicators dropped |
 | A participant dies mid-collective | NCCL error or timeout on the surviving ranks | `ReportCollectiveTransfer(FAILED)`; operation `FAILED`; the epoch bumps so the next `compute_plan` rebuilds. Communicators are not reusable after an aborted collective |
+| No participant reports before the transfer deadline | Redis-time deadline sweep during collective lifecycle RPCs | Operation becomes `ABORTED`; if it still owns the group epoch MX fences the group and clears lane bootstraps. The idempotency reservation is released atomically, so the same-key create retry opens a replacement operation. |
 | Membership changes between refits | Epoch mismatch on `start_weight_update` | `FAILED_PRECONDITION`; the caller re-runs `compute_plan` — the layering doc's stated trigger |
 | Plan digest mismatch | Generator verifies the fetched plan against `plan_source.digest` | Fail closed before any wire op |
 
@@ -431,7 +433,7 @@ is exactly what the fused-parameter path already does.
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for one lane's non-blocking `Communicator.init` |
-| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Deadline for the transfer, i.e. `RUNNING -> ABORTED` above |
+| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Deadline stored by the Redis control plane when an operation is created. A `Create`, `Get`, `Delete`, or `Report` lifecycle RPC atomically converts an expired `PENDING` or `RUNNING` operation to `ABORTED`, fences its current group epoch, and releases its idempotency key for a same-key retry. Set the same value on the MX server and NCCL clients. |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
 
 Timing is reported through the existing `RefitTimingRecorder` stage vocabulary so
@@ -458,21 +460,55 @@ toolkit. Reshard needs NCCL 2.30.7 or newer. Importing
 actionable message; the torch-free plan and rendezvous modules import and test
 cleanly without NCCL, CUDA, or torch.
 
-## 11. Proposed implementation slices
+## 11. Implementation status
 
 | Slice | Contents |
 |---|---|
 | 1. Control plane | `refit_collective.proto`; Rust `RefitCollectiveService` + backend trait + Redis backend (atomic join, admission, epoch bump via Lua) |
 | 2. Torch-free client core | Plan records, mesh and placement derivation, bulk/misc split, layer groups, rank-assignment mirror, digest |
-| 3. Rendezvous client | Join, poll to READY, publish/fetch `uniqueId`, communicator cache keyed by `(group_id, epoch)` |
+| 3. Rendezvous client | Join, poll to READY, publish/fetch `uniqueId`, create/get/delete versioned transfers, communicator cache keyed by `(group_id, epoch)` |
 | 4. Backend | `NcclM2nSender` / `NcclM2nReceiver`: reshard lanes, broadcast lane, stream assignment |
 | 5. Two-sided clients | `RefitClientTrainer` / `RefitClientGenerator` lifecycle + Publisher/Loader SPI + reference implementations |
 | 6. Tests | Torch-free unit tests for slices 1-3 and 5; a GPU end-to-end harness for slice 4 |
+| 7. MILES adapters | `collective.integrations.miles` binds explicit native trainer tensors and aliases; `collective.integrations.sglang` binds direct or staged destination buffers and runs the generator half inside an engine safe point |
 
-Megatron publisher and vLLM loader are deliberately **out of this PR**: they are
-the only pieces with genuinely new logic per NeMo RL's own analysis, they need
-real engines to validate, and the SPI above is `LocalParamSpec`-compatible so
-NeMo RL's existing builders port directly.
+The initial MILES adapter supports BF16 base-model weights, an immutable
+trainer/generator topology, explicit canonical aliases, all-bulk plans, and
+stable direct or staged buffers. It rejects LoRA, quantized destinations,
+changing storage, incomplete coverage, and topology changes within a session.
+JAX support remains a separate framework adapter over the same shared
+`Publisher` / `Loader` SPI; it is not routed through the MILES bridge.
+MILES retains ownership of engine pause/resume and version sequencing; MX owns
+group admission, epoch fencing, communicator bootstrap, transfer identity, and
+terminal reports.
+
+Each MILES protocol instance agrees on a run identity across trainer ranks and
+uses it to scope participant slots. `MX_MILES_RUN_ID` may supply that identity
+for deployment traceability; otherwise rank 0 generates one and shares it. The
+operation idempotency key also includes the admitted `group_id`, so unrelated
+groups publishing the same model version do not collide.
+
+The generic clients can rebuild at a new epoch after a failed collective, but
+the concrete MILES adapter deliberately closes its trainer and generator
+sessions after any round or bootstrap failure. Because a failed push may have
+partially mutated live generator weights, recovery requires reconstructing the
+MILES actors or job rather than reusing that protocol instance.
+
+The adapter is process-local by design. A deployment must install the
+`SglangLoader` and `SglangGeneratorSession` inside every SGLang worker and fan
+out the same version and operation id to trainer and generator ranks. A trainer
+sidecar cannot substitute for that worker hook because it does not own the
+destination tensors. Current MILES can select the integration through its
+explicit external whole-round protocol hook:
+
+```text
+--update-weight-transfer-mode external
+--update-weight-transfer-protocol <module>:<factory>
+```
+
+That factory owns the actor fan-out and constructs the ModelExpress sessions.
+ModelExpress does not import MILES, and MILES does not acquire a hard
+ModelExpress dependency.
 
 ## 12. Open questions
 

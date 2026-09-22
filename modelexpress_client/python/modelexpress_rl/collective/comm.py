@@ -167,7 +167,7 @@ class LaneCommunicator:
         )
         with device_context:
             if stream is None:
-                torch.cuda.current_stream().synchronize()
+                torch.cuda.default_stream(device=self.device).synchronize()
             else:
                 handle = getattr(stream, "cuda_stream", stream)
                 torch.cuda.ExternalStream(int(handle)).synchronize()
@@ -197,7 +197,7 @@ class LaneCommunicator:
         try:
             with device_context:
                 if stream is None:
-                    target = torch.cuda.current_stream()
+                    target = torch.cuda.default_stream(device=self.device)
                 elif isinstance(stream, torch.cuda.Stream):
                     target = stream
                 elif isinstance(stream, int):
@@ -380,28 +380,53 @@ class CommunicatorCache:
             unique_id=bytes(unique_id),
         )
         self._lanes[key] = lane
-        # Bringing a new communicator up puts every other live one back into
-        # ncclInProgress, and a non-blocking communicator refuses collectives
-        # until it has been polled to ncclSuccess again. The lanes of a group
-        # are created one at a time with a full-group barrier between them, so
-        # without this the barrier after the second lane fails with
-        # ncclInvalidArgument on every rank. Poll here rather than on every
-        # handle access: creation is rare and is what causes the transition.
-        self._settle_others(key, bindings, timeout_s)
         return lane
 
-    def _settle_others(self, created: LaneKey, bindings: Any, timeout_s: float) -> None:
-        """Return every other live lane to ncclSuccess after a new init."""
+    def settle_group(
+        self,
+        group_id: str,
+        epoch: int,
+        *,
+        timeout_s: float | None = None,
+    ) -> int:
+        """Wait until every live lane in one group epoch is usable.
+
+        NCCL rejects a collective while that communicator still reports
+        ``ncclInProgress``. Every rank polls here before the next shared
+        bootstrap barrier, including ranks that did not create the current
+        reshard lane and therefore had no other readiness check in this step.
+        """
+        timeout_s = (
+            timeout_s
+            if timeout_s is not None
+            else envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S
+        )
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError(
+                f"timeout_s must be finite and positive, got {timeout_s!r}"
+            )
+
+        _, _, bindings = _nccl()
+        deadline = time.monotonic() + timeout_s
+        settled = 0
         for key, lane in list(self._lanes.items()):
-            if key == created or lane.aborted:
+            if key.group_id != group_id or key.epoch != epoch or lane.aborted:
                 continue
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                raise TimeoutError(
+                    f"lane {key.lane_id} of group {group_id} at epoch {epoch} "
+                    f"did not settle within {timeout_s:.1f}s"
+                )
             try:
-                _wait_until_initialized(lane.handle, bindings, timeout_s)
+                _wait_until_initialized(lane.handle, bindings, remaining_s)
             except Exception as error:
                 raise RuntimeError(
-                    f"lane {key.lane_id} of group {key.group_id} did not return to a "
-                    f"usable state after lane {created.lane_id} was initialized: {error!r}"
+                    f"lane {key.lane_id} of group {group_id} at epoch {epoch} "
+                    f"did not return to a usable state: {error!r}"
                 ) from error
+            settled += 1
+        return settled
 
     def invalidate_epoch(self, group_id: str, epoch: int) -> int:
         """Drop every lane not at ``epoch``. Returns how many were dropped."""

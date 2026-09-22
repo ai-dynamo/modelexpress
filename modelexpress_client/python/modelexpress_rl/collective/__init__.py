@@ -10,7 +10,7 @@ without a GPU. See ``docs/NCCL_M2N_REFIT.md``.
 """
 
 from .backend import DEFAULT_LAYER_GROUP, NcclM2nReceiver, NcclM2nSender
-from .client import RefitClientGenerator, RefitClientTrainer
+from .client import RefitClientGenerator, RefitClientTrainer, build_partitioned_lanes
 from .comm import CommunicatorCache, LaneCommunicator, LaneKey, NcclUnavailableError
 from .plan import (
     PlanCoverageError,
@@ -26,6 +26,7 @@ from .plan import (
     validate_coverage,
 )
 from .rendezvous import (
+    BootstrapFenceTimeoutError,
     CollectiveRendezvous,
     EpochChangedError,
     GroupNotReadyError,
@@ -46,6 +47,7 @@ from .types import (
 
 __all__ = [
     "DEFAULT_LAYER_GROUP",
+    "BootstrapFenceTimeoutError",
     "CollectiveRendezvous",
     "CommunicatorCache",
     "EpochChangedError",
@@ -74,6 +76,7 @@ __all__ = [
     "Role",
     "build_mesh",
     "build_param_plan",
+    "build_partitioned_lanes",
     "default_placements",
     "default_shard_dim",
     "generator_rank_offset",

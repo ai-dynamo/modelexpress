@@ -79,6 +79,16 @@ class RefitCollectiveServiceStub(object):
                 request_serializer=refit__collective__pb2.PublishGroupBootstrapRequest.SerializeToString,
                 response_deserializer=refit__collective__pb2.CollectiveGroup.FromString,
                 _registered_method=True)
+        self.ReachCollectiveBootstrapFence = channel.unary_unary(
+                '/model_express.refit_collective.RefitCollectiveService/ReachCollectiveBootstrapFence',
+                request_serializer=refit__collective__pb2.ReachCollectiveBootstrapFenceRequest.SerializeToString,
+                response_deserializer=refit__collective__pb2.CollectiveBootstrapFence.FromString,
+                _registered_method=True)
+        self.AbortCollectiveBootstrap = channel.unary_unary(
+                '/model_express.refit_collective.RefitCollectiveService/AbortCollectiveBootstrap',
+                request_serializer=refit__collective__pb2.AbortCollectiveBootstrapRequest.SerializeToString,
+                response_deserializer=refit__collective__pb2.CollectiveGroup.FromString,
+                _registered_method=True)
         self.ReportCollectiveTransfer = channel.unary_unary(
                 '/model_express.refit_collective.RefitCollectiveService/ReportCollectiveTransfer',
                 request_serializer=refit__collective__pb2.ReportCollectiveTransferRequest.SerializeToString,
@@ -143,6 +153,18 @@ class RefitCollectiveServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ReachCollectiveBootstrapFence(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AbortCollectiveBootstrap(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ReportCollectiveTransfer(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -180,6 +202,16 @@ def add_RefitCollectiveServiceServicer_to_server(servicer, server):
             'PublishGroupBootstrap': grpc.unary_unary_rpc_method_handler(
                     servicer.PublishGroupBootstrap,
                     request_deserializer=refit__collective__pb2.PublishGroupBootstrapRequest.FromString,
+                    response_serializer=refit__collective__pb2.CollectiveGroup.SerializeToString,
+            ),
+            'ReachCollectiveBootstrapFence': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReachCollectiveBootstrapFence,
+                    request_deserializer=refit__collective__pb2.ReachCollectiveBootstrapFenceRequest.FromString,
+                    response_serializer=refit__collective__pb2.CollectiveBootstrapFence.SerializeToString,
+            ),
+            'AbortCollectiveBootstrap': grpc.unary_unary_rpc_method_handler(
+                    servicer.AbortCollectiveBootstrap,
+                    request_deserializer=refit__collective__pb2.AbortCollectiveBootstrapRequest.FromString,
                     response_serializer=refit__collective__pb2.CollectiveGroup.SerializeToString,
             ),
             'ReportCollectiveTransfer': grpc.unary_unary_rpc_method_handler(
@@ -361,6 +393,60 @@ class RefitCollectiveService(object):
             target,
             '/model_express.refit_collective.RefitCollectiveService/PublishGroupBootstrap',
             refit__collective__pb2.PublishGroupBootstrapRequest.SerializeToString,
+            refit__collective__pb2.CollectiveGroup.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReachCollectiveBootstrapFence(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.refit_collective.RefitCollectiveService/ReachCollectiveBootstrapFence',
+            refit__collective__pb2.ReachCollectiveBootstrapFenceRequest.SerializeToString,
+            refit__collective__pb2.CollectiveBootstrapFence.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AbortCollectiveBootstrap(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.refit_collective.RefitCollectiveService/AbortCollectiveBootstrap',
+            refit__collective__pb2.AbortCollectiveBootstrapRequest.SerializeToString,
             refit__collective__pb2.CollectiveGroup.FromString,
             options,
             channel_credentials,

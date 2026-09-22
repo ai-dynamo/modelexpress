@@ -8,11 +8,12 @@
 use std::sync::Arc;
 
 use modelexpress_common::grpc::refit_collective::{
+    AbortCollectiveBootstrapRequest, BootstrapFencePhase, CollectiveBootstrapFence,
     CollectiveGroup, CollectiveGroupMembership, CollectiveGroupSpec, CollectiveRole,
     CollectiveTransfer, CreateCollectiveTransferRequest, DeleteCollectiveTransferRequest,
     GetCollectiveGroupRequest, GetCollectiveTransferRequest, JoinCollectiveGroupRequest,
-    PublishGroupBootstrapRequest, ReportCollectiveTransferRequest,
-    refit_collective_service_server::RefitCollectiveService,
+    PublishGroupBootstrapRequest, ReachCollectiveBootstrapFenceRequest,
+    ReportCollectiveTransferRequest, refit_collective_service_server::RefitCollectiveService,
 };
 use tonic::{Request, Response, Status};
 
@@ -59,7 +60,9 @@ fn backend_status(error: CollectiveBackendError) -> Status {
 
 /// Validate the membership declaration every participant of one operation must
 /// send identically.
-fn validate_spec(spec: Option<&CollectiveGroupSpec>) -> Result<&CollectiveGroupSpec, Status> {
+fn canonicalize_spec(
+    spec: Option<&mut CollectiveGroupSpec>,
+) -> Result<&mut CollectiveGroupSpec, Status> {
     let spec = spec.ok_or_else(|| Status::invalid_argument("spec is required"))?;
     required(&spec.model_name, "spec.model_name")?;
     delimiter_free(&spec.model_name, "spec.model_name", &['\0'])?;
@@ -100,7 +103,7 @@ fn validate_spec(spec: Option<&CollectiveGroupSpec>) -> Result<&CollectiveGroupS
     ] {
         for slot in slots {
             required(slot, field)?;
-            delimiter_free(slot, field, &['\0', '\n', '\r', '|'])?;
+            delimiter_free(slot, field, &['\0', '\n', '\r', '|', ','])?;
         }
     }
     if spec
@@ -112,6 +115,23 @@ fn validate_spec(spec: Option<&CollectiveGroupSpec>) -> Result<&CollectiveGroupS
             "trainer and generator slot namespaces must not overlap",
         ));
     }
+    for lane in &spec.lanes {
+        for (field, slots) in [
+            ("spec.lanes.trainer_slots", &lane.trainer_slots),
+            ("spec.lanes.generator_slots", &lane.generator_slots),
+        ] {
+            for slot in slots {
+                required(slot, field)?;
+                delimiter_free(slot, field, &['\0', '\n', '\r', '|', ','])?;
+            }
+        }
+    }
+    // Membership order has no communicator semantics. Canonicalize it before
+    // the request reaches Redis so every participant derives the same ordinal
+    // and persisted group record. Lane order remains untouched: it assigns
+    // communicator ranks.
+    spec.expected_trainer_slots.sort();
+    spec.expected_generator_slots.sort();
     Ok(spec)
 }
 
@@ -138,8 +158,8 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
         &self,
         request: Request<CreateCollectiveTransferRequest>,
     ) -> Result<Response<CollectiveTransfer>, Status> {
-        let request = request.into_inner();
-        validate_spec(request.spec.as_ref())?;
+        let mut request = request.into_inner();
+        canonicalize_spec(request.spec.as_mut())?;
         required(&request.version_id, "version_id")?;
         required(&request.idempotency_key, "idempotency_key")?;
 
@@ -180,18 +200,31 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
         &self,
         request: Request<JoinCollectiveGroupRequest>,
     ) -> Result<Response<CollectiveGroupMembership>, Status> {
-        let request = request.into_inner();
-        validate_spec(request.spec.as_ref())?;
+        let mut request = request.into_inner();
+        let spec = canonicalize_spec(request.spec.as_mut())?;
         required(&request.slot_id, "slot_id")?;
         required(&request.worker_id, "worker_id")?;
         required(&request.plan_digest, "plan_digest")?;
-        delimiter_free(&request.slot_id, "slot_id", &['\0', '\n', '\r', '|'])?;
+        delimiter_free(&request.slot_id, "slot_id", &['\0', '\n', '\r', '|', ','])?;
         delimiter_free(&request.worker_id, "worker_id", &['\0', '|'])?;
 
         let role = CollectiveRole::try_from(request.role).unwrap_or(CollectiveRole::Unspecified);
         if role == CollectiveRole::Unspecified {
             return Err(Status::invalid_argument("role must be specified"));
         }
+        let role_slots = match role {
+            CollectiveRole::Trainer => &spec.expected_trainer_slots,
+            CollectiveRole::Generator => &spec.expected_generator_slots,
+            CollectiveRole::Unspecified => unreachable!("validated above"),
+        };
+        let index_in_role = role_slots.binary_search(&request.slot_id).map_err(|_| {
+            Status::invalid_argument(format!(
+                "slot_id {} is not declared for role {role:?}",
+                request.slot_id
+            ))
+        })?;
+        request.index_in_role = u32::try_from(index_in_role)
+            .map_err(|_| Status::invalid_argument("role contains too many slots"))?;
         if let Some(source) = request.plan_source.as_ref() {
             required(&source.worker_id, "plan_source.worker_id")?;
             required(&source.endpoint, "plan_source.endpoint")?;
@@ -254,9 +287,58 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
                 request.nccl_unique_id.len()
             )));
         }
-
         self.backend
             .publish_bootstrap(&request)
+            .await
+            .map(Response::new)
+            .map_err(backend_status)
+    }
+
+    async fn reach_collective_bootstrap_fence(
+        &self,
+        request: Request<ReachCollectiveBootstrapFenceRequest>,
+    ) -> Result<Response<CollectiveBootstrapFence>, Status> {
+        let request = request.into_inner();
+        required(&request.group_id, "group_id")?;
+        required(&request.slot_id, "slot_id")?;
+        required(&request.worker_id, "worker_id")?;
+        delimiter_free(&request.slot_id, "slot_id", &['\0', '\n', '\r', '|', ','])?;
+        if request.epoch == 0 {
+            return Err(Status::invalid_argument(
+                "epoch must be the group's current epoch",
+            ));
+        }
+        if BootstrapFencePhase::try_from(request.phase).unwrap_or(BootstrapFencePhase::Unspecified)
+            == BootstrapFencePhase::Unspecified
+        {
+            return Err(Status::invalid_argument("phase must be specified"));
+        }
+
+        self.backend
+            .reach_bootstrap_fence(&request)
+            .await
+            .map(Response::new)
+            .map_err(backend_status)
+    }
+
+    async fn abort_collective_bootstrap(
+        &self,
+        request: Request<AbortCollectiveBootstrapRequest>,
+    ) -> Result<Response<CollectiveGroup>, Status> {
+        let request = request.into_inner();
+        required(&request.group_id, "group_id")?;
+        required(&request.slot_id, "slot_id")?;
+        required(&request.worker_id, "worker_id")?;
+        required(&request.message, "message")?;
+        delimiter_free(&request.slot_id, "slot_id", &['\0', '\n', '\r', '|', ','])?;
+        if request.epoch == 0 {
+            return Err(Status::invalid_argument(
+                "epoch must be the group's current epoch",
+            ));
+        }
+
+        self.backend
+            .abort_bootstrap(&request)
             .await
             .map(Response::new)
             .map_err(backend_status)
@@ -311,13 +393,13 @@ mod tests {
 
     #[test]
     fn a_valid_spec_passes() {
-        assert!(validate_spec(Some(&spec())).is_ok());
+        assert!(canonicalize_spec(Some(&mut spec())).is_ok());
     }
 
     #[test]
     fn an_absent_spec_is_rejected() {
         assert_eq!(
-            validate_spec(None).expect_err("absent spec").code(),
+            canonicalize_spec(None).expect_err("absent spec").code(),
             tonic::Code::InvalidArgument
         );
     }
@@ -326,19 +408,19 @@ mod tests {
     fn empty_membership_is_rejected() {
         let mut s = spec();
         s.expected_trainer_slots.clear();
-        assert!(validate_spec(Some(&s)).is_err());
+        assert!(canonicalize_spec(Some(&mut s)).is_err());
 
         let mut s = spec();
         s.expected_generator_slots.clear();
-        assert!(validate_spec(Some(&s)).is_err());
+        assert!(canonicalize_spec(Some(&mut s)).is_err());
 
         let mut s = spec();
         s.lanes.clear();
-        assert!(validate_spec(Some(&s)).is_err());
+        assert!(canonicalize_spec(Some(&mut s)).is_err());
 
         let mut s = spec();
         s.model_name = "  ".to_string();
-        assert!(validate_spec(Some(&s)).is_err());
+        assert!(canonicalize_spec(Some(&mut s)).is_err());
     }
 
     #[test]
@@ -348,11 +430,11 @@ mod tests {
         // client deadline instead of reporting the typo.
         let mut s = spec();
         s.expected_trainer_slots = vec!["t0".to_string(), "t0".to_string()];
-        assert!(validate_spec(Some(&s)).is_err());
+        assert!(canonicalize_spec(Some(&mut s)).is_err());
 
         let mut s = spec();
         s.expected_generator_slots = vec!["g0".to_string(), "g0".to_string()];
-        assert!(validate_spec(Some(&s)).is_err());
+        assert!(canonicalize_spec(Some(&mut s)).is_err());
     }
 
     #[test]
@@ -377,17 +459,40 @@ mod tests {
         let mut s = spec();
         s.expected_trainer_slots = vec!["r0".to_string()];
         s.expected_generator_slots = vec!["r0".to_string()];
-        assert!(validate_spec(Some(&s)).is_err());
+        assert!(canonicalize_spec(Some(&mut s)).is_err());
     }
 
     #[test]
     fn slots_reject_the_redis_record_delimiters() {
         let mut s = spec();
         s.expected_trainer_slots = vec!["trainer\n0".to_string()];
-        assert!(validate_spec(Some(&s)).is_err());
+        assert!(canonicalize_spec(Some(&mut s)).is_err());
 
         let mut s = spec();
         s.expected_generator_slots = vec!["generator|0".to_string()];
-        assert!(validate_spec(Some(&s)).is_err());
+        assert!(canonicalize_spec(Some(&mut s)).is_err());
+    }
+
+    #[test]
+    fn slots_reject_the_redis_lane_delimiter() {
+        let mut s = spec();
+        s.expected_trainer_slots = vec!["trainer,0".to_string()];
+        assert!(canonicalize_spec(Some(&mut s)).is_err());
+
+        let mut s = spec();
+        s.lanes[0].generator_slots = vec!["generator,0".to_string()];
+        assert!(canonicalize_spec(Some(&mut s)).is_err());
+    }
+
+    #[test]
+    fn membership_slots_are_canonicalized_but_lane_ranks_are_not() {
+        let mut s = spec();
+        s.expected_trainer_slots = vec!["t1".to_string(), "t0".to_string()];
+        s.lanes[0].trainer_slots = vec!["t1".to_string(), "t0".to_string()];
+
+        let canonical = canonicalize_spec(Some(&mut s)).expect("valid spec");
+
+        assert_eq!(canonical.expected_trainer_slots, ["t0", "t1"]);
+        assert_eq!(canonical.lanes[0].trainer_slots, ["t1", "t0"]);
     }
 }

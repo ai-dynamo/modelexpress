@@ -4,8 +4,10 @@
 -- KEYS[2]: reported worker set
 -- KEYS[3]: group hash
 -- KEYS[4]: participants hash
--- KEYS[5..]: every lane hash, cleared if the collective fails
--- ARGV: operation_id, group_id, epoch, worker_id, succeeded ('1'/'0'), message
+-- KEYS[5]: create-request idempotency key
+-- KEYS[6..]: every lane hash, cleared if the collective fails
+-- ARGV: operation_id, group_id, epoch, worker_id, succeeded ('1'/'0'), message,
+--       deadline_message
 
 local function parse_participant(record)
   if not record then
@@ -26,6 +28,48 @@ end
 local operation_epoch = redis.call('HGET', KEYS[1], 'epoch')
 if not operation_epoch or tonumber(operation_epoch) ~= tonumber(ARGV[3]) then
   return 'OPSTALE:' .. (operation_epoch or '0')
+end
+
+-- The expiry check belongs in this transaction. A preflight sweep alone would
+-- leave a race where the deadline elapsed after the sweep but before a late
+-- report turned RUNNING into COMPLETE.
+if state ~= 'COMPLETE' and state ~= 'FAILED' and state ~= 'ABORTED' then
+  local deadline = tonumber(redis.call('HGET', KEYS[1], 'deadline_unix_ms'))
+  local clock = redis.call('TIME')
+  local now_ms = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+  if not deadline or deadline <= now_ms then
+    redis.call('HSET', KEYS[1],
+      'state', 'ABORTED',
+      'failure_message', ARGV[7])
+
+    local current_epoch = tonumber(redis.call('HGET', KEYS[3], 'epoch'))
+    if current_epoch and current_epoch == tonumber(operation_epoch) then
+      redis.call('HSET', KEYS[3],
+        'epoch', current_epoch + 1,
+        'state', 'FORMING',
+        'bootstrap_complete_epoch', 0,
+        'active_operation_id', '',
+        'plan_source_worker_id', '',
+        'plan_source_endpoint', '',
+        'plan_source_digest', '')
+      for i = 6, #KEYS do
+        redis.call('DEL', KEYS[i])
+      end
+      local lanes = redis.call('HGET', KEYS[3], 'lanes')
+      if lanes then
+        for line in string.gmatch(lanes .. '\n', '([^\n]*)\n') do
+          local lane_id = string.match(line, '^([^|]*)|')
+          if lane_id then
+            redis.call('DEL', KEYS[3] .. ':fence:' .. lane_id)
+          end
+        end
+      end
+    end
+    if redis.call('GET', KEYS[5]) == ARGV[1] then
+      redis.call('DEL', KEYS[5])
+    end
+    return 'OK:ABORTED'
+  end
 end
 
 -- Terminal state is immutable. In particular, a late failure must not regress
@@ -69,11 +113,22 @@ if ARGV[5] == '0' then
   redis.call('HSET', KEYS[3],
     'epoch', next_epoch,
     'state', 'FORMING',
+    'bootstrap_complete_epoch', 0,
+    'active_operation_id', '',
     'plan_source_worker_id', '',
     'plan_source_endpoint', '',
     'plan_source_digest', '')
-  for i = 5, #KEYS do
+  for i = 6, #KEYS do
     redis.call('DEL', KEYS[i])
+  end
+  local lanes = redis.call('HGET', KEYS[3], 'lanes')
+  if lanes then
+    for line in string.gmatch(lanes .. '\n', '([^\n]*)\n') do
+      local lane_id = string.match(line, '^([^|]*)|')
+      if lane_id then
+        redis.call('DEL', KEYS[3] .. ':fence:' .. lane_id)
+      end
+    end
   end
   return 'OK:FAILED'
 end
@@ -82,6 +137,9 @@ local reported = redis.call('SCARD', KEYS[2])
 local expected = tonumber(redis.call('HGET', KEYS[3], 'expected_total'))
 if expected and reported == expected then
   redis.call('HSET', KEYS[1], 'state', 'COMPLETE')
+  if redis.call('HGET', KEYS[3], 'active_operation_id') == ARGV[1] then
+    redis.call('HSET', KEYS[3], 'active_operation_id', '')
+  end
   return 'OK:COMPLETE'
 end
 

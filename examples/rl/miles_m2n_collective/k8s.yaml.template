@@ -1,0 +1,185 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: miles-m2n
+    app.kubernetes.io/managed-by: modelexpress-example
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-server
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: modelexpress-server
+    app.kubernetes.io/managed-by: modelexpress-example
+spec:
+  selector:
+    app: mx-server
+  ports:
+  - name: grpc
+    port: 8000
+    targetPort: grpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-server
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: modelexpress-server
+    app.kubernetes.io/managed-by: modelexpress-example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-server
+  template:
+    metadata:
+      labels:
+        app: mx-server
+        app.kubernetes.io/name: modelexpress-server
+        app.kubernetes.io/managed-by: modelexpress-example
+    spec:
+      imagePullSecrets:
+      - name: ${RUNTIME_PULL_SECRET}
+      initContainers:
+      - name: redis
+        image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+        args: ["--save", "", "--appendonly", "no"]
+        restartPolicy: Always
+        startupProbe:
+          tcpSocket:
+            port: 6379
+          periodSeconds: 1
+          failureThreshold: 30
+      containers:
+      - name: modelexpress-server
+        image: ${MX_SERVER_IMAGE}
+        command: ["./modelexpress-server"]
+        args: ["--port", "8000"]
+        env:
+        - name: MX_METADATA_BACKEND
+          value: redis
+        - name: REDIS_URL
+          value: redis://localhost:6379
+        - name: MX_NCCL_REFIT_TRANSFER_TIMEOUT_S
+          value: "${MX_NCCL_REFIT_TRANSFER_TIMEOUT_S}"
+        ports:
+        - name: grpc
+          containerPort: 8000
+        readinessProbe:
+          grpc:
+            port: 8000
+          periodSeconds: 2
+          failureThreshold: 30
+        resources:
+          requests:
+            cpu: "2"
+            memory: 4Gi
+          limits:
+            memory: 8Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: miles-m2n-${RUN_ID}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: miles-m2n
+    app.kubernetes.io/managed-by: modelexpress-example
+    modelexpress.nvidia.com/run-id: ${RUN_ID}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: miles-m2n
+        app.kubernetes.io/managed-by: modelexpress-example
+        modelexpress.nvidia.com/run-id: ${RUN_ID}
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+      - name: ${RUNTIME_PULL_SECRET}
+      nodeSelector:
+        node.dgxc.nvidia.com/has-gpu: "true"
+        nvidia.com/gpu.product: ${GPU_PRODUCT}
+      containers:
+      - name: miles
+        image: ${RUNTIME_IMAGE}
+        imagePullPolicy: Always
+        command: ["python3", "/opt/modelexpress-miles-m2n/run_miles.py"]
+        envFrom:
+        - secretRef:
+            name: hf-token-secret
+            optional: true
+        env:
+        - name: MODEL_ID
+          value: Qwen/Qwen2.5-0.5B-Instruct
+        - name: MILES_MODEL_TYPE
+          value: qwen2.5-0.5B
+        - name: MILES_CACHE_ROOT
+          value: /models
+        - name: MX_SERVER_ADDRESS
+          value: mx-server:8000
+        - name: MX_MILES_VERIFY_TENSOR_EQUALITY
+          value: "1"
+        - name: MX_MILES_RUN_ID
+          value: "${RUN_ID}"
+        - name: MX_NCCL_REFIT_NUM_STREAMS
+          value: "${MX_NCCL_REFIT_NUM_STREAMS}"
+        - name: MX_NCCL_REFIT_TRANSFER_TIMEOUT_S
+          value: "${MX_NCCL_REFIT_TRANSFER_TIMEOUT_S}"
+        - name: SGLANG_PLUGINS
+          value: modelexpress_miles_collective
+        - name: SGLANG_NCCL_SO_PATH
+          value: /opt/modelexpress/lib/libnccl.so.2
+        - name: LD_PRELOAD
+          value: /opt/modelexpress/lib/libnccl.so.2
+        - name: NCCL_DEBUG
+          value: INFO
+        - name: NCCL_CUMEM_ENABLE
+          value: "1"
+        - name: NCCL_NVLS_ENABLE
+          value: "1"
+        - name: ACTOR_GPUS
+          value: "${ACTOR_GPUS}"
+        - name: PIPELINE_PARALLEL_SIZE
+          value: "${PIPELINE_PARALLEL_SIZE}"
+        - name: ROLLOUT_GPUS
+          value: "${ROLLOUT_GPUS}"
+        - name: ROLLOUT_GPUS_PER_ENGINE
+          value: "${ROLLOUT_GPUS_PER_ENGINE}"
+        - name: TOTAL_GPUS
+          value: "${TOTAL_GPUS}"
+        resources:
+          requests:
+            cpu: "48"
+            memory: 256Gi
+            nvidia.com/gpu: "${TOTAL_GPUS}"
+          limits:
+            memory: 512Gi
+            nvidia.com/gpu: "${TOTAL_GPUS}"
+        securityContext:
+          capabilities:
+            add: ["IPC_LOCK"]
+        volumeMounts:
+        - name: model-cache
+          mountPath: /models
+        - name: shared-memory
+          mountPath: /dev/shm
+        - name: run-output
+          mountPath: /root/shared_data
+      volumes:
+      - name: model-cache
+        emptyDir: {}
+      - name: shared-memory
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+      - name: run-output
+        emptyDir: {}

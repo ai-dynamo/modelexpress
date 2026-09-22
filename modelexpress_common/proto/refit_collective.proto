@@ -31,6 +31,8 @@ service RefitCollectiveService {
   rpc JoinCollectiveGroup(JoinCollectiveGroupRequest) returns (CollectiveGroupMembership);
   rpc GetCollectiveGroup(GetCollectiveGroupRequest) returns (CollectiveGroup);
   rpc PublishGroupBootstrap(PublishGroupBootstrapRequest) returns (CollectiveGroup);
+  rpc ReachCollectiveBootstrapFence(ReachCollectiveBootstrapFenceRequest) returns (CollectiveBootstrapFence);
+  rpc AbortCollectiveBootstrap(AbortCollectiveBootstrapRequest) returns (CollectiveGroup);
   rpc ReportCollectiveTransfer(ReportCollectiveTransferRequest) returns (CollectiveTransfer);
 }
 
@@ -74,6 +76,15 @@ enum CollectiveTransferState {
   COLLECTIVE_TRANSFER_STATE_ABORTED = 5;
 }
 
+enum BootstrapFencePhase {
+  BOOTSTRAP_FENCE_PHASE_UNSPECIFIED = 0;
+  // Every rank has settled its local communicators before the lane step's
+  // shared NCCL broadcast barrier.
+  BOOTSTRAP_FENCE_PHASE_PRE_BARRIER = 1;
+  // Every rank has completed the final NCCL bootstrap barrier.
+  BOOTSTRAP_FENCE_PHASE_COMPLETE = 2;
+}
+
 // One admitted worker process inside one lane.
 message CollectiveParticipant {
   // Logical, version-scoped contribution identifier. Stable across restarts.
@@ -82,8 +93,8 @@ message CollectiveParticipant {
   // which is what lets MX fence a stale generation out of a formed group.
   string worker_id = 2;
   CollectiveRole role = 3;
-  // Ordinal within the role, supplied by the client. MX derives rank_in_lane
-  // from it; it never interprets the caller's parallelism.
+  // Canonical ordinal within the role. The client may populate it, but MX
+  // derives and overwrites it from the sorted declared role slots.
   uint32 index_in_role = 4;
   // MX-assigned. Trainers occupy the low ranks of a lane, generators follow.
   uint32 rank_in_lane = 5;
@@ -202,6 +213,38 @@ message PublishGroupBootstrapRequest {
   uint32 lane_id = 3;
   string worker_id = 4;
   bytes nccl_unique_id = 5;
+}
+
+// One full-group control-plane fence between communicator initialization steps.
+// Every admitted slot reaches every declared lane step, even when that slot is
+// not a member of the lane being initialized.
+message ReachCollectiveBootstrapFenceRequest {
+  string group_id = 1;
+  uint64 epoch = 2;
+  uint32 lane_id = 3;
+  string slot_id = 4;
+  string worker_id = 5;
+  BootstrapFencePhase phase = 6;
+}
+
+message CollectiveBootstrapFence {
+  string group_id = 1;
+  uint64 epoch = 2;
+  uint32 lane_id = 3;
+  bool released = 4;
+  // Sorted for deterministic diagnostics and retry behavior.
+  repeated string missing_slots = 5;
+  BootstrapFencePhase phase = 6;
+}
+
+// Atomically invalidate every bootstrap and fence after a post-READY failure.
+// The epoch check prevents a late failure from aborting a newer cohort.
+message AbortCollectiveBootstrapRequest {
+  string group_id = 1;
+  uint64 epoch = 2;
+  string slot_id = 3;
+  string worker_id = 4;
+  string message = 5;
 }
 
 message CollectiveTransfer {

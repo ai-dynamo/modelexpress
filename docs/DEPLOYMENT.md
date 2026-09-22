@@ -734,6 +734,45 @@ trainer and one generator, so it is not a scale effect. More than one source
 partition (pipeline stage) is supported by the protocol and has not been
 exercised against a real engine.
 
+#### MILES integration
+
+MILES selects this path through its external whole-round protocol hook rather
+than the streamed Hugging Face bucket sender:
+
+```text
+--update-weight-transfer-mode external
+--update-weight-transfer-protocol <module>:<factory>
+```
+
+The factory must use the same frozen participant topology and plan on every
+rank, create one MX transfer per MILES weight version, and fan the operation out
+to both trainer and generator actors. Trainer ranks use
+`collective.integrations.miles.MilesTrainerSession`. Each SGLang worker must
+host its own `collective.integrations.sglang.SglangGeneratorSession` because
+only that process owns the destination storage and engine safe point.
+
+Set `MX_MILES_RUN_ID` to a stable job identifier when the deployment already
+has one. Otherwise trainer rank 0 generates an identity and shares it with the
+other trainer ranks. The identity scopes participant slots so concurrent jobs
+for the same model do not join or fence each other's collective group.
+
+Any MILES collective failure closes the current trainer and generator sessions.
+Restart the affected actors or job before retrying; a possibly partial direct
+write is not made safe by rebuilding only the MX communicator epoch.
+
+The first supported adapter contract is deliberately narrow:
+
+- BF16 full base-model weights;
+- explicit canonical aliases and complete all-bulk plan coverage;
+- non-colocated trainer and generator workers;
+- stable topology and tensor storage for the session lifetime;
+- direct destination buffers only when their layout is proven, otherwise an
+  explicit persistent receive buffer and install callback.
+
+LoRA, quantized destinations, PD disaggregation, dynamic membership within a
+round, JAX, automatic NIXL fallback, and cross-node performance claims are not
+part of this integration.
+
 ### Collective Refit (NCCL M2N) Environment Variables
 
 Client-side policy for the NCCL M2N collective refit path
@@ -748,7 +787,7 @@ stock behavior. Design: [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md).
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600.0` | Deadline for group formation, from join until the group reports `READY` with every participant admitted. |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | Backoff floor for `GetCollectiveGroup` polling while waiting for formation and for lane bootstrap ids to be published. |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300.0` | Deadline for bringing up one lane's NCCL communicator once its bootstrap id is published. Communicators are created non-blocking, and this bounds the poll to `ncclSuccess`. Setting `NCCL_COMM_BLOCKING` to anything other than `0` is rejected at startup, because blocking initialization would defeat this deadline. |
-| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600.0` | Deadline for the reshard itself, armed per weight version. `READY` only means the group formed, so this bounds what happens after it; on expiry the group is aborted and has to re-form at a fresh epoch, because peers that disagree about which collectives completed cannot be recovered on the same communicator. |
+| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600.0` | Deadline for one reshard, armed per weight version by NCCL clients and stored by the Redis collective control plane at `CreateCollectiveTransfer`. A later collective lifecycle RPC atomically aborts an expired `PENDING` or `RUNNING` operation, fences the group to a fresh epoch, and releases that operation's idempotency key so the orchestrator can retry. Set the same value on the MX server and all NCCL clients. |
 | `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams used to overlap per-pipeline-stage reshard lanes. |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS`, so `90` | How long a participant's registration stays alive without a heartbeat. Derived from `MX_HEARTBEAT_INTERVAL_SECS` (default `30`), so raising the heartbeat interval raises this with it. |
 

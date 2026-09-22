@@ -18,6 +18,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    MX_MILES_VERIFY_TENSOR_EQUALITY: bool
     MX_NCCL_REFIT_NUM_STREAMS: int
     MX_NCCL_REFIT_GROUP_TIMEOUT_S: float
     MX_NCCL_REFIT_POLL_INTERVAL_S: float
@@ -46,10 +47,29 @@ def _float(name: str, default: float) -> float:
     return value
 
 
+def _bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid {name}: {value!r}")
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
+    "MX_MILES_VERIFY_TENSOR_EQUALITY": lambda: _bool(
+        "MX_MILES_VERIFY_TENSOR_EQUALITY", False
+    ),
     "MX_NCCL_REFIT_NUM_STREAMS": lambda: _int("MX_NCCL_REFIT_NUM_STREAMS", 2),
-    "MX_NCCL_REFIT_GROUP_TIMEOUT_S": lambda: _float("MX_NCCL_REFIT_GROUP_TIMEOUT_S", 600.0),
-    "MX_NCCL_REFIT_POLL_INTERVAL_S": lambda: _float("MX_NCCL_REFIT_POLL_INTERVAL_S", 0.25),
+    "MX_NCCL_REFIT_GROUP_TIMEOUT_S": lambda: _float(
+        "MX_NCCL_REFIT_GROUP_TIMEOUT_S", 600.0
+    ),
+    "MX_NCCL_REFIT_POLL_INTERVAL_S": lambda: _float(
+        "MX_NCCL_REFIT_POLL_INTERVAL_S", 0.25
+    ),
     "MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S": lambda: _float(
         "MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S", 300.0
     ),

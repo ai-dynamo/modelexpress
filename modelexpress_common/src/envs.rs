@@ -27,6 +27,7 @@ use crate::Error;
 use crate::constants;
 use std::env;
 use std::path::PathBuf;
+use std::time::Duration;
 
 // ── Config-loader prefix ────────────────────────────────────────────────────
 /// Prefix consumed by the `config` crate's `Environment` source in
@@ -133,6 +134,8 @@ pub const MX_REGISTRY_STATS_INTERVAL_SECS: &str = "MX_REGISTRY_STATS_INTERVAL_SE
 pub const MX_HEARTBEAT_TIMEOUT_SECS: &str = "MX_HEARTBEAT_TIMEOUT_SECS";
 /// Age (seconds) after which a STALE worker is garbage-collected.
 pub const MX_GC_TIMEOUT_SECS: &str = "MX_GC_TIMEOUT_SECS";
+/// Deadline in seconds for one NCCL M2N collective transfer.
+pub const MX_NCCL_REFIT_TRANSFER_TIMEOUT_S: &str = "MX_NCCL_REFIT_TRANSFER_TIMEOUT_S";
 
 // ── Security / auth (server) ────────────────────────────────────────────────
 /// ServiceAccount auth mode (`off`, `enforce`). Off by default.
@@ -167,6 +170,7 @@ const DEFAULT_REAPER_SCAN_INTERVAL_SECS: u64 = 30;
 const DEFAULT_REGISTRY_STATS_INTERVAL_SECS: u64 = 60;
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_GC_TIMEOUT_SECS: u64 = 3600;
+const DEFAULT_NCCL_REFIT_TRANSFER_TIMEOUT_S: f64 = 600.0;
 
 // ── Getters ───────────────────────────────────────────────────────────────
 
@@ -316,6 +320,40 @@ pub fn gc_timeout_secs() -> u64 {
     env_u64(MX_GC_TIMEOUT_SECS, DEFAULT_GC_TIMEOUT_SECS)
 }
 
+/// Deadline for a collective transfer, from its creation until completion.
+///
+/// This is shared by the Redis collective control plane and the clients that
+/// issue the actual NCCL operations. Values below one Redis millisecond round
+/// up so every positive finite client setting remains bounded server-side.
+pub fn nccl_refit_transfer_timeout() -> Result<Duration, String> {
+    let seconds = match env::var(MX_NCCL_REFIT_TRANSFER_TIMEOUT_S) {
+        Ok(value) => value.parse::<f64>().map_err(|error| {
+            format!(
+                "{MX_NCCL_REFIT_TRANSFER_TIMEOUT_S} must be a positive finite number of seconds: {error}"
+            )
+        })?,
+        Err(env::VarError::NotPresent) => DEFAULT_NCCL_REFIT_TRANSFER_TIMEOUT_S,
+        Err(error) => {
+            return Err(format!(
+                "failed to read {MX_NCCL_REFIT_TRANSFER_TIMEOUT_S}: {error}"
+            ));
+        }
+    };
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(format!(
+            "{MX_NCCL_REFIT_TRANSFER_TIMEOUT_S} must be a positive finite number of seconds"
+        ));
+    }
+
+    let millis = (seconds * 1_000.0).ceil();
+    if millis > u64::MAX as f64 {
+        return Err(format!(
+            "{MX_NCCL_REFIT_TRANSFER_TIMEOUT_S} is too large to represent as milliseconds"
+        ));
+    }
+    Ok(Duration::from_millis(millis.max(1.0) as u64))
+}
+
 /// Read an environment variable as `u64`, falling back to `default`.
 fn env_u64(name: &str, default: u64) -> u64 {
     env::var(name)
@@ -354,6 +392,10 @@ mod tests {
         assert_eq!(
             MODEL_EXPRESS_SERVER_METRICS_PORT,
             "MODEL_EXPRESS_SERVER_METRICS_PORT"
+        );
+        assert_eq!(
+            MX_NCCL_REFIT_TRANSFER_TIMEOUT_S,
+            "MX_NCCL_REFIT_TRANSFER_TIMEOUT_S"
         );
         assert_eq!(
             MODEL_EXPRESS_CACHE_EVICTION_ENABLED,
@@ -479,5 +521,31 @@ mod tests {
 
         let _g = EnvVarGuard::set(&lock, MX_GC_TIMEOUT_SECS, "not-a-number");
         assert_eq!(gc_timeout_secs(), DEFAULT_GC_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn collective_transfer_timeout_defaults_and_validates() {
+        let lock = acquire_env_mutex();
+        let _unset = EnvVarGuard::remove(&lock, MX_NCCL_REFIT_TRANSFER_TIMEOUT_S);
+        assert_eq!(
+            nccl_refit_transfer_timeout().expect("default timeout"),
+            Duration::from_secs(600)
+        );
+        drop(_unset);
+
+        let _valid = EnvVarGuard::set(&lock, MX_NCCL_REFIT_TRANSFER_TIMEOUT_S, "0.0001");
+        assert_eq!(
+            nccl_refit_transfer_timeout().expect("sub-millisecond timeout"),
+            Duration::from_millis(1)
+        );
+        drop(_valid);
+
+        for invalid in ["0", "-1", "nan", "infinity", "not-a-number"] {
+            let _invalid = EnvVarGuard::set(&lock, MX_NCCL_REFIT_TRANSFER_TIMEOUT_S, invalid);
+            assert!(
+                nccl_refit_transfer_timeout().is_err(),
+                "{invalid} must be rejected"
+            );
+        }
     }
 }

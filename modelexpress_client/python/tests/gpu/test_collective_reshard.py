@@ -18,7 +18,6 @@ value, and both must report a mismatch for the passing case to mean anything.
 from __future__ import annotations
 
 import multiprocessing as mp
-import os
 
 import pytest
 import torch
@@ -31,6 +30,7 @@ RANKS = 4
 SRC_RANKS = (0, 1)
 DST_RANKS = (2, 3)
 GLOBAL_SHAPE = (8, 16)
+
 
 def _requirements() -> str | None:
     if torch.cuda.device_count() < RANKS:
@@ -97,7 +97,9 @@ def _rank_main(rank: int, unique_id: bytes, mode: str, results) -> None:
         src = reference[index * rows : (index + 1) * rows].contiguous().to(device)
     else:
         cols = GLOBAL_SHAPE[1] // len(DST_RANKS)
-        dst = torch.full((GLOBAL_SHAPE[0], cols), -1.0, dtype=torch.float32, device=device)
+        dst = torch.full(
+            (GLOBAL_SHAPE[0], cols), -1.0, dtype=torch.float32, device=device
+        )
 
     if mode != "skip-reshard":
         with torch.cuda.stream(stream):
@@ -161,6 +163,7 @@ def test_a_wrong_expectation_does_not_match() -> None:
     """Control: the comparison discriminates values, not merely shapes."""
     assert _run_cohort("perturb-expectation") == {rank: False for rank in DST_RANKS}
 
+
 def _two_lane_main(rank: int, uids: tuple[bytes, bytes], results) -> None:
     """Create one lane, use it, create a second, then use the first again."""
     from modelexpress_rl.collective.comm import CommunicatorCache, LaneKey
@@ -174,7 +177,9 @@ def _two_lane_main(rank: int, uids: tuple[bytes, bytes], results) -> None:
         buf = torch.zeros(1, dtype=torch.uint8, device=device)
         with torch.cuda.device(device):
             lane.handle.broadcast(
-                sendbuf=buf, recvbuf=buf, root=0,
+                sendbuf=buf,
+                recvbuf=buf,
+                root=0,
                 stream=int(lane.stream.cuda_stream),
             )
         lane.synchronize()
@@ -182,14 +187,22 @@ def _two_lane_main(rank: int, uids: tuple[bytes, bytes], results) -> None:
     try:
         first = cache.create(
             LaneKey(group_id="two-lane", epoch=1, lane_id=0),
-            rank=rank, world_size=RANKS, unique_id=uids[0],
-            device=device, stream=stream, timeout_s=120.0,
+            rank=rank,
+            world_size=RANKS,
+            unique_id=uids[0],
+            device=device,
+            stream=stream,
+            timeout_s=120.0,
         )
         barrier(first)
         cache.create(
             LaneKey(group_id="two-lane", epoch=1, lane_id=1),
-            rank=rank, world_size=RANKS, unique_id=uids[1],
-            device=device, stream=stream, timeout_s=120.0,
+            rank=rank,
+            world_size=RANKS,
+            unique_id=uids[1],
+            device=device,
+            stream=stream,
+            timeout_s=120.0,
         )
         barrier(first)
         results.put((rank, True))
@@ -201,11 +214,11 @@ def _two_lane_main(rank: int, uids: tuple[bytes, bytes], results) -> None:
 def test_a_lane_stays_usable_after_another_lane_is_created() -> None:
     """Bringing up a second communicator must not strand the first.
 
-    The lanes of a group are created one at a time with a full-group barrier
-    between them, and a new init puts every other non-blocking communicator
-    back into ncclInProgress. Without settling them, that second barrier fails
-    with ncclInvalidArgument on every rank, which takes the whole collective
-    path down before any weight moves.
+    Public NCCL source does not promise that initializing one communicator
+    changes an unrelated communicator's async state. This test keeps the
+    narrower invariant the client needs: after another lane is initialized,
+    the first communicator can still be settled and reused for the next
+    full-group barrier.
     """
     from nccl.core import utils
 

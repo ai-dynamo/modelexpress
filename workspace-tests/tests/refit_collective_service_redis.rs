@@ -21,13 +21,14 @@ use modelexpress_common::grpc::refit::{
 use modelexpress_common::grpc::refit_collective::{
     CollectiveGroup, CollectiveGroupSpec, CollectiveGroupState, CollectiveRole, CollectiveTransfer,
     CollectiveTransferState, CreateCollectiveTransferRequest, DeleteCollectiveTransferRequest,
-    GetCollectiveGroupRequest, JoinCollectiveGroupRequest, LaneKind, LaneSpec, PlanSource,
-    PublishGroupBootstrapRequest, ReportCollectiveTransferRequest,
+    GetCollectiveGroupRequest, GetCollectiveTransferRequest, JoinCollectiveGroupRequest, LaneKind,
+    LaneSpec, PlanSource, PublishGroupBootstrapRequest, ReportCollectiveTransferRequest,
     refit_collective_service_client::RefitCollectiveServiceClient,
 };
 use modelexpress_server::backend_config::BackendConfig;
 use modelexpress_server::config::ServerConfig;
 use modelexpress_server::run_server;
+use redis::AsyncCommands;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
@@ -215,6 +216,22 @@ async fn create_transfer(
         .await
         .expect("create collective transfer")
         .into_inner()
+}
+
+async fn expire_transfer(redis_url: &str, operation_id: &str) {
+    let client = redis::Client::open(redis_url).expect("valid Redis URL");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect Redis");
+    let _: usize = connection
+        .hset(
+            format!("mx:refitc:op:{operation_id}"),
+            "deadline_unix_ms",
+            0_u64,
+        )
+        .await
+        .expect("set test-controlled deadline");
 }
 
 #[tokio::test]
@@ -882,6 +899,290 @@ async fn expired_registration_revokes_ready_membership() {
         .map(|participant| participant.slot_id.as_str())
         .collect();
     assert_eq!(participant_slots, vec!["t0"]);
+
+    stop(stop_server, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn an_expired_pending_transfer_aborts_and_releases_its_idempotency_key() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (stop_server, server) = start_server(port, &redis_url);
+    let (mut refit, mut collective) = connect(port).await;
+
+    let model = unique_id("pending-deadline");
+    let group_spec = spec(&model, &["t0"], &["g0"]);
+    let trainer = unique_id("pending-trainer");
+    let generator = unique_id("pending-generator");
+    register(&mut refit, &model, &trainer, WorkerRole::Trainer, 60).await;
+    register(&mut refit, &model, &generator, WorkerRole::Generator, 60).await;
+    let membership = join(
+        &mut collective,
+        join_request(&group_spec, "t0", &trainer, CollectiveRole::Trainer, 0),
+    )
+    .await;
+    join(
+        &mut collective,
+        join_request(&group_spec, "g0", &generator, CollectiveRole::Generator, 0),
+    )
+    .await;
+    publish(
+        &mut collective,
+        &membership.group_id,
+        membership.epoch,
+        RESHARD_LANE,
+        &trainer,
+        31,
+    )
+    .await;
+    publish(
+        &mut collective,
+        &membership.group_id,
+        membership.epoch,
+        BROADCAST_LANE,
+        &trainer,
+        32,
+    )
+    .await;
+
+    let idempotency_key = unique_id("pending-deadline-operation");
+    let pending = create_transfer(
+        &mut collective,
+        &group_spec,
+        "pending-deadline-version",
+        &idempotency_key,
+    )
+    .await;
+    expire_transfer(&redis_url, &pending.operation_id).await;
+
+    let aborted = collective
+        .get_collective_transfer(GetCollectiveTransferRequest {
+            operation_id: pending.operation_id.clone(),
+        })
+        .await
+        .expect("expired pending transfer")
+        .into_inner();
+    assert_eq!(aborted.state, i32::from(CollectiveTransferState::Aborted));
+    assert!(
+        aborted
+            .failure_message
+            .contains("MX_NCCL_REFIT_TRANSFER_TIMEOUT_S")
+    );
+
+    let fenced = collective
+        .get_collective_group(GetCollectiveGroupRequest {
+            group_id: membership.group_id,
+        })
+        .await
+        .expect("read group after deadline")
+        .into_inner();
+    assert_eq!(fenced.epoch, pending.epoch + 1);
+    assert_eq!(fenced.state, i32::from(CollectiveGroupState::Forming));
+    assert!(
+        fenced
+            .lanes
+            .iter()
+            .all(|lane| lane.nccl_unique_id.is_empty())
+    );
+
+    let replacement = create_transfer(
+        &mut collective,
+        &group_spec,
+        "pending-deadline-version",
+        &idempotency_key,
+    )
+    .await;
+    assert_ne!(replacement.operation_id, pending.operation_id);
+
+    collective
+        .delete_collective_transfer(DeleteCollectiveTransferRequest {
+            operation_id: pending.operation_id,
+        })
+        .await
+        .expect("delete expired transfer");
+    let replay = create_transfer(
+        &mut collective,
+        &group_spec,
+        "pending-deadline-version",
+        &idempotency_key,
+    )
+    .await;
+    assert_eq!(replay.operation_id, replacement.operation_id);
+
+    stop(stop_server, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn an_expired_running_transfer_aborts_and_releases_its_idempotency_key() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (stop_server, server) = start_server(port, &redis_url);
+    let (mut refit, mut collective) = connect(port).await;
+
+    let model = unique_id("running-deadline");
+    let group_spec = spec(&model, &["t0"], &["g0"]);
+    let trainer = unique_id("running-trainer");
+    let generator = unique_id("running-generator");
+    register(&mut refit, &model, &trainer, WorkerRole::Trainer, 60).await;
+    register(&mut refit, &model, &generator, WorkerRole::Generator, 60).await;
+    let membership = join(
+        &mut collective,
+        join_request(&group_spec, "t0", &trainer, CollectiveRole::Trainer, 0),
+    )
+    .await;
+    join(
+        &mut collective,
+        join_request(&group_spec, "g0", &generator, CollectiveRole::Generator, 0),
+    )
+    .await;
+    publish(
+        &mut collective,
+        &membership.group_id,
+        membership.epoch,
+        RESHARD_LANE,
+        &trainer,
+        41,
+    )
+    .await;
+    publish(
+        &mut collective,
+        &membership.group_id,
+        membership.epoch,
+        BROADCAST_LANE,
+        &trainer,
+        42,
+    )
+    .await;
+
+    let idempotency_key = unique_id("running-deadline-operation");
+    let running = create_transfer(
+        &mut collective,
+        &group_spec,
+        "running-deadline-version",
+        &idempotency_key,
+    )
+    .await;
+    let running = collective
+        .report_collective_transfer(ReportCollectiveTransferRequest {
+            operation_id: running.operation_id,
+            group_id: running.group_id,
+            epoch: running.epoch,
+            worker_id: trainer,
+            succeeded: true,
+            message: String::new(),
+        })
+        .await
+        .expect("first report starts the transfer")
+        .into_inner();
+    assert_eq!(running.state, i32::from(CollectiveTransferState::Running));
+    expire_transfer(&redis_url, &running.operation_id).await;
+
+    let aborted = collective
+        .report_collective_transfer(ReportCollectiveTransferRequest {
+            operation_id: running.operation_id.clone(),
+            group_id: running.group_id.clone(),
+            epoch: running.epoch,
+            worker_id: generator,
+            succeeded: true,
+            message: String::new(),
+        })
+        .await
+        .expect("late report observes the deadline")
+        .into_inner();
+    assert_eq!(aborted.state, i32::from(CollectiveTransferState::Aborted));
+    let fenced = collective
+        .get_collective_group(GetCollectiveGroupRequest {
+            group_id: membership.group_id,
+        })
+        .await
+        .expect("read group after running deadline")
+        .into_inner();
+    assert_eq!(fenced.epoch, running.epoch + 1);
+    assert_eq!(fenced.state, i32::from(CollectiveGroupState::Forming));
+
+    let replacement = create_transfer(
+        &mut collective,
+        &group_spec,
+        "running-deadline-version",
+        &idempotency_key,
+    )
+    .await;
+    assert_ne!(replacement.operation_id, running.operation_id);
+
+    stop(stop_server, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn slot_encoding_and_membership_ordinals_are_canonical() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (stop_server, server) = start_server(port, &redis_url);
+    let (mut refit, mut collective) = connect(port).await;
+
+    let model = unique_id("canonical-slots");
+    let ordered = spec(&model, &["t0", "t1"], &["g0"]);
+    let mut reordered = ordered.clone();
+    reordered.expected_trainer_slots.reverse();
+    let trainer_zero = unique_id("canonical-t0");
+    let trainer_one = unique_id("canonical-t1");
+    let generator = unique_id("canonical-g0");
+    register(&mut refit, &model, &trainer_zero, WorkerRole::Trainer, 60).await;
+    register(&mut refit, &model, &trainer_one, WorkerRole::Trainer, 60).await;
+    register(&mut refit, &model, &generator, WorkerRole::Generator, 60).await;
+
+    let first = join(
+        &mut collective,
+        join_request(&ordered, "t0", &trainer_zero, CollectiveRole::Trainer, 0),
+    )
+    .await;
+    let second = join(
+        &mut collective,
+        join_request(&reordered, "t1", &trainer_one, CollectiveRole::Trainer, 0),
+    )
+    .await;
+    assert_eq!(first.group_id, second.group_id);
+
+    let group = collective
+        .get_collective_group(GetCollectiveGroupRequest {
+            group_id: first.group_id,
+        })
+        .await
+        .expect("read canonical group")
+        .into_inner();
+    assert_eq!(group.expected_trainer_slots, ["t0", "t1"]);
+    let broadcast = group
+        .lanes
+        .iter()
+        .find(|lane| lane.lane_id == BROADCAST_LANE)
+        .expect("broadcast lane");
+    let trainer_one = broadcast
+        .participants
+        .iter()
+        .find(|participant| participant.slot_id == "t1")
+        .expect("second trainer");
+    assert_eq!(trainer_one.index_in_role, 1);
+
+    let mut comma = ordered;
+    comma.expected_trainer_slots[0] = "t,0".to_string();
+    comma.lanes[0].trainer_slots[0] = "t,0".to_string();
+    comma.lanes[1].trainer_slots[0] = "t,0".to_string();
+    let error = collective
+        .join_collective_group(join_request(
+            &comma,
+            "t,0",
+            &trainer_zero,
+            CollectiveRole::Trainer,
+            0,
+        ))
+        .await
+        .expect_err("comma slot is not Redis-serializable");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
 
     stop(stop_server, server).await;
 }

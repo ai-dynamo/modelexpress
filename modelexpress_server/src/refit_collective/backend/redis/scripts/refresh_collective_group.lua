@@ -47,11 +47,22 @@ if changed then
   redis.call('HSET', KEYS[1],
     'epoch', epoch,
     'state', 'FORMING',
+    'bootstrap_complete_epoch', 0,
+    'active_operation_id', '',
     'plan_source_worker_id', '',
     'plan_source_endpoint', '',
     'plan_source_digest', '')
   for i = 4, #KEYS do
     redis.call('DEL', KEYS[i])
+  end
+  local lanes = redis.call('HGET', KEYS[1], 'lanes')
+  if lanes then
+    for line in string.gmatch(lanes .. '\n', '([^\n]*)\n') do
+      local lane_id = string.match(line, '^([^|]*)|')
+      if lane_id then
+        redis.call('DEL', KEYS[1] .. ':fence:' .. lane_id)
+      end
+    end
   end
 end
 
