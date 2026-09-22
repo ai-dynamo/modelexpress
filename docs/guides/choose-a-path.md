@@ -5,48 +5,35 @@ SPDX-License-Identifier: Apache-2.0
 
 # Choose a ModelExpress path
 
-Choose based on where the weights start and what the target workers can reach.
+Start with what you want to do:
 
-| Scenario | Use | Main requirement |
-|---|---|---|
-| One replica can load the model; later replicas should start quickly | P2P | NIXL, a supported fabric, and source discovery |
-| Replicas cannot share a filesystem | P2P or server-backed cache | Targets still need model configuration and non-weight files |
-| Every worker should read from object storage | ModelStreamer | `MX_MODEL_URI`, credentials, and safetensors |
-| Weights are fixed and you do not want a central MX server | `k8s-service` | Stable revisions and rank-aware Kubernetes Services |
-| You only need cache management | Standalone server and CLI | Redis or Kubernetes metadata backend |
-| An orchestrator owns worker lifecycle | [Dynamo](../integrations/orchestrators/dynamo.md) or [llm-d](../integrations/orchestrators/llm-d.md) | Orchestrator operator, runtime image, and MX configuration |
+- **Start inference replicas faster:** one worker loads a checkpoint, then compatible workers copy its ready GPU weights. Follow the [vLLM Kubernetes quickstart](../integrations/runtimes/vllm.md), or choose [SGLang](../integrations/runtimes/sglang.md) or [TensorRT-LLM](../integrations/runtimes/tensorrt-llm.md).
+- **Update rollout workers during RL training:** publish a weight version, install it on the required rollout workers, then resume generation. Start with [RL weight updates](rl.md).
 
-## P2P without shared storage
+Inference startup and an RL weight update are different operations. Selecting the `modelexpress` loader starts an inference worker; updating a running rollout worker also requires the training framework's version and refit lifecycle.
 
-P2P does not require target replicas to mount the source model filesystem. The first compatible worker loads the model, publishes metadata, and later workers receive post-processed tensors directly from GPU memory over NIXL. The ModelExpress server coordinates discovery; weight bytes do not pass through it.
+## Inference: load once, then copy from a peer
 
-Targets still need the runtime and ModelExpress client, model configuration and tokenizer files, and connectivity to the metadata endpoint. If targets cannot obtain non-weight repository files, use the [server-backed no-shared-storage path](../DEPLOYMENT.md#server-backed-model-cache-no-shared-storage) or package those files in the image.
+The first worker loads weights from storage and publishes its availability. Later compatible workers discover that source and receive post-processed tensors directly over NIXL. Keep the source running while targets start. The ModelExpress server coordinates discovery; these P2P weight bytes do not pass through it.
 
-For the central topology, deploy a [Redis or Kubernetes-backed server](../../examples/p2p_transfer_k8s/server/README.md), build a runtime image, apply the matching [P2P example](../../examples/p2p_transfer_k8s/README.md), wait for the first replica to become ready, then scale. Use the [`k8s-service` examples](../../examples/k8s_service_sources/README.md) only when source pods hold stable, interchangeable revisions.
+For a first Kubernetes deployment, use the central server with Kubernetes CRDs in the [vLLM quickstart](../integrations/runtimes/vllm.md). [Redis](../../examples/p2p_transfer_k8s/server/README.md) is an alternative metadata backend. For orchestrator integration, see [Dynamo](../integrations/orchestrators/dynamo.md) or [llm-d](../integrations/orchestrators/llm-d.md). The serverless [`k8s-service` backend](../../examples/k8s_service_sources/README.md) is an advanced option for fixed, interchangeable model revisions.
 
-## Load from object storage or a local path
+Source and target must use compatible runtime, model revision, dtype, and parallelism settings. Targets still need model configuration and tokenizer files. P2P does not require a shared model filesystem, but it does not make a worker automatically offline-capable: package non-weight files locally or use the [server-backed no-shared-storage setup](../DEPLOYMENT.md#server-backed-model-cache-no-shared-storage).
 
-Set `MX_MODEL_URI` to `s3://`, `gs://`, `az://`, or an absolute local path. ModelStreamer reads safetensors directly in the worker, so direct storage loading does not require a ModelExpress server, Redis, a PVC, or RDMA. Add `MX_SERVER_ADDRESS` and fabric resources only if the loaded worker should become a P2P source.
+A healthy target alone does not prove P2P succeeded: inference loading can fall back to storage. Check its logs for `RDMA transfer complete` and exercise its inference API, as shown in the quickstart.
 
-For vLLM, the storage URI can be the model argument. For SGLang, keep `--model-path` on the model identity or configuration path and pass the storage URI only through `MX_MODEL_URI`; using an object-storage URI as `--model-path` selects SGLang's native loader instead.
+## Inference: read weights directly from storage
 
-Start with the checked-in [vLLM](../../examples/model_streamer_k8s/client/vllm/README.md) or [SGLang](../../examples/model_streamer_k8s/client/sglang/README.md) manifests. Credentials use the storage SDK's normal environment, workload identity, or secret chain. Leave `MX_MS_DISTRIBUTED=1` to divide ModelStreamer reads across CUDA tensor-parallel ranks.
+Use ModelStreamer when workers should read safetensors from S3, GCS, Azure Blob Storage, or an absolute local path. Set `MX_MODEL_URI` on the **inference worker**, with credentials available to that worker. This path is storage → worker; it does not need a ModelExpress server, Redis, a shared PVC, or RDMA. Add a server address and a working NIXL transport if the loaded worker should also become a P2P source.
 
-## Configure loader behavior
+Start with the [vLLM](../../examples/model_streamer_k8s/client/vllm/README.md) or [SGLang](../../examples/model_streamer_k8s/client/sglang/README.md) storage examples. The runtime still needs configuration and tokenizer files. For SGLang, keep `--model-path` on the model identity or configuration path and supply the storage URI through `MX_MODEL_URI`; an object-storage `--model-path` selects SGLang's native loader instead.
 
-ModelExpress uses a fixed strategy order: P2P, server cache, InstantTensor, ModelStreamer, GDS, then the runtime's native loader. You configure whether a path is eligible and how it behaves; you do not supply an arbitrary order.
+Verify `Trying strategy: model_streamer` followed by `Model streamer weight loading complete`. If the logs show another loader, check that the worker image includes the expected MX version and runtime integration. Setting a URI alone does not prove the storage path ran.
 
-| Goal | Setting |
-|---|---|
-| Connect to a central P2P coordinator | `MX_SERVER_ADDRESS` and `MX_METADATA_BACKEND=redis` or `kubernetes` |
-| Use decentralized source discovery | `MX_METADATA_BACKEND=k8s-service` |
-| Fetch repository files through the server | `MODEL_EXPRESS_NO_SHARED_STORAGE=1` plus a server address |
-| Stream from storage | `MX_MODEL_URI` |
-| Disable InstantTensor | `MX_INSTANT_TENSOR=0` |
-| Inspect the decision | `MODEL_EXPRESS_LOG_LEVEL=DEBUG` |
+## Defaults and optional configuration
 
-Eligibility also depends on the runtime adapter, installed packages, device, model format, and metadata reachability. See [Configuration](../CONFIGURATION.md#loading-strategy-selection) for defaults and [Troubleshooting](../TROUBLESHOOTING.md#loader-selection) for the relevant log messages.
+`MX_LOAD_STRATEGY_CHAIN=INFERENCE` is the default. Its fixed order is P2P, server cache, InstantTensor, ModelStreamer, GDS, then the runtime's native loader; unavailable strategies are skipped and recoverable failures can fall through. With an object-storage `MX_MODEL_URI`, current MX skips InstantTensor automatically. A local path can still be eligible for InstantTensor first.
 
-## Without RDMA or GDS
+`MX_LOAD_STRATEGY_CHAIN=RL` selects the separate RL startup policy. When an exact desired version UID is configured, startup must load that version through the supported RL sources or fail; it must not silently use an unrelated checkpoint. See the [RL guide](rl.md) for integration requirements.
 
-ModelExpress remains usable. P2P and GDS are skipped, while server cache, InstantTensor, ModelStreamer, or the native runtime loader can still run when eligible.
+Without RDMA, storage loading remains available. P2P eligibility checks package, device, and discovery support; they do not prove the network is usable. A failed transport may trigger fallback, so inspect completion logs before claiming a P2P result. See [Configuration](../CONFIGURATION.md#loading-strategy-selection) and [Troubleshooting](../TROUBLESHOOTING.md#loader-selection) for details.

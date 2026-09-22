@@ -24,7 +24,7 @@ For technical architecture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). 
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/ai-dynamo/modelexpress.git
 cd modelexpress
 
 # Install pre-commit hooks
@@ -38,7 +38,7 @@ cargo build
 cargo test
 
 # (Optional) Install the Python P2P client for development
-pip install -e modelexpress_client/python[dev]
+pip install -e './modelexpress_client/python[dev]'
 ```
 
 ### DevContainer
@@ -61,12 +61,12 @@ A devcontainer configuration is provided for VSCode in `.devcontainer/`. It incl
 | `cargo test` | Run all tests |
 | `cargo clippy` | Lint (must pass with no warnings) |
 | `cargo bench` | Run Criterion benchmarks |
-| `cargo run --bin modelexpress-server` | Run the gRPC server |
+| `MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 cargo run --bin modelexpress-server` | Run the server with an existing local Redis instance |
 | `cargo run --bin modelexpress-cli` | Run the CLI client |
 | `cargo run --bin config_gen -- --output model-express.yaml` | Generate server config |
 | `cargo run --bin test_client -- --test-model "google-t5/t5-small"` | Run test client |
 | `cargo run --bin fallback_test` | Run fallback tests |
-| `./run_integration_tests.sh` | Integration tests (starts server) |
+| `./run_integration_tests.sh` | Concurrent-download integration test; requires backend environment and a reachable backend |
 | `pytest modelexpress_client/python/tests/` | Run Python client tests |
 | `modelexpress_client/python/generate_proto.sh` | Regenerate Python protobuf stubs |
 | `modelexpress_client/go/generate_proto.sh` | Regenerate Go protobuf and gRPC bindings |
@@ -74,11 +74,14 @@ A devcontainer configuration is provided for VSCode in `.devcontainer/`. It incl
 | `pre-commit run` | Run hooks on staged files |
 | `pre-commit run --all-files` | Run hooks on all files |
 
+Server and client integration commands require a reachable backend and the configuration below. `run_integration_tests.sh` starts a server but does not provision Redis or Kubernetes; it also runs `cargo clean` and can change the default Rust toolchain. Review those effects before using it. For configuration-only validation without a backend or GPU, use the commands in [AGENTS.md](AGENTS.md#work-and-validation).
+
 ### Pre-commit Hooks
 
 The repository uses pre-commit hooks defined in `.pre-commit-config.yaml`:
 
 **General hooks:**
+
 - `trailing-whitespace` - Remove trailing whitespace (excludes `.md`)
 - `end-of-file-fixer` - Ensure files end with newline
 - `check-yaml` - Validate YAML syntax
@@ -90,6 +93,7 @@ The repository uses pre-commit hooks defined in `.pre-commit-config.yaml`:
 - `mixed-line-ending` - Enforce consistent line endings
 
 **Rust hooks:**
+
 - `cargo fmt` - Format with rustfmt
 - `cargo clippy` - Lint with `--fix` and `-D warnings`
 - `cargo check` - Compilation check
@@ -109,12 +113,12 @@ Run pre-commit after every code change, even before creating commits. Do not wai
 | `MODEL_EXPRESS_LOG_LEVEL` | `info` | Log level (trace, debug, info, warn, error) |
 | `MODEL_EXPRESS_LOG_FORMAT` | `pretty` | Log format (json, pretty, compact) |
 | `MX_METADATA_BACKEND` | (required) | `redis` or `kubernetes` — drives both the P2P metadata and model registry backends |
-| `REDIS_URL` | `redis://localhost:6379` | Redis URL (when backend is `redis`) |
+| `REDIS_URL` | Required for Redis, unless both host and port settings are supplied | Reachable Redis endpoint; there is no implicit localhost fallback |
 
-For local dev the quickest Redis is a one-liner:
+For local development, start Redis in one shell and run the server in another or in the foreground:
 
 ```bash
-docker run --rm -d -p 6379:6379 --name mx-redis redis:7-alpine
+docker run --rm -d -p 6379:6379 --name mx-redis redis:8-alpine
 MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 cargo run -p modelexpress-server
 ```
 
@@ -134,11 +138,8 @@ Cache directory resolution order: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CAC
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Legacy address; takes precedence over `MX_SERVER_ADDRESS` when both are set. Prefer `MX_SERVER_ADDRESS`; keep both equal only when an older integration requires it. |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration (registers cudaMalloc blocks instead of individual tensors) |
-| `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
-| `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |
-| `MX_SYNC_START` | `1` | Target: wait for all workers before transferring |
 
 ### Docker
 
@@ -154,22 +155,13 @@ docker build -f examples/p2p_transfer_k8s/client/vllm/Dockerfile \
   -t your-registry/IMAGE_NAME:TAG .
 ```
 
-The SGLang build and TensorRT-LLM deployment paths are documented under
-[`examples/p2p_transfer_k8s/client/`](examples/p2p_transfer_k8s/client/).
+The SGLang build and TensorRT-LLM deployment paths are documented under [`examples/p2p_transfer_k8s/client/`](examples/p2p_transfer_k8s/client/).
 
 ### Helm
 
-The `helm/` directory contains a Helm chart for Kubernetes deployment. See `helm/README.md` for full documentation.
+The chart deploys the server and requires an explicit metadata backend, its connection settings, and a compatible server image. Follow [Helm installation](helm/README.md#installation) for working Redis or Kubernetes backend commands. The chart does not deploy Redis or inference workers. If you use `helm/deploy.sh`, supply a values file with those settings; its bare default invocation does not select a backend.
 
-```bash
-# Deploy with default values
-helm/deploy.sh --namespace my-ns
-
-# Deploy with custom values
-helm/deploy.sh --namespace my-ns --values helm/values-development.yaml
-```
-
-Values files: `values.yaml` (default), `values-development.yaml`, `values-production.yaml`, `values-local-storage.yaml`.
+Values files: `values.yaml` (base defaults), `values-development.yaml`, `values-production.yaml`, `values-local-storage.yaml`. Review their storage, image, and backend settings for your environment.
 
 ## Contribution Guidelines
 
@@ -223,9 +215,11 @@ Signed-off-by: Jane Smith <jane.smith@email.com>
 
 You can use `-s` or `--signoff` to add the `Signed-off-by` line automatically.
 
-If your pull request fails the DCO check, add the trailer to the existing commits and force-push:
+If your pull request fails the DCO check, inspect the affected commits and preserve existing sign-offs. Check `git config user.name` and `git config user.email`, and add your sign-off only to contributions you can certify. The following repair is appropriate when every commit being rebased is yours to certify; otherwise arrange sign-off by each contributor or repair only the relevant commits:
 
 ```bash
 git rebase --signoff origin/main
 git push --force-with-lease
 ```
+
+See the [DCO skill](.agents/skills/dco/SKILL.md) for the shared agent procedure. Do not add tool-attribution or `Co-Authored-By` trailers.

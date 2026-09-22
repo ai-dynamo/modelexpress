@@ -52,10 +52,7 @@ logging:
 
 ### Starting the Server
 
-The server requires `MX_METADATA_BACKEND` (`redis` or `kubernetes`) plus the connection
-env vars for the chosen backend — the server refuses to start without them. See
-[Distributed backend selection](#distributed-backend-selection) below for the full env
-contract.
+The server requires `MX_METADATA_BACKEND` (`redis` or `kubernetes`) plus the connection environment variables for the chosen backend. See [Distributed backend selection](#distributed-backend-selection) for the required settings.
 
 ```bash
 # Redis backend
@@ -76,11 +73,11 @@ MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 \
 MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 \
   cargo run --bin modelexpress-server -- --port 8080 --log-level debug
 
-# Validate config without starting (backend env vars still required — the validator
-# parses the full startup path including MX_METADATA_BACKEND)
-MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 \
-  cargo run --bin modelexpress-server -- --config model-express.yaml --validate-config
+# Validate the config file without starting or connecting to a backend
+cargo run --bin modelexpress-server -- --config model-express.yaml --validate-config
 ```
+
+`--validate-config` checks server configuration and exits before metadata backend initialization. It does not require or validate `MX_METADATA_BACKEND`, test Redis/Kubernetes connectivity, or prove the server can start.
 
 ### Configuration Options
 
@@ -160,7 +157,7 @@ MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS
 |------|-------------|-------|
 | Single-replica MX, all pods on one node, RWO cache | RWO | Simplest option |
 | Multi-container sharing the cache (e.g. vLLM worker on a different node) | RWX | Operator choice; MX doesn't force it |
-| Multi-replica MX with `MODEL_EXPRESS_NO_SHARED_STORAGE=true` on clients (gRPC streaming) | RWO per replica OR ephemeral | Needs an MX-aware init container in the client pod; no ready-made vLLM recipe today (tracked MX-290) |
+| Multi-replica MX with `MODEL_EXPRESS_NO_SHARED_STORAGE=true` on clients (gRPC streaming) | RWO per replica OR ephemeral | Clients need a writable local cache; runtime integration fetches repository metadata before loading and weights after a P2P miss. See [server-backed loading](#server-backed-model-cache-no-shared-storage). |
 | ModelStreamer from object storage on clients | none | Clients stream through a bounded CPU staging buffer without landing the checkpoint on local disk |
 | ModelStreamer from a local path on clients | Existing local/PVC path | Reads the configured local checkpoint through the pipelined ModelStreamer path |
 | P2P RDMA receivers, weights only | none on receiver | Weights land in GPU HBM; the source may have bootstrapped through server cache, InstantTensor, ModelStreamer, GDS, or the native loader |
@@ -329,8 +326,16 @@ The multi-stage Dockerfile builds all binaries (server, CLI, test tools):
 
 ```bash
 docker build -f docker/Dockerfile -t model-express .
-docker run -p 8001:8001 model-express
+docker network create mx-local
+docker run -d --name mx-redis --network mx-local redis:8-alpine
+docker run --rm --name mx-server --network mx-local \
+  -p 127.0.0.1:8001:8001 \
+  -e MX_METADATA_BACKEND=redis \
+  -e REDIS_URL=redis://mx-redis:6379 \
+  model-express
 ```
+
+This local example keeps Redis on the container network and publishes the MX gRPC port on localhost. The server cache is ephemeral. For a persistent deployment, mount a cache volume writable by UID `1000`; for Kubernetes, use the [Helm guide](../helm/README.md).
 
 ### Docker Compose
 
@@ -386,26 +391,7 @@ Without buildx (single arch, matches the host):
 ```bash
 docker build -f docker/Dockerfile.client-wheel --target builder -t mx-wheel-builder .
 docker run --rm -v "$PWD/dist:/out" mx-wheel-builder bash -lc 'cp -r /dist/. /out/'
-
-#### CI uploads to Artifactory
-
-`.github/workflows/build-wheels.yml` runs this Dockerfile on every PR
-(via `copy-pr-bot` mirroring into `pull-request/<pr_id>` branches) and
-every push to `main` / `release/**`, building both archs in parallel on
-velonix self-hosted runners and uploading the artifacts to NV Artifactory.
-
-Destination layout under `${ARTIFACTORY_PYPI_REPO_NAME}`:
-
-| Event | Subpath |
-|---|---|
-| `push` to `pull-request/<pr_id>` (copy-pr-bot mirror) | `pr/<pr_id>/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
-| `push` to `main`, `release/**` | `post-merge/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
-
-Each path contains the 6 artifacts from one arch: 4 manylinux wheels
-(cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist. The upload step is
-gated on the `automated-release` GitHub environment, which holds three
-secrets: `ARTIFACTORY_URL`, `ARTIFACTORY_TOKEN` (JFrog identity token),
-and `ARTIFACTORY_PYPI_REPO_NAME`.
+```
 
 ### Custom Client Image (P2P Transfers)
 
@@ -561,7 +547,7 @@ desired UID, so a failed or mismatched reconciliation cannot admit the worker.
 
 ## P2P GPU Weight Transfers
 
-ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively, which runs the fixed priority chain P2P RDMA -> server cache -> InstantTensor -> ModelStreamer -> GDS -> native loader; the ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
+ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively. The default `MX_LOAD_STRATEGY_CHAIN=INFERENCE` policy tries P2P RDMA -> server cache -> InstantTensor -> ModelStreamer -> GDS -> native loader, skipping ineligible strategies. The ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
 
 ### Cross-Vendor (CUDA/XPU) Compatibility
 
@@ -615,15 +601,15 @@ Pick based on workload, not operational preference. The choice has structural co
 | Workload shape                                                         | Backend          | Why                                                                                                                                            |
 |------------------------------------------------------------------------|------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
 | Stable-weight inference. Weights fixed at pod startup, no mid-life refit. Simple K8s deployment. | `k8s-service`    | Lowest deployment footprint. No server, no Redis, no CRDs. Matches the homogeneous pool assumption that Service-routing requires.             |
-| Future RL refit workflows (under development). Training updates weights every step and rollout workers need per-worker sources. | `redis` or `kubernetes` | The central store provides the per-worker addressability required by the planned receiver-driven refit workflow. Selecting this backend does not enable end-to-end live refit today. |
-| Future live fine-tune broadcasts (under development). New checkpoints are pushed to running replicas. | `redis` or `kubernetes` | These workflows require the same per-worker addressability. The `k8s-service` backend cannot swap a live pod's `mx_source_id` without restarting the pod. |
+| RL weight updates. Trainers publish new versions for running generation workers. | `redis` | The central coordinator tracks versions and worker state. A framework integration is also required; start with [RL weight updates](guides/rl.md). |
+| Live updates through the current refit service. | `redis` | A refit integration must coordinate loading and activation. The `k8s-service` backend cannot swap a live pod's `mx_source_id` without restarting the pod. |
 | Mixed-version fleet. Multiple revisions serving concurrently, callers dispatch by revision. | `redis` or `kubernetes` | Central store indexes by `mx_source_id`, so multiple identities coexist cleanly. k8s-service requires one Service pool per identity.          |
 | Heterogeneous hardware. Some sources on H100, some on B200, callers match on topology. | `redis` or `kubernetes` | Central store carries per-worker metadata including identity fields; k8s-service's pool assumption requires all pods to be interchangeable.   |
 | Multiple checkpoints in parallel (base + LoRA, fp16 + nvfp4, etc.).   | Either           | Different `SourceIdentity` produces different `mx_source_id`. Each identity gets its own Service (k8s-service) or its own source records (central). Both work. |
 
 The central-coordinator backends (`redis`, `kubernetes`) are the default. Reach for `k8s-service` specifically when the deployment meets three criteria: (1) weights stay fixed for each pod's lifetime, (2) every pod behind a given Service serves the exact same checkpoint, and (3) dropping the `modelexpress-server` / Redis / CRD components is a material simplification.
 
-Receiver-driven RL refit and live fine-tune broadcast are under development. The table identifies the metadata backend required by those future workflows; it does not describe a currently supported end-to-end refit path.
+Backend selection provides metadata coordination; it does not wire an RL framework into ModelExpress or manage when that framework pauses and resumes generation. Follow a [refit example](guides/rl.md) for the complete lifecycle and its integration requirements.
 
 See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale, limitations, and the structural reasons these backend families differ.
 
@@ -1052,7 +1038,7 @@ Requirements and limits:
 
 ### InstantTensor (Fast Local Safetensors)
 
-InstantTensor loads the model's own safetensors directly onto CUDA using distributed loading, pipelined prefetching, and direct I/O, with GPUDirect Storage when the hardware supports it. It follows server-backed loading in the fixed chain: when no peer source is already serving, ModelExpress tries server cache first when no-shared-storage mode is enabled, then uses InstantTensor when eligible before falling back to ModelStreamer, GDS, or the native loader. Unlike ModelStreamer it needs no `MX_MODEL_URI`; it reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves the model's weight files (downloading from the Hugging Face Hub into the local cache first if they are not already local). When `MX_MODEL_URI` uses `s3://`, `gs://`, or `az://`, ModelExpress skips InstantTensor so ModelStreamer can handle that remote source directly.
+InstantTensor loads the model's own safetensors directly onto CUDA using distributed loading, pipelined prefetching, and direct I/O, with GPUDirect Storage when the hardware supports it. It follows server-backed loading in the default `INFERENCE` chain: when no peer source is already serving, ModelExpress tries server cache first when no-shared-storage mode is enabled, then uses InstantTensor when eligible before falling back to ModelStreamer, GDS, or the native loader. Unlike ModelStreamer it needs no `MX_MODEL_URI`; it reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves the model's weight files (downloading from the Hugging Face Hub into the local cache first if they are not already local). When `MX_MODEL_URI` uses `s3://`, `gs://`, or `az://`, ModelExpress skips InstantTensor so ModelStreamer can handle that remote source directly.
 
 The strategy is enabled by default. The `instanttensor` package is a core dependency on Linux (installed automatically alongside `runai-model-streamer`), so no extra install step is needed. The strategy activates on a CUDA device **when the engine adapter implements the InstantTensor capability**. Currently only the vLLM adapter implements it; on engines that do not (for example SGLang today), the strategy falls through even when `instanttensor` and a CUDA device are available. If the package is unavailable (for example on a non-Linux platform) the chain simply skips to the next strategy.
 
@@ -1269,14 +1255,11 @@ kubectl -n $NAMESPACE logs -f deploy/modelexpress-server
 # Stream vLLM instance logs
 kubectl -n $NAMESPACE logs -f deploy/mx-vllm
 
-# Check Redis state (P2P metadata)
-kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli KEYS 'mx:source:*'
+# Check Redis state (P2P metadata) without a blocking KEYS scan
+kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli --scan --pattern 'mx:source:*'
 
 # Inspect a source index (identity + worker list)
 kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli HGETALL 'mx:source:<source_id>'
-
-# Flush Redis (clear stale metadata - do this on redeploy)
-kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli FLUSHALL
 
 # Check Kubernetes CRD state (P2P worker metadata + model registry)
 kubectl -n $NAMESPACE get modelmetadatas
@@ -1287,6 +1270,8 @@ kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/co
   -H "Content-Type: application/json" \
   -d '{"model": "deepseek-ai/DeepSeek-V4-Pro", "prompt": "Hello", "max_tokens": 10}'
 ```
+
+Do not flush Redis as a routine redeployment step: `FLUSHALL` deletes every database, including model registry state and unrelated applications' data. For stale donors, inspect the affected source and worker records, pod identity, and heartbeat cleanup first. Reset metadata only in an isolated test instance after stopping its workers.
 
 ## Performance Reference
 

@@ -1,22 +1,24 @@
 ---
 name: add-cli-argument
-description: Add or change a ModelExpress client CLI argument or environment variable. Use whenever touching ClientArgs, ClientConfig::load(), the Cli struct, or envs.rs/envs.py.
+description: Add or change a ModelExpress client CLI argument or environment setting in Rust shared configuration, Python inference settings, or Python RL settings.
 ---
 
-# Adding CLI Arguments
+# Client arguments and environment settings
 
-Client CLI arguments are defined in a shared struct to avoid duplication:
+Choose the procedure for the component that reads the setting. A Python environment variable does not need a Rust CLI argument.
 
-1. **Add to `ClientArgs`** in `modelexpress_common/src/client_config.rs`
-   - Single source of truth for shared arguments
-   - Register the variable name in `modelexpress_common/src/envs.rs` and reference the constant: `#[arg(long, env = crate::envs::MODEL_EXPRESS_...)]` (never a bare string literal, so the CLI and the `envs` getters cannot drift). All env-var names live in `modelexpress_common/src/envs.rs` (Rust) and `modelexpress/envs.py` (Python).
-   - Do NOT use `-v` short flag (reserved for CLI's verbose)
+## Python settings
 
-2. **Update `ClientConfig::load()`** in the same file
-   - Add override logic in the "APPLY CLI ARGUMENT OVERRIDES" section
+- Inference and shared client settings live in `modelexpress_client/python/modelexpress/envs.py`. RL also uses this module for shared model identity, server connectivity, worker endpoints, and heartbeat timing.
+- RL-specific deployment policy lives in `modelexpress_client/python/modelexpress_rl/envs.py`, including trainer staging, payload format, desired version, checkpoint replay, and S3 transfer settings. Inspect existing readers before choosing a module; the variable prefix alone does not determine ownership.
+- Add or update the `environment_variables` reader and its `TYPE_CHECKING` annotation. Define parsing, defaults, and validation in the owning module. Both registries read values live through `__getattr__`; use `envs.NAME` at the call site instead of copying the value at import time. Environment writes remain at their call sites.
+- Cover the setting's default, overrides, and relevant invalid values in `tests/test_envs.py` or `tests/test_refit_envs.py` under `modelexpress_client/python/`, and test the behavior that consumes it when applicable.
 
-3. **Do NOT duplicate in `Cli`** (`modelexpress_client/src/bin/modules/args.rs`)
-   - `Cli` embeds `ClientArgs` via `#[command(flatten)]`
-   - Only add CLI-specific arguments there (e.g., `--format`, `--verbose`)
+## Rust client CLI and settings
 
-4. **Add tests** in the `tests` module of `client_config.rs`
+1. Add shared arguments to `ClientArgs` in `modelexpress_common/src/client_config.rs`. Register environment names in `modelexpress_common/src/envs.rs` and reference their constants, for example `#[arg(long, env = crate::envs::MODEL_EXPRESS_...)]`.
+2. Update `ClientConfig::load()` to apply CLI overrides. For a Rust environment-only setting, use the existing reader/configuration path; do not add a CLI option unless the requested interface needs one.
+3. Keep shared arguments out of `Cli` in `modelexpress_client/src/bin/modules/args.rs`; it already flattens `ClientArgs`. Only CLI-specific options such as output format and verbosity belong there. `-v` is reserved for verbosity.
+4. Add parsing and precedence tests in the relevant Rust module; shared client configuration tests live in `client_config.rs`.
+
+Update `docs/CONFIGURATION.md` for settings and `docs/CLI.md` for CLI changes. Keep defaults, precedence, and examples consistent with the implementation; link specialized RL settings from the relevant RL guide rather than duplicating whole tables.

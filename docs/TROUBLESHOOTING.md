@@ -34,7 +34,7 @@ The strategy names are `rdma`, `server-cache`, `instant_tensor`, `model_streamer
 The server uses gRPC on port `8001` by default and exposes Prometheus metrics separately on `9401`. Do not use a browser request to `/health` as a gRPC health check.
 
 ```bash
-modelexpress-cli health --endpoint http://localhost:8001
+modelexpress-cli --endpoint http://localhost:8001 health
 nc -vz localhost 8001
 curl -s http://localhost:9401/metrics | head
 ```

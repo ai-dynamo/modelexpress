@@ -1,110 +1,69 @@
-# ModelExpress
+# ModelExpress agent guide
 
-Rust-based model cache management service and GPU-to-GPU weight transfer system using NVIDIA NIXL over RDMA.
+ModelExpress loads inference weights, transfers weights between peers, and updates RL rollout workers. The Rust server manages caches and metadata; Python runtime integrations move and install weights.
 
-This file holds the always-on rules for every AI coding agent working in this repository. Multi-step procedures live as skills under `.agents/skills/` and load on demand. Both are shared across tools:
+This is the shared instruction file. Keep `CLAUDE.md` and `.github/copilot-instructions.md` as pointers; put reusable procedures in `.agents/skills/`. Claude's skill entries under `.claude/skills/` are symlinks to those shared skills.
 
-| Tool | Always-on rules | Skills |
+## Find the relevant path
+
+| Task | Start here | Implementation |
 |---|---|---|
-| Codex | `AGENTS.md` (native) | `.agents/skills/` (native) |
-| Cursor | `AGENTS.md` (native) | `.agents/skills/` (native) |
-| Claude Code | `CLAUDE.md` imports this file via `@AGENTS.md` | `.claude/skills/<name>` symlinks into `.agents/skills/<name>` |
-| GitHub Copilot | Coding agent reads `AGENTS.md`; Copilot Chat is pointed here by `.github/copilot-instructions.md` | via `AGENTS.md` pointers below |
+| Inference startup or P2P | [Loading paths](docs/guides/choose-a-path.md), then the runtime guide | [`modelexpress/engines/`](modelexpress_client/python/modelexpress/engines/) and [`load_strategy/`](modelexpress_client/python/modelexpress/load_strategy/) |
+| RL weight updates | [RL guide](docs/guides/rl.md) | [`modelexpress_rl/`](modelexpress_client/python/modelexpress_rl/); shared geometry in [`refit/`](modelexpress_client/python/modelexpress/refit/) |
+| Server, cache, or deployment | [Configuration](docs/CONFIGURATION.md), [Deployment](docs/DEPLOYMENT.md) | [`modelexpress_server/src/`](modelexpress_server/src/), [`helm/`](helm/) |
+| CLI or shared RPC types | [CLI](docs/CLI.md), [Architecture](docs/ARCHITECTURE.md) | [`modelexpress_client/src/`](modelexpress_client/src/), [`modelexpress_common/`](modelexpress_common/) |
 
-Edit `AGENTS.md` or the skill; never add a tool-specific copy. When a section here grows into a procedure, move it to a skill and list it below.
+Inspect the current implementation before editing. Rust environment names live in [`envs.rs`](modelexpress_common/src/envs.rs); Python inference settings live in [`modelexpress/envs.py`](modelexpress_client/python/modelexpress/envs.py), with RL settings also in [`modelexpress_rl/envs.py`](modelexpress_client/python/modelexpress_rl/envs.py). Check [Compatibility](docs/COMPATIBILITY.md) before choosing images: example pins, CI pins, and published releases can differ.
 
-**Reference documentation:**
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - Project structure, crate catalog, gRPC services, server internals, Python client, NIXL integration
-- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) - Configuration reference, Docker, Kubernetes, Helm, P2P transfer setup, debugging
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) - Development setup, available commands, pre-commit hooks, environment variables, DCO
-- [`docs/CLI.md`](docs/CLI.md) - CLI tool usage, commands, output formats, integration examples
+## Work and validation
 
-## Coding Standards
+- Carry out the requested changes after checking existing behavior. For significant new functionality, follow the design discussion process in [CONTRIBUTING.md](CONTRIBUTING.md); routine fixes and documentation edits do not need a separate proposal approval.
+- Start with checks that fit the change. Server configuration and many client unit tests need no GPU. A GPU serving response alone does not prove a particular transfer path ran; verify its completion logs and, for RL, the installed version and update lifecycle.
+- Use isolated namespaces and cache paths for deployment tests. Inspect stale source records before changing them; never treat a blanket Redis flush as routine redeployment cleanup.
+- Update the relevant user guide or reference with behavior changes. Use existing documents for explanations; do not add change diaries or decision reports to the repository unless requested. Keep Markdown paragraphs and list items on one line, relying on soft wrapping.
+- Report what you checked and any missing runtime evidence. Do not imply that CPU tests validate a GPU or fabric combination.
 
-- `unwrap()` is **strictly forbidden** except in benchmarks. `expect()` is allowed in tests. Always handle errors with `match`, `?`, or custom error types.
-- All cargo dependencies go in the root `Cargo.toml`. Sub-crates use workspace dependencies exclusively. Never edit `Cargo.toml` or `Cargo.lock` by hand to add or update dependencies - use `cargo add` so you always get the latest version.
-- Python dependencies go in `pyproject.toml`. Never edit dependency files by hand - use `uv add` so you always get the latest version.
-- `cargo clippy` must pass with no warnings.
-- No emojis in code or comments.
-- Do not create markdown files to document code changes or decisions.
-- Do not over-comment code. Removing code is fine without adding comments to explain why.
-- Use mermaid diagrams instead of ASCII art in markdown files.
-- Prefer established crates over hand-rolled implementations. Check existing workspace dependencies before adding new ones.
-
-## Build and Test Commands
+From the repository root, these configuration checks do not require a running backend or GPU:
 
 ```bash
-cargo build                          # Build
-cargo build --release                # Release build
-cargo test                           # Run all tests
-cargo clippy                         # Lint (must pass, no warnings)
-cargo run --bin modelexpress-server  # Run server
-cargo run --bin config_gen -- --output model-express.yaml  # Generate config
-cargo run --bin test_client -- --test-model "google-t5/t5-small"  # Test client
-cargo run --bin fallback_test        # Fallback test
-cargo bench                          # Criterion benchmarks
-./run_integration_tests.sh           # Integration tests (starts server)
+cargo run --bin config_gen -- --output /tmp/mx-agent-config.yaml
+cargo run --bin modelexpress-server -- --config /tmp/mx-agent-config.yaml --validate-config
+cargo run --bin modelexpress-cli -- --help
 ```
 
-## Pre-commit Hooks
+Config validation does not test backend connectivity. Starting a server requires an existing backend, for example `MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 cargo run --bin modelexpress-server`. RL's refit service currently requires Redis. See [Deployment](docs/DEPLOYMENT.md) for backend setup.
 
-Run pre-commit after every code change, even before creating commits:
+For Python changes, install the client in a virtual environment with `pip install -e './modelexpress_client/python[dev]'`, then run the relevant tests with `python -m pytest`. For example, `python -m pytest modelexpress_client/python/tests/test_envs.py -q` checks environment parsing without a GPU. For Rust changes, run the affected tests plus formatting and lint checks; [CONTRIBUTING.md](CONTRIBUTING.md) and the [CI workflow](.github/workflows/ci.yml) describe the broader checks.
+
+Run pre-commit on changed files before handing off work:
 
 ```bash
-pre-commit run              # Staged files only
-pre-commit run --all-files  # All files (recommended after significant changes)
+pre-commit run --files path/to/changed-file
 ```
 
-Hooks: `cargo fmt`, `cargo clippy` (--fix), `cargo check`, trailing whitespace, end-of-file, YAML/TOML/JSON validation, merge conflict detection, large file check.
+The [hook configuration](.pre-commit-config.yaml) selects applicable checks. Rust hooks run workspace formatting, Clippy with `--fix` and `-D warnings`, and compilation; inspect any changes they make.
 
-## Procedures (skills)
+## Coding standards
 
-Load the matching skill before starting any of these. Each is a `SKILL.md` under `.agents/skills/`:
+- Never use `unwrap()` outside benchmarks. `expect()` is allowed in tests; handle other errors with `match`, `?`, or error types. Clippy must pass with no warnings.
+- Keep Rust dependencies in the root `Cargo.toml`; member crates use workspace dependencies. Use `cargo add` for dependency changes rather than editing dependency entries or lockfiles by hand.
+- Keep Python dependencies in `pyproject.toml` and use `uv add` for dependency changes. Preserve the runtime's compatible dependency stack.
+- Prefer existing dependencies and established libraries over new implementations. Keep comments useful; do not add comments merely to narrate removed code.
+- No emojis in code or comments. Use Mermaid instead of ASCII diagrams in Markdown. Preserve applicable copyright/SPDX headers and [license requirements](LICENSE).
 
-| Task | Skill |
+## Procedures
+
+Read the matching skill before doing the work:
+
+| Task | Shared skill |
 |---|---|
-| Add or change a client CLI argument or env var | `add-cli-argument` |
-| Add a gRPC service | `add-grpc-service` |
-| Bump the release version or public-image tags | `bump-version` |
-| Commit sign-off and DCO repair | `dco` |
+| Add or change a client CLI argument or environment variable | [add-cli-argument](.agents/skills/add-cli-argument/SKILL.md) |
+| Add a gRPC service | [add-grpc-service](.agents/skills/add-grpc-service/SKILL.md) |
+| Bump versions or public-image tags | [bump-version](.agents/skills/bump-version/SKILL.md) |
+| Create, rewrite, or publish commits; open a PR; repair DCO | [dco](.agents/skills/dco/SKILL.md) |
 
-## Git Workflow
+## Commits
 
-Feature branches use `<username>/feature-name` format, forked from `main`.
+Feature branches use `<username>/feature-name`, based on `main`. Reuse the user's existing branch or draft PR when that is the requested starting point.
 
-### Commits and DCO
-
-- Every commit must carry a `Signed-off-by: Real Name <email>` trailer. Always commit with `git commit -s`. The DCO check is required CI and fails the PR otherwise.
-- Use the contributor's real name and the email configured in `git config user.name` / `user.email`. Check both before committing on an unfamiliar machine.
-- Preserve existing trailers when amending, rebasing, squashing, or cherry-picking. Use `git rebase --signoff` or `git cherry-pick --signoff` only when the person running the command is the one certifying the change.
-- Do not add `Co-Authored-By` or tool-attribution trailers.
-- See the DCO section of `CONTRIBUTING.md` for the full policy.
-
-## Tips
-
-- Always read files to understand context before making changes.
-- Do not implement changes eagerly. When discussing a problem or new feature, investigate thoroughly first, report findings, propose changes, and ask if they are acceptable before writing code.
-- Flush Redis on redeploy: stale metadata causes P2P transfer failures.
-- Long startup times are normal: DeepSeek-V3 takes ~40 min to warm up.
-- Set `UCX_LOG_LEVEL=DEBUG` for NIXL/RDMA diagnostics.
-- NIXL agents must match ranks: source rank 0 -> target rank 0.
-
-## Documentation Updates
-
-When making changes, update the appropriate documentation files:
-
-| Change type | Files to update |
-|---|---|
-| Architecture, components, NIXL, gRPC services | `docs/ARCHITECTURE.md` |
-| Coding standards, build commands, new patterns, agent rules | `AGENTS.md` (the only agent-instruction file; `CLAUDE.md` and `.github/copilot-instructions.md` are pointers) |
-| CLI arguments or commands | `docs/CLI.md` + `.agents/skills/add-cli-argument/SKILL.md` |
-| Configuration, environment variables | `docs/DEPLOYMENT.md` |
-| Deployment (Docker, K8s, Helm, P2P) | `docs/DEPLOYMENT.md` |
-| Known issues, FP8 handling | `docs/ARCHITECTURE.md` |
-| Dev setup, scripts, pre-commit hooks | `CONTRIBUTING.md` |
-| Contribution process, DCO | `CONTRIBUTING.md` |
-| New binary targets, crates, Python modules | `docs/ARCHITECTURE.md` |
-| Version-bump procedure changes | `.agents/skills/bump-version/SKILL.md` |
-| Agent procedures (multi-step how-tos) | `.agents/skills/<name>/SKILL.md` + the Procedures table in `AGENTS.md` |
-
-**A feature is incomplete until documentation is updated.**
+Every commit requires `Signed-off-by: Real Name <email>`; use `git commit -s` and check `git config user.name` and `git config user.email` first. Preserve existing sign-offs when rewriting commits, and only certify contributions you are authorized to certify. Do not add `Co-Authored-By` or tool-attribution trailers. Follow the [DCO policy](CONTRIBUTING.md#developer-certificate-of-origin) and the linked skill.

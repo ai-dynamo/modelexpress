@@ -7,320 +7,83 @@ SPDX-License-Identifier: Apache-2.0
   <img src="docs/images/model-express-key-visual.jpg" alt="ModelExpress distributes model weights across GPU workers" width="70%">
 </p>
 
-<p align="center">
-  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.90%2B-orange" alt="Rust"></a>
-</p>
-
 <h1 align="center">Dynamo ModelExpress</h1>
 
-<p align="center">
-  <strong>Move model weights into GPU memory and reusable artifacts into filesystem caches</strong> — through P2P RDMA, streaming, GPUDirect Storage, or host-staged POSIX I/O.
-</p>
+ModelExpress (MX) moves model weights between storage, training workers, and inference workers. Use it to start inference replicas from an already-loaded peer or to update rollout workers with new weights during reinforcement learning (RL). It integrates with inference engines; NVIDIA Dynamo is optional.
 
-<p align="center">
-  <a href="docs/README.md">Docs hub</a> •
-  <a href="#features">Features</a> •
-  <a href="#modelexpress-architecture">Architecture</a> •
-  <a href="#benchmarks">Benchmarks</a> •
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#deployment">Deployment</a> •
-  <a href="#documentation">Docs</a> •
-  <a href="#contributing">Contributing</a>
-</p>
+> **Used by Prime Intellect:** GLM-5.2 RL weight updates in **3.9 seconds** using ModelExpress + NIXL with tuned vLLM pause synchronization. [Read their case study →](https://www.primeintellect.ai/blog/nixl-modelexpress-weight-transfer)
 
----
+[Get started](#quick-start) · [Documentation](docs/README.md) · [Compatibility](docs/COMPATIBILITY.md) · [Benchmarks](docs/BENCHMARKS.md)
 
-## Overview
+## What can I do with it?
 
-ModelExpress (MX) starts with a simple question: before loading a model, where does a compatible copy of its weights already live? Rather than treating every replica as an independent cold start, ModelExpress discovers available sources and selects the fastest supported path into GPU memory. Deploy it standalone or alongside vLLM, SGLang, NVIDIA Dynamo, and other inference runtimes.
+| Goal | How ModelExpress helps | Start here |
+|---|---|---|
+| **Start inference replicas faster** | The first replica loads from storage. Later compatible replicas can receive its weights directly from GPU memory over NVIDIA NIXL; compatible JIT caches can also be reused. | [vLLM on Kubernetes](docs/integrations/runtimes/vllm.md) |
+| **Load from object storage** | ModelStreamer reads weights from S3, GCS, Azure Blob, or local files inside the inference worker. This path can run without an MX server. | [Choose a loading path](docs/guides/choose-a-path.md) |
+| **Update weights during RL** | Publish a weight version, pause and drain rollout workers, install that version through direct transfer or object storage, then resume generation. | [RL guide](docs/guides/rl.md) |
+| **Cache model downloads** | A server coordinates downloads and serves cached repository files through shared storage or gRPC. This path needs no GPU. | [Server deployment](docs/DEPLOYMENT.md) and [CLI](docs/CLI.md) |
 
-| LLM serving problem | How ModelExpress helps |
-|---------------------|------------------------|
-| **Models take too long to load** | GPU-to-GPU transfer via NIXL/RDMA instead of loading from storage. In P2P mode, weights already serving inference act as the cache—no extra storage. |
-| **JIT warmup dominates startup** | Compatible vLLM and SGLang NIXL TorchInductor, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches transfer from a ready replica instead of being rebuilt. |
-| **Many nodes need the same model** | Metadata backends (Redis, K8s CRD) coordinate sharing: one node loads; others receive via P2P or local paths. |
+## Quick start
 
-> **Today, ModelExpress loads DeepSeek-V4-Pro weights from a serving replica in 11 seconds—a 48× speedup over a cold Hugging Face pull. Reusing compatible weights and JIT kernel-cache artifacts reduces process-start-to-API-ready time from 8 minutes 1 second to 1 minute 44 seconds (4.6×).**
->
-> Measured with vLLM 0.23.0 and TP=8 on an 8×B200 node with NVIDIA ConnectX-7 NICs. The 48× baseline is the cold Hugging Face pull in the same environment, at 8m 53s. See [Benchmarks](#benchmarks) for the full configuration and the intermediate storage paths.
-
-### Runtime path selection
-
-At startup, ModelExpress probes the capabilities available in the environment and tries the fixed loading strategy chain documented in [Configuration](docs/CONFIGURATION.md#loading-strategy-selection):
-
-1. **Serving peer → GPU** — Transfer post-processed weights directly from a compatible replica over NIXL P2P RDMA. Each new replica then joins the source pool, turning scale-out into GPU-to-GPU fan-out.
-2. **Server cache → runtime** — In no-shared-storage mode, fetch the snapshot through the ModelExpress server and hand it to the runtime's native loader.
-3. **Local safetensors → GPU** — Use InstantTensor when its package, CUDA-like device, and runtime adapter capability are available.
-4. **Remote or local storage → GPU with ModelStreamer** — Fetch safetensor ranges concurrently through a bounded CPU staging buffer while overlapping reads with GPU placement.
-5. **Local storage → GPU with GDS** — Use GPUDirect Storage when the platform and runtime adapter support it.
-6. **Default loader** — Fall back to the inference engine's native path.
-
-The first applicable strategy runs. If a strategy fails before changing model state, ModelExpress continues to the next one. If weights may already have landed, it reinitializes the model before continuing so a partially loaded model is never served.
-
-The ModelExpress control plane discovers compatible sources through Redis, Kubernetes CRDs, or the decentralized `k8s-service` backend. Weight bytes stay on the data plane and move directly between storage or source and target. For clusters with a shared disk cache, the Model Cache Service also coordinates a single download so concurrent replicas reuse one cached checkpoint instead of multiplying external ingress.
-
----
-
-## Features
-
-- **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
-- **Capability-driven loading** — Fixed priority chain: P2P RDMA → server cache → InstantTensor → ModelStreamer → GDS → native loader, with safe fallback
-- **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
-- **P2P GPU transfer** — vLLM `modelexpress` loader, SGLang `remote_instance` loader with the `modelexpress` backend, and TRT-LLM `checkpoint_format="MX"` with NVIDIA NIXL over InfiniBand, RoCE, NVLink, EFA, and other supported fabrics
-- **JIT cache transfer** — Reuse compatible vLLM and SGLang NIXL compilation caches when replicas scale out
-- **Metadata backends** — Redis, Kubernetes CRD, or decentralized Kubernetes Service routing
-- **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
-- **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
-- **ModelStreamer integration** — Pipeline concurrent reads from S3, Azure Blob, GCS, or local storage into vLLM and SGLang
-- **Expanded model pull providers**: NGC catalog and Google Cloud Storage in addition to Hugging Face
-- **GDS (GPUDirect Storage)**: load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path
-- **Lower NIXL registration overhead** — Opt in to allocation-level pool registration or a single VMM arena registration
-
-### Integrations
-
-| Runtime | Integration |
-|---------|-------------|
-| vLLM | Native `--load-format modelexpress` in 0.23.0+ for P2P weight and JIT cache transfer; older versions use the ModelExpress plugin |
-| SGLang | `remote_instance` + `modelexpress` backend with `transport=nixl` or `transport=transfer_engine` — see [`docs/SGLANG.md`](docs/SGLANG.md) |
-| TensorRT-LLM | Native `checkpoint_format="MX"` for Llama-family P2P weight transfer (beta) — [TensorRT-LLM example](examples/p2p_transfer_k8s/client/trtllm/) |
-| NVIDIA Dynamo vLLM runtime | `--load-format modelexpress` for P2P weight and JIT cache transfer — [Dynamo P2P example](examples/dynamo_p2p_transfer_k8s/README.md) |
-| NVIDIA Dynamo SGLang runtime | `remote_instance` + `modelexpress` backend for P2P weight transfer; `transport=nixl` also supports JIT cache transfer — see [`docs/SGLANG.md`](docs/SGLANG.md) |
-| llm-d | Upstream Optimized Baseline integration — [llm-d integration guide](docs/integrations/orchestrators/llm-d.md) |
-
----
-
-## ModelExpress Architecture
-
-![ModelExpress runtime paths: metadata stays on the control plane while weights move directly over P2P RDMA, ModelStreamer, GDS, or POSIX I/O](docs/images/model-express-runtime-paths.png)
-
-*The ModelExpress server brokers metadata only. Weight bytes move directly from a compatible serving peer, object storage, or file storage into the new inference engine.*
-
-![ModelExpress Architecture: Upload once, then autoscale new pods via NIXL GPUDirect RDMA from seed GPU](docs/images/model-express-architecture.png)
-
-*Phase 1 — Bootstrap once:* The seed pod selects the fastest available storage path, loads and post-processes the weights, registers GPU memory with NIXL, and publishes metadata. *Phase 2 — Scale out:* Compatible pods discover a serving peer through the control plane and receive weights directly over NIXL GPUDirect RDMA; the ModelExpress server never handles the weight bytes.
-
-- **modelexpress_server**: gRPC server with configurable metadata backends (Redis, Kubernetes CRD).
-- **modelexpress_client**: Rust CLI for cache management; Python package with inference engine loaders and `MxClient` for gRPC.
-- **modelexpress_common**: Protobuf definitions, model-provider traits, and shared configuration.
-
-See [Architecture](docs/ARCHITECTURE.md).
-
----
-
-## Benchmarks
-
-The following results use DeepSeek-V4-Pro with vLLM 0.23.0 and TP=8 on an 8×B200 GPU node with NVIDIA ConnectX-7 NICs. Runs used `--enable-flashinfer-autotune`; timings are end-to-end startup measurements from the benchmark environment and will vary with storage, network, and runtime configuration.
-
-### Cold-start loading paths
-
-![DeepSeek-V4-Pro cold-start loading benchmark comparing Hugging Face, S3 ModelStreamer, local storage, and P2P RDMA](docs/images/benchmark-cold-start-loading.png)
-
-| Loading path | Time | Speedup vs. cold Hugging Face pull |
-|--------------|-----:|-----------------------------------:|
-| Cold pull from Hugging Face | 8m 53s | 1× |
-| ModelStreamer from S3 | 3m 16s | 2.7× |
-| High-throughput local storage, cold page cache | 1m 10s | 7.6× |
-| P2P GPU-to-GPU over NIXL/RDMA | 11s | 48× |
-
-### NIXL memory registration
-
-![DeepSeek-V4-Pro NIXL registration benchmark comparing per-tensor, pool, and VMM arena registration](docs/images/benchmark-nixl-registration.png)
-
-| Registration strategy | Time | Speedup |
-|-----------------------|-----:|--------:|
-| Per tensor (default) | 8.16s | 1× |
-| Pool registration (`MX_POOL_REG=1`) | 1.14s | 7.1× |
-| VMM arena (`MX_VMM_ARENA=1`) | 0.79s | 10.3× |
-
-Pool registration and VMM arena registration are alternatives; enable only one.
-
-### Weight and kernel-artifact transfer
-
-![DeepSeek-V4-Pro startup benchmark comparing storage loading, P2P weights, and P2P weights with kernel artifacts](docs/images/benchmark-artifact-transfer.png)
-
-| Startup path | API ready | Speedup |
-|--------------|----------:|--------:|
-| Cold start from VAST, no P2P source | 8m 1s | 1× |
-| P2P RDMA weights only | 7m | 1.1× |
-| P2P RDMA weights and kernel artifacts | 1m 44s | 4.6× |
-
-The artifact-enabled run reused compatible Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. ModelExpress transfers these file-backed artifacts between registered host-memory buffers, verifies them, and installs them into the target engine's filesystem cache; they are not loaded into GPU memory.
-
----
-
-## Quick Start
-
-This Quick Start sets up the P2P path, which is what the benchmarks above measure, so it needs the full NIXL and metadata-backend prerequisites listed below. For a local single-machine setup instead, `docker compose -f docker/docker-compose.yml up --build` brings up the server with a Redis backend and no NIXL, and the `modelexpress-cli` commands in [CLI](docs/CLI.md) exercise it. See the [documentation hub](docs/README.md) for the scenario that matches your storage and orchestration setup.
-
-**Requirements:** vLLM 0.23.0+, the ModelExpress Python package, NIXL-compatible GPU nodes, and a reachable [metadata backend](examples/p2p_transfer_k8s/server/README.md).
+Clone the repository so the docs, client code, and example manifests come from the same revision:
 
 ```bash
 git clone https://github.com/ai-dynamo/modelexpress.git
 cd modelexpress
-python -m pip install ./modelexpress_client/python
-
-export MX_SERVER_ADDRESS=modelexpress-server:8001
-export MX_P2P_METADATA=1
-export MX_ARTIFACT_TRANSFER=1
-
-vllm serve deepseek-ai/DeepSeek-V4-Pro \
-  --load-format modelexpress \
-  --tensor-parallel-size 8 \
-  --trust-remote-code
 ```
 
-Start the first replica with weights available through local storage or `MX_MODEL_URI`. After it becomes healthy, launch the same command on another compatible node: ModelExpress discovers the serving replica and transfers its post-processed weights directly over NIXL P2P RDMA.
+For a released deployment, check out its release tag and follow the docs at that tag. The `main` branch may contain features ahead of published images; see [Compatibility](docs/COMPATIBILITY.md).
 
-JIT artifact transfer requires `MX_P2P_METADATA=1`, a central-coordinator backend (`redis` or `kubernetes`), and writable target staging and runtime cache directories. With those prerequisites, `MX_ARTIFACT_TRANSFER=1` installs compatible artifacts into the new replica's filesystem caches. Omit it for weight-only transfer or when using the decentralized `k8s-service` backend.
+### Inference
 
-See the [Kubernetes P2P example](examples/p2p_transfer_k8s/README.md) for metadata-server and inference-worker manifests.
+Follow the [vLLM Kubernetes quick start](docs/integrations/runtimes/vllm.md). It starts a small model, verifies the inference API, then scales to a second replica and checks the transfer logs. You need a Kubernetes cluster with two available GPUs on separate nodes, a supported NIXL transport, and a runtime image containing ModelExpress.
 
----
+Using another runtime or an orchestrator? Start with [SGLang](docs/integrations/runtimes/sglang.md), [TensorRT-LLM](docs/integrations/runtimes/tensorrt-llm.md), [Dynamo](docs/integrations/orchestrators/dynamo.md), or [llm-d](docs/integrations/orchestrators/llm-d.md). Each guide identifies its integration and example requirements.
 
-## Deployment
+### RL
 
-### Kubernetes (Helm)
+Follow the [RL guide](docs/guides/rl.md) to choose between direct trainer-to-rollout updates and full/delta checkpoints through object storage. The runnable examples state what they validate and which trainer, rollout engine, server, and storage components are required.
 
-```bash
-kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=${HF_TOKEN} -n <namespace>
-helm install modelexpress ./helm --namespace modelexpress --create-namespace
-```
+The inference load format alone does not configure an RL update loop. Your training orchestrator owns when to publish a version, pause generation, update workers, and resume.
 
-Override [values-production.yaml](helm/values-production.yaml) for your env. Full config: [helm/README.md](helm/README.md).
+## How it works
 
-### P2P GPU Transfer (vLLM)
+For inference, ModelExpress tries eligible loaders in a fixed order: **peer → server cache → InstantTensor → ModelStreamer → GDS → engine default**. Eligibility depends on the runtime adapter, packages, device, and configuration. This is a priority order, not a measurement of the fastest path in your environment. See [loader configuration](docs/CONFIGURATION.md#loading-strategy-selection).
 
-```bash
-vllm serve deepseek-ai/DeepSeek-V4-Pro \
-  --load-format modelexpress \
-  --tensor-parallel-size 8 \
-  --trust-remote-code
-```
+- **Peer transfer:** workers register GPU tensors with NIXL and publish source metadata. A compatible target discovers a source and receives weights directly; the central server handles metadata on this path.
+- **Storage loading:** the worker reads the configured storage source. Object-store credentials belong in the worker. A server is optional unless you also enable central P2P discovery.
+- **Server cache:** the server downloads repository files into its cache. Clients either share that filesystem or fetch files, including weights, over gRPC.
+- **RL updates:** the coordinator tracks weight versions and participating workers. The chosen transfer path supplies weights; the rollout integration installs them at a controlled update boundary. The current RL service requires Redis.
 
-vLLM 0.23.0 recognizes the load format natively; the ModelExpress Python package must still be installed in the runtime image. The first instance loads from disk, while subsequent instances receive weights via RDMA. Set `MX_ARTIFACT_TRANSFER=1` to transfer compatible JIT caches as well. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Server setup](examples/p2p_transfer_k8s/server/README.md).
+A P2P target still needs model configuration and tokenizer files. Keep a usable storage or server-cache fallback if a peer is unavailable. An inference API becoming ready proves the model loaded; the [transfer logs](docs/TROUBLESHOOTING.md#p2p) show whether P2P was used.
 
-### ModelStreamer on Kubernetes
+See [Architecture](docs/ARCHITECTURE.md) for data flow, state, and implementation details.
 
-Set `MX_MODEL_URI` to an `s3://`, `gs://`, or `az://` URI or an absolute local path. For tensor-parallel deployments, participating ranks divide remote reads via `MX_MS_DISTRIBUTED` (on by default; set to `0` to disable); TP=1 ignores the setting. [ModelStreamer examples](examples/model_streamer_k8s/README.md) · [vLLM recipes](examples/model_streamer_k8s/client/vllm/README.md).
+## Benchmarks
 
-### Docker
+These published results use DeepSeek-V4-Pro, vLLM 0.23.0, TP=8, and an 8×B200 node with ConnectX-7 NICs. They measure different parts of startup:
 
-```bash
-docker compose -f docker/docker-compose.yml up --build
-```
+| Measurement | Baseline | With ModelExpress |
+|---|---|---|
+| Weight loading | Cold Hugging Face pull: 8m 53s | P2P from a loaded peer: 11s (48×) |
+| Process start to API ready | Cold VAST storage load: 8m 1s | P2P weights and compatible JIT artifacts: 1m 44s (4.6×) |
 
----
+Results depend on the model, runtime, storage, and fabric. The 11-second result is weight loading, not total API startup. [Full benchmark conditions and comparisons](docs/BENCHMARKS.md).
 
-## Configuration
+## Deployment and operation
 
-**Precedence:** CLI → env vars (`MODEL_EXPRESS_*`, `MX_*`) → YAML → defaults. See the [configuration reference](docs/CONFIGURATION.md) for defaults and eligibility gates.
+- [Helm](helm/README.md): configure a metadata backend and deploy the MX server. Inference workers are deployed separately.
+- [Configuration](docs/CONFIGURATION.md): server/client settings, loader eligibility, and transport controls.
+- [Troubleshooting](docs/TROUBLESHOOTING.md): startup failures, fallback, stale sources, and offline loading.
+- [Metrics](docs/METRICS.md): server and worker metrics and alerting.
+- [Compatibility](docs/COMPATIBILITY.md): runtime examples, CI coverage, and version sources.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MODEL_EXPRESS_SERVER_PORT` | `8001` | gRPC port |
-| `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Cache root |
-| `MX_METADATA_BACKEND` | Server: required; client: unset | Server: `redis` \| `kubernetes`. Client: unset, `server`, `redis`, or `kubernetes` uses a central coordinator; `k8s-service` enables decentralized Kubernetes Service routing. |
-| `REDIS_URL` | (required for `redis`) | Redis connection URL. Alternatively set `MX_REDIS_HOST` + `MX_REDIS_PORT`. No localhost fallback. |
-| `MX_SERVER_ADDRESS` | `localhost:8001` | Client-side gRPC server address (P2P). Recommended. |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
-| `MX_MODEL_URI` | (unset) | Enable ModelStreamer for an object-store URI or absolute local path. |
-| `MX_MS_DISTRIBUTED` | `1` | Divide ModelStreamer reads across tensor-parallel ranks when TP > 1. On by default; set to `0` to disable. |
-| `MX_POOL_REG` | `0` | Register each underlying CUDA allocation once instead of registering every tensor. |
-| `MX_VMM_ARENA` | `0` | Load into a CUDA VMM arena and register the used range once; alternative to `MX_POOL_REG`. |
-| `MX_P2P_SOURCE_SELECTOR` | `random` | Peer ordering policy; set `rendezvous_hash` for deterministic, minimally disruptive selection. |
-
-```bash
-cargo run --bin config_gen -- --output model-express.yaml
-cargo run --bin modelexpress-server -- --config model-express.yaml --validate-config
-```
-
-Full reference: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
-
----
-
-## CLI
-
-```bash
-modelexpress-cli health
-modelexpress-cli model download <model-id>
-modelexpress-cli model list
-modelexpress-cli model validate <model-id>
-modelexpress-cli model clear <model-id>
-```
-
-[CLI Reference](docs/CLI.md)
-
----
-
-## Testing
-
-```bash
-cargo test
-cargo test --test integration_tests
-cargo run --bin test_client -- --test-model "google-t5/t5-small"
-./run_integration_tests.sh
-cargo bench
-```
-
----
-
-## Documentation
-
-Start with the [ModelExpress documentation hub](docs/README.md).
-
-| Doc | Description |
-|-----|-------------|
-| [Choose a path](docs/guides/choose-a-path.md) | Scenario-driven path selection for P2P, storage, no shared storage, and orchestrators |
-| [Deployment](docs/DEPLOYMENT.md) | Server prerequisites, Docker, Kubernetes, Helm, and rollout |
-| [Configuration](docs/CONFIGURATION.md) | ModelExpress-owned settings, defaults, and fixed loader-chain eligibility |
-| [Integrations](docs/integrations/README.md) | vLLM, SGLang, TensorRT-LLM, Dynamo, and llm-d |
-| [Troubleshooting](docs/TROUBLESHOOTING.md) | Symptom-driven diagnostics |
-| [Architecture](docs/ARCHITECTURE.md) | Components, gRPC, NIXL, FP8 |
-| [Benchmarks](docs/BENCHMARKS.md) | Loading paths, NIXL registration, and artifact-transfer results |
-| [RL weight refit](modelexpress_client/python/modelexpress/refit/README.md) | Receiver-driven trainer-to-rollout resharding design and implementation status |
-| [CLI](docs/CLI.md) | Full CLI reference |
-| [Metrics](docs/METRICS.md) | Prometheus exposition for the server and the client |
-| [Metadata](docs/metadata.md) | Redis keys, K8s CRD schema |
-| [Helm](helm/README.md) | Kubernetes configuration |
-
----
-
-## Known Issues
-
-- **GDS loader does not scale with TP** — Each TP rank reads full checkpoint tensors and vLLM shards them afterward, so GDS/disk reads scale with TP degree. This can reduce or reverse expected GDS speedups versus the default mmap-based disk loader; TP-aware range reads are needed for a full fix. See [GDS Reads Full Checkpoint Tensors Under TP](docs/ARCHITECTURE.md#gds-reads-full-checkpoint-tensors-under-tp).
-- **P2P source wedges after a reader is torn down (UCX/InfiniBand)** — Once a reader that pulled from a source is removed, the source can stop serving new readers: their RDMA reads stall to the transfer timeout and fall back to disk, while the source keeps advertising `Ready` and serving inference normally. Loading stays correct, but P2P is effectively lost for that source until the source worker pod is restarted. The cause is NIXL retaining queue-pair state for a peer it holds no record of, so it is not fixable from ModelExpress; tracked as nvbug 6519532. Lower `MX_TRANSFER_TIMEOUT` to bound the stall.
-
----
-
-## Roadmap
-
-### Priorities Under Development
-
-- **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high-speed NVMe.
-- **[RL post-training refit](modelexpress_client/python/modelexpress/refit/README.md)**: Make updates receiver-driven—trainer ranks publish the shards they own, rollout workers discover and plan against their target layout, then pull, convert, reshard, and load directly over NIXL.
-- **Earlier weight availability**: Bring weights to prefill earlier; identify prefill workers that can act as strong source nodes.
-- **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
-- **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.
-- **Training checkpoint management**: Cache and reuse CUDA kernel compilations (torch.compile, deepGEMM) and CUDA graphs across restarts.
-- **Metrics and observability**: The exposition path exists today — the server serves `/metrics` on its own port, and the client collector is opt-in behind `MX_METRICS_ENABLED=1` (see [Metrics](docs/METRICS.md)). Still to build on it: cache hit rates, eviction frequency, and P2P RDMA utilization.
-- **Predictive prefetching**: Pre-warm caches from workload history or scheduling hints.
-- **Dynamic EPLB (Expert Parallelism Load Balancer)**: Rebalance MoE expert placement across GPUs at runtime via P2P transfer of expert weights as load shifts.
-
----
+P2P requires compatible model identity, runtime layout, and accelerator configuration. GDS has a [tensor-parallel I/O limitation](docs/ARCHITECTURE.md#gds-reads-full-checkpoint-tensors-under-tp). Qualify the runtime and fabric combination you deploy; a successful fallback does not establish P2P performance.
 
 ## Contributing
 
-Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-```bash
-pip install pre-commit && pre-commit install
-pre-commit run --all-files
-```
-
-**Issues:** [GitHub Issues](https://github.com/ai-dynamo/modelexpress/issues)
-
----
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, tests, and contribution requirements. Report problems through [GitHub issues](https://github.com/ai-dynamo/modelexpress/issues), including the image versions, selected loader, and relevant logs.
 
 ## License
 

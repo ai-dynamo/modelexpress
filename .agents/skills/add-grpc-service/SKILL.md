@@ -9,4 +9,4 @@ description: Add a new gRPC service to ModelExpress. Use whenever creating a .pr
 2. Add the proto file to `modelexpress_common/build.rs` compile list
 3. Add the generated module to `modelexpress_common/src/lib.rs` under `pub mod grpc`
 4. Implement the service trait in `modelexpress_server/src/` (new file or existing)
-5. Register the service in `modelexpress_server/src/main.rs` during server startup
+5. Register the service in `modelexpress_server/src/server.rs` during server startup (`main.rs` delegates to `run_server`)
