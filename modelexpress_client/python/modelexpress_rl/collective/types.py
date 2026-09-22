@@ -59,13 +59,24 @@ class Placement:
         """Stable text form, used by the plan digest."""
         return "R" if self.kind is PlacementKind.REPLICATE else f"S{self.dim}"
 
-    def to_dtensor(self):
-        """Convert to the torch DTensor placement the reshard op expects.
+    def to_wire(self):
+        """Convert to the placement object the reshard op expects.
 
-        torch is imported here rather than at module scope so the plan
-        contract stays importable, and testable, without it.
+        Torch's DTensor placements are tried first, which keeps an MX-brokered
+        call identical to NeMo RL's ``xferdtensor`` one wherever torch is
+        installed. Where it is not - a JAX trainer - ``nccl.m2n`` ships its own
+        ``Replicate`` and ``Shard``, and its ``_placement_to_int`` duck-types on
+        the class *name* rather than on a torch type, so the two forms normalize
+        to the same integer. The reshard signature itself is framework-neutral:
+        ``src_placements: Sequence[object] | None``.
+
+        Both are imported here rather than at module scope so the plan contract
+        stays importable, and testable, without either package.
         """
-        from torch.distributed.tensor import Replicate, Shard  # noqa: PLC0415
+        try:
+            from torch.distributed.tensor import Replicate, Shard  # noqa: PLC0415
+        except ImportError:
+            from nccl.m2n import Replicate, Shard  # noqa: PLC0415
 
         return Replicate() if self.kind is PlacementKind.REPLICATE else Shard(self.dim)
 

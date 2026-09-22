@@ -15,7 +15,7 @@ G=${G:-4}
 ROUNDS=${ROUNDS:-5}
 RUN=${RUN:-e2e-$(date +%s)}
 OUT=${OUT:-/work/out/$RUN}
-TRAINER=${TRAINER:-fsdp2}
+TRAINER=${TRAINER:-fsdp2}   # fsdp2 | deepspeed | jax
 DST=${DST:-replicate}
 
 export PYTHONPATH=${PYTHONPATH:-$(cd "$(dirname "$0")" && pwd)}
@@ -32,16 +32,30 @@ echo "run=$RUN model=$MODEL trainer=$TRAINER dst=$DST trainers=$T generators=$G 
 
 sleep 5
 for rank in $(seq 0 $((T-1))); do
-  # LOCAL_RANK and WORLD_SIZE are DeepSpeed's; each process pins one visible
-  # device, so its local rank is always zero.
-  ( CUDA_VISIBLE_DEVICES=$((G+rank)) LOCAL_DEVICE=0 RANK=$rank \
-    LOCAL_RANK=0 WORLD_SIZE=$T \
-    MASTER_ADDR=127.0.0.1 MASTER_PORT=${MASTER_PORT:-29555} \
-    python3 -m mx_m2n_e2e.trainer --model-dir "$MODEL" --endpoint "$MX_ENDPOINT" \
-      --model-name "$RUN" --run-id "$RUN" --trainers "$T" --generators "$G" \
-      --rounds "$ROUNDS" --backend "$TRAINER" --dst-layout "$DST" \
-      --out "$OUT" > "$OUT/trainer$rank.log" 2>&1
-    echo $? > "$OUT/trainer$rank.rc" ) &
+  if [ "$TRAINER" = jax ]; then
+    # JAX has its own coordinator and no torch.distributed. Preallocation is
+    # off because XLA otherwise claims most of the device and leaves NCCL's
+    # buffers nowhere to live.
+    ( CUDA_VISIBLE_DEVICES=$((G+rank)) RANK=$rank \
+      MASTER_ADDR=127.0.0.1 JAX_PORT=${JAX_PORT:-29566} \
+      XLA_PYTHON_CLIENT_PREALLOCATE=false \
+      python3 -m mx_m2n_e2e.jax_trainer --model-dir "$MODEL" --endpoint "$MX_ENDPOINT" \
+        --model-name "$RUN" --run-id "$RUN" --trainers "$T" --generators "$G" \
+        --rounds "$ROUNDS" --dst-layout "$DST" \
+        --out "$OUT" > "$OUT/trainer$rank.log" 2>&1
+      echo $? > "$OUT/trainer$rank.rc" ) &
+  else
+    # LOCAL_RANK and WORLD_SIZE are DeepSpeed's; each process pins one visible
+    # device, so its local rank is always zero.
+    ( CUDA_VISIBLE_DEVICES=$((G+rank)) LOCAL_DEVICE=0 RANK=$rank \
+      LOCAL_RANK=0 WORLD_SIZE=$T \
+      MASTER_ADDR=127.0.0.1 MASTER_PORT=${MASTER_PORT:-29555} \
+      python3 -m mx_m2n_e2e.trainer --model-dir "$MODEL" --endpoint "$MX_ENDPOINT" \
+        --model-name "$RUN" --run-id "$RUN" --trainers "$T" --generators "$G" \
+        --rounds "$ROUNDS" --backend "$TRAINER" --dst-layout "$DST" \
+        --out "$OUT" > "$OUT/trainer$rank.log" 2>&1
+      echo $? > "$OUT/trainer$rank.rc" ) &
+  fi
 done
 wait
 

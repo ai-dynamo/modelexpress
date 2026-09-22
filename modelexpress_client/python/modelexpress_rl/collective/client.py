@@ -19,6 +19,7 @@ The sequencing is the contract, and two of its rules are load-bearing here:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from contextlib import nullcontext
 from typing import Any
 
@@ -38,8 +39,31 @@ from .types import ReshardPlan, Role
 logger = logging.getLogger("modelexpress_rl.collective.client")
 
 
+def _broadcast_barrier(
+    lane: LaneCommunicator, barrier: Any, timeout_s: float | None
+) -> None:
+    """Broadcast one device byte over the lane and wait for it, bounded."""
+    stream = lane.stream
+    stream_arg = None if stream is None else int(getattr(stream, "cuda_stream", stream))
+    lane.handle.broadcast(
+        sendbuf=barrier,
+        recvbuf=barrier,
+        root=0,
+        stream=stream_arg,
+    )
+    lane.synchronize(
+        timeout_s=envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S
+        if timeout_s is None
+        else timeout_s
+    )
+
+
 def _bootstrap_barrier(
-    lane: LaneCommunicator, device: Any, *, timeout_s: float | None = None
+    lane: LaneCommunicator,
+    device: Any,
+    *,
+    timeout_s: float | None = None,
+    alloc: Callable[[Any], Any] | None = None,
 ) -> None:
     """Full-group barrier used between overlapping communicator initializations.
 
@@ -49,7 +73,17 @@ def _bootstrap_barrier(
     ``Communicator.init`` only, and the transfer deadline does not arm until
     bootstrap is done. The caller's ``except BaseException`` aborts the group,
     so a timeout raised here tears it down and forces a fresh epoch.
+
+    ``alloc`` supplies the byte for a worker whose framework is not torch. The
+    buffer is opaque to this path -- it is written and never read, so only the
+    device it sits on matters -- and nccl4py resolves a buffer through the CUDA
+    Array Interface or DLPack, which a ``jax.Array`` satisfies. Leaving it None
+    keeps the torch allocation this path has always used.
     """
+    if alloc is not None:
+        _broadcast_barrier(lane, alloc(device), timeout_s)
+        return
+
     import torch
 
     device_context = torch.cuda.device(device) if device is not None else nullcontext()
@@ -57,21 +91,7 @@ def _bootstrap_barrier(
         barrier = torch.zeros(
             1, dtype=torch.uint8, device=device if device is not None else "cuda"
         )
-        stream = lane.stream
-        stream_arg = (
-            None if stream is None else int(getattr(stream, "cuda_stream", stream))
-        )
-        lane.handle.broadcast(
-            sendbuf=barrier,
-            recvbuf=barrier,
-            root=0,
-            stream=stream_arg,
-        )
-        lane.synchronize(
-            timeout_s=envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S
-            if timeout_s is None
-            else timeout_s
-        )
+        _broadcast_barrier(lane, barrier, timeout_s)
 
 
 class _RefitClientBase:
@@ -90,6 +110,7 @@ class _RefitClientBase:
         m2n_abi_version: str = "",
         device: Any = None,
         streams: list[Any] | None = None,
+        barrier_alloc: Callable[[Any], Any] | None = None,
     ) -> None:
         self._rendezvous = rendezvous
         self._model_name = model_name
@@ -103,6 +124,7 @@ class _RefitClientBase:
         self._m2n_abi_version = m2n_abi_version
         self._device = device
         self._streams = list(streams) if streams else [None]
+        self._barrier_alloc = barrier_alloc
 
         self._cache = CommunicatorCache()
         self._publisher: Publisher | None = None
@@ -345,7 +367,9 @@ class _RefitClientBase:
                     raise RuntimeError(
                         "broadcast communicator was not initialized first"
                     )
-                _bootstrap_barrier(broadcast, self._device)
+                _bootstrap_barrier(
+                    broadcast, self._device, alloc=self._barrier_alloc
+                )
         except BaseException:
             self._cache.abort_group(membership.group_id)
             self._membership = None
