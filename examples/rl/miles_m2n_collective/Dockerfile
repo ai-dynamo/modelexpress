@@ -29,6 +29,7 @@ ENV PYTHONPATH=/opt/megatron-bridge/src:/root/miles:/root/Megatron-LM
 
 COPY examples/rl/miles_m2n_collective/run_miles.py /opt/modelexpress-miles-m2n/run_miles.py
 COPY examples/rl/miles_m2n_collective/verify_runtime.py /opt/modelexpress-miles-m2n/verify_runtime.py
+COPY examples/rl/miles_m2n_collective/microbench /opt/modelexpress-miles-m2n/microbench
 
 RUN LD_PRELOAD=/opt/modelexpress/lib/libnccl.so.2 \
     python3 /opt/modelexpress-miles-m2n/verify_runtime.py
