@@ -46,9 +46,9 @@
 #
 #   Every job runs on the internal (velonix) runner pools — nothing lands on
 #   GitHub-hosted runners. Build/stage jobs and the hosted suite use
-#   prod-modelexpress-builder-amd-v1 (dind, maxRunners 64); lightweight
-#   coordination jobs (preflight, approval, Slack, status) use
-#   prod-modelexpress-default-small-v1 (maxRunners 200, no dind).
+#   prod-modelexpress-builder-amd-v1 (dind, maxRunners 64). The coordination
+#   jobs belong on a small pool, but prod-modelexpress-default-small-v1 has no
+#   runners serving this repo, so they share the builder pool for now.
 #
 # Triggers:
 #   - schedule: daily 09:00 UTC (01:00 PST) — release mode forced on
@@ -142,7 +142,7 @@ jobs:
   # ---------------------------------------------------------------------------
   preflight:
     name: Compute nightly metadata
-    runs-on: prod-modelexpress-default-small-v1
+    runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 10
     outputs:
       date: ${{ steps.meta.outputs.date }}
@@ -266,7 +266,7 @@ jobs:
   # ---------------------------------------------------------------------------
   manual-release-approval:
     name: Manual release approval
-    runs-on: prod-modelexpress-default-small-v1
+    runs-on: prod-modelexpress-builder-amd-v1
     needs: [preflight]
     if: >-
       ${{ needs.preflight.outputs.release == 'true' &&
@@ -323,7 +323,7 @@ jobs:
   # ---------------------------------------------------------------------------
   notify-slack-start:
     name: Notify Slack — nightly started
-    runs-on: prod-modelexpress-default-small-v1
+    runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 10
     needs: [preflight]
     # Every run, not just release runs: this thread is the anchor that the
@@ -896,7 +896,7 @@ jobs:
   # ---------------------------------------------------------------------------
   notify-slack-staging:
     name: Notify Slack — staging status
-    runs-on: prod-modelexpress-default-small-v1
+    runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 10
     needs: [preflight, notify-slack-start, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc]
     if: >-
@@ -1138,7 +1138,7 @@ jobs:
   # ---------------------------------------------------------------------------
   nightly-status:
     name: Nightly status
-    runs-on: prod-modelexpress-default-small-v1
+    runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 10
     needs:
       - preflight
