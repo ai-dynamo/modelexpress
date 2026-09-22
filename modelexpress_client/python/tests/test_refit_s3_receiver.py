@@ -525,9 +525,19 @@ def _full_inputs(*, version="full-a", version_label=2):
     )
 
 
-def test_bootstrap_s3_checkpoint_downloads_and_reuses_full_root(tmp_path):
+@pytest.mark.parametrize("reported_size_gb", [None, 600])
+def test_bootstrap_s3_checkpoint_downloads_and_reuses_full_root(
+    monkeypatch, tmp_path, reported_size_gb
+):
     objects = _full_artifact(torch.tensor([7.0, 8.0]))
     storage = _MemoryS3(objects)
+    if reported_size_gb is not None:
+        monkeypatch.setattr(storage, "size", lambda _uri: reported_size_gb * 10**9)
+        monkeypatch.setattr(
+            checkpoint_store_module.shutil,
+            "disk_usage",
+            lambda _path: SimpleNamespace(free=3_000_000_000_000),
+        )
     version = receiver_module._S3Version(
         version_id="full-a",
         base_version_id=None,
@@ -818,7 +828,7 @@ def test_object_storage_generator_config_defaults_cache_quota(tmp_path):
         refit_checkpoint_dir=tmp_path / "cache",
     )
 
-    assert config.refit_checkpoint_max_size_gb == 500
+    assert config.refit_checkpoint_max_size_gb == 2000
 
 
 def test_reset_initial_checkpoint_transitions_updating_to_ready(monkeypatch, tmp_path):

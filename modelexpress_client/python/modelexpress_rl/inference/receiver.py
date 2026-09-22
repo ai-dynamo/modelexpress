@@ -37,7 +37,7 @@ from modelexpress_rl.utils import (
 )
 
 _BYTES_PER_GB = 1_000_000_000
-DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB = 500
+DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB = 2000
 
 
 @dataclass(frozen=True)
