@@ -134,6 +134,22 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
         .get("trainer_mesh_id")
         .filter(|mesh_id| !mesh_id.is_empty())
         .cloned();
+    // Keep the legacy URI field; records without a provider were written as S3.
+    let object_storage = fields
+        .get("s3_uri")
+        .filter(|uri| !uri.is_empty())
+        .map(|uri| -> RefitResult<ObjectStorageSource> {
+            let storage_type = if fields.contains_key("object_storage_type") {
+                parse_hash_field(&fields, "object_storage_type")?
+            } else {
+                ObjectStorageType::S3.into()
+            };
+            Ok(ObjectStorageSource {
+                uri: uri.clone(),
+                storage_type,
+            })
+        })
+        .transpose()?;
     Ok(WeightVersion {
         uid: hash_field(&fields, "uid")?.to_string(),
         model_name: hash_field(&fields, "model_name")?.to_string(),
@@ -146,13 +162,7 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
         layout_signature: hash_field(&fields, "layout_signature")?.to_string(),
         state: parse_hash_field(&fields, "state")?,
         created_at_unix_ms: parse_hash_field(&fields, "created_at_unix_ms")?,
-        object_storage: fields
-            .get("s3_uri")
-            .filter(|uri| !uri.is_empty())
-            .map(|uri| ObjectStorageSource {
-                uri: uri.clone(),
-                storage_type: ObjectStorageType::S3.into(),
-            }),
+        object_storage,
         trainer_mesh_id,
         trainer_mesh_generation: parse_hash_field(&fields, "trainer_mesh_generation")?,
         version_number: fields
@@ -326,6 +336,14 @@ impl RedisRefitBackend {
                 .version_number
                 .map(|number| number.to_string())
                 .unwrap_or_default(),
+        );
+        invocation.arg(
+            request
+                .object_storage
+                .as_ref()
+                .map_or(i32::from(ObjectStorageType::Unspecified), |source| {
+                    source.storage_type
+                }),
         );
         let mut redis = self.redis.clone();
         invocation
@@ -1094,6 +1112,34 @@ mod tests {
         let version = version_from_hash(stored_version("", Some("0")))
             .expect("generation is not applicable without a mesh");
         assert_eq!(version.trainer_mesh_generation, 0);
+    }
+
+    #[test]
+    fn legacy_s3_version_metadata_remains_readable() -> RefitResult<()> {
+        let fields = HashMap::from([
+            ("uid", "legacy-s3"),
+            ("model_name", "test/model"),
+            ("idempotency_key", "legacy-request"),
+            ("payload_format", "3"),
+            ("base_version_id", ""),
+            ("trainer_mesh_generation", "0"),
+            ("layout_signature", ""),
+            ("state", "2"),
+            ("created_at_unix_ms", "1234"),
+            ("s3_uri", "s3://weights/run/model.safetensors.index.json"),
+        ])
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let version = version_from_hash(fields)?;
+        assert_eq!(
+            version.object_storage,
+            Some(ObjectStorageSource {
+                uri: "s3://weights/run/model.safetensors.index.json".to_string(),
+                storage_type: ObjectStorageType::S3.into(),
+            })
+        );
+        Ok(())
     }
 
     #[test]
