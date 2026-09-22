@@ -4,7 +4,9 @@
 -- KEYS[1]: group hash
 -- KEYS[2]: participants hash
 -- KEYS[3]: reported plan digests hash
--- KEYS[4..]: every lane hash
+-- KEYS[4]: group active-operations set
+-- KEYS[5..]: every lane hash
+-- ARGV[1]: operation_key_prefix
 
 local function parse_participant(record)
   if not record then
@@ -22,6 +24,22 @@ local function registration_matches(worker_id, role, model_name)
   return redis.call('HGET', key, 'worker_id') == worker_id
     and redis.call('HGET', key, 'role') == expected_role
     and redis.call('HGET', key, 'model_name') == model_name
+end
+
+-- A group churn that invalidates the current epoch's in-flight communicator
+-- also strands any transfer op still riding it. Abort every non-terminal op
+-- this group knows about before the epoch moves out from under it.
+local function abort_stale_ops(ops_set_key, op_key_prefix)
+  local op_ids = redis.call('SMEMBERS', ops_set_key)
+  for i = 1, #op_ids do
+    local op_key = op_key_prefix .. op_ids[i]
+    local op_state = redis.call('HGET', op_key, 'state')
+    if op_state == 'PENDING' or op_state == 'RUNNING' then
+      redis.call('HSET', op_key, 'state', 'ABORTED',
+        'failure_message', 'group epoch advanced before the transfer completed')
+    end
+    redis.call('SREM', ops_set_key, op_ids[i])
+  end
 end
 
 local epoch = tonumber(redis.call('HGET', KEYS[1], 'epoch'))
@@ -50,9 +68,10 @@ if changed then
     'plan_source_worker_id', '',
     'plan_source_endpoint', '',
     'plan_source_digest', '')
-  for i = 4, #KEYS do
+  for i = 5, #KEYS do
     redis.call('DEL', KEYS[i])
   end
+  abort_stale_ops(KEYS[4], ARGV[1])
 end
 
 local expected = tonumber(redis.call('HGET', KEYS[1], 'expected_total'))
@@ -72,7 +91,7 @@ if ready then
 end
 
 if ready then
-  for i = 4, #KEYS do
+  for i = 5, #KEYS do
     local stamped = redis.call('HGET', KEYS[i], 'bootstrap_epoch')
     if not stamped or tonumber(stamped) ~= epoch then
       ready = false
