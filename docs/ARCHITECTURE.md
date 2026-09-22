@@ -1142,8 +1142,19 @@ installs it through `process_weights_after_loading`. For tensor and checkpoint
 reloads, vLLM owns quantization-aware refresh of MLA's `W_UV` and `W_UK_T`;
 ModelExpress preserves their graph-bound storage when post-load processing
 replaces these bare tensor attributes. The RL installer does not recompute MLA
-weights from `kv_b_proj.weight` or reject quantized MLA models. Correct refresh
-requires the deployed vLLM version to update these tensors during reload.
+weights from `kv_b_proj.weight` or reject quantized MLA models. MLA reloads require a stable
+vLLM release >= 0.19.0 (local build suffixes are allowed); older, prerelease,
+and unknown versions are rejected before reload mutates the model. In
+[vLLM 0.19.0's reload finalizer](https://github.com/vllm-project/vllm/blob/v0.19.0/vllm/model_executor/model_loader/reload/layerwise.py),
+MLA post-load processing runs after projection loading. Its
+[MLA implementation](https://github.com/vllm-project/vllm/blob/v0.19.0/vllm/model_executor/layers/attention/mla_attention.py)
+uses `get_and_maybe_dequant_weights` before rebuilding both tensors.
+The opt-in `tests/gpu/test_mla_refit_integration.py` test exercises real vLLM
+checkpoint refit with two local quantized MLA checkpoints; set
+`MX_TEST_MLA_BASE` and `MX_TEST_MLA_UPDATED` to compatible checkpoints with
+different KV projection weights, then run that test on a supported CUDA GPU.
+It checks refreshed values against vLLM's dequantized projection and verifies
+that the original tensor objects and storage addresses survive reload.
 Generator peers instead
 transfer the complete post-load runtime tensor set directly into existing live
 storage without re-running PWAL. The adapter rebuilds a trainer plan when

@@ -35,6 +35,7 @@ def _install_fake_vllm(monkeypatch, initialize):
     modules = {
         "vllm": ModuleType("vllm"),
         "vllm.config": ModuleType("vllm.config"),
+        "vllm.version": ModuleType("vllm.version"),
         "vllm.model_executor": ModuleType("vllm.model_executor"),
         "vllm.model_executor.layers": ModuleType("vllm.model_executor.layers"),
         "vllm.model_executor.layers.quantization": ModuleType(
@@ -56,6 +57,7 @@ def _install_fake_vllm(monkeypatch, initialize):
             "vllm.model_executor.model_loader.reload.layerwise"
         ),
     }
+    modules["vllm.version"].__version__ = "0.19.0"
     modules["vllm.config"].set_current_vllm_config = current_config
     modules[
         "vllm.model_executor.layers.quantization.base_config"
@@ -474,3 +476,40 @@ def test_installer_preserves_vllm_mla_refresh(
         assert actual.data_ptr() == pointers[name]
         assert actual.item() == expected
     assert synchronized == [torch.device("cpu")]
+
+
+@pytest.mark.parametrize("version", ["0.18.0", "0.19.0rc1", "0.19.0.dev1", "dev"])
+def test_installer_rejects_unverified_mla_versions_before_mutation(monkeypatch, version):
+    events = []
+    _install_fake_vllm(monkeypatch, lambda _model: events.append("initialize"))
+    sys.modules["vllm.version"].__version__ = version
+    model = nn.Module()
+    model.W_UV = torch.zeros(1)
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+
+    with pytest.raises(IncompleteRefit, match="requires vLLM >= 0.19.0"):
+        installer._reload(lambda: events.append("load"))
+
+    assert events == []
+    assert model.W_UV.item() == 0
+
+
+@pytest.mark.parametrize("version", ["0.19.0", "0.19.0+cu130", "0.20.0", "1.0.0"])
+def test_installer_accepts_supported_mla_versions(monkeypatch, version):
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    sys.modules["vllm.version"].__version__ = version
+    model = nn.Module()
+    model.W_UV = torch.zeros(1)
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+
+    installer._reload(lambda: None)

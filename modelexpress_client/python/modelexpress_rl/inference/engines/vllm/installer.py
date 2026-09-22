@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -330,6 +331,19 @@ class _VllmInstaller(EngineInstaller):
             raise RuntimeError(
                 "ModelExpress refit requires vLLM's layerwise reload APIs"
             ) from error
+
+        if any(
+            hasattr(layer, "W_UV") or hasattr(layer, "W_UK_T")
+            for layer in self._model.modules()
+        ):
+            from vllm.version import __version__
+
+            release = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\+.+)?", __version__)
+            if release is None or tuple(map(int, release.groups())) < (0, 19, 0):
+                raise IncompleteRefit(
+                    "MLA refit requires vLLM >= 0.19.0 with MLA post-load "
+                    f"processing during layerwise reload; found {__version__}"
+                )
 
         # vLLM also keeps graph-bound tensors as plain object attributes rather
         # than registered parameters or buffers. Layerwise reload does not save
