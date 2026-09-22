@@ -210,9 +210,15 @@ class TestDigest:
     @pytest.mark.parametrize(
         "mutate",
         [
-            pytest.param(lambda p: ReshardPlan(bulk=[param("a", dtype="float16")]), id="dtype"),
-            pytest.param(lambda p: ReshardPlan(bulk=[param("a", shape=(16, 4))]), id="shape"),
-            pytest.param(lambda p: ReshardPlan(bulk=[param("a", group_key="k")]), id="group_key"),
+            pytest.param(
+                lambda p: ReshardPlan(bulk=[param("a", dtype="float16")]), id="dtype"
+            ),
+            pytest.param(
+                lambda p: ReshardPlan(bulk=[param("a", shape=(16, 4))]), id="shape"
+            ),
+            pytest.param(
+                lambda p: ReshardPlan(bulk=[param("a", group_key="k")]), id="group_key"
+            ),
             pytest.param(lambda p: ReshardPlan(bulk=[param("z")]), id="name"),
             pytest.param(
                 lambda p: ReshardPlan(bulk=[param("a")], source_partition_count=2),
@@ -294,7 +300,12 @@ class TestDefaultDerivation:
         )
         assert grouped_expert_name("model.layers.0.mlp.gate_proj.weight") is None
         # An FP8 scale sibling must not be folded into the weight group.
-        assert grouped_expert_name("model.layers.0.mlp.experts.7.gate_proj.weight_scale_inv") is None
+        assert (
+            grouped_expert_name(
+                "model.layers.0.mlp.experts.7.gate_proj.weight_scale_inv"
+            )
+            is None
+        )
 
 
 class TestDefaultMesh:
@@ -362,7 +373,9 @@ class TestDefaultMesh:
 
     def test_one_dimensional_params_replicate(self):
         _, axis_of = build_mesh(rank_count=8, tp_size=8)
-        placements = default_placements("model.layers.0.input_layernorm.weight", axis_of, ndim=1)
+        placements = default_placements(
+            "model.layers.0.input_layernorm.weight", axis_of, ndim=1
+        )
         assert all(p.canonical() == "R" for p in placements)
 
     def test_the_default_derivation_produces_a_valid_plan(self):
@@ -459,3 +472,59 @@ class TestAgreementMembers:
         assert plan_digest(plan, receiver_protocol="a", m2n_abi_version="1") == (
             plan_digest(plan, receiver_protocol="a", m2n_abi_version="1")
         )
+
+    def test_no_semantic_manifest_preserves_the_existing_digest(self):
+        plan = self._plan()
+
+        assert plan_digest(plan) == (
+            "445ffda623edccab618e2c95a4460a1b908e3024e115bc66deb9a9deb23159cd"
+        )
+        assert plan_digest(
+            plan,
+            semantic_manifest_version=None,
+            semantic_manifest_digest=None,
+        ) == plan_digest(plan)
+
+    def test_a_differing_semantic_manifest_changes_the_admission_digest(self):
+        plan = self._plan()
+
+        assert plan_digest(
+            plan,
+            semantic_manifest_version="native-records-v1",
+            semantic_manifest_digest="01" * 32,
+        ) != plan_digest(
+            plan,
+            semantic_manifest_version="native-records-v1",
+            semantic_manifest_digest="02" * 32,
+        )
+        assert plan_digest(
+            plan,
+            semantic_manifest_version="native-records-v1",
+            semantic_manifest_digest="01" * 32,
+        ) != plan_digest(
+            plan,
+            semantic_manifest_version="native-records-v2",
+            semantic_manifest_digest="01" * 32,
+        )
+
+    @pytest.mark.parametrize(
+        ("version", "digest", "message"),
+        [
+            (None, "01" * 32, "must be supplied together"),
+            ("native-records-v1", None, "must be supplied together"),
+            ("", "01" * 32, "version must be a non-empty string"),
+            ("native-records-v1", "not-a-digest", "64 lowercase hexadecimal"),
+        ],
+    )
+    def test_an_invalid_semantic_manifest_identity_fails_closed(
+        self,
+        version,
+        digest,
+        message,
+    ):
+        with pytest.raises(ValueError, match=message):
+            plan_digest(
+                self._plan(),
+                semantic_manifest_version=version,
+                semantic_manifest_digest=digest,
+            )

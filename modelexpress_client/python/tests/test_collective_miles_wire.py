@@ -64,6 +64,75 @@ def test_control_wire_round_trips_the_exact_plan_and_topology():
     assert decoded == control
 
 
+def test_prepare_control_round_trips_an_opaque_semantic_manifest_identity():
+    control = CollectiveControl(
+        action="prepare",
+        plan=_plan(),
+        topology=_topology(),
+        generator_slot_offset=2,
+        endpoint="mx:50051",
+        semantic_manifest_version="native-records-v1",
+        semantic_manifest_digest="ab" * 32,
+    )
+
+    decoded = decode_control(encode_control(control))
+
+    assert decoded == control
+
+
+def test_prepare_control_omits_semantic_manifest_fields_for_legacy_callers():
+    control = CollectiveControl(
+        action="prepare",
+        plan=_plan(),
+        topology=_topology(),
+        generator_slot_offset=2,
+        endpoint="mx:50051",
+    )
+
+    payload = wire.json.loads(encode_control(control).removeprefix(wire.CONTROL_PREFIX))
+
+    assert "semantic_manifest_version" not in payload
+    assert "semantic_manifest_digest" not in payload
+    assert decode_control(encode_control(control)) == control
+
+
+@pytest.mark.parametrize(
+    ("version", "digest", "message"),
+    [
+        (None, "01" * 32, "must be supplied together"),
+        ("native-records-v1", None, "must be supplied together"),
+        ("", "01" * 32, "version must be a non-empty string"),
+        ("native-records-v1", "not-a-digest", "64 lowercase hexadecimal"),
+    ],
+)
+def test_prepare_control_rejects_an_invalid_semantic_manifest_identity(
+    version,
+    digest,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        CollectiveControl(
+            action="prepare",
+            plan=_plan(),
+            topology=_topology(),
+            generator_slot_offset=2,
+            endpoint="mx:50051",
+            semantic_manifest_version=version,
+            semantic_manifest_digest=digest,
+        )
+
+
+def test_non_prepare_control_rejects_a_semantic_manifest_identity():
+    with pytest.raises(ValueError, match="valid only for prepare"):
+        CollectiveControl(
+            action="run_round",
+            version="7",
+            operation_id="operation-7",
+            semantic_manifest_version="native-records-v1",
+            semantic_manifest_digest="01" * 32,
+        )
+
+
 def test_control_wire_leaves_stock_sglang_group_names_untouched():
     assert decode_control("miles-pp-0") is None
 

@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from ..plan import validate_semantic_manifest_identity
 from ..types import MeshSpec, ParamPlan, Placement, PlacementKind, ReshardPlan
 from .miles import CollectiveTopology
 
@@ -202,6 +203,8 @@ class CollectiveControl:
     operation_id: str | None = None
     endpoint: str | None = None
     tensor_digests: TensorDigestMap | None = None
+    semantic_manifest_version: str | None = None
+    semantic_manifest_digest: str | None = None
 
     def __post_init__(self) -> None:
         if self.action not in _ACTIONS:
@@ -215,6 +218,10 @@ class CollectiveControl:
                 )
             if not str(self.endpoint or "").strip():
                 raise ValueError("prepare requires a ModelExpress endpoint")
+            validate_semantic_manifest_identity(
+                version=self.semantic_manifest_version,
+                digest=self.semantic_manifest_digest,
+            )
         elif self.action == "run_round":
             if not str(self.version or "").strip():
                 raise ValueError("run_round requires a version")
@@ -224,6 +231,11 @@ class CollectiveControl:
                 validate_tensor_digests(self.tensor_digests)
         if self.action != "run_round" and self.tensor_digests is not None:
             raise ValueError("tensor digests are valid only for run_round")
+        if self.action != "prepare" and (
+            self.semantic_manifest_version is not None
+            or self.semantic_manifest_digest is not None
+        ):
+            raise ValueError("semantic manifest identity is valid only for prepare")
 
 
 def encode_control(control: CollectiveControl) -> str:
@@ -242,6 +254,9 @@ def encode_control(control: CollectiveControl) -> str:
         payload["endpoint"] = control.endpoint
     if control.tensor_digests is not None:
         payload["tensor_digests"] = [list(item) for item in control.tensor_digests]
+    if control.semantic_manifest_version is not None:
+        payload["semantic_manifest_version"] = control.semantic_manifest_version
+        payload["semantic_manifest_digest"] = control.semantic_manifest_digest
     encoded = CONTROL_PREFIX + json.dumps(
         payload,
         ensure_ascii=True,
@@ -299,6 +314,8 @@ def decode_control(value: object) -> CollectiveControl | None:
         operation_id=raw.get("operation_id"),
         endpoint=raw.get("endpoint"),
         tensor_digests=tensor_digests,
+        semantic_manifest_version=raw.get("semantic_manifest_version"),
+        semantic_manifest_digest=raw.get("semantic_manifest_digest"),
     )
 
 

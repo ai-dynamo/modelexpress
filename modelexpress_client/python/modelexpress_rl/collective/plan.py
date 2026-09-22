@@ -23,7 +23,7 @@ import hashlib
 import re
 from collections import Counter
 
-from .types import MESH_MAX_NDIM, MeshSpec, MiscParam, ParamPlan, Placement, ReshardPlan
+from .types import MESH_MAX_NDIM, MeshSpec, ParamPlan, Placement, ReshardPlan
 
 # FFN projection weights. Column-parallel projections shard the output dim,
 # the row-parallel one shards the input dim.
@@ -32,7 +32,10 @@ _ROW_PARALLEL_SUFFIXES = ("down_proj.weight",)
 _EXPERT_MARKER = ".experts."
 _SHARED_EXPERT_MARKER = "shared_expert"
 
-_GROUPED_EXPERT_RE = re.compile(r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+_GROUPED_EXPERT_RE = re.compile(
+    r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+)
+_SEMANTIC_MANIFEST_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class PlanCoverageError(ValueError):
@@ -68,7 +71,9 @@ def validate_coverage(plan: ReshardPlan, expected: list[str]) -> None:
         )
 
     expected_counts = Counter(expected)
-    expected_duplicates = sorted(name for name, count in expected_counts.items() if count > 1)
+    expected_duplicates = sorted(
+        name for name, count in expected_counts.items() if count > 1
+    )
     if expected_duplicates:
         raise PlanCoverageError(
             "the model parameter list names "
@@ -96,11 +101,43 @@ def validate_coverage(plan: ReshardPlan, expected: list[str]) -> None:
 DEFAULT_RECEIVER_PROTOCOL = "mx-nccl-m2n-bootstrap-v1"
 
 
+def validate_semantic_manifest_identity(
+    *,
+    version: object,
+    digest: object,
+) -> tuple[str, str] | None:
+    """Validate an integration-owned semantic manifest identity.
+
+    ModelExpress deliberately treats both values as opaque. The integration
+    owns the manifest contents and canonicalization; this gate only makes sure
+    participants cannot silently omit half of the identity or use a malformed
+    digest representation.
+    """
+    if version is None and digest is None:
+        return None
+    if version is None or digest is None:
+        raise ValueError(
+            "semantic manifest version and digest must be supplied together"
+        )
+    if not isinstance(version, str) or not version:
+        raise ValueError("semantic manifest version must be a non-empty string")
+    if (
+        not isinstance(digest, str)
+        or _SEMANTIC_MANIFEST_DIGEST_RE.fullmatch(digest) is None
+    ):
+        raise ValueError(
+            "semantic manifest digest must be 64 lowercase hexadecimal characters"
+        )
+    return version, digest
+
+
 def plan_digest(
     plan: ReshardPlan,
     *,
     receiver_protocol: str = DEFAULT_RECEIVER_PROTOCOL,
     m2n_abi_version: str = "",
+    semantic_manifest_version: str | None = None,
+    semantic_manifest_digest: str | None = None,
 ) -> str:
     """A canonical digest over the whole plan.
 
@@ -108,10 +145,13 @@ def plan_digest(
     MX admits the group only when they all agree, and a change bumps the group
     epoch, which drops the cached plan and the cached communicator together.
 
-    ``receiver_protocol`` names the bootstrap encoding both sides must share
-    and ``m2n_abi_version`` the M2N build they must be compatible on. Peers
-    that disagree on either produce different digests, so the group never
-    reaches READY instead of meeting inside a collective and finding out.
+    ``receiver_protocol`` names the bootstrap encoding both sides must share,
+    ``m2n_abi_version`` the M2N build they must be compatible on, and the
+    optional semantic manifest identity binds integration-owned recipes and
+    atomic relationships without teaching ModelExpress their meaning. Peers
+    that disagree on any supplied identity produce different digests, so the
+    group never reaches READY instead of meeting inside a collective and
+    finding out.
 
     Both lists are hashed in order. The backend walks bulk entries as collective
     operations and misc entries as broadcast payloads, so either ordering is
@@ -120,6 +160,10 @@ def plan_digest(
     number.
     """
     plan.validate()
+    semantic_manifest = validate_semantic_manifest_identity(
+        version=semantic_manifest_version,
+        digest=semantic_manifest_digest,
+    )
     hasher = hashlib.sha256()
     hasher.update(b"mx-nccl-m2n-plan-v2\0")
     # The digest is what readiness compares, so anything two peers must agree
@@ -129,6 +173,12 @@ def plan_digest(
     # deliberately importable without nccl4py present.
     hasher.update(f"{receiver_protocol}\0".encode())
     hasher.update(f"{m2n_abi_version}\0".encode())
+    if semantic_manifest is not None:
+        hasher.update(b"semantic-manifest\0")
+        for value in semantic_manifest:
+            encoded = value.encode("utf-8")
+            hasher.update(len(encoded).to_bytes(8, "big"))
+            hasher.update(encoded)
     hasher.update(f"{plan.source_partition_count}\0".encode())
 
     hasher.update(b"bulk\0")
@@ -230,7 +280,9 @@ def build_mesh(
     return MeshSpec(shape=shape, rank_offset=rank_offset), axis_of
 
 
-def default_placements(name: str, axis_of: dict[str, int], ndim: int) -> tuple[Placement, ...]:
+def default_placements(
+    name: str, axis_of: dict[str, int], ndim: int
+) -> tuple[Placement, ...]:
     """Default placement derivation for one parameter.
 
     One-dimensional parameters replicate. Expert parameters shard the leading
