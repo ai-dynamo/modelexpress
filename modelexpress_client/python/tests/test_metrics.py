@@ -63,10 +63,16 @@ _RECORDERS = [
     ("observe_candidates", ("random", "listed", 2)),
     ("observe_selection_seconds", ("random", 0.001)),
     ("observe_transfer_seconds", ("random", "success", 1.0)),
+    ("observe_source_attempt_phase_seconds", ("random", "receive", "ok", 1.0)),
     ("record_nixl_error", ("timeout",)),
     ("record_nixl_receive", ("complete",)),
     ("observe_load_seconds", ("vllm", "Qwen/Qwen2.5-0.5B-Instruct", "main", "success", 12.0)),
     ("observe_load_phase_seconds", ("vllm", "Qwen/Qwen2.5-0.5B-Instruct", "chain", 4.0)),
+    (
+        "observe_artifact_install_step_seconds",
+        ("torch_compile_cache", "primary", "extract", 2.0),
+    ),
+    ("record_artifact_install_bytes", ("torch_compile_cache", "primary", 4096)),
 ]
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -152,6 +158,7 @@ def test_recorders_never_raise_into_load_path(monkeypatch):
     m.candidates = boom
     m.selection_seconds = boom
     m.transfer_seconds = boom
+    m.source_attempt_phase_seconds = boom
     m.nixl_errors = boom
     m.nixl_receives = boom
     # None of these may propagate the RuntimeError.
@@ -1218,6 +1225,94 @@ def test_load_timers_never_raise_into_the_load_path(monkeypatch):
     collector.observe_load_phase_seconds("vllm", "m", "chain", 1.0)
 
 
+# ---------------------------------------------------------------------------
+# Inside artifact_install: validate / extract per archive
+# ---------------------------------------------------------------------------
+
+
+def test_artifact_install_steps_are_recorded_per_archive(monkeypatch):
+    """Both steps land on their own series, keyed by artifact and archive.
+
+    This is the breakdown the ``artifact_install`` phase cannot give: the
+    phase also covers discovery and the RDMA copy, so a slow install is
+    ambiguous until the on-target steps are visible on their own.
+    """
+    collector = _fresh_collector(monkeypatch)
+    with collector.time_artifact_install_step("flashinfer_cache", "primary", "validate"):
+        pass
+    with collector.time_artifact_install_step("flashinfer_cache", "primary", "extract"):
+        pass
+    with collector.time_artifact_install_step("flashinfer_cache", "cubin", "extract"):
+        pass
+    collector.record_artifact_install_bytes("flashinfer_cache", "primary", 1024)
+    collector.record_artifact_install_bytes("flashinfer_cache", "primary", 1024)
+
+    exposition = _exposition(collector)
+    for archive, step in (("primary", "validate"), ("primary", "extract"), ("cubin", "extract")):
+        assert (
+            "mx_artifact_install_step_seconds_count"
+            f'{{archive="{archive}",artifact="flashinfer_cache",scheme="",step="{step}"}} 1.0'
+        ) in exposition, exposition
+    assert (
+        "mx_artifact_install_bytes_total"
+        '{archive="primary",artifact="flashinfer_cache",scheme=""} 2048.0'
+    ) in exposition, exposition
+
+
+def test_an_artifact_step_that_raises_is_still_recorded(monkeypatch):
+    """A ``tar -xf`` that dies on a full disk is the observation worth having."""
+    collector = _fresh_collector(monkeypatch)
+    with pytest.raises(RuntimeError):
+        with collector.time_artifact_install_step("torch_compile_cache", "primary", "extract"):
+            raise RuntimeError("tar command failed")
+
+    exposition = _exposition(collector)
+    assert (
+        "mx_artifact_install_step_seconds_count"
+        '{archive="primary",artifact="torch_compile_cache",scheme="",step="extract"} 1.0'
+    ) in exposition, exposition
+
+
+def test_artifact_step_labels_are_closed_enums(monkeypatch):
+    """An unknown step is dropped; an unknown artifact clamps to ``other``.
+
+    Same asymmetry as the load phases: the steps are read against each other,
+    so a stray step name folded into one would inflate it while looking sound,
+    whereas an out-of-tree artifact kind is still worth an ``other`` reading.
+    """
+    collector = _fresh_collector(monkeypatch)
+    collector.observe_artifact_install_step_seconds(
+        "torch_compile_cache", "primary", "unpack", 1.0
+    )
+    collector.observe_artifact_install_step_seconds("my_custom_cache", "primary", "extract", 1.0)
+    collector.record_artifact_install_bytes("my_custom_cache", "primary", 7)
+
+    exposition = _exposition(collector)
+    assert 'step="unpack"' not in exposition, exposition
+    assert (
+        "mx_artifact_install_step_seconds_count"
+        '{archive="primary",artifact="other",scheme="",step="extract"} 1.0'
+    ) in exposition, exposition
+    assert (
+        'mx_artifact_install_bytes_total{archive="primary",artifact="other",scheme=""} 7.0'
+        in exposition
+    ), exposition
+
+
+def test_artifact_kinds_match_the_transfer_factories():
+    """The closed enum is the factory list, so a new factory cannot silently
+    land in ``other``."""
+    from modelexpress import metrics as metrics_module
+    from modelexpress.metadata import artifact_transfer
+
+    source = Path(artifact_transfer.__file__).read_text()
+    factories = set(
+        re.findall(r'^\s+"([a-z_]+_cache)",\n\s+p2p_pb2\.MX_SOURCE_TYPE_', source, re.M)
+    )
+    assert factories, "the factory regex no longer matches artifact_transfer.py"
+    assert factories == set(metrics_module.ARTIFACT_KINDS) - {"other"}
+
+
 def test_load_buckets_match_the_rust_xslow_band():
     """A server download and a client load are compared on one dashboard.
 
@@ -1240,3 +1335,69 @@ def test_load_buckets_match_the_rust_xslow_band():
     assert rust_buckets == tuple(float(b) for b in _XSLOW_BUCKETS), (
         f"Rust XSLOW {rust_buckets} != Python _XSLOW_BUCKETS {_XSLOW_BUCKETS}"
     )
+
+
+class TestObserveCandidateLoads:
+    """With the per-peer label off there is ONE series: it must hold the chosen
+    candidate's load, not whichever candidate the loop happened to write last
+    (under load_aware, the busiest)."""
+
+    @staticmethod
+    def _refs(loads):
+        from modelexpress import p2p_pb2
+        out = []
+        for i, load in enumerate(loads):
+            r = p2p_pb2.SourceInstanceRef(mx_source_id="deadbeefdeadbeef", worker_id=f"w{i}", worker_rank=0)
+            if load is not None:
+                r.source_load = load
+            out.append(r)
+        return out
+
+    @staticmethod
+    def _collector(monkeypatch, label_on):
+        from prometheus_client import CollectorRegistry
+        from modelexpress import metrics as M
+        # Through the environment, never setattr on the envs module: envs resolves
+        # names dynamically, so getattr succeeds when monkeypatch records the old
+        # value and the teardown pins a real attribute that shadows the lookup
+        # for the rest of the process -- every later test that relies on
+        # MX_METRICS_ENABLED then records nothing.
+        monkeypatch.setenv("MX_METRICS_ENABLED", "1")
+        monkeypatch.setenv("MX_METRICS_SOURCE_ID_LABEL", "1" if label_on else "0")
+        monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+        reg = CollectorRegistry()
+        c = M.MetricsCollector(registry=reg)
+        assert c._ensure()
+        return c, reg
+
+    @staticmethod
+    def _series(reg):
+        from prometheus_client import generate_latest
+        return [l for l in generate_latest(reg).decode().splitlines() if l.startswith("mx_p2p_source_load{")]
+
+    def test_label_off_records_the_chosen_source_not_the_busiest(self, monkeypatch):
+        c, reg = self._collector(monkeypatch, label_on=False)
+        c.observe_candidate_loads(self._refs([0.0, 0.3, 0.9]))  # best-first
+        lines = self._series(reg)
+        assert len(lines) == 1, lines
+        assert lines[0].endswith(" 0.0"), lines
+
+    def test_label_on_records_every_candidate(self, monkeypatch):
+        c, reg = self._collector(monkeypatch, label_on=True)
+        c.observe_candidate_loads(self._refs([0.0, 0.3, 0.9]))
+        lines = self._series(reg)
+        assert len(lines) == 3, lines
+        # The wire field is a proto float32, so compare the parsed value, not text.
+        by_worker = {l.split('source_worker_id="')[1].split('"')[0]: float(l.rsplit(" ", 1)[1]) for l in lines}
+        assert by_worker["w2"] == pytest.approx(0.9, abs=1e-6), lines
+        assert by_worker["w0"] == pytest.approx(0.0, abs=1e-6), lines
+
+    def test_unknown_load_is_skipped_not_recorded_as_zero(self, monkeypatch):
+        c, reg = self._collector(monkeypatch, label_on=False)
+        c.observe_candidate_loads(self._refs([None, 0.4]))  # chosen has no reading
+        assert self._series(reg) == []
+
+    def test_empty_ordered_is_a_noop(self, monkeypatch):
+        c, reg = self._collector(monkeypatch, label_on=False)
+        c.observe_candidate_loads([])
+        assert self._series(reg) == []

@@ -57,7 +57,14 @@ def patch_hf_snapshot_prefetch() -> bool:
         repo_type = kwargs.get("repo_type") or "model"
         if isinstance(repo_id, str) and repo_type == "model":
             try:
-                model_prefetch.ensure_metadata(repo_id, kwargs.get("revision"))
+                # The caller's cache_dir wins: vLLM passes its download-dir
+                # here, and installing somewhere else would leave the original
+                # call resolving against a root the snapshot is not in.
+                model_prefetch.ensure_metadata(
+                    repo_id,
+                    kwargs.get("revision"),
+                    cache_directory=kwargs.get("cache_dir"),
+                )
             except Exception as exc:
                 # Let the original call report the failure the engine expects
                 # instead of replacing it with a ModelExpress error.

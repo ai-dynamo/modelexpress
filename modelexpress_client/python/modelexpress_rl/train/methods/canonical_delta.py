@@ -21,7 +21,12 @@ import torch.distributed as dist
 from ... import envs as rl_envs
 from ... import refit_pb2, refit_pb2_grpc
 from ...s3 import S3Client
-from ...utils import adler32_checksum, compress_delta, compute_delta, threadpool_map
+from ...utils import (
+    checksum_factory,
+    compress_delta,
+    compute_delta,
+    threadpool_map,
+)
 from ...version import WeightVersionRef
 
 logger = logging.getLogger("modelexpress_rl.train.client")
@@ -97,6 +102,8 @@ class CanonicalDeltaPublicationMethod:
         self._read_seed_tensor = read_seed_tensor
         self._s3 = s3
         self._clock = clock
+        self._checksum_format = rl_envs.MX_REFIT_CHECKSUM_FORMAT
+        checksum_factory(self._checksum_format)
         self.current_base_version_id = config.initial_base_version_id
         self.snapshot: dict[str, np.ndarray | torch.Tensor] = {}
         self._staged: StagedCanonicalDelta | StagedFullCheckpoint | None = None
@@ -165,7 +172,9 @@ class CanonicalDeltaPublicationMethod:
             total_bytes += int(current.nbytes)
             if delta is not None:
                 encoded[name] = compress_delta(delta)
-                checksums[name] = adler32_checksum(current)
+                checksum = checksum_factory(self._checksum_format)
+                checksum.update(current)
+                checksums[name] = checksum.hexdigest()
         return candidate, encoded, checksums, changed_bytes, total_bytes
 
     def stage(
@@ -331,12 +340,11 @@ class CanonicalDeltaPublicationMethod:
             item: tuple[str, dict[str, torch.Tensor]],
         ) -> tuple[dict[str, str], int]:
             filename, tensors = item
-            checksums = {
-                name: adler32_checksum(
-                    tensor.reshape(-1).view(torch.uint8).numpy()
-                )
-                for name, tensor in tensors.items()
-            }
+            checksums = {}
+            for name, tensor in tensors.items():
+                checksum = checksum_factory(self._checksum_format)
+                checksum.update(tensor.reshape(-1).view(torch.uint8).numpy())
+                checksums[name] = checksum.hexdigest()
             data = safetensors.torch.save(tensors, metadata=checksums)
             self._s3.put(uri=f"{parent_uri}/{filename}", data=data)
             return dict.fromkeys(tensors, filename), len(data)
@@ -374,7 +382,10 @@ class CanonicalDeltaPublicationMethod:
                 weight_map[name] = shard_name
         index = json.dumps(
             {
-                "metadata": {"total_size": total_size},
+                "metadata": {
+                    "total_size": total_size,
+                    "checksum_format": self._checksum_format,
+                },
                 "weight_map": weight_map,
             },
             sort_keys=True,
@@ -453,7 +464,7 @@ class CanonicalDeltaPublicationMethod:
                         "base_version": staged.base_version_id,
                         "delta_encoding": "xor",
                         "compression_format": "zstd",
-                        "checksum_format": "adler32",
+                        "checksum_format": self._checksum_format,
                     },
                     "weight_map": weight_map,
                 },

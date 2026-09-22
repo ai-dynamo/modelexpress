@@ -36,6 +36,83 @@ def _make_loader():
     return loader
 
 
+def test_get_model_loader_returns_completed_inference_loader():
+    from modelexpress.engines.vllm import loader as loader_mod
+
+    loader = _make_loader()
+    ctx = _make_load_context(device_id=3)
+    loader._ctx = ctx
+    loader_mod._loader_registry[3] = loader
+    try:
+        assert loader_mod.get_model_loader(3) is loader
+    finally:
+        loader_mod._loader_registry.pop(3, None)
+
+
+def test_get_model_loader_returns_none_for_unknown_device():
+    from modelexpress.engines.vllm import loader as loader_mod
+
+    loader_mod._loader_registry.pop(99, None)
+    assert loader_mod.get_model_loader(99) is None
+
+
+def test_model_loader_owns_runtime_tensor_publication(monkeypatch):
+    from modelexpress.engines.vllm import loader as loader_mod
+
+    loader = _make_loader()
+    ctx = _make_load_context(device_id=3)
+    loader._ctx = ctx
+    events = []
+    monkeypatch.setattr(
+        loader_mod,
+        "drain_tensor_readers",
+        lambda received, *, timeout: events.append(
+            ("drain", received, timeout)
+        ),
+    )
+    monkeypatch.setattr(
+        loader_mod,
+        "unpublish_metadata",
+        lambda received: events.append(("unpublish", received)),
+    )
+    monkeypatch.setattr(
+        loader_mod,
+        "publish_metadata",
+        lambda received: events.append(("publish", received)),
+    )
+
+    loader.unpublish_runtime_tensors()
+    loader.publish_runtime_tensors("version-a")
+
+    assert events == [
+        ("drain", ctx, 900),
+        ("unpublish", ctx),
+        ("publish", ctx),
+    ]
+    assert ctx.identity.revision == "version-a"
+
+
+def test_model_loader_keeps_source_published_when_reader_drain_times_out(
+    monkeypatch,
+):
+    from modelexpress.engines.vllm import loader as loader_mod
+
+    loader = _make_loader()
+    loader._ctx = _make_load_context(device_id=3)
+    unpublish = MagicMock()
+    monkeypatch.setattr(loader_mod, "unpublish_metadata", unpublish)
+    monkeypatch.setattr(
+        loader_mod,
+        "drain_tensor_readers",
+        MagicMock(side_effect=TimeoutError("active readers")),
+    )
+
+    with pytest.raises(TimeoutError, match="active readers"):
+        loader.unpublish_runtime_tensors()
+
+    unpublish.assert_not_called()
+
+
 def _make_identity(model_name="test-model"):
     # Realistic identity: unquantized weights with dtype set, matching every
     # production vLLM/SGLang/TRT-LLM publish path. The accelerator gate treats
@@ -127,6 +204,7 @@ def _make_load_context(**overrides):
         target_device=torch.device("cpu"),
         global_rank=0,
         worker_rank=0,
+        local_rank=0,
         device_id=0,
         identity=_make_identity(),
         mx_client=MagicMock(),
@@ -135,6 +213,50 @@ def _make_load_context(**overrides):
     )
     defaults.update(overrides)
     return LoadContext(**defaults)
+
+
+def test_initial_load_uses_inference_chain_by_default(monkeypatch):
+    from modelexpress.load_strategy import run_load_strategy_chain
+
+    monkeypatch.delenv("MX_LOAD_STRATEGY_CHAIN", raising=False)
+    model = MagicMock()
+    ctx = _make_load_context()
+
+    with patch(
+        "modelexpress.load_strategy.LoadStrategyChain.run",
+        return_value=model,
+    ) as inference_run:
+        assert run_load_strategy_chain(model, ctx) is model
+
+    inference_run.assert_called_once_with(model, ctx)
+
+
+def test_initial_load_uses_dedicated_rl_chain(monkeypatch):
+    from modelexpress.load_strategy import run_load_strategy_chain
+
+    monkeypatch.setenv("MX_LOAD_STRATEGY_CHAIN", "RL")
+    model = MagicMock()
+    ctx = _make_load_context()
+
+    with patch(
+        "modelexpress.load_strategy.LoadStrategyChain.run"
+    ) as inference_run, patch(
+        "modelexpress_rl.inference.load_strategy.RLLoadStrategyChain.run",
+        return_value=model,
+    ) as rl_run:
+        assert run_load_strategy_chain(model, ctx) is model
+
+    inference_run.assert_not_called()
+    rl_run.assert_called_once_with(model, ctx)
+
+
+def test_initial_load_rejects_unknown_chain(monkeypatch):
+    from modelexpress.load_strategy import run_load_strategy_chain
+
+    monkeypatch.setenv("MX_LOAD_STRATEGY_CHAIN", "unknown")
+
+    with pytest.raises(ValueError, match="MX_LOAD_STRATEGY_CHAIN"):
+        run_load_strategy_chain(MagicMock(), _make_load_context())
 
 
 class _FakeRpcError(grpc.RpcError):
@@ -269,6 +391,14 @@ class TestAbstractMethodCompleteness:
                 loader.download_model(cfg)
                 mock_cls.return_value.download_model.assert_not_called()
 
+    def test_download_model_defers_to_rl_initial_load(self):
+        loader = _make_loader()
+        cfg = MagicMock()
+        with patch.dict("os.environ", {"MX_LOAD_STRATEGY_CHAIN": "RL"}, clear=True):
+            with patch("modelexpress.engines.vllm.loader.DefaultModelLoader") as mock_cls:
+                loader.download_model(cfg)
+                mock_cls.return_value.download_model.assert_not_called()
+
     def test_load_weights_delegates(self):
         loader = _make_loader()
         model, cfg = MagicMock(), MagicMock()
@@ -295,17 +425,19 @@ class TestAbstractMethodCompleteness:
                 "modelexpress.engines.vllm.loader.initialize_model",
                 return_value=model,
             ), patch(
-                "modelexpress.engines.vllm.loader.LoadStrategyChain.run",
+                "modelexpress.engines.vllm.loader.run_load_strategy_chain",
                 return_value=model,
             ):
                 loaded = loader.load_model(MagicMock(), MagicMock(dtype=torch.float32))
 
             assert loaded is model.eval.return_value
+            assert loader_mod._loader_registry[3] is loader
             assert loader_mod._tensor_registry[3] == ctx.tensors
             assert 3 not in loader_mod._nixl_managers
         finally:
             loader_mod._nixl_managers.pop(3, None)
             loader_mod._tensor_registry.pop(3, None)
+            loader_mod._loader_registry.pop(3, None)
 
     @pytest.mark.parametrize(
         ("ready_url", "health_gated"),
@@ -355,7 +487,7 @@ class TestAbstractMethodCompleteness:
             "modelexpress.engines.vllm.loader.initialize_model",
             side_effect=initialize_model,
         ), patch(
-            "modelexpress.engines.vllm.loader.LoadStrategyChain.run",
+            "modelexpress.engines.vllm.loader.run_load_strategy_chain",
             side_effect=run,
         ), patch(
             "modelexpress.engines.vllm.loader.schedule_vllm_cache_artifact_publish",
@@ -466,7 +598,7 @@ class TestMtpDrafterSecondLoad:
             "modelexpress.engines.vllm.loader.initialize_model",
             return_value=MagicMock(),
         ), patch(
-            "modelexpress.engines.vllm.loader.LoadStrategyChain.run",
+            "modelexpress.engines.vllm.loader.run_load_strategy_chain",
             side_effect=lambda model, _ctx: model,
         ), patch(
             "modelexpress.engines.vllm.loader.schedule_vllm_cache_artifact_publish",
@@ -493,12 +625,41 @@ class TestMtpDrafterSecondLoad:
         draft_ctx.nixl_manager = MagicMock()
         try:
             schedule = self._load(loader, draft_vllm_config, draft_config, draft_ctx)
+            assert loader_mod._loader_registry[0] is loader
+            assert loader.tensors is target_ctx.tensors
             assert loader_mod._tensor_registry[0] is target_ctx.tensors
             assert loader_mod._nixl_managers[0] is target_ctx.nixl_manager
             schedule.assert_not_called()
         finally:
             loader_mod._tensor_registry.pop(0, None)
             loader_mod._nixl_managers.pop(0, None)
+            loader_mod._loader_registry.pop(0, None)
+
+    def test_rl_drafter_is_rejected_before_initialization(self):
+        """RL has no version contract for speculative draft weights."""
+        loader = _make_loader()
+        vllm_config = MagicMock()
+        model_config = MagicMock(dtype=torch.float32, runner_type="draft")
+
+        with patch.dict(
+            os.environ,
+            {
+                "MX_LOAD_STRATEGY_CHAIN": "RL",
+                "MX_REFIT_DESIRED_VERSION_UID": "main-version",
+            },
+            clear=True,
+        ), patch(
+            "modelexpress.engines.vllm.loader.build_vllm_load_context"
+        ) as build_context, patch(
+            "modelexpress.engines.vllm.loader.initialize_model"
+        ) as initialize, pytest.raises(
+            ValueError,
+            match="RL initial loading does not support speculative draft models",
+        ):
+            loader.load_model(vllm_config, model_config)
+
+        build_context.assert_not_called()
+        initialize.assert_not_called()
 
     def test_is_speculative_draft(self):
         from modelexpress.engines.vllm.loader import _is_speculative_draft

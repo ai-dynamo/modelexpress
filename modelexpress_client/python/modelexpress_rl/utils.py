@@ -12,13 +12,30 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import numpy as np
 
 
 _WorkItem = TypeVar("_WorkItem")
 _WorkResult = TypeVar("_WorkResult")
+
+
+class Adler32Checksum:
+    def __init__(self) -> None:
+        self._value = 1
+
+    def update(self, data: Any) -> None:
+        self._value = zlib.adler32(data, self._value)
+
+    def hexdigest(self) -> str:
+        return f"{self._value:08x}"
+
+
+def checksum_factory(checksum_format: str) -> Adler32Checksum:
+    if checksum_format == "adler32":
+        return Adler32Checksum()
+    raise ValueError(f"unsupported checksum format {checksum_format!r}")
 
 
 def threadpool_map(
@@ -61,11 +78,6 @@ def compress_delta(delta: np.ndarray) -> np.ndarray:
         zstandard.ZstdCompressor(level=1).compress(delta),
         dtype=np.uint8,
     )
-
-
-def adler32_checksum(value: np.ndarray) -> str:
-    """Return the Adler-32 checksum of the given tensor bytes."""
-    return f"{zlib.adler32(value):08x}"
 
 
 def _tied_names(root: Path) -> set[str]:
@@ -182,7 +194,8 @@ def index_checkpoint_tensors(
 
 
 __all__ = [
-    "adler32_checksum",
+    "Adler32Checksum",
+    "checksum_factory",
     "compress_delta",
     "compute_delta",
     "index_checkpoint_tensors",

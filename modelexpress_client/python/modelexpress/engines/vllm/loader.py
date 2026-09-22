@@ -33,7 +33,13 @@ import torch
 import torch.nn as nn
 
 from ... import configure_vllm_logging, envs, model_prefetch
-from ...load_strategy import LoadContext, LoadStrategyChain
+from ...load_strategy import (
+    LoadContext,
+    drain_tensor_readers,
+    publish_metadata,
+    run_load_strategy_chain,
+    unpublish_metadata,
+)
 from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
@@ -57,6 +63,12 @@ logger = logging.getLogger(__name__)
 # Global storage for tensor metadata, keyed by device_id (local CUDA ordinal).
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
+_loader_registry: dict[int, MxModelLoader] = {}
+
+
+def get_model_loader(device_id: int) -> MxModelLoader | None:
+    """Return the ModelExpress loader that completed this device's main load."""
+    return _loader_registry.get(device_id)
 
 
 class MxModelLoader(BaseModelLoader):
@@ -93,11 +105,18 @@ class MxModelLoader(BaseModelLoader):
         """
         load_start = time.perf_counter()
 
+        is_speculative_draft = _is_speculative_draft(vllm_config, model_config)
+        if is_speculative_draft and envs.MX_LOAD_STRATEGY_CHAIN == "RL":
+            raise ValueError(
+                "RL initial loading does not support speculative draft models"
+            )
+
         ctx = build_vllm_load_context(vllm_config, model_config)
-        ctx.p2p_enabled = not _is_speculative_draft(vllm_config, model_config)
+        ctx.p2p_enabled = not is_speculative_draft
         if envs.MX_ARTIFACT_READY_URL.strip():
             ctx.source_ready_fn = lambda: _vllm_health_ready(ctx)
-        self._ctx = ctx
+        if ctx.p2p_enabled:
+            self._ctx = ctx
 
         logger.info(
             f"[Worker {ctx.global_rank}] MxModelLoader starting "
@@ -110,7 +129,7 @@ class MxModelLoader(BaseModelLoader):
         # inferred from p2p_enabled: that flag happens to agree today, but it is
         # a capability switch and any future reason to clear it would silently
         # relabel real loads as drafts.
-        model_role = "draft" if _is_speculative_draft(vllm_config, model_config) else "main"
+        model_role = "draft" if is_speculative_draft else "main"
 
         # L0 wraps everything below, and the four L1 phases inside it are
         # disjoint, so their sum is bounded by the total by construction. The
@@ -131,9 +150,10 @@ class MxModelLoader(BaseModelLoader):
                             )
 
                     with metrics.time_load_phase("vllm", model_id, "chain"):
-                        model = LoadStrategyChain.run(model, ctx)
+                        model = run_load_strategy_chain(model, ctx)
 
                     if ctx.p2p_enabled:
+                        _loader_registry[ctx.device_id] = self
                         _tensor_registry[ctx.device_id] = ctx.tensors
                         if ctx.nixl_manager is not None:
                             _nixl_managers[ctx.device_id] = ctx.nixl_manager
@@ -157,6 +177,13 @@ class MxModelLoader(BaseModelLoader):
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Download the model so it can be loaded immediately."""
+        if envs.MX_LOAD_STRATEGY_CHAIN == "RL":
+            logger.info(
+                "RL initial load is selected; leaving weight acquisition to "
+                "the RL strategy chain"
+            )
+            return
+
         if model_prefetch.is_enabled():
             # Without shared storage this would pull the full weight set from
             # Hugging Face before any strategy runs, defeating P2P-first and
@@ -201,3 +228,25 @@ class MxModelLoader(BaseModelLoader):
         if self._ctx is not None:
             return self._ctx.tensors
         return {}
+
+    @property
+    def worker_id(self) -> str | None:
+        """Return the inference P2P worker ID after a completed main load."""
+        if self._ctx is not None:
+            return self._ctx.worker_id
+        return None
+
+    def unpublish_runtime_tensors(self) -> None:
+        """Withdraw this loader's runtime tensors before an active refit."""
+        if self._ctx is not None:
+            drain_tensor_readers(
+                self._ctx,
+                timeout=envs.MX_TRANSFER_TIMEOUT,
+            )
+            unpublish_metadata(self._ctx)
+
+    def publish_runtime_tensors(self, version_id: str) -> None:
+        """Publish this loader's installed runtime tensors at an exact version."""
+        if self._ctx is not None:
+            self._ctx.identity.revision = version_id
+            publish_metadata(self._ctx)

@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .canonical_delta import CanonicalDeltaUpdateMethod
-from .full_tensor import FullTensorNixlUpdateMethod
+from .load_time_tensor import LoadTimeTensorNixlUpdateMethod
+from .runtime_tensor import RuntimeTensorNixlUpdateMethod
 
-__all__ = ["CanonicalDeltaUpdateMethod", "FullTensorNixlUpdateMethod"]
+__all__ = [
+    "CanonicalDeltaUpdateMethod",
+    "LoadTimeTensorNixlUpdateMethod",
+    "RuntimeTensorNixlUpdateMethod",
+]

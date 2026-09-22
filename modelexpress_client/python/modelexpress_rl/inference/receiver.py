@@ -9,7 +9,6 @@ import json
 import mmap
 import shutil
 import time
-import zlib
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -22,6 +21,7 @@ import numpy as np
 from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.checkpoint_store import (
     CheckpointCacheCapacityError,
+    CheckpointRecord,
     CheckpointState,
     LocalCheckpointStore,
     checkpoint_files_state,
@@ -30,7 +30,7 @@ from modelexpress_rl.object_storage import ObjectStorageType
 from modelexpress_rl.s3 import S3Client
 from modelexpress_rl.train import WeightPayloadFormat
 from modelexpress_rl.utils import (
-    adler32_checksum,
+    checksum_factory,
     index_checkpoint_tensors,
     read_safetensors_header,
     threadpool_map,
@@ -89,6 +89,9 @@ class _S3Version:
     uri: str
 
 
+_S3Manifest = tuple[_S3Version, bytes, dict[str, Any], dict[str, str]]
+
+
 def _source_identity(version: _S3Version) -> dict[str, str]:
     return {"uri": version.uri}
 
@@ -117,66 +120,58 @@ def _is_safe_shard_basename(value: object) -> bool:
     )
 
 
-def _parse_delta_manifest(
+def _parse_index_manifest(
     data: bytes,
-    version: _S3Version,
-) -> tuple[dict[str, str], _Decompressor]:
+    *,
+    is_delta: bool,
+    version: _S3Version | None = None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Parse and validate an index manifest."""
     try:
-        manifest = json.loads(data)
+        index = json.loads(data)
     except (TypeError, ValueError) as error:
-        raise ValueError("canonical delta manifest is not valid JSON") from error
-    try:
-        metadata = manifest["metadata"]
-        weight_map = manifest["weight_map"]
-    except (KeyError, TypeError) as error:
-        raise ValueError(
-            "canonical delta manifest is missing required fields"
-        ) from error
-    if not isinstance(metadata, dict):
-        raise TypeError("canonical delta manifest metadata is invalid")
-    expected_metadata = {
-        "version": version.version_id,
-        "base_version": version.base_version_id,
-        "delta_encoding": "xor",
-        "checksum_format": "adler32",
-    }
-    for name, expected in expected_metadata.items():
-        if metadata.get(name) != expected:
-            raise ValueError(
-                f"canonical delta manifest {name} does not match revision "
-                f"{version.version_id!r}"
-            )
-    compression_format = metadata.get("compression_format")
-    try:
-        decompressor = _DECOMPRESSORS[compression_format]
-    except KeyError as error:
-        raise ValueError(
-            f"unsupported canonical delta compression format {compression_format!r}"
-        ) from error
+        raise ValueError("The index manifest is not valid JSON") from error
+
+    weight_map = index.get("weight_map")
+    if weight_map is None:
+        raise ValueError("The index manifest has no weight_map")
     if not isinstance(weight_map, dict):
-        raise TypeError("canonical delta manifest weight_map is invalid")
+        raise ValueError("The index manifest has invalid weight_map")
+    if not is_delta and not weight_map:
+        raise ValueError("The index manifest has no tensors")
     for name, filename in weight_map.items():
-        if not isinstance(name, str) or not isinstance(filename, str):
-            raise TypeError("canonical delta manifest weight_map must contain strings")
-        if not _is_safe_shard_basename(filename):
-            raise ValueError(f"invalid canonical delta shard filename {filename!r}")
-    return weight_map, decompressor
+        if (
+            not isinstance(name, str)
+            or not _is_safe_shard_basename(filename)
+            or not filename.endswith(".safetensors")
+        ):
+            raise ValueError("The index manifest has invalid weight_map")
 
-
-def _parse_full_checkpoint_manifest(data: bytes) -> dict[str, str]:
-    try:
-        manifest = json.loads(data)
-        weight_map = manifest["weight_map"]
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("full HF checkpoint index is not valid JSON") from error
-    if not isinstance(weight_map, dict) or not weight_map:
-        raise ValueError("full HF checkpoint index has no tensors")
-    for name, filename in weight_map.items():
-        if not isinstance(name, str) or not isinstance(filename, str):
-            raise ValueError("full HF checkpoint weight_map must contain strings")
-        if not _is_safe_shard_basename(filename):
-            raise ValueError(f"invalid full HF checkpoint shard filename {filename!r}")
-    return weight_map
+    metadata = index.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValueError("The index manifest has invalid metadata")
+    if is_delta:
+        assert version is not None
+        expected_metadata = {
+            "version": version.version_id,
+            "base_version": version.base_version_id,
+            "delta_encoding": "xor",
+            "checksum_format": "adler32",
+        }
+        for name, expected in expected_metadata.items():
+            if metadata.get(name) != expected:
+                raise ValueError(
+                    f"The index manifest {name} does not match revision "
+                    f"{version.version_id!r}"
+                )
+        compression_format = metadata.get("compression_format")
+        if compression_format not in _DECOMPRESSORS:
+            raise ValueError(
+                f"unsupported compression format {compression_format!r}"
+            )
+    elif "checksum_format" in metadata:
+        checksum_factory(metadata["checksum_format"])
+    return metadata, weight_map
 
 
 def _group_tensors_by_shard(
@@ -186,6 +181,227 @@ def _group_tensors_by_shard(
     for name, filename in weight_map.items():
         shard_to_tensors[filename].append(name)
     return shard_to_tensors
+
+
+def _download_full_checkpoint(
+    *,
+    s3: S3Client,
+    store: LocalCheckpointStore,
+    target: Path,
+    index_metadata: dict[str, Any],
+    weight_map: dict[str, str],
+    root_uri: str,
+    protected_versions: set[str],
+    tensor_metadata: dict[str, dict] | None = None,
+) -> tuple[float, float]:
+    """Download and validate one full HF checkpoint artifact."""
+    checksum_format = index_metadata.get("checksum_format")
+    if tensor_metadata is not None and set(weight_map) != set(tensor_metadata):
+        raise ValueError("full HF checkpoint tensor set differs from local checkpoint")
+
+    shard_to_tensors = _group_tensors_by_shard(weight_map)
+    parent_uri = root_uri.rsplit("/", 1)[0]
+    workers = min(rl_envs.MX_S3_DOWNLOAD_WORKERS, len(shard_to_tensors))
+    shard_sizes = threadpool_map(
+        shard_to_tensors,
+        lambda filename: s3.size(f"{parent_uri}/{filename}"),
+        max_workers=workers,
+        thread_name_prefix="modelexpress-s3-head-full",
+    )
+    store.ensure_capacity(
+        sum(shard_sizes),
+        protected_versions=protected_versions,
+        protected_paths={target},
+    )
+
+    def download_and_validate(filename: str) -> tuple[float, float]:
+        download_started = time.perf_counter()
+        try:
+            data = s3.get(f"{parent_uri}/{filename}")
+        except Exception as error:
+            raise RuntimeError(
+                f"full HF checkpoint download failed for {filename!r}"
+            ) from error
+        download_time = time.perf_counter() - download_started
+
+        validation_started = time.perf_counter()
+        header, data_start = read_safetensors_header(data, repr(filename))
+        tensor_names = shard_to_tensors[filename]
+        metadata = header.get("__metadata__", {})
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                f"full HF checkpoint shard {filename!r} has invalid metadata"
+            )
+        if set(header) - {"__metadata__"} != set(tensor_names):
+            raise ValueError(
+                f"full HF checkpoint shard {filename!r} tensor set differs "
+                "from its index"
+            )
+
+        view = memoryview(data)
+        for name in tensor_names:
+            tensor_header = header[name]
+            begin, end = tensor_header["data_offsets"]
+            if tensor_metadata is not None:
+                local_metadata = tensor_metadata[name]
+                if (
+                    tensor_header["dtype"] != local_metadata["dtype"]
+                    or tensor_header["shape"] != local_metadata["shape"]
+                    or end - begin != local_metadata["byte_size"]
+                ):
+                    raise ValueError(
+                        f"full HF checkpoint metadata differs for {name!r}"
+                    )
+            source = np.frombuffer(
+                view,
+                dtype=np.uint8,
+                count=end - begin,
+                offset=data_start + begin,
+            )
+            if checksum_format is not None:
+                expected_checksum = metadata.get(name)
+                if expected_checksum is None:
+                    raise ValueError(
+                        f"full HF checkpoint shard {filename!r} is missing "
+                        f"checksum for tensor {name!r}"
+                    )
+                checksum = checksum_factory(checksum_format)
+                checksum.update(source)
+                if checksum.hexdigest() != expected_checksum:
+                    raise ValueError(
+                        f"full HF checkpoint checksum differs for {name!r}"
+                    )
+        (target / filename).write_bytes(data)
+        return download_time, time.perf_counter() - validation_started
+
+    timings = list(
+        threadpool_map(
+            shard_to_tensors,
+            download_and_validate,
+            max_workers=workers,
+            thread_name_prefix="modelexpress-s3-download-full",
+        )
+    )
+    return (
+        max(download for download, _ in timings),
+        max(validation for _, validation in timings),
+    )
+
+
+def _active_version(store: LocalCheckpointStore) -> str | None:
+    """Return the installed version when the store has committed one."""
+    try:
+        return store.active_version()
+    except RuntimeError:
+        return None
+
+
+def _protected_versions(
+    store: LocalCheckpointStore,
+    *versions: str,
+) -> set[str]:
+    """Return versions excluded from cache eviction during this operation.
+
+    Callers supply the operation's working set. The installed version is also
+    retained so recovery can rebuild from the checkpoint backing the engine.
+    """
+    protected = set(versions)
+    active = _active_version(store)
+    if active is not None:
+        protected.add(active)
+    return protected
+
+
+def _ensure_full_checkpoint(
+    *,
+    store: LocalCheckpointStore,
+    target: Path,
+    version: _S3Version,
+    s3: S3Client,
+    protected_versions: set[str],
+) -> None:
+    """Ensure one immutable, source-verified full checkpoint is cached."""
+    source = _source_identity(version)
+    if target.exists():
+        try:
+            store.verify_artifact_source(target, source)
+            index_checkpoint_tensors(target)
+            return
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+    index_data = s3.get(version.uri)
+    metadata, weight_map = _parse_index_manifest(index_data, is_delta=False)
+    store.ensure_capacity(
+        len(index_data),
+        protected_versions=protected_versions,
+    )
+    with store.replace_directory(target) as temporary:
+        (temporary / Path(version.uri).name).write_bytes(index_data)
+        _download_full_checkpoint(
+            s3=s3,
+            store=store,
+            target=temporary,
+            index_metadata=metadata,
+            weight_map=weight_map,
+            root_uri=version.uri,
+            protected_versions=protected_versions,
+        )
+        store.record_artifact(temporary, source=source)
+    index_checkpoint_tensors(target)
+
+
+def bootstrap_s3_checkpoint(
+    *,
+    model_name: str,
+    version: _S3Version,
+    refit_checkpoint_dir: str | Path,
+    s3: S3Client,
+    refit_checkpoint_max_size_gb: int | None = DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB,
+) -> Path:
+    """Download the immutable full root needed by a cold-start replay."""
+    if version.payload_format is not WeightPayloadFormat.FULL_HF_CHECKPOINT:
+        raise ValueError("cold-start replay root must be FULL_HF_CHECKPOINT")
+    if version.base_version_id is not None:
+        raise ValueError("FULL_HF_CHECKPOINT must not have base_version_id")
+
+    store = LocalCheckpointStore(
+        root=refit_checkpoint_dir,
+        model_name=model_name,
+        max_size_bytes=(
+            refit_checkpoint_max_size_gb * _BYTES_PER_GB
+            if refit_checkpoint_max_size_gb is not None
+            else None
+        ),
+    )
+    store.initialize()
+    target = store.full_path(version.version_id)
+    with store.installation_locked(), store.locked():
+        protected_versions = _protected_versions(store, version.version_id)
+        state = store.state()
+        if state is not None:
+            protected_versions.add(state.version)
+        _ensure_full_checkpoint(
+            store=store,
+            target=target,
+            version=version,
+            s3=s3,
+            protected_versions=protected_versions,
+        )
+
+        store.write_chain(
+            version.version_id,
+            {
+                "version": version.version_id,
+                "full_version": version.version_id,
+                "deltas": [],
+            },
+        )
+        # Bootstrap only populates immutable cache data. A later TP rank may
+        # arrive after another rank has prepared the target, so this path must
+        # not change shared preparation or engine-installation state.
+        store.enforce_capacity(protected_versions=protected_versions)
+    return target
 
 
 class _LocalCheckpoint:
@@ -214,38 +430,116 @@ class _LocalCheckpoint:
         self.checkpoint_paths: list[Path] = []
         self.locations: dict[str, tuple[Path, int, int]] = {}
         self.tensor_metadata: dict[str, dict] = {}
-        self.decompressor: _Decompressor | None = None
 
     def initialize(self) -> None:
         self.store.initialize()
         with self.store.installation_locked(), self.store.locked():
-            self.local_checkpoint = self.store.full_path(self.initial_version)
-            state = self.store.state()
-            reusable = (
-                state is not None
-                and state.get("status") == CheckpointState.READY
-                and state.get("version") == self.initial_version
-                and any(self.local_checkpoint.glob("*.safetensors"))
+            initial_checkpoint = self.store.full_path(self.initial_version)
+            # Cold-start bootstrap passes the cached immutable root as its seed.
+            # That lets the receiver detect this path without a caller-owned flag.
+            cached_seed = (
+                self.seed_checkpoint_path.resolve() == initial_checkpoint.resolve()
             )
-            if reusable:
-                (
-                    self.checkpoint_paths,
-                    self.locations,
-                    self.tensor_metadata,
-                ) = index_checkpoint_tensors(self.local_checkpoint)
-                reusable = state.get("files") == checkpoint_files_state(
-                    self.checkpoint_paths
-                )
-                reusable = reusable and self.store.chain(self.initial_version) == {
-                    "version": self.initial_version,
-                    "full_version": self.initial_version,
-                    "deltas": [],
-                }
-            if not reusable:
-                self.reset_initial_checkpoint()
-            self.store.activate(self.initial_version)
+            version = self._initialize_checkpoint_state(
+                state=self.store.state(),
+                initial_checkpoint=initial_checkpoint,
+                cached_seed=cached_seed,
+            )
+            if not cached_seed:
+                self.store.activate(self.initial_version)
             self.store.enforce_capacity(
-                protected_versions={self.initial_version},
+                protected_versions=_protected_versions(self.store, version),
+            )
+
+    def _initialize_checkpoint_state(
+        self,
+        *,
+        state: CheckpointRecord | None,
+        initial_checkpoint: Path,
+        cached_seed: bool,
+    ) -> str:
+        version = self.initial_version
+        if (
+            cached_seed
+            and state is not None
+            and state.status is CheckpointState.READY
+        ):
+            # A co-located rank may already have reconstructed the desired
+            # target. Reuse that verified cache head instead of rewinding it.
+            version = state.version
+        reusable = self._reuse_ready_checkpoint(state=state, version=version)
+        if reusable and (
+            cached_seed
+            or self.store.chain(self.initial_version)
+            == {
+                "version": self.initial_version,
+                "full_version": self.initial_version,
+                "deltas": [],
+            }
+        ):
+            return version
+
+        self.local_checkpoint = initial_checkpoint
+        if cached_seed:
+            self._restore_cached_initial_checkpoint()
+        else:
+            self.reset_initial_checkpoint()
+        return self.initial_version
+
+    def _reuse_ready_checkpoint(
+        self,
+        *,
+        state: CheckpointRecord | None,
+        version: str,
+    ) -> bool:
+        if (
+            state is None
+            or state.status is not CheckpointState.READY
+            or state.version != version
+        ):
+            return False
+        try:
+            checkpoint = self.store.checkpoint_path(version)
+            if not any(checkpoint.glob("*.safetensors")):
+                return False
+            self._set_local_checkpoint(checkpoint)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if state.files != checkpoint_files_state(self.checkpoint_paths):
+            return False
+        return True
+
+    def _restore_cached_initial_checkpoint(self) -> None:
+        """Recover incomplete preparation without copying over the S3 root."""
+        self.store.verify_artifact(self.local_checkpoint)
+        self._set_local_checkpoint(self.local_checkpoint)
+        self.store.write_chain(
+            self.initial_version,
+            {
+                "version": self.initial_version,
+                "full_version": self.initial_version,
+                "deltas": [],
+            },
+        )
+        self.store.write_state(
+            status=CheckpointState.READY,
+            version=self.initial_version,
+            checkpoint_paths=self.checkpoint_paths,
+        )
+
+    def recover_incomplete_preparation(self) -> None:
+        """Restore a usable cache head after an in-process replay failure."""
+        with self.store.installation_locked(), self.store.locked():
+            state = self.store.state()
+            if state is None or state.status is CheckpointState.READY:
+                return
+            self.local_checkpoint = self.store.full_path(self.initial_version)
+            self._restore_cached_initial_checkpoint()
+            self.store.enforce_capacity(
+                protected_versions=_protected_versions(
+                    self.store,
+                    self.initial_version,
+                ),
             )
 
     def _set_local_checkpoint(self, path: Path) -> None:
@@ -267,7 +561,7 @@ class _LocalCheckpoint:
         self.store.write_state(
             status=CheckpointState.UPDATING,
             version=(
-                state.get("version", self.initial_version)
+                state.version
                 if state is not None
                 else self.initial_version
             ),
@@ -316,136 +610,196 @@ class _LocalCheckpoint:
         if not versions:
             raise ValueError("canonical replay chain is empty")
         with self.store.installation_locked(), self.store.locked():
-            state = self.store.state()
-            if state is None:
-                raise RuntimeError("local checkpoint state is missing")
-            active_version = self.store.active_version()
             target = versions[-1]
-            if state.get("status") != CheckpointState.READY:
-                raise RuntimeError("local checkpoint update is incomplete")
-            state_checkpoint = self.store.checkpoint_path(state["version"])
-            if self.local_checkpoint != state_checkpoint:
-                self._set_local_checkpoint(state_checkpoint)
-            if state.get("files") != checkpoint_files_state(self.checkpoint_paths):
+            state, active_version = self._load_ready_state()
+            prepared = self._reuse_prepared_target(
+                state=state,
+                target=target,
+                active_version=active_version,
+            )
+            if prepared is not None:
+                return prepared
+            # P2P can advance the engine without advancing this disk checkpoint.
+            # Choose the replay suffix from the verified cache head under lock.
+            for position, version in enumerate(versions[:-1]):
+                if version.version_id != state.version:
+                    continue
+                source = self.store.artifact_source(self._artifact_path(version))
+                if source is None:
+                    break
+                if source != _source_identity(version):
+                    raise ValueError("prepared checkpoint has different source identity")
+                versions = versions[position + 1 :]
+                break
+            manifests, index_download_time = self._download_replay_manifests(
+                versions=versions,
+                target=target,
+                base_version=state.version,
+            )
+            return self._reconstruct_target(
+                manifests=manifests,
+                target=target,
+                active_version=active_version,
+                index_download_time=index_download_time,
+            )
+
+    def _load_ready_state(self) -> tuple[CheckpointRecord, str]:
+        state = self.store.state()
+        if state is None:
+            raise RuntimeError("local checkpoint state is missing")
+        if state.status is not CheckpointState.READY:
+            raise RuntimeError("local checkpoint update is incomplete")
+        active_version = _active_version(self.store) or state.version
+        state_checkpoint = self.store.checkpoint_path(state.version)
+        if self.local_checkpoint != state_checkpoint:
+            self._set_local_checkpoint(state_checkpoint)
+        if state.files != checkpoint_files_state(self.checkpoint_paths):
+            raise RuntimeError("local checkpoint files changed outside ModelExpress")
+        return state, active_version
+
+    def _reuse_prepared_target(
+        self,
+        *,
+        state: CheckpointRecord,
+        target: _S3Version,
+        active_version: str,
+    ) -> PreparedCheckpoint | None:
+        if state.version != target.version_id:
+            return None
+        # Followers reach this after the lock holder has reconstructed the
+        # target. Source identity prevents attaching to a reused UID artifact.
+        self.store.enforce_capacity(
+            protected_versions={active_version, target.version_id},
+        )
+        self.store.verify_artifact_source(
+            self._artifact_path(target),
+            _source_identity(target),
+        )
+        return PreparedCheckpoint(
+            target_version=target.version_id,
+            path=self.local_checkpoint,
+            metrics={
+                "perf/mx_receive_delta_index_download": 0.0,
+                "perf/mx_receive_delta_download": 0.0,
+                "perf/mx_receive_delta_apply": 0.0,
+            },
+        )
+
+    def _download_replay_manifests(
+        self,
+        *,
+        versions: tuple[_S3Version, ...],
+        target: _S3Version,
+        base_version: str,
+    ) -> tuple[list[_S3Manifest], float]:
+        """Validate the entire chain before mutating preparation state."""
+        expected_base = base_version
+        manifests = []
+        index_download_time = 0.0
+        for position, version in enumerate(versions):
+            if (
+                position > 0
+                and version.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
+            ):
                 raise RuntimeError(
-                    "local checkpoint files changed outside ModelExpress"
+                    f"full checkpoint revision {version.version_id!r} must be "
+                    "the first replay revision"
                 )
+            if (
+                version.payload_format is WeightPayloadFormat.XOR_DELTA
+                and expected_base != version.base_version_id
+            ):
+                raise RuntimeError(
+                    f"local checkpoint version {expected_base!r} does not match "
+                    f"exact base {version.base_version_id!r} for revision "
+                    f"{version.version_id!r}"
+                )
+            expected_base = version.version_id
+            started = time.perf_counter()
+            try:
+                index_data = self.s3.get(version.uri)
+                is_delta = version.payload_format is WeightPayloadFormat.XOR_DELTA
+                metadata, weight_map = _parse_index_manifest(
+                    index_data,
+                    is_delta=is_delta,
+                    version=version if is_delta else None,
+                )
+            except Exception as error:
+                raise RuntimeError(
+                    f"target {target.version_id!r}: replay validation failed "
+                    f"at revision {version.version_id!r}: {error}"
+                ) from error
+            index_download_time += time.perf_counter() - started
+            manifests.append((version, index_data, metadata, weight_map))
+        return manifests, index_download_time
 
-            # The requested immutable artifact was already prepared.
-            if state["version"] == target.version_id:
-                self.store.enforce_capacity(
-                    protected_versions={active_version, target.version_id},
-                )
-                self.store.verify_artifact_source(
-                    self._artifact_path(target),
-                    _source_identity(target),
-                )
-                return PreparedCheckpoint(
-                    target_version=target.version_id,
-                    path=self.local_checkpoint,
-                    metrics={
-                        "perf/mx_receive_delta_index_download": 0.0,
-                        "perf/mx_receive_delta_download": 0.0,
-                        "perf/mx_receive_delta_apply": 0.0,
-                    },
-                )
-            expected_base = active_version
-            manifests: list[
-                tuple[_S3Version, bytes, dict[str, str], _Decompressor | None]
-            ] = []
-            index_download_time = 0.0
-            for position, version in enumerate(versions):
-                if (
-                    position > 0
-                    and version.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
-                ):
-                    raise RuntimeError(
-                        f"full checkpoint revision {version.version_id!r} must be "
-                        "the first replay revision"
-                    )
-                if (
-                    version.payload_format is WeightPayloadFormat.XOR_DELTA
-                    and expected_base != version.base_version_id
-                ):
-                    raise RuntimeError(
-                        f"active checkpoint version {expected_base!r} does not match "
-                        f"exact base {version.base_version_id!r} for revision "
-                        f"{version.version_id!r}"
-                    )
-                expected_base = version.version_id
-                started = time.perf_counter()
-                try:
-                    index_data = self.s3.get(version.uri)
-                    if version.payload_format is WeightPayloadFormat.XOR_DELTA:
-                        weight_map, decompressor = _parse_delta_manifest(
-                            index_data, version
-                        )
-                    else:
-                        weight_map = _parse_full_checkpoint_manifest(index_data)
-                        decompressor = None
-                except Exception as error:
-                    raise RuntimeError(
-                        f"target {target.version_id!r}: replay validation failed "
-                        f"at revision {version.version_id!r}: {error}"
-                    ) from error
-                index_download_time += time.perf_counter() - started
-                manifests.append((version, index_data, weight_map, decompressor))
+    def _reconstruct_target(
+        self,
+        *,
+        manifests: list[_S3Manifest],
+        target: _S3Version,
+        active_version: str,
+        index_download_time: float,
+    ) -> PreparedCheckpoint:
+        # READY -> UPDATING is persisted before any derived checkpoint mutates.
+        # A crash therefore makes the next initializer rebuild from lineage.
+        self.store.write_state(
+            status=CheckpointState.UPDATING,
+            version=active_version,
+            checkpoint_paths=self.checkpoint_paths,
+        )
 
+        failed_version = target
+        try:
+            download_time = 0.0
+            apply_time = 0.0
+            for version, index_data, metadata, weight_map in manifests:
+                failed_version = version
+                if version.payload_format is WeightPayloadFormat.XOR_DELTA:
+                    downloaded, applied = self._prepare_delta(
+                        version,
+                        index_data,
+                        metadata,
+                        weight_map,
+                    )
+                else:
+                    downloaded, applied = self._prepare_full(
+                        version,
+                        index_data,
+                        metadata,
+                        weight_map,
+                    )
+                download_time += downloaded
+                apply_time += applied
+        except CheckpointCacheCapacityError:
+            self._set_local_checkpoint(self.store.checkpoint_path(active_version))
             self.store.write_state(
-                status=CheckpointState.UPDATING,
+                status=CheckpointState.READY,
                 version=active_version,
                 checkpoint_paths=self.checkpoint_paths,
             )
+            raise
+        except Exception as error:
+            raise RuntimeError(
+                f"target {target.version_id!r}: replay failed at revision "
+                f"{failed_version.version_id!r}: {error}"
+            ) from error
 
-            try:
-                download_time = 0.0
-                apply_time = 0.0
-                for version, index_data, weight_map, decompressor in manifests:
-                    if version.payload_format is WeightPayloadFormat.XOR_DELTA:
-                        assert decompressor is not None
-                        downloaded, applied = self._prepare_delta(
-                            version,
-                            index_data,
-                            weight_map,
-                            decompressor,
-                        )
-                    else:
-                        downloaded, applied = self._prepare_full(
-                            version, index_data, weight_map
-                        )
-                    download_time += downloaded
-                    apply_time += applied
-            except CheckpointCacheCapacityError:
-                self._set_local_checkpoint(
-                    self.store.checkpoint_path(active_version)
-                )
-                self.store.write_state(
-                    status=CheckpointState.READY,
-                    version=active_version,
-                    checkpoint_paths=self.checkpoint_paths,
-                )
-                raise
-            except Exception as error:
-                raise RuntimeError(
-                    f"target {target.version_id!r}: replay failed at revision "
-                    f"{version.version_id!r}: {error}"
-                ) from error
-
-            self.store.write_state(
-                status=CheckpointState.READY,
-                version=target.version_id,
-                checkpoint_paths=self.checkpoint_paths,
-                source=_source_identity(target),
-            )
-            return PreparedCheckpoint(
-                target_version=target.version_id,
-                path=self.local_checkpoint,
-                metrics={
-                    "perf/mx_receive_delta_index_download": index_download_time,
-                    "perf/mx_receive_delta_download": download_time,
-                    "perf/mx_receive_delta_apply": apply_time,
-                },
-            )
+        self.store.write_state(
+            status=CheckpointState.READY,
+            version=target.version_id,
+            checkpoint_paths=self.checkpoint_paths,
+            source=_source_identity(target),
+        )
+        return PreparedCheckpoint(
+            target_version=target.version_id,
+            path=self.local_checkpoint,
+            metrics={
+                "perf/mx_receive_delta_index_download": index_download_time,
+                "perf/mx_receive_delta_download": download_time,
+                "perf/mx_receive_delta_apply": apply_time,
+            },
+        )
 
     def _artifact_path(self, version: _S3Version) -> Path:
         if version.payload_format is WeightPayloadFormat.XOR_DELTA:
@@ -482,35 +836,35 @@ class _LocalCheckpoint:
         self,
         version: _S3Version,
         index_data: bytes,
+        metadata: dict[str, Any],
         weight_map: dict[str, str],
     ) -> tuple[float, float]:
         target = self.store.full_path(version.version_id)
         if target.exists():
-            self.store.enforce_capacity(
-                protected_versions={
-                    self.store.active_version(),
+            source = self.store.artifact_source(target)
+            if source is not None:
+                self.store.enforce_capacity(
+                    protected_versions=_protected_versions(
+                        self.store,
+                        version.version_id,
+                    ),
+                )
+                self.store.verify_artifact_source(
+                    target,
+                    _source_identity(version),
+                )
+                self._set_local_checkpoint(target)
+                self.store.write_chain(
                     version.version_id,
-                },
-            )
-            self.store.verify_artifact_source(
-                target,
-                _source_identity(version),
-            )
-            self._set_local_checkpoint(target)
-            self.store.write_chain(
-                version.version_id,
-                {
-                    "version": version.version_id,
-                    "full_version": version.version_id,
-                    "deltas": [],
-                },
-            )
-            return 0.0, 0.0
+                    {
+                        "version": version.version_id,
+                        "full_version": version.version_id,
+                        "deltas": [],
+                    },
+                )
+                return 0.0, 0.0
 
-        protected_versions = {
-            self.store.active_version(),
-            version.version_id,
-        }
+        protected_versions = _protected_versions(self.store, version.version_id)
         self.store.ensure_capacity(
             self._non_weight_files_size(self.seed_checkpoint_path) + len(index_data),
             protected_versions=protected_versions,
@@ -521,6 +875,7 @@ class _LocalCheckpoint:
             (temporary / index_name).write_bytes(index_data)
             download_time, validation_time = self._download_full_checkpoint(
                 target=temporary,
+                index_metadata=metadata,
                 weight_map=weight_map,
                 root_uri=version.uri,
                 protected_versions=protected_versions,
@@ -545,8 +900,8 @@ class _LocalCheckpoint:
         self,
         version: _S3Version,
         index_data: bytes,
+        metadata: dict[str, Any],
         weight_map: dict[str, str],
-        decompressor: _Decompressor,
     ) -> tuple[float, float]:
         assert version.base_version_id is not None
         base_chain = self.store.chain(version.base_version_id)
@@ -564,11 +919,11 @@ class _LocalCheckpoint:
                 _source_identity(version),
             )
         else:
-            protected_versions = {
-                self.store.active_version(),
+            protected_versions = _protected_versions(
+                self.store,
                 version.base_version_id,
                 version.version_id,
-            }
+            )
             shards = self._download_deltas(weight_map, version.uri)
             self.store.ensure_capacity(
                 len(index_data) + sum(len(data) for data, _names in shards.values()),
@@ -598,11 +953,11 @@ class _LocalCheckpoint:
         reuse_materialized = base_checkpoint.parent == self.store.materialized_cache
         self.store.ensure_capacity(
             0 if reuse_materialized else self.store.path_size_bytes(base_checkpoint),
-            protected_versions={
-                self.store.active_version(),
+            protected_versions=_protected_versions(
+                self.store,
                 version.base_version_id,
                 version.version_id,
-            },
+            ),
         )
         if reuse_materialized:
             # A sequential delta can take ownership of the derived base. Rename
@@ -610,7 +965,7 @@ class _LocalCheckpoint:
             shutil.rmtree(target, ignore_errors=True)
             base_checkpoint.replace(target)
             self._set_local_checkpoint(target)
-            self._apply_delta_artifact(artifact, weight_map, decompressor)
+            self._apply_delta_artifact(artifact, metadata, weight_map)
         else:
             # The first delta after a full checkpoint copies once so applying
             # it cannot modify the canonical full artifact.
@@ -619,7 +974,7 @@ class _LocalCheckpoint:
                 copy_from=base_checkpoint,
             ) as temporary:
                 self._set_local_checkpoint(temporary)
-                self._apply_delta_artifact(artifact, weight_map, decompressor)
+                self._apply_delta_artifact(artifact, metadata, weight_map)
 
         self._set_local_checkpoint(target)
         self.store.write_chain(version.version_id, chain)
@@ -628,11 +983,10 @@ class _LocalCheckpoint:
     def _apply_delta_artifact(
         self,
         artifact: Path,
+        index_metadata: dict[str, Any],
         weight_map: dict[str, str],
-        decompressor: _Decompressor,
     ) -> None:
         self.store.verify_artifact(artifact)
-        self.decompressor = decompressor
         shards = {
             filename: (
                 (artifact / filename).read_bytes(),
@@ -640,7 +994,7 @@ class _LocalCheckpoint:
             )
             for filename, names in _group_tensors_by_shard(weight_map).items()
         }
-        self._apply_shards(shards)
+        self._apply_shards(shards, index_metadata=index_metadata)
 
     def _download_deltas(
         self,
@@ -674,104 +1028,30 @@ class _LocalCheckpoint:
         self,
         *,
         target: Path,
+        index_metadata: dict[str, Any],
         weight_map: dict[str, str],
         root_uri: str,
         protected_versions: set[str],
     ) -> tuple[float, float]:
-        if set(weight_map) != set(self.locations):
-            raise ValueError(
-                "full HF checkpoint tensor set differs from local checkpoint"
-            )
-
-        shard_to_tensors = _group_tensors_by_shard(weight_map)
-        parent_uri = root_uri.rsplit("/", 1)[0]
-        workers = min(
-            rl_envs.MX_S3_DOWNLOAD_WORKERS,
-            len(shard_to_tensors),
-        )
-        shard_sizes = threadpool_map(
-            shard_to_tensors,
-            lambda filename: self.s3.size(f"{parent_uri}/{filename}"),
-            max_workers=workers,
-            thread_name_prefix="modelexpress-s3-head-full",
-        )
-        self.store.ensure_capacity(
-            sum(shard_sizes),
+        return _download_full_checkpoint(
+            s3=self.s3,
+            store=self.store,
+            target=target,
+            index_metadata=index_metadata,
+            weight_map=weight_map,
+            root_uri=root_uri,
             protected_versions=protected_versions,
-            protected_paths={target},
-        )
-
-        def download_and_validate(filename: str) -> tuple[float, float]:
-            download_started = time.perf_counter()
-            try:
-                data = self.s3.get(f"{parent_uri}/{filename}")
-            except Exception as error:
-                raise RuntimeError(
-                    f"full HF checkpoint download failed for {filename!r}"
-                ) from error
-            download_time = time.perf_counter() - download_started
-
-            validation_started = time.perf_counter()
-            header, data_start = read_safetensors_header(data, repr(filename))
-            tensor_names = shard_to_tensors[filename]
-            checksums = header.get("__metadata__")
-            if not isinstance(checksums, dict) or set(checksums) != set(tensor_names):
-                raise ValueError(
-                    f"full HF checkpoint shard {filename!r} has invalid checksums"
-                )
-
-            view = memoryview(data)
-            for name in tensor_names:
-                if name not in header:
-                    raise ValueError(
-                        f"full HF checkpoint shard {filename!r} is missing tensor "
-                        f"{name!r}"
-                    )
-                tensor_header = header[name]
-                begin, end = tensor_header["data_offsets"]
-                local_metadata = self.tensor_metadata[name]
-                if (
-                    tensor_header["dtype"] != local_metadata["dtype"]
-                    or tensor_header["shape"] != local_metadata["shape"]
-                    or end - begin != local_metadata["byte_size"]
-                ):
-                    raise ValueError(
-                        f"full HF checkpoint metadata differs for {name!r}"
-                    )
-                source = np.frombuffer(
-                    view,
-                    dtype=np.uint8,
-                    count=end - begin,
-                    offset=data_start + begin,
-                )
-                if adler32_checksum(source) != checksums[name]:
-                    raise ValueError(
-                        f"full HF checkpoint checksum differs for {name!r}"
-                    )
-            (target / filename).write_bytes(data)
-            return download_time, time.perf_counter() - validation_started
-
-        timings = list(
-            threadpool_map(
-                shard_to_tensors,
-                download_and_validate,
-                max_workers=workers,
-                thread_name_prefix="modelexpress-s3-download-full",
-            )
-        )
-
-        return (
-            max((download for download, _ in timings)),
-            max((apply for _, apply in timings)),
+            tensor_metadata=self.tensor_metadata,
         )
 
     def _apply_shards(
         self,
         shards: dict[str, tuple[bytes, list[str]]],
+        *,
+        index_metadata: dict[str, Any],
     ) -> None:
         if not shards:
             return
-        assert self.decompressor is not None
 
         items = []
         for filename, (data, names) in shards.items():
@@ -823,10 +1103,12 @@ class _LocalCheckpoint:
                     count=size,
                     offset=file_offset,
                 )
-                checksum = 1
+                checksum = checksum_factory(index_metadata["checksum_format"])
+                reader = _DECOMPRESSORS[index_metadata["compression_format"]](
+                    compressed
+                )
                 position = 0
                 extra = b""
-                reader = self.decompressor(compressed)
                 try:
                     while position < size:
                         block = reader.read(min(2 << 20, size - position))
@@ -837,7 +1119,7 @@ class _LocalCheckpoint:
                         region = target[position:end]
                         try:
                             np.bitwise_xor(region, delta, out=region)
-                            checksum = zlib.adler32(region, checksum)
+                            checksum.update(region)
                         finally:
                             del region
                         position = end
@@ -848,7 +1130,7 @@ class _LocalCheckpoint:
                     del target
                 if position != size or extra:
                     raise ValueError(f"canonical delta byte size differs for {name!r}")
-                if f"{checksum:08x}" != expected_checksum:
+                if checksum.hexdigest() != expected_checksum:
                     raise ValueError(f"canonical target checksum differs for {name!r}")
 
             list(
@@ -864,38 +1146,59 @@ class _LocalCheckpoint:
                 mapped.close()
                 file_handle.close()
 
+    def _validate_prepared(
+        self,
+        prepared: PreparedCheckpoint,
+        *,
+        message: str,
+    ) -> None:
+        """Ensure the prepared checkpoint still matches durable store state."""
+        state = self.store.state()
+        if (
+            state is None
+            or state.status is not CheckpointState.READY
+            or state.version != prepared.target_version
+            or state.files != checkpoint_files_state(self.checkpoint_paths)
+        ):
+            raise ReceiverInstallError(message)
+
+    def activate(self, prepared: PreparedCheckpoint) -> None:
+        """Commit a prepared checkpoint after every local installer succeeds."""
+        with self.store.installation_locked(), self.store.locked():
+            self._validate_prepared(
+                prepared,
+                message="prepared checkpoint changed before activation",
+            )
+            self.store.activate(prepared.target_version)
+            self.store.enforce_capacity(
+                protected_versions={prepared.target_version},
+            )
+
     @contextmanager
-    def installation_context(self, prepared: PreparedCheckpoint):
+    def installation_context(
+        self,
+        prepared: PreparedCheckpoint,
+        *,
+        activate: bool = True,
+    ):
+        """Hold installation locks and optionally activate on successful exit."""
         with self.store.installation_locked(shared=True):
             with self.store.locked(shared=True):
-                state = self.store.state()
-                if (
-                    state is None
-                    or state.get("status") != CheckpointState.READY
-                    or state.get("version") != prepared.target_version
-                    or state.get("files")
-                    != checkpoint_files_state(self.checkpoint_paths)
-                ):
-                    raise ReceiverInstallError(
-                        "prepared checkpoint changed before installation"
-                    )
-                yield
-            with self.store.locked():
-                state = self.store.state()
-                if (
-                    state is None
-                    or state.get("status") != CheckpointState.READY
-                    or state.get("version") != prepared.target_version
-                    or state.get("files")
-                    != checkpoint_files_state(self.checkpoint_paths)
-                ):
-                    raise ReceiverInstallError(
-                        "prepared checkpoint changed during installation"
-                    )
-                self.store.activate(prepared.target_version)
-                self.store.enforce_capacity(
-                    protected_versions={prepared.target_version},
+                self._validate_prepared(
+                    prepared,
+                    message="prepared checkpoint changed before installation",
                 )
+                yield
+            if activate:
+                with self.store.locked():
+                    self._validate_prepared(
+                        prepared,
+                        message="prepared checkpoint changed during installation",
+                    )
+                    self.store.activate(prepared.target_version)
+                    self.store.enforce_capacity(
+                        protected_versions={prepared.target_version},
+                    )
 
 
 __all__ = [
@@ -903,4 +1206,5 @@ __all__ = [
     "PreparedCheckpoint",
     "ReceiverInstallError",
     "ObjectStorageGeneratorConfig",
+    "bootstrap_s3_checkpoint",
 ]

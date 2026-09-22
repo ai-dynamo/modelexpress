@@ -288,6 +288,12 @@ message WorkerMetadata {
   // unknown and must be accepted for backward compatibility with old writers.
   string accelerator = 9;
 
+  // Datacenter topology domain values keyed by Grove ClusterTopology domain
+  // (see SourceInstanceRef.topology). Static per node, so it is published once
+  // at registration; the server passes it through onto SourceInstanceRef. This
+  // is runtime metadata, not SourceIdentity hash material.
+  map<string, string> topology = 11;
+
   // Source-type-specific bounded metadata. This selects the metadata payload
   // shape, not a transfer endpoint. Readers should prefer tensor_source over
   // deprecated tensors when both are present, and fall back to tensors for old
@@ -309,6 +315,10 @@ message WorkerMetadata {
 // source-side registered DRAM range and returns its transfer descriptor.
 service WorkerService {
   rpc GetTensorManifest(GetTensorManifestRequest) returns (GetTensorManifestResponse);
+  // Prepare/Release protect a mutable RL generator's live tensor storage while
+  // another generator reads it during active-refit P2P transfer.
+  rpc PrepareTensorRead(PrepareTensorReadRequest) returns (PrepareTensorReadResponse);
+  rpc ReleaseTensorRead(ReleaseTensorReadRequest) returns (ReleaseTensorReadResponse);
   rpc GetArtifactManifestHeader(GetArtifactManifestHeaderRequest) returns (GetArtifactManifestHeaderResponse);
   rpc GetArtifactManifestChunks(GetArtifactManifestChunksRequest) returns (GetArtifactManifestChunksResponse);
   rpc PrepareArtifactChunk(PrepareArtifactChunkRequest) returns (PrepareArtifactChunkResponse);
@@ -351,6 +361,38 @@ message GetTensorManifestResponse {
   // always set it; absence identifies a legacy source during rolling upgrade.
   optional string worker_id = 7;
 }
+
+message PrepareTensorReadRequest {
+  // Exact source version selected through discovery.
+  string mx_source_id = 1;
+
+  // Exact worker process selected through discovery. Unlike immutable artifact
+  // chunks, live tensor addresses become stale when the worker process changes.
+  optional string worker_id = 2;
+}
+
+message PrepareTensorReadResponse {
+  // Lease protecting the returned tensor addresses from donor mutation. The
+  // target releases it after the read; if the target process exits first, the
+  // donor expires it after its bounded server-owned lifetime.
+  string lease_id = 1;
+
+  // Tensor addresses and NIXL endpoint captured under this lease. Artifact
+  // prepare returns the analogous single-chunk transfer descriptor instead.
+  GetTensorManifestResponse manifest = 2;
+}
+
+message ReleaseTensorReadRequest {
+  // Revalidate that the lease belongs to this source version and worker.
+  string mx_source_id = 1;
+  optional string worker_id = 2;
+
+  // Lease returned by PrepareTensorRead. Release is best-effort on target
+  // shutdown; donor-side expiry handles SIGKILL, OOM, and node loss.
+  string lease_id = 3;
+}
+
+message ReleaseTensorReadResponse {}
 
 message GetArtifactManifestHeaderRequest {
   // mx_source_id for validation (catches stale discovery)
@@ -562,6 +604,31 @@ message SourceInstanceRef {
   // Unlike training_step this remains constant across versions and changes
   // whenever cached layout metadata must be rebuilt.
   optional string layout_signature = 8;
+
+  // Datacenter topology domain values keyed by Grove ClusterTopology domain
+  // (region/zone/datacenter/block/rack/host/numa), e.g.
+  // {"block": "b1", "rack": "r3", "host": "node7"}. Populated from the node's
+  // labels via the ClusterTopology domain->key mapping and published once at
+  // registration. The topology_aware selector prefers sources in the narrowest
+  // RDMA-fabric domain the target and source share. Empty means unknown (the
+  // selector then falls back to rendezvous ordering for that source).
+  // (#519 took fields 6-8, #512 took 9, #510 took 10.)
+  map<string, string> topology = 9;
+
+  // Source-published busyness estimate in [0, 1] (0 = idle, 1 = saturated).
+  // The source computes it about itself and publishes it; the server only
+  // passes it through (never accumulates it), keeping servers stateless. The
+  // default provider measures the source's RDMA NIC utilization (from its
+  // own port counters); a runtime provider (e.g. vLLM/SGLang serving load)
+  // can supply it instead behind the same field. Consumed by the client
+  // `load_aware` selector to steer new targets toward sources with spare
+  // headroom, so weight transfers avoid contending with a source's in-flight
+  // inference. Ordering-only and advisory. Unset means unknown (an older
+  // client, or a provider with no signal) and ranks as a neutral prior; 0
+  // means measured idle. Presence is what keeps a source with no reading
+  // from outranking one that reports real load.
+  // (#519 took fields 6-8, #512 took 9, #510 took 10.)
+  optional float source_load = 10;
 }
 
 message ListSourcesRequest {
@@ -637,6 +704,12 @@ message UpdateStatusRequest {
 
   // worker_id returned from PublishMetadata
   string worker_id = 4;
+
+  // Source-published busyness in [0, 1], refreshed on each heartbeat so the
+  // server's SourceInstanceRef.source_load tracks live load. Leave unset when
+  // no provider has a reading; 0 means measured idle. See
+  // SourceInstanceRef.source_load.
+  optional float source_load = 5;
 }
 
 message UpdateStatusResponse {

@@ -20,28 +20,50 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
-
+from modelexpress.accelerators import accelerator_backend_for
+from modelexpress.engines.vllm.host_quantization import (
+    refresh_host_quantization_state,
+)
 from modelexpress.refit.reshard.geometry import (
     capture_weights,
     convert_source_weights,
 )
 from modelexpress.refit.reshard.types import IncompleteRefit
+from modelexpress.refit.timing import refit_span
+
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
     PreparedArtifact,
     PreparedCheckpointArtifact,
     PreparedEngineTensors,
+    PreparedRuntimeTensors,
 )
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
 
 if TYPE_CHECKING:
+    from modelexpress.refit.reshard.types import CaptureResult
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
 
-    from modelexpress.refit.reshard.types import CaptureResult
-
 logger = logging.getLogger("modelexpress_rl.inference.engines.vllm.installer")
+
+
+def _reserve_runtime_buffer_slots(model: Module, layerwise_info) -> None:
+    """Keep late-created kernel buffers registered while PWAL runs again."""
+    for layer in model.modules():
+        info = layerwise_info.get(layer)
+        if info is None or info.kernel_tensors is None:
+            continue
+        _, buffers = info.kernel_tensors
+        for name, buffer in buffers.items():
+            if name in layer._buffers:
+                continue
+            if hasattr(layer, name):
+                raise IncompleteRefit(
+                    f"{type(layer).__name__}.{name} conflicts with a runtime buffer"
+                )
+            layer.register_buffer(name, buffer)
 
 
 class _VllmInstaller(EngineInstaller):
@@ -55,15 +77,14 @@ class _VllmInstaller(EngineInstaller):
         model_config: ModelConfig,
         device: torch.device,
         convert_native_to_hf: Callable[[dict], dict] | None = None,
+        runtime_tensors: dict[str, torch.Tensor] | None = None,
     ) -> None:
         self._model = model
         self._vllm_config = vllm_config
         self._model_config = model_config
         self._device = device
         self._convert_native_to_hf = convert_native_to_hf
-        self._parameter_layout: dict[
-            str, tuple[tuple[int, ...], torch.dtype]
-        ] | None = None
+        self._runtime_tensors = runtime_tensors
 
     @property
     def capabilities(self) -> EngineCapabilities:
@@ -71,6 +92,7 @@ class _VllmInstaller(EngineInstaller):
             artifact_types=frozenset(
                 {
                     PreparedEngineTensors,
+                    PreparedRuntimeTensors,
                     PreparedCheckpointArtifact,
                 }
             )
@@ -78,8 +100,11 @@ class _VllmInstaller(EngineInstaller):
 
     def install(self, prepared: PreparedArtifact) -> dict[str, float]:
         started = time.perf_counter()
+        metrics = prepared.metrics
         if isinstance(prepared, PreparedEngineTensors):
             self.install_tensors(prepared.staged.tensors)
+        elif isinstance(prepared, PreparedRuntimeTensors):
+            self.install_runtime_tensors(prepared.staged.tensors)
         elif isinstance(prepared, PreparedCheckpointArtifact):
             checkpoint = prepared.checkpoint
             if not isinstance(checkpoint, PreparedCheckpoint):
@@ -89,57 +114,13 @@ class _VllmInstaller(EngineInstaller):
             raise TypeError(
                 f"unsupported prepared artifact {type(prepared).__name__}"
             )
-        return {"perf/mx_receive_install_time": time.perf_counter() - started}
+        metrics["perf/mx_receive_install_time"] = time.perf_counter() - started
+        return metrics
 
     @property
     def _is_quantized(self) -> bool:
         """Whether the live model uses a post-load quantized kernel layout."""
         return getattr(self._vllm_config, "quant_config", None) is not None
-
-    def _build_meta_twin(self) -> Module:
-        """Build an unquantized, storage-free copy of the load-time model.
-
-        Quantized live parameters are already packed for their kernels, so they
-        cannot describe where bf16 trainer weights land during normal loading.
-        The unquantized meta twin has the same structural fusion and load-time
-        parameter layout without allocating tensor storage.
-        """
-        try:
-            from vllm.model_executor.model_loader.utils import initialize_model
-            from vllm.utils.torch_utils import set_default_torch_dtype
-        except (ImportError, AttributeError) as error:
-            raise RuntimeError(
-                "ModelExpress refit requires vLLM's layerwise reload APIs"
-            ) from error
-
-        # Strip quantization so capture observes pre-PWAL load-time parameters,
-        # not fp8/Marlin kernel storage.
-        twin_config = copy.copy(self._vllm_config)
-        twin_model_config = copy.copy(self._vllm_config.model_config)
-        twin_model_config.quantization = None
-        twin_config.model_config = twin_model_config
-        twin_config.quant_config = None
-        # The live model already populated static_forward_context. The twin needs
-        # a separate empty registry or Attention initialization rejects duplicate
-        # layer prefixes.
-        twin_compilation_config = copy.copy(self._vllm_config.compilation_config)
-        twin_compilation_config.static_forward_context = {}
-        twin_config.compilation_config = twin_compilation_config
-
-        # Match vLLM's normal loader initialization; otherwise torch's fp32
-        # default would produce the wrong destination dtype during capture.
-        with set_default_torch_dtype(self._model_config.dtype), torch.device("meta"):
-            return initialize_model(twin_config)
-
-    @staticmethod
-    def _layout_of(
-        model: Module,
-    ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
-        """Describe one model's named parameter shapes and dtypes."""
-        return {
-            name: (tuple(parameter.shape), parameter.dtype)
-            for name, parameter in model.named_parameters()
-        }
 
     def capture(
         self, manifest: list[tuple[str, torch.dtype, tuple[int, ...]]]
@@ -201,20 +182,45 @@ class _VllmInstaller(EngineInstaller):
             len(capture.unsupported),
             self._is_quantized,
         )
-        self._parameter_layout = param_layout
         return capture, param_layout
-
-    def parameter_layout(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
-        """Return the canonical load-time layout used by peer staging buffers."""
-        if self._parameter_layout is None:
-            self._parameter_layout = self._layout_of(self._build_meta_twin())
-        return self._parameter_layout
 
     def install_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Install verified load-layout tensors without changing graph addresses."""
         self._process_and_commit(tensors)
-        _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
-        torch.cuda.synchronize(self._device)
+        # Derived-weight fixups plus the synchronize that makes the whole
+        # install observable. Separate from the per-layer stages because it is
+        # paid once and does not scale with the number of layers, so folding it
+        # in would make those look worse than they are on small models.
+        with refit_span("post_install"):
+            _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
+            torch.cuda.synchronize(self._device)
+
+    def install_runtime_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
+        """Finish a direct peer transfer into existing graph-bound storage."""
+        if self._runtime_tensors is None:
+            raise RuntimeError("vLLM runtime tensor installation is unavailable")
+        destinations = self._runtime_tensors
+        local_only = sorted(set(destinations) - set(tensors))
+        source_only = sorted(set(tensors) - set(destinations))
+        if local_only or source_only:
+            raise IncompleteRefit(
+                "vLLM runtime tensor set differs from the staged peer: "
+                f"{len(local_only)} local-only, {len(source_only)} source-only"
+            )
+        for name, source in tensors.items():
+            if destinations[name] is not source:
+                raise IncompleteRefit(
+                    "vLLM runtime P2P must write directly into live storage"
+                )
+
+        if getattr(self._model_config, "enforce_eager", False):
+            with refit_span("post_install"):
+                refresh_host_quantization_state(
+                    self._model,
+                    self._vllm_config,
+                    accelerator_backend_for(self._device),
+                    allow_warm=True,
+                )
 
     def install_checkpoint(self, path: str | Path) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""
@@ -238,8 +244,11 @@ class _VllmInstaller(EngineInstaller):
         loader = DefaultModelLoader(load_config)
 
         self._reload(lambda: loader.load_weights(self._model, model_config))
-        _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
-        torch.cuda.synchronize(self._device)
+        # Same fixups and synchronize as install_tensors, so a checkpoint refit
+        # reports the stage too rather than charging it to the caller's total.
+        with refit_span("post_install"):
+            _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
+            torch.cuda.synchronize(self._device)
 
     @torch.no_grad()
     def _process_and_commit(self, tensors: dict[str, torch.Tensor]) -> None:
@@ -284,6 +293,12 @@ class _VllmInstaller(EngineInstaller):
                     f"unmatched={unmatched[:10]}"
                 )
 
+            # Per-layer spans, accumulated across every layer into two stages.
+            # This loop is the whole of what a framework sees as "install", and
+            # the two things it does have unrelated costs: post-load processing
+            # is compute that scales with quantization scheme, while the copy
+            # back is bandwidth into storage the CUDA graphs already point at.
+            # Charged together they cannot be acted on.
             for layer, parameters in groups.items():
                 info = LAYERWISE_INFO.get(layer)
                 for full_name, leaf in parameters:
@@ -296,9 +311,11 @@ class _VllmInstaller(EngineInstaller):
                 if isinstance(quant_method, QuantizeMethodBase):
                     if hasattr(layer, "_already_called_process_weights_after_loading"):
                         delattr(layer, "_already_called_process_weights_after_loading")
-                    quant_method.process_weights_after_loading(layer)
+                    with refit_span("transformation"):
+                        quant_method.process_weights_after_loading(layer)
                 if info is not None and info.kernel_tensors is not None:
-                    _copy_and_restore_kernel_tensors(layer, info)
+                    with refit_span("installation"):
+                        _copy_and_restore_kernel_tensors(layer, info)
                 if info is not None:
                     info.reset()
 
@@ -310,6 +327,7 @@ class _VllmInstaller(EngineInstaller):
         try:
             from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.reload.layerwise import (
+                LAYERWISE_INFO,
                 finalize_layerwise_reload,
                 initialize_layerwise_reload,
             )
@@ -336,6 +354,7 @@ class _VllmInstaller(EngineInstaller):
 
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(self._model)
+            _reserve_runtime_buffer_slots(self._model, LAYERWISE_INFO)
             load()
             finalize_layerwise_reload(self._model, self._model_config)
 

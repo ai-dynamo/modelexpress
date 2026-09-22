@@ -146,7 +146,7 @@ runs:
         kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
 
         # CRD is cluster-scoped — idempotent, safe to re-apply on every run.
-        kubectl apply -f ci/k8s/server/crd-modelmetadata.yaml
+        kubectl apply -f examples/crds.yaml
 
         # RBAC scoped to this namespace.
         NAMESPACE=${NAMESPACE} envsubst < ci/k8s/server/rbac-modelmetadata.yaml | \
