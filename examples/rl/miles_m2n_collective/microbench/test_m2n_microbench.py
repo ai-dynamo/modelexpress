@@ -187,6 +187,23 @@ def test_import_provenance_tracks_the_loaded_module_path():
     assert "revision" in provenance
 
 
+def test_import_provenance_does_not_execute_an_unloaded_module(tmp_path, monkeypatch):
+    marker = tmp_path / "imported"
+    module = tmp_path / "provenance_probe.py"
+    module.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop("provenance_probe", None)
+
+    provenance = microbench._module_provenance("provenance_probe", None)
+
+    assert provenance["available"] is True
+    assert provenance["module_file"] == str(module)
+    assert not marker.exists()
+    assert "provenance_probe" not in sys.modules
+
+
 @pytest.mark.parametrize(
     "overrides",
     (

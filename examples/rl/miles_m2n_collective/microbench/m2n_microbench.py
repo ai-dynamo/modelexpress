@@ -13,9 +13,8 @@ from __future__ import annotations
 import argparse
 import datetime
 import hashlib
-import importlib
+import importlib.machinery
 import importlib.metadata
-import inspect
 import json
 import os
 import platform
@@ -426,10 +425,27 @@ def _git_revision(path: Path) -> str | None:
 
 
 def _module_provenance(module_name: str, distribution: str | None) -> dict[str, Any]:
-    """Describe the module actually imported by the benchmark process."""
+    """Describe a module without importing it only to collect metadata."""
     try:
-        module = importlib.import_module(module_name)
-        module_file = Path(inspect.getfile(module)).resolve()
+        loaded = sys.modules.get(module_name)
+        if loaded is not None:
+            origin = getattr(loaded, "__file__", None)
+        else:
+            search_path = None
+            qualified = ""
+            spec = None
+            for component in module_name.split("."):
+                qualified = f"{qualified}.{component}" if qualified else component
+                spec = importlib.machinery.PathFinder.find_spec(qualified, search_path)
+                if spec is None:
+                    break
+                search_path = spec.submodule_search_locations
+            origin = None if spec is None else spec.origin
+            if origin is None and spec is not None and spec.submodule_search_locations:
+                origin = next(iter(spec.submodule_search_locations), None)
+        if origin is None:
+            raise ModuleNotFoundError(module_name)
+        module_file = Path(origin).resolve()
     except (ImportError, OSError, TypeError) as error:
         return {
             "module": module_name,
