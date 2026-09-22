@@ -36,6 +36,10 @@ permissions:
 jobs:
   build-and-upload:
     name: Build & upload wheels (${{ matrix.arch }})
+    # Upstream-only: the runners are ai-dynamo's self-hosted and the upload
+    # targets their Artifactory. In a fork this queues forever waiting for a
+    # runner that never checks in.
+    if: github.repository == 'ai-dynamo/modelexpress'
     environment: automated-release
     runs-on: ${{ matrix.runner }}
     strategy:

@@ -1,0 +1,158 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Azure single-job template for SGLang P2P RDMA weight-transfer CI tests with
+# tensor parallelism = 2, on a DeepSeek MLA + MoE model.
+#
+# SGLang counterpart of ci/k8s/client/vllm/manifest-azure-tp2.yaml. Same intent
+# (single-node TP=2 on a full-GPU node, DeepSeek-V2-Lite, fixed-small KV so
+# source/target VRAM parity stays sensitive to weight residency) with the
+# SGLang launch command from sgl/manifest-azure.yaml.
+#
+# WHY THIS MODEL: deepseek-ai/DeepSeek-V2-Lite is MLA + MoE. Its attention
+# weight-loader mixin derives w_kc/w_vc and assigns them directly on the module
+# (invisible to named_parameters()). On the P2P target those hidden tensors must
+# be captured, transferred, and match the source, or the target serves garbage
+# while the transfer log looks clean. This job gates that path for SGLang.
+#
+# Differences vs sgl/manifest-azure.yaml (TP=1, Qwen):
+#   - nvidia.com/gpu / rdma/ib: 2 each (one IB device per GPU)
+#   - --tp 2
+#   - --context-length 1024 + --mem-fraction-static 0.6: keep the KV pool small
+#     and fixed. SGLang has no direct byte cap like vLLM's
+#     --kv-cache-memory-bytes; a low static fraction on a full 80GiB A100 caps
+#     the pool well below the weight footprint so VRAM parity tracks weight
+#     residency, not autosized cache growth.
+#   - --trust-remote-code: DeepSeek-V2 ships custom modeling code.
+#   - cpu/memory bumped to accommodate 2 GPUs of orchestration.
+#
+# CLUSTER REQUIREMENT — MUST RUN ON NON-MIG GPU NODES (agentpool: a100b).
+# When nvidia.com/gpu: 2 is requested on a MIG node, K8s assigns 2 MIG slices,
+# not 2 full GPUs. NVIDIA hardware blocks NVML topology queries, NCCL P2P, and
+# NVLink across slices, so TP=2 fails during engine init. The full-GPU a100b
+# pool is also required for the VRAM sampling this job enables (in-container
+# NVML memory accounting is blocked on MIG slices).
+#
+# SGLang's MxModelLoader runs the SAME command on both source and target: the
+# first replica finds no READY source, loads natively, and publishes; the
+# second discovers it and loads via NIXL RDMA. No source/target branching.
+#
+# Environment variables substituted by envsubst before each apply:
+#   JOB_NAME      — mx-source or mx-target
+#   WORKER_IMAGE  — image built from ci/k8s/client/sgl/Dockerfile
+#   WORKER_PORT   — port the SGLang server listens on
+#   MX_CI_MODEL   — HuggingFace model id
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mx-p2p-worker
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: worker-registry
+      # Pin to a non-MIG full-GPU pool (see CLUSTER REQUIREMENT above). The
+      # agentpool podAffinity below is redundant under this nodeSelector but is
+      # kept for self-documentation and as defense if the nodeSelector changes.
+      nodeSelector:
+        agentpool: a100b
+      affinity:
+        # Source and target on different hosts so we exercise true cross-host
+        # RDMA over IB, not intra-node loopback through the same NIC.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: kubernetes.io/hostname
+        # Pin source + target to the SAME node pool. The test cluster splits GPU
+        # nodes across InfiniBand partitions (different pkeys), and pods on
+        # different pkeys can't talk RDMA (UCX "local pkey differs from remote
+        # pkey", NIXL_ERR_BACKEND on receive). Combined with the hostname
+        # anti-affinity, this forces source/target onto different hosts WITHIN
+        # the same IB partition.
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: agentpool
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: no-datadog
+          operator: Exists
+          effect: NoExecute
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: ${JOB_NAME}
+          image: ${WORKER_IMAGE}
+          # Force re-pull on every pod creation so CI/dev iterations on the same
+          # tag pick up freshly pushed images instead of the node's cached copy.
+          imagePullPolicy: Always
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            - --model-path
+            - "${MX_CI_MODEL}"
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "${WORKER_PORT}"
+            - --tp
+            - "2"
+            # Keep KV fixed and small so VRAM parity stays sensitive to weight
+            # residency instead of the engine auto-sizing cache around leaks.
+            - --context-length
+            - "1024"
+            - --mem-fraction-static
+            - "0.6"
+            - --trust-remote-code
+            - --load-format
+            - remote_instance
+            - --remote-instance-weight-loader-backend
+            - modelexpress
+            - --modelexpress-config
+            - '{"transport": "nixl"}'
+          env:
+            - name: MX_SERVER_ADDRESS
+              value: "mx-server:8000"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - containerPort: ${WORKER_PORT}
+          resources:
+            requests:
+              cpu: "8"
+              memory: "32Gi"
+              nvidia.com/gpu: "2"
+              rdma/ib: "2"
+            limits:
+              nvidia.com/gpu: "2"
+              rdma/ib: "2"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]

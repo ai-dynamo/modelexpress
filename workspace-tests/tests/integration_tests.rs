@@ -14,6 +14,7 @@ use tracing::{info, warn};
 /// This prevents race conditions when tests run in parallel.
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+#[allow(clippy::result_large_err)] // The public error type exceeds Rust 1.98's threshold.
 async fn download_model_directly(
     model_name: &str,
     provider: ModelProvider,

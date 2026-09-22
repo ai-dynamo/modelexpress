@@ -1,0 +1,108 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" viewBox="0 0 1200 900"
+     role="img" aria-labelledby="title desc">
+  <title id="title">ModelExpress reshards weights while moving them</title>
+  <desc id="desc">A tensor is split by rows across two trainer ranks while one rollout rank needs a column slice crossing both shards. Geometry capture records the rollout slice, the planner intersects it with each trainer shard, and two NIXL reads reconstruct the local destination without a trainer-side gather.</desc>
+  <defs>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2E7D32"/>
+    </marker>
+    <style>
+      .title { font: 700 30px system-ui, sans-serif; fill: #1f2937; }
+      .subtitle { font: 500 17px system-ui, sans-serif; fill: #4b5563; }
+      .section { font: 700 21px system-ui, sans-serif; }
+      .node-title { font: 700 17px system-ui, sans-serif; fill: #111827; }
+      .node-text { font: 500 16px system-ui, sans-serif; fill: #374151; }
+      .cell { fill: #dbeafe; stroke: #1565C0; stroke-width: 2; }
+      .needed { fill: #bbf7d0; stroke: #2E7D32; stroke-width: 3; }
+      .target { fill: #ede9fe; stroke: #5E35B1; stroke-width: 2; }
+      .step { font: 700 16px system-ui, sans-serif; fill: white; }
+      .edge { fill: none; stroke: #2E7D32; stroke-width: 3; marker-end: url(#arrow-green); }
+    </style>
+  </defs>
+
+  <rect width="1200" height="900" rx="24" fill="#f8fafc"/>
+  <text x="600" y="52" text-anchor="middle" class="title">Reshard while the weights move</text>
+  <text x="600" y="82" text-anchor="middle" class="subtitle">The receiver requests its own layout; the planner reads overlaps from every owning trainer rank</text>
+
+  <!-- Source shards -->
+  <text x="230" y="145" text-anchor="middle" class="section" fill="#1565C0">Trainer ownership</text>
+  <circle cx="75" cy="205" r="20" fill="#1565C0"/><text x="75" y="211" text-anchor="middle" class="step">1</text>
+  <text x="230" y="185" text-anchor="middle" class="node-title">Full tensor W [8 x 8]</text>
+
+  <rect x="110" y="210" width="240" height="120" rx="8" class="cell"/>
+  <line x1="140" y1="210" x2="140" y2="330" stroke="#1565C0" stroke-width="2"/>
+  <line x1="170" y1="210" x2="170" y2="330" stroke="#1565C0" stroke-width="2"/>
+  <line x1="200" y1="210" x2="200" y2="330" stroke="#1565C0" stroke-width="2"/>
+  <line x1="230" y1="210" x2="230" y2="330" stroke="#1565C0" stroke-width="2"/>
+  <line x1="260" y1="210" x2="260" y2="330" stroke="#1565C0" stroke-width="2"/>
+  <line x1="290" y1="210" x2="290" y2="330" stroke="#1565C0" stroke-width="2"/>
+  <line x1="320" y1="210" x2="320" y2="330" stroke="#1565C0" stroke-width="2"/>
+  <rect x="200" y="210" width="60" height="120" class="needed" opacity="0.86"/>
+  <text x="230" y="270" text-anchor="middle" class="node-title">rank 0 rows 0-3</text>
+
+  <rect x="110" y="350" width="240" height="120" rx="8" class="cell"/>
+  <line x1="140" y1="350" x2="140" y2="470" stroke="#1565C0" stroke-width="2"/>
+  <line x1="170" y1="350" x2="170" y2="470" stroke="#1565C0" stroke-width="2"/>
+  <line x1="200" y1="350" x2="200" y2="470" stroke="#1565C0" stroke-width="2"/>
+  <line x1="230" y1="350" x2="230" y2="470" stroke="#1565C0" stroke-width="2"/>
+  <line x1="260" y1="350" x2="260" y2="470" stroke="#1565C0" stroke-width="2"/>
+  <line x1="290" y1="350" x2="290" y2="470" stroke="#1565C0" stroke-width="2"/>
+  <line x1="320" y1="350" x2="320" y2="470" stroke="#1565C0" stroke-width="2"/>
+  <rect x="200" y="350" width="60" height="120" class="needed" opacity="0.86"/>
+  <text x="230" y="410" text-anchor="middle" class="node-title">rank 1 rows 4-7</text>
+  <text x="230" y="505" text-anchor="middle" class="node-text">Green columns are the receiver's needed range</text>
+
+  <!-- Planner -->
+  <text x="600" y="145" text-anchor="middle" class="section" fill="#2E7D32">Receiver-local planner</text>
+  <circle cx="405" cy="230" r="20" fill="#2E7D32"/><text x="405" y="236" text-anchor="middle" class="step">2</text>
+  <rect x="430" y="190" width="340" height="80" rx="14" fill="#dcfce7" stroke="#2E7D32" stroke-width="2"/>
+  <text x="600" y="222" text-anchor="middle" class="node-title">Capture loader geometry</text>
+  <text x="600" y="246" text-anchor="middle" class="node-text">W[:, 3:5] to local param</text>
+
+  <path d="M600 270 V340" class="edge"/>
+  <circle cx="405" cy="380" r="20" fill="#2E7D32"/><text x="405" y="386" text-anchor="middle" class="step">3</text>
+  <rect x="430" y="340" width="340" height="80" rx="14" fill="#dcfce7" stroke="#2E7D32" stroke-width="2"/>
+  <text x="600" y="372" text-anchor="middle" class="node-title">Intersect ownership</text>
+  <text x="600" y="396" text-anchor="middle" class="node-text">Two source overlaps</text>
+
+  <path d="M600 420 V490" class="edge"/>
+  <circle cx="405" cy="530" r="20" fill="#2E7D32"/><text x="405" y="536" text-anchor="middle" class="step">4</text>
+  <rect x="430" y="490" width="340" height="80" rx="14" fill="#dcfce7" stroke="#2E7D32" stroke-width="2"/>
+  <text x="600" y="522" text-anchor="middle" class="node-title">Emit byte runs</text>
+  <text x="600" y="546" text-anchor="middle" class="node-text">One plan, reused per step</text>
+
+  <!-- Destination -->
+  <text x="970" y="145" text-anchor="middle" class="section" fill="#5E35B1">Rollout destination</text>
+  <circle cx="820" cy="185" r="20" fill="#5E35B1"/><text x="820" y="191" text-anchor="middle" class="step">5</text>
+  <rect x="860" y="210" width="220" height="240" rx="10" class="target"/>
+  <line x1="970" y1="210" x2="970" y2="450" stroke="#5E35B1" stroke-width="2"/>
+  <line x1="860" y1="240" x2="1080" y2="240" stroke="#5E35B1" stroke-width="2"/>
+  <line x1="860" y1="270" x2="1080" y2="270" stroke="#5E35B1" stroke-width="2"/>
+  <line x1="860" y1="300" x2="1080" y2="300" stroke="#5E35B1" stroke-width="2"/>
+  <line x1="860" y1="330" x2="1080" y2="330" stroke="#5E35B1" stroke-width="2"/>
+  <line x1="860" y1="360" x2="1080" y2="360" stroke="#5E35B1" stroke-width="2"/>
+  <line x1="860" y1="390" x2="1080" y2="390" stroke="#5E35B1" stroke-width="2"/>
+  <line x1="860" y1="420" x2="1080" y2="420" stroke="#5E35B1" stroke-width="2"/>
+  <text x="970" y="485" text-anchor="middle" class="node-title">local param [8 x 2]</text>
+  <text x="970" y="511" text-anchor="middle" class="node-text">assembled from both ranks</text>
+
+  <path d="M350 270 C390 135 790 135 860 285" class="edge"/>
+  <path d="M350 410 C390 610 800 610 860 375" class="edge"/>
+  <text x="760" y="168" text-anchor="middle" class="node-text">NIXL read A</text>
+  <text x="780" y="602" text-anchor="middle" class="node-text">NIXL read B</text>
+
+  <rect x="125" y="630" width="950" height="190" rx="18" fill="#ffffff" stroke="#9E9E9E" stroke-width="2"/>
+  <text x="600" y="670" text-anchor="middle" class="section" fill="#2E7D32">What this removes</text>
+  <text x="190" y="715" class="node-title">No full-model gather</text>
+  <text x="190" y="743" class="node-text">Trainer ranks keep their native shards.</text>
+  <text x="190" y="775" class="node-title">No catalog data hop</text>
+  <text x="190" y="803" class="node-text">Only ownership metadata uses the server.</text>
+  <text x="650" y="715" class="node-title">No pair-specific reshard spec</text>
+  <text x="650" y="743" class="node-text">The engine loader describes the target layout.</text>
+  <text x="650" y="775" class="node-title">No repeated planning</text>
+  <text x="650" y="803" class="node-text">Stable geometry and addresses reuse one plan.</text>
+</svg>

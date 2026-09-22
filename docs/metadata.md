@@ -30,18 +30,20 @@ Every source is identified by a `SourceIdentity` proto containing all fields tha
 
 | Field | Example | Purpose |
 |-------|---------|---------|
-| `mx_version` | `"0.5.0"` | Format compatibility across upgrades |
-| `mx_source_type` | `WEIGHTS`, `LORA`, `CUDA_GRAPH`, `TORCH_COMPILE_CACHE`, `TRITON_CACHE`, `DEEP_GEMM_CACHE` | Type of source metadata being served |
+| `mx_version` | `"0.7.0"` | Format compatibility across upgrades |
+| `mx_source_type` | `WEIGHTS`, `LORA`, `CUDA_GRAPH`, `TORCH_COMPILE_CACHE`, `TRITON_CACHE`, `DEEP_GEMM_CACHE`, `TILELANG_CACHE`, `CUTE_DSL_CACHE`, `FLASHINFER_CACHE` | Type of source metadata being served |
 | `model_name` | `"deepseek-ai/DeepSeek-V3"` | Model identifier |
 | `backend_framework` | `VLLM`, `SGLANG`, `TRT_LLM` | Inference framework |
 | `tensor_parallel_size` | `8` | TP degree |
 | `pipeline_parallel_size` | `2` | PP degree |
-| `expert_parallel_size` | `4` | EP degree (MoE models) |
+| `expert_parallel_size` | `4` | EP world size, `1` when expert parallelism is off (MoE models) |
 | `dtype` | `"bfloat16"` | Weight data type |
 | `quantization` | `"fp8"`, `""` | Quantization method |
 | `extra_parameters` | `{}` | Framework-specific config |
 
 The server computes `mx_source_id = SHA256(canonical_json(identity))[:16]` -- a 16-char hex key used to address all metadata for sources with identical configuration. This is content-addressed: two sources with the same identity hash to the same `mx_source_id`, enabling automatic peer discovery.
+
+Runtime accelerator compatibility is deliberately not part of `SourceIdentity` or `mx_source_id`. The source worker's active accelerator backend is stored as runtime `WorkerMetadata.accelerator` so rolling upgrades and existing pinned source-ID hash tests remain stable.
 
 ### Multi-Instance Support
 
@@ -53,6 +55,14 @@ Each worker publishes independently -- no inter-worker coordination or barriers 
 
 Workers use `torch.distributed.get_rank()` as their global rank, which captures both tensor-parallel and pipeline-parallel position. This is stored as `worker_rank` in metadata so targets can find a peer with a matching rank.
 
+### Runtime Accelerator Compatibility
+
+The source worker's runtime accelerator family, such as `cuda` or `xpu`, comes from the active `AcceleratorBackend.name`. It is published on `WorkerMetadata.accelerator` and also surfaced on the lightweight `SourceInstanceRef.accelerator` returned by `ListSources`. This field is used only for source compatibility filtering. It is not folded into `SourceIdentity`, does not affect `mx_source_id`, and does not change the Rust/Python pinned source-ID cross-check hashes.
+
+Targets treat an empty `accelerator` value as unknown and do not reject it, which keeps transfers backward compatible with metadata published before this field existed. If both source and target publish non-empty accelerator values and they differ, the target skips that source. Because `SourceInstanceRef` carries the value, incompatible sources are dropped while handling `ListSources` -- before the selector orders candidates and before the `MAX_SOURCE_RETRIES` slice -- so incompatible sources cannot exhaust the retry budget ahead of a compatible one. The post-`GetMetadata` check on `WorkerMetadata.accelerator` remains as defense-in-depth, before target preparation or RDMA receive.
+
+The same rule guards artifact cache transfers. vLLM JIT and compile caches (Torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, FlashInfer) are accelerator-specific, so `discover_artifact_source` drops sources whose `SourceInstanceRef.accelerator` is incompatible before `GetMetadata`, then re-checks the authoritative `WorkerMetadata.accelerator` after the fetch. Both checks share the single `accelerators_compatible` helper (`metadata/payload.py`) with the RDMA tensor path, so empty-means-unknown behaves identically. The `k8s-service` backend does not yet expose artifact discovery, so this filtering applies to the central-coordinator backends only.
+
 ### Tensor and Artifact Source Payloads
 
 `WorkerMetadata.source_payload` selects the source-specific metadata shape:
@@ -60,7 +70,7 @@ Workers use `torch.distributed.get_rank()` as their global rank, which captures 
 | Payload | Purpose |
 |---------|---------|
 | `tensor_source` | Tensor descriptors for weight transfer. Readers fall back to the deprecated top-level `tensors` field for old publishers. |
-| `artifact_source` | Lightweight artifact discovery summary: `artifact_id`, `total_size`, `file_count`, and `chunk_count`. |
+| `artifact_source` | Lightweight artifact discovery summary: `artifact_id`, `total_size`, `file_count`, `chunk_count`, and the owning `node_rank`. |
 
 Artifact summaries do not contain full file or chunk tables. Targets use the worker's `worker_grpc_endpoint` to call `GetArtifactManifestHeader` and `GetArtifactManifestChunks` on the source worker, then use `PrepareArtifactChunk` and `ReleaseArtifactChunk` around each NIXL transfer. `artifact_id` is SHA-256 over the canonical artifact manifest JSON, encoded as lowercase hex without a prefix. File and chunk `checksum` fields use CRC32C lowercase hex. Manifest file paths are canonical absolute publisher paths and are included in the sealed manifest; transfer helpers may rewrite them to target-local staging paths before installing the artifact.
 
@@ -96,14 +106,14 @@ Called once per GPU worker after loading weights and registering with the transf
 ```protobuf
 PublishMetadataRequest {
   identity: SourceIdentity    // Server computes mx_source_id from this
-  worker: WorkerMetadata       // One worker per call (rank, backend metadata, tensors)
+  worker: WorkerMetadata       // One worker per call (rank, accelerator, backend metadata, tensors)
   worker_id: string            // Unique per GPU process (uuid4 hex[:8])
 }
 ```
 
 ### ListSources
 
-Lightweight listing -- returns `SourceInstanceRef` entries (no tensor data). Clients filter by `worker_rank` to find matching peers, then call `GetMetadata` for the chosen one.
+Lightweight listing -- returns `SourceInstanceRef` entries (no tensor data). Clients filter by `worker_rank` and `accelerator` to find matching peers, then call `GetMetadata` for the chosen one.
 
 ```protobuf
 ListSourcesRequest {
@@ -120,12 +130,15 @@ SourceInstanceRef {
   worker_id: string       // Unique worker identifier
   model_name: string      // Human-readable
   worker_rank: uint32     // Global rank for peer matching
+  accelerator: string     // Runtime accelerator family for pre-fetch compatibility filtering
 }
 ```
 
 ### GetMetadata
 
 Fetches full metadata for one specific worker. Called on demand after filtering `ListSources` results. In central metadata mode this can include tensor descriptors directly. In P2P metadata mode the central response carries endpoint pointers and source summaries; targets fetch tensor descriptors or artifact manifests from `WorkerService`.
+
+Accelerator compatibility filtering happens in two places. `SourceInstanceRef` now carries the source's `accelerator`, so the target drops incompatible sources during `ListSources` handling, before ordering and before the `MAX_SOURCE_RETRIES` slice; this prevents incompatible sources from consuming every retry slot and stranding a compatible one. The target then re-checks the authoritative `WorkerMetadata.accelerator` after `GetMetadata` as defense-in-depth against empty refs on older servers, stale records, or metadata drift between list and fetch. In both places, a target skips a source only when both source and target publish non-empty, different accelerator values.
 
 ```protobuf
 GetMetadataRequest {
@@ -154,17 +167,21 @@ The Python `P2PArtifactTransfer` interface is the shared lifecycle for cache art
 
 The current implementation, `TarredP2PArtifactTransfer`, packages the source cache directory into one uncompressed tar file before building the artifact manifest. The source manifest records the publisher's tar path and therefore contributes that path to `artifact_id`. During transfer, the target rewrites the received file table to its own `bundle_root / artifact.tar`, then extracts that tar into `target_root`. This keeps the published manifest sealed while avoiding any requirement that source and target share the same absolute staging path.
 
-Factory helpers provide the three cache source types currently expected by loaders:
+Factory helpers provide the cache source types currently expected by loaders:
 
 | Helper | `mx_source_type` | Target cache shape |
 |--------|------------------|--------------------|
 | `torch_compile_cache_artifact_transfer()` | `TORCH_COMPILE_CACHE` | TorchInductor/vLLM torch compile cache directory |
 | `triton_cache_artifact_transfer()` | `TRITON_CACHE` | Triton kernel cache directory |
-| `deep_gemm_cache_artifact_transfer()` | `DEEP_GEMM_CACHE` | DeepGEMM cache directory |
+| `tvm_ffi_cache_artifact_transfer()` | `TVM_FFI_CACHE` | TVM-FFI compiled SGLang kernel modules (`TVM_FFI_CACHE_DIR`, or `~/.cache/tvm-ffi`) |
+| `deep_gemm_cache_artifact_transfer()` | `DEEP_GEMM_CACHE` | DeepGEMM JIT cache directory (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`) |
+| `tilelang_cache_artifact_transfer()` | `TILELANG_CACHE` | TileLang JIT cache directory (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`) |
+| `cute_dsl_cache_artifact_transfer()` | `CUTE_DSL_CACHE` | CuTe DSL compiled-kernel cache directory (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`) |
+| `flashinfer_cache_artifact_transfer()` | `FLASHINFER_CACHE` | Engine-selected FlashInfer JIT and autotune cache directories packaged as one artifact |
 
 ### UpdateStatus
 
-Transitions a worker's lifecycle status. Called periodically by the client-side heartbeat thread to refresh `updated_at`, and on shutdown to mark `STALE`.
+Transitions a worker's lifecycle status. Called periodically by the client-side publisher thread to refresh `updated_at`, and on shutdown to mark `STALE`.
 
 ```protobuf
 UpdateStatusRequest {
@@ -189,8 +206,13 @@ stateDiagram-v2
 
 - **INITIALIZING**: Worker has published metadata but heartbeat hasn't confirmed NIXL health yet
 - **READY**: Worker is healthy and accepting RDMA connections. Heartbeat refreshes `updated_at` every `MX_HEARTBEAT_INTERVAL_SECS` (default 30s)
-- **STALE**: Worker is no longer available. Set by the client `atexit` handler on clean shutdown (SIGTERM), or by the server-side reaper when `updated_at` exceeds `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s)
+- **STALE**: Worker is no longer available. Set by the client `atexit` handler on clean shutdown, by the client when its NIXL data plane fails, or by the server-side reaper when `updated_at` exceeds `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s). A worker demoted for a failed data plane returns to READY on its next healthy heartbeat, so this transition is not terminal. Note that the `atexit` route covers normal interpreter exit and `SystemExit`, but CPython does not run `atexit` handlers when the default `SIGTERM` disposition terminates the process; a worker killed that way is caught by the reaper instead
 - **Deleted**: Reaper garbage-collects stale entries after `MX_GC_TIMEOUT_SECS` (default 3600s)
+
+vLLM and SGLang weight sources wait for the framework health endpoint before
+calling `PublishMetadata`, so they are not discoverable during warmup or CUDA
+graph capture. After publication, the publisher sends the first READY update
+in the same tick.
 
 ## Backend Implementations
 
@@ -242,7 +264,7 @@ No Redis TTL is applied to keys. P2P stale detection and cleanup are handled by 
 ```
 # Source index -- identity stored once, workers as presence markers
 mx:source:a1b2c3d4e5f67890
-  __attributes__  ->  {"model_name":"deepseek-ai/DeepSeek-V3","mx_version":"0.5.0",...}
+  __attributes__  ->  {"model_name":"deepseek-ai/DeepSeek-V3","mx_version":"0.7.0",...}
   f3a2b1c4        ->  "0"    # worker_id f3a2b1c4, global rank 0
   e7d6c5b8        ->  "1"    # worker_id e7d6c5b8, global rank 1
 
@@ -319,9 +341,22 @@ Uses `ModelMetadata` CRDs for P2P source metadata, `ConfigMap`s for tensor descr
 
 **ConfigMap name format**: `mx-source-{source_id}-{worker_id}-tensors-worker-{rank}`
 
-ConfigMaps use `ownerReferences` pointing to the parent CRD so they are garbage-collected automatically.
+When a client publishes a complete Kubernetes Pod identity (`POD_NAME`,
+`POD_UID`, and `POD_NAMESPACE`) and the Pod is in the metadata namespace, the
+`ModelMetadata` CR uses that Pod as an owner. This applies to both weight and
+artifact metadata because both use the same `PublishMetadata` RPC. Deleting the
+Pod therefore garbage-collects its `ModelMetadata` CR. Tensor `ConfigMap`s use a
+second owner reference pointing to the parent CR, so they are collected with it.
 
-**Model lifecycle CRD name format**: `mx-cache-{sanitized-model-name}-{hash}`
+Kubernetes owner references cannot cross namespaces. If the identity is
+missing, partial, or names a different namespace, publication still succeeds
+without a Pod owner reference. This preserves behavior for older clients and
+non-Kubernetes environments; the server-side stale metadata reaper remains the
+cleanup path in those cases.
+
+**Model lifecycle CRD name format**: `mx-cache-{provider}--{sanitized-model-name}-{hash}`
+
+The name is `mx-cache-` followed by `sanitize("{provider}/{model_name}")`, so each `/` becomes `--` and the sha256 suffix binds the pair `(provider, name)`. For provider `HuggingFace` and model `deepseek-ai/DeepSeek-V3` the CR is named `mx-cache-huggingface--deepseek-ai--deepseek-v3-{hash}`. Pre-0.5.0 deployments carry name-only CRs (`mx-cache-{sanitized-model-name}-{hash}`), which the server still looks up so those records migrate.
 
 `ModelCacheEntry.spec.modelName` preserves the original model name while `status.phase`, `status.createdAt`, `status.lastUsedAt`, and `status.message` track the same lifecycle fields as the Redis `mx:model:*` hash.
 
@@ -337,6 +372,13 @@ apiVersion: modelexpress.nvidia.com/v1alpha1
 kind: ModelMetadata
 metadata:
   name: mx-source-a1b2c3d4e5f67890-f3a2b1c4
+  ownerReferences:
+    - apiVersion: v1
+      kind: Pod
+      name: mx-vllm-7d9f8f6c8b-k2m4p
+      uid: 8c69d55f-3e40-4b6e-a16b-6f0c1168e171
+      controller: false
+      blockOwnerDeletion: false
   labels:
     modelexpress.nvidia.com/mx-source-id: a1b2c3d4e5f67890
     modelexpress.nvidia.com/mx-worker-id: f3a2b1c4
@@ -349,6 +391,7 @@ status:
     nixlMetadata: <base64>
     tensorCount: 1327
     tensorConfigMap: mx-source-a1b2c3d4e5f67890-f3a2b1c4-tensors-worker-0
+    accelerator: cuda
     status: Ready
     updatedAt: "2025-11-14T22:13:20Z"
   conditions:
@@ -368,6 +411,13 @@ apiVersion: modelexpress.nvidia.com/v1alpha1
 kind: ModelMetadata
 metadata:
   name: mx-source-b2c3d4e5f67890a1-f3a2b1c4
+  ownerReferences:
+    - apiVersion: v1
+      kind: Pod
+      name: mx-vllm-7d9f8f6c8b-k2m4p
+      uid: 8c69d55f-3e40-4b6e-a16b-6f0c1168e171
+      controller: false
+      blockOwnerDeletion: false
 spec:
   modelName: artifact-transfer-e2e
   sourceType: deep_gemm_cache
@@ -375,11 +425,13 @@ status:
   worker:
     workerRank: 0
     backendType: none
+    accelerator: cuda
     artifactSource:
       artifactId: a0f08392f2abc45f78bd59f0fe2c601750c2b270dc5cc37c2166d86a65398466
       totalSize: 67108864
       fileCount: 1
       chunkCount: 8
+      nodeRank: 0
     tensorCount: 0
     status: Ready
     updatedAt: "2025-11-14T22:13:20Z"
@@ -389,14 +441,14 @@ status:
 
 ```bash
 kubectl get modelcacheentries -n <namespace>
-kubectl get modelcacheentry mx-cache-deepseek-ai--deepseek-v3-<hash> -n <namespace> -o yaml
+kubectl get modelcacheentry mx-cache-huggingface--deepseek-ai--deepseek-v3-<hash> -n <namespace> -o yaml
 ```
 
 ```yaml
 apiVersion: modelexpress.nvidia.com/v1alpha1
 kind: ModelCacheEntry
 metadata:
-  name: mx-cache-deepseek-ai--deepseek-v3-<hash>
+  name: mx-cache-huggingface--deepseek-ai--deepseek-v3-<hash>
 spec:
   modelName: deepseek-ai/DeepSeek-V3
   provider: HuggingFace
@@ -409,7 +461,7 @@ status:
 
 ## Client Workflow
 
-### Source Path (load from disk, publish metadata)
+### Source Path (load from storage, publish metadata)
 
 ```mermaid
 sequenceDiagram
@@ -417,14 +469,14 @@ sequenceDiagram
     participant MX as MX Server
     participant Backend as Redis / K8s
 
-    W->>W: Load weights from disk (or GDS)
+    W->>W: Load via server cache, InstantTensor, ModelStreamer, GDS, or native loader
     W->>W: process_weights_after_loading()
     W->>W: Collect all post-processed tensors
     W->>W: Initialize NIXL agent, register tensors
     W->>MX: PublishMetadata(identity, worker, worker_id)
     MX->>Backend: Store worker metadata (status=INITIALIZING)
     MX-->>W: mx_source_id
-    W->>W: Start HeartbeatThread
+    W->>W: Start PublisherThread
     loop Every MX_HEARTBEAT_INTERVAL_SECS
         W->>MX: UpdateStatus(mx_source_id, worker_id, rank, READY)
         MX->>Backend: Patch status + updated_at
@@ -440,36 +492,49 @@ sequenceDiagram
 
     W->>MX: ListSources(identity, status=READY)
     MX-->>W: [SourceInstanceRef, ...]
-    W->>W: Filter by worker_rank, shuffle for load balancing
+    W->>W: Filter by worker_rank and accelerator, then order via SourceSelector
     W->>W: Load dummy weights, initialize NIXL agent
-    loop For each candidate (max MAX_SOURCE_RETRIES) until metadata found
+    loop For each candidate (max MAX_SOURCE_RETRIES) until transfer succeeds
         W->>MX: GetMetadata(mx_source_id, worker_id)
         MX-->>W: WorkerMetadata (tensors, nixl_metadata)
         alt Metadata missing or fetch error
             W->>W: Try next candidate
+        else Accelerator mismatch and both values known
+            W->>W: Skip candidate before target preparation
+        else Compatible metadata
+            W->>W: Add remote NIXL agent, execute RDMA transfers
+            alt Transfer fails (SourceTransferError / ManifestMismatchError)
+                W->>W: Roll back transfer state
+                W->>W: Reinitialize model if target state may be mutated
+                W->>W: Try next candidate
+            else Transfer succeeds
+                W->>W: Stop source retries
+            end
         end
     end
-    W->>W: Add remote NIXL agent, execute RDMA transfers
-    alt Transfer fails (SourceTransferError / ManifestMismatchError)
-        W->>W: Abandon RDMA, fall through to next strategy (GDS, disk)
+    opt No source succeeds within retry budget
+        W->>W: Fall through to server cache, InstantTensor, ModelStreamer, GDS, or native loader
     end
     W->>W: process_weights_after_loading()
     W->>W: Register and publish own metadata (become a source)
 ```
 
-### Three-Tier Loading Strategy
+### Loading Strategy Chain
 
-The `MxModelLoader` (`--load-format modelexpress`; `mx` alias) auto-detects the best loading strategy:
+The `MxModelLoader` (`--load-format modelexpress`; `mx` alias) filters and evaluates this fixed loading strategy chain:
 
-1. **RDMA** -- If `ListSources` returns READY instances with matching rank, receive weights via NIXL/Mooncake
-2. **GDS** -- If no source available and GPUDirect Storage is available, load directly from file to GPU
-3. **Disk** -- Standard vLLM `DefaultModelLoader` as final fallback
+1. **RDMA** -- If `ListSources` returns READY instances with matching rank, and the per-candidate metadata fetch confirms a compatible accelerator, receive weights from a serving peer.
+2. **Server cache** -- When no-shared-storage mode is enabled and the worker has a server address, stream the model's weight files into the resolved local snapshot and use the engine's native loader.
+3. **InstantTensor** -- When enabled and supported by the installed package, device, and runtime adapter, load local safetensors through InstantTensor.
+4. **ModelStreamer** -- If `MX_MODEL_URI` is set and `runai_model_streamer` is installed, pipeline safetensor reads from S3, GCS, Azure Blob Storage, or a local path through a bounded CPU staging buffer into the engine.
+5. **GDS** -- If no higher-priority path succeeds and GPUDirect Storage is available, load directly from local storage to GPU.
+6. **Native loader** -- Use the inference engine's native path as the final fallback.
 
-After loading by any path, the worker registers its tensors and publishes metadata so future workers can discover it as an RDMA source.
+The first applicable strategy runs. A failure before model mutation falls through directly; a failure after weights may have landed reinitializes the model before the next strategy runs. After loading by any path, the worker registers its tensors. Server-backed deployments then publish metadata so future workers can discover the worker as an RDMA source; `k8s-service` serves metadata through its decentralized backend.
 
 ## Transfer Backends
 
-`WorkerMetadata` uses a `oneof backend_metadata` field supporting multiple transfer backends:
+`WorkerMetadata` stores runtime compatibility metadata plus a `oneof backend_metadata` field supporting multiple transfer backends. The `accelerator` field records the source worker's accelerator family for target-side filtering; empty means unknown and is accepted for backward compatibility.
 
 | Backend | Field | Description |
 |---------|-------|-------------|
@@ -484,16 +549,17 @@ The `backend_type` discriminator is persisted in storage for unambiguous deseria
 |----------|---------|-------------|
 | `MX_METADATA_BACKEND` | (required) | `redis` or `kubernetes` |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
-| `MX_REDIS_HOST` / `REDIS_HOST` | `localhost` | Redis host |
-| `MX_REDIS_PORT` / `REDIS_PORT` | `6379` | Redis port |
-| `REDIS_URL` | (computed) | Full Redis URL (overrides host/port) |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
+| `MX_REDIS_HOST` / `REDIS_HOST` | (required with port) | Redis host when `REDIS_URL` is not set |
+| `MX_REDIS_PORT` / `REDIS_PORT` | (required with host) | Redis port when `REDIS_URL` is not set |
+| `REDIS_URL` | (required unless host and port are set) | Full Redis URL; overrides host/port |
 | `MX_METADATA_NAMESPACE` / `POD_NAMESPACE` | (required for Kubernetes) | K8s namespace for CRD backend |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
 | `MX_GC_TIMEOUT_SECS` | `3600` | Time before stale entries are deleted |
 | `MX_POOL_REG` | `0` | Register each unique cudaMalloc allocation instead of each tensor (allocation-level NIXL registration) |
+| `MX_TRANSFER_TIMEOUT` | `300` on the RDMA receive path | Per-candidate budget for receiving weights from one source. Applies **per source**, not per load, so a target trying `MAX_SOURCE_RETRIES` candidates can spend this much three times before falling back to disk. Set it against your model size: the default suits a small model but is long for one that transfers in under a second. Note the RDMA path only honours this variable when it is explicitly set, and otherwise uses 300s rather than the 900s default that other transfer paths use. |
 
 ## Debugging
 
@@ -532,4 +598,4 @@ kubectl get configmaps -l modelexpress.nvidia.com/mx-source-id=<source_id> -n <n
 | K8s CRs missing | RBAC issue -- check source logs and service account permissions for both `modelmetadatas` and `modelcacheentries` |
 | Stale P2P metadata after redeploy | Reaper marks stale within 90s. For immediate Redis cleanup: delete `mx:source:*` keys or `FLUSHDB` in a dedicated Redis DB |
 | Stale model lifecycle metadata after redeploy | Inspect `mx:model:*` or `modelcacheentries`; delete the stale lifecycle entry if it no longer matches cache contents |
-| Transfer failure with address errors | Source pod restarted -- GPU addresses are invalid. Target retries next candidate (max 3) |
+| Transfer failure with address errors | Source pod restarted, so its GPU addresses are invalid. ModelExpress clears the failed NIXL state, reinitializes a potentially mutated target, and tries the next ranked source within the retry budget. If no source succeeds, the strategy chain continues through server cache, InstantTensor, ModelStreamer, GDS, and the native loader. |

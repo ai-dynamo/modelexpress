@@ -16,19 +16,11 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
-/// Read an environment variable as `u64`, falling back to `default`.
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
 /// Run the reaper loop until the shutdown signal fires.
 pub async fn run_reaper(state: Arc<P2pStateManager>, shutdown: oneshot::Receiver<()>) {
-    let scan_interval_secs = env_u64("MX_REAPER_SCAN_INTERVAL_SECS", 30);
-    let heartbeat_timeout_secs = env_u64("MX_HEARTBEAT_TIMEOUT_SECS", 90);
-    let gc_timeout_secs = env_u64("MX_GC_TIMEOUT_SECS", 3600);
+    let scan_interval_secs = modelexpress_common::envs::reaper_scan_interval_secs();
+    let heartbeat_timeout_secs = modelexpress_common::envs::heartbeat_timeout_secs();
+    let gc_timeout_secs = modelexpress_common::envs::gc_timeout_secs();
     let heartbeat_timeout_ms = heartbeat_timeout_secs.saturating_mul(1000);
     let gc_timeout_ms = gc_timeout_secs.saturating_mul(1000);
 
@@ -80,6 +72,7 @@ async fn reap_once(
                     &w.worker_id,
                     w.worker_rank,
                     SourceStatus::Stale,
+                    None,
                 )
                 .await
             {
@@ -137,14 +130,19 @@ mod tests {
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
                 updated_at: old_time,
+                accelerator: "cuda".into(),
+                source_load: None,
+                topology: Default::default(),
+                training_step: None,
+                layout_signature: None,
             }])
         });
         mock.expect_update_status()
-            .withf(|sid, wid, rank, status, _| {
+            .withf(|sid, wid, rank, status, _, _| {
                 sid == "src1" && wid == "w1" && *rank == 0 && *status == SourceStatus::Stale
             })
             .once()
-            .returning(|_, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(()));
 
         let state = P2pStateManager::with_backend(Arc::new(mock));
         reap_once(&state, 90_000, 3_600_000)
@@ -166,6 +164,11 @@ mod tests {
                 worker_rank: 0,
                 status: SourceStatus::Stale as i32,
                 updated_at: very_old,
+                accelerator: "cuda".into(),
+                source_load: None,
+                topology: Default::default(),
+                training_step: None,
+                layout_signature: None,
             }])
         });
         mock.expect_remove_worker()
@@ -193,6 +196,11 @@ mod tests {
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
                 updated_at: recent,
+                accelerator: "cuda".into(),
+                source_load: None,
+                topology: Default::default(),
+                training_step: None,
+                layout_signature: None,
             }])
         });
         // No update_status or remove_worker calls expected

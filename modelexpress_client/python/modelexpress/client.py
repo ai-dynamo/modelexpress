@@ -13,11 +13,12 @@ registered by the owning process for GPUDirect RDMA.
 """
 
 import logging
-import os
 from abc import ABC, abstractmethod
 
 import grpc
 
+from . import auth
+from . import envs
 from . import p2p_pb2
 from . import p2p_pb2_grpc
 
@@ -39,6 +40,10 @@ class MxClientBase(ABC):
     """
 
     REQUIRES_P2P_METADATA: bool = False
+
+    def worker_rpc_retry_policy(self) -> tuple[int, float]:
+        """Return fresh-channel retries and backoff for worker RPCs."""
+        return 0, 0.0
 
     @abstractmethod
     def publish_metadata(
@@ -72,6 +77,7 @@ class MxClientBase(ABC):
         worker_id: str,
         worker_rank: int,
         status: "p2p_pb2.SourceStatus",
+        source_load: float | None = None,
     ) -> bool:
         """Update a source worker's lifecycle status."""
 
@@ -95,16 +101,18 @@ def _get_server_url(explicit_url: str | None = None) -> str:
 
     Priority:
     1. Explicit ``server_url`` argument
-    2. ``MODEL_EXPRESS_URL`` env var (Dynamo-consistent)
-    3. ``MX_SERVER_ADDRESS`` env var (backward compat)
+    2. ``MODEL_EXPRESS_URL`` env var (deprecated, but still takes precedence:
+       the TRT-LLM live-transfer integration reads only this name)
+    3. ``MX_SERVER_ADDRESS`` env var (the name ModelExpress is standardizing on)
     4. Default ``localhost:8001``
     """
     if explicit_url:
         return _parse_server_address(explicit_url)
-    url = os.environ.get(
-        "MODEL_EXPRESS_URL",
-        os.environ.get("MX_SERVER_ADDRESS", "localhost:8001"),
-    )
+    url = envs.MODEL_EXPRESS_URL
+    if url is None:
+        url = envs.MX_SERVER_ADDRESS
+        if url is None:
+            url = "localhost:8001"
     return _parse_server_address(url)
 
 
@@ -147,7 +155,9 @@ class MxClient(MxClientBase):
                 ("grpc.max_send_message_length", self._max_message_size),
                 ("grpc.max_receive_message_length", self._max_message_size),
             ]
-            self._channel = grpc.insecure_channel(self.server_url, options=options)
+            self._channel = auth.with_auth(
+                grpc.insecure_channel(self.server_url, options=options)
+            )
             self._stub = p2p_pb2_grpc.P2pServiceStub(self._channel)
             logger.debug("MxClient connected to %s", self.server_url)
         return self._stub
@@ -175,6 +185,9 @@ class MxClient(MxClientBase):
             identity=identity,
             worker=worker,
             worker_id=worker_id,
+            pod_name=envs.POD_NAME,
+            pod_uid=envs.POD_UID,
+            pod_namespace=envs.POD_NAMESPACE,
         )
         response = self.stub.PublishMetadata(request, timeout=30)
         if not response.success:
@@ -211,6 +224,7 @@ class MxClient(MxClientBase):
         worker_id: str,
         worker_rank: int,
         status: "p2p_pb2.SourceStatus",
+        source_load: float | None = None,
     ) -> bool:
         """Update worker status.  Returns *True* on success."""
         request = p2p_pb2.UpdateStatusRequest(
@@ -219,6 +233,10 @@ class MxClient(MxClientBase):
             worker_rank=worker_rank,
             status=status,
         )
+        # Leave the optional field unset when there is no reading: presence is
+        # how the server and pullers tell "unknown" from a measured 0.0.
+        if source_load is not None:
+            request.source_load = source_load
         response = self.stub.UpdateStatus(request, timeout=30)
         if not response.success:
             logger.error("UpdateStatus failed: %s", response.message)

@@ -1,0 +1,133 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Single-node SGLang deployment with ModelExpress ModelStreamer.
+# Streams weights from S3 via runai-model-streamer — no disk, no PVC.
+#
+# Prerequisites:
+#   - Model weights uploaded to S3 bucket
+#   - An SGLang image with ModelExpress and ModelStreamer support
+#   - kubectl create secret generic aws-creds \
+#       --from-literal=AWS_ACCESS_KEY_ID=<key> \
+#       --from-literal=AWS_SECRET_ACCESS_KEY=<secret> \
+#       --from-literal=AWS_SESSION_TOKEN=<token>
+#
+# For P2P RDMA serving after S3 load, also set MX_SERVER_ADDRESS
+# and add RDMA resources (rdma/ib), UCX env vars. See the P2P examples under
+# examples/p2p_transfer_k8s/client/sglang/.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-sglang-s3
+  labels:
+    app: mx-sglang-s3
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+  selector:
+    app: mx-sglang-s3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-sglang-s3
+  labels:
+    app: mx-sglang-s3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-sglang-s3
+  template:
+    metadata:
+      labels:
+        app: mx-sglang-s3
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: sglang
+          image: <your-registry>/modelexpress-sglang:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          command:
+            - python3
+            - -m
+            - sglang.launch_server
+          env:
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            # S3 path format: s3://<bucket>/<model-prefix>
+            - name: MX_MODEL_URI
+              value: "s3://my-bucket/deepseek-ai/DeepSeek-V3"
+            - name: AWS_DEFAULT_REGION
+              value: "us-west-2"
+            - name: MX_MS_DISTRIBUTED
+              value: "1"
+            - name: RUNAI_STREAMER_CONCURRENCY
+              value: "32"
+            # Optional: enable P2P serving after S3 load (requires MX server + RDMA)
+            # - name: MX_SERVER_ADDRESS
+            #   value: "modelexpress-server:8001"
+          # AWS credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+          envFrom:
+            - secretRef:
+                name: aws-creds
+          args:
+            - --model-path
+            - $(MODEL_NAME)
+            - --served-model-name
+            - $(MODEL_NAME)
+            - --load-format
+            - remote_instance
+            - --remote-instance-weight-loader-backend
+            - modelexpress
+            - --modelexpress-config
+            - '{"transport":"nixl"}'
+            - --tp
+            - "8"
+            - --dtype
+            - bfloat16
+            - --disable-cuda-graph
+            - --disable-piecewise-cuda-graph
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+          ports:
+            - containerPort: 8000
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            timeoutSeconds: 10
+            periodSeconds: 10
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              # Optional: uncomment for P2P RDMA serving
+              # rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              # rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

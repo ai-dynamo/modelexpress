@@ -5,11 +5,13 @@
 
 import json
 import struct
+from types import SimpleNamespace
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 import torch
 
+from modelexpress.accelerators import CudaAcceleratorBackend
 from modelexpress.adapter import EngineAdapter, StrategyFailed
 from modelexpress.load_strategy.context import LoadResult
 
@@ -98,14 +100,18 @@ class TestGdsTransferManager:
     def test_not_available_raises(self):
         with patch("modelexpress.gds_transfer.NIXL_AVAILABLE", False):
             from modelexpress.gds_transfer import GdsTransferManager
-            mgr = GdsTransferManager(agent_name="test")
+            mgr = GdsTransferManager(
+                agent_name="test", accelerator_backend=CudaAcceleratorBackend()
+            )
             with pytest.raises(RuntimeError, match="not available"):
                 mgr.initialize()
 
     def test_batch_load_requires_init(self):
         with patch("modelexpress.gds_transfer.NIXL_AVAILABLE", True):
             from modelexpress.gds_transfer import GdsTransferManager
-            mgr = GdsTransferManager(agent_name="test")
+            mgr = GdsTransferManager(
+                agent_name="test", accelerator_backend=CudaAcceleratorBackend()
+            )
             with pytest.raises(RuntimeError, match="not initialized"):
                 mgr.batch_load_file(0, 100, [], torch.device("cpu"))
 
@@ -135,7 +141,7 @@ class TestParseSafetensorsHeader:
             f.write(header_bytes)
             f.write(b"\x00" * 32)
 
-        loader = MxGdsLoader()
+        loader = MxGdsLoader(CudaAcceleratorBackend())
         parsed = loader._parse_safetensors_header(str(file_path))
         assert "weight" in parsed
         assert parsed["weight"]["dtype"] == "F32"
@@ -186,13 +192,13 @@ class TestResolveSafetensorsFiles:
         }
         (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
 
-        loader = MxGdsLoader()
+        loader = MxGdsLoader(CudaAcceleratorBackend())
         result = loader._resolve_safetensors_files(str(tmp_path))
         assert len(result) == 2
 
     def test_no_files_raises(self, tmp_path):
         from modelexpress.gds_loader import MxGdsLoader
-        loader = MxGdsLoader()
+        loader = MxGdsLoader(CudaAcceleratorBackend())
         with pytest.raises(FileNotFoundError, match=r"No \.safetensors"):
             loader._resolve_safetensors_files(str(tmp_path))
 
@@ -218,6 +224,7 @@ class TestGdsStrategyIntegration:
             return result
 
     def _make_context(self):
+        """Build a CPU load context for GDS strategy tests."""
         from modelexpress.load_strategy import LoadContext
         return LoadContext(
             model_config=MagicMock(),
@@ -225,6 +232,7 @@ class TestGdsStrategyIntegration:
             target_device=torch.device("cpu"),
             global_rank=0,
             worker_rank=0,
+            local_rank=0,
             device_id=0,
             identity=MagicMock(),
             mx_client=MagicMock(),
@@ -254,6 +262,31 @@ class TestGdsStrategyIntegration:
         assert result.model is model
         mock_gds.load_iter.assert_called_once()
         model.load_weights.assert_called_once()
+        mock_gds.shutdown.assert_called_once()
+
+    @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
+    @patch("modelexpress.gds_loader.MxGdsLoader")
+    def test_gds_uses_sglang_model_path(self, mock_gds_cls, _mock_avail):
+        from modelexpress.load_strategy.gds_strategy import GdsStrategy
+
+        mock_gds = MagicMock()
+        mock_gds.load_iter.return_value = iter([("w", torch.zeros(1))])
+        mock_gds_cls.return_value = mock_gds
+
+        ctx = self._make_context()
+        ctx.model_config = SimpleNamespace(
+            model_path="test-sglang-model",
+            revision="test-revision",
+        )
+        ctx.load_config.use_tqdm_on_load = False
+
+        GdsStrategy().load(MagicMock(), ctx)
+
+        mock_gds.load_iter.assert_called_once_with(
+            "test-sglang-model",
+            use_tqdm=False,
+            revision="test-revision",
+        )
         mock_gds.shutdown.assert_called_once()
 
     @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)

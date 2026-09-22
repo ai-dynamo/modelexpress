@@ -14,7 +14,7 @@ use crate::p2p::k8s_types::{
 };
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::{api::core::v1::ConfigMap, apimachinery::pkg::apis::meta::v1::OwnerReference};
 use kube::{
     Client,
     api::{Api, ListParams, Patch, PatchParams, PostParams},
@@ -48,6 +48,30 @@ impl KubernetesBackend {
     /// Get the API handle for ConfigMaps
     fn configmap_api(&self) -> Api<ConfigMap> {
         Api::namespaced(self.client.clone(), &self.namespace)
+    }
+
+    fn pod_owner_references(
+        pod_name: &str,
+        pod_uid: &str,
+        pod_namespace: &str,
+        metadata_namespace: &str,
+    ) -> Option<Vec<OwnerReference>> {
+        if pod_name.is_empty()
+            || pod_uid.is_empty()
+            || pod_namespace.is_empty()
+            || pod_namespace != metadata_namespace
+        {
+            return None;
+        }
+
+        Some(vec![OwnerReference {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            name: pod_name.to_string(),
+            uid: pod_uid.to_string(),
+            controller: Some(false),
+            block_owner_deletion: Some(false),
+        }])
     }
 
     /// Create or update a ConfigMap with tensor descriptors for a worker.
@@ -190,6 +214,9 @@ impl MetadataBackend for KubernetesBackend {
         identity: &SourceIdentity,
         worker_id: &str,
         worker: WorkerMetadata,
+        pod_name: &str,
+        pod_uid: &str,
+        pod_namespace: &str,
     ) -> MetadataResult<()> {
         let source_id = crate::p2p::source_identity::compute_mx_source_id(identity);
         let source_id = source_id.as_str();
@@ -202,6 +229,8 @@ impl MetadataBackend for KubernetesBackend {
 
         // First, ensure the CR exists
         let existing = api.get_opt(&cr_name).await?;
+        let pod_owner_references =
+            Self::pod_owner_references(pod_name, pod_uid, pod_namespace, &self.namespace);
 
         if existing.is_none() {
             let new_cr = ModelMetadata {
@@ -220,6 +249,7 @@ impl MetadataBackend for KubernetesBackend {
                         );
                         labels
                     }),
+                    owner_references: pod_owner_references.clone(),
                     ..Default::default()
                 },
                 spec: ModelMetadataSpec {
@@ -247,6 +277,19 @@ impl MetadataBackend for KubernetesBackend {
 
         // Get CR UID for ownerReferences on ConfigMaps
         let cr = api.get(&cr_name).await?;
+        if let Some(owner_references) = &pod_owner_references
+            && cr.metadata.owner_references.as_ref() != Some(owner_references)
+        {
+            let owner_patch = json!({
+                "metadata": { "ownerReferences": owner_references }
+            });
+            api.patch(
+                &cr_name,
+                &PatchParams::default(),
+                &Patch::Merge(&owner_patch),
+            )
+            .await?;
+        }
         let owner_uid = cr.metadata.uid.as_deref();
         let owner_name = cr.metadata.name.as_deref();
 
@@ -283,6 +326,9 @@ impl MetadataBackend for KubernetesBackend {
             metadata_endpoint: worker_record.metadata_endpoint.clone(),
             agent_name: worker_record.agent_name.clone(),
             worker_grpc_endpoint: worker_record.worker_grpc_endpoint.clone(),
+            accelerator: worker_record.accelerator.clone(),
+            source_load: worker_record.source_load,
+            topology: worker_record.topology.clone(),
             artifact_source: worker_record
                 .artifact_source
                 .clone()
@@ -433,6 +479,9 @@ impl MetadataBackend for KubernetesBackend {
                 metadata_endpoint: worker_status.metadata_endpoint.clone(),
                 agent_name: worker_status.agent_name.clone(),
                 worker_grpc_endpoint: worker_status.worker_grpc_endpoint.clone(),
+                accelerator: worker_status.accelerator.clone(),
+                source_load: worker_status.source_load,
+                topology: worker_status.topology.clone(),
                 artifact_source: worker_status
                     .artifact_source
                     .clone()
@@ -460,6 +509,11 @@ impl MetadataBackend for KubernetesBackend {
             model_name: cr.spec.model_name.clone(),
             workers,
             published_at,
+            // K8s CRD backend doesn't yet round-trip the full SourceIdentity.
+            // v2 RL clients fall back to the sidecar transport (synthetic
+            // TensorDescriptor named __mx_v2_meta__) until the CRD schema is
+            // extended; see modelexpress_client/python/modelexpress/nemo_rl_v2.py.
+            identity: None,
         }))
     }
 
@@ -537,6 +591,25 @@ impl MetadataBackend for KubernetesBackend {
                 })
                 .unwrap_or((0, 0));
 
+            let accelerator = cr
+                .status
+                .as_ref()
+                .and_then(|s| s.worker.as_ref())
+                .map(|w| w.accelerator.clone())
+                .unwrap_or_default();
+            let source_load = cr
+                .status
+                .as_ref()
+                .and_then(|s| s.worker.as_ref())
+                .and_then(|w| w.source_load);
+
+            let topology = cr
+                .status
+                .as_ref()
+                .and_then(|s| s.worker.as_ref())
+                .map(|w| w.topology.clone())
+                .unwrap_or_default();
+
             result.push(super::SourceInstanceInfo {
                 source_id: sid,
                 worker_id: iid,
@@ -544,6 +617,13 @@ impl MetadataBackend for KubernetesBackend {
                 worker_rank,
                 status,
                 updated_at,
+                accelerator,
+                source_load,
+                topology,
+                // The current CRD list shape does not round-trip
+                // SourceIdentity.extra_parameters.
+                training_step: None,
+                layout_signature: None,
             });
         }
 
@@ -643,6 +723,7 @@ impl MetadataBackend for KubernetesBackend {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
+        source_load: Option<f32>,
     ) -> MetadataResult<()> {
         let api = self.model_metadata_api();
         let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
@@ -670,6 +751,7 @@ impl MetadataBackend for KubernetesBackend {
 
             worker.status = status_name.clone();
             worker.updated_at = Some(updated_at_rfc3339.clone());
+            worker.source_load = source_load;
 
             crd_status.update_ready_condition(status as i32);
 
@@ -743,6 +825,7 @@ impl TryFrom<ArtifactSourceMetadataRecord> for ArtifactSourceStatus {
             total_size,
             file_count: record.file_count,
             chunk_count: record.chunk_count,
+            node_rank: record.node_rank,
         })
     }
 }
@@ -766,6 +849,7 @@ impl TryFrom<ArtifactSourceStatus> for ArtifactSourceMetadataRecord {
             total_size,
             file_count: status.file_count,
             chunk_count: status.chunk_count,
+            node_rank: status.node_rank,
         })
     }
 }
@@ -781,6 +865,7 @@ mod tests {
             total_size: i64::MAX as u64 + 1,
             file_count: 1,
             chunk_count: 1,
+            node_rank: 0,
         };
 
         assert!(ArtifactSourceStatus::try_from(record).is_err());
@@ -793,8 +878,54 @@ mod tests {
             total_size: -1,
             file_count: 1,
             chunk_count: 1,
+            node_rank: 0,
         };
 
         assert!(ArtifactSourceMetadataRecord::try_from(status).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn worker_status_topology_survives_serde_round_trip() {
+        // The k8s backend stores WorkerStatus as CR JSON, so a non-empty
+        // topology must survive the round trip. The deployed CRD schema must
+        // also carry status.worker.topology (examples/crds.yaml) or the API
+        // server prunes it.
+        let status = WorkerStatus {
+            topology: std::collections::HashMap::from([
+                ("rack".to_string(), "r3".to_string()),
+                ("block".to_string(), "b1".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status).expect("serialize");
+        let back: WorkerStatus = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.topology, status.topology);
+        assert_eq!(back.topology.get("rack").map(String::as_str), Some("r3"));
+    }
+
+    #[test]
+    fn pod_owner_references_require_complete_same_namespace_identity() {
+        assert!(KubernetesBackend::pod_owner_references("pod-0", "", "ns", "ns").is_none());
+        assert!(KubernetesBackend::pod_owner_references("", "pod-uid", "ns", "ns").is_none());
+        assert!(KubernetesBackend::pod_owner_references("pod-0", "pod-uid", "", "ns").is_none());
+        assert!(
+            KubernetesBackend::pod_owner_references("pod-0", "pod-uid", "other", "ns").is_none()
+        );
+    }
+
+    #[test]
+    fn pod_owner_references_identify_the_publishing_pod() {
+        let Some(owner_references) =
+            KubernetesBackend::pod_owner_references("pod-0", "pod-uid", "ns", "ns")
+        else {
+            panic!("a complete same-namespace pod identity should produce an owner reference");
+        };
+
+        assert_eq!(owner_references.len(), 1);
+        assert_eq!(owner_references[0].api_version, "v1");
+        assert_eq!(owner_references[0].kind, "Pod");
+        assert_eq!(owner_references[0].name, "pod-0");
+        assert_eq!(owner_references[0].uid, "pod-uid");
     }
 }

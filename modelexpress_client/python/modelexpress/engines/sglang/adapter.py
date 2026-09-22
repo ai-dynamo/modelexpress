@@ -6,18 +6,25 @@
 from __future__ import annotations
 
 import copy
+import gc
 import logging
-import os
 import uuid
 from importlib.metadata import version as pkg_version
 from typing import TYPE_CHECKING, Iterator
 
 import torch
 
+from ... import envs
 from ... import p2p_pb2
 from ...adapter import EngineAdapter
+from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
+from ...tensor_utils import (
+    adopt_hidden_tensors,
+    capture_tensor_attrs,
+    collect_module_tensors,
+)
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
 
@@ -40,6 +47,7 @@ class SglangAdapter(EngineAdapter):
         self.model_config = model_config
         self.device_config = device_config
         self.target_device = torch.device(device_config.device)
+        self.accelerator_backend = accelerator_backend_for(self.target_device)
 
     def build_identity(self) -> p2p_pb2.SourceIdentity:
         return build_sglang_source_identity(
@@ -53,6 +61,17 @@ class SglangAdapter(EngineAdapter):
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             return int(torch.distributed.get_rank())
         return self.get_worker_rank()
+
+    def get_local_rank(self) -> int:
+        """Return this worker's rank within its local node."""
+        if not (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        ):
+            return 0
+
+        from sglang.srt import distributed
+
+        return int(distributed.get_world_group().local_rank)
 
     def get_device_id(self) -> int:
         gpu_id = getattr(self.device_config, "gpu_id", None)
@@ -73,13 +92,26 @@ class SglangAdapter(EngineAdapter):
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("SGLang tensor discovery requires result.model")
-        return collect_sglang_tensors(result.model)
+        # capture_tensor_attrs() only promotes bare Tensor attributes assigned
+        # onto Modules (self.w_kc = tensor). Accelerator tensors stashed inside
+        # containers on non-Module objects - dicts, lists, nested dataclasses -
+        # stay invisible to named_parameters()/named_buffers() and so never
+        # reach the manifest. Kimi-K3 is full of them: on the vLLM path the same
+        # scan adopts 553 per rank, 368 of which live in one dict
+        # (Mxfp4MoEMethod._cache_permute_indices, keyed by tuples), plus an
+        # attention-backend workspace buffer. A target that never receives them
+        # runs forward with whatever its own init left behind.
+        #
+        # This adds _mx_* names to the manifest, so source and target must run
+        # the same ModelExpress version; mixing old and new manifests fails
+        # tensor matching.
+        adopt_hidden_tensors(result.model, self.accelerator_backend)
+        return collect_module_tensors(result.model, self.accelerator_backend)
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
-        return self._process_weights_after_loading(result)
-
-    def after_rdma_receive(self, result: LoadResult) -> LoadResult:
-        return self._post_load_weights(result)
+        with capture_tensor_attrs(self.accelerator_backend):
+            result = self._post_load_weights(result)
+            return self._process_weights_after_loading(result)
 
     def apply_weight_iter(
         self,
@@ -88,7 +120,8 @@ class SglangAdapter(EngineAdapter):
     ) -> LoadResult:
         if result.model is None:
             raise RuntimeError("SGLang weight iterator loading requires result.model")
-        result.model.load_weights(weights_iter)
+        with capture_tensor_attrs(self.accelerator_backend):
+            result.model.load_weights(weights_iter)
         return result
 
     def build_model_streamer_weight_iter(
@@ -119,7 +152,8 @@ class SglangAdapter(EngineAdapter):
         return loader._get_all_weights(stream_model_config, model)
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
-        return self._process_weights_after_loading(result)
+        with capture_tensor_attrs(self.accelerator_backend):
+            return self._process_weights_after_loading(result)
 
     def load_via_native(self, result: LoadResult) -> LoadResult:
         if result.model is None:
@@ -132,9 +166,12 @@ class SglangAdapter(EngineAdapter):
         disk_config.load_format = LoadFormat.AUTO
         disk_loader = DefaultModelLoader(disk_config)
         weights_iter = disk_loader._get_all_weights(self.model_config, result.model)
-        DefaultModelLoader.load_weights_and_postprocess(
-            result.model, weights_iter, self.target_device,
-        )
+        # Same capture as the target path so the source publishes the derived
+        # MLA tensors under matching buffer names (symmetric manifest).
+        with capture_tensor_attrs(self.accelerator_backend):
+            DefaultModelLoader.load_weights_and_postprocess(
+                result.model, weights_iter, self.target_device,
+            )
         return result
 
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
@@ -142,26 +179,77 @@ class SglangAdapter(EngineAdapter):
             _get_quantization_config,
             _initialize_model,
         )
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
 
-        old_value = result.value
+        model = result.model
+        if model is None:
+            raise RuntimeError("SGLang retry reinitialization requires result.model")
+        if result.value is not model:
+            raise RuntimeError(
+                "SGLang retry reinitialization requires result.value and "
+                "result.model to reference the same model root"
+            )
+
+        publishable = result.publishable
+        metadata = result.metadata
         result.value = None
         result.model = None
-        del old_value
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+
+        # SGLang's RemoteInstanceModelLoader and MxModelLoader both retain the
+        # root model object while this hook runs. Deleting LoadResult references
+        # cannot release its parameters, so constructing a replacement directly
+        # would temporarily allocate two full models. Preserve the externally
+        # owned root identity, but first turn it into an empty shell so the old
+        # CUDA allocations can be reclaimed before initialization starts.
+        model.__dict__.clear()
+        gc.collect()
+        self.accelerator_backend.empty_cache()
 
         logger.info(
-            "[Worker %s] Re-initializing SGLang model after failed strategy",
+            "[Worker %s] Re-initializing SGLang model state in-place after "
+            "failed strategy",
             self.get_global_rank(),
         )
         quant_config = _get_quantization_config(self.model_config, self.load_config)
-        with self.target_device:
-            model = _initialize_model(
-                self.model_config,
-                self.load_config,
-                quant_config,
-            )
-        return LoadResult(value=model, model=model, publishable=result.publishable)
+        # Match SGLang's initial load path so retry parameters use the model's
+        # configured dtype instead of PyTorch's default float32.
+        try:
+            with set_default_torch_dtype(self.model_config.dtype):
+                with self.target_device:
+                    fresh_model = _initialize_model(
+                        self.model_config,
+                        self.load_config,
+                        quant_config,
+                    )
+            if type(fresh_model) is not type(model):
+                raise RuntimeError(
+                    "SGLang retry initialization returned a different model type: "
+                    f"expected {type(model).__qualname__}, "
+                    f"got {type(fresh_model).__qualname__}"
+                )
+        except BaseException:
+            # The old parameter graph was intentionally released before fresh
+            # initialization and cannot be restored without retaining the HBM
+            # that caused duplicate-model OOM. Restore the envelope to the
+            # engine-owned empty root so callers do not observe None, then let
+            # the original failure abort startup rather than attempting another
+            # strategy with an invalid model.
+            result.value = model
+            result.model = model
+            result.publishable = publishable
+            result.metadata = metadata
+            raise
+
+        # Both roots briefly reference the same new children, so there is still
+        # only one set of parameter storage. The externally owned root remains
+        # valid after the temporary fresh root is dropped.
+        model.__dict__.update(fresh_model.__dict__)
+        del fresh_model
+        result.value = model
+        result.model = model
+        result.publishable = publishable
+        result.metadata = metadata
+        return result
 
     def _process_weights_after_loading(self, result: LoadResult) -> LoadResult:
         if result.model is None:
@@ -187,7 +275,7 @@ class SglangAdapter(EngineAdapter):
         return (
             tp_size > 1
             and self.is_cuda_alike()
-            and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+            and envs.MX_MS_DISTRIBUTED
         )
 
 
@@ -208,37 +296,6 @@ def _call_sglang_post_load_weights(model: torch.nn.Module) -> None:
         post_load_weights = getattr(child, "post_load_weights", None)
         if callable(post_load_weights):
             post_load_weights()
-
-
-def collect_sglang_tensors(model) -> dict[str, torch.Tensor]:
-    """Collect SGLang model parameters for NIXL registration.
-
-    SGLang's current NIXL path registers contiguous parameters directly and
-    registers a byte view of the underlying storage for non-contiguous
-    parameters. Keep that naming behavior so source and target descriptors
-    match the upstream integration.
-    """
-    tensors: dict[str, torch.Tensor] = {}
-    seen_ptrs: set[int] = set()
-
-    for name, param in model.named_parameters():
-        t = param.data
-        if t.is_contiguous():
-            tensor_name = name
-            registered = t
-        else:
-            tensor_name = f"{name}.__storage"
-            registered = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
-                t.untyped_storage()
-            )
-
-        ptr = registered.data_ptr()
-        if ptr in seen_ptrs:
-            continue
-        seen_ptrs.add(ptr)
-        tensors[tensor_name] = registered
-
-    return tensors
 
 
 def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIdentity:
@@ -288,7 +345,7 @@ def _get_quantization(model_config: ModelConfig) -> str:
 
 
 def _get_revision(model_config: ModelConfig) -> str:
-    override = os.environ.get("MX_MODEL_REVISION", "")
+    override = envs.MX_MODEL_REVISION
     if override:
         return override
     return str(getattr(model_config, "revision", "") or "")
@@ -333,6 +390,7 @@ def build_sglang_load_context(
         target_device=adapter.get_target_device(),
         global_rank=global_rank,
         worker_rank=worker_rank,
+        local_rank=adapter.get_local_rank(),
         device_id=adapter.get_device_id(),
         identity=adapter.build_identity(),
         mx_client=create_metadata_client(
@@ -341,4 +399,5 @@ def build_sglang_load_context(
         ),
         worker_id=uuid.uuid4().hex[:8],
         adapter=adapter,
+        accelerator_backend=adapter.accelerator_backend,
     )

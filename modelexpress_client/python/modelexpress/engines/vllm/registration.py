@@ -13,50 +13,12 @@ logger = logging.getLogger(__name__)
 
 
 _PLUGIN_LOAD_FORMATS = ("modelexpress", "mx")
-
-
-def _patch_vllm_s3_format_check() -> None:
-    """Allow ModelExpress load formats for object storage on older vLLM."""
-    try:
-        from vllm.config import VllmConfig
-        from vllm.transformers_utils.runai_utils import is_runai_obj_uri
-    except ImportError:
-        return
-
-    original = VllmConfig.try_verify_and_update_config
-    if getattr(original, "__modelexpress_patched__", False):
-        return
-
-    def patched(self: VllmConfig) -> None:
-        if (
-            self.load_config.load_format in _PLUGIN_LOAD_FORMATS
-            and hasattr(self.model_config, "model_weights")
-            and is_runai_obj_uri(self.model_config.model_weights)
-        ):
-            saved = self.model_config.model_weights
-            del self.model_config.model_weights
-            try:
-                original(self)
-            finally:
-                self.model_config.model_weights = saved
-        else:
-            original(self)
-
-    patched.__modelexpress_patched__ = True
-    VllmConfig.try_verify_and_update_config = patched
-    logger.debug(
-        "Patched VllmConfig.try_verify_and_update_config to allow ModelExpress "
-        "for object storage URIs"
-    )
+_WEIGHT_TRANSFER_BACKEND = "modelexpress"
 
 
 def register_plugin_model_loader() -> None:
     """Register ModelExpress loaders through vLLM's plugin registry."""
     import vllm.model_executor.model_loader as model_loader
-
-    # Older vLLM still needs the plugin registration side effects that used to
-    # happen when importing loader.py directly.
-    _patch_vllm_s3_format_check()
 
     from .loader import MxModelLoader
 
@@ -67,3 +29,26 @@ def register_plugin_model_loader() -> None:
             )
             continue
         register_model_loader(load_format)(MxModelLoader)
+
+
+def register_plugin_weight_transfer_engine() -> None:
+    """Register the ModelExpress backend when vLLM exposes weight transfer."""
+    try:
+        from vllm.distributed.weight_transfer.factory import (
+            WeightTransferEngineFactory,
+        )
+    except ImportError:
+        logger.debug("vLLM does not expose the weight-transfer engine factory")
+        return
+
+    if _WEIGHT_TRANSFER_BACKEND in WeightTransferEngineFactory._registry:
+        logger.debug(
+            "vLLM already provides '%s' weight-transfer registration",
+            _WEIGHT_TRANSFER_BACKEND,
+        )
+        return
+    WeightTransferEngineFactory.register_engine(
+        _WEIGHT_TRANSFER_BACKEND,
+        "modelexpress_rl.inference.engines.vllm.weight_transfer_engine",
+        "ModelExpressWeightTransferEngine",
+    )

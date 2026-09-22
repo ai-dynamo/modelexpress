@@ -97,12 +97,12 @@ spec:
           runAsGroup: 1000
           fsGroup: 1000
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0
+          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.3.0
           imagePullPolicy: IfNotPresent
           env:
             - name: MODEL_EXPRESS_SERVER_PORT
               value: "8000"
-            - name: MODEL_EXPRESS_LOGGING_LEVEL
+            - name: MODEL_EXPRESS_LOG_LEVEL
               value: "info"
             - name: MODEL_EXPRESS_CACHE_DIRECTORY
               value: "/model/.model-express/cache"

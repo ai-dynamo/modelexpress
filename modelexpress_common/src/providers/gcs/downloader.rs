@@ -6,10 +6,10 @@ use super::{
     cache_manifest::{CacheManifest, ManifestEntry},
     download_progress::DownloadProgress,
     download_task::DownloadTask,
-    lock_file::LockFile,
     model_dir::{INTERNAL_METADATA_DIR_NAME, ModelDir},
     model_name::{BucketName, ModelName},
 };
+use crate::providers::lock_file::LockFile;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use futures::stream;

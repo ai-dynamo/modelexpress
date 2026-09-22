@@ -31,13 +31,27 @@ inputs:
     required: false
     default: 'mx-ci'
   vcluster_k8s_version:
-    description: 'Kubernetes version for the vCluster control plane'
+    description: |
+      Kubernetes version for the vCluster control plane. Must be >= the host
+      cluster's minor version. Kubernetes 1.34 added the observedGeneration
+      field on pod conditions; if the host is 1.34+ but the vCluster is 1.33 or
+      older, the vCluster API drops that field and the syncer enters an infinite
+      reconcile loop that keeps overwriting Ready=True with stale data, so pods
+      never surface as Ready (Deployment availableReplicas and Service endpoints
+      stay stuck). Keep this at or above the host minor to match schemas.
     required: false
-    default: 'v1.32.13'
+    default: 'v1.34.10'
   dynamo_ref:
-    description: 'Git ref of the ai-dynamo/dynamo repo to clone for the helm chart'
+    description: |
+      Branch, tag, or commit of ai-dynamo/dynamo to use for the helm chart.
+      Pinned to the `v1.0.2` release tag so the chart matches the operator
+      image tag below. Previously `main`, but that drifted: a re-bootstrap
+      pulled a `main` chart against the `1.0.2` image and the operator's
+      init container crash-looped on the version skew. Keep this and
+      `dynamo_operator_tag` in lockstep — bump both together to a newer
+      published release from https://github.com/ai-dynamo/dynamo/releases.
     required: false
-    default: 'main'
+    default: 'v1.0.2'
   dynamo_operator_image:
     description: |
       Full Dynamo operator image repo (without tag). Defaults to the chart's
@@ -47,12 +61,10 @@ inputs:
     default: 'nvcr.io/nvidia/ai-dynamo/kubernetes-operator'
   dynamo_operator_tag:
     description: |
-      Tag for the Dynamo operator image. Pinned to a known-published
-      release because `dynamo_ref` defaults to `main`, where the chart's
-      AppVersion is a future-version-in-preparation that hasn't been
-      published to nvcr.io/nvidia/ai-dynamo/kubernetes-operator yet. Bump
-      to a newer version from https://github.com/ai-dynamo/dynamo/releases
-      when also bumping `dynamo_ref` to that release tag.
+      Tag for the Dynamo operator image. Matches `dynamo_ref` (v1.0.2) so the
+      chart and image are the same release — a mismatch crash-loops the
+      operator's init container. Bump together with `dynamo_ref` to a newer
+      release from https://github.com/ai-dynamo/dynamo/releases.
     required: false
     default: '1.0.2'
 
@@ -112,6 +124,31 @@ runs:
         echo "::group::Create vCluster ${VCLUSTER_NAME} in ${NAMESPACE}"
         # GPU workloads require syncing host nodes into the vCluster so the GPU
         # device plugin and resource limits are visible to the scheduler.
+        #
+        # Pin the vCluster control-plane pod to the `system` agentpool
+        # (CPU-only, spacious, static — not Karpenter-managed). Per the ops
+        # team, this stops the intermittent Karpenter `Drifted` evictions of
+        # mx-ci-cluster-0 that were killing the control plane mid-run (MX-359):
+        # losing the vCluster mid-test breaks the kubectl port-forward AND
+        # skips per-run cleanup, leaking GPU pods onto the a100b pool. Keeping
+        # the control plane on a static pool removes the disruption at its
+        # source.
+        #
+        # The AKS `system` pool nodes carry the `CriticalAddonsOnly=true`
+        # taint, so the nodeSelector alone leaves the pod Pending
+        # ("untolerated taint {CriticalAddonsOnly: true}"). The matching
+        # toleration below lets it schedule there. operator=Exists avoids
+        # helm coercing the string value "true" into a bool.
+        #
+        # CoreDNS image override (--set controlPlane.coredns.deployment.image):
+        # the CoreDNS tag is coupled to the vCluster k8s version — bumping
+        # VCLUSTER_K8S_VERSION also moves the CoreDNS version vCluster wants
+        # (1.33 -> 1.34 pulls coredns v1.12.0). vCluster's default image path
+        # routes through the `dynamoci` ACR mirror, which 401s on this image, so
+        # CoreDNS never starts and the whole vCluster is DNS-dead. Pin to
+        # registry.k8s.io (anonymous, no mirror auth) to bypass that. Keep this
+        # tag in sync when you bump VCLUSTER_K8S_VERSION across a CoreDNS bump.
+        COREDNS_IMAGE="registry.k8s.io/coredns/coredns:v1.12.0"
         vcluster create ${VCLUSTER_NAME} \
           --namespace ${NAMESPACE} \
           --connect=false \
@@ -119,7 +156,12 @@ runs:
           --set controlPlane.distro.k8s.enabled=true \
           --set controlPlane.distro.k8s.version=${VCLUSTER_K8S_VERSION} \
           --set sync.fromHost.nodes.enabled=true \
-          --set sync.fromHost.nodes.selector.all=true
+          --set sync.fromHost.nodes.selector.all=true \
+          --set 'controlPlane.statefulSet.scheduling.nodeSelector.kubernetes\.azure\.com/agentpool=system' \
+          --set 'controlPlane.statefulSet.scheduling.tolerations[0].key=CriticalAddonsOnly' \
+          --set 'controlPlane.statefulSet.scheduling.tolerations[0].operator=Exists' \
+          --set 'controlPlane.statefulSet.scheduling.tolerations[0].effect=NoSchedule' \
+          --set controlPlane.coredns.deployment.image="${COREDNS_IMAGE}"
         echo "::endgroup::"
 
     - name: Wait for vCluster pod to be ready
@@ -150,7 +192,7 @@ runs:
         # CRD is cluster-scoped — applied once here on bootstrap.
         # run-mx-p2p-test also applies it on every run for idempotency.
         kubectl --kubeconfig="${GITHUB_WORKSPACE}/.kubeconfig-vcluster" apply \
-          -f ci/k8s/server/crd-modelmetadata.yaml
+          -f examples/crds.yaml
         echo "::endgroup::"
 
     - name: Clone dynamo repo for operator helm chart
@@ -161,11 +203,12 @@ runs:
         echo "::group::Clone ai-dynamo/dynamo @ ${DYNAMO_REF} (shallow, sparse)"
         DYNAMO_DIR="${RUNNER_TEMP}/dynamo"
         rm -rf "${DYNAMO_DIR}"
-        git clone --depth 1 --filter=blob:none --sparse \
-          --branch "${DYNAMO_REF}" \
-          https://github.com/ai-dynamo/dynamo.git "${DYNAMO_DIR}"
-        cd "${DYNAMO_DIR}"
-        git sparse-checkout set deploy/helm
+        git init "${DYNAMO_DIR}"
+        git -C "${DYNAMO_DIR}" remote add origin https://github.com/ai-dynamo/dynamo.git
+        git -C "${DYNAMO_DIR}" sparse-checkout init --cone
+        git -C "${DYNAMO_DIR}" sparse-checkout set deploy/helm
+        git -C "${DYNAMO_DIR}" fetch --depth 1 --filter=blob:none origin "${DYNAMO_REF}"
+        git -C "${DYNAMO_DIR}" checkout --detach FETCH_HEAD
         echo "DYNAMO_DIR=${DYNAMO_DIR}" >> "$GITHUB_ENV"
         echo "::endgroup::"
 
@@ -198,7 +241,7 @@ runs:
         # (nvcr.io/nvidia/ai-dynamo/kubernetes-operator) lives under the
         # public `nvidia` NGC org and is pullable anonymously. The
         # `worker-registry` secret used by test pods is created per-run by
-        # the test actions for our private nvcr.io/nvidian/dynamo-dev/*
+        # the test actions for our private nvcr.io/0980761089281446/*
         # images, separately from this operator install.
         kubectl create namespace dynamo-system --dry-run=client -o yaml \
           | kubectl apply -f -

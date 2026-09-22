@@ -89,6 +89,14 @@ modelexpress-cli model download google-t5/t5-small \
   --provider hugging-face \
   --strategy server-only
 
+# Pin a branch, tag, or commit SHA (Hugging Face only). The commit SHA the request
+# resolved to is printed on success, so a frontend and its workers can be held to
+# one revision. A revision that does not exist fails; it never falls back to the
+# default revision.
+modelexpress-cli model download google-t5/t5-small --revision refs/pr/1
+modelexpress-cli model download google-t5/t5-small \
+  --revision df1b051c49625cf57a3d0d8d3863ed4d13564fe4
+
 # Download from Google Cloud Storage
 modelexpress-cli model download gs://my-bucket/models/qwen/rev-1 \
   --provider gcs
@@ -390,14 +398,21 @@ modelexpress-cli model status
 
 ### Configuration File Support
 
-The CLI loads a YAML configuration file via `-c, --config <FILE>` (default
-`~/.model-express/config.yaml`). Values are merged in this order of precedence,
-highest first:
+The CLI loads a YAML configuration file via `-c, --config <FILE>`. With no
+`--config`, it searches these paths in order and uses the first that exists:
+`model-express.yaml` and `model-express.yml` in the working directory, then
+`/etc/model-express/config.yaml` and `/etc/model-express/config.yml`. Values are
+merged in this order of precedence, highest first:
 
 1. Command line arguments
 2. Environment variables (`MODEL_EXPRESS_*`)
 3. Configuration file
 4. Built-in defaults
+
+This client configuration is separate from the cache configuration written by
+`modelexpress-cli model init`, which lives at `~/.model-express/config.yaml` and
+holds the local storage path and server endpoint used by the cache-management
+commands.
 
 ```bash
 modelexpress-cli --config /etc/modelexpress/client.yaml health

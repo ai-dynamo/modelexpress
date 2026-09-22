@@ -1,0 +1,411 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Client-side P2P source selection.
+
+Ranks the compatible READY source workers returned by the metadata backend
+before transfer attempts. The flow is:
+
+    metadata backend -> ListSources(identity, READY) -> filter by worker_rank
+      -> SourceSelector.order(candidates, ctx) -> slice to MAX_SOURCE_RETRIES
+      -> NIXL/RDMA transfer
+
+Selectors order candidates using the live ``LoadContext`` (the same object the
+load strategies already pass around): only a few fields are read
+(``worker_rank``, ``worker_id``, ``identity.model_name``), so there is no
+parallel context type to keep in sync. The annotation is a forward reference to
+avoid importing the load_strategy package at module load.
+
+Phase 1 is stateless: a policy ranks candidates using only the current
+candidate list, the target context, and the configured policy. It keeps no
+global counters, leases, or server-side state. ``random`` preserves today's
+behavior and stays the fallback whenever a non-random policy is misconfigured
+or fails to construct.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import random
+from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
+
+from . import envs, p2p_pb2
+
+if TYPE_CHECKING:
+    from .load_strategy.context import LoadContext
+
+logger = logging.getLogger("modelexpress.source_selection")
+
+# Environment variable that chooses the active policy. Invalid values log a
+# warning and fall back to DEFAULT_SELECTOR.
+ENV_SELECTOR = "MX_P2P_SOURCE_SELECTOR"
+DEFAULT_SELECTOR = "random"
+
+
+@runtime_checkable
+class SourceSelector(Protocol):
+    """Orders compatible candidates into a per-target preference list."""
+
+    name: str
+
+    def order(
+        self,
+        candidates: list[p2p_pb2.SourceInstanceRef],
+        ctx: LoadContext,
+    ) -> list[p2p_pb2.SourceInstanceRef]:
+        ...
+
+
+class ScoredSelector:
+    """Base for stateless policies that assign each candidate a score.
+
+    Subclasses implement ``score``; the base orders by descending score so the
+    top candidate is the winner and the full order is the preference list. Pure
+    and deterministic, which keeps policies tiny and unit-testable.
+    """
+
+    name = "scored"
+
+    def score(
+        self,
+        candidate: p2p_pb2.SourceInstanceRef,
+        ctx: LoadContext,
+    ) -> float:
+        raise NotImplementedError
+
+    def order(
+        self,
+        candidates: list[p2p_pb2.SourceInstanceRef],
+        ctx: LoadContext,
+    ) -> list[p2p_pb2.SourceInstanceRef]:
+        return sorted(
+            candidates,
+            key=lambda c: self.score(c, ctx),
+            reverse=True,
+        )
+
+
+class RandomSelector:
+    """Behavior-preserving default: shuffle candidates with a local RNG.
+
+    Uses a local ``random.Random`` rather than process-global state so it does
+    not perturb other callers. Matches the previous ``random.shuffle`` behavior.
+    """
+
+    name = "random"
+
+    def order(
+        self,
+        candidates: list[p2p_pb2.SourceInstanceRef],
+        ctx: LoadContext,
+    ) -> list[p2p_pb2.SourceInstanceRef]:
+        out = list(candidates)
+        random.Random().shuffle(out)
+        return out
+
+
+def _identity_digest(
+    candidate: p2p_pb2.SourceInstanceRef,
+    ctx: LoadContext,
+) -> int:
+    """Stable 64-bit HRW digest of (target identity, candidate identity).
+
+    Process-independent (blake2b, not Python's salted ``hash()``), so it is
+    stable across restarts and reproducible in tests. Shared by every
+    identity-based policy so they hash the same key.
+    """
+    key = "|".join(
+        str(x)
+        for x in (
+            ctx.identity.model_name,
+            ctx.worker_id,
+            ctx.worker_rank,
+            candidate.mx_source_id,
+            candidate.worker_id,
+            candidate.worker_rank,
+        )
+    )
+    return int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), "big")
+
+
+def _unit_hash(candidate: p2p_pb2.SourceInstanceRef, ctx: LoadContext) -> float:
+    """The rendezvous digest mapped into the unit interval ``[0, 1)``.
+
+    Lets a scored policy blend the identity spread with a bounded load term on
+    the same scale (see ``LoadAwareSelector``).
+    """
+    return _identity_digest(candidate, ctx) / 2**64
+
+
+class RendezvousHashSelector(ScoredSelector):
+    """Stateless deterministic spreading via rendezvous (HRW) hashing.
+
+    Each candidate's score is a stable hash of the target identity and the
+    candidate identity. Ordering by descending score gives each target a
+    deterministic preference list; because the target identity is part of the
+    key, different targets get different first choices, spreading first-choice
+    sources across independently starting targets without a shared counter,
+    server coordination, or new metadata fields.
+
+    Stable across process restarts (uses blake2b, not Python's salted
+    ``hash()``) and across small source-set changes: adding or removing one
+    source perturbs only a fraction of rankings. The distribution is
+    probabilistic, not guaranteed -- with more targets than sources, collisions
+    still occur.
+    """
+
+    name = "rendezvous_hash"
+
+    def score(
+        self,
+        candidate: p2p_pb2.SourceInstanceRef,
+        ctx: LoadContext,
+    ) -> float:
+        return _identity_digest(candidate, ctx)
+
+
+#: Load assumed for a candidate that published no ``source_load`` at all. The
+#: field is ``optional`` on the wire, so "unset" is distinguishable from a
+#: measured 0.0; scoring unset as idle would steer every target toward exactly
+#: the sources whose load the client cannot see (older clients, providers with
+#: no signal). The midpoint neither rewards nor buries them.
+UNKNOWN_LOAD_PRIOR = 0.5
+
+
+class LoadAwareSelector(ScoredSelector):
+    """Load-aware spreading: rendezvous ordering biased away from busy sources.
+
+    ``score = unit_hash(target, candidate) - w_load * source_load``
+
+    ``source_load`` is a source-published estimate in ``[0, 1]`` of how busy
+    that source is, measured by the source about itself and surfaced on the
+    candidate. The default provider reads the source's RDMA NIC utilization
+    (from its own port counters); a runtime provider (e.g. vLLM/SGLang serving
+    load) can supply it instead behind the same field. Subtracting it steers
+    new targets toward sources with spare headroom, so pulling weights does not
+    contend with a source's in-flight inference (e.g. a prefill node streaming
+    KV cache). ``w_load`` comes from ``MX_P2P_LOAD_WEIGHT`` (default 1.0).
+
+    Statelessness is preserved: the load signal is self-described source
+    metadata read off each candidate, not a server-side counter -- so every
+    replica ranks identically and MX servers stay stateless behind a load
+    balancer. A measured load of 0 carries no penalty, so a fleet of idle
+    sources orders exactly as ``rendezvous_hash``. A candidate that published
+    no load at all is different: it scores as ``UNKNOWN_LOAD_PRIOR`` rather
+    than as idle, so in a mixed fleet the sources whose load is invisible
+    (older clients, providers with no signal) neither outrank nor trail the
+    ones that report it. When every candidate is unknown the penalty is a
+    constant and ordering again collapses to ``rendezvous_hash``.
+    """
+
+    name = "load_aware"
+
+    def __init__(self) -> None:
+        self.w_load = envs.MX_P2P_LOAD_WEIGHT
+
+    def score(
+        self,
+        candidate: p2p_pb2.SourceInstanceRef,
+        ctx: LoadContext,
+    ) -> float:
+        # Presence matters: a source with NO reading (older client, or a provider
+        # with no signal) must not outrank one reporting real load, so unknown
+        # ranks as a neutral prior rather than as idle. A measured 0.0 still gets
+        # the full bonus. Objects without presence tracking (tests, old servers)
+        # count as unknown.
+        has_field = getattr(candidate, "HasField", None)
+        try:
+            known = bool(has_field("source_load")) if has_field else False
+        except (ValueError, TypeError):
+            known = False
+        if known:
+            load = min(1.0, max(0.0, candidate.source_load))
+        else:
+            load = UNKNOWN_LOAD_PRIOR
+        return _unit_hash(candidate, ctx) - self.w_load * load
+
+
+class TopologyAwareSelector(ScoredSelector):
+    """Locality-first spreading: prefer sources in the narrowest shared RDMA domain.
+
+    ``score = (shared_depth, tiebreak)``. ``shared_depth`` is the index of the
+    narrowest topology level (broad -> narrow) at which the target and the
+    candidate share a domain value; ``order()`` sorts by descending score, so the
+    closest source wins and the tiebreak only decides among equidistant peers.
+    Because MX P2P is NIXL over RDMA between replicas on different nodes, the
+    relevant locality is the inter-node RDMA fabric -- same rack (one leaf hop)
+    -> same block (spine group) -> same datacenter -> cross-datacenter. The level
+    hierarchy is not hard-coded: it comes from ``MX_P2P_TOPOLOGY_LEVELS``, the
+    ordered Grove ``ClusterTopology`` (``clustertopologies.grove.io``)
+    ``spec.levels`` domains, and the per-source values from each candidate's
+    published ``topology`` metadata -- so MX consumes the same node-label
+    topology Grove/Dynamo already define rather than inventing its own.
+
+    The ``tiebreak`` is the rendezvous jitter, so peers in the same tier still
+    spread instead of piling onto the one nearest source. When no levels are
+    configured, this node has no topology, or nothing is shared, ``shared_depth``
+    is constant and ordering collapses exactly to that jitter (rendezvous order)
+    -- never worse than the deterministic baseline. NVLink is intentionally not
+    modeled: co-located source/target replicas let NIXL auto-select the NVLink
+    backend, so the selector need not.
+
+    Composes with load-aware selection without depending on it: when the
+    within-tier load weight is > 0 the tiebreak becomes ``unit_hash - w *
+    source_load`` (``source_load`` read defensively off the candidate), so within
+    a locality tier it also steers away from busy sources. The weight is
+    ``MX_P2P_TOPOLOGY_LOAD_WEIGHT`` when set, else it falls back to the load_aware
+    weight ``MX_P2P_LOAD_WEIGHT`` when that feature is deployed -- so a single
+    knob turns both on together. With the weight at 0 (default) the tiebreak is
+    the pure jitter and the selector needs nothing from the load-aware feature.
+    """
+
+    name = "topology_aware"
+
+    def __init__(self) -> None:
+        import math
+        import os
+
+        from . import envs
+        from .topology import local_topology, resolve_levels
+
+        self._levels = resolve_levels()
+        self._local = local_topology()
+        # Within-tier load blend weight. Use MX_P2P_TOPOLOGY_LOAD_WEIGHT when it
+        # is set; otherwise fall back to the load_aware weight MX_P2P_LOAD_WEIGHT
+        # when that feature is deployed, so a single knob turns on both
+        # topology- and load-aware selection together. Default 0 (pure topology).
+        # Key the fallback on the operator having SET MX_P2P_LOAD_WEIGHT, not on
+        # the load_aware feature's compiled-in default: that default is 1.0, so
+        # reading it through envs would turn the blend on silently the moment
+        # both features ship together, and this class documents 0 as default.
+        if os.environ.get("MX_P2P_TOPOLOGY_LOAD_WEIGHT") is not None:
+            w = envs.MX_P2P_TOPOLOGY_LOAD_WEIGHT
+        elif os.environ.get("MX_P2P_LOAD_WEIGHT") is not None:
+            w = getattr(envs, "MX_P2P_LOAD_WEIGHT", 0.0)
+        else:
+            w = 0.0
+        self.w_load = (
+            w if isinstance(w, (int, float)) and math.isfinite(w) and w >= 0.0 else 0.0
+        )
+
+    def _unit_hash(
+        self,
+        candidate: p2p_pb2.SourceInstanceRef,
+        ctx: LoadContext,
+    ) -> float:
+        """Rendezvous digest for (target, candidate), mapped into ``[0, 1)``."""
+        key = "|".join(
+            str(x)
+            for x in (
+                ctx.identity.model_name,
+                ctx.worker_id,
+                ctx.worker_rank,
+                candidate.mx_source_id,
+                candidate.worker_id,
+                candidate.worker_rank,
+            )
+        )
+        digest = hashlib.blake2b(key.encode(), digest_size=8).digest()
+        return int.from_bytes(digest, "big") / 2**64
+
+    def _shared_depth(self, source_topology: dict[str, str]) -> int:
+        """Depth of the shared hierarchical prefix between target and source.
+
+        Later level = narrower = closer; -1 when nothing is shared. Levels are
+        a hierarchy, so matching stops at the first level where the two
+        disagree: a source in another block that happens to reuse this rack's
+        label is not rack-adjacent, and must not outrank a source that shares
+        the block. Domain values are only unique within their parent level.
+        """
+        depth = -1
+        for i, level in enumerate(self._levels):
+            local_value = self._local.get(level)
+            source_value = source_topology.get(level)
+            if local_value is None and source_value is None:
+                continue  # neither side reports this level: no information
+            if local_value != source_value:
+                break  # present on one side only, or present and different
+            depth = i
+        return depth
+
+    def score(  # type: ignore[override]
+        self,
+        candidate: p2p_pb2.SourceInstanceRef,
+        ctx: LoadContext,
+    ) -> tuple[int, float]:
+        # Read defensively so old servers / non-topology candidates degrade to
+        # rendezvous ordering rather than raising.
+        raw = getattr(candidate, "topology", None)
+        source_topology = dict(raw) if raw else {}
+        depth = self._shared_depth(source_topology)
+        tiebreak = self._unit_hash(candidate, ctx)
+        if self.w_load > 0.0:
+            load = min(1.0, max(0.0, getattr(candidate, "source_load", 0.0)))
+            tiebreak -= self.w_load * load
+        return (depth, tiebreak)
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+# A policy registers a factory by name so adding one does not touch the RDMA
+# strategy. Factories are context-free: the per-target signal flows in through
+# the LoadContext passed to order(), not through construction.
+SelectorFactory = Callable[[], SourceSelector]
+
+SELECTORS: dict[str, SelectorFactory] = {}
+
+
+def register_selector(name: str, factory: SelectorFactory) -> None:
+    """Register a selector factory under ``name`` (last registration wins)."""
+    SELECTORS[name] = factory
+
+
+register_selector("random", lambda: RandomSelector())
+register_selector("rendezvous_hash", lambda: RendezvousHashSelector())
+register_selector("load_aware", lambda: LoadAwareSelector())
+register_selector("topology_aware", lambda: TopologyAwareSelector())
+
+
+def get_selector(name: str) -> SourceSelector:
+    """Resolve a policy name to a selector instance.
+
+    Unknown names, or factories that raise, log a warning and fall back to
+    ``random`` so a misconfiguration never blocks loading.
+    """
+    factory = SELECTORS.get(name)
+    if factory is None:
+        logger.warning(
+            "Unknown P2P source selector %r, falling back to %r. Known: %s",
+            name,
+            DEFAULT_SELECTOR,
+            sorted(SELECTORS),
+        )
+        return SELECTORS[DEFAULT_SELECTOR]()
+    try:
+        return factory()
+    except Exception as e:  # defensive: a broken factory must not block loading
+        logger.warning(
+            "Failed to construct P2P source selector %r (%s), falling back to %r",
+            name,
+            e,
+            DEFAULT_SELECTOR,
+        )
+        return SELECTORS[DEFAULT_SELECTOR]()
+
+
+def get_configured_selector() -> SourceSelector:
+    """Resolve the selector named by ``MX_P2P_SOURCE_SELECTOR`` (default random)."""
+    return get_selector(envs.MX_P2P_SOURCE_SELECTOR or DEFAULT_SELECTOR)
+
+
+def configured_policy_label() -> str:
+    """Resolved policy name for metric/label use, matching get_selector.
+
+    Resolves through the same registry path selection uses, including the
+    fallback to ``random`` when the configured policy is unknown *or* its factory
+    raises -- so emitted labels never claim a policy that did not actually run.
+    """
+    return get_configured_selector().name

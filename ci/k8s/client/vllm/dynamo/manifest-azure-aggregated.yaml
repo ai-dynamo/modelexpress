@@ -40,7 +40,7 @@
 #   WORKER_IMAGE       — image built from ci/k8s/client/vllm/dynamo/Dockerfile
 #                        (dynamo vllm-runtime + modelexpress client)
 #   MX_SERVER_IMAGE    — image built from ci/k8s/server/Dockerfile.server
-#                        (our own MX server, not a published release image)
+#                        (our own MX server, not the public nvcr.io/0.3.0)
 
 ---
 # apiVersion: nvidia.com/v1alpha1 is deprecated in favor of v1beta1, but the
@@ -153,6 +153,18 @@ spec:
           custom:
             rdma/ib: "1"
       envs:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         - name: VLLM_PLUGINS
           value: "modelexpress"
         - name: MX_SERVER_ADDRESS
@@ -217,7 +229,7 @@ spec:
             - --model
             - "${MX_CI_MODEL}"
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "1"
             - --trust-remote-code

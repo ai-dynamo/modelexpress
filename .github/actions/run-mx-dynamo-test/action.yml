@@ -118,12 +118,9 @@ runs:
         echo "::group::Create namespace ${NAMESPACE} and install prerequisites"
         kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
 
-        # ModelExpress CRD (ModelMetadata). Cluster-scoped — idempotent,
-        # safe to re-apply on every run. Same file used by the row-1 P2P
-        # action — staying consistent with the rest of CI rather than
-        # pulling in examples/crds.yaml (which also includes ModelCacheEntry,
-        # not needed for the P2P transfer path).
-        kubectl apply -f ci/k8s/server/crd-modelmetadata.yaml
+        # ModelExpress CRDs are cluster-scoped and safe to re-apply. Use the
+        # same canonical manifest documented for non-Helm installations.
+        kubectl apply -f examples/crds.yaml
 
         # RBAC scoped to this namespace. Same file used by the row-1 P2P test;
         # creates the `modelexpress` ServiceAccount + Role + RoleBinding that

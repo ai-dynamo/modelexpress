@@ -7,6 +7,8 @@
 //! All state — model metadata and source status — is persisted to the backend,
 //! making the server stateless and horizontally scalable.
 
+use crate::metrics::backend::{BackendMetrics, Store};
+use crate::p2p::backend::instrumented::InstrumentedMetadataBackend;
 use crate::p2p::backend::{BackendConfig, MetadataBackend, MetadataResult, create_backend};
 use modelexpress_common::grpc::p2p::{SourceIdentity, WorkerMetadata};
 use std::sync::Arc;
@@ -26,6 +28,7 @@ pub use crate::p2p::backend::{
 pub struct P2pStateManager {
     backend: Arc<RwLock<Option<Arc<dyn MetadataBackend>>>>,
     config: Option<BackendConfig>,
+    metrics: Option<BackendMetrics>,
 }
 
 impl P2pStateManager {
@@ -34,7 +37,43 @@ impl P2pStateManager {
         Self {
             backend: Arc::new(RwLock::new(None)),
             config: Some(config),
+            metrics: None,
         }
+    }
+
+    /// Record backend operations against `metrics`.
+    ///
+    /// Opt-in rather than a `with_config` parameter so the call sites that do not
+    /// care -- tests, and anything constructing a manager outside `run_server` --
+    /// are unchanged. Without it the backend is used bare.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: BackendMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Build the backend for `config`, wrapping it in the metrics decorator when
+    /// one is configured.
+    ///
+    /// Both connection paths route through here. Wrapping inside `create_backend`
+    /// instead would also instrument the direct-construction integration tests.
+    async fn build_backend(
+        &self,
+        config: BackendConfig,
+    ) -> MetadataResult<Arc<dyn MetadataBackend>> {
+        let Some(metrics) = self.metrics.clone() else {
+            return create_backend(config).await;
+        };
+        // The connect is timed around the factory rather than through the
+        // decorator's own `connect` forward. `create_backend` connects the
+        // concrete backend before returning it, so by the time there is anything
+        // to wrap the connection has already happened -- and this is not a
+        // startup-only path: `get_backend` reconnects lazily, so a flapping
+        // backend shows up here as repeated `connect` failures.
+        let backend = metrics
+            .time(Store::P2p, "connect", create_backend(config))
+            .await?;
+        Ok(InstrumentedMetadataBackend::wrap(backend, metrics))
     }
 
     /// Inject a pre-built backend directly (test only).
@@ -43,6 +82,7 @@ impl P2pStateManager {
         Self {
             backend: Arc::new(RwLock::new(Some(backend))),
             config: None,
+            metrics: None,
         }
     }
 
@@ -53,7 +93,7 @@ impl P2pStateManager {
         )?;
 
         let backend_name = config.to_string();
-        let backend = create_backend(config).await?;
+        let backend = self.build_backend(config).await?;
         let mut guard = self.backend.write().await;
         *guard = Some(backend);
 
@@ -79,7 +119,7 @@ impl P2pStateManager {
             "MX_METADATA_BACKEND is not set or invalid. Set it to 'redis' or 'kubernetes'.",
         )?;
 
-        let backend = create_backend(config.clone()).await?;
+        let backend = self.build_backend(config.clone()).await?;
         info!("P2pStateManager connected with {:?}", config);
         *guard = Some(backend.clone());
         Ok(backend)
@@ -95,10 +135,20 @@ impl P2pStateManager {
         identity: &SourceIdentity,
         worker_id: &str,
         worker: WorkerMetadata,
+        pod_name: &str,
+        pod_uid: &str,
+        pod_namespace: &str,
     ) -> MetadataResult<()> {
         self.get_backend()
             .await?
-            .publish_metadata(identity, worker_id, worker)
+            .publish_metadata(
+                identity,
+                worker_id,
+                worker,
+                pod_name,
+                pod_uid,
+                pod_namespace,
+            )
             .await
     }
 
@@ -123,6 +173,31 @@ impl P2pStateManager {
         self.get_backend()
             .await?
             .list_workers(source_id, status_filter)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_workers_filtered(
+        &self,
+        source_id: Option<String>,
+        status_filter: Option<modelexpress_common::grpc::p2p::SourceStatus>,
+        model_name_filter: Option<String>,
+        worker_rank_filter: Option<u32>,
+        min_training_step: Option<u64>,
+        min_updated_at: Option<i64>,
+        limit: Option<usize>,
+    ) -> MetadataResult<Vec<crate::p2p::backend::SourceInstanceInfo>> {
+        self.get_backend()
+            .await?
+            .list_workers_filtered(
+                source_id,
+                status_filter,
+                model_name_filter,
+                worker_rank_filter,
+                min_training_step,
+                min_updated_at,
+                limit,
+            )
             .await
     }
 
@@ -155,11 +230,19 @@ impl P2pStateManager {
         worker_id: &str,
         worker_rank: u32,
         status: modelexpress_common::grpc::p2p::SourceStatus,
+        source_load: Option<f32>,
     ) -> MetadataResult<()> {
         let updated_at = chrono::Utc::now().timestamp_millis();
         self.get_backend()
             .await?
-            .update_status(source_id, worker_id, worker_rank, status, updated_at)
+            .update_status(
+                source_id,
+                worker_id,
+                worker_rank,
+                status,
+                updated_at,
+                source_load,
+            )
             .await?;
 
         debug!(
@@ -182,7 +265,7 @@ mod tests {
 
     fn test_identity() -> SourceIdentity {
         SourceIdentity {
-            mx_version: "0.5.0".to_string(),
+            mx_version: "0.7.0".to_string(),
             mx_source_type: MxSourceType::Weights as i32,
             model_name: "my-model".to_string(),
             backend_framework: 1,
@@ -309,6 +392,7 @@ mod tests {
                 total_size: 1024,
                 file_count: 2,
                 chunk_count: 4,
+                node_rank: 0,
             })),
             ..Default::default()
         };
@@ -421,6 +505,9 @@ mod tests {
                     metadata_endpoint: String::new(),
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
+                    accelerator: String::new(),
+                    source_load: None,
+                    topology: Default::default(),
                     artifact_source: None,
                 },
                 WorkerRecord {
@@ -438,10 +525,14 @@ mod tests {
                     metadata_endpoint: String::new(),
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
+                    accelerator: String::new(),
+                    source_load: None,
+                    topology: Default::default(),
                     artifact_source: None,
                 },
             ],
             published_at: 1234567890,
+            identity: None,
         };
 
         assert_eq!(record.model_name, "meta-llama/Llama-3.1-70B");
@@ -454,14 +545,19 @@ mod tests {
     async fn test_publish_metadata_calls_backend() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
-            .withf(|identity, worker_id, worker| {
-                identity.model_name == "my-model"
-                    && identity.tensor_parallel_size == 8
-                    && worker_id == "a1b2c3d4"
-                    && worker.worker_rank == 3
-            })
+            .withf(
+                |identity, worker_id, worker, pod_name, pod_uid, pod_namespace| {
+                    identity.model_name == "my-model"
+                        && identity.tensor_parallel_size == 8
+                        && worker_id == "a1b2c3d4"
+                        && worker.worker_rank == 3
+                        && pod_name == "vllm-worker-0"
+                        && pod_uid == "pod-uid-1"
+                        && pod_namespace == "default"
+                },
+            )
             .once()
-            .returning(|_, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         manager
@@ -475,6 +571,9 @@ mod tests {
                     updated_at: 0,
                     ..Default::default()
                 },
+                "vllm-worker-0",
+                "pod-uid-1",
+                "default",
             )
             .await
             .expect("publish_metadata failed");
@@ -485,12 +584,19 @@ mod tests {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
             .once()
-            .returning(|_, _, _| Err("storage unavailable".into()));
+            .returning(|_, _, _, _, _, _| Err("storage unavailable".into()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         assert!(
             manager
-                .publish_metadata(&test_identity(), "a1b2c3d4", WorkerMetadata::default())
+                .publish_metadata(
+                    &test_identity(),
+                    "a1b2c3d4",
+                    WorkerMetadata::default(),
+                    "",
+                    "",
+                    "",
+                )
                 .await
                 .is_err()
         );
@@ -501,6 +607,7 @@ mod tests {
         let manager = P2pStateManager {
             backend: Arc::new(RwLock::new(None)),
             config: None,
+            metrics: None,
         };
         assert!(manager.connect().await.is_err());
     }
@@ -515,13 +622,20 @@ mod tests {
                 eq(2u32),
                 eq(SourceStatus::Ready),
                 mockall::predicate::always(),
+                eq(Some(0.5f32)),
             )
             .once()
-            .returning(|_, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         manager
-            .update_worker_status("abc123def456abcd", "test-instance", 2, SourceStatus::Ready)
+            .update_worker_status(
+                "abc123def456abcd",
+                "test-instance",
+                2,
+                SourceStatus::Ready,
+                Some(0.5),
+            )
             .await
             .expect("update_worker_status failed");
     }
@@ -531,12 +645,18 @@ mod tests {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()
             .once()
-            .returning(|_, _, _, _, _| Err("redis unavailable".into()));
+            .returning(|_, _, _, _, _, _| Err("redis unavailable".into()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         assert!(
             manager
-                .update_worker_status("abc123def456abcd", "test-instance", 0, SourceStatus::Ready)
+                .update_worker_status(
+                    "abc123def456abcd",
+                    "test-instance",
+                    0,
+                    SourceStatus::Ready,
+                    None
+                )
                 .await
                 .is_err()
         );
@@ -559,6 +679,11 @@ mod tests {
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
+                    accelerator: "cuda".to_string(),
+                    source_load: None,
+                    topology: Default::default(),
+                    training_step: None,
+                    layout_signature: None,
                 }])
             });
 
@@ -629,18 +754,26 @@ mod tests {
     async fn test_update_worker_status_stores_correct_status() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()
-            .withf(|source_id, worker_id, worker_rank, status, _updated_at| {
-                source_id == "abc123def456abcd"
-                    && worker_id == "test-instance"
-                    && *worker_rank == 7
-                    && *status == SourceStatus::Ready
-            })
+            .withf(
+                |source_id, worker_id, worker_rank, status, _updated_at, _nic| {
+                    source_id == "abc123def456abcd"
+                        && worker_id == "test-instance"
+                        && *worker_rank == 7
+                        && *status == SourceStatus::Ready
+                },
+            )
             .once()
-            .returning(|_, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         manager
-            .update_worker_status("abc123def456abcd", "test-instance", 7, SourceStatus::Ready)
+            .update_worker_status(
+                "abc123def456abcd",
+                "test-instance",
+                7,
+                SourceStatus::Ready,
+                None,
+            )
             .await
             .expect("update_worker_status failed");
     }

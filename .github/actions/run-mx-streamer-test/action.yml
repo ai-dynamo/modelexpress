@@ -3,9 +3,10 @@
 
 name: 'Run ModelExpress Model Streamer Test'
 description: |
-  Standalone model-streamer CI test. Runs a single vLLM pod via Docker on a
+  Standalone model-streamer CI test. Runs a single inference server via Docker on a
   GPU runner — no vCluster, no mx-server, no P2P. Exercises the
-  runai-model-streamer path by streaming safetensors directly from S3.
+  runai-model-streamer path by streaming safetensors directly from S3, or
+  verifies fallback to HuggingFace when S3 streaming fails.
 
   Pre-run setup (one-time): downloads the model safetensors from HuggingFace
   and uploads to S3 if not already present. Subsequent runs skip the upload.
@@ -17,8 +18,11 @@ description: |
   into the Docker container so boto3 can assume the role.
 
 inputs:
+  framework:
+    description: 'Inference framework to launch (vllm or sglang)'
+    required: true
   worker_image:
-    description: 'Fully-qualified vLLM worker image (built from ci/k8s/client/vllm/Dockerfile)'
+    description: 'Fully-qualified worker image for the selected framework'
     required: true
   model:
     description: 'HuggingFace model id — used for architecture config and as the upload/download target'
@@ -32,7 +36,7 @@ inputs:
     required: false
     default: 'us-east-1'
   port:
-    description: 'Port the vLLM server listens on inside the container'
+    description: 'Port the inference server listens on inside the container'
     required: false
     default: '18888'
   streamer_concurrency:
@@ -47,6 +51,10 @@ inputs:
     description: 'HuggingFace token — only required for gated models. Ignored when empty (public models work without it).'
     required: false
     default: ''
+  test_model_streamer_fallback:
+    description: 'Test Model Streamer fallback to the default loader when S3 streaming fails'
+    required: false
+    default: 'false'
 
 runs:
   using: "composite"
@@ -57,6 +65,7 @@ runs:
         python-version: "3.12"
 
     - name: Populate S3 model cache (upload safetensors if missing)
+      if: inputs.test_model_streamer_fallback == 'false'
       shell: bash
       env:
         MODEL: ${{ inputs.model }}
@@ -132,20 +141,24 @@ runs:
                 print(f"Upload verified: {len(uploaded)} file(s).")
         EOF
 
-    - name: Start vLLM container with model streamer
+    - name: Prepare model streamer launch
       shell: bash
       env:
-        WORKER_IMAGE: ${{ inputs.worker_image }}
+        FRAMEWORK: ${{ inputs.framework }}
         MODEL: ${{ inputs.model }}
         S3_BUCKET: ${{ inputs.s3_bucket }}
-        S3_REGION: ${{ inputs.s3_region }}
         PORT: ${{ inputs.port }}
         STREAMER_CONCURRENCY: ${{ inputs.streamer_concurrency }}
+        TEST_MODEL_STREAMER_FALLBACK: ${{ inputs.test_model_streamer_fallback }}
       run: |
         set -euo pipefail
         [[ "${PORT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: port must be a positive integer, got '${PORT}'"; exit 1; }
         [[ "${STREAMER_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: streamer_concurrency must be a positive integer, got '${STREAMER_CONCURRENCY}'"; exit 1; }
+        [[ "${FRAMEWORK}" = "vllm" || "${FRAMEWORK}" = "sglang" ]] || { echo "ERROR: unsupported framework '${FRAMEWORK}'"; exit 1; }
         MODEL_S3_URI="s3://${S3_BUCKET}/models/${MODEL}"
+        if [ "${TEST_MODEL_STREAMER_FALLBACK}" = "true" ]; then
+          MODEL_S3_URI="s3://${S3_BUCKET}/mx-ci-s3-fallback/missing/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${MODEL}"
+        fi
 
         # IRSA credentials don't auto-propagate into child containers. The EKS
         # runner pod gets AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE wired in,
@@ -153,14 +166,25 @@ runs:
         # the role ARN as -e and mount the OIDC token file in as a volume.
         # boto3 inside the container then does its own sts:AssumeRoleWithWebIdentity.
         IRSA_TOKEN="${AWS_WEB_IDENTITY_TOKEN_FILE:-/var/run/secrets/eks.amazonaws.com/serviceaccount/token}"
+        echo "MODEL_S3_URI=${MODEL_S3_URI}" >> "$GITHUB_ENV"
+        echo "IRSA_TOKEN=${IRSA_TOKEN}" >> "$GITHUB_ENV"
 
-        # `--entrypoint python3` overrides the image's ENTRYPOINT (which is
-        # the `vllm` multi-command CLI in vllm 0.17+). Without this override
-        # the args below get passed AS args to `vllm`, which doesn't recognize
-        # `-m vllm.entrypoints.openai.api_server` and errors out. The K8s
-        # manifests (e.g. ci/k8s/client/vllm/manifest-azure.yaml) get this
-        # for free because `command:` overrides ENTRYPOINT implicitly;
-        # `docker run` doesn't, so we have to be explicit.
+    - name: Start vLLM container with model streamer
+      if: inputs.framework == 'vllm'
+      shell: bash
+      env:
+        WORKER_IMAGE: ${{ inputs.worker_image }}
+        MODEL: ${{ inputs.model }}
+        S3_REGION: ${{ inputs.s3_region }}
+        PORT: ${{ inputs.port }}
+        STREAMER_CONCURRENCY: ${{ inputs.streamer_concurrency }}
+        TEST_MODEL_STREAMER_FALLBACK: ${{ inputs.test_model_streamer_fallback }}
+      run: |
+        set -euo pipefail
+        MODEL_ARG="${MODEL_S3_URI}"
+        if [ "${TEST_MODEL_STREAMER_FALLBACK}" = "true" ]; then
+          MODEL_ARG="${MODEL}"
+        fi
         CONTAINER_ID=$(docker run -d --gpus all --ipc=host \
           --entrypoint python3 \
           -e AWS_ROLE_ARN="${AWS_ROLE_ARN}" \
@@ -173,28 +197,75 @@ runs:
           -p "${PORT}:${PORT}" \
           "${WORKER_IMAGE}" \
           -m vllm.entrypoints.openai.api_server \
-            --model "${MODEL}" \
-            --load-format mx \
+            --model "${MODEL_ARG}" \
+            --served-model-name "${MODEL}" \
+            --hf-config-path "${MODEL}" \
+            --tokenizer "${MODEL}" \
+            --load-format modelexpress \
             --port "${PORT}")
         echo "Container: ${CONTAINER_ID}"
-        # Persist CONTAINER_ID for subsequent steps in this composite action.
         echo "CONTAINER_ID=${CONTAINER_ID}" >> "$GITHUB_ENV"
 
-    - name: Wait for model streamer to complete
+    - name: Start SGLang container with model streamer
+      if: inputs.framework == 'sglang'
+      shell: bash
+      env:
+        WORKER_IMAGE: ${{ inputs.worker_image }}
+        MODEL: ${{ inputs.model }}
+        S3_REGION: ${{ inputs.s3_region }}
+        PORT: ${{ inputs.port }}
+        STREAMER_CONCURRENCY: ${{ inputs.streamer_concurrency }}
+      run: |
+        set -euo pipefail
+        # Keep SGLang's model path on the Hugging Face id. Passing the S3 URI
+        # here selects SGLang's native runai_streamer loader and bypasses MX.
+        CONTAINER_ID=$(docker run -d --gpus all --ipc=host \
+          --entrypoint python3 \
+          -e AWS_ROLE_ARN="${AWS_ROLE_ARN}" \
+          -e AWS_WEB_IDENTITY_TOKEN_FILE="/var/run/secrets/eks-token" \
+          -v "${IRSA_TOKEN}:/var/run/secrets/eks-token:ro" \
+          -e AWS_DEFAULT_REGION="${S3_REGION}" \
+          -e MX_MODEL_URI="${MODEL_S3_URI}" \
+          -e RUNAI_STREAMER_CONCURRENCY="${STREAMER_CONCURRENCY}" \
+          -p "${PORT}:${PORT}" \
+          "${WORKER_IMAGE}" \
+          -m sglang.launch_server \
+            --model-path "${MODEL}" \
+            --served-model-name "${MODEL}" \
+            --load-format remote_instance \
+            --remote-instance-weight-loader-backend modelexpress \
+            --modelexpress-config '{"transport":"nixl"}' \
+            --dtype bfloat16 \
+            --disable-cuda-graph \
+            --disable-piecewise-cuda-graph \
+            --host 0.0.0.0 \
+            --port "${PORT}")
+        echo "Container: ${CONTAINER_ID}"
+        echo "CONTAINER_ID=${CONTAINER_ID}" >> "$GITHUB_ENV"
+
+    - name: Wait for model load to complete
       shell: bash
       env:
         LOAD_TIMEOUT: ${{ inputs.load_timeout_seconds }}
+        TEST_MODEL_STREAMER_FALLBACK: ${{ inputs.test_model_streamer_fallback }}
       run: |
         set -euo pipefail
         [[ "${LOAD_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: load_timeout_seconds must be a positive integer, got '${LOAD_TIMEOUT}'"; exit 1; }
         deadline=$((SECONDS + LOAD_TIMEOUT))
         while [ $SECONDS -lt $deadline ]; do
-          if docker logs "${CONTAINER_ID}" 2>&1 | grep -q "Model streamer weight loading complete"; then
+          LOGS="$(docker logs "${CONTAINER_ID}" 2>&1)"
+          if [ "${TEST_MODEL_STREAMER_FALLBACK}" = "true" ]; then
+            if echo "${LOGS}" | grep -q "Strategy model_streamer failed" \
+              && echo "${LOGS}" | grep -q "Weights loaded from disk"; then
+              echo "Model streamer fallback to default loader confirmed."
+              exit 0
+            fi
+          elif echo "${LOGS}" | grep -q "Model streamer weight loading complete"; then
             echo "Model streamer loading confirmed."
             exit 0
           fi
           if [ "$(docker inspect "${CONTAINER_ID}" --format '{{.State.Running}}')" != "true" ]; then
-            echo "ERROR: container exited before model streamer completed."
+            echo "ERROR: container exited before model loading completed."
             docker logs "${CONTAINER_ID}" 2>&1 | tail -80
             exit 1
           fi
@@ -202,7 +273,7 @@ runs:
           sleep 10
         done
 
-        echo "ERROR: model streamer did not complete within ${LOAD_TIMEOUT}s."
+        echo "ERROR: model loading did not complete within ${LOAD_TIMEOUT}s."
         docker logs "${CONTAINER_ID}" 2>&1 | tail -80
         exit 1
 

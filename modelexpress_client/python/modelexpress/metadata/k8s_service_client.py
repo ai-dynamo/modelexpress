@@ -41,14 +41,13 @@ object is the source list, maintained by K8s based on pod readiness.
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 import grpc
 
-from .. import p2p_pb2
+from .. import envs
+from .. import p2p_pb2, p2p_pb2_grpc
 from .payload import tensor_source_metadata
-from .. import p2p_pb2_grpc
 from ..client import MxClientBase
 from .source_id import compute_mx_source_id
 
@@ -78,16 +77,14 @@ class MxK8sServiceClient(MxClientBase):
         backoff_seconds: float | None = None,
     ):
         self._worker_rank = worker_rank
-        self._service_pattern = service_pattern or os.environ.get(
-            "MX_K8S_SERVICE_PATTERN", _DEFAULT_SERVICE_PATTERN,
-        )
-        env_retries = os.environ.get("MX_K8S_SOURCE_RETRIES", "")
+        self._service_pattern = service_pattern or envs.MX_K8S_SERVICE_PATTERN
+        env_retries = envs.MX_K8S_SOURCE_RETRIES
         self._max_retries = (
             max_retries if max_retries is not None
             else int(env_retries) if env_retries
             else _DEFAULT_MAX_RETRIES
         )
-        env_backoff = os.environ.get("MX_K8S_SOURCE_BACKOFF_SECONDS", "")
+        env_backoff = envs.MX_K8S_SOURCE_BACKOFF_SECONDS
         self._backoff_seconds = (
             backoff_seconds if backoff_seconds is not None
             else float(env_backoff) if env_backoff
@@ -98,6 +95,10 @@ class MxK8sServiceClient(MxClientBase):
 
     def close(self) -> None:
         """No-op: channels are opened per-call and closed immediately."""
+
+    def worker_rpc_retry_policy(self) -> tuple[int, float]:
+        """Retry worker RPCs because each channel may select a new pod."""
+        return self._max_retries, self._backoff_seconds
 
     # -- RPC wrappers (MxClient duck-type) -----------------------------------
 
@@ -197,13 +198,9 @@ class MxK8sServiceClient(MxClientBase):
                 # Defense-in-depth: validate the response matches what
                 # was asked for. The server-side handshake in
                 # WorkerServiceServicer rejects mismatched mx_source_id
-                # with FAILED_PRECONDITION, but only when the request
-                # carries a non-empty ID AND the server's own storage
-                # is correct. A misconfigured Service selector routing
-                # the caller to a wrong-rank pool, or the client
-                # somehow passing an empty mx_source_id, would slip
-                # past that check. Validate both fields here before
-                # accepting the manifest.
+                # with FAILED_PRECONDITION. A misconfigured Service selector
+                # could still route to the wrong rank, so validate both fields
+                # here before accepting the manifest.
                 mismatch_reason: str | None = None
                 if resp.mx_source_id != mx_source_id:
                     mismatch_reason = (
@@ -248,6 +245,7 @@ class MxK8sServiceClient(MxClientBase):
                     tensor_source=tensor_source_metadata(resp.tensors),
                     status=p2p_pb2.SOURCE_STATUS_READY,
                     worker_grpc_endpoint=endpoint,
+                    accelerator=resp.accelerator,
                 )
                 logger.info(
                     "MxK8sServiceClient.get_metadata: fetched "
@@ -281,7 +279,6 @@ class MxK8sServiceClient(MxClientBase):
                 raise
             finally:
                 channel.close()
-
         message = (
             f"MxK8sServiceClient.get_metadata: exhausted "
             f"{self._max_retries + 1} attempts against {endpoint}"
@@ -295,6 +292,7 @@ class MxK8sServiceClient(MxClientBase):
         worker_id: str,
         worker_rank: int,
         status: "p2p_pb2.SourceStatus",
+        source_load: float = 0.0,
     ) -> bool:
         """No-op: K8s readiness probes supersede central liveness tracking."""
         return True
@@ -313,7 +311,5 @@ class MxK8sServiceClient(MxClientBase):
         resolved = self._service_pattern.format(rank=self._worker_rank)
         if ":" in resolved:
             return resolved
-        base_port = int(
-            os.environ.get("MX_WORKER_GRPC_PORT", str(_DEFAULT_WORKER_GRPC_PORT)),
-        )
+        base_port = envs.MX_WORKER_GRPC_PORT
         return f"{resolved}:{base_port + self._worker_rank}"

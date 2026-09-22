@@ -10,7 +10,7 @@
 #
 # Built and pushed by the `build` job in .github/workflows/modelexpress-ci-tests.yml
 # under tag <MX_IMAGE_REPO>/mx-worker-vllm-dynamo:<sha>.
-FROM nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1
+FROM nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
 
 # Layer the ModelExpress Python client on top. Build context is the repo root
 # (matches the existing build job's build context), so the COPY path is

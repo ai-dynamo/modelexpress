@@ -8,11 +8,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from pathlib import Path
 
 import google_crc32c
 
+from .. import envs
 from .. import p2p_pb2
 
 ARTIFACT_MANIFEST_VERSION = 1
@@ -80,7 +80,7 @@ def build_artifact_manifest(
 def artifact_transfer_chunk_size(
     default: int = DEFAULT_ARTIFACT_TRANSFER_CHUNK_SIZE,
 ) -> int:
-    raw = os.environ.get(MX_ARTIFACT_TRANSFER_CHUNK_SIZE_ENV)
+    raw = envs.MX_ARTIFACT_TRANSFER_CHUNK_SIZE
     if raw is None:
         return default
     try:
@@ -114,12 +114,14 @@ def artifact_manifest_id(manifest: p2p_pb2.ArtifactManifest) -> str:
 
 def artifact_source_metadata(
     manifest: p2p_pb2.ArtifactManifest,
+    node_rank: int = 0,
 ) -> p2p_pb2.ArtifactSourceMetadata:
     return p2p_pb2.ArtifactSourceMetadata(
         artifact_id=artifact_manifest_id(manifest),
         total_size=sum(file.size for file in manifest.files),
         file_count=len(manifest.files),
         chunk_count=len(manifest.chunks),
+        node_rank=node_rank,
     )
 
 

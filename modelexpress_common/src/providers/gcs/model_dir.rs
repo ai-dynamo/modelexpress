@@ -5,11 +5,10 @@ use super::{
     GcsProvider,
     cache_manifest::{CacheManifest, MANIFEST_VERSION},
     downloader::Downloader,
-    lock_file::LockFile,
     model_name::{BucketName, CACHE_ROOT_DIR_NAME, ModelName},
     path_ext::PathExt,
 };
-use crate::providers::ModelProviderTrait;
+use crate::providers::{ModelProviderTrait, lock_file::LockFile};
 use anyhow::{Context, Result};
 use std::{
     collections::HashSet,

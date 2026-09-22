@@ -12,6 +12,152 @@ use tracing::Level;
 
 use crate::cache::CacheEvictionConfig;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    #[default]
+    Off,
+    Enforce,
+}
+
+/// A `<namespace>:<serviceaccount>` pair, parsed from `ns:sa`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ServiceAccountRef {
+    pub namespace: String,
+    pub service_account: String,
+}
+
+impl std::fmt::Display for ServiceAccountRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.namespace, self.service_account)
+    }
+}
+
+impl std::str::FromStr for ServiceAccountRef {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (namespace, service_account) = s
+            .split_once(':')
+            .ok_or_else(|| format!("expected '<namespace>:<serviceaccount>', got '{s}'"))?;
+        let namespace = namespace.trim();
+        let service_account = service_account.trim();
+        if namespace.is_empty() || service_account.is_empty() {
+            return Err(format!(
+                "namespace and service account must both be non-empty in '{s}'"
+            ));
+        }
+        Ok(Self {
+            namespace: namespace.to_string(),
+            service_account: service_account.to_string(),
+        })
+    }
+}
+
+/// Comma-separated CLI/env list of `T`, ignoring blank entries.
+#[derive(Debug, Clone)]
+pub struct CommaList<T>(Vec<T>);
+
+impl<T> CommaList<T> {
+    #[must_use]
+    pub fn into_inner(self) -> Vec<T> {
+        self.0
+    }
+}
+
+impl<T: std::str::FromStr> std::str::FromStr for CommaList<T> {
+    type Err = T::Err;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let items = s
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(T::from_str)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self(items))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    pub mode: Option<AuthMode>,
+    pub token_audiences: Vec<String>,
+    pub allowed_service_accounts: Vec<ServiceAccountRef>,
+    pub cache_ttl_secs: u64,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            token_audiences: Vec::new(),
+            allowed_service_accounts: Vec::new(),
+            cache_ttl_secs: 60,
+        }
+    }
+}
+
+impl SecurityConfig {
+    #[must_use]
+    pub fn resolve_mode(&self) -> AuthMode {
+        self.mode.unwrap_or(AuthMode::Off)
+    }
+
+    pub fn validate_resolved(&self, mode: AuthMode) -> Result<(), String> {
+        if mode == AuthMode::Enforce {
+            if self.token_audiences.is_empty() {
+                return Err(
+                    "security mode 'enforce' requires at least one token audience \
+                    (security.token_audiences)"
+                        .to_string(),
+                );
+            }
+            if self.allowed_service_accounts.is_empty() {
+                return Err(
+                    "security mode 'enforce' requires a non-empty service account \
+                    allowlist (security.allowed_service_accounts)"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct SecurityArgs {
+    /// ServiceAccount auth mode (off, enforce). Off by default.
+    #[arg(
+        long = "security-mode",
+        env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_MODE,
+        value_enum
+    )]
+    pub mode: Option<AuthMode>,
+
+    /// Comma-separated SA token audiences the caller's token must carry.
+    #[arg(
+        long = "security-token-audiences",
+        env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES
+    )]
+    pub token_audiences: Option<CommaList<String>>,
+
+    /// Comma-separated allowed callers as `<namespace>:<serviceaccount>`.
+    #[arg(
+        long = "security-allowed-service-accounts",
+        env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS
+    )]
+    pub allowed_service_accounts: Option<CommaList<ServiceAccountRef>>,
+
+    /// TTL for the verified-token and rejection caches, in seconds.
+    #[arg(
+        long = "security-cache-ttl-secs",
+        env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS
+    )]
+    pub cache_ttl_secs: Option<u64>,
+}
+
 /// Command line arguments for the server
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -21,28 +167,43 @@ pub struct ServerArgs {
     pub config: Option<PathBuf>,
 
     /// Server port
-    #[arg(short, long, env = "MODEL_EXPRESS_SERVER_PORT")]
+    #[arg(short, long, env = modelexpress_common::envs::MODEL_EXPRESS_SERVER_PORT)]
     pub port: Option<NonZeroU16>,
 
     /// Server host address
-    #[arg(long, env = "MODEL_EXPRESS_SERVER_HOST")]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_SERVER_HOST)]
     pub host: Option<String>,
 
+    // This clap override is the ONLY path that reaches
+    // `ServerSettings::metrics_port`. The layered config loader builds its
+    // environment source as
+    // `Environment::with_prefix("MODEL_EXPRESS").separator("_")`, so
+    // `MODEL_EXPRESS_SERVER_METRICS_PORT` resolves to the key path
+    // `server.metrics.port`, matches no field, and is dropped by serde without a
+    // warning. Do not "simplify" this by deleting the override. Kept as a plain
+    // comment rather than a doc comment so it stays out of `--help`.
+    /// Prometheus `/metrics` port. `0` disables the metrics listener.
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_SERVER_METRICS_PORT)]
+    pub metrics_port: Option<u16>,
+
     /// Log level
-    #[arg(short, long, env = "MODEL_EXPRESS_LOG_LEVEL", value_enum)]
+    #[arg(short, long, env = modelexpress_common::envs::MODEL_EXPRESS_LOG_LEVEL, value_enum)]
     pub log_level: Option<LogLevel>,
 
     /// Log format
-    #[arg(long, env = "MODEL_EXPRESS_LOG_FORMAT", value_enum)]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_LOG_FORMAT, value_enum)]
     pub log_format: Option<LogFormat>,
 
     /// Cache directory path
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_DIRECTORY")]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_DIRECTORY)]
     pub cache_directory: Option<PathBuf>,
 
     /// Enable cache eviction
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_EVICTION_ENABLED")]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_EVICTION_ENABLED)]
     pub cache_eviction_enabled: Option<bool>,
+
+    #[command(flatten)]
+    pub security: SecurityArgs,
 
     /// Validate configuration and exit
     #[arg(long)]
@@ -58,6 +219,8 @@ pub struct ServerConfig {
     pub cache: CacheConfig,
     /// Logging configuration
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 /// Server-specific settings
@@ -67,6 +230,31 @@ pub struct ServerSettings {
     pub host: String,
     /// Server port
     pub port: NonZeroU16,
+    /// Prometheus `/metrics` port. `0` disables the listener.
+    ///
+    /// Two properties here are load-bearing, and both exist because
+    /// `load_layered_config` swallows any deserialization error and silently
+    /// returns `T::default()` — so anything this field rejects is not "the
+    /// field is ignored" but "the entire config file is ignored", with no log
+    /// line at any level. The gRPC port, cache directory, eviction policy and
+    /// **auth settings** would all revert to defaults because of a typo here.
+    ///
+    /// 1. `#[serde(default)]` covers the missing-key case. `ServerSettings` has
+    ///    no struct-level default, so without it every existing
+    ///    `model-express.yaml` — none of which mention this field — would fail
+    ///    to parse.
+    /// 2. The type is `u16`, not `NonZeroU16`. `0` is the documented disable
+    ///    value, and `NonZeroU16` rejects it during deserialization, which is
+    ///    exactly the silent-total-fallback case above. Normalization to
+    ///    "disabled" happens in [`ServerConfig::metrics_socket_addr`].
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+}
+
+/// Serde default for [`ServerSettings::metrics_port`]. Server metrics are on by
+/// default; the client's stay opt-in.
+fn default_metrics_port() -> u16 {
+    modelexpress_common::constants::DEFAULT_METRICS_PORT.get()
 }
 
 /// Cache configuration wrapper
@@ -100,6 +288,7 @@ impl Default for ServerSettings {
         Self {
             host: "0.0.0.0".to_string(),
             port: modelexpress_common::constants::DEFAULT_GRPC_PORT,
+            metrics_port: default_metrics_port(),
         }
     }
 }
@@ -144,7 +333,11 @@ impl ServerConfig {
             }
         } else {
             // Use layered config loading with fallbacks to defaults
-            load_layered_config(args.config.clone(), "MODEL_EXPRESS", Self::default())?
+            load_layered_config(
+                args.config.clone(),
+                modelexpress_common::envs::MODEL_EXPRESS_PREFIX,
+                Self::default(),
+            )?
         };
 
         // Apply command line overrides (same for both modes)
@@ -154,6 +347,12 @@ impl ServerConfig {
 
         if let Some(host) = args.host {
             config.server.host = host;
+        }
+
+        // `0` is the documented "off" value. Env-only deployments (Helm) have no
+        // other way to turn the listener off.
+        if let Some(metrics_port) = args.metrics_port {
+            config.server.metrics_port = metrics_port;
         }
 
         if let Some(log_level) = args.log_level {
@@ -171,6 +370,20 @@ impl ServerConfig {
 
         if let Some(cache_eviction_enabled) = args.cache_eviction_enabled {
             config.cache.eviction.enabled = cache_eviction_enabled;
+        }
+
+        // Apply security overrides
+        if let Some(mode) = args.security.mode {
+            config.security.mode = Some(mode);
+        }
+        if let Some(token_audiences) = args.security.token_audiences {
+            config.security.token_audiences = token_audiences.into_inner();
+        }
+        if let Some(allowed) = args.security.allowed_service_accounts {
+            config.security.allowed_service_accounts = allowed.into_inner();
+        }
+        if let Some(cache_ttl_secs) = args.security.cache_ttl_secs {
+            config.security.cache_ttl_secs = cache_ttl_secs;
         }
 
         // Validate the final configuration
@@ -191,6 +404,11 @@ impl ServerConfig {
             )));
         }
 
+        let mode = self.security.resolve_mode();
+        self.security
+            .validate_resolved(mode)
+            .map_err(ConfigError::Message)?;
+
         Ok(())
     }
 
@@ -199,6 +417,24 @@ impl ServerConfig {
         let addr = format!("{}:{}", self.server.host, self.server.port);
         addr.parse()
             .map_err(|e| ConfigError::Message(format!("Invalid server address {addr}: {e}")))
+    }
+
+    /// Socket address for the Prometheus `/metrics` listener, or `None` when
+    /// metrics are disabled.
+    ///
+    /// # Errors
+    /// Returns an error when host and metrics port do not form a valid address.
+    pub fn metrics_socket_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
+        // `0` is the disable sentinel. Normalizing here rather than in the field
+        // type keeps `0` deserializable from a config file; see
+        // `ServerSettings::metrics_port`.
+        let Some(metrics_port) = NonZeroU16::new(self.server.metrics_port) else {
+            return Ok(None);
+        };
+        let addr = format!("{}:{}", self.server.host, metrics_port);
+        addr.parse()
+            .map(Some)
+            .map_err(|e| ConfigError::Message(format!("Invalid metrics address {addr}: {e}")))
     }
 
     /// Get the logging level as a tracing Level
@@ -213,6 +449,10 @@ impl ServerConfig {
         info!("Server Configuration:");
         info!("  Host: {}", self.server.host);
         info!("  Port: {}", self.server.port);
+        match NonZeroU16::new(self.server.metrics_port) {
+            Some(port) => info!("  Metrics Port: {port} (/metrics)"),
+            None => info!("  Metrics Port: disabled"),
+        }
 
         info!("Cache Configuration:");
         info!("  Directory: {}", self.cache.directory.display());
@@ -228,6 +468,20 @@ impl ServerConfig {
         info!("  Format: {}", self.logging.format);
         info!("  File: {:?}", self.logging.file);
         info!("  Structured: {}", self.logging.structured);
+
+        info!("Security Configuration:");
+        info!("  Mode: {:?}", self.security.resolve_mode());
+        info!("  Token audiences: {:?}", self.security.token_audiences);
+        info!(
+            "  Allowed service accounts: {}",
+            self.security
+                .allowed_service_accounts
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        info!("  Cache TTL: {}s", self.security.cache_ttl_secs);
     }
 }
 
@@ -488,10 +742,12 @@ mod tests {
             config: Some(config_file),
             port: None,
             host: None,
+            metrics_port: None,
             log_level: None,
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
+            security: SecurityArgs::default(),
             validate_config: false,
         };
 
@@ -527,10 +783,12 @@ mod tests {
             config: Some(config_file),
             port: None,
             host: None,
+            metrics_port: None,
             log_level: None,
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
+            security: SecurityArgs::default(),
             validate_config: false,
         };
 
@@ -572,10 +830,12 @@ mod tests {
             config: Some(config_file),
             port: Some(NonZeroU16::new(9000).expect("9000 is non-zero")),
             host: Some("0.0.0.0".to_string()),
+            metrics_port: None,
             log_level: Some(LogLevel::Error),
             log_format: Some(LogFormat::Json),
             cache_directory: Some(PathBuf::from("/tmp/override_cache")),
             cache_eviction_enabled: Some(false),
+            security: SecurityArgs::default(),
             validate_config: false,
         };
 
@@ -599,10 +859,12 @@ mod tests {
             config: None,
             port: Some(NonZeroU16::new(9001).expect("9001 is non-zero")),
             host: Some("localhost".to_string()),
+            metrics_port: None,
             log_level: Some(LogLevel::Warn),
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
+            security: SecurityArgs::default(),
             validate_config: false,
         };
 
@@ -614,5 +876,169 @@ mod tests {
         assert_eq!(config.server.host, "localhost");
         assert_eq!(config.server.port.get(), 9001);
         assert_eq!(config.logging.level, LogLevel::Warn);
+    }
+
+    #[test]
+    fn security_defaults_to_off() {
+        let security = SecurityConfig::default();
+        assert_eq!(security.resolve_mode(), AuthMode::Off);
+        assert!(security.token_audiences.is_empty());
+        assert!(security.allowed_service_accounts.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn service_account_ref_parses_namespace_and_sa() {
+        let parsed: ServiceAccountRef = "vllm:worker".parse().expect("valid ns:sa");
+        assert_eq!(parsed.namespace, "vllm");
+        assert_eq!(parsed.service_account, "worker");
+        assert_eq!(parsed.to_string(), "vllm:worker");
+        let trimmed: ServiceAccountRef = "  ns : sa ".parse().expect("trims");
+        assert_eq!(trimmed, "ns:sa".parse().expect("valid"));
+    }
+
+    #[test]
+    fn service_account_ref_rejects_malformed() {
+        assert!("noseparator".parse::<ServiceAccountRef>().is_err());
+        assert!(":sa".parse::<ServiceAccountRef>().is_err());
+        assert!("ns:".parse::<ServiceAccountRef>().is_err());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn comma_list_parses_and_skips_blanks() {
+        let list: CommaList<ServiceAccountRef> =
+            "a:one, b:two ,, c:three".parse().expect("valid list");
+        let items = list.into_inner();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].namespace, "b");
+        assert_eq!(items[2].service_account, "three");
+
+        let empty: CommaList<String> = "  ".parse().expect("empty");
+        assert!(empty.into_inner().is_empty());
+    }
+
+    #[test]
+    fn enforce_requires_audience_and_allowlist() {
+        let mut security = SecurityConfig {
+            mode: Some(AuthMode::Enforce),
+            ..SecurityConfig::default()
+        };
+        assert!(security.validate_resolved(AuthMode::Enforce).is_err());
+
+        security.token_audiences = vec!["modelexpress".to_string()];
+        assert!(security.validate_resolved(AuthMode::Enforce).is_err());
+
+        security.allowed_service_accounts = vec![ServiceAccountRef {
+            namespace: "vllm".to_string(),
+            service_account: "worker".to_string(),
+        }];
+        assert!(security.validate_resolved(AuthMode::Enforce).is_ok());
+    }
+
+    /// A config file must survive both spellings of the metrics port.
+    ///
+    /// `load_layered_config` swallows every deserialization error and returns
+    /// `T::default()` with no log line, so any value this field rejects costs the
+    /// operator the gRPC port, the cache directory, the eviction policy and the
+    /// auth settings -- silently. That is why `metrics_port` is a `u16` and not a
+    /// `NonZeroU16` (`0` has to deserialize, and is normalized afterwards), and
+    /// why it carries `#[serde(default)]` (no existing model-express.yaml mentions
+    /// it). Both cases assert the *rest* of the file survived, because that is how
+    /// the failure would present.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn metrics_port_never_costs_the_rest_of_the_config_file() {
+        // (metrics_port line, expected port, expected metrics address)
+        let cases = [
+            ("metrics_port: 0", 0_u16, None),
+            ("", default_metrics_port(), Some(default_metrics_port())),
+        ];
+
+        for (metrics_line, expected_metrics_port, expects_addr) in cases {
+            let temp_dir = tempdir().expect("Failed to create temp dir");
+            let config_file = temp_dir.path().join("metrics_port.yaml");
+            fs::write(
+                &config_file,
+                format!(
+                    r#"
+            server:
+              host: "127.0.0.1"
+              port: 18012
+              {metrics_line}
+            cache:
+              eviction:
+                enabled: false
+                policy:
+                  type: lru
+                  unused_threshold: "3d"
+                  max_models: 10
+                  min_free_space_bytes: 1000000
+                check_interval: "30m"
+              directory: "./cache"
+              max_size_bytes: 5000000
+            logging:
+              level: Debug
+              format: Json
+              file: null
+              structured: true
+        "#
+                ),
+            )
+            .expect("Failed to write config file");
+
+            let args = ServerArgs {
+                config: Some(config_file),
+                port: None,
+                host: None,
+                metrics_port: None,
+                log_level: None,
+                log_format: None,
+                cache_directory: None,
+                cache_eviction_enabled: None,
+                security: SecurityArgs::default(),
+                validate_config: false,
+            };
+            let config = ServerConfig::load(args).expect("config should load");
+
+            assert_eq!(config.server.metrics_port, expected_metrics_port);
+            assert_eq!(
+                config
+                    .metrics_socket_addr()
+                    .expect("metrics address should resolve")
+                    .map(|addr| addr.port()),
+                expects_addr,
+                "0 must mean disabled and nothing else"
+            );
+            // The rest of the file survived. If this regresses these fail
+            // together, because the whole file was dropped.
+            assert_eq!(config.server.port.get(), 18012, "the file was dropped");
+            assert_eq!(config.server.host, "127.0.0.1");
+            assert!(!config.cache.eviction.enabled);
+            assert_eq!(config.logging.level, LogLevel::Debug);
+        }
+    }
+
+    /// The env var must stay wired through clap.
+    ///
+    /// `load_layered_config` reads env as
+    /// `Environment::with_prefix("MODEL_EXPRESS").separator("_")`, so
+    /// `MODEL_EXPRESS_SERVER_METRICS_PORT` resolves to the key path
+    /// `server.metrics.port`, matches no field, and serde drops it without a
+    /// warning. The clap `#[arg(env = ...)]` override is the only path that
+    /// reaches the field, and `--metrics-port` is what the Helm chart drives.
+    #[test]
+    fn metrics_port_is_reachable_from_the_command_line() {
+        use clap::Parser as _;
+
+        let args = ServerArgs::parse_from(["modelexpress-server", "--metrics-port", "9999"]);
+        assert_eq!(args.metrics_port, Some(9999));
+
+        let off = ServerArgs::parse_from(["modelexpress-server", "--metrics-port", "0"]);
+        assert_eq!(
+            off.metrics_port,
+            Some(0),
+            "0 is the documented disable value"
+        );
     }
 }

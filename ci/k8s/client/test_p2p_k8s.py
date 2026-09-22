@@ -6,12 +6,17 @@
 Runs after the workflow has applied the source and target Jobs and both pods
 have reached Running state.  Asserts:
   1. Target pod logs contain the framework-specific P2P transfer marker (--p2p-marker).
-  2. Target connected to `--tp-size` distinct source NIXL agents covering ranks
-     0..tp_size-1 (catches TP collapse and source-rank-pairing regressions).
+  2. Target connected to source NIXL agents covering ranks 0..tp_size-1, with a
+     distinct-agent count in [tp_size, tp_size * dp_size] (catches TP collapse
+     and source-rank-pairing regressions; the range accommodates interchangeable
+     DP replicas that share a rank — see --dp-size).
   3. Both source and target servers respond to /v1/completions — confirms weights
      are loaded and the model is serving correctly on each.
   4. When enabled by the workflow, target peak and final VRAM do not materially
      exceed source VRAM.
+  5. When --expect-mtp is set, the target transfers the main model through P2P
+     before loading the MTP draft model locally, and source/target greedy
+     completions for a small prompt match exactly.
 
 Invoked by the workflow as:
   pytest ci/k8s/client/test_p2p_k8s.py -v \
@@ -20,18 +25,25 @@ Invoked by the workflow as:
       --source-port $SOURCE_PORT \
       --worker-port $WORKER_PORT \
       --tp-size $TP_SIZE \
-      [--p2p-marker "framework-specific transfer complete string"]
+      [--dp-size $DP_SIZE] \
+      [--p2p-marker "framework-specific transfer complete string"] \
+      [--expect-mtp]
 
 --p2p-marker defaults:
-  vLLM:    "RDMA transfer complete"             (emitted by vLLM's RdmaStrategy)
-  TRT-LLM: "ModelExpress P2P transfer complete" (printed by trtllm_p2p_launcher.py)
+  vLLM: "RDMA transfer complete" (emitted by vLLM's RdmaStrategy)
 
 --tp-size default is 1 — every existing TP=1 P2P test still asserts exactly
 one source agent, which is the correct expectation and adds a free safety net.
+
+--dp-size default is 1 — with a single copy per rank the accepted range
+collapses to exactly tp_size, so TP-only jobs are unaffected. Set it to the
+target's data-parallel size (e.g. 2 for the DP=2 job) so the range widens to
+[tp_size, tp_size * dp_size] for the interchangeable replicas DP publishes.
 """
 
 import json
 import re
+import time
 import urllib.request
 
 import pytest
@@ -89,7 +101,7 @@ def _all_pod_logs(namespace: str, job_name: str, container: str) -> str:
     `--distributed-executor-backend=ray` on vLLM, rank-1's worker process
     lives in pod-1 and Ray doesn't forward worker stdout to the head
     pod's container logs by default. So lines like rank-1's
-    `[Worker 1] RDMA transfer complete` or `add_remote_agent: ...` only
+    `[Worker 1] RDMA transfer complete` or remote-agent load logs only
     appear in pod-1's logs, not pod-0's.
 
     For single-pod Jobs (existing TP=1 / single-node TP>=2 cases) this
@@ -97,20 +109,62 @@ def _all_pod_logs(namespace: str, job_name: str, container: str) -> str:
     `.items[*]` has exactly one element and the regex/assertions in the
     callers operate on one concatenated string either way.
     """
+    return "\n".join(_pod_logs_by_pod(namespace, job_name, container).values())
+
+
+def _pod_logs_by_pod(namespace: str, job_name: str, container: str) -> dict[str, str]:
+    """Same fetch as `_all_pod_logs`, keyed by pod name instead of concatenated.
+
+    Assertions about "every pod did X" cannot be expressed on the concatenated
+    string: one matching line anywhere satisfies a substring check no matter how
+    many pods are missing it.
+    """
     pod_list = kubectl(
         "get", "pods",
         "-l", f"job-name={job_name}",
         "-o", "jsonpath={.items[*].metadata.name}",
         namespace=namespace,
     ).stdout.split()
-    chunks = []
+    out: dict[str, str] = {}
     for pod in pod_list:
         r = kubectl("logs", pod, "-c", container, "--tail=-1", namespace=namespace)
-        chunks.append(r.stdout)
-    return "\n".join(chunks)
+        out[pod] = r.stdout
+    return out
 
 
-def _assert_inference(namespace: str, job_name: str, model: str, remote_port: int, local_port: int) -> None:
+def _ready_artifact_source_types(namespace: str) -> set[str]:
+    result = kubectl(
+        "get", "modelmetadata",
+        "-o", "json",
+        namespace=namespace,
+    )
+    payload = json.loads(result.stdout)
+    source_types = set()
+    for item in payload.get("items", []):
+        spec = item.get("spec") or {}
+        status = item.get("status") or {}
+        worker = status.get("worker") or {}
+        artifact = worker.get("artifactSource") or {}
+        source_type = spec.get("sourceType")
+        if (
+            source_type
+            and source_type != "weights"
+            and worker.get("status") == "Ready"
+            and artifact.get("artifactId")
+        ):
+            source_types.add(source_type)
+    return source_types
+
+
+def _assert_inference(
+    namespace: str,
+    job_name: str,
+    model: str,
+    remote_port: int,
+    local_port: int,
+    *,
+    deterministic: bool = False,
+) -> str:
     # Pin to pod-0 explicitly. For multi-node StatefulSets, only the head
     # pod (apps.kubernetes.io/pod-index=0) runs the vLLM HTTP API server;
     # the worker pod has no HTTP listener. For single-pod Jobs, _pod_name
@@ -120,11 +174,14 @@ def _assert_inference(namespace: str, job_name: str, model: str, remote_port: in
     print(f"\n[{job_name}] pod={pod} remote_port={remote_port} local_port={local_port}")
     # TODO: replace with a more complex prompt that exercises multi-token reasoning
     # to better validate model correctness beyond a single-word completion.
-    payload = json.dumps({
+    request_payload = {
         "model": model,
         "prompt": "The capital of France is",
         "max_tokens": 8,
-    }).encode()
+    }
+    if deterministic:
+        request_payload.update({"temperature": 0, "seed": 0})
+    payload = json.dumps(request_payload).encode()
     with port_forward(namespace, pod, local_port=local_port, remote_port=remote_port) as port:
         req = urllib.request.Request(
             f"http://localhost:{port}/v1/completions",
@@ -144,6 +201,7 @@ def _assert_inference(namespace: str, job_name: str, model: str, remote_port: in
     text = choices[0].get("text", "")
     print(f"[{job_name}] completion text: {text!r}")
     assert text, f"Empty completion text from {job_name}: {body}"
+    return text
 
 
 def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
@@ -165,56 +223,240 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
     )
 
 
-def test_per_rank_source_agents(namespace: str, tp_size: int, transport: str) -> None:
-    """Target must connect to one distinct source NIXL agent per target rank.
+def test_mtp_load_phases(namespace: str, expect_mtp: bool) -> None:
+    """MTP must use P2P only for the main model, never for its draft head."""
+    if not expect_mtp:
+        pytest.skip("MTP phase assertion not enabled")
 
-    NIXL-only: the assertion scans for `add_remote_agent` log lines that the
-    shared NixlTransferManager emits. The Mooncake TransferEngine path
+    logs = _all_pod_logs(namespace, "mx-target", "mx-target")
+    main_marker = "p2p_enabled=True"
+    transfer_marker = "RDMA transfer complete"
+    draft_marker = "p2p_enabled=False"
+    main_index = logs.find(main_marker)
+    transfer_index = logs.find(transfer_marker, main_index + 1)
+    draft_index = logs.find(draft_marker, transfer_index + 1)
+    phase_lines = [
+        line
+        for line in logs.splitlines()
+        if any(marker in line for marker in (main_marker, transfer_marker, draft_marker))
+    ]
+    print("[mx-target] MTP load phases:\n" + "\n".join(phase_lines))
+    assert main_index >= 0, "Target did not start a P2P-enabled main-model load"
+    assert transfer_index > main_index, (
+        "Target did not complete RDMA transfer after starting the main-model load"
+    )
+    assert draft_index > transfer_index, (
+        "Target did not load the MTP draft locally after the main-model transfer"
+    )
+    assert logs.find(transfer_marker, draft_index + 1) < 0, (
+        "Target performed another RDMA transfer while loading the MTP draft"
+    )
+
+
+def test_per_rank_source_agents(
+    namespace: str, tp_size: int, dp_size: int, transport: str
+) -> None:
+    """Target's source NIXL agents must cover every rank without mis-pairing.
+
+    NIXL-only: the assertion scans for remote-agent log lines that the shared
+    NixlTransferManager emits. The Mooncake TransferEngine path
     (transport=transfer_engine) transfers via batch_transfer_sync_read and
     never registers NIXL agents, so there is nothing to count — skip it there.
 
     Each source rank publishes exactly one NIXL agent. The shared
     NixlTransferManager.receive_from_source (in modelexpress.nixl_transfer)
-    logs `add_remote_agent: ... (agent=b'<name>')` for every target→source
-    connection in both engine paths (vLLM via rdma_strategy.py and TRT-LLM
-    via trtllm_live_transfer.py), though the agent-name format differs per
-    engine (see regex below). Failure modes:
+    logs either `add_remote_agent: ... (agent=b'<name>')` for central metadata
+    or `Using pre-loaded remote agent <name>` for P2P metadata.
 
-      - TP collapse: fewer than `tp_size` add_remote_agent lines.
-      - Source-rank collapse (e.g. all target ranks pulling from source rank 0
-        because the rank filter regressed in _find_source_instances): same agent
-        name repeats across target ranks → distinct-count < tp_size.
-      - Wrong source-rank set: source ranks observed don't cover 0..tp_size-1.
+    Two orthogonal checks:
 
-    Inference alone can't catch source-rank collapse because TP shards have the
-    same shape per rank, so the load succeeds with wrong values and produces
-    plausible-but-garbage text — which the current non-empty assertion passes.
+      1. source_ranks == range(tp_size). This is the deterministic invariant:
+         the observed source ranks must cover exactly 0..tp_size-1, no matter
+         which replica each target core selected. It catches TP collapse (a
+         target rank never ran → missing rank) and source-rank collapse (the
+         rank filter in _find_source_instances regressed so a target rank
+         pulled from the wrong rank). Inference alone can't catch the latter:
+         shards share a shape per rank, so a wrong-rank load succeeds with
+         garbage values and still produces plausible text.
+
+      2. tp_size <= distinct_agents <= tp_size * dp_size. Distinct-agent count
+         is NOT deterministic under DP: DP replicas are interchangeable full
+         copies at the SAME worker_rank, so a rank can expose up to dp_size
+         agents and each target core of that rank picks one at random (default
+         `random` selector). The dp_size cores at a rank therefore land on
+         1..dp_size distinct replicas → the total is anywhere in
+         [tp_size, tp_size * dp_size]. Asserting == tp_size is only correct
+         when dp_size == 1 (pure TP, one candidate per rank); it is a coin-flip
+         flake under DP > 1. The lower bound still catches full collapse; the
+         upper bound catches agents outside the expected rank set.
     """
     if transport != "nixl":
         pytest.skip(
             f"per-rank NIXL agent assertion does not apply to transport={transport!r}"
         )
     # Same multi-pod concat as test_rdma_transfer_logged — under multi-node
-    # TP each rank's `add_remote_agent` line lives in its own pod's logs.
+    # TP each rank's remote-agent line lives in its own pod's logs.
     logs = _all_pod_logs(namespace, "mx-target", "mx-target")
-    matches = re.findall(
+    matches = []
+    for pattern in (
         r"agent=b?'?((?:mx-\w+-worker|trtllm-live-source-rank)(\d+)[-\w]*)'?",
-        logs,
-    )
+        r"Using pre-loaded remote agent ((?:mx-\w+-worker|trtllm-live-source-rank)(\d+)[-\w]*)",
+    ):
+        matches.extend(re.findall(pattern, logs))
 
     distinct_pairs = set(matches)
     distinct_agents = {name for name, _ in distinct_pairs}
     source_ranks = sorted({int(r) for _, r in distinct_pairs})
     print(f"[mx-target] distinct source agents: {distinct_agents}  source_ranks={source_ranks}")
 
-    assert len(distinct_agents) == tp_size, (
-        f"Expected {tp_size} distinct source agent(s), got {len(distinct_agents)}: "
-        f"{distinct_agents}. Fewer means TP collapse (target rank didn't run) or "
-        f"source-rank collapse (multiple target ranks pulled from the same source)."
+    lo, hi = tp_size, tp_size * dp_size
+    assert lo <= len(distinct_agents) <= hi, (
+        f"Expected between {lo} and {hi} distinct source agent(s) "
+        f"(tp_size={tp_size}, dp_size={dp_size}), got {len(distinct_agents)}: "
+        f"{distinct_agents}. Below {lo} means TP collapse (a target rank didn't "
+        f"run) or source-rank collapse (a rank's target cores all pulled from a "
+        f"single source); above {hi} means agents outside the expected rank set."
     )
     assert source_ranks == list(range(tp_size)), (
         f"Expected source ranks {list(range(tp_size))}, got {source_ranks}."
     )
+
+
+EFFECTIVENESS_TIMEOUT_SECS = 180
+EFFECTIVENESS_POLL_SECS = 10
+
+# Either outcome ends the wait: the hit line means the cache was reused, the
+# warning means it was not. Both are emitted from the same call site, so seeing
+# one proves the publisher thread ran and the snapshot is no longer premature.
+_EFFECTIVENESS_MARKERS = (
+    "which ModelExpress installed",
+    "was not reused and the engine recompiled",
+)
+
+
+_COMPILE_INSTALL_MARKER = "vLLM artifact install complete: name=torch_compile_cache"
+
+
+def _pods_pending_effectiveness(per_pod: dict[str, str]) -> set[str]:
+    """Pods that installed a torch.compile cache but have not logged the check.
+
+    The granularity is per pod, not per worker rank: `mark_publish_scheduled` is
+    documented as pod-scoped, so in a TP>1 pod exactly one rank schedules the
+    publisher and therefore exactly one rank runs the check. Requiring a line per
+    rank would fail every multi-rank deployment by construction.
+    """
+    return {
+        pod
+        for pod, logs in per_pod.items()
+        if _COMPILE_INSTALL_MARKER in logs
+        and not any(marker in logs for marker in _EFFECTIVENESS_MARKERS)
+    }
+
+
+def _await_effectiveness_check(namespace: str) -> dict[str, str]:
+    """Re-read target logs until every installing pod logged the check.
+
+    Returns the freshest per-pod logs either way; the caller still asserts on
+    content, so a timeout surfaces as a named-pod assertion failure rather than a
+    bare TimeoutError with no context.
+    """
+    per_pod = _pod_logs_by_pod(namespace, "mx-target", "mx-target")
+    pending = _pods_pending_effectiveness(per_pod)
+    if not pending:
+        return per_pod
+    deadline = time.monotonic() + EFFECTIVENESS_TIMEOUT_SECS
+    while time.monotonic() < deadline:
+        time.sleep(EFFECTIVENESS_POLL_SECS)
+        per_pod = _pod_logs_by_pod(namespace, "mx-target", "mx-target")
+        pending = _pods_pending_effectiveness(per_pod)
+        if not pending:
+            print("[mx-target] every installing pod logged the effectiveness check")
+            return per_pod
+    print(
+        f"[mx-target] {len(pending)} pod(s) still missing the effectiveness check "
+        f"after {EFFECTIVENESS_TIMEOUT_SECS}s: {sorted(pending)}"
+    )
+    return per_pod
+
+
+def test_artifact_transfer(
+    namespace: str,
+    require_artifact_transfer: bool,
+    expected_artifact_sources: int,
+    expected_artifact_source_types: set[str],
+) -> None:
+    if not require_artifact_transfer:
+        pytest.skip("artifact transfer assertion not enabled")
+
+    source_types = _ready_artifact_source_types(namespace)
+    assert len(source_types) >= expected_artifact_sources, (
+        f"Expected at least {expected_artifact_sources} ready artifact source(s), "
+        f"got {len(source_types)}: {sorted(source_types)}"
+    )
+    assert expected_artifact_source_types <= source_types, (
+        f"Expected ready artifact source types {sorted(expected_artifact_source_types)}, "
+        f"got {sorted(source_types)}"
+    )
+
+    # The effectiveness check runs on each target's own publisher thread, gated on
+    # /health plus a cache-settle interval. The composite action only waits for the
+    # *source* to publish before starting targets, so at this point a target's
+    # publisher may not have fired yet. Poll rather than asserting on one snapshot.
+    per_pod = _await_effectiveness_check(namespace)
+    logs = "\n".join(per_pod.values())
+
+    install_lines = [line for line in logs.splitlines() if "artifact install complete" in line]
+    print("[mx-target] artifact install lines:\n" + "\n".join(install_lines))
+    assert install_lines, "Target did not log artifact installation"
+    for source_type in expected_artifact_source_types:
+        assert f"name={source_type}" in logs, (
+            f"Target did not log artifact installation for {source_type}"
+        )
+
+    # A successful install only means the bytes arrived. The engine still has to
+    # pick the installed cache, and it will not if the source was compiled under
+    # a different configuration - it silently recompiles instead. Without this
+    # assertion the test passes on a deployment that gets no artifact benefit.
+    unused_lines = [
+        line
+        for line in logs.splitlines()
+        if "was not reused and the engine recompiled" in line
+    ]
+    assert not unused_lines, (
+        "Target installed a torch.compile cache that vLLM did not use, so it "
+        "recompiled. The source and target compile configurations differ; "
+        "partition the artifact source pool with "
+        "MX_ARTIFACT_COMPILE_CONFIG_DIGEST.\n" + "\n".join(unused_lines)
+    )
+
+    # Per pod, not across the concatenation: one matching line anywhere would
+    # otherwise satisfy the check no matter how many pods skipped it.
+    pending = _pods_pending_effectiveness(per_pod)
+    assert not pending, (
+        f"{len(pending)} target pod(s) installed a torch.compile cache but never "
+        f"logged the effectiveness check: {sorted(pending)}. The engine may not "
+        "have reached the publish path, or the check regressed."
+    )
+
+    # Every target in this fleet runs the same configuration, so each artifact
+    # type must resolve to one identity. Divergence means identity construction
+    # is not deterministic across pods - the failure mode that turns an artifact
+    # pool into a set of singletons.
+    ids_by_type: dict[str, set[str]] = {}
+    for line in install_lines:
+        fields = dict(
+            token.split("=", 1)
+            for token in line.split()
+            if token.count("=") >= 1 and token.split("=", 1)[0] in {"name", "mx_source_id"}
+        )
+        if "name" in fields and "mx_source_id" in fields:
+            ids_by_type.setdefault(fields["name"], set()).add(fields["mx_source_id"])
+    for source_type, source_ids in sorted(ids_by_type.items()):
+        assert len(source_ids) == 1, (
+            f"Targets resolved {len(source_ids)} distinct mx_source_ids for "
+            f"{source_type}: {sorted(source_ids)}. Identically configured "
+            "workers must agree on the artifact identity."
+        )
 
 
 def test_source_inference_produces_output(namespace: str, model: str, source_port: int) -> None:
@@ -225,6 +467,39 @@ def test_source_inference_produces_output(namespace: str, model: str, source_por
 def test_target_inference_produces_output(namespace: str, model: str, worker_port: int) -> None:
     """Target server must return a valid completion response after P2P transfer."""
     _assert_inference(namespace, "mx-target", model, remote_port=worker_port, local_port=18000)
+
+
+def test_mtp_source_target_outputs_match(
+    namespace: str,
+    model: str,
+    source_port: int,
+    worker_port: int,
+    expect_mtp: bool,
+) -> None:
+    """Disk-loaded source and P2P-loaded target must produce identical output."""
+    if not expect_mtp:
+        pytest.skip("MTP output consistency assertion not enabled")
+
+    source_text = _assert_inference(
+        namespace,
+        "mx-source",
+        model,
+        remote_port=source_port,
+        local_port=18003,
+        deterministic=True,
+    )
+    target_text = _assert_inference(
+        namespace,
+        "mx-target",
+        model,
+        remote_port=worker_port,
+        local_port=18004,
+        deterministic=True,
+    )
+    assert target_text == source_text, (
+        "MTP source/target completions differ for the deterministic prompt: "
+        f"source={source_text!r}, target={target_text!r}"
+    )
 
 
 def _assert_target_vram_matches_source(

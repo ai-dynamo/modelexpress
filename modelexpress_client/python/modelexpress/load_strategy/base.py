@@ -6,23 +6,48 @@
 from __future__ import annotations
 
 import logging
-import os
+import traceback
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, ClassVar
 
-import torch
 import torch.nn as nn
 
+from .. import envs
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import log_tensor_summary
 from ..metadata.publish import publish_metadata_and_ready
 from .context import LoadContext, LoadResult
 
 if TYPE_CHECKING:
+    from ..accelerators import AcceleratorBackend
     from ..nixl_transfer import NixlTransferManager
 
 logger = logging.getLogger("modelexpress.load_strategy")
+
+
+def clear_exception_tracebacks(exc: BaseException) -> None:
+    """Drop completed failure frames before releasing a mutated model.
+
+    Transfer failures commonly retain target tensors through traceback frame
+    locals (for example ``local_tensor`` in the NIXL matching loop). Clearing
+    only ``LoadResult`` and ``LoadContext`` therefore does not guarantee that
+    CUDA allocations become unreachable before retry initialization.
+    """
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if current.__traceback__ is not None:
+            traceback.clear_frames(current.__traceback__)
+            current.__traceback__ = None
 
 
 class SourceTransferError(Exception):
@@ -82,7 +107,11 @@ class LoadStrategy(ABC):
 
 
 def _init_nixl_manager(
-    global_rank: int, device_id: int, role: str, listen_port: int = 0,
+    global_rank: int,
+    device_id: int,
+    role: str,
+    listen_port: int = 0,
+    accelerator_backend: AcceleratorBackend | None = None,
 ) -> NixlTransferManager:
     """Create and initialize a NIXL transfer manager."""
     from ..nixl_transfer import NixlTransferManager
@@ -93,6 +122,7 @@ def _init_nixl_manager(
         agent_name=agent_name,
         device_id=device_id,
         listen_port=listen_port,
+        accelerator_backend=accelerator_backend,
     )
     manager.initialize()
     logger.debug(f"[Worker {global_rank}] NIXL manager initialized")
@@ -107,7 +137,9 @@ def _as_load_result(result_or_model: LoadResult | nn.Module) -> LoadResult:
 
 def _metadata_publication_configured(ctx: LoadContext) -> bool:
     """Return whether this worker has a metadata path for P2P serving."""
-    server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
+    server_addr = (
+        ctx.mx_server_url or envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
+    )
     if server_addr:
         return True
     return getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
@@ -147,6 +179,8 @@ def register_tensors(
             Falls back to discovery if ``ctx.tensors`` is empty so the
             flag is safe even if the caller misuses it.
     """
+    if not ctx.p2p_enabled:
+        return
     if not _metadata_publication_configured(ctx):
         logger.info(
             f"[Worker {ctx.global_rank}] No MX metadata path configured, "
@@ -178,10 +212,14 @@ def register_tensors(
             log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
 
         if ctx.nixl_manager is None:
-            base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
+            base_port = envs.MX_METADATA_PORT
             listen_port = base_port + ctx.device_id
             ctx.nixl_manager = _init_nixl_manager(
-                ctx.global_rank, ctx.device_id, "auto", listen_port
+                ctx.global_rank,
+                ctx.device_id,
+                "auto",
+                listen_port,
+                ctx.accelerator_backend,
             )
 
         if not ctx.nixl_manager.tensor_descriptors:
@@ -223,6 +261,8 @@ def publish_metadata(ctx: LoadContext) -> None:
         publish_metadata_and_ready(
             ctx.mx_client, ctx.nixl_manager, ctx.tensors,
             ctx.worker_rank, ctx.device_id, ctx.identity, ctx.worker_id,
+            accelerator=ctx.accelerator_backend.name,
+            ready_fn=ctx.source_ready_fn,
         )
     except Exception as e:
         logger.warning(
@@ -246,24 +286,47 @@ def unpublish_metadata(ctx: LoadContext) -> None:
     Call publish_metadata() again after memory is valid to re-enter the
     P2P network.
     """
+    unpublish_metadata_for_worker(
+        worker_rank=ctx.worker_rank,
+        device_id=ctx.device_id,
+    )
+
+
+def drain_tensor_readers(ctx: LoadContext, *, timeout: float) -> None:
+    """Block new tensor reads and wait for current readers before mutation."""
     from ..metadata.publish import _heartbeat_threads, _worker_servers
 
-    hb = _heartbeat_threads.pop(ctx.worker_rank, None)
+    worker_server = _worker_servers.get(ctx.device_id)
+    if worker_server is not None:
+        worker_server.drain_tensor_reads(timeout)
+        return
+    if _heartbeat_threads.get(ctx.worker_rank) is not None:
+        raise RuntimeError(
+            "active refit cannot safely mutate centrally published tensors; "
+            "enable MX_P2P_METADATA"
+        )
+
+
+def unpublish_metadata_for_worker(*, worker_rank: int, device_id: int) -> None:
+    """Stop one worker's publication without requiring a boot-load context."""
+    from ..metadata.publish import _heartbeat_threads, _worker_servers
+
+    hb = _heartbeat_threads.pop(worker_rank, None)
     if hb is not None:
         try:
             hb.stop()  # also marks STALE on MX server
-            logger.info(f"[Worker {ctx.global_rank}] Heartbeat stopped")
+            logger.info(f"[Worker {worker_rank}] Heartbeat stopped")
         except Exception as e:
             logger.warning(
-                f"[Worker {ctx.global_rank}] Failed to stop heartbeat cleanly: {e}"
+                f"[Worker {worker_rank}] Failed to stop heartbeat cleanly: {e}"
             )
 
-    ws = _worker_servers.pop(ctx.device_id, None)
+    ws = _worker_servers.pop(device_id, None)
     if ws is not None:
         try:
             ws.stop()
-            logger.info(f"[Worker {ctx.global_rank}] Worker gRPC server stopped")
+            logger.info(f"[Worker {worker_rank}] Worker gRPC server stopped")
         except Exception as e:
             logger.warning(
-                f"[Worker {ctx.global_rank}] Failed to stop worker gRPC server cleanly: {e}"
+                f"[Worker {worker_rank}] Failed to stop worker gRPC server cleanly: {e}"
             )

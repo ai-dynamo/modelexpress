@@ -41,43 +41,35 @@ pub struct ClientArgs {
     pub config: Option<PathBuf>,
 
     /// Server endpoint
-    #[arg(short, long, env = "MODEL_EXPRESS_ENDPOINT")]
+    #[arg(short, long, env = crate::envs::MODEL_EXPRESS_ENDPOINT)]
     pub endpoint: Option<String>,
 
     /// Request timeout in seconds
-    #[arg(short, long, env = "MODEL_EXPRESS_TIMEOUT")]
+    #[arg(short, long, env = crate::envs::MODEL_EXPRESS_TIMEOUT)]
     pub timeout: Option<u64>,
 
     /// Cache path override
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_DIRECTORY")]
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_CACHE_DIRECTORY)]
     pub cache_path: Option<PathBuf>,
 
     /// Log level (no short flag to avoid conflict with CLI's -v/--verbose)
-    #[arg(long, env = "MODEL_EXPRESS_LOG_LEVEL", value_enum)]
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_LOG_LEVEL, value_enum)]
     pub log_level: Option<LogLevel>,
 
     /// Log format
-    #[arg(long, env = "MODEL_EXPRESS_LOG_FORMAT", value_enum)]
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_LOG_FORMAT, value_enum)]
     pub log_format: Option<LogFormat>,
 
     /// Quiet mode (suppress all output except errors)
     #[arg(long, short = 'q')]
     pub quiet: bool,
 
-    /// Maximum number of retries
-    #[arg(long, env = "MODEL_EXPRESS_MAX_RETRIES")]
-    pub max_retries: Option<u32>,
-
-    /// Retry delay in seconds
-    #[arg(long, env = "MODEL_EXPRESS_RETRY_DELAY")]
-    pub retry_delay: Option<u64>,
-
     /// Disable shared storage mode (will transfer files from server to client)
-    #[arg(long, env = "MODEL_EXPRESS_NO_SHARED_STORAGE")]
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_NO_SHARED_STORAGE)]
     pub no_shared_storage: bool,
 
     /// Chunk size in bytes for file transfer when shared storage is disabled
-    #[arg(long, env = "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE")]
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_TRANSFER_CHUNK_SIZE)]
     pub transfer_chunk_size: Option<usize>,
 }
 
@@ -120,8 +112,11 @@ impl ClientConfig {
     /// 3. Add a test in the `tests` module to verify the override works
     pub fn load(args: ClientArgs) -> Result<Self, ConfigError> {
         // Start with layered config loading (file + env + defaults)
-        let mut config =
-            load_layered_config(args.config.clone(), "MODEL_EXPRESS", Self::default())?;
+        let mut config = load_layered_config(
+            args.config.clone(),
+            crate::envs::MODEL_EXPRESS_PREFIX,
+            Self::default(),
+        )?;
 
         // ==================== APPLY CLI ARGUMENT OVERRIDES ====================
         // When adding a new field to ClientArgs, add the override logic here.
@@ -135,14 +130,6 @@ impl ClientConfig {
 
         if let Some(timeout) = args.timeout {
             config.connection.timeout_secs = Some(timeout);
-        }
-
-        if let Some(max_retries) = args.max_retries {
-            config.connection.max_retries = Some(max_retries);
-        }
-
-        if let Some(retry_delay) = args.retry_delay {
-            config.connection.retry_delay_secs = Some(retry_delay);
         }
 
         // Cache settings
@@ -232,14 +219,6 @@ impl ClientConfig {
             cache: CacheConfig::default(),
             logging: LoggingConfig::default(),
         }
-    }
-
-    /// Apply cache path override if provided
-    pub fn with_cache_path(mut self, cache_path: Option<PathBuf>) -> Self {
-        if let Some(path) = cache_path {
-            self.cache.local_path = path;
-        }
-        self
     }
 
     /// Set timeout for the connection
@@ -404,8 +383,6 @@ mod tests {
             log_level: None,
             log_format: None,
             quiet: true,
-            max_retries: Some(5),
-            retry_delay: Some(10),
             no_shared_storage: true,
             transfer_chunk_size: Some(2097152),
         };
@@ -415,8 +392,6 @@ mod tests {
         assert_eq!(config.connection.endpoint, "http://cli-override:7777");
         assert_eq!(config.connection.timeout_secs, Some(120));
         assert!(config.logging.quiet);
-        assert_eq!(config.connection.max_retries, Some(5));
-        assert_eq!(config.connection.retry_delay_secs, Some(10));
         assert!(!config.cache.shared_storage);
         assert_eq!(config.cache.transfer_chunk_size, 2097152);
     }

@@ -1,179 +1,110 @@
----
-name: modelexpress-user-guide
-description: Help users understand, deploy, operate, and debug public ModelExpress. Use for questions about MX concepts, quick starts, Kubernetes, Helm, metadata backends, engine integrations, ModelStreamer, P2P transfer, and troubleshooting.
-license: Apache-2.0
-compatibility: Applies to the public ai-dynamo/modelexpress repository.
-metadata:
-  author: ModelExpress maintainers
-  version: "1.0"
----
+# ModelExpress
 
-# ModelExpress guide for user-facing agents
+Rust-based model cache management service and GPU-to-GPU weight transfer system using NVIDIA NIXL over RDMA.
 
-Use this file when helping a user get ModelExpress running or debug a
-deployment. Prefer clear operational guidance over internal implementation
-details.
+This file holds the always-on rules for every AI coding agent working in this repository. Multi-step procedures live as skills under `.agents/skills/` and load on demand. Both are shared across tools:
 
-## What ModelExpress does
+| Tool | Always-on rules | Skills |
+|---|---|---|
+| Codex | `AGENTS.md` (native) | `.agents/skills/` (native) |
+| Cursor | `AGENTS.md` (native) | `.agents/skills/` (native) |
+| Claude Code | `CLAUDE.md` imports this file via `@AGENTS.md` | `.claude/skills/<name>` symlinks into `.agents/skills/<name>` |
+| GitHub Copilot | Coding agent reads `AGENTS.md`; Copilot Chat is pointed here by `.github/copilot-instructions.md` | via `AGENTS.md` pointers below |
 
-ModelExpress manages model weights for LLM inference:
+Edit `AGENTS.md` or the skill; never add a tool-specific copy. When a section here grows into a procedure, move it to a skill and list it below.
 
-- downloads or resolves model artifacts from Hugging Face, object storage, or
-  local/PVC-backed paths
-- tracks model lifecycle and worker metadata with Redis or Kubernetes CRDs
-- lets new inference replicas receive weights from an already-loaded replica
-  through GPU-to-GPU P2P transfer
-- can also run ModelStreamer paths that stream from object storage without an
-  MX coordination server
+**Reference documentation:**
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - Project structure, crate catalog, gRPC services, server internals, Python client, NIXL integration
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) - Configuration reference, Docker, Kubernetes, Helm, P2P transfer setup, debugging
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) - Development setup, available commands, pre-commit hooks, environment variables, DCO
+- [`docs/CLI.md`](docs/CLI.md) - CLI tool usage, commands, output formats, integration examples
 
-ModelExpress can run standalone. Dynamo is one integration path, not a
-requirement. vLLM uses `--load-format modelexpress`; SGLang uses
-`remote_instance` with the `modelexpress` backend; TensorRT-LLM P2P is a beta
-path using the documented patch/runtime flow.
+## Coding Standards
 
-## Route users by goal
+- `unwrap()` is **strictly forbidden** except in benchmarks. `expect()` is allowed in tests. Always handle errors with `match`, `?`, or custom error types.
+- All cargo dependencies go in the root `Cargo.toml`. Sub-crates use workspace dependencies exclusively. Never edit `Cargo.toml` or `Cargo.lock` by hand to add or update dependencies - use `cargo add` so you always get the latest version.
+- Python dependencies go in `pyproject.toml`. Never edit dependency files by hand - use `uv add` so you always get the latest version.
+- `cargo clippy` must pass with no warnings.
+- No emojis in code or comments.
+- Do not create markdown files to document code changes or decisions.
+- Do not over-comment code. Removing code is fine without adding comments to explain why.
+- Use mermaid diagrams instead of ASCII art in markdown files.
+- Prefer established crates over hand-rolled implementations. Check existing workspace dependencies before adding new ones.
 
-| User goal | Send them to | Notes |
-|-----------|--------------|-------|
-| Try MX locally | [`README.md#quick-start`](README.md#quick-start), [`docs/CLI.md`](docs/CLI.md) | Good first path; basic health/cache commands do not require GPUs. |
-| Deploy MX server on Kubernetes | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), [`helm/README.md`](helm/README.md) | Choose Redis or Kubernetes CRD metadata before deploying. |
-| Speed up vLLM scale-out with P2P | [`examples/p2p_transfer_k8s/README.md`](examples/p2p_transfer_k8s/README.md) | Requires MX server, metadata backend, GPU workers, and RDMA-capable networking for the fast path. |
-| Use SGLang | [`docs/SGLANG.md`](docs/SGLANG.md) | Use an SGLang image with the ModelExpress delegation hook; install MX with `--no-deps`. |
-| Evaluate TensorRT-LLM P2P | [`examples/p2p_transfer_k8s/client/trtllm/`](examples/p2p_transfer_k8s/client/trtllm/) | Treat as beta and keep the TRT-LLM/Dynamo runtime requirements visible. |
-| Stream from object storage | [`examples/model_streamer_k8s/README.md`](examples/model_streamer_k8s/README.md) | ModelStreamer does not require MX server or RDMA by itself. |
-| Use Dynamo | [`examples/dynamo_model_cache_k8s/README.md`](examples/dynamo_model_cache_k8s/README.md), [`examples/dynamo_p2p_transfer_k8s/README.md`](examples/dynamo_p2p_transfer_k8s/README.md) | Explain Dynamo as optional orchestration around MX. |
-| Check support and tested versions | [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md), [`ci/TEST_PLAN.md`](ci/TEST_PLAN.md) | Do not invent version pins; derive them from these files and Dockerfiles. |
-
-## Deployment questions to answer first
-
-Before recommending a deployment, identify:
-
-- runtime: vLLM, SGLang, TensorRT-LLM, Dynamo, or standalone CLI/server
-- environment: local Docker, Kubernetes, Helm, DynamoGraphDeployment, or cloud
-  managed Kubernetes
-- weight source: Hugging Face, S3, GCS, Azure Blob Storage, local disk, or PVC
-- metadata backend: Redis, Kubernetes CRD, or `k8s-service`
-- networking: InfiniBand/RoCE, AWS EFA, or no RDMA
-- scaling shape: single replica, replica scale-out, tensor parallelism,
-  live-refit/RL, or stable-weight serving
-
-### Metadata backend guidance
-
-- Use `redis` or `kubernetes` for coordinated fleets, live refits, RL loops,
-  mixed revisions, or heterogeneous workers.
-- Use `k8s-service` only for stable-weight inference where all pods behind a
-  Service serve the same checkpoint and avoiding a central MX server is the
-  main simplification.
-- For Redis, set `MX_METADATA_BACKEND=redis` and `REDIS_URL`.
-- For Kubernetes CRD, apply `examples/crds.yaml`, configure RBAC, and set
-  `MX_METADATA_BACKEND=kubernetes` plus namespace wiring.
-
-See [`docs/DEPLOYMENT.md#choosing-a-metadata-backend`](docs/DEPLOYMENT.md#choosing-a-metadata-backend).
-
-## Important environment variables
-
-| Variable | When to mention |
-|----------|-----------------|
-| `MX_METADATA_BACKEND` | Required server-side for Redis/Kubernetes metadata. |
-| `REDIS_URL` | Required when the metadata backend is Redis. |
-| `MX_METADATA_NAMESPACE` | Kubernetes CRD namespace override. |
-| `MX_SERVER_ADDRESS` | Recommended client gRPC endpoint for central-server P2P paths. |
-| `MODEL_EXPRESS_URL` | Deprecated, but still needed by some legacy/client paths; set both during transition when docs say so. |
-| `VLLM_PLUGINS=modelexpress` | vLLM plugin registration when needed by the launch path. |
-| `MX_MODEL_URI` | Enables ModelStreamer storage loading. |
-| `MX_NIXL_BACKEND` | Use `UCX` for InfiniBand/RoCE; use `LIBFABRIC` on AWS EFA examples. |
-| `MX_RDMA_NIC_PIN` | Use for NIC pinning or `auto` topology selection on multi-NIC RDMA hosts. |
-| `MODEL_EXPRESS_LOG_LEVEL` | Set to `DEBUG` for more detailed MX Python logs. |
-
-## Debugging playbook
-
-Start with the failure surface: server unreachable, model cache issue, metadata
-issue, image/config issue, or P2P/RDMA issue.
-
-### Local CLI and server
+## Build and Test Commands
 
 ```bash
-modelexpress-cli -vv health
-nc -vz localhost 8001
-modelexpress-cli model status
-modelexpress-cli model validate
-modelexpress-cli model stats --detailed
+cargo build                          # Build
+cargo build --release                # Release build
+cargo test                           # Run all tests
+cargo clippy                         # Lint (must pass, no warnings)
+cargo run --bin modelexpress-server  # Run server
+cargo run --bin config_gen -- --output model-express.yaml  # Generate config
+cargo run --bin test_client -- --test-model "google-t5/t5-small"  # Test client
+cargo run --bin fallback_test        # Fallback test
+cargo bench                          # Criterion benchmarks
+./run_integration_tests.sh           # Integration tests (starts server)
 ```
 
-The MX server speaks gRPC, not REST; `curl http://localhost:8001/health` is not
-a valid health check.
+## Pre-commit Hooks
 
-### Kubernetes server and metadata
+Run pre-commit after every code change, even before creating commits:
 
 ```bash
-kubectl -n $NAMESPACE logs -f deploy/modelexpress-server
-kubectl -n $NAMESPACE describe pod -l app=modelexpress-server
-
-# Redis backend
-kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli KEYS 'mx:source:*'
-kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli HGETALL 'mx:source:<source_id>'
-
-# Kubernetes CRD backend
-kubectl -n $NAMESPACE get modelmetadatas
-kubectl -n $NAMESPACE get modelcacheentries
+pre-commit run              # Staged files only
+pre-commit run --all-files  # All files (recommended after significant changes)
 ```
 
-If stale Redis metadata is suspected after redeploy, flushing Redis is a valid
-debug step, but call out that it clears MX metadata:
+Hooks: `cargo fmt`, `cargo clippy` (--fix), `cargo check`, trailing whitespace, end-of-file, YAML/TOML/JSON validation, merge conflict detection, large file check.
 
-```bash
-kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli FLUSHALL
-```
+## Procedures (skills)
 
-### Inference worker and P2P
+Load the matching skill before starting any of these. Each is a `SKILL.md` under `.agents/skills/`:
 
-```bash
-kubectl -n $NAMESPACE logs -f deploy/mx-vllm
-kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/models
-kubectl -n $NAMESPACE exec deploy/mx-vllm -c vllm -- ibstat
-kubectl -n $NAMESPACE exec deploy/mx-vllm -c vllm -- ucx_info -d
-```
+| Task | Skill |
+|---|---|
+| Add or change a client CLI argument or env var | `add-cli-argument` |
+| Add a gRPC service | `add-grpc-service` |
+| Bump the release version or public-image tags | `bump-version` |
+| Commit sign-off and DCO repair | `dco` |
 
-Look for logs that indicate loader registration, native source load, metadata
-publish, source discovery, transfer start, and transfer completion. If a target
-falls back to storage, check whether a READY source exists, whether the
-`mx_source_id` identity matches, and whether source metadata is stale.
+## Git Workflow
 
-### Storage and ModelStreamer
+Feature branches use `<username>/feature-name` format, forked from `main`.
 
-For ModelStreamer, confirm `MX_MODEL_URI` is set and the pod has the right
-cloud identity or secret. Expected vLLM logs include the ModelExpress loader
-registration, `Trying strategy: model_streamer`, and a storage streaming
-completion message. See [`examples/model_streamer_k8s/README.md`](examples/model_streamer_k8s/README.md).
+### Commits and DCO
 
-## Answering standards
+- Every commit must carry a `Signed-off-by: Real Name <email>` trailer. Always commit with `git commit -s`. The DCO check is required CI and fails the PR otherwise.
+- Use the contributor's real name and the email configured in `git config user.name` / `user.email`. Check both before committing on an unfamiliar machine.
+- Preserve existing trailers when amending, rebasing, squashing, or cherry-picking. Use `git rebase --signoff` or `git cherry-pick --signoff` only when the person running the command is the one certifying the change.
+- Do not add `Co-Authored-By` or tool-attribution trailers.
+- See the DCO section of `CONTRIBUTING.md` for the full policy.
 
-- Give the shortest viable path first, then link to deeper docs.
-- Include prerequisites before commands: GPU/RDMA requirements, secrets, CRDs,
-  RBAC, image build/push, or cloud credentials.
-- Be explicit about status: supported, beta, experimental, example-only, or
-  not in CI.
-- Keep public answers free of private repositories, internal registries,
-  internal runner names, and secrets.
-- When editing docs, keep README for orientation and put detailed support,
-  compatibility, and version pins in `docs/COMPATIBILITY.md`.
+## Tips
 
-## Sources to verify before changing docs
+- Always read files to understand context before making changes.
+- Do not implement changes eagerly. When discussing a problem or new feature, investigate thoroughly first, report findings, propose changes, and ask if they are acceptable before writing code.
+- Flush Redis on redeploy: stale metadata causes P2P transfer failures.
+- Long startup times are normal: DeepSeek-V3 takes ~40 min to warm up.
+- Set `UCX_LOG_LEVEL=DEBUG` for NIXL/RDMA diagnostics.
+- NIXL agents must match ranks: source rank 0 -> target rank 0.
 
-- [`README.md`](README.md) for overview and first-run paths.
-- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for server, Kubernetes, metadata,
-  P2P, ModelStreamer, and debugging details.
-- [`docs/CLI.md`](docs/CLI.md) for CLI commands and troubleshooting.
-- [`docs/SGLANG.md`](docs/SGLANG.md) for SGLang-specific launch guidance.
-- [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) and
-  [`ci/TEST_PLAN.md`](ci/TEST_PLAN.md) for support status and tested versions.
-- [`examples/`](examples/) for copy/paste deployment manifests.
+## Documentation Updates
 
-For docs-only edits, run:
+When making changes, update the appropriate documentation files:
 
-```bash
-git diff --check
-find AGENTS.md README.md docs CONTRIBUTING.md helm/README.md examples -name '*.md' -print0 \
-  | xargs -0 awk 'BEGIN{bad=0} /^```/{count[FILENAME]++} END{for (f in count) if (count[f] % 2) {print f ": odd fence count " count[f]; bad=1} exit bad}'
-helm lint helm
-```
+| Change type | Files to update |
+|---|---|
+| Architecture, components, NIXL, gRPC services | `docs/ARCHITECTURE.md` |
+| Coding standards, build commands, new patterns, agent rules | `AGENTS.md` (the only agent-instruction file; `CLAUDE.md` and `.github/copilot-instructions.md` are pointers) |
+| CLI arguments or commands | `docs/CLI.md` + `.agents/skills/add-cli-argument/SKILL.md` |
+| Configuration, environment variables | `docs/DEPLOYMENT.md` |
+| Deployment (Docker, K8s, Helm, P2P) | `docs/DEPLOYMENT.md` |
+| Known issues, FP8 handling | `docs/ARCHITECTURE.md` |
+| Dev setup, scripts, pre-commit hooks | `CONTRIBUTING.md` |
+| Contribution process, DCO | `CONTRIBUTING.md` |
+| New binary targets, crates, Python modules | `docs/ARCHITECTURE.md` |
+| Version-bump procedure changes | `.agents/skills/bump-version/SKILL.md` |
+| Agent procedures (multi-step how-tos) | `.agents/skills/<name>/SKILL.md` + the Procedures table in `AGENTS.md` |
+
+**A feature is incomplete until documentation is updated.**

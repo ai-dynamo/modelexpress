@@ -1,0 +1,164 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# promtool unit tests for the alert rules in templates/prometheusrule.yaml.
+#
+# These assert the alerts FIRE, which is a different claim from the one
+# helm_alert_rules.rs makes. That test proves every metric name in the rules
+# exists; this proves the expressions actually transition to firing on the
+# condition they describe. Both are needed: an alert can name only real metrics
+# and still be incapable of firing, which is how three of these shipped in an
+# earlier draft of this chart.
+#
+# Run it by rendering the rules first, since the thresholds are templated:
+#
+#   helm template mx helm/ --api-versions monitoring.coreos.com/v1 \
+#     --set metrics.rules.enabled=true --set metrics.rules.client=true \
+#     --show-only templates/prometheusrule.yaml \
+#     | python3 -c "import sys,yaml;yaml.safe_dump(yaml.safe_load(sys.stdin)['spec'],open('rules.yaml','w'))"
+#   promtool test rules helm/tests/alert_rules_test.yaml
+#
+# The rules file must sit beside this one as rules.yaml.
+
+rule_files:
+  - rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # A counter is pre-created at zero by RegistryMetrics::register precisely so
+  # this case works. A Family creates children lazily, so without that the
+  # series would first appear at 1, increase() would have nothing to subtract,
+  # and the first takeover in each process -- a full re-pull of the model --
+  # would pass unnoticed.
+  - interval: 1m
+    name: the first takeover fires, given the counter was pre-created at zero
+    input_series:
+      - series: 'mx_download_claims_total{result="takeover",pod="mx-server-0"}'
+        values: '0+0x20 1+0x20'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: MXDownloadTakeover
+        exp_alerts:
+          - exp_labels: {severity: warning, pod: mx-server-0}
+            exp_annotations:
+              summary: A download was taken over and is being pulled again by mx-server-0
+              description: >-
+                The previous downloader died mid-transfer and mx-server-0 took over. The bytes already fetched are re-fetched from scratch.
+
+  # The companion to the above: a series that appears at 1 with no zero baseline
+  # is invisible to increase(). This is what the pre-creation prevents, and it
+  # is why that change is load-bearing rather than cosmetic.
+  - interval: 1m
+    name: a takeover on a counter born at one is invisible
+    input_series:
+      - series: 'mx_download_claims_total{result="takeover",pod="mx-server-0"}'
+        values: '_x20 1+0x20'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: MXDownloadTakeover
+        exp_alerts: []
+
+  # A one-shot event is above zero for exactly one window-length, so the `for:`
+  # hold has to sit well inside the range selector. A hold equal to the window
+  # can never complete: the condition goes false one scrape interval early.
+  - interval: 1m
+    name: a single lost lease completes its hold and fires
+    input_series:
+      - series: 'mx_download_lease_refresh_total{result="lost",pod="mx-server-1"}'
+        values: '0+0x20 1+0x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: MXDownloadLeaseLost
+        exp_alerts:
+          - exp_labels: {severity: warning, pod: mx-server-1}
+            exp_annotations:
+              summary: A download lease was lost on mx-server-1
+              description: >-
+                mx-server-1 stopped heartbeating and another replica may now claim its model. Expect MXDownloadTakeover next if it does.
+
+  # The point of grouping by pod: one replica losing a lease must name that
+  # replica and leave the healthy one out of the alert entirely. A flat sum()
+  # fires once for "the fleet", which is the wrong end of a triage that starts
+  # by reading one pod's logs.
+  - interval: 1m
+    name: only the pod that lost its lease alerts
+    input_series:
+      - series: 'mx_download_lease_refresh_total{result="lost",pod="mx-server-0"}'
+        values: '0+0x50'
+      - series: 'mx_download_lease_refresh_total{result="lost",pod="mx-server-1"}'
+        values: '0+0x20 1+0x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: MXDownloadLeaseLost
+        exp_alerts:
+          - exp_labels: {severity: warning, pod: mx-server-1}
+            exp_annotations:
+              summary: A download lease was lost on mx-server-1
+              description: >-
+                mx-server-1 stopped heartbeating and another replica may now claim its model. Expect MXDownloadTakeover next if it does.
+
+  # The transition counters are process-local while DOWNLOADING persists in the
+  # shared store, so after a restart they can have no series at all. `unless`
+  # passes the left side through in that case; `and X == 0` would compare
+  # against an empty vector and match nothing, silencing the alert in exactly
+  # the situation it exists for.
+  - interval: 1m
+    name: entries wedged with no transition series at all still fires
+    input_series:
+      - series: 'mx_registry_entries{status="downloading"}'
+        values: '2+0x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: MXDownloadWedged
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Entries stuck in DOWNLOADING with nothing entering that state
+              description: >-
+                The transition counters are process-local while DOWNLOADING persists in the store, so a restart leaves the level with no matching flow. Cross-check MXRegistryStatsStale first: if the refresh task is wedged, this gauge is frozen rather than genuinely stuck.
+
+  - interval: 1m
+    name: a store with operations in flight and no completions at all still fires
+    input_series:
+      - series: 'mx_backend_ops_in_flight{store="registry",op="get_status"}'
+        values: '3+0x40'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: MXBackendOpsStuck
+        exp_alerts:
+          - exp_labels: {severity: critical, store: registry}
+            exp_annotations:
+              summary: Storage backend registry has operations in flight and none completing
+
+  # Without this the suite would only prove the alerts can fire, not that they
+  # discriminate -- an expression stuck permanently true would pass every test
+  # above.
+  - interval: 1m
+    name: a healthy system fires nothing
+    input_series:
+      - series: 'mx_download_claims_total{result="takeover"}'
+        values: '0+0x60'
+      - series: 'mx_download_lease_refresh_total{result="lost"}'
+        values: '0+0x60'
+      - series: 'mx_registry_entries{status="downloading"}'
+        values: '2+0x60'
+      - series: 'mx_registry_status_transitions_total{from="absent",to="downloading"}'
+        values: '0+1x60'
+      - series: 'mx_backend_ops_in_flight{store="registry",op="get_status"}'
+        values: '1+0x60'
+      - series: 'mx_backend_ops_total{store="registry",op="get_status",result="ok"}'
+        values: '0+5x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: MXDownloadTakeover
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: MXDownloadLeaseLost
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: MXDownloadWedged
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: MXBackendOpsStuck
+        exp_alerts: []

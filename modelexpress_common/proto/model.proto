@@ -37,6 +37,9 @@ message ModelDownloadRequest {
   string model_name = 1;
   ModelProvider provider = 2;
   bool ignore_weights = 3;
+  // Optional branch, tag, or commit SHA. When unset the provider's default
+  // revision is used. Providers without a revision concept reject a set value.
+  optional string revision = 4;
 }
 
 // Streaming status update for model download progress
@@ -46,6 +49,9 @@ message ModelStatusUpdate {
   // Optional message for additional context (e.g., progress info, error details)
   optional string message = 3;
   ModelProvider provider = 4;
+  // Immutable commit SHA the request resolved to. Unset for providers that do
+  // not expose revisions.
+  optional string resolved_revision = 5;
 }
 
 // Enum representing the status of a model
@@ -60,6 +66,7 @@ enum ModelProvider {
   HUGGING_FACE = 0;
   NGC = 1;
   GCS = 2;
+  S3 = 3;
 }
 
 // Request for streaming model files
@@ -72,6 +79,12 @@ message ModelFilesRequest {
   uint32 chunk_size = 3;
   // Optional file selector. If unset, all files are streamed.
   ModelFileSelector file_selector = 4;
+  // When true, weight files are skipped and only non-weight files
+  // (config, tokenizer, etc.) are streamed. Mirrors ModelDownloadRequest.
+  bool ignore_weights = 5;
+  // Optional branch, tag, or commit SHA identifying the cached snapshot to
+  // serve. When unset the most recent local snapshot is used.
+  optional string revision = 6;
 }
 
 // Selects files within a model directory

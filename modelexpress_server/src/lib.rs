@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod auth;
 pub mod backend_config;
 pub mod cache;
 pub mod config;
+pub mod metrics;
 pub mod p2p;
+pub mod refit;
 pub mod registry;
 pub mod server;
 pub mod services;

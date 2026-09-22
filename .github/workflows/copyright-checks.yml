@@ -5,6 +5,9 @@ on:
 
 jobs:
   copyright-checks:
+      # Upstream-only: the container image ghcr.io/ai-dynamo/dynamo/helm-tester
+      # is only accessible within the ai-dynamo org.
+      if: github.repository_owner == 'ai-dynamo'
       runs-on: ubuntu-24.04
       container:
         image: ghcr.io/ai-dynamo/dynamo/helm-tester:0.1.1
@@ -15,7 +18,7 @@ jobs:
         contents: read
         packages: read
       steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         # Allowlist both variants of the mounted source directory.
       - run: git config --global --add safe.directory /__w/dynamo/dynamo
       - run: git config --global --add safe.directory /workspace

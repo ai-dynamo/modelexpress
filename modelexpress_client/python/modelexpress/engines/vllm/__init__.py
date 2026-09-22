@@ -3,7 +3,11 @@
 
 """vLLM compatibility integration for ModelExpress."""
 
+from ... import configure_vllm_logging
+from ...patches import apply_patches
 from .adapter import VllmAdapter, build_vllm_load_context
+from .patches import PATCHES as VLLM_PATCHES
+from .refit import MdlLoader
 
 _loaders_registered = False
 
@@ -13,16 +17,24 @@ def register_modelexpress_loaders() -> None:
     global _loaders_registered
     if _loaders_registered:
         return
-    from .registration import register_plugin_model_loader
+    from .registration import (
+        register_plugin_model_loader,
+        register_plugin_weight_transfer_engine,
+    )
+
+    configure_vllm_logging()
+    apply_patches(VLLM_PATCHES)
 
     # Needed for older vLLM versions before native ModelExpress loader
     # registration is available.
     register_plugin_model_loader()
+    register_plugin_weight_transfer_engine()
 
     _loaders_registered = True
 
 
 __all__ = [
+    "MdlLoader",
     "VllmAdapter",
     "build_vllm_load_context",
     "register_modelexpress_loaders",

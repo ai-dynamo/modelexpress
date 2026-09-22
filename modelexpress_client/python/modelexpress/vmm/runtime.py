@@ -19,9 +19,10 @@ runs after the load body returns.
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator
+
+from .. import envs
 
 if TYPE_CHECKING:
     from ..load_strategy.context import LoadContext
@@ -103,7 +104,19 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
       allocation, not peak live size. With 16 TiB reserved, this is
       bounded only by HBM (we never exhaust VA).
     """
-    if os.environ.get("MX_VMM_ARENA") != "1":
+    if not envs.MX_VMM_ARENA or not ctx.p2p_enabled:
+        # p2p_enabled is False for the speculative draft's second load;
+        # skip the arena so it does not replace the target model's.
+        yield
+        return
+
+    if not ctx.accelerator_backend.supports_vmm():
+        logger.warning(
+            "[Worker %d] MX_VMM_ARENA=1 set but %s does not support VMM "
+            "arena; falling back to the non-arena load path.",
+            ctx.global_rank,
+            ctx.accelerator_backend.name,
+        )
         yield
         return
 
@@ -114,7 +127,7 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
     # the old env vars forward from a pre-refactor manifest sees one
     # clear message rather than silent behavior change.
     for stale_var in ("MX_VMM_ARENA_BYTES", "MX_VMM_ARENA_CHUNK_BYTES"):
-        if os.environ.get(stale_var):
+        if envs.is_set(stale_var):
             logger.warning(
                 "[Worker %d] %s is set but no longer honored; the new VMM "
                 "arena reserves 16 TiB of VA unconditionally and uses one "
@@ -231,10 +244,12 @@ def log_arena_post_load(ctx: "LoadContext") -> None:
     ``ibv_reg_dmabuf_mr`` over ``[base, base+used_bytes)`` already ran
     inside ``LoadStrategyChain`` via
     ``NixlTransferManager.register_arena``; this hook is purely
-    diagnostic. Empirically validated on Blackwell + ConnectX over
-    InfiniBand: the registration succeeds over a VA range with
+    diagnostic. Validated on the dmabuf/IB path, Blackwell + ConnectX
+    over InfiniBand: the registration succeeds over a VA range with
     mid-range holes from prior ``cuMemUnmap`` calls, and the dmabuf pin
-    keeps live tensor pages addressable to the HCA.
+    keeps live tensor pages addressable to the HCA. On ``cuda_ipc`` a
+    multi-allocation arena cannot be covered by one MR at all, and
+    ``register_arena`` falls back to per-tensor registration.
     """
     arena = _vmm_arenas.get(ctx.device_id)
     if arena is None:

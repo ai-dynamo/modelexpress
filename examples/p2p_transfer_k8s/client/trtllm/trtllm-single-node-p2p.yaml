@@ -1,0 +1,171 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Single-node TensorRT-LLM deployment with ModelExpress P2P weight transfer.
+#
+# Prerequisites:
+#   - ModelExpress server deployed (see ../../server/)
+#   - TensorRT-LLM image with ModelExpress installed
+#   - PVC with the model pre-downloaded in Hugging Face cache layout
+#   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
+#
+# On startup, the native MX checkpoint loader queries the ModelExpress server:
+#   - If a ready source exists for this model -> receive weights via RDMA
+#   - If no source is available -> load weights from storage
+# Either way, the replica publishes its post-transform weights so future
+# replicas can discover it as a source.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mx-trtllm-config
+data:
+  config.yaml: |
+    checkpoint_format: MX
+    mx_config:
+      server_url: modelexpress-server:8001
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-trtllm
+  labels:
+    app: mx-trtllm
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  selector:
+    app: mx-trtllm
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-trtllm
+  labels:
+    app: mx-trtllm
+spec:
+  replicas: 1
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: mx-trtllm
+  template:
+    metadata:
+      labels:
+        app: mx-trtllm
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-trtllm
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: trtllm
+          # Use a qualified TensorRT-LLM image containing the native MX
+          # checkpoint loader, with the ModelExpress client installed.
+          image: <your-registry>/trtllm-modelexpress:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - trtllm-serve
+          args:
+            - "$(MODEL_NAME)"
+            - --backend
+            - pytorch
+            - --tp_size
+            - "$(TP_SIZE)"
+            - --config
+            - /etc/trtllm/config.yaml
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8000"
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: HF_HOME
+              value: /models
+            - name: MODEL_NAME
+              value: meta-llama/Llama-3.1-70B-Instruct
+            - name: TP_SIZE
+              value: "4"
+            # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
+            - name: MX_RDMA_NIC_PIN
+              value: auto
+            - name: NIXL_LOG_LEVEL
+              value: INFO
+            - name: UCX_LOG_LEVEL
+              value: INFO
+            - name: UCX_RNDV_SCHEME
+              value: get_zcopy
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 180
+          resources:
+            limits:
+              nvidia.com/gpu: "4"
+              rdma/ib: "4"
+            requests:
+              cpu: "16"
+              memory: 200Gi
+              nvidia.com/gpu: "4"
+              rdma/ib: "4"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+            - name: trtllm-config
+              mountPath: /etc/trtllm
+              readOnly: true
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - name: trtllm-config
+          configMap:
+            name: mx-trtllm-config
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule

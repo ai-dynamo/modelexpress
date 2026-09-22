@@ -1,0 +1,805 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Exact-version staged NIXL transfer for RL generator workers.
+
+This module owns the state that makes a pull transfer correct: the selected
+source manifests, the physical plan, registered destination buffers, peer
+metadata, transfer completion, and verification. It deliberately does not know
+how an inference engine captures its load layout or installs received weights.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+
+from modelexpress import envs, p2p_pb2
+from modelexpress.metadata.payload import worker_tensor_descriptors
+from modelexpress.metadata.worker_server import (
+    TensorReadLease,
+    prepare_tensor_read,
+)
+from modelexpress.nixl_transfer import NixlTransferManager
+from modelexpress.refit.reshard import throughput
+from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress.refit.reshard.rendezvous import (
+    build_sources,
+    merge_shard_tables,
+    unwrap_rendezvous_blob,
+)
+from modelexpress.refit.reshard.slice_plan import plan_pull
+from modelexpress.refit.reshard.transfer_plan import (
+    FullPullSource,
+    TransferPlan,
+    exact_descriptors,
+    plan_transfer,
+)
+from modelexpress.refit.reshard.transport import ReadDescriptor
+from modelexpress.refit.reshard.transport.nixl import NixlReshardTransport
+from modelexpress.refit.reshard.types import (
+    CaptureResult,
+    IncompleteRefit,
+    RecordedCopy,
+    UnsupportedReshard,
+    summarize_unsupported,
+)
+from modelexpress.refit.reshard.verify import shard_region, tensor_digest
+from modelexpress.types import ManifestMismatchError, TensorDescriptor
+
+# Named under modelexpress.* (not modelexpress_rl) so the per-update summary surfaces
+# in the vLLM engine process, which only configures the modelexpress logger.
+logger = logging.getLogger("modelexpress.reshard.staged_transfer")
+
+
+@dataclass(frozen=True)
+class _ResolvedSources:
+    sources: dict
+    session_to_agent: dict
+    session_to_device: dict
+    agent_metadata: dict[str, bytes]
+
+
+@dataclass(frozen=True)
+class _PreparedNixlTransfer:
+    """One immutable physical plan over reusable registered destinations."""
+
+    plan: TransferPlan
+    capture: CaptureResult
+    sources: dict
+    descriptors: tuple[ReadDescriptor, ...]
+    transport: NixlReshardTransport
+
+
+@dataclass(frozen=True)
+class _StagedNixlWeights:
+    """Verified tensors ready for engine installation."""
+
+    tensors: dict[str, torch.Tensor]
+    metrics: dict[str, Any]
+
+
+def _resolve_sources(manifests: list[bytes]) -> _ResolvedSources:
+    if not manifests:
+        raise ValueError("at least one source manifest is required")
+    payloads = [unwrap_rendezvous_blob(manifest) for manifest in manifests]
+    agents = [payload.agent_name for payload in payloads]
+    if len(set(agents)) != len(agents):
+        raise ValueError("source manifests contain duplicate NIXL agents")
+    merged = merge_shard_tables([payload.tensors for payload in payloads])
+    sources, session_to_agent, session_to_device = build_sources(merged)
+    return _ResolvedSources(
+        sources=sources,
+        session_to_agent=session_to_agent,
+        session_to_device=session_to_device,
+        agent_metadata={
+            payload.agent_name: payload.agent_metadata for payload in payloads
+        },
+    )
+
+
+def _required_agent_metadata(
+    plan: TransferPlan, resolved: _ResolvedSources
+) -> dict[str, bytes]:
+    sessions = plan.sessions()
+    missing_sessions = sorted(sessions - set(resolved.session_to_agent))
+    if missing_sessions:
+        raise RuntimeError(
+            f"transfer plan references unknown source sessions: {missing_sessions[:10]}"
+        )
+    needed = {resolved.session_to_agent[session] for session in sessions}
+    missing = sorted(needed - set(resolved.agent_metadata))
+    if missing:
+        raise RuntimeError(
+            "transfer plan references source agents without NIXL metadata: "
+            f"{missing[:10]}"
+        )
+    return {
+        agent: metadata
+        for agent, metadata in resolved.agent_metadata.items()
+        if agent in needed
+    }
+
+
+def _source_structure(source) -> tuple:
+    """Reduce a source to the fields a reused transfer plan has baked in.
+
+    Deliberately excludes the per-shard content digests, which are exactly what
+    a refresh replaces, and includes the addresses, which a plan holds and must
+    never be allowed to drift underneath.
+    """
+    return (
+        source.dtype,
+        tuple(source.global_shape),
+        source.elsize,
+        tuple(
+            (
+                shard.session,
+                shard.addr,
+                shard.elsize,
+                tuple(shard.shard_offset),
+                tuple(shard.shape),
+            )
+            for shard in source.shards
+        ),
+    )
+
+
+def _load_agent_metadata(
+    manager: NixlTransferManager, metadata_by_agent: dict[str, bytes]
+) -> None:
+    """Load the exact source registrations carried by the version manifests."""
+    for expected_agent, metadata in metadata_by_agent.items():
+        loaded_agent = manager.add_remote_agent(metadata)
+        if isinstance(loaded_agent, bytes):
+            loaded_agent = loaded_agent.decode("utf-8")
+        if loaded_agent != expected_agent:
+            raise RuntimeError(
+                "NIXL metadata agent does not match its manifest: "
+                f"expected {expected_agent!r}, got {loaded_agent!r}"
+            )
+
+
+def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
+    value = tensor
+    for op_name, args, frozen_kwargs in op_chain:
+        kwargs = dict(frozen_kwargs)
+        if op_name == "__getitem__":
+            value = value.__getitem__(*args)
+        else:
+            value = getattr(value, op_name)(*args, **kwargs)
+    return value
+
+
+def _row_major_strides(shape: tuple) -> tuple:
+    strides = []
+    stride = 1
+    for extent in reversed(shape):
+        strides.append(stride)
+        stride *= int(extent)
+    return tuple(reversed(strides))
+
+
+def _merge_plan(target: TransferPlan, source: TransferPlan) -> None:
+    target.segments.extend(source.segments)
+    target.converts.extend(source.converts)
+    target.full_pulls.extend(source.full_pulls)
+    target.unbounded_sources.extend(source.unbounded_sources)
+    for name in source.fallback:
+        if name not in target.fallback:
+            target.fallback.append(name)
+    target.exact_descriptor_count += source.exact_descriptor_count
+    target.exact_bytes += source.exact_bytes
+
+
+def _plan_staged_transfer(capture: CaptureResult, sources: dict) -> TransferPlan:
+    """Plan reads for each source.
+
+    Default: minimal slice reads via plan_transfer (a partial read of a shard cannot
+    be whole-shard digest-verified, so correctness rests on the coverage gate). Under
+    MX_RESHARD_PUBLISH_DIGEST (verification mode): reconstruct every source that isn't
+    a whole-tensor identity copy as a full pull, so _verify has a complete shard to
+    digest-check.
+    """
+    if not envs.MX_RESHARD_PUBLISH_DIGEST:
+        return plan_transfer(capture, sources)
+
+    result = TransferPlan()
+    copies_by_source: dict[str, list[RecordedCopy]] = {}
+    for copy in capture.copies:
+        copies_by_source.setdefault(copy.src_name, []).append(copy)
+
+    for name in capture.unsupported:
+        if name not in result.fallback:
+            result.fallback.append(name)
+
+    for name, source in sources.items():
+        copies = copies_by_source.pop(name, [])
+        if not copies:
+            continue
+        directly_recoverable = any(
+            not copy.op_chain and tuple(copy.dest_shape) == tuple(source.global_shape)
+            for copy in copies
+        )
+        if directly_recoverable:
+            _merge_plan(
+                result,
+                plan_transfer(CaptureResult(copies=copies), {name: source}),
+            )
+            continue
+
+        identity = RecordedCopy(
+            src_name=name,
+            op_chain=(),
+            param_name=name,
+            dest_offset=0,
+            dest_shape=tuple(source.global_shape),
+            dest_stride=_row_major_strides(source.global_shape),
+            dest_dtype=source.dtype,
+        )
+        try:
+            segments = plan_pull(
+                identity,
+                source.global_shape,
+                source.dtype,
+                source.elsize,
+                source.shards,
+            )
+        except UnsupportedReshard as error:
+            raise UnsupportedReshard(
+                f"{name}: strict staged verification cannot reconstruct the "
+                "complete published source"
+            ) from error
+        result.full_pulls.append(
+            FullPullSource(
+                src_name=name,
+                global_shape=tuple(source.global_shape),
+                dtype=source.dtype,
+                elsize=source.elsize,
+                segments=segments,
+                copies=copies,
+            )
+        )
+        result.exact_descriptor_count += len(segments)
+        result.exact_bytes += sum(segment.nbytes for segment in segments)
+
+    for name in copies_by_source:
+        if name not in result.fallback:
+            result.fallback.append(name)
+    return result
+
+
+class _NixlStagedTransfer:
+    """Own the complete prepare-and-stage lifecycle for one generator rank."""
+
+    def __init__(
+        self,
+        *,
+        device_id: int,
+        device: torch.device,
+        agent_name: str | None = None,
+        listen_port: int | None = None,
+        timeout_seconds: float | None = None,
+        manager: NixlTransferManager | None = None,
+    ) -> None:
+        self._device_id = device_id
+        self._device = device
+        self._timeout = float(
+            envs.MX_TRANSFER_TIMEOUT
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        self._owns_manager = manager is None
+        if manager is None:
+            if agent_name is None:
+                raise ValueError("an owned NIXL manager requires an agent name")
+            manager = NixlTransferManager(
+                agent_name=agent_name,
+                device_id=device_id,
+                listen_port=listen_port,
+            )
+        self._manager = manager
+        if self._owns_manager:
+            try:
+                self._manager.initialize()
+            except Exception:
+                self._manager.shutdown()
+                raise
+        # Canonical engine-layout staging buffers. Exact slices land directly
+        # here; reconstructed or converted values are copied here before these
+        # buffers are verified, installed, and advertised to peer generators.
+        self._recv_buffers: dict[str, torch.Tensor] = {}
+        # Wire-dtype staging for sources whose dtype differs from the engine
+        # parameter. RDMA writes here first, then stage() casts into recv buffers.
+        self._convert_buffers: dict[str, torch.Tensor] = {}
+        # Complete contiguous source tensors used when captured transforms must
+        # be replayed locally, or when direct slicing exceeds the descriptor
+        # budget. stage() reconstructs each source here, then copies its derived
+        # views into the canonical receive buffers.
+        self._full_buffers: dict[str, torch.Tensor] = {}
+        self._registered_recv_params: set[str] = set()
+        self._convert_registered = False
+        self._full_registered = False
+        self._active: _PreparedNixlTransfer | None = None
+        self._loaded_agent_metadata: dict[str, bytes] = {}
+        self._closed = False
+
+    def prepare(
+        self,
+        *,
+        manifests: list[bytes],
+        capture_layout: Callable[
+            [list[tuple[str, torch.dtype, tuple[int, ...]]]],
+            tuple[
+                CaptureResult,
+                dict[str, tuple[tuple[int, ...], torch.dtype]],
+            ],
+        ],
+    ) -> _PreparedNixlTransfer:
+        """Compile one exact source version into a physical NIXL plan."""
+        if self._closed:
+            raise RuntimeError("NIXL staged transfer is closed")
+        resolved = _resolve_sources(manifests)
+        manifest = [
+            (name, source.dtype, tuple(source.global_shape))
+            for name, source in resolved.sources.items()
+        ]
+        capture, parameter_layout = capture_layout(manifest)
+        plan = _plan_staged_transfer(capture, resolved.sources)
+        self._validate_complete(capture, parameter_layout, plan)
+        required_metadata = _required_agent_metadata(plan, resolved)
+        changed = {
+            agent: metadata
+            for agent, metadata in required_metadata.items()
+            if self._loaded_agent_metadata.get(agent) != metadata
+        }
+        conflicting = sorted(
+            agent
+            for agent in changed
+            if agent in self._loaded_agent_metadata
+        )
+        if conflicting:
+            raise RuntimeError(
+                "NIXL metadata changed for an already connected source agent: "
+                f"{conflicting[:10]}"
+            )
+        _load_agent_metadata(self._manager, changed)
+        self._loaded_agent_metadata.update(changed)
+        transport = NixlReshardTransport(
+            self._manager,
+            resolved.session_to_agent,
+            resolved.session_to_device,
+            timeout_seconds=self._timeout,
+        )
+        self._ensure_workspace(plan, parameter_layout)
+        descriptors = tuple(self._descriptors(plan))
+        used_sources = {
+            copy.src_name: resolved.sources[copy.src_name]
+            for copy in capture.copies
+            if copy.src_name in resolved.sources
+        }
+        prepared = _PreparedNixlTransfer(
+            plan=plan,
+            capture=capture,
+            sources=used_sources,
+            descriptors=descriptors,
+            transport=transport,
+        )
+        self._active = prepared
+        return prepared
+
+    def refresh_sources(
+        self, prepared: _PreparedNixlTransfer, manifests: list[bytes]
+    ) -> None:
+        """Refresh version-specific source digests without rebuilding the plan."""
+        if prepared is not self._active:
+            raise RuntimeError("NIXL transfer plan is no longer active")
+        resolved = _resolve_sources(manifests)
+        used_sources = {
+            copy.src_name: resolved.sources[copy.src_name]
+            for copy in prepared.capture.copies
+            if copy.src_name in resolved.sources
+        }
+        if set(used_sources) != set(prepared.sources):
+            raise RuntimeError("source tensor set changed while reusing transfer plan")
+        if any(
+            _source_structure(source) != _source_structure(prepared.sources[name])
+            for name, source in used_sources.items()
+        ):
+            raise RuntimeError("source geometry changed while reusing transfer plan")
+        prepared.sources.clear()
+        prepared.sources.update(used_sources)
+
+    @staticmethod
+    def _validate_complete(
+        capture: CaptureResult,
+        parameter_layout: dict[str, tuple[tuple[int, ...], torch.dtype]],
+        plan: TransferPlan,
+    ) -> None:
+        written = {copy.param_name for copy in capture.copies}
+        missing = sorted(set(parameter_layout) - written)
+        unsupported = list(capture.unsupported)
+        if missing or unsupported or capture.unattributed or plan.fallback:
+            causes = summarize_unsupported(capture.unsupported_reasons)
+            raise IncompleteRefit(
+                "full-tensor refit must cover every engine parameter; "
+                f"missing={len(missing)}, unsupported={len(unsupported)}, "
+                f"unattributed={capture.unattributed}, fallback={len(plan.fallback)}, "
+                f"causes={causes}"
+            )
+
+    @staticmethod
+    def _layout(tensors: dict[str, torch.Tensor]) -> dict:
+        return {
+            name: (tuple(tensor.shape), tensor.dtype)
+            for name, tensor in tensors.items()
+        }
+
+    def _ensure_buffers(
+        self,
+        current: dict[str, torch.Tensor],
+        expected: dict[str, tuple[tuple[int, ...], torch.dtype]],
+        *,
+        label: str,
+    ) -> None:
+        if current:
+            if self._layout(current) != expected:
+                raise RuntimeError(
+                    f"{label} layout changed; restart the generator engine"
+                )
+            return
+        with classic_cuda_alloc():
+            current.update(
+                {
+                    name: torch.empty(shape, dtype=dtype, device=self._device)
+                    for name, (shape, dtype) in expected.items()
+                }
+            )
+
+    def _ensure_workspace(
+        self,
+        plan: TransferPlan,
+        parameter_layout: dict[str, tuple[tuple[int, ...], torch.dtype]],
+    ) -> None:
+        recv_expected = {
+            name: (tuple(shape), dtype)
+            for name, (shape, dtype) in parameter_layout.items()
+        }
+        self._ensure_buffers(self._recv_buffers, recv_expected, label="receive-buffer")
+
+        convert_expected = {
+            convert.param_name: (tuple(convert.dest_shape), convert.src_dtype)
+            for convert in plan.converts
+        }
+        self._ensure_buffers(
+            self._convert_buffers, convert_expected, label="conversion-buffer"
+        )
+        full_expected = {
+            full.src_name: (tuple(full.global_shape), full.dtype)
+            for full in plan.full_pulls
+        }
+        self._ensure_buffers(
+            self._full_buffers, full_expected, label="full-pull buffer"
+        )
+
+        recv_params = set(recv_expected)
+        if (
+            self._registered_recv_params
+            and self._registered_recv_params != recv_params
+        ):
+            raise RuntimeError(
+                "receive parameter set changed; restart the generator engine"
+            )
+        if convert_expected and not self._convert_registered:
+            self._manager.register_tensors(
+                {
+                    f"__convert__{name}": tensor
+                    for name, tensor in self._convert_buffers.items()
+                }
+            )
+            self._convert_registered = True
+        if full_expected and not self._full_registered:
+            self._manager.register_tensors(
+                {
+                    f"__full__{name}": tensor
+                    for name, tensor in self._full_buffers.items()
+                }
+            )
+            self._full_registered = True
+        if not self._registered_recv_params and recv_params:
+            self._manager.register_tensors(self._recv_buffers)
+            self._registered_recv_params = recv_params
+
+    def _descriptors(self, plan: TransferPlan) -> list[ReadDescriptor]:
+        descriptors = exact_descriptors(
+            plan, lambda name: self._recv_buffers[name].data_ptr()
+        )
+        descriptors.extend(
+            ReadDescriptor(
+                session=segment.session,
+                src_addr=segment.src_addr,
+                dst_addr=self._full_buffers[full.src_name].data_ptr()
+                + segment.dst_byte,
+                nbytes=segment.nbytes,
+            )
+            for full in plan.full_pulls
+            for segment in full.segments
+        )
+        descriptors.extend(
+            ReadDescriptor(
+                session=segment.session,
+                src_addr=segment.src_addr,
+                dst_addr=self._convert_buffers[convert.param_name].data_ptr()
+                + segment.dst_byte,
+                nbytes=segment.nbytes,
+            )
+            for convert in plan.converts
+            for segment in convert.segments
+        )
+        return descriptors
+
+    @torch.no_grad()
+    def stage(self, prepared: _PreparedNixlTransfer) -> _StagedNixlWeights:
+        """Pull, reconstruct, convert, and verify without touching live weights."""
+        if self._closed:
+            raise RuntimeError("NIXL staged transfer is closed")
+        if prepared is not self._active:
+            raise RuntimeError("NIXL transfer plan is no longer active")
+        started = time.perf_counter()
+        prepared.transport.read(list(prepared.descriptors))
+        wire_seconds = time.perf_counter() - started
+
+        reconstruct_started = time.perf_counter()
+        for full in prepared.plan.full_pulls:
+            source = self._full_buffers[full.src_name]
+            for copy in full.copies:
+                destination = self._recv_buffers[copy.param_name].as_strided(
+                    copy.dest_shape,
+                    copy.dest_stride,
+                    self._recv_buffers[copy.param_name].storage_offset()
+                    + copy.dest_offset,
+                )
+                destination.copy_(_replay_ops(source, copy.op_chain))
+        for convert in prepared.plan.converts:
+            self._recv_buffers[convert.param_name].copy_(
+                self._convert_buffers[convert.param_name]
+            )
+        torch.cuda.synchronize(self._device)
+        reconstruct_seconds = time.perf_counter() - reconstruct_started
+        # Only digest mode has complete tensors and stamped digests to check.
+        if envs.MX_RESHARD_PUBLISH_DIGEST:
+            self._verify(prepared)
+
+        bytes_received = sum(d.nbytes for d in prepared.descriptors)
+        # This is the path the FSDP trainer refits over, and the path the 20x
+        # collapse was measured on, so it is the one the floor most needs to cover.
+        throughput.warn_if_below_floor(
+            wire_bytes=bytes_received,
+            wire_seconds=wire_seconds,
+            log=logger,
+            context={"device_id": self._device_id, "phase": "stage"},
+        )
+        logger.info(
+            "[TIMING] staged xfer: %.3f GB, %d descriptors "
+            "(seg=%d full_pull=%d convert=%d), %d tensors | "
+            "wire=%.3fs reconstruct=%.3fs",
+            bytes_received / 1e9,
+            len(prepared.descriptors),
+            len(prepared.plan.segments),
+            len(prepared.plan.full_pulls),
+            len(prepared.plan.converts),
+            len(self._recv_buffers),
+            wire_seconds,
+            reconstruct_seconds,
+        )
+        return _StagedNixlWeights(
+            tensors=self._recv_buffers,
+            metrics={
+                "bytes_received": bytes_received,
+                "segments": len(prepared.descriptors),
+                "wire_s": round(wire_seconds, 6),
+                "reconstruct_s": round(reconstruct_seconds, 6),
+                "full_pull_sources": len(prepared.plan.full_pulls),
+                "converts": len(prepared.plan.converts),
+            },
+        )
+
+    @staticmethod
+    def _validate_peer_manifest(
+        manifest: p2p_pb2.GetTensorManifestResponse,
+        destination_tensors: dict[str, torch.Tensor],
+    ) -> list[TensorDescriptor]:
+        source_tensors = [
+            TensorDescriptor(
+                name=tensor.name,
+                addr=tensor.addr,
+                size=tensor.size,
+                device_id=tensor.device_id,
+                dtype=tensor.dtype,
+            )
+            for tensor in manifest.tensors
+        ]
+        if not source_tensors:
+            raise RuntimeError("P2P source has no tensor descriptors")
+
+        source_names = {tensor.name for tensor in source_tensors}
+        local_names = set(destination_tensors)
+        if source_names != local_names:
+            local_only = sorted(local_names - source_names)
+            source_only = sorted(source_names - local_names)
+            raise ManifestMismatchError(
+                "runtime tensor name mismatch: "
+                f"{len(local_only)} local-only (first: {local_only[:5]}), "
+                f"{len(source_only)} source-only (first: {source_only[:5]})"
+            )
+        for source in source_tensors:
+            destination = destination_tensors[source.name]
+            size = destination.numel() * destination.element_size()
+            if source.size != size or source.dtype != str(destination.dtype):
+                raise ManifestMismatchError(
+                    f"runtime tensor metadata mismatch for {source.name!r}"
+                )
+        return source_tensors
+
+    @staticmethod
+    def _peer_endpoint(
+        manifest: p2p_pb2.GetTensorManifestResponse,
+    ) -> tuple[str, int, str]:
+        endpoint = manifest.metadata_endpoint
+        try:
+            host, port_text = endpoint.rsplit(":", 1)
+            port = int(port_text)
+        except ValueError as error:
+            raise RuntimeError(
+                "P2P source published an unusable metadata endpoint: "
+                f"{endpoint!r}"
+            ) from error
+        if not host or not 1 <= port <= 65535 or not manifest.agent_name:
+            raise RuntimeError(
+                "P2P source published unusable NIXL connection metadata: "
+                f"endpoint={endpoint!r}, agent_name={manifest.agent_name!r}"
+            )
+        return host, port, manifest.agent_name
+
+    def prepare_peer_read(
+        self,
+        *,
+        source: p2p_pb2.WorkerMetadata,
+        mx_source_id: str,
+        worker_id: str,
+        destination_tensors: dict[str, torch.Tensor],
+    ) -> TensorReadLease:
+        """Validate and retain a donor lease until apply or release."""
+        if self._closed:
+            raise RuntimeError("NIXL staged transfer is closed")
+        if not source.worker_grpc_endpoint:
+            raise RuntimeError("generator P2P source has no tensor lease endpoint")
+        lease, _ = prepare_tensor_read(
+            source.worker_grpc_endpoint,
+            mx_source_id,
+            worker_id=worker_id,
+            timeout=self._timeout,
+        )
+        try:
+            self._validate_peer_manifest(lease.manifest, destination_tensors)
+            self._peer_endpoint(lease.manifest)
+        except BaseException:
+            lease.close()
+            raise
+        return lease
+
+    def receive_peer(
+        self,
+        *,
+        tensor_read: TensorReadLease,
+        destination_tensors: dict[str, torch.Tensor],
+        on_transfer_start: Callable[[], None],
+    ) -> dict[str, Any]:
+        """Pull a peer's runtime tensors directly into live engine storage."""
+        if self._closed:
+            raise RuntimeError("NIXL staged transfer is closed")
+
+        remote_agent_name: str | None = None
+        started = time.perf_counter()
+        manifest = tensor_read.manifest
+        source_tensors = self._validate_peer_manifest(
+            manifest,
+            destination_tensors,
+        )
+        host, port, remote_agent_name = self._peer_endpoint(manifest)
+        try:
+            self._manager.fetch_remote_and_wait(
+                remote_agent_name=remote_agent_name,
+                ip=host,
+                port=port,
+                timeout_seconds=self._timeout,
+            )
+            bytes_received, tensor_count, wire_seconds = (
+                self._manager.receive_from_source(
+                    source_metadata=b"",
+                    source_tensors=source_tensors,
+                    timeout_seconds=self._timeout,
+                    remote_agent_name=remote_agent_name,
+                    require_exact_match=True,
+                    destination_tensors=destination_tensors,
+                    on_transfer_start=on_transfer_start,
+                )
+            )
+        finally:
+            if remote_agent_name is not None:
+                self._manager.remove_remote_agent(remote_agent_name)
+
+        throughput.warn_if_below_floor(
+            wire_bytes=bytes_received,
+            wire_seconds=wire_seconds,
+            log=logger,
+            context={"device_id": self._device_id, "phase": "receive_peer"},
+        )
+        return {
+            "bytes_received": bytes_received,
+            "segments": tensor_count,
+            "wire_s": round(wire_seconds, 6),
+            "peer_s": round(time.perf_counter() - started, 6),
+        }
+
+    def _verification_tensor(self, prepared: _PreparedNixlTransfer, name: str):
+        source = prepared.sources[name]
+        if name in self._full_buffers:
+            return self._full_buffers[name]
+        copy = next(
+            (
+                copy
+                for copy in prepared.capture.copies
+                if copy.src_name == name
+                and not copy.op_chain
+                and tuple(copy.dest_shape) == tuple(source.global_shape)
+            ),
+            None,
+        )
+        if copy is None:
+            raise RuntimeError(f"cannot recover complete staged source {name!r}")
+        if copy.param_name in self._convert_buffers:
+            return self._convert_buffers[copy.param_name]
+        buffer = self._recv_buffers[copy.param_name]
+        return buffer.as_strided(
+            copy.dest_shape,
+            copy.dest_stride,
+            buffer.storage_offset() + copy.dest_offset,
+        )
+
+    def _verify(self, prepared: _PreparedNixlTransfer) -> None:
+        for name, source in prepared.sources.items():
+            tensor = self._verification_tensor(prepared, name)
+            for shard in source.shards:
+                if not shard.digest:
+                    raise RuntimeError(
+                        f"source {name!r} did not publish a verification digest"
+                    )
+                actual = tensor_digest(
+                    shard_region(
+                        tensor,
+                        source.global_shape,
+                        shard.shard_offset,
+                        shard.shape,
+                    )
+                )
+                if actual != shard.digest:
+                    raise RuntimeError(
+                        f"staged weight digest mismatch for source {name!r} "
+                        f"at offset {tuple(shard.shard_offset)}"
+                    )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._owns_manager:
+            self._manager.shutdown()
+
+
+__all__: list[str] = []

@@ -45,7 +45,7 @@ spec:
             - name: HF_HUB_CACHE
               value: /models
             - name: MODEL_NAME
-              value: "meta-llama/Llama-3.1-405B-Instruct"
+              value: "deepseek-ai/DeepSeek-V4-Pro"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:

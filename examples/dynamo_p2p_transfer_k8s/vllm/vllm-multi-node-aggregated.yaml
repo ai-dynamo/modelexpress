@@ -3,7 +3,7 @@
 
 # Multi-node vLLM DynamoGraphDeployment with ModelExpress P2P weight transfer.
 #
-# Deploys nvidia/Kimi-K2.5-NVFP4 with TP=4, PP=2 (8 GPUs across 2 nodes per replica).
+# Deploys deepseek-ai/DeepSeek-V4-Pro with TP=4, PP=2 (8 GPUs across 2 nodes per replica).
 # Includes ModelExpress server (kubernetes CRD backend) and dynamo Frontend.
 #
 # Start with replicas=1 (source loads from disk), then scale to 2 for P2P:
@@ -49,7 +49,7 @@ spec:
       extraPodSpec:
         serviceAccountName: modelexpress
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0
+          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.3.0
           command:
             - /bin/sh
             - -c
@@ -106,13 +106,23 @@ spec:
         - name: HF_HOME
           value: "/models"
         - name: MODEL_NAME
-          value: "nvidia/Kimi-K2.5-NVFP4"
-        - name: VLLM_PLUGINS
-          value: "modelexpress"
+          value: "deepseek-ai/DeepSeek-V4-Pro"
+        # vLLM 0.23.0 recognizes --load-format modelexpress natively. For
+        # older vLLM versions, add:
+        # - name: VLLM_PLUGINS
+        #   value: "modelexpress"
         # Dynamo's ModelExpress integration uses MODEL_EXPRESS_URL today; MX is
         # standardizing on MX_SERVER_ADDRESS going forward (see README).
         - name: MODEL_EXPRESS_URL
           value: "mx-vllm-modelexpress:8000"
+        - name: MX_ARTIFACT_TRANSFER
+          value: "1"
+        # Dynamo serves worker health on 9090; publish caches only after the
+        # generate endpoint is ready and JIT warmup has completed. Only the head
+        # pod serves 9090, so non-head nodes rewrite this loopback host onto the
+        # head (see "Multi-node readiness" in docs/DEPLOYMENT.md).
+        - name: MX_ARTIFACT_READY_URL
+          value: "http://127.0.0.1:9090/health"
         # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
         - name: MX_RDMA_NIC_PIN
           value: "auto"
@@ -133,6 +143,12 @@ spec:
           # Build using examples/dynamo_p2p_transfer_k8s/Dockerfile
           image: <your-registry>/modelexpress-vllm-runtime:latest
           securityContext:
+            # The dynamo runtime image defaults to the non-root dynamo user.
+            # FlashInfer downloads missing cubins into its installed
+            # flashinfer-cubin package directory under root-owned
+            # site-packages, which fails with EACCES and kills the worker
+            # during EngineCore init. See README "Debugging".
+            runAsUser: 0
             capabilities:
               add:
               - IPC_LOCK
@@ -142,7 +158,7 @@ spec:
             - dynamo.vllm
           args:
             - --model
-            - nvidia/Kimi-K2.5-NVFP4
+            - deepseek-ai/DeepSeek-V4-Pro
             - --load-format
             - modelexpress
             - --tensor-parallel-size
@@ -151,6 +167,8 @@ spec:
             - "2"
             - --max-model-len
             - "32768"
+            - --kv-cache-dtype
+            - fp8
             - --trust-remote-code
       volumeMounts:
         - name: shared-model-cache

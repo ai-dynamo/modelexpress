@@ -53,6 +53,7 @@ def _make_load_context(**overrides):
         target_device=torch.device("cpu"),
         global_rank=0,
         worker_rank=0,
+        local_rank=0,
         device_id=0,
         identity=p2p_pb2.SourceIdentity(
             model_name="test-model",
@@ -207,11 +208,10 @@ class TestModelStreamerLoad:
         mock_stream.assert_called_once_with("/models/deepseek", ctx, model)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_uri_from_model_weights_not_from_env(self, mock_register):
-        """The streaming URI comes from model_config, not from MX_MODEL_URI."""
+    def test_uri_from_env_with_hf_model_as_fallback(self, mock_register):
         model = MagicMock()
         ctx = self._make_ctx_with_uri(
-            model_weights="s3://bucket/from-config", model="/ignored"
+            model_weights=None, model="Qwen/Qwen2.5-0.5B"
         )
         strategy = self._make_strategy()
 
@@ -224,7 +224,7 @@ class TestModelStreamerLoad:
                 with pytest.raises(StrategyFailed, match="expected"):
                     strategy.load(model, ctx)
 
-        mock_stream.assert_called_once_with("s3://bucket/from-config", ctx, model)
+        mock_stream.assert_called_once_with("s3://other/path-in-env", ctx, model)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
     def test_raises_strategy_failed_on_error(self, mock_register):
@@ -368,7 +368,7 @@ class TestVllmModelStreamerIterator:
         native_load_config = loader_cls.call_args.args[0]
         assert native_load_config.model_loader_extra_config == {"concurrency": 4}
 
-    def test_distributed_disabled_by_default_even_with_tp_gt_one(self):
+    def test_distributed_enabled_by_default_when_tp_gt_one(self):
         adapter, _load_config = self._make_adapter(
             tp_size=8,
             extra_config={"concurrency": 4},
@@ -376,6 +376,22 @@ class TestVllmModelStreamerIterator:
         patcher, loader_cls, _loader_instance = self._patch_runai_loader([])
 
         with patcher, patch.dict("os.environ", {}, clear=True):
+            list(adapter.build_model_streamer_weight_iter("az://models/model"))
+
+        native_load_config = loader_cls.call_args.args[0]
+        assert native_load_config.model_loader_extra_config == {
+            "concurrency": 4,
+            "distributed": True,
+        }
+
+    def test_distributed_can_be_disabled_via_env(self):
+        adapter, _load_config = self._make_adapter(
+            tp_size=8,
+            extra_config={"concurrency": 4},
+        )
+        patcher, loader_cls, _loader_instance = self._patch_runai_loader([])
+
+        with patcher, patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "0"}):
             list(adapter.build_model_streamer_weight_iter("az://models/model"))
 
         native_load_config = loader_cls.call_args.args[0]

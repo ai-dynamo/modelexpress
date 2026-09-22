@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modelexpress"
-version = "0.5.0"
+version = "0.7.0"
 description = "Python client for ModelExpress P2P GPU transfer service"
 readme = "README.md"
 license = "Apache-2.0"
@@ -27,30 +27,48 @@ dependencies = [
     "grpcio>=1.66.2",
     "google-crc32c>=1.5.0",
     "huggingface_hub>=0.20.0",
-    "nixl[cu12]; sys_platform == 'linux'",
     "numpy>=1.24.0",
-    "protobuf>=5.27.0,<6.0.0", # protobuf 5.x compatibility
+    "protobuf>=5.27.2,<7.0.0",
     "pydantic>=2.0.0",
     "torch>=2.6.0",
     "runai-model-streamer[s3,gcs,azure]; sys_platform == 'linux'",
+    "instanttensor>=0.1.9 ; sys_platform == 'linux'",
+    # First release with IfNoneMatch on CompleteMultipartUpload.
+    "boto3>=1.35.2",
+    "zstandard>=0.22.0",
+    "safetensors>=0.8.0",
+    "s3transfer>=0.10.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    # Use grpcio-tools<=1.66.2 for protobuf 5.x, >=1.67.0 for protobuf 6.x
-    "grpcio-tools>=1.60.0,<=1.66.2",
     "opentelemetry-api>=1.41.1",
     "opentelemetry-sdk>=1.41.1",
+    # tests/test_metrics.py builds the real collectors and forks real ranks, so
+    # the test extra needs what the metrics extra installs. CI installs only
+    # [dev]; without this the metrics tests would error out on import rather
+    # than run.
+    "prometheus-client>=0.20.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+]
+codegen = [
+    # Keep generated Python stubs compatible with both protobuf 5 and 6.
+    "grpcio-tools==1.66.2",
 ]
 otel = [
     "opentelemetry-api>=1.20.0",
 ]
+# Opt-in Prometheus metrics collector (MX_METRICS_ENABLED=1).
+# Lazily imported; not required for normal operation.
+metrics = [
+    "prometheus-client>=0.20.0",
+]
 # Required for the VmmArena allocator (CudaVmmBackend uses cuMem* APIs).
 # The pure-Python VmmArena tests don't need it; CudaVmmBackend does.
 vmm = [
-    "cuda-python>=12.0",
+    # 12.4 is the first release exposing CU_MEM_HANDLE_TYPE_FABRIC.
+    "cuda-python>=12.4",
 ]
 
 [project.urls]
@@ -59,7 +77,13 @@ Repository = "https://github.com/ai-dynamo/modelexpress.git"
 Documentation = "https://github.com/ai-dynamo/modelexpress/tree/main/docs"
 
 [project.entry-points."vllm.general_plugins"]
-modelexpress = "modelexpress:register_modelexpress_loaders"
+modelexpress = "modelexpress:register_modelexpress"
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires one or more CUDA GPUs",
+    "slow: long-running test (real model load + transfer)",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

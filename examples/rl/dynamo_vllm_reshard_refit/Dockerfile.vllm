@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Current vLLM nightly, built from a9a17e7095a66ef6c6685a1c7ddd657781a78d3c.
+# It contains the post-v0.27.1 RL Control service required by Dynamo main.
+ARG VLLM_IMAGE=vllm/vllm-openai@sha256:3578c1fa6a9676e1de068b9d75c777cc865d251fadfbe6175ae82278739c6674
+FROM ${VLLM_IMAGE}
+
+COPY modelexpress_client/python /opt/modelexpress
+RUN python3 -m pip install --no-cache-dir --no-deps /opt/modelexpress

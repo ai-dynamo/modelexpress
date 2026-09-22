@@ -6,24 +6,226 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
+import tempfile
 import uuid
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Iterator
 
 import torch
 
+from ... import envs
 from ...adapter import EngineAdapter
+from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
-from ...metadata.publish import build_source_identity
 from ...rank_utils import get_global_rank
 from ...tensor_utils import adopt_hidden_tensors, capture_tensor_attrs, collect_module_tensors
+from .host_quantization import refresh_host_quantization_state
+from .source_identity import build_source_identity
 
 logger = logging.getLogger("modelexpress.engines.vllm.adapter")
 
+_VLLM_PRE_RDMA_FINALIZER_NAMES = (
+    # MegaMoE changes the model's tensor layout. It must run before tensor
+    # discovery and RDMA registration so the target exposes the same regions
+    # that the source published.
+    "finalize_mega_moe_weights",
+)
+
+_VLLM_POST_RDMA_FINALIZER_NAMES = (
+    # DeepSeek V4 derives this tensor from hc_attn_fn. Unlike MegaMoE, it is
+    # target-local and is not sent by RDMA, so it must be built only after
+    # hc_attn_fn has received its real weight values.
+    "finalize_mhc_broadcast_weights",
+)
+
+# MTP draft weights have no single naming convention, so the selector matches a
+# small per-family allowlist and streams all shards for anything unrecognized:
+#   - "mtp." prefix: DeepSeek (e.g. mtp.0.*).
+#   - extra decoder layer model.layers.{num_hidden_layers + i}: GLM-family
+#     (Glm4MoeForCausalLM, e.g. model.layers.78.*); see _mtp_layer_prefixes.
+# The draft's embedding and lm_head come from the target.
+_DRAFT_WEIGHT_PREFIXES: tuple[str, ...] = ("mtp.",)
+
+_SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
+_CONFIG_JSON_NAME = "config.json"
+
+# Registries on compilation_config that vLLM keys by layer name.
+_LAYER_REGISTRY_FIELDS: tuple[str, ...] = (
+    "static_forward_context",
+    "static_all_moe_layers",
+)
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+
+def _is_speculative_draft(vllm_config, model_config) -> bool:
+    """True for the draft pass of a speculative load.
+
+    vLLM gives the draft ModelConfig runner="draft" and the target "generate".
+    Reading runner_type avoids the ngram/custom_class case where the draft
+    config aliases the target's.
+    """
+    if getattr(vllm_config, "speculative_config", None) is None:
+        return False
+    return getattr(model_config, "runner_type", None) == "draft"
+
+
+class DraftShardSelection(Enum):
+    """Outcome of picking the draft's own shards out of a checkpoint."""
+
+    SELECTED = auto()
+    NO_DRAFT_WEIGHTS = auto()
+    UNRESOLVED = auto()
+
+
+def _read_local_json(directory: str, name: str) -> dict | None:
+    """Read a JSON file by name from a local directory."""
+    path = os.path.join(directory, name)
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _read_json(model_uri: str, name: str) -> dict | None:
+    """Read a JSON file by name from a local dir or object store.
+
+    Returns the parsed JSON, or None if it cannot be read.
+    """
+    local = _read_local_json(model_uri, name)
+    if local is not None:
+        return local
+
+    from runai_model_streamer import pull_files
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # runai's allow_pattern is a glob matched against the full object key,
+        # so a bare filename never matches; anchor it with a leading wildcard.
+        pull_files(model_uri, tmp, allow_pattern=[f"*{name}"])
+        for root, _dirs, files in os.walk(tmp):
+            if name in files:
+                with open(os.path.join(root, name), encoding="utf-8") as handle:
+                    return json.load(handle)
+    return None
+
+
+def _read_local_json_near_shards(
+    hf_weights_files: list[str], name: str
+) -> dict | None:
+    """Read a JSON file from the first resolved shard directory that has it.
+
+    _prepare_weights has already resolved model_uri (which may be an HF repo id)
+    to local shard paths, so config.json and the index sit next to them.
+    """
+    seen: set[str] = set()
+    for shard in hf_weights_files:
+        directory = os.path.dirname(shard)
+        if not directory or directory in seen:
+            continue
+        seen.add(directory)
+        found = _read_local_json(directory, name)
+        if found is not None:
+            return found
+    return None
+
+
+def _read_safetensors_index(model_uri: str) -> dict | None:
+    """Read model.safetensors.index.json from a local dir or object store."""
+    index = _read_json(model_uri, _SAFETENSORS_INDEX_NAME)
+    if index is None:
+        logger.warning(
+            "safetensors index %s not found under %s; draft-shard selection "
+            "will fall back to streaming all shards",
+            _SAFETENSORS_INDEX_NAME,
+            model_uri,
+        )
+    return index
+
+
+def _load_safetensors_index(
+    model_uri: str,
+    hf_weights_files: list[str],
+) -> dict | None:
+    """Read the checkpoint index, preferring the resolved shards' directory,
+    then model_uri for shards the streamer hands back as object-store paths."""
+    local = _read_local_json_near_shards(hf_weights_files, _SAFETENSORS_INDEX_NAME)
+    return local if local is not None else _read_safetensors_index(model_uri)
+
+
+def _load_config(model_uri: str, hf_weights_files: list[str]) -> dict | None:
+    """Read the checkpoint's config.json, preferring the resolved shards' dir,
+    then model_uri as an object-store fallback."""
+    local = _read_local_json_near_shards(hf_weights_files, _CONFIG_JSON_NAME)
+    return local if local is not None else _read_json(model_uri, _CONFIG_JSON_NAME)
+
+
+def _mtp_layer_prefixes(config: dict | None) -> tuple[str, ...]:
+    """GLM-family draft prefixes derived from the checkpoint's config.json.
+
+    GLM (Glm4MoeForCausalLM) stores the MTP head as extra decoder layers
+    model.layers.{num_hidden_layers + i}, i < num_nextn_predict_layers, with
+    both counts at the top level. Reads the on-disk config, not the runtime
+    draft config: vLLM rewrites num_hidden_layers to 0 for some families (MiMo,
+    GLM-Lite), which would then match the ordinary layer 0. Any other shape
+    returns () so the selector safely streams all shards. Name forms mirror
+    vLLM's get_spec_layer_idx_from_weight_name.
+    """
+    if not config:
+        return ()
+    base = config.get("num_hidden_layers")
+    n = config.get("num_nextn_predict_layers")
+    if isinstance(base, bool) or isinstance(n, bool):
+        return ()
+    if not isinstance(base, int) or not isinstance(n, int):
+        return ()
+    if base <= 0 or n <= 0:
+        return ()
+    prefixes: list[str] = []
+    for i in range(n):
+        prefixes.append(f"model.layers.{base + i}.")
+        prefixes.append(f"layers.{base + i}.")
+        prefixes.append(f"model.language_model.layers.{base + i}.")
+    return tuple(prefixes)
+
+
+def _select_draft_weight_files(
+    model_uri: str,
+    hf_weights_files: list[str],
+    draft_prefixes: tuple[str, ...],
+) -> tuple[DraftShardSelection, list[str]]:
+    """Return the shards holding the draft's own weights.
+
+    Keeps shards whose index tensors start with one of draft_prefixes (DeepSeek's
+    "mtp." plus GLM's config-derived layer names). Anything other than SELECTED
+    leaves the caller streaming every shard, so a checkpoint without a resolvable
+    draft head (or without a readable index) is never truncated to nothing.
+    """
+    if not draft_prefixes:
+        return DraftShardSelection.NO_DRAFT_WEIGHTS, []
+    try:
+        index = _load_safetensors_index(model_uri, hf_weights_files)
+        if not index:
+            return DraftShardSelection.UNRESOLVED, []
+        weight_map = index.get("weight_map") or {}
+        wanted = {
+            fname
+            for tname, fname in weight_map.items()
+            if tname.startswith(draft_prefixes)
+        }
+        if not wanted:
+            return DraftShardSelection.NO_DRAFT_WEIGHTS, []
+        subset = [f for f in hf_weights_files if os.path.basename(f) in wanted]
+        if not subset:
+            return DraftShardSelection.UNRESOLVED, []
+        return DraftShardSelection.SELECTED, subset
+    except Exception as exc:
+        logger.warning("Draft weight-file selection failed: %s", exc)
+        return DraftShardSelection.UNRESOLVED, []
 
 
 class VllmAdapter(EngineAdapter):
@@ -34,6 +236,7 @@ class VllmAdapter(EngineAdapter):
         self.model_config = model_config
         self.load_config = vllm_config.load_config
         self.target_device = self._resolve_target_device()
+        self.accelerator_backend = accelerator_backend_for(self.target_device)
 
     def build_identity(self):
         return build_source_identity(self.vllm_config, self.model_config)
@@ -55,11 +258,30 @@ class VllmAdapter(EngineAdapter):
 
         return bool(current_platform.is_cuda_alike())
 
+    def all_gather_state(self, state) -> tuple[object, ...]:
+        """Gather rank-local state through vLLM's CPU process group."""
+        from vllm.distributed import get_world_group
+
+        group = get_world_group()
+        states = [None] * group.world_size
+        torch.distributed.all_gather_object(
+            states,
+            state,
+            group=group.cpu_group,
+        )
+        return tuple(states)
+
+    def broadcast_state(self, state):
+        """Broadcast rank-zero state through vLLM's world group."""
+        from vllm.distributed import get_world_group
+
+        return get_world_group().broadcast_object(state, src=0)
+
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("vLLM tensor discovery requires result.model")
-        adopt_hidden_tensors(result.model)
-        return collect_module_tensors(result.model)
+        adopt_hidden_tensors(result.model, self.accelerator_backend)
+        return collect_module_tensors(result.model, self.accelerator_backend)
 
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         if result.model is None:
@@ -72,11 +294,31 @@ class VllmAdapter(EngineAdapter):
             dummy_config.load_format = "dummy"
         except AttributeError:
             object.__setattr__(dummy_config, "load_format", "dummy")
+        # DummyModelLoader rejects any model_loader_extra_config. The RDMA
+        # target only allocates empty tensors, so strip the streamer-oriented
+        # extra config (e.g. distributed / memory_limit) the source config may
+        # carry. Rebind rather than mutate: the shared dict is still used by the
+        # streamer fallback path.
+        _set_load_config_extra_config(dummy_config, {})
         DummyModelLoader(dummy_config).load_weights(result.model, self.model_config)
         return result
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
+        # Native vLLM load_weights() runs model-specific finalizers before
+        # post-load processing. RDMA targets use the dummy loader, so run
+        # those hooks before receiving tensors to expose the same target
+        # tensor layout and hidden buffers that the source published.
+        result = self._finalize_model_specific_weights(
+            result, _VLLM_PRE_RDMA_FINALIZER_NAMES
+        )
         return self._process_weights_after_loading(result)
+
+    def after_rdma_receive(self, result: LoadResult) -> LoadResult:
+        """Build target-local tensors derived from the received weights."""
+        result = self._finalize_model_specific_weights(
+            result, _VLLM_POST_RDMA_FINALIZER_NAMES
+        )
+        return self._refresh_host_quantization_state(result)
 
     def apply_weight_iter(
         self,
@@ -105,7 +347,76 @@ class VllmAdapter(EngineAdapter):
 
         loader = RunaiModelStreamerLoader(load_config)
         revision = getattr(self.model_config, "revision", None)
-        return loader._get_weights_iterator(model_uri, revision)
+
+        if not _is_speculative_draft(self.vllm_config, self.model_config):
+            return loader._get_weights_iterator(model_uri, revision)
+
+        # An MTP draft shares the target's checkpoint but needs only its own
+        # shards. Stream just those so we do not re-read the whole model from
+        # storage for a small head. Fall back to the full set if unrecognized.
+        from vllm.model_executor.model_loader.weight_utils import (
+            runai_safetensors_weights_iterator,
+        )
+
+        hf_weights_files = loader._prepare_weights(model_uri, revision)
+        config = _load_config(model_uri, hf_weights_files)
+        draft_prefixes = _DRAFT_WEIGHT_PREFIXES + _mtp_layer_prefixes(config)
+        selection, subset = _select_draft_weight_files(
+            model_uri, hf_weights_files, draft_prefixes
+        )
+        if selection is DraftShardSelection.UNRESOLVED:
+            logger.warning(
+                "[draft] could not resolve draft-only shards from %s for %s; "
+                "streaming all %d shards",
+                _SAFETENSORS_INDEX_NAME,
+                model_uri,
+                len(hf_weights_files),
+            )
+            return loader._get_weights_iterator(model_uri, revision)
+        if selection is DraftShardSelection.NO_DRAFT_WEIGHTS:
+            logger.info(
+                "[draft] %s for %s contains no draft tensors (checked prefixes "
+                "%s); streaming all %d shards",
+                _SAFETENSORS_INDEX_NAME,
+                model_uri,
+                draft_prefixes,
+                len(hf_weights_files),
+            )
+            return loader._get_weights_iterator(model_uri, revision)
+
+        logger.info(
+            "[draft] streaming %d of %d safetensors shards for draft weights: %s",
+            len(subset),
+            len(hf_weights_files),
+            [os.path.basename(f) for f in subset],
+        )
+        return runai_safetensors_weights_iterator(
+            subset,
+            load_config.use_tqdm_on_load,
+            loader._is_distributed,
+        )
+
+    def build_instanttensor_weight_iter(
+        self,
+        model: torch.nn.Module | None = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        if model is None:
+            raise RuntimeError("vLLM InstantTensor loading requires the initialized model")
+
+        from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+        # vLLM's DefaultModelLoader selects instanttensor_weights_iterator when
+        # load_format == "instanttensor"; get_all_weights() resolves the model's
+        # own safetensors (and any secondary sources). The iterator handles the
+        # CUDA check and TP process group internally.
+        load_config = copy.copy(self.load_config)
+        try:
+            load_config.load_format = "instanttensor"
+        except AttributeError:
+            object.__setattr__(load_config, "load_format", "instanttensor")
+
+        loader = DefaultModelLoader(load_config)
+        return loader.get_all_weights(self.model_config, model)
 
     def load_via_native(self, result: LoadResult) -> LoadResult:
         if result.model is None:
@@ -131,12 +442,16 @@ class VllmAdapter(EngineAdapter):
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
         from vllm.model_executor.model_loader.utils import initialize_model
 
-        old_value = result.value
+        stale_value = result.value
+        stale_model = result.model
         result.value = None
         result.model = None
-        del old_value
-        torch.cuda.empty_cache()
-        self._reset_compilation_state()
+        # Unregister before dropping the model: its registrations identify it,
+        # and clearing them frees its parameters before the rebuild allocates.
+        self._unregister_model_layers(stale_model)
+        del stale_value
+        del stale_model
+        self.accelerator_backend.empty_cache()
         logger.info(
             "[Worker %s] Re-initializing vLLM model after failed strategy",
             self.get_global_rank(),
@@ -148,16 +463,69 @@ class VllmAdapter(EngineAdapter):
             )
         return LoadResult(value=model, model=model, publishable=result.publishable)
 
-    def _process_weights_after_loading(self, result: LoadResult) -> LoadResult:
+    def _process_weights_after_loading(
+        self,
+        result: LoadResult,
+    ) -> LoadResult:
         if result.model is None:
             raise RuntimeError("vLLM post-load processing requires result.model")
 
         from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
-        with capture_tensor_attrs():
+        with capture_tensor_attrs(self.accelerator_backend):
             process_weights_after_loading(
-                result.model, self.model_config, self.target_device,
+                result.model,
+                self.model_config,
+                self.target_device,
             )
+        return result
+
+    def _refresh_host_quantization_state(self, result: LoadResult) -> LoadResult:
+        if result.model is None:
+            raise RuntimeError("vLLM RDMA post-load processing requires result.model")
+        refresh_host_quantization_state(
+            result.model, self.vllm_config, self.accelerator_backend
+        )
+        return result
+
+    def _finalize_model_specific_weights(
+        self,
+        result: LoadResult,
+        finalizer_names: tuple[str, ...],
+    ) -> LoadResult:
+        """Run selected model finalizers that vLLM normally calls in load_weights()."""
+
+        if result.model is None:
+            raise RuntimeError("vLLM RDMA post-load processing requires result.model")
+
+        finalized_prefixes: list[str] = []
+        with capture_tensor_attrs(self.accelerator_backend):
+            for name, module in result.model.named_modules():
+                # Some vLLM finalizers are model-level hooks that recursively
+                # transform child layers. If a parent ran one, do not call another
+                # matching hook on its descendants and risk duplicate repacking.
+                if any(
+                    _is_same_or_descendant(name, prefix)
+                    for prefix in finalized_prefixes
+                ):
+                    continue
+
+                module_finalized = False
+                for finalizer_name in finalizer_names:
+                    finalizer = getattr(module, finalizer_name, None)
+                    if not callable(finalizer):
+                        continue
+
+                    logger.info(
+                        "Running vLLM model finalizer %s on %s",
+                        finalizer_name,
+                        name or type(module).__name__,
+                    )
+                    finalizer()
+                    module_finalized = True
+
+                if module_finalized:
+                    finalized_prefixes.append(name)
         return result
 
     def _resolve_target_device(self) -> torch.device:
@@ -168,27 +536,41 @@ class VllmAdapter(EngineAdapter):
         )
         return torch.device(load_device)
 
-    def _reset_compilation_state(self) -> None:
-        compilation_config = self.vllm_config.compilation_config
-        # vLLM registers each attention / MLA / Mamba / FusedMoE layer into
-        # fields on vllm_config.compilation_config during initialize_model().
-        # Those fields live on the config object, not the model, so they survive
-        # del model and trip duplicate registration on the next initialize_model().
-        # Clear them so re-init starts from a clean slate. Audited against vLLM
-        # 0.17.1; other versions may add init=False fields that need similar
-        # treatment.
-        compilation_config.static_forward_context.clear()
-        compilation_config.static_all_moe_layers.clear()
-        compilation_config.enabled_custom_ops.clear()
-        compilation_config.disabled_custom_ops.clear()
-        compilation_config.traced_files.clear()
-        compilation_config.compilation_time = 0.0
+    def _unregister_model_layers(self, stale_model: torch.nn.Module | None) -> None:
+        """Remove `stale_model`'s layers from vLLM's layer registries.
+
+        The registries live on compilation_config, so dropping the model leaves
+        its entries behind and the rebuild fails vLLM's duplicate-name check.
+        Clearing them is wrong: one compilation_config is shared by every model
+        built from a VllmConfig, so under MTP they also hold the live target's
+        layers. Remove only what this model registered, matched by its own
+        modules or the `layer_name` they registered under.
+
+        Args:
+            stale_model: Model being discarded, or None to clear outright.
+        """
+        owned_ids: set[int] = set()
+        owned_names: set[str] = set()
+        for module in stale_model.modules() if stale_model is not None else ():
+            owned_ids.add(id(module))
+            layer_name = getattr(module, "layer_name", None)
+            if isinstance(layer_name, str):
+                owned_names.add(layer_name)
+
+        for attr in _LAYER_REGISTRY_FIELDS:
+            registry = getattr(self.vllm_config.compilation_config, attr, None)
+            if registry is None:
+                continue
+            if stale_model is None:
+                registry.clear()
+            else:
+                _drop_owned_entries(attr, registry, owned_ids, owned_names)
 
     def _model_streamer_distributed_enabled(self) -> bool:
         tp_size = getattr(self.vllm_config.parallel_config, "tensor_parallel_size", 1)
         return (
             tp_size > 1
-            and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+            and envs.MX_MS_DISTRIBUTED
         )
 
 
@@ -197,6 +579,39 @@ def _set_load_config_extra_config(load_config, extra_config: dict) -> None:
         load_config.model_loader_extra_config = extra_config
     except AttributeError:
         object.__setattr__(load_config, "model_loader_extra_config", extra_config)
+
+
+def _is_same_or_descendant(name: str, prefix: str) -> bool:
+    return prefix == "" or name == prefix or name.startswith(f"{prefix}.")
+
+
+def _drop_owned_entries(
+    attr: str,
+    registry,
+    owned_ids: set[int],
+    owned_names: set[str],
+) -> None:
+    """Remove one compilation registry's entries belonging to a single model."""
+
+    def is_owned(entry) -> bool:
+        return id(entry) in owned_ids or (isinstance(entry, str) and entry in owned_names)
+
+    if isinstance(registry, dict):
+        for key in [k for k, v in registry.items() if is_owned(k) or is_owned(v)]:
+            del registry[key]
+    elif isinstance(registry, set):
+        registry.difference_update({e for e in registry if is_owned(e)})
+    elif isinstance(registry, list):
+        registry[:] = [e for e in registry if not is_owned(e)]
+    else:
+        # A leftover entry only fails the rebuild's duplicate-name check, while
+        # clearing blind could unregister a co-owner's layers.
+        logger.warning(
+            "compilation_config.%s is a %s, which cannot be filtered by owner; "
+            "leaving it untouched",
+            attr,
+            type(registry).__name__,
+        )
 
 
 def _get_vllm_worker_rank(
@@ -232,6 +647,8 @@ def _get_vllm_device_id(target_device: torch.device) -> int:
 def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
     """Build a LoadContext from vLLM config objects."""
 
+    from vllm.distributed import get_world_group
+
     adapter = VllmAdapter(vllm_config, model_config)
     global_rank = adapter.get_global_rank()
     worker_rank = adapter.get_worker_rank()
@@ -241,9 +658,13 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
         target_device=adapter.get_target_device(),
         global_rank=global_rank,
         worker_rank=worker_rank,
+        local_rank=int(get_world_group().local_rank),
         device_id=adapter.get_device_id(),
         identity=adapter.build_identity(),
         mx_client=create_metadata_client(worker_rank=worker_rank),
         worker_id=uuid.uuid4().hex[:8],
+        node_rank=int(getattr(vllm_config.parallel_config, "node_rank", 0)),
+        head_addr=getattr(vllm_config.parallel_config, "master_addr", None),
         adapter=adapter,
+        accelerator_backend=adapter.accelerator_backend,
     )

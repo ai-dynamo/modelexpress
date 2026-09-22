@@ -1,8 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(not(any(feature = "tls-rustls", feature = "tls-native")))]
+compile_error!(
+    "no TLS backend selected: enable `tls-rustls` (default) or `tls-native`/`openssl`. \
+     Without one, reqwest builds with no TLS support and every HTTPS request fails at runtime."
+);
+
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::error::Error as StdError;
 
 pub mod artifact_manifest;
@@ -10,6 +15,7 @@ pub mod cache;
 pub mod client_config;
 pub mod config;
 pub mod download;
+pub mod envs;
 pub mod models;
 pub mod providers;
 #[cfg(any(test, feature = "test-support"))]
@@ -21,6 +27,7 @@ pub mod test_support;
 #[allow(clippy::default_trait_access)]
 #[allow(clippy::doc_markdown)]
 #[allow(clippy::must_use_candidate)]
+#[allow(clippy::result_large_err)]
 pub mod grpc {
     pub mod health {
         tonic::include_proto!("model_express.health");
@@ -33,6 +40,9 @@ pub mod grpc {
     }
     pub mod p2p {
         tonic::include_proto!("model_express.p2p");
+    }
+    pub mod refit {
+        tonic::include_proto!("model_express.refit");
     }
 }
 
@@ -47,9 +57,6 @@ pub struct Response<T> {
 /// Common error types that both client and server can use
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Network error: {0}")]
-    Network(String),
-
     #[error("Server returned error: {0}")]
     Server(String),
 
@@ -121,11 +128,10 @@ pub type Result<T> = std::result::Result<T, Box<Error>>;
 pub struct Utils;
 
 impl Utils {
-    /// Get home directory from environment variables
+    /// Get home directory from environment variables ([`envs::HOME`], then
+    /// [`envs::USERPROFILE`]).
     pub fn get_home_dir() -> std::result::Result<String, Box<Error>> {
-        env::var("HOME")
-            .or_else(|_| env::var("USERPROFILE"))
-            .map_err(|e| Error::Generic(format!("Failed to get home directory: {e}")).into())
+        envs::home_dir()
     }
 }
 
@@ -139,6 +145,14 @@ pub mod constants {
 
     pub const DEFAULT_GRPC_PORT: NonZeroU16 = NonZeroU16::new(8001).expect("8001 is non-zero");
     pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+    /// Default port for the server's Prometheus `/metrics` listener.
+    ///
+    /// Deliberately not [`DEFAULT_GRPC_PORT`]: tonic serves HTTP/2 only, so a
+    /// scrape aimed at the gRPC port can never succeed. Chosen clear of the
+    /// ports already in play around a ModelExpress deployment — 8001/8002 (gRPC
+    /// and the client worker service) and 9090 (Dynamo's health endpoint).
+    pub const DEFAULT_METRICS_PORT: NonZeroU16 = NonZeroU16::new(9401).expect("9401 is non-zero");
 
     /// Default setting for shared storage mode (true = client and server share a network drive)
     pub const DEFAULT_SHARED_STORAGE: bool = true;
@@ -174,6 +188,7 @@ impl From<models::ModelProvider> for grpc::model::ModelProvider {
             models::ModelProvider::HuggingFace => grpc::model::ModelProvider::HuggingFace,
             models::ModelProvider::Ngc => grpc::model::ModelProvider::Ngc,
             models::ModelProvider::Gcs => grpc::model::ModelProvider::Gcs,
+            models::ModelProvider::S3 => grpc::model::ModelProvider::S3,
         }
     }
 }
@@ -184,6 +199,7 @@ impl From<grpc::model::ModelProvider> for models::ModelProvider {
             grpc::model::ModelProvider::HuggingFace => models::ModelProvider::HuggingFace,
             grpc::model::ModelProvider::Ngc => models::ModelProvider::Ngc,
             grpc::model::ModelProvider::Gcs => models::ModelProvider::Gcs,
+            grpc::model::ModelProvider::S3 => models::ModelProvider::S3,
         }
     }
 }
@@ -215,6 +231,7 @@ impl From<&models::ModelStatusResponse> for grpc::model::ModelStatusUpdate {
             status: grpc::model::ModelStatus::from(response.status) as i32,
             message: None,
             provider: grpc::model::ModelProvider::from(response.provider) as i32,
+            resolved_revision: None,
         }
     }
 }
@@ -298,6 +315,7 @@ mod tests {
             models::ModelProvider::HuggingFace,
             models::ModelProvider::Ngc,
             models::ModelProvider::Gcs,
+            models::ModelProvider::S3,
         ] {
             let grpc_provider: grpc::model::ModelProvider = model_provider.into();
             let back_to_model: models::ModelProvider = grpc_provider.into();
@@ -349,6 +367,7 @@ mod tests {
             status: grpc::model::ModelStatus::Downloaded as i32,
             message: Some("Test message".to_string()),
             provider: grpc::model::ModelProvider::HuggingFace as i32,
+            resolved_revision: None,
         };
 
         let response: models::ModelStatusResponse = grpc_update.into();
@@ -360,9 +379,6 @@ mod tests {
 
     #[test]
     fn test_error_types() {
-        let network_error = Error::Network("Connection failed".to_string());
-        assert!(network_error.to_string().contains("Network error"));
-
         let server_error = Error::Server("Internal error".to_string());
         assert!(server_error.to_string().contains("Server returned error"));
 
@@ -383,6 +399,13 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(constants::DEFAULT_GRPC_PORT.get(), 8001);
+        assert_eq!(constants::DEFAULT_METRICS_PORT.get(), 9401);
+        // The scrape target must never be the gRPC listener: tonic is HTTP/2
+        // only and Prometheus scrapes with an HTTP/1.1 GET.
+        assert_ne!(
+            constants::DEFAULT_METRICS_PORT,
+            constants::DEFAULT_GRPC_PORT
+        );
         assert_eq!(constants::DEFAULT_TIMEOUT_SECS, 30);
         assert_eq!(constants::DEFAULT_TRANSFER_CHUNK_SIZE, 32 * 1024);
     }

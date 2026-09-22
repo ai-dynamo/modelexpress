@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if and .Values.metrics .Values.metrics.clientPodMonitor .Values.metrics.clientPodMonitor.enabled -}}
+{{- /*
+  The ModelExpress client is a Python library inside the inference engine's pod
+  -- vLLM, TRT-LLM, Dynamo -- which this chart neither deploys nor labels. So
+  this resource is the one place the chart points at workloads it does not own,
+  and every default here is deliberately absent rather than guessed.
+
+  Note this is independent of metrics.enabled, which governs the *server*
+  listener. A server-side deployment with metrics off can still scrape clients.
+*/}}
+{{- $cfg := .Values.metrics.clientPodMonitor }}
+{{- if not (or $cfg.skipApiVersionCheck (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1")) }}
+{{- fail "metrics.clientPodMonitor.enabled but monitoring.coreos.com/v1 is not available: install the Prometheus Operator, or set metrics.clientPodMonitor.skipApiVersionCheck=true if the CRDs are applied alongside this chart." }}
+{{- end }}
+{{- /*
+  An empty selector is not a no-op: it matches every pod in scope. Prometheus
+  would then evaluate every unrelated workload in the namespace against this
+  port name. Refused rather than rendered, because the result is a silently
+  over-broad scrape rather than an obvious failure.
+*/}}
+{{- $sel := $cfg.selector | default dict }}
+{{- if and (empty (get $sel "matchLabels")) (empty (get $sel "matchExpressions")) }}
+{{- fail "metrics.clientPodMonitor.enabled requires metrics.clientPodMonitor.selector.matchLabels (or matchExpressions): an empty selector matches every pod in the namespace. Set it to the labels on your inference pods -- see examples/p2p_transfer_k8s/client/vllm/vllm-single-node-metrics.yaml." }}
+{{- end }}
+{{- include "modelexpress.checkScrapeTimeout" (list $cfg.interval $cfg.scrapeTimeout "metrics.clientPodMonitor") }}
+{{- if not $cfg.portName }}
+{{- fail "metrics.clientPodMonitor.portName must be set: a PodMonitor selects by port name, and the client's port carries whatever name your engine manifest gave it (the shipped example uses mx-metrics)." }}
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "modelexpress.fullname" . }}-client
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "modelexpress.labels" . | nindent 4 }}
+    {{- with $cfg.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    {{- toYaml $sel | nindent 4 }}
+  {{- with $cfg.namespaceSelector }}
+  namespaceSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  podMetricsEndpoints:
+    - port: {{ $cfg.portName }}
+      path: /metrics
+      {{- with $cfg.interval }}
+      interval: {{ . }}
+      {{- end }}
+      {{- with $cfg.scrapeTimeout }}
+      scrapeTimeout: {{ . }}
+      {{- end }}
+      {{- with $cfg.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $cfg.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

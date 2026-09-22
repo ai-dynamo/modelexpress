@@ -81,6 +81,11 @@ pub enum ModelCommands {
         /// Download strategy
         #[arg(long, short = 's', value_enum, default_value = "smart-fallback")]
         strategy: DownloadStrategy,
+
+        /// Branch, tag, or commit SHA to download. Defaults to the provider's
+        /// default revision. Only providers with revisions (Hugging Face) accept this.
+        #[arg(long, short = 'r', value_name = "REVISION")]
+        revision: Option<String>,
     },
 
     /// Initialize model storage configuration

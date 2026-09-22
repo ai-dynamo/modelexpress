@@ -23,6 +23,12 @@ class GdsStrategy(LoadStrategy):
     def is_available(self, ctx: LoadContext) -> bool:
         if not super().is_available(ctx):
             return False
+        if not ctx.accelerator_backend.supports_gds():
+            logger.info(
+                f"[Worker {ctx.global_rank}] GDS not supported on "
+                f"{ctx.accelerator_backend.name}, skipping"
+            )
+            return False
         from ..gds_transfer import is_gds_available
         available = is_gds_available()
         if not available:
@@ -34,13 +40,15 @@ class GdsStrategy(LoadStrategy):
         from ..gds_loader import MxGdsLoader
 
         logger.info(f"[Worker {ctx.global_rank}] Attempting GDS loading...")
-        gds_loader = MxGdsLoader()
+        gds_loader = MxGdsLoader(accelerator_backend=ctx.accelerator_backend)
         try:
             try:
                 use_tqdm = getattr(ctx.load_config, "use_tqdm_on_load", True)
                 revision = getattr(ctx.model_config, "revision", None)
                 weights_iter = gds_loader.load_iter(
-                    ctx.model_config.model, use_tqdm=use_tqdm, revision=revision
+                    _get_model_path(ctx.model_config),
+                    use_tqdm=use_tqdm,
+                    revision=revision,
                 )
             except Exception as e:
                 logger.warning(
@@ -62,3 +70,12 @@ class GdsStrategy(LoadStrategy):
 
         register_tensors(result, ctx)
         return result
+
+
+def _get_model_path(model_config) -> str:
+    """Return the checkpoint path used by vLLM or SGLang model configs."""
+    for attribute in ("model", "model_path"):
+        value = getattr(model_config, attribute, None)
+        if value:
+            return str(value)
+    raise AttributeError("model config has neither 'model' nor 'model_path'")

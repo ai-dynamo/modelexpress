@@ -1,0 +1,93 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="920" viewBox="0 0 1200 920"
+     role="img" aria-labelledby="title desc">
+  <title id="title">Conventional RL weight refit compared with ModelExpress refit</title>
+  <desc id="desc">Two vertical flows compare a centralized gather or checkpoint path with receiver-driven ModelExpress resharding. ModelExpress keeps trainer shards distributed and lets each rollout rank pull the ranges needed for its own layout.</desc>
+  <defs>
+    <marker id="arrow-gray" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#616161"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2E7D32"/>
+    </marker>
+    <style>
+      .title { font: 700 30px system-ui, sans-serif; fill: #1f2937; }
+      .subtitle { font: 500 17px system-ui, sans-serif; fill: #4b5563; }
+      .lane-title { font: 700 22px system-ui, sans-serif; }
+      .node-title { font: 700 18px system-ui, sans-serif; fill: #111827; }
+      .node-text { font: 500 16px system-ui, sans-serif; fill: #374151; }
+      .step { font: 700 17px system-ui, sans-serif; fill: white; }
+      .note { font: 600 16px system-ui, sans-serif; }
+      .edge { fill: none; stroke-width: 3; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="920" rx="24" fill="#f8fafc"/>
+  <text x="600" y="54" text-anchor="middle" class="title">Shorten the RL refit critical path</text>
+  <text x="600" y="84" text-anchor="middle" class="subtitle">Move each new trainer version into rollout layouts without first rebuilding one full model</text>
+
+  <rect x="50" y="120" width="520" height="750" rx="22" fill="#f3f4f6" stroke="#9E9E9E" stroke-width="2"/>
+  <text x="310" y="160" text-anchor="middle" class="lane-title" fill="#616161">Centralized refit path</text>
+
+  <rect x="630" y="120" width="520" height="750" rx="22" fill="#ecfdf5" stroke="#4CAF50" stroke-width="2"/>
+  <text x="890" y="160" text-anchor="middle" class="lane-title" fill="#2E7D32">ModelExpress refit</text>
+
+  <!-- Conventional path -->
+  <circle cx="105" cy="220" r="20" fill="#616161"/><text x="105" y="226" text-anchor="middle" class="step">1</text>
+  <rect x="145" y="185" width="360" height="70" rx="14" fill="#dbeafe" stroke="#1565C0" stroke-width="2"/>
+  <text x="325" y="215" text-anchor="middle" class="node-title">Distributed trainer shards</text>
+  <text x="325" y="239" text-anchor="middle" class="node-text">TP / PP / EP layout</text>
+
+  <path d="M325 255 V320" class="edge" stroke="#616161" marker-end="url(#arrow-gray)"/>
+  <circle cx="105" cy="360" r="20" fill="#616161"/><text x="105" y="366" text-anchor="middle" class="step">2</text>
+  <rect x="145" y="325" width="360" height="70" rx="14" fill="#e5e7eb" stroke="#616161" stroke-width="2"/>
+  <text x="325" y="355" text-anchor="middle" class="node-title">Centralize the model</text>
+  <text x="325" y="379" text-anchor="middle" class="node-text">Gather, merge, or save checkpoint</text>
+
+  <path d="M325 395 V460" class="edge" stroke="#616161" marker-end="url(#arrow-gray)"/>
+  <circle cx="105" cy="500" r="20" fill="#616161"/><text x="105" y="506" text-anchor="middle" class="step">3</text>
+  <rect x="145" y="465" width="360" height="70" rx="14" fill="#e5e7eb" stroke="#616161" stroke-width="2"/>
+  <text x="325" y="495" text-anchor="middle" class="node-title">Redistribute full payload</text>
+  <text x="325" y="519" text-anchor="middle" class="node-text">Broadcast or reload from storage</text>
+
+  <path d="M325 535 V600" class="edge" stroke="#616161" marker-end="url(#arrow-gray)"/>
+  <circle cx="105" cy="640" r="20" fill="#616161"/><text x="105" y="646" text-anchor="middle" class="step">4</text>
+  <rect x="145" y="605" width="360" height="70" rx="14" fill="#ede9fe" stroke="#5E35B1" stroke-width="2"/>
+  <text x="325" y="635" text-anchor="middle" class="node-title">Reshard and install</text>
+  <text x="325" y="659" text-anchor="middle" class="node-text">Build each rollout rank's layout</text>
+
+  <rect x="120" y="735" width="380" height="86" rx="14" fill="#ffffff" stroke="#9E9E9E" stroke-width="2"/>
+  <text x="310" y="770" text-anchor="middle" class="note" fill="#616161">Critical-path cost</text>
+  <text x="310" y="798" text-anchor="middle" class="node-text">gather / storage + transfer + reshard + install</text>
+
+  <!-- MX path -->
+  <circle cx="685" cy="220" r="20" fill="#2E7D32"/><text x="685" y="226" text-anchor="middle" class="step">1</text>
+  <rect x="725" y="185" width="360" height="70" rx="14" fill="#dbeafe" stroke="#1565C0" stroke-width="2"/>
+  <text x="905" y="215" text-anchor="middle" class="node-title">Publish existing shards</text>
+  <text x="905" y="239" text-anchor="middle" class="node-text">Metadata points at trainer buffers</text>
+
+  <path d="M905 255 V320" class="edge" stroke="#2E7D32" marker-end="url(#arrow-green)"/>
+  <circle cx="685" cy="360" r="20" fill="#2E7D32"/><text x="685" y="366" text-anchor="middle" class="step">2</text>
+  <rect x="725" y="325" width="360" height="70" rx="14" fill="#dcfce7" stroke="#2E7D32" stroke-width="2"/>
+  <text x="905" y="355" text-anchor="middle" class="node-title">Discover READY sources</text>
+  <text x="905" y="379" text-anchor="middle" class="node-text">Catalog returns ownership metadata</text>
+
+  <path d="M905 395 V460" class="edge" stroke="#2E7D32" marker-end="url(#arrow-green)"/>
+  <circle cx="685" cy="500" r="20" fill="#2E7D32"/><text x="685" y="506" text-anchor="middle" class="step">3</text>
+  <rect x="725" y="465" width="360" height="70" rx="14" fill="#dcfce7" stroke="#2E7D32" stroke-width="2"/>
+  <text x="905" y="495" text-anchor="middle" class="node-title">Plan receiver-local ranges</text>
+  <text x="905" y="519" text-anchor="middle" class="node-text">Intersect source and target layouts</text>
+
+  <path d="M905 535 V600" class="edge" stroke="#2E7D32" marker-end="url(#arrow-green)"/>
+  <circle cx="685" cy="640" r="20" fill="#2E7D32"/><text x="685" y="646" text-anchor="middle" class="step">4</text>
+  <rect x="725" y="605" width="360" height="70" rx="14" fill="#ede9fe" stroke="#5E35B1" stroke-width="2"/>
+  <text x="905" y="635" text-anchor="middle" class="node-title">Pull, transform, install</text>
+  <text x="905" y="659" text-anchor="middle" class="node-text">NIXL reads directly into GPU buffers</text>
+
+  <rect x="700" y="735" width="380" height="86" rx="14" fill="#ffffff" stroke="#4CAF50" stroke-width="2"/>
+  <text x="890" y="770" text-anchor="middle" class="note" fill="#2E7D32">Critical-path cost</text>
+  <text x="890" y="798" text-anchor="middle" class="node-text">discovery + plan + needed wire bytes + install</text>
+</svg>

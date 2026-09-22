@@ -5,6 +5,9 @@ that have EFA-capable nodes, using the libfabric NIXL backend for GPU-to-GPU
 RDMA over the EFA fabric. Scale the Deployment to N>=2 to demonstrate P2P
 weight transfer between replicas.
 
+The manifest uses `deepseek-ai/DeepSeek-V3` and requires an EFA-enabled Dynamo
+runtime with vLLM and ModelExpress installed.
+
 The default NIXL backend (`UCX`) is tuned for InfiniBand and RoCE clusters. On
 AWS EFA, UCX can silently fall back to TCP depending on the libibverbs / EFA
 installer combination on the host - `MX_NIXL_BACKEND=LIBFABRIC` selects the
@@ -38,6 +41,7 @@ From the repository root:
 ```bash
 docker build \
   -f examples/p2p_transfer_k8s/client/vllm/aws_efa/Dockerfile \
+  --build-arg DYNAMO_VLLM_EFA_RUNTIME_IMAGE=<efa-runtime-image> \
   -t <YOUR_REGISTRY>/modelexpress-aws-efa:latest \
   .
 
@@ -122,12 +126,6 @@ container sees every EFA NIC on its host node.
 
 ## Architecture notes
 
-The example Dockerfile uses `nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.0-efa-amd64`
-as the base, so the resulting image runs only on x86_64 nodes. AWS EFAv2 H100
-instances (`p5.*`) are x86_64 and work out of the box. AWS EFAv3 GB200
-instances (`p6e-*`) are arm64 and need an arm64-built variant: extend from
-the multi-arch `nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.0` base, layer in
-the AWS-patched libfabric from `dynamoci.azurecr.io/ai-dynamo/efa-libs`
-(NVIDIA-internal), and install `libhwloc15` so the NIXL libfabric plugin
-can resolve its dynamic deps. Build with
-`docker buildx build --platform linux/arm64 ...`.
+The base passed through `DYNAMO_VLLM_EFA_RUNTIME_IMAGE` determines the target
+architecture. Use an amd64 EFA image for AWS EFAv2 H100 instances (`p5.*`) or
+an arm64 EFA image for AWS EFAv3 GB200 instances (`p6e-*`).

@@ -17,7 +17,7 @@ from modelexpress.metadata.source_id import compute_mx_source_id
 
 def _base_identity() -> p2p_pb2.SourceIdentity:
     return p2p_pb2.SourceIdentity(
-        mx_version="0.5.0",
+        mx_version="0.7.0",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
         model_name="deepseek-ai/DeepSeek-V3",
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
@@ -60,7 +60,7 @@ def test_different_revision_gives_different_id():
 
 
 def test_empty_artifact_fields_preserve_existing_id():
-    assert compute_mx_source_id(_base_identity()) == "5a5f555570065064"
+    assert compute_mx_source_id(_base_identity()) == "c19c9f4300b46054"
 
 
 def test_artifact_compatibility_fields_affect_id():
@@ -94,6 +94,36 @@ def test_deep_gemm_cache_is_separate_artifact_source_type():
     assert compute_mx_source_id(torch_compile) != compute_mx_source_id(deep_gemm)
 
 
+def test_tilelang_cache_is_separate_artifact_source_type():
+    deep_gemm = _base_identity()
+    deep_gemm.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE
+
+    tilelang = _base_identity()
+    tilelang.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE
+
+    assert compute_mx_source_id(deep_gemm) != compute_mx_source_id(tilelang)
+
+
+def test_tvm_ffi_cache_is_separate_artifact_source_type():
+    triton = _base_identity()
+    triton.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE
+
+    tvm_ffi = _base_identity()
+    tvm_ffi.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE
+
+    assert compute_mx_source_id(triton) != compute_mx_source_id(tvm_ffi)
+
+
+def test_cute_dsl_and_flashinfer_have_separate_artifact_source_types():
+    cute_dsl = _base_identity()
+    cute_dsl.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE
+
+    flashinfer = _base_identity()
+    flashinfer.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE
+
+    assert compute_mx_source_id(cute_dsl) != compute_mx_source_id(flashinfer)
+
+
 def test_artifact_compatibility_fields_are_case_insensitive():
     upper = _base_identity()
     upper.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
@@ -124,13 +154,13 @@ def test_extra_parameters_sorted():
 # ---------------------------------------------------------------------------
 
 def test_pinned_hash_base_identity():
-    assert compute_mx_source_id(_base_identity()) == "5a5f555570065064"
+    assert compute_mx_source_id(_base_identity()) == "c19c9f4300b46054"
 
 
 def test_pinned_hash_with_revision():
     pinned = _base_identity()
     pinned.revision = "abc123def4567890"
-    assert compute_mx_source_id(pinned) == "d0c184b2a9a34c82"
+    assert compute_mx_source_id(pinned) == "89b1b7fe9aa9bb69"
 
 
 def test_case_colliding_extra_parameters_are_deterministic():
@@ -146,4 +176,4 @@ def test_case_colliding_extra_parameters_are_deterministic():
     b.extra_parameters["foo"] = "b"
     b.extra_parameters["Foo"] = "a"
     assert compute_mx_source_id(a) == compute_mx_source_id(b)
-    assert compute_mx_source_id(a) == "bf71fb9340cd940a"
+    assert compute_mx_source_id(a) == "88f79c84d05d9c32"

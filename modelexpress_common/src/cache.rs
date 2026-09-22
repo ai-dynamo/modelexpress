@@ -8,6 +8,7 @@ use crate::{
     models::ModelProvider,
     providers::{
         gcs::GcsProviderCache, huggingface::HuggingFaceProviderCache, ngc::NgcProviderCache,
+        s3::S3ProviderCache,
     },
 };
 use anyhow::{Context, Result};
@@ -72,7 +73,7 @@ impl CacheConfig {
         }
 
         // Try environment variable
-        if let Ok(path) = env::var("MODEL_EXPRESS_CACHE_DIRECTORY") {
+        if let Some(path) = crate::envs::cache_directory() {
             return Self::from_path(path);
         }
 
@@ -191,13 +192,6 @@ impl CacheConfig {
         ))
     }
 
-    /// Query server for cache information
-    pub fn from_server() -> Result<Self> {
-        // This would typically make an HTTP request to the server
-        // For now, we'll return an error to indicate server is not available
-        Err(anyhow::anyhow!("Server not available for cache discovery"))
-    }
-
     /// Get cache path from command line arguments
     fn get_cache_path_from_args() -> Option<String> {
         let args: Vec<String> = env::args().collect();
@@ -215,10 +209,7 @@ impl CacheConfig {
 
     /// Get default server endpoint
     fn get_default_server_endpoint() -> String {
-        normalize_grpc_endpoint(
-            env::var("MODEL_EXPRESS_SERVER_ENDPOINT")
-                .unwrap_or_else(|_| format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT)),
-        )
+        normalize_grpc_endpoint(crate::envs::server_endpoint_or_default())
     }
 
     /// Get configuration file path
@@ -244,6 +235,7 @@ impl CacheConfig {
             ModelProvider::HuggingFace,
             ModelProvider::Ngc,
             ModelProvider::Gcs,
+            ModelProvider::S3,
         ] {
             models.extend(cache_for_provider(provider).list_models(&self.local_path)?);
         }
@@ -353,6 +345,7 @@ pub(crate) fn cache_for_provider(provider: ModelProvider) -> &'static dyn Provid
         ModelProvider::HuggingFace => &HuggingFaceProviderCache,
         ModelProvider::Ngc => &NgcProviderCache,
         ModelProvider::Gcs => &GcsProviderCache,
+        ModelProvider::S3 => &S3ProviderCache,
     }
 }
 
@@ -387,6 +380,7 @@ fn provider_sort_key(provider: ModelProvider) -> u8 {
         ModelProvider::HuggingFace => 0,
         ModelProvider::Ngc => 1,
         ModelProvider::Gcs => 2,
+        ModelProvider::S3 => 3,
     }
 }
 

@@ -12,9 +12,61 @@ validation works correctly.
 
 import sys
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from unittest.mock import MagicMock
 
+import pytest
+import torch
 import torch.nn as nn
+
+
+@dataclass
+class MockAcceleratorBackend:
+    name: str = "mock"
+    torch_device_type: str = "mock"
+    nixl_mem_type: str = "VRAM"
+    rdma_p2p: bool = False
+    pool_reg: bool = False
+    vmm: bool = False
+    gds: bool = False
+    set_device_calls: list[int] = field(default_factory=list)
+    synchronize_calls: list[int | None] = field(default_factory=list)
+    empty_cache_calls: int = 0
+
+    def set_device(self, device_id: int) -> None:
+        self.set_device_calls.append(device_id)
+
+    def current_device(self) -> int:
+        return 0
+
+    def synchronize(self, device_id: int | None = None) -> None:
+        self.synchronize_calls.append(device_id)
+
+    def empty_cache(self) -> None:
+        self.empty_cache_calls += 1
+
+    def torch_device(self, device_id: int) -> torch.device:
+        return torch.device("cpu")
+
+    def is_accel_tensor(self, tensor: torch.Tensor) -> bool:
+        return tensor.device.type == self.torch_device_type
+
+    def supports_rdma_p2p(self) -> bool:
+        return self.rdma_p2p
+
+    def supports_pool_reg(self) -> bool:
+        return self.pool_reg
+
+    def supports_vmm(self) -> bool:
+        return self.vmm
+
+    def supports_gds(self) -> bool:
+        return self.gds
+
+
+@pytest.fixture
+def mock_accelerator_backend_cls():
+    return MockAcceleratorBackend
 
 
 def _maybe_mock_vllm():
@@ -47,6 +99,40 @@ def _maybe_mock_vllm():
             return cls
         return _wrapper
 
+    @dataclass
+    class WeightTransferInitInfo:
+        pass
+
+    @dataclass
+    class WeightTransferUpdateInfo:
+        pass
+
+    class WeightTransferEngine(ABC):
+        def __init__(self, config, vllm_config, device, model):
+            self.config = config
+            self.vllm_config = vllm_config
+            self.parallel_config = vllm_config.parallel_config
+            self.model_config = vllm_config.model_config
+            self.device = device
+            self.model = model
+
+        def update_weights(self, update_info):
+            self.receive_weights(self.update_info_cls(**update_info))
+
+        @staticmethod
+        @abstractmethod
+        def trainer_send_weights(iterator, trainer_args):
+            raise NotImplementedError
+
+    class WeightTransferEngineFactory:
+        _registry = {}
+
+        @classmethod
+        def register_engine(cls, name, module_path_or_cls, class_name=None):
+            if name in cls._registry:
+                raise ValueError(f"Weight transfer engine {name!r} is registered")
+            cls._registry[name] = (module_path_or_cls, class_name)
+
     # Build mock module tree
     vllm_mods = {
         "vllm": MagicMock(),
@@ -61,12 +147,27 @@ def _maybe_mock_vllm():
         "vllm.utils": MagicMock(),
         "vllm.utils.torch_utils": MagicMock(),
         "vllm.distributed": MagicMock(),
+        "vllm.distributed.weight_transfer": MagicMock(),
+        "vllm.distributed.weight_transfer.base": MagicMock(),
+        "vllm.distributed.weight_transfer.factory": MagicMock(),
     }
 
     # Wire up real objects where behavior matters
     vllm_mods["vllm.model_executor.model_loader.base_loader"].BaseModelLoader = BaseModelLoader
     vllm_mods["vllm.model_executor.model_loader"].register_model_loader = register_model_loader
     vllm_mods["vllm.model_executor.model_loader"].BaseModelLoader = BaseModelLoader
+    vllm_mods["vllm.distributed.weight_transfer"].WeightTransferEngine = (
+        WeightTransferEngine
+    )
+    vllm_mods["vllm.distributed.weight_transfer.base"].WeightTransferInitInfo = (
+        WeightTransferInitInfo
+    )
+    vllm_mods["vllm.distributed.weight_transfer.base"].WeightTransferUpdateInfo = (
+        WeightTransferUpdateInfo
+    )
+    vllm_mods["vllm.distributed.weight_transfer.factory"].WeightTransferEngineFactory = (
+        WeightTransferEngineFactory
+    )
 
     # set_default_torch_dtype needs to be a real context manager
     from contextlib import contextmanager

@@ -45,6 +45,10 @@ enum MxSourceType {
   MX_SOURCE_TYPE_TORCH_COMPILE_CACHE = 3; // torch.compile cache files
   MX_SOURCE_TYPE_TRITON_CACHE = 4;        // Triton cache files
   MX_SOURCE_TYPE_DEEP_GEMM_CACHE = 5;     // DeepGEMM kernel cache files
+  MX_SOURCE_TYPE_TILELANG_CACHE = 6;      // TileLang JIT kernel cache files
+  MX_SOURCE_TYPE_CUTE_DSL_CACHE = 7;      // CuTe DSL compiled kernel cache files
+  MX_SOURCE_TYPE_FLASHINFER_CACHE = 8;    // FlashInfer JIT workspace cache files
+  MX_SOURCE_TYPE_TVM_FFI_CACHE = 9;       // TVM-FFI compiled SGLang kernel modules
 }
 
 // All fields that affect source compatibility for reusable model material.
@@ -155,6 +159,9 @@ message ArtifactSourceMetadata {
 
   // Number of transfer chunks in the sealed artifact manifest.
   uint32 chunk_count = 4;
+
+  // Distributed node rank that owns this node-scoped artifact.
+  uint32 node_rank = 5;
 }
 
 // Tensor source payload for the source_payload migration. Writers populate this
@@ -262,7 +269,7 @@ message WorkerMetadata {
   // Timestamp of last status update (unix millis)
   int64 updated_at = 5;
 
-  // P2P metadata exchange fields (opt-in via MX_P2P_METADATA=1).
+  // P2P metadata exchange fields (disable via MX_P2P_METADATA=0).
   // When populated, targets fetch NIXL metadata and tensor manifests
   // directly from the source worker instead of from the central server.
 
@@ -275,6 +282,17 @@ message WorkerMetadata {
   // host:port for the worker's gRPC WorkerService, used for tensor manifests,
   // artifact manifests, and artifact chunk transfer coordination.
   string worker_grpc_endpoint = 8;
+
+  // Runtime accelerator family for compatibility filtering (e.g. "cuda").
+  // This is runtime metadata, not SourceIdentity hash material. Empty means
+  // unknown and must be accepted for backward compatibility with old writers.
+  string accelerator = 9;
+
+  // Datacenter topology domain values keyed by Grove ClusterTopology domain
+  // (see SourceInstanceRef.topology). Static per node, so it is published once
+  // at registration; the server passes it through onto SourceInstanceRef. This
+  // is runtime metadata, not SourceIdentity hash material.
+  map<string, string> topology = 11;
 
   // Source-type-specific bounded metadata. This selects the metadata payload
   // shape, not a transfer endpoint. Readers should prefer tensor_source over
@@ -297,6 +315,10 @@ message WorkerMetadata {
 // source-side registered DRAM range and returns its transfer descriptor.
 service WorkerService {
   rpc GetTensorManifest(GetTensorManifestRequest) returns (GetTensorManifestResponse);
+  // Prepare/Release protect a mutable RL generator's live tensor storage while
+  // another generator reads it during active-refit P2P transfer.
+  rpc PrepareTensorRead(PrepareTensorReadRequest) returns (PrepareTensorReadResponse);
+  rpc ReleaseTensorRead(ReleaseTensorReadRequest) returns (ReleaseTensorReadResponse);
   rpc GetArtifactManifestHeader(GetArtifactManifestHeaderRequest) returns (GetArtifactManifestHeaderResponse);
   rpc GetArtifactManifestChunks(GetArtifactManifestChunksRequest) returns (GetArtifactManifestChunksResponse);
   rpc PrepareArtifactChunk(PrepareArtifactChunkRequest) returns (PrepareArtifactChunkResponse);
@@ -306,6 +328,10 @@ service WorkerService {
 message GetTensorManifestRequest {
   // mx_source_id for validation (catches stale discovery)
   string mx_source_id = 1;
+
+  // Runtime generation selected from discovery metadata. The serving endpoint
+  // rejects the request if it belongs to a different worker process.
+  optional string worker_id = 2;
 }
 
 message GetTensorManifestResponse {
@@ -326,7 +352,47 @@ message GetTensorManifestResponse {
 
   // Rank of the serving worker (for rank-matched transfers)
   uint32 worker_rank = 5;
+
+  // Runtime accelerator family for compatibility filtering (e.g. "cuda").
+  // Empty means unknown and must be accepted for backward compatibility.
+  string accelerator = 6;
+
+  // Runtime generation of the process serving this manifest. New sources
+  // always set it; absence identifies a legacy source during rolling upgrade.
+  optional string worker_id = 7;
 }
+
+message PrepareTensorReadRequest {
+  // Exact source version selected through discovery.
+  string mx_source_id = 1;
+
+  // Exact worker process selected through discovery. Unlike immutable artifact
+  // chunks, live tensor addresses become stale when the worker process changes.
+  optional string worker_id = 2;
+}
+
+message PrepareTensorReadResponse {
+  // Lease protecting the returned tensor addresses from donor mutation. The
+  // target releases it after the read; if the target process exits first, the
+  // donor expires it after its bounded server-owned lifetime.
+  string lease_id = 1;
+
+  // Tensor addresses and NIXL endpoint captured under this lease. Artifact
+  // prepare returns the analogous single-chunk transfer descriptor instead.
+  GetTensorManifestResponse manifest = 2;
+}
+
+message ReleaseTensorReadRequest {
+  // Revalidate that the lease belongs to this source version and worker.
+  string mx_source_id = 1;
+  optional string worker_id = 2;
+
+  // Lease returned by PrepareTensorRead. Release is best-effort on target
+  // shutdown; donor-side expiry handles SIGKILL, OOM, and node loss.
+  string lease_id = 3;
+}
+
+message ReleaseTensorReadResponse {}
 
 message GetArtifactManifestHeaderRequest {
   // mx_source_id for validation (catches stale discovery)
@@ -476,6 +542,19 @@ message PublishMetadataRequest {
   // Differentiates multiple replicas with identical SourceIdentity.
   // If empty, the server rejects the request.
   string worker_id = 3;
+
+  // Kubernetes pod name of the calling worker, set via the downward API.
+  // Used with pod_uid and pod_namespace to set an ownerReference on the
+  // ModelMetadata CR so K8s garbage-collects it when the pod is deleted.
+  string pod_name = 4;
+
+  // Kubernetes pod UID of the calling worker, set via the downward API.
+  string pod_uid = 5;
+
+  // Kubernetes namespace of the calling worker, set via the downward API.
+  // Owner references are only valid when this matches the ModelMetadata
+  // namespace. Empty means no ownerReference is set.
+  string pod_namespace = 6;
 }
 
 message PublishMetadataResponse {
@@ -506,6 +585,50 @@ message SourceInstanceRef {
   // Global rank of this worker within the instance.
   // Clients filter on this field to find a peer with a matching rank.
   uint32 worker_rank = 4;
+
+  // Runtime accelerator family for compatibility filtering (e.g. "cuda").
+  // Lets clients drop incompatible sources before GetMetadata and before
+  // the retry-cap slice. Empty means unknown (treated as compatible for
+  // rolling upgrades and sources that predate this field).
+  string accelerator = 5;
+
+  // Timestamp of the worker's last status update (unix milliseconds).
+  // Zero means unknown for records created by older servers/backends.
+  int64 updated_at = 6;
+
+  // Training step/version lifted from SourceIdentity.extra_parameters.
+  // Presence matters: an absent value must not be interpreted as step zero.
+  optional uint64 training_step = 7;
+
+  // Stable digest of topology, tensor registry, and translation metadata.
+  // Unlike training_step this remains constant across versions and changes
+  // whenever cached layout metadata must be rebuilt.
+  optional string layout_signature = 8;
+
+  // Datacenter topology domain values keyed by Grove ClusterTopology domain
+  // (region/zone/datacenter/block/rack/host/numa), e.g.
+  // {"block": "b1", "rack": "r3", "host": "node7"}. Populated from the node's
+  // labels via the ClusterTopology domain->key mapping and published once at
+  // registration. The topology_aware selector prefers sources in the narrowest
+  // RDMA-fabric domain the target and source share. Empty means unknown (the
+  // selector then falls back to rendezvous ordering for that source).
+  // (#519 took fields 6-8, #512 took 9, #510 took 10.)
+  map<string, string> topology = 9;
+
+  // Source-published busyness estimate in [0, 1] (0 = idle, 1 = saturated).
+  // The source computes it about itself and publishes it; the server only
+  // passes it through (never accumulates it), keeping servers stateless. The
+  // default provider measures the source's RDMA NIC utilization (from its
+  // own port counters); a runtime provider (e.g. vLLM/SGLang serving load)
+  // can supply it instead behind the same field. Consumed by the client
+  // `load_aware` selector to steer new targets toward sources with spare
+  // headroom, so weight transfers avoid contending with a source's in-flight
+  // inference. Ordering-only and advisory. Unset means unknown (an older
+  // client, or a provider with no signal) and ranks as a neutral prior; 0
+  // means measured idle. Presence is what keeps a source with no reading
+  // from outranking one that reports real load.
+  // (#519 took fields 6-8, #512 took 9, #510 took 10.)
+  optional float source_load = 10;
 }
 
 message ListSourcesRequest {
@@ -515,6 +638,17 @@ message ListSourcesRequest {
 
   // Filter by worker status. Not set = return workers in all statuses.
   optional SourceStatus status_filter = 2;
+
+  // Lightweight discovery filters. Unlike identity, these do not require the
+  // caller to know every source-identity field and can therefore be applied
+  // before fetching MB-scale worker metadata.
+  optional string model_name_filter = 3;
+  optional uint32 worker_rank_filter = 4;
+  optional uint64 min_training_step = 5;
+  optional int64 min_updated_at = 6;
+
+  // Return newest workers first and cap the response. Zero/unset means no cap.
+  optional uint32 limit = 7;
 }
 
 message ListSourcesResponse {
@@ -545,6 +679,13 @@ message GetMetadataResponse {
 
   // Echoed worker_id
   string worker_id = 4;
+
+  // Source identity (mirrors the SourceIdentity that produced mx_source_id).
+  // Required by v2 (NemoRL) clients that store framework metadata
+  // (training_step, role, shape registry, ...) in extra_parameters.
+  // Pre-v2 clients ignore this field; populating it on existing servers is
+  // backward-compatible.
+  SourceIdentity identity = 5;
 }
 
 // ============================================================================
@@ -563,6 +704,12 @@ message UpdateStatusRequest {
 
   // worker_id returned from PublishMetadata
   string worker_id = 4;
+
+  // Source-published busyness in [0, 1], refreshed on each heartbeat so the
+  // server's SourceInstanceRef.source_load tracks live load. Leave unset when
+  // no provider has a reading; 0 means measured idle. See
+  // SourceInstanceRef.source_load.
+  optional float source_load = 5;
 }
 
 message UpdateStatusResponse {

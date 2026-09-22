@@ -66,11 +66,12 @@ def test_build_artifact_manifest_sorts_hashes_and_chunks_files(tmp_path):
         (2, 1, 4, 2, "6bb2dff5"),
     ]
 
-    metadata = artifact_source_metadata(manifest)
+    metadata = artifact_source_metadata(manifest, node_rank=2)
     assert metadata.artifact_id == artifact_manifest_id(manifest)
     assert metadata.total_size == 9
     assert metadata.file_count == 2
     assert metadata.chunk_count == 3
+    assert metadata.node_rank == 2
 
 
 def test_build_artifact_manifest_sorts_by_manifest_path_with_prefix_collision(tmp_path):

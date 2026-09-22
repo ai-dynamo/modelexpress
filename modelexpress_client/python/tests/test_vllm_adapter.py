@@ -3,18 +3,29 @@
 
 """Tests for the vLLM engine adapter."""
 
+import json
+import os
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
+import torch.nn as nn
 
 from modelexpress.engines.vllm.adapter import (
+    DraftShardSelection,
     VllmAdapter,
+    _DRAFT_WEIGHT_PREFIXES,
+    _SAFETENSORS_INDEX_NAME,
     _get_vllm_device_id,
     _get_vllm_worker_rank,
+    _mtp_layer_prefixes,
+    _read_safetensors_index,
+    _select_draft_weight_files,
     build_vllm_load_context,
 )
+from modelexpress.load_strategy.context import LoadResult
 
 
 def _vllm_config(*, rank: int, tp_size: int, pp_size: int):
@@ -24,6 +35,14 @@ def _vllm_config(*, rank: int, tp_size: int, pp_size: int):
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
         )
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_accelerator_backend_selection(monkeypatch, mock_accelerator_backend_cls):
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.accelerator_backend_for",
+        lambda device: mock_accelerator_backend_cls(),
     )
 
 
@@ -77,21 +96,84 @@ def test_vllm_device_id_uses_current_platform_device(monkeypatch):
     assert _get_vllm_device_id(torch.device("cuda")) == 2
 
 
-def test_vllm_is_cuda_alike_uses_current_platform(monkeypatch):
+def test_vllm_is_cuda_alike_uses_current_platform(
+    monkeypatch,
+    mock_accelerator_backend_cls,
+):
     fake_platforms = SimpleNamespace(
         current_platform=SimpleNamespace(
             is_cuda_alike=lambda: True,
         ),
     )
     monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.accelerator_backend_for",
+        lambda device: mock_accelerator_backend_cls(),
+    )
     adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
 
     assert adapter.is_cuda_alike() is True
 
 
+def test_vllm_all_gathers_state_on_cpu_group(monkeypatch):
+    """Use vLLM's CPU group for state collectives."""
+    cpu_group = object()
+    broadcasts = []
+
+    def broadcast(state, *, src):
+        """Record a broadcast and return the simulated rank-zero value."""
+        broadcasts.append((state, src))
+        return "rank-zero"
+
+    world_group = SimpleNamespace(
+        world_size=2,
+        cpu_group=cpu_group,
+        local_rank=0,
+        broadcast_object=broadcast,
+    )
+    distributed = ModuleType("vllm.distributed")
+    distributed.get_world_group = lambda: world_group
+    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed)
+
+    def all_gather(states, state, *, group):
+        """Populate the gather destination with local and peer state."""
+        assert group is cpu_group
+        states[:] = [state, ("peer",)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather)
+    adapter = object.__new__(VllmAdapter)
+
+    assert adapter.all_gather_state(("local",)) == (
+        ("local",),
+        ("peer",),
+    )
+    assert adapter.broadcast_state("local") == "rank-zero"
+    assert broadcasts == [("local", 0)]
+
+
+def test_vllm_adapter_discovery_uses_backend_predicate(
+    monkeypatch,
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.accelerator_backend_for",
+        lambda device: backend,
+    )
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.randn(4, 3))
+
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
+
+    assert list(tensors) == ["weight"]
+
+
 def test_build_vllm_load_context_uses_current_platform_for_bare_cuda(monkeypatch):
+    """Resolve a bare CUDA device through vLLM's current platform."""
     _stub_vllm_current_device(monkeypatch, current_device=2)
     _stub_metadata_client(monkeypatch)
+    sys.modules["vllm.distributed"].get_world_group.return_value.local_rank = 2
     vllm_config = _context_config(load_device=None)
 
     ctx = build_vllm_load_context(vllm_config, _model_config())
@@ -99,11 +181,14 @@ def test_build_vllm_load_context_uses_current_platform_for_bare_cuda(monkeypatch
     assert ctx.target_device == torch.device("cuda")
     assert ctx.target_device.index is None
     assert ctx.device_id == 2
+    assert ctx.local_rank == 2
 
 
 def test_build_vllm_load_context_keeps_explicit_cuda_index(monkeypatch):
+    """Preserve an explicitly configured CUDA device index."""
     _stub_vllm_current_device(monkeypatch, current_device=2)
     _stub_metadata_client(monkeypatch)
+    sys.modules["vllm.distributed"].get_world_group.return_value.local_rank = 3
     vllm_config = _context_config(load_device="cuda:3")
 
     ctx = build_vllm_load_context(vllm_config, _model_config())
@@ -111,6 +196,321 @@ def test_build_vllm_load_context_keeps_explicit_cuda_index(monkeypatch):
     assert ctx.target_device == torch.device("cuda:3")
     assert ctx.target_device.index == 3
     assert ctx.device_id == ctx.target_device.index
+    assert ctx.local_rank == 3
+
+
+def test_build_vllm_load_context_uses_node_rank_as_node_rank(monkeypatch):
+    """Populate node rank from vLLM's parallel configuration."""
+    _stub_metadata_client(monkeypatch)
+    sys.modules["vllm.distributed"].get_world_group.return_value.local_rank = 0
+    vllm_config = _context_config(load_device="cuda:0")
+    vllm_config.parallel_config.node_rank = 1
+
+    ctx = build_vllm_load_context(vllm_config, _model_config())
+
+    assert ctx.node_rank == 1
+
+
+def test_before_rdma_receive_runs_layout_finalizers(monkeypatch):
+    events = []
+
+    def process_weights_after_loading(model, model_config, target_device):
+        events.append(("process", target_device))
+
+    _stub_vllm_process_weights_after_loading(monkeypatch, process_weights_after_loading)
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = _TopLevelModel(events)
+
+    result = adapter.before_rdma_receive(LoadResult(value=model, model=model))
+
+    assert result.model is model
+    assert events == [
+        ("finalize", "model", "finalize_mega_moe_weights"),
+        ("process", torch.device("cpu")),
+    ]
+
+
+def test_after_rdma_receive_runs_derived_weight_finalizers(monkeypatch):
+    events = []
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = _TopLevelModel(events)
+
+    result = adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert result.model is model
+    assert events == [
+        ("finalize", "model", "finalize_mhc_broadcast_weights"),
+    ]
+
+
+def test_after_rdma_receive_refreshes_host_attention_scale_mirrors(
+    mock_accelerator_backend_cls,
+):
+    """RDMA accelerator scales replace every stale host mirror in place."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    pointers = {
+        name: tensor.data_ptr()
+        for name, tensor in model.attn.named_buffers(recurse=False)
+    }
+
+    result = adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert result.model is model
+    assert model.attn._q_scale_float == pytest.approx(0.25)
+    # Match compressed-tensors' host conversion for per-head scales.
+    assert model.attn._k_scale_float == pytest.approx(0.5)
+    assert model.attn._v_scale_float == pytest.approx(0.75)
+    # vLLM does not derive a host mirror from _prob_scale.
+    assert model.attn._prob_scale_float == pytest.approx(1.0)
+    assert model.attn._k_scale_cpu.item() == pytest.approx(0.5)
+    assert model.attn._v_scale_cpu.item() == pytest.approx(0.75)
+    assert model.attn.impl.bmm1_scale is None
+    assert model.attn.impl.bmm2_scale is None
+    assert model.attn.impl.o_sf_scale is None
+    assert {
+        name: tensor.data_ptr()
+        for name, tensor in model.attn.named_buffers(recurse=False)
+    } == pointers
+
+
+def test_after_rdma_receive_refreshes_scales_after_model_finalizer(
+    mock_accelerator_backend_cls,
+):
+    """The mirror refresh observes scale changes made by the finalizer."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = _AttentionScaleFinalizerModel()
+
+    adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert model.finalized is True
+    assert model.attn._q_scale.item() == pytest.approx(0.625)
+    assert model.attn._q_scale_float == pytest.approx(0.625)
+
+
+def test_after_rdma_receive_fails_when_fp8_scales_are_unrecognized(
+    mock_accelerator_backend_cls,
+):
+    """An FP8 target cannot silently complete without refreshing any scales."""
+    config = _context_config(load_device="cpu")
+    config.cache_config.cache_dtype = "fp8"
+    adapter = VllmAdapter(config, _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+
+    with pytest.raises(RuntimeError, match="no attention module was refreshed"):
+        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+
+def test_after_rdma_receive_fails_on_incomplete_scale_contract(
+    mock_accelerator_backend_cls,
+):
+    """A partial private q/k/v scale contract fails closed."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    del model.attn._v_scale_float
+
+    with pytest.raises(RuntimeError, match="Incomplete.*_v_scale_float"):
+        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+
+def test_after_rdma_receive_rejects_invalid_python_host_scalar(
+    mock_accelerator_backend_cls,
+):
+    """A renamed or type-changed Python scale fails the private contract."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    model.attn._q_scale_float = torch.tensor(1.0)
+
+    with pytest.raises(RuntimeError, match="_q_scale_float must be a float"):
+        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+
+def test_after_rdma_receive_rejects_invalid_cpu_scale(
+    mock_accelerator_backend_cls,
+):
+    """Host tensor mirrors must preserve vLLM's singleton CPU contract."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    model.attn._k_scale_cpu = torch.ones(2)
+
+    with pytest.raises(RuntimeError, match="_k_scale_cpu must be"):
+        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+
+def test_after_rdma_receive_allows_missing_backend_specific_cpu_scales(
+    mock_accelerator_backend_cls,
+):
+    """Backends without CPU scale mirrors still refresh Python host state."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    del model.attn._k_scale_cpu
+    del model.attn._v_scale_cpu
+
+    adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert model.attn._q_scale_float == pytest.approx(0.25)
+    assert model.attn._k_scale_float == pytest.approx(0.5)
+    assert model.attn._v_scale_float == pytest.approx(0.75)
+
+
+def test_after_rdma_receive_allows_mla_flashinfer_cache_contract(
+    mock_accelerator_backend_cls,
+):
+    """FlashInfer MLA legitimately has bmm caches without an output cache."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    del model.attn.impl.o_sf_scale
+
+    adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert model.attn._q_scale_float == pytest.approx(0.25)
+    assert model.attn._k_scale_float == pytest.approx(0.5)
+    assert model.attn._v_scale_float == pytest.approx(0.75)
+
+
+@pytest.mark.parametrize(
+    ("scale_name", "invalid_value"),
+    (
+        ("_q_scale", torch.tensor([])),
+        ("_k_scale", torch.tensor([float("nan")])),
+        ("_v_scale", torch.tensor(0.0)),
+    ),
+)
+def test_after_rdma_receive_rejects_invalid_accelerator_scales(
+    mock_accelerator_backend_cls,
+    scale_name,
+    invalid_value,
+):
+    """Accelerator scales must be nonempty, finite, and positive."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    setattr(model.attn, scale_name, invalid_value)
+
+    with pytest.raises(RuntimeError, match="Invalid vLLM accelerator attention scale"):
+        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+
+@pytest.mark.parametrize(
+    ("owner_name", "cache_name"),
+    (
+        ("module", "_o_scale_float"),
+        ("impl", "bmm1_scale"),
+        ("impl", "bmm2_scale"),
+        ("impl", "o_sf_scale"),
+    ),
+)
+def test_after_rdma_receive_rejects_prewarmed_attention_scale_cache(
+    mock_accelerator_backend_cls,
+    owner_name,
+    cache_name,
+):
+    """The compatibility shim only supports vLLM's cold-load lifecycle."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    owner = model.attn if owner_name == "module" else model.attn.impl
+    setattr(owner, cache_name, 99.0)
+
+    with pytest.raises(RuntimeError, match="requires a cold-load state"):
+        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+
+def test_rdma_lifecycle_discovers_prepared_tensors_and_finalizes_received_weights(
+    monkeypatch,
+    mock_accelerator_backend_cls,
+):
+    """RDMA discovers the pre-finalized layout before applying source weights."""
+    events = []
+
+    def process_weights_after_loading(model, model_config, target_device):
+        events.append(("process", target_device))
+
+    _stub_vllm_process_weights_after_loading(monkeypatch, process_weights_after_loading)
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    model = _RdmaLifecycleTopLevelModel(events)
+    result = LoadResult(value=model, model=model)
+
+    result = adapter.before_rdma_receive(result)
+    tensors = adapter.discover_tensors(result)
+    events.append(("discover", sorted(tensors)))
+
+    # Simulate RDMA applying the source tensor into the region registered above.
+    tensors["model.hc_attn_fn"].fill_(7)
+    events.append(("rdma_receive", 7))
+    result = adapter.after_rdma_receive(result)
+
+    assert result.model is model
+    assert events == [
+        ("finalize", "model", "finalize_mega_moe_weights"),
+        ("process", torch.device("cpu")),
+        ("discover", ["model.hc_attn_fn"]),
+        ("rdma_receive", 7),
+        ("finalize", "model", "finalize_mhc_broadcast_weights", 7),
+    ]
+
+
+def test_finalize_model_specific_weights_requires_explicit_names_and_model():
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+
+    with pytest.raises(TypeError, match="finalizer_names"):
+        adapter._finalize_model_specific_weights(LoadResult(value=object()))
+
+    with pytest.raises(RuntimeError, match="RDMA post-load processing"):
+        adapter._finalize_model_specific_weights(LoadResult(value=object()), ())
+
+
+def test_after_weight_iter_load_does_not_rerun_model_specific_finalizers(monkeypatch):
+    events = []
+
+    def process_weights_after_loading(model, model_config, target_device):
+        events.append(("process", target_device))
+
+    _stub_vllm_process_weights_after_loading(monkeypatch, process_weights_after_loading)
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = _TopLevelModel(events)
+
+    result = adapter.after_weight_iter_load(LoadResult(value=model, model=model))
+
+    assert result.model is model
+    assert events == [("process", torch.device("cpu"))]
 
 
 def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:
@@ -120,6 +520,22 @@ def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:
         ),
     )
     monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+
+
+def _stub_vllm_process_weights_after_loading(monkeypatch, process_fn) -> None:
+    packages = [
+        "vllm",
+        "vllm.model_executor",
+        "vllm.model_executor.model_loader",
+    ]
+    for name in packages:
+        module = ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+
+    utils = ModuleType("vllm.model_executor.model_loader.utils")
+    utils.process_weights_after_loading = process_fn
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
 
 
 def _stub_metadata_client(monkeypatch) -> None:
@@ -133,6 +549,7 @@ def _context_config(*, load_device):
     return SimpleNamespace(
         device_config=SimpleNamespace(device="cuda"),
         load_config=SimpleNamespace(device=load_device),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
         parallel_config=SimpleNamespace(
             rank=0,
             tensor_parallel_size=2,
@@ -148,3 +565,405 @@ def _model_config():
         quantization=None,
         revision=None,
     )
+
+
+class _TopLevelModel(torch.nn.Module):
+    def __init__(self, events):
+        super().__init__()
+        self.model = _MegaMoeModel(events)
+        self.standalone = _StandaloneFinalizer(events)
+
+
+class _MegaMoeModel(torch.nn.Module):
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+        self.layer = _MegaMoeLayer(events)
+
+    def finalize_mega_moe_weights(self) -> None:
+        self.events.append(("finalize", "model", "finalize_mega_moe_weights"))
+
+    def finalize_mhc_broadcast_weights(self) -> None:
+        self.events.append(
+            ("finalize", "model", "finalize_mhc_broadcast_weights")
+        )
+
+
+class _MegaMoeLayer(torch.nn.Module):
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+
+    def finalize_mega_moe_weights(self) -> None:
+        self.events.append(("finalize", "layer", "finalize_mega_moe_weights"))
+
+
+class _RdmaLifecycleTopLevelModel(torch.nn.Module):
+    def __init__(self, events):
+        super().__init__()
+        self.model = _RdmaLifecycleModel(events)
+
+
+class _RdmaLifecycleModel(torch.nn.Module):
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+        self.register_buffer("hc_attn_fn", torch.zeros(1))
+
+    def finalize_mega_moe_weights(self) -> None:
+        self.events.append(("finalize", "model", "finalize_mega_moe_weights"))
+
+    def finalize_mhc_broadcast_weights(self) -> None:
+        self.events.append(
+            (
+                "finalize",
+                "model",
+                "finalize_mhc_broadcast_weights",
+                int(self.hc_attn_fn.item()),
+            )
+        )
+
+
+class _AttentionWithStaleHostScales(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("_q_scale", torch.tensor(0.25))
+        self.register_buffer("_k_scale", torch.tensor([0.1, 0.5]))
+        self.register_buffer("_v_scale", torch.tensor(0.75))
+        self.register_buffer("_prob_scale", torch.tensor(0.125))
+        self._q_scale_float = 1.0
+        self._k_scale_float = 1.0
+        self._v_scale_float = 1.0
+        self._prob_scale_float = 1.0
+        self._k_scale_cpu = torch.tensor(1.0)
+        self._v_scale_cpu = torch.tensor(1.0)
+        self._o_scale_float = None
+        self.kv_cache_dtype = "fp8"
+        self.impl = SimpleNamespace(
+            bmm1_scale=None,
+            bmm2_scale=None,
+            o_sf_scale=None,
+        )
+
+
+class _AttentionScaleFinalizerModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.finalized = False
+        self.attn = _AttentionWithStaleHostScales()
+
+    def finalize_mhc_broadcast_weights(self) -> None:
+        self.attn._q_scale.fill_(0.625)
+        self.finalized = True
+
+
+class _StandaloneFinalizer(torch.nn.Module):
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+
+    def finalize_weights(self) -> None:
+        self.events.append(("finalize", "standalone", "finalize_weights"))
+
+    def finalize_weight(self) -> None:
+        self.events.append(("finalize", "standalone", "finalize_weight"))
+
+    def post_load_weights(self) -> None:
+        self.events.append(("finalize", "standalone", "post_load_weights"))
+
+    def finalize_cache(self) -> None:
+        self.events.append(("finalize", "standalone", "finalize_cache"))
+
+    def finalize_cache_weights(self) -> None:
+        self.events.append(("finalize", "standalone", "finalize_cache_weights"))
+
+    def finalize_requires_arg_weights(self, context) -> None:
+        self.events.append(
+            ("finalize", "standalone", "finalize_requires_arg_weights", context)
+        )
+
+
+def _union_prefixes(num_hidden_layers, num_nextn_predict_layers):
+    """The prefix set the adapter actually passes to the selector: DeepSeek's
+    "mtp." unioned with GLM's config.json-derived layer names."""
+    config = {
+        "num_hidden_layers": num_hidden_layers,
+        "num_nextn_predict_layers": num_nextn_predict_layers,
+    }
+    return _DRAFT_WEIGHT_PREFIXES + _mtp_layer_prefixes(config)
+
+
+class TestDraftWeightFileSelection:
+    """A draft load streams only its own shards, and falls back to the full set
+    when the checkpoint has no resolvable draft head. The selector matches both
+    real conventions: DeepSeek's "mtp." prefix and GLM's extra decoder layer
+    model.layers.{num_hidden_layers + i}. Fixtures mirror DeepSeek-V4-Pro
+    (base=61, mtp.0.*) and GLM-5.3 (base=78, model.layers.78.*)."""
+
+    def _write_index(self, tmp_path, weight_map):
+        """Write a safetensors index mapping tensor names to shard files."""
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map}), encoding="utf-8"
+        )
+
+    def test_selects_glm_extra_layer_shard(self, tmp_path):
+        """GLM extra-layer MTP (base=78): only the model.layers.78 shard is selected."""
+        self._write_index(
+            tmp_path,
+            {
+                "model.layers.0.self_attn.qkv_proj.weight": "model-00001-of-00002.safetensors",
+                "model.layers.77.mlp.down_proj.weight": "model-00002-of-00002.safetensors",
+                "model.layers.78.eh_proj.weight": "model-mtp.safetensors",
+                "model.layers.78.self_attn.qkv_proj.weight": "model-mtp.safetensors",
+            },
+        )
+        files = [
+            os.path.join(str(tmp_path), name)
+            for name in (
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+                "model-mtp.safetensors",
+            )
+        ]
+        assert _select_draft_weight_files(
+            str(tmp_path), files, _union_prefixes(78, 1)
+        ) == (
+            DraftShardSelection.SELECTED,
+            [os.path.join(str(tmp_path), "model-mtp.safetensors")],
+        )
+
+    def test_selects_deepseek_mtp_prefix_shard(self, tmp_path):
+        """DeepSeek "mtp." prefix resolves the draft shard when the layer-index prefix matches nothing."""
+        self._write_index(
+            tmp_path,
+            {
+                "layers.0.hc_attn_base": "model-00002-of-00003.safetensors",
+                "layers.60.hc_ffn_base": "model-00002-of-00003.safetensors",
+                "mtp.0.hc_head_base": "model-mtp.safetensors",
+                "mtp.0.hc_head_fn": "model-mtp.safetensors",
+            },
+        )
+        files = [
+            os.path.join(str(tmp_path), name)
+            for name in (
+                "model-00002-of-00003.safetensors",
+                "model-mtp.safetensors",
+            )
+        ]
+        assert _select_draft_weight_files(
+            str(tmp_path), files, _union_prefixes(61, 1)
+        ) == (
+            DraftShardSelection.SELECTED,
+            [os.path.join(str(tmp_path), "model-mtp.safetensors")],
+        )
+
+    def test_selects_draft_shard_for_hf_repo_id(self, tmp_path):
+        """HF repo-id URI: the index is found next to the resolved shard files."""
+        self._write_index(
+            tmp_path,
+            {
+                "model.layers.0.self_attn.qkv_proj.weight": "model-00001-of-00002.safetensors",
+                "model.layers.78.self_attn.qkv_proj.weight": "model-mtp.safetensors",
+            },
+        )
+        files = [
+            os.path.join(str(tmp_path), name)
+            for name in (
+                "model-00001-of-00002.safetensors",
+                "model-mtp.safetensors",
+            )
+        ]
+        assert _select_draft_weight_files(
+            "Qwen/Qwen3.5-27B", files, _union_prefixes(78, 1)
+        ) == (
+            DraftShardSelection.SELECTED,
+            [os.path.join(str(tmp_path), "model-mtp.safetensors")],
+        )
+
+    def test_does_not_match_shorter_layer_index(self, tmp_path):
+        """layers.7 must not match the layers.78 prefix (trailing-dot guard)."""
+        self._write_index(
+            tmp_path,
+            {"model.layers.7.self_attn.qkv_proj.weight": "model-00001-of-00001.safetensors"},
+        )
+        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
+        assert _select_draft_weight_files(
+            str(tmp_path), files, _union_prefixes(78, 1)
+        ) == (
+            DraftShardSelection.NO_DRAFT_WEIGHTS,
+            [],
+        )
+
+    def test_falls_back_without_draft_head(self, tmp_path):
+        self._write_index(
+            tmp_path, {"model.layers.0.self_attn.qkv_proj.weight": "model-00001-of-00001.safetensors"}
+        )
+        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
+        assert _select_draft_weight_files(
+            str(tmp_path), files, _union_prefixes(78, 1)
+        ) == (
+            DraftShardSelection.NO_DRAFT_WEIGHTS,
+            [],
+        )
+
+    def test_empty_prefixes_reports_no_draft_weights(self, tmp_path):
+        """No prefixes: report no draft weights without reading the index."""
+        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
+        assert _select_draft_weight_files(str(tmp_path), files, ()) == (
+            DraftShardSelection.NO_DRAFT_WEIGHTS,
+            [],
+        )
+
+    def test_corrupt_index_reports_unresolved(self, tmp_path):
+        (tmp_path / "model.safetensors.index.json").write_text(
+            "{not json", encoding="utf-8"
+        )
+        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
+        assert _select_draft_weight_files(
+            "Qwen/Qwen3.5-27B", files, _union_prefixes(78, 1)
+        ) == (
+            DraftShardSelection.UNRESOLVED,
+            [],
+        )
+
+    def test_unreadable_index_reports_unresolved(self, tmp_path):
+        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
+        with patch(
+            "modelexpress.engines.vllm.adapter._read_safetensors_index",
+            return_value=None,
+        ):
+            assert _select_draft_weight_files(
+                "Qwen/Qwen3.5-27B", files, _union_prefixes(78, 1)
+            ) == (
+                DraftShardSelection.UNRESOLVED,
+                [],
+            )
+
+
+class TestMtpLayerPrefixes:
+    """MTP layer prefixes are derived from the checkpoint's config.json
+    (top-level num_hidden_layers + num_nextn_predict_layers), mirroring vLLM's
+    spec-layer indexing. Any other shape falls back to no prefixes so the
+    selector streams all shards rather than truncating to the wrong ones."""
+
+    def test_derives_glm_extra_layer_prefixes(self):
+        """GLM config (base=92, n=1) yields the layer-92 prefix variants."""
+        config = {"num_hidden_layers": 92, "num_nextn_predict_layers": 1}
+        assert _mtp_layer_prefixes(config) == (
+            "model.layers.92.",
+            "layers.92.",
+            "model.language_model.layers.92.",
+        )
+
+    def test_multiple_nextn_layers(self):
+        """n>1 yields prefixes for each consecutive extra layer."""
+        config = {"num_hidden_layers": 61, "num_nextn_predict_layers": 2}
+        assert _mtp_layer_prefixes(config) == (
+            "model.layers.61.",
+            "layers.61.",
+            "model.language_model.layers.61.",
+            "model.layers.62.",
+            "layers.62.",
+            "model.language_model.layers.62.",
+        )
+
+    def test_no_mtp_layers_returns_empty(self):
+        """num_nextn_predict_layers=0 yields no prefixes."""
+        config = {"num_hidden_layers": 92, "num_nextn_predict_layers": 0}
+        assert _mtp_layer_prefixes(config) == ()
+
+    def test_missing_fields_returns_empty(self):
+        """Missing config fields yield no prefixes."""
+        assert _mtp_layer_prefixes({}) == ()
+        assert _mtp_layer_prefixes(None) == ()
+
+    def test_zeroed_base_returns_empty(self):
+        """A post-override num_hidden_layers=0 (MiMo/GLM-Lite) must not derive
+        layer-0 prefixes; that would collide with the ordinary first layer."""
+        config = {"num_hidden_layers": 0, "num_nextn_predict_layers": 1}
+        assert _mtp_layer_prefixes(config) == ()
+
+    def test_nested_text_config_returns_empty(self):
+        """Fields nested under text_config are not the supported top-level GLM
+        shape, so no prefixes are derived."""
+        config = {
+            "text_config": {"num_hidden_layers": 92, "num_nextn_predict_layers": 1}
+        }
+        assert _mtp_layer_prefixes(config) == ()
+
+
+def _stub_runai(monkeypatch, available: dict[str, str]) -> list:
+    """Install a fake runai_model_streamer whose pull_files mirrors runai's
+    real semantics: allow_pattern is fnmatched against the full object key, so
+    an unanchored bare filename matches nothing. Returns the list of
+    allow_pattern values it was called with.
+
+    ``available`` maps object basenames (relative to model_uri) to file content.
+    """
+    import fnmatch
+
+    calls: list = []
+
+    def pull_files(model_uri, dest, allow_pattern=None):
+        calls.append(allow_pattern)
+        for key, content in available.items():
+            full_key = f"{model_uri.rstrip('/')}/{key}"
+            if any(fnmatch.fnmatch(full_key, pat) for pat in (allow_pattern or ["*"])):
+                with open(os.path.join(dest, key), "w", encoding="utf-8") as handle:
+                    handle.write(content)
+
+    module = ModuleType("runai_model_streamer")
+    module.pull_files = pull_files
+    monkeypatch.setitem(sys.modules, "runai_model_streamer", module)
+    return calls
+
+
+class TestReadSafetensorsIndexObjectStore:
+    """Reading the index from an object store depends on runai's glob matching
+    the full object key; the bare filename this once used matched nothing."""
+
+    def test_reads_index_via_anchored_glob(self, monkeypatch):
+        index = {"weight_map": {"model.layers.92.self_attn.qkv_proj.weight": "model-mtp.safetensors"}}
+        calls = _stub_runai(
+            monkeypatch,
+            {
+                _SAFETENSORS_INDEX_NAME: json.dumps(index),
+                "model-00001-of-00001.safetensors": "weights",
+            },
+        )
+        # Reverting to a bare, unanchored pattern makes the fake fnmatch miss,
+        # so this returns None and the assertion fails, as it should.
+        assert _read_safetensors_index("s3://bucket/model") == index
+        assert calls == [[f"*{_SAFETENSORS_INDEX_NAME}"]]
+
+    def test_returns_none_and_warns_when_index_absent(self, monkeypatch, caplog):
+        _stub_runai(monkeypatch, {"model-00001-of-00001.safetensors": "weights"})
+        with caplog.at_level("WARNING", logger="modelexpress.engines.vllm.adapter"):
+            assert _read_safetensors_index("s3://bucket/model") is None
+        assert any("not found under" in rec.message for rec in caplog.records)
+
+    def test_selects_draft_shard_from_object_store(self, monkeypatch):
+        """Object-store URI: selects only the draft shard via the index read over runai."""
+        index = {
+            "weight_map": {
+                "model.layers.0.self_attn.qkv_proj.weight": "model-00001-of-00002.safetensors",
+                "model.layers.91.mlp.down_proj.weight": "model-00002-of-00002.safetensors",
+                "model.layers.92.self_attn.qkv_proj.weight": "model-mtp.safetensors",
+                "model.layers.92.input_layernorm.weight": "model-mtp.safetensors",
+            }
+        }
+        _stub_runai(monkeypatch, {_SAFETENSORS_INDEX_NAME: json.dumps(index)})
+        files = [
+            f"s3://bucket/model/{name}"
+            for name in (
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+                "model-mtp.safetensors",
+            )
+        ]
+        assert _select_draft_weight_files(
+            "s3://bucket/model", files, _union_prefixes(92, 1)
+        ) == (
+            DraftShardSelection.SELECTED,
+            ["s3://bucket/model/model-mtp.safetensors"],
+        )

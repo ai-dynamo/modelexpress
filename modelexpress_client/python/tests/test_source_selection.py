@@ -1,0 +1,1332 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Unit tests for client-side P2P source selection.
+
+Covers the selector module (policies, registry, config fallback, determinism)
+and the RdmaStrategy integration (rank filtering, max-retry slicing,
+metadata-miss fallback, and the no-retry-after-transfer-start rule).
+"""
+
+from __future__ import annotations
+
+import gc
+import logging
+import weakref
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from modelexpress import p2p_pb2
+from modelexpress.adapter import StrategyFailed, StrategyRecoveryError
+from modelexpress.load_strategy.base import LoadResult, clear_exception_tracebacks
+from modelexpress.load_strategy.rdma_strategy import MAX_SOURCE_RETRIES, RdmaStrategy
+from modelexpress.source_selection import (
+    ENV_SELECTOR,
+    LoadAwareSelector,
+    RandomSelector,
+    RendezvousHashSelector,
+    configured_policy_label,
+    get_configured_selector,
+    get_selector,
+    register_selector,
+)
+
+
+def _ctx(worker_id="target-0", worker_rank=0, model_name="m"):
+    # Selectors read only these fields off the live LoadContext, so a tiny
+    # duck-typed stand-in is enough; no need to build a full LoadContext.
+    return SimpleNamespace(
+        worker_rank=worker_rank,
+        global_rank=worker_rank,
+        worker_id=worker_id,
+        identity=SimpleNamespace(model_name=model_name),
+    )
+
+
+def _ref(
+    mx_source_id,
+    worker_id,
+    worker_rank=0,
+    model_name="m",
+    accelerator="",
+    source_load=0.0,
+):
+    return p2p_pb2.SourceInstanceRef(
+        mx_source_id=mx_source_id,
+        worker_id=worker_id,
+        model_name=model_name,
+        worker_rank=worker_rank,
+        accelerator=accelerator,
+        source_load=source_load,
+    )
+
+
+def _sources(n, worker_rank=0):
+    return [_ref(f"src{i:04x}aaaaaaaaaa", f"w{i}", worker_rank) for i in range(n)]
+
+
+def test_clear_exception_tracebacks_releases_transfer_frame_locals():
+    class Allocation:
+        pass
+
+    def fail_with_local_allocation():
+        allocation = Allocation()
+        allocation_ref = weakref.ref(allocation)
+        try:
+            raise RuntimeError("transfer failed")
+        except RuntimeError as exc:
+            return exc, allocation_ref
+
+    exc, allocation_ref = fail_with_local_allocation()
+    assert allocation_ref() is not None
+
+    clear_exception_tracebacks(exc)
+    gc.collect()
+
+    assert allocation_ref() is None
+
+
+# ---------------------------------------------------------------------------
+# Registry / config resolution
+# ---------------------------------------------------------------------------
+
+
+def test_default_is_random(monkeypatch):
+    monkeypatch.delenv(ENV_SELECTOR, raising=False)
+    assert get_configured_selector().name == "random"
+
+
+def test_env_selects_rendezvous_hash(monkeypatch):
+    monkeypatch.setenv(ENV_SELECTOR, "rendezvous_hash")
+    assert get_configured_selector().name == "rendezvous_hash"
+
+
+def test_unknown_name_falls_back_to_random(caplog):
+    with caplog.at_level(logging.WARNING, logger="modelexpress.source_selection"):
+        sel = get_selector("does-not-exist")
+    assert sel.name == "random"
+    assert any("Unknown P2P source selector" in r.message for r in caplog.records)
+
+
+def test_invalid_env_falls_back_to_random(monkeypatch):
+    monkeypatch.setenv(ENV_SELECTOR, "garbage")
+    assert get_configured_selector().name == "random"
+
+
+def test_factory_failure_falls_back_to_random(caplog):
+    def _boom():
+        raise RuntimeError("broken factory")
+
+    register_selector("broken", _boom)
+    try:
+        with caplog.at_level(logging.WARNING, logger="modelexpress.source_selection"):
+            sel = get_selector("broken")
+        assert sel.name == "random"
+        assert any("Failed to construct" in r.message for r in caplog.records)
+    finally:
+        from modelexpress.source_selection import SELECTORS
+
+        SELECTORS.pop("broken", None)
+
+
+def test_register_custom_selector():
+    sentinel = RandomSelector()
+    register_selector("custom-x", lambda: sentinel)
+    try:
+        assert get_selector("custom-x") is sentinel
+    finally:
+        from modelexpress.source_selection import SELECTORS
+
+        SELECTORS.pop("custom-x", None)
+
+
+# ---------------------------------------------------------------------------
+# Random policy
+# ---------------------------------------------------------------------------
+
+
+def test_random_preserves_candidate_set():
+    cands = _sources(6)
+    out = RandomSelector().order(cands, _ctx())
+    assert len(out) == len(cands)
+    assert {c.worker_id for c in out} == {c.worker_id for c in cands}
+
+
+def test_random_uses_local_rng_not_global(monkeypatch):
+    import random as _random
+
+    calls = []
+    orig_shuffle = _random.shuffle
+    monkeypatch.setattr(_random, "shuffle", lambda *a, **k: calls.append(a))
+    try:
+        RandomSelector().order(_sources(4), _ctx())
+    finally:
+        monkeypatch.setattr(_random, "shuffle", orig_shuffle)
+    # The policy must not touch process-global random.shuffle.
+    assert calls == []
+
+
+def test_empty_candidates():
+    assert RandomSelector().order([], _ctx()) == []
+    assert RendezvousHashSelector().order([], _ctx()) == []
+
+
+# ---------------------------------------------------------------------------
+# Rendezvous hash policy
+# ---------------------------------------------------------------------------
+
+
+def test_rendezvous_hash_deterministic():
+    cands = _sources(8)
+    sel = RendezvousHashSelector()
+    a = [c.worker_id for c in sel.order(cands, _ctx())]
+    b = [c.worker_id for c in sel.order(cands, _ctx())]
+    assert a == b
+
+
+def test_rendezvous_hash_order_independent_of_input_order():
+    cands = _sources(8)
+    sel = RendezvousHashSelector()
+    forward = [c.worker_id for c in sel.order(cands, _ctx())]
+    reverse = [c.worker_id for c in sel.order(list(reversed(cands)), _ctx())]
+    assert forward == reverse
+
+
+def test_rendezvous_hash_stable_across_processes():
+    # Pinned blake2b value guards against an accidental switch to Python's
+    # process-salted hash(). key = "m|t|0|s|cw|0".
+    score = RendezvousHashSelector().score(
+        _ref("s", "cw", 0), _ctx(worker_id="t", worker_rank=0, model_name="m")
+    )
+    assert score == 3844933907942436947
+
+
+def test_rendezvous_hash_spreads_first_choices():
+    sources = _sources(4)
+    sel = RendezvousHashSelector()
+    first_choices = {
+        sel.order(sources, _ctx(worker_id=f"target-{t}"))[0].worker_id
+        for t in range(40)
+    }
+    # Different targets must not all converge on the same source.
+    assert len(first_choices) > 1
+
+
+def test_rendezvous_hash_removing_source_preserves_relative_order():
+    # Each candidate's score is independent of the others, so dropping one
+    # leaves the relative order of the rest unchanged (only a fraction of
+    # rankings is perturbed when the set changes).
+    cands = _sources(8)
+    sel = RendezvousHashSelector()
+    full = [c.worker_id for c in sel.order(cands, _ctx())]
+    dropped = full[3]
+    remaining = [c for c in cands if c.worker_id != dropped]
+    after = [c.worker_id for c in sel.order(remaining, _ctx())]
+    assert after == [w for w in full if w != dropped]
+
+
+# ---------------------------------------------------------------------------
+# RdmaStrategy integration
+# ---------------------------------------------------------------------------
+
+
+def _rdma_ctx(instances):
+    ctx = MagicMock()
+    ctx.global_rank = 0
+    ctx.worker_rank = 0
+    ctx.worker_id = "target-0"
+    # Realistic default identity: unquantized weights with dtype set (every
+    # production vLLM/SGLang/TRT-LLM identity sets dtype). Tests that exercise
+    # the quantization gate override mx_source_type/quantization/dtype below.
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m", quantization="", dtype="bfloat16"
+    )
+    ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
+        instances=instances
+    )
+    return ctx
+
+
+def test_find_source_instances_filters_by_worker_rank(monkeypatch):
+    monkeypatch.setenv(ENV_SELECTOR, "rendezvous_hash")
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "w0", worker_rank=0),
+        _ref("s1aaaaaaaaaaaaaa", "w1", worker_rank=1),
+        _ref("s2aaaaaaaaaaaaaa", "w2", worker_rank=0),
+    ]
+    ctx = _rdma_ctx(instances)
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"w0", "w2"}
+
+
+def test_find_source_instances_empty_on_list_error():
+    ctx = _rdma_ctx([])
+    ctx.mx_client.list_sources.side_effect = RuntimeError("grpc down")
+    assert RdmaStrategy()._find_source_instances(ctx) == []
+
+
+def test_no_peers_published_records_a_zero_funnel(monkeypatch):
+    """The empty path must observe zero, not return before recording anything.
+
+    ``_find_source_instances`` used to return early when the response carried no
+    instances, before any ``observe_candidates`` call. That made
+    ``mx_p2p_candidates{stage="listed"}`` unable to ever observe zero — the one
+    bucket that separates "no peers published" from "peers listed but every one
+    filtered out". On a dashboard the two were the same absence.
+    """
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.delenv(ENV_SELECTOR, raising=False)
+
+    ctx = _rdma_ctx([])
+    assert RdmaStrategy()._find_source_instances(ctx) == []
+
+    m.record_list_sources.assert_called_once_with("random", "empty")
+    observed = {call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list}
+    assert observed == {"listed": 0, "rank_matched": 0, "accelerator_matched": 0}
+
+
+def test_list_sources_rpc_failure_is_recorded_not_silent(monkeypatch):
+    """A backend outage used to record nothing at all.
+
+    Both a Redis outage and a healthy cluster with no peers presented as the same
+    absence, so the graph could not tell "the metadata backend is down" from
+    "nobody has published weights yet".
+    """
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.delenv(ENV_SELECTOR, raising=False)
+
+    ctx = _rdma_ctx([])
+    ctx.mx_client.list_sources.side_effect = RuntimeError("grpc down")
+    assert RdmaStrategy()._find_source_instances(ctx) == []
+
+    m.record_list_sources.assert_called_once_with("random", "error")
+
+
+def test_successful_listing_records_an_ok_outcome(monkeypatch):
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.setenv(ENV_SELECTOR, "rendezvous_hash")
+
+    ctx = _rdma_ctx([_ref("s0aaaaaaaaaaaaaa", "w0", worker_rank=0)])
+    RdmaStrategy()._find_source_instances(ctx)
+
+    m.record_list_sources.assert_called_once_with("rendezvous_hash", "ok")
+
+
+def test_find_source_instances_filters_incompatible_accelerator():
+    # A compatible source ranked last must survive incompatible ones ranked
+    # first, since filtering happens before the MAX_SOURCE_RETRIES slice.
+    # "other" is a placeholder for any non-matching accelerator family; the
+    # filter compares the strings and does not enumerate known backends.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "match-0", accelerator="cuda"),
+        _ref("s1aaaaaaaaaaaaaa", "other-0", accelerator="other"),
+        _ref("s2aaaaaaaaaaaaaa", "other-1", accelerator="other"),
+        _ref("s3aaaaaaaaaaaaaa", "other-2", accelerator="other"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"match-0"}
+
+
+def test_find_source_instances_empty_accelerator_is_compatible():
+    # Empty source accelerator (records that predate the field) is treated as
+    # unknown and accepted; a populated mismatch is still filtered.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "legacy", accelerator=""),
+        _ref("s1aaaaaaaaaaaaaa", "other-0", accelerator="other"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"legacy"}
+
+
+def test_find_source_instances_accepts_xpu_source_for_cuda_weights():
+    # Heterogeneous weight transfer: a cuda target may pull xpu weights.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "xpu-src", accelerator="xpu"),
+        _ref("s1aaaaaaaaaaaaaa", "rocm-src", accelerator="rocm"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"xpu-src"}
+
+
+def test_find_source_instances_accepts_cuda_source_for_xpu_weights():
+    # Heterogeneous weight transfer is symmetric: an xpu target pulls cuda.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "cuda-src", accelerator="cuda"),
+        _ref("s1aaaaaaaaaaaaaa", "rocm-src", accelerator="rocm"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="",
+        dtype="float16",
+    )
+    ctx.accelerator_backend.name = "xpu"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"cuda-src"}
+
+
+def test_find_source_instances_rejects_cross_family_quantized_weights():
+    # Quantized weight layouts are hardware/kernel specific and not proven
+    # transferable cross-vendor, so the prefilter drops cross-family sources
+    # when the identity is quantized (here DeepSeek-V3-style fp8 with bf16 dtype).
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "xpu-src", accelerator="xpu"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="fp8",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert out == []
+
+
+def test_find_source_instances_defers_empty_accelerator_quantized_to_post_fetch():
+    # An empty (unknown) source accelerator on a quantized identity is NOT
+    # rejected at the prefilter: the lightweight ref may legitimately omit the
+    # accelerator (the k8s-service backend publishes a synthetic ref and only
+    # learns the real accelerator from GetTensorManifest). Dropping it here
+    # would strand a valid same-family quantized source before its accelerator
+    # is known. The authoritative post-fetch check does the strict rejection.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "unknown-src", accelerator=""),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="fp8",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"unknown-src"}
+
+
+def test_accelerator_compatible_post_fetch_rejects_cross_family_quantized():
+    # Defense-in-depth re-check on the authoritative WorkerMetadata: a drifted
+    # cross-family quantized source that slipped past the prefilter is still
+    # rejected before target preparation.
+    ctx = MagicMock()
+    ctx.global_rank = 0
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="fp8",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    worker = p2p_pb2.WorkerMetadata(accelerator="xpu")
+    assert not RdmaStrategy()._accelerator_compatible(ctx, worker, "xpu-src")
+
+
+def test_accelerator_compatible_post_fetch_rejects_empty_accelerator_quantized():
+    # Authoritative post-fetch: a still-empty accelerator on a quantized weight
+    # identity fails closed. An unknown family could be a different vendor whose
+    # kernels expect a different fp8 layout, and by this point the real
+    # WorkerMetadata.accelerator would be populated if it were known.
+    ctx = MagicMock()
+    ctx.global_rank = 0
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="fp8",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    worker = p2p_pb2.WorkerMetadata(accelerator="")
+    assert not RdmaStrategy()._accelerator_compatible(ctx, worker, "unknown-src")
+
+
+def test_accelerator_compatible_post_fetch_accepts_same_family_quantized():
+    # The k8s-service path: prefilter deferred the synthetic empty-accel ref,
+    # GetTensorManifest returned the real accelerator (same family), so the
+    # authoritative check allows the quantized same-family transfer.
+    ctx = MagicMock()
+    ctx.global_rank = 0
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="fp8",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    worker = p2p_pb2.WorkerMetadata(accelerator="cuda")
+    assert RdmaStrategy()._accelerator_compatible(ctx, worker, "cuda-src")
+
+
+def test_accelerator_compatible_post_fetch_accepts_cross_family_unquantized():
+    ctx = MagicMock()
+    ctx.global_rank = 0
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    worker = p2p_pb2.WorkerMetadata(accelerator="xpu")
+    assert RdmaStrategy()._accelerator_compatible(ctx, worker, "xpu-src")
+
+
+def test_find_source_instances_rejects_cross_family_for_non_weight_source():
+    # Non-weight source types (e.g. CUDA graph artifacts) stay strict
+    # same-family even for the cuda/xpu pair.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "xpu-src", accelerator="xpu"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m", mx_source_type=p2p_pb2.MX_SOURCE_TYPE_CUDA_GRAPH
+    )
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert out == []
+
+
+def test_find_source_instances_unknown_target_accepts_all():
+    # Empty target accelerator (unknown) accepts every source regardless of
+    # the source's published accelerator.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "match-0", accelerator="cuda"),
+        _ref("s1aaaaaaaaaaaaaa", "other-0", accelerator="other"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.accelerator_backend.name = ""
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"match-0", "other-0"}
+
+
+def test_load_slices_to_max_source_retries():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(5))
+    strat._fetch_worker_metadata = MagicMock(return_value=None)
+    strat._load_as_target = MagicMock()
+    ctx = MagicMock(global_rank=0)
+
+    with pytest.raises(StrategyFailed) as ei:
+        strat.load(MagicMock(), ctx)
+
+    assert ei.value.mutated is False
+    assert strat._fetch_worker_metadata.call_count == MAX_SOURCE_RETRIES
+    strat._load_as_target.assert_not_called()
+
+
+def test_load_metadata_miss_tries_next_candidate():
+    strat = RdmaStrategy()
+    cands = _sources(3)
+    strat._find_source_instances = MagicMock(return_value=cands)
+    worker = MagicMock()
+    # First candidate misses metadata (None); second returns a worker.
+    strat._fetch_worker_metadata = MagicMock(side_effect=[None, worker])
+    strat._load_as_target = MagicMock(return_value="loaded")
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            "modelexpress.load_strategy.rdma_strategy.worker_tensor_count",
+            lambda w: 1,
+        )
+        result = strat.load(MagicMock(), ctx)
+
+    assert result == "loaded"
+    assert strat._fetch_worker_metadata.call_count == 2
+    # _load_as_target invoked with the second candidate's identifiers.
+    args = strat._load_as_target.call_args.args
+    assert cands[1].mx_source_id in args
+    assert cands[1].worker_id in args
+
+
+def test_load_generation_mismatch_tries_next_candidate(monkeypatch):
+    strat = RdmaStrategy()
+    cands = _sources(2)
+    strat._find_source_instances = MagicMock(return_value=cands)
+    workers = [
+        p2p_pb2.WorkerMetadata(worker_grpc_endpoint="source:6555"),
+        p2p_pb2.WorkerMetadata(
+            worker_grpc_endpoint="source:6556",
+            tensor_source=p2p_pb2.TensorSourceMetadata(
+                tensors=[p2p_pb2.TensorDescriptor(name="stale")],
+            ),
+        ),
+    ]
+    strat._load_as_target = MagicMock(return_value="loaded")
+    manifest = [p2p_pb2.TensorDescriptor(name="weight")]
+    fetch_manifest = MagicMock(
+        side_effect=[
+            RuntimeError("worker_id mismatch"),
+            (manifest, 10),
+        ],
+    )
+    monkeypatch.setattr(
+        "modelexpress.metadata.worker_server.fetch_tensor_manifest",
+        fetch_manifest,
+    )
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.rdma_strategy.worker_tensor_count",
+        lambda worker: 1,
+    )
+
+    ctx = MagicMock(global_rank=0)
+    ctx.mx_client.get_metadata.side_effect = [
+        p2p_pb2.GetMetadataResponse(found=True, worker=worker)
+        for worker in workers
+    ]
+
+    result = strat.load(MagicMock(), ctx)
+
+    assert result == "loaded"
+    assert fetch_manifest.call_args_list[0].kwargs == {
+        "endpoint": "source:6555",
+        "mx_source_id": cands[0].mx_source_id,
+        "worker_id": cands[0].worker_id,
+    }
+    assert fetch_manifest.call_args_list[1].kwargs == {
+        "endpoint": "source:6556",
+        "mx_source_id": cands[1].mx_source_id,
+        "worker_id": cands[1].worker_id,
+    }
+    assert strat._load_as_target.call_count == 1
+    ctx.adapter.reinit_for_retry.assert_not_called()
+    selected_worker = strat._load_as_target.call_args.args[2]
+    assert [tensor.name for tensor in selected_worker.tensor_source.tensors] == [
+        "weight"
+    ]
+
+
+def test_fetch_worker_metadata_fetches_missing_manifest(monkeypatch):
+    strat = RdmaStrategy()
+    worker = p2p_pb2.WorkerMetadata(worker_grpc_endpoint="source:6555")
+    ctx = MagicMock(global_rank=0)
+    ctx.mx_client.get_metadata.return_value = p2p_pb2.GetMetadataResponse(
+        found=True,
+        worker=worker,
+    )
+    fetch_manifest = MagicMock(return_value=([], 0))
+    monkeypatch.setattr(
+        "modelexpress.metadata.worker_server.fetch_tensor_manifest",
+        fetch_manifest,
+    )
+
+    result = strat._fetch_worker_metadata(ctx, "source-123", "")
+
+    assert result is not None
+    fetch_manifest.assert_called_once_with(
+        endpoint="source:6555",
+        mx_source_id="source-123",
+        worker_id="",
+    )
+
+
+def test_fetch_worker_metadata_reuses_empty_worker_id_manifest(monkeypatch):
+    strat = RdmaStrategy()
+    worker = p2p_pb2.WorkerMetadata(
+        worker_grpc_endpoint="service:6555",
+        tensor_source=p2p_pb2.TensorSourceMetadata(
+            tensors=[p2p_pb2.TensorDescriptor(name="weight")],
+        ),
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.mx_client.get_metadata.return_value = p2p_pb2.GetMetadataResponse(
+        found=True,
+        worker=worker,
+    )
+    fetch_manifest = MagicMock()
+    monkeypatch.setattr(
+        "modelexpress.metadata.worker_server.fetch_tensor_manifest",
+        fetch_manifest,
+    )
+
+    result = strat._fetch_worker_metadata(ctx, "source-123", "")
+
+    assert [tensor.name for tensor in result.tensor_source.tensors] == ["weight"]
+    fetch_manifest.assert_not_called()
+
+
+def test_load_transfer_failure_reinitializes_and_tries_next_source():
+    strat = RdmaStrategy()
+    cands = _sources(3)
+    strat._find_source_instances = MagicMock(return_value=cands)
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=[StrategyFailed("receive failed", mutated=True), "loaded"]
+    )
+    original_model = MagicMock(name="original-model")
+    retry_model = MagicMock(name="retry-model")
+    original_result = LoadResult(value=original_model, model=original_model)
+    retry_result = LoadResult(
+        value=retry_model,
+        model=retry_model,
+        publishable=False,
+        metadata={"retry": True},
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
+    ctx.adapter.reinit_for_retry.return_value = retry_result
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            "modelexpress.load_strategy.rdma_strategy.worker_tensor_count",
+            lambda w: 1,
+        )
+        result = strat.load(original_result, ctx)
+
+    assert result == "loaded"
+    assert strat._fetch_worker_metadata.call_count == 2
+    assert strat._load_as_target.call_count == 2
+    ctx.adapter.reinit_for_retry.assert_called_once()
+    retry_envelope = strat._load_as_target.call_args_list[1].args[0]
+    assert ctx.adapter.reinit_for_retry.call_args.args[0] is retry_envelope
+    assert retry_envelope.value is retry_result.value
+    assert retry_envelope.model is retry_result.model
+    assert retry_envelope.publishable is False
+    assert retry_envelope.metadata == {"retry": True}
+
+
+@pytest.mark.parametrize("vmm_arena", [None, object()])
+def test_load_transfer_failure_supports_identity_preserving_retry(vmm_arena):
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=[StrategyFailed("receive failed", mutated=True), "loaded"]
+    )
+    model = MagicMock(name="engine-owned-model-root")
+    result = LoadResult(value=model, model=model)
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+    ctx.vmm_arena = vmm_arena
+    ctx.adapter.reinit_for_retry.side_effect = lambda current: current
+
+    assert strat.load(result, ctx) == "loaded"
+    assert strat._load_as_target.call_args_list[1].args[0] is result
+    assert ctx.vmm_arena is vmm_arena
+
+
+def test_load_clean_transfer_failure_tries_next_source_without_reinit():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=[StrategyFailed("clean failure", mutated=False), "loaded"]
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+
+    assert strat.load(MagicMock(), ctx) == "loaded"
+    ctx.adapter.reinit_for_retry.assert_not_called()
+
+
+def test_load_internal_reinit_is_visible_after_later_metadata_miss():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(side_effect=[MagicMock(), None])
+    strat._load_as_target = MagicMock(
+        side_effect=StrategyFailed("receive failed", mutated=True)
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+    original_model = MagicMock(name="original-model")
+    original_result = LoadResult(value=original_model, model=original_model)
+
+    def reinit(result):
+        result.value = None
+        result.model = None
+        retry_model = MagicMock(name="retry-model")
+        return LoadResult(value=retry_model, model=retry_model)
+
+    ctx.adapter.reinit_for_retry.side_effect = reinit
+
+    with pytest.raises(StrategyFailed) as exc:
+        strat.load(original_result, ctx)
+
+    assert exc.value.mutated is False
+    assert original_result.model is not None
+    ctx.adapter.reinit_for_retry.assert_called_once()
+
+
+def test_load_internal_reinit_then_clean_failure_stays_clean():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=[
+            StrategyFailed("mutated failure", mutated=True),
+            StrategyFailed("clean failure", mutated=False),
+        ]
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+    ctx.adapter.reinit_for_retry.return_value = MagicMock(name="retry-result")
+
+    with pytest.raises(StrategyFailed, match="clean failure") as exc:
+        strat.load(MagicMock(), ctx)
+
+    assert exc.value.mutated is False
+    ctx.adapter.reinit_for_retry.assert_called_once()
+
+
+def test_load_last_candidate_mutated_failure_propagates_mutated():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=StrategyFailed("mutated failure", mutated=True)
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+
+    with pytest.raises(StrategyFailed, match="mutated failure") as exc:
+        strat.load(MagicMock(), ctx)
+
+    assert exc.value.mutated is True
+    ctx.adapter.reinit_for_retry.assert_not_called()
+
+
+def test_load_reinit_failure_is_unrecoverable():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=StrategyFailed("receive failed", mutated=True)
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+    ctx.adapter.reinit_for_retry.side_effect = RuntimeError("reinit failed")
+
+    with pytest.raises(StrategyRecoveryError, match="reinit failed") as exc:
+        strat.load(MagicMock(), ctx)
+
+    assert isinstance(exc.value.__cause__, RuntimeError)
+
+
+def test_load_cleanup_failure_aborts_before_reinit():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=StrategyFailed("receive failed", mutated=True)
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+    manager = MagicMock()
+    manager.shutdown.side_effect = RuntimeError("shutdown failed")
+    ctx.nixl_manager = manager
+
+    with pytest.raises(StrategyFailed, match="shutdown failed") as exc:
+        strat.load(MagicMock(), ctx)
+
+    assert exc.value.mutated is True
+    assert strat._load_as_target.call_count == 1
+    assert ctx.nixl_manager is manager
+    ctx.adapter.reinit_for_retry.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# configured_policy_label (metric/label resolution)
+# ---------------------------------------------------------------------------
+
+
+def test_configured_policy_label_default(monkeypatch):
+    monkeypatch.delenv(ENV_SELECTOR, raising=False)
+    assert configured_policy_label() == "random"
+
+
+def test_configured_policy_label_valid(monkeypatch):
+    monkeypatch.setenv(ENV_SELECTOR, "rendezvous_hash")
+    assert configured_policy_label() == "rendezvous_hash"
+
+
+def test_configured_policy_label_unknown_falls_back(monkeypatch):
+    # Must match get_selector's fallback so labels never claim a policy that
+    # did not actually run.
+    monkeypatch.setenv(ENV_SELECTOR, "garbage")
+    assert configured_policy_label() == "random"
+
+
+def test_configured_policy_label_failing_factory_falls_back(monkeypatch):
+    # A registered-but-raising factory resolves to "random" at runtime, so the
+    # label must too (else load() metrics would be split from selection metrics).
+    def _boom():
+        raise RuntimeError("broken factory")
+
+    register_selector("broken-label", _boom)
+    monkeypatch.setenv(ENV_SELECTOR, "broken-label")
+    try:
+        assert configured_policy_label() == "random"
+    finally:
+        from modelexpress.source_selection import SELECTORS
+
+        SELECTORS.pop("broken-label", None)
+
+
+def test_rendezvous_hash_stable_on_score_tie():
+    # Identical hash-key fields (mx_source_id/worker_id/worker_rank) tie on
+    # score; model_name is not hashed, so it distinguishes order. sorted() is
+    # stable, so a tie preserves input order.
+    sel = RendezvousHashSelector()
+    a = _ref("samesrc0000aaaa", "samew", 0, model_name="A")
+    b = _ref("samesrc0000aaaa", "samew", 0, model_name="B")
+    assert sel.score(a, _ctx()) == sel.score(b, _ctx())
+    assert [c.model_name for c in sel.order([a, b], _ctx())] == ["A", "B"]
+    assert [c.model_name for c in sel.order([b, a], _ctx())] == ["B", "A"]
+
+
+# ---------------------------------------------------------------------------
+# RdmaStrategy.load() -> selection metrics
+# ---------------------------------------------------------------------------
+
+
+def _patched_metrics(monkeypatch):
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.rdma_strategy.worker_tensor_count", lambda w: 1
+    )
+    monkeypatch.delenv(ENV_SELECTOR, raising=False)  # policy label -> "random"
+    return m
+
+
+def test_load_records_success_metrics(monkeypatch):
+    m = _patched_metrics(monkeypatch)
+    strat = RdmaStrategy()
+    cands = _sources(1)
+    strat._find_source_instances = MagicMock(return_value=cands)
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(return_value="loaded")
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
+
+    assert strat.load(MagicMock(), ctx) == "loaded"
+    # The peer id is still passed; the collector drops it unless
+    # MX_METRICS_SOURCE_ID_LABEL=1, because it is a per-process uuid whose label
+    # domain grows with process count rather than with cluster size. That the
+    # label really is absent by default is asserted on the exposition itself in
+    # tests/test_metrics.py.
+    m.record_selection.assert_called_once_with("random", cands[0].worker_id)
+    m.record_attempt.assert_any_call("random", "success")
+    assert m.observe_transfer_seconds.call_args.args[:2] == ("random", "success")
+
+
+def test_load_records_transfer_fallback_metrics(monkeypatch):
+    m = _patched_metrics(monkeypatch)
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=StrategyFailed("receive failed", mutated=True)
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
+
+    with pytest.raises(StrategyFailed):
+        strat.load(MagicMock(), ctx)
+    m.record_attempt.assert_any_call("random", "transfer_fallback")
+    assert m.observe_transfer_seconds.call_args.args[:2] == ("random", "fallback")
+
+
+def test_load_records_transfer_retry_metrics(monkeypatch):
+    m = _patched_metrics(monkeypatch)
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=[StrategyFailed("receive failed", mutated=True), "loaded"]
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+    ctx.adapter.reinit_for_retry.return_value = MagicMock(name="retry-result")
+
+    assert strat.load(MagicMock(), ctx) == "loaded"
+    m.record_attempt.assert_any_call("random", "transfer_retry")
+    assert m.observe_transfer_seconds.call_args_list[0].args[:2] == (
+        "random",
+        "retry",
+    )
+
+
+def test_load_records_metadata_miss_metric(monkeypatch):
+    m = _patched_metrics(monkeypatch)
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(3))
+    strat._fetch_worker_metadata = MagicMock(return_value=None)
+    strat._load_as_target = MagicMock()
+
+    with pytest.raises(StrategyFailed):
+        strat.load(MagicMock(), MagicMock(global_rank=0))
+    assert m.record_attempt.call_count == MAX_SOURCE_RETRIES
+    m.record_attempt.assert_called_with("random", "metadata_miss")
+    m.record_selection.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# LoadAwareSelector (bandwidth-aware)
+# ---------------------------------------------------------------------------
+
+
+def test_load_aware_registered():
+    assert get_selector("load_aware").name == "load_aware"
+
+
+def test_load_aware_collapses_to_rendezvous_when_idle(monkeypatch):
+    # With every source's source_load at 0, the load term vanishes and the
+    # ordering must equal rendezvous_hash exactly (safe degradation).
+    monkeypatch.delenv("MX_P2P_LOAD_WEIGHT", raising=False)
+    ctx = _ctx()
+    srcs = _sources(6)
+    load = LoadAwareSelector().order(srcs, ctx)
+    rdv = RendezvousHashSelector().order(srcs, ctx)
+    assert [c.worker_id for c in load] == [c.worker_id for c in rdv]
+
+
+def test_load_aware_steers_away_from_busy_source(monkeypatch):
+    # A source that would win on the hash but is busy must be demoted below an
+    # idle peer when the load penalty outweighs the hash gap.
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+    ctx = _ctx()
+    srcs = _sources(4)
+    rdv_first = RendezvousHashSelector().order(srcs, ctx)[0].worker_id
+    busy = [
+        _ref(c.mx_source_id, c.worker_id, source_load=1.0 if c.worker_id == rdv_first else 0.0)
+        for c in srcs
+    ]
+    ordered = LoadAwareSelector().order(busy, ctx)
+    assert ordered[0].worker_id != rdv_first
+    assert ordered[-1].worker_id == rdv_first
+
+
+def test_load_aware_deterministic(monkeypatch):
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+    ctx = _ctx()
+    srcs = [_ref(f"src{i:04x}aa", f"w{i}", source_load=0.1 * i) for i in range(5)]
+    a = [c.worker_id for c in LoadAwareSelector().order(srcs, ctx)]
+    b = [c.worker_id for c in LoadAwareSelector().order(srcs, ctx)]
+    assert a == b
+
+
+def test_load_aware_weight_monotonic(monkeypatch):
+    # Higher MX_P2P_LOAD_WEIGHT means a busy source is penalized at least as hard:
+    # once it drops to last it stays last as the weight grows.
+    ctx = _ctx()
+    srcs = _sources(4)
+    rdv_first = RendezvousHashSelector().order(srcs, ctx)[0].worker_id
+    busy = [
+        _ref(c.mx_source_id, c.worker_id, source_load=0.9 if c.worker_id == rdv_first else 0.0)
+        for c in srcs
+    ]
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "0.0")
+    assert LoadAwareSelector().order(busy, ctx)[0].worker_id == rdv_first  # weight 0 == rendezvous
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "5.0")
+    assert LoadAwareSelector().order(busy, ctx)[-1].worker_id == rdv_first
+
+
+def test_load_aware_negative_weight_clamped_to_zero(monkeypatch):
+    # A negative MX_P2P_LOAD_WEIGHT would invert the policy into preferring busy
+    # sources. envs clamps it to >= 0, so it collapses to rendezvous ordering
+    # rather than rewarding load.
+    from modelexpress import envs as envs_mod
+
+    ctx = _ctx()
+    srcs = _sources(4)
+    rdv = [c.worker_id for c in RendezvousHashSelector().order(srcs, ctx)]
+    busy = [
+        _ref(c.mx_source_id, c.worker_id, source_load=0.9 if c.worker_id == rdv[0] else 0.0)
+        for c in srcs
+    ]
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "-3.0")
+    assert envs_mod.MX_P2P_LOAD_WEIGHT == 0.0
+    assert [c.worker_id for c in LoadAwareSelector().order(busy, ctx)] == rdv
+
+
+def test_load_aware_missing_field_treated_as_idle(monkeypatch):
+    # A candidate object without source_load (old server) must not raise and
+    # must behave as load 0.
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+    ctx = _ctx()
+    candidates = [
+        SimpleNamespace(mx_source_id=f"src{i}", worker_id=f"w{i}", worker_rank=0)
+        for i in range(4)
+    ]
+    ordered = LoadAwareSelector().order(candidates, ctx)
+    assert {c.worker_id for c in ordered} == {f"w{i}" for i in range(4)}
+
+
+def test_load_aware_utilization_clamped(monkeypatch):
+    # Out-of-range utilization is clamped, so a garbage value cannot invert the
+    # sign of the penalty or explode the score.
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+    ctx = _ctx()
+    srcs = _sources(3)
+    hi = [_ref(c.mx_source_id, c.worker_id, source_load=42.0) for c in srcs]
+    lo = [_ref(c.mx_source_id, c.worker_id, source_load=-7.0) for c in srcs]
+    # All clamped to the same value -> both collapse to rendezvous ordering.
+    assert [c.worker_id for c in LoadAwareSelector().order(lo, ctx)] == [
+        c.worker_id for c in RendezvousHashSelector().order(srcs, ctx)
+    ]
+    # High-but-equal utilization also collapses to rendezvous (equal penalty).
+    assert [c.worker_id for c in LoadAwareSelector().order(hi, ctx)] == [
+        c.worker_id for c in RendezvousHashSelector().order(srcs, ctx)
+    ]
+
+
+class TestSourceLoadPresence:
+    """`source_load` is optional on the wire: unset is unknown, not idle.
+
+    Reviewer-found: with a plain proto3 float, a source that published NO load
+    (older client, provider with no signal) scored as 0.0 -- the best possible --
+    and systematically outranked sources reporting real load. Presence tracking
+    plus a neutral prior for unknown fixes the mixed-fleet case.
+    """
+
+    @staticmethod
+    def _ctx():
+        from types import SimpleNamespace
+        from modelexpress import p2p_pb2
+        return SimpleNamespace(
+            identity=p2p_pb2.SourceIdentity(model_name="m", mx_version="0.7.0"),
+            worker_id="target-0",
+            worker_rank=0,
+            model_name="m",
+        )
+
+    @staticmethod
+    def _ref(load):
+        # Identical identity => identical unit_hash, so only the load term differs.
+        from modelexpress import p2p_pb2
+        r = p2p_pb2.SourceInstanceRef(
+            mx_source_id="deadbeefdeadbeef", worker_id="src", worker_rank=0
+        )
+        if load is not None:
+            r.source_load = load
+        return r
+
+    def test_unknown_load_scores_as_the_neutral_prior(self, monkeypatch):
+        from modelexpress import source_selection as ss
+        monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+        sel = ss.LoadAwareSelector()
+        unknown, idle = self._ref(None), self._ref(0.0)
+        assert ss.UNKNOWN_LOAD_PRIOR == 0.5
+        assert sel.score(idle, self._ctx()) - sel.score(unknown, self._ctx()) == pytest.approx(0.5)
+
+    def test_real_reading_beats_unknown_when_real_is_lighter_than_prior(self, monkeypatch):
+        from modelexpress import source_selection as ss
+        monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+        sel = ss.LoadAwareSelector()
+        assert sel.score(self._ref(0.3), self._ctx()) > sel.score(self._ref(None), self._ctx())
+
+    def test_measured_idle_beats_unknown(self, monkeypatch):
+        from modelexpress import source_selection as ss
+        monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+        sel = ss.LoadAwareSelector()
+        assert sel.score(self._ref(0.0), self._ctx()) > sel.score(self._ref(None), self._ctx())
+
+    def test_unknown_still_beats_a_heavily_loaded_source(self, monkeypatch):
+        from modelexpress import source_selection as ss
+        monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+        sel = ss.LoadAwareSelector()
+        assert sel.score(self._ref(None), self._ctx()) > sel.score(self._ref(0.9), self._ctx())
+
+    def test_object_without_presence_tracking_counts_as_unknown(self, monkeypatch):
+        from types import SimpleNamespace
+        from modelexpress import source_selection as ss
+        monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+        sel = ss.LoadAwareSelector()
+        bare = SimpleNamespace(mx_source_id="deadbeefdeadbeef", worker_id="src", worker_rank=0, source_load=0.0)
+        assert sel.score(bare, self._ctx()) == pytest.approx(sel.score(self._ref(None), self._ctx()))
+
+    def test_all_unknown_collapses_to_rendezvous_order(self, monkeypatch):
+        from modelexpress import p2p_pb2, source_selection as ss
+        monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+        cands = [p2p_pb2.SourceInstanceRef(mx_source_id="deadbeefdeadbeef", worker_id=f"w{i}", worker_rank=0) for i in range(6)]
+        la = [c.worker_id for c in ss.LoadAwareSelector().order(cands, self._ctx())]
+        rz = [c.worker_id for c in ss.RendezvousHashSelector().order(cands, self._ctx())]
+        assert la == rz
+
+
+# ---------------------------------------------------------------------------
+# RdmaStrategy.load() -> source attempt phases
+# ---------------------------------------------------------------------------
+
+
+def _real_metrics(monkeypatch):
+    """A collector on a private registry, wired into the strategy module."""
+    from prometheus_client import CollectorRegistry
+
+    from modelexpress.metrics import MetricsCollector
+
+    monkeypatch.setenv("MX_METRICS_ENABLED", "1")
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+    monkeypatch.delenv(ENV_SELECTOR, raising=False)
+    collector = MetricsCollector(registry=CollectorRegistry())
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", collector)
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.rdma_strategy.worker_tensor_count", lambda w: 1
+    )
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.rdma_strategy.register_tensors", lambda result, ctx: None
+    )
+    return collector
+
+
+def _phase_series(collector):
+    """{(phase, outcome): (count, sum)} and the transfer _sum, from the exposition."""
+    import re
+
+    from prometheus_client import generate_latest
+
+    text = generate_latest(collector._exposition_registry()).decode()
+    phases = {}
+    for kind in ("count", "sum"):
+        for m in re.finditer(
+            r"mx_p2p_source_attempt_phase_seconds_" + kind
+            + r'\{[^}]*outcome="([^"]+)"[^}]*phase="([^"]+)"[^}]*\} (\S+)',
+            text,
+        ):
+            key = (m.group(2), m.group(1))
+            c, s = phases.get(key, (0.0, 0.0))
+            phases[key] = (float(m.group(3)), s) if kind == "count" else (c, float(m.group(3)))
+    transfer = sum(
+        float(m.group(1))
+        for m in re.finditer(r"mx_p2p_transfer_seconds_sum\{[^}]*\} (\S+)", text)
+    )
+    return phases, transfer
+
+
+def _receiving_ctx():
+    """A context whose adapter and NIXL manager accept everything."""
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
+    ctx.nixl_manager.receive_from_source.return_value = (0, 0, 0.0)
+    ctx.nixl_manager.add_remote_agent.return_value = "peer"
+    return ctx
+
+
+def _centralized_source():
+    """A source served through the central record: no gRPC endpoint, so the
+    handshake is add_remote_agent rather than a P2P metadata fetch."""
+    source = MagicMock()
+    source.worker_grpc_endpoint = ""
+    source.tensor_source.tensors = []
+    source.nixl_metadata = b"meta"
+    source.accelerator = ""
+    return source
+
+
+def test_a_successful_attempt_records_every_phase_once_and_they_nest_in_the_transfer(
+    monkeypatch,
+):
+    """The tier-C invariant on real timings: sum(phase != metadata) <= transfer.
+
+    Every phase is a with-block around a call the strategy already made, so the
+    nesting holds by construction. The test exists so that a phase recorded
+    from a second site, or one that drifts outside the transfer span, fails
+    instead of quietly inflating a phase.
+    """
+    collector = _real_metrics(monkeypatch)
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
+    strat._fetch_worker_metadata = MagicMock(return_value=_centralized_source())
+    ctx = _receiving_ctx()
+
+    strat.load(MagicMock(), ctx)
+
+    phases, transfer = _phase_series(collector)
+    assert {p for p, _ in phases} == {
+        "metadata", "prepare", "register", "handshake", "receive", "finalize", "release"
+    }, phases
+    assert all(outcome == "ok" for _, outcome in phases), phases
+    assert all(count == 1.0 for count, _ in phases.values()), phases
+    inside = sum(s for (p, _), (_, s) in phases.items() if p != "metadata")
+    assert inside <= transfer, (
+        f"phases inside the transfer summed to {inside:.6f}s but the transfer took "
+        f"{transfer:.6f}s; a phase is recorded outside the span or from two sites"
+    )
+
+
+def test_a_receive_that_raises_is_recorded_as_an_error_in_that_phase(monkeypatch):
+    """The phase a failed attempt died in is the reading worth having.
+
+    The RDMA read raises, so `receive` records `error`, the phases before it
+    record `ok`, `finalize` never runs, and `release` still runs from the
+    finally -- which is the one place a partition on failed attempts can be
+    checked at all.
+    """
+    collector = _real_metrics(monkeypatch)
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
+    strat._fetch_worker_metadata = MagicMock(return_value=_centralized_source())
+    ctx = _receiving_ctx()
+    ctx.nixl_manager.receive_from_source.side_effect = RuntimeError("READ timed out")
+
+    with pytest.raises(StrategyFailed):
+        strat.load(MagicMock(), ctx)
+
+    phases, _ = _phase_series(collector)
+    by_phase = {p: outcome for p, outcome in phases}
+    assert by_phase == {
+        "metadata": "ok",
+        "prepare": "ok",
+        "register": "ok",
+        "handshake": "ok",
+        "receive": "error",
+        "release": "ok",
+    }, by_phase
+
+
+def test_a_metadata_miss_records_only_the_metadata_phase(monkeypatch):
+    """A candidate that fails GetMetadata never opens the transfer span, so
+    `metadata` is the only phase it leaves -- with `error`, since the fetch
+    raised -- and the attempt is counted as metadata_miss, not as a transfer."""
+    collector = _real_metrics(monkeypatch)
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
+    strat._fetch_worker_metadata = MagicMock(side_effect=RuntimeError("unreachable"))
+
+    with pytest.raises(StrategyFailed):
+        strat.load(MagicMock(), _receiving_ctx())
+
+    phases, transfer = _phase_series(collector)
+    assert set(phases) == {("metadata", "error")}, phases
+    assert transfer == 0.0
+
+
+def test_the_phase_span_hands_its_duration_back_for_the_log_line(monkeypatch):
+    """One clock per span: the strategy logs what the metric measured."""
+    import time
+
+    collector = _real_metrics(monkeypatch)
+    with collector.time_source_attempt_phase("random", "receive") as span:
+        time.sleep(0.005)
+    assert span.seconds >= 0.005
+    phases, _ = _phase_series(collector)
+    assert phases[("receive", "ok")][1] == pytest.approx(span.seconds)
+
+
+def test_an_unknown_phase_is_dropped_and_an_unknown_outcome_clamps(monkeypatch):
+    collector = _real_metrics(monkeypatch)
+    collector.observe_source_attempt_phase_seconds("random", "not_a_phase", "ok", 1.0)
+    collector.observe_source_attempt_phase_seconds("random", "receive", "not_an_outcome", 1.0)
+    phases, _ = _phase_series(collector)
+    assert set(phases) == {("receive", "error")}, phases

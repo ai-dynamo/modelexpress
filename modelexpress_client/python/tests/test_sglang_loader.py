@@ -3,11 +3,15 @@
 
 """Tests for the SGLang ModelExpress adapter and loader entrypoint."""
 
+import os
 import sys
+import weakref
+from contextlib import contextmanager
 from types import ModuleType
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -15,9 +19,9 @@ from modelexpress import p2p_pb2
 from modelexpress.engines.sglang.adapter import (
     SglangAdapter,
     build_sglang_load_context,
-    collect_sglang_tensors,
 )
 from modelexpress.engines.sglang.loader import MxModelLoader
+from modelexpress.load_strategy.context import LoadResult
 
 
 def _load_config(**overrides):
@@ -44,6 +48,14 @@ def _device_config(**overrides):
     defaults = dict(device="cpu", gpu_id=0)
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
+
+
+@pytest.fixture(autouse=True)
+def _stub_accelerator_backend_selection(monkeypatch, mock_accelerator_backend_cls):
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.adapter.accelerator_backend_for",
+        lambda device: mock_accelerator_backend_cls(),
+    )
 
 
 def test_sglang_adapter_builds_identity_from_sglang_configs():
@@ -82,12 +94,14 @@ def test_sglang_context_uses_tp_rank_for_matching_and_url_override():
 
 
 def test_sglang_context_separates_worker_rank_from_global_rank(monkeypatch):
+    """Keep SGLang's engine worker rank separate from the distributed rank."""
     sglang_mod = ModuleType("sglang")
     srt_mod = ModuleType("sglang.srt")
     distributed_mod = ModuleType("sglang.srt.distributed")
     distributed_mod.get_tensor_model_parallel_rank = lambda: 1
     distributed_mod.get_pipeline_model_parallel_rank = lambda: 2
     distributed_mod.get_tensor_model_parallel_world_size = lambda: 4
+    distributed_mod.get_world_group = lambda: SimpleNamespace(local_rank=3)
     srt_mod.distributed = distributed_mod
 
     monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
@@ -105,6 +119,7 @@ def test_sglang_context_separates_worker_rank_from_global_rank(monkeypatch):
 
     assert ctx.worker_rank == 9
     assert ctx.global_rank == 17
+    assert ctx.local_rank == 3
     assert ctx.mx_client.server_url == "mx.example:9000"
 
 
@@ -122,25 +137,94 @@ def test_sglang_is_cuda_alike_uses_sglang_platform_helper(monkeypatch):
     assert adapter.is_cuda_alike() is True
 
 
-def test_collect_sglang_tensors_preserves_non_contiguous_storage_names():
+def test_collect_sglang_tensors_preserves_non_contiguous_storage_names(
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = backend
     model = nn.Module()
     model.weight_t = nn.Parameter(torch.randn(4, 3).T)
 
-    tensors = collect_sglang_tensors(model)
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
 
     assert "weight_t.__storage" in tensors
     assert tensors["weight_t.__storage"].dtype == torch.uint8
 
 
-def test_collect_sglang_tensors_deduplicates_tied_parameters():
+def test_collect_sglang_tensors_deduplicates_tied_parameters(
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = backend
     model = nn.Module()
     shared = nn.Parameter(torch.randn(4, 3))
     model.first = shared
     model.second = shared
 
-    tensors = collect_sglang_tensors(model)
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
 
     assert list(tensors) == ["first"]
+
+
+def test_collect_sglang_tensors_includes_named_buffers(
+    mock_accelerator_backend_cls,
+):
+    # capture_tensor_attrs promotes bare tensor assigns (e.g. the DeepSeek MLA
+    # w_kc/w_vc) to non-persistent buffers; discovery must include
+    # named_buffers so they register on both roles and transfer via RDMA.
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = backend
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.randn(4, 3))
+    model.register_buffer("w_kc", torch.randn(3, 2), persistent=False)
+
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
+
+    assert "weight" in tensors
+    assert "w_kc" in tensors
+
+
+def test_capture_then_collect_registers_bare_tensor_assign(
+    mock_accelerator_backend_cls,
+):
+    # End-to-end of the Class H-direct fix: a bare tensor assign made under
+    # capture_tensor_attrs (as the DeepSeek MLA mixin does self_attn.w_kc = t)
+    # is promoted to a non-persistent buffer and then discovered by
+    # discover_tensors' named_buffers() pass.
+    from modelexpress.tensor_utils import capture_tensor_attrs
+
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = backend
+    model = nn.Module()
+    model.self_attn = nn.Module()
+
+    with capture_tensor_attrs(backend):
+        model.self_attn.w_kc = torch.randn(3, 2)
+
+    assert "w_kc" in dict(model.self_attn.named_buffers())
+    assert "self_attn.w_kc" in adapter.discover_tensors(SimpleNamespace(model=model))
+
+
+def test_sglang_adapter_discovery_uses_backend_predicate(
+    monkeypatch,
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.adapter.accelerator_backend_for",
+        lambda device: backend,
+    )
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.randn(4, 3))
+
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
+
+    assert list(tensors) == ["weight"]
 
 
 def test_sglang_adapter_post_load_delegates_to_child_module():
@@ -157,7 +241,7 @@ def test_sglang_adapter_post_load_delegates_to_child_module():
     model = nn.Module()
     model.child = ChildModel()
 
-    adapter.after_rdma_receive(SimpleNamespace(model=model))
+    adapter._post_load_weights(SimpleNamespace(model=model))
 
     assert model.child.post_load_called
 
@@ -181,7 +265,7 @@ def test_sglang_adapter_post_load_prefers_top_level_hook():
     model = TopLevelModel()
     model.child.post_load_weights = child_post_load_weights
 
-    adapter.after_rdma_receive(SimpleNamespace(model=model))
+    adapter._post_load_weights(SimpleNamespace(model=model))
 
     assert model.post_load_called
     assert not model.child.post_load_called
@@ -294,6 +378,167 @@ def test_sglang_model_streamer_requires_initialized_model(monkeypatch):
         raise AssertionError("Expected missing model to fail")
 
 
+def test_sglang_retry_initializes_model_with_configured_dtype(monkeypatch):
+    original_dtype = torch.get_default_dtype()
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    model_loader_mod = ModuleType("sglang.srt.model_loader")
+    loader_mod = ModuleType("sglang.srt.model_loader.loader")
+    model_loader_utils_mod = ModuleType("sglang.srt.model_loader.utils")
+    observed_dtypes = []
+    initial_model = nn.Linear(2, 2)
+    initial_weight_ref = weakref.ref(initial_model.weight)
+
+    @contextmanager
+    def set_default_torch_dtype(dtype):
+        previous_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(dtype)
+        try:
+            yield
+        finally:
+            torch.set_default_dtype(previous_dtype)
+
+    loader_mod._get_quantization_config = lambda *_: None
+
+    def initialize_model(*_):
+        assert initial_weight_ref() is None
+        observed_dtypes.append(torch.get_default_dtype())
+        return nn.Linear(2, 2)
+
+    loader_mod._initialize_model = initialize_model
+    model_loader_utils_mod.set_default_torch_dtype = set_default_torch_dtype
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader", model_loader_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader.loader", loader_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.model_loader.utils",
+        model_loader_utils_mod,
+    )
+
+    model_config = _model_config(dtype=torch.bfloat16)
+    adapter = SglangAdapter(_load_config(), model_config, _device_config())
+    result = LoadResult(
+        value=initial_model,
+        model=initial_model,
+        publishable=True,
+    )
+
+    retried = adapter.reinit_for_retry(result)
+
+    assert observed_dtypes == [torch.bfloat16]
+    assert torch.get_default_dtype() == original_dtype
+    assert retried.value is initial_model
+    assert retried.model is initial_model
+    assert list(initial_model.parameters())
+
+
+def test_sglang_retry_failure_restores_envelope_and_original_error(monkeypatch):
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    model_loader_mod = ModuleType("sglang.srt.model_loader")
+    loader_mod = ModuleType("sglang.srt.model_loader.loader")
+    model_loader_utils_mod = ModuleType("sglang.srt.model_loader.utils")
+
+    @contextmanager
+    def set_default_torch_dtype(_dtype):
+        yield
+
+    failure = RuntimeError("fresh initialization failed")
+    loader_mod._get_quantization_config = lambda *_: None
+    loader_mod._initialize_model = MagicMock(side_effect=failure)
+    model_loader_utils_mod.set_default_torch_dtype = set_default_torch_dtype
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader", model_loader_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader.loader", loader_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.model_loader.utils",
+        model_loader_utils_mod,
+    )
+
+    model = nn.Linear(2, 2)
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    result = LoadResult(value=model, model=model, metadata={"attempt": 1})
+
+    with pytest.raises(RuntimeError) as exc:
+        adapter.reinit_for_retry(result)
+
+    assert exc.value is failure
+    assert result.value is model
+    assert result.model is model
+    assert result.metadata == {"attempt": 1}
+    assert model.__dict__ == {}
+
+
+def test_sglang_retry_reuses_root_for_native_fallback(monkeypatch):
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    model_loader_mod = ModuleType("sglang.srt.model_loader")
+    loader_mod = ModuleType("sglang.srt.model_loader.loader")
+    model_loader_utils_mod = ModuleType("sglang.srt.model_loader.utils")
+    configs_mod = ModuleType("sglang.srt.configs")
+    load_config_mod = ModuleType("sglang.srt.configs.load_config")
+
+    @contextmanager
+    def set_default_torch_dtype(_dtype):
+        yield
+
+    initial_model = nn.Linear(2, 2)
+    initial_weight_ref = weakref.ref(initial_model.weight)
+    native_roots = []
+
+    loader_mod._get_quantization_config = lambda *_: None
+
+    def initialize_model(*_):
+        assert initial_weight_ref() is None
+        return nn.Linear(2, 2)
+
+    class DefaultModelLoader:
+        def __init__(self, _load_config):
+            pass
+
+        def _get_all_weights(self, _model_config, model):
+            native_roots.append(model)
+            return iter([])
+
+        @staticmethod
+        def load_weights_and_postprocess(model, _weights, _target_device):
+            model.weight.data.fill_(7)
+
+    loader_mod._initialize_model = initialize_model
+    loader_mod.DefaultModelLoader = DefaultModelLoader
+    model_loader_utils_mod.set_default_torch_dtype = set_default_torch_dtype
+    load_config_mod.LoadFormat = SimpleNamespace(AUTO="auto")
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader", model_loader_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader.loader", loader_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.model_loader.utils",
+        model_loader_utils_mod,
+    )
+    monkeypatch.setitem(sys.modules, "sglang.srt.configs", configs_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.configs.load_config",
+        load_config_mod,
+    )
+
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    result = LoadResult(value=initial_model, model=initial_model)
+
+    retried = adapter.reinit_for_retry(result)
+    loaded = adapter.load_via_native(retried)
+
+    assert loaded.model is initial_model
+    assert native_roots == [initial_model]
+    assert torch.all(initial_model.weight == 7)
+
+
 def test_mx_model_loader_delegates_to_shared_strategy_chain():
     model = nn.Linear(2, 2)
     loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
@@ -317,14 +562,26 @@ def test_mx_model_loader_delegates_to_shared_strategy_chain():
     )
 
 
-def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain():
+@pytest.mark.parametrize(
+    ("ready_url", "health_gated"),
+    [("", False), ("http://127.0.0.1:30000/health", True)],
+)
+def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain(
+    ready_url, health_gated
+):
+    from modelexpress.engines.sglang import loader as loader_mod
+
     model = nn.Linear(2, 2)
     loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
 
-    with patch(
-        "modelexpress.engines.sglang.loader.LoadStrategyChain.run",
+    with patch.dict(os.environ, {"MX_ARTIFACT_READY_URL": ready_url}), patch(
+        "modelexpress.engines.sglang.loader.run_load_strategy_chain",
         return_value=model,
-    ) as run:
+    ) as run, patch(
+        "modelexpress.engines.sglang.loader.install_sglang_cache_artifacts",
+    ) as install_artifacts, patch(
+        "modelexpress.engines.sglang.loader.schedule_sglang_cache_artifact_publish",
+    ) as schedule_artifacts:
         loaded = loader._load_model_via_nixl(
             model=model,
             model_config=_model_config(),
@@ -337,6 +594,14 @@ def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain():
     ctx = run.call_args.args[1]
     assert ctx.adapter.__class__ is SglangAdapter
     assert ctx.identity.backend_framework == p2p_pb2.BACKEND_FRAMEWORK_SGLANG
+    if health_gated:
+        # Bound to ctx so the URL resolves against this worker's node_rank
+        # and head address, so identity is not asserted.
+        assert callable(ctx.source_ready_fn)
+    else:
+        assert ctx.source_ready_fn is None
+    install_artifacts.assert_called_once_with(ctx)
+    schedule_artifacts.assert_called_once_with(ctx)
 
 
 def test_mx_model_loader_delegates_transfer_engine_transport_in_mx_package():
@@ -362,6 +627,132 @@ def test_mx_model_loader_delegates_transfer_engine_transport_in_mx_package():
     )
 
 
+def test_transfer_engine_receive_failure_reinitializes_before_native_fallback():
+    transfer_engine = MagicMock()
+    transfer_engine.register_memory.return_value = 0
+    transfer_engine.batch_transfer_sync_read.return_value = -1
+    load_config = _load_config(
+        modelexpress_transport="transfer_engine",
+        remote_instance_weight_loader_transfer_engine=transfer_engine,
+        remote_instance_weight_loader_transfer_engine_session_id="target-session",
+    )
+    loader = MxModelLoader(load_config)
+    initial_model = nn.Linear(2, 2)
+    prepared_model = nn.Linear(2, 2)
+    fresh_model = nn.Linear(2, 2)
+    native_model = nn.Linear(2, 2)
+    target_tensor = torch.randn(2, 3)
+    native_tensor = torch.randn(3, 2)
+    prepared_result = SimpleNamespace(value=prepared_model, model=prepared_model)
+    fresh_result = SimpleNamespace(value=fresh_model, model=fresh_model)
+    native_result = SimpleNamespace(value=native_model, model=native_model)
+    adapter = MagicMock()
+    adapter.before_rdma_receive.return_value = prepared_result
+    adapter.discover_tensors.side_effect = [
+        {"target": target_tensor},
+        {"native": native_tensor},
+    ]
+    adapter.reinit_for_retry.return_value = fresh_result
+    adapter.load_via_native.return_value = native_result
+    ctx = SimpleNamespace(
+        global_rank=0,
+        identity=SimpleNamespace(model_name="model"),
+        adapter=adapter,
+        tensors={},
+    )
+    source_worker = p2p_pb2.WorkerMetadata(
+        transfer_engine_session_id="source-session",
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="target",
+                addr=1234,
+                size=target_tensor.numel() * target_tensor.element_size(),
+            )
+        ],
+    )
+
+    with patch(
+        "modelexpress.engines.sglang.loader.build_sglang_load_context",
+        return_value=ctx,
+    ), patch.object(
+        loader,
+        "_find_transfer_engine_source",
+        return_value=source_worker,
+    ), patch.object(
+        loader,
+        "_publish_transfer_engine_source",
+        return_value=True,
+    ) as publish:
+        loaded = loader._load_model_via_transfer_engine(
+            model=initial_model,
+            model_config=_model_config(),
+            device_config=_device_config(),
+        )
+
+    assert loaded is native_model
+    transfer_engine.unregister_memory.assert_called_once_with(
+        target_tensor.data_ptr()
+    )
+    adapter.reinit_for_retry.assert_called_once_with(prepared_result)
+    adapter.load_via_native.assert_called_once_with(fresh_result)
+    publish.assert_called_once()
+    assert publish.call_args.kwargs["weight_info"] == {
+        "native": (
+            native_tensor.data_ptr(),
+            native_tensor.numel(),
+            native_tensor.element_size(),
+        )
+    }
+
+
+def test_transfer_engine_source_registration_failure_keeps_native_model():
+    transfer_engine = MagicMock()
+    transfer_engine.register_memory.side_effect = [0, -1]
+    load_config = _load_config(
+        modelexpress_transport="transfer_engine",
+        remote_instance_weight_loader_transfer_engine=transfer_engine,
+        remote_instance_weight_loader_transfer_engine_session_id="source-session",
+    )
+    loader = MxModelLoader(load_config)
+    initial_model = nn.Linear(2, 2)
+    native_model = nn.Linear(2, 2)
+    first = torch.randn(2, 3)
+    second = torch.randn(3, 2)
+    native_result = SimpleNamespace(value=native_model, model=native_model)
+    adapter = MagicMock()
+    adapter.load_via_native.return_value = native_result
+    adapter.discover_tensors.return_value = {"first": first, "second": second}
+    ctx = SimpleNamespace(
+        global_rank=0,
+        identity=SimpleNamespace(model_name="model"),
+        adapter=adapter,
+        tensors={},
+    )
+
+    with patch(
+        "modelexpress.engines.sglang.loader.build_sglang_load_context",
+        return_value=ctx,
+    ), patch.object(
+        loader,
+        "_find_transfer_engine_source",
+        return_value=None,
+    ), patch.object(
+        loader,
+        "_publish_transfer_engine_source",
+    ) as publish:
+        loaded = loader._load_model_via_transfer_engine(
+            model=initial_model,
+            model_config=_model_config(),
+            device_config=_device_config(),
+        )
+
+    assert loaded is native_model
+    transfer_engine.unregister_memory.assert_called_once_with(first.data_ptr())
+    adapter.reinit_for_retry.assert_not_called()
+    adapter.load_via_native.assert_called_once()
+    publish.assert_not_called()
+
+
 def test_mx_model_loader_rejects_unknown_transport_in_mx_package():
     loader = MxModelLoader(_load_config(modelexpress_transport="unknown"))
 
@@ -380,6 +771,7 @@ def test_mx_model_loader_rejects_unknown_transport_in_mx_package():
 def test_transfer_engine_registers_discovered_tensor_map():
     loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
     tensor = torch.randn(2, 3)
+    empty = torch.empty(0)
     calls = []
 
     class FakeTransferEngine:
@@ -388,7 +780,7 @@ def test_transfer_engine_registers_discovered_tensor_map():
             return 0
 
     weight_info = loader._register_transfer_engine_tensors(
-        {"weight.__storage": tensor},
+        {"weight.__storage": tensor, "empty": empty},
         FakeTransferEngine(),
     )
 
@@ -398,13 +790,15 @@ def test_transfer_engine_registers_discovered_tensor_map():
             tensor.data_ptr(),
             tensor.numel(),
             tensor.element_size(),
-        )
+        ),
+        "empty": (empty.data_ptr(), empty.numel(), empty.element_size()),
     }
 
 
 def test_transfer_engine_receive_uses_discovered_tensor_map():
     loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
     tensor = torch.randn(2, 3)
+    empty = torch.empty(0)
     ctx = SimpleNamespace(global_rank=0)
     transferred = {}
     source_worker = p2p_pb2.WorkerMetadata(
@@ -415,7 +809,8 @@ def test_transfer_engine_receive_uses_discovered_tensor_map():
                 addr=1234,
                 size=tensor.numel() * tensor.element_size(),
                 device_id=0,
-            )
+            ),
+            p2p_pb2.TensorDescriptor(name="empty", addr=0, size=0, device_id=0),
         ],
     )
 
@@ -434,7 +829,7 @@ def test_transfer_engine_receive_uses_discovered_tensor_map():
             return 0
 
     loader._receive_via_transfer_engine(
-        {"weight.__storage": tensor},
+        {"weight.__storage": tensor, "empty": empty},
         FakeTransferEngine(),
         source_worker,
         ctx,
@@ -448,7 +843,13 @@ def test_transfer_engine_receive_uses_discovered_tensor_map():
     }
 
 
-def test_transfer_engine_publish_starts_non_nixl_heartbeat():
+@pytest.mark.parametrize(
+    ("ready_url", "health_gated"),
+    [("", False), ("http://127.0.0.1:30000/health", True)],
+)
+def test_transfer_engine_publish_starts_non_nixl_heartbeat(
+    ready_url, health_gated
+):
     loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
     ctx = SimpleNamespace(
         global_rank=9,
@@ -457,6 +858,7 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
         device_id=1,
         identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
         mx_client=SimpleNamespace(),
+        accelerator_backend=SimpleNamespace(name="cuda"),
     )
     published = {}
 
@@ -473,16 +875,16 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
     ctx.mx_client.publish_metadata = publish_metadata
     ctx.mx_client.update_status = update_status
 
-    class FakeHeartbeat:
+    class FakePublisher:
         def __init__(self, **kwargs):
             published["heartbeat"] = kwargs
 
         def start(self):
             published["heartbeat_started"] = True
 
-    with patch(
-        "modelexpress.engines.sglang.loader.HeartbeatThread",
-        FakeHeartbeat,
+    with patch.dict(os.environ, {"MX_ARTIFACT_READY_URL": ready_url}), patch(
+        "modelexpress.engines.sglang.loader.PublisherThread",
+        FakePublisher,
     ):
         published_ok = loader._publish_transfer_engine_source(
             ctx=ctx,
@@ -491,13 +893,25 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
         )
 
     assert published_ok
-    assert published["worker"].transfer_engine_session_id == "te-session"
-    assert published["status"]["status"] == p2p_pb2.SOURCE_STATUS_READY
+    assert "identity" not in published
+    assert "status" not in published
     assert published["heartbeat"]["nixl_manager"] is None
+    assert callable(published["heartbeat"]["publish_fn"])
+    if health_gated:
+        assert callable(published["heartbeat"]["ready_fn"])
+    else:
+        assert published["heartbeat"]["ready_fn"] is None
     assert published["heartbeat_started"]
 
+    mx_source_id = published["heartbeat"]["publish_fn"]()
 
-def test_transfer_engine_publish_failure_is_non_fatal():
+    assert mx_source_id == "mx-source-id"
+    assert published["worker"].transfer_engine_session_id == "te-session"
+    assert published["worker"].accelerator == "cuda"
+    assert "status" not in published
+
+
+def test_transfer_engine_publish_failure_is_deferred_to_publisher():
     loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
     ctx = SimpleNamespace(
         global_rank=9,
@@ -505,6 +919,7 @@ def test_transfer_engine_publish_failure_is_non_fatal():
         worker_id="worker-id",
         device_id=1,
         identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
+        accelerator_backend=SimpleNamespace(name="cuda"),
         mx_client=SimpleNamespace(
             publish_metadata=lambda *args: (_ for _ in ()).throw(
                 RuntimeError("metadata down")
@@ -512,8 +927,188 @@ def test_transfer_engine_publish_failure_is_non_fatal():
         ),
     )
 
-    assert not loader._publish_transfer_engine_source(
-        ctx=ctx,
-        session_id="te-session",
-        weight_info={"weight": (1000, 4, 2)},
+    scheduled = {}
+
+    class FakePublisher:
+        def __init__(self, **kwargs):
+            scheduled.update(kwargs)
+
+        def start(self):
+            pass
+
+    with patch(
+        "modelexpress.engines.sglang.loader.PublisherThread",
+        FakePublisher,
+    ):
+        assert loader._publish_transfer_engine_source(
+            ctx=ctx,
+            session_id="te-session",
+            weight_info={"weight": (1000, 4, 2)},
+        )
+
+    with pytest.raises(RuntimeError, match="metadata down"):
+        scheduled["publish_fn"]()
+
+
+# ---------------------------------------------------------------------------
+# _find_transfer_engine_source: source-selector wiring
+# ---------------------------------------------------------------------------
+
+
+def _te_ref(sid, wid, rank=0):
+    return p2p_pb2.SourceInstanceRef(
+        mx_source_id=sid, worker_id=wid, model_name="m", worker_rank=rank
     )
+
+
+def _te_ctx(instances):
+    ctx = SimpleNamespace()
+    ctx.global_rank = 0
+    ctx.worker_rank = 0
+    ctx.worker_id = "tgt-0"
+    ctx.identity = SimpleNamespace(model_name="m")
+    ctx.mx_client = MagicMock()
+    ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
+        instances=instances
+    )
+    return ctx
+
+
+def _te_meta(found=True, transfer_engine=False):
+    if not found:
+        return SimpleNamespace(found=False, worker=None)
+    worker = (
+        p2p_pb2.WorkerMetadata(worker_rank=0, transfer_engine_session_id="te")
+        if transfer_engine
+        else p2p_pb2.WorkerMetadata(worker_rank=0)
+    )
+    return SimpleNamespace(found=True, worker=worker)
+
+
+def test_te_find_source_filters_rank_and_returns_transfer_engine(monkeypatch):
+    monkeypatch.delenv("MX_P2P_SOURCE_SELECTOR", raising=False)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx(
+        [
+            _te_ref("s0aaaaaaaaaaaaaa", "w0", rank=0),
+            _te_ref("s1aaaaaaaaaaaaaa", "w1", rank=1),  # wrong rank -> filtered out
+            _te_ref("s2aaaaaaaaaaaaaa", "w2", rank=0),
+        ]
+    )
+    ctx.mx_client.get_metadata.side_effect = lambda mx_source_id, worker_id: _te_meta(
+        transfer_engine=(worker_id == "w2")
+    )
+
+    worker = loader._find_transfer_engine_source(ctx)
+    assert worker is not None
+    assert worker.WhichOneof("backend_metadata") == "transfer_engine_session_id"
+    queried = {c.kwargs["worker_id"] for c in ctx.mx_client.get_metadata.call_args_list}
+    assert "w1" not in queried  # rank-mismatched source never queried
+
+
+def test_te_find_source_iterates_in_selector_order_and_none_when_no_match(monkeypatch):
+    class _ReverseSelector:
+        name = "reverse"
+
+        def order(self, candidates, context):
+            return list(reversed(candidates))
+
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.loader.get_configured_selector",
+        lambda: _ReverseSelector(),
+    )
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx([_te_ref(f"s{i}aaaaaaaaaaaaaa", f"w{i}", rank=0) for i in range(3)])
+    ctx.mx_client.get_metadata.side_effect = lambda mx_source_id, worker_id: _te_meta(
+        transfer_engine=False
+    )
+
+    # No transfer_engine source -> None, and iteration follows the selector order.
+    assert loader._find_transfer_engine_source(ctx) is None
+    order = [c.kwargs["worker_id"] for c in ctx.mx_client.get_metadata.call_args_list]
+    assert order == ["w2", "w1", "w0"]
+
+
+def test_te_find_source_skips_not_found(monkeypatch):
+    # Force identity order so w0 (not-found) is queried first and the
+    # `if not metadata.found: continue` branch is actually exercised.
+    class _IdentitySelector:
+        name = "identity"
+
+        def order(self, candidates, context):
+            return list(candidates)
+
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.loader.get_configured_selector",
+        lambda: _IdentitySelector(),
+    )
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx(
+        [_te_ref("s0aaaaaaaaaaaaaa", "w0"), _te_ref("s1aaaaaaaaaaaaaa", "w1")]
+    )
+    ctx.mx_client.get_metadata.side_effect = lambda mx_source_id, worker_id: _te_meta(
+        found=(worker_id == "w1"), transfer_engine=(worker_id == "w1")
+    )
+    worker = loader._find_transfer_engine_source(ctx)
+    assert worker is not None
+    assert worker.WhichOneof("backend_metadata") == "transfer_engine_session_id"
+    assert [
+        c.kwargs["worker_id"] for c in ctx.mx_client.get_metadata.call_args_list
+    ] == ["w0", "w1"]
+
+
+# ---------------------------------------------------------------------------
+# TransferEngine source discovery -> selection metrics
+#
+# This transport bypasses LoadStrategyChain and RdmaStrategy, so the D8
+# instrumentation added to RdmaStrategy._find_source_instances does not reach
+# it. Without its own recording, a mooncake/transfer_engine pod exports
+# mx_build_info and nothing else in every state, and a metadata-backend outage
+# is indistinguishable from a cluster that has published no peers.
+# ---------------------------------------------------------------------------
+
+
+def _patched_te_metrics(monkeypatch):
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.engines.sglang.loader.selection_metrics", m)
+    return m
+
+
+def test_te_find_source_records_a_list_sources_error(monkeypatch):
+    m = _patched_te_metrics(monkeypatch)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx([])
+    ctx.mx_client.list_sources.side_effect = RuntimeError("grpc down")
+
+    assert loader._find_transfer_engine_source(ctx) is None
+
+    assert m.record_list_sources.call_args.args[1] == "error"
+
+
+def test_te_find_source_records_a_zero_funnel_when_no_peers(monkeypatch):
+    m = _patched_te_metrics(monkeypatch)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+
+    assert loader._find_transfer_engine_source(_te_ctx([])) is None
+
+    assert m.record_list_sources.call_args.args[1] == "empty"
+    observed = {
+        call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list
+    }
+    assert observed == {"listed": 0, "rank_matched": 0}
+
+
+def test_te_find_source_records_the_funnel_on_success(monkeypatch):
+    m = _patched_te_metrics(monkeypatch)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx(
+        [_te_ref("s0aaaaaaaaaaaaaa", "w0"), _te_ref("s1aaaaaaaaaaaaaa", "w1")]
+    )
+
+    loader._find_transfer_engine_source(ctx)
+
+    assert m.record_list_sources.call_args.args[1] == "ok"
+    observed = {
+        call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list
+    }
+    assert observed["listed"] == 2

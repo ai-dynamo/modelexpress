@@ -1,8 +1,12 @@
-# Dynamo P2P Weight Transfer Example
+# Dynamo P2P Weight and JIT Cache Transfer Example
 
 Deploys [ModelExpress](https://github.com/ai-dynamo/modelexpress) P2P RDMA weight transfer on top of [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) using the `DynamoGraphDeployment` custom resource on Kubernetes.
 
-New worker replicas pull model weights over RDMA from other running replicas instead of loading from disk or object storage — dramatically cutting warm-up time when scaling out large models.
+New worker replicas pull model weights over RDMA and install compatible vLLM JIT caches from running replicas instead of rebuilding all state locally, reducing warm-up time when scaling out large models.
+
+Both deployment variants use `deepseek-ai/DeepSeek-V4-Pro`. vLLM 0.23.0 and
+newer recognize the `modelexpress` load format natively; for older versions,
+set `VLLM_PLUGINS=modelexpress` in the worker deployment.
 
 ## Deployment Variants
 
@@ -43,7 +47,9 @@ graph LR
 
 - **ModelExpress server** (Kubernetes CRD backend): tracks which workers have the model Ready, handles heartbeats, and reaps stale entries. Decode and prefill publish under the same `source_id` (derived from model identity), so any worker of either service can serve as an RDMA source for any other worker of either service.
 - **Frontend**: Dynamo's HTTP entry point; routes to decode workers round-robin.
-- **Workers**: `--load-format modelexpress` means the first replica loads from disk and publishes metadata; every subsequent replica receives weights from a Ready source over RDMA. The `mx` load format is kept as a backward-compatible alias.
+- **Workers**: `--load-format modelexpress` means the first replica loads from disk and publishes metadata and compatible JIT caches; every subsequent replica receives weights and caches from a Ready source. The `mx` load format is kept as a backward-compatible alias.
+
+The worker manifests point `MX_ARTIFACT_READY_URL` at Dynamo's pod-local `9090/health` endpoint so weight and cache publication wait for the `generate` endpoint to become healthy.
 
 > **ModelExpress server address.** These examples set `MODEL_EXPRESS_URL`. ModelExpress is standardizing on `MX_SERVER_ADDRESS` as the recommended variable going forward, but Dynamo's ModelExpress integration currently uses `MODEL_EXPRESS_URL`. The `modelexpress` plugin loader used here accepts either, so for Dynamo deployments set `MODEL_EXPRESS_URL` for now.
 
@@ -66,17 +72,18 @@ Note: RBAC (ServiceAccount, Role, RoleBinding) is included in the aggregated YAM
 
 ## Building the Image
 
-**Option A — Layer the ModelExpress client on top of the official Dynamo runtime** (fast, good for iteration):
+**Option A — Layer the ModelExpress client on an existing Dynamo vLLM runtime** (fast, good for iteration):
 
 ```bash
 docker build --platform linux/amd64 \
   -f examples/dynamo_p2p_transfer_k8s/Dockerfile \
+  --build-arg DYNAMO_VLLM_RUNTIME_IMAGE=<dynamo-vllm-runtime> \
   -t <your-registry>/mx-vllm-runtime:<tag> .
 ```
 
-Uses the public `nvcr.io/nvidia/ai-dynamo/vllm-runtime` base and adds the ModelExpress Python client. Builds in a couple of minutes.
+The Dockerfile installs the ModelExpress Python client on the selected runtime.
 
-**Option B — Rebuild from the Dynamo repo with ModelExpress integrated** (slower; needed if you want a newer vLLM than the base image ships with):
+**Option B — Rebuild from the Dynamo repo with ModelExpress integrated** (slower):
 
 ```bash
 git clone https://github.com/ai-dynamo/dynamo && cd dynamo
@@ -155,3 +162,24 @@ kubectl logs -n <namespace> <pod> -c main | grep "Adopted .* hidden"
 # vLLM's disagg KV-transfer metrics on the decode side
 kubectl logs -n <namespace> <decode-pod> -c main | grep -E "KV Transfer metrics|prefix cache"
 ```
+
+### FlashInfer cubin permission denied
+
+If workers restart during `EngineCore` init with:
+
+```
+[Errno 13] Permission denied:
+  '/usr/local/lib/python3.12/dist-packages/flashinfer_cubin/cubins/flashinfer'
+```
+
+the container is running as the image's default non-root `dynamo` user.
+FlashInfer resolves its cubin directory to the installed `flashinfer-cubin`
+package under root-owned `site-packages`, and downloads any cubin missing for
+the current GPU architecture back into that directory. FP8 MoE models take this
+path by default, so the worker dies before the engine comes up.
+
+The manifests here set `securityContext.runAsUser: 0` on the worker containers
+to avoid this. To stay non-root instead, point `FLASHINFER_CUBIN_DIR` at a
+writable directory - but note that this bypasses the `flashinfer-cubin` package
+entirely, so every cubin is re-downloaded at startup and the pod needs network
+access to the FlashInfer artifact host.
