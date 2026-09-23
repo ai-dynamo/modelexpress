@@ -12,7 +12,7 @@ import pytest
 import torch.nn as nn
 
 from modelexpress.adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
-from modelexpress.engines.vllm.source_identity import build_source_identity
+from modelexpress.engines.vllm.adapter import VllmAdapter
 from modelexpress.load_strategy import LoadResult
 from modelexpress_rl import (
     ObjectStorageSource,
@@ -284,10 +284,14 @@ def test_desired_p2p_uses_exact_revision(monkeypatch, model_name):
         monkeypatch.setenv("MODEL_NAME", model_name)
     model_path = "/root/.cache/vllm/assets/model_streamer/0088a9aa"
     ctx = _context()
-    ctx.identity = build_source_identity(
-        SimpleNamespace(parallel_config=SimpleNamespace()),
+    adapter = VllmAdapter(
+        SimpleNamespace(
+            parallel_config=SimpleNamespace(),
+            load_config=SimpleNamespace(device="cuda:0"),
+        ),
         SimpleNamespace(model=model_path, dtype="bfloat16", quantization=None),
     )
+    ctx.identity = adapter.build_identity()
     result = LoadResult(value=nn.Linear(1, 1))
     client = MagicMock()
     client.__enter__.return_value = client

@@ -54,7 +54,8 @@ def _vllm_config(parallel):
 
 
 @pytest.mark.parametrize("model_name", [None, "", "mx_model_abc"])
-def test_model_name_override_preserves_vllm_model_path(monkeypatch, model_name):
+def test_build_source_identity_uses_supplied_model_name(monkeypatch, model_name):
+    """Identity construction uses its supplied config, regardless of MODEL_NAME."""
     if model_name is None:
         monkeypatch.delenv("MODEL_NAME", raising=False)
     else:
@@ -64,7 +65,7 @@ def test_model_name_override_preserves_vllm_model_path(monkeypatch, model_name):
 
     identity = build_source_identity(_vllm_config(_parallel_config()), model_config)
 
-    assert identity.model_name == (model_name or model_path)
+    assert identity.model_name == model_path
     assert model_config.model == model_path
 
 

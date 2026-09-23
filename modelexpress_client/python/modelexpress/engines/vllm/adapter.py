@@ -234,12 +234,15 @@ class VllmAdapter(EngineAdapter):
     def __init__(self, vllm_config, model_config):
         self.vllm_config = vllm_config
         self.model_config = model_config
+        # Resolve the MX name separately from vLLM's model-loading configuration.
+        self._identity_model_config = copy.copy(model_config)
+        self._identity_model_config.model = envs.MODEL_NAME or model_config.model
         self.load_config = vllm_config.load_config
         self.target_device = self._resolve_target_device()
         self.accelerator_backend = accelerator_backend_for(self.target_device)
 
     def build_identity(self):
-        return build_source_identity(self.vllm_config, self.model_config)
+        return build_source_identity(self.vllm_config, self._identity_model_config)
 
     def get_worker_rank(self) -> int:
         return _get_vllm_worker_rank(self.vllm_config, self.target_device)

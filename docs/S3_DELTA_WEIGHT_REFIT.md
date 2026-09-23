@@ -173,8 +173,10 @@ For an S3 launch such as `--model s3://bucket/model`, vLLM can rewrite its inter
 model name to a local streamer cache path. `MODEL_NAME=s3://bucket/model` keeps
 the original URI as the MX name; a name such as `customer-bot` works too. Publish
 every WeightVersion with that exact name and configure trainer clients to match.
-The override does not change the model path that vLLM loads. Without the override,
-the existing behavior, including use of the rewritten path, is unchanged.
+The adapter resolves the override once on a model-configuration copy used only
+for MX identity construction. The original configuration continues to provide
+vLLM's model-loading path. Without the override, the existing behavior, including
+use of the rewritten path, is unchanged.
 
 An explicit `init_info.model_name` still overrides the transfer client's default
 after startup. Keep it consistent with `MODEL_NAME`; it cannot change an identity

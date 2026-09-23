@@ -7,7 +7,7 @@ import json
 import os
 import sys
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -167,6 +167,41 @@ def test_vllm_adapter_discovery_uses_backend_predicate(
     tensors = adapter.discover_tensors(SimpleNamespace(model=model))
 
     assert list(tensors) == ["weight"]
+
+
+@pytest.mark.parametrize("model_name", [None, "", "mx_model_abc"])
+def test_identity_name_is_resolved_once_without_changing_loader_config(
+    monkeypatch, model_name
+):
+    """Freeze the MX name while native loading retains the original config."""
+    if model_name is None:
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+    else:
+        monkeypatch.setenv("MODEL_NAME", model_name)
+    model_path = "/root/.cache/vllm/assets/model_streamer/0088a9aa"
+    model_config = _model_config()
+    model_config.model = model_path
+    vllm_config = _context_config(load_device="cpu")
+    vllm_config.model_config = model_config
+    adapter = VllmAdapter(vllm_config, model_config)
+    identity = adapter.build_identity()
+
+    monkeypatch.setenv("MODEL_NAME", "changed-after-initialization")
+    assert adapter.build_identity() == identity
+    assert identity.model_name == (model_name or model_path)
+
+    model = nn.Linear(2, 2)
+    loader = MagicMock()
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.model_loader.default_loader"],
+        "DefaultModelLoader",
+        loader,
+    )
+    adapter.load_via_native(LoadResult(value=model, model=model))
+
+    loader.return_value.load_weights.assert_called_once_with(model, model_config)
+    assert adapter.model_config is vllm_config.model_config is model_config
+    assert model_config.model == model_path
 
 
 def test_build_vllm_load_context_uses_current_platform_for_bare_cuda(monkeypatch):

@@ -3,9 +3,9 @@
 
 """SourceIdentity construction from vLLM config objects.
 
-Lives under the vLLM engine rather than in metadata/ because the identity
-combines vLLM config objects with ModelExpress overrides. The expert-parallel
-derivation depends on vLLM internals, and keeping it in an engine-agnostic
+Lives under the vLLM engine rather than in metadata/ because every field here
+is read off vLLM's own config objects. The expert-parallel derivation in
+particular depends on vLLM internals, and keeping it in an engine-agnostic
 module is how a read of a nonexistent ParallelConfig attribute went unnoticed.
 """
 
@@ -64,7 +64,7 @@ def build_source_identity(
     return p2p_pb2.SourceIdentity(
         mx_version=mx_version,
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
-        model_name=envs.MODEL_NAME or model_config.model,
+        model_name=model_config.model,
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
         tensor_parallel_size=tp_size,
         pipeline_parallel_size=pp_size,

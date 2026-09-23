@@ -7,7 +7,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from modelexpress.engines.vllm.source_identity import build_source_identity
+from modelexpress.engines.vllm.adapter import VllmAdapter
 from modelexpress_rl.inference.engines.vllm import (
     VllmGeneratorContext,
     _create_vllm_engine_runtime,
@@ -60,6 +60,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     class VllmConfig:
         model_config = ModelConfig()
         parallel_config = SimpleNamespace()
+        load_config = SimpleNamespace(device="cuda:2")
 
         def __init__(self):
             self.quant_config = quant_config
@@ -70,12 +71,11 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     config_module.VllmConfig = VllmConfig
     monkeypatch.setitem(sys.modules, "vllm.config", config_module)
 
-    class Engine:
-        accelerator_backend = SimpleNamespace(name="cuda")
-
+    class Engine(VllmAdapter):
         def __init__(self, vllm_config, model_config):
             assert vllm_config is config
             assert model_config is config.model_config
+            super().__init__(vllm_config, model_config)
 
         def get_device_id(self):
             return 2
@@ -85,9 +85,6 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
 
         def get_worker_rank(self):
             return 3
-
-        def build_identity(self):
-            return build_source_identity(config, config.model_config)
 
     class Installer:
         def __init__(self, **kwargs):
@@ -177,6 +174,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
             ("unpublish", loader),
             ("publish", loader, "version-a"),
         ]
+    monkeypatch.setenv("MODEL_NAME", "changed-after-initialization")
     identity = runtime.full_tensor.build_identity("version-a")
     assert identity.model_name == runtime.model_name
     assert identity.revision == "version-a"
