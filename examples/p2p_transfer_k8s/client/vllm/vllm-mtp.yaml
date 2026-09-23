@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Single-GPU vLLM deployment with ModelExpress P2P weight transfer and MTP.
-# Uses Qwen3.5-0.8B so the full source -> target flow fits on two GPUs.
+# Single-node vLLM deployment with ModelExpress P2P weight transfer and MTP.
+# Uses the FP8 GLM-5.2 checkpoint (TP=8) so each replica fits on one 8-GPU
+# H200 or B200 node.
 #
 # Prerequisites:
 #   - ModelExpress server deployed (see ../../server/)
-#   - PVC named model-cache for the Hugging Face cache
+#   - Two 8-GPU H200 or B200 nodes for the source -> target workflow
+#   - PVC named model-cache with at least 1 TiB for the Hugging Face cache
 #   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
 #
 # Verification workflow:
@@ -63,7 +65,7 @@ spec:
             - name: HF_HUB_CACHE
               value: "/models"
             - name: MODEL_NAME
-              value: "Qwen/Qwen3.5-0.8B"
+              value: "zai-org/GLM-5.2-FP8"
             - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
             - name: MX_ARTIFACT_TRANSFER
@@ -109,23 +111,25 @@ spec:
             - --load-format
             - modelexpress
             - --tensor-parallel-size
-            - "1"
+            - "8"
             - --language-model-only
             - --max-model-len
             - "1024"
             - --kv-cache-memory-bytes
             - "1073741824"
+            - --kv-cache-dtype
+            - fp8
             - --speculative-config
-            - '{"method":"mtp","num_speculative_tokens":1}'
+            - '{"method":"mtp","num_speculative_tokens":5}'
           resources:
             limits:
-              nvidia.com/gpu: "1"
-              rdma/ib: "1"
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
             requests:
-              nvidia.com/gpu: "1"
-              rdma/ib: "1"
-              memory: "32Gi"
-              cpu: "8"
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
           volumeMounts:
             - name: shm
               mountPath: /dev/shm
@@ -136,7 +140,7 @@ spec:
         - name: shm
           emptyDir:
             medium: Memory
-            sizeLimit: 16Gi
+            sizeLimit: 64Gi
         - name: model-cache
           persistentVolumeClaim:
             claimName: model-cache
