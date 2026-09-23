@@ -229,3 +229,23 @@ If your pull request fails the DCO check, add the trailer to the existing commit
 git rebase --signoff origin/main
 git push --force-with-lease
 ```
+
+### Offline model E2E CI checks
+
+The AWS harness has CPU-only contracts for rendering, all-rank validation,
+failure reporting, and target selection. From the repository root:
+
+```bash
+uv run --no-project --with pytest --with pyyaml pytest ci/rl/e2e/tests
+for script in ci/rl/e2e/scripts/*.sh; do bash -n "$script"; done
+```
+
+Rendering and reporting use the Python standard library; tests additionally use
+pytest and PyYAML. These checks launch no Kubernetes or GPU workloads and do not
+establish AWS compatibility. See [deployment usage](docs/DEPLOYMENT.md#modelexpress-e2e-ci-harness).
+
+The offline contracts run in the normal PR workflow. For an optional GPU run,
+a repository writer can comment `/e2e-test --model kimi --sha <full-PR-head-SHA>` after that
+revision has passed the existing copy-pr-bot approval/mirroring process. The
+command becomes available after its workflow lands on the default branch; see
+[setup and cleanup](docs/DEPLOYMENT.md#trigger-e2e-ci-with-a-pr-comment).

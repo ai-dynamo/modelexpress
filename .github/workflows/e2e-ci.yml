@@ -1,0 +1,176 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+name: E2E S3 qualification
+run-name: "E2E PR #${{ github.event.issue.number }} requested by @${{ github.actor }}"
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+# Serialize requests for a PR so a later comment cannot cancel cleanup.
+concurrency:
+  group: e2e-pr-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+env:
+  KUBECONFIG: /teleport/kubeconfig.yaml
+  KUBE_CONTEXT: ${{ vars.MX_E2E_KUBE_CONTEXT }}
+  MX_E2E_S3_ROLE_ARN: ${{ vars.MX_E2E_S3_ROLE_ARN }}
+  MX_CI_S3_BUCKET: ${{ vars.MX_E2E_S3_BUCKET }}
+  MX_CI_S3_REGION: ${{ vars.MX_E2E_S3_REGION }}
+  NAMESPACE: mx-ci-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+  RESULTS_DIR: ${{ github.workspace }}/e2e-results
+
+jobs:
+  authorize:
+    if: >-
+      github.repository == 'ai-dynamo/modelexpress' &&
+      github.event.issue.pull_request &&
+      (github.event.comment.body == '/e2e-test' || startsWith(github.event.comment.body, '/e2e-test '))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.gate.outputs.sha }}
+      model: ${{ steps.gate.outputs.model }}
+      runtime: ${{ steps.config.outputs.runtime }}
+    steps:
+      # issue_comment uses default-branch code. Never check out PR code here.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Validate caller and copy-pr-bot mirror
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/rl/e2e/scripts/comment_gate.py
+      - name: Require configured AWS identity and runtime
+        id: config
+        env:
+          MODEL_PROFILE: ${{ steps.gate.outputs.model }}
+          RUNTIME_BASES: ${{ vars.MX_E2E_RUNTIME_BASES }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          for key in ['KUBE_CONTEXT', 'MX_E2E_S3_ROLE_ARN', 'MX_CI_S3_BUCKET', 'MX_CI_S3_REGION']:
+              if not os.environ.get(key):
+                  raise SystemExit('Missing repository configuration: ' + key)
+          runtime = json.loads(os.environ['RUNTIME_BASES']).get(os.environ['MODEL_PROFILE'], '')
+          if not re.fullmatch(r'[a-zA-Z0-9./:_-]+@sha256:[0-9a-f]{64}', runtime):
+              raise SystemExit('MX_E2E_RUNTIME_BASES must contain a digest-pinned runtime for the selected model')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('runtime=' + runtime + '\n')
+          PY
+
+  build:
+    needs: authorize
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 60
+    outputs:
+      server: ${{ steps.images.outputs.server }}
+      worker: ${{ steps.images.outputs.worker }}
+    steps:
+      - name: Checkout trusted harness
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Checkout approved source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+      - name: Build images from the approved revision
+        id: images
+        env:
+          TEST_SHA: ${{ needs.authorize.outputs.sha }}
+          RUNTIME_BASE: ${{ needs.authorize.outputs.runtime }}
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+          repo=nvcr.io/0980761089281446
+          server="$repo/mx-e2e-server:$TEST_SHA"
+          worker="$repo/mx-e2e-worker:$TEST_SHA"
+          docker buildx build --platform linux/amd64 -f ci/k8s/server/Dockerfile.server \
+            -t "$server" --metadata-file server-build.json --push candidate
+          docker buildx build --platform linux/amd64 -f ci/rl/e2e/Dockerfile \
+            --build-arg "RUNTIME_BASE=$RUNTIME_BASE" -t "$worker" \
+            --metadata-file worker-build.json --push candidate
+          echo "server=$repo/mx-e2e-server@$(jq -r '."containerimage.digest"' server-build.json)" >> "$GITHUB_OUTPUT"
+          echo "worker=$repo/mx-e2e-worker@$(jq -r '."containerimage.digest"' worker-build.json)" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: [authorize, build]
+    runs-on: prod-deploy-tester-v1
+    timeout-minutes: 60
+    env:
+      MODEL_PROFILE: ${{ needs.authorize.outputs.model }}
+      RUN_ID: ${{ needs.authorize.outputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
+      SERVER_IMAGE: ${{ needs.build.outputs.server }}
+      WORKER_IMAGE: ${{ needs.build.outputs.worker }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install manifest parser
+        run: python3 -m pip install pyyaml
+      - name: Provision profile-sized namespace and render S3 run
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+        run: bash ci/rl/e2e/scripts/ci.sh setup
+      - name: Run E2E cold load and refit
+        timeout-minutes: 45
+        run: bash ci/rl/e2e/scripts/ci.sh run
+      - name: Collect evidence
+        if: always()
+        run: |
+          if [ -f "$RESULTS_DIR/run.env" ]; then
+            bash ci/rl/e2e/scripts/collect.sh "$RESULTS_DIR"
+          fi
+      - name: Save evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Record tested revision
+        if: always()
+        env:
+          TEST_SHA: ${{ needs.authorize.outputs.sha }}
+        run: echo "E2E S3 qualification of $TEST_SHA; evidence is attached to this run." >> "$GITHUB_STEP_SUMMARY"
+
+  cleanup:
+    needs: [authorize, build, test]
+    if: ${{ always() && needs.build.result == 'success' && needs.test.result != 'skipped' }}
+    runs-on: prod-deploy-tester-v1
+    timeout-minutes: 15
+    env:
+      MODEL_PROFILE: ${{ needs.authorize.outputs.model }}
+      RUN_ID: ${{ needs.authorize.outputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
+      SERVER_IMAGE: ${{ needs.build.outputs.server }}
+      WORKER_IMAGE: ${{ needs.build.outputs.worker }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install manifest parser
+        run: python3 -m pip install pyyaml
+      - name: Remove exact-run objects and owned namespace
+        run: bash ci/rl/e2e/scripts/ci.sh cleanup
+      - name: Save cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: warn
+          retention-days: 14

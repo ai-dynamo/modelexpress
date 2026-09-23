@@ -1,0 +1,20 @@
+{
+  "model": "moonshotai/Kimi-K2.7-Code",
+  "revision": "74797c9c62378b951a1f6fcf5c4631024e9b8bef",
+  "tp": 8,
+  "cpu": "64",
+  "memory": "1Ti",
+  "embedding": "language_model.model.embed_tokens.weight",
+  "delta_bytes": 1073741824,
+  "expected_tensors_per_rank": null,
+  "expected_host_scales_per_rank": null,
+  "default_paths": "s3",
+  "limit_mm_per_prompt": {
+    "image": 0,
+    "video": 0
+  },
+  "key": "kimi",
+  "seed_prefix": "models/huggingface/moonshotai/Kimi-K2.7-Code/74797c9c62378b951a1f6fcf5c4631024e9b8bef/",
+  "delta_prefix": "checkpoints/benchmarks/kimi-hotload/",
+  "refit_checkpoint_max_size_gb": 3000
+}

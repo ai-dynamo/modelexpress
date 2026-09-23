@@ -21,6 +21,21 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  e2e-contracts:
+    name: E2E offline contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install pytest pyyaml
+      - run: python3 -m pytest ci/rl/e2e/tests -q
+      - run: for script in ci/rl/e2e/scripts/*.sh; do bash -n "$script"; done
+
   test:
     name: Test Suite
     runs-on: ubuntu-latest

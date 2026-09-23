@@ -1472,3 +1472,25 @@ Optimization opportunities: contiguous regions (blocked), warm source pool, Deep
 ## Deployment and Configuration
 
 See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering server/client configuration, Docker, Kubernetes, Helm, P2P transfer setup, and debugging commands.
+
+## Model E2E CI regression harness
+
+`ci/rl/e2e/common/` owns the native HTTP worker, refit API adapter, delta publisher,
+seed downloader, diagnostics, validation/reporting, and object cleanup. `scripts/`
+operates templates in `yaml/`. `profiles.json` registers models and the default;
+`profiles/<key>/profile.json` defines a pinned checkpoint, resources, and expected
+checks. An optional `model_checks.py` adds model-specific checks. Current profiles
+cover Nemotron NVFP4 and Kimi-K2.7-Code; no Applied Training checkout is required.
+
+Nemotron expects 761 GPU tensors and 18 coherent host-scale entries per rank.
+Its peer hook checks 11 changed host scales and cleared immediate launch caches;
+post-inference cache differences are retained without asserting numerical safety.
+Kimi uses shared all-rank tensor/refit checks; GPU compatibility remains unvalidated
+and the experimental WNA16 workaround is not included.
+
+`e2e-ci.yml` authorizes `/e2e-test` on a hosted runner, then builds the immutable
+copy-pr-bot-approved revision on privileged runners. `scripts/comment_gate.py`
+resolves the profile and SHA; `scripts/ci.sh` sizes quotas from rendered profiles.
+`common/cleanup_run.py` handles interrupted publication with exact-run prefix
+cleanup. Normal PR CI runs offline contracts. See
+[deployment and command usage](DEPLOYMENT.md#modelexpress-e2e-ci-harness).

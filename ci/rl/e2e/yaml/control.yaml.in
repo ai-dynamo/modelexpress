@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: List
+items:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: ${AWS_CONFIG_NAME}
+      namespace: ${NAMESPACE}
+      labels: ${RUN_LABELS}
+    data:
+      config: ${AWS_CONFIG}
+  - apiVersion: v1
+    kind: Pod
+    metadata:
+      name: ${CONTROL_NAME}
+      namespace: ${NAMESPACE}
+      labels: ${CONTROL_LABELS}
+    spec:
+      restartPolicy: Never
+      activeDeadlineSeconds: 43200
+      nodeSelector: ${CONTROL_NODE_SELECTOR}
+      tolerations: ${CONTROL_TOLERATIONS}
+      serviceAccountName: ${SERVICE_ACCOUNT}
+      priorityClassName: ${PRIORITY_CLASS}
+      imagePullSecrets: ${IMAGE_PULL_SECRETS}
+      volumes:
+        - name: aws-config
+          configMap: {name: ${AWS_CONFIG_NAME}}
+        - name: benchmark
+          configMap: {name: ${HARNESS_NAME}}
+      containers:
+        - name: main
+          image: ${MX_MAIN_RUNTIME_IMAGE}
+          command: [sleep, "43200"]
+          env: ${CONTROL_ENV}
+          envFrom: ${ENV_FROM}
+          volumeMounts:
+            - {name: aws-config, mountPath: /etc/aws/config, subPath: config, readOnly: true}
+            - {name: benchmark, mountPath: /opt/benchmark}
+          resources: ${CONTROL_RESOURCES}
+        - name: server
+          image: ${MX_MAIN_SERVER_IMAGE}
+          command: [/app/modelexpress-server]
+          args: [--port, "8000"]
+          ports: [{name: http, containerPort: 8000}]
+          readinessProbe: {tcpSocket: {port: http}, initialDelaySeconds: 2, periodSeconds: 5}
+          livenessProbe: {tcpSocket: {port: http}, initialDelaySeconds: 5, periodSeconds: 10}
+          env:
+            - {name: MX_METADATA_BACKEND, value: redis}
+            - {name: REDIS_URL, value: "redis://127.0.0.1:6379"}
+          resources:
+            requests: {cpu: "1", memory: 1Gi}
+            limits: {cpu: "2", memory: 2Gi}
+        - name: redis
+          image: ${REDIS_IMAGE}
+          args: [--save, "", --appendonly, "no"]
+          ports: [{name: redis, containerPort: 6379}]
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: ${CONTROL_NAME}
+      namespace: ${NAMESPACE}
+      labels: ${RUN_LABELS}
+    spec:
+      selector: {app: ${CONTROL_NAME}}
+      ports: [{name: grpc, port: 8000, targetPort: 8000}]
+      publishNotReadyAddresses: true

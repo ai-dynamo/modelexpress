@@ -1,0 +1,17 @@
+{
+  "model": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+  "revision": "bee7596271d1495f6992ae224aefde4410e816b8",
+  "tp": 1,
+  "cpu": "16",
+  "memory": "128Gi",
+  "embedding": "backbone.embeddings.weight",
+  "delta_bytes": 67108864,
+  "expected_tensors_per_rank": 761,
+  "expected_host_scales_per_rank": 18,
+  "default_paths": "both",
+  "limit_mm_per_prompt": {},
+  "key": "nemotron",
+  "seed_prefix": "models/huggingface/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4/bee7596271d1495f6992ae224aefde4410e816b8/",
+  "delta_prefix": "checkpoints/benchmarks/nemotron-hotload/",
+  "refit_checkpoint_max_size_gb": 3000
+}

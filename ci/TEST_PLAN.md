@@ -54,3 +54,13 @@ Coverage matrix for the ModelExpress CI infrastructure. Reflects what's currentl
 - **Not started** — no scaffold, no matrix entry, no dependency planning yet.
 
 When a row moves status, update this table in the same PR so the doc stays the source of truth on what CI does and doesn't catch.
+
+## Comment-triggered model E2E qualification
+
+`ci/rl/e2e/` contains registered Nemotron and Kimi-K2.7-Code profiles. Offline
+contracts run on every PR. `e2e-ci.yml` accepts `/e2e-test [--model PROFILE]
+[--sha FULL_SHA]` from repository writers after copy-pr-bot mirrors the current
+head. S3-only GPU runs use profile-derived quotas and configured per-model runtime
+images. No live AWS validation has been performed; Kimi refit compatibility is
+not established. Peer coverage stays manual. See
+[usage and limitations](../docs/DEPLOYMENT.md#modelexpress-e2e-ci-harness).
