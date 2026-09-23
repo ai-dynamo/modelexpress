@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import logging
 import os
@@ -447,15 +448,17 @@ class VllmAdapter(EngineAdapter):
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
         from vllm.model_executor.model_loader.utils import initialize_model
 
-        stale_value = result.value
         stale_model = result.model
+        if stale_model is None:
+            raise RuntimeError("vLLM retry reinitialization requires result.model")
         result.value = None
         result.model = None
-        # Unregister before dropping the model: its registrations identify it,
-        # and clearing them frees its parameters before the rebuild allocates.
         self._unregister_model_layers(stale_model)
-        del stale_value
+        # Active loader frames retain the root, so release its tensor graph
+        # before allocating a replacement, including cyclic child modules.
+        stale_model.__dict__.clear()
         del stale_model
+        gc.collect()
         self.accelerator_backend.empty_cache()
         logger.info(
             "[Worker %s] Re-initializing vLLM model after failed strategy",

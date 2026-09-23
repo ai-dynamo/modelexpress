@@ -1195,6 +1195,13 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 | p4 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
 | p5 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
 
+When a vLLM loading attempt fails after mutating the model, retry cleanup
+unregisters its layers and clears the old model's tensor graph before allocating
+the replacement. Caller frames can still retain the old root object, so clearing
+only `LoadResult` cannot release its GPU storage. Cyclic child modules are
+collected before the allocator cache is emptied and initialization starts.
+If initialization fails, recovery aborts without attempting another loader.
+
 See [ModelExpress Benchmarks](BENCHMARKS.md) for measured loading-path, NIXL registration, and artifact-transfer results with explicit timing boundaries.
 
 ### Server-Backed Model Cache

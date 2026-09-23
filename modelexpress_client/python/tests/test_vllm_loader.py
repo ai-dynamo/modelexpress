@@ -2137,3 +2137,58 @@ def test_unregister_releases_the_discarded_model():
     gc.collect()
 
     assert layer_ref() is None
+
+
+@pytest.mark.parametrize("rebuild_fails", [False, True])
+def test_retry_releases_tensors_while_caller_retains_model(
+    monkeypatch, mock_accelerator_backend_cls, rebuild_fails,
+):
+    """Retry must free old tensors before allocating a replacement model."""
+    import sys
+    import weakref
+
+    cc = _make_compilation_config()
+    target, _ = _initialize_model(cc, "target")
+    retained_model, adapter = _initialize_model(cc, "retry")
+    retained_model.weight = nn.Parameter(torch.ones(1))
+    retained_model.register_buffer("scale", torch.ones(1))
+    retained_model.scratch = torch.ones(1)
+    retained_model.self_attn.weight = nn.Parameter(torch.ones(1))
+    retained_model.self_attn.cycle = [retained_model.self_attn]
+    tensor_refs = [
+        weakref.ref(tensor) for tensor in (
+            retained_model.weight,
+            retained_model.scale,
+            retained_model.scratch,
+            retained_model.self_attn.weight,
+        )
+    ]
+    adapter.target_device = torch.device("cpu")
+    adapter.model_config = object()
+    adapter.accelerator_backend = mock_accelerator_backend_cls()
+    result = LoadResult(value=retained_model, model=retained_model, publishable=False)
+
+    def initialize_model(**kwargs):
+        assert all(ref() is None for ref in tensor_refs)
+        assert cc.static_forward_context == {
+            "target.layers.0.self_attn": target.self_attn,
+        }
+        if rebuild_fails:
+            raise RuntimeError("rebuild failed")
+        return _initialize_model(cc, "retry")[0]
+
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.model_loader.utils"],
+        "initialize_model",
+        initialize_model,
+    )
+    if rebuild_fails:
+        with pytest.raises(RuntimeError, match="rebuild failed"):
+            adapter.reinit_for_retry(result)
+        assert result.model is None and result.value is None
+    else:
+        rebuilt = adapter.reinit_for_retry(result)
+        assert rebuilt.model is not retained_model
+        assert rebuilt.value is rebuilt.model
+        assert rebuilt.publishable is False
+    assert adapter.accelerator_backend.empty_cache_calls == 1
