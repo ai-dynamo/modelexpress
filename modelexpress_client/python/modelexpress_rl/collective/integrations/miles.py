@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +14,7 @@ from ..client import RefitClientTrainer
 from ..plan import DEFAULT_RECEIVER_PROTOCOL
 from ..rendezvous import CollectiveRendezvous, LaneDeclaration
 from ..spi import LocalParamSpec
+from .miles_topology import MilesReshardTopologyPlan
 from ._common import (
     _FrozenPlan,
     _check_stable,
@@ -29,6 +31,94 @@ from ._common import (
 logger = logging.getLogger("modelexpress_rl.collective.integrations.miles")
 
 
+def _validate_miles_route_alignment(
+    miles_plan: MilesReshardTopologyPlan,
+    trainer_lanes: tuple[tuple[int, ...], ...],
+) -> None:
+    bulk_name_counts = {}
+    for entry in miles_plan.plan.bulk:
+        bulk_name_counts[entry.name] = bulk_name_counts.get(entry.name, 0) + 1
+    duplicate_bulk_names = sorted(
+        name for name, count in bulk_name_counts.items() if count != 1
+    )
+    if duplicate_bulk_names:
+        raise ValueError(
+            f"MILES plan bulk parameter names must be unique: {duplicate_bulk_names}"
+        )
+
+    routes_by_name = {}
+    for route in miles_plan.routes:
+        routes_by_name.setdefault(route.canonical_name, []).append(route)
+
+    plan_names = set(bulk_name_counts)
+    unexpected_routes = sorted(set(routes_by_name) - plan_names)
+    if unexpected_routes:
+        raise ValueError(
+            f"MILES source routes have no matching plan bulk entry: {unexpected_routes}"
+        )
+
+    for entry in miles_plan.plan.bulk:
+        matching_routes = routes_by_name.get(entry.name, ())
+        if len(matching_routes) != 1:
+            raise ValueError(
+                f"{entry.name}: expected exactly one source route, "
+                f"got {len(matching_routes)}"
+            )
+        route = matching_routes[0]
+        if route.partition_id != entry.partition_id:
+            raise ValueError(
+                f"{entry.name}: route partition {route.partition_id} does not "
+                f"match plan partition {entry.partition_id}"
+            )
+        if not 0 <= entry.partition_id < len(trainer_lanes):
+            raise ValueError(
+                f"{entry.name}: plan partition {entry.partition_id} has no trainer lane"
+            )
+
+        lane = trainer_lanes[entry.partition_id]
+        source_mesh_ranks = tuple(entry.src_mesh.ranks())
+        if any(rank >= len(lane) for rank in source_mesh_ranks):
+            raise ValueError(
+                f"{entry.name}: source mesh ranks {source_mesh_ranks} exceed "
+                f"trainer lane width {len(lane)}"
+            )
+        expected_owners = tuple(lane[rank] for rank in source_mesh_ranks)
+        route_owners = tuple(route.source_world_ranks)
+        if any(
+            isinstance(world_rank, bool) or not isinstance(world_rank, int)
+            for world_rank in route_owners
+        ):
+            raise ValueError(f"{entry.name}: route source world ranks must be integers")
+        if route_owners != expected_owners:
+            raise ValueError(
+                f"{entry.name}: source owners do not match source mesh ranks; "
+                f"expected {expected_owners}, got {route.source_world_ranks}"
+            )
+
+        named_owners = tuple(
+            world_rank for world_rank, _ in route.source_names_by_world
+        )
+        if any(
+            isinstance(world_rank, bool) or not isinstance(world_rank, int)
+            for world_rank in named_owners
+        ):
+            raise ValueError(
+                f"{entry.name}: source_names_by_world owners must be integers"
+            )
+        if named_owners != expected_owners:
+            raise ValueError(
+                f"{entry.name}: source_names_by_world owners do not match "
+                f"source mesh ranks; expected {expected_owners}, got {named_owners}"
+            )
+        if any(
+            not source_names or any(not source_name for source_name in source_names)
+            for _, source_names in route.source_names_by_world
+        ):
+            raise ValueError(
+                f"{entry.name}: every source owner must provide source names"
+            )
+
+
 @dataclass(frozen=True)
 class CollectiveTopology:
     """The immutable participant and ABI identity shared by every rank."""
@@ -39,6 +129,84 @@ class CollectiveTopology:
     source_partition_count: int
     m2n_abi_version: str
     receiver_protocol: str = DEFAULT_RECEIVER_PROTOCOL
+
+    @classmethod
+    def from_miles_reshard_plan(
+        cls,
+        *,
+        model_name: str,
+        miles_plan: MilesReshardTopologyPlan,
+        trainer_slots_by_world_rank: Mapping[int, str],
+        generator_slots: Sequence[str],
+        m2n_abi_version: str,
+        receiver_protocol: str = DEFAULT_RECEIVER_PROTOCOL,
+    ) -> CollectiveTopology:
+        """Bind MILES world ranks to PR 795 lane-local collective ranks."""
+        trainer_lanes = tuple(
+            tuple(world_rank for world_rank in lane)
+            for lane in miles_plan.trainer_lanes
+        )
+        source_partition_count = miles_plan.plan.source_partition_count
+        if len(trainer_lanes) != source_partition_count:
+            raise ValueError(
+                "MILES trainer lanes must match the plan source partitions: "
+                f"{len(trainer_lanes)} != {source_partition_count}"
+            )
+        if not trainer_lanes or any(not lane for lane in trainer_lanes):
+            raise ValueError("MILES trainer lanes must not be empty")
+        lane_sizes = {len(lane) for lane in trainer_lanes}
+        if len(lane_sizes) != 1:
+            raise ValueError(
+                "MILES trainer lanes must contain the same number of trainers"
+            )
+
+        ordered_world_ranks = tuple(
+            world_rank for lane in trainer_lanes for world_rank in lane
+        )
+        if any(
+            isinstance(world_rank, bool) or not isinstance(world_rank, int)
+            for world_rank in ordered_world_ranks
+        ):
+            raise ValueError("MILES trainer lane world ranks must be integers")
+        if len(ordered_world_ranks) != len(set(ordered_world_ranks)):
+            raise ValueError("MILES trainer lanes contain duplicate world ranks")
+        _validate_miles_route_alignment(miles_plan, trainer_lanes)
+
+        slots_by_world_rank = dict(trainer_slots_by_world_rank)
+        if any(
+            isinstance(world_rank, bool) or not isinstance(world_rank, int)
+            for world_rank in slots_by_world_rank
+        ):
+            raise ValueError("trainer slot projection world ranks must be integers")
+        expected_world_ranks = set(ordered_world_ranks)
+        actual_world_ranks = set(slots_by_world_rank)
+        missing = sorted(expected_world_ranks - actual_world_ranks)
+        if missing:
+            raise ValueError(
+                f"trainer slot projection is missing world ranks {missing}"
+            )
+        unexpected = sorted(
+            actual_world_ranks - expected_world_ranks,
+            key=repr,
+        )
+        if unexpected:
+            raise ValueError(
+                f"trainer slot projection contains unexpected world ranks {unexpected}"
+            )
+
+        trainer_slots = tuple(
+            str(slots_by_world_rank[world_rank]) for world_rank in ordered_world_ranks
+        )
+        if len(trainer_slots) != len(set(trainer_slots)):
+            raise ValueError("trainer slot projection contains duplicate trainer slots")
+        return cls(
+            model_name=model_name,
+            trainer_slots=trainer_slots,
+            generator_slots=tuple(generator_slots),
+            source_partition_count=source_partition_count,
+            m2n_abi_version=m2n_abi_version,
+            receiver_protocol=receiver_protocol,
+        )
 
     def __post_init__(self) -> None:
         object.__setattr__(
