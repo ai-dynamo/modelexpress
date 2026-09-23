@@ -9,6 +9,13 @@ from .miles import (
     MilesTrainerSession,
     MilesTransferCoordinator,
 )
+from .miles_native import (
+    MilesNativePublisher,
+    MilesNativeTensorRecord,
+    MilesSourceBinding,
+    MilesSourceRecipe,
+    inventory_miles_native_tensors,
+)
 from .sglang import (
     SglangGeneratorSession,
     SglangLoader,
@@ -17,10 +24,15 @@ from .sglang import (
 
 __all__ = [
     "CollectiveTopology",
+    "MilesNativePublisher",
+    "MilesNativeTensorRecord",
     "MilesPublisher",
+    "MilesSourceBinding",
+    "MilesSourceRecipe",
     "MilesTrainerSession",
     "MilesTransferCoordinator",
     "SglangGeneratorSession",
     "SglangLoader",
     "SglangParameterBinding",
+    "inventory_miles_native_tensors",
 ]
