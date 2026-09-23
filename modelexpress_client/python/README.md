@@ -126,7 +126,7 @@ trainer.bind_tensors(megatron_tensor_specs)
 trainer.publish_version(version=WeightVersionRef(version.uid))
 ```
 
-The deployment supplies `MODEL_NAME`,
+The deployment supplies `MX_MODEL_NAME_OVERRIDE`,
 `MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the
 normal ModelExpress server configuration. The Megatron adapter derives its
 source slot from logical tensor names and shard geometry. DP replicas of the same
@@ -179,6 +179,12 @@ objects are stored beside it. A delta index records the target
 `metadata.base_version`. After upload, the orchestrator changes the version from
 `STAGING` to `READY`. S3 versions remain READY for rollout recovery; their
 immutable objects are governed by the bucket's external lifecycle policy.
+
+Generators use registered MX IDs and base relationships to replay S3 deltas.
+The manifest's `metadata.version` and `metadata.base_version` may differ from
+those IDs or be absent, allowing existing artifacts to be registered without
+rewriting their indexes. The caller must register the correct S3 URI and base
+version; MX's exact-base checks and payload validation remain enabled.
 
 The client owns the NIXL manager and trainer-side manifest service. `server_url`
 selects the central ModelExpress control-plane service and defaults to the

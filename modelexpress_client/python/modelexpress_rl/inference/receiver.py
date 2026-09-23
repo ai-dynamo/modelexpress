@@ -46,7 +46,7 @@ class ObjectStorageGeneratorConfig:
 
     storage_type: ObjectStorageType
     initial_base_version_id: str
-    seed_checkpoint_path: str | Path
+    seed_checkpoint_path: str | Path | None
     refit_checkpoint_dir: str | Path
     refit_checkpoint_max_size_gb: int | None = DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB
     endpoint_url: str | None = None
@@ -57,8 +57,11 @@ class ObjectStorageGeneratorConfig:
             raise TypeError("storage_type must be an ObjectStorageType")
         if not self.initial_base_version_id.strip():
             raise ValueError("initial_base_version_id is required")
-        if not str(self.seed_checkpoint_path).strip():
-            raise ValueError("seed_checkpoint_path is required")
+        if (
+            self.seed_checkpoint_path is not None
+            and not str(self.seed_checkpoint_path).strip()
+        ):
+            raise ValueError("seed_checkpoint_path must be non-empty when provided")
         if not str(self.refit_checkpoint_dir).strip():
             raise ValueError("refit_checkpoint_dir is required")
         if (
@@ -153,8 +156,6 @@ def _parse_index_manifest(
     if is_delta:
         assert version is not None
         expected_metadata = {
-            "version": version.version_id,
-            "base_version": version.base_version_id,
             "delta_encoding": "xor",
             "checksum_format": "adler32",
         }
@@ -415,7 +416,6 @@ class _LocalCheckpoint:
         s3: S3Client,
     ) -> None:
         self.initial_version = config.initial_base_version_id
-        self.seed_checkpoint_path = Path(config.seed_checkpoint_path)
         self.s3 = s3
         self.store = LocalCheckpointStore(
             root=config.refit_checkpoint_dir,
@@ -427,6 +427,11 @@ class _LocalCheckpoint:
             ),
         )
         self.local_checkpoint = self.store.full_path(self.initial_version)
+        self.seed_checkpoint_path = (
+            Path(config.seed_checkpoint_path)
+            if config.seed_checkpoint_path is not None
+            else self.local_checkpoint
+        )
         self.checkpoint_paths: list[Path] = []
         self.locations: dict[str, tuple[Path, int, int]] = {}
         self.tensor_metadata: dict[str, dict] = {}
@@ -435,11 +440,15 @@ class _LocalCheckpoint:
         self.store.initialize()
         with self.store.installation_locked(), self.store.locked():
             initial_checkpoint = self.store.full_path(self.initial_version)
-            # Cold-start bootstrap passes the cached immutable root as its seed.
-            # That lets the receiver detect this path without a caller-owned flag.
+            # An omitted seed or an explicit cached-root path reuses the cache.
             cached_seed = (
                 self.seed_checkpoint_path.resolve() == initial_checkpoint.resolve()
             )
+            if cached_seed and not initial_checkpoint.is_dir():
+                raise FileNotFoundError(
+                    f"cached seed checkpoint for {self.initial_version!r} "
+                    f"not found: {initial_checkpoint}"
+                )
             version = self._initialize_checkpoint_state(
                 state=self.store.state(),
                 initial_checkpoint=initial_checkpoint,
@@ -864,13 +873,21 @@ class _LocalCheckpoint:
                 )
                 return 0.0, 0.0
 
+        non_weight_source = self.seed_checkpoint_path
+        if (
+            non_weight_source.resolve()
+            == self.store.full_path(self.initial_version).resolve()
+        ):
+            # Updates carry seed metadata forward; the initial root may be evicted.
+            non_weight_source = self.local_checkpoint
         protected_versions = _protected_versions(self.store, version.version_id)
         self.store.ensure_capacity(
-            self._non_weight_files_size(self.seed_checkpoint_path) + len(index_data),
+            self._non_weight_files_size(non_weight_source) + len(index_data),
             protected_versions=protected_versions,
+            protected_paths={non_weight_source},
         )
         with self.store.replace_directory(target) as temporary:
-            self._copy_non_weight_files(self.seed_checkpoint_path, temporary)
+            self._copy_non_weight_files(non_weight_source, temporary)
             index_name = Path(version.uri).name
             (temporary / index_name).write_bytes(index_data)
             download_time, validation_time = self._download_full_checkpoint(

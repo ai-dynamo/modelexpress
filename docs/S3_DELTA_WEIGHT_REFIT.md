@@ -40,6 +40,7 @@ Environment variables used by the clients and vLLM engine:
 | Variable | Default | Purpose |
 |---|---|---|
 | `MX_SERVER_ADDRESS` | `localhost:8001` | ModelExpress server address. |
+| `MX_MODEL_NAME_OVERRIDE` | unset | Logical MX model name used by vLLM at startup and during refit. Use the same name for trainer clients and published WeightVersions. Without it, vLLM's configured model path or ID is used. |
 | `MX_AUTH_TOKEN_PATH` | unset | Optional ModelExpress bearer-token file. |
 | `MX_AUTH_TOKEN_TTL_SECONDS` | `60` | Token-file reread interval in seconds. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | unset | S3 credentials when an IAM role or workload identity is unavailable. |
@@ -159,11 +160,29 @@ modelexpress = "modelexpress:register_modelexpress"
 export VLLM_SERVER_DEV_MODE=1
 export VLLM_PLUGINS=modelexpress
 export MX_SERVER_ADDRESS=modelexpress:8001
+export MX_MODEL_NAME_OVERRIDE=Qwen/Qwen3-30B-A3B
 
 vllm serve /models/Qwen3-30B-A3B \
   --tensor-parallel-size 4 \
   --weight-transfer-config '{"backend":"modelexpress"}'
 ```
+
+Set `MX_MODEL_NAME_OVERRIDE` before starting vLLM so cold-start version validation,
+generator registration, peer identity, and the checkpoint cache use the same
+logical name.
+For an S3 launch such as `--model s3://bucket/model`, vLLM can rewrite its internal
+model name to a local streamer cache path.
+`MX_MODEL_NAME_OVERRIDE=s3://bucket/model` keeps the original URI as the MX name;
+a name such as `customer-bot` works too. Publish every WeightVersion with that
+exact name and configure trainer clients to match.
+The adapter resolves the override once on a model-configuration copy used only
+for MX identity construction. The original configuration continues to provide
+vLLM's model-loading path. Without the override, the existing behavior, including
+use of the rewritten path, is unchanged.
+
+An explicit `init_info.model_name` still overrides the transfer client's default
+after startup. Keep it consistent with `MX_MODEL_NAME_OVERRIDE`; it cannot change
+an identity already used during cold start.
 
 After vLLM is ready, initialize each server once:
 
@@ -196,7 +215,7 @@ response.raise_for_status()
 
 #### `seed_checkpoint_path`
 
-This must be a complete local safetensors checkpoint for
+When supplied, this must be a complete local safetensors checkpoint for
 `initial_base_version_id`, readable by every inference engine worker. It may be
 either:
 
@@ -207,6 +226,23 @@ either:
 
 For typical sharded models such as Qwen3-30B-A3B, use the full Hugging Face
 snapshot directory.
+
+If desired-version cold start already cached the full checkpoint for
+`initial_base_version_id`, omit `seed_checkpoint_path` from `init_info` or set it
+to `null`. With the Python `ObjectStorageGeneratorConfig`, pass
+`seed_checkpoint_path=None`. ModelExpress resolves the cached full root using
+the model name, `refit_checkpoint_dir`, and `initial_base_version_id`; callers do
+not need to reproduce the cache path or its URL encoding.
+
+This mode reuses the cached checkpoint without downloading or copying a seed.
+Initialization fails if the required root is missing or cannot be restored.
+Passing the cached full-root path explicitly retains the same reuse behavior.
+Passing an external checkpoint path retains the existing seed-import behavior.
+
+With a cached seed, later full updates carry non-weight files forward from the
+current prepared checkpoint. Its directory is protected from eviction until the
+copy finishes, so eviction of the original seed does not drop these files.
+Explicit external seed paths remain the source of their non-weight files.
 
 #### `refit_checkpoint_dir`
 
@@ -235,7 +271,7 @@ exclusively by preparation, preventing another preparation from entering before
 activation.
 
 ```text
-<refit_checkpoint_dir>/<URL-quoted-vLLM-model-path-or-ID>/
+<refit_checkpoint_dir>/<URL-quoted-MX-model-name>/
   .lock
   .install.lock
   active.json
@@ -401,10 +437,17 @@ filenames in `weight_map` are resolved relative to that index.
 }
 ```
 
-The generator requires all five metadata fields and `weight_map`. It requires
-`delta_encoding="xor"` and `checksum_format="adler32"`, and uses
-`compression_format` to select the decompressor. `version` and `base_version`
-describe the artifact.
+The generator requires `weight_map`, `delta_encoding="xor"`,
+`checksum_format="adler32"`, and a supported `compression_format` to select the
+decompressor. `metadata.version` and `metadata.base_version` are optional
+descriptive fields; the receiver does not compare them with MX IDs. This allows
+existing S3 artifacts to be registered under different IDs without rewriting
+their indexes.
+
+Reconstruction and cache bookkeeping use the registered MX IDs and base
+relationships. The caller must register the correct S3 artifact URI and exact
+base checkpoint. MX's exact-base checks, tensor validation, and checksums remain
+enabled.
 
 Each delta shard contains compressed `U8` XOR bytes. Its safetensors
 `__metadata__` must contain the Adler-32 checksum of every reconstructed full

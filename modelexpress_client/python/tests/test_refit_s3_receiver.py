@@ -571,7 +571,92 @@ def test_bootstrap_s3_checkpoint_downloads_and_reuses_full_root(
     assert storage.calls == first_calls
 
 
-def test_cold_start_ranks_do_not_rewind_prepared_target(monkeypatch, tmp_path):
+def test_implicit_cached_seed_restores_without_copying(monkeypatch, tmp_path):
+    weights = torch.tensor([1.0, 2.0])
+    storage = _MemoryS3(_full_artifact(weights, version_label=20))
+    seed = receiver_module.bootstrap_s3_checkpoint(
+        model_name="test/model",
+        version=receiver_module._S3Version(
+            version_id="seed/v0",
+            base_version_id=None,
+            payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
+            uri="s3://weights/test/v20/model.safetensors.index.json",
+        ),
+        refit_checkpoint_dir=tmp_path / "cache",
+        s3=storage,
+    )
+    storage.calls.clear()
+    copy_file = Mock(side_effect=AssertionError("cached seed must not be copied"))
+    copy_tree = Mock(side_effect=AssertionError("cached seed must not be copied"))
+    monkeypatch.setattr(receiver_module.shutil, "copy2", copy_file)
+    monkeypatch.setattr(receiver_module.shutil, "copytree", copy_tree)
+    checkpoint = receiver_module._LocalCheckpoint(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="seed/v0",
+            seed_checkpoint_path=None,
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        s3=storage,
+    )
+
+    checkpoint.initialize()
+
+    assert checkpoint.local_checkpoint == seed
+    assert checkpoint.store.state().version == "seed/v0"
+    assert torch.equal(
+        load_file(seed / "model-00001-of-00001.safetensors")["weight"], weights
+    )
+    assert storage.calls == []
+    copy_file.assert_not_called()
+    copy_tree.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "cached_root, error, message",
+    [
+        ("missing", FileNotFoundError, "cached seed checkpoint.*seed/v0.*not found"),
+        ("unrecorded", ValueError, "cached checkpoint artifact changed"),
+        ("corrupt", ValueError, "cached checkpoint artifact changed"),
+    ],
+)
+def test_implicit_cached_seed_requires_valid_root(
+    monkeypatch, tmp_path, cached_root, error, message
+):
+    storage = _MemoryS3({})
+    checkpoint = receiver_module._LocalCheckpoint(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="seed/v0",
+            seed_checkpoint_path=None,
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        s3=storage,
+    )
+    seed = checkpoint.local_checkpoint
+    if cached_root != "missing":
+        seed.mkdir(parents=True)
+        save_file({"weight": torch.tensor([1.0, 2.0])}, seed / "model.safetensors")
+        if cached_root == "corrupt":
+            checkpoint.store.record_artifact(seed)
+            (seed / "model.safetensors").write_bytes(b"corrupt")
+    reset = Mock(side_effect=AssertionError("cached seed must not be copied"))
+    monkeypatch.setattr(checkpoint, "reset_initial_checkpoint", reset)
+
+    with pytest.raises(error, match=message):
+        checkpoint.initialize()
+
+    assert storage.calls == []
+    reset.assert_not_called()
+
+
+@pytest.mark.parametrize("implicit_seed", [False, True])
+@pytest.mark.parametrize("aliased_manifest_ids", [False, True])
+def test_cold_start_ranks_do_not_rewind_prepared_target(
+    monkeypatch, tmp_path, aliased_manifest_ids, implicit_seed
+):
     base = torch.tensor([1.0, 2.0])
     target = torch.tensor([3.0, 4.0])
     objects = _full_artifact(base, version_label=20)
@@ -579,9 +664,9 @@ def test_cold_start_ranks_do_not_rewind_prepared_target(monkeypatch, tmp_path):
         _artifact(
             base.view(torch.uint8).numpy(),
             target.view(torch.uint8).numpy(),
-            version="v21",
+            version="snapshot-21" if aliased_manifest_ids else "v21",
             version_label=21,
-            base_version="v20",
+            base_version="snapshot-20" if aliased_manifest_ids else "v20",
         )
     )
     storage = _MemoryS3(objects)
@@ -604,7 +689,7 @@ def test_cold_start_ranks_do_not_rewind_prepared_target(monkeypatch, tmp_path):
         config=ObjectStorageGeneratorConfig(
             storage_type=ObjectStorageType.S3,
             initial_base_version_id="v20",
-            seed_checkpoint_path=seed,
+            seed_checkpoint_path=None if implicit_seed else seed,
             refit_checkpoint_dir=cache,
         ),
     )
@@ -637,7 +722,7 @@ def test_cold_start_ranks_do_not_rewind_prepared_target(monkeypatch, tmp_path):
         config=ObjectStorageGeneratorConfig(
             storage_type=ObjectStorageType.S3,
             initial_base_version_id="v20",
-            seed_checkpoint_path=seed,
+            seed_checkpoint_path=None if implicit_seed else seed,
             refit_checkpoint_dir=cache,
         ),
     )
@@ -673,7 +758,7 @@ def test_cold_start_ranks_do_not_rewind_prepared_target(monkeypatch, tmp_path):
         config=ObjectStorageGeneratorConfig(
             storage_type=ObjectStorageType.S3,
             initial_base_version_id="v20",
-            seed_checkpoint_path=seed,
+            seed_checkpoint_path=None if implicit_seed else seed,
             refit_checkpoint_dir=cache,
         ),
     )
@@ -1074,11 +1159,11 @@ def test_canonical_s3_validates_all_replay_manifests_before_mutation(
     )
     second_root = "s3://weights/test/v2/model.safetensors.index.json"
     manifest = json.loads(objects[second_root])
-    manifest["metadata"]["base_version"] = "wrong-base"
+    manifest["metadata"]["checksum_format"] = "crc32"
     objects[second_root] = json.dumps(manifest).encode()
     adapter, _ = _build(monkeypatch, tmp_path, objects)
 
-    with pytest.raises(RuntimeError, match=r"base_version.*target-b"):
+    with pytest.raises(RuntimeError, match=r"checksum_format.*target-b"):
         adapter.stage_chain(
             (
                 _inputs(None),
@@ -1227,11 +1312,64 @@ def test_canonical_s3_reinstalls_active_checkpoint_after_install_failure(
     adapter.close()
 
 
+@pytest.mark.parametrize("omit_version_metadata", [False, True])
+def test_canonical_s3_replays_aliased_manifest_ids_using_mx_cache_ids(
+    monkeypatch, tmp_path, omit_version_metadata
+):
+    tensors = [torch.tensor([float(i), float(i + 1)]) for i in (1, 3, 5)]
+    objects = {}
+    for index in (1, 2):
+        objects.update(
+            _artifact(
+                tensors[index - 1].view(torch.uint8).numpy(),
+                tensors[index].view(torch.uint8).numpy(),
+                version=f"snapshot-{index}",
+                base_version=f"snapshot-{index - 1}",
+                version_label=index,
+            )
+        )
+        if omit_version_metadata:
+            uri = f"s3://weights/test/v{index}/model.safetensors.index.json"
+            manifest = json.loads(objects[uri])
+            del manifest["metadata"]["version"]
+            del manifest["metadata"]["base_version"]
+            objects[uri] = json.dumps(manifest).encode()
+    adapter, storage = _build(monkeypatch, tmp_path, objects)
+    first = _inputs(None)
+    second = _inputs(
+        None, version="target-b", base_version="target-a", version_label=2
+    )
+    staged = adapter.stage_weight(first)
+    adapter.apply_weight(staged)
+    adapter.release_staged_weight(staged)
+    storage.calls.clear()
+
+    cached = adapter.stage_weight(first)
+    assert storage.calls == []
+    adapter.release_staged_weight(cached)
+    staged = adapter.stage_chain((first, second))
+
+    assert torch.equal(load_file(staged.path / "model.safetensors")["weight"], tensors[2])
+    store = adapter._checkpoint.store
+    assert store.chain("target-b") == {
+        "version": "target-b",
+        "full_version": "base-a",
+        "deltas": ["target-a", "target-b"],
+    }
+    assert store.state().version == "target-b"
+    assert store.active_version() == "target-a"
+    assert (
+        store.delta_path("target-b") / "model.safetensors.index.json"
+    ).read_bytes() == objects[second.object_storage.uri]
+    adapter.apply_weight(staged)
+    assert store.active_version() == "target-b"
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
 @pytest.mark.parametrize(
     ("field", "message"),
     [
-        ("version", "version does not match revision"),
-        ("base_version", "base_version does not match revision"),
         ("delta_encoding", "delta_encoding does not match revision"),
         ("compression_format", "unsupported compression format"),
         ("checksum_format", "checksum_format does not match revision"),
@@ -1291,6 +1429,126 @@ def test_canonical_s3_rejects_mismatched_delta_formats(
     assert state.status is checkpoint_store_module.CheckpointState.READY
     assert state.version == "base-a"
     adapter.close()
+
+
+@pytest.mark.parametrize("seed_mode", ["implicit", "cached", "external"])
+@pytest.mark.parametrize("intermediate_delta", [False, True])
+def test_full_checkpoint_preserves_metadata_after_cached_seed_eviction(
+    monkeypatch, tmp_path, seed_mode, intermediate_delta
+):
+    """Full updates retain metadata when the original cached seed is evicted."""
+    weights = torch.arange(2048, dtype=torch.float32)
+    config_text = '{"model_type":"llama"}'
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    (launch / "config.json").write_text(config_text)
+    next_full = _full_artifact(weights + 3, version_label=3)
+    objects = {**_full_artifact(weights + 1, version_label=1), **next_full}
+    adapter, _storage = _build(
+        monkeypatch, tmp_path, objects, launch_tensors={"weight": weights}
+    )
+    seed = adapter._checkpoint.store.full_path("base-a")
+    adapter.close()
+    adapter = _Adapter(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path={
+                "implicit": None,
+                "cached": seed,
+                "external": launch,
+            }[seed_mode],
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+    )
+    store = adapter._checkpoint.store
+    first = adapter.stage_weight(_full_inputs(version="full-a", version_label=1))
+    adapter.apply_weight(first)
+    adapter.release_staged_weight(first)
+
+    if intermediate_delta:
+        delta_objects = _artifact(
+            (weights + 1).view(torch.uint8).numpy(),
+            (weights + 2).view(torch.uint8).numpy(),
+            version="delta-a",
+            version_label=2,
+            base_version="full-a",
+        )
+        objects.update(delta_objects)
+        store.max_size_bytes = (
+            2 * store.path_size_bytes(first.path)
+            + sum(len(data) for data in delta_objects.values())
+            + 512
+        )
+        delta = adapter.stage_weight(
+            _inputs(None, version="delta-a", version_label=2, base_version="full-a")
+        )
+        adapter.apply_weight(delta)
+        adapter.release_staged_weight(delta)
+        assert not seed.exists()
+
+    if seed_mode == "external":
+        config_text = '{"model_type":"llama","external_seed":true}'
+        (launch / "config.json").write_text(config_text)
+    store.max_size_bytes = (
+        store.cache_size_bytes()
+        - store._payload_size_bytes(seed)
+        + sum(len(data) for data in next_full.values())
+        + len(config_text.encode())
+    )
+    second = adapter.stage_weight(_full_inputs(version="full-b", version_label=3))
+
+    assert (second.path / "config.json").read_text() == config_text
+    assert torch.equal(
+        load_file(second.path / "model-00001-of-00001.safetensors")["weight"],
+        weights + 3,
+    )
+    assert not seed.exists()
+    adapter.apply_weight(second)
+    adapter.release_staged_weight(second)
+    adapter.close()
+
+
+def test_cached_metadata_source_is_protected_before_first_activation(tmp_path):
+    """Reject insufficient capacity before evicting an unactivated copy source."""
+    weights = torch.arange(2048, dtype=torch.float32)
+    storage = _MemoryS3(_full_artifact(weights + 1))
+    checkpoint = receiver_module._LocalCheckpoint(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path=None,
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        s3=storage,
+    )
+    seed = checkpoint.local_checkpoint
+    seed.mkdir(parents=True)
+    (seed / "model.safetensors").write_bytes(_save_full_tensors({"weight": weights}))
+    (seed / "config.json").write_text('{"model_type":"llama"}')
+    checkpoint.store.record_artifact(seed)
+    checkpoint.initialize()
+    uri = "s3://weights/test/v2/model.safetensors.index.json"
+    checkpoint.store.max_size_bytes = (
+        checkpoint.store.cache_size_bytes() + len(storage.objects[uri])
+    )
+
+    with pytest.raises(checkpoint_store_module.CheckpointCacheCapacityError):
+        checkpoint.prepare(
+            receiver_module._S3Version(
+                version_id="full-a",
+                base_version_id=None,
+                payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
+                uri=uri,
+            )
+        )
+
+    assert (seed / "config.json").is_file()
+    state = checkpoint.store.state()
+    assert state.status is checkpoint_store_module.CheckpointState.READY
+    assert state.version == "base-a"
 
 
 def test_canonical_s3_full_checkpoint_resets_base_for_next_delta(monkeypatch, tmp_path):
@@ -1611,8 +1869,9 @@ def test_full_lineage_replay_resumes_from_verified_local_checkpoint(
 
 
 @pytest.mark.parametrize("use_peer_for_second_delta", [False, True])
+@pytest.mark.parametrize("aliased_manifest_ids", [False, True])
 def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
-    monkeypatch, tmp_path, use_peer_for_second_delta
+    monkeypatch, tmp_path, use_peer_for_second_delta, aliased_manifest_ids
 ):
     tensors = [torch.tensor([float(i), float(i + 1)]) for i in (1, 3, 5, 7)]
     objects = _full_artifact(tensors[0], version_label=0)
@@ -1624,9 +1883,11 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
             _artifact(
                 tensors[index - 1].view(torch.uint8).numpy(),
                 tensors[index].view(torch.uint8).numpy(),
-                version=version,
+                version=f"snapshot-{index}" if aliased_manifest_ids else version,
                 version_label=index,
-                base_version=base_version,
+                base_version=(
+                    f"snapshot-{index - 1}" if aliased_manifest_ids else base_version
+                ),
             )
         )
         inputs.append(

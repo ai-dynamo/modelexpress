@@ -17,6 +17,7 @@ from vllm.distributed.weight_transfer.base import (
     WeightTransferUpdateInfo,
 )
 
+from modelexpress import envs
 from modelexpress_rl.inference.client import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
@@ -90,7 +91,10 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
             model=model,
             vllm_config=vllm_config,
         )
-        self._model_name = getattr(vllm_config.model_config, "model", None)
+        # Keep MX identity stable when vLLM rewrites S3 model URIs to cache paths.
+        self._model_name = envs.MX_MODEL_NAME_OVERRIDE or getattr(
+            vllm_config.model_config, "model", None
+        )
         self._client: ModelExpressGeneratorClient | None = None
         self._update_active = False
         self._active_version_id: str | None = None
@@ -121,12 +125,11 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
             if (
                 init_info.object_storage_type is None
                 or init_info.initial_base_version_id is None
-                or init_info.seed_checkpoint_path is None
                 or init_info.refit_checkpoint_dir is None
             ):
                 raise ValueError(
                     "object storage requires object_storage_type, "
-                    "initial_base_version_id, seed_checkpoint_path, and "
+                    "initial_base_version_id, and "
                     "refit_checkpoint_dir"
                 )
             try:

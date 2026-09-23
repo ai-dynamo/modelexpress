@@ -161,7 +161,7 @@ spec:
             --weight-transfer-config '{"backend":"modelexpress"}'
             --gpu-memory-utilization 0.5 --max-model-len 512 --max-num-seqs 8
           env:
-          - {name: MODEL_NAME, value: "${MODEL_NAME}"}
+          - {name: MX_MODEL_NAME_OVERRIDE, value: "${MODEL_NAME}"}
           - {name: MX_MODEL_URI, value: /models}
           - {name: MX_SERVER_ADDRESS, value: "mx-s3-refit-server:8000"}
           - {name: MX_LOAD_STRATEGY_CHAIN, value: RL}
