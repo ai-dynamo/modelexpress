@@ -16,6 +16,7 @@ from modelexpress.client import MxClient
 from ..control import WeightVersion
 
 from .adapter import GeneratorEngineContext
+from .bootstrap import _ModelExpressGeneratorBootstrap
 from .methods import (
     CanonicalDeltaUpdateMethod,
     LoadTimeTensorNixlUpdateMethod,
@@ -176,12 +177,17 @@ def _create_load_time_tensor_method(
     *,
     capability: FullTensorEngineCapability,
     worker_id: str,
+    bootstrap: _ModelExpressGeneratorBootstrap | None,
 ) -> LoadTimeTensorNixlUpdateMethod:
-    transfer = _NixlStagedTransfer(
-        agent_name=f"mx-refit-load-time-{worker_id}",
-        device_id=capability.device_id,
-        device=capability.device,
-        listen_port=None,
+    transfer = (
+        bootstrap.claim(device_id=capability.device_id)
+        if bootstrap is not None
+        else _NixlStagedTransfer(
+            agent_name=f"mx-refit-load-time-{worker_id}",
+            device_id=capability.device_id,
+            device=capability.device,
+            listen_port=None,
+        )
     )
     return LoadTimeTensorNixlUpdateMethod(
         transfer=transfer,
@@ -284,6 +290,7 @@ def initialize_generator_runtime(
         [str, bool], tuple[WeightVersion, ...]
     ]
     | None = None,
+    bootstrap: _ModelExpressGeneratorBootstrap | None = None,
 ) -> GeneratorRuntime:
     """Resolve construction policy and build one rank-local runtime."""
     from .engines import _create_engine_runtime
@@ -300,6 +307,8 @@ def initialize_generator_runtime(
         object_storage=object_storage,
         source_order=resolved_source_order,
     )
+    if bootstrap is not None and resolved_source_order != (WeightSource.TRAINER,):
+        raise ValueError("generator bootstrap requires trainer-only refit")
     methods: list[UpdateMethod] = []
     p2p_client = None
     try:
@@ -325,6 +334,7 @@ def initialize_generator_runtime(
                         _create_load_time_tensor_method(
                             capability=engine.full_tensor,
                             worker_id=worker_id,
+                            bootstrap=bootstrap,
                         )
                     )
                 if WeightSource.GENERATOR in resolved_source_order:

@@ -291,6 +291,69 @@ def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
     runtime.close()
 
 
+def test_trainer_only_runtime_claims_preinitialized_transport(monkeypatch):
+    context = GeneratorEngineContext()
+    monkeypatch.setattr(
+        engines_module, "_create_engine_runtime", lambda received: _full_tensor_engine()
+    )
+    transfer = object()
+
+    class _Bootstrap:
+        def claim(self, *, device_id):
+            assert device_id == 2
+            return transfer
+
+    method_kwargs = {}
+
+    def create_method(**kwargs):
+        method_kwargs.update(kwargs)
+        return _Method({WeightSource.TRAINER})
+
+    monkeypatch.setattr(runtime_module, "LoadTimeTensorNixlUpdateMethod", create_method)
+    monkeypatch.setattr(
+        runtime_module,
+        "_NixlStagedTransfer",
+        lambda **_kwargs: pytest.fail("bootstrap transport must be reused"),
+    )
+
+    runtime = initialize_generator_runtime(
+        engine_context=context,
+        worker_id="generator-3",
+        server_url="mx:8000",
+        object_storage=None,
+        source_order=(WeightSource.TRAINER,),
+        max_transfer_attempts=3,
+        rpc_timeout_seconds=30,
+        service=lambda: object(),
+        start_lease=lambda _version_id: object(),
+        bootstrap=_Bootstrap(),
+    )
+
+    assert method_kwargs["transfer"] is transfer
+    runtime.close()
+
+
+def test_generator_bootstrap_requires_trainer_only_source(monkeypatch):
+    context = GeneratorEngineContext()
+    monkeypatch.setattr(
+        engines_module, "_create_engine_runtime", lambda received: _full_tensor_engine()
+    )
+
+    with pytest.raises(ValueError, match="trainer-only"):
+        initialize_generator_runtime(
+            engine_context=context,
+            worker_id="generator-3",
+            server_url="mx:8000",
+            object_storage=None,
+            source_order=(WeightSource.GENERATOR,),
+            max_transfer_attempts=3,
+            rpc_timeout_seconds=30,
+            service=lambda: object(),
+            start_lease=lambda _version_id: object(),
+            bootstrap=object(),
+        )
+
+
 def test_object_storage_runtime_survives_p2p_initialization_failure(
     monkeypatch,
     tmp_path,
