@@ -64,7 +64,9 @@ class SglangLoader:
         plan,
         bindings: dict[str, SglangParameterBinding],
         layer_groups: tuple[tuple[str, ...], ...] = (),
+        start: Callable[[], None] | None = None,
         finish: Callable[[], None] | None = None,
+        fail: Callable[[], None] | None = None,
         cleanup: Callable[[], None] | None = None,
         verify_tensor_equality: bool | None = None,
     ) -> None:
@@ -77,7 +79,9 @@ class SglangLoader:
                 f"order; expected {expected}, got {list(self._bindings)}"
             )
         self._groups = _layer_groups(layer_groups, expected)
+        self._start_callback = start
         self._finish_callback = finish
+        self._fail_callback = fail
         self._cleanup_callback = cleanup
         self._live_signatures = {}
         self._wire_signatures = {}
@@ -234,7 +238,13 @@ class SglangLoader:
                 f"round digest version {self._round_version!r} does not match "
                 f"start version {version!r}"
             )
-        self._validate_names(self._plan.names())
+        try:
+            if self._start_callback is not None:
+                self._start_callback()
+            self._validate_names(self._plan.names())
+        except BaseException:
+            self._poisoned = True
+            raise
         self._round_started = True
         self._mutation_possible = False
         self._installed_groups.clear()
@@ -338,6 +348,12 @@ class SglangLoader:
             self._operation_id = None
 
     def fail_round(self, *, possibly_mutated: bool) -> None:
+        try:
+            if self._fail_callback is not None:
+                self._fail_callback()
+        except BaseException:
+            logger.warning("SGLang binding failure cleanup failed", exc_info=True)
+            possibly_mutated = True
         if possibly_mutated or self._mutation_possible:
             self._poisoned = True
         self._round_started = False
@@ -381,6 +397,8 @@ class SglangGeneratorSession:
         slot_id: str,
         worker_id: str,
         index_in_role: int,
+        semantic_manifest_version: str | None = None,
+        semantic_manifest_digest: str | None = None,
         safe_point: Callable[[], ContextManager[None]],
         layer_groups: tuple[tuple[str, ...], ...] = (),
         device: Any = None,
@@ -400,6 +418,8 @@ class SglangGeneratorSession:
             index_in_role=index_in_role,
             receiver_protocol=topology.receiver_protocol,
             m2n_abi_version=topology.m2n_abi_version,
+            semantic_manifest_version=semantic_manifest_version,
+            semantic_manifest_digest=semantic_manifest_digest,
             device=device,
             streams=streams,
         )

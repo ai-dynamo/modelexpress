@@ -9,6 +9,8 @@ from modelexpress_rl.collective.integrations import wire
 from modelexpress_rl.collective.integrations.miles import CollectiveTopology
 from modelexpress_rl.collective.integrations.wire import (
     CollectiveControl,
+    DestinationManifestEntry,
+    DestinationQuantization,
     decode_control,
     encode_control,
     tensor_equality_receipt,
@@ -78,6 +80,132 @@ def test_prepare_control_round_trips_an_opaque_semantic_manifest_identity():
     decoded = decode_control(encode_control(control))
 
     assert decoded == control
+
+
+def test_prepare_control_round_trips_bounded_destination_semantics():
+    control = CollectiveControl(
+        action="prepare",
+        plan=_plan(),
+        topology=_topology(),
+        generator_slot_offset=2,
+        endpoint="mx:50051",
+        semantic_manifest_version="native-records-v1",
+        semantic_manifest_digest="ab" * 32,
+        destination_manifest=(
+            DestinationManifestEntry(
+                name="model.layers.0.weight",
+                dtype="bfloat16",
+                local_shape=(2, 4),
+                parameter="model.layers.0.weight",
+                recipe="direct",
+            ),
+        ),
+    )
+
+    assert decode_control(encode_control(control)) == control
+
+
+def test_prepare_control_round_trips_fp8_destination_semantics():
+    quantization = DestinationQuantization(
+        quant_method="fp8",
+        activation_scheme="dynamic",
+        weight_block_size=(128, 128),
+        weight_dtype="float8_e4m3fn",
+        scale_dtype="float32",
+        scale_format="canonical",
+    )
+    control = CollectiveControl(
+        action="prepare",
+        plan=_plan(),
+        topology=_topology(),
+        generator_slot_offset=2,
+        endpoint="mx:50051",
+        semantic_manifest_version="miles-nccl-m2n-manifest-v1",
+        semantic_manifest_digest="ab" * 32,
+        destination_manifest=(
+            DestinationManifestEntry(
+                name="model.layers.0.weight",
+                dtype="float8_e4m3fn",
+                local_shape=(2, 4),
+                parameter="model.layers.0.experts.weight",
+                recipe="expert_down",
+                family="routed_expert",
+                pair_id="model.layers.0.experts.down",
+                tensor_role="weight",
+                quantization=quantization,
+            ),
+        ),
+    )
+
+    assert decode_control(encode_control(control)) == control
+
+
+def test_destination_manifest_requires_semantic_identity():
+    with pytest.raises(ValueError, match="requires semantic manifest identity"):
+        CollectiveControl(
+            action="prepare",
+            plan=_plan(),
+            topology=_topology(),
+            generator_slot_offset=2,
+            endpoint="mx:50051",
+            destination_manifest=(
+                DestinationManifestEntry(
+                    name="model.layers.0.weight",
+                    dtype="bfloat16",
+                    local_shape=(2, 4),
+                    parameter="model.layers.0.weight",
+                    recipe="direct",
+                ),
+            ),
+        )
+
+
+def test_destination_manifest_rejects_duplicate_names():
+    entry = DestinationManifestEntry(
+        name="model.layers.0.weight",
+        dtype="bfloat16",
+        local_shape=(2, 4),
+        parameter="model.layers.0.weight",
+        recipe="direct",
+    )
+    with pytest.raises(ValueError, match="names must be unique"):
+        CollectiveControl(
+            action="prepare",
+            plan=_plan(),
+            topology=_topology(),
+            generator_slot_offset=2,
+            endpoint="mx:50051",
+            semantic_manifest_version="native-records-v1",
+            semantic_manifest_digest="ab" * 32,
+            destination_manifest=(entry, entry),
+        )
+
+
+def test_destination_manifest_wire_rejects_unknown_fields():
+    value = wire.CONTROL_PREFIX + wire.json.dumps(
+        {
+            "action": "prepare",
+            "plan": wire.plan_to_wire(_plan()),
+            "topology": wire.topology_to_wire(_topology()),
+            "generator_slot_offset": 0,
+            "endpoint": "mx:50051",
+            "semantic_manifest_version": "native-records-v1",
+            "semantic_manifest_digest": "ab" * 32,
+            "destination_manifest": [
+                {
+                    "name": "model.layers.0.weight",
+                    "dtype": "bfloat16",
+                    "local_shape": [2, 4],
+                    "parameter": "model.layers.0.weight",
+                    "recipe": "direct",
+                    "unexpected": True,
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="contain exactly"):
+        decode_control(value)
 
 
 def test_prepare_control_omits_semantic_manifest_fields_for_legacy_callers():

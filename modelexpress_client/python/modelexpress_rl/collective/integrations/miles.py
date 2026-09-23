@@ -428,6 +428,8 @@ class MilesTrainerSession:
         slot_id: str,
         worker_id: str,
         index_in_role: int,
+        semantic_manifest_version: str | None = None,
+        semantic_manifest_digest: str | None = None,
         layer_groups: tuple[tuple[str, ...], ...] = (),
         device: Any = None,
         streams: list[Any] | None = None,
@@ -446,6 +448,8 @@ class MilesTrainerSession:
             index_in_role=index_in_role,
             receiver_protocol=topology.receiver_protocol,
             m2n_abi_version=topology.m2n_abi_version,
+            semantic_manifest_version=semantic_manifest_version,
+            semantic_manifest_digest=semantic_manifest_digest,
             device=device,
             streams=streams,
         )

@@ -32,7 +32,12 @@ from .backend import (
     require_nccl_m2n,
 )
 from .comm import CommunicatorCache, LaneCommunicator, LaneKey, new_unique_id
-from .plan import DEFAULT_RECEIVER_PROTOCOL, plan_digest, validate_coverage
+from .plan import (
+    DEFAULT_RECEIVER_PROTOCOL,
+    plan_digest,
+    validate_coverage,
+    validate_semantic_manifest_identity,
+)
 from .rendezvous import (
     CollectiveRendezvous,
     EpochChangedError,
@@ -161,6 +166,8 @@ class _RefitClientBase:
         index_in_role: int,
         receiver_protocol: str = DEFAULT_RECEIVER_PROTOCOL,
         m2n_abi_version: str = "",
+        semantic_manifest_version: str | None = None,
+        semantic_manifest_digest: str | None = None,
         device: Any = None,
         streams: list[Any] | None = None,
         barrier_alloc: Callable[[Any], Any] | None = None,
@@ -175,6 +182,18 @@ class _RefitClientBase:
         self._index_in_role = index_in_role
         self._receiver_protocol = receiver_protocol
         self._m2n_abi_version = m2n_abi_version
+        semantic_manifest = validate_semantic_manifest_identity(
+            version=semantic_manifest_version,
+            digest=semantic_manifest_digest,
+        )
+        if semantic_manifest is None:
+            self._semantic_manifest_version = None
+            self._semantic_manifest_digest = None
+        else:
+            (
+                self._semantic_manifest_version,
+                self._semantic_manifest_digest,
+            ) = semantic_manifest
         self._device = device
         self._streams = list(streams) if streams else [None]
         self._barrier_alloc = barrier_alloc
@@ -245,6 +264,8 @@ class _RefitClientBase:
             plan,
             receiver_protocol=self._receiver_protocol,
             m2n_abi_version=self._m2n_abi_version,
+            semantic_manifest_version=self._semantic_manifest_version,
+            semantic_manifest_digest=self._semantic_manifest_digest,
         )
 
     def setup_layer_groups(self, groupings: list[list[str]] | None) -> None:

@@ -354,6 +354,7 @@ class MilesNativePublisher:
         inventory: Sequence[MilesNativeTensorRecord],
         device: str,
         fp8_quantizer: Callable[[Any], tuple[Any, Any]] | None = None,
+        source_recipes: Mapping[str, MilesSourceRecipe] | None = None,
     ) -> None:
         self._topology = copy.deepcopy(topology)
         self._plan = copy.deepcopy(topology.plan)
@@ -400,6 +401,25 @@ class MilesNativePublisher:
                 f"(missing={sorted(set(entries) - set(routes))[:5]}, "
                 f"unknown={sorted(set(routes) - set(entries))[:5]})"
             )
+        if source_recipes is None:
+            recipe_by_name = {
+                name: _recipe(name, route.family) for name, route in routes.items()
+            }
+        else:
+            recipe_by_name = dict(source_recipes)
+            if set(recipe_by_name) != set(entries):
+                raise ValueError(
+                    "MILES source recipes must exactly cover bulk plan entries "
+                    f"(missing={sorted(set(entries) - set(recipe_by_name))[:5]}, "
+                    f"unknown={sorted(set(recipe_by_name) - set(entries))[:5]})"
+                )
+            if any(
+                not isinstance(recipe, MilesSourceRecipe)
+                for recipe in recipe_by_name.values()
+            ):
+                raise ValueError(
+                    "MILES source recipes must be MilesSourceRecipe values"
+                )
         for name, route in routes.items():
             entry = entries[name]
             if route.partition_id != entry.partition_id:
@@ -442,7 +462,7 @@ class MilesNativePublisher:
                 ) from exc
             if not records:
                 raise ValueError(f"{entry.name}: owned route has no native sources")
-            recipe = _recipe(entry.name, route.family)
+            recipe = recipe_by_name[entry.name]
             projection = _record_projection(recipe)
             layer = _canonical_layer(entry.name)
             if any(

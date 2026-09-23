@@ -21,8 +21,124 @@ _TENSOR_DIGEST = re.compile(r"[0-9a-f]{64}")
 MAX_CONTROL_CHARS = 32 * 1024 * 1024
 MAX_TENSOR_DIGESTS = 100_000
 MAX_TENSOR_NAME_CHARS = 1024
+MAX_DESTINATION_ENTRIES = 100_000
+MAX_DESTINATION_NDIM = 8
 
 TensorDigestMap = tuple[tuple[str, str], ...]
+
+
+def _bounded_text(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} must be a non-empty string")
+    if len(value) > MAX_TENSOR_NAME_CHARS:
+        raise ValueError(f"{name} exceeds the {MAX_TENSOR_NAME_CHARS} character limit")
+    return value
+
+
+@dataclass(frozen=True)
+class DestinationQuantization:
+    """Transport-independent quantization contract for one destination."""
+
+    quant_method: str
+    activation_scheme: str
+    weight_block_size: tuple[int, int]
+    weight_dtype: str
+    scale_dtype: str
+    scale_format: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "quant_method",
+            "activation_scheme",
+            "weight_dtype",
+            "scale_dtype",
+            "scale_format",
+        ):
+            _bounded_text(getattr(self, name), f"destination quantization {name}")
+        if (
+            not isinstance(self.weight_block_size, tuple)
+            or len(self.weight_block_size) != 2
+            or any(
+                isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0
+                for dim in self.weight_block_size
+            )
+        ):
+            raise ValueError(
+                "destination quantization weight_block_size must contain two "
+                "positive integers"
+            )
+
+
+@dataclass(frozen=True)
+class DestinationManifestEntry:
+    """Exact receiver-side semantics selected by an integration manifest."""
+
+    name: str
+    dtype: str
+    local_shape: tuple[int, ...]
+    parameter: str
+    recipe: str
+    family: str = "dense"
+    pair_id: str | None = None
+    tensor_role: str | None = None
+    quantization: DestinationQuantization | None = None
+
+    def __post_init__(self) -> None:
+        _bounded_text(self.name, "destination manifest name")
+        _bounded_text(self.dtype, "destination manifest dtype")
+        _bounded_text(self.parameter, "destination manifest parameter")
+        _bounded_text(self.recipe, "destination manifest recipe")
+        if self.family not in ("dense", "routed_expert"):
+            raise ValueError(f"unsupported destination manifest family {self.family!r}")
+        if (self.pair_id is None) != (self.tensor_role is None):
+            raise ValueError(
+                "destination manifest pair_id and tensor_role must be set together"
+            )
+        if self.tensor_role not in (None, "weight", "scale"):
+            raise ValueError(
+                f"unsupported destination tensor_role {self.tensor_role!r}"
+            )
+        if self.pair_id is not None:
+            _bounded_text(self.pair_id, "destination manifest pair_id")
+            if self.family != "routed_expert" or self.quantization is None:
+                raise ValueError(
+                    "paired destination tensors require routed_expert family "
+                    "and quantization"
+                )
+        elif self.quantization is not None:
+            raise ValueError("destination quantization requires atomic pair metadata")
+        if (
+            not isinstance(self.local_shape, tuple)
+            or not self.local_shape
+            or len(self.local_shape) > MAX_DESTINATION_NDIM
+            or any(
+                isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0
+                for dim in self.local_shape
+            )
+        ):
+            raise ValueError(
+                "destination manifest local_shape must contain one to "
+                f"{MAX_DESTINATION_NDIM} positive integer dimensions"
+            )
+
+
+def validate_destination_manifest(
+    value: object,
+) -> tuple[DestinationManifestEntry, ...]:
+    if not isinstance(value, tuple) or not value:
+        raise ValueError("destination manifest must be a non-empty tuple")
+    if len(value) > MAX_DESTINATION_ENTRIES:
+        raise ValueError(
+            f"destination manifest exceeds the {MAX_DESTINATION_ENTRIES} entry limit"
+        )
+    if not all(isinstance(entry, DestinationManifestEntry) for entry in value):
+        raise ValueError(
+            "destination manifest entries must be DestinationManifestEntry values"
+        )
+    names = [entry.name for entry in value]
+    if len(names) != len(set(names)):
+        raise ValueError("destination manifest names must be unique")
+    return value
 
 
 def validate_tensor_digests(value: object) -> TensorDigestMap:
@@ -205,6 +321,7 @@ class CollectiveControl:
     tensor_digests: TensorDigestMap | None = None
     semantic_manifest_version: str | None = None
     semantic_manifest_digest: str | None = None
+    destination_manifest: tuple[DestinationManifestEntry, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.action not in _ACTIONS:
@@ -222,6 +339,12 @@ class CollectiveControl:
                 version=self.semantic_manifest_version,
                 digest=self.semantic_manifest_digest,
             )
+            if self.destination_manifest is not None:
+                validate_destination_manifest(self.destination_manifest)
+                if self.semantic_manifest_version is None:
+                    raise ValueError(
+                        "destination manifest requires semantic manifest identity"
+                    )
         elif self.action == "run_round":
             if not str(self.version or "").strip():
                 raise ValueError("run_round requires a version")
@@ -236,6 +359,8 @@ class CollectiveControl:
             or self.semantic_manifest_digest is not None
         ):
             raise ValueError("semantic manifest identity is valid only for prepare")
+        if self.action != "prepare" and self.destination_manifest is not None:
+            raise ValueError("destination manifest is valid only for prepare")
 
 
 def encode_control(control: CollectiveControl) -> str:
@@ -257,6 +382,32 @@ def encode_control(control: CollectiveControl) -> str:
     if control.semantic_manifest_version is not None:
         payload["semantic_manifest_version"] = control.semantic_manifest_version
         payload["semantic_manifest_digest"] = control.semantic_manifest_digest
+    if control.destination_manifest is not None:
+        payload["destination_manifest"] = [
+            {
+                "name": entry.name,
+                "dtype": entry.dtype,
+                "local_shape": list(entry.local_shape),
+                "parameter": entry.parameter,
+                "recipe": entry.recipe,
+                "family": entry.family,
+                "pair_id": entry.pair_id,
+                "tensor_role": entry.tensor_role,
+                "quantization": (
+                    {
+                        "quant_method": entry.quantization.quant_method,
+                        "activation_scheme": entry.quantization.activation_scheme,
+                        "weight_block_size": list(entry.quantization.weight_block_size),
+                        "weight_dtype": entry.quantization.weight_dtype,
+                        "scale_dtype": entry.quantization.scale_dtype,
+                        "scale_format": entry.quantization.scale_format,
+                    }
+                    if entry.quantization is not None
+                    else None
+                ),
+            }
+            for entry in control.destination_manifest
+        ]
     encoded = CONTROL_PREFIX + json.dumps(
         payload,
         ensure_ascii=True,
@@ -301,6 +452,82 @@ def decode_control(value: object) -> CollectiveControl | None:
                 )
             normalized.append((item[0], item[1]))
         tensor_digests = tuple(normalized)
+    raw_destination_manifest = raw.get("destination_manifest")
+    destination_manifest = None
+    if raw_destination_manifest is not None:
+        if not isinstance(raw_destination_manifest, list):
+            raise ValueError("destination_manifest must be a list")
+        if len(raw_destination_manifest) > MAX_DESTINATION_ENTRIES:
+            raise ValueError(
+                "destination manifest exceeds the "
+                f"{MAX_DESTINATION_ENTRIES} entry limit"
+            )
+        normalized_destinations = []
+        expected_fields = {
+            "name",
+            "dtype",
+            "local_shape",
+            "parameter",
+            "recipe",
+            "family",
+            "pair_id",
+            "tensor_role",
+            "quantization",
+        }
+        for raw_entry in raw_destination_manifest:
+            if not isinstance(raw_entry, dict) or set(raw_entry) != expected_fields:
+                raise ValueError(
+                    "destination manifest entries must contain exactly "
+                    f"{sorted(expected_fields)}"
+                )
+            raw_shape = raw_entry["local_shape"]
+            if not isinstance(raw_shape, list):
+                raise ValueError("destination manifest local_shape must be a list")
+            raw_quantization = raw_entry["quantization"]
+            quantization = None
+            if raw_quantization is not None:
+                quantization_fields = {
+                    "quant_method",
+                    "activation_scheme",
+                    "weight_block_size",
+                    "weight_dtype",
+                    "scale_dtype",
+                    "scale_format",
+                }
+                if (
+                    not isinstance(raw_quantization, dict)
+                    or set(raw_quantization) != quantization_fields
+                    or not isinstance(
+                        raw_quantization["weight_block_size"],
+                        list,
+                    )
+                ):
+                    raise ValueError(
+                        "destination quantization must contain exactly "
+                        f"{sorted(quantization_fields)}"
+                    )
+                quantization = DestinationQuantization(
+                    quant_method=raw_quantization["quant_method"],
+                    activation_scheme=raw_quantization["activation_scheme"],
+                    weight_block_size=tuple(raw_quantization["weight_block_size"]),
+                    weight_dtype=raw_quantization["weight_dtype"],
+                    scale_dtype=raw_quantization["scale_dtype"],
+                    scale_format=raw_quantization["scale_format"],
+                )
+            normalized_destinations.append(
+                DestinationManifestEntry(
+                    name=raw_entry["name"],
+                    dtype=raw_entry["dtype"],
+                    local_shape=tuple(raw_shape),
+                    parameter=raw_entry["parameter"],
+                    recipe=raw_entry["recipe"],
+                    family=raw_entry["family"],
+                    pair_id=raw_entry["pair_id"],
+                    tensor_role=raw_entry["tensor_role"],
+                    quantization=quantization,
+                )
+            )
+        destination_manifest = tuple(normalized_destinations)
     return CollectiveControl(
         action=str(raw.get("action", "")),
         plan=plan_from_wire(raw["plan"]) if "plan" in raw else None,
@@ -316,13 +543,18 @@ def decode_control(value: object) -> CollectiveControl | None:
         tensor_digests=tensor_digests,
         semantic_manifest_version=raw.get("semantic_manifest_version"),
         semantic_manifest_digest=raw.get("semantic_manifest_digest"),
+        destination_manifest=destination_manifest,
     )
 
 
 __all__ = [
     "CONTROL_PREFIX",
     "CollectiveControl",
+    "DestinationManifestEntry",
+    "DestinationQuantization",
     "MAX_CONTROL_CHARS",
+    "MAX_DESTINATION_ENTRIES",
+    "MAX_DESTINATION_NDIM",
     "MAX_TENSOR_DIGESTS",
     "MAX_TENSOR_NAME_CHARS",
     "TensorDigestMap",
@@ -333,5 +565,6 @@ __all__ = [
     "topology_from_wire",
     "topology_to_wire",
     "tensor_equality_receipt",
+    "validate_destination_manifest",
     "validate_tensor_digests",
 ]

@@ -14,6 +14,7 @@ from modelexpress_rl.collective.integrations import sglang as sglang_integration
 from modelexpress_rl.collective.integrations.miles import CollectiveTopology
 from modelexpress_rl.collective.integrations.wire import (
     CollectiveControl,
+    DestinationManifestEntry,
     encode_control,
 )
 from modelexpress_rl.collective.types import (
@@ -65,7 +66,22 @@ def _slotted_manager() -> _SlottedManager:
     )
     return _SlottedManager(
         tp_worker=SimpleNamespace(
-            ps=SimpleNamespace(tp_rank=1),
+            ps=SimpleNamespace(
+                tp_rank=1,
+                tp_size=6,
+                moe_ep_rank=0,
+                moe_ep_size=1,
+                dp_rank=0,
+                dp_size=1,
+                pp_rank=0,
+                pp_size=1,
+            ),
+            server_args=SimpleNamespace(
+                enable_eplb=False,
+                elastic_ep_backend=None,
+                ep_num_redundant_experts=0,
+                init_expert_location="trivial",
+            ),
             model_runner=runner,
         )
     )
@@ -135,6 +151,120 @@ def _patch_runtime(monkeypatch, create_session):
         lambda *_args, **_kwargs: None,
     )
     return channels, rendezvous
+
+
+def _patch_refit_api(
+    monkeypatch,
+    *,
+    parameter_name="model.layers.0.weight",
+    recipe="dense_down",
+):
+    events = []
+
+    @dataclass(frozen=True)
+    class BlockFp8Spec:
+        quant_method: str
+        activation_scheme: str
+        weight_block_size: tuple[int, int]
+        weight_dtype: torch.dtype
+        scale_dtype: torch.dtype
+        scale_format: str
+
+    @dataclass(frozen=True)
+    class CanonicalRefitTensor:
+        name: str
+        local_shape: tuple[int, ...]
+        dtype: torch.dtype
+        family: str
+        pair_id: str | None = None
+        tensor_role: str | None = None
+        quantization: BlockFp8Spec | None = None
+
+    @dataclass(frozen=True)
+    class SglangRefitTopology:
+        tp_rank: int
+        tp_size: int
+        moe_ep_rank: int
+        moe_ep_size: int
+        moe_tp_rank: int
+        moe_tp_size: int
+        dp_rank: int
+        dp_size: int
+        pp_rank: int
+        pp_size: int
+        static_expert_placement: bool
+
+    class Adapter:
+        def __init__(self, descriptors):
+            self.descriptors = tuple(descriptors)
+            self.destinations = {}
+
+        def prepare_round(self):
+            events.append("prepare")
+            self.destinations = {}
+            for descriptor in self.descriptors:
+                live = torch.zeros(descriptor.local_shape, dtype=descriptor.dtype)
+                receive = torch.empty(descriptor.local_shape, dtype=descriptor.dtype)
+
+                def install(
+                    *,
+                    source=receive,
+                    target=live,
+                    name=descriptor.name,
+                ):
+                    events.append(("install", name))
+                    target.copy_(source)
+
+                metadata = SimpleNamespace(
+                    canonical_name=descriptor.name,
+                    parameter_name=parameter_name,
+                    recipe=recipe,
+                    family=descriptor.family,
+                    tensor_role=descriptor.tensor_role,
+                    quantization=descriptor.quantization,
+                    receive_shape=tuple(receive.shape),
+                    receive_dtype=receive.dtype,
+                    live_shape=tuple(live.shape),
+                    live_dtype=live.dtype,
+                    receive_aliases_live=False,
+                    requires_install=True,
+                )
+                self.destinations[descriptor.name] = SimpleNamespace(
+                    live=live,
+                    receive=receive,
+                    install=install,
+                    metadata=metadata,
+                )
+
+        def start_round(self):
+            events.append("start")
+
+        def finish_round(self):
+            events.append("finish")
+
+        def abort_round(self):
+            events.append("abort")
+
+    adapters = []
+
+    def bind(_model, descriptors, *, topology, device):
+        events.append(("bind", topology, device))
+        adapter = Adapter(descriptors)
+        adapters.append(adapter)
+        return adapter
+
+    monkeypatch.setattr(
+        sglang_plugin,
+        "_sglang_refit_api",
+        lambda: (
+            BlockFp8Spec,
+            CanonicalRefitTensor,
+            SglangRefitTopology,
+            bind,
+            lambda: SimpleNamespace(moe_tp_rank=1, moe_tp_size=6),
+        ),
+    )
+    return events, adapters
 
 
 def test_endpoint_rejects_unsupported_secure_schemes():
@@ -221,12 +351,141 @@ def test_prepare_uses_the_declared_run_scoped_slot_with_sparse_gpu_offsets(
             topology=topology,
             generator_slot_offset=2,
             endpoint="mx:50051",
+            semantic_manifest_version="native-records-v1",
+            semantic_manifest_digest="a" * 64,
         ),
     )
 
     assert result.success
     assert captured["slot_id"] == "run-7:generator-5"
     assert captured["index_in_role"] == 3
+    assert captured["semantic_manifest_version"] == "native-records-v1"
+    assert captured["semantic_manifest_digest"] == "a" * 64
+
+
+def test_pr3304_prepare_rejects_destination_drift_before_ready(
+    monkeypatch,
+):
+    events, _adapters = _patch_refit_api(
+        monkeypatch,
+        parameter_name="model.layers.0.mlp.gate_up_proj.weight",
+        recipe="dense_gate",
+    )
+    session_creations = []
+    _patch_runtime(
+        monkeypatch,
+        lambda **kwargs: session_creations.append(kwargs),
+    )
+    plan = ReshardPlan(
+        bulk=[
+            ParamPlan(
+                name="model.layers.0.mlp.gate_proj.weight",
+                global_shape=(12, 4),
+                dtype="bfloat16",
+                partition_id=0,
+                src_mesh=MeshSpec((1,)),
+                src_placements=(Placement.shard(0),),
+                dst_mesh=MeshSpec((6,), rank_offset=1),
+                dst_placements=(Placement.shard(0),),
+            )
+        ],
+        source_partition_count=2,
+    )
+    control = CollectiveControl(
+        action="prepare",
+        plan=plan,
+        topology=_topology(),
+        generator_slot_offset=0,
+        endpoint="mx:50051",
+        semantic_manifest_version="miles-nccl-m2n-manifest-v1",
+        semantic_manifest_digest="a" * 64,
+        destination_manifest=(
+            DestinationManifestEntry(
+                name="model.layers.0.mlp.gate_proj.weight",
+                dtype="bfloat16",
+                local_shape=(2, 4),
+                parameter="model.layers.0.mlp.WRONG.weight",
+                recipe="dense_gate",
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="resolved destination semantics differ"):
+        sglang_plugin._prepare(_slotted_manager(), control)
+
+    assert events[-1] == "abort"
+    assert session_creations == []
+
+
+def test_pr3304_prepare_executes_resolved_destination_and_reuses_bindings(
+    monkeypatch,
+):
+    events, adapters = _patch_refit_api(monkeypatch)
+    captured = {}
+
+    class Session:
+        def prepare(self):
+            captured["prepared"] = True
+
+        def close(self):
+            captured["closed"] = True
+
+    def create_session(**kwargs):
+        captured.update(kwargs)
+        return Session()
+
+    _patch_runtime(monkeypatch, create_session)
+    manager = _slotted_manager()
+    model_loads = []
+    manager.tp_worker.model_runner.model.load_weights = lambda weights: (
+        model_loads.extend(weights)
+    )
+    control = CollectiveControl(
+        action="prepare",
+        plan=_plan(),
+        topology=_topology(),
+        generator_slot_offset=0,
+        endpoint="mx:50051",
+        semantic_manifest_version="miles-nccl-m2n-manifest-v1",
+        semantic_manifest_digest="a" * 64,
+        destination_manifest=(
+            DestinationManifestEntry(
+                name="model.layers.0.weight",
+                dtype="bfloat16",
+                local_shape=(2, 4),
+                parameter="model.layers.0.weight",
+                recipe="dense_down",
+            ),
+        ),
+    )
+
+    result = sglang_plugin._prepare(manager, control)
+    loader = captured["loader"]
+    destination = adapters[0].destinations["model.layers.0.weight"]
+    receive_address = destination.receive.data_ptr()
+
+    for version, value in (("1", 3), ("2", 7)):
+        loader.start_new_round(version)
+        loader.local_params()["model.layers.0.weight"].base.fill_(value)
+        loader.install(0)
+        loader.finish()
+        assert torch.all(destination.live == value)
+
+    sglang_plugin._close(manager)
+
+    assert result.success
+    assert captured["prepared"]
+    assert captured["closed"]
+    assert destination.receive.data_ptr() == receive_address
+    assert model_loads == []
+    assert events[1:] == [
+        "prepare",
+        ("install", "model.layers.0.weight"),
+        "finish",
+        "start",
+        ("install", "model.layers.0.weight"),
+        "finish",
+    ]
 
 
 def test_non_marker_requests_pass_through_unchanged():
@@ -693,6 +952,43 @@ def test_marked_request_requires_the_existing_weight_update_session(monkeypatch)
 
     assert not response.success
     assert "open begin_weight_update session" in response.message
+
+
+def test_prepare_succeeds_after_weight_update_session_opens(monkeypatch):
+    class Session:
+        def prepare(self):
+            pass
+
+        def close(self):
+            pass
+
+    _patch_runtime(monkeypatch, lambda **_kwargs: Session())
+    manager = _slotted_manager()
+    manager._weight_update_in_progress = False
+    request = _control_request(
+        "prepare",
+        plan=_plan(),
+        topology=_topology(),
+        generator_slot_offset=0,
+        endpoint="mx:50051",
+    )
+
+    before_session = sglang_plugin.around_update_weights_from_distributed(
+        lambda *_args: None,
+        manager,
+        request,
+    )
+    manager._weight_update_in_progress = True
+    during_session = sglang_plugin.around_update_weights_from_distributed(
+        lambda *_args: None,
+        manager,
+        request,
+    )
+    sglang_plugin._close(manager)
+
+    assert not before_session.success
+    assert "open begin_weight_update session" in before_session.message
+    assert during_session.success
 
 
 def test_close_is_allowed_after_the_weight_update_session_ends(monkeypatch):

@@ -378,6 +378,76 @@ def test_publisher_prepares_native_dense_and_expert_sources_and_rebinds_specs() 
     assert specs["model.layers.0.mlp.gate_proj.weight"].base[0, 0].item() == 201
 
 
+def test_publisher_uses_supplied_manifest_recipe_as_single_authority() -> None:
+    topology = _bf16_topology()
+    weights = _rank_11_weights()
+    recipes = {
+        entry.name: {
+            "model.layers.0.mlp.gate_proj.weight": MilesSourceRecipe.DENSE_FC1_UP,
+            "model.layers.0.mlp.up_proj.weight": MilesSourceRecipe.DENSE_FC1_GATE,
+            "model.layers.0.mlp.down_proj.weight": MilesSourceRecipe.DENSE_FC2,
+            "model.layers.0.mlp.experts.gate_proj.weight": (
+                MilesSourceRecipe.EXPERT_FC1_GATE
+            ),
+            "model.layers.0.mlp.experts.up_proj.weight": (
+                MilesSourceRecipe.EXPERT_FC1_UP
+            ),
+            "model.layers.0.mlp.experts.down_proj.weight": (
+                MilesSourceRecipe.EXPERT_FC2
+            ),
+        }[entry.name]
+        for entry in topology.plan.bulk
+    }
+    publisher = MilesNativePublisher(
+        topology=topology,
+        collective_topology=_collective_topology(topology),
+        source_partition=0,
+        source_world_rank=11,
+        inventory=_rank_11_records(weights),
+        device="cuda:0",
+        source_recipes=recipes,
+    )
+
+    publisher.refresh(weights)
+
+    assert publisher.local_params()[
+        "model.layers.0.mlp.gate_proj.weight"
+    ].base.tolist() == [
+        [21, 22, 23],
+        [24, 25, 26],
+        [27, 28, 29],
+        [30, 31, 32],
+    ]
+    assert (
+        next(
+            binding
+            for binding in publisher.source_bindings()
+            if binding.canonical_name == "model.layers.0.mlp.gate_proj.weight"
+        ).recipe
+        is MilesSourceRecipe.DENSE_FC1_UP
+    )
+
+
+def test_publisher_rejects_incomplete_manifest_recipe_mapping() -> None:
+    topology = _bf16_topology()
+    weights = _rank_11_weights()
+
+    with pytest.raises(ValueError, match="must exactly cover"):
+        MilesNativePublisher(
+            topology=topology,
+            collective_topology=_collective_topology(topology),
+            source_partition=0,
+            source_world_rank=11,
+            inventory=_rank_11_records(weights),
+            device="cuda:0",
+            source_recipes={
+                "model.layers.0.mlp.gate_proj.weight": (
+                    MilesSourceRecipe.DENSE_FC1_GATE
+                )
+            },
+        )
+
+
 def test_publisher_emits_specs_only_for_entries_owned_by_this_world_rank() -> None:
     topology = _bf16_topology()
     rank_4_names = {
