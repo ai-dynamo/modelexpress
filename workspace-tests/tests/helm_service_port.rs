@@ -41,7 +41,7 @@ fn server_port_env_var_is_not_a_literal_in_any_values_file() {
         let is_values_file = path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with("values.yaml") || n.ends_with("values.yml"));
+            .is_some_and(|n| (n.ends_with(".yaml") || n.ends_with(".yml")) && n.contains("values"));
         if !is_values_file {
             continue;
         }
