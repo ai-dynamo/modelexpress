@@ -1,0 +1,58 @@
+{
+  "benchmark_kind": "topology_preserving_validation",
+  "cluster": {
+    "context": "nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02",
+    "gpu_product": "NVIDIA-H100-80GB-HBM3",
+    "namespace": "acasagrande-mx-miles-bench",
+    "node_name": "ip-100-66-161-177.ec2.internal",
+    "runtime_pull_secret": "nvcr-imagepullsecret"
+  },
+  "experiment": {
+    "blocks": 3,
+    "bootstrap_samples": 10000,
+    "command_timeout_s": 7200,
+    "nccl_debug": "WARN",
+    "num_rollouts": 20,
+    "require_symmetric_weight_checker": true,
+    "seed": 3304,
+    "verify_tensor_equality": false
+  },
+  "images": {
+    "runtime": "<runtime-image>@sha256:<64-lowercase-hex>",
+    "server": "<server-image>@sha256:<64-lowercase-hex>"
+  },
+  "kubectl": "kubectl",
+  "launcher": "/home/anthony/nvidia/projects/modelexpress-miles-nccl-m2n/examples/rl/miles_m2n_collective/deploy.sh",
+  "output_root": "/home/anthony/.skillpack/modelexpress/1790113801304578140-match-pr3304-numbers/results",
+  "run_id": "miles-mx-awsdev02-01",
+  "source_repositories": {
+    "miles_main_reference": "/home/anthony/.skillpack/modelexpress/1790113801304578140-match-pr3304-numbers/logs/benchmark-harness/source-clones/miles-main",
+    "miles_pr3304_reference": "/home/anthony/.skillpack/modelexpress/1790113801304578140-match-pr3304-numbers/logs/benchmark-harness/source-clones/miles-pr3304",
+    "modelexpress": "/home/anthony/nvidia/projects/modelexpress-miles-nccl-m2n"
+  },
+  "storage": {
+    "model_claim": "m2n-devbox-workspace",
+    "workspace_claim": "m2n-devbox-workspace"
+  },
+  "topology": {
+    "actor_gpus": 2,
+    "m2n_pp_concurrency": 2,
+    "node_count": 1,
+    "pipeline_parallel_size": 2,
+    "rollout_gpus": 2,
+    "rollout_gpus_per_engine": 1,
+    "total_gpus": 4
+  },
+  "workload": {
+    "checkpoint_manifest_path": "/workspace/models/checkpoints/DeepSeek-V4-Flash-FP8/repo-files.sha256",
+    "checkpoint_revision": "ae01d80c06cdfe30581edfd0e1c5449dc7ed7f17",
+    "checkpoint_sha256": "bae62dda7995e9b8c51fb0cd4b0806f4975ff1fdf72adf5c7b62224f411d251d",
+    "dataset_id": "zhuzilin/dapo-math-17k",
+    "dataset_path": "/workspace/datasets/DAPO-Math-17k/repo/dapo-math-17k.jsonl",
+    "dataset_revision": "2e65612930298bde4c5d58fd97b3f23a483aaff9",
+    "dataset_sha256": "cc9c39c2aa19177abe9464741e121cf4cac90fd25484ef3cdf86535101e3a5b6",
+    "miles_model_type": "deepseek-v4-flash",
+    "model_id": "sgl-project/DeepSeek-V4-Flash-FP8",
+    "model_path": "/workspace/models/checkpoints/DeepSeek-V4-Flash-FP8"
+  }
+}
