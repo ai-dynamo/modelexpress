@@ -21,6 +21,7 @@ pub mod providers;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;
+pub mod tls;
 
 // Generated gRPC code
 #[allow(clippy::similar_names)]

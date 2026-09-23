@@ -13,11 +13,29 @@ repository.workspace = true
 keywords.workspace = true
 
 [features]
-default = ["modelexpress-common/default"]
-openssl = ["modelexpress-common/openssl"]
+default = ["gcs", "tls-rustls"]
+openssl = ["tls-native"]
 gcs = ["modelexpress-common/gcs"]
-tls-native = ["modelexpress-common/tls-native"]
-tls-rustls = ["modelexpress-common/tls-rustls"]
+tls-native = [
+    "modelexpress-common/tls-native",
+    "dep:openssl",
+    "dep:tokio-openssl",
+    "dep:hyper-util",
+    "dep:tower",
+    "dep:http",
+]
+tls-rustls = [
+    "modelexpress-common/tls-rustls",
+    "dep:rustls",
+    "rustls/ring",
+    "rustls/std",
+    "rustls/tls12",
+    "dep:rustls-native-certs",
+    "dep:tokio-rustls",
+    "dep:hyper-util",
+    "dep:tower",
+    "dep:http",
+]
 
 [dependencies]
 modelexpress-common = { workspace = true, default-features = false }
@@ -33,6 +51,14 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 colored = { workspace = true }
+openssl = { workspace = true, optional = true }
+tokio-openssl = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 
 [dev-dependencies]
 modelexpress-common = { workspace = true, default-features = false, features = ["test-support"] }
