@@ -420,8 +420,12 @@ def test_warm_host_scale_refresh_requires_eager_execution(warm_runtime_install):
 
 @pytest.mark.parametrize("install_path", ["tensors", "checkpoint"])
 @pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("version", [
+    "0.19.0", "0.10.1.1", "0.6.3.post1", "0.19.0.post1",
+    "0.19.1rc1.dev12+g1a2b3c", "dev",
+])
 def test_installer_preserves_vllm_mla_refresh(
-    monkeypatch, tmp_path, install_path, quantized,
+    monkeypatch, tmp_path, install_path, quantized, version,
 ):
     model = nn.Module()
     mla = nn.Module()
@@ -433,6 +437,7 @@ def test_installer_preserves_vllm_mla_refresh(
     pointers = {name: tensor.data_ptr() for name, tensor in originals.items()}
 
     _install_fake_vllm(monkeypatch, lambda _model: None)
+    sys.modules["vllm.version"].__version__ = version
     layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
 
     def finalize(target, _config):
@@ -478,33 +483,21 @@ def test_installer_preserves_vllm_mla_refresh(
     assert synchronized == [torch.device("cpu")]
 
 
-@pytest.mark.parametrize("version", ["0.18.0", "0.19.0rc1", "0.19.0.dev1", "dev"])
-def test_installer_rejects_unverified_mla_versions_before_mutation(monkeypatch, version):
-    events = []
-    _install_fake_vllm(monkeypatch, lambda _model: events.append("initialize"))
-    sys.modules["vllm.version"].__version__ = version
-    model = nn.Module()
-    model.W_UV = torch.zeros(1)
-    installer = _VllmInstaller(
-        model=model,
-        vllm_config=object(),
-        model_config=object(),
-        device=torch.device("cpu"),
-    )
-
-    with pytest.raises(IncompleteRefit, match="requires vLLM >= 0.19.0"):
-        installer._reload(lambda: events.append("load"))
-
-    assert events == []
-    assert model.W_UV.item() == 0
-
-
-@pytest.mark.parametrize("version", ["0.19.0", "0.19.0+cu130", "0.20.0", "1.0.0"])
-def test_installer_accepts_supported_mla_versions(monkeypatch, version):
+@pytest.mark.parametrize("stale_name", ["W_UV", "W_UK_T"])
+def test_installer_rejects_missing_mla_refresh(monkeypatch, stale_name):
     _install_fake_vllm(monkeypatch, lambda _model: None)
-    sys.modules["vllm.version"].__version__ = version
     model = nn.Module()
     model.W_UV = torch.zeros(1)
+    model.W_UK_T = torch.zeros(1)
+    model.projection = nn.Parameter(torch.zeros(1))
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+
+    def finalize(target, _config):
+        for name in ("W_UV", "W_UK_T"):
+            if name != stale_name:
+                setattr(target, name, target.projection.detach().clone())
+
+    layerwise.finalize_layerwise_reload = finalize
     installer = _VllmInstaller(
         model=model,
         vllm_config=object(),
@@ -512,4 +505,5 @@ def test_installer_accepts_supported_mla_versions(monkeypatch, version):
         device=torch.device("cpu"),
     )
 
-    installer._reload(lambda: None)
+    with pytest.raises(IncompleteRefit, match=rf"{stale_name} was not refreshed"):
+        installer._reload(lambda: model.projection.data.fill_(7))

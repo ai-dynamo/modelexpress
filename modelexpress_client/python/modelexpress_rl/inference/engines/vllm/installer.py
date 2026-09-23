@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -332,19 +331,6 @@ class _VllmInstaller(EngineInstaller):
                 "ModelExpress refit requires vLLM's layerwise reload APIs"
             ) from error
 
-        if any(
-            hasattr(layer, "W_UV") or hasattr(layer, "W_UK_T")
-            for layer in self._model.modules()
-        ):
-            from vllm.version import __version__
-
-            release = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\+.+)?", __version__)
-            if release is None or tuple(map(int, release.groups())) < (0, 19, 0):
-                raise IncompleteRefit(
-                    "MLA refit requires vLLM >= 0.19.0 with MLA post-load "
-                    f"processing during layerwise reload; found {__version__}"
-                )
-
         # vLLM also keeps graph-bound tensors as plain object attributes rather
         # than registered parameters or buffers. Layerwise reload does not save
         # these. Snapshot their original storage so Marlin workspaces and MLA
@@ -373,6 +359,11 @@ class _VllmInstaller(EngineInstaller):
             for module, attributes in bare_tensors.items():
                 for name, graph_tensor in attributes.items():
                     current = module.__dict__.get(name)
+                    if name in ("W_UV", "W_UK_T") and current is graph_tensor:
+                        raise IncompleteRefit(
+                            f"{type(module).__name__}.{name} was not refreshed by "
+                            "vLLM post-load processing during reload"
+                        )
                     if (
                         isinstance(current, torch.Tensor)
                         and current is not graph_tensor
