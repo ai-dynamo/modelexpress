@@ -43,6 +43,12 @@ class Recorder:
 @pytest.fixture
 def recorder(monkeypatch):
     rec = Recorder()
+    monkeypatch.setattr(
+        backend,
+        "_allocate_fence_buffer",
+        lambda lane: f"fence::{id(lane)}",
+        raising=False,
+    )
 
     def reshard(src, dst, comm, **kwargs):
         rec.ops.append(
@@ -99,11 +105,15 @@ class FakeComm:
 _DEFAULT_STREAM = object()
 
 
-def lane(rec, name, *, rank=0, world=4, stream=_DEFAULT_STREAM):
+def lane(rec, name, *, rank=0, world=4, stream=_DEFAULT_STREAM, device=None):
     if stream is _DEFAULT_STREAM:
         stream = FakeStream(rec, f"stream::{name}")
     return LaneCommunicator(
-        FakeComm(rec, name), rank=rank, world_size=world, stream=stream
+        FakeComm(rec, name),
+        rank=rank,
+        world_size=world,
+        stream=stream,
+        device=device,
     )
 
 
@@ -160,6 +170,255 @@ def build(
 
 
 class TestOpOrdering:
+    def test_a_source_mesh_transition_fences_the_previous_batch(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setattr(backend, "require_nccl_m2n", lambda: None)
+        monkeypatch.setattr(backend, "transfer_timeout", lambda: math.inf)
+        plan = ReshardPlan(
+            bulk=[
+                entry("a", src_shape=(1,), src_rank_offset=0),
+                entry("b", src_shape=(1,), src_rank_offset=0),
+                entry("c", src_shape=(1,), src_rank_offset=1),
+                entry("d", src_shape=(1,), src_rank_offset=1),
+            ]
+        )
+        half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+
+        half.start_weight_update("v1")
+        half.publish_weights(0)
+
+        assert [(op.kind, getattr(op, "src", None)) for op in recorder.ops] == [
+            ("reshard", "buf::a"),
+            ("reshard", "buf::b"),
+            ("sync", None),
+            ("broadcast", None),
+            ("sync", None),
+            ("reshard", "buf::c"),
+            ("reshard", "buf::d"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("source_rank_in_lane", "owned"),
+        [
+            (0, {"a", "b"}),
+            (1, {"c", "d"}),
+        ],
+    )
+    def test_sparse_nonowners_take_the_same_source_mesh_fence(
+        self, recorder, monkeypatch, source_rank_in_lane, owned
+    ):
+        monkeypatch.setattr(backend, "require_nccl_m2n", lambda: None)
+        monkeypatch.setattr(backend, "transfer_timeout", lambda: math.inf)
+        plan = ReshardPlan(
+            bulk=[
+                entry("a", src_shape=(1,), src_rank_offset=0),
+                entry("b", src_shape=(1,), src_rank_offset=0),
+                entry("c", src_shape=(1,), src_rank_offset=1),
+                entry("d", src_shape=(1,), src_rank_offset=1),
+            ]
+        )
+        cache = CommunicatorCache()
+        cache._lanes[LaneKey("g", 1, 0)] = lane(
+            recorder, "lane0", rank=source_rank_in_lane, world=4
+        )
+        cache._lanes[LaneKey("g", 1, 1)] = lane(
+            recorder, "broadcast", rank=source_rank_in_lane, world=4
+        )
+        half = NcclM2nSender(
+            plan=plan,
+            specs={name: LocalParamSpec(base=f"buf::{name}") for name in owned},
+            group_id="g",
+            epoch=1,
+            cache=cache,
+            source_partition=0,
+            source_rank_in_lane=source_rank_in_lane,
+        )
+
+        half.start_weight_update("v1")
+        half.publish_weights(0)
+
+        assert [op.kind for op in recorder.ops] == [
+            "reshard",
+            "reshard",
+            "sync",
+            "broadcast",
+            "sync",
+            "reshard",
+            "reshard",
+        ]
+        assert [op.src is not None for op in recorder.ops if op.kind == "reshard"] == [
+            name in owned for name in ("a", "b", "c", "d")
+        ]
+
+    def test_a_failed_source_mesh_fence_aborts_the_whole_group(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setattr(backend, "require_nccl_m2n", lambda: None)
+        monkeypatch.setattr(backend, "transfer_timeout", lambda: math.inf)
+        plan = ReshardPlan(
+            bulk=[
+                entry("a", src_shape=(1,), src_rank_offset=0),
+                entry("b", src_shape=(1,), src_rank_offset=1),
+            ]
+        )
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        live = cache.get(LaneKey("g", 1, 0))
+        synchronize = live.synchronize
+        waits = 0
+
+        def fail_fence(timeout_s=None):
+            nonlocal waits
+            waits += 1
+            if waits == 2:
+                raise RuntimeError("injected source-mesh fence failure")
+            synchronize(timeout_s)
+
+        live.synchronize = fail_fence
+
+        half.start_weight_update("v1")
+        with pytest.raises(RuntimeError, match="source-mesh fence failure"):
+            half.publish_weights(0)
+
+        assert [op.kind for op in recorder.ops] == [
+            "reshard",
+            "sync",
+            "broadcast",
+        ]
+        assert all(live.aborted for live in cache._lanes.values())
+        assert half._pending_contexts == []
+        assert not half._active_lanes
+
+    def test_a_lane_fence_reuses_one_custom_buffer(self, recorder, monkeypatch):
+        monkeypatch.setattr(backend, "require_nccl_m2n", lambda: None)
+        monkeypatch.setattr(backend, "transfer_timeout", lambda: math.inf)
+        plan = ReshardPlan(
+            bulk=[
+                entry("a", src_shape=(1,), src_rank_offset=0),
+                entry("b", src_shape=(1,), src_rank_offset=1),
+                entry("c", src_shape=(1,), src_rank_offset=0),
+            ]
+        )
+        cache = CommunicatorCache()
+        live = lane(recorder, "lane0", device="cuda:7")
+        cache._lanes[LaneKey("g", 1, 0)] = live
+        cache._lanes[LaneKey("g", 1, 1)] = lane(recorder, "broadcast")
+        barrier = object()
+        allocations = []
+
+        def allocate(device):
+            allocations.append(device)
+            return barrier
+
+        half = NcclM2nSender(
+            plan=plan,
+            specs={
+                name: LocalParamSpec(base=f"buf::{name}")
+                for name in plan.parameter_names()
+            },
+            group_id="g",
+            epoch=1,
+            cache=cache,
+            barrier_alloc=allocate,
+        )
+
+        half.start_weight_update("v1")
+        half.publish_weights(0)
+
+        assert allocations == ["cuda:7"]
+        assert [op.buf for op in recorder.ops if op.kind == "broadcast"] == [
+            barrier,
+            barrier,
+        ]
+        assert half._fence_buffers == {id(live): barrier}
+
+    def test_the_default_fence_allocator_is_framework_fallback(self, recorder):
+        half, _ = build(
+            recorder,
+            plan=ReshardPlan(bulk=[entry("a")]),
+            half_cls=NcclM2nSender,
+        )
+        assert half._barrier_alloc is backend._allocate_fence_buffer
+
+    def test_receiver_source_mesh_transitions_fence_only_the_matching_lane(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setattr(backend, "require_nccl_m2n", lambda: None)
+        monkeypatch.setattr(backend, "transfer_timeout", lambda: math.inf)
+        plan = ReshardPlan(
+            bulk=[
+                entry("a0", partition=0, src_shape=(1,), src_rank_offset=0),
+                entry("a1", partition=1, src_shape=(1,), src_rank_offset=0),
+                entry("b0", partition=0, src_shape=(1,), src_rank_offset=1),
+                entry("b1", partition=1, src_shape=(1,), src_rank_offset=1),
+            ],
+            source_partition_count=2,
+        )
+        half, cache = build(
+            recorder,
+            plan=plan,
+            half_cls=NcclM2nReceiver,
+            partitions=2,
+        )
+        half._specs = {
+            name: LocalParamSpec(
+                base=f"buf::{name}",
+                pre=lambda base, name=name: RefitCtx(buf=base, extra={"name": name}),
+            )
+            for name in plan.parameter_names()
+        }
+        retained_at_sync = []
+        for lane_id in (0, 1):
+            live = cache.get(LaneKey("g", 1, lane_id))
+            synchronize = live.synchronize
+
+            def record_retained(
+                timeout_s=None,
+                *,
+                lane_id=lane_id,
+                synchronize=synchronize,
+            ):
+                retained_at_sync.append(
+                    (
+                        lane_id,
+                        {ctx.extra["name"] for _, ctx in half._pending_contexts},
+                    )
+                )
+                synchronize(timeout_s)
+
+            live.synchronize = record_retained
+
+        half.start_weight_update("v1")
+        half.update_weights(0)
+
+        assert [
+            (
+                op.kind,
+                getattr(op, "stream", None),
+                getattr(getattr(op, "comm", None), "_name", None),
+            )
+            for op in recorder.ops
+        ] == [
+            ("reshard", None, "lane0"),
+            ("reshard", None, "lane1"),
+            ("sync", "stream::lane0", None),
+            ("broadcast", None, None),
+            ("sync", "stream::lane0", None),
+            ("reshard", None, "lane0"),
+            ("sync", "stream::lane1", None),
+            ("broadcast", None, None),
+            ("sync", "stream::lane1", None),
+            ("reshard", None, "lane1"),
+            ("sync", "stream::lane0", None),
+            ("sync", "stream::lane1", None),
+        ]
+        assert retained_at_sync[:4] == [
+            (0, {"a0", "a1"}),
+            (0, {"a1"}),
+            (1, {"a1", "b0"}),
+            (1, {"b0"}),
+        ]
+
     def test_the_misc_broadcast_waits_for_every_layer_group(self, recorder):
         # The regression this guards: running the broadcast at the end of each
         # publish_weights call means entering the all-ranks communicator while
@@ -194,11 +453,13 @@ class TestOpOrdering:
         half.finish_weight_update(broadcast_lane_id=1)
         assert [op.kind for op in recorder.ops].count("broadcast") == 1
 
-    def test_both_halves_issue_the_same_op_sequence(self, recorder):
+    def test_both_halves_issue_the_same_op_sequence(self, recorder, monkeypatch):
         # A collective requires identical sequences; a divergence hangs the
         # communicator rather than failing on the rank that is wrong.
+        monkeypatch.setattr(backend, "require_nccl_m2n", lambda: None)
+        monkeypatch.setattr(backend, "transfer_timeout", lambda: math.inf)
         plan = ReshardPlan(
-            bulk=[entry("a"), entry("b")],
+            bulk=[entry("a"), entry("b", src_shape=(1,), src_rank_offset=1)],
             misc=[MiscParam("m", (4,), "f"), MiscParam("n", (4,), "f")],
         )
 
@@ -218,6 +479,9 @@ class TestOpOrdering:
         assert sent == received
         assert sent == [
             "reshard",
+            "sync",
+            "broadcast",
+            "sync",
             "reshard",
             "sync",
             "broadcast",
@@ -395,7 +659,7 @@ class TestLaneRouting:
         half.start_weight_update("v")
         half.publish_weights(0)
 
-        assert [(op.src, op.dst) for op in recorder.ops] == [
+        assert [(op.src, op.dst) for op in recorder.ops if op.kind == "reshard"] == [
             (None, None),
             ("buf::owner1", None),
         ]

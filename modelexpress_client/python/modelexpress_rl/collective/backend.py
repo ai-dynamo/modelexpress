@@ -21,12 +21,12 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import nullcontext
-from typing import Any
+from typing import Any, Callable
 
 from . import envs
 from .comm import CommunicatorCache, LaneCommunicator, LaneKey, NcclUnavailableError
 from .spi import LocalParamSpec, RefitCtx, resolve_specs
-from .types import ParamPlan, ReshardPlan
+from .types import MeshSpec, ParamPlan, ReshardPlan
 
 logger = logging.getLogger("modelexpress_rl.collective.backend")
 
@@ -150,6 +150,19 @@ def _stream_handle(stream: Any) -> int:
     return int(handle)
 
 
+def _allocate_fence_buffer(device: Any) -> Any:
+    """Allocate the default one-byte lane-fence buffer through Torch."""
+    import torch
+
+    device_context = torch.cuda.device(device) if device is not None else nullcontext()
+    with device_context:
+        return torch.zeros(
+            1,
+            dtype=torch.uint8,
+            device=device if device is not None else "cuda",
+        )
+
+
 class _CollectiveHalf:
     """Shared plan walking, layer grouping and lane bookkeeping."""
 
@@ -163,6 +176,7 @@ class _CollectiveHalf:
         cache: CommunicatorCache,
         active_partition: int | None = None,
         required_bulk_names: list[str] | None = None,
+        barrier_alloc: Callable[[Any], Any] | None = None,
     ) -> None:
         if plan.source_partition_count <= 0:
             raise ValueError("source_partition_count must be positive")
@@ -209,7 +223,12 @@ class _CollectiveHalf:
         self.setup_layer_groups(None)
         self._pending_misc = False
         self._active_lanes: OrderedDict[int, LaneCommunicator] = OrderedDict()
-        self._pending_contexts: list[RefitCtx] = []
+        self._pending_contexts: list[tuple[int, RefitCtx]] = []
+        self._previous_source_mesh_by_lane: dict[int, MeshSpec] = {}
+        self._fence_buffers: dict[int, Any] = {}
+        self._barrier_alloc = (
+            _allocate_fence_buffer if barrier_alloc is None else barrier_alloc
+        )
         self._deadline: float | None = None
         self._timeout_s: float | None = None
         self._version: str | None = None
@@ -284,6 +303,7 @@ class _CollectiveHalf:
         hang with no owner.
         """
         self._pending_misc = True
+        self._previous_source_mesh_by_lane.clear()
         self._version = version
         self._timeout_s = transfer_timeout()
         self._deadline = time.monotonic() + self._timeout_s
@@ -318,6 +338,8 @@ class _CollectiveHalf:
         self._cache.abort_group(self._group_id)
         self._active_lanes.clear()
         self._pending_contexts.clear()
+        self._previous_source_mesh_by_lane.clear()
+        self._fence_buffers.clear()
         self._deadline = None
 
     def _stream_context(self, lane: LaneCommunicator, spec: LocalParamSpec):
@@ -342,16 +364,62 @@ class _CollectiveHalf:
     def _record_lane(self, lane: LaneCommunicator) -> None:
         self._active_lanes[id(lane)] = lane
 
+    def _retain_context(self, lane: LaneCommunicator, ctx: RefitCtx) -> None:
+        self._pending_contexts.append((id(lane), ctx))
+
+    def _wait_lane(self, lane: LaneCommunicator) -> None:
+        remaining = self._remaining()
+        try:
+            lane.synchronize(timeout_s=None if remaining == math.inf else remaining)
+        except TimeoutError:
+            self._fail_deadline()
+
+    def _drain_lane(self, lane: LaneCommunicator) -> None:
+        self._wait_lane(lane)
+        lane_id = id(lane)
+        self._active_lanes.pop(lane_id, None)
+        self._pending_contexts[:] = [
+            (owner, ctx) for owner, ctx in self._pending_contexts if owner != lane_id
+        ]
+
+    def _fence_lane(self, lane: LaneCommunicator) -> None:
+        lane_id = id(lane)
+        barrier = self._fence_buffers.get(lane_id)
+        if barrier is None:
+            barrier = self._barrier_alloc(lane.device)
+            self._fence_buffers[lane_id] = barrier
+        _broadcast(lane, barrier, root=0)
+        self._wait_lane(lane)
+
     def _drain_active_lanes(self) -> None:
-        lanes = list(self._active_lanes.values())
-        for lane in lanes:
-            remaining = self._remaining()
+        for lane in list(self._active_lanes.values()):
+            self._drain_lane(lane)
+
+    def _fence_source_mesh_transition(
+        self, entry: ParamPlan, lane: LaneCommunicator
+    ) -> None:
+        """Complete the previous ownership batch before changing source mesh.
+
+        MILES and SGLang fence this handoff on both sides of the M2N call.
+        Sparse source ranks must make the decision from the shared plan rather
+        than local tensor ownership, otherwise a nonowner can run ahead into
+        the next mesh while an owner still has work in flight. Each PP lane is
+        independent, so its handoff must not drain another lane in the same
+        concurrent wave.
+        """
+        lane_id = id(lane)
+        source_mesh = entry.src_mesh
+        previous_source_mesh = self._previous_source_mesh_by_lane.get(lane_id)
+        if previous_source_mesh is not None and source_mesh != previous_source_mesh:
             try:
-                lane.synchronize(timeout_s=None if remaining == math.inf else remaining)
-            except TimeoutError:
-                self._fail_deadline()
-        self._active_lanes.clear()
-        self._pending_contexts.clear()
+                self._drain_lane(lane)
+                self._fence_lane(lane)
+            except BaseException:
+                # Once peers disagree about which source-mesh batch completed,
+                # this epoch cannot be retried safely.
+                self.abort()
+                raise
+        self._previous_source_mesh_by_lane[lane_id] = source_mesh
 
     def _issue_reshard(
         self,
@@ -363,6 +431,7 @@ class _CollectiveHalf:
     ) -> None:
         self._remaining()
         lane = self._lane(entry.partition_id)
+        self._fence_source_mesh_transition(entry, lane)
         if spec is None:
             _reshard(comm=lane, entry=entry, src=None, dst=None)
             self._record_lane(lane)
@@ -372,7 +441,7 @@ class _CollectiveHalf:
             # Retain staging buffers and hook state until the asynchronous CUDA
             # work is complete. Relying only on an allocator's stream tracking
             # is not sufficient for engine-owned or external buffers.
-            self._pending_contexts.append(ctx)
+            self._retain_context(lane, ctx)
             _reshard(comm=lane, entry=entry, src=src(ctx), dst=dst(ctx))
             spec.leave(ctx)
         self._record_lane(lane)
@@ -389,7 +458,7 @@ class _CollectiveHalf:
             spec = self._specs[misc.name]
             with self._stream_context(lane, spec):
                 ctx = spec.enter()
-                self._pending_contexts.append(ctx)
+                self._retain_context(lane, ctx)
                 _broadcast(lane, ctx.buf, root=0)
                 spec.leave(ctx)
             self._record_lane(lane)

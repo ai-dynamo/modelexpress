@@ -252,6 +252,22 @@ def trainer(rz, engine, **kw):
     return client
 
 
+def generator(rz, engine, **kw):
+    client = RefitClientGenerator(
+        rendezvous=rz,
+        model_name="m",
+        trainer_slots=["t0", "t1"],
+        generator_slots=["g0", "g1"],
+        source_partition_count=1,
+        slot_id="g0",
+        worker_id="w0",
+        index_in_role=0,
+        **kw,
+    )
+    client.initialize(engine)
+    return client
+
+
 class TestSequencing:
     def test_a_transfer_before_compute_plan_is_refused(self):
         client = trainer(FakeRendezvous(), FakeEngine())
@@ -324,6 +340,26 @@ class TestBootstrap:
 
         assert len(seen) == 2
         assert all(call[3] is allocator for call in seen)
+
+    def test_data_halves_retain_the_framework_barrier_allocator(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setattr(collective_client, "require_nccl_m2n", lambda: None)
+
+        def allocator(device):
+            return object()
+
+        trainer_client = trainer(
+            FakeRendezvous(), FakeEngine(), barrier_alloc=allocator
+        )
+        trainer_client.compute_plan()
+        generator_client = generator(
+            FakeRendezvous(), FakeEngine(), barrier_alloc=allocator
+        )
+        generator_client.compute_plan()
+
+        assert trainer_client._half._barrier_alloc is allocator
+        assert generator_client._half._barrier_alloc is allocator
 
     def test_pp2_nonmember_settles_broadcast_before_the_next_barrier(
         self, fake_nccl, monkeypatch

@@ -595,6 +595,7 @@ class RefitClientTrainer(_RefitClientBase):
                 cache=self._cache,
                 source_partition=self._source_partition,
                 source_rank_in_lane=source_rank_in_lane,
+                barrier_alloc=self._barrier_alloc,
             )
             self._half.setup_layer_groups(self._groupings)
         except BaseException:
@@ -693,6 +694,7 @@ class RefitClientGenerator(_RefitClientBase):
                 group_id=membership.group_id,
                 epoch=membership.epoch,
                 cache=self._cache,
+                barrier_alloc=self._barrier_alloc,
             )
             self._half.setup_layer_groups(self._groupings)
         except BaseException:
