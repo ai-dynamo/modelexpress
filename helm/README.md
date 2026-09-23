@@ -103,7 +103,7 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `podSecurityContext`                         | Pod security context                           | `{runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}` |
 | `securityContext`                            | Container security context                     | `{runAsNonRoot: true}` |
 | `service.type`                               | Service type                                   | `ClusterIP` |
-| `service.port`                               | Service port                                   | `8001`   |
+| `service.port`                               | Service port. Single source of truth for the `MODEL_EXPRESS_SERVER_PORT` env var, containerPort and probes | `8001`   |
 | `metrics.enabled`                            | Serve Prometheus metrics on their own port     | `true`   |
 | `metrics.port`                               | Metrics port. Single source of truth for the env var, containerPort, annotation and Service port | `9401` |
 | `metrics.podAnnotations`                     | Emit `prometheus.io/{scrape,port,path}`. Inert on Prometheus Operator clusters -- use `metrics.podMonitor` there | `true` |
