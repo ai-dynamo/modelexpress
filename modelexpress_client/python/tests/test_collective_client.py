@@ -56,6 +56,17 @@ def entry(name, partition=0):
 PLAN = ReshardPlan(bulk=[entry("a")], misc=[MiscParam("m", (4,), "bfloat16")])
 
 
+class FakeTensor(str):
+    def __new__(cls, name, *, shape, dtype):
+        value = super().__new__(cls, name)
+        value.shape = shape
+        value.dtype = dtype
+        return value
+
+    def data_ptr(self):
+        return id(self)
+
+
 class FakeEngine:
     """Stands in for both a Publisher and a Loader."""
 
@@ -70,9 +81,28 @@ class FakeEngine:
         return self._plan.parameter_names()
 
     def local_params(self):
-        return {
-            n: LocalParamSpec(base=f"buf::{n}") for n in self._plan.parameter_names()
-        }
+        specs = {}
+        for plan_entry in self._plan.bulk:
+            shape = list(plan_entry.global_shape)
+            for axis, placement in enumerate(plan_entry.src_placements):
+                if placement.dim is not None:
+                    shape[placement.dim] //= plan_entry.src_mesh.shape[axis]
+            specs[plan_entry.name] = LocalParamSpec(
+                base=FakeTensor(
+                    f"buf::{plan_entry.name}",
+                    shape=tuple(shape),
+                    dtype=plan_entry.dtype,
+                )
+            )
+        for misc in self._plan.misc:
+            specs[misc.name] = LocalParamSpec(
+                base=FakeTensor(
+                    f"buf::{misc.name}",
+                    shape=misc.global_shape,
+                    dtype=misc.dtype,
+                )
+            )
+        return specs
 
     def start_new_round(self, version):
         self.calls.append(("start", version))
@@ -176,6 +206,10 @@ def fake_nccl(monkeypatch):
     def reshard(src, dst, comm, **kwargs):
         ops.append("reshard")
 
+    @contextmanager
+    def group():
+        yield
+
     class Comm:
         def broadcast(self, sendbuf, recvbuf, root, stream):
             ops.append("broadcast")
@@ -198,6 +232,7 @@ def fake_nccl(monkeypatch):
         InProgress = 7
 
     m2n = ModuleType("nccl.m2n")
+    m2n.group = group
     m2n.reshard = reshard
     communicator = ModuleType("nccl.core.communicator")
     communicator.NCCLConfig = NCCLConfig
@@ -225,6 +260,10 @@ def fake_nccl(monkeypatch):
     monkeypatch.setattr(
         "modelexpress_rl.collective.comm.LaneCommunicator.synchronize",
         lambda self, timeout_s=None: None,
+    )
+    monkeypatch.setattr(
+        "modelexpress_rl.collective.backend.loaded_nccl_version",
+        lambda: (2, 30, 7),
     )
     return ops
 

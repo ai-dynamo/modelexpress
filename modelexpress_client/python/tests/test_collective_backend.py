@@ -38,11 +38,27 @@ class Recorder:
 
     def __init__(self):
         self.ops = []
+        self.groups = []
+
+
+class FakeBuffer(str):
+    """String-compatible tensor stand-in with binding-visible geometry."""
+
+    def __new__(cls, name, *, shape, dtype="bfloat16"):
+        value = super().__new__(cls, name)
+        value.shape = shape
+        value.dtype = dtype
+        return value
+
+    def data_ptr(self):
+        return id(self)
 
 
 @pytest.fixture
 def recorder(monkeypatch):
     rec = Recorder()
+    monkeypatch.setattr(backend, "require_nccl_m2n", lambda: None)
+    monkeypatch.setattr(backend, "transfer_timeout", lambda: math.inf)
     monkeypatch.setattr(
         backend,
         "_allocate_fence_buffer",
@@ -65,6 +81,18 @@ def recorder(monkeypatch):
 
     module = ModuleType("nccl.m2n")
     module.reshard = reshard
+
+    class Group:
+        def __enter__(self):
+            rec.groups.append(("start", len(rec.ops)))
+
+        def __exit__(self, exc_type, exc, tb):
+            rec.groups.append(
+                ("abort" if exc_type is not None else "end", len(rec.ops))
+            )
+            return False
+
+    module.group = Group
     parent = ModuleType("nccl")
     monkeypatch.setitem(sys.modules, "nccl", parent)
     monkeypatch.setitem(sys.modules, "nccl.m2n", module)
@@ -117,6 +145,52 @@ def lane(rec, name, *, rank=0, world=4, stream=_DEFAULT_STREAM, device=None):
     )
 
 
+def settlement_probe(
+    half, lane, *, fail_on=(), error="lane cannot settle", passthrough=False
+):
+    """Capture retained resources whenever a fault-injected lane is settled."""
+    snapshots = []
+    calls = 0
+    original = lane.synchronize
+
+    def synchronize(timeout_s=None):
+        nonlocal calls
+        calls += 1
+        snapshots.append(
+            SimpleNamespace(
+                contexts=[ctx for _, ctx in half._pending_contexts],
+                fences=dict(half._pending_fence_buffers),
+            )
+        )
+        if calls in fail_on:
+            raise RuntimeError(error)
+        if passthrough:
+            original(timeout_s)
+
+    lane.synchronize = synchronize
+    return snapshots
+
+
+def staged_spec(name, *, post_error=None):
+    def pre(base):
+        return RefitCtx(
+            buf=FakeBuffer(f"buf::{name}", shape=(4, 4)),
+            extra={"name": name},
+        )
+
+    def post(ctx):
+        if post_error is not None:
+            raise RuntimeError(post_error)
+
+    return LocalParamSpec(pre=pre, post=post)
+
+
+def assert_transfer_released(half):
+    assert half._pending_contexts == []
+    assert not half._active_lanes
+    assert not half._pending_fence_buffers
+
+
 def entry(
     name,
     partition=0,
@@ -153,9 +227,34 @@ def build(
         cache._lanes[LaneKey("g", 1, lane_id)] = lane(
             rec, f"lane{lane_id}", stream=stream
         )
-    specs = {
-        name: LocalParamSpec(base=f"buf::{name}") for name in plan.parameter_names()
-    }
+    by_name = {entry.name: entry for entry in plan.bulk}
+    specs = {}
+    for name in plan.parameter_names():
+        if name in by_name:
+            plan_entry = by_name[name]
+            mesh = (
+                plan_entry.src_mesh
+                if half_cls is NcclM2nSender
+                else plan_entry.dst_mesh
+            )
+            placements = (
+                plan_entry.src_placements
+                if half_cls is NcclM2nSender
+                else plan_entry.dst_placements
+            )
+            shape = backend._local_shape(
+                plan_entry.global_shape,
+                mesh,
+                placements,
+            )
+            dtype = plan_entry.dtype
+        else:
+            misc = next(entry for entry in plan.misc if entry.name == name)
+            shape = misc.global_shape
+            dtype = misc.dtype
+        specs[name] = LocalParamSpec(
+            base=FakeBuffer(f"buf::{name}", shape=shape, dtype=dtype)
+        )
     kwargs = {
         "plan": plan,
         "specs": specs,
@@ -227,7 +326,20 @@ class TestOpOrdering:
         )
         half = NcclM2nSender(
             plan=plan,
-            specs={name: LocalParamSpec(base=f"buf::{name}") for name in owned},
+            specs={
+                plan_entry.name: LocalParamSpec(
+                    base=FakeBuffer(
+                        f"buf::{plan_entry.name}",
+                        shape=backend._local_shape(
+                            plan_entry.global_shape,
+                            plan_entry.src_mesh,
+                            plan_entry.src_placements,
+                        ),
+                    )
+                )
+                for plan_entry in plan.bulk
+                if plan_entry.name in owned
+            },
             group_id="g",
             epoch=1,
             cache=cache,
@@ -256,6 +368,8 @@ class TestOpOrdering:
     ):
         monkeypatch.setattr(backend, "require_nccl_m2n", lambda: None)
         monkeypatch.setattr(backend, "transfer_timeout", lambda: math.inf)
+        quarantined = []
+        monkeypatch.setattr(backend, "_UNSETTLED_TRANSFER_RESOURCES", quarantined)
         plan = ReshardPlan(
             bulk=[
                 entry("a", src_shape=(1,), src_rank_offset=0),
@@ -264,19 +378,28 @@ class TestOpOrdering:
         )
         half, cache = build(recorder, plan=plan, half_cls=NcclM2nSender)
         live = cache.get(LaneKey("g", 1, 0))
-        synchronize = live.synchronize
-        waits = 0
-
-        def fail_fence(timeout_s=None):
-            nonlocal waits
-            waits += 1
-            if waits == 2:
-                raise RuntimeError("injected source-mesh fence failure")
-            synchronize(timeout_s)
-
-        live.synchronize = fail_fence
+        scratch_lane = cache.get(LaneKey("g", 1, 1))
+        scratch_ctx = RefitCtx(
+            buf=FakeBuffer("prior-run-scratch", shape=(1,)),
+            extra=None,
+        )
+        transition_snapshots = settlement_probe(
+            half,
+            live,
+            fail_on={2, 3},
+            error="injected source-mesh fence failure",
+            passthrough=True,
+        )
+        scratch_snapshots = settlement_probe(
+            half,
+            scratch_lane,
+            fail_on={1},
+            error="prior lane cannot settle",
+        )
 
         half.start_weight_update("v1")
+        half._record_lane(scratch_lane)
+        half._retain_context(scratch_lane, scratch_ctx)
         with pytest.raises(RuntimeError, match="source-mesh fence failure"):
             half.publish_weights(0)
 
@@ -285,9 +408,22 @@ class TestOpOrdering:
             "sync",
             "broadcast",
         ]
+        barrier = transition_snapshots[1].fences[id(live)]
+        assert [
+            [ctx.buf for ctx in snapshot.contexts] for snapshot in transition_snapshots
+        ] == [
+            ["prior-run-scratch", "buf::a"],
+            ["prior-run-scratch"],
+            ["prior-run-scratch"],
+        ]
+        assert transition_snapshots[1].fences == {id(live): barrier}
+        assert transition_snapshots[2].fences == {id(live): barrier}
+        assert [
+            [ctx.buf for ctx in snapshot.contexts] for snapshot in scratch_snapshots
+        ] == [["prior-run-scratch"]]
+        assert quarantined == [scratch_ctx, barrier]
         assert all(live.aborted for live in cache._lanes.values())
-        assert half._pending_contexts == []
-        assert not half._active_lanes
+        assert_transfer_released(half)
 
     def test_a_lane_fence_reuses_one_custom_buffer(self, recorder, monkeypatch):
         monkeypatch.setattr(backend, "require_nccl_m2n", lambda: None)
@@ -313,8 +449,17 @@ class TestOpOrdering:
         half = NcclM2nSender(
             plan=plan,
             specs={
-                name: LocalParamSpec(base=f"buf::{name}")
-                for name in plan.parameter_names()
+                plan_entry.name: LocalParamSpec(
+                    base=FakeBuffer(
+                        f"buf::{plan_entry.name}",
+                        shape=backend._local_shape(
+                            plan_entry.global_shape,
+                            plan_entry.src_mesh,
+                            plan_entry.src_placements,
+                        ),
+                    )
+                )
+                for plan_entry in plan.bulk
             },
             group_id="g",
             epoch=1,
@@ -360,9 +505,10 @@ class TestOpOrdering:
             half_cls=NcclM2nReceiver,
             partitions=2,
         )
+        base_specs = half._specs
         half._specs = {
             name: LocalParamSpec(
-                base=f"buf::{name}",
+                base=base_specs[name].base,
                 pre=lambda base, name=name: RefitCtx(buf=base, extra={"name": name}),
             )
             for name in plan.parameter_names()
@@ -400,11 +546,11 @@ class TestOpOrdering:
             for op in recorder.ops
         ] == [
             ("reshard", None, "lane0"),
-            ("reshard", None, "lane1"),
             ("sync", "stream::lane0", None),
             ("broadcast", None, None),
             ("sync", "stream::lane0", None),
             ("reshard", None, "lane0"),
+            ("reshard", None, "lane1"),
             ("sync", "stream::lane1", None),
             ("broadcast", None, None),
             ("sync", "stream::lane1", None),
@@ -412,11 +558,13 @@ class TestOpOrdering:
             ("sync", "stream::lane0", None),
             ("sync", "stream::lane1", None),
         ]
-        assert retained_at_sync[:4] == [
-            (0, {"a0", "a1"}),
-            (0, {"a1"}),
+        assert retained_at_sync == [
+            (0, {"a0"}),
+            (0, set()),
             (1, {"a1", "b0"}),
             (1, {"b0"}),
+            (0, {"b0", "b1"}),
+            (1, {"b1"}),
         ]
 
     def test_the_misc_broadcast_waits_for_every_layer_group(self, recorder):
@@ -452,6 +600,57 @@ class TestOpOrdering:
         half.finish_weight_update(broadcast_lane_id=1)
         half.finish_weight_update(broadcast_lane_id=1)
         assert [op.kind for op in recorder.ops].count("broadcast") == 1
+
+    def test_receiver_final_drain_failure_settles_before_abort(self, recorder):
+        half, cache = build(
+            recorder,
+            plan=ReshardPlan(bulk=[entry("a")]),
+            half_cls=NcclM2nReceiver,
+        )
+        live = cache.get(LaneKey("g", 1, 0))
+        snapshots = settlement_probe(half, live, fail_on={1})
+        abort_after = []
+        abort = live._comm.abort
+        live._comm.abort = lambda: (abort_after.append(len(snapshots)), abort())
+
+        half.start_weight_update("v")
+        with pytest.raises(RuntimeError, match="lane cannot settle"):
+            half.update_weights(0)
+
+        assert [[ctx.buf for ctx in item.contexts] for item in snapshots] == [
+            ["buf::a"],
+            ["buf::a"],
+        ]
+        assert abort_after == [2]
+        assert_transfer_released(half)
+
+    def test_misc_post_failure_settles_broadcast_before_abort(self, recorder):
+        half, cache = build(
+            recorder,
+            plan=ReshardPlan(misc=[MiscParam("m", (4,), "bfloat16")]),
+            half_cls=NcclM2nSender,
+        )
+        live = cache.get(LaneKey("g", 1, 1))
+        post_contexts = []
+
+        def fail_post(ctx):
+            post_contexts.append(ctx)
+            raise RuntimeError("misc post failed")
+
+        half._specs["m"].post = fail_post
+        snapshots = settlement_probe(half, live)
+        abort_after = []
+        abort = live._comm.abort
+        live._comm.abort = lambda: (abort_after.append(len(snapshots)), abort())
+
+        half.start_weight_update("v")
+        with pytest.raises(RuntimeError, match="misc post failed"):
+            half.finish_weight_update(broadcast_lane_id=1)
+
+        assert [op.kind for op in recorder.ops] == ["broadcast"]
+        assert [item.contexts for item in snapshots] == [post_contexts]
+        assert abort_after == [1]
+        assert_transfer_released(half)
 
     def test_both_halves_issue_the_same_op_sequence(self, recorder, monkeypatch):
         # A collective requires identical sequences; a divergence hangs the
@@ -499,6 +698,8 @@ class TestOpOrdering:
         sender.publish_weights(0)
         assert recorder.ops[0].src == "buf::a"
         assert recorder.ops[0].dst is None
+        assert "src_local_shape" not in recorder.ops[0].kwargs
+        assert recorder.ops[0].kwargs["dst_local_shape"] == (4, 4)
 
         recorder.ops.clear()
         receiver, _ = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
@@ -506,6 +707,8 @@ class TestOpOrdering:
         receiver.update_weights(0)
         assert recorder.ops[0].src is None
         assert recorder.ops[0].dst == "buf::a"
+        assert recorder.ops[0].kwargs["src_local_shape"] == (4, 4)
+        assert "dst_local_shape" not in recorder.ops[0].kwargs
 
     def test_both_meshes_travel_with_every_transfer(self, recorder):
         plan = ReshardPlan(bulk=[entry("a")])
@@ -514,7 +717,7 @@ class TestOpOrdering:
         cache._lanes[LaneKey("g", 1, 1)] = lane(recorder, "lane1", stream=None)
         sender = NcclM2nSender(
             plan=plan,
-            specs={"a": LocalParamSpec(base="buf::a")},
+            specs={"a": LocalParamSpec(base=FakeBuffer("buf::a", shape=(4, 4)))},
             group_id="g",
             epoch=1,
             cache=cache,
@@ -551,9 +754,15 @@ class TestOpOrdering:
             "src_placements",
             "dst_mesh",
             "dst_placements",
+            "dst_local_shape",
+            "dst_dtype",
         }
         assert isinstance(op.kwargs["src_placements"][0], Shard)
         assert op.kwargs["src_placements"][0].dim == 0
+        assert "src_local_shape" not in op.kwargs
+        assert "src_dtype" not in op.kwargs
+        assert op.kwargs["dst_local_shape"] == (4, 4)
+        assert op.kwargs["dst_dtype"] == "bfloat16"
 
     def test_a_multi_axis_mesh_is_nested_not_flattened(self, recorder):
         """A flat list would describe a different topology entirely."""
@@ -584,11 +793,316 @@ class TestOpOrdering:
             stream=SimpleNamespace(cuda_stream=99),
         )
         cache._lanes[LaneKey("g", 1, 1)] = lane(recorder, "lane1")
-        specs = {"a": LocalParamSpec(base="buf::a")}
+        specs = {"a": LocalParamSpec(base=FakeBuffer("buf::a", shape=(4, 4)))}
         half = NcclM2nSender(plan=plan, specs=specs, group_id="g", epoch=1, cache=cache)
         half.start_weight_update("v")
         half.publish_weights(0)
         assert recorder.ops[0].kwargs["stream"] == 99
+
+
+class TestM2nGrouping:
+    def test_a_same_lane_source_mesh_run_is_one_group(self, recorder):
+        plan = ReshardPlan(
+            bulk=[
+                entry("a", src_shape=(1,), src_rank_offset=0),
+                entry("b", src_shape=(1,), src_rank_offset=0),
+            ]
+        )
+        half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+
+        half.start_weight_update("v")
+        half.publish_weights(0)
+
+        assert recorder.groups == [("start", 0), ("end", 2)]
+
+    def test_groups_never_mix_lanes_and_lane_order_is_deterministic(self, recorder):
+        plan = ReshardPlan(
+            bulk=[
+                entry("a-lane1", partition=1),
+                entry("z-lane0", partition=0),
+            ],
+            source_partition_count=2,
+        )
+        half, _ = build(
+            recorder,
+            plan=plan,
+            half_cls=NcclM2nSender,
+            partitions=2,
+        )
+
+        half.start_weight_update("v")
+        half.publish_weights(0)
+
+        assert [op.comm._name for op in recorder.ops] == ["lane0", "lane1"]
+        assert recorder.groups == [
+            ("start", 0),
+            ("end", 1),
+            ("start", 1),
+            ("end", 2),
+        ]
+        assert list(half._active_lanes.values()) == [
+            half._lane(0),
+            half._lane(1),
+        ]
+        assert not any(op.kind == "sync" for op in recorder.ops)
+
+    def test_a_source_mesh_transition_closes_the_group_before_fencing(self, recorder):
+        plan = ReshardPlan(
+            bulk=[
+                entry("a", src_shape=(1,), src_rank_offset=0),
+                entry("b", src_shape=(1,), src_rank_offset=0),
+                entry("c", src_shape=(1,), src_rank_offset=1),
+            ]
+        )
+        half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+
+        half.start_weight_update("v")
+        half.publish_weights(0)
+
+        assert recorder.groups == [
+            ("start", 0),
+            ("end", 2),
+            ("start", 5),
+            ("end", 6),
+        ]
+        assert [op.kind for op in recorder.ops] == [
+            "reshard",
+            "reshard",
+            "sync",
+            "broadcast",
+            "sync",
+            "reshard",
+        ]
+
+    def test_group_key_is_not_an_execution_boundary(self, recorder):
+        plan = ReshardPlan(
+            bulk=[
+                entry("a", group_key="one"),
+                entry("b", group_key="two"),
+            ]
+        )
+        half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+
+        half.start_weight_update("v")
+        half.publish_weights(0)
+
+        assert recorder.groups == [("start", 0), ("end", 2)]
+
+    def test_a_group_exception_aborts_epoch_and_releases_contexts(
+        self, recorder, monkeypatch
+    ):
+        calls = 0
+
+        def fail_second(src, dst, comm, **kwargs):
+            nonlocal calls
+            calls += 1
+            recorder.ops.append(SimpleNamespace(kind="reshard", src=src, dst=dst))
+            if calls == 2:
+                raise RuntimeError("injected grouped reshard failure")
+
+        monkeypatch.setattr(sys.modules["nccl.m2n"], "reshard", fail_second)
+        plan = ReshardPlan(bulk=[entry("a"), entry("b")])
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        live = cache.get(LaneKey("g", 1, 0))
+        snapshots = settlement_probe(half, live)
+
+        half.start_weight_update("v")
+        with pytest.raises(RuntimeError, match="grouped reshard failure"):
+            half.publish_weights(0)
+
+        assert recorder.groups == [("start", 0), ("abort", 2)]
+        assert [[ctx.buf for ctx in snapshot.contexts] for snapshot in snapshots] == [
+            ["buf::a", "buf::b"]
+        ]
+        assert_transfer_released(half)
+        assert all(live.aborted for live in cache._lanes.values())
+
+    def test_group_end_failure_settles_pre_hook_contexts(self, recorder, monkeypatch):
+        posts = []
+
+        class FailingGroupEnd:
+            def __enter__(self):
+                recorder.groups.append(("start", len(recorder.ops)))
+
+            def __exit__(self, exc_type, exc, tb):
+                if exc_type is not None:
+                    recorder.groups.append(("abort", len(recorder.ops)))
+                    return False
+                raise RuntimeError("group_end failed")
+
+        monkeypatch.setattr(sys.modules["nccl.m2n"], "group", FailingGroupEnd)
+        plan = ReshardPlan(bulk=[entry("a")])
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        half._specs["a"].post = lambda ctx: posts.append(ctx)
+        live = cache.get(LaneKey("g", 1, 0))
+        snapshots = settlement_probe(half, live)
+        half.start_weight_update("v")
+
+        with pytest.raises(RuntimeError, match="group_end failed"):
+            half.publish_weights(0)
+
+        assert [[ctx.buf for ctx in snapshot.contexts] for snapshot in snapshots] == [
+            ["buf::a"]
+        ]
+        assert posts == []
+        assert live.aborted
+
+    def test_sparse_group_end_failure_settles_active_lane_without_context(
+        self, recorder, monkeypatch
+    ):
+        order = []
+
+        class FailingGroupEnd:
+            def __enter__(self):
+                order.append("group_start")
+
+            def __exit__(self, exc_type, exc, tb):
+                order.append("group_end")
+                raise RuntimeError("sparse group_end failed")
+
+        monkeypatch.setattr(sys.modules["nccl.m2n"], "group", FailingGroupEnd)
+        plan = ReshardPlan(
+            bulk=[entry("owned-elsewhere", src_shape=(1,), src_rank_offset=0)]
+        )
+        cache = CommunicatorCache()
+        live = lane(recorder, "lane0", rank=1, world=4)
+        cache._lanes[LaneKey("g", 1, 0)] = live
+        live.synchronize = lambda timeout_s=None: order.append("sync")
+        live._comm.abort = lambda: order.append("abort")
+        half = NcclM2nSender(
+            plan=plan,
+            specs={},
+            group_id="g",
+            epoch=1,
+            cache=cache,
+            source_partition=0,
+            source_rank_in_lane=1,
+        )
+        half.start_weight_update("v")
+
+        with pytest.raises(RuntimeError, match="sparse group_end failed"):
+            half.publish_weights(0)
+
+        assert order == ["group_start", "group_end", "sync", "abort"]
+        assert_transfer_released(half)
+
+
+class TestBufferValidation:
+    def test_a_source_shape_mismatch_is_rejected_before_native_recording(
+        self, recorder
+    ):
+        plan = ReshardPlan(bulk=[entry("a")])
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        half._specs["a"] = LocalParamSpec(base=FakeBuffer("wrong-shape", shape=(8, 4)))
+
+        half.start_weight_update("v")
+        with pytest.raises(ValueError, match=r"local src shape.*declared shape"):
+            half.publish_weights(0)
+
+        assert [op.kind for op in recorder.ops] == ["sync"]
+        assert all(live.aborted for live in cache._lanes.values())
+
+    def test_binding_equivalent_dtype_aliases_compare_equal(self, recorder):
+        plan_entry = ParamPlan(
+            name="a",
+            global_shape=(8, 4),
+            dtype="float32",
+            partition_id=0,
+            src_mesh=MeshSpec(shape=(2,), rank_offset=0),
+            src_placements=(Placement.shard(0),),
+            dst_mesh=MeshSpec(shape=(2,), rank_offset=2),
+            dst_placements=(Placement.shard(0),),
+        )
+        half, _ = build(
+            recorder,
+            plan=ReshardPlan(bulk=[plan_entry]),
+            half_cls=NcclM2nSender,
+        )
+        half._specs["a"] = LocalParamSpec(
+            base=FakeBuffer("numpy-float32", shape=(4, 4), dtype="<f4")
+        )
+
+        half.start_weight_update("v")
+        half.publish_weights(0)
+
+        assert len(recorder.ops) == 1
+
+    def test_data_ptr_metadata_precedes_cuda_array_interface(self, recorder):
+        class DataPtrBuffer:
+            shape = (4, 4)
+            dtype = "bfloat16"
+
+            def data_ptr(self):
+                return 1
+
+            @property
+            def __cuda_array_interface__(self):
+                raise AssertionError("CUDA Array Interface must not be inspected")
+
+        plan = ReshardPlan(bulk=[entry("a")])
+        half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        half._specs["a"] = LocalParamSpec(base=DataPtrBuffer())
+
+        half.start_weight_update("v")
+        half.publish_weights(0)
+
+        assert len(recorder.ops) == 1
+
+    def test_partial_data_ptr_metadata_uses_the_complete_cuda_interface(self, recorder):
+        class HybridBuffer:
+            shape = (4, 4)
+
+            def data_ptr(self):
+                return 1
+
+            @property
+            def __cuda_array_interface__(self):
+                return {
+                    "shape": (8, 4),
+                    "typestr": "<f4",
+                    "data": (1, False),
+                    "version": 3,
+                }
+
+        plan_entry = ParamPlan(
+            name="a",
+            global_shape=(8, 4),
+            dtype="float32",
+            partition_id=0,
+            src_mesh=MeshSpec(shape=(2,), rank_offset=0),
+            src_placements=(Placement.shard(0),),
+            dst_mesh=MeshSpec(shape=(2,), rank_offset=2),
+            dst_placements=(Placement.shard(0),),
+        )
+        half, cache = build(
+            recorder,
+            plan=ReshardPlan(bulk=[plan_entry]),
+            half_cls=NcclM2nSender,
+        )
+        half._specs["a"] = LocalParamSpec(base=HybridBuffer())
+        half.start_weight_update("v")
+
+        with pytest.raises(ValueError, match=r"local src shape.*declared shape"):
+            half.publish_weights(0)
+
+        assert not any(op.kind == "reshard" for op in recorder.ops)
+        assert all(live.aborted for live in cache._lanes.values())
+
+    def test_a_destination_dtype_mismatch_is_rejected_before_native_recording(
+        self, recorder
+    ):
+        plan = ReshardPlan(bulk=[entry("a")])
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
+        half._specs["a"] = LocalParamSpec(
+            base=FakeBuffer("wrong-dtype", shape=(4, 4), dtype="float32")
+        )
+
+        half.start_weight_update("v")
+        with pytest.raises(ValueError, match=r"local dst dtype.*declared dtype"):
+            half.update_weights(0)
+
+        assert [op.kind for op in recorder.ops] == ["sync"]
+        assert all(live.aborted for live in cache._lanes.values())
 
 
 class TestLaneRouting:
@@ -614,7 +1128,7 @@ class TestLaneRouting:
         half = NcclM2nSender(
             plan=plan,
             specs={
-                "stage1": LocalParamSpec(base="buf::stage1"),
+                "stage1": LocalParamSpec(base=FakeBuffer("buf::stage1", shape=(4, 4))),
                 "m": LocalParamSpec(base="buf::m"),
             },
             group_id="g",
@@ -648,7 +1162,9 @@ class TestLaneRouting:
         cache._lanes[LaneKey("g", 1, 1)] = lane(recorder, "broadcast", rank=1, world=4)
         half = NcclM2nSender(
             plan=plan,
-            specs={"owner1": LocalParamSpec(base="buf::owner1")},
+            specs={
+                "owner1": LocalParamSpec(base=FakeBuffer("buf::owner1", shape=(8, 4)))
+            },
             group_id="g",
             epoch=1,
             cache=cache,
@@ -663,6 +1179,82 @@ class TestLaneRouting:
             (None, None),
             ("buf::owner1", None),
         ]
+        nonowner = recorder.ops[0]
+        assert nonowner.kwargs["src_local_shape"] == (8, 4)
+        assert nonowner.kwargs["dst_local_shape"] == (4, 4)
+        assert nonowner.kwargs["src_dtype"] == "bfloat16"
+        assert nonowner.kwargs["dst_dtype"] == "bfloat16"
+
+    def test_a_nonowner_call_matches_the_real_binding_signature(
+        self, recorder, monkeypatch
+    ):
+        observed = []
+
+        def binding(
+            src,
+            dst,
+            comm,
+            stream=None,
+            *,
+            src_mesh=None,
+            src_placements=None,
+            src_local_shape=None,
+            src_dtype=None,
+            dst_mesh=None,
+            dst_placements=None,
+            dst_local_shape=None,
+            dst_dtype=None,
+            handle=None,
+        ):
+            observed.append(
+                {
+                    "src": src,
+                    "dst": dst,
+                    "comm": comm,
+                    "stream": stream,
+                    "src_mesh": src_mesh,
+                    "src_placements": src_placements,
+                    "src_local_shape": src_local_shape,
+                    "src_dtype": src_dtype,
+                    "dst_mesh": dst_mesh,
+                    "dst_placements": dst_placements,
+                    "dst_local_shape": dst_local_shape,
+                    "dst_dtype": dst_dtype,
+                    "handle": handle,
+                }
+            )
+
+        monkeypatch.setattr(sys.modules["nccl.m2n"], "reshard", binding)
+        plan = ReshardPlan(
+            bulk=[entry("owned-elsewhere", src_shape=(1,), src_rank_offset=0)]
+        )
+        cache = CommunicatorCache()
+        cache._lanes[LaneKey("g", 1, 0)] = lane(
+            recorder, "lane0", rank=1, world=4, stream=None
+        )
+        half = NcclM2nSender(
+            plan=plan,
+            specs={},
+            group_id="g",
+            epoch=1,
+            cache=cache,
+            source_partition=0,
+            source_rank_in_lane=1,
+        )
+
+        half.start_weight_update("v")
+        half.publish_weights(0)
+
+        assert len(observed) == 1
+        call = observed[0]
+        assert call["src"] is None
+        assert call["dst"] is None
+        assert call["stream"] is None
+        assert call["src_local_shape"] == (8, 4)
+        assert call["dst_local_shape"] == (4, 4)
+        assert call["src_dtype"] == "bfloat16"
+        assert call["dst_dtype"] == "bfloat16"
+        assert call["handle"] is None
 
     def test_a_source_owner_still_requires_local_storage(self, recorder):
         plan = ReshardPlan(bulk=[entry("owner0", src_shape=(1,), src_rank_offset=0)])
@@ -714,7 +1306,10 @@ class TestHooks:
 
         def pre(base):
             order.append("pre")
-            return RefitCtx(buf="staged", extra={"region": base})
+            return RefitCtx(
+                buf=FakeBuffer("staged", shape=(4, 4)),
+                extra={"region": base},
+            )
 
         def post(ctx):
             order.append("post")
@@ -728,6 +1323,256 @@ class TestHooks:
         assert order == ["pre", "post"]
         # The wire op must see the staged buffer, not the live parameter.
         assert recorder.ops[0].src == "staged"
+
+    def test_post_runs_only_after_group_end_submits_the_recording(
+        self, recorder, monkeypatch
+    ):
+        order = []
+
+        class TrackingRLock:
+            def __init__(self):
+                self.depth = 0
+
+            def __enter__(self):
+                self.depth += 1
+
+            def __exit__(self, exc_type, exc, tb):
+                self.depth -= 1
+
+        lock = TrackingRLock()
+
+        def deferred_reshard(src, dst, comm, **kwargs):
+            order.append("record")
+
+        class DeferredGroup:
+            def __enter__(self):
+                order.append("group_start")
+
+            def __exit__(self, exc_type, exc, tb):
+                if exc_type is not None:
+                    order.append("group_abort")
+                    return False
+                order.extend(("group_end", "wire"))
+                return False
+
+        module = sys.modules["nccl.m2n"]
+        monkeypatch.setattr(backend, "_M2N_CALL_LOCK", lock)
+        monkeypatch.setattr(module, "group", DeferredGroup)
+        monkeypatch.setattr(module, "reshard", deferred_reshard)
+
+        def pre(base):
+            order.append("pre")
+            return RefitCtx(buf=FakeBuffer("staged", shape=(4, 4)))
+
+        def post(ctx):
+            assert lock.depth == 0
+            order.append("post")
+
+        plan = ReshardPlan(bulk=[entry("a")])
+        cache = CommunicatorCache()
+        cache._lanes[LaneKey("g", 1, 0)] = lane(recorder, "lane0")
+        half = NcclM2nSender(
+            plan=plan,
+            specs={"a": LocalParamSpec(pre=pre, post=post)},
+            group_id="g",
+            epoch=1,
+            cache=cache,
+        )
+
+        half.start_weight_update("v")
+        half.publish_weights(0)
+
+        assert order == [
+            "group_start",
+            "pre",
+            "record",
+            "group_end",
+            "wire",
+            "post",
+        ]
+
+    def test_a_raising_post_retains_its_context_until_lane_sync(self, recorder):
+        order = []
+        retained_at_sync = []
+        post_contexts = []
+        plan = ReshardPlan(bulk=[entry("a")])
+        cache = CommunicatorCache()
+        live = lane(recorder, "lane0")
+        cache._lanes[LaneKey("g", 1, 0)] = live
+
+        def post(ctx):
+            post_contexts.append(ctx)
+            order.append("post-enqueued")
+            raise RuntimeError("post failed after enqueue")
+
+        half = NcclM2nSender(
+            plan=plan,
+            specs={
+                "a": LocalParamSpec(
+                    base=FakeBuffer("buf::a", shape=(4, 4)),
+                    post=post,
+                )
+            },
+            group_id="g",
+            epoch=1,
+            cache=cache,
+        )
+
+        def synchronize(timeout_s=None):
+            order.append("sync")
+            retained_at_sync.append([ctx for _, ctx in half._pending_contexts])
+
+        live.synchronize = synchronize
+        half.start_weight_update("v")
+
+        with pytest.raises(RuntimeError, match="post failed after enqueue"):
+            half.publish_weights(0)
+
+        assert order == ["post-enqueued", "sync"]
+        assert retained_at_sync == [post_contexts]
+        assert half._pending_contexts == []
+        assert live.aborted
+
+    def test_a_pre_hook_failure_settles_the_lane_before_abort(self, recorder):
+        order = []
+        plan = ReshardPlan(bulk=[entry("a")])
+        cache = CommunicatorCache()
+        live = lane(recorder, "lane0")
+        cache._lanes[LaneKey("g", 1, 0)] = live
+
+        def pre(base):
+            order.append("pre-enqueued")
+            raise RuntimeError("pre failed after enqueue")
+
+        live.synchronize = lambda timeout_s=None: order.append("sync")
+        live._comm.abort = lambda: order.append("abort")
+        half = NcclM2nSender(
+            plan=plan,
+            specs={"a": LocalParamSpec(pre=pre)},
+            group_id="g",
+            epoch=1,
+            cache=cache,
+        )
+        half.start_weight_update("v")
+
+        with pytest.raises(RuntimeError, match="pre failed after enqueue"):
+            half.publish_weights(0)
+
+        assert order == ["pre-enqueued", "sync", "abort"]
+        assert_transfer_released(half)
+
+    def test_an_unsynchronized_failed_post_is_quarantined(self, recorder, monkeypatch):
+        quarantined = []
+        monkeypatch.setattr(backend, "_UNSETTLED_TRANSFER_RESOURCES", quarantined)
+        plan = ReshardPlan(bulk=[entry("a")])
+        cache = CommunicatorCache()
+        live = lane(recorder, "lane0")
+        cache._lanes[LaneKey("g", 1, 0)] = live
+        observed = []
+
+        def post(ctx):
+            observed.append(ctx)
+            raise RuntimeError("post failed")
+
+        half = NcclM2nSender(
+            plan=plan,
+            specs={
+                "a": LocalParamSpec(
+                    base=FakeBuffer("buf::a", shape=(4, 4)),
+                    post=post,
+                )
+            },
+            group_id="g",
+            epoch=1,
+            cache=cache,
+        )
+        settlement_probe(half, live, fail_on={1})
+        half.start_weight_update("v")
+
+        with pytest.raises(RuntimeError, match="post failed"):
+            half.publish_weights(0)
+
+        assert quarantined == observed
+        assert live.aborted
+
+    def test_failed_post_settles_earlier_layer_contexts_on_the_same_lane(
+        self, recorder
+    ):
+        plan = ReshardPlan(bulk=[entry("a"), entry("b")])
+        cache = CommunicatorCache()
+        live = lane(recorder, "lane0")
+        cache._lanes[LaneKey("g", 1, 0)] = live
+
+        half = NcclM2nSender(
+            plan=plan,
+            specs={
+                "a": staged_spec("a"),
+                "b": staged_spec("b", post_error="later layer post failed"),
+            },
+            group_id="g",
+            epoch=1,
+            cache=cache,
+        )
+        half.setup_layer_groups([["a"], ["b"]])
+        snapshots = settlement_probe(half, live)
+        half.start_weight_update("v")
+        half.publish_weights(0)
+
+        with pytest.raises(RuntimeError, match="later layer post failed"):
+            half.publish_weights(1)
+
+        assert [
+            {ctx.extra["name"] for ctx in snapshot.contexts} for snapshot in snapshots
+        ] == [{"a", "b"}]
+        assert live.aborted
+
+    def test_failed_post_settles_previously_submitted_other_lanes(self, recorder):
+        plan = ReshardPlan(
+            bulk=[entry("a", partition=0), entry("b", partition=1)],
+            source_partition_count=2,
+        )
+        cache = CommunicatorCache()
+        lane0 = lane(recorder, "lane0")
+        lane1 = lane(recorder, "lane1")
+        cache._lanes[LaneKey("g", 1, 0)] = lane0
+        cache._lanes[LaneKey("g", 1, 1)] = lane1
+        retained_at_sync = []
+
+        half = NcclM2nSender(
+            plan=plan,
+            specs={
+                "a": staged_spec("a"),
+                "b": staged_spec("b", post_error="second lane post failed"),
+            },
+            group_id="g",
+            epoch=1,
+            cache=cache,
+        )
+
+        def synchronize(name):
+            def record(timeout_s=None):
+                retained_at_sync.append(
+                    (
+                        name,
+                        {ctx.extra["name"] for _, ctx in half._pending_contexts},
+                    )
+                )
+
+            return record
+
+        lane0.synchronize = synchronize("lane0")
+        lane1.synchronize = synchronize("lane1")
+        half.start_weight_update("v")
+
+        with pytest.raises(RuntimeError, match="second lane post failed"):
+            half.publish_weights(0)
+
+        assert retained_at_sync == [
+            ("lane0", {"a", "b"}),
+            ("lane1", {"b"}),
+        ]
+        assert lane0.aborted
+        assert lane1.aborted
 
     def test_a_spec_with_neither_base_nor_pre_is_rejected(self):
         with pytest.raises(ValueError, match="base tensor or a pre hook"):
@@ -920,6 +1765,50 @@ class TestTransferDeadline:
         # recovered on the same communicator, so every lane must be gone.
         assert all(lane.aborted for lane in cache._lanes.values())
 
+    def test_expired_deadline_quarantines_all_retained_layer_contexts_before_abort(
+        self, recorder, clock, short_deadline, monkeypatch
+    ):
+        quarantined = []
+        monkeypatch.setattr(backend, "_UNSETTLED_TRANSFER_RESOURCES", quarantined)
+        plan = ReshardPlan(bulk=[entry("a"), entry("b"), entry("c")])
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        half.setup_layer_groups([["a"], ["b", "c"]])
+        live = cache.get(LaneKey("g", 1, 0))
+        observed_at_abort = []
+
+        def advance_deadline(base):
+            clock.advance(31.0)
+            return RefitCtx(
+                buf=FakeBuffer("buf::b", shape=(4, 4)),
+                extra=None,
+            )
+
+        half._specs["b"] = LocalParamSpec(pre=advance_deadline)
+        live.synchronize = lambda timeout_s=None: pytest.fail(
+            "an already-expired deadline must not enter an unbounded lane wait"
+        )
+
+        def abort():
+            observed_at_abort.append(
+                (
+                    [ctx.buf for _, ctx in half._pending_contexts],
+                    [ctx.buf for ctx in quarantined],
+                )
+            )
+            live._comm.aborted = True
+
+        live._comm.abort = abort
+
+        half.start_weight_update("v7")
+        half.publish_weights(0)
+
+        with pytest.raises(TimeoutError, match="v7"):
+            half.publish_weights(1)
+
+        assert observed_at_abort == [(["buf::a", "buf::b"], ["buf::a", "buf::b"])]
+        assert [ctx.buf for ctx in quarantined] == ["buf::a", "buf::b"]
+        assert_transfer_released(half)
+
     def test_a_transfer_inside_its_deadline_is_untouched(
         self, recorder, clock, short_deadline
     ):
@@ -1106,8 +1995,16 @@ class TestNcclVersionFloor:
     def _importable(monkeypatch):
         module = ModuleType("nccl.m2n")
         module.reshard = lambda *args, **kwargs: None
+        module.group = lambda: None
         monkeypatch.setitem(sys.modules, "nccl", ModuleType("nccl"))
         monkeypatch.setitem(sys.modules, "nccl.m2n", module)
+
+    def test_a_runtime_without_group_is_refused(self, monkeypatch):
+        self._importable(monkeypatch)
+        sys.modules["nccl.m2n"].group = None
+        monkeypatch.setattr(backend, "loaded_nccl_version", lambda: backend.MIN_NCCL)
+        with pytest.raises(backend.NcclUnavailableError, match=r"m2n\.group"):
+            backend.require_nccl_m2n()
 
     def test_a_library_below_the_floor_is_refused(self, monkeypatch):
         self._importable(monkeypatch)

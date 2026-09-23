@@ -31,7 +31,12 @@ from .types import MeshSpec, ParamPlan, ReshardPlan
 logger = logging.getLogger("modelexpress_rl.collective.backend")
 
 DEFAULT_LAYER_GROUP = 0
-_M2N_CALL_LOCK = threading.Lock()
+_M2N_CALL_LOCK = threading.RLock()
+# Any transfer failure may follow CUDA work enqueued by a pre hook, reshard, or
+# post hook. If its lane cannot be synchronized, retaining the associated
+# contexts for process lifetime is safer than releasing storage the device may
+# still consume.
+_UNSETTLED_TRANSFER_RESOURCES: list[Any] = []
 
 #: The reshard entry points were added in this NCCL release. An older library
 #: fails inside the native call rather than at import, so importability alone
@@ -74,7 +79,7 @@ def require_nccl_m2n() -> None:
     joins a group.
     """
     try:
-        from nccl.m2n import reshard as _  # noqa: F401
+        from nccl.m2n import group, reshard  # noqa: F401
     except (ImportError, OSError) as error:  # pragma: no cover - environment dependent
         raise NcclUnavailableError(
             "the collective refit data plane needs nccl.m2n, which ships as "
@@ -82,6 +87,11 @@ def require_nccl_m2n() -> None:
             "install nccl-extensions[cu12] or nccl-extensions[cu13] to match "
             "the host CUDA toolkit"
         ) from error
+    if not callable(group):
+        raise NcclUnavailableError(
+            "the collective refit data plane needs nccl.m2n.group(), which is "
+            "part of the supported nccl-extensions M2N runtime"
+        )
     found = loaded_nccl_version()
     if found is None:
         logger.debug(
@@ -129,6 +139,26 @@ def _reshard(
         "dst_mesh": entry.dst_mesh.nested(),
         "dst_placements": [p.to_wire() for p in entry.dst_placements],
     }
+    _set_or_validate_endpoint(
+        kwargs,
+        name=entry.name,
+        side="src",
+        buffer=src,
+        expected_shape=_local_shape(
+            entry.global_shape, entry.src_mesh, entry.src_placements
+        ),
+        expected_dtype=entry.dtype,
+    )
+    _set_or_validate_endpoint(
+        kwargs,
+        name=entry.name,
+        side="dst",
+        buffer=dst,
+        expected_shape=_local_shape(
+            entry.global_shape, entry.dst_mesh, entry.dst_placements
+        ),
+        expected_dtype=entry.dtype,
+    )
     stream = comm.stream
     if stream is not None:
         kwargs["stream"] = _stream_handle(stream)
@@ -138,6 +168,94 @@ def _reshard(
     # submissions still permits device-side overlap on the supplied streams.
     with _M2N_CALL_LOCK:
         reshard(src, dst, comm.handle, **kwargs)
+
+
+def _local_shape(
+    global_shape: tuple[int, ...],
+    mesh: MeshSpec,
+    placements: tuple[Any, ...],
+) -> tuple[int, ...]:
+    """Project a declared global shape onto one rank of a mesh."""
+    shape = list(global_shape)
+    for axis, placement in enumerate(placements):
+        if placement.dim is not None:
+            shape[placement.dim] //= mesh.shape[axis]
+    return tuple(shape)
+
+
+def _set_or_validate_endpoint(
+    kwargs: dict[str, Any],
+    *,
+    name: str,
+    side: str,
+    buffer: Any,
+    expected_shape: tuple[int, ...],
+    expected_dtype: str,
+) -> None:
+    """Describe an absent endpoint or validate a locally owned buffer."""
+    if buffer is None:
+        kwargs[f"{side}_local_shape"] = expected_shape
+        kwargs[f"{side}_dtype"] = expected_dtype
+        return
+
+    data_ptr = getattr(buffer, "data_ptr", None)
+    ordinary_shape = getattr(buffer, "shape", None)
+    ordinary_dtype = getattr(buffer, "dtype", None)
+    if callable(data_ptr) and ordinary_shape is not None and ordinary_dtype is not None:
+        raw_shape = ordinary_shape
+        raw_dtype = ordinary_dtype
+    else:
+        cuda_interface = getattr(buffer, "__cuda_array_interface__", None)
+        raw_shape = cuda_interface.get("shape") if cuda_interface is not None else None
+        raw_dtype = (
+            cuda_interface.get("typestr") if cuda_interface is not None else None
+        )
+    if raw_shape is None or raw_dtype is None:
+        raise TypeError(
+            f"{name}: local {side} buffer must expose shape and dtype so its "
+            "declared NCCL M2N layout can be validated"
+        )
+
+    actual_shape = tuple(int(dim) for dim in raw_shape)
+    if actual_shape != expected_shape:
+        raise ValueError(
+            f"{name}: local {side} shape {actual_shape} does not match the "
+            f"declared shape {expected_shape}"
+        )
+    actual_dtype = _normalize_dtype(raw_dtype)
+    planned_dtype = _normalize_dtype(expected_dtype)
+    if actual_dtype != planned_dtype:
+        raise ValueError(
+            f"{name}: local {side} dtype {actual_dtype!r} does not match the "
+            f"declared dtype {planned_dtype!r}"
+        )
+
+
+def _normalize_dtype(dtype: Any) -> Any:
+    """Use the binding's dtype normalization, with a dependency-light fallback."""
+    try:
+        from nccl.m2n.tensor import normalize_dtype
+    except ImportError:
+        normalized = str(dtype).removeprefix("torch.").lower()
+        aliases = {
+            "char": "int8",
+            "byte": "uint8",
+            "int": "int32",
+            "long": "int64",
+            "half": "float16",
+            "float": "float32",
+            "double": "float64",
+            "float8_e4m3": "float8_e4m3fn",
+        }
+        normalized = aliases.get(normalized, normalized)
+        try:
+            import numpy as np
+
+            normalized = str(np.dtype(normalized))
+        except (ImportError, TypeError, ValueError):
+            pass
+        return aliases.get(normalized, normalized)
+    return normalize_dtype(dtype)
 
 
 def _stream_handle(stream: Any) -> int:
@@ -226,6 +344,7 @@ class _CollectiveHalf:
         self._pending_contexts: list[tuple[int, RefitCtx]] = []
         self._previous_source_mesh_by_lane: dict[int, MeshSpec] = {}
         self._fence_buffers: dict[int, Any] = {}
+        self._pending_fence_buffers: dict[int, Any] = {}
         self._barrier_alloc = (
             _allocate_fence_buffer if barrier_alloc is None else barrier_alloc
         )
@@ -318,19 +437,18 @@ class _CollectiveHalf:
         return remaining
 
     def _fail_deadline(self) -> None:
-        """Abort the group and name what overran.
+        """Name what overran and let the owning operation abort safely.
 
-        The abort is not optional. Peers that disagree about which collectives
-        completed cannot be recovered by retrying on the same communicator, so
-        the group is torn down and has to re-form at a fresh epoch.
+        Callers may still own contexts used by enqueued CUDA work. The outer
+        operation boundary must settle or quarantine those contexts before it
+        aborts and clears the epoch state.
         """
         timeout_s = self._timeout_s
         version = self._version
-        self.abort()
         raise TimeoutError(
             f"collective refit of version {version!r} did not complete within "
             f"MX_NCCL_REFIT_TRANSFER_TIMEOUT_S ({timeout_s:.1f}s); group "
-            f"{self._group_id} was aborted and must re-form at a new epoch"
+            f"{self._group_id} must abort and re-form at a new epoch"
         )
 
     def abort(self) -> None:
@@ -340,6 +458,7 @@ class _CollectiveHalf:
         self._pending_contexts.clear()
         self._previous_source_mesh_by_lane.clear()
         self._fence_buffers.clear()
+        self._pending_fence_buffers.clear()
         self._deadline = None
 
     def _stream_context(self, lane: LaneCommunicator, spec: LocalParamSpec):
@@ -388,8 +507,13 @@ class _CollectiveHalf:
         if barrier is None:
             barrier = self._barrier_alloc(lane.device)
             self._fence_buffers[lane_id] = barrier
+        # The probe itself is asynchronous work. Keep the lane visible to the
+        # outer failure settlement if either broadcast or its wait fails.
+        self._record_lane(lane)
+        self._pending_fence_buffers[lane_id] = barrier
         _broadcast(lane, barrier, root=0)
         self._wait_lane(lane)
+        self._pending_fence_buffers.pop(lane_id, None)
 
     def _drain_active_lanes(self) -> None:
         for lane in list(self._active_lanes.values()):
@@ -411,14 +535,8 @@ class _CollectiveHalf:
         source_mesh = entry.src_mesh
         previous_source_mesh = self._previous_source_mesh_by_lane.get(lane_id)
         if previous_source_mesh is not None and source_mesh != previous_source_mesh:
-            try:
-                self._drain_lane(lane)
-                self._fence_lane(lane)
-            except BaseException:
-                # Once peers disagree about which source-mesh batch completed,
-                # this epoch cannot be retried safely.
-                self.abort()
-                raise
+            self._drain_lane(lane)
+            self._fence_lane(lane)
         self._previous_source_mesh_by_lane[lane_id] = source_mesh
 
     def _issue_reshard(
@@ -428,44 +546,189 @@ class _CollectiveHalf:
         spec: LocalParamSpec | None,
         src: Any,
         dst: Any,
-    ) -> None:
+        lane: LaneCommunicator | None = None,
+        fence_transition: bool = True,
+    ) -> tuple[LocalParamSpec, RefitCtx, LaneCommunicator] | None:
         self._remaining()
-        lane = self._lane(entry.partition_id)
-        self._fence_source_mesh_transition(entry, lane)
+        lane = self._lane(entry.partition_id) if lane is None else lane
+        if fence_transition:
+            self._fence_source_mesh_transition(entry, lane)
+        # A pre hook or sparse collective call can enqueue work before a
+        # RefitCtx exists. Mark the lane active before any per-op work so every
+        # transfer failure path settles it before aborting the epoch.
+        self._record_lane(lane)
         if spec is None:
             _reshard(comm=lane, entry=entry, src=None, dst=None)
-            self._record_lane(lane)
-            return
+            return None
         with self._stream_context(lane, spec):
             ctx = spec.enter()
             # Retain staging buffers and hook state until the asynchronous CUDA
             # work is complete. Relying only on an allocator's stream tracking
             # is not sufficient for engine-owned or external buffers.
             self._retain_context(lane, ctx)
+            # A pre hook may already have enqueued work on this stream. Mark
+            # its returned context before validation or native recording can
+            # fail so the outer failure path can retain it while settling.
             _reshard(comm=lane, entry=entry, src=src(ctx), dst=dst(ctx))
-            spec.leave(ctx)
-        self._record_lane(lane)
+        return spec, ctx, lane
+
+    def _issue_grouped_reshards(
+        self,
+        operations: list[
+            tuple[
+                ParamPlan,
+                LocalParamSpec | None,
+                Callable[[RefitCtx], Any],
+                Callable[[RefitCtx], Any],
+            ]
+        ],
+    ) -> None:
+        """Submit deterministic same-lane/source-mesh runs as M2N groups."""
+        require_nccl_m2n()
+        from nccl.m2n import group
+
+        by_lane: dict[
+            int,
+            list[
+                tuple[
+                    ParamPlan,
+                    LocalParamSpec | None,
+                    Callable[[RefitCtx], Any],
+                    Callable[[RefitCtx], Any],
+                ]
+            ],
+        ] = {}
+        for operation in operations:
+            by_lane.setdefault(operation[0].partition_id, []).append(operation)
+
+        try:
+            for lane_id in sorted(by_lane):
+                lane = self._lane(lane_id)
+                lane_operations = by_lane[lane_id]
+                run_start = 0
+                while run_start < len(lane_operations):
+                    source_mesh = lane_operations[run_start][0].src_mesh
+                    run_end = run_start + 1
+                    while (
+                        run_end < len(lane_operations)
+                        and lane_operations[run_end][0].src_mesh == source_mesh
+                    ):
+                        run_end += 1
+
+                    self._fence_source_mesh_transition(
+                        lane_operations[run_start][0], lane
+                    )
+                    self._remaining()
+                    pending_leaves: list[
+                        tuple[LocalParamSpec, RefitCtx, LaneCommunicator]
+                    ] = []
+                    with _M2N_CALL_LOCK:
+                        with group():
+                            for entry, spec, src, dst in lane_operations[
+                                run_start:run_end
+                            ]:
+                                pending = self._issue_reshard(
+                                    entry,
+                                    spec=spec,
+                                    src=src,
+                                    dst=dst,
+                                    lane=lane,
+                                    fence_transition=False,
+                                )
+                                if pending is not None:
+                                    pending_leaves.append(pending)
+                    # group_end has submitted the recorded transfers. Release
+                    # the process-global native lock before post hooks enqueue
+                    # framework work behind them on each lane's stream.
+                    for pending_spec, ctx, pending_lane in pending_leaves:
+                        with self._stream_context(pending_lane, pending_spec):
+                            pending_spec.leave(ctx)
+                    run_start = run_end
+        except BaseException:
+            # Pre hooks can enqueue before validation, recording, group_end, or
+            # post fails. Prove every retained async resource safe before abort
+            # clears ownership, or quarantine it for process lifetime.
+            self._settle_failed_transfer()
+            self.abort()
+            raise
+
+    def _settle_failed_transfer(self) -> None:
+        """Keep every retained async resource alive until its stream is safe."""
+        contexts_by_lane: OrderedDict[int, list[RefitCtx]] = OrderedDict()
+        for lane_id, ctx in self._pending_contexts:
+            contexts_by_lane.setdefault(lane_id, []).append(ctx)
+
+        lane_ids = OrderedDict.fromkeys(
+            [
+                *self._active_lanes,
+                *contexts_by_lane,
+                *self._pending_fence_buffers,
+            ]
+        )
+        for lane_id in lane_ids:
+            contexts = contexts_by_lane.get(lane_id, [])
+            fence_buffer = self._pending_fence_buffers.get(lane_id)
+            resources = [*contexts]
+            if fence_buffer is not None:
+                resources.append(fence_buffer)
+            lane = self._active_lanes.get(lane_id)
+            if lane is None:
+                _UNSETTLED_TRANSFER_RESOURCES.extend(resources)
+                logger.error(
+                    "collective transfer failed with %d retained async resource(s) "
+                    "whose owning lane is no longer active; retaining them for "
+                    "process lifetime",
+                    len(resources),
+                )
+                continue
+            try:
+                self._wait_lane(lane)
+            except BaseException as error:  # noqa: BLE001 - preserve original error
+                _UNSETTLED_TRANSFER_RESOURCES.extend(resources)
+                logger.error(
+                    "collective transfer failed and lane %s/%s could not be "
+                    "synchronized; retaining %d async resource(s) for process "
+                    "lifetime: %r",
+                    lane.rank,
+                    lane.world_size,
+                    len(resources),
+                    error,
+                )
+            else:
+                self._active_lanes.pop(lane_id, None)
+                self._pending_fence_buffers.pop(lane_id, None)
+                self._pending_contexts[:] = [
+                    (owner, ctx)
+                    for owner, ctx in self._pending_contexts
+                    if owner != lane_id
+                ]
 
     def _finish_misc(self, broadcast_lane_id: int) -> None:
         if not self._pending_misc:
             return
-        # Every rank drains every reshard stream it used before entering the
-        # overlapping all-ranks communicator.
-        self._drain_active_lanes()
-        lane = self._lane(broadcast_lane_id)
-        for misc in self._plan.misc:
-            self._remaining()
-            spec = self._specs[misc.name]
-            with self._stream_context(lane, spec):
-                ctx = spec.enter()
-                self._retain_context(lane, ctx)
-                _broadcast(lane, ctx.buf, root=0)
-                spec.leave(ctx)
-            self._record_lane(lane)
-        # Keep temporary buffers and post hooks alive until the broadcast work
-        # has completed, and do not report success for merely enqueued work.
-        self._drain_active_lanes()
-        self._pending_misc = False
+        try:
+            # Every rank drains every reshard stream it used before entering
+            # the overlapping all-ranks communicator.
+            self._drain_active_lanes()
+            lane = self._lane(broadcast_lane_id)
+            for misc in self._plan.misc:
+                self._remaining()
+                spec = self._specs[misc.name]
+                self._record_lane(lane)
+                with self._stream_context(lane, spec):
+                    ctx = spec.enter()
+                    self._retain_context(lane, ctx)
+                    _broadcast(lane, ctx.buf, root=0)
+                    spec.leave(ctx)
+            # Keep temporary buffers and post hooks alive until the broadcast
+            # work has completed, and do not report success for merely
+            # enqueued work.
+            self._drain_active_lanes()
+            self._pending_misc = False
+        except BaseException:
+            self._settle_failed_transfer()
+            self.abort()
+            raise
 
 
 class NcclM2nSender(_CollectiveHalf):
@@ -515,17 +778,20 @@ class NcclM2nSender(_CollectiveHalf):
         communicators with operations in flight in different orders, which is
         the case that deadlocks.
         """
+        operations = []
         for entry in self.entries(layer_group_id):
-            owns_source = (
-                self._source_rank_in_lane is None
-                or self._source_rank_in_lane in entry.src_mesh.ranks()
+            owns_source = self._source_rank_in_lane is None or (
+                self._source_rank_in_lane in entry.src_mesh.ranks()
             )
-            self._issue_reshard(
-                entry,
-                spec=self._specs[entry.name] if owns_source else None,
-                src=lambda ctx: ctx.buf,
-                dst=lambda ctx: None,
+            operations.append(
+                (
+                    entry,
+                    self._specs[entry.name] if owns_source else None,
+                    lambda ctx: ctx.buf,
+                    lambda ctx: None,
+                )
             )
+        self._issue_grouped_reshards(operations)
 
     def finish_weight_update(self, broadcast_lane_id: int) -> None:
         """Drain every reshard lane, then broadcast the misc parameters once."""
@@ -540,17 +806,26 @@ class NcclM2nReceiver(_CollectiveHalf):
         logger.debug("collective receiver starting version %s", version)
 
     def update_weights(self, layer_group_id: int) -> None:
-        for entry in self.entries(layer_group_id):
-            self._issue_reshard(
-                entry,
-                spec=self._specs[entry.name],
-                src=lambda ctx: None,
-                dst=lambda ctx: ctx.buf,
-            )
+        self._issue_grouped_reshards(
+            [
+                (
+                    entry,
+                    self._specs[entry.name],
+                    lambda ctx: None,
+                    lambda ctx: ctx.buf,
+                )
+                for entry in self.entries(layer_group_id)
+            ]
+        )
         # Loader.install runs immediately after this method. It may read or
         # release receive buffers, so the group's transfers and post hooks must
         # be complete before returning.
-        self._drain_active_lanes()
+        try:
+            self._drain_active_lanes()
+        except BaseException:
+            self._settle_failed_transfer()
+            self.abort()
+            raise
 
     def finish_weight_update(self, broadcast_lane_id: int) -> None:
         self._finish_misc(broadcast_lane_id)
