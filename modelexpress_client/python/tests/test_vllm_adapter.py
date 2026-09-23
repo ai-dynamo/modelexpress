@@ -174,10 +174,11 @@ def test_identity_name_is_resolved_once_without_changing_loader_config(
     monkeypatch, model_name
 ):
     """Freeze the MX name while native loading retains the original config."""
+    monkeypatch.setenv("MODEL_NAME", "unrelated-launch-script-variable")
     if model_name is None:
-        monkeypatch.delenv("MODEL_NAME", raising=False)
+        monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
     else:
-        monkeypatch.setenv("MODEL_NAME", model_name)
+        monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", model_name)
     model_path = "/root/.cache/vllm/assets/model_streamer/0088a9aa"
     model_config = _model_config()
     model_config.model = model_path
@@ -186,7 +187,7 @@ def test_identity_name_is_resolved_once_without_changing_loader_config(
     adapter = VllmAdapter(vllm_config, model_config)
     identity = adapter.build_identity()
 
-    monkeypatch.setenv("MODEL_NAME", "changed-after-initialization")
+    monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", "changed-after-initialization")
     assert adapter.build_identity() == identity
     assert identity.model_name == (model_name or model_path)
 

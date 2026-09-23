@@ -40,7 +40,7 @@ Environment variables used by the clients and vLLM engine:
 | Variable | Default | Purpose |
 |---|---|---|
 | `MX_SERVER_ADDRESS` | `localhost:8001` | ModelExpress server address. |
-| `MODEL_NAME` | unset | Logical MX model name used by vLLM at startup and during refit. Use the same name for trainer clients and published WeightVersions. Without it, vLLM's configured model path or ID is used. |
+| `MX_MODEL_NAME_OVERRIDE` | unset | Logical MX model name used by vLLM at startup and during refit. Use the same name for trainer clients and published WeightVersions. Without it, vLLM's configured model path or ID is used. |
 | `MX_AUTH_TOKEN_PATH` | unset | Optional ModelExpress bearer-token file. |
 | `MX_AUTH_TOKEN_TTL_SECONDS` | `60` | Token-file reread interval in seconds. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | unset | S3 credentials when an IAM role or workload identity is unavailable. |
@@ -160,27 +160,29 @@ modelexpress = "modelexpress:register_modelexpress"
 export VLLM_SERVER_DEV_MODE=1
 export VLLM_PLUGINS=modelexpress
 export MX_SERVER_ADDRESS=modelexpress:8001
-export MODEL_NAME=Qwen/Qwen3-30B-A3B
+export MX_MODEL_NAME_OVERRIDE=Qwen/Qwen3-30B-A3B
 
 vllm serve /models/Qwen3-30B-A3B \
   --tensor-parallel-size 4 \
   --weight-transfer-config '{"backend":"modelexpress"}'
 ```
 
-Set `MODEL_NAME` before starting vLLM so cold-start version validation, generator
-registration, peer identity, and the checkpoint cache use the same logical name.
+Set `MX_MODEL_NAME_OVERRIDE` before starting vLLM so cold-start version validation,
+generator registration, peer identity, and the checkpoint cache use the same
+logical name.
 For an S3 launch such as `--model s3://bucket/model`, vLLM can rewrite its internal
-model name to a local streamer cache path. `MODEL_NAME=s3://bucket/model` keeps
-the original URI as the MX name; a name such as `customer-bot` works too. Publish
-every WeightVersion with that exact name and configure trainer clients to match.
+model name to a local streamer cache path.
+`MX_MODEL_NAME_OVERRIDE=s3://bucket/model` keeps the original URI as the MX name;
+a name such as `customer-bot` works too. Publish every WeightVersion with that
+exact name and configure trainer clients to match.
 The adapter resolves the override once on a model-configuration copy used only
 for MX identity construction. The original configuration continues to provide
 vLLM's model-loading path. Without the override, the existing behavior, including
 use of the rewritten path, is unchanged.
 
 An explicit `init_info.model_name` still overrides the transfer client's default
-after startup. Keep it consistent with `MODEL_NAME`; it cannot change an identity
-already used during cold start.
+after startup. Keep it consistent with `MX_MODEL_NAME_OVERRIDE`; it cannot change
+an identity already used during cold start.
 
 After vLLM is ready, initialize each server once:
 

@@ -51,9 +51,9 @@ def test_weight_transfer_engine_initializes_client_in_init_hook(
     monkeypatch, model_name, init_model_name, expected_model_name
 ):
     if model_name is None:
-        monkeypatch.delenv("MODEL_NAME", raising=False)
+        monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
     else:
-        monkeypatch.setenv("MODEL_NAME", model_name)
+        monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", model_name)
     client = MagicMock()
     initialize = MagicMock(return_value=client)
     monkeypatch.setattr(

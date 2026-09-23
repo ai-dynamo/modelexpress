@@ -47,9 +47,9 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     model_name,
 ):
     if model_name is None:
-        monkeypatch.delenv("MODEL_NAME", raising=False)
+        monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
     else:
-        monkeypatch.setenv("MODEL_NAME", model_name)
+        monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", model_name)
 
     class ModelConfig:
         model = "test/model"
@@ -174,7 +174,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
             ("unpublish", loader),
             ("publish", loader, "version-a"),
         ]
-    monkeypatch.setenv("MODEL_NAME", "changed-after-initialization")
+    monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", "changed-after-initialization")
     identity = runtime.full_tensor.build_identity("version-a")
     assert identity.model_name == runtime.model_name
     assert identity.revision == "version-a"

@@ -279,9 +279,9 @@ def test_desired_p2p_requires_a_tensor_read_lease():
 def test_desired_p2p_uses_exact_revision(monkeypatch, model_name):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
     if model_name is None:
-        monkeypatch.delenv("MODEL_NAME", raising=False)
+        monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
     else:
-        monkeypatch.setenv("MODEL_NAME", model_name)
+        monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", model_name)
     model_path = "/root/.cache/vllm/assets/model_streamer/0088a9aa"
     ctx = _context()
     adapter = VllmAdapter(

@@ -55,11 +55,11 @@ def _vllm_config(parallel):
 
 @pytest.mark.parametrize("model_name", [None, "", "mx_model_abc"])
 def test_build_source_identity_uses_supplied_model_name(monkeypatch, model_name):
-    """Identity construction uses its supplied config, regardless of MODEL_NAME."""
+    """Identity construction uses its supplied config, regardless of MX_MODEL_NAME_OVERRIDE."""
     if model_name is None:
-        monkeypatch.delenv("MODEL_NAME", raising=False)
+        monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
     else:
-        monkeypatch.setenv("MODEL_NAME", model_name)
+        monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", model_name)
     model_path = "/root/.cache/vllm/assets/model_streamer/0088a9aa"
     model_config = _model_config(model=model_path)
 

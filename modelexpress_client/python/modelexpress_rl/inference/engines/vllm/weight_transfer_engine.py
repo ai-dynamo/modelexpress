@@ -92,7 +92,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
             vllm_config=vllm_config,
         )
         # Keep MX identity stable when vLLM rewrites S3 model URIs to cache paths.
-        self._model_name = envs.MODEL_NAME or getattr(
+        self._model_name = envs.MX_MODEL_NAME_OVERRIDE or getattr(
             vllm_config.model_config, "model", None
         )
         self._client: ModelExpressGeneratorClient | None = None

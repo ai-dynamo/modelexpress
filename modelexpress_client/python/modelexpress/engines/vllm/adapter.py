@@ -236,7 +236,9 @@ class VllmAdapter(EngineAdapter):
         self.model_config = model_config
         # Resolve the MX name separately from vLLM's model-loading configuration.
         self._identity_model_config = copy.copy(model_config)
-        self._identity_model_config.model = envs.MODEL_NAME or model_config.model
+        self._identity_model_config.model = (
+            envs.MX_MODEL_NAME_OVERRIDE or model_config.model
+        )
         self.load_config = vllm_config.load_config
         self.target_device = self._resolve_target_device()
         self.accelerator_backend = accelerator_backend_for(self.target_device)

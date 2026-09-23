@@ -126,7 +126,7 @@ trainer.bind_tensors(megatron_tensor_specs)
 trainer.publish_version(version=WeightVersionRef(version.uid))
 ```
 
-The deployment supplies `MODEL_NAME`,
+The deployment supplies `MX_MODEL_NAME_OVERRIDE`,
 `MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the
 normal ModelExpress server configuration. The Megatron adapter derives its
 source slot from logical tensor names and shard geometry. DP replicas of the same

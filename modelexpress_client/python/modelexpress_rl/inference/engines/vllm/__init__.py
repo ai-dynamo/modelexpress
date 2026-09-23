@@ -68,7 +68,7 @@ def _create_vllm_engine_runtime(
             loader.publish_runtime_tensors(version_id)
 
     return EngineRuntime(
-        model_name=envs.MODEL_NAME or vllm_config.model_config.model,
+        model_name=envs.MX_MODEL_NAME_OVERRIDE or vllm_config.model_config.model,
         installer=installer,
         full_tensor=FullTensorEngineCapability(
             device_id=engine.get_device_id(),
