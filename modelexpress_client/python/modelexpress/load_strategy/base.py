@@ -329,6 +329,31 @@ def register_tensors(
                 ctx.nixl_manager.register_tensors(ctx.tensors)
             logger.debug(f"[Worker {ctx.global_rank}] Tensors registered with NIXL")
     except Exception as e:
+        # Registration failed, so there is nothing for this worker to serve.
+        # Drop the manager instead of leaving it half-initialized, for two
+        # reasons:
+        #
+        # 1. The agent created above owns the metadata listener socket on
+        #    MX_METADATA_PORT + device_id. Leaking it makes every subsequent
+        #    attempt die on "Address already in use", turning a single
+        #    recoverable failure into a permanent one for the life of the
+        #    process -- the re-registration that runs after a CRIU restore
+        #    never gets its port back.
+        # 2. publish_metadata() treats a non-None manager as "ready to serve",
+        #    so a half-initialized one gets advertised to the MX server and
+        #    peers select a source that cannot transfer.
+        if ctx.nixl_manager is not None:
+            try:
+                ctx.nixl_manager.shutdown()
+            except Exception:
+                logger.warning(
+                    f"[Worker {ctx.global_rank}] Failed to shut down NIXL manager "
+                    "after registration failure; the metadata listener port may "
+                    "stay bound",
+                    exc_info=True,
+                )
+            finally:
+                ctx.nixl_manager = None
         logger.warning(
             f"[Worker {ctx.global_rank}] NIXL registration failed, "
             f"worker will continue without P2P serving: {e}"

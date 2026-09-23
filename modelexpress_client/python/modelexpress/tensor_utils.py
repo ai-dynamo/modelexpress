@@ -173,6 +173,37 @@ def _find_hidden_accel_tensors(
     return results
 
 
+#: Attribute names never adopted into the RDMA manifest, however many
+#: accelerator tensors they hold.
+#:
+#: ``kv_cache`` is runtime inference state, not weight-derived state. vLLM's
+#: Mamba/GDN layers keep their conv/ssm state in a plain tuple
+#: (``mamba/abstract.py``: ``self.kv_cache = tuple(states)``), which is exactly
+#: the shape of object this function recurses into, so without an exclusion the
+#: state tensors get adopted and published like weights. Three reasons not to:
+#:
+#:   * the target allocates its own KV cache and wakes it separately from
+#:     weights, so a source's cache is never what it should be running on;
+#:   * the entries are per-sequence state, meaningless to another replica; and
+#:   * they are non-contiguous views into the KV-cache arena, so
+#:     collect_module_tensors widens each to its whole underlying storage --
+#:     1.48 GiB per layer against a 68 MB tensor. On a Qwen3-Next-80B restore
+#:     that added 18.6 GB to the manifest and made registration fail outright:
+#:     the arena is multi-handle VMM memory, and ibv_reg_mr rejects a range
+#:     spanning cuMemCreate boundaries with EFAULT, which fails the whole
+#:     transfer.
+#:
+#: Only reachable after a restore: on a cold load the attribute still holds
+#: placeholder empty tensors, which are skipped for having no elements.
+#:
+#: ``aot_compiled_fn`` is the torch.compile artifact vLLM attaches to the model
+#: after warmup. Its example inputs are accelerator tensors, so a reload --
+#: which discovers tensors on an already compiled model -- would publish them
+#: as weights: a cold-loaded target never has them, and a reloaded one would
+#: have its own overwritten.
+_NEVER_ADOPTED_ATTRS = frozenset({"kv_cache", "aot_compiled_fn"})
+
+
 def adopt_hidden_tensors(
     model: nn.Module,
     accelerator_backend: AcceleratorBackend | None = None,
@@ -188,6 +219,9 @@ def adopt_hidden_tensors(
     This function scans each module's non-Module attributes recursively for
     any accelerator tensors not already registered, and adopts them as
     non-persistent buffers so they appear in the manifest and get transferred.
+
+    Attributes named in _NEVER_ADOPTED_ATTRS are skipped: the scan is looking
+    for weight-derived state, and not every tensor hanging off a module is that.
     """
     import time
     start = time.perf_counter()
@@ -202,6 +236,8 @@ def adopt_hidden_tensors(
     adopted = 0
     for _module_name, module in model.named_modules():
         for attr_name in list(vars(module)):
+            if attr_name in _NEVER_ADOPTED_ATTRS:
+                continue
             attr_val = getattr(module, attr_name, None)
             if attr_val is None:
                 continue
@@ -349,6 +385,17 @@ def collect_module_tensors(
             seen_ptrs.add(ptr)
             tensors[f"{name}.__storage"] = sv
             storage_view_count += 1
+            # A storage view covers the whole underlying storage, not the
+            # tensor, so it can be orders of magnitude larger than the weight
+            # that produced it, and can span more than one allocation -- which
+            # ibv_reg_mr rejects. When registration fails the log gives only an
+            # address and a length, so record both here to make the region
+            # identifiable after the fact.
+            logger.debug(
+                f"Storage view '{name}.__storage': addr=0x{ptr:x} "
+                f"bytes={sv.numel()} (tensor itself: "
+                f"{t.numel() * t.element_size()} bytes)"
+            )
 
     if storage_view_count:
         logger.info(

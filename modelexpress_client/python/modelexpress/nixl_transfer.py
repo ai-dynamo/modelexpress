@@ -946,11 +946,20 @@ class NixlTransferManager:
             # recording now: this path falls through to the same return as a
             # clean transfer, and recording here would count the receive twice.
             receive_result = "partial"
+            # Names, not just counts. A local-only tensor keeps its dummy value
+            # while the transfer still reports success, so this line is the only
+            # thing between a partial load and silently wrong output -- and a
+            # count cannot distinguish "48 harmless empty buffers" from "48
+            # weights that never arrived". The strict branch above already
+            # reports names for exactly this reason.
             logger.warning(
                 "Tensor name mismatch between source manifest and local "
-                "registration: %d local-only, %d source-only",
+                "registration: %d local-only (first: %s), "
+                "%d source-only (first: %s)",
                 len(local_only),
+                local_only[:10],
                 len(source_only),
+                source_only[:10],
             )
 
         if not remote_descs:
