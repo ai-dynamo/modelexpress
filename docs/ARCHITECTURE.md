@@ -1160,6 +1160,34 @@ storage without re-running PWAL. The adapter rebuilds a trainer plan when
 validated source manifests change; an incompatible destination staging layout
 requires an engine restart.
 
+### Experimental streamed full refit
+
+With `MX_REFIT_FULL_STREAMING=true`, vLLM can stream a new, non-checksummed full
+HF checkpoint directly from indexed S3 shards through its existing graph-safe
+layerwise reload. `inference/streaming_checkpoint.py` verifies names, shapes,
+dtypes, byte sizes, uniqueness and complete iterator consumption. Declared
+checksums keep the existing canonical verified download path. Partial engine
+mutation retains the normal refit failure fencing; it never silently falls back.
+
+Distributed ModelStreamer shares the S3 payload read across TP ranks. Local rank
+zero snapshots the yielded tensors to owned CPU buffers before model loading can
+mutate them, then a background writer reconstructs ordinary safetensors shards.
+Other ranks do not write the cache. Tensor bytes remain exact, while generated
+headers and offsets can differ from the source. Pending snapshots are bounded to
+2 GiB, allowing one larger tensor. Copies and backpressure can affect install time;
+this is asynchronous disk writing, not a guarantee of zero disk influence.
+
+The writer uses the existing cache locks, quota, source records and atomic directory
+promotion. It publishes only after complete streaming and successful installation,
+and never changes `state.json` or `active.json`. The next canonical replay waits
+for local writer completion and can reuse its full ancestor without another payload
+download. A writer failure is logged and reported before the owning rank prepares
+a subsequent canonical update. Shutdown drains or discards outstanding writes.
+The operation lease already covers all remote reads; the disk tail consumes only
+owned local snapshots. Cache readiness is logged separately from serving readiness.
+CPU snapshot and backpressure times appear in the install metrics as
+`perf/mx_stream_cache_snapshot_time` and `perf/mx_stream_cache_backpressure_time`.
+
 See the [RL weight refit overview](../modelexpress_client/python/modelexpress/refit/README.md)
 for the end-to-end design, integration contract, implementation status, and
 validation requirements, including descriptor bounding for strided slices,

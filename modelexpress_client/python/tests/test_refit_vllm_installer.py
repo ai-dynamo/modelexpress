@@ -507,3 +507,83 @@ def test_installer_rejects_missing_mla_refresh(monkeypatch, stale_name):
 
     with pytest.raises(IncompleteRefit, match=rf"{stale_name} was not refreshed"):
         installer._reload(lambda: model.projection.data.fill_(7))
+
+
+def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(monkeypatch):
+    from unittest.mock import Mock
+    from modelexpress_rl.inference.streaming_checkpoint import StreamedCheckpoint
+    from modelexpress_rl.inference.receiver import _S3Version
+    from modelexpress_rl.train import WeightPayloadFormat
+
+    events = []
+    _install_fake_vllm(monkeypatch, lambda model: events.append("initialize"))
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    layerwise.finalize_layerwise_reload = lambda model, config: events.append(
+        "finalize"
+    )
+    weight_utils = ModuleType("vllm.model_executor.model_loader.weight_utils")
+    distributed = ModuleType("vllm.distributed")
+    distributed.get_world_group = lambda: SimpleNamespace(local_rank=1)
+    distributed.get_pipeline_model_parallel_world_size = lambda: 1
+    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed)
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.model_loader.weight_utils", weight_utils
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
+    monkeypatch.setenv("MX_MS_DISTRIBUTED", "1")
+
+    def iterator(files, use_tqdm_on_load, is_distributed):
+        assert files == ["s3://bucket/v2/model.safetensors"]
+        assert is_distributed
+        try:
+            events.append("stream")
+            yield "weight", torch.tensor([7.0, 8.0])
+        finally:
+            events.append("close")
+
+    weight_utils.runai_safetensors_weights_iterator = iterator
+    model = nn.Module()
+    model.register_parameter(
+        "weight", nn.Parameter(torch.zeros(2), requires_grad=False)
+    )
+    address = model.weight.data_ptr()
+
+    def load(weights):
+        for name, tensor in weights:
+            events.append("load")
+            model.weight.data.copy_(tensor)
+
+    model.load_weights = load
+    stream = StreamedCheckpoint(
+        version=_S3Version(
+            "v2",
+            None,
+            WeightPayloadFormat.FULL_HF_CHECKPOINT,
+            "s3://bucket/v2/model.safetensors.index.json",
+        ),
+        index_data=b"{}",
+        weight_map={"weight": "model.safetensors"},
+        tensor_metadata={"weight": {"dtype": "F32", "shape": [2], "byte_size": 8}},
+        store=Mock(),
+    )
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=SimpleNamespace(
+            load_config=SimpleNamespace(use_tqdm_on_load=False),
+            parallel_config=SimpleNamespace(tensor_parallel_size=4),
+        ),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    from pathlib import Path
+
+    installer.install(
+        PreparedCheckpointArtifact(
+            PreparedCheckpoint("v2", Path("/unused"), {}, streaming=stream)
+        )
+    )
+    assert events == ["initialize", "stream", "load", "close", "finalize", "sync"]
+    assert model.weight.data_ptr() == address
+    assert torch.equal(model.weight, torch.tensor([7.0, 8.0]))
+    assert stream._writer is None
+    assert stream._complete

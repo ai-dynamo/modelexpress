@@ -382,3 +382,50 @@ def test_generator_runtime_closes_resources_when_resolver_creation_fails(
 
     assert full_tensor.closed
     assert p2p.closed
+
+
+@pytest.mark.parametrize(
+    "enabled,supported,expected",
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_streaming_requires_opt_in_and_engine_capability(
+    monkeypatch, tmp_path, enabled, supported, expected
+):
+    from dataclasses import replace
+    from unittest.mock import Mock
+    from modelexpress_rl.inference.plan import PreparedCheckpointArtifact
+
+    monkeypatch.setenv("MX_REFIT_FULL_STREAMING", str(enabled))
+    engine = _full_tensor_engine()
+    installer = Mock(
+        capabilities=EngineCapabilities(
+            artifact_types=frozenset({PreparedCheckpointArtifact}),
+            streamed_checkpoints=supported,
+        )
+    )
+    monkeypatch.setattr(
+        engines_module,
+        "_create_engine_runtime",
+        lambda context: replace(engine, installer=installer),
+    )
+    canonical = _Method({WeightSource.OBJECT_STORAGE})
+    constructor = Mock(return_value=canonical)
+    monkeypatch.setattr(runtime_module, "CanonicalDeltaUpdateMethod", constructor)
+    runtime = initialize_generator_runtime(
+        engine_context=GeneratorEngineContext(),
+        worker_id="generator-0",
+        server_url="mx:8000",
+        object_storage=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="v0",
+            seed_checkpoint_path=tmp_path / "launch",
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        source_order=(WeightSource.OBJECT_STORAGE,),
+        max_transfer_attempts=1,
+        rpc_timeout_seconds=30,
+        service=lambda: object(),
+        start_lease=lambda version: object(),
+    )
+    assert constructor.call_args.kwargs["stream_full_checkpoints"] is expected
+    runtime.close()

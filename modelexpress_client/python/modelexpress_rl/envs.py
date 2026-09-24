@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
+    MX_REFIT_FULL_STREAMING: bool
     MX_REFIT_TIMING: bool
     MX_S3_DOWNLOAD_RANGE_BYTES: int
     MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
@@ -136,6 +137,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_S3_TCP_KEEPALIVE": lambda: parse_bool(
         os.environ.get("MX_S3_TCP_KEEPALIVE", "true"),
         "MX_S3_TCP_KEEPALIVE",
+    ),
+    "MX_REFIT_FULL_STREAMING": lambda: parse_bool(
+        os.environ.get("MX_REFIT_FULL_STREAMING", "false"),
+        "MX_REFIT_FULL_STREAMING",
     ),
     # One normalized timing record per generator refit. On by default: the
     # durations are already being measured on the staging path, so recording
