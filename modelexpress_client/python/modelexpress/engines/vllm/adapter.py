@@ -454,10 +454,13 @@ class VllmAdapter(EngineAdapter):
         result.value = None
         result.model = None
         self._unregister_model_layers(stale_model)
-        # Active loader frames retain the root, so release its tensor graph
-        # before allocating a replacement, including cyclic child modules.
-        stale_model.__dict__.clear()
-        del stale_model
+        # Native tensor aliases can retain child modules through weight-loader
+        # callbacks beyond Python GC. Preserve shared parameterless caches,
+        # such as rotary embeddings, while releasing the discarded weights.
+        for module in list(stale_model.modules()):
+            if module is stale_model or module._parameters:
+                module.__dict__.clear()
+        del module, stale_model
         gc.collect()
         self.accelerator_backend.empty_cache()
         logger.info(

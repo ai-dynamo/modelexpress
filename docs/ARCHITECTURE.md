@@ -1198,8 +1198,11 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 When a vLLM loading attempt fails after mutating the model, retry cleanup
 unregisters its layers and clears the old model's tensor graph before allocating
 the replacement. Caller frames can still retain the old root object, so clearing
-only `LoadResult` cannot release its GPU storage. Cyclic child modules are
-collected before the allocator cache is emptied and initialization starts.
+only `LoadResult` cannot release its GPU storage. Cleanup also clears the state
+of child modules that own parameters: native tensor aliases can retain replaced
+parameters and their bound weight-loader callbacks outside Python's GC traversal.
+Shared parameterless caches, such as rotary embeddings, remain intact. Remaining
+cycles are collected before the allocator cache is emptied and initialization starts.
 If initialization fails, recovery aborts without attempting another loader.
 
 See [ModelExpress Benchmarks](BENCHMARKS.md) for measured loading-path, NIXL registration, and artifact-transfer results with explicit timing boundaries.

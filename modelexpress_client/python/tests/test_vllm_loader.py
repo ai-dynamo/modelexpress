@@ -2139,9 +2139,10 @@ def test_unregister_releases_the_discarded_model():
     assert layer_ref() is None
 
 
+@pytest.mark.parametrize("native_scale_alias", [False, True])
 @pytest.mark.parametrize("rebuild_fails", [False, True])
 def test_retry_releases_tensors_while_caller_retains_model(
-    monkeypatch, mock_accelerator_backend_cls, rebuild_fails,
+    monkeypatch, mock_accelerator_backend_cls, rebuild_fails, native_scale_alias,
 ):
     """Retry must free old tensors before allocating a replacement model."""
     import sys
@@ -2155,6 +2156,19 @@ def test_retry_releases_tensors_while_caller_retains_model(
     retained_model.scratch = torch.ones(1)
     retained_model.self_attn.weight = nn.Parameter(torch.ones(1))
     retained_model.self_attn.cycle = [retained_model.self_attn]
+    if native_scale_alias:
+        # A native alias can retain a replaced scale parameter and its loader
+        # callback outside Python's GC traversal, pinning the expert weights.
+        original_scale = nn.Parameter(torch.ones(1), requires_grad=False)
+        original_scale.weight_loader = retained_model.self_attn.forward
+        retained_model.self_attn.weight_scale = nn.Parameter(
+            torch.from_dlpack(original_scale), requires_grad=False,
+        )
+        del original_scale
+    cached_rotary = nn.Module()
+    cached_rotary.register_buffer("cos_sin_cache", torch.ones(1))
+    retained_model.rotary = cached_rotary
+    rotary_cache = cached_rotary.cos_sin_cache
     tensor_refs = [
         weakref.ref(tensor) for tensor in (
             retained_model.weight,
@@ -2170,6 +2184,7 @@ def test_retry_releases_tensors_while_caller_retains_model(
 
     def initialize_model(**kwargs):
         assert all(ref() is None for ref in tensor_refs)
+        assert cached_rotary.cos_sin_cache is rotary_cache
         assert cc.static_forward_context == {
             "target.layers.0.self_attn": target.self_attn,
         }
