@@ -125,6 +125,12 @@ The chart creates a `ClusterRole` and `ClusterRoleBinding`, allowing the server
 to run in a dedicated namespace while accessing metadata resources in another
 namespace.
 
+The Kubernetes backend also needs the projected service account token to
+authenticate against the API server, so set `serviceAccount.automount=true`
+explicitly in your values file. `serviceAccount.automount` defaults to
+`false`, and unlike an unset value, an explicit `false` is honored rather than
+silently reset.
+
 For automatic cleanup of P2P metadata, expose the client Pod identity through
 the Kubernetes Downward API. The checked-in vLLM, SGLang, and Dynamo manifests
 already include these fields:
