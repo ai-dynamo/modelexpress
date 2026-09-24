@@ -37,6 +37,7 @@ def _copy_checkpoint_file(source: str, destination: str) -> str:
             # Whole-file cloning can be unsupported for a filesystem, mount
             # pair, or file layout. Permission, capacity and I/O errors are fatal.
             if error.errno not in {
+                errno.EBADF,  # Also means the source filesystem cannot reflink.
                 errno.EOPNOTSUPP,
                 errno.ENOTTY,
                 errno.EXDEV,

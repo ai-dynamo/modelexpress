@@ -61,7 +61,8 @@ def test_materialization_is_independent_and_preserves_copy_metadata(
 
 
 @pytest.mark.parametrize(
-    "error", [errno.EOPNOTSUPP, errno.ENOTTY, errno.EXDEV, errno.EINVAL, errno.ENOSYS]
+    "error",
+    [errno.EBADF, errno.EOPNOTSUPP, errno.ENOTTY, errno.EXDEV, errno.EINVAL, errno.ENOSYS],
 )
 def test_unsupported_clone_falls_back_to_complete_copy(monkeypatch, tmp_path, error):
     monkeypatch.setattr(store_module.sys, "platform", "linux")
@@ -80,7 +81,7 @@ def test_unsupported_clone_falls_back_to_complete_copy(monkeypatch, tmp_path, er
 
 
 @pytest.mark.parametrize(
-    "error", [errno.EIO, errno.ENOSPC, errno.EACCES, errno.EPERM, errno.EBADF]
+    "error", [errno.EIO, errno.ENOSPC, errno.EACCES, errno.EPERM]
 )
 @pytest.mark.parametrize("existing_target", [False, True])
 def test_clone_failure_cleans_partial_tree_without_publishing(
@@ -164,6 +165,7 @@ def test_real_reflink_keeps_canonical_bytes_private(tmp_path):
             store_module.fcntl.ioctl(dst.fileno(), 0x40049409, src.fileno())
         except OSError as error:
             if error.errno in {
+                errno.EBADF,
                 errno.EOPNOTSUPP,
                 errno.ENOTTY,
                 errno.EXDEV,

@@ -639,7 +639,9 @@ installable. The first delta after a full checkpoint copies that immutable full
 checkpoint into a version-scoped derived checkpoint. On Linux the checkpoint
 store attempts `FICLONE` per regular file, sharing blocks copy-on-write where
 the filesystem supports reflinks. Unsupported filesystems, cross-mount copies,
-and other platforms use an ordinary copy. File metadata and symlink dereferencing
+and other platforms use an ordinary copy. This includes `EBADF` from `FICLONE`
+on already-opened files when the source filesystem cannot reflink.
+File metadata and symlink dereferencing
 retain `copytree`/`copy2` behavior; mutable files never use hard links. Clone I/O,
 permission, and capacity failures abort preparation and clean its temporary
 directory before promotion. Later sequential deltas
