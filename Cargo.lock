@@ -2567,6 +2567,7 @@ dependencies = [
  "hf-hub",
  "jiff",
  "object_store",
+ "openssl",
  "prost 0.13.5",
  "reqwest 0.12.23",
  "reqwest 0.13.2",

@@ -14,9 +14,10 @@ keywords.workspace = true
 
 
 [features]
-default = ["gcs", "tls-rustls"]
+default = ["gcs", "tls-rustls", "s3"]
 openssl = ["tls-openssl"]
 gcs = ["modelexpress-common/gcs"]
+s3 = ["modelexpress-common/s3"]
 # In-memory backend for tests and local dev (MX_METADATA_BACKEND=memory). Off by
 # default; enable explicitly with `--features memory-backend` to run its unit tests.
 memory-backend = []
