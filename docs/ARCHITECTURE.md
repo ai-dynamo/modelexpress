@@ -995,7 +995,7 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `train/methods/` | Independent full-tensor NIXL and canonical-checkpoint publication methods |
 | `train/engines/megatron/selection.py` | Megatron-Bridge mapping and tensor-selection translation into MX publication specs |
 | `train/engines/megatron/adapter.py` | Stable in-place Megatron tensor registration and manifest construction |
-| `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place or device-copy staging |
+| `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place or device-copy staging. Device-copy staging fences each snapshot on the arena's own device, so a rank's arenas must share one device; a set spanning devices is rejected before registration |
 | `inference/client.py` | Rank-local generator lifecycle, leases, exact-version source discovery, staging, and apply |
 | `inference/runtime.py` | Generator source policy, method/resource composition, and update-session ownership |
 | `inference/engines/vllm/control.py` | Direct vLLM Control gRPC client |

@@ -9,8 +9,9 @@ the client passes each stage, so a trainer that re-materializes its state_dict
 - COPY_TO_DEVICE (default): ``initialize`` allocates one persistent wire-dtype
   arena per shard and registers them once. Each stage snapshots the live weights
   into those stable arenas (cast to the wire dtype only when the source differs);
-  ``publish_ready`` fences the async copy. Robust to a moving source because the
-  registered arena never moves.
+  ``publish_ready`` fences the async copy on the arena's own device, so the
+  arenas of one rank must all be on a single device. Robust to a moving source
+  because the registered arena never moves.
 - IN_PLACE (optimization): ``initialize`` registers the DTensor local storage
   directly (contiguous, so RDMA-registerable) and serves it with no copy. Its
   premise is stable storage: the registered address must not change, so each
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -136,12 +138,16 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         # - env var to stage into CPU pinned host memory vs GPU device memory
         #   (host staging frees device memory when the GPU is tight).
         with classic_cuda_alloc():
-            self._arenas = {
+            arenas = {
                 s.name: torch.empty(
                     s.local_shape, dtype=WIRE_DTYPE, device=s.source_tensor.device
                 )
                 for s in shards
             }
+        # Reject before registering: a mixed-device set would otherwise bind
+        # buffers to a manager configured for a single device.
+        self._arena_device(arenas.values())
+        self._arenas = arenas
         self._manager.register_tensors(
             {
                 self._register_key(i, s.name): self._arenas[s.name]
@@ -238,17 +244,38 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
 
         ``copy_`` casts to bf16 only when the source dtype differs. The arena is
         the served buffer, so point each shard at it.
+
+        The fence is recorded on the arena device's own current stream. ``copy_``
+        runs on the destination device, while the process current device belongs
+        to whichever library set it last, so fencing the process default can
+        record on a different device than the copy and complete while the copy is
+        still in flight.
         """
-        stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
+        device = self._arena_device(self._arenas[shard.name] for shard in shards)
         for shard in shards:
             arena = self._arenas[shard.name]
             arena.copy_(shard.source_tensor)
             shard.staging_tensor = arena
-        if stream is not None:
-            done = torch.cuda.Event()
-            done.record(stream)
-            return CompletionFence(done.synchronize)
-        return CompletionFence(lambda: None)
+        device_module = torch.get_device_module(device)
+        done = device_module.Event()
+        done.record(device_module.current_stream(device))
+        return CompletionFence(done.synchronize)
+
+    @staticmethod
+    def _arena_device(arenas: Iterable[torch.Tensor]) -> torch.device:
+        """Return the single device every COPY_TO_DEVICE arena lives on.
+
+        Arenas spanning devices cannot be fenced by one event, and cannot all
+        belong to the one device the rank's manager is configured for.
+        """
+        devices = {arena.device for arena in arenas}
+        if len(devices) > 1:
+            raise NotImplementedError(
+                "FSDP arenas span multiple devices "
+                f"({sorted(str(device) for device in devices)}); "
+                "one device per rank is required"
+            )
+        return devices.pop()
 
     def _require_sources_pinned(self, shards: list[LocalTensorShard]) -> None:
         """Fail unless every source still sits where it was registered.
