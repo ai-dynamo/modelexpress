@@ -1,6 +1,7 @@
 """Report saved results for the selected model, including failed/incomplete runs."""
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -9,7 +10,7 @@ import model_checks
 import validation
 
 
-def build_report(root):
+def _build_report(root):
     config = json.loads((root / "config.json").read_text())
     log = (
         (root / "e2e-driver.log").read_text()
@@ -20,6 +21,8 @@ def build_report(root):
     for line in log.splitlines():
         if line.startswith("RESULT "):
             _, role, step, body = line.split(" ", 3)
+            if (role, step) in records:
+                raise ValueError(f"Duplicate driver record: {role} {step}")
             records[role, step] = json.loads(body)
     report = {
         "status": "FAILED",
@@ -54,6 +57,10 @@ def build_report(root):
             "model_load_seconds": times,
             "rdma_transfer_records": wire,
             "refit": records.get((role, "refit")),
+            "sequential_refits": {
+                step: records.get((role, prefix + "refit"))
+                for step, prefix in [("d1", ""), ("d2", "d2-")]
+            },
             "failures": [],
         }
         # Preserve streamed records even when an OOM prevented an RPC response.
@@ -92,25 +99,17 @@ def build_report(root):
         )
         publication = json.loads((root / "publication.json").read_text())
         report["publication"] = publication
-        assert (
-            publication["run"] == config["run"]
-            and publication["model_revision"] == config["revision"]
-        )
-        baseline, updated = {}, {}
+        trials = validation.trials(publication, config)
+        baseline = {
+            role: validation.hashes(result(role, "base-hashes"), config)
+            for role in config["roles"]
+        }
+        if "peer" in baseline:
+            assert baseline["s3"] == baseline["peer"], "Cold peer tensors differ"
+        sessions = validation.sessions(config, result)
         for role in config["roles"]:
-            baseline[role] = validation.hashes(result(role, "base-hashes"), config)
-            updated[role] = validation.hashes(result(role, "updated-hashes"), config)
-            assert baseline[role] != updated[role], "No updated tensors"
-            validation.refit(result(role, "refit"), config, role)
-            validation.inference(result(role, "post-refit-inference"))
-            if config["expected_host_scales_per_rank"] is not None:
-                for step in [
-                    "baseline-host-scales",
-                    "immediate-post-refit-host-scales",
-                    "post-inference-host-scales",
-                ]:
-                    validation.scales(result(role, step), config)
             worker = report["workers"][role]
+            assert not worker["failures"], "Worker reported a failed operation"
             # The pinned runtimes log the model-load interval once on rank zero.
             assert len(worker["model_load_seconds"]) == 1, (
                 "Expected one fresh model load"
@@ -134,30 +133,76 @@ def build_report(root):
                 x["restartCount"] == 0 and "terminated" not in x["state"]
                 for x in pod["status"]["containerStatuses"]
             )
-            if worker["memory_events"]:
-                assert (
-                    int(
-                        dict(s.split() for s in worker["memory_events"].splitlines())[
-                            "oom_kill"
-                        ]
-                    )
-                    == 0
-                )
-        for row in validation.ranks(result("s3", "verify-checkpoint"), config).values():
-            assert row["verified"] and row["sha256"] == row["expected_sha256"]
+            assert worker["memory_events"], "Missing memory monitor evidence"
+            events = dict(line.split() for line in worker["memory_events"].splitlines())
+            assert int(events["oom"]) == int(events["oom_kill"]) == 0, "Worker OOM"
         if "peer" in config["roles"]:
-            assert (
-                baseline["s3"] == baseline["peer"] and updated["s3"] == updated["peer"]
-            )
             assert (
                 report["workers"]["s3"]["pod"]["spec"]["nodeName"]
                 != report["workers"]["peer"]["pod"]["spec"]["nodeName"]
             )
-        report.update(model_checks.validate(config, result))
+        previous_layout = None
+        report["sequential_refits"] = {}
+        report["model_checks"] = {}
+        for step, trial in enumerate(trials, 1):
+            prefix = "" if step == 1 else "d2-"
+
+            def step_result(role, name, prefix=prefix):
+                return result(role, prefix + name)
+
+            layout = validation.ranks(step_result("s3", "layout-before"), config)
+            if previous_layout is not None:
+                assert layout == previous_layout, "Checkpoint changed between updates"
+            baseline = validation.update(
+                config, trial, step_result, baseline, sessions, reuse=step == 2
+            )
+            previous_layout = validation.ranks(
+                step_result("s3", "layout-after"), config
+            )
+            report["model_checks"][f"d{step}"] = model_checks.validate(
+                config, step_result
+            )
+            step_records = {}
+            for role in config["roles"]:
+                record = records[role, prefix + "refit"]
+                assert math.isfinite(record["seconds"]) and record["seconds"] > 0
+                step_records[role] = record
+            report["sequential_refits"][f"d{step}"] = step_records
+        first = report["sequential_refits"]["d1"]["s3"]["seconds"]
+        second = report["sequential_refits"]["d2"]["s3"]["seconds"]
+        report["s3_savings"] = {
+            "seconds": first - second,
+            "percent": 100 * (first - second) / first,
+        }
         report["status"] = "PASS"
-    except (AssertionError, KeyError, ValueError, OSError, TypeError) as error:
+    except (
+        AssertionError,
+        KeyError,
+        ValueError,
+        OSError,
+        TypeError,
+        IndexError,
+    ) as error:
         report["failure_reason"] = str(error) or type(error).__name__
     return report
+
+
+def build_report(root):
+    try:
+        return _build_report(root)
+    except (
+        AssertionError,
+        KeyError,
+        ValueError,
+        OSError,
+        TypeError,
+        IndexError,
+    ) as error:
+        return {
+            "status": "FAILED",
+            "workers": {},
+            "failure_reason": str(error) or type(error).__name__,
+        }
 
 
 if __name__ == "__main__":

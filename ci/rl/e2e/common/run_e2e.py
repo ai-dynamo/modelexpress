@@ -5,6 +5,7 @@ import time
 import traceback
 from pathlib import Path
 
+import model_checks
 import requests
 import validation
 from config import CONFIG as config
@@ -16,9 +17,11 @@ urls = {
     role: f"http://{config['resource_prefix']}-{role}:8080/" for role in config["roles"]
 }
 records = {}
+step_prefix = ""
 
 
 def call(role, name, route, body):
+    name = step_prefix + name
     started = time.time()
     t = time.perf_counter()
     response = requests.post(urls[role] + route, json=body, timeout=7200)
@@ -60,7 +63,9 @@ def tensor_hashes(role, name):
 
 
 try:
-    base, updated = {}, {}
+    publication = json.loads(Path("/tmp/mx-delta/report.json").read_text())
+    trials = validation.trials(publication, config)
+    base = {}
     for role, url in urls.items():
         deadline = time.monotonic() + 7200
         while time.monotonic() < deadline:
@@ -96,38 +101,77 @@ try:
             },
         )
         assert all(x["phase"] == "init" for x in rows)
-    for role in urls:
-        rows = rpc(role, "refit", "hotload", {"weight_path": run + "-d1"})
-        validation.refit(rows, config, role)
-        if role == "s3":
-            verified = rpc(
-                role,
-                "verify-checkpoint",
-                "hotload_verify_checkpoint",
-                {"version_id": run + "-d1"},
-            )
-            assert all(x.get("verified") for x in verified), verified
-        audit(role, "immediate-post-refit-host-scales")
-        updated[role] = tensor_hashes(role, "updated-hashes")
-        assert updated[role] != base[role], "No updated tensors"
-    if "peer" in urls:
-        assert updated["s3"] == updated["peer"], "Refit peer tensors differ per TP rank"
-    for role in urls:
-        audit(role, "host-scales")
-    for role in urls:
-        call(role, "resume", "resume", {})
-        validation.inference(
-            call(
-                role,
-                "post-refit-inference",
-                "generate",
-                {"prompt": "The capital of France is"},
-            )
+    sessions = validation.sessions(config, lambda role, name: records[role, name])
+    previous_layout = None
+    for step, trial in enumerate(trials, 1):
+        step_prefix = "" if step == 1 else "d2-"
+        version = trial["version"]
+        for role in urls:
+            if step > 1:
+                call(role, "pause", "pause", {})
+                audit(role, "baseline-host-scales")
+            if config.get("derived_weight_check"):
+                rpc(role, "derived-baseline", "derived_verify", {"phase": "baseline"})
+        layout = rpc(
+            "s3",
+            "layout-before",
+            "checkpoint_layout",
+            {"version_id": trial["base_version"]},
         )
-    for role in urls:
-        call(role, "final-pause", "pause", {})
-        audit(role, "post-inference-host-scales")
-        call(role, "final-resume", "resume", {})
+        if previous_layout is not None:
+            assert validation.ranks(layout, config) == validation.ranks(
+                previous_layout, config
+            )
+        for role in urls:
+            rows = rpc(
+                role,
+                "refit",
+                "hotload",
+                {
+                    "weight_path": version,
+                    "allocation_tracing": True
+                    if step == 1
+                    else config["second_update_allocation_tracing"],
+                },
+            )
+            validation.refit(rows, config, role, version)
+            if role == "s3":
+                rpc(
+                    role,
+                    "verify-checkpoint",
+                    "hotload_verify_checkpoint",
+                    {"version_id": version},
+                )
+                previous_layout = rpc(
+                    role, "layout-after", "checkpoint_layout", {"version_id": version}
+                )
+            if config.get("derived_weight_check"):
+                rpc(role, "derived-updated", "derived_verify", {"phase": "updated"})
+            audit(role, "immediate-post-refit-host-scales")
+            tensor_hashes(role, "updated-hashes")
+
+        def result(role, name, step_prefix=step_prefix):
+            return records[role, step_prefix + name]
+
+        validation.refitted(config, trial, result, base, sessions, reuse=step == 2)
+        if config.get("derived_weight_check"):
+            model_checks.validate(config, result)
+        for role in urls:
+            call(role, "resume", "resume", {})
+            validation.inference(
+                call(
+                    role,
+                    "post-refit-inference",
+                    "generate",
+                    {"prompt": "The capital of France is"},
+                )
+            )
+            call(role, "final-pause", "pause", {})
+            audit(role, "post-inference-host-scales")
+            call(role, "final-resume", "resume", {})
+
+        base = validation.update(config, trial, result, base, sessions, reuse=step == 2)
+        model_checks.validate(config, result)
     (root / "PASS").write_text(
         "Requested paths, all TP ranks, refit and resumed inference verified\n"
     )

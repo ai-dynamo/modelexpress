@@ -6,6 +6,7 @@ import json
 import os
 import time
 import traceback
+import uuid
 from pathlib import Path
 
 import torch
@@ -17,6 +18,8 @@ class RegressionWorker:
         p = Path("/refit/benchmark")
         p.mkdir(exist_ok=True)
         body.update(rank=self.rank, phase=phase)
+        if hasattr(self, "_refit_session"):
+            body["refit_session"] = self._refit_session
         self._last_record = body
         dest = p / f"{phase}-rank{self.rank}.json"
         tmp = dest.with_suffix(".tmp")
@@ -42,6 +45,7 @@ class RegressionWorker:
             cfg.load_config = copy.copy(cfg.load_config)
             cfg.load_config.model_loader_extra_config = {}
             self._hotload_run = run_id
+            self._refit_session = uuid.uuid4().hex
             assert cfg.model_config.enforce_eager is True, (
                 "PR783 requires eager execution"
             )
@@ -118,7 +122,7 @@ class RegressionWorker:
                 {"error": repr(e), "traceback": traceback.format_exc()},
             )
 
-    def _hotload_impl(self, weight_path):
+    def _hotload_impl(self, weight_path, allocation_tracing=True):
         version = weight_path
         t = time.perf_counter()
         baseline_allocated = torch.cuda.memory_allocated(self.device)
@@ -144,7 +148,9 @@ class RegressionWorker:
             try:
                 import diagnostic_observer
 
-                with diagnostic_observer.allocation_trace(self.rank):
+                with diagnostic_observer.allocation_trace(
+                    self.rank, enabled=allocation_tracing
+                ):
                     applied = self._hotload_client.apply_weight(staged)
                 torch.cuda.synchronize(self.device)
                 from modelexpress.tensor_utils import collect_module_tensors
@@ -169,6 +175,7 @@ class RegressionWorker:
                         "source": self._hotload_source,
                         "stage_seconds": at - t,
                         "install_seconds": time.perf_counter() - at,
+                        "allocation_tracing": allocation_tracing,
                         "total_seconds": time.perf_counter() - t,
                         "metrics": metrics,
                         "serving_version": self._hotload_client._serving_version_id,
@@ -340,6 +347,19 @@ class RegressionWorker:
                             },
                         )
                     expected = raw[start : start + actual.shape[0]].to(self.device)
+                publisher_hashes = {}
+                if self.rank == 0:
+                    import model_adapter
+
+                    for tensor_name in [name, *model_adapter.extra_tensor_names(index)]:
+                        with safe_open(
+                            str(checkpoint / index["weight_map"][tensor_name]),
+                            framework="pt",
+                        ) as sf:
+                            value = sf.get_tensor(tensor_name)
+                            publisher_hashes[tensor_name] = hashlib.sha256(
+                                value.contiguous().view(torch.uint8).numpy()
+                            ).hexdigest()
                 assert torch.equal(actual, expected), (
                     "GPU embedding differs from reconstructed delta checkpoint"
                 )
@@ -363,6 +383,8 @@ class RegressionWorker:
                         "shape": list(actual.shape),
                         "sha256": digest(actual),
                         "expected_sha256": digest(expected),
+                        "full_checkpoint_sha256": publisher_hashes.get(name),
+                        "publisher_hashes": publisher_hashes,
                         "verified": True,
                     },
                 )
@@ -390,13 +412,13 @@ class RegressionWorker:
         )
         return self._last_record
 
-    def hotload(self, weight_path):
+    def hotload(self, weight_path, allocation_tracing=True):
         import importlib
 
         import regression_worker
 
         importlib.reload(regression_worker).RegressionWorker._hotload_impl(
-            self, weight_path
+            self, weight_path, allocation_tracing
         )
         return self._last_record
 
@@ -414,3 +436,58 @@ class RegressionWorker:
 
         self._diagnostic_observer = diagnostic_observer.start(self)
         return {"rank": self.rank, "diagnostic_observer_started": True}
+
+    def derived_verify(self, phase):
+        import model_adapter
+
+        try:
+            body = model_adapter.verify_derived(self, phase)
+            RegressionWorker._record(self, "derived-" + phase, body)
+        except Exception as error:  # noqa: BLE001 -- Preserve runtime failure evidence.
+            RegressionWorker._record(
+                self,
+                "derived-" + phase + "-failed",
+                {
+                    "error": repr(error),
+                    "traceback": traceback.format_exc(),
+                },
+            )
+        return self._last_record
+
+    def checkpoint_layout(self, version_id):
+        from modelexpress_rl.inference.checkpoint_store import LocalCheckpointStore
+
+        try:
+            store = LocalCheckpointStore(root="/refit", model_name=CONFIG["model"])
+            checkpoint = store.checkpoint_path(version_id)
+            index = json.loads(
+                (checkpoint / "model.safetensors.index.json").read_text()
+            )
+            files = {}
+            for name in sorted(set(index["weight_map"].values())):
+                stat = (checkpoint / name).stat()
+                files[name] = {
+                    "inode": stat.st_ino,
+                    "device": stat.st_dev,
+                    "bytes": stat.st_size,
+                }
+            assert files, "Empty checkpoint index"
+            RegressionWorker._record(
+                self,
+                "layout-" + version_id,
+                {
+                    "version": version_id,
+                    "path": str(checkpoint),
+                    "files": files,
+                },
+            )
+        except Exception as error:  # noqa: BLE001 -- Preserve runtime failure evidence.
+            RegressionWorker._record(
+                self,
+                "layout-failed",
+                {
+                    "error": repr(error),
+                    "traceback": traceback.format_exc(),
+                },
+            )
+        return self._last_record

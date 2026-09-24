@@ -1451,7 +1451,7 @@ and requires different donor/peer nodes.
 The driver checks every rank's tensor hashes, reconstructed checkpoint embedding,
 refit source/version, preserved tensor addresses, and resumed inference. Optional
 profile hooks add model-specific checks, including Nemotron host scales and
-FlashInfer cache diagnostics. A failed rank stops before resume. Native HTTP
+FlashInfer cache diagnostics, and Kimi MLA derived weights. A failed rank stops before resume. Native HTTP
 pause/resume is not Dynamo administration. Synthetic embedding deltas are about
 64 MiB for Nemotron and 1 GiB for Kimi; peer refit transfers full runtime tensors.
 
@@ -1462,6 +1462,49 @@ seed. Refit includes staging, reconstruction, installation, and CUDA synchroniza
 hashing, independent verification, and inference are outside its timing.
 Diagnostics add overhead; a single trial is not a stable benchmark. Do not run
 assertion-based validators with Python `-O`.
+
+The publisher creates a `base -> d1 -> d2` chain, and the driver applies both
+updates on the same workers and refit clients. Each update has separate S3 and,
+with `--paths both`, peer RPC timings in `sequential_refits`. The report requires
+both publications, every rank's version and original client identity, matching
+runtime tensor inventories/hashes between donor and peer, checkpoint hashes
+matching the publisher, model-specific checks, and identical resumed inference
+outputs. It rejects missing or duplicate evidence, worker restarts, and OOMs.
+
+The driver compares device/inode/size for every shard in the checkpoint index:
+d1 must copy every shard, while d2 must reuse every materialized shard. Shard
+counts are discovered from the model, not fixed to the historical Kimi run.
+Kimi additionally changes the first-layer BF16 MLA projection and checks both
+associated derived weights against that projection, with stable addresses. Each
+step takes a fresh derived-weight baseline. The embedding uses the same XOR twice,
+so d2 restores its original bytes; the projection receives another increment.
+
+Allocation tracing is enabled on d1 and disabled on d2 by default; passive
+monitoring remains active. Set `"second_update_allocation_tracing": true` in the
+explicit environment JSON to trace d2 as well. This is harness configuration,
+not a production client setting. `s3_savings` compares the paired RPC durations;
+it does not isolate tracing overhead from reuse or warm-cache effects.
+
+A historical Kimi-K2.6 experiment on 2026-09-24 used revision
+`7eb5002f6aadc958aed6a9177b7ed26bb94011bb`, two TP8 B200 workers, vLLM 0.19.0,
+ModelExpress 0.7.0 and PR #798 commit `1b0622b`. It measured S3 RPCs of
+936.257083 s (d1, traced) and 579.972943 s (d2, untraced), a 38.05% reduction;
+peer RPCs were 1.873846 s and 1.865688 s. Reconstruction decreased from
+336.350432 s to 5.055537 s, with all 64 shards retaining their identities on d2.
+Both updates passed eight-rank checks, including 1,735 nonempty runtime tensors
+and 122 MLA derived tensors per rank, checkpoint/publisher equality, and resumed
+inference. Payloads were 1,082,342,004 and 1,082,248,389 bytes. Peer refit transferred
+full runtime state (about 76.6 GB/rank), not just those deltas.
+
+That is one paired run of the preceding experimental harness, **not GPU validation
+of this adapted implementation or the current Kimi-K2.7-Code profile**. Existing
+materialized-checkpoint reuse explains the major gain; no production optimization
+was added. The 17.93 s installation reduction cannot be attributed solely to
+tracing because warm-cache effects also changed. The experiment required the
+existing WNA16 absent-index host-OOM workaround and zstandard 0.25.0; this harness
+does not apply that workaround. PR #798's MLA refresh fix is now merged. The
+experiment's resources and delta objects were removed; raw artifacts and
+provider-specific manifests are not part of this repository.
 
 CI uploads evidence on success/failure and runs a separate cleanup job. It stops
 publisher/workers, removes objects under exactly the profile's delta-prefix/run-ID

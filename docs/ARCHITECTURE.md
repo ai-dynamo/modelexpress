@@ -1479,14 +1479,20 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering serv
 seed downloader, diagnostics, validation/reporting, and object cleanup. `scripts/`
 operates templates in `yaml/`. `profiles.json` registers models and the default;
 `profiles/<key>/profile.json` defines a pinned checkpoint, resources, and expected
-checks. An optional `model_checks.py` adds model-specific checks. Current profiles
+checks. Optional `model_adapter.py` and `model_checks.py` hooks add publication
+mutations, worker-side derived-weight verification, and saved-evidence checks. Current profiles
 cover Nemotron NVFP4 and Kimi-K2.7-Code; no Applied Training checkout is required.
 
 Nemotron expects 761 GPU tensors and 18 coherent host-scale entries per rank.
 Its peer hook checks 11 changed host scales and cleared immediate launch caches;
 post-inference cache differences are retained without asserting numerical safety.
-Kimi uses shared all-rank tensor/refit checks; GPU compatibility remains unvalidated
-and the experimental WNA16 workaround is not included.
+Kimi mutates its first MLA projection and verifies both targeted derived weights
+against it on every rank. The shared publisher chains two deltas; one driver
+initializes each refit client once and verifies both updates, checkpoint-file reuse,
+and resumed inference. The report independently requires complete evidence for
+both updates. Allocation tracing can be disabled for d2 without disabling passive
+diagnostics. No production refit behavior changes. The adapted harness has not
+been GPU-qualified and the experimental WNA16 workaround is not included.
 
 `e2e-ci.yml` authorizes `/e2e-test` on a hosted runner, then builds the immutable
 copy-pr-bot-approved revision on privileged runners. `scripts/comment_gate.py`

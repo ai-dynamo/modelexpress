@@ -135,13 +135,31 @@ def saved_run(tmp_path):
         "roles": ["s3", "peer"],
         "run": "nemotron-test",
         "revision": "revision",
+        "embedding": "embedding",
         "expected_tensors_per_rank": None,
         "expected_host_scales_per_rank": None,
+        "second_update_allocation_tracing": False,
     }
     (tmp_path / "config.json").write_text(json.dumps(config))
     (tmp_path / "images.json").write_text("{}")
+    trials = [
+        {
+            "version": f"nemotron-test-d{step}",
+            "base_version": "nemotron-test-" + ("base" if step == 1 else "d1"),
+            "expected_sha256": f"digest{step}",
+            "expected_hashes": {"embedding": f"digest{step}"},
+            "payload_bytes": 128,
+        }
+        for step in (1, 2)
+    ]
     (tmp_path / "publication.json").write_text(
-        json.dumps({"run": "nemotron-test", "model_revision": "revision"})
+        json.dumps(
+            {
+                "run": config["run"],
+                "model_revision": config["revision"],
+                "trials": trials,
+            }
+        )
     )
     lines = []
 
@@ -152,47 +170,90 @@ def saved_run(tmp_path):
             + " "
             + step
             + " "
-            + json.dumps({"http_status": 200, "response": {"ok": True, "result": rows}})
+            + json.dumps(
+                {
+                    "seconds": 4.0 if not step.startswith("d2-") else 2.0,
+                    "http_status": 200,
+                    "response": {"ok": True, "result": rows},
+                }
+            )
         )
 
-    for role in config["roles"]:
-        for step, digest in [("base-hashes", "before"), ("updated-hashes", "after")]:
-            result(
-                role,
-                step,
-                [
-                    {
-                        "rank": r,
-                        "phase": step,
-                        "tensors": {
-                            "embedding": {
-                                "sha256": digest + str(r),
-                                "shape": [2, 4],
-                                "dtype": "bfloat16",
-                            }
-                        },
-                    }
-                    for r in range(2)
-                ],
-            )
+    def hashes(role, name, digest):
         result(
             role,
-            "refit",
+            name,
             [
                 {
-                    "rank": r,
-                    "phase": "nemotron-test-d1",
-                    "version": "nemotron-test-d1",
-                    "serving_version": "nemotron-test-d1",
-                    "source": "OBJECT_STORAGE" if role == "s3" else "GENERATOR",
-                    "weight_addresses_preserved": True,
+                    "rank": rank,
+                    "phase": name,
+                    "tensors": {
+                        "embedding": {
+                            "sha256": digest + str(rank),
+                            "shape": [2, 4],
+                            "dtype": "bfloat16",
+                        },
+                    },
                 }
-                for r in range(2)
+                for rank in range(2)
             ],
         )
+
+    def layout(version, inode):
+        return [
+            {
+                "rank": rank,
+                "phase": "layout-" + version,
+                "version": version,
+                "path": "/refit/" + version,
+                "files": {
+                    f"shard{i}": {"inode": inode + i, "device": 1, "bytes": 128}
+                    for i in range(3)
+                },
+            }
+            for rank in range(2)
+        ]
+
+    for role in config["roles"]:
+        hashes(role, "base-hashes", "before")
         result(
-            role, "post-refit-inference", [{"token_ids": [3, 4], "logprob_count": 2}]
+            role,
+            "init",
+            [
+                {
+                    "rank": rank,
+                    "phase": "init",
+                    "version": "nemotron-test-base",
+                    "refit_session": f"{role}-{rank}",
+                }
+                for rank in range(2)
+            ],
         )
+        for step in (1, 2):
+            prefix = "" if step == 1 else "d2-"
+            hashes(role, prefix + "updated-hashes", f"after{step}")
+            result(
+                role,
+                prefix + "refit",
+                [
+                    {
+                        "rank": rank,
+                        "phase": f"nemotron-test-d{step}",
+                        "version": f"nemotron-test-d{step}",
+                        "serving_version": f"nemotron-test-d{step}",
+                        "source": "OBJECT_STORAGE" if role == "s3" else "GENERATOR",
+                        "weight_addresses_preserved": True,
+                        "allocation_tracing": step == 1,
+                        "refit_session": f"{role}-{rank}",
+                    }
+                    for rank in range(2)
+                ],
+            )
+            result(
+                role,
+                prefix + "post-refit-inference",
+                [{"token_ids": [3, 4], "logprob_count": 2}],
+            )
         log = "Model loading took 1 GiB memory and 2.0 seconds\n"
         log += (
             "Streaming weights from s3://bucket/model\n"
@@ -200,6 +261,9 @@ def saved_run(tmp_path):
             else "RDMA transfer complete: test\n"
         )
         (tmp_path / f"{role}-worker.log").write_text(log)
+        (tmp_path / f"{role}-monitor.log").write_text(
+            'HOST_MEMORY {"memory.events": "oom 0\\noom_kill 0\\n"}\n'
+        )
         (tmp_path / f"{role}-pod.json").write_text(
             json.dumps(
                 {
@@ -212,20 +276,33 @@ def saved_run(tmp_path):
                 }
             )
         )
-    result(
-        "s3",
-        "verify-checkpoint",
-        [
-            {
-                "rank": r,
-                "phase": "checkpoint-verified",
-                "verified": True,
-                "sha256": str(r),
-                "expected_sha256": str(r),
-            }
-            for r in range(2)
-        ],
-    )
+    for step, trial in enumerate(trials, 1):
+        prefix = "" if step == 1 else "d2-"
+        result(
+            "s3",
+            prefix + "verify-checkpoint",
+            [
+                {
+                    "rank": rank,
+                    "phase": "checkpoint-verified",
+                    "version": trial["version"],
+                    "verified": True,
+                    "sha256": str(rank),
+                    "expected_sha256": str(rank),
+                    "full_checkpoint_sha256": trial["expected_sha256"]
+                    if rank == 0
+                    else None,
+                    "publisher_hashes": trial["expected_hashes"] if rank == 0 else {},
+                }
+                for rank in range(2)
+            ],
+        )
+        result(
+            "s3",
+            prefix + "layout-before",
+            layout(trial["base_version"], 10 if step == 1 else 20),
+        )
+        result("s3", prefix + "layout-after", layout(trial["version"], 20))
     (tmp_path / "e2e-driver.log").write_text("\n".join(lines) + "\nE2E_PASS\n")
     return config
 

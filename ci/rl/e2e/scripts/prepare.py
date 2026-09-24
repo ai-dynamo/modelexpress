@@ -90,6 +90,11 @@ def prepare(model, output, run, paths=None, *, environment, **overrides):
     )
     if not 0 < config["gpu_memory_utilization"] <= 1:
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
+    config["second_update_allocation_tracing"] = env.get(
+        "second_update_allocation_tracing", False
+    )
+    if type(config["second_update_allocation_tracing"]) is not bool:
+        raise ValueError("second_update_allocation_tracing must be a boolean")
     prefix = config["resource_prefix"]
     images = {}
     for kind, aliases in {
@@ -215,9 +220,10 @@ def prepare(model, output, run, paths=None, *, environment, **overrides):
             output / ("control.yaml" if role == "control" else f"worker-{role}.yaml")
         ).write_text(text)
     data = {p.name: p.read_text() for p in (ROOT / "common").glob("*.py")}
-    model_checks = ROOT / "profiles" / model / "model_checks.py"
-    if model_checks.exists():
-        data["model_checks.py"] = model_checks.read_text()
+    for module in ["model_checks.py", "model_adapter.py"]:
+        source = ROOT / "profiles" / model / module
+        if source.exists():
+            data[module] = source.read_text()
     data["config.json"] = json.dumps(config, indent=2)
     for name, text in data.items():
         if name.endswith(".py"):

@@ -240,8 +240,8 @@ class AllocationTrace(TorchDispatchMode):
 
 
 @contextlib.contextmanager
-def allocation_trace(rank):
-    if rank != 0:
+def allocation_trace(rank, enabled=True):
+    if not enabled or rank != 0:
         yield
         return
     from vllm.model_executor.model_loader.reload import layerwise

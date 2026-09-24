@@ -16,5 +16,6 @@
   "key": "kimi",
   "seed_prefix": "models/huggingface/moonshotai/Kimi-K2.7-Code/74797c9c62378b951a1f6fcf5c4631024e9b8bef/",
   "delta_prefix": "checkpoints/benchmarks/kimi-hotload/",
-  "refit_checkpoint_max_size_gb": 3000
+  "refit_checkpoint_max_size_gb": 3000,
+  "derived_weight_check": true
 }

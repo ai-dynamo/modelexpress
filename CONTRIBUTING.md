@@ -233,7 +233,10 @@ git push --force-with-lease
 ### Offline model E2E CI checks
 
 The AWS harness has CPU-only contracts for rendering, all-rank validation,
-failure reporting, and target selection. From the repository root:
+failure reporting, target selection, two-update publication/driver behavior, and
+checkpoint-reuse evidence. Failure cases cover both updates, including missing
+ranks, restarted clients, partial shard copies, and divergent hashes/inference.
+From the repository root:
 
 ```bash
 uv run --no-project --with pytest --with pyyaml pytest ci/rl/e2e/tests

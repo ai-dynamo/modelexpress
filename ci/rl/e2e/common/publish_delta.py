@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import boto3
+import model_adapter
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -27,6 +28,7 @@ from modelexpress_rl import (
     WeightVersionState,
 )
 from modelexpress_rl.utils import compress_delta
+from publication import publish_updates
 from safetensors.torch import save_file
 
 root = Path("/tmp/mx-delta")
@@ -102,12 +104,42 @@ os.close(fd)
 print("SEED_DOWNLOAD", time.perf_counter() - t, size, flush=True)
 raw = np.memmap(raw_path, dtype=np.uint8, mode="r+")
 tensor = torch.from_numpy(raw).view(torch.bfloat16).reshape(entry["shape"])
+
+
+def read_tensor(name):
+    key = seed_prefix + idx["weight_map"][name]
+
+    def read_range(start, stop):
+        body = s3.get_object(Bucket=bucket, Key=key, Range=f"bytes={start}-{stop}")[
+            "Body"
+        ]
+        try:
+            data = body.read()
+        finally:
+            body.close()
+        assert len(data) == stop - start + 1
+        return data
+
+    length = struct.unpack("<Q", read_range(0, 7))[0]
+    entry = json.loads(read_range(8, 7 + length))[name]
+    assert entry["dtype"] == "BF16", entry
+    begin, end = entry["data_offsets"]
+    data = bytearray(read_range(8 + length + begin, 7 + length + end))
+    return torch.frombuffer(data, dtype=torch.bfloat16).reshape(entry["shape"])
+
+
+tensors = {
+    name: tensor,
+    **{n: read_tensor(n) for n in model_adapter.extra_tensor_names(idx)},
+}
 seed = root / "seed"
 seed.mkdir(exist_ok=True)
-save_file({name: tensor}, str(seed / "model.safetensors"))
+save_file(tensors, str(seed / "model.safetensors"))
 seed_index = {
-    "metadata": {"total_size": size},
-    "weight_map": {name: "model.safetensors"},
+    "metadata": {
+        "total_size": sum(t.numel() * t.element_size() for t in tensors.values())
+    },
+    "weight_map": {n: "model.safetensors" for n in tensors},
 }
 (seed / "model.safetensors.index.json").write_text(json.dumps(seed_index))
 dist.init_process_group(
@@ -115,7 +147,6 @@ dist.init_process_group(
 )
 control = ModelExpressControlClient.connect(server_url="127.0.0.1:8000")
 base = run + "-base"
-version = run + "-d1"
 target = CONFIG["delta_bytes"]
 control.create_weight_version(
     uid=base,
@@ -145,7 +176,7 @@ trainer = ModelExpressTrainerClient.initialize(
         ),
     )
 )
-trainer.prepare_delta_base(hf_tensor_iter=[[(name, tensor)]])
+trainer.prepare_delta_base(hf_tensor_iter=[list(tensors.items())])
 sample = np.zeros(32 * 1024**2, dtype=np.uint8)
 sample[::2] = np.random.default_rng(15).integers(
     0, 128, len(sample) // 2, dtype=np.uint8
@@ -172,44 +203,55 @@ print(
     ),
     flush=True,
 )
-np.bitwise_xor(raw, xor, out=raw)
+
+
+def mutate():
+    np.bitwise_xor(raw, xor, out=raw)
+    model_adapter.mutate_extra({n: t for n, t in tensors.items() if n != name})
+    gc.collect()
+
+
+def digests():
+    return {
+        n: hashlib.sha256(t.contiguous().view(torch.uint8).numpy()).hexdigest()
+        for n, t in tensors.items()
+    }
+
+
 changed_bytes = int(np.count_nonzero(xor))
-del xor
-gc.collect()
-expected = hashlib.sha256(raw).hexdigest()
-v = control.create_weight_version(
-    uid=version,
-    model_name=model,
-    idempotency_key=version,
-    payload_format=WeightPayloadFormat.XOR_DELTA,
-    base_version_id=base,
-    object_storage=ObjectStorageSource(
-        storage_type=ObjectStorageType.S3, uri=uri + "d1/model.safetensors.index.json"
-    ),
+trials = publish_updates(
+    control,
+    trainer,
+    run=run,
+    model=model,
+    uri=uri,
+    tensors=tensors,
+    embedding=name,
+    mutate=mutate,
+    digests=digests,
 )
-t = time.perf_counter()
-staged = trainer.stage_shard(version=v.ref, hf_tensor_iter=[[(name, tensor)]])
-encode_seconds = time.perf_counter() - t
-t = time.perf_counter()
-staged.publish()
-publication_seconds = time.perf_counter() - t
-control.update_weight_version_state(version, WeightVersionState.READY)
-publisher_metrics = trainer.pop_metrics()
+xor = None
 trainer.close()
 control.close()
 dist.destroy_process_group()
-del trainer, staged, tensor, raw
+del trainer
+tensors = tensor = raw = None
 gc.collect()
 objects = [
     {"key": x["Key"], "bytes": x["Size"]}
-    for x in s3.list_objects_v2(Bucket=bucket, Prefix=prefix).get("Contents", [])
+    for page in s3.get_paginator("list_objects_v2").paginate(
+        Bucket=bucket, Prefix=prefix
+    )
+    for x in page.get("Contents", [])
 ]
-payload_bytes = sum(
-    x["bytes"]
-    for x in objects
-    if "/d1/" in x["key"] and x["key"].endswith(".safetensors")
-)
-assert abs(payload_bytes - target) / target < 0.03, payload_bytes
+for step, trial in enumerate(trials, 1):
+    trial["payload_bytes"] = sum(
+        x["bytes"]
+        for x in objects
+        if x["key"].startswith(prefix + f"d{step}/")
+        and x["key"].endswith(".safetensors")
+    )
+    assert abs(trial["payload_bytes"] - target) / target < 0.03, trial
 report = {
     "run": run,
     "model_source": model,
@@ -218,15 +260,15 @@ report = {
     "tensor_shape": entry["shape"],
     "tensor_bytes": size,
     "target_payload_bytes": target,
-    "payload_bytes": payload_bytes,
+    "payload_bytes": trials[0]["payload_bytes"],
     "active_tensor_bytes": active_bytes,
     "changed_bytes": changed_bytes,
-    "expected_sha256": expected,
-    "encode_seconds": encode_seconds,
-    "publication_seconds": publication_seconds,
-    "publisher_metrics": publisher_metrics,
+    "expected_sha256": trials[0]["expected_sha256"],
+    "encode_seconds": trials[0]["encode_seconds"],
+    "publication_seconds": trials[0]["publication_seconds"],
+    "publisher_metrics": trials[0]["publisher_metrics"],
     "objects": objects,
-    "trials": [],
+    "trials": trials,
 }
 (root / "report.json").write_text(json.dumps(report, indent=2))
 print(
