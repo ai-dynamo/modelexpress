@@ -51,6 +51,8 @@ dev = [
     "prometheus-client>=0.20.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "requests>=2.33.1",
+    "urllib3>=2.7.0",
 ]
 codegen = [
     # Keep generated Python stubs compatible with both protobuf 5 and 6.
@@ -69,6 +71,10 @@ metrics = [
 vmm = [
     # 12.4 is the first release exposing CU_MEM_HANDLE_TYPE_FABRIC.
     "cuda-python>=12.4",
+]
+azure = [
+    "azure-identity>=1.13.0",
+    "azure-storage-blob>=12.28.0",
 ]
 
 [project.urls]
