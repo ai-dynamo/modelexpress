@@ -39,7 +39,6 @@ def _run(monkeypatch, caplog, *, fused=True, enabled=True):
     monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "1" if fused else "0")
     monkeypatch.setenv("MX_REFIT_STAGE_RECORD", "1" if enabled else "0")
     monkeypatch.delenv("MX_RESHARD_MAX_GBPS", raising=False)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     transport = _RecordingTransport()
     harness, keepalive = _build(transport)
     with caplog.at_level(logging.WARNING):
@@ -141,7 +140,6 @@ def test_setup_costs_land_on_the_step_that_paid_them(monkeypatch, caplog):
     # clear the ceiling itself; a low one inherited from the environment aborts the
     # refit before any of the record assertions below are reached.
     monkeypatch.delenv("MX_RESHARD_MAX_GBPS", raising=False)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     transport = _RecordingTransport()
     harness, keepalive = _build(transport)
 
@@ -193,7 +191,6 @@ def test_a_skipped_stage_is_absent_rather_than_zero(monkeypatch, caplog):
     # Built directly rather than through _run, so the ceiling has to be cleared here
     # too, for the same reason.
     monkeypatch.delenv("MX_RESHARD_MAX_GBPS", raising=False)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     transport = _RecordingTransport()
     harness, keepalive = _build(transport)
     harness._plan.converts = []
@@ -226,7 +223,6 @@ def test_an_exact_phase_that_moved_nothing_is_not_timed(monkeypatch, caplog):
     monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "0")
     monkeypatch.setenv("MX_REFIT_STAGE_RECORD", "1")
     monkeypatch.delenv("MX_RESHARD_MAX_GBPS", raising=False)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     harness, keepalive = _build(_RecordingTransport())
     # A bounded plan, which is the only way a real plan reaches zero segments:
     # plan_transfer counts every copy into exact_descriptor_count and then moves the

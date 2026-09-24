@@ -32,6 +32,7 @@ from modelexpress.refit.reshard.transfer_plan import (
     TransferPlan,
 )
 from modelexpress.refit.reshard.transport import InMemoryReferenceTransport
+from tests.conftest import MockAcceleratorBackend
 
 EL = 4  # float32 element size
 
@@ -63,6 +64,9 @@ class _Harness(ReshardReceiver):
         self._global_rank = 0
         self._cached_descriptors = None
         self._install_order: list[str] = []
+        # The stage syncs go through the accelerator backend, so a stub backend is
+        # what keeps this CPU-only rather than patching a torch device module.
+        self._backend = MockAcceleratorBackend()
 
     def _install(self, recv_buffers) -> None:
         self._install_order.append("install")
@@ -176,7 +180,6 @@ class _Copy:
 
 def _run(monkeypatch, *, fused: bool):
     monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "1" if fused else "0")
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     transport = _RecordingTransport()
     harness, keepalive = _build(transport)
     metrics = harness.update_weights(step=1)
@@ -246,7 +249,6 @@ def test_accounting_covers_all_three_groups(monkeypatch):
 
 def test_empty_full_pull_and_convert_groups_are_skipped(monkeypatch):
     """A plan with only exact segments must still issue exactly one batch."""
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
 
     for fused in (True, False):
         monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "1" if fused else "0")

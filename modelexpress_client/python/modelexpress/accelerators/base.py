@@ -70,3 +70,15 @@ class AcceleratorBackend(Protocol):
     def supports_gds(self) -> bool:
         """Return whether GPUDirect Storage loading is supported."""
         ...
+
+    def requires_classic_alloc_pool(self) -> bool:
+        """Return whether NIXL-registered buffers must come from a separate
+        classic-allocation pool on this backend.
+
+        A requirement, not a capability: True where this backend's default torch
+        allocator can hand out a range the HCA cannot pin, so registered buffers
+        have to be scoped into a classic-allocation pool instead (see
+        ``refit/reshard/cuda_pool.py`` for the hazard and the CUDA
+        implementation). False means the default allocator is already suitable.
+        """
+        ...
