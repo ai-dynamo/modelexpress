@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
     MX_REFIT_FULL_STREAMING: bool
+    MX_REFIT_STREAM_WINDOW_LAYERS: int
     MX_REFIT_TIMING: bool
     MX_S3_DOWNLOAD_RANGE_BYTES: int
     MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
@@ -142,6 +143,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("MX_REFIT_FULL_STREAMING", "false"),
         "MX_REFIT_FULL_STREAMING",
     ),
+    # Decoder layers per streamed full-refit request; 0 streams all at once.
+    "MX_REFIT_STREAM_WINDOW_LAYERS": lambda: require_non_negative_int(
+        int(os.environ.get("MX_REFIT_STREAM_WINDOW_LAYERS", 2)),
+        "MX_REFIT_STREAM_WINDOW_LAYERS",
+    ),
     # One normalized timing record per generator refit. On by default: the
     # durations are already being measured on the staging path, so recording
     # them costs a few perf_counter calls and one log line, against a refit
@@ -159,6 +165,13 @@ def require_positive_int(value: int, name: str) -> int:
     """Return ``value`` or raise when it is not positive."""
     if value <= 0:
         raise ValueError(f"{name} must be positive")
+    return value
+
+
+def require_non_negative_int(value: int, name: str) -> int:
+    """Return ``value`` or raise when it is negative."""
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
     return value
 
 
