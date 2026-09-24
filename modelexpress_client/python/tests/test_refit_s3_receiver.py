@@ -1716,6 +1716,29 @@ def test_canonical_s3_can_defer_activation_until_distributed_load_completes(
     adapter.close()
 
 
+def test_first_delta_retains_full_materialization_capacity_check(monkeypatch, tmp_path):
+    objects = _artifact(
+        torch.tensor([1.0, 2.0]).view(torch.uint8).numpy(),
+        torch.tensor([3.0, 4.0]).view(torch.uint8).numpy(),
+    )
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    store = adapter._checkpoint.store
+    base = store.full_path("base-a")
+    base_size = store.path_size_bytes(base)
+    ensure_capacity = store.ensure_capacity
+    reservations = []
+
+    def track_capacity(additional_bytes, **kwargs):
+        reservations.append(additional_bytes)
+        ensure_capacity(additional_bytes, **kwargs)
+
+    monkeypatch.setattr(store, "ensure_capacity", track_capacity)
+    staged = adapter.stage_weight(_inputs(None))
+    assert base_size in reservations
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
 def test_canonical_s3_applies_one_delta_to_the_active_checkpoint(
     monkeypatch, tmp_path
 ):
