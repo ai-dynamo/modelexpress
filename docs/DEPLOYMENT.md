@@ -688,6 +688,81 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
 
+### Collective Refit (NCCL M2N) Topology
+
+Four roles, and the split that decides placement is that **no weight byte crosses
+the ModelExpress server**. It brokers admission, rank assignment and the NCCL
+`uniqueId`; the weights move directly between trainer and generator ranks.
+
+| Role | Count | Runs where | Needs |
+|---|---|---|---|
+| ModelExpress server | one endpoint | any node with network reach; for this path it needs no GPU and no fast fabric | gRPC reachable from every rank, plus a metadata backend |
+| Metadata backend | one | beside the server | Redis for more than one server replica, or for group state that survives a server restart. The in-memory backend is single-replica and forgets on exit |
+| Trainer ranks | one per trainer GPU | inside the training job's own worker processes | the policy weights, the framework's own process group, gRPC to the server, NCCL to the generator ranks |
+| Generator ranks | one per inference-engine GPU | **inside the inference engine's own worker processes** | gRPC to the server, NCCL to the trainer ranks |
+| Coordinator | one | anywhere with gRPC reach | drives `start_weight_update` / publish / `finish_weight_update` on both sides in lockstep |
+
+Five constraints bind the layout:
+
+1. **The generator client is not separately deployable.** It has to run in the
+   engine's worker processes, because the destination storage is the engine's
+   and exists nowhere else. For vLLM that is a `worker_extension_cls` driven by
+   `collective_rpc`; for any other engine it is whatever that engine's
+   equivalent per-worker extension point is. A sidecar cannot do this.
+2. **The server is off the data path,** so it does not scale with model size and
+   does not want a GPU. Sizing it against the weights is the common mistake.
+3. **Every rank needs two different networks:** ordinary TCP to the server for
+   the control plane, and whatever NCCL needs for the data plane. They have
+   different reachability requirements and are worth checking separately.
+4. **Rank order inside a lane is trainers first, generators after,** and the
+   server assigns it. A deployment does not choose ranks; it chooses membership.
+5. **Both sides derive the same plan independently,** so both need a consistent
+   view of the canonical parameter set. Deriving it from the checkpoint the two
+   sides already share is the least surprising way to guarantee that.
+
+Preflight, in this order, because each one fails in a way that does not name
+itself:
+
+1. **NCCL 2.30.7 or newer, LOADED.** `torch.cuda.nccl.version()` reports what
+   torch was compiled against, not what is mapped into the process, and the
+   mismatch fails inside the native reshard call rather than at import. Read it
+   with `ctypes.CDLL("libnccl.so.2").ncclGetVersion()`. Where an image ships its
+   own older `libnccl`, `LD_PRELOAD` the one the wheels installed.
+2. **`nccl-extensions` matching the CUDA major** (`[cu12]` or `[cu13]`). A bare
+   install resolves and then fails to import.
+3. **gRPC from a trainer rank and from a generator rank to the server**, checked
+   separately: in an inference deployment those two are frequently on different
+   networks.
+4. **A one-GPU-per-side reshard between the two placements you intend to use.**
+   If trainers and generators will sit on different nodes, prove the data plane
+   crosses that boundary before scaling anything up.
+
+Scope of what has been measured, because the boundary matters more than the
+numbers: **all ranks on a single node is exercised end to end against a live
+inference engine.** Cross-node is not, and has been seen to fail below
+ModelExpress inside NCCL's transport layer on at least one fabric, with one
+trainer and one generator, so it is not a scale effect. More than one source
+partition (pipeline stage) is supported by the protocol and has not been
+exercised against a real engine.
+
+### Collective Refit (NCCL M2N) Environment Variables
+
+Client-side policy for the NCCL M2N collective refit path
+(`modelexpress_rl.collective`), which is a sibling of the NIXL pull path
+rather than a mode of it. Every value is validated when it is read: a
+non-numeric, zero or negative setting raises rather than falling back to the
+default, so a typo fails loudly at startup instead of silently restoring
+stock behavior. Design: [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600.0` | Deadline for group formation, from join until the group reports `READY` with every participant admitted. |
+| `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | Backoff floor for `GetCollectiveGroup` polling while waiting for formation and for lane bootstrap ids to be published. |
+| `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300.0` | Deadline for bringing up one lane's NCCL communicator once its bootstrap id is published. Communicators are created non-blocking, and this bounds the poll to `ncclSuccess`. Setting `NCCL_COMM_BLOCKING` to anything other than `0` is rejected at startup, because blocking initialization would defeat this deadline. |
+| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600.0` | Deadline for the reshard itself, armed per weight version. `READY` only means the group formed, so this bounds what happens after it; on expiry the group is aborted and has to re-form at a fresh epoch, because peers that disagree about which collectives completed cannot be recovered on the same communicator. |
+| `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams used to overlap per-pipeline-stage reshard lanes. |
+| `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS`, so `90` | How long a participant's registration stays alive without a heartbeat. Derived from `MX_HEARTBEAT_INTERVAL_SECS` (default `30`), so raising the heartbeat interval raises this with it. |
+
 ### NIXL Backend Selection
 
 `MX_NIXL_BACKEND` selects the NIXL plugin used for GPU-to-GPU RDMA.
