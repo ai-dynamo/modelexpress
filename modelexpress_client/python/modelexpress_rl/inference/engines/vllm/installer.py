@@ -40,6 +40,13 @@ from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import refit_span
 
 from modelexpress_rl.inference.engines.vllm._capture_snapshot import _CaptureSnapshot
+
+
+from modelexpress_rl import envs as rl_envs
+from modelexpress_rl.inference.engines.vllm.stream_windows import (
+    layer_windows,
+    windowed_weights,
+)
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -1058,11 +1065,19 @@ class _VllmInstaller(EngineInstaller):
         extra["distributed"] = tp_size > 1 and envs.MX_MS_DISTRIBUTED
         object.__setattr__(load_config, "model_loader_extra_config", extra)
         loader = RunaiModelStreamerLoader(load_config)
-        weights = runai_safetensors_weights_iterator(
-            list(checkpoint.shard_uris),
-            load_config.use_tqdm_on_load,
-            is_distributed=loader._is_distributed,
-        )
+        window_layers = rl_envs.MX_REFIT_STREAM_WINDOW_LAYERS
+        if window_layers:
+            weights = windowed_weights(
+                list(checkpoint.shard_uris),
+                layer_windows(checkpoint.tensor_metadata, window_layers),
+                is_distributed=loader._is_distributed,
+            )
+        else:
+            weights = runai_safetensors_weights_iterator(
+                list(checkpoint.shard_uris),
+                load_config.use_tqdm_on_load,
+                is_distributed=loader._is_distributed,
+            )
         cache = get_world_group().local_rank == 0
         with (
             closing(weights),
