@@ -57,9 +57,10 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
           {{- end }}
+          {{- $serverPort := .Values.service.port | default 8001 }}
           ports:
             - name: http
-              containerPort: {{ .Values.service.port | default 8001 }}
+              containerPort: {{ $serverPort }}
               protocol: TCP
             {{- if and .Values.metrics .Values.metrics.enabled }}
             - name: metrics
@@ -69,6 +70,7 @@ spec:
           env:
             {{- $hasNsInExtra := false }}
             {{- $hasMetricsPortInExtra := false }}
+            {{- $hasServerPortInExtra := false }}
             {{- range .Values.extraEnv }}
               {{- if eq .name "MX_METADATA_NAMESPACE" }}
                 {{- $hasNsInExtra = true }}
@@ -76,7 +78,23 @@ spec:
               {{- if eq .name "MODEL_EXPRESS_SERVER_METRICS_PORT" }}
                 {{- $hasMetricsPortInExtra = true }}
               {{- end }}
+              {{- if eq .name "MODEL_EXPRESS_SERVER_PORT" }}
+                {{- $hasServerPortInExtra = true }}
+              {{- end }}
             {{- end }}
+            {{- /*
+              service.port is the single source of truth for the gRPC listener.
+              It drives this env var, containerPort, the Service port and the
+              probes. Setting the env var directly would move only the server's
+              actual bind, leaving Kubernetes routing traffic and probes at the
+              old port -- desyncing "where the server listens" from "where the
+              cluster thinks it listens". Rejected rather than silently skipped.
+            */}}
+            {{- if or (hasKey .Values.env "MODEL_EXPRESS_SERVER_PORT") $hasServerPortInExtra }}
+            {{- fail "Set service.port rather than MODEL_EXPRESS_SERVER_PORT directly: the chart derives containerPort, the Service port and the probes from service.port, and an env-only override desynchronizes them." }}
+            {{- end }}
+            - name: MODEL_EXPRESS_SERVER_PORT
+              value: {{ $serverPort | quote }}
             {{- /*
               metrics.port is the single source of truth. It drives four things
               that have to agree: this env var, the scrape annotation, the
@@ -150,7 +168,7 @@ spec:
               {{- toYaml .Values.livenessProbe.tcpSocket | nindent 14 }}
             {{- else }}
             tcpSocket:
-              port: {{ .Values.service.port | default 8001 }}
+              port: {{ $serverPort }}
             {{- end }}
             initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds | default 5 }}
             periodSeconds: {{ .Values.livenessProbe.periodSeconds | default 10 }}
@@ -164,7 +182,7 @@ spec:
               {{- toYaml .Values.readinessProbe.tcpSocket | nindent 14 }}
             {{- else }}
             tcpSocket:
-              port: {{ .Values.service.port | default 8001 }}
+              port: {{ $serverPort }}
             {{- end }}
             initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds | default 5 }}
             periodSeconds: {{ .Values.readinessProbe.periodSeconds | default 10 }}
