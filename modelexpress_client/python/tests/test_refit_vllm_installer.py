@@ -541,6 +541,24 @@ def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(monkeypa
         finally:
             events.append("close")
 
+    loader_module = ModuleType("vllm.model_executor.model_loader.runai_streamer_loader")
+
+    class StreamerLoader:
+        def __init__(self, config):
+            assert config.model_loader_extra_config == {
+                "memory_limit": 123,
+                "concurrency": 7,
+                "distributed": True,
+            }
+            self._is_distributed = config.model_loader_extra_config["distributed"]
+            events.append("configure")
+
+    loader_module.RunaiModelStreamerLoader = StreamerLoader
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.model_loader.runai_streamer_loader",
+        loader_module,
+    )
     weight_utils.runai_safetensors_weights_iterator = iterator
     model = nn.Module()
     model.register_parameter(
@@ -569,7 +587,10 @@ def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(monkeypa
     installer = _VllmInstaller(
         model=model,
         vllm_config=SimpleNamespace(
-            load_config=SimpleNamespace(use_tqdm_on_load=False),
+            load_config=SimpleNamespace(
+                use_tqdm_on_load=False,
+                model_loader_extra_config={"memory_limit": 123, "concurrency": 7},
+            ),
             parallel_config=SimpleNamespace(tensor_parallel_size=4),
         ),
         model_config=object(),
@@ -582,7 +603,19 @@ def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(monkeypa
             PreparedCheckpoint("v2", Path("/unused"), {}, streaming=stream)
         )
     )
-    assert events == ["initialize", "stream", "load", "close", "finalize", "sync"]
+    assert events == [
+        "configure",
+        "initialize",
+        "stream",
+        "load",
+        "close",
+        "finalize",
+        "sync",
+    ]
+    assert installer._vllm_config.load_config.model_loader_extra_config == {
+        "memory_limit": 123,
+        "concurrency": 7,
+    }
     assert model.weight.data_ptr() == address
     assert torch.equal(model.weight, torch.tensor([7.0, 8.0]))
     assert stream._writer is None

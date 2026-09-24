@@ -237,6 +237,9 @@ class _VllmInstaller(EngineInstaller):
     def install_streamed_checkpoint(self, checkpoint: StreamedCheckpoint) -> None:
         """Stream once through graph-safe reload and tee to one writer per node."""
         from vllm.distributed import get_world_group
+        from vllm.model_executor.model_loader.runai_streamer_loader import (
+            RunaiModelStreamerLoader,
+        )
         from vllm.model_executor.model_loader.weight_utils import (
             runai_safetensors_weights_iterator,
         )
@@ -246,10 +249,15 @@ class _VllmInstaller(EngineInstaller):
             "tensor_parallel_size",
             1,
         )
+        load_config = copy.copy(self._vllm_config.load_config)
+        extra = dict(getattr(load_config, "model_loader_extra_config", None) or {})
+        extra["distributed"] = tp_size > 1 and envs.MX_MS_DISTRIBUTED
+        object.__setattr__(load_config, "model_loader_extra_config", extra)
+        loader = RunaiModelStreamerLoader(load_config)
         weights = runai_safetensors_weights_iterator(
             list(checkpoint.shard_uris),
-            self._vllm_config.load_config.use_tqdm_on_load,
-            is_distributed=tp_size > 1 and envs.MX_MS_DISTRIBUTED,
+            load_config.use_tqdm_on_load,
+            is_distributed=loader._is_distributed,
         )
         cache = get_world_group().local_rank == 0
         with (
