@@ -636,7 +636,13 @@ is consulted only when a later refit cannot use P2P.
 The canonical receiver retains each full checkpoint and delta payload under its
 version, then writes a resolved chain manifest. A full target is directly
 installable. The first delta after a full checkpoint copies that immutable full
-checkpoint into a version-scoped derived checkpoint. Later sequential deltas
+checkpoint into a version-scoped derived checkpoint. On Linux the checkpoint
+store attempts `FICLONE` per regular file, sharing blocks copy-on-write where
+the filesystem supports reflinks. Unsupported filesystems, cross-mount copies,
+and other platforms use an ordinary copy. File metadata and symlink dereferencing
+retain `copytree`/`copy2` behavior; mutable files never use hard links. Clone I/O,
+permission, and capacity failures abort preparation and clean its temporary
+directory before promotion. Later sequential deltas
 rename the active materialization and apply only the incoming XOR delta in
 place, avoiding another full-model copy. Canonical artifacts are never modified
 during reconstruction, and derived checkpoints can be rebuilt from the lineage.
@@ -648,6 +654,12 @@ The local checkpoint store caps its configured quota at the existing model cache
 size plus free disk space. It logs any cap applied at initialization and rechecks
 free space before known writes and copies. Capacity checks evict stale
 checkpoints or reject the update while preserving protected lineage.
+Reflinks retain logical-size accounting and the full first-materialization
+free-space check: delta writes can allocate private blocks. This is an admission
+check, not a filesystem reservation against concurrent users. Reflink support
+must be tested on the actual checkpoint cache mount; a Kubernetes `emptyDir`
+does not establish support. First-refit latency savings require a fresh benchmark
+on that mount; existing sequential-reuse timings do not measure this optimization.
 
 Under the local checkpoint lock, preparation state advances from `READY` to
 `UPDATING` before artifact construction and back to `READY(target)` only after

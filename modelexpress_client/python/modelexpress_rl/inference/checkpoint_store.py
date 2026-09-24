@@ -5,10 +5,13 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import logging
 import shutil
+import stat
+import sys
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,6 +20,35 @@ from pathlib import Path
 from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
+
+
+def _copy_checkpoint_file(source: str, destination: str) -> str:
+    """Copy a file with copy2 metadata, using Linux copy-on-write if supported."""
+    if sys.platform != "linux" or not stat.S_ISREG(Path(source).stat().st_mode):
+        return shutil.copy2(source, destination)
+
+    # FICLONE from linux/fs.h; Python exposes the constant starting in 3.12.
+    with open(source, "rb") as src, open(destination, "xb") as dst:
+        try:
+            fcntl.ioctl(
+                dst.fileno(), getattr(fcntl, "FICLONE", 0x40049409), src.fileno()
+            )
+        except OSError as error:
+            # Whole-file cloning can be unsupported for a filesystem, mount
+            # pair, or file layout. Permission, capacity and I/O errors are fatal.
+            if error.errno not in {
+                errno.EOPNOTSUPP,
+                errno.ENOTTY,
+                errno.EXDEV,
+                errno.EINVAL,
+                errno.ENOSYS,
+            }:
+                raise
+        else:
+            shutil.copystat(source, destination)
+            return destination
+
+    return shutil.copy2(source, destination)
 
 
 def _encode_cache_component(value: str) -> str:
@@ -192,7 +224,9 @@ class LocalCheckpointStore:
             if copy_from is None:
                 temporary.mkdir(parents=True)
             else:
-                shutil.copytree(copy_from, temporary)
+                shutil.copytree(
+                    copy_from, temporary, copy_function=_copy_checkpoint_file
+                )
             yield temporary
             shutil.rmtree(target, ignore_errors=True)
             temporary.replace(target)
