@@ -3,6 +3,8 @@
 
 """Tests for the ModelExpress model-cache client and its stream validation."""
 
+import json
+
 import grpc
 import pytest
 
@@ -93,6 +95,21 @@ def make_client(tmp_path, stub, **kwargs):
     client = ModelCacheClient(server_url="localhost:1", cache_directory=tmp_path, **kwargs)
     client._stub = stub
     return client
+
+
+@pytest.fixture
+def metadata_snapshot(tmp_path):
+    stub = FakeStub(
+        files={"config.json": 2, "tokenizer.model": 3},
+        chunks=[
+            whole_file("config.json", b"{}", commit_hash=COMMIT),
+            whole_file("tokenizer.model", b"spm", is_last_file=True),
+        ],
+        resolved_revision=COMMIT,
+    )
+    return make_client(tmp_path, stub).install_metadata_snapshot(
+        MODEL, requested_revision=COMMIT
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -512,6 +529,419 @@ class TestInstallMetadataSnapshot:
         resolved = snapshot_download(MODEL, cache_dir=str(tmp_path), local_files_only=True)
 
         assert resolved == str(snapshot)
+
+
+class TestMetadataInventoryReuse:
+    def test_confirmed_install_records_metadata_outside_the_snapshot(
+        self, tmp_path, metadata_snapshot
+    ):
+        cache = ModelSnapshotCache(MODEL, tmp_path)
+        inventory_path = cache._metadata_inventory_path(COMMIT)
+
+        assert json.loads(inventory_path.read_text()) == {
+            "version": 1,
+            "repo": MODEL,
+            "commit": COMMIT,
+            "files": {"config.json": 2, "tokenizer.model": 3},
+        }
+        assert sorted(path.name for path in metadata_snapshot.iterdir()) == [
+            "config.json",
+            "tokenizer.model",
+        ]
+
+    def test_warm_pin_needs_neither_repo_lock_nor_rpc_stub(
+        self, tmp_path, metadata_snapshot, monkeypatch
+    ):
+        def forbidden(*args, **kwargs):
+            raise AssertionError("A warm pin must not acquire a lock, write refs or use RPC")
+
+        monkeypatch.setattr(ModelSnapshotCache, "lock", forbidden)
+        monkeypatch.setattr(ModelSnapshotCache, "write_revision_ref", forbidden)
+        monkeypatch.setattr(ModelCacheClient, "stub", property(forbidden))
+        client = ModelCacheClient(server_url="localhost:1", cache_directory=tmp_path)
+
+        assert client.install_metadata_snapshot(
+            MODEL, requested_revision=COMMIT
+        ) == metadata_snapshot
+        assert client._stub is None
+        assert client._channel is None
+
+    def test_pin_is_checked_again_after_acquiring_the_lock(self, tmp_path, monkeypatch):
+        from contextlib import contextmanager
+
+        original_lock = ModelSnapshotCache.lock
+
+        @contextmanager
+        def completed_while_waiting(cache):
+            with original_lock(cache):
+                staging = cache.staging()
+                staging.begin_file("config.json")
+                staging.write(b"{}")
+                staging.end_file()
+                staging.publish(COMMIT, {"config.json": 2}, requested_revision=COMMIT)
+                cache._write_metadata_inventory(COMMIT, {"config.json": 2})
+                yield
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("The second readiness check must avoid RPC")
+
+        monkeypatch.setattr(ModelSnapshotCache, "lock", completed_while_waiting)
+        monkeypatch.setattr(ModelCacheClient, "stub", property(forbidden))
+        client = ModelCacheClient(server_url="localhost:1", cache_directory=tmp_path)
+
+        snapshot = client.install_metadata_snapshot(MODEL, requested_revision=COMMIT)
+
+        assert snapshot == ModelSnapshotCache(MODEL, tmp_path).snapshot_path(COMMIT)
+        assert (snapshot / "config.json").read_bytes() == b"{}"
+        assert client._stub is None
+
+    def test_warm_pin_returns_while_another_process_holds_the_repo_lock(
+        self, tmp_path, metadata_snapshot
+    ):
+        import queue
+        import select
+        import subprocess
+        import sys
+        import threading
+
+        cache = ModelSnapshotCache(MODEL, tmp_path)
+        holder_code = (
+            "import fcntl, sys\n"
+            "with open(sys.argv[1], 'a') as handle:\n"
+            "    fcntl.flock(handle, fcntl.LOCK_EX)\n"
+            "    print('locked', flush=True)\n"
+            "    sys.stdin.read()\n"
+        )
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_code, str(cache.repo_root / ".modelexpress.lock")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stub = FakeStub(
+            updates=[
+                model_pb2.ModelStatusUpdate(
+                    status=model_pb2.ERROR, message="Warm metadata must not use RPC"
+                )
+            ]
+        )
+        client = make_client(tmp_path, stub)
+        results = queue.Queue()
+
+        def read_warm_pin():
+            try:
+                results.put(
+                    client.install_metadata_snapshot(MODEL, requested_revision=COMMIT)
+                )
+            except Exception as exc:
+                results.put(exc)
+
+        reader = threading.Thread(target=read_warm_pin, daemon=True)
+        try:
+            assert holder.stdout is not None
+            assert select.select([holder.stdout], [], [], 10)[0], "Lock holder did not start"
+            assert holder.stdout.readline() == "locked\n"
+            reader.start()
+            try:
+                result = results.get(timeout=10)
+            except queue.Empty:
+                pytest.fail("Warm metadata reader waited for another process's repo lock")
+            if isinstance(result, Exception):
+                raise result
+            assert result == metadata_snapshot
+            assert holder.poll() is None
+            assert stub.download_requests == []
+            assert stub.list_requests == []
+            assert stub.stream_requests == []
+        finally:
+            try:
+                _, stderr = holder.communicate(input="", timeout=10)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                _, stderr = holder.communicate(timeout=10)
+            if reader.ident is not None:
+                reader.join(timeout=10)
+            assert not reader.is_alive(), "Warm metadata reader failed to stop"
+        assert holder.returncode == 0, stderr
+
+    @pytest.mark.parametrize(
+        "damage",
+        ["missing-inventory", "corrupt-inventory", "missing-file", "size", "dangling", "empty"],
+    )
+    def test_invalid_cache_cannot_bypass_pin_confirmation(
+        self, tmp_path, metadata_snapshot, damage
+    ):
+        cache = ModelSnapshotCache(MODEL, tmp_path)
+        if damage == "missing-inventory":
+            cache._metadata_inventory_path(COMMIT).unlink()
+        elif damage == "corrupt-inventory":
+            cache._metadata_inventory_path(COMMIT).write_text("{")
+        elif damage == "missing-file":
+            (metadata_snapshot / "config.json").unlink()
+        elif damage == "size":
+            (metadata_snapshot / "config.json").write_bytes(b"partial")
+        elif damage == "dangling":
+            (metadata_snapshot / "config.json").unlink()
+            (metadata_snapshot / "config.json").symlink_to("missing-blob")
+        else:
+            for path in metadata_snapshot.iterdir():
+                path.unlink()
+        stub = FakeStub()
+
+        with pytest.raises(ModelCacheError, match="did not confirm revision"):
+            make_client(tmp_path, stub).install_metadata_snapshot(
+                MODEL, requested_revision=COMMIT
+            )
+
+        assert len(stub.download_requests) == 1
+        assert not stub.list_requests
+        assert not stub.stream_requests
+
+    @pytest.mark.parametrize("revision", ["main", "v1.0", COMMIT.upper(), None])
+    def test_refs_and_unpinned_requests_still_ask_the_server(
+        self, tmp_path, metadata_snapshot, revision
+    ):
+        cache = ModelSnapshotCache(MODEL, tmp_path)
+        previous_main = COMMIT if revision is None else "d" * 40
+        with cache.lock():
+            cache.write_main_ref(previous_main)
+        stub = FakeStub(
+            files={"config.json": 2, "tokenizer.model": 3}, resolved_revision=COMMIT
+        )
+        client = make_client(tmp_path, stub)
+
+        assert client.install_metadata_snapshot(
+            MODEL, requested_revision=revision
+        ) == metadata_snapshot
+        assert len(stub.download_requests) == 1
+        request = stub.download_requests[0]
+        if revision is None:
+            assert not request.HasField("revision")
+        else:
+            assert request.revision == revision
+            assert cache.read_ref(revision) == COMMIT
+        expected_main = COMMIT if revision in (None, "main") else previous_main
+        assert cache.read_main_ref() == expected_main
+        assert stub.list_requests[0].revision == COMMIT
+        assert not stub.stream_requests
+
+    @pytest.mark.parametrize("revision", ["main", "v1.0", COMMIT.upper()])
+    def test_inventory_does_not_confirm_a_branch_tag_or_uppercase_ref(
+        self, tmp_path, metadata_snapshot, revision
+    ):
+        stub = FakeStub()
+
+        with pytest.raises(ModelCacheError, match="did not confirm revision"):
+            make_client(tmp_path, stub).install_metadata_snapshot(
+                MODEL, requested_revision=revision
+            )
+
+        assert stub.download_requests[0].revision == revision
+
+    def test_old_cache_is_inventoried_after_server_confirmation(
+        self, tmp_path, metadata_snapshot
+    ):
+        cache = ModelSnapshotCache(MODEL, tmp_path)
+        cache._metadata_inventory_path(COMMIT).unlink()
+        stub = FakeStub(
+            files={"config.json": 2, "tokenizer.model": 3}, resolved_revision=COMMIT
+        )
+
+        assert make_client(tmp_path, stub).install_metadata_snapshot(
+            MODEL, requested_revision=COMMIT
+        ) == metadata_snapshot
+        assert cache._ready_metadata(COMMIT) == metadata_snapshot
+        assert len(stub.download_requests) == 1
+        assert not stub.stream_requests
+
+    def test_unconfirmed_legacy_install_cannot_create_a_pin_shortcut(self, tmp_path):
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+        )
+        snapshot = make_client(tmp_path, stub).install_metadata_snapshot(MODEL)
+        cache = ModelSnapshotCache(MODEL, tmp_path)
+
+        assert (snapshot / "config.json").read_bytes() == b"{}"
+        assert not cache._metadata_inventory_path(COMMIT).exists()
+        with pytest.raises(ModelCacheError, match="did not confirm revision"):
+            make_client(tmp_path, FakeStub()).install_metadata_snapshot(
+                MODEL, requested_revision=COMMIT
+            )
+
+    def test_synthetic_snapshot_still_requires_revision_confirmation(self, tmp_path):
+        commit = "legacy-snapshot"
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=commit)],
+            resolved_revision=commit,
+        )
+        snapshot = make_client(tmp_path, stub).install_metadata_snapshot(MODEL)
+        cache = ModelSnapshotCache(MODEL, tmp_path)
+
+        assert snapshot.name == commit
+        assert cache._read_metadata_inventory(commit) == {"config.json": 2}
+        assert cache._ready_metadata(commit) is None
+        with pytest.raises(ModelCacheError, match="did not confirm revision"):
+            make_client(tmp_path, FakeStub()).install_metadata_snapshot(
+                MODEL, requested_revision=commit
+            )
+
+    def test_another_root_cannot_reuse_this_roots_inventory(
+        self, tmp_path, metadata_snapshot
+    ):
+        other_root = tmp_path / "other-root"
+        stub = FakeStub(
+            files={"config.json": 2, "tokenizer.model": 3},
+            chunks=[
+                whole_file("config.json", b"{}", commit_hash=COMMIT),
+                whole_file("tokenizer.model", b"spm", is_last_file=True),
+            ],
+            resolved_revision=COMMIT,
+        )
+
+        snapshot = make_client(other_root, stub).install_metadata_snapshot(
+            MODEL, requested_revision=COMMIT
+        )
+
+        assert snapshot != metadata_snapshot
+        assert snapshot == ModelSnapshotCache(MODEL, other_root).snapshot_path(COMMIT)
+        assert len(stub.download_requests) == 1
+
+    def test_metadata_repair_preserves_weights_and_excludes_them_from_inventory(
+        self, tmp_path, metadata_snapshot
+    ):
+        weights = metadata_snapshot / "model.safetensors"
+        weights.write_bytes(b"weights")
+        (metadata_snapshot / "tokenizer.model").unlink()
+        stub = FakeStub(
+            files={"config.json": 2, "tokenizer.model": 3, "model.safetensors": 7},
+            chunks=[
+                whole_file("config.json", b"{}", commit_hash=COMMIT),
+                whole_file("tokenizer.model", b"spm", is_last_file=True),
+            ],
+            resolved_revision=COMMIT,
+        )
+
+        snapshot = make_client(tmp_path, stub).install_metadata_snapshot(
+            MODEL, requested_revision=COMMIT
+        )
+
+        assert snapshot == metadata_snapshot
+        assert weights.read_bytes() == b"weights"
+        assert stub.download_requests[0].ignore_weights
+        assert stub.list_requests[0].ignore_weights
+        assert list(stub.stream_requests[0].file_selector.paths) == [
+            "config.json",
+            "tokenizer.model",
+        ]
+        assert ModelSnapshotCache(MODEL, tmp_path)._read_metadata_inventory(COMMIT) == {
+            "config.json": 2,
+            "tokenizer.model": 3,
+        }
+
+
+class TestMetadataInventoryPersistenceFailure:
+    @pytest.mark.parametrize("reuse", [False, True], ids=["publish", "reuse"])
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            "directory-file",
+            "directory-symlink",
+            "inventory-symlink",
+            "inventory-directory",
+            "read-only",
+            "no-space",
+        ],
+    )
+    def test_sidecar_failure_preserves_successful_metadata(
+        self, tmp_path, monkeypatch, caplog, reuse, failure
+    ):
+        import errno
+        from pathlib import Path
+
+        from huggingface_hub import snapshot_download
+
+        from modelexpress import model_snapshot
+
+        cache = ModelSnapshotCache(MODEL, tmp_path)
+        snapshot = cache.snapshot_path(COMMIT)
+        inventory = cache._metadata_inventory_path(COMMIT)
+        cache.repo_root.mkdir(parents=True)
+        if reuse:
+            snapshot.mkdir(parents=True)
+            (snapshot / "config.json").write_bytes(b"{}")
+            (snapshot / "tokenizer.model").write_bytes(b"spm")
+
+        user_file = tmp_path / "user-data"
+        user_file.write_bytes(b"preserve user data")
+        if failure == "directory-file":
+            inventory.parent.write_bytes(b"preserve directory-name conflict")
+        elif failure == "directory-symlink":
+            user_directory = tmp_path / "user-directory"
+            user_directory.mkdir()
+            inventory.parent.symlink_to(user_directory, target_is_directory=True)
+        elif failure == "inventory-symlink":
+            inventory.parent.mkdir()
+            inventory.symlink_to(user_file)
+        elif failure == "inventory-directory":
+            inventory.mkdir(parents=True)
+            (inventory / "user-file").write_bytes(b"preserve user directory")
+        elif failure == "read-only":
+            original_open = Path.open
+
+            def read_only(path, mode="r", *args, **kwargs):
+                if path.parent == inventory.parent and mode == "x":
+                    raise PermissionError(errno.EROFS, "read-only inventory", str(path))
+                return original_open(path, mode, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "open", read_only)
+        else:
+            original_replace = model_snapshot.os.replace
+
+            def no_space(source, target):
+                if target == inventory:
+                    raise OSError(errno.ENOSPC, "inventory device is full", str(target))
+                return original_replace(source, target)
+
+            monkeypatch.setattr(model_snapshot.os, "replace", no_space)
+
+        stub = FakeStub(
+            files={"config.json": 2, "tokenizer.model": 3},
+            chunks=[
+                whole_file("config.json", b"{}", commit_hash=COMMIT),
+                whole_file("tokenizer.model", b"spm", is_last_file=True),
+            ],
+            resolved_revision=COMMIT,
+        )
+        result = make_client(tmp_path, stub).install_metadata_snapshot(
+            MODEL, requested_revision=COMMIT
+        )
+
+        assert result == snapshot
+        assert (snapshot / "config.json").read_bytes() == b"{}"
+        assert (snapshot / "tokenizer.model").read_bytes() == b"spm"
+        assert snapshot_download(
+            MODEL, revision=COMMIT, cache_dir=str(tmp_path), local_files_only=True
+        ) == str(snapshot)
+        assert len(stub.download_requests) == 1
+        assert len(stub.stream_requests) == (0 if reuse else 1)
+        assert cache._ready_metadata(COMMIT) is None
+        assert "Could not persist metadata inventory" in caplog.text
+        assert user_file.read_bytes() == b"preserve user data"
+        if failure == "directory-file":
+            assert inventory.parent.read_bytes() == b"preserve directory-name conflict"
+        elif failure == "directory-symlink":
+            assert inventory.parent.is_symlink()
+            assert list(user_directory.iterdir()) == []
+        elif failure == "inventory-symlink":
+            assert inventory.is_symlink()
+        elif failure == "inventory-directory":
+            assert (inventory / "user-file").read_bytes() == b"preserve user directory"
+        else:
+            assert not inventory.exists()
+            assert list(inventory.parent.iterdir()) == []
 
 
 class TestInstallWeightFiles:
