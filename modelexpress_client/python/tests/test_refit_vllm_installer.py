@@ -559,3 +559,31 @@ def test_collective_checkpoint_api_commits_or_permanently_fences(
     else:
         assert apply() == "full"
         assert events == ["enter", "full", "sync", "exit", "activate", "commit"]
+
+
+def test_collective_checkpoint_rejects_different_rank_mappings(monkeypatch, tmp_path):
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    installer = _VllmInstaller(
+        model=nn.Module(), vllm_config=object(), model_config=object(),
+        device=torch.device("cpu"), checkpoint_tensor_mapping={"weight": "tokens"},
+    )
+    events = []
+
+    @contextmanager
+    def locked():
+        pytest.fail("mapping disagreement must fence before installation")
+        yield
+
+    def gather(value):
+        return (value, ({"weight": "different_tokens"}, value[1]))
+
+    with pytest.raises(IncompleteRefit, match="mappings differ"):
+        installer.install_checkpoint_collectively(
+            PreparedCheckpoint("target", tmp_path, {}), serving_version="base",
+            world_size=2, all_gather=gather, installation_context=locked,
+            activate=lambda: events.append("activate"),
+            commit_version=lambda: events.append("commit"),
+            fence=lambda: events.append("fence"),
+        )
+    assert events == ["fence"]
+    assert installer._checkpoint_fenced

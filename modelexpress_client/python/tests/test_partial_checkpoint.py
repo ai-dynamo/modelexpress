@@ -8,9 +8,10 @@ import pytest
 import torch
 from modelexpress_rl.inference.engines.vllm import partial_checkpoint
 from modelexpress_rl.inference.engines.vllm.partial_checkpoint import (
-    StagedBf16Checkpoint,
+    StagedVllmCheckpoint,
     _Copy,
     _projection_aliases,
+    _resolve_bindings,
     _stage_mla,
     _stage_weight,
     _Unsupported,
@@ -21,11 +22,9 @@ from torch import nn
 
 
 class Projection(nn.Module):
-    def __init__(self, rank):
+    def __init__(self, rank, dtype=torch.bfloat16):
         super().__init__()
-        self.weight = nn.Parameter(
-            torch.zeros(4, 2, dtype=torch.bfloat16), requires_grad=False
-        )
+        self.weight = nn.Parameter(torch.zeros(4, 2, dtype=dtype), requires_grad=False)
         self.weight.output_dim = 0
         self.tp_rank = rank
 
@@ -45,7 +44,7 @@ class Attention(nn.Module):
         self.calculate_kv_scales = False
         self.register_buffer("_q_scale", torch.ones(1))
         # Strided, shared storage with the projection, as in unquantized MLA.
-        self.process_weights_after_loading(torch.bfloat16)
+        self.process_weights_after_loading(projection.weight.dtype)
 
     def process_weights_after_loading(self, dtype):
         weight = self.kv_b_proj.weight.to(dtype).T.view(2, 2, 2)
@@ -78,7 +77,7 @@ def test_partial_install_stages_tp_and_mla_without_mutating_unselected_tensors(r
     model.projection = layer
     model.attention = attention
     _validate_aliases(model, copies, {id(layer): {"projection", "attention.kv_b_proj"}})
-    StagedBf16Checkpoint(tuple(copies)).install()
+    StagedVllmCheckpoint(tuple(copies)).install()
 
     expected = source[rank * 4 : (rank + 1) * 4]
     assert torch.equal(layer.weight, expected)
@@ -123,7 +122,7 @@ def test_destination_rebinding_rejects_entire_write_set_before_mutation():
     )
     second.weight = nn.Parameter(torch.zeros_like(second.weight), requires_grad=False)
     with pytest.raises(RuntimeError, match="destination changed"):
-        StagedBf16Checkpoint(copies).install()
+        StagedVllmCheckpoint(copies).install()
     assert torch.count_nonzero(first.weight) == 0
     assert torch.count_nonzero(second.weight) == 0
 
@@ -237,7 +236,7 @@ def test_mla_staging_never_copies_unrelated_kv_cache(monkeypatch):
 def test_runtime_contract_declines_before_checkpoint_reads(
     monkeypatch, tmp_path, unsupported
 ):
-    monkeypatch.setattr(partial_checkpoint, "_contract", lambda: (nn.Module,) * 8)
+    monkeypatch.setattr(partial_checkpoint, "_contract", lambda: (nn.Module,) * 7)
     config = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=True, dtype=torch.bfloat16),
         parallel_config=SimpleNamespace(
@@ -259,7 +258,7 @@ def test_runtime_contract_declines_before_checkpoint_reads(
 
     monkeypatch.setattr(partial_checkpoint, "index_checkpoint_tensors", unexpected_read)
     assert (
-        partial_checkpoint.prepare_bf16_checkpoint(
+        partial_checkpoint.prepare_partial_checkpoint(
             nn.Module(),
             config,
             PreparedCheckpoint("target", tmp_path, {}),
@@ -340,10 +339,15 @@ def test_audited_projection_wrapper_aliases_install(combined):
             _Copy.stage(embedding, "weight", torch.ones_like(embedding.weight))
         )
     paths = _projection_aliases(
-        model, outer.kv_b_proj, wrapper.mla_attn, OuterAttention, AttentionWrapper
+        model,
+        "language_model.model.layers.0.self_attn",
+        outer.kv_b_proj,
+        wrapper.mla_attn,
+        OuterAttention,
+        AttentionWrapper,
     )
     _validate_aliases(model, copies, paths)
-    StagedBf16Checkpoint(tuple(copies)).install()
+    StagedVllmCheckpoint(tuple(copies)).install()
     for item in copies:
         assert torch.equal(item.destination, item.source)
 
@@ -399,7 +403,91 @@ def test_audited_projection_wrapper_rejects_unknown_topology_or_storage(mutation
         del wrapper.kv_b_proj
     with pytest.raises((_Unsupported, AttributeError)):
         paths = _projection_aliases(
-            model, outer.kv_b_proj, attention, OuterAttention, AttentionWrapper
+            model,
+            "language_model.model.layers.0.self_attn",
+            outer.kv_b_proj,
+            attention,
+            OuterAttention,
+            AttentionWrapper,
         )
         _validate_aliases(model, copies, paths)
     assert torch.count_nonzero(outer.kv_b_proj.weight) == 0
+
+
+class Embedding(Projection):
+    pass
+
+
+class Unquantized:
+    pass
+
+
+def _capability_bindings(model, mapping):
+    return _resolve_bindings(
+        model,
+        mapping,
+        Embedding,
+        Unquantized,
+        Projection,
+        Unquantized,
+        Attention,
+        OuterAttention,
+        AttentionWrapper,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_non_kimi_mapping_supports_multiple_layers_and_floating_dtypes(dtype):
+    model = nn.Module()
+    model.tokens = Embedding(0, dtype)
+    model.tokens.quant_method = Unquantized()
+    model.tokens.num_embeddings = model.tokens.org_vocab_size = 8
+    model.blocks = nn.ModuleList()
+    mapping = {"checkpoint.vocabulary": "tokens"}
+    for index in range(2):
+        outer = OuterAttention()
+        outer.kv_b_proj = Projection(0, dtype)
+        outer.kv_b_proj.quant_method = Unquantized()
+        outer.mla_attn = AttentionWrapper()
+        outer.mla_attn.kv_b_proj = outer.kv_b_proj
+        outer.mla_attn.mla_attn = Attention(outer.kv_b_proj)
+        model.blocks.append(outer)
+        mapping[f"checkpoint.projection.{index}"] = f"blocks.{index}.kv_b_proj"
+    bindings = _capability_bindings(model, mapping)
+    copies, aliases = [], {}
+    for index, binding in enumerate(bindings.values(), start=1):
+        source = torch.full((8, 2), index, dtype=dtype)
+        shadow = _stage_weight(binding.layer, source, Projection.loader)
+        if binding.attention is not None:
+            copies.extend(_stage_mla(binding.attention, shadow, Attention))
+            aliases.update(binding.aliases)
+        copies.append(_Copy.stage(binding.layer, "weight", shadow.weight))
+    _validate_aliases(model, copies, aliases)
+    StagedVllmCheckpoint(tuple(copies)).install()
+    for item in copies:
+        assert item.destination.dtype == dtype
+        assert torch.equal(item.destination, item.source)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["duplicate", "unknown", "quantized", "added_vocab", "missing_consumer"]
+)
+def test_explicit_mapping_does_not_bypass_capability_checks(invalid):
+    model = nn.Module()
+    model.tokens = Embedding(0)
+    model.tokens.quant_method = Unquantized()
+    model.tokens.num_embeddings = model.tokens.org_vocab_size = 8
+    mapping = {"source": "tokens"}
+    if invalid == "duplicate":
+        mapping["other_source"] = "tokens"
+    elif invalid == "unknown":
+        mapping["source"] = "missing"
+    elif invalid == "quantized":
+        model.tokens.quant_method = object()
+    elif invalid == "added_vocab":
+        model.tokens.num_embeddings = 9
+    else:
+        model.tokens = Projection(0)
+        model.tokens.quant_method = Unquantized()
+    with pytest.raises((_Unsupported, AttributeError)):
+        _capability_bindings(model, mapping)

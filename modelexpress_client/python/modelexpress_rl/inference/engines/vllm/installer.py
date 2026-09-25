@@ -122,6 +122,7 @@ class _VllmInstaller(EngineInstaller):
         device: torch.device,
         convert_native_to_hf: Callable[[dict], dict] | None = None,
         runtime_tensors: dict[str, torch.Tensor] | None = None,
+        checkpoint_tensor_mapping: dict[str, str] | None = None,
     ) -> None:
         self._model = model
         self._vllm_config = vllm_config
@@ -130,6 +131,9 @@ class _VllmInstaller(EngineInstaller):
         self._convert_native_to_hf = convert_native_to_hf
         self._runtime_tensors = runtime_tensors
         self._checkpoint_fenced = False
+        self._checkpoint_tensor_mapping = (
+            dict(checkpoint_tensor_mapping) if checkpoint_tensor_mapping is not None else None
+        )
 
     @property
     def capabilities(self) -> EngineCapabilities:
@@ -314,7 +318,7 @@ class _VllmInstaller(EngineInstaller):
         from vllm.config import set_current_vllm_config
 
         from ...checkpoint_transaction import refit_checkpoint_collectively
-        from .partial_checkpoint import prepare_bf16_checkpoint
+        from .partial_checkpoint import prepare_partial_checkpoint
 
         if self._checkpoint_fenced:
             raise IncompleteRefit("checkpoint transaction failed; worker recovery required")
@@ -323,16 +327,27 @@ class _VllmInstaller(EngineInstaller):
             self._checkpoint_fenced = True
             fence()
 
+        def gather_with_mapping(value):
+            peers = all_gather((self._checkpoint_tensor_mapping, value))
+            if any(
+                not isinstance(peer, tuple) or len(peer) != 2
+                or peer[0] != self._checkpoint_tensor_mapping
+                for peer in peers
+            ):
+                raise IncompleteRefit("checkpoint tensor mappings differ across ranks")
+            return tuple(peer[1] for peer in peers)
+
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
             return refit_checkpoint_collectively(
                 prepared,
                 serving_version=serving_version,
                 world_size=world_size,
-                all_gather=all_gather,
+                all_gather=gather_with_mapping,
                 installation_context=installation_context,
-                prepare_partial=lambda checkpoint: prepare_bf16_checkpoint(
+                prepare_partial=lambda checkpoint: prepare_partial_checkpoint(
                     self._model, self._vllm_config, checkpoint,
                     serving_version=serving_version,
+                    tensor_mapping=self._checkpoint_tensor_mapping,
                 ),
                 install_full=lambda: self.install_checkpoint(prepared.path),
                 synchronize=lambda: torch.cuda.synchronize(self._device),

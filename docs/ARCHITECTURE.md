@@ -1182,12 +1182,23 @@ run with a filtered input stream.
 
 #### Supported scope and fallback
 
-The current adapter supports the Kimi BF16 embedding and first-layer
-`kv_b_proj` projection, separately or together, on audited vLLM 0.19.0 with CUDA,
-eager execution, and ordinary tensor parallelism. Projection updates include the
-derived MLA tensors. Quantized or expert updates, added-vocabulary embeddings,
-graph execution, offloading, LoRA, speculative decoding, and pipeline, expert,
-data, or context parallelism are outside this partial-installation contract.
+The vLLM adapter selects layer capabilities rather than a model name or fixed
+layer number. Supported groups are unquantized vocabulary embeddings and MLA
+projections with their derived tensors, using FP16, BF16, or FP32 weights on
+audited vLLM 0.19.0 with CUDA, eager execution, and ordinary tensor parallelism.
+Quantized or expert updates, added-vocabulary embeddings, graph execution,
+offloading, LoRA, speculative decoding, and pipeline, expert, data, or context
+parallelism remain outside this partial-installation contract.
+
+Architectures provide `VllmGeneratorContext.checkpoint_tensor_mapping`, mapping
+checkpoint source names to runtime module paths. Each entry binds a complete
+weight to a supported layer; the integration must establish that no additional
+fused inputs, checkpoint transformations, or derived-state refreshes are needed.
+The installer verifies native layer types and their embedding or MLA dependency
+contracts. Name similarity alone does not authorize partial installation. An
+isolated, audited mapping provider supplies Kimi embeddings and MLA projections
+at every layer when no explicit mapping is configured; unknown architectures
+without a mapping use full reload.
 
 Changed-tensor metadata records the union of names in a verified delta chain and
 its exact base and target versions. Reverted tensors remain in the union. An
@@ -1204,9 +1215,9 @@ are checked at runtime. The known projection references in the native attention
 wrappers are accepted only as one verified shared dependency; unexpected aliases
 or tied storage still select full reload.
 
-Both installation paths preserve Kimi's generated, weight-independent vision
-buffer. Partial MLA staging preserves live scalar state and refreshes only the
-selected projection and its derived tensors. Unrelated weights and KV caches
+Architecture-specific compatibility handling remains isolated: both installation
+paths preserve Kimi's generated, weight-independent vision buffer. Partial MLA
+staging preserves live scalar state and refreshes only the selected projection and its derived tensors. Unrelated weights and KV caches
 are not copied by the partial path.
 
 #### Collective serving lifecycle
@@ -1216,8 +1227,8 @@ Partial mode requires canonical S3 as the only configured source:
 `VllmGeneratorContext.checkpoint_collective` with a `CheckpointCollectiveContext`
 that provides serving pause/drain, a serving fence, and a finite-timeout gather
 across every worker rank. These callbacks must control the actual scheduler and
-publication lifecycle. All ranks use the same configuration and enter updates
-together. This setting belongs to the generator-client API.
+publication lifecycle. All ranks use the same configuration and checkpoint
+mapping and enter updates together. This setting belongs to the generator-client API.
 
 The client coordinates the update in this order:
 
@@ -1240,7 +1251,8 @@ The framework must never resume a fenced worker unconditionally.
 Acceptance requires equivalence to full reload of the same checkpoint: selected
 and unaffected runtime tensors, derived MLA state, inference outputs, and storage
 layouts must agree on all ranks. Failure tests must establish that serving and
-donor publication remain blocked until clean-worker recovery. Detailed run
+donor publication remain blocked until clean-worker recovery. Full-model GPU
+evidence is limited to Kimi-K2.6 BF16 updates; support for other model mappings and dtypes does not imply GPU qualification. Detailed run
 results and qualification status are tracked in [PR #810](https://github.com/ai-dynamo/modelexpress/pull/810).
 Broader failure cases, in-flight donor races, P2P, and Dynamo integration require
 separate qualification; the scoped S3 tests do not establish production readiness.

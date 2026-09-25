@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Offline partial-checkpoint planning; deliberately not a live engine installer.
+"""Engine-independent checkpoint dependency selection and source staging.
 
 Dependency groups must come from an audited engine adapter, not name heuristics.
-The current vLLM installer does not consume these plans.
+The engine adapter supplies the bindings and executes their refresh operations.
 """
 
 from __future__ import annotations

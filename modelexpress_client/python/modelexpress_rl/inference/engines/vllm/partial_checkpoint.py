@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Experimental Kimi BF16 checkpoint groups; never initialize global reload."""
+"""Capability-based partial checkpoint installation for audited vLLM layers."""
 
 from __future__ import annotations
 
@@ -25,8 +25,7 @@ from modelexpress_rl.utils import index_checkpoint_tensors
 
 logger = logging.getLogger(__name__)
 
-_EMBEDDING = "language_model.model.embed_tokens.weight"
-_PROJECTION = "language_model.model.layers.0.self_attn.kv_b_proj.weight"
+_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _DERIVED = ("W_UV", "W_UK_T")
 _MLA_SCALES = frozenset(
     {
@@ -84,7 +83,7 @@ class _Copy:
 
 
 @dataclass(frozen=True)
-class StagedBf16Checkpoint:
+class StagedVllmCheckpoint:
     copies: tuple[_Copy, ...]
 
     @torch.no_grad()
@@ -118,7 +117,6 @@ def _contract():
         VocabParallelEmbedding,
     )
     from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLAAttention
-    from vllm.model_executor.models.kimi_k25 import KimiK25ForConditionalGeneration
     from vllm.version import __version__
 
     _require(__version__ == "0.19.0", "requires the audited vLLM 0.19.0 API")
@@ -152,10 +150,6 @@ def _contract():
             set_default_quant_scales,
             "2e45ac35100a1396bd03f9fe8d7f3e4dd41f3dc0a78b3bc7e5e118b536a0fe3c",
         ),
-        (
-            KimiK25ForConditionalGeneration,
-            "1bbce9c894945a6b95818181b52cd066debb39eb8f47334ecff6d870ead5326b",
-        ),
     ):
         try:
             actual = hashlib.sha256(
@@ -165,7 +159,6 @@ def _contract():
             raise _Unsupported("audited source is unavailable") from error
         _require(actual == digest, "vLLM source differs from the audited tag")
     return (
-        KimiK25ForConditionalGeneration,
         VocabParallelEmbedding,
         UnquantizedEmbeddingMethod,
         ColumnParallelLinear,
@@ -188,8 +181,7 @@ def _direct_tensors(module: nn.Module) -> dict[str, torch.Tensor]:
     }
 
 
-def _projection_aliases(model, projection, attention, outer_type, wrapper_type):
-    path = _PROJECTION.rsplit(".", 2)[0]
+def _projection_aliases(model, path, projection, attention, outer_type, wrapper_type):
     outer = model.get_submodule(path)
     wrapper = getattr(outer, "mla_attn", None)
     _require(
@@ -243,13 +235,14 @@ def _validate_aliases(
 def _stage_weight(layer, source, loader) -> nn.Module:
     weight = layer.weight
     _require(
-        weight.dtype == source.dtype == torch.bfloat16
+        weight.dtype == source.dtype
+        and weight.dtype in _DTYPES
         and weight.ndim == source.ndim == 2
         and weight.is_contiguous()
         and source.shape[1] == weight.shape[1]
         and getattr(weight, "output_dim", None) == 0
         and getattr(weight, "packed_dim", None) is None,
-        "requires ordinary row-sharded BF16 weights",
+        "requires ordinary row-sharded floating-point weights",
     )
     _require(
         {name for name, value in layer._parameters.items() if value is not None}
@@ -307,7 +300,7 @@ def _stage_mla(attention, projection, mla_type) -> list[_Copy]:
     versions = {name: value._version for name, value in isolated.items()}
     shadow.quant_config = copy.deepcopy(attention.quant_config)
     shadow.kv_b_proj = projection
-    mla_type.process_weights_after_loading(shadow, torch.bfloat16)
+    mla_type.process_weights_after_loading(shadow, projection.weight.dtype)
     refreshed = _direct_tensors(shadow)
     _require(
         set(refreshed) == set(original), "MLA finalizer changed its tensor contract"
@@ -342,24 +335,85 @@ def _stage_mla(attention, projection, mla_type) -> list[_Copy]:
     return [_Copy.stage(attention, name, refreshed[name]) for name in _DERIVED]
 
 
+@dataclass(frozen=True)
+class _Binding:
+    layer: nn.Module
+    attention: nn.Module | None
+    aliases: dict[int, set[str]]
+
+
+def _resolve_bindings(
+    model,
+    mapping,
+    embedding_type,
+    embedding_method,
+    linear_type,
+    linear_method,
+    mla_type,
+    outer_type,
+    wrapper_type,
+):
+    _require(isinstance(mapping, dict), "checkpoint mapping unavailable")
+    bindings = {}
+    owners = set()
+    for source, path in mapping.items():
+        _require(
+            isinstance(source, str)
+            and bool(source)
+            and isinstance(path, str)
+            and bool(path),
+            "invalid checkpoint binding",
+        )
+        layer = model.get_submodule(path)
+        _require(
+            id(layer) not in owners, "multiple checkpoint inputs share a destination"
+        )
+        owners.add(id(layer))
+        if type(layer) is embedding_type:
+            _require(
+                type(layer.quant_method) is embedding_method
+                and layer.num_embeddings == layer.org_vocab_size,
+                "unsupported embedding layout",
+            )
+            bindings[source] = _Binding(layer, None, {})
+        else:
+            _require(
+                type(layer) is linear_type
+                and type(layer.quant_method) is linear_method,
+                "unsupported checkpoint layer",
+            )
+            consumers = [
+                m
+                for m in model.modules()
+                if getattr(m, "kv_b_proj", None) is layer and type(m) is mla_type
+            ]
+            _require(len(consumers) == 1, "requires exactly one MLA consumer")
+            parent, _, leaf = path.rpartition(".")
+            _require(leaf == "kv_b_proj", "requires outer MLA projection binding")
+            aliases = _projection_aliases(
+                model, parent, layer, consumers[0], outer_type, wrapper_type
+            )
+            bindings[source] = _Binding(layer, consumers[0], aliases)
+    return bindings
+
+
 @torch.inference_mode(False)
 @torch.no_grad()
-def prepare_bf16_checkpoint(
+def prepare_partial_checkpoint(
     model: nn.Module,
     vllm_config,
     prepared: PreparedCheckpoint,
     *,
     serving_version: str,
-) -> StagedBf16Checkpoint | None:
-    """Stage the two historical Kimi BF16 groups, or decline before mutation.
+    tensor_mapping: dict[str, str] | None = None,
+) -> StagedVllmCheckpoint | None:
+    """Stage explicit checkpoint bindings using supported native layer capabilities.
 
-    No quantized parameters, expert weights, tied destinations, graph mode,
-    offloading, PP/EP, LoRA, speculative or secondary weights are supported.
-    GPU correctness and latency remain unverified; use only the collective API.
+    Unknown mappings or dependencies decline before mutation. The integration
+    owns the checkpoint-name mapping; layer and storage contracts are checked here.
     """
     try:
         (
-            kimi,
             embedding_type,
             embedding_method,
             linear,
@@ -371,20 +425,35 @@ def prepare_bf16_checkpoint(
         config = vllm_config.model_config
         parallel = vllm_config.parallel_config
         _require(
-            type(model) is kimi
-            and config.enforce_eager
-            and config.dtype == torch.bfloat16
+            config.enforce_eager
+            and config.dtype in _DTYPES
             and parallel.pipeline_parallel_size == 1
             and not parallel.enable_expert_parallel
             and getattr(parallel, "data_parallel_size", 1) == 1
             and getattr(parallel, "decode_context_parallel_size", 1) == 1
             and getattr(parallel, "prefill_context_parallel_size", 1) == 1
             and getattr(vllm_config.cache_config, "cpu_offload_gb", 0) == 0
-            and vllm_config.cache_config.cache_dtype in ("auto", "bfloat16")
+            and vllm_config.cache_config.cache_dtype
+            in ("auto", "bfloat16", "float16", "float32")
             and getattr(vllm_config, "lora_config", None) is None
             and getattr(vllm_config, "speculative_config", None) is None
             and not getattr(model, "secondary_weights", ()),
             "unsupported runtime configuration",
+        )
+        if tensor_mapping is None:
+            from .checkpoint_bindings import default_checkpoint_mapping
+
+            tensor_mapping = default_checkpoint_mapping(model)
+        bindings = _resolve_bindings(
+            model,
+            tensor_mapping,
+            embedding_type,
+            embedding_method,
+            linear,
+            linear_method,
+            mla,
+            outer_type,
+            wrapper_type,
         )
         _, locations, _ = index_checkpoint_tensors(prepared.path)
         selection = select_checkpoint_sources(
@@ -392,11 +461,15 @@ def prepare_bf16_checkpoint(
             serving_version=serving_version,
             target_version=prepared.target_version,
             checkpoint_names=frozenset(locations),
-            groups=(
-                DependencyGroup("embedding", frozenset({_EMBEDDING})),
+            groups=tuple(
                 DependencyGroup(
-                    "projection", frozenset({_PROJECTION}), frozenset(_DERIVED)
-                ),
+                    name,
+                    frozenset({name}),
+                    frozenset(_DERIVED)
+                    if binding.attention is not None
+                    else frozenset(),
+                )
+                for name, binding in bindings.items()
             ),
         )
         _require(
@@ -411,41 +484,29 @@ def prepare_bf16_checkpoint(
         copies = []
         audited_paths = {}
         for name, source in sources.items():
-            layer = model.get_submodule(name.rsplit(".", 1)[0])
+            binding = bindings[name]
+            layer = binding.layer
             _require(layer.weight.device.type == "cuda", "CPU/offloaded weights")
-            if name == _EMBEDDING:
+            _require(
+                layer.weight.dtype == config.dtype, "activation/weight dtype mismatch"
+            )
+            if binding.attention is None:
                 _require(
-                    type(layer) is embedding_type
-                    and type(layer.quant_method) is embedding_method
-                    and layer.num_embeddings == layer.org_vocab_size
-                    and source.shape[0] == layer.org_vocab_size,
-                    "unsupported embedding layout",
+                    source.shape[0] == layer.org_vocab_size, "embedding size mismatch"
                 )
                 shadow = _stage_weight(layer, source, embedding_type.weight_loader)
             else:
                 _require(
-                    type(layer) is linear
-                    and type(layer.quant_method) is linear_method
-                    and source.shape[0] == layer.weight.shape[0] * layer.tp_size,
+                    source.shape[0] == layer.weight.shape[0] * layer.tp_size,
                     "unsupported projection layout",
                 )
                 shadow = _stage_weight(layer, source, linear.weight_loader)
-                consumers = [
-                    m
-                    for m in model.modules()
-                    if getattr(m, "kv_b_proj", None) is layer and type(m) is mla
-                ]
-                _require(len(consumers) == 1, "requires exactly one MLA consumer")
-                audited_paths.update(
-                    _projection_aliases(
-                        model, layer, consumers[0], outer_type, wrapper_type
-                    )
-                )
-                copies.extend(_stage_mla(consumers[0], shadow, mla))
+                audited_paths.update(binding.aliases)
+                copies.extend(_stage_mla(binding.attention, shadow, mla))
             copies.append(_Copy.stage(layer, "weight", shadow.weight))
 
         _validate_aliases(model, copies, audited_paths)
-        return StagedBf16Checkpoint(tuple(copies))
+        return StagedVllmCheckpoint(tuple(copies))
     except (_Unsupported, ImportError, AttributeError) as error:
         logger.info("Partial checkpoint unsupported; using full reload: %s", error)
         return None
