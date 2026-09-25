@@ -1324,3 +1324,70 @@ kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/co
 |-------|-----------|---------------|------------------|
 | DeepSeek-V3 (671B, FP8) | 681 GB (8 GPUs) | ~15 seconds | ~45 Gbps |
 | Llama 3.3 70B | 140 GB (8 GPUs) | ~5 seconds | ~28 Gbps |
+
+### Partial checkpoint installation (experimental)
+
+The generator client can opt into collective partial installation for the scoped
+Kimi BF16 checkpoint groups. The default remains full checkpoint reload. This
+embedding-only path passed a scoped GPU test, but projection aliases still force
+full fallback and the overall acceptance gate remains failed. See the
+[architecture contract](ARCHITECTURE.md#changed-checkpoint-tensor-exploration)
+for verified cases, remaining limitations, and fallback conditions.
+
+```python
+from modelexpress_rl import (
+    CheckpointCollectiveContext,
+    ModelExpressGeneratorClient,
+    ModelExpressGeneratorConfig,
+    VllmGeneratorContext,
+    WeightSource,
+)
+
+collective = CheckpointCollectiveContext(
+    world_size=worker_world_size,
+    all_gather=gather_all_worker_ranks,  # (value, timeout_seconds), enforces deadline
+    safe_point=paused_and_drained_serving,  # context manager; resume only on success
+    fence=stop_serving_until_worker_recovery,
+    timeout_seconds=900.0,  # allow slow full-load fallback on peers
+)
+client = ModelExpressGeneratorClient.initialize(
+    ModelExpressGeneratorConfig(
+        model_name=model_name,
+        engine_context=VllmGeneratorContext(
+            model=model,
+            vllm_config=vllm_config,
+            checkpoint_collective=collective,
+        ),
+        object_storage=object_storage_config,
+        initial_serving_version_id=current_version,
+        source_order=(WeightSource.OBJECT_STORAGE,),
+        checkpoint_install_mode="partial_if_supported",
+    )
+)
+# Every worker rank stages and applies the same target.
+staged = client.stage_weight(version=target_version_ref)
+try:
+    selected_mode = client.apply_weight(staged)  # "partial" or "full"
+finally:
+    staged.release()
+```
+
+The named serving/transport functions above are framework integrations, not
+ModelExpress helpers. The safe-point context must pause and drain inference and
+must never resume a fenced worker. The gather transport must include the entire
+worker and enforce the supplied finite timeout. All ranks must use the same
+configuration. ModelExpress drains and withdraws its runtime donor source before
+mutation, delays publication until all installations and lease cleanups succeed,
+and fences on any lifecycle failure. Recover the worker after failure; changing
+version labels does not undo tensor writes.
+
+Only canonical S3 source selection is accepted in partial mode. Unsupported
+checkpoint metadata, tensor groups, or runtime layouts collectively use full
+reload; actual installation/transport failures abort and fence instead of retrying.
+Logs report the chosen installation mode and fallback reasons.
+
+This setting belongs to the generator-client API; there is no environment-variable,
+server-YAML, or native transfer JSON switch. The pinned vLLM 0.19 native transfer
+API is incompatible with the repository's existing native adapter, so this E2E
+image requires direct generator-client integration. Orchestrators must not resume
+serving unconditionally after a failed update.

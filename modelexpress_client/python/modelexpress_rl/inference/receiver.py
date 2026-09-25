@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 
 from modelexpress_rl import envs as rl_envs
+from modelexpress_rl.inference.checkpoint_selection import CheckpointChanges
 from modelexpress_rl.inference.checkpoint_store import (
     CheckpointCacheCapacityError,
     CheckpointRecord,
@@ -82,6 +83,7 @@ class PreparedCheckpoint:
     target_version: str
     path: Path
     metrics: dict[str, float]
+    changes: CheckpointChanges | None = None
 
 
 @dataclass(frozen=True)
@@ -808,6 +810,22 @@ class _LocalCheckpoint:
                 "perf/mx_receive_delta_download": download_time,
                 "perf/mx_receive_delta_apply": apply_time,
             },
+            changes=(
+                CheckpointChanges(
+                    base_version=manifests[0][0].base_version_id,
+                    target_version=target.version_id,
+                    names=frozenset().union(
+                        *(weight_map for _, _, _, weight_map in manifests)
+                    ),
+                )
+                if manifests
+                and all(
+                    version.payload_format is WeightPayloadFormat.XOR_DELTA
+                    and version.base_version_id is not None
+                    for version, _, _, _ in manifests
+                )
+                else None
+            ),
         )
 
     def _artifact_path(self, version: _S3Version) -> Path:

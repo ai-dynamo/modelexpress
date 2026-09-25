@@ -1165,6 +1165,347 @@ for the end-to-end design, integration contract, implementation status, and
 validation requirements, including descriptor bounding for strided slices,
 receive and staging buffer ownership, and when PWAL applies rather than MDL.
 
+### Changed-checkpoint tensor exploration
+
+**Status: draft opt-in prototype. Embedding-only GPU correctness, post-copy fencing,
+and clean-engine recovery passed. Projection aliases still force full reload, so
+the overall acceptance gate remains failed. Default warm refits stay full.**
+`modelexpress_rl/inference/checkpoint_selection.py` provides a provider-independent
+changed-name contract, dependency closure, and owned CPU tensor staging.
+`checkpoint_transaction.py` coordinates installation across ranks, and
+`engines/vllm/partial_checkpoint.py` stages a narrowly guarded Kimi BF16 write set.
+The regular `installer.install` entry point and default generator configuration still
+reload the full checkpoint. `checkpoint_install_mode="partial_if_supported"`
+routes canonical S3 updates through the collective lifecycle described below.
+No live model/quantization combination is GPU-qualified by these CPU tests.
+
+The assessment used ModelExpress `e97ca8454770d9497a7610cbd73c4f9eb31a6ca9`
+(also fetched upstream main on 2026-09-24) and upstream vLLM **v0.19.0** source.
+The historical Kimi-K2.6 run used revision
+`7eb5002f6aadc958aed6a9177b7ed26bb94011bb`, official INT4 with BF16 attention,
+eager execution and one TP8 B200 worker. Its archived `kimi26-first-reflink`
+results measured 5.83 s reconstruction but 577.24 s installation/synchronization/
+commit. The tested image included a separate uncommitted reflink patch and the
+WNA16 absent-index workaround. Neither is copied into this prototype. The
+existing ModelExpress MLA refresh/address-preservation behavior remains intact.
+Upstream tag inspection is not verification of every source file in that image;
+compare actual installed source hashes before any later GPU experiment.
+
+#### Metadata and preparation boundary
+
+`receiver._download_replay_manifests` validates the entire ordered lineage;
+`_apply_shards` applies only manifest `weight_map` names and verifies reconstructed
+tensor checksums. These names are a conservative changed set (a declared tensor
+may ultimately have identical bytes). `_reconstruct_target` now attaches their
+union as `PreparedCheckpoint.changes`, only after successful reconstruction, for
+an all-delta suffix. Its base is the first applied delta's exact base, not the
+disk store's active label or the requested target. Reverted changes stay in the
+union; no tensor comparison is necessary.
+
+A chain containing a full checkpoint has unknown changes. A reused READY target
+also has unknown changes: another local rank may have prepared it, while this
+rank's serving state differs. Empty verified deltas have an empty set, distinct
+from unknown metadata. Invalid delta manifests/checksums continue to fail
+preparation; they must not be converted into successful empty updates. The
+planner falls back on missing changes, version mismatch, unknown names,
+unsupported sources or an invalid dependency catalog. It does not infer a
+mapping from spelling or a checkpoint index.
+
+`CanonicalDeltaUpdateMethod` carries the prepared object through
+`PreparedCheckpointArtifact`; `_VllmInstaller.install` currently passes only its
+path to `install_checkpoint`. This intentionally preserves full reload. The
+opt-in collective entry point exchanges prepared metadata across ranks. A follower
+with unknown changes may adopt a verified peer's union only when all known unions
+agree and their base/target match the agreed serving/target versions. Every rank
+must still enter its own validated checkpoint installation context. Missing or
+conflicting unions select full reload collectively. A P2P advance or replay suffix
+can make the engine and disk versions different; its metadata cannot authorize
+partial loading against another engine base.
+
+#### Why filtering the default loader is insufficient
+
+Pinned source evidence:
+
+| Concern | Source and consequence |
+| --- | --- |
+| Full-load completeness | [DefaultModelLoader.load_weights](https://github.com/vllm-project/vllm/blob/v0.19.0/vllm/model_executor/model_loader/default_loader.py) compares loaded parameter names against the full model for nonquantized models; secondary sources and EP filters also belong to this loader. Filtering its iterator is not a partial-load API. |
+| Partial layer corruption | [layerwise reload](https://github.com/vllm-project/vllm/blob/v0.19.0/vllm/model_executor/model_loader/reload/layerwise.py) restores all modules to load-time meta skeletons. Finalization restores zero-loaded modules but processes a module with `0 < load_numel < load_numel_total`, which is valid for padding, not proof that missing fused siblings are initialized. Attention finalization visits the entire model. |
+| Names and fused destinations | [KimiK25ForConditionalGeneration](https://github.com/vllm-project/vllm/blob/v0.19.0/vllm/model_executor/models/kimi_k25.py) applies `hf_to_vllm_mapper` and delegates through AutoWeightsLoader. [DeepseekV2ForCausalLM.load_weights](https://github.com/vllm-project/vllm/blob/v0.19.0/vllm/model_executor/models/deepseek_v2.py) maps gate/up into `gate_up_proj`, MLA A projections into `fused_qkv_a_proj`, MHA Q/K/V into `qkv_proj`, and checkpoint experts into fused expert destinations. Actual architecture dispatch and mappings must be confirmed in the tested runtime. |
+| TP and padding | [VocabParallelEmbedding.weight_loader](https://github.com/vllm-project/vllm/blob/v0.19.0/vllm/model_executor/layers/vocab_parallel_embedding.py) slices the vocabulary and handles padding; [ColumnParallelLinear](https://github.com/vllm-project/vllm/blob/v0.19.0/vllm/model_executor/layers/linear.py) uses parameter loaders for rank slices and packed layouts. A raw same-name copy cannot replace these operations. |
+| Quantized expert groups | [CompressedTensorsWNA16MarlinMoEMethod](https://github.com/vllm-project/vllm/blob/v0.19.0/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py) sorts optional indices, repacks weights/scales, and builds kernel state. Updating one expert or scale can require the complete fused local expert layer, including all its quantization inputs. Preserve the historical absent-index workaround for later runs. |
+| Derived MLA state | [MLAAttention.process_weights_after_loading](https://github.com/vllm-project/vllm/blob/v0.19.0/vllm/model_executor/layers/attention/mla_attention.py) obtains and possibly dequantizes `kv_b_proj`, splits it by head, and derives `W_UV`/`W_UK_T` or backend-specific quantized alternatives. Refresh must follow projection installation, with original graph-bound storage restored. |
+| Transformations and host state | [loader postprocessing](https://github.com/vllm-project/vllm/blob/v0.19.0/vllm/model_executor/model_loader/utils.py) processes quantized layers before attention, moving CPU-offloaded parameters onto the target device and back. ModelExpress's `adapter._finalize_model_specific_weights` handles model hooks that can recursively transform children; `host_quantization.refresh_host_quantization_state` updates CPU scale mirrors and invalidates warm eager caches, but rejects warm graph-mode refresh. These are dependencies beyond named parameters. |
+
+#### Scoped installation contract
+
+The prototype has two engine-owned groups over the common changed-name contract.
+Any expansion requires a versioned catalog enumerating every checkpoint
+input needed to reconstruct its load-time destinations, tied-storage aliases,
+TP/PP/EP mapping, derived tensors, CPU transformations, host caches and ordered
+finalizers. Aliased module paths and tied embedding/output weights require storage
+identity checks and all consumers, not just `named_parameters()` (which can
+deduplicate aliases). An explicit unknown/unsupported result selects full reload.
+Full checkpoints, unknown architecture/backend, quantized updates, expert updates,
+offloading, secondary weight sources and unverified tied layouts remain full-load
+cases until their complete contracts are established.
+
+The implemented candidate is the historical BF16 embedding and first-layer BF16
+`language_model.model.layers.0.self_attn.kv_b_proj.weight` inside the otherwise
+INT4 model. It admits only exact vLLM 0.19.0 classes with audited source-file hashes:
+KimiK25ForConditionalGeneration, VocabParallelEmbedding with its unquantized
+method, ColumnParallelLinear with UnquantizedLinearMethod, and one MLAAttention
+consumer of the first-layer projection. CUDA BF16, eager mode, ordinary TP,
+PP/DP/context-parallel size one, no EP/LoRA/speculation/offload, and auto/BF16 KV
+cache are required. Source/hash/layout mismatches select full reload. Added-vocab
+embeddings, fused/quantized/expert updates and unaccounted tied/storage aliases
+are excluded. This is not a general INT4 partial-reload feature.
+
+The adapter invokes the native embedding/column loader on an isolated parameter
+to obtain the TP slice and padding. CUDA postprocessing for these exact
+unquantized methods is a no-op; their CPU transformations are explicitly excluded.
+For the projection it invokes native MLA PWAL on a shadow with the staged
+projection. The shadow clones only small scale/range tensors, substitutes meta
+placeholders for unrelated tensors (including the KV cache), and requires the
+finalizer to leave unrelated tensors and primitive host state unchanged. It must
+produce both derived tensors with compatible shape/dtype/device. The adapter
+never globally initializes or finalizes layerwise reload and does not rebuild
+MLA weights with a hand-written formula.
+
+The resulting write set contains owned staged values for the selected parameters
+and affected derived tensors. It validates all destination identities, storage
+addresses, strides and offsets before the first in-place copy. Tensor aliases
+outside this write set, including duplicate registered names normally hidden by
+parameter deduplication, force full reload. The original full-reload MLA refresh
+checks remain unchanged. This path avoids reading unrelated checkpoint payloads,
+processing INT4 experts, or copying KV-cache contents; GPU savings are unmeasured.
+
+At a drained serving safe point, all ranks must agree on base, target, changed-set
+identity, capability decision and complete local preflight. Stage/validate every
+selected group before live mutation. After installation, synchronize devices and
+gather success on **all** ranks before disk activation, serving-version commit,
+runtime-source publication or resuming requests. An error before mutation can
+select full reload collectively. Any error after mutation must fence the entire
+worker and require coordinated full reload/reset; changing a version label back
+does not roll back tensors. A timeout or failed rank also fences the worker.
+
+`checkpoint_transaction.refit_checkpoint_collectively` implements the barriers:
+version/metadata agreement, validated context entry, completed staging, unanimous
+partial/full selection, synchronized installation, release of all shared locks,
+disk activation, and serving-version commit. Unsupported staging selects full
+reload on every rank before any live partial copy. Staging exceptions abort;
+installation exceptions never retry. Every exception, including transport failure,
+calls the required serving-fence callback. Activation and commit failures fence
+all surviving ranks; they do not pretend to roll back tensors or durable labels.
+The vLLM wrapper also permanently fences its installer instance after failure.
+
+The opt-in API is `_VllmInstaller.install_checkpoint_collectively`. The caller must
+hold a drained serving safe point on **all worker ranks**, supply a full-worker
+gather transport with a finite timeout, and provide a real serving/publication
+fence. Withdraw the old runtime source and drain outstanding donor reads before
+entering; otherwise a peer could read weights during mutation. The API cannot
+stop an unrelated scheduler by setting a Python flag. For a
+prepared canonical artifact, the callback wiring is:
+
+```python
+mode = installer.install_checkpoint_collectively(
+    artifact.checkpoint,
+    serving_version=current_version,
+    world_size=worker_world_size,
+    all_gather=gather_all_worker_ranks,
+    installation_context=lambda: method.installation_context(artifact, activate=False),
+    activate=lambda: method.activate(artifact),
+    commit_version=commit_local_version_without_publishing,
+    fence=stop_serving_and_publication_until_worker_recovery,
+)
+```
+
+Only successful return permits publication/resume. The caller retains ownership
+of staging leases and release when using this low-level API. The configured
+`client.apply_weight` integration supplies those callbacks automatically through
+`CheckpointCollectiveContext`; see below. A controlled harness/framework must
+still supply real serving controls and a deadline-enforcing full-worker transport. Startup
+`DesiredVersionS3Strategy.load` already has its separate collective activation
+path. No in-place installer can guarantee rollback merely by preserving addresses.
+
+#### Configured collective lifecycle
+
+`ModelExpressGeneratorConfig.checkpoint_install_mode` defaults to `"full"`.
+`"partial_if_supported"` requires a `VllmGeneratorContext.checkpoint_collective`
+containing a public `CheckpointCollectiveContext` and canonical S3 as the only
+configured source. Initialization rejects missing lifecycle controls, unsupported
+mode strings, and mixed source orders. Independent P2P/source selection could
+otherwise send ranks into different collective protocols.
+
+The client first agrees on serving/target versions and whether the apply is a
+no-op or retry, so a locally advanced rank cannot skip a required collective.
+`checkpoint_lifecycle.py` coordinates validation, serving pause, donor withdrawal
+and drainage, installation, lease cleanup, publication, and serving resume.
+`CheckpointCollectiveContext.all_gather(value, timeout_seconds)` must enforce its
+finite deadline (120 seconds by default) and include every worker rank in stable
+rank order. The framework's `safe_point()` context must pause/drain inference,
+resume only after successful exit, and never resume after `fence()` has run.
+The fence must stop actual serving/publication until coordinated worker recovery;
+a rank-local flag alone is insufficient. All ranks must use the same mode and
+enter updates together, using a dedicated control collective transport.
+
+The client runs `WeightUpdateSession.apply` with a collective checkpoint installer
+callback. The session still owns installation failure handling and lease cleanup;
+its result becomes the selected `"partial"` or `"full"` mode. Disk activation and
+local serving-version commits occur inside the installer transaction. Publication
+waits for every rank to finish installation and session cleanup. Publication and
+safe-point exit failures also fence every surviving rank. A failed client rejects
+later stage/apply calls until worker recovery, even if its local installation
+finished. Full mode retains the existing behavior.
+
+This configuration is on the generator-client API. The pinned vLLM 0.19 native
+weight-transfer API differs from this repository's existing native adapter; the
+E2E image uses direct generator-client integration. Native transfer JSON does not
+enable this feature. Do not use orchestration that resumes in a `finally` block
+after failed updates.
+
+See [deployment configuration](DEPLOYMENT.md#partial-checkpoint-installation-experimental)
+for the generator config example. The supported Kimi tensor groups and conservative
+fallback rules remain as described above. Logs report the selected mode, metadata
+fallback, and rank-local capability rejection reasons.
+
+#### Real-GPU gate failures and fixes
+
+The 2026-09-24/25 TP8 B200 Kimi-K2.6 gate on vLLM 0.19.0 failed acceptance.
+Embedding d1 returned partial on every rank and passed the observed scope checks,
+but a full reload of the identical checkpoint corrupted
+`vision_tower.patch_embed.pos_emb.time_weight` on all eight ranks. The other 1,734
+nonempty registered tensors matched. The generated sinusoidal buffer is
+non-persistent and has no checkpoint payload. Native layerwise reload includes it
+in meta restoration and materializes it with `empty_strided` when loading the
+spatial weight; finalization then copies unwritten contents into its original
+storage. Stable addresses did not establish correct values.
+
+The installer now temporarily excludes `time_weight` from native buffer
+registration and restore metadata for the exact Kimi position-embedding class.
+It remains readable as a plain attribute during loading. On both successful and
+failed exit, its original tensor, non-persistent registration, and restore metadata
+are restored. This does not exempt vision state from equivalence checks or freeze
+all non-persistent buffers; it protects this known weight-independent initializer
+without copying KV caches or suppressing weight-derived finalizers. Restart from
+a clean cold load before rerunning: this fix does not repair an already corrupted
+buffer. A missing/non-persistent-contract mismatch is rejected before reload.
+
+Projection d2 failed before mutation after the full reference reload: native MLA
+postprocessing recreated q/k/v range constants on CUDA under the current device
+context, while the original plain attributes were on CPU. Staging now compares
+those isolated scalar values on CPU, requiring identical shape, dtype and value.
+Live CPU/GPU scalar tensors retain their original identity and device; only the
+selected projection and derived tensors are installed. This comparison does not
+move or copy KV caches, and changes to scalar values still decline partial mode.
+
+`tests/test_kimi_reload_native.py` exercises real pinned vLLM implementations with
+small modules: generated-buffer preservation across repeated/failed full reloads,
+plus MLA staging before and after full reload. Its generated-buffer initializer
+hash matches the GPU report. CUDA variants explicitly skip when CUDA is absent;
+CPU execution cannot establish mixed-device or full-model GPU acceptance.
+
+The first failed run proved staging-failure fencing only; its post-copy injection
+was not reached. A subsequent fixed-image run on 2026-09-25 tested Kimi-K2.6
+revision `7eb5002f6aadc958aed6a9177b7ed26bb94011bb`, vLLM 0.19.0, eager TP8 on
+8 B200 GPUs. The generated temporal buffer matched its initializer exactly on
+all ranks after full reload, and cold projection staging passed the scalar check.
+
+The remaining projection blocker is `_validate_aliases`: the same
+`ColumnParallelLinear` is reachable beneath the outer `DeepseekV2MLAAttention`,
+its `MultiHeadLatentAttentionWrapper`, and the nested `MLAAttention`. The current
+rule excludes the last reference but counts the first two, where it requires one.
+Every rank declined partial mode before mutation and collectively completed full
+reload. This draft leaves the guard unchanged; a future fix must recognize only
+the audited wrapper relationship and retain rejection of other aliases.
+
+An independent embedding-only branch returned partial on all eight ranks and
+matched full reload of the identical checkpoint: all 1,736 nonempty runtime tensor
+hashes and all 122 explicit MLA views per rank matched exactly. Raw logits of shape
+`[1, 163840]` matched on every rank with maximum error zero, within the unchanged
+atol 1e-3 and rtol 1e-4. Only embedding values changed; addresses/layouts and other
+observed state stayed stable. No global layerwise reload, INT4 expert processing,
+or KV-cache copying was observed (61 caches tracked per rank).
+
+A rank-7 injection copied changed embedding bytes, synchronized and verified the
+destination hash, then raised. All ranks fenced, retained the last committed
+version and withdrew donor servers/heartbeats; inference and resume were rejected.
+A clean replacement engine restored that committed checkpoint by full reload,
+matched all tensor/MLA hashes and logits, and resumed inference. No unhealthy
+client's fence was cleared. Recovery installation took 601.811 seconds, excluding
+cold startup and initialization; combined replay during recovery still selected
+full fallback through the projection alias guard.
+
+For one instrumented embedding delta of approximately 1 GiB compressed, measured
+serving pause was 17.498 seconds partial versus 571.684 seconds full (32.7x,
+96.9% reduction). Partial includes S3 download and reconstruction; full reference
+uses the identical already-reconstructed target and excludes those costs. These
+are different measurement boundaries and one paired validation, not a statistical
+benchmark. Reconstruction took 4.620 seconds; peak allocated GPU memory per rank
+was 85.857 GiB partial versus 87.525 GiB full. No OOMs occurred.
+
+**The overall gate remains failed.** Standalone projection and combined partial
+installation, empty/revert, additional replay, malformed-metadata/one-rank fallback,
+remaining failure stages/timeouts and in-flight donor races remain unqualified.
+This was native S3 checkpoint-install testing, not P2P or Dynamo integration.
+
+#### Local verification and later GPU gate
+
+`tests/test_checkpoint_selection.py` checks dependency closure (including shared
+projection consumers), declared refresh operations, fallback before reads, exact
+selected reads, owned staging tensors, unchanged checkpoint bytes and read failure
+without returning a partial result. It does **not** execute the declared refresh
+operations. Receiver tests cover distinct-name multi-delta unions, repeated names,
+full/reused metadata fallback and empty deltas. Existing installer/import tests
+remain applicable to the unchanged full path.
+
+`tests/test_partial_checkpoint.py` exercises actual staged copies with CPU stand-in
+loaders/finalizers: two TP slices, embedding padding, strided/shared MLA storage,
+unchanged unrelated tensors, alias rejection, rebinding before mutation, unexpected
+finalizer effects and absence of KV-cache copies. The stand-ins are not native
+vLLM kernel tests. `tests/test_checkpoint_transaction.py` runs concurrent two-rank
+collectives and injects failures at entry, staging, copying, synchronization,
+context exit, activation and commit. It checks collective fallback, metadata
+adoption, version disagreement, timeout fencing and no successful return on
+failure. Wrapper tests verify full fallback and permanent installer fencing.
+
+Run the following from the root with the Python dependencies installed:
+
+```bash
+PYTHONPATH=modelexpress_client/python python modelexpress_client/python/benchmarks/bench_checkpoint_selection.py
+```
+
+On this macOS CPU environment with torch
+2.14.0, the synthetic warm-cache trial opened 3 instead of 64 shards and staged
+3 MiB instead of 64 MiB after expanding two changes to three inputs: **95.3125% less
+source payload**. Six measured iterations gave medians of 0.648 ms selected and
+12.880 ms full. This measures owned CPU source staging only, not filesystem
+physical I/O, TP loading, transformations, synchronization or end-to-end refit.
+
+For the real run, 1,082,342,004 compressed delta bytes do not equal selected source
+bytes: the embedding alone is 2,348,810,240 bytes (163840 by 7168 BF16). Compute the
+exact dependency-expanded source/shard and rank-local destination byte counts from
+the verified checkpoint and runtime catalog. The approximately 595 GB checkpoint
+and 577.24 s installation interval suggest substantial avoidable work, but do not
+justify a GPU latency estimate or assuming only two shard files are needed.
+
+Before a controlled GPU run, review the prototype and wire the real framework
+safe point, finite-timeout transport, fence and version commit callbacks. Confirm
+that the installed source passes the guards; investigate any fallback instead of
+loosening the guards blindly. Then compare full versus selected installation in the same
+pinned runtime on one TP8 B200 worker, with the same Kimi revision, eager settings,
+delta and required WNA16 workaround. Retain PR798 MLA behavior. Measure staging,
+CPU/H2D bytes, transformations, installation, synchronization/commit and total RPC
+separately; alternate repeated trials and record cache state. On all eight ranks,
+compare affected values to a full reload, audit all 122 MLA tensors (only intended
+consumers change), verify unaffected parameters/buffers/hidden state and addresses,
+canonical base immutability, version agreement and resumed inference/logprobs.
+Exercise sequential and skipped-version delta chains, empty/full/unknown metadata,
+unsupported quantized/expert changes, and one-rank failures both before and after
+mutation plus during activation. Confirm no resume or version publication on
+failure. Graph mode, multiple workers, P2P-to-S3 transitions and Dynamo integration
+require separate verification; CPU unit tests and the historical full reload do
+not qualify them.
+
 ### SGLang Loader
 
 **MxModelLoader** is instantiated by SGLang's `remote_instance` loader when

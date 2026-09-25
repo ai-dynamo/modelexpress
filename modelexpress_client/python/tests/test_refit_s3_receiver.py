@@ -426,12 +426,13 @@ def _artifact(
     version="target-a",
     version_label=1,
     base_version="base-a",
+    tensor_name="weight",
 ):
     delta, _ = compute_delta(target, base)
     assert delta is not None
     shard = safetensors.numpy.save(
-        {"weight": compress_delta(delta)},
-        metadata={"weight": checksum or _checksum(target)},
+        {tensor_name: compress_delta(delta)},
+        metadata={tensor_name: checksum or _checksum(target)},
     )
     root = json.dumps(
         {
@@ -442,7 +443,7 @@ def _artifact(
                 "compression_format": "zstd",
                 "checksum_format": "adler32",
             },
-            "weight_map": {"weight": "model-00000-of-00001.safetensors"},
+            "weight_map": {tensor_name: "model-00000-of-00001.safetensors"},
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1090,7 +1091,10 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
     adapter.close()
 
 
-def test_canonical_s3_replays_multiple_deltas_before_one_install(monkeypatch, tmp_path):
+@pytest.mark.parametrize("second_name", ["weight", "other"])
+def test_canonical_s3_replays_multiple_deltas_before_one_install(
+    monkeypatch, tmp_path, second_name
+):
     base = torch.tensor([1.0, 2.0])
     first = torch.tensor([3.0, 4.0])
     target = torch.tensor([5.0, 6.0])
@@ -1102,6 +1106,7 @@ def test_canonical_s3_replays_multiple_deltas_before_one_install(monkeypatch, tm
             version="target-b",
             version_label=2,
             base_version="target-a",
+            tensor_name=second_name,
         )
     )
     parse_calls = []
@@ -1113,7 +1118,12 @@ def test_canonical_s3_replays_multiple_deltas_before_one_install(monkeypatch, tm
         return parse_index_manifest(data, is_delta=is_delta, version=version)
 
     monkeypatch.setattr(receiver_module, "_parse_index_manifest", track_parse)
-    adapter, _ = _build(monkeypatch, tmp_path, objects)
+    adapter, _ = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={"weight": base, "other": first},
+    )
 
     staged = adapter.stage_chain(
         (
@@ -1127,15 +1137,24 @@ def test_canonical_s3_replays_multiple_deltas_before_one_install(monkeypatch, tm
         )
     )
 
-    assert torch.equal(load_file(staged.path / "model.safetensors")["weight"], target)
+    assert torch.equal(load_file(staged.path / "model.safetensors")[second_name], target)
     assert json.loads(adapter._checkpoint.store.state_path.read_text())["version"] == (
         "target-b"
     )
     assert parse_calls == ["target-a", "target-b"]
+    assert staged.changes is not None
+    assert staged.changes.base_version == "base-a"
+    assert staged.changes.target_version == "target-b"
+    assert staged.changes.names == {"weight", second_name}
     assert adapter.installed == []
     adapter.apply_weight(staged)
     assert adapter.installed == [staged.path]
     adapter.release_staged_weight(staged)
+    reused = adapter.stage_weight(
+        _inputs(None, version="target-b", version_label=2, base_version="target-a")
+    )
+    assert reused.changes is None
+    adapter.release_staged_weight(reused)
     adapter.close()
 
 
@@ -1557,6 +1576,7 @@ def test_canonical_s3_full_checkpoint_resets_base_for_next_delta(monkeypatch, tm
     adapter, storage = _build(monkeypatch, tmp_path, objects)
 
     full = adapter.stage_weight(_full_inputs())
+    assert full.changes is None
     assert torch.equal(
         load_file(full.path / "model-00001-of-00001.safetensors")["weight"],
         full_tensor,
@@ -1851,6 +1871,12 @@ def test_full_lineage_replay_resumes_from_verified_local_checkpoint(
     ):
         staged = adapter.stage_chain(lineage)
 
+    if cached_delta_count in (-1, 3):
+        assert staged.changes is None
+    else:
+        assert staged.changes is not None
+        assert staged.changes.base_version == lineage[cached_delta_count].version_id
+        assert staged.changes.names == {"weight"}
     assert torch.equal(
         load_file(staged.path / "model-00001-of-00001.safetensors")["weight"],
         tensors[-1],
@@ -2782,6 +2808,8 @@ def test_canonical_s3_shared_cache_observes_full_update(
 
     first_staged = first.stage_weight(_full_inputs())
     second_staged = second.stage_weight(_full_inputs())
+    assert first_staged.changes is None
+    assert second_staged.changes is None
 
     assert torch.equal(
         load_file(second_staged.path / "model-00001-of-00001.safetensors")[
@@ -2819,6 +2847,9 @@ def test_canonical_s3_accepts_an_empty_delta(monkeypatch, tmp_path):
 
     staged = adapter.stage_weight(_inputs(root))
 
+    assert staged.changes is not None
+    assert staged.changes.names == frozenset()
+    assert staged.changes.base_version == "base-a"
     assert storage.calls == [key]
     assert torch.equal(
         load_file(staged.path / "model.safetensors")["weight"],

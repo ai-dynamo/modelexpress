@@ -5,6 +5,7 @@
 
 from .control import ModelExpressControlClient, WeightVersion, WeightVersionState
 from .inference import (
+    CheckpointCollectiveContext,
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
     ObjectStorageGeneratorConfig,
@@ -12,6 +13,7 @@ from .inference import (
     VllmGeneratorContext,
     WeightSource,
 )
+from .object_storage import ObjectStorageSource, ObjectStorageType
 from .train import (
     FSDPTrainerContext,
     MegatronTrainerContext,
@@ -22,7 +24,6 @@ from .train import (
     TrainerStagingMode,
     WeightPayloadFormat,
 )
-from .object_storage import ObjectStorageSource, ObjectStorageType
 from .version import WeightVersionRef
 
 __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
@@ -31,6 +32,7 @@ __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     "ModelExpressGeneratorClient",
     "ModelExpressTrainerClient",
     # Configuration fixed when a worker client is initialized.
+    "CheckpointCollectiveContext",
     "ModelExpressGeneratorConfig",
     "ModelExpressTrainerConfig",
     "FSDPTrainerContext",
