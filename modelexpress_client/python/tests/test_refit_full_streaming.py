@@ -111,7 +111,8 @@ def test_cache_uses_stream_bytes_and_next_delta_never_downloads_full(
         with adapter._method.installation_context(adapter._active):
             consume(full)
         full.streaming.wait_cache()
-        assert adapter._checkpoint.store.state() == old_state
+        assert old_state.version == "base-a"
+        assert adapter._checkpoint.store.state().version == "full-a"
         assert torch.equal(
             load_file(full.path / "model-00001-of-00001.safetensors")["weight"],
             torch.tensor([7.0, 8.0]),
@@ -461,3 +462,86 @@ def test_other_rank_waits_for_shared_cache_then_replays_delta(monkeypatch, tmp_p
         unblock.set()
         owner.close()
         follower.close()
+
+
+def _head(store):
+    state = store.state()
+    return state.version, state.status, store.active_version()
+
+
+def test_streamed_full_becomes_cache_head_so_old_chain_is_evictable(
+    monkeypatch, tmp_path
+):
+    from modelexpress_rl.inference.checkpoint_store import (
+        CheckpointState,
+        checkpoint_files_state,
+    )
+    from modelexpress_rl.utils import index_checkpoint_tensors
+
+    adapter, _ = build(monkeypatch, tmp_path)
+    store = adapter._checkpoint.store
+    try:
+        assert _head(store)[0] == _head(store)[2] == "base-a"
+        full = adapter.stage_weight(_full_inputs())
+        with adapter._method.installation_context(adapter._active):
+            consume(full)
+        full.streaming.wait_cache()
+        assert _head(store) == ("full-a", CheckpointState.READY, "full-a")
+        paths, _, _ = index_checkpoint_tensors(full.path)
+        assert store.state().files == checkpoint_files_state(paths)
+        assert store.full_path("base-a").exists()
+        # The next replay protects its base plus the active head. The old head
+        # must now be evictable instead of exhausting the quota.
+        protected = receiver._protected_versions(store, "full-a", "delta-b")
+        assert "base-a" not in protected
+        store.max_size_bytes = store.cache_size_bytes()
+        store.ensure_capacity(
+            store._payload_size_bytes(store.full_path("base-a")),
+            protected_versions=protected,
+        )
+        assert not store.full_path("base-a").exists()
+        assert full.path.exists()
+        adapter.release_staged_weight(full)
+    finally:
+        adapter.close()
+
+
+def test_failed_cache_keeps_previous_cache_head(monkeypatch, tmp_path):
+    from modelexpress_rl.inference.streaming_checkpoint import _CheckpointWriter
+
+    adapter, _ = build(monkeypatch, tmp_path)
+    store = adapter._checkpoint.store
+    before = _head(store)
+
+    def fail(*args):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(_CheckpointWriter, "_write_tensor", fail)
+    try:
+        full = adapter.stage_weight(_full_inputs())
+        with adapter._method.installation_context(adapter._active):
+            consume(full)
+        with pytest.raises(OSError, match="disk unavailable"):
+            full.streaming.wait_cache()
+        assert _head(store) == before
+    finally:
+        adapter.close()
+
+
+def test_deferred_activation_adopts_stream_only_on_activate(monkeypatch, tmp_path):
+    from modelexpress_rl.inference.checkpoint_store import CheckpointState
+
+    adapter, _ = build(monkeypatch, tmp_path)
+    store = adapter._checkpoint.store
+    before = _head(store)
+    try:
+        full = adapter.stage_weight(_full_inputs())
+        with adapter._method.installation_context(adapter._active, activate=False):
+            consume(full)
+        full.streaming.wait_cache()
+        assert full.path.exists()
+        assert _head(store) == before
+        adapter._method.activate(adapter._active)
+        assert _head(store) == ("full-a", CheckpointState.READY, "full-a")
+    finally:
+        adapter.close()
