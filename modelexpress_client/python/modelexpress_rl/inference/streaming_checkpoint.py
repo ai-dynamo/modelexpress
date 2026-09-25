@@ -19,7 +19,7 @@ from queue import Queue
 import torch
 from safetensors.torch import _getdtype
 
-from .checkpoint_store import LocalCheckpointStore
+from .checkpoint_store import CheckpointState, LocalCheckpointStore
 from .receiver import _S3Version, _protected_versions, _source_identity
 from ..utils import index_checkpoint_tensors
 
@@ -71,15 +71,28 @@ class StreamedCheckpoint:
             raise ValueError("full checkpoint stream is missing tensors")
         self._complete = True
 
-    def finish_cache(self, *, success: bool) -> None:
+    def finish_cache(self, *, success: bool, activate: bool = True) -> None:
         if self._writer is not None:
-            self._writer.finish(success and self._complete)
+            self._writer.finish(success and self._complete, activate=activate)
         if success and not self._complete:
             raise RuntimeError("full checkpoint stream was not completely consumed")
 
     def wait_cache(self) -> None:
         if self._writer is not None:
             self._writer.wait()
+
+    def activate_cache(self) -> None:
+        """Adopt the published cache as the head after deferred activation."""
+        self.wait_cache()
+        store = self.store
+        with store.installation_locked(), store.locked():
+            if store.full_path(self.version.version_id).exists():
+                _adopt_full_checkpoint(store, self.version)
+            else:
+                logger.warning(
+                    "Streamed checkpoint cache missing at activation version=%s",
+                    self.version.version_id,
+                )
 
     @property
     def cache_metrics(self) -> dict[str, float]:
@@ -101,6 +114,21 @@ class StreamedCheckpoint:
                 )
 
 
+def _adopt_full_checkpoint(store: LocalCheckpointStore, version: _S3Version) -> None:
+    """Make a published streamed full checkpoint the ready, active cache head."""
+    target = store.full_path(version.version_id)
+    store.verify_artifact_source(target, _source_identity(version))
+    paths, _, _ = index_checkpoint_tensors(target)
+    store.write_state(
+        status=CheckpointState.READY,
+        version=version.version_id,
+        checkpoint_paths=paths,
+        source=_source_identity(version),
+    )
+    store.activate(version.version_id)
+    store.enforce_capacity(protected_versions={version.version_id})
+
+
 class _CheckpointWriter:
     """One writer per node, with owned CPU snapshots and bounded backpressure."""
 
@@ -112,6 +140,7 @@ class _CheckpointWriter:
         self._error: Exception | None = None
         self._finished = False
         self._success = False
+        self._activate = False
         self.snapshot_seconds = 0.0
         self.backpressure_seconds = 0.0
         self._locations: dict[str, tuple[str, int]] = {}
@@ -151,10 +180,11 @@ class _CheckpointWriter:
             if self._error is None:
                 self._queue.put((name, snapshot, size))
 
-    def finish(self, success: bool) -> None:
+    def finish(self, success: bool, *, activate: bool = False) -> None:
         if not self._finished:
             self._finished = True
             self._success = success
+            self._activate = activate
             self._queue.put(None)
 
     def wait(self) -> None:
@@ -256,6 +286,11 @@ class _CheckpointWriter:
                 store.write_chain(
                     version, {"version": version, "full_version": version, "deltas": []}
                 )
+                if self._activate:
+                    # The engine now serves this version; the replaced head and
+                    # its chain must become evictable like a canonical install.
+                    _adopt_full_checkpoint(store, checkpoint.version)
+                    protected = {version}
                 store.enforce_capacity(protected_versions=protected)
             logger.info(
                 "Streamed checkpoint cache ready version=%s seconds=%.3f",

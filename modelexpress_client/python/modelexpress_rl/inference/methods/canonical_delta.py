@@ -169,7 +169,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         if stream is not None:
             try:
                 yield
-                stream.finish_cache(success=True)
+                stream.finish_cache(success=True, activate=activate)
             except BaseException:
                 stream.finish_cache(success=False)
                 raise
@@ -188,6 +188,8 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
             raise RuntimeError("canonical checkpoint is no longer active")
         if prepared.checkpoint.streaming is None:
             self._checkpoint.activate(prepared.checkpoint)
+        else:
+            prepared.checkpoint.streaming.activate_cache()
 
     def release(self, prepared: PreparedArtifact) -> None:
         if prepared is not self._active:
