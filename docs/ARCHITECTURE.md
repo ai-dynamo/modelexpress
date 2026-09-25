@@ -1177,6 +1177,14 @@ headers and offsets can differ from the source. Pending snapshots are bounded to
 2 GiB, allowing one larger tensor. Copies and backpressure can affect install time;
 this is asynchronous disk writing, not a guarantee of zero disk influence.
 
+Layerwise reload frees a layer's incoming tensors only after the whole layer has
+arrived. ModelStreamer's distributed partition spreads each layer across ranks, so
+a single whole-checkpoint stream can leave most layers partially loaded at once.
+The installer therefore streams `MX_REFIT_STREAM_WINDOW_LAYERS` decoder layers
+(`layers.<N>`) per ranged request, default 2, after one metadata read. Non-layer
+tensors form a leading window. Every byte is still read once and the cache tee is
+unchanged; `0` restores the single stream.
+
 The writer uses the existing cache locks, quota, source records and atomic directory
 promotion. It publishes only after complete streaming and successful installation,
 and never changes `state.json` or `active.json`. The next canonical replay waits
