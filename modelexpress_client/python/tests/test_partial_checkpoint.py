@@ -10,6 +10,7 @@ from modelexpress_rl.inference.engines.vllm import partial_checkpoint
 from modelexpress_rl.inference.engines.vllm.partial_checkpoint import (
     StagedBf16Checkpoint,
     _Copy,
+    _projection_aliases,
     _stage_mla,
     _stage_weight,
     _Unsupported,
@@ -76,7 +77,7 @@ def test_partial_install_stages_tp_and_mla_without_mutating_unselected_tensors(r
     model = nn.Module()
     model.projection = layer
     model.attention = attention
-    _validate_aliases(model, copies)
+    _validate_aliases(model, copies, {id(layer): {"projection", "attention.kv_b_proj"}})
     StagedBf16Checkpoint(tuple(copies)).install()
 
     expected = source[rank * 4 : (rank + 1) * 4]
@@ -236,7 +237,7 @@ def test_mla_staging_never_copies_unrelated_kv_cache(monkeypatch):
 def test_runtime_contract_declines_before_checkpoint_reads(
     monkeypatch, tmp_path, unsupported
 ):
-    monkeypatch.setattr(partial_checkpoint, "_contract", lambda: (nn.Module,) * 6)
+    monkeypatch.setattr(partial_checkpoint, "_contract", lambda: (nn.Module,) * 8)
     config = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=True, dtype=torch.bfloat16),
         parallel_config=SimpleNamespace(
@@ -287,7 +288,9 @@ def test_recreated_mla_range_scalars_are_compared_strictly(change):
     attention.initialized = True
     original = attention.q_range
     with torch.no_grad():
-        shadow = _stage_weight(layer, torch.ones(8, 2, dtype=torch.bfloat16), Projection.loader)
+        shadow = _stage_weight(
+            layer, torch.ones(8, 2, dtype=torch.bfloat16), Projection.loader
+        )
         if change == "same":
             assert len(_stage_mla(attention, shadow, RangeAttention)) == 2
         else:
@@ -295,3 +298,108 @@ def test_recreated_mla_range_scalars_are_compared_strictly(change):
                 _stage_mla(attention, shadow, RangeAttention)
     assert attention.q_range is original and original.item() == 7
     assert torch.count_nonzero(layer.weight) == 0
+
+
+class OuterAttention(nn.Module):
+    pass
+
+
+class AttentionWrapper(nn.Module):
+    pass
+
+
+def _wrapped_projection(outer_type=OuterAttention, wrapper_type=AttentionWrapper):
+    model = nn.Module()
+    model.language_model = nn.Module()
+    model.language_model.model = nn.Module()
+    model.language_model.model.layers = nn.ModuleList([nn.Module()])
+    outer = outer_type.__new__(outer_type)
+    nn.Module.__init__(outer)
+    wrapper = wrapper_type.__new__(wrapper_type)
+    nn.Module.__init__(wrapper)
+    outer.kv_b_proj = Projection(0)
+    wrapper.kv_b_proj = outer.kv_b_proj
+    wrapper.mla_attn = Attention(outer.kv_b_proj)
+    outer.mla_attn = wrapper
+    model.language_model.model.layers[0].self_attn = outer
+    shadow = _stage_weight(
+        outer.kv_b_proj, torch.ones(8, 2, dtype=torch.bfloat16), Projection.loader
+    )
+    copies = _stage_mla(wrapper.mla_attn, shadow, Attention)
+    copies.append(_Copy.stage(outer.kv_b_proj, "weight", shadow.weight))
+    return model, outer, wrapper, copies
+
+
+@pytest.mark.parametrize("combined", [False, True])
+def test_audited_projection_wrapper_aliases_install(combined):
+    model, outer, wrapper, copies = _wrapped_projection()
+    if combined:
+        model.language_model.model.embed_tokens = Projection(0)
+        embedding = model.language_model.model.embed_tokens
+        copies.append(
+            _Copy.stage(embedding, "weight", torch.ones_like(embedding.weight))
+        )
+    paths = _projection_aliases(
+        model, outer.kv_b_proj, wrapper.mla_attn, OuterAttention, AttentionWrapper
+    )
+    _validate_aliases(model, copies, paths)
+    StagedBf16Checkpoint(tuple(copies)).install()
+    for item in copies:
+        assert torch.equal(item.destination, item.source)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "extra_projection",
+        "extra_wrapper",
+        "extra_outer",
+        "extra_consumer",
+        "tied_parameter",
+        "buffer_view",
+        "wrong_wrapper",
+        "wrong_outer",
+        "different_projection",
+        "different_consumer",
+        "missing_path",
+    ],
+)
+def test_audited_projection_wrapper_rejects_unknown_topology_or_storage(mutation):
+    model, outer, wrapper, copies = _wrapped_projection()
+    attention = wrapper.mla_attn
+    if mutation == "extra_projection":
+        model.extra = outer.kv_b_proj
+    elif mutation == "extra_wrapper":
+        model.extra = wrapper
+    elif mutation == "extra_outer":
+        model.extra = outer
+    elif mutation == "extra_consumer":
+        model.extra = attention
+    elif mutation == "tied_parameter":
+        model.tied = outer.kv_b_proj.weight
+    elif mutation == "buffer_view":
+        model.register_buffer("view", outer.kv_b_proj.weight.view(-1))
+    elif mutation == "wrong_wrapper":
+
+        class Replacement(AttentionWrapper):
+            pass
+
+        wrapper.__class__ = Replacement
+    elif mutation == "wrong_outer":
+
+        class Replacement(OuterAttention):
+            pass
+
+        outer.__class__ = Replacement
+    elif mutation == "different_projection":
+        wrapper.kv_b_proj = Projection(0)
+    elif mutation == "different_consumer":
+        wrapper.mla_attn = Attention(outer.kv_b_proj)
+    else:
+        del wrapper.kv_b_proj
+    with pytest.raises((_Unsupported, AttributeError)):
+        paths = _projection_aliases(
+            model, outer.kv_b_proj, attention, OuterAttention, AttentionWrapper
+        )
+        _validate_aliases(model, copies, paths)
+    assert torch.count_nonzero(outer.kv_b_proj.weight) == 0

@@ -1168,8 +1168,9 @@ receive and staging buffer ownership, and when PWAL applies rather than MDL.
 ### Changed-checkpoint tensor exploration
 
 **Status: draft opt-in prototype. Embedding-only GPU correctness, post-copy fencing,
-and clean-engine recovery passed. Projection aliases still force full reload, so
-the overall acceptance gate remains failed. Default warm refits stay full.**
+and clean-engine recovery passed. The projection wrapper alias fix awaits GPU
+qualification; the overall acceptance gate remains failed. Default warm refits
+stay full.**
 `modelexpress_rl/inference/checkpoint_selection.py` provides a provider-independent
 changed-name contract, dependency closure, and owned CPU tensor staging.
 `checkpoint_transaction.py` coordinates installation across ranks, and
@@ -1254,7 +1255,8 @@ The implemented candidate is the historical BF16 embedding and first-layer BF16
 INT4 model. It admits only exact vLLM 0.19.0 classes with audited source-file hashes:
 KimiK25ForConditionalGeneration, VocabParallelEmbedding with its unquantized
 method, ColumnParallelLinear with UnquantizedLinearMethod, and one MLAAttention
-consumer of the first-layer projection. CUDA BF16, eager mode, ordinary TP,
+consumer of the first-layer projection, beneath exact DeepseekV2MLAAttention and
+MultiHeadLatentAttentionWrapper types with audited source hashes. CUDA BF16, eager mode, ordinary TP,
 PP/DP/context-parallel size one, no EP/LoRA/speculation/offload, and auto/BF16 KV
 cache are required. Source/hash/layout mismatches select full reload. Added-vocab
 embeddings, fused/quantized/expert updates and unaccounted tied/storage aliases
@@ -1410,13 +1412,17 @@ revision `7eb5002f6aadc958aed6a9177b7ed26bb94011bb`, vLLM 0.19.0, eager TP8 on
 8 B200 GPUs. The generated temporal buffer matched its initializer exactly on
 all ranks after full reload, and cold projection staging passed the scalar check.
 
-The remaining projection blocker is `_validate_aliases`: the same
+The tested image hit a projection blocker in `_validate_aliases`: the same
 `ColumnParallelLinear` is reachable beneath the outer `DeepseekV2MLAAttention`,
-its `MultiHeadLatentAttentionWrapper`, and the nested `MLAAttention`. The current
-rule excludes the last reference but counts the first two, where it requires one.
+its `MultiHeadLatentAttentionWrapper`, and the nested `MLAAttention`. The tested
+rule excluded the last reference but counted the first two, where it required one.
 Every rank declined partial mode before mutation and collectively completed full
-reload. This draft leaves the guard unchanged; a future fix must recognize only
-the audited wrapper relationship and retain rejection of other aliases.
+reload. The subsequent code fix pins the outer attention and wrapper source hashes,
+checks their exact native types and shared projection/consumer identities, and
+requires exactly the three audited projection paths. Extra references to the
+projection, wrappers or consumer and unaccounted tied storage still decline.
+CPU regression coverage includes projection-only and combined write sets; this
+fix has not yet passed the GPU acceptance gate.
 
 An independent embedding-only branch returned partial on all eight ranks and
 matched full reload of the identical checkpoint: all 1,736 nonempty runtime tensor

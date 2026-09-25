@@ -109,6 +109,7 @@ def _contract():
         ColumnParallelLinear,
         UnquantizedLinearMethod,
     )
+    from vllm.model_executor.layers.mla import MultiHeadLatentAttentionWrapper
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
         get_and_maybe_dequant_weights,
     )
@@ -116,12 +117,21 @@ def _contract():
         UnquantizedEmbeddingMethod,
         VocabParallelEmbedding,
     )
+    from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLAAttention
     from vllm.model_executor.models.kimi_k25 import KimiK25ForConditionalGeneration
     from vllm.version import __version__
 
     _require(__version__ == "0.19.0", "requires the audited vLLM 0.19.0 API")
     # File hashes from upstream v0.19.0; patched/nightly implementations decline.
     for implementation, digest in (
+        (
+            MultiHeadLatentAttentionWrapper,
+            "4919d21219ee82502b16c645fb1d52333be47bd3c04fd60bd323de88c382fc63",
+        ),
+        (
+            DeepseekV2MLAAttention,
+            "c0f27b22e0023d42861ed4763e2a23fe305d049c6c45f6bd3ac05299d8e76da2",
+        ),
         (
             ColumnParallelLinear.weight_loader,
             "db35d8070e734f2a5d4f705213bcc30a44cab2642c4d29cefd83a14339bef346",
@@ -161,6 +171,8 @@ def _contract():
         ColumnParallelLinear,
         UnquantizedLinearMethod,
         MLAAttention,
+        DeepseekV2MLAAttention,
+        MultiHeadLatentAttentionWrapper,
     )
 
 
@@ -176,22 +188,44 @@ def _direct_tensors(module: nn.Module) -> dict[str, torch.Tensor]:
     }
 
 
-def _validate_aliases(model: nn.Module, copies: list[_Copy]) -> None:
-    allowed = {(id(item.owner), item.name) for item in copies}
-    derived_owners = {id(item.owner) for item in copies if item.name in _DERIVED}
-    owner_paths: dict[int, int] = {}
-    for path, module in model.named_modules(remove_duplicate=False):
-        if not any(module is item.owner for item in copies):
-            continue
-        parent_path, _, leaf = path.rpartition(".")
-        parent = model.get_submodule(parent_path) if path else None
-        if id(parent) in derived_owners and leaf == "kv_b_proj":
-            continue
-        owner_paths[id(module)] = owner_paths.get(id(module), 0) + 1
+def _projection_aliases(model, projection, attention, outer_type, wrapper_type):
+    path = _PROJECTION.rsplit(".", 2)[0]
+    outer = model.get_submodule(path)
+    wrapper = getattr(outer, "mla_attn", None)
     _require(
-        all(count == 1 for count in owner_paths.values()),
-        "unaccounted aliased storage module",
+        type(outer) is outer_type
+        and type(wrapper) is wrapper_type
+        and outer.kv_b_proj is projection
+        and wrapper.kv_b_proj is projection
+        and wrapper.mla_attn is attention
+        and attention.kv_b_proj is projection,
+        "unsupported MLA wrapper topology",
     )
+    return {
+        id(projection): {
+            f"{path}.kv_b_proj",
+            f"{path}.mla_attn.kv_b_proj",
+            f"{path}.mla_attn.mla_attn.kv_b_proj",
+        }
+    }
+
+
+def _validate_aliases(
+    model: nn.Module,
+    copies: list[_Copy],
+    audited_paths: dict[int, set[str]] | None = None,
+) -> None:
+    allowed = {(id(item.owner), item.name) for item in copies}
+    owner_paths: dict[int, set[str]] = {id(item.owner): set() for item in copies}
+    for path, module in model.named_modules(remove_duplicate=False):
+        if id(module) in owner_paths:
+            owner_paths[id(module)].add(path)
+    for owner, paths in owner_paths.items():
+        expected = (audited_paths or {}).get(owner)
+        _require(
+            paths == expected if expected is not None else len(paths) == 1,
+            "unaccounted aliased storage module",
+        )
     storages = {
         (item.destination.device, item.destination.untyped_storage().data_ptr())
         for item in copies
@@ -324,7 +358,16 @@ def prepare_bf16_checkpoint(
     GPU correctness and latency remain unverified; use only the collective API.
     """
     try:
-        kimi, embedding_type, embedding_method, linear, linear_method, mla = _contract()
+        (
+            kimi,
+            embedding_type,
+            embedding_method,
+            linear,
+            linear_method,
+            mla,
+            outer_type,
+            wrapper_type,
+        ) = _contract()
         config = vllm_config.model_config
         parallel = vllm_config.parallel_config
         _require(
@@ -366,6 +409,7 @@ def prepare_bf16_checkpoint(
             weight_map={name: location[0].name for name, location in locations.items()},
         )
         copies = []
+        audited_paths = {}
         for name, source in sources.items():
             layer = model.get_submodule(name.rsplit(".", 1)[0])
             _require(layer.weight.device.type == "cuda", "CPU/offloaded weights")
@@ -392,10 +436,15 @@ def prepare_bf16_checkpoint(
                     if getattr(m, "kv_b_proj", None) is layer and type(m) is mla
                 ]
                 _require(len(consumers) == 1, "requires exactly one MLA consumer")
+                audited_paths.update(
+                    _projection_aliases(
+                        model, layer, consumers[0], outer_type, wrapper_type
+                    )
+                )
                 copies.extend(_stage_mla(consumers[0], shadow, mla))
             copies.append(_Copy.stage(layer, "weight", shadow.weight))
 
-        _validate_aliases(model, copies)
+        _validate_aliases(model, copies, audited_paths)
         return StagedBf16Checkpoint(tuple(copies))
     except (_Unsupported, ImportError, AttributeError) as error:
         logger.info("Partial checkpoint unsupported; using full reload: %s", error)

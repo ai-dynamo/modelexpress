@@ -21,8 +21,11 @@ except PackageNotFoundError:
 from modelexpress_rl.inference.engines.vllm.installer import _VllmInstaller
 from modelexpress_rl.inference.engines.vllm.partial_checkpoint import (
     StagedBf16Checkpoint,
+    _contract,
     _Copy,
+    _projection_aliases,
     _stage_mla,
+    _validate_aliases,
 )
 
 
@@ -141,6 +144,21 @@ def test_native_mla_staging_preserves_host_ranges(
     with torch.device(device):
         copies = _stage_mla(attention, shadow, MLAAttention)
         copies.append(_Copy.stage(projection, "weight", shadow.weight))
+    *_, outer_type, wrapper_type = _contract()
+    outer = outer_type.__new__(outer_type)
+    nn.Module.__init__(outer)
+    wrapper = wrapper_type.__new__(wrapper_type)
+    nn.Module.__init__(wrapper)
+    outer.kv_b_proj = wrapper.kv_b_proj = projection
+    wrapper.mla_attn = attention
+    outer.mla_attn = wrapper
+    del model.attention
+    model.language_model = nn.Module()
+    model.language_model.model = nn.Module()
+    model.language_model.model.layers = nn.ModuleList([nn.Module()])
+    model.language_model.model.layers[0].self_attn = outer
+    paths = _projection_aliases(model, projection, attention, outer_type, wrapper_type)
+    _validate_aliases(model, copies, paths)
     StagedBf16Checkpoint(tuple(copies)).install()
     assert attention.W_UV is derived[0] and attention.W_UK_T is derived[1]
     assert torch.equal(attention.W_UV, torch.full_like(attention.W_UV, 3))

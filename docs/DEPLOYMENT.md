@@ -1329,8 +1329,8 @@ kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/co
 
 The generator client can opt into collective partial installation for the scoped
 Kimi BF16 checkpoint groups. The default remains full checkpoint reload. This
-embedding-only path passed a scoped GPU test, but projection aliases still force
-full fallback and the overall acceptance gate remains failed. See the
+embedding-only path passed a scoped GPU test. The projection wrapper alias fix
+awaits GPU qualification and the overall acceptance gate remains failed. See the
 [architecture contract](ARCHITECTURE.md#changed-checkpoint-tensor-exploration)
 for verified cases, remaining limitations, and fallback conditions.
 
