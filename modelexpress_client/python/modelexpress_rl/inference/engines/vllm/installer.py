@@ -16,6 +16,7 @@ import copy
 import logging
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -49,6 +50,49 @@ if TYPE_CHECKING:
 logger = logging.getLogger("modelexpress_rl.inference.engines.vllm.installer")
 
 
+@contextmanager
+def _preserve_generated_vision_buffers(model: Module, layerwise_info):
+    """Exclude Kimi's generated temporal embedding from checkpoint materialization."""
+    saved = []
+    try:
+        for layer in model.modules():
+            if (
+                type(layer).__module__ != "vllm.model_executor.models.kimi_k25_vit"
+                or type(layer).__name__ != "Learnable2DInterpPosEmbDivided_fixed"
+            ):
+                continue
+            from vllm.model_executor.models.kimi_k25_vit import (
+                Learnable2DInterpPosEmbDivided_fixed,
+            )
+
+            if type(layer) is not Learnable2DInterpPosEmbDivided_fixed:
+                continue
+            buffer = layer._buffers.get("time_weight")
+            info = layerwise_info.get(layer)
+            if (
+                buffer is None
+                or "time_weight" not in layer._non_persistent_buffers_set
+                or info is None
+            ):
+                raise IncompleteRefit("Kimi generated temporal buffer contract changed")
+            metadata = info.restore_metadata
+            saved.append((layer, buffer, info, metadata))
+            # Native reload otherwise allocates this buffer with empty_strided
+            # and copies unwritten bytes back when the spatial weight loads.
+            info.restore_metadata = (
+                metadata[0],
+                {name: value for name, value in metadata[1].items() if name != "time_weight"},
+            )
+            delattr(layer, "time_weight")
+            object.__setattr__(layer, "time_weight", buffer)
+        yield
+    finally:
+        for layer, buffer, info, metadata in reversed(saved):
+            info.restore_metadata = metadata
+            delattr(layer, "time_weight")
+            layer.register_buffer("time_weight", buffer, persistent=False)
+
+
 def _reserve_runtime_buffer_slots(model: Module, layerwise_info) -> None:
     """Keep late-created kernel buffers registered while PWAL runs again."""
     for layer in model.modules():
@@ -78,6 +122,7 @@ class _VllmInstaller(EngineInstaller):
         device: torch.device,
         convert_native_to_hf: Callable[[dict], dict] | None = None,
         runtime_tensors: dict[str, torch.Tensor] | None = None,
+        checkpoint_tensor_mapping: dict[str, str] | None = None,
     ) -> None:
         self._model = model
         self._vllm_config = vllm_config
@@ -85,6 +130,10 @@ class _VllmInstaller(EngineInstaller):
         self._device = device
         self._convert_native_to_hf = convert_native_to_hf
         self._runtime_tensors = runtime_tensors
+        self._checkpoint_fenced = False
+        self._checkpoint_tensor_mapping = (
+            dict(checkpoint_tensor_mapping) if checkpoint_tensor_mapping is not None else None
+        )
 
     @property
     def capabilities(self) -> EngineCapabilities:
@@ -99,6 +148,8 @@ class _VllmInstaller(EngineInstaller):
         )
 
     def install(self, prepared: PreparedArtifact) -> dict[str, float]:
+        if self._checkpoint_fenced:
+            raise IncompleteRefit("checkpoint transaction failed; worker recovery required")
         started = time.perf_counter()
         metrics = prepared.metrics
         if isinstance(prepared, PreparedEngineTensors):
@@ -245,6 +296,66 @@ class _VllmInstaller(EngineInstaller):
         with refit_span("post_install"):
             torch.cuda.synchronize(self._device)
 
+    def install_checkpoint_collectively(
+        self,
+        prepared: PreparedCheckpoint,
+        *,
+        serving_version: str,
+        world_size: int,
+        all_gather: Callable[[object], tuple[object, ...]],
+        installation_context: Callable,
+        activate: Callable[[], None],
+        commit_version: Callable[[], None],
+        fence: Callable[[], None],
+    ) -> str:
+        """Experimental partial refit; all ranks must enter a drained safe point.
+
+        Supply the canonical method's context with activate=False, followed by
+        its explicit activate callback. The caller owns the serving-version
+        commit and a fence that prevents inference/publication after ANY failure.
+        The default warm-refit session does not opt into this API.
+        """
+        from vllm.config import set_current_vllm_config
+
+        from ...checkpoint_transaction import refit_checkpoint_collectively
+        from .partial_checkpoint import prepare_partial_checkpoint
+
+        if self._checkpoint_fenced:
+            raise IncompleteRefit("checkpoint transaction failed; worker recovery required")
+
+        def fail_closed() -> None:
+            self._checkpoint_fenced = True
+            fence()
+
+        def gather_with_mapping(value):
+            peers = all_gather((self._checkpoint_tensor_mapping, value))
+            if any(
+                not isinstance(peer, tuple) or len(peer) != 2
+                or peer[0] != self._checkpoint_tensor_mapping
+                for peer in peers
+            ):
+                raise IncompleteRefit("checkpoint tensor mappings differ across ranks")
+            return tuple(peer[1] for peer in peers)
+
+        with torch.device(self._device), set_current_vllm_config(self._vllm_config):
+            return refit_checkpoint_collectively(
+                prepared,
+                serving_version=serving_version,
+                world_size=world_size,
+                all_gather=gather_with_mapping,
+                installation_context=installation_context,
+                prepare_partial=lambda checkpoint: prepare_partial_checkpoint(
+                    self._model, self._vllm_config, checkpoint,
+                    serving_version=serving_version,
+                    tensor_mapping=self._checkpoint_tensor_mapping,
+                ),
+                install_full=lambda: self.install_checkpoint(prepared.path),
+                synchronize=lambda: torch.cuda.synchronize(self._device),
+                activate=activate,
+                commit_version=commit_version,
+                fence=fail_closed,
+            )
+
     @torch.no_grad()
     def _process_and_commit(self, tensors: dict[str, torch.Tensor]) -> None:
         """Run vLLM's per-layer post-load processing into graph-bound storage.
@@ -319,6 +430,8 @@ class _VllmInstaller(EngineInstaller):
     @torch.no_grad()
     def _reload(self, load: Callable[[], None]) -> None:
         """Run one weight loader inside vLLM's graph-safe reload window."""
+        if self._checkpoint_fenced:
+            raise IncompleteRefit("checkpoint transaction failed; worker recovery required")
         try:
             from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.reload.layerwise import (
@@ -347,7 +460,11 @@ class _VllmInstaller(EngineInstaller):
             module: values for module, values in bare_tensors.items() if values
         }
 
-        with torch.device(self._device), set_current_vllm_config(self._vllm_config):
+        with (
+            torch.device(self._device),
+            set_current_vllm_config(self._vllm_config),
+            _preserve_generated_vision_buffers(self._model, LAYERWISE_INFO),
+        ):
             initialize_layerwise_reload(self._model)
             _reserve_runtime_buffer_slots(self._model, LAYERWISE_INFO)
             load()

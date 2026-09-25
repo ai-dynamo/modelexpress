@@ -1165,6 +1165,103 @@ for the end-to-end design, integration contract, implementation status, and
 validation requirements, including descriptor bounding for strided slices,
 receive and staging buffer ownership, and when PWAL applies rather than MDL.
 
+### Partial checkpoint installation
+
+ModelExpress can install supported changed checkpoint tensors without reloading
+unrelated model weights. Full checkpoint reload remains the default. Partial
+installation is experimental and opt-in through
+`ModelExpressGeneratorConfig.checkpoint_install_mode="partial_if_supported"`.
+
+The design separates checkpoint reconstruction from engine installation. S3 delta
+replay still produces a complete, verified checkpoint. Partial installation uses
+its changed-tensor metadata to stage only supported dependency groups, including
+any derived runtime tensors. Each group is installed into existing storage to
+preserve tensor identities and layouts. Native vLLM loaders and postprocessing
+handle sharding, padding, and MLA transformations; the full-model loader is not
+run with a filtered input stream.
+
+#### Supported scope and fallback
+
+The vLLM adapter selects layer capabilities rather than a model name or fixed
+layer number. Supported groups are unquantized vocabulary embeddings and MLA
+projections with their derived tensors, using FP16, BF16, or FP32 weights on
+audited vLLM 0.19.0 with CUDA, eager execution, and ordinary tensor parallelism.
+Quantized or expert updates, added-vocabulary embeddings, graph execution,
+offloading, LoRA, speculative decoding, and pipeline, expert, data, or context
+parallelism remain outside this partial-installation contract.
+
+Architectures provide `VllmGeneratorContext.checkpoint_tensor_mapping`, mapping
+checkpoint source names to runtime module paths. Each entry binds a complete
+weight to a supported layer; the integration must establish that no additional
+fused inputs, checkpoint transformations, or derived-state refreshes are needed.
+The installer verifies native layer types and their embedding or MLA dependency
+contracts. Name similarity alone does not authorize partial installation. An
+isolated, audited mapping provider supplies Kimi embeddings and MLA projections
+at every layer when no explicit mapping is configured; unknown architectures
+without a mapping use full reload.
+
+Changed-tensor metadata records the union of names in a verified delta chain and
+its exact base and target versions. Reverted tensors remain in the union. An
+empty verified delta has a known empty set; full checkpoints and reused cached
+targets have unknown changes. Ranks may share verified metadata only when its
+base and target match their serving state and all known sets agree. Invalid
+checkpoint manifests or checksums fail preparation.
+
+Partial installation requires every rank to support the complete changed set.
+Missing or conflicting metadata, unsupported groups, source-version mismatches,
+or incompatible layouts select full reload on all ranks before mutation. Native
+module types, source hashes, storage identities, and dependency relationships
+are checked at runtime. The known projection references in the native attention
+wrappers are accepted only as one verified shared dependency; unexpected aliases
+or tied storage still select full reload.
+
+Architecture-specific compatibility handling remains isolated: both installation
+paths preserve Kimi's generated, weight-independent vision buffer. Partial MLA
+staging preserves live scalar state and refreshes only the selected projection and its derived tensors. Unrelated weights and KV caches
+are not copied by the partial path.
+
+#### Collective serving lifecycle
+
+Partial mode requires canonical S3 as the only configured source:
+`source_order=(WeightSource.OBJECT_STORAGE,)`. The caller supplies
+`VllmGeneratorContext.checkpoint_collective` with a `CheckpointCollectiveContext`
+that provides serving pause/drain, a serving fence, and a finite-timeout gather
+across every worker rank. These callbacks must control the actual scheduler and
+publication lifecycle. All ranks use the same configuration and checkpoint
+mapping and enter updates together. This setting belongs to the generator-client API.
+
+The client coordinates the update in this order:
+
+1. Agree on serving and target versions, including no-op decisions.
+2. Pause and drain inference, withdraw the donor source, and drain donor reads.
+3. Stage and validate the complete write set, then collectively choose partial
+   installation or full reload.
+4. Install and synchronize on every rank, activate the checkpoint, commit the
+   serving version, and complete lease cleanup.
+5. Publish the new donor source and resume inference only after collective success.
+
+Unsupported capability selects full reload; staging, installation, transport,
+activation, publication, or resume failures fence the worker. A fenced client
+rejects subsequent updates and requires coordinated worker recovery. Preserving
+storage addresses or restoring a version label does not roll back tensor writes.
+The framework must never resume a fenced worker unconditionally.
+
+#### Validation and integration boundaries
+
+Acceptance requires equivalence to full reload of the same checkpoint: selected
+and unaffected runtime tensors, derived MLA state, inference outputs, and storage
+layouts must agree on all ranks. Failure tests must establish that serving and
+donor publication remain blocked until clean-worker recovery. Full-model GPU
+evidence is limited to Kimi-K2.6 BF16 updates; support for other model mappings and dtypes does not imply GPU qualification. Detailed run
+results and qualification status are tracked in [PR #810](https://github.com/ai-dynamo/modelexpress/pull/810).
+Broader failure cases, in-flight donor races, P2P, and Dynamo integration require
+separate qualification; the scoped S3 tests do not establish production readiness.
+
+Fault injection, tensor snapshots, logits comparisons, and test control endpoints
+belong to the external E2E harness. Production packaging excludes that harness
+and its test tooling. Runtime compatibility, alias/layout, collective-agreement,
+and fencing checks remain required for correct operation.
+
 ### SGLang Loader
 
 **MxModelLoader** is instantiated by SGLang's `remote_instance` loader when

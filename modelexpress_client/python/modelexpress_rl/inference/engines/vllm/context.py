@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ...adapter import GeneratorEngineContext
+from ...checkpoint_lifecycle import CheckpointCollectiveContext
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -25,6 +26,11 @@ class VllmGeneratorContext(GeneratorEngineContext):
     vllm_config: VllmConfig
     # Maps a trainer-native source state_dict to HF names/layout before capture.
     convert_native_to_hf: Callable[[dict], dict] | None = None
+    checkpoint_collective: CheckpointCollectiveContext | None = None
+    # Checkpoint source name -> runtime module path, binding its complete weight.
+    # The integration guarantees no fused inputs, remapping, or extra refreshes
+    # beyond the supported embedding/MLA dependency contracts.
+    checkpoint_tensor_mapping: dict[str, str] | None = None
 
 
 __all__ = ["VllmGeneratorContext"]

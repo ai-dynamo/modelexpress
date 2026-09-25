@@ -18,11 +18,10 @@ def _create_vllm_engine_runtime(
     if not isinstance(engine_context, VllmGeneratorContext):
         raise TypeError("VLLM requires a VllmGeneratorContext")
 
-    from torch.nn import Module
-    from vllm.config import ModelConfig, VllmConfig
-
     from modelexpress.engines.vllm.adapter import VllmAdapter
     from modelexpress.engines.vllm.loader import get_model_loader
+    from torch.nn import Module
+    from vllm.config import ModelConfig, VllmConfig
 
     from .installer import _VllmInstaller
 
@@ -52,6 +51,7 @@ def _create_vllm_engine_runtime(
         device=engine.get_target_device(),
         convert_native_to_hf=engine_context.convert_native_to_hf,
         runtime_tensors=runtime_tensors,
+        checkpoint_tensor_mapping=engine_context.checkpoint_tensor_mapping,
     )
 
     def build_identity(version_id: str):
