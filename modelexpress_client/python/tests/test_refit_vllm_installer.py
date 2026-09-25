@@ -507,3 +507,138 @@ def test_installer_rejects_missing_mla_refresh(monkeypatch, stale_name):
 
     with pytest.raises(IncompleteRefit, match=rf"{stale_name} was not refreshed"):
         installer._reload(lambda: model.projection.data.fill_(7))
+
+
+@pytest.mark.parametrize("window_layers", ["0", "2"])
+def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(
+    monkeypatch, window_layers
+):
+    from unittest.mock import Mock
+    from modelexpress_rl.inference.streaming_checkpoint import StreamedCheckpoint
+    from modelexpress_rl.inference.receiver import _S3Version
+    from modelexpress_rl.train import WeightPayloadFormat
+
+    events = []
+    _install_fake_vllm(monkeypatch, lambda model: events.append("initialize"))
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    layerwise.finalize_layerwise_reload = lambda model, config: events.append(
+        "finalize"
+    )
+    weight_utils = ModuleType("vllm.model_executor.model_loader.weight_utils")
+    distributed = ModuleType("vllm.distributed")
+    distributed.get_world_group = lambda: SimpleNamespace(local_rank=1)
+    distributed.get_pipeline_model_parallel_world_size = lambda: 1
+    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed)
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.model_loader.weight_utils", weight_utils
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
+    monkeypatch.setenv("MX_MS_DISTRIBUTED", "1")
+    monkeypatch.setenv("MX_REFIT_STREAM_WINDOW_LAYERS", window_layers)
+
+    paths = []
+
+    def iterator(files, use_tqdm_on_load, is_distributed):
+        paths.append("vllm")
+        assert files == ["s3://bucket/v2/model.safetensors"]
+        assert is_distributed
+        try:
+            events.append("stream")
+            yield "weight", torch.tensor([7.0, 8.0])
+        finally:
+            events.append("close")
+
+    loader_module = ModuleType("vllm.model_executor.model_loader.runai_streamer_loader")
+
+    class StreamerLoader:
+        def __init__(self, config):
+            assert config.model_loader_extra_config == {
+                "memory_limit": 123,
+                "concurrency": 7,
+                "distributed": True,
+            }
+            self._is_distributed = config.model_loader_extra_config["distributed"]
+            events.append("configure")
+
+    loader_module.RunaiModelStreamerLoader = StreamerLoader
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.model_loader.runai_streamer_loader",
+        loader_module,
+    )
+    weight_utils.runai_safetensors_weights_iterator = iterator
+
+    def windowed(files, windows, *, is_distributed):
+        assert windows == [["weight"]]
+        yield from iterator(files, False, is_distributed)
+        paths[-1] = "windowed"
+
+    import modelexpress_rl.inference.engines.vllm.installer as installer_module
+
+    monkeypatch.setattr(installer_module, "windowed_weights", windowed)
+    monkeypatch.setattr(
+        installer_module,
+        "layer_windows",
+        lambda names, size: [sorted(names)] if size == 2 else pytest.fail("size"),
+    )
+    model = nn.Module()
+    model.register_parameter(
+        "weight", nn.Parameter(torch.zeros(2), requires_grad=False)
+    )
+    address = model.weight.data_ptr()
+
+    def load(weights):
+        for name, tensor in weights:
+            events.append("load")
+            model.weight.data.copy_(tensor)
+
+    model.load_weights = load
+    stream = StreamedCheckpoint(
+        version=_S3Version(
+            "v2",
+            None,
+            WeightPayloadFormat.FULL_HF_CHECKPOINT,
+            "s3://bucket/v2/model.safetensors.index.json",
+        ),
+        index_data=b"{}",
+        weight_map={"weight": "model.safetensors"},
+        tensor_metadata={"weight": {"dtype": "F32", "shape": [2], "byte_size": 8}},
+        store=Mock(),
+    )
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=SimpleNamespace(
+            load_config=SimpleNamespace(
+                use_tqdm_on_load=False,
+                model_loader_extra_config={"memory_limit": 123, "concurrency": 7},
+            ),
+            parallel_config=SimpleNamespace(tensor_parallel_size=4),
+        ),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    from pathlib import Path
+
+    installer.install(
+        PreparedCheckpointArtifact(
+            PreparedCheckpoint("v2", Path("/unused"), {}, streaming=stream)
+        )
+    )
+    assert events == [
+        "configure",
+        "initialize",
+        "stream",
+        "load",
+        "close",
+        "finalize",
+        "sync",
+    ]
+    assert installer._vllm_config.load_config.model_loader_extra_config == {
+        "memory_limit": 123,
+        "concurrency": 7,
+    }
+    assert model.weight.data_ptr() == address
+    assert torch.equal(model.weight, torch.tensor([7.0, 8.0]))
+    assert stream._writer is None
+    assert stream._complete
+    assert paths == ["vllm" if window_layers == "0" else "windowed"]
