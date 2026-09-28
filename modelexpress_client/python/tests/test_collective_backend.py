@@ -415,7 +415,10 @@ class TestOpOrdering:
         ] == [
             ["prior-run-scratch", "buf::a"],
             ["prior-run-scratch"],
-            ["prior-run-scratch"],
+            # Settlement iterates the scratch lane first and drops its context
+            # from tracking as soon as it is quarantined (the settle pass is
+            # idempotent), so the live lane's failing sync observes it gone.
+            [],
         ]
         assert transition_snapshots[1].fences == {id(live): barrier}
         assert transition_snapshots[2].fences == {id(live): barrier}
