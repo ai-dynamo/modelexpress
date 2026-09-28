@@ -216,6 +216,10 @@ class _RefitClientBase:
         # never uses either.
         self._outstanding: deque[int] = deque()
         self._inflight = 1
+        # The first failure of the current round, if one poisoned it. A later
+        # finish_weight_update re-raises it instead of masking it with errors
+        # from the already-aborted backend state.
+        self._round_error: BaseException | None = None
 
     @property
     def membership(self) -> Membership:
@@ -566,10 +570,17 @@ class _RefitClientBase:
         raise AssertionError("collective formation loop exhausted")  # pragma: no cover
 
     def cleanup(self) -> None:
-        if self._membership is not None:
+        if self._half is not None:
+            # abort settles retained async work before the communicator group
+            # is torn down; a loader install failure never reaches the
+            # backend's own failure settlement.
+            self._half.abort()
+        elif self._membership is not None:
             self._cache.abort_group(self._membership.group_id)
         self._membership = None
         self._half = None
+        self._outstanding.clear()
+        self._round_error = None
         self._round_started = False
         self._version = None
 
@@ -745,6 +756,7 @@ class RefitClientGenerator(_RefitClientBase):
                 "already carry the next group's transfers"
             )
         self._outstanding.clear()
+        self._round_error = None
         self._loader.start_new_round(version)
         self._half.start_weight_update(version)
         self._round_started = True
@@ -765,16 +777,30 @@ class RefitClientGenerator(_RefitClientBase):
         half = self._require_round(version, "update_weights")
         if self._loader is None:
             raise RuntimeError("initialize must run before update_weights")
-        half.update_weights(layer_group_id)
-        self._outstanding.append(layer_group_id)
-        if len(self._outstanding) >= self._inflight:
-            self._install_oldest_outstanding(half)
+        if self._round_error is not None:
+            raise RuntimeError(
+                f"round {self._version!r} already failed; start a new round"
+            ) from self._round_error
+        try:
+            half.update_weights(layer_group_id)
+            self._outstanding.append(layer_group_id)
+            if len(self._outstanding) >= self._inflight:
+                self._install_oldest_outstanding(half, caller="update_weights")
+        except BaseException as error:
+            # The backend settled and aborted internally; drop the deque and
+            # poison the round so a later finish_weight_update re-raises this
+            # original failure instead of masking it with stale-group errors.
+            self._outstanding.clear()
+            self._round_error = error
+            raise
 
-    def _install_oldest_outstanding(self, half: NcclM2nReceiver) -> None:
+    def _install_oldest_outstanding(
+        self, half: NcclM2nReceiver, *, caller: str
+    ) -> None:
         layer_group_id = self._outstanding.popleft()
         half.await_group(layer_group_id)
         if self._loader is None:
-            raise RuntimeError("initialize must run before update_weights")
+            raise RuntimeError(f"initialize must run before {caller}")
         self._loader.install(layer_group_id)
 
     def finish_weight_update(
@@ -784,12 +810,19 @@ class RefitClientGenerator(_RefitClientBase):
         if self._loader is None:
             raise RuntimeError("initialize must run before finish_weight_update")
         try:
+            if self._round_error is not None:
+                # An earlier update_weights poisoned the round; re-raise that
+                # original failure through the abort/report path rather than
+                # masking it with errors from the already-aborted backend.
+                raise self._round_error
             # Install every still-outstanding group before the backend drains
             # the lanes for the misc broadcast: Loader.finish requires every
             # group installed, and the drain must follow the last install's
             # reads of the receive buffers.
             while self._outstanding:
-                self._install_oldest_outstanding(half)
+                self._install_oldest_outstanding(
+                    half, caller="finish_weight_update"
+                )
             half.finish_weight_update(self.membership.broadcast_lane.lane_id)
             self._loader.finish()
         except Exception as error:
@@ -806,6 +839,7 @@ class RefitClientGenerator(_RefitClientBase):
             raise
         finally:
             self._outstanding.clear()
+            self._round_error = None
             self._round_started = False
             self._version = None
         self._report(operation_id, succeeded=True)
