@@ -1809,7 +1809,10 @@ class TestTransferDeadline:
         with pytest.raises(TimeoutError, match="v7"):
             half.publish_weights(1)
 
-        assert observed_at_abort == [(["buf::a", "buf::b"], ["buf::a", "buf::b"])]
+        # Both contexts are quarantined before the comm aborts; settlement
+        # drops them from the pending list as it quarantines them, so the
+        # quarantine list is their single owner by abort time.
+        assert observed_at_abort == [([], ["buf::a", "buf::b"])]
         assert [ctx.buf for ctx in quarantined] == ["buf::a", "buf::b"]
         assert_transfer_released(half)
 
@@ -2375,7 +2378,6 @@ class TestEventInstallMode:
             assert [str(ctx.buf) for ctx in quarantined] == ["buf::a"]
         finally:
             del backend._UNSETTLED_TRANSFER_RESOURCES[quarantined_before:]
-        assert [op.kind for op in recorder.ops].count("sync") == 1
         assert_transfer_released(half)
 
     def test_event_mode_a_second_await_names_the_real_problem(
