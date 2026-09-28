@@ -115,6 +115,12 @@ def _maybe_mock_vllm():
             self.model_config = vllm_config.model_config
             self.device = device
             self.model = model
+            self._default_model = model
+            self._default_model_config = self.model_config
+
+        def reset_weight_update_target(self):
+            self.model = self._default_model
+            self.model_config = self._default_model_config
 
         def update_weights(self, update_info):
             self.receive_weights(self.update_info_cls(**update_info))
