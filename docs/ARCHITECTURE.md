@@ -610,7 +610,14 @@ Without `enforce_eager`, peer refits retain the existing direct-copy behavior
 and do not run this host-scale refresh. Updating host mirrors alone cannot
 update scalar values already captured in CUDA graphs; graph-scale refresh and
 recapture remain outside this eager-mode fix.
-Cold RDMA loading retains its requirement that attention caches be uninitialized.
+Cold RDMA loading requires lazily populated attention caches to be uninitialized.
+Q/K/V-only attention paths, including MiniMax-M3 sparse attention, do not need an
+`_o_scale_float` field; that field is specific to output quantization. DeepSeek
+V4/V4.1 FlashInfer instead recomputes its constructor-initialized BMM scalars from
+the received custom Q/KV scale buffers. Its GPU scale buffers stay unchanged.
+Recognized DeepSeek packed KV attention (`fp8_ds_mla` / `nvfp4_ds_mla`) carries
+per-block scales in the cache format and needs no standard host mirrors. Unknown
+FP8 attention without a recognized scale contract still fails loading.
 
 An object-storage generator with full-tensor engine support defaults to a
 same-rank generator peer first and the version-level object-storage source
