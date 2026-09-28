@@ -3,12 +3,14 @@
 
 """Tests for the worker-local SGLang collective plugin."""
 
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from modelexpress_rl.collective import envs
 from modelexpress_rl.collective.integrations import sglang_plugin
 from modelexpress_rl.collective.integrations import sglang as sglang_integration
 from modelexpress_rl.collective.integrations.miles import CollectiveTopology
@@ -41,6 +43,56 @@ def _plan() -> ReshardPlan:
         ],
         source_partition_count=2,
     )
+
+
+def _bulk_plan(entries: list[tuple[str, tuple[int, ...], str]]) -> ReshardPlan:
+    """Multi-entry bulk plan; dim 0 of every shape must be divisible by 6."""
+    return ReshardPlan(
+        bulk=[
+            ParamPlan(
+                name=name,
+                global_shape=shape,
+                dtype=dtype,
+                partition_id=0,
+                src_mesh=MeshSpec((1,)),
+                src_placements=(Placement.shard(0),),
+                dst_mesh=MeshSpec((6,), rank_offset=1),
+                dst_placements=(Placement.shard(0),),
+            )
+            for name, shape, dtype in entries
+        ],
+        source_partition_count=2,
+    )
+
+
+def _captured_prepare(monkeypatch, plan: ReshardPlan):
+    """Run _prepare with a mocked session and return its captured kwargs."""
+    captured = {}
+
+    class Session:
+        def prepare(self):
+            pass
+
+        def close(self):
+            pass
+
+    def create_session(**kwargs):
+        captured.update(kwargs)
+        return Session()
+
+    channels, _rendezvous = _patch_runtime(monkeypatch, create_session)
+    manager = _slotted_manager()
+    result = sglang_plugin._prepare(
+        manager,
+        CollectiveControl(
+            action="prepare",
+            plan=plan,
+            topology=_topology(),
+            generator_slot_offset=0,
+            endpoint="mx:50051",
+        ),
+    )
+    return result, captured, channels, manager
 
 
 def _topology(*, slot_prefix: str = "") -> CollectiveTopology:
@@ -1035,3 +1087,160 @@ def test_close_is_allowed_after_the_weight_update_session_ends(monkeypatch):
     assert sessions[0].closed
     assert rendezvous[0].closed
     assert channels[0].closed
+
+
+def test_prepare_group_bytes_zero_keeps_one_group_per_bulk_entry(monkeypatch):
+    monkeypatch.setenv("MX_NCCL_REFIT_GROUP_BYTES", "0")
+    plan = _bulk_plan(
+        [
+            ("model.layers.0.weight", (6, 4), "bfloat16"),
+            ("model.layers.1.weight", (12, 4), "bfloat16"),
+            ("model.layers.2.weight", (6, 2), "bfloat16"),
+        ]
+    )
+
+    result, captured, _channels, manager = _captured_prepare(monkeypatch, plan)
+
+    assert result.success
+    assert captured["layer_groups"] == tuple((entry.name,) for entry in plan.bulk)
+    assert captured["layer_groups"] == (
+        ("model.layers.0.weight",),
+        ("model.layers.1.weight",),
+        ("model.layers.2.weight",),
+    )
+    sglang_plugin._close(manager)
+
+
+def test_prepare_group_bytes_packs_consecutive_entries_within_target(monkeypatch):
+    # bf16 sizes: (6, 4) -> 48 B, (12, 4) -> 96 B, (6, 2) -> 24 B.
+    monkeypatch.setenv("MX_NCCL_REFIT_GROUP_BYTES", "96")
+    plan = _bulk_plan(
+        [
+            ("a", (6, 4), "bfloat16"),
+            ("b", (6, 4), "bfloat16"),
+            ("c", (12, 4), "bfloat16"),
+            ("d", (6, 2), "bfloat16"),
+            ("e", (6, 2), "bfloat16"),
+        ]
+    )
+
+    result, captured, _channels, manager = _captured_prepare(monkeypatch, plan)
+
+    assert result.success
+    groups = captured["layer_groups"]
+    assert groups == (("a", "b"), ("c",), ("d", "e"))
+    # Plan order is preserved and every entry is covered exactly once.
+    assert [name for group in groups for name in group] == [
+        entry.name for entry in plan.bulk
+    ]
+    # No group exceeds the byte target (this plan has no oversize entry).
+    bytes_by_name = {
+        entry.name: math.prod(entry.global_shape) * 2 for entry in plan.bulk
+    }
+    for group in groups:
+        assert sum(bytes_by_name[name] for name in group) <= 96
+    sglang_plugin._close(manager)
+
+
+def test_prepare_group_bytes_gives_an_oversize_entry_its_own_group(monkeypatch):
+    # bf16 sizes: (6, 2) -> 24 B, (12, 8) -> 192 B, oversize for a 48 B target.
+    monkeypatch.setenv("MX_NCCL_REFIT_GROUP_BYTES", "48")
+    plan = _bulk_plan(
+        [
+            ("a", (6, 2), "bfloat16"),
+            ("big", (12, 8), "bfloat16"),
+            ("c", (6, 2), "bfloat16"),
+        ]
+    )
+
+    result, captured, _channels, manager = _captured_prepare(monkeypatch, plan)
+
+    assert result.success
+    assert captured["layer_groups"] == (("a",), ("big",), ("c",))
+    sglang_plugin._close(manager)
+
+
+def test_prepare_group_bytes_rejects_unknown_dtype_before_connecting(monkeypatch):
+    monkeypatch.setenv("MX_NCCL_REFIT_GROUP_BYTES", "1024")
+    plan = _bulk_plan([("bad", (6, 4), "complex64")])
+    captured = {}
+
+    class Session:
+        def prepare(self):
+            pass
+
+        def close(self):
+            pass
+
+    def create_session(**kwargs):
+        captured.update(kwargs)
+        return Session()
+
+    channels, rendezvous = _patch_runtime(monkeypatch, create_session)
+
+    with pytest.raises(ValueError, match=r"bad.*unknown dtype.*complex64"):
+        sglang_plugin._prepare(
+            _slotted_manager(),
+            CollectiveControl(
+                action="prepare",
+                plan=plan,
+                topology=_topology(),
+                generator_slot_offset=0,
+                endpoint="mx:50051",
+            ),
+        )
+
+    # The failure happens before any channel, rendezvous or session exists.
+    assert channels == []
+    assert rendezvous == []
+    assert captured == {}
+
+
+def test_entry_bytes_sizes_the_dtypes_plans_carry():
+    cases = [
+        ("bfloat16", 2),
+        ("float16", 2),
+        ("float32", 4),
+        ("float8_e4m3fn", 1),
+        ("int32", 4),
+        ("int64", 8),
+        ("uint8", 1),
+    ]
+    for dtype, size in cases:
+        entry = ParamPlan(
+            name=f"p-{dtype}",
+            global_shape=(6, 4),
+            dtype=dtype,
+            partition_id=0,
+            src_mesh=MeshSpec((1,)),
+            src_placements=(Placement.shard(0),),
+            dst_mesh=MeshSpec((6,), rank_offset=1),
+            dst_placements=(Placement.shard(0),),
+        )
+        assert sglang_plugin._entry_bytes(entry) == 24 * size
+
+
+def test_plan_layer_groups_is_deterministic_and_covers_the_plan(monkeypatch):
+    monkeypatch.setenv("MX_NCCL_REFIT_GROUP_BYTES", "96")
+    plan = _bulk_plan(
+        [
+            ("a", (6, 4), "bfloat16"),
+            ("b", (6, 4), "bfloat16"),
+            ("c", (12, 4), "bfloat16"),
+            ("d", (6, 2), "bfloat16"),
+            ("e", (6, 2), "bfloat16"),
+        ]
+    )
+
+    first = sglang_plugin._plan_layer_groups(
+        list(plan.bulk), envs.MX_NCCL_REFIT_GROUP_BYTES
+    )
+    second = sglang_plugin._plan_layer_groups(
+        list(plan.bulk), envs.MX_NCCL_REFIT_GROUP_BYTES
+    )
+
+    assert first == second
+    assert [name for group in first for name in group] == [
+        entry.name for entry in plan.bulk
+    ]
+    assert len({name for group in first for name in group}) == len(plan.bulk)

@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from threading import Lock
@@ -18,7 +20,8 @@ from modelexpress import auth
 
 from .. import envs
 from ..rendezvous import CollectiveRendezvous
-from ._common import _endpoint, _local_shape
+from ..types import ParamPlan
+from ._common import _dtype_label, _endpoint, _local_shape
 from .sglang import SglangGeneratorSession, SglangLoader, SglangParameterBinding
 from .wire import CollectiveControl, decode_control
 
@@ -356,6 +359,76 @@ def _torch_dtype(torch: Any, dtype: str):
         raise ValueError(f"unsupported PR 3304 destination dtype {dtype!r}") from error
 
 
+# Element sizes for the dtypes a collective plan may carry. Anything absent is
+# rejected rather than guessed: a wrong size silently mis-groups the transfer.
+_DTYPE_BYTES = {
+    "bfloat16": 2,
+    "bool": 1,
+    "float8_e4m3fn": 1,
+    "float8_e5m2": 1,
+    "float16": 2,
+    "float32": 4,
+    "float64": 8,
+    "int8": 1,
+    "int16": 2,
+    "int32": 4,
+    "int64": 8,
+    "uint8": 1,
+}
+
+
+def _entry_bytes(entry: ParamPlan) -> int:
+    """Global byte size of one bulk entry, from its declared shape and dtype.
+
+    Sized from the plan's global geometry, never from rank-local placements,
+    so every rank derives the same size for the same plan.
+    """
+    dtype = _dtype_label(entry.dtype).lower()
+    try:
+        dtype_size = _DTYPE_BYTES[dtype]
+    except KeyError:
+        raise ValueError(
+            f"{entry.name}: cannot size layer groups for unknown dtype "
+            f"{entry.dtype!r}"
+        ) from None
+    return math.prod(entry.global_shape) * dtype_size
+
+
+def _plan_layer_groups(
+    bulk: Sequence[ParamPlan],
+    group_bytes: int,
+) -> tuple[tuple[str, ...], ...]:
+    """Chunk plan-order bulk entries into layer groups of about ``group_bytes``.
+
+    Grouping is purely a scheduling decision: every group still transfers and
+    installs the same tensors in the same plan order, so the wire sequence is
+    identical for any ``group_bytes`` and the result is deterministic on every
+    rank. A zero ``group_bytes`` disables chunking and reproduces the
+    historical one group per entry. Otherwise consecutive entries are greedily
+    packed into the largest group whose summed bytes do not exceed the target.
+    An entry is never split, so one larger than the target forms its own
+    group. The result covers every bulk entry exactly once, in plan order.
+    """
+    if group_bytes < 0:
+        raise ValueError(f"group_bytes must be non-negative, got {group_bytes}")
+    if group_bytes == 0:
+        return tuple((entry.name,) for entry in bulk)
+    groups: list[tuple[str, ...]] = []
+    current: list[str] = []
+    current_bytes = 0
+    for entry in bulk:
+        entry_bytes = _entry_bytes(entry)
+        if current and current_bytes + entry_bytes > group_bytes:
+            groups.append(tuple(current))
+            current = []
+            current_bytes = 0
+        current.append(entry.name)
+        current_bytes += entry_bytes
+    if current:
+        groups.append(tuple(current))
+    return tuple(groups)
+
+
 def _output(success: bool, message: str):
     from sglang.srt.managers.io_struct import UpdateWeightsFromDistributedReqOutput
 
@@ -404,7 +477,10 @@ def _prepare(manager: Any, control: CollectiveControl):
     rendezvous = None
     session = None
     try:
-        layer_groups = tuple((entry.name,) for entry in control.plan.bulk)
+        layer_groups = _plan_layer_groups(
+            control.plan.bulk,
+            envs.MX_NCCL_REFIT_GROUP_BYTES,
+        )
         loader = SglangLoader(
             plan=control.plan,
             bindings=bindings,
