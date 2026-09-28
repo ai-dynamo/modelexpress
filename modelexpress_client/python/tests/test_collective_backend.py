@@ -16,6 +16,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from modelexpress_rl.collective import backend
+from modelexpress_rl.collective import envs
 from modelexpress_rl.collective import (
     CommunicatorCache,
     LaneCommunicator,
@@ -2044,3 +2045,259 @@ class TestNcclVersionFloor:
             assert backend.loaded_nccl_version() == (2, 30, 7)
         finally:
             backend.loaded_nccl_version.cache_clear()
+
+
+class TestEventInstallMode:
+    """Event install mode: per-group completion instead of round-wide drains.
+
+    The CPU doubles here cannot carry a real CUDA event, so record_event
+    returns None and await_group falls back to a bounded synchronize of only
+    the group's own lanes. That fallback still proves the scheduling contract:
+    no host wait happens at issue time, and a wait never covers a lane outside
+    the group being installed.
+    """
+
+    def test_update_weights_records_events_and_defers_the_wait(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        plan = ReshardPlan(
+            bulk=[entry("a"), entry("b")], misc=[MiscParam("m", (4,), "bfloat16")]
+        )
+        half, _ = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
+        half.setup_layer_groups([["a"], ["b"]])
+
+        half.start_weight_update("v1")
+        half.update_weights(0)
+        # No host wait at issue time, and the group's retained contexts moved
+        # out of the pending list into the group's bucket.
+        assert [op.kind for op in recorder.ops] == ["reshard"]
+        assert set(half._group_events) == {0}
+        assert half._pending_contexts == []
+        assert [
+            ctx.buf for _, _, covered in half._group_events[0] for ctx in covered
+        ] == ["buf::a"]
+
+        # The next group issues without waiting on the first: that overlap is
+        # the whole point of the mode.
+        half.update_weights(1)
+        assert [op.kind for op in recorder.ops] == ["reshard", "reshard"]
+
+        half.await_group(0)
+        assert [op.kind for op in recorder.ops] == ["reshard", "reshard", "sync"]
+        assert set(half._group_events) == {1}
+        half.await_group(1)
+        assert [op.kind for op in recorder.ops].count("sync") == 2
+        assert not half._group_events
+        assert half._pending_contexts == []
+
+    def test_await_group_waits_only_the_groups_own_lanes(self, recorder, monkeypatch):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        plan = ReshardPlan(bulk=[entry("a", partition=0), entry("b", partition=1)])
+        half, _ = build(
+            recorder, plan=plan, half_cls=NcclM2nReceiver, partitions=2
+        )
+        half.setup_layer_groups([["a"], ["b"]])
+        half.start_weight_update("v1")
+        half.update_weights(0)
+        half.update_weights(1)
+        assert not [op for op in recorder.ops if op.kind == "sync"]
+
+        half.await_group(0)
+        assert [op.stream for op in recorder.ops if op.kind == "sync"] == [
+            "stream::lane0"
+        ]
+        half.await_group(1)
+        assert [op.stream for op in recorder.ops if op.kind == "sync"] == [
+            "stream::lane0",
+            "stream::lane1",
+        ]
+
+    def test_drain_mode_await_group_is_a_no_op(self, recorder):
+        half, _ = build(
+            recorder, plan=ReshardPlan(bulk=[entry("a")]), half_cls=NcclM2nReceiver
+        )
+        half.start_weight_update("v1")
+        half.update_weights(0)
+        assert [op.kind for op in recorder.ops] == ["reshard", "sync"]
+        half.await_group(0)
+        half.await_group(99)  # unknown groups are only an error in event mode
+        assert [op.kind for op in recorder.ops] == ["reshard", "sync"]
+        assert_transfer_released(half)
+
+    def test_event_mode_await_of_an_unissued_group_is_an_error(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        half, _ = build(
+            recorder, plan=ReshardPlan(bulk=[entry("a")]), half_cls=NcclM2nReceiver
+        )
+        half.start_weight_update("v1")
+        with pytest.raises(RuntimeError, match="no recorded completion events"):
+            half.await_group(0)
+        half.update_weights(0)
+        with pytest.raises(RuntimeError, match="no recorded completion events"):
+            half.await_group(1)
+
+    def test_event_mode_rejects_a_group_issued_twice_before_touching_the_wire(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        half, _ = build(
+            recorder, plan=ReshardPlan(bulk=[entry("a")]), half_cls=NcclM2nReceiver
+        )
+        half.start_weight_update("v1")
+        half.update_weights(0)
+        with pytest.raises(RuntimeError, match="already issued this round"):
+            half.update_weights(0)
+        # A clean refusal: the duplicate never reached the wire and the round
+        # is still usable.
+        assert [op.kind for op in recorder.ops] == ["reshard"]
+        assert set(half._group_events) == {0}
+        half.await_group(0)
+
+    def test_event_mode_finish_still_drains_before_the_misc_broadcast(
+        self, recorder, monkeypatch
+    ):
+        # The overlapping-communicator invariant does not relax in event mode:
+        # the all-ranks misc lane is entered only after every reshard lane is
+        # host-drained, including groups whose await never ran.
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        plan = ReshardPlan(
+            bulk=[entry("a", partition=0), entry("b", partition=1)],
+            misc=[MiscParam("m", (4,), "bfloat16")],
+        )
+        half, _ = build(
+            recorder, plan=plan, half_cls=NcclM2nReceiver, partitions=2
+        )
+        half.setup_layer_groups([["a"], ["b"]])
+        half.start_weight_update("v1")
+        half.update_weights(0)
+        half.await_group(0)
+        half.update_weights(1)  # never awaited; finish must cover it
+
+        half.finish_weight_update(broadcast_lane_id=2)
+        assert [op.kind for op in recorder.ops] == [
+            "reshard",
+            "sync",
+            "reshard",
+            "sync",
+            "sync",
+            "broadcast",
+            "sync",
+        ]
+        assert not half._group_events
+        assert_transfer_released(half)
+
+    def test_event_mode_await_deadline_settles_and_aborts(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        monkeypatch.setattr(backend, "transfer_timeout", lambda: 0.2)
+        half, cache = build(
+            recorder, plan=ReshardPlan(bulk=[entry("a")]), half_cls=NcclM2nReceiver
+        )
+        lane0 = cache.get(LaneKey("g", 1, 0))
+        never = SimpleNamespace(query=lambda: False)
+        monkeypatch.setattr(lane0, "record_event", lambda: never)
+
+        half.start_weight_update("v1")
+        half.update_weights(0)
+        with pytest.raises(TimeoutError, match="v1"):
+            half.await_group(0)
+        # The deadline bought an attributable failure, and the settle path
+        # could synchronize the lane, so nothing is quarantined.
+        assert len(cache) == 0
+        assert_transfer_released(half)
+
+    def test_event_mode_settlement_quarantines_bucketed_contexts(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        half, cache = build(
+            recorder, plan=ReshardPlan(bulk=[entry("a")]), half_cls=NcclM2nReceiver
+        )
+        live = cache.get(LaneKey("g", 1, 0))
+        half.start_weight_update("v1")
+        half.update_weights(0)
+        assert half._pending_contexts == []
+        settlement_probe(half, live, fail_on={1, 2})
+
+        quarantined_before = len(backend._UNSETTLED_TRANSFER_RESOURCES)
+        try:
+            with pytest.raises(RuntimeError, match="lane cannot settle"):
+                half.await_group(0)
+            # The first synchronize fails inside await's bounded wait and the
+            # second inside settlement, so the bucketed context is retained
+            # for process lifetime rather than released under live device work.
+            quarantined = backend._UNSETTLED_TRANSFER_RESOURCES[
+                quarantined_before:
+            ]
+            assert [str(ctx.buf) for ctx in quarantined] == ["buf::a"]
+        finally:
+            del backend._UNSETTLED_TRANSFER_RESOURCES[quarantined_before:]
+        assert_transfer_released(half)
+
+    def test_a_mesh_transition_drain_releases_the_earlier_groups_bucket(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        plan = ReshardPlan(
+            bulk=[entry("a", src_shape=(2,)), entry("b", src_shape=(4,))]
+        )
+        half, _ = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
+        half.setup_layer_groups([["a"], ["b"]])
+        half.start_weight_update("v1")
+        half.update_weights(0)
+        assert [
+            ctx.buf for _, _, covered in half._group_events[0] for ctx in covered
+        ] == ["buf::a"]
+
+        # The ownership handoff fences and drains the lane mid-issue. That
+        # drain covers the earlier group's recorded event, so its bucket is
+        # released immediately rather than at await time.
+        half.update_weights(1)
+        assert [op.kind for op in recorder.ops] == [
+            "reshard",
+            "sync",
+            "broadcast",
+            "sync",
+            "reshard",
+        ]
+        assert half._group_events[0] == []
+        assert [
+            ctx.buf for _, _, covered in half._group_events[1] for ctx in covered
+        ] == ["buf::b"]
+
+        half.await_group(0)  # nothing left to wait on
+        assert [op.kind for op in recorder.ops].count("sync") == 2
+        half.await_group(1)
+        assert [op.kind for op in recorder.ops].count("sync") == 3
+        assert not half._group_events
+
+
+class TestInstallModeEnvs:
+    def test_defaults_preserve_the_serialized_schedule(self, monkeypatch):
+        for name in (
+            "MX_NCCL_REFIT_INSTALL_MODE",
+            "MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS",
+            "MX_NCCL_REFIT_GROUP_BYTES",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        assert envs.MX_NCCL_REFIT_INSTALL_MODE == "drain"
+        assert envs.MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS == 1
+        assert envs.MX_NCCL_REFIT_GROUP_BYTES == 0
+
+    def test_install_mode_is_a_closed_literal(self, monkeypatch):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "EVENT")
+        assert envs.MX_NCCL_REFIT_INSTALL_MODE == "event"
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "stream")
+        with pytest.raises(ValueError, match="MX_NCCL_REFIT_INSTALL_MODE"):
+            envs.MX_NCCL_REFIT_INSTALL_MODE
+
+    def test_group_bytes_accepts_zero_but_not_negative(self, monkeypatch):
+        monkeypatch.setenv("MX_NCCL_REFIT_GROUP_BYTES", "0")
+        assert envs.MX_NCCL_REFIT_GROUP_BYTES == 0
+        monkeypatch.setenv("MX_NCCL_REFIT_GROUP_BYTES", "-1")
+        with pytest.raises(ValueError, match="MX_NCCL_REFIT_GROUP_BYTES"):
+            envs.MX_NCCL_REFIT_GROUP_BYTES
