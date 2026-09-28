@@ -55,6 +55,18 @@ class FakeBuffer(str):
         return id(self)
 
 
+@pytest.fixture(autouse=True)
+def _clean_refit_knob_env(monkeypatch):
+    # The install-mode knobs are operator env vars; tests asserting default
+    # behavior must not depend on the ambient environment.
+    for name in (
+        "MX_NCCL_REFIT_INSTALL_MODE",
+        "MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS",
+        "MX_NCCL_REFIT_GROUP_BYTES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def recorder(monkeypatch):
     rec = Recorder()
