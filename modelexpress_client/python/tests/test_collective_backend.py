@@ -2093,7 +2093,10 @@ class TestEventInstallMode:
 
     def test_await_group_waits_only_the_groups_own_lanes(self, recorder, monkeypatch):
         monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
-        plan = ReshardPlan(bulk=[entry("a", partition=0), entry("b", partition=1)])
+        plan = ReshardPlan(
+            bulk=[entry("a", partition=0), entry("b", partition=1)],
+            source_partition_count=2,
+        )
         half, _ = build(
             recorder, plan=plan, half_cls=NcclM2nReceiver, partitions=2
         )
