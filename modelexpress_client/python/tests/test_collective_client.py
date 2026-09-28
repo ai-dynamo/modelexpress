@@ -1575,7 +1575,7 @@ class TestGeneratorPipelining:
         self._spy(engine, client._half, monkeypatch)
 
         def failing_install(layer_group_id):
-            if layer_group_id == 1:
+            if layer_group_id != 0:
                 raise RuntimeError("install exploded")
             engine.calls.append(("install", layer_group_id))
 
