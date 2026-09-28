@@ -1471,6 +1471,10 @@ class TestGeneratorPipelining:
     def test_the_default_window_installs_each_group_before_issuing_the_next(
         self, fake_nccl, monkeypatch
     ):
+        # Pin the defaults explicitly so the asserted legacy order does not
+        # depend on the ambient environment.
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "drain")
+        monkeypatch.setenv("MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS", "1")
         engine = FakeEngine(PLAN3)
         client = self._generator(engine)
         self._spy(engine, client._half, monkeypatch)
@@ -1527,6 +1531,7 @@ class TestGeneratorPipelining:
     def test_a_window_above_one_is_refused_outside_event_install_mode(
         self, fake_nccl, monkeypatch
     ):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "drain")
         monkeypatch.setenv("MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS", "2")
         engine = FakeEngine(PLAN3)
         client = self._generator(engine)
