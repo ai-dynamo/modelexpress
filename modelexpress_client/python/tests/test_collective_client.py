@@ -1413,3 +1413,189 @@ class TestCleanup:
             index_in_role=0,
         )
         client.cleanup()
+
+
+PLAN3 = ReshardPlan(
+    bulk=[entry("a"), entry("b"), entry("c")],
+    misc=[MiscParam("m", (4,), "bfloat16")],
+)
+
+
+class TestGeneratorPipelining:
+    """The in-flight window on the generator client: issue ahead of install.
+
+    The window is what lets the next group's reshards overlap the previous
+    group's install. These tests pin the exact call order the window
+    produces, because a reordering here is silent: every call still happens,
+    just serialized again.
+    """
+
+    def _generator(self, engine, rz=None):
+        client = RefitClientGenerator(
+            rendezvous=rz or FakeRendezvous(),
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=1,
+            slot_id="g0",
+            worker_id="w0",
+            index_in_role=0,
+        )
+        client.initialize(engine)
+        client.setup_layer_groups([["a"], ["b"], ["c"]])
+        client.compute_plan()
+        return client
+
+    def _spy(self, engine, half, monkeypatch):
+        update = half.update_weights
+        await_group = half.await_group
+        finish = half.finish_weight_update
+
+        def spy_update(layer_group_id):
+            engine.calls.append(("issue", layer_group_id))
+            update(layer_group_id)
+
+        def spy_await(layer_group_id):
+            engine.calls.append(("await", layer_group_id))
+            await_group(layer_group_id)
+
+        def spy_finish(broadcast_lane_id):
+            engine.calls.append(("drain", broadcast_lane_id))
+            finish(broadcast_lane_id)
+
+        monkeypatch.setattr(half, "update_weights", spy_update)
+        monkeypatch.setattr(half, "await_group", spy_await)
+        monkeypatch.setattr(half, "finish_weight_update", spy_finish)
+
+    def test_the_default_window_installs_each_group_before_issuing_the_next(
+        self, fake_nccl, monkeypatch
+    ):
+        engine = FakeEngine(PLAN3)
+        client = self._generator(engine)
+        self._spy(engine, client._half, monkeypatch)
+
+        client.start_weight_update("v1")
+        for layer_group_id in range(3):
+            client.update_weights("v1", layer_group_id)
+        client.finish_weight_update("v1")
+
+        assert engine.calls == [
+            ("start", "v1"),
+            ("issue", 0),
+            ("await", 0),
+            ("install", 0),
+            ("issue", 1),
+            ("await", 1),
+            ("install", 1),
+            ("issue", 2),
+            ("await", 2),
+            ("install", 2),
+            ("drain", 1),
+            ("finish",),
+        ]
+
+    def test_a_window_of_two_issues_the_next_group_before_installing_the_previous(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        monkeypatch.setenv("MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS", "2")
+        engine = FakeEngine(PLAN3)
+        client = self._generator(engine)
+        self._spy(engine, client._half, monkeypatch)
+
+        client.start_weight_update("v1")
+        for layer_group_id in range(3):
+            client.update_weights("v1", layer_group_id)
+        client.finish_weight_update("v1")
+
+        assert engine.calls == [
+            ("start", "v1"),
+            ("issue", 0),
+            ("issue", 1),
+            ("await", 0),
+            ("install", 0),
+            ("issue", 2),
+            ("await", 1),
+            ("install", 1),
+            ("await", 2),
+            ("install", 2),
+            ("drain", 1),
+            ("finish",),
+        ]
+
+    def test_a_window_above_one_is_refused_outside_event_install_mode(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS", "2")
+        engine = FakeEngine(PLAN3)
+        client = self._generator(engine)
+
+        with pytest.raises(ValueError, match="MX_NCCL_REFIT_INSTALL_MODE"):
+            client.start_weight_update("v1")
+
+        # The refusal precedes the round: the loader never sees it open.
+        assert ("start", "v1") not in engine.calls
+
+    def test_finish_installs_every_outstanding_group_before_the_backend_drains(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        monkeypatch.setenv("MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS", "4")
+        engine = FakeEngine(PLAN3)
+        client = self._generator(engine)
+        self._spy(engine, client._half, monkeypatch)
+
+        client.start_weight_update("v1")
+        for layer_group_id in range(3):
+            client.update_weights("v1", layer_group_id)
+
+        # The window never filled, so nothing was installed mid-round.
+        assert ("install", 0) not in engine.calls
+
+        client.finish_weight_update("v1")
+
+        assert engine.calls[-8:] == [
+            ("await", 0),
+            ("install", 0),
+            ("await", 1),
+            ("install", 1),
+            ("await", 2),
+            ("install", 2),
+            ("drain", 1),
+            ("finish",),
+        ]
+
+    def test_a_failed_install_does_not_leak_outstanding_groups_into_the_next_round(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        monkeypatch.setenv("MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS", "2")
+        engine = FakeEngine(PLAN3)
+        client = self._generator(engine)
+        self._spy(engine, client._half, monkeypatch)
+
+        def failing_install(layer_group_id):
+            if layer_group_id == 1:
+                raise RuntimeError("install exploded")
+            engine.calls.append(("install", layer_group_id))
+
+        monkeypatch.setattr(engine, "install", failing_install)
+
+        client.start_weight_update("v1")
+        client.update_weights("v1", 0)
+        client.update_weights("v1", 1)  # fills the window; install(0) succeeds
+        with pytest.raises(RuntimeError, match="install exploded"):
+            client.update_weights("v1", 2)  # triggers install(1)
+
+        # finish retries the outstanding tail, fails again, and still resets.
+        with pytest.raises(RuntimeError, match="install exploded"):
+            client.finish_weight_update("v1")
+        assert list(client._outstanding) == []
+        assert client._round_started is False
+
+        # The abort emptied the lane cache, so the group re-forms before the
+        # next round; that round's window starts empty, not holding v1's tail.
+        client.compute_plan()
+        client.start_weight_update("v2")
+        client.update_weights("v2", 0)
+        assert list(client._outstanding) == [0]
