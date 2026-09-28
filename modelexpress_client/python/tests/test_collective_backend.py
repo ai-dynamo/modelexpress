@@ -2279,6 +2279,117 @@ class TestEventInstallMode:
         assert [op.kind for op in recorder.ops].count("sync") == 3
         assert not half._group_events
 
+    def test_a_mid_record_failure_keeps_moved_contexts_visible_to_settlement(
+        self, recorder, monkeypatch
+    ):
+        # Recording a multi-lane group's events moves each lane's contexts out
+        # of _pending_contexts as it goes. If a later lane's record raises,
+        # the partially filled bucket must already be published, or settlement
+        # would drop the moved contexts while their lane's work is live.
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        plan = ReshardPlan(
+            bulk=[entry("a", partition=0), entry("b", partition=1)],
+            source_partition_count=2,
+        )
+        half, cache = build(
+            recorder, plan=plan, half_cls=NcclM2nReceiver, partitions=2
+        )
+        lane1 = cache.get(LaneKey("g", 1, 1))
+
+        def exploding_record():
+            raise KeyboardInterrupt("interrupted mid-record")
+
+        monkeypatch.setattr(lane1, "record_event", exploding_record)
+
+        observed = []
+        settle = half._settle_failed_transfer
+
+        def observing_settle():
+            observed.append(
+                {
+                    gid: [
+                        ctx.buf for _, _, covered in bucket for ctx in covered
+                    ]
+                    for gid, bucket in half._group_events.items()
+                }
+            )
+            settle()
+
+        monkeypatch.setattr(half, "_settle_failed_transfer", observing_settle)
+
+        half.start_weight_update("v1")
+        with pytest.raises(KeyboardInterrupt):
+            half.update_weights(0)
+        # Settlement first saw the moved contexts in the published bucket;
+        # abort's settle-first re-run found them already settled, and both
+        # lanes synchronized so nothing was quarantined or left tracked.
+        assert observed == [{0: ["buf::a"]}, {0: []}]
+        assert_transfer_released(half)
+        assert not half._group_events
+
+    def test_abort_settles_retained_buckets_before_tearing_down(
+        self, recorder, monkeypatch
+    ):
+        # Client teardown (a loader install failure, cleanup) reaches abort()
+        # without any backend failure having run; retained buckets must be
+        # settled there, not dropped under live device work.
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        half, _ = build(
+            recorder, plan=ReshardPlan(bulk=[entry("a")]), half_cls=NcclM2nReceiver
+        )
+        half.start_weight_update("v1")
+        half.update_weights(0)
+        assert set(half._group_events) == {0}
+        assert [op.kind for op in recorder.ops] == ["reshard"]
+
+        half.abort()
+        assert [op.kind for op in recorder.ops] == ["reshard", "sync"]
+        assert_transfer_released(half)
+        assert not half._group_events
+
+    def test_a_repeated_settle_does_not_quarantine_the_same_resources_twice(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        half, cache = build(
+            recorder, plan=ReshardPlan(bulk=[entry("a")]), half_cls=NcclM2nReceiver
+        )
+        live = cache.get(LaneKey("g", 1, 0))
+        half.start_weight_update("v1")
+        half.update_weights(0)
+        # Both synchronize attempts fail, so the bucketed context must be
+        # quarantined — once. The second settle finds the tracking structures
+        # already emptied by the first instead of re-quarantining.
+        settlement_probe(half, live, fail_on={1, 2})
+
+        quarantined_before = len(backend._UNSETTLED_TRANSFER_RESOURCES)
+        try:
+            half._settle_failed_transfer()
+            half._settle_failed_transfer()
+            quarantined = backend._UNSETTLED_TRANSFER_RESOURCES[
+                quarantined_before:
+            ]
+            assert [str(ctx.buf) for ctx in quarantined] == ["buf::a"]
+        finally:
+            del backend._UNSETTLED_TRANSFER_RESOURCES[quarantined_before:]
+        assert [op.kind for op in recorder.ops].count("sync") == 1
+        assert_transfer_released(half)
+
+    def test_event_mode_a_second_await_names_the_real_problem(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        half, _ = build(
+            recorder, plan=ReshardPlan(bulk=[entry("a")]), half_cls=NcclM2nReceiver
+        )
+        half.start_weight_update("v1")
+        half.update_weights(0)
+        half.await_group(0)
+        with pytest.raises(RuntimeError, match="already awaited"):
+            half.await_group(0)
+        with pytest.raises(RuntimeError, match="no recorded completion events"):
+            half.await_group(1)
+
 
 class TestInstallModeEnvs:
     def test_defaults_preserve_the_serialized_schedule(self, monkeypatch):
@@ -2305,3 +2416,8 @@ class TestInstallModeEnvs:
         monkeypatch.setenv("MX_NCCL_REFIT_GROUP_BYTES", "-1")
         with pytest.raises(ValueError, match="MX_NCCL_REFIT_GROUP_BYTES"):
             envs.MX_NCCL_REFIT_GROUP_BYTES
+
+    def test_install_mode_error_reports_the_raw_env_value(self, monkeypatch):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "Stream")
+        with pytest.raises(ValueError, match="'Stream'"):
+            envs.MX_NCCL_REFIT_INSTALL_MODE

@@ -17,6 +17,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 import modelexpress_rl.collective.client as collective_client
+from modelexpress_rl.collective import backend
 from modelexpress_rl.collective import (
     CommunicatorCache,
     LaneKey,
@@ -1587,7 +1588,9 @@ class TestGeneratorPipelining:
         with pytest.raises(RuntimeError, match="install exploded"):
             client.update_weights("v1", 2)  # triggers install(1)
 
-        # finish retries the outstanding tail, fails again, and still resets.
+        # finish re-raises the stored original failure through its abort and
+        # report path rather than retrying the tail against the aborted
+        # backend, and the round state still resets.
         with pytest.raises(RuntimeError, match="install exploded"):
             client.finish_weight_update("v1")
         assert list(client._outstanding) == []
@@ -1595,6 +1598,97 @@ class TestGeneratorPipelining:
 
         # The abort emptied the lane cache, so the group re-forms before the
         # next round; that round's window starts empty, not holding v1's tail.
+        client.compute_plan()
+        client.start_weight_update("v2")
+        client.update_weights("v2", 0)
+        assert list(client._outstanding) == [0]
+
+    def test_a_failed_install_settles_the_outstanding_buckets_on_abort(
+        self, fake_nccl, monkeypatch
+    ):
+        # A Loader.install failure never reaches the backend's own failure
+        # settlement; finish's abort must settle the issued-but-never-awaited
+        # buckets before the lanes are torn down, or their retained contexts
+        # could be freed under live device work.
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        monkeypatch.setenv("MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS", "2")
+        engine = FakeEngine(PLAN3)
+        client = self._generator(engine)
+        half = client._half
+
+        def failing_install(layer_group_id):
+            if layer_group_id != 0:
+                raise RuntimeError("install exploded")
+            engine.calls.append(("install", layer_group_id))
+
+        monkeypatch.setattr(engine, "install", failing_install)
+
+        observed = []
+        settle = half._settle_failed_transfer
+
+        def observing_settle():
+            observed.append(
+                [
+                    str(ctx.buf)
+                    for bucket in half._group_events.values()
+                    for _, _, covered in bucket
+                    for ctx in covered
+                ]
+            )
+            settle()
+
+        monkeypatch.setattr(half, "_settle_failed_transfer", observing_settle)
+        quarantined_before = len(backend._UNSETTLED_TRANSFER_RESOURCES)
+
+        client.start_weight_update("v1")
+        client.update_weights("v1", 0)
+        client.update_weights("v1", 1)  # fills the window; install(0) succeeds
+        with pytest.raises(RuntimeError, match="install exploded"):
+            client.update_weights("v1", 2)  # issues, then install(1) raises
+
+        with pytest.raises(RuntimeError, match="install exploded"):
+            client.finish_weight_update("v1")
+
+        # Group 2 was issued but never awaited when the loader failed; the
+        # abort inside finish settled its bucket first. The fake lanes
+        # synchronize cleanly, so nothing had to be quarantined.
+        assert observed == [["buf::c"]]
+        assert len(backend._UNSETTLED_TRANSFER_RESOURCES) == quarantined_before
+
+    def test_finish_reraises_the_original_failure_instead_of_stale_group_errors(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_INSTALL_MODE", "event")
+        monkeypatch.setenv("MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS", "2")
+        engine = FakeEngine(PLAN3)
+        client = self._generator(engine)
+        half = client._half
+        update = half.update_weights
+
+        def exploding_update(layer_group_id):
+            if layer_group_id == 2:
+                raise RuntimeError("issue exploded")
+            update(layer_group_id)
+
+        monkeypatch.setattr(half, "update_weights", exploding_update)
+
+        client.start_weight_update("v1")
+        client.update_weights("v1", 0)
+        client.update_weights("v1", 1)  # fills the window; install(0) succeeds
+        with pytest.raises(RuntimeError, match="issue exploded"):
+            client.update_weights("v1", 2)
+
+        # The poisoned round refuses further issues, and finish surfaces the
+        # original failure instead of a 'no recorded completion events' error
+        # from awaiting groups the aborted backend no longer tracks.
+        with pytest.raises(RuntimeError, match="already failed"):
+            client.update_weights("v1", 2)
+        with pytest.raises(RuntimeError, match="issue exploded"):
+            client.finish_weight_update("v1")
+        assert list(client._outstanding) == []
+        assert client._round_started is False
+
+        # Recovery still works: the next round starts clean.
         client.compute_plan()
         client.start_weight_update("v2")
         client.update_weights("v2", 0)
