@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import Any
@@ -210,6 +211,11 @@ class _RefitClientBase:
         self._round_started = False
         self._version: str | None = None
         self._bootstrap_poisoned: BaseException | None = None
+        # Generator-side pipelining state: groups issued but not yet installed,
+        # in issue order, and this round's in-flight window. The trainer half
+        # never uses either.
+        self._outstanding: deque[int] = deque()
+        self._inflight = 1
 
     @property
     def membership(self) -> Membership:
@@ -730,6 +736,15 @@ class RefitClientGenerator(_RefitClientBase):
             raise RuntimeError("compute_plan must run before start_weight_update")
         if self._loader is None:
             raise RuntimeError("initialize must run before start_weight_update")
+        self._inflight = envs.MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS
+        if self._inflight > 1 and envs.MX_NCCL_REFIT_INSTALL_MODE != "event":
+            raise ValueError(
+                "MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS > 1 requires "
+                "MX_NCCL_REFIT_INSTALL_MODE=event, so installs wait on their "
+                "own group's completion events rather than draining lanes that "
+                "already carry the next group's transfers"
+            )
+        self._outstanding.clear()
         self._loader.start_new_round(version)
         self._half.start_weight_update(version)
         self._round_started = True
@@ -738,10 +753,28 @@ class RefitClientGenerator(_RefitClientBase):
     def update_weights(
         self, version: str, layer_group_id: int = DEFAULT_LAYER_GROUP
     ) -> None:
+        """Issue one group, then keep the in-flight window within its bound.
+
+        With MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS above 1 (event install mode),
+        issuing group g returns before group g is installed: the oldest
+        outstanding group is awaited and installed once the window fills, so
+        the next group's reshards overlap the previous group's install. The
+        default window of 1 reproduces the historical issue-then-install
+        order exactly.
+        """
         half = self._require_round(version, "update_weights")
         if self._loader is None:
             raise RuntimeError("initialize must run before update_weights")
         half.update_weights(layer_group_id)
+        self._outstanding.append(layer_group_id)
+        if len(self._outstanding) >= self._inflight:
+            self._install_oldest_outstanding(half)
+
+    def _install_oldest_outstanding(self, half: NcclM2nReceiver) -> None:
+        layer_group_id = self._outstanding.popleft()
+        half.await_group(layer_group_id)
+        if self._loader is None:
+            raise RuntimeError("initialize must run before update_weights")
         self._loader.install(layer_group_id)
 
     def finish_weight_update(
@@ -751,6 +784,12 @@ class RefitClientGenerator(_RefitClientBase):
         if self._loader is None:
             raise RuntimeError("initialize must run before finish_weight_update")
         try:
+            # Install every still-outstanding group before the backend drains
+            # the lanes for the misc broadcast: Loader.finish requires every
+            # group installed, and the drain must follow the last install's
+            # reads of the receive buffers.
+            while self._outstanding:
+                self._install_oldest_outstanding(half)
             half.finish_weight_update(self.membership.broadcast_lane.lane_id)
             self._loader.finish()
         except Exception as error:
@@ -766,6 +805,7 @@ class RefitClientGenerator(_RefitClientBase):
                 )
             raise
         finally:
+            self._outstanding.clear()
             self._round_started = False
             self._version = None
         self._report(operation_id, succeeded=True)
