@@ -81,10 +81,11 @@ def _nonnegative_int(name: str, default: int) -> int:
 
 
 def _literal(name: str, default: str, allowed: frozenset[str]) -> str:
-    value = os.environ.get(name, default).strip().lower()
+    raw = os.environ.get(name, default)
+    value = raw.strip().lower()
     if value not in allowed:
         raise ValueError(
-            f"invalid {name}: {value!r} (expected one of {sorted(allowed)})"
+            f"invalid {name}: {raw!r} (expected one of {sorted(allowed)})"
         )
     return value
 
@@ -116,6 +117,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS": lambda: _int(
         "MX_NCCL_REFIT_MAX_INFLIGHT_GROUPS", 1
     ),
+    # Layer-group chunk target, sized by each entry's *global* tensor bytes
+    # (deterministic on every rank), not the per-rank shard an operator might
+    # expect from a memory knob.
     "MX_NCCL_REFIT_GROUP_BYTES": lambda: _nonnegative_int(
         "MX_NCCL_REFIT_GROUP_BYTES", 0
     ),

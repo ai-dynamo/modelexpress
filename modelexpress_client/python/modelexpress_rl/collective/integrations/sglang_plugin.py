@@ -401,9 +401,14 @@ def _plan_layer_groups(
     """Chunk plan-order bulk entries into layer groups of about ``group_bytes``.
 
     Grouping is purely a scheduling decision: every group still transfers and
-    installs the same tensors in the same plan order, so the wire sequence is
-    identical for any ``group_bytes`` and the result is deterministic on every
-    rank. A zero ``group_bytes`` disables chunking and reproduces the
+    installs the same tensors in the same plan order, and the result is
+    deterministic on every rank. The wire sequence is identical for any
+    ``group_bytes`` provided ``bulk`` arrives in canonical plan order — the
+    same assumption asymmetric grouping already makes, since
+    ``setup_layer_groups`` canonical-sorts within each group. Sizes are each
+    entry's *global* tensor bytes (``_entry_bytes``), not the per-rank shard,
+    so every rank derives the same grouping from the same plan. A zero
+    ``group_bytes`` disables chunking and reproduces the
     historical one group per entry. Otherwise consecutive entries are greedily
     packed into the largest group whose summed bytes do not exceed the target.
     An entry is never split, so one larger than the target forms its own
