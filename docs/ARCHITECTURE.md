@@ -616,8 +616,10 @@ Q/K/V-only attention paths, including MiniMax-M3 sparse attention, do not need a
 V4/V4.1 FlashInfer instead recomputes its constructor-initialized BMM scalars from
 the received custom Q/KV scale buffers. Its GPU scale buffers stay unchanged.
 Recognized DeepSeek packed KV attention (`fp8_ds_mla` / `nvfp4_ds_mla`) carries
-per-block scales in the cache format and needs no standard host mirrors. Unknown
-FP8 attention without a recognized scale contract still fails loading.
+per-block scales in the cache format and needs no standard host mirrors. Each
+`AttentionLayerBase` owner declaring FP8 KV cache must have a recognized scale
+contract, even when another layer was refreshed or uses a supported packed format.
+Container modules and `MambaBase` state-space layers are not attention scale owners.
 
 An object-storage generator with full-tensor engine support defaults to a
 same-rank generator peer first and the version-level object-storage source

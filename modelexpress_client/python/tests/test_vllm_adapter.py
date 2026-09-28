@@ -13,6 +13,9 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.mamba.abstract import MambaBase
+
 from modelexpress.engines.vllm.adapter import (
     DraftShardSelection,
     VllmAdapter,
@@ -458,6 +461,72 @@ def test_no_host_scale_bypass_for_unknown_or_incomplete_attention(
         )
 
 
+@pytest.mark.parametrize("known_kind", ["standard", "deepseek_flashinfer", "packed"])
+@pytest.mark.parametrize("unknown_first", [False, True])
+@pytest.mark.parametrize("allow_warm", [False, True])
+def test_known_attention_does_not_mask_unknown_fp8_owner(
+    mock_accelerator_backend_cls, known_kind, unknown_first, allow_warm,
+):
+    """Every FP8 owner needs a scale contract, regardless of other layers."""
+    if known_kind == "standard":
+        known = _AttentionWithStaleHostScales()
+    elif known_kind == "deepseek_flashinfer":
+        known = _DeepseekFlashInferScales(0.25, 0.5)
+    else:
+        layer_type = type("DeepseekV4Attention", (nn.Module,), {
+            "__module__": "vllm.models.deepseek_v4.attention",
+        })
+        known = layer_type()
+        known.kv_cache_dtype = "fp8_ds_mla"
+    unknown = _AttentionWithoutHostScales()
+    unknown.kv_cache_dtype = "fp8"
+    layers = [("known", known), ("unknown", unknown)]
+    model = nn.Module()
+    for name, layer in reversed(layers) if unknown_first else layers:
+        model.add_module(name, layer)
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype="fp8"),
+        model_config=SimpleNamespace(enforce_eager=True),
+    )
+
+    with pytest.raises(RuntimeError, match="Unrecognized FP8.*unknown"):
+        refresh_host_quantization_state(
+            model, config,
+            mock_accelerator_backend_cls(torch_device_type="cpu"),
+            allow_warm=allow_warm,
+        )
+
+
+@pytest.mark.parametrize("extra_kind", ["container", "state_space", "bf16_attention"])
+def test_host_scale_guard_ignores_non_fp8_attention_owners(
+    mock_accelerator_backend_cls, extra_kind,
+):
+    """A global FP8 setting does not make every module an FP8 attention owner."""
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    if extra_kind == "container":
+        model.extra = nn.Module()
+        model.extra.attn = _DeepseekFlashInferScales(0.25, 0.5)
+    elif extra_kind == "state_space":
+        layer_type = type("StateSpaceLayer", (nn.Module, MambaBase), {
+            "get_state_shape": lambda self: (),
+            "get_state_dtype": lambda self: (),
+            "mamba_type": None,
+        })
+        model.extra = layer_type()
+    else:
+        model.extra = _AttentionWithoutHostScales()
+    model.extra.kv_cache_dtype = "bfloat16" if extra_kind == "bf16_attention" else "fp8"
+    config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="fp8"))
+
+    refresh_host_quantization_state(
+        model, config,
+        mock_accelerator_backend_cls(torch_device_type="cpu"),
+    )
+
+    assert model.attn._k_scale_float == pytest.approx(0.5)
+
+
 def test_after_rdma_receive_refreshes_scales_after_model_finalizer(
     mock_accelerator_backend_cls,
 ):
@@ -825,6 +894,14 @@ class _AttentionWithStaleHostScales(torch.nn.Module):
             o_sf_scale=None,
         )
 
+
+
+class _AttentionWithoutHostScales(nn.Module, AttentionLayerBase):
+    def get_attn_backend(self):
+        return None
+
+    def get_kv_cache_spec(self, vllm_config):
+        raise AssertionError("KV cache sizing is not initialized during model loading")
 
 
 class _DeepseekFlashInferScales(torch.nn.Module):

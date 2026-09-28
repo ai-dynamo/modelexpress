@@ -37,6 +37,9 @@ def refresh_host_quantization_state(
     invalidate them for vLLM to recompute on the next forward; captured graph
     scalars cannot be updated this way.
     """
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+    from vllm.model_executor.layers.mamba.abstract import MambaBase
+
     model_config = getattr(vllm_config, "model_config", None)
     if allow_warm and not getattr(model_config, "enforce_eager", False):
         raise RuntimeError("Warm vLLM host-scale refresh requires enforce_eager")
@@ -69,7 +72,8 @@ def refresh_host_quantization_state(
     for module_name, module in model.named_modules():
         module_label = module_name or type(module).__name__
         kv_cache_dtype = getattr(module, "kv_cache_dtype", None)
-        if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
+        fp8_cache = isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8")
+        if fp8_cache:
             fp8_expected = True
 
         deepseek_device_names = (
@@ -115,6 +119,15 @@ def refresh_host_quantization_state(
                 for cls in type(module).__mro__
             ):
                 packed_attention_modules += 1
+            elif (
+                fp8_cache
+                and isinstance(module, AttentionLayerBase)
+                and not isinstance(module, MambaBase)
+            ):
+                raise RuntimeError(
+                    "Unrecognized FP8 vLLM attention scale contract on "
+                    f"{module_label}: {type(module).__name__}"
+                )
             continue
 
         missing_names = [
