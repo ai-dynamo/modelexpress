@@ -351,6 +351,15 @@ class _CollectiveHalf:
         self._deadline: float | None = None
         self._timeout_s: float | None = None
         self._version: str | None = None
+        self._install_mode = "drain"
+        # Event install mode: group id -> one (lane, event, covered contexts)
+        # entry per lane the group's transfer used. The contexts move out of
+        # _pending_contexts at record time and are released when the event is
+        # observed complete; stream order guarantees an event also covers every
+        # earlier group's work on that lane.
+        self._group_events: OrderedDict[
+            int, list[tuple[LaneCommunicator, Any, list[RefitCtx]]]
+        ] = OrderedDict()
 
     def setup_layer_groups(self, groupings: list[list[str]] | None) -> None:
         """Partition the bulk parameters into layer groups.
@@ -423,6 +432,8 @@ class _CollectiveHalf:
         """
         self._pending_misc = True
         self._previous_source_mesh_by_lane.clear()
+        self._group_events.clear()
+        self._install_mode = envs.MX_NCCL_REFIT_INSTALL_MODE
         self._version = version
         self._timeout_s = transfer_timeout()
         self._deadline = time.monotonic() + self._timeout_s
@@ -456,6 +467,7 @@ class _CollectiveHalf:
         self._cache.abort_group(self._group_id)
         self._active_lanes.clear()
         self._pending_contexts.clear()
+        self._group_events.clear()
         self._previous_source_mesh_by_lane.clear()
         self._fence_buffers.clear()
         self._pending_fence_buffers.clear()
@@ -500,6 +512,10 @@ class _CollectiveHalf:
         self._pending_contexts[:] = [
             (owner, ctx) for owner, ctx in self._pending_contexts if owner != lane_id
         ]
+        # A drained lane's stream is provably complete, which also covers every
+        # group event recorded on it; release those buckets' contexts too.
+        for recorded in self._group_events.values():
+            recorded[:] = [item for item in recorded if id(item[0]) != lane_id]
 
     def _fence_lane(self, lane: LaneCommunicator) -> None:
         lane_id = id(lane)
@@ -518,6 +534,83 @@ class _CollectiveHalf:
     def _drain_active_lanes(self) -> None:
         for lane in list(self._active_lanes.values()):
             self._drain_lane(lane)
+
+    def _record_group_events(self, layer_group_id: int) -> None:
+        """Record one completion event per lane this group's transfer used.
+
+        Event install mode's whole premise: stream order makes such an event
+        cover every reshard and hook the group enqueued on that lane, so the
+        install side can prove *this group's* receive buffers complete without
+        host-draining lanes that are already carrying the next group's work.
+        Contexts retained for the lane move into the group's bucket and are
+        released when the event is observed complete.
+        """
+        if layer_group_id in self._group_events:
+            raise RuntimeError(
+                f"layer group {layer_group_id} already has completion events "
+                "recorded; issue each group at most once per round"
+            )
+        recorded: list[tuple[LaneCommunicator, Any, list[RefitCtx]]] = []
+        partition_ids = sorted(
+            {entry.partition_id for entry in self.entries(layer_group_id)}
+        )
+        for partition_id in partition_ids:
+            lane = self._lane(partition_id)
+            event = lane.record_event()
+            lane_key = id(lane)
+            covered = [
+                ctx for owner, ctx in self._pending_contexts if owner == lane_key
+            ]
+            if covered:
+                self._pending_contexts[:] = [
+                    (owner, ctx)
+                    for owner, ctx in self._pending_contexts
+                    if owner != lane_key
+                ]
+            recorded.append((lane, event, covered))
+        self._group_events[layer_group_id] = recorded
+
+    def await_group(self, layer_group_id: int) -> None:
+        """Wait for one issued group's transfers, releasing what they retained.
+
+        Event install mode waits on the group's own lane events, bounded by
+        the round's transfer deadline; afterwards install may read or release
+        the group's receive buffers without a round-wide drain. Drain mode
+        already host-drained inside update_weights, so there is nothing to
+        wait on and this is a no-op.
+        """
+        recorded = self._group_events.get(layer_group_id)
+        if recorded is None:
+            if self._install_mode == "event":
+                raise RuntimeError(
+                    f"layer group {layer_group_id} has no recorded completion "
+                    "events; update_weights must issue it before install"
+                )
+            return
+        try:
+            for lane, event, _covered in recorded:
+                if event is None:
+                    # The lane's stream cannot carry an event (test double or
+                    # raw handle); the bounded lane synchronize is the fallback
+                    # bound, still scoped to this group's lanes rather than
+                    # every lane the round has touched.
+                    self._wait_lane(lane)
+                    continue
+                remaining = self._remaining()
+                try:
+                    lane.wait_event(
+                        event,
+                        timeout_s=None if remaining == math.inf else remaining,
+                    )
+                except TimeoutError:
+                    self._fail_deadline()
+        except BaseException:
+            self._settle_failed_transfer()
+            self.abort()
+            raise
+        # Only now do the bucket's retained contexts get released; on failure
+        # the entry stays so settlement can still see every async resource.
+        del self._group_events[layer_group_id]
 
     def _fence_source_mesh_transition(
         self, entry: ParamPlan, lane: LaneCommunicator
@@ -657,6 +750,10 @@ class _CollectiveHalf:
         contexts_by_lane: OrderedDict[int, list[RefitCtx]] = OrderedDict()
         for lane_id, ctx in self._pending_contexts:
             contexts_by_lane.setdefault(lane_id, []).append(ctx)
+        for recorded in self._group_events.values():
+            for lane, _event, covered in recorded:
+                if covered:
+                    contexts_by_lane.setdefault(id(lane), []).extend(covered)
 
         lane_ids = OrderedDict.fromkeys(
             [
@@ -724,6 +821,7 @@ class _CollectiveHalf:
             # work has completed, and do not report success for merely
             # enqueued work.
             self._drain_active_lanes()
+            self._group_events.clear()
             self._pending_misc = False
         except BaseException:
             self._settle_failed_transfer()
@@ -799,7 +897,15 @@ class NcclM2nSender(_CollectiveHalf):
 
 
 class NcclM2nReceiver(_CollectiveHalf):
-    """Generator half: supplies each parameter's destination to the collective."""
+    """Generator half: supplies each parameter's destination to the collective.
+
+    Completion discipline is a deployment choice (MX_NCCL_REFIT_INSTALL_MODE):
+    ``drain`` host-synchronizes every active lane inside update_weights, while
+    ``event`` records per-lane completion events and lets await_group bound
+    the wait to one group's own transfers, so issue can run ahead of install.
+    Both modes end the round with the same full drain before the misc
+    broadcast, and both settle retained async work identically on failure.
+    """
 
     def start_weight_update(self, version: str) -> None:
         self._begin_transfer(version)
@@ -817,6 +923,18 @@ class NcclM2nReceiver(_CollectiveHalf):
                 for entry in self.entries(layer_group_id)
             ]
         )
+        if self._install_mode == "event":
+            # Loader.install still runs after this method, but it now proves
+            # the group's own transfers complete (await_group) instead of
+            # draining every lane the round has touched, which lets the next
+            # group's reshards overlap this group's install.
+            try:
+                self._record_group_events(layer_group_id)
+            except BaseException:
+                self._settle_failed_transfer()
+                self.abort()
+                raise
+            return
         # Loader.install runs immediately after this method. It may read or
         # release receive buffers, so the group's transfers and post hooks must
         # be complete before returning.
