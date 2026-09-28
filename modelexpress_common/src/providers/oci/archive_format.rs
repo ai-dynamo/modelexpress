@@ -57,39 +57,29 @@ impl ArchiveFormat {
         Ok(None)
     }
 
-    pub fn extract_blob(self, blob_path: &Path, output_root: &Path) -> Result<Vec<String>> {
+    pub fn extract(
+        self,
+        blob_path: &Path,
+        output_root: &Path,
+        mode: ExtractionMode,
+    ) -> Result<Vec<String>> {
         let file = fs::File::open(blob_path)
             .with_context(|| format!("Failed to open OCI archive blob {blob_path:?}"))?;
         let reader = BufReader::new(file);
 
         match self {
-            Self::Tar => TarExtractor::new(output_root, ExtractionMode::Filtered).extract(reader),
+            Self::Tar => TarExtractor::new(output_root, mode).extract(reader),
             Self::TarZstd => {
                 let decoder = zstd::stream::read::Decoder::new(reader)
                     .with_context(|| format!("Failed to create zstd decoder for {blob_path:?}"))?;
-                TarExtractor::new(output_root, ExtractionMode::Filtered).extract(decoder)
-            }
-        }
-    }
-
-    pub fn extract_all_files(self, blob_path: &Path, output_root: &Path) -> Result<Vec<String>> {
-        let file = fs::File::open(blob_path)
-            .with_context(|| format!("Failed to open OCI archive blob {blob_path:?}"))?;
-        let reader = BufReader::new(file);
-
-        match self {
-            Self::Tar => TarExtractor::new(output_root, ExtractionMode::Exact).extract(reader),
-            Self::TarZstd => {
-                let decoder = zstd::stream::read::Decoder::new(reader)
-                    .with_context(|| format!("Failed to create zstd decoder for {blob_path:?}"))?;
-                TarExtractor::new(output_root, ExtractionMode::Exact).extract(decoder)
+                TarExtractor::new(output_root, mode).extract(decoder)
             }
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExtractionMode {
+pub enum ExtractionMode {
     Filtered,
     Exact,
 }
@@ -297,7 +287,7 @@ mod tests {
         let blob = write_blob(&dir, &tar);
 
         let files = ArchiveFormat::Tar
-            .extract_blob(&blob, &output)
+            .extract(&blob, &output, ExtractionMode::Filtered)
             .expect("extract archive");
 
         assert_eq!(files, vec!["program.0.gas".to_string()]);
@@ -320,7 +310,7 @@ mod tests {
         let blob = write_blob(&dir, &compressed);
 
         let files = ArchiveFormat::TarZstd
-            .extract_blob(&blob, &output)
+            .extract(&blob, &output, ExtractionMode::Filtered)
             .expect("extract archive");
 
         assert_eq!(files, vec!["config.json".to_string()]);
@@ -339,7 +329,7 @@ mod tests {
         let blob = write_blob(&dir, &tar);
 
         let err = ArchiveFormat::Tar
-            .extract_blob(&blob, &output)
+            .extract(&blob, &output, ExtractionMode::Filtered)
             .expect_err("unsafe archive path should fail");
 
         assert!(err.to_string().contains(".."));
@@ -356,7 +346,7 @@ mod tests {
         let blob = write_blob(&dir, &compressed);
 
         let files = ArchiveFormat::TarZstd
-            .extract_all_files(&blob, &output)
+            .extract(&blob, &output, ExtractionMode::Exact)
             .expect("complete archive should extract");
 
         assert_eq!(files, vec!["README.md", "program.0.gas"]);

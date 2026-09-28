@@ -273,12 +273,13 @@ spec:
                 description: Full model name (e.g., `meta-llama/Llama-3.1-70B`). Preserved in spec so operators can recover the original name even when the CR's metadata.name is a sanitized/hashed form.
                 type: string
               provider:
-                description: Provider string — `"HuggingFace"`, `"Ngc"`, `"Gcs"`, or `"S3"`.
+                description: 'Provider string: `"HuggingFace"`, `"Ngc"`, `"Gcs"`, `"S3"`, or `"Oci"`.'
                 enum:
                 - HuggingFace
                 - Ngc
                 - Gcs
                 - S3
+                - Oci
                 type: string
             required:
             - modelName

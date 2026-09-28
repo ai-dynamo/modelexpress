@@ -64,7 +64,10 @@ impl<'a> CacheWalker<'a> {
             return Ok(false);
         };
 
-        if CacheEntry::files_dir_is_non_empty(files_dir)? {
+        let entry = files_dir
+            .parent()
+            .context("OCI files directory has no parent")?;
+        if CacheEntry::existing_files_dir_at(entry)?.is_some() {
             self.models.push(ModelInfo {
                 provider: ModelProvider::Oci,
                 name,
@@ -88,7 +91,10 @@ impl<'a> CacheWalker<'a> {
         })?;
         let parts = Self::path_parts(relative)?;
 
-        if parts.len() != 5 || parts.last().is_none_or(|part| part != FILES_DIR_NAME) {
+        if parts.len() != 6
+            || parts.last().is_none_or(|part| part != FILES_DIR_NAME)
+            || !matches!(parts[4].as_str(), "full" | "metadata")
+        {
             return Ok(None);
         }
 
@@ -126,11 +132,11 @@ impl<'a> CacheWalker<'a> {
 impl ProviderCache for OciProviderCache {
     fn clear_model(&self, cache_root: &Path, model_name: &str) -> Result<()> {
         let reference = OciReference::parse(model_name)?;
-        let entry = CacheEntry::new(cache_root, &reference);
+        let entry = CacheEntry::path_for(cache_root, &reference);
 
-        if entry.path().exists() {
-            fs::remove_dir_all(entry.path())
-                .with_context(|| format!("Failed to remove OCI model cache {:?}", entry.path()))?;
+        if entry.exists() {
+            fs::remove_dir_all(&entry)
+                .with_context(|| format!("Failed to remove OCI model cache {:?}", entry))?;
             info!("Cleared OCI model: {model_name}");
         } else {
             warn!("OCI model '{model_name}' not found in cache");
@@ -146,11 +152,6 @@ impl ProviderCache for OciProviderCache {
         _revision: Option<&str>,
     ) -> Result<PathBuf> {
         let reference = OciReference::parse(model_name)?;
-        // This is a deterministic destination path, not an existing-cache check.
-        // In no-shared-storage mode the client streams files directly here, so an
-        // interrupted transfer can leave a non-empty partial directory. Keep this
-        // method as a provider-specific path mapper; direct OCI downloads still use
-        // staging plus rename before publishing a final cache entry.
         Ok(CacheEntry::new(cache_root, &reference).files_dir())
     }
 
@@ -182,7 +183,7 @@ mod tests {
         assert_eq!(
             path,
             dir.path()
-                .join("oci/registry.example.com/team%2Fmodel/tags/v1/files")
+                .join("oci/registry.example.com/team%2Fmodel/tags/v1/full/files")
         );
     }
 
@@ -191,10 +192,11 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let reference = OciReference::parse("registry.example.com/team/model:v1")
             .expect("reference should parse");
-        let entry = CacheEntry::path_for(dir.path(), &reference);
+        let entry = CacheEntry::new(dir.path(), &reference).path().to_path_buf();
         let files = entry.join(FILES_DIR_NAME);
         fs::create_dir_all(&files).expect("create files dir");
         fs::write(files.join("config.json"), b"{}").expect("write model file");
+        fs::write(entry.join("complete"), b"").expect("completion marker");
 
         let cache = OciProviderCache;
         let models = cache.list_models(dir.path()).expect("list models");
@@ -214,10 +216,11 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let reference = OciReference::parse("registry.example.com/team/files/model:v1")
             .expect("reference should parse");
-        let entry = CacheEntry::path_for(dir.path(), &reference);
+        let entry = CacheEntry::new(dir.path(), &reference).path().to_path_buf();
         let files = entry.join(FILES_DIR_NAME);
         fs::create_dir_all(&files).expect("create files dir");
         fs::write(files.join("config.json"), b"{}").expect("write model file");
+        fs::write(entry.join("complete"), b"").expect("completion marker");
 
         let models = OciProviderCache
             .list_models(dir.path())
@@ -233,10 +236,11 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let nested = OciReference::parse("registry.example.com/team/model/tags/dev/files/other:v1")
             .expect("nested reference should parse");
-        let nested_entry = CacheEntry::path_for(dir.path(), &nested);
+        let nested_entry = CacheEntry::new(dir.path(), &nested).path().to_path_buf();
         let nested_files = nested_entry.join(FILES_DIR_NAME);
         fs::create_dir_all(&nested_files).expect("create nested files dir");
         fs::write(nested_files.join("config.json"), b"{}").expect("write model file");
+        fs::write(nested_entry.join("complete"), b"").expect("completion marker");
 
         let alias = OciReference::parse("registry.example.com/team/model:dev")
             .expect("alias reference should parse");

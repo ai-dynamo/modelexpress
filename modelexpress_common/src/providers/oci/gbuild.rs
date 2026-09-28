@@ -4,7 +4,6 @@
 use super::layer_download::TITLE_ANNOTATION;
 use anyhow::{Context, Result};
 use oci_client::manifest::{OciDescriptor, OciImageManifest};
-use serde::Deserialize;
 use std::collections::HashSet;
 
 pub const ARTIFACT_MEDIA_TYPE: &str = "application/vnd.groq.gbuild.full-compile.v1";
@@ -21,7 +20,6 @@ pub(super) const PAYLOAD_FILE_NAME: &str = "payload.tar.zst";
 
 const OCI_EMPTY_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
 const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
-const RUNTIME_MANIFEST_REVISION: u8 = 2;
 
 pub fn is_gbuild_artifact(manifest: &OciImageManifest) -> bool {
     manifest.artifact_type.as_deref() == Some(ARTIFACT_MEDIA_TYPE)
@@ -118,57 +116,6 @@ fn validate_descriptor(descriptor: &OciDescriptor, description: &str) -> Result<
     Ok(())
 }
 
-pub(super) fn validate_runtime_manifest(manifest: &[u8], metadata_files: &[String]) -> Result<()> {
-    let header: RuntimeManifestHeader =
-        serde_json::from_slice(manifest).context("Failed to parse the GBuild runtime manifest")?;
-    if header.contract_revision != RUNTIME_MANIFEST_REVISION {
-        anyhow::bail!(
-            "GBuild runtime manifest revision {} is not supported; expected {RUNTIME_MANIFEST_REVISION}",
-            header.contract_revision
-        );
-    }
-    let preset_path = header
-        .build
-        .preset_snapshot_path
-        .context("GBuild runtime manifest does not name its preset snapshot")?;
-    let mut expected_files = vec![preset_path];
-    if let Some(lpu_sim) = header.artifacts.lpu_sim {
-        expected_files.push(lpu_sim.path);
-    }
-    expected_files.sort();
-
-    let mut actual_files = metadata_files.to_vec();
-    actual_files.sort();
-    if actual_files != expected_files {
-        anyhow::bail!(
-            "GBuild compile metadata files do not match Manifest V2: expected {expected_files:?}, found {actual_files:?}"
-        );
-    }
-    Ok(())
-}
-
-#[derive(Deserialize)]
-struct RuntimeManifestHeader {
-    contract_revision: u8,
-    build: RuntimeManifestBuild,
-    artifacts: RuntimeManifestArtifacts,
-}
-
-#[derive(Deserialize)]
-struct RuntimeManifestBuild {
-    preset_snapshot_path: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RuntimeManifestArtifacts {
-    lpu_sim: Option<RuntimeManifestPath>,
-}
-
-#[derive(Deserialize)]
-struct RuntimeManifestPath {
-    path: String,
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -233,34 +180,5 @@ mod tests {
         manifest.layers[0].media_type =
             "application/vnd.groq.gbuild.runtime-manifest.v1+json".to_string();
         assert!(validate_gbuild_manifest(&manifest).is_err());
-    }
-
-    #[test]
-    fn test_gbuild_artifact_accepts_runtime_manifest_revision_2() {
-        validate_runtime_manifest(
-            br#"{"contract_revision":2,"build":{"preset_snapshot_path":"llama-original.json"},"artifacts":{"lpu_sim":null}}"#,
-            &["llama-original.json".to_string()],
-        )
-        .expect("revision 2 and referenced metadata must be accepted");
-    }
-
-    #[test]
-    fn test_gbuild_artifact_rejects_other_runtime_manifest_revisions() {
-        for manifest in [
-            br#"{"contract_revision":1}"#.as_slice(),
-            br#"{"contract_revision":3}"#.as_slice(),
-            br#"{"contract_revision":true}"#.as_slice(),
-            br#"{"model":{}}"#.as_slice(),
-        ] {
-            assert!(validate_runtime_manifest(manifest, &[]).is_err());
-        }
-    }
-
-    #[test]
-    fn test_gbuild_artifact_rejects_unreferenced_compile_metadata() {
-        let manifest = br#"{"contract_revision":2,"build":{"preset_snapshot_path":"llama-original.json"},"artifacts":{"lpu_sim":null}}"#;
-        let metadata_files = vec!["compile.log".to_string(), "llama-original.json".to_string()];
-
-        assert!(validate_runtime_manifest(manifest, &metadata_files).is_err());
     }
 }

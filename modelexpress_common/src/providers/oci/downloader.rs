@@ -2,11 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
+    archive_format::ExtractionMode,
     cache_entry::StagingCacheEntry,
-    gbuild::{
-        COMPILE_METADATA_MEDIA_TYPE, is_gbuild_artifact, validate_gbuild_manifest,
-        validate_runtime_manifest,
-    },
+    gbuild::{is_gbuild_artifact, validate_gbuild_manifest},
     layer_download::{LayerDownload, LayerDownloadKind, LayerDownloads},
     path::ArtifactPath,
     reference::OciReference,
@@ -19,9 +17,13 @@ use oci_client::{
     manifest::{OciDescriptor, OciImageManifest, OciManifest},
     secrets::RegistryAuth,
 };
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tracing::info;
 
+#[cfg(test)]
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 
 pub struct Downloader<'a> {
@@ -41,7 +43,7 @@ impl<'a> Downloader<'a> {
 
     pub async fn download_to_staging(
         &self,
-        staging_entry: &StagingCacheEntry,
+        staging_entry: &Arc<StagingCacheEntry>,
         ignore_weights: bool,
     ) -> Result<()> {
         let staging_files = staging_entry.files_dir();
@@ -75,29 +77,13 @@ impl<'a> Downloader<'a> {
         }
 
         let downloads = LayerDownloads::from_layers(&manifest.layers, ignore_weights)?;
-        let compile_metadata_files = self
-            .download_layers(
-                staging_entry,
-                &staging_files,
-                downloads.as_slice(),
-                is_gbuild,
-            )
-            .await?;
-        if is_gbuild {
-            let runtime_manifest_path = staging_files.join(MANIFEST_FILE_NAME);
-            let runtime_manifest =
-                tokio::fs::read(&runtime_manifest_path)
-                    .await
-                    .with_context(|| {
-                        format!("Failed to read GBuild runtime manifest {runtime_manifest_path:?}")
-                    })?;
-            validate_runtime_manifest(&runtime_manifest, &compile_metadata_files)?;
+        let mode = if is_gbuild {
+            ExtractionMode::Exact
         } else {
-            self.download_manifest_json(&manifest, &staging_files)
-                .await?;
-        }
-
-        Ok(())
+            ExtractionMode::Filtered
+        };
+        self.download_layers(staging_entry, &staging_files, downloads.as_slice(), mode)
+            .await
     }
 
     async fn pull_image_manifest(&self, auth: &RegistryAuth) -> Result<OciImageManifest> {
@@ -109,40 +95,13 @@ impl<'a> Downloader<'a> {
         Self::image_manifest(manifest)
     }
 
-    async fn download_manifest_json(
-        &self,
-        manifest: &OciImageManifest,
-        staging_files: &Path,
-    ) -> Result<()> {
-        let output_path = staging_files.join(MANIFEST_FILE_NAME);
-        // The model artifact wins if it already provided manifest.json as a
-        // layer file or archive member; otherwise expose the OCI config blob as
-        // manifest.json so gbuild-produced models can carry model config there.
-        if tokio::fs::try_exists(&output_path)
-            .await
-            .with_context(|| format!("Failed to inspect OCI manifest.json {output_path:?}"))?
-        {
-            return Ok(());
-        }
-
-        self.pull_blob_to_file(&manifest.config, &output_path, "OCI manifest.json")
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to download OCI config blob {} as manifest.json",
-                    manifest.config.digest
-                )
-            })
-    }
-
     async fn download_layers(
         &self,
-        staging_entry: &StagingCacheEntry,
+        staging_entry: &Arc<StagingCacheEntry>,
         staging_files: &Path,
         downloads: &[LayerDownload],
-        complete_archives: bool,
-    ) -> Result<Vec<String>> {
-        let mut compile_metadata_files = Vec::new();
+        mode: ExtractionMode,
+    ) -> Result<()> {
         let blob_root = staging_entry.blob_root();
 
         for download in downloads {
@@ -157,24 +116,22 @@ impl<'a> Downloader<'a> {
                 }
                 LayerDownloadKind::Archive { format } => {
                     let path = self.download_archive_blob(download, &blob_root).await?;
-                    // Archive member paths define the artifact layout. Layer title
-                    // annotations are labels/debug metadata unless a manifest schema
-                    // explicitly assigns placement semantics.
-                    let extracted_files = if complete_archives {
-                        format.extract_all_files(&path, staging_files)
-                    } else {
-                        format.extract_blob(&path, staging_files)
-                    }
+                    // The blocking task owns staging until extraction finishes, even if
+                    // its async caller is cancelled.
+                    let staging = Arc::clone(staging_entry);
+                    let blob_path = path.clone();
+                    let format = *format;
+                    tokio::task::spawn_blocking(move || {
+                        format.extract(&blob_path, &staging.files_dir(), mode)
+                    })
+                    .await
+                    .context("OCI archive extraction task failed")?
                     .with_context(|| {
                         format!(
                             "Failed to extract OCI archive blob {}",
                             download.descriptor.digest
                         )
                     })?;
-
-                    if download.descriptor.media_type == COMPILE_METADATA_MEDIA_TYPE {
-                        compile_metadata_files = extracted_files.clone();
-                    }
 
                     tokio::fs::remove_file(&path).await.with_context(|| {
                         format!("Failed to remove OCI temporary blob file {path:?}")
@@ -185,7 +142,7 @@ impl<'a> Downloader<'a> {
 
         Self::remove_blob_root(&blob_root).await?;
 
-        Ok(compile_metadata_files)
+        Ok(())
     }
 
     async fn download_raw_blob(
@@ -333,11 +290,15 @@ mod tests {
     };
     use super::MANIFEST_FILE_NAME;
     use crate::providers::ModelProviderTrait;
+    use crate::{
+        envs,
+        test_support::{EnvVarGuard, acquire_env_mutex},
+    };
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::fs;
     use tempfile::TempDir;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{basic_auth, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn digest_bytes(bytes: &[u8]) -> String {
@@ -363,7 +324,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // OCI tests share credential environment variables.
     async fn test_mock_registry_download_publishes_final_cache_entry() {
+        let env_lock = acquire_env_mutex();
+        let _credentials = [
+            envs::MODEL_EXPRESS_OCI_BEARER_TOKEN,
+            envs::MODEL_EXPRESS_OCI_USERNAME,
+            envs::MODEL_EXPRESS_OCI_PASSWORD,
+            envs::MODEL_EXPRESS_OCI_TOKEN,
+        ]
+        .map(|name| EnvVarGuard::remove(&env_lock, name));
         let cache_dir = TempDir::new().expect("temp cache");
         let server = MockServer::start().await;
         let registry = server
@@ -371,7 +341,29 @@ mod tests {
             .strip_prefix("http://")
             .expect("wiremock should use http")
             .to_string();
+        let config_dir = TempDir::new().expect("docker config");
+        fs::write(
+            config_dir.path().join("config.json"),
+            serde_json::to_vec(&json!({
+                "auths": { &registry: {"auth": "dXNlcjpwYXNzd29yZA=="} }
+            }))
+            .expect("serialize docker config"),
+        )
+        .expect("docker config");
+        let _docker = EnvVarGuard::set(
+            &env_lock,
+            envs::DOCKER_CONFIG,
+            config_dir.path().to_str().expect("config path"),
+        );
         let repo = "team/model";
+        Mock::given(method("GET"))
+            .and(path("/v2/"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("www-authenticate", "Basic realm=\"registry\""),
+            )
+            .mount(&server)
+            .await;
         let config = b"{}";
         let artifact_manifest = br#"{"artifact":true}"#;
         let tokenizer = b"{\"tokenizer\":true}";
@@ -419,6 +411,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(format!("/v2/{repo}/manifests/v1")))
+            .and(basic_auth("user", "password"))
             .respond_with(ResponseTemplate::new(200).set_body_json(manifest))
             .mount(&server)
             .await;
@@ -452,6 +445,14 @@ mod tests {
             artifact_manifest
         );
         assert!(!path.join("model.safetensors").exists());
+        let full = OciProvider
+            .download_model(&model_ref, Some(cache_dir.path().to_path_buf()), false)
+            .await
+            .expect("full download after metadata-only download");
+        assert_eq!(
+            fs::read(full.join("model.safetensors")).expect("weights"),
+            weights
+        );
         assert!(
             !path
                 .parent()
@@ -466,7 +467,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // OCI tests share credential environment variables.
     async fn test_mock_registry_download_extracts_archive_layer() {
+        let env_lock = acquire_env_mutex();
+        let _credentials = [
+            envs::MODEL_EXPRESS_OCI_BEARER_TOKEN,
+            envs::MODEL_EXPRESS_OCI_USERNAME,
+            envs::MODEL_EXPRESS_OCI_PASSWORD,
+            envs::MODEL_EXPRESS_OCI_TOKEN,
+        ]
+        .map(|name| EnvVarGuard::remove(&env_lock, name));
         let cache_dir = TempDir::new().expect("temp cache");
         let server = MockServer::start().await;
         let registry = server
@@ -477,6 +487,7 @@ mod tests {
         let repo = "team/archive-model";
         let manifest_json = br#"{"build":{"id":"archive-model"}}"#;
         let archive = tar_bytes(&[
+            ("manifest.json", manifest_json),
             ("config.json", b"{}"),
             ("model.safetensors", b"weights"),
             ("README.md", b"readme"),
@@ -537,7 +548,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // OCI tests share credential environment variables.
     async fn test_mock_registry_materializes_digest_pinned_gbuild_artifact() {
+        let env_lock = acquire_env_mutex();
+        let _credentials = [
+            envs::MODEL_EXPRESS_OCI_BEARER_TOKEN,
+            envs::MODEL_EXPRESS_OCI_USERNAME,
+            envs::MODEL_EXPRESS_OCI_PASSWORD,
+            envs::MODEL_EXPRESS_OCI_TOKEN,
+        ]
+        .map(|name| EnvVarGuard::remove(&env_lock, name));
         let cache_dir = TempDir::new().expect("temp cache");
         let server = MockServer::start().await;
         let registry = server
@@ -665,7 +685,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // OCI tests share credential environment variables.
     async fn test_mock_registry_downloads_manifest_after_filtering_layers() {
+        let env_lock = acquire_env_mutex();
+        let _credentials = [
+            envs::MODEL_EXPRESS_OCI_BEARER_TOKEN,
+            envs::MODEL_EXPRESS_OCI_USERNAME,
+            envs::MODEL_EXPRESS_OCI_PASSWORD,
+            envs::MODEL_EXPRESS_OCI_TOKEN,
+        ]
+        .map(|name| EnvVarGuard::remove(&env_lock, name));
         let cache_dir = TempDir::new().expect("temp cache");
         let server = MockServer::start().await;
         let registry = server
@@ -690,6 +719,12 @@ mod tests {
                     "mediaType": "application/vnd.kitops.modelkit.model.v1.tar",
                     "size": 7,
                     "digest": digest_bytes(b"archive")
+                },
+                {
+                    "mediaType": "application/json",
+                    "size": manifest_json.len(),
+                    "digest": manifest_digest,
+                    "annotations": { TITLE_ANNOTATION: "manifest.json" }
                 }
             ]
         });

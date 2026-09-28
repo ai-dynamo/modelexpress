@@ -14,6 +14,7 @@ pub const CACHE_ROOT_DIR_NAME: &str = "oci";
 pub const TMP_DIR_NAME: &str = ".tmp";
 pub const FILES_DIR_NAME: &str = "files";
 const BLOBS_DIR_NAME: &str = ".blobs";
+const COMPLETE_FILE_NAME: &str = "complete";
 
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
@@ -22,8 +23,20 @@ pub struct CacheEntry {
 
 impl CacheEntry {
     pub fn new(cache_root: &Path, reference: &OciReference) -> Self {
+        Self::for_mode(cache_root, reference, super::DownloadMode::Full)
+    }
+
+    pub fn for_mode(
+        cache_root: &Path,
+        reference: &OciReference,
+        mode: super::DownloadMode,
+    ) -> Self {
+        let directory = match mode {
+            super::DownloadMode::Full => "full",
+            super::DownloadMode::Metadata => "metadata",
+        };
         Self {
-            path: Self::path_for(cache_root, reference),
+            path: Self::path_for(cache_root, reference).join(directory),
         }
     }
 
@@ -42,6 +55,7 @@ impl CacheEntry {
         path
     }
 
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -55,6 +69,8 @@ impl CacheEntry {
     }
 
     pub fn publish_from(&self, staging: &StagingCacheEntry) -> Result<PathBuf> {
+        Self::validate_files(staging.path())?;
+        fs::write(staging.path().join(COMPLETE_FILE_NAME), b"")?;
         let result = self.publish(staging);
         staging.cleanup();
         result
@@ -111,6 +127,14 @@ impl CacheEntry {
     }
 
     fn validate_path(entry_path: &Path) -> Result<PathBuf> {
+        anyhow::ensure!(
+            entry_path.join(COMPLETE_FILE_NAME).is_file(),
+            "missing OCI cache completion marker"
+        );
+        Self::validate_files(entry_path)
+    }
+
+    fn validate_files(entry_path: &Path) -> Result<PathBuf> {
         let files_dir = Self::files_dir_for(entry_path);
         if !files_dir.is_dir() {
             anyhow::bail!("missing files directory at {files_dir:?}");
@@ -123,7 +147,7 @@ impl CacheEntry {
         Ok(files_dir)
     }
 
-    fn existing_files_dir_at(entry_path: &Path) -> Result<Option<PathBuf>> {
+    pub fn existing_files_dir_at(entry_path: &Path) -> Result<Option<PathBuf>> {
         if !entry_path.exists() {
             return Ok(None);
         }
@@ -289,10 +313,11 @@ mod tests {
         fs::create_dir_all(&files).expect("create files dir");
 
         let err =
-            CacheEntry::validate_path(&entry).expect_err("empty cache should fail validation");
+            CacheEntry::validate_files(&entry).expect_err("empty cache should fail validation");
         assert!(err.to_string().contains("is empty"));
 
         fs::write(files.join("config.json"), b"{}").expect("write model file");
+        fs::write(entry.join(COMPLETE_FILE_NAME), b"").expect("complete marker");
         assert_eq!(
             CacheEntry::validate_path(&entry).expect("valid cache"),
             files
@@ -335,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn test_existing_cache_entry_uses_non_empty_files_dir() {
+    fn test_existing_cache_entry_requires_completion() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let reference = OciReference::parse("registry.example.com/team/model:v1")
             .expect("reference should parse");
@@ -344,6 +369,12 @@ mod tests {
         fs::create_dir_all(&files).expect("create files dir");
         fs::write(files.join("config.json"), b"{}").expect("write model file");
 
+        let error = CacheEntry::existing_files_dir_at(&entry).expect_err("unfinished transfer");
+        assert_eq!(
+            error.root_cause().to_string(),
+            "missing OCI cache completion marker"
+        );
+        fs::write(entry.join(COMPLETE_FILE_NAME), b"").expect("completion marker");
         let files_dir = CacheEntry::existing_files_dir_at(&entry)
             .expect("cache lookup should succeed")
             .expect("cache should exist");

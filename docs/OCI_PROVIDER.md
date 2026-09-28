@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ModelExpress can download file-oriented OCI model artifacts. The provider supports raw file blobs and simple archive layers. It uses the Rust `oci-client` crate for registry reference parsing, authentication, manifest fetches, and blob streaming.
 
-OCI support is a materializer, not a container image unpacker. It does not apply whiteouts, root filesystem merges, symlinks, hardlinks, or special files.
+Each layer supplies model files. The OCI config remains registry metadata; ModelExpress does not turn it into a model manifest. Container filesystem features such as whiteouts, links, and special files are unsupported.
 
 ## References
 
@@ -29,7 +29,16 @@ Archive layers are supported when their media type is `tar` or `tar+zstd`, inclu
 
 The provider rejects empty paths, absolute paths, `.` and `..` components, backslashes, non-UTF-8 path data, duplicate output paths, symlinks, hardlinks, and special archive entries. README files, dotfiles, and images are skipped. When `ignore_weights=true`, raw weight-file layers are skipped before download and archive-like layers are skipped as whole blobs.
 
-GBuild full-compile artifacts use `application/vnd.groq.gbuild.full-compile.v1` with one tar+zstd payload. ModelExpress requires a digest reference, validates the required Manifest V2 metadata layers, and materializes the payload. These artifacts do not support `ignore_weights`.
+GBuild full-compile artifacts use `application/vnd.groq.gbuild.full-compile.v1` and require a digest reference. They contain four layers:
+
+| Layer | Contents |
+| --- | --- |
+| `manifest.json` | Runtime Manifest V2 JSON |
+| `manifest.v2.capnp.bin` | The same manifest in Cap'n Proto |
+| `compile-metadata.tar.zst` | Preset snapshot and optional LPUSim result |
+| `payload.tar.zst` | Runtime files for all compile partitions |
+
+ModelExpress checks the layer names, media types, and blob digests. It extracts the complete GBuild tree, including files the generic provider filters. GBuild validates the published manifest and its file set; runtime readers validate model semantics. ModelExpress does not carry a second Manifest V2 parser. These artifacts require a full download (`ignore_weights=false`).
 
 With `--strategy direct --format json`, the successful response includes the materialized `path`.
 
@@ -61,19 +70,22 @@ Authentication uses this precedence:
 1. `MODEL_EXPRESS_OCI_BEARER_TOKEN`
 2. `MODEL_EXPRESS_OCI_USERNAME` plus `MODEL_EXPRESS_OCI_PASSWORD`
 3. `MODEL_EXPRESS_OCI_USERNAME` plus `MODEL_EXPRESS_OCI_TOKEN`
-4. Application Default Credentials for registries under `*.pkg.dev`
-5. Anonymous access for other registries
+4. Docker config credentials and configured helpers (`DOCKER_CONFIG/config.json`, or `~/.docker/config.json`)
+5. Application Default Credentials for registries under `*.pkg.dev`
+6. Anonymous access for other registries
+
+Partial or empty explicit credentials, malformed Docker config, and failed credential helpers stop the download. Docker identity tokens are unsupported by the OCI client and produce an explicit error. For GAR, `GOOGLE_APPLICATION_CREDENTIALS` can point to a workload-identity configuration.
 
 ## Cache Layout
 
 OCI artifacts are cached under the ModelExpress cache root:
 
 ```text
-<cache-root>/oci/<registry>/<repo...>/tags/<tag>/files
-<cache-root>/oci/<registry>/<repo...>/digests/<algorithm>-<hex>/files
+<cache-root>/oci/<registry>/<repo...>/tags/<tag>/<mode>/files
+<cache-root>/oci/<registry>/<repo...>/digests/<algorithm>-<hex>/<mode>/files
 ```
 
-The provider follows NGC-like cache reuse semantics: `ignore_weights` affects which files are materialized during the download, but it is not part of the cache identity. An existing non-empty `files` directory for the same OCI reference is reused.
+Repository slashes are encoded as `%2F`. The mode is `full` or `metadata`, so a metadata-only download cannot satisfy a full request. Each published entry has a `complete` marker beside its `files` directory.
 
 ## Publish Behavior
 
@@ -83,6 +95,6 @@ Downloads materialize into a staging directory:
 <cache-root>/oci/.tmp/<uuid>/files
 ```
 
-Raw blobs stream directly into files. Archive blobs stream to a temporary blob file under the staging entry, extract into `files`, and are removed before publish.
+Raw blobs stream directly into files. Archive blobs stream to a temporary file, extract on a blocking worker, and are removed before publication. The worker retains the staging directory until extraction ends, including when the request is cancelled.
 
-After all selected blobs are written, the staging entry is atomically renamed into the final cache path. If the final cache entry already exists and has a non-empty `files` directory, ModelExpress removes the staging entry and reuses the existing cache. If the final cache entry exists but is incomplete or corrupt, publish fails with a cache-corruption error and removes the staging entry; clear the corrupt cache entry before retrying.
+Direct downloads and server streams use the same completion rule: write all requested files, add the completion marker, then rename the staged entry into the final path. Concurrent downloads reuse the first completed entry. Interrupted transfers remain outside the reusable cache. Clear an incomplete or corrupt final entry before retrying.

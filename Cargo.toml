@@ -22,6 +22,8 @@ repository = "https://github.com/ai-dynamo/modelexpress.git"
 keywords = ["llm", "inference", "nvidia"]
 
 [workspace.dependencies]
+docker_credential = "1.4.0"
+google-cloud-auth = { version = "1.7.0", default-features = false }
 anyhow = { version = "1.0.98", features = ["backtrace"] }
 async-trait = "0.1"
 # Default features off deliberately. axum already reaches the lock as a

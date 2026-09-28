@@ -221,7 +221,7 @@ Cache directory resolution for NGC: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `~/.cache
 
 GCS uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DIRECTORY` overrides it. Cached GCS models are stored under `<cache>/gcs/<bucket>/<object-prefix>`. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for provider internals.
 
-OCI uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DIRECTORY` overrides it. Cached OCI artifacts are stored under `<cache>/oci/<registry>/<repo...>/tags/<tag>/files` or `<cache>/oci/<registry>/<repo...>/digests/<algorithm>-<hex>/files`. See [`OCI_PROVIDER.md`](OCI_PROVIDER.md) for provider internals.
+OCI uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DIRECTORY` overrides it. Cached OCI artifacts are stored under `<cache>/oci/<registry>/<repository>/tags/<tag>/<mode>/files` or `<cache>/oci/<registry>/<repository>/digests/<algorithm>-<hex>/<mode>/files`. The mode is `full` or `metadata`. See [`OCI_PROVIDER.md`](OCI_PROVIDER.md) for provider internals.
 
 See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
@@ -503,7 +503,11 @@ OCI artifact downloads use registry-qualified refs such as `oci://registry.examp
 1. `MODEL_EXPRESS_OCI_BEARER_TOKEN`
 2. `MODEL_EXPRESS_OCI_USERNAME` plus `MODEL_EXPRESS_OCI_PASSWORD`
 3. `MODEL_EXPRESS_OCI_USERNAME` plus `MODEL_EXPRESS_OCI_TOKEN`
-4. Anonymous access
+4. Docker config credentials and configured helpers (`DOCKER_CONFIG/config.json`, or `~/.docker/config.json`)
+5. Application Default Credentials for GAR (`*.pkg.dev`)
+6. Anonymous access for other registries
+
+Incomplete credentials or a failed configured helper stop the download. GAR can use a mounted workload-identity configuration through `GOOGLE_APPLICATION_CREDENTIALS`.
 
 For artifact format, archive support, cache layout, and failure behavior, see [`OCI_PROVIDER.md`](OCI_PROVIDER.md).
 
