@@ -178,22 +178,33 @@ class LaneCommunicator:
         Returns False when the stream cannot carry an event, so the caller can
         fall back rather than silently reporting a bound it did not apply.
         """
+        event = self.record_event()
+        if event is None:
+            return False
+        self.wait_event(event, timeout_s)
+        return True
+
+    def record_event(self) -> Any | None:
+        """Record a CUDA event on this lane's stream, or None if it cannot.
+
+        Resolving and recording is attempted rather than predicted. An object
+        merely CARRYING a cuda_stream attribute is not necessarily one torch
+        can record against - the test doubles in this repo have exactly that
+        shape - and a wrong guess here would raise on a GPU box while every
+        CPU box stayed green. None means the caller must fall back to a
+        blocking wait rather than report a bound it did not apply.
+        """
         try:
             import torch
         except ImportError:
-            return False
+            return None
         if not torch.cuda.is_available():
-            return False
+            return None
 
         stream = self.stream
         device_context = (
             torch.cuda.device(self.device) if self.device is not None else nullcontext()
         )
-        # Resolving and recording is attempted rather than predicted. An object
-        # merely CARRYING a cuda_stream attribute is not necessarily one torch
-        # can record against - the test doubles in this repo have exactly that
-        # shape - and a wrong guess here would raise on a GPU box while every
-        # CPU box stayed green.
         try:
             with device_context:
                 if stream is None:
@@ -205,17 +216,20 @@ class LaneCommunicator:
                 elif hasattr(stream, "cuda_stream"):
                     target = torch.cuda.ExternalStream(int(stream.cuda_stream))
                 else:
-                    return False
+                    return None
                 event = torch.cuda.Event()
                 event.record(target)
         except Exception as error:  # noqa: BLE001 - any resolve failure means fall back
             logger.debug(
-                "this lane's stream cannot carry a CUDA event, falling back to a "
-                "blocking wait: %r",
+                "this lane's stream cannot carry a CUDA event; the caller must "
+                "fall back to a blocking wait: %r",
                 error,
             )
-            return False
+            return None
+        return event
 
+    def wait_event(self, event: Any, timeout_s: float) -> None:
+        """Poll a recorded CUDA event until it lands or the timeout passes."""
         deadline = time.monotonic() + timeout_s
         while not event.query():
             remaining = deadline - time.monotonic()
@@ -225,7 +239,6 @@ class LaneCommunicator:
                     f"work within {timeout_s:.1f}s"
                 )
             time.sleep(min(0.005, remaining))
-        return True
 
 
 def _wait_until_initialized(comm: Any, bindings: Any, timeout_s: float) -> None:
