@@ -912,6 +912,11 @@ class NcclM2nReceiver(_CollectiveHalf):
         logger.debug("collective receiver starting version %s", version)
 
     def update_weights(self, layer_group_id: int) -> None:
+        if self._install_mode == "event" and layer_group_id in self._group_events:
+            raise RuntimeError(
+                f"layer group {layer_group_id} was already issued this round; "
+                "a duplicate would record the wire op twice on every rank"
+            )
         self._issue_grouped_reshards(
             [
                 (

@@ -228,8 +228,15 @@ class LaneCommunicator:
             return None
         return event
 
-    def wait_event(self, event: Any, timeout_s: float) -> None:
-        """Poll a recorded CUDA event until it lands or the timeout passes."""
+    def wait_event(self, event: Any, timeout_s: float | None) -> None:
+        """Poll a recorded CUDA event until it lands or the timeout passes.
+
+        None carries no bound, mirroring synchronize: the wait is the event's
+        own blocking synchronize rather than a poll.
+        """
+        if timeout_s is None:
+            event.synchronize()
+            return
         deadline = time.monotonic() + timeout_s
         while not event.query():
             remaining = deadline - time.monotonic()
