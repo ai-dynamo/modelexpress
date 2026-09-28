@@ -2169,6 +2169,7 @@ class TestEventInstallMode:
         plan = ReshardPlan(
             bulk=[entry("a", partition=0), entry("b", partition=1)],
             misc=[MiscParam("m", (4,), "bfloat16")],
+            source_partition_count=2,
         )
         half, _ = build(
             recorder, plan=plan, half_cls=NcclM2nReceiver, partitions=2
