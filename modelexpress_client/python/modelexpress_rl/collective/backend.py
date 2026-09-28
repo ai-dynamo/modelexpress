@@ -360,6 +360,9 @@ class _CollectiveHalf:
         self._group_events: OrderedDict[
             int, list[tuple[LaneCommunicator, Any, list[RefitCtx]]]
         ] = OrderedDict()
+        # Groups already awaited this round; lets await_group distinguish a
+        # double await from a never-issued group in its error message.
+        self._awaited_groups: set[int] = set()
 
     def setup_layer_groups(self, groupings: list[list[str]] | None) -> None:
         """Partition the bulk parameters into layer groups.
@@ -433,6 +436,7 @@ class _CollectiveHalf:
         self._pending_misc = True
         self._previous_source_mesh_by_lane.clear()
         self._group_events.clear()
+        self._awaited_groups.clear()
         self._install_mode = envs.MX_NCCL_REFIT_INSTALL_MODE
         self._version = version
         self._timeout_s = transfer_timeout()
@@ -463,11 +467,26 @@ class _CollectiveHalf:
         )
 
     def abort(self) -> None:
-        """Give up on every lane of this group at once."""
+        """Give up on every lane of this group at once.
+
+        Client teardown paths (a loader install failure, cleanup) reach abort
+        without any backend failure having run, so settle retained async work
+        first when any is still tracked; otherwise abort would drop the bucket
+        and pending references while their lanes' CUDA work may still be live.
+        Settlement is idempotent, so the backend's own settle-then-abort paths
+        re-run it here on emptied structures as a no-op.
+        """
+        if (
+            self._pending_contexts
+            or self._group_events
+            or self._pending_fence_buffers
+        ):
+            self._settle_failed_transfer()
         self._cache.abort_group(self._group_id)
         self._active_lanes.clear()
         self._pending_contexts.clear()
         self._group_events.clear()
+        self._awaited_groups.clear()
         self._previous_source_mesh_by_lane.clear()
         self._fence_buffers.clear()
         self._pending_fence_buffers.clear()
@@ -551,6 +570,10 @@ class _CollectiveHalf:
                 "recorded; issue each group at most once per round"
             )
         recorded: list[tuple[LaneCommunicator, Any, list[RefitCtx]]] = []
+        # Publish the bucket before the loop: it must be visible to failure
+        # settlement from the first context moved, or a mid-loop raise would
+        # drop already-moved contexts from every structure settlement reads.
+        self._group_events[layer_group_id] = recorded
         partition_ids = sorted(
             {entry.partition_id for entry in self.entries(layer_group_id)}
         )
@@ -568,7 +591,6 @@ class _CollectiveHalf:
                     if owner != lane_key
                 ]
             recorded.append((lane, event, covered))
-        self._group_events[layer_group_id] = recorded
 
     def await_group(self, layer_group_id: int) -> None:
         """Wait for one issued group's transfers, releasing what they retained.
@@ -582,6 +604,11 @@ class _CollectiveHalf:
         recorded = self._group_events.get(layer_group_id)
         if recorded is None:
             if self._install_mode == "event":
+                if layer_group_id in self._awaited_groups:
+                    raise RuntimeError(
+                        f"layer group {layer_group_id} was already awaited "
+                        "this round; each issued group is awaited exactly once"
+                    )
                 raise RuntimeError(
                     f"layer group {layer_group_id} has no recorded completion "
                     "events; update_weights must issue it before install"
@@ -611,6 +638,7 @@ class _CollectiveHalf:
         # Only now do the bucket's retained contexts get released; on failure
         # the entry stays so settlement can still see every async resource.
         del self._group_events[layer_group_id]
+        self._awaited_groups.add(layer_group_id)
 
     def _fence_source_mesh_transition(
         self, entry: ParamPlan, lane: LaneCommunicator
@@ -746,7 +774,12 @@ class _CollectiveHalf:
             raise
 
     def _settle_failed_transfer(self) -> None:
-        """Keep every retained async resource alive until its stream is safe."""
+        """Keep every retained async resource alive until its stream is safe.
+
+        Idempotent: each processed resource is removed from the tracking
+        structures whether it was released or quarantined, so the repeated
+        settle that abort() runs first finds nothing to do.
+        """
         contexts_by_lane: OrderedDict[int, list[RefitCtx]] = OrderedDict()
         for lane_id, ctx in self._pending_contexts:
             contexts_by_lane.setdefault(lane_id, []).append(ctx)
@@ -754,6 +787,10 @@ class _CollectiveHalf:
             for lane, _event, covered in recorded:
                 if covered:
                     contexts_by_lane.setdefault(id(lane), []).extend(covered)
+                    # Move, don't copy: once merged, the contexts are settled
+                    # through contexts_by_lane and must not be re-processed by
+                    # a later settle.
+                    covered.clear()
 
         lane_ids = OrderedDict.fromkeys(
             [
@@ -777,28 +814,30 @@ class _CollectiveHalf:
                     "process lifetime",
                     len(resources),
                 )
-                continue
-            try:
-                self._wait_lane(lane)
-            except BaseException as error:  # noqa: BLE001 - preserve original error
-                _UNSETTLED_TRANSFER_RESOURCES.extend(resources)
-                logger.error(
-                    "collective transfer failed and lane %s/%s could not be "
-                    "synchronized; retaining %d async resource(s) for process "
-                    "lifetime: %r",
-                    lane.rank,
-                    lane.world_size,
-                    len(resources),
-                    error,
-                )
             else:
-                self._active_lanes.pop(lane_id, None)
-                self._pending_fence_buffers.pop(lane_id, None)
-                self._pending_contexts[:] = [
-                    (owner, ctx)
-                    for owner, ctx in self._pending_contexts
-                    if owner != lane_id
-                ]
+                try:
+                    self._wait_lane(lane)
+                except BaseException as error:  # noqa: BLE001 - preserve original error
+                    _UNSETTLED_TRANSFER_RESOURCES.extend(resources)
+                    logger.error(
+                        "collective transfer failed and lane %s/%s could not be "
+                        "synchronized; retaining %d async resource(s) for process "
+                        "lifetime: %r",
+                        lane.rank,
+                        lane.world_size,
+                        len(resources),
+                        error,
+                    )
+            # The lane's resources are settled either way — released after a
+            # successful synchronize or quarantined for process lifetime — so
+            # drop them from every tracking structure on both legs.
+            self._active_lanes.pop(lane_id, None)
+            self._pending_fence_buffers.pop(lane_id, None)
+            self._pending_contexts[:] = [
+                (owner, ctx)
+                for owner, ctx in self._pending_contexts
+                if owner != lane_id
+            ]
 
     def _finish_misc(self, broadcast_lane_id: int) -> None:
         if not self._pending_misc:
