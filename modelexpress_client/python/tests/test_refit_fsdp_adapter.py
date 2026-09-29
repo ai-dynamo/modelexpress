@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from contextlib import nullcontext
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -14,8 +15,30 @@ from modelexpress_rl.train.engines.fsdp.adapter import FSDPTrainerAdapter
 ADAPTER = "modelexpress_rl.train.engines.fsdp.adapter"
 
 
-def test_copy_preserves_per_tensor_dtype_and_warm_buffers(dist_ready, monkeypatch):
+def _mock_host_allocation_without_cuda(monkeypatch):
+    """Exercise snapshot logic on CPU; the CUDA test checks real pinned copies."""
+    if torch.cuda.is_available():
+        return
+    empty = torch.empty
+
+    def allocate(size, *, dtype, device, pin_memory):
+        assert device == "cpu"
+        assert pin_memory is True
+        return empty(size, dtype=dtype, device=device)
+
+    monkeypatch.setattr(f"{ADAPTER}.torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr(f"{ADAPTER}.torch.empty", allocate)
+
+
+@pytest.mark.parametrize(
+    "mode", [TrainerStagingMode.COPY_TO_HOST, TrainerStagingMode.COPY_TO_DEVICE]
+)
+def test_copy_preserves_per_tensor_dtype_and_warm_buffers(
+    dist_ready, monkeypatch, mode
+):
     monkeypatch.setattr(f"{ADAPTER}.classic_cuda_alloc", nullcontext)
+    if mode is TrainerStagingMode.COPY_TO_HOST:
+        _mock_host_allocation_without_cuda(monkeypatch)
     manager = _Manager()
     overrides = {"bias": torch.float32}
     adapter = _create_trainer_adapter(
@@ -27,7 +50,7 @@ def test_copy_preserves_per_tensor_dtype_and_warm_buffers(dist_ready, monkeypatc
     bias = torch.tensor([1.000123, -2.0031, 0.015540123], dtype=torch.float32)
     weights = torch.tensor([1.000123, 2.0031], dtype=torch.float32)
     state = {"bias": bias, "weights": weights}
-    first = _stage(adapter, state, TrainerStagingMode.COPY_TO_DEVICE)
+    first = _stage(adapter, state, mode)
     first.publish_ready.wait()
     served = {
         key.split("__", 3)[-1]: value for key, value in manager.registered[0].items()
@@ -46,7 +69,7 @@ def test_copy_preserves_per_tensor_dtype_and_warm_buffers(dist_ready, monkeypatc
     addresses = {name: value.data_ptr() for name, value in served.items()}
     overrides["bias"] = torch.bfloat16  # Caller mutation cannot change a bound policy.
     bias.add_(0.000321)
-    second = _stage(adapter, state, TrainerStagingMode.COPY_TO_DEVICE)
+    second = _stage(adapter, state, mode)
     second.publish_ready.wait()
     assert torch.equal(served["bias"], bias)
     assert second.manifest.total_bytes == first.manifest.total_bytes
@@ -257,7 +280,7 @@ def test_stage_rejects_a_changed_shard_geometry(dist_ready):
 
 def test_in_place_requires_wire_dtype_source(dist_ready):
     adapter = _adapter()
-    with pytest.raises(NotImplementedError, match="use COPY_TO_DEVICE to cast"):
+    with pytest.raises(NotImplementedError, match="use COPY_TO_HOST to cast"):
         _stage(adapter, {"w": torch.ones(2, 4, dtype=torch.float32)})
 
 
@@ -282,11 +305,11 @@ def test_staging_mode_cannot_change_after_initialize(dist_ready):
 
 def test_unsupported_staging_mode_is_rejected(dist_ready):
     adapter = _adapter()
-    with pytest.raises(NotImplementedError, match="COPY_TO_HOST"):
+    with pytest.raises(NotImplementedError, match="WRITE_TO_STORAGE"):
         _stage(
             adapter,
             {"w": torch.ones(2, 4, dtype=torch.bfloat16)},
-            mode=TrainerStagingMode.COPY_TO_HOST,
+            mode=TrainerStagingMode.WRITE_TO_STORAGE,
         )
 
 
@@ -304,3 +327,82 @@ def test_non_dict_tensors_is_rejected(dist_ready):
     adapter = _adapter()
     with pytest.raises(TypeError, match="state_dict"):
         _stage(adapter, [torch.ones(2, 4, dtype=torch.bfloat16)])
+
+
+def test_host_staging_without_cuda_rejects_before_allocation(dist_ready, monkeypatch):
+    manager = _Manager()
+    adapter = _adapter(manager)
+    source = torch.ones(2, dtype=torch.float32)
+    allocate = Mock(side_effect=AssertionError("must reject before allocation"))
+    monkeypatch.setattr(f"{ADAPTER}.torch.cuda.is_available", lambda: False)
+    monkeypatch.setattr(f"{ADAPTER}.torch.empty", allocate)
+
+    with pytest.raises(RuntimeError, match="COPY_TO_HOST staging requires CUDA"):
+        _stage(adapter, {"w": source}, TrainerStagingMode.COPY_TO_HOST)
+
+    allocate.assert_not_called()
+    assert manager.registered == []
+
+
+def test_host_snapshot_survives_source_mutation_and_rematerialization(
+    dist_ready, monkeypatch
+):
+    _mock_host_allocation_without_cuda(monkeypatch)
+    manager = _Manager()
+    adapter = _adapter(manager)
+    source = torch.arange(12, dtype=torch.float32).reshape(3, 4).t()
+    staged = _stage(adapter, {"w": source}, TrainerStagingMode.COPY_TO_HOST)
+    staged.publish_ready.wait()
+    (served,) = staged.buffer_owner
+    assert served.device.type == "cpu"
+    assert served.is_contiguous()
+    assert torch.equal(served, source.bfloat16())
+    snapshot = served.clone()
+    address = served.data_ptr()
+    source.fill_(-1)
+    assert torch.equal(served, snapshot)
+    for value in (7, 11):
+        next_source = torch.full((4, 3), value, dtype=torch.float32)
+        next_stage = _stage(
+            adapter, {"w": next_source}, TrainerStagingMode.COPY_TO_HOST
+        )
+        next_stage.publish_ready.wait()
+        assert next_stage.manifest is staged.manifest
+        assert served.data_ptr() == address
+        assert torch.equal(served, next_source.bfloat16())
+    assert len(manager.registered) == 1
+    (published,) = unwrap_rendezvous_blob(staged.manifest.data).tensors
+    assert published.shards[0].memory_type == "DRAM"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA pinned host copies"
+)
+def test_cuda_host_snapshot_fences_nondefault_stream_and_preserves_fp32(dist_ready):
+    manager = _Manager()
+    adapter = FSDPTrainerAdapter(
+        manager=manager,
+        nixl_metadata_endpoint="host:1234",
+        wire_dtype_overrides={"bias": torch.float32},
+    )
+    stream = torch.cuda.Stream()
+    addresses = None
+    for value in (1.000123, 2.000321, 3.001234):
+        with torch.cuda.stream(stream):
+            state = {
+                "w": torch.full(
+                    (128, 256), value, device="cuda", dtype=torch.float32
+                ).t(),
+                "bias": torch.tensor([value], device="cuda", dtype=torch.float32),
+            }
+            staged = _stage(adapter, state, TrainerStagingMode.COPY_TO_HOST)
+        staged.publish_ready.wait()
+        served = {k.split("__", 3)[-1]: v for k, v in manager.registered[0].items()}
+        assert all(t.is_pinned() and t.device.type == "cpu" for t in served.values())
+        assert torch.equal(served["w"], torch.full((256, 128), value).bfloat16())
+        assert torch.equal(served["bias"], torch.tensor([value], dtype=torch.float32))
+        current = {k: t.data_ptr() for k, t in served.items()}
+        if addresses is not None:
+            assert current == addresses
+        addresses = current
+    assert len(manager.registered) == 1
