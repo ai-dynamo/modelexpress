@@ -1239,3 +1239,56 @@ class TestReadSafetensorsIndexObjectStore:
             DraftShardSelection.SELECTED,
             ["s3://bucket/model/model-mtp.safetensors"],
         )
+
+
+class TestTargetSharedDraftPrefixes:
+    def _mtp_model(self):
+        class _SharedHead(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = torch.nn.Linear(2, 2)
+
+        class _Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.shared_head = _SharedHead()
+
+        class _Mtp(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([_Layer()])
+
+        return _Mtp()
+
+    def test_mtp_draft_drops_embed_lm_head_and_shared_heads(self):
+        from types import SimpleNamespace
+
+        from modelexpress.engines.vllm.adapter import _target_shared_draft_prefixes
+
+        config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=1))
+        assert _target_shared_draft_prefixes(self._mtp_model(), config) == (
+            "model.embed_tokens.",
+            "lm_head.",
+            "layers.0.shared_head.head.",
+        )
+
+    def test_draft_owning_its_heads_keeps_everything(self):
+        from types import SimpleNamespace
+
+        from modelexpress.engines.vllm.adapter import _target_shared_draft_prefixes
+
+        model = self._mtp_model()
+        model.has_own_embed_tokens = True
+        model.has_own_lm_head = True
+        config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=1))
+        assert _target_shared_draft_prefixes(model, config) == ()
+
+    def test_pipeline_parallel_keeps_draft_embedding(self):
+        from types import SimpleNamespace
+
+        from modelexpress.engines.vllm.adapter import _target_shared_draft_prefixes
+
+        config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=2))
+        assert "model.embed_tokens." not in _target_shared_draft_prefixes(
+            self._mtp_model(), config
+        )
