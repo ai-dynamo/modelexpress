@@ -35,6 +35,20 @@ PUBLISH_METADATA_RETRYABLE_STATUS_CODES = {
 # Global storage for heartbeat threads and worker servers, keyed by device_id.
 _heartbeat_threads: dict[int, PublisherThread] = {}
 _worker_servers: dict[int, "WorkerGrpcServer"] = {}  # P2P mode only
+# Centralized mode only: the tensor manifest each device's publisher sends,
+# kept extendable so a speculative draft pass can join the publication.
+_central_manifests: dict[int, "_CentralManifest"] = {}
+
+
+class _CentralManifest:
+    """Tensor descriptors a centralized publish_fn sends, read at publish time."""
+
+    def __init__(self, tensor_protos: list["p2p_pb2.TensorDescriptor"]):
+        self.tensor_protos = tensor_protos
+
+    def extend(self, tensor_protos: list["p2p_pb2.TensorDescriptor"]) -> None:
+        # Copy-on-write so a concurrent publish_fn reads a complete list.
+        self.tensor_protos = [*self.tensor_protos, *tensor_protos]
 
 
 def _get_worker_server(device_id: int) -> "WorkerGrpcServer | None":
@@ -113,6 +127,7 @@ def publish_metadata_and_ready(
         )
         actual_port = grpc_server.start()
         _worker_servers[device_id] = grpc_server
+        _central_manifests.pop(device_id, None)
 
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=worker_rank,
@@ -143,21 +158,28 @@ def publish_metadata_and_ready(
                 _worker_servers.pop(device_id, None)
             grpc_server.stop()
     else:
-        # Dual-write the legacy `tensors` field alongside `tensor_source`.
-        # Server builds predating the `tensor_source` oneof read only
-        # `tensors`; without it they store 0 tensors and targets fall back to
-        # disk. The server does the same dual-write on its WorkerRecord ->
-        # WorkerMetadata round-trip.
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=worker_rank,
-            nixl_metadata=nixl_manager.nixl_metadata,
-            tensors=tensor_protos,
-            tensor_source=tensor_source_metadata(tensor_protos),
-            accelerator=accelerator,
-            topology=node_topology,
-        )
+        manifest = _CentralManifest(tensor_protos)
+        _central_manifests[device_id] = manifest
 
         def publish_fn() -> str:
+            # Built at publish time, not here: a speculative draft pass may
+            # have extended the manifest and registered more memory with the
+            # shared agent since, so both the descriptors and the NIXL
+            # metadata blob must be read fresh.
+            protos = manifest.tensor_protos
+            # Dual-write the legacy `tensors` field alongside `tensor_source`.
+            # Server builds predating the `tensor_source` oneof read only
+            # `tensors`; without it they store 0 tensors and targets fall back
+            # to disk. The server does the same dual-write on its
+            # WorkerRecord -> WorkerMetadata round-trip.
+            worker = p2p_pb2.WorkerMetadata(
+                worker_rank=worker_rank,
+                nixl_metadata=nixl_manager.nixl_metadata,
+                tensors=protos,
+                tensor_source=tensor_source_metadata(protos),
+                accelerator=accelerator,
+                topology=node_topology,
+            )
             mx_source_id = _publish_metadata_to_server(
                 mx_client=mx_client,
                 identity=identity,
@@ -189,6 +211,46 @@ def publish_metadata_and_ready(
     )
     publisher.start()
     _heartbeat_threads[worker_rank] = publisher
+
+
+def extend_published_tensors(
+    tensors: dict[str, torch.Tensor],
+    device_id: int,
+    worker_rank: int,
+) -> bool:
+    """Add tensors to this device's existing publication.
+
+    For the speculative draft pass, which shares the main load's NIXL agent
+    and SourceIdentity. Starting a second publication would bind
+    ``MX_WORKER_GRPC_PORT + device_id`` again and advertise a second source
+    under the same ``mx_source_id``. The tensors must already be registered
+    with the shared agent.
+
+    Returns False when the device has no publication to extend.
+    """
+    tensor_protos = build_tensor_protos(tensors, device_id, worker_rank)
+
+    server = _get_worker_server(device_id)
+    if server is not None:
+        # P2P mode: peers fetch the manifest and the NIXL metadata live, so
+        # extending the served manifest is enough.
+        server.extend_tensors(tensor_protos)
+        return True
+
+    manifest = _central_manifests.get(device_id)
+    if manifest is None:
+        return False
+    manifest.extend(tensor_protos)
+    publisher = _heartbeat_threads.get(worker_rank)
+    if publisher is not None and publisher.mx_source_id is not None:
+        # Already published: the server holds the old manifest and NIXL
+        # metadata blob, so publish again with both refreshed.
+        publisher.republish()
+    logger.info(
+        f"[Worker {worker_rank}] Extended centralized manifest by "
+        f"{len(tensor_protos)} tensors ({len(manifest.tensor_protos)} total)"
+    )
+    return True
 
 
 def _publish_metadata_to_server(

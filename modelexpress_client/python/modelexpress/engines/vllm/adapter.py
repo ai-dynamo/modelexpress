@@ -76,6 +76,34 @@ def _is_speculative_draft(vllm_config, model_config) -> bool:
     return getattr(model_config, "runner_type", None) == "draft"
 
 
+def _target_shared_draft_prefixes(model, vllm_config) -> tuple[str, ...]:
+    """Tensor-name prefixes vLLM swaps for the target's after an MTP draft loads.
+
+    Mirrors the MTP branch of vLLM's proposer ``_maybe_share_embeddings`` /
+    ``_maybe_share_lm_head``: a draft without ``has_own_embed_tokens`` always
+    takes the target's embedding (single pipeline stage), and one without
+    ``has_own_lm_head`` always takes the target's ``lm_head``, including every
+    MTP layer's ``shared_head.head``. Those draft copies are discarded, so
+    they are neither served nor received over P2P; holding them for NIXL
+    would pin memory vLLM frees to size the KV cache. EAGLE drafts carry the
+    ``has_own_*`` attributes and are compared by content, so nothing is
+    dropped for them.
+    """
+    prefixes: list[str] = []
+    parallel = getattr(vllm_config, "parallel_config", None)
+    if (
+        not hasattr(model, "has_own_embed_tokens")
+        and getattr(parallel, "pipeline_parallel_size", 1) == 1
+    ):
+        prefixes.append("model.embed_tokens.")
+    if not hasattr(model, "has_own_lm_head"):
+        prefixes.append("lm_head.")
+        for name, module in model.named_modules():
+            if name.endswith("shared_head") and hasattr(module, "head"):
+                prefixes.append(f"{name}.head.")
+    return tuple(prefixes)
+
+
 class DraftShardSelection(Enum):
     """Outcome of picking the draft's own shards out of a checkpoint."""
 
@@ -287,7 +315,16 @@ class VllmAdapter(EngineAdapter):
         if result.model is None:
             raise RuntimeError("vLLM tensor discovery requires result.model")
         adopt_hidden_tensors(result.model, self.accelerator_backend)
-        return collect_module_tensors(result.model, self.accelerator_backend)
+        tensors = collect_module_tensors(result.model, self.accelerator_backend)
+        if _is_speculative_draft(self.vllm_config, self.model_config):
+            prefixes = _target_shared_draft_prefixes(result.model, self.vllm_config)
+            if prefixes:
+                tensors = {
+                    name: tensor
+                    for name, tensor in tensors.items()
+                    if not name.startswith(prefixes)
+                }
+        return tensors
 
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         if result.model is None:

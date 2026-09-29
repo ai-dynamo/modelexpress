@@ -174,6 +174,14 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             if not source.manifests:
                 self._artifact_sources.pop(mx_source_id, None)
 
+    def extend_tensors(self, tensor_protos: list[p2p_pb2.TensorDescriptor]) -> None:
+        # Copy-on-write rebinding: readers take self._tensor_protos once per
+        # response, so they see either the old or the extended list, never a
+        # list mid-mutation. No lock guards the manifest (the lease Condition
+        # tracks readers, not manifest contents), and none is needed for an
+        # atomic reference swap.
+        self._tensor_protos = [*self._tensor_protos, *tensor_protos]
+
     def GetTensorManifest(self, request, context):
         self._validate_tensor_source(
             request.mx_source_id,
@@ -542,6 +550,22 @@ class WorkerGrpcServer:
         if self._servicer is None:
             return
         self._servicer.unregister_artifact_source(mx_source_id, artifact_id)
+
+    def extend_tensors(self, tensor_protos: list[p2p_pb2.TensorDescriptor]) -> None:
+        """Append descriptors to the served tensor manifest.
+
+        Lets a second in-process load (the speculative draft) join this
+        worker's publication instead of binding a second server on the same
+        port. Callers must register the tensors with NIXL first: peers can
+        request any tensor in the manifest as soon as this returns.
+        """
+        self._tensor_protos = [*self._tensor_protos, *tensor_protos]
+        if self._servicer is not None:
+            self._servicer.extend_tensors(tensor_protos)
+        logger.info(
+            f"WorkerGrpcServer manifest extended by {len(tensor_protos)} tensors "
+            f"({len(self._tensor_protos)} total)"
+        )
 
     def start(self) -> int:
         """Start the gRPC server. Returns the actual bound port."""

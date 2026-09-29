@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 import torch
@@ -64,6 +65,62 @@ logger = logging.getLogger(__name__)
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
 _loader_registry: dict[int, MxModelLoader] = {}
+# Main-pass publication gates awaiting this device's speculative draft pass.
+_draft_publication_gates: dict[int, _DraftPublicationGate] = {}
+
+# Upper bound on how long a main load's publication waits for its draft pass.
+# vLLM loads the drafter right after the target, so this only matters when the
+# expected draft never comes through this loader (e.g. a draft-specific load
+# format); the target must still publish.
+_DRAFT_PUBLICATION_GRACE_SECS = 600.0
+
+
+class _DraftPublicationGate:
+    """Keeps a main load undiscoverable until its draft has joined the manifest.
+
+    Opens when the draft pass on the same device finishes, or after
+    ``_DRAFT_PUBLICATION_GRACE_SECS`` from the end of the main pass.
+    """
+
+    def __init__(self, grace_secs: float = _DRAFT_PUBLICATION_GRACE_SECS):
+        self._released = threading.Event()
+        self._grace_secs = grace_secs
+        self._deadline: float | None = None
+        self._expired_logged = False
+
+    def arm(self) -> None:
+        self._deadline = time.monotonic() + self._grace_secs
+
+    def release(self) -> None:
+        self._released.set()
+
+    def is_open(self) -> bool:
+        if self._released.is_set():
+            return True
+        if self._deadline is None or time.monotonic() < self._deadline:
+            return False
+        if not self._expired_logged:
+            self._expired_logged = True
+            logger.warning(
+                "Speculative draft pass did not reach the ModelExpress loader "
+                "within %.0fs of the target load; publishing the target without "
+                "draft tensors",
+                self._grace_secs,
+            )
+        return True
+
+
+def _expects_draft_pass(vllm_config) -> bool:
+    """True when vLLM will run a second, draft load_model on this worker.
+
+    Mirrors _is_speculative_draft: ngram and similar methods alias the draft
+    config to the target's (runner "generate") and never load a draft.
+    """
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is None:
+        return False
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    return getattr(draft_model_config, "runner_type", None) == "draft"
 
 
 def get_model_loader(device_id: int) -> MxModelLoader | None:
@@ -112,16 +169,63 @@ class MxModelLoader(BaseModelLoader):
             )
 
         ctx = build_vllm_load_context(vllm_config, model_config)
-        ctx.p2p_enabled = not is_speculative_draft
+        ctx.p2p_role = "draft" if is_speculative_draft else "main"
+        draft_gate: _DraftPublicationGate | None = None
+        if is_speculative_draft:
+            main_loader = _loader_registry.get(ctx.device_id)
+            main_ctx = main_loader._ctx if main_loader is not None else None
+            if main_ctx is not None and main_ctx.identity == ctx.identity:
+                # Same checkpoint (MTP): join the main load's publication
+                # through its NIXL agent instead of binding a second one.
+                ctx.shared_nixl_manager = _nixl_managers.get(ctx.device_id)
+            else:
+                # A draft from a different checkpoint (e.g. EAGLE) has its own
+                # SourceIdentity, so peers could never find its tensors in the
+                # target's publication. Keep it out of P2P.
+                ctx.p2p_enabled = False
+            draft_gate = _draft_publication_gates.pop(ctx.device_id, None)
         if envs.MX_ARTIFACT_READY_URL.strip():
+            # The engine is not healthy until the draft has loaded too, so this
+            # already keeps the main publication hidden until then.
             ctx.source_ready_fn = lambda: _vllm_health_ready(ctx)
-        if ctx.p2p_enabled:
+        elif ctx.p2p_role == "main" and _expects_draft_pass(vllm_config):
+            main_gate = _DraftPublicationGate()
+            _draft_publication_gates[ctx.device_id] = main_gate
+            ctx.source_ready_fn = main_gate.is_open
+        if ctx.p2p_role == "main" and ctx.p2p_enabled:
             self._ctx = ctx
 
         logger.info(
             f"[Worker {ctx.global_rank}] MxModelLoader starting "
-            f"(model={ctx.identity.model_name}, p2p_enabled={ctx.p2p_enabled})"
+            f"(model={ctx.identity.model_name}, p2p_enabled={ctx.p2p_enabled}, "
+            f"p2p_role={ctx.p2p_role})"
         )
+        try:
+            model = self._load_model(
+                vllm_config, model_config, prefix, ctx, is_speculative_draft
+            )
+        finally:
+            if draft_gate is not None:
+                draft_gate.release()
+            main_gate_pending = _draft_publication_gates.get(ctx.device_id)
+            if ctx.p2p_role == "main" and main_gate_pending is not None:
+                main_gate_pending.arm()
+
+        total_time = time.perf_counter() - load_start
+        logger.info(
+            f"[Worker {ctx.global_rank}] MxModelLoader.load_model() COMPLETE "
+            f"in {total_time:.2f}s"
+        )
+        return model.eval()
+
+    def _load_model(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        prefix: str,
+        ctx: LoadContext,
+        is_speculative_draft: bool,
+    ) -> nn.Module:
 
         # A speculative draft loads through this same path and finishes far
         # sooner than the model the user asked for, so timing them together
@@ -137,7 +241,7 @@ class MxModelLoader(BaseModelLoader):
         model_id = ctx.identity.model_name
         with metrics.time_load("vllm", model_id, model_role):
             with maybe_enter_vmm_arena(ctx):
-                if ctx.p2p_enabled:
+                if ctx.p2p_enabled and ctx.p2p_role == "main":
                     with metrics.time_load_phase("vllm", model_id, "artifact_install"):
                         install_vllm_cache_artifacts(ctx)
                 with set_default_torch_dtype(model_config.dtype):
@@ -152,7 +256,15 @@ class MxModelLoader(BaseModelLoader):
                     with metrics.time_load_phase("vllm", model_id, "chain"):
                         model = run_load_strategy_chain(model, ctx)
 
-                    if ctx.p2p_enabled:
+                    if ctx.p2p_enabled and ctx.p2p_role == "draft":
+                        if ctx.nixl_manager is not None:
+                            # Same checkpoint, same SourceIdentity: extend the
+                            # main load's manifest instead of registering a
+                            # second source under a colliding mx_source_id.
+                            _tensor_registry.setdefault(ctx.device_id, {}).update(
+                                ctx.tensors
+                            )
+                    elif ctx.p2p_enabled:
                         _loader_registry[ctx.device_id] = self
                         _tensor_registry[ctx.device_id] = ctx.tensors
                         if ctx.nixl_manager is not None:
@@ -168,12 +280,7 @@ class MxModelLoader(BaseModelLoader):
 
             log_arena_post_load(ctx)
 
-        total_time = time.perf_counter() - load_start
-        logger.info(
-            f"[Worker {ctx.global_rank}] MxModelLoader.load_model() COMPLETE "
-            f"in {total_time:.2f}s"
-        )
-        return model.eval()
+        return model
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Download the model so it can be loaded immediately."""

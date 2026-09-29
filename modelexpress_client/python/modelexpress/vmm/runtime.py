@@ -105,8 +105,22 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
       bounded only by HBM (we never exhaust VA).
     """
     if not envs.MX_VMM_ARENA or not ctx.p2p_enabled:
-        # p2p_enabled is False for the speculative draft's second load;
-        # skip the arena so it does not replace the target model's.
+        yield
+        return
+
+    if getattr(ctx, "p2p_role", "main") == "draft":
+        # Load-bearing skip. The draft is a second load on a worker whose
+        # arena is already registered. Re-entering would grow the bump range
+        # past the MR the target published (requiring a deregister and
+        # re-register that invalidates in-flight peer rkeys), and *creating*
+        # one would hit the replace-and-close path below, unmapping the live
+        # target's weights. Let the draft allocate normally; its small head
+        # registers per-tensor, which has no range-coverage constraint.
+        logger.info(
+            "[Worker %d] MX_VMM_ARENA=1 but this is the speculative draft "
+            "pass; loading outside the arena and registering per-tensor.",
+            ctx.global_rank,
+        )
         yield
         return
 
