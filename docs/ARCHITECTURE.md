@@ -213,7 +213,8 @@ ModelExpress/
 │       │   ├── backend.py              # NcclM2nSender / NcclM2nReceiver
 │       │   ├── client.py               # RefitClientTrainer / RefitClientGenerator
 │       │   ├── jax_interop.py          # JAX storage adapter (shard lookup, buffer shim)
-│       │   └── envs.py                 # Deadlines and stream count
+│       │   ├── envs.py                 # Deadlines and stream count
+│       │   └── integrations/           # Framework adapters (MILES protocol, session, wire)
 │       ├── refit_collective_pb2.py     # Generated protobuf stubs
 │       └── refit_collective_pb2_grpc.py # Generated gRPC stubs
 │

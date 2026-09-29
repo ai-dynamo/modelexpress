@@ -33,15 +33,19 @@ completion.
 
 ## Configuration
 
-All knobs are mx-namespaced; every argument has an environment fallback read
-only when the argument is unset.
+All knobs are mx-namespaced. Each can be set by a MILES argument or an
+environment variable; the environment fallback is read only when the argument
+is unset. **The environment variables are the supported path**: stock MILES
+entry points parse their arguments strictly and reject the four
+`--modelexpress-*` flags below, which are only reachable through a custom
+entry hook.
 
-| MILES argument | Environment variable | Default | Notes |
+| Environment variable | MILES argument | Default | Notes |
 | --- | --- | --- | --- |
-| `--modelexpress-server-address` | `MX_SERVER_ADDRESS` | `127.0.0.1:50051` | mx-server `host:port`. `build_protocol.validate_args` fails loudly when neither the argument nor the env var is set. Plain `host:port` or `grpc://`; secure schemes are rejected. |
-| `--modelexpress-m2n-run-id` | `MX_MILES_RUN_ID` | unset | Optional run identity. When set it must be set identically on every trainer rank; a mix of set and unset ranks is rejected. |
-| `--modelexpress-m2n-publish-groups` | `MX_MILES_PUBLISH_GROUPS` | `1` | Integer >= 1. Caps how many publish groups a round is chunked into along the canonical plan order; larger values give finer engine-side overlap granularity. Never splits a tensor. |
-| `--modelexpress-m2n-connect-timeout-s` | `MX_MILES_CONNECT_TIMEOUT_S` | `10.0` | Seconds the first round waits for the mx-server channel to become ready before failing. |
+| `MX_SERVER_ADDRESS` | `--modelexpress-server-address` | none (required) | mx-server `host:port`. `build_protocol.validate_args` fails loudly when neither the env var nor the argument is set. Plain `host:port` or `grpc://`; secure schemes are rejected. |
+| `MX_MILES_RUN_ID` | `--modelexpress-m2n-run-id` | unset | Optional run identity. When set it must be set identically on every trainer rank; a mix of set and unset ranks is rejected. |
+| `MX_MILES_PUBLISH_GROUPS` | `--modelexpress-m2n-publish-groups` | `1` | Integer >= 1. Caps how many publish groups a round is chunked into along the canonical plan order; larger values give finer engine-side overlap granularity. Never splits a tensor. |
+| `MX_MILES_CONNECT_TIMEOUT_S` | `--modelexpress-m2n-connect-timeout-s` | `10.0` | Seconds the first round waits for the mx-server channel to become ready before failing. |
 
 Configuration errors are meant to surface before any weight moves:
 `validate_args` runs during MILES argument validation and reports a missing
@@ -49,6 +53,16 @@ server address, an unsupported scheme, or a malformed knob with the exact
 flag/env to fix. An unreachable mx-server fails at the first round's connect
 probe with a `RuntimeError` naming the endpoint, the timeout, and the
 remediation — not deep inside a round.
+
+## Canonical plan order
+
+Publish groups are contiguous byte-balanced chunks of the weight plan sorted
+by the 795 canonical key (`ParamPlan.canonical()`), and every trainer rank
+publishes every group id in that order. The ordering is the wire contract: the
+795 receiver backend re-sorts `plan.bulk` canonically and executes each layer
+group's active subset in canonical order regardless of caller order, so any
+contiguous chunking of a canonically ordered plan stays wire-safe — the
+receiver never has to reconcile two orderings of the same tensors.
 
 ## Supported geometry (fail-closed limits)
 
@@ -58,6 +72,9 @@ outside the supported envelope:
 - One source rank per PP partition: TP/EP must be fully gathered on the
   source rank (`required_placement` is `WeightUpdatePlacement(gather_pp=False)`
   with TP/EP gather); every trainer rank is a sender for its own partition.
+- `--megatron-to-hf-mode raw` (the MILES default) is required: `bridge` mode
+  forces `gather_pp=True`, and this adapter rejects that placement at
+  `connect()` with "MILES NCCL M2N requires PP-local HF tensors".
 - Explicit engine GPU topology: `engine_gpu_counts`/`engine_gpu_offsets` must
   be provided; ambiguous engine placement is rejected.
 - Base-model rounds only: `supports_lora = False`; selector must be `"all"`
@@ -69,8 +86,28 @@ outside the supported envelope:
   reference the wire buffers materialized during `begin_sync`.
 
 Any mid-round failure closes the protocol (channel, rendezvous, and session
-torn down, errors fanned out to every rank); the next `begin_sync` raises
-rather than silently continuing a degraded round.
+torn down) and the next `begin_sync` raises rather than silently continuing a
+degraded round. Failures raised inside `begin_sync` or `finalize` fan out to
+every trainer rank through gloo all-gathers. A failure raised out of the
+`send_bucket` path closes the local rank immediately; its peers observe it at
+the finalize fan-out or, when the round never reaches finalize, through the
+receiver's transfer deadline.
+
+## Receiver-side deployment requirements
+
+The derived `operation_id` (`miles-<group>-weight-version-<version>`) names a
+transfer row this adapter never creates: `create_transfer` is not part of the
+795 client surface, and the trainer intentionally never reports. The deployed
+full-branch receiver reports with that `operation_id` at end of round, and
+mx-server maps a missing transfer row to NOTFOUND, which fails the receiver's
+round after the weights have landed. A deployment must therefore ensure a
+transfer row exists per `operation_id` — seeded out-of-band, or created by a
+server build carrying the idempotent transfer API — before the receiver's
+report fires.
+
+The adapter sends no tensor digests, so the receiver's
+`MX_MILES_VERIFY_TENSOR_EQUALITY` digest check must stay at its default (off);
+enabling it against this adapter fails loudly at round start.
 
 ## Performance caveat
 
