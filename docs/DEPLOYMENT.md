@@ -1542,3 +1542,117 @@ Wire-to-engine dtype conversion respects the captured destination slice, strides
 and arena storage offset, including padding surrounding the destination view.
 Bounded staging views are zeroed before each READ so untouched loader padding
 cannot retain bytes from a previous batch or version.
+
+## ModelExpress benchmark CI harness
+
+[`ci/bench/`](../ci/bench/) runs native vLLM cold-load and refit checks using
+registered, pinned model profiles. `profiles.json` lists supported profile keys
+and the default (`nemotron`). Add a profile to the catalog to extend the harness;
+the trigger and lifecycle scripts do not contain model-specific allowlists.
+
+| Profile | Pinned model | Resources per worker |
+| --- | --- | --- |
+| `nemotron` | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4`, revision `bee7596271d1495f6992ae224aefde4410e816b8` | TP1, 16 CPU, 128 GiB RAM |
+| `kimi` | `moonshotai/Kimi-K2.7-Code`, revision `74797c9c62378b951a1f6fcf5c4631024e9b8bef` | TP8, 64 CPU, 1 TiB RAM |
+
+There has been **no live AWS validation**. Profile support means the model can be
+selected, rendered, and tested; it does not establish GPU/kernel or refit
+compatibility. Kimi requires eight GPUs on one node with sufficient host RAM.
+Its quantized MLA refit path needs qualification; the experimental WNA16 workaround
+is not included or applied. Failures remain failures and stop before resume.
+
+### Manual CLI and environments
+
+```bash
+export KUBE_CONTEXT='<aws-context>' NAMESPACE='<existing-run-namespace>'
+export SERVER_IMAGE='<registry/server:full-commit-sha>'
+export WORKER_IMAGE='<registry/runtime:full-commit-sha>'
+export MX_CI_S3_BUCKET='<snapshot-bucket>' MX_CI_S3_REGION='<aws-region>'
+export RESULTS_DIR=/tmp/mx-bench-unique-run
+python3 ci/bench/scripts/prepare.py kimi "$RESULTS_DIR" \
+  --environment aws-ci --run-id kimi-unique-run
+# Inspect rendered manifests before deploying.
+python3 ci/bench/scripts/lifecycle.py run "$RESULTS_DIR"
+python3 ci/bench/scripts/lifecycle.py collect "$RESULTS_DIR"
+python3 ci/bench/scripts/lifecycle.py cleanup "$RESULTS_DIR"
+```
+
+Manual callers provision their namespace, service account, secrets, and mirror.
+The Python `lifecycle.py` CLI reads the rendered JSON configuration directly.
+Seed download and publication share a two-hour deadline from process startup;
+either process failing stops the run, including during worker readiness.
+
+Use a fresh run ID/output directory; run IDs begin with the selected profile key.
+`KUBECONFIG` overrides `/teleport/kubeconfig.yaml`. CLI overrides take precedence
+over environment variables and environment-file values. Images require full
+commit SHA tags or digests. The AWS preset selects H100 80 GB nodes,
+0.70 GPU memory utilization, `ci-nightly-high-priority`, and `nvcr-imagepullsecret`.
+S3 is the default with no custom endpoint or RDMA device. Profile defaults supply
+TP/CPU/memory and object prefixes.
+
+Use `--environment /path/to/environment.json` for placement/storage changes.
+Fields include worker/control node selectors, tolerations, control resources,
+service account, image-pull secrets, security context, `addressing_style`,
+`pod_env` (including Secret references), `pod_env_from`, and image references.
+CLI options include context, namespace, region, bucket, endpoint URL, service
+account, seed/delta prefixes, TP, CPU, memory, and GPU memory utilization. Literal
+credentials must not enter the environment file: resolved settings are retained
+as evidence. `--endpoint-url ''` clears an inherited endpoint.
+
+Peer coverage remains manual: `--paths both` requires two suitable nodes plus
+explicit `extra_worker_resources`, `worker_env.MX_NIXL_BACKEND`, and
+`peer_transfer_marker`. See the [EFA example](../examples/p2p_transfer_k8s/client/vllm/aws_efa/).
+Setting these fields does not qualify transport. Each worker's TP ranks stay on
+one node. The report rejects peer fallback to S3, ModelStreamer, or InstantTensor
+and requires different donor/peer nodes.
+
+### Validation, timing, and cleanup
+
+The benchmark uses vLLM’s default execution mode without forcing eager execution.
+
+The CI-only `BenchWorkerExtension` in `ci/bench/common/bench_worker.py` extends
+each vLLM worker with refit timing and weight/checkpoint validation RPC methods.
+
+The driver checks every rank's tensor hashes, reconstructed checkpoint embedding,
+refit source/version, preserved tensor addresses, and resumed inference. Shared
+validation checks GPU/CPU/host scale agreement for profiles with configured scale
+counts. Model-specific scale-change counts and FlashInfer cache invalidation are
+not asserted. A failed rank stops before resume. Native HTTP
+pause/resume is not Dynamo administration. The publisher preserves the selected
+checkpoint tensor's stored dtype and changes low-order bits to produce a delta.
+The configured payload size (64 MiB for Nemotron, 1 GiB for Kimi) is a best-effort
+target; reports include actual bytes, and size differences do not fail validation.
+Peer refit transfers full runtime tensors.
+Each rank verifies the reconstructed checkpoint tensor hash against the publisher's
+expected hash. Runtime tensor inventories must change after refit and match between
+S3 and peer workers when both paths run. The harness does not assume a runtime
+embedding name or TP sharding layout, and does not independently compare GPU
+embedding slices with the checkpoint. Profiles still select a checkpoint tensor;
+its dtype must be supported by the installed safetensors/PyTorch and refit stack.
+
+`report.json` retains model-load seconds, RPC and per-rank stage/install/total
+seconds, failures, image IDs, and restarts. Loading excludes
+scheduling, image pulls, engine warmup, and the separately downloaded reconstruction
+seed. Stage timing covers the stage operation and completion synchronization;
+installation timing covers apply plus CUDA synchronization. Total refit time is
+stage plus installation; logging, pointer verification, hashing, and inference
+are outside these intervals. The separate RPC duration includes those additional
+operations and must not be compared as the same interval.
+
+The report separates `validation_status` (`PASS`/`FAILED`) from
+`measurement_status` (`VALID`/`INVALID`). Overall `status` passes only when both
+pass. Successful `latency_summary` entries include the model-load time, RPC time,
+each rank's stage/install/total, and the maximum per-rank total. Every required
+duration must be finite and nonnegative; missing timings invalidate a benchmark.
+Failed runs keep raw measurements as evidence but have an empty summary.
+
+This is one trial per run,
+with no percentiles, baseline comparison, or performance threshold.
+No AWS performance baseline has been established. Do not run assertion-based
+validators with Python `-O`.
+
+Run resources use the `mx-benchmark` label for selection and cleanup.
+Manual cleanup uses the publication report and preserves the namespace, snapshot,
+and local evidence. If publication never wrote its report, manual cleanup stops
+for inspection. Never delete the shared model prefix or bucket. Every fresh run
+has isolated server/Redis state and empty worker volumes.

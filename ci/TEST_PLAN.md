@@ -54,3 +54,11 @@ Coverage matrix for the ModelExpress CI infrastructure. Reflects what's currentl
 - **Not started** — no scaffold, no matrix entry, no dependency planning yet.
 
 When a row moves status, update this table in the same PR so the doc stays the source of truth on what CI does and doesn't catch.
+
+## Model benchmark harness
+
+`ci/bench/` provides manual cold-load/refit validation and latency measurement
+with pinned Nemotron and Kimi profiles. Its CPU tests run on every PR; live AWS
+and Kimi refit compatibility remain unverified. S3 and optional peer paths share
+weight/checkpoint checks, per-rank timings, and failure evidence. See
+[usage and limitations](../docs/DEPLOYMENT.md#modelexpress-benchmark-ci-harness).
