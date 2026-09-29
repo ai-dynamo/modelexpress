@@ -550,8 +550,12 @@ class TestCommunicatorBootstrap:
             Stuck(), rank=0, world_size=3, stream=None
         )
 
-        with pytest.raises(TimeoutError, match="lane 1 of group g at epoch 1"):
+        with pytest.raises(
+            RuntimeError,
+            match="lane 1 of group g at epoch 1 did not return to a usable state",
+        ) as caught:
             cache.settle_group("g", 1, timeout_s=0.05)
+        assert isinstance(caught.value.__cause__, TimeoutError)
 
 
 class TestBootstrapBarrier:
