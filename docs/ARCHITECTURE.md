@@ -169,6 +169,7 @@ ModelExpress/
 │       ├── load_strategy/              # Loading strategy chain
 │       │   ├── __init__.py             # LoadStrategyChain.run()
 │       │   ├── context.py              # LoadContext and LoadResult
+│       │   ├── draft_gate.py           # DraftPublicationGate (main publication waits for the draft pass)
 │       │   ├── base.py                 # LoadStrategy ABC and shared helpers
 │       │   ├── rdma_strategy.py        # RdmaStrategy (P2P GPU transfer via NIXL)
 │       │   ├── server_cache_strategy.py # ServerCacheStrategy (weights from MX Server)
@@ -1064,7 +1065,7 @@ Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `
 - **Per-tensor append registration.** Reusing the main manager means `tensor_descriptors` is already populated. The draft therefore calls `register_additional_tensors`, never `register_arena`, and never replaces the catalog. The arena MR covers `[base, base + used_bytes)` as of the target's registration. Covering the draft's later allocations would mean deregistering and re-registering that MR, which invalidates the rkey peers already hold. The MTP head is about 2% of the weights (~0.85 GB against ~38.5 GB), so giving up the single-MR property for it costs little. TODO: an extended registration over the adjacent arena sub-range.
 - **No VMM arena for the draft.** `maybe_enter_vmm_arena` skips the draft deliberately. Re-entering the target's arena would bump allocations past the registered range. Creating a new arena would hit the replace path, which `close()`s the target's live arena: `cuMemUnmap` of a published model's weights while peers may be reading them. `_vmm_arenas[device_id]` keeps the target's arena.
 - **Extending the publication.** In P2P mode, `extend_published_tensors` appends the draft's descriptors to the running `WorkerGrpcServer` through `extend_tensors`, which swaps the manifest list copy-on-write. Peers fetch the manifest and NIXL metadata live, so nothing else is needed. In centralized mode, the publisher's `publish_fn` builds `WorkerMetadata` at publish time from an extendable manifest and the current agent metadata. If the source was already published, `PublisherThread.republish()` publishes again. The loader merges the draft's tensors into `_tensor_registry[device_id]`, while `_loader_registry`, `_nixl_managers`, and the loader's `_ctx` stay on the main load.
-- **Publish ordering.** The target's metadata must not become discoverable before the draft's tensors are in it. With `MX_ARTIFACT_READY_URL` set, `source_ready_fn` waits for engine health, which comes after the draft loads. Without it, a main pass that expects a draft (`speculative_config.draft_model_config.runner_type == "draft"`) gets a `_DraftPublicationGate` as its `source_ready_fn`. The gate opens when the draft pass finishes, whether or not its P2P attempt succeeded. If no draft pass reaches this worker, the gate opens 600 s after the main pass. The RL chain still rejects a speculative draft.
+- **Publish ordering.** The target's metadata must not become discoverable before the draft's tensors are in it. With `MX_ARTIFACT_READY_URL` set, `source_ready_fn` waits for engine health, which comes after the draft loads. Without it, a main pass that expects a draft (`speculative_config.draft_model_config.runner_type == "draft"`) gets a `DraftPublicationGate` (`load_strategy/draft_gate.py`, shared with the SGLang loader) as its `source_ready_fn`. The gate opens when the draft pass finishes, whether or not its P2P attempt succeeded. If no draft pass reaches this worker, the gate opens 600 s after the main pass. The RL chain still rejects a speculative draft.
 - **Fallback.** If the draft's RDMA attempt fails, the chain falls through to the remaining strategies: server cache, InstantTensor, ModelStreamer, GDS, or the runtime's native loader. `RdmaStrategy.rollback` then deregisters only the draft's appended tensors and never shuts down the shared agent. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors. It reads `model.safetensors.index.json` from the directory of the shards `_prepare_weights` already resolved, which is what makes a Hugging Face model ID work. For object storage it falls back to the model URI itself: first a local directory, then the runai streamer's `pull_files`. It keeps shards whose tensor names start with `mtp.`. An index that holds no `mtp.` tensors is expected on a checkpoint without a draft head and streams every shard. An index that cannot be resolved at all logs a warning and also streams every shard.
 
 ### vLLM Refit Installation
@@ -1201,6 +1202,30 @@ loading, quantized-weight post-processing, and tensor discovery, including the
 storage-view naming used for non-contiguous SGLang parameters.
 The SGLang side does not expose separate source and target modes; transport
 selection and source discovery remain inside the ModelExpress package.
+
+**Speculative draft pass.** SGLang's EAGLE worker builds a second ModelRunner
+for the draft on the same GPU. Its `ModelConfig` has `is_draft_model=True` and,
+unless `speculative_draft_load_format` names another format, it loads through the
+same `remote_instance` backend. `MxModelLoader` handles that second call the way
+the vLLM loader does (see "MTP two-pass load" above):
+
+- On `transport=nixl`, a draft with the main load's `SourceIdentity` (MTP /
+  NextN, same checkpoint) sets `p2p_role = "draft"` and adopts the main load's
+  NIXL agent. It registers and publishes its tensors as `mx_draft::<name>` in
+  the target's publication and merges them into `_tensor_registry[device_id]`.
+  It skips artifact install and publish. A draft with a different identity
+  (EAGLE from another checkpoint) stays out of P2P.
+- Discovery drops the draft's `model.embed_tokens.*` (single pipeline stage)
+  and `lm_head.*`, because `set_embed_and_head` replaces them with the target's.
+- A main load gets a `DraftPublicationGate` when SGLang's speculative settings
+  (`get_spec()`, or `get_global_server_args()` on older releases) name an
+  algorithm other than NGRAM and the draft load format is unset or
+  `remote_instance`. `MX_ARTIFACT_READY_URL` health gating takes precedence.
+- On `transport=transfer_engine`, the draft loads natively and never publishes.
+  A second TransferEngine source would advertise the head under the target's
+  identity and replace the target's heartbeat, and its same-named tensors would
+  match the target's manifest.
+- `MX_LOAD_STRATEGY_CHAIN=RL` rejects a draft.
 
 **LoadStrategyChain** (`load_strategy/`):
 

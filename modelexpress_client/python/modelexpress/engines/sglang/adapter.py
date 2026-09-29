@@ -106,7 +106,16 @@ class SglangAdapter(EngineAdapter):
         # the same ModelExpress version; mixing old and new manifests fails
         # tensor matching.
         adopt_hidden_tensors(result.model, self.accelerator_backend)
-        return collect_module_tensors(result.model, self.accelerator_backend)
+        tensors = collect_module_tensors(result.model, self.accelerator_backend)
+        if is_sglang_draft_model(self.model_config):
+            prefixes = _target_shared_draft_prefixes(result.model)
+            if prefixes:
+                tensors = {
+                    name: tensor
+                    for name, tensor in tensors.items()
+                    if not name.startswith(prefixes)
+                }
+        return tensors
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
         with capture_tensor_attrs(self.accelerator_backend):
@@ -296,6 +305,35 @@ def _call_sglang_post_load_weights(model: torch.nn.Module) -> None:
         post_load_weights = getattr(child, "post_load_weights", None)
         if callable(post_load_weights):
             post_load_weights()
+
+
+def is_sglang_draft_model(model_config: ModelConfig) -> bool:
+    """True for SGLang's speculative draft ModelRunner load.
+
+    The draft worker builds its ModelConfig with ``is_draft_model=True`` and,
+    unless ``speculative_draft_load_format`` says otherwise, loads through the
+    same ``remote_instance`` path as the target, on the same GPU.
+    """
+    return bool(getattr(model_config, "is_draft_model", False))
+
+
+def _target_shared_draft_prefixes(model) -> tuple[str, ...]:
+    """Tensor-name prefixes SGLang swaps for the target's after an MTP draft loads.
+
+    Same-checkpoint drafts (MTP / NextN) go through the EAGLE worker's
+    non-EAGLE3 branch, which calls ``set_embed_and_head(embed, head)``: the
+    draft's own ``model.embed_tokens.weight`` and ``lm_head.weight`` are
+    deleted and replaced with the target's (the embedding only on a single
+    pipeline stage, where the target provides it). Those draft copies are
+    discarded, so they are neither served nor received over P2P; holding them
+    for NIXL would pin memory SGLang frees right after the load.
+    """
+    if not hasattr(model, "set_embed_and_head"):
+        return ()
+    prefixes = ["lm_head."]
+    if _get_parallel_size("get_pipeline_model_parallel_world_size") == 1:
+        prefixes.insert(0, "model.embed_tokens.")
+    return tuple(prefixes)
 
 
 def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIdentity:

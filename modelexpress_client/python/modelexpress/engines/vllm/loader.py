@@ -27,7 +27,6 @@ Usage:
 from __future__ import annotations
 
 import logging
-import threading
 import time
 
 import torch
@@ -41,6 +40,7 @@ from ...load_strategy import (
     run_load_strategy_chain,
     unpublish_metadata,
 )
+from ...load_strategy.draft_gate import DraftPublicationGate
 from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
@@ -66,48 +66,7 @@ _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
 _loader_registry: dict[int, MxModelLoader] = {}
 # Main-pass publication gates awaiting this device's speculative draft pass.
-_draft_publication_gates: dict[int, _DraftPublicationGate] = {}
-
-# Upper bound on how long a main load's publication waits for its draft pass.
-# vLLM loads the drafter right after the target, so this only matters when the
-# expected draft never comes through this loader (e.g. a draft-specific load
-# format); the target must still publish.
-_DRAFT_PUBLICATION_GRACE_SECS = 600.0
-
-
-class _DraftPublicationGate:
-    """Keeps a main load undiscoverable until its draft has joined the manifest.
-
-    Opens when the draft pass on the same device finishes, or after
-    ``_DRAFT_PUBLICATION_GRACE_SECS`` from the end of the main pass.
-    """
-
-    def __init__(self, grace_secs: float = _DRAFT_PUBLICATION_GRACE_SECS):
-        self._released = threading.Event()
-        self._grace_secs = grace_secs
-        self._deadline: float | None = None
-        self._expired_logged = False
-
-    def arm(self) -> None:
-        self._deadline = time.monotonic() + self._grace_secs
-
-    def release(self) -> None:
-        self._released.set()
-
-    def is_open(self) -> bool:
-        if self._released.is_set():
-            return True
-        if self._deadline is None or time.monotonic() < self._deadline:
-            return False
-        if not self._expired_logged:
-            self._expired_logged = True
-            logger.warning(
-                "Speculative draft pass did not reach the ModelExpress loader "
-                "within %.0fs of the target load; publishing the target without "
-                "draft tensors",
-                self._grace_secs,
-            )
-        return True
+_draft_publication_gates: dict[int, DraftPublicationGate] = {}
 
 
 def _expects_draft_pass(vllm_config) -> bool:
@@ -170,7 +129,7 @@ class MxModelLoader(BaseModelLoader):
 
         ctx = build_vllm_load_context(vllm_config, model_config)
         ctx.p2p_role = "draft" if is_speculative_draft else "main"
-        draft_gate: _DraftPublicationGate | None = None
+        draft_gate: DraftPublicationGate | None = None
         if is_speculative_draft:
             main_loader = _loader_registry.get(ctx.device_id)
             main_ctx = main_loader._ctx if main_loader is not None else None
@@ -189,7 +148,7 @@ class MxModelLoader(BaseModelLoader):
             # already keeps the main publication hidden until then.
             ctx.source_ready_fn = lambda: _vllm_health_ready(ctx)
         elif ctx.p2p_role == "main" and _expects_draft_pass(vllm_config):
-            main_gate = _DraftPublicationGate()
+            main_gate = DraftPublicationGate()
             _draft_publication_gates[ctx.device_id] = main_gate
             ctx.source_ready_fn = main_gate.is_open
         if ctx.p2p_role == "main" and ctx.p2p_enabled:

@@ -755,9 +755,9 @@ class TestMtpDrafterSecondLoad:
     def test_main_publication_opens_when_no_draft_arrives(self):
         """A target whose expected draft never reaches this loader still
         publishes once the grace period after its own load expires."""
-        from modelexpress.engines.vllm.loader import _DraftPublicationGate
+        from modelexpress.load_strategy.draft_gate import DraftPublicationGate
 
-        gate = _DraftPublicationGate(grace_secs=0.0)
+        gate = DraftPublicationGate(grace_secs=0.0)
         assert gate.is_open() is False  # not armed until the main pass ends
         gate.arm()
         assert gate.is_open() is True
