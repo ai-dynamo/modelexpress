@@ -3,6 +3,9 @@
 
 from pathlib import Path
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -39,6 +42,7 @@ class _Method(UpdateMethod):
     def __init__(self, sources):
         self._sources = frozenset(sources)
         self.closed = False
+        self.requires_full_root = False
 
     @property
     def capabilities(self):
@@ -186,6 +190,7 @@ def test_object_storage_runtime_preserves_source_order(
     assert p2p.closed
 
 
+@pytest.mark.parametrize("requires_full_root", [False, True])
 @pytest.mark.parametrize(
     "source_order",
     [None, (WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE)],
@@ -203,6 +208,7 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
     source_order,
     runtime_tensors,
     nixl_manager,
+    requires_full_root,
 ):
     context = GeneratorEngineContext()
     monkeypatch.setattr(
@@ -219,6 +225,8 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
         lambda **_kwargs: pytest.fail("P2P client must not be created"),
     )
     canonical = _Method({WeightSource.OBJECT_STORAGE})
+    canonical.requires_full_root = requires_full_root
+    resolve_chain = Mock(return_value=())
     monkeypatch.setattr(
         runtime_module,
         "CanonicalDeltaUpdateMethod",
@@ -241,10 +249,13 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
         rpc_timeout_seconds=30,
         service=lambda: object(),
         start_lease=lambda _version_id: object(),
+        resolve_replay_chain=resolve_chain,
     )
 
     assert runtime.session._planner.source_order == (WeightSource.OBJECT_STORAGE,)
     assert runtime.methods == (canonical,)
+    runtime.session._resolve_replay_chain(SimpleNamespace(version_id="target"))
+    resolve_chain.assert_called_once_with("target", requires_full_root)
     runtime.close()
 
 

@@ -436,7 +436,8 @@ class _LocalCheckpoint:
         self.locations: dict[str, tuple[Path, int, int]] = {}
         self.tensor_metadata: dict[str, dict] = {}
 
-    def initialize(self) -> None:
+    def initialize(self, *, allow_unrecorded_seed: bool = False) -> bool:
+        """Initialize the disk seed, or return False if bootstrap is deferred."""
         self.store.initialize()
         with self.store.installation_locked(), self.store.locked():
             initial_checkpoint = self.store.full_path(self.initial_version)
@@ -444,6 +445,13 @@ class _LocalCheckpoint:
             cached_seed = (
                 self.seed_checkpoint_path.resolve() == initial_checkpoint.resolve()
             )
+            if (
+                allow_unrecorded_seed
+                and cached_seed
+                and not self.store.has_artifact_record(initial_checkpoint)
+                and self.store.state() is None
+            ):
+                return False
             if cached_seed and not initial_checkpoint.is_dir():
                 raise FileNotFoundError(
                     f"cached seed checkpoint for {self.initial_version!r} "
@@ -459,6 +467,8 @@ class _LocalCheckpoint:
             self.store.enforce_capacity(
                 protected_versions=_protected_versions(self.store, version),
             )
+
+        return True
 
     def _initialize_checkpoint_state(
         self,
