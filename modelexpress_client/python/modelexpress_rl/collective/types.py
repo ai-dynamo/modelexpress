@@ -229,6 +229,16 @@ def _check_placements(
             # from this record alone, so it is rejected rather than guessed.
             raise ValueError(f"{name}: {side} shards tensor dim {dim} on two mesh axes")
         sharded.append(dim)
+        if side == "src" and len(sharded) > 1:
+            # nccl.m2n's reshard refuses a source split on two tensor dims
+            # ("src must have exactly one SHARD placement after normalization"),
+            # measured against nccl-extensions 0.1.0. Rejecting it when the plan
+            # is built names the limit instead of failing every rank mid-round.
+            raise ValueError(
+                f"{name}: src shards tensor dims {sharded}; the collective accepts "
+                "one sharded dim per source tensor (any dim, any mesh axis), with "
+                "the other mesh axes replicated"
+            )
         extent = global_shape[dim]
         axis_size = mesh.shape[axis]
         if extent % axis_size != 0:
