@@ -356,6 +356,15 @@ class _RefitClientBase:
                         stream=self._stream_for(lane_id),
                     )
 
+                # A fresh non-blocking communicator can report Success at
+                # creation and still reject the barrier launch moments later
+                # when its scalable-init trailing phase fails. Poll every
+                # local lane of this group epoch -- including the one just
+                # created -- before the shared bootstrap barrier, so that
+                # failure surfaces here as a clean init error naming the lane
+                # instead of a rejected barrier launch on a peer.
+                self._cache.settle_group(membership.group_id, membership.epoch)
+
                 broadcast = self._cache.get(
                     LaneKey(
                         group_id=membership.group_id,

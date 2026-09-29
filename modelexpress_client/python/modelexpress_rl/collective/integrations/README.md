@@ -109,6 +109,11 @@ The adapter sends no tensor digests, so the receiver's
 `MX_MILES_VERIFY_TENSOR_EQUALITY` digest check must stay at its default (off);
 enabling it against this adapter fails loudly at round start.
 
+The 795-base rendezvous has no bootstrap-fence RPCs, so this client cannot
+answer a fence: groups must form with `requires_bootstrap_fence=0`. A group
+formed with the fence required would deadlock at bootstrap, with receivers
+waiting at the fence for trainers that have no RPC to arrive with.
+
 ## Performance caveat
 
 This port targets the minimal 795-base client surface. The wide-lane and
