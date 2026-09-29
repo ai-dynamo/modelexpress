@@ -706,12 +706,12 @@ class MilesCollectiveProtocolCore:
         trainer_world = dist.get_world_size()
         local_error = ""
         try:
-            if self._closed or self._session is None:
-                raise RuntimeError("the MILES NCCL M2N protocol closed mid-round")
             if not self._round_begun:
                 raise RuntimeError(
                     "MILES NCCL M2N received no weight buckets for the armed round"
                 )
+            if self._closed or self._session is None:
+                raise RuntimeError("the MILES NCCL M2N protocol closed mid-round")
             self._drain_ready_groups(version)
             if self._publish_groups is None or self._next_group != len(
                 self._publish_groups
