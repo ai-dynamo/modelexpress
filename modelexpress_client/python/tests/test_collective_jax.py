@@ -95,25 +95,140 @@ class _Lane:
         self.sync_calls.append(timeout_s)
 
 
-class TestBootstrapBarrierAllocator:
-    def test_a_supplied_allocator_provides_the_byte_and_torch_is_not_imported(
-        self, monkeypatch
-    ):
-        """The whole point: a worker with no torch still barriers."""
-        lane = _Lane()
+class _Err:
+    cudaSuccess = "success"
+    cudaErrorNotReady = "not-ready"
+
+
+class _FakeRuntime:
+    """cuda.bindings.runtime as far as the torch-free lane path touches it.
+
+    Every call returns a tuple with the status first, which is the binding's
+    own convention and the thing ``_cudart_check`` unpacks.
+    """
+
+    cudaError_t = _Err
+    cudaEventDisableTiming = 2
+
+    def __init__(self, *, ready_after=0, current=3):
+        self.calls = []
+        self._ready_after = ready_after
+        self._current = current
+
+    def cudaGetDevice(self):
+        self.calls.append(("get_device",))
+        return (_Err.cudaSuccess, self._current)
+
+    def cudaSetDevice(self, ordinal):
+        self.calls.append(("set_device", ordinal))
+        self._current = ordinal
+        return (_Err.cudaSuccess,)
+
+    def cudaEventCreateWithFlags(self, flags):
+        self.calls.append(("event_create", flags))
+        return (_Err.cudaSuccess, "event")
+
+    def cudaEventRecord(self, event, stream):
+        self.calls.append(("event_record", event, stream))
+        return (_Err.cudaSuccess,)
+
+    def cudaEventQuery(self, event):
+        self.calls.append(("event_query", event))
+        if self._ready_after > 0:
+            self._ready_after -= 1
+            return (_Err.cudaErrorNotReady,)
+        return (_Err.cudaSuccess,)
+
+    def cudaEventDestroy(self, event):
+        self.calls.append(("event_destroy", event))
+        return (_Err.cudaSuccess,)
+
+    def cudaStreamSynchronize(self, stream):
+        self.calls.append(("stream_sync", stream))
+        return (_Err.cudaSuccess,)
+
+
+class _BroadcastComm:
+    def __init__(self):
+        self.broadcast_calls = []
+
+    def broadcast(self, *, sendbuf, recvbuf, root, stream):
+        self.broadcast_calls.append((sendbuf, recvbuf, root, stream))
+
+
+@pytest.fixture
+def no_torch(monkeypatch):
+    """Block torch the way a JAX-only worker lacks it, and fake the CUDA runtime."""
+    from modelexpress_rl.collective import comm
+
+    runtime = _FakeRuntime()
+    monkeypatch.setitem(sys.modules, "torch", None)
+    monkeypatch.setattr(comm, "_cudart", lambda: runtime)
+    return runtime
+
+
+def _real_lane(device=0, stream=None):
+    from modelexpress_rl.collective.comm import LaneCommunicator
+
+    return LaneCommunicator(
+        _BroadcastComm(), rank=0, world_size=2, stream=stream, device=device
+    )
+
+
+class TestTorchFreeLane:
+    """The real ``LaneCommunicator`` with torch absent, not a recording double."""
+
+    def test_the_barrier_completes_without_torch(self, no_torch):
+        """Broadcast, then a bounded wait through the CUDA runtime."""
+        lane = _real_lane(device=0)
         seen = []
 
         def alloc(device):
             seen.append(device)
             return "jax::barrier"
 
-        monkeypatch.setitem(sys.modules, "torch", None)
-        collective_client._bootstrap_barrier(lane, "dev0", alloc=alloc)
+        collective_client._bootstrap_barrier(lane, 0, timeout_s=5.0, alloc=alloc)
 
-        assert seen == ["dev0"]
-        assert lane.broadcast_calls == [("jax::barrier", "jax::barrier", 0, None)]
-        assert len(lane.sync_calls) == 1
+        assert seen == [0]
+        assert lane.handle.broadcast_calls == [("jax::barrier", "jax::barrier", 0, None)]
+        assert ("event_record", "event", 0) in no_torch.calls
+        assert no_torch.calls[-1] == ("set_device", 3), "the previous device is restored"
+        assert ("event_destroy", "event") in no_torch.calls
 
+    def test_the_bounded_wait_polls_until_the_event_lands(self, no_torch):
+        no_torch._ready_after = 3
+        _real_lane(device=None).synchronize(timeout_s=5.0)
+        queries = [c for c in no_torch.calls if c[0] == "event_query"]
+        assert len(queries) == 4
+
+    def test_the_bounded_wait_still_times_out(self, no_torch):
+        no_torch._ready_after = 10**9
+        with pytest.raises(TimeoutError, match="did not finish"):
+            _real_lane(device=None).synchronize(timeout_s=0.05)
+        assert ("event_destroy", "event") in no_torch.calls
+
+    def test_an_unbounded_wait_synchronizes_the_lane_stream(self, no_torch):
+        class _Stream:
+            cuda_stream = 0xABC
+
+        _real_lane(device=1, stream=_Stream()).synchronize()
+        assert ("stream_sync", 0xABC) in no_torch.calls
+        assert ("set_device", 1) in no_torch.calls
+
+    def test_the_device_is_restored_when_the_block_raises(self, no_torch):
+        from modelexpress_rl.collective.comm import cuda_device
+
+        with pytest.raises(ValueError):
+            with cuda_device("cuda:2"):
+                raise ValueError("boom")
+        assert no_torch.calls == [
+            ("get_device",),
+            ("set_device", 2),
+            ("set_device", 3),
+        ]
+
+
+class TestBootstrapBarrierAllocator:
     def test_the_timeout_still_reaches_synchronize_through_the_allocator_path(self):
         lane = _Lane()
         collective_client._bootstrap_barrier(
