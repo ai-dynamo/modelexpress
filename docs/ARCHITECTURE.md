@@ -494,7 +494,11 @@ one wherever torch is installed, and falls back to the `Replicate`/`Shard`
 classes `nccl.m2n` ships otherwise; the library duck-types placements on the
 class name and normalizes every form to the same integer. `_bootstrap_barrier`
 takes an optional allocator for the one device byte it broadcasts, so a worker
-with no torch supplies its own.
+with no torch supplies its own, and the lane's stream waits and device switches
+go through the CUDA runtime bindings (`cuda.bindings.runtime`, which nccl4py
+already pulls in) whenever torch cannot be imported. This is about the code
+path only: the `modelexpress` distribution still lists torch as a dependency,
+so installing it brings torch along.
 
 `collective/jax_interop.py` is the JAX side of the engine boundary. A
 `jax.Array` cannot be handed to `nccl.m2n.reshard` directly: the resolver tries

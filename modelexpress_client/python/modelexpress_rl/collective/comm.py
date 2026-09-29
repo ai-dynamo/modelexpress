@@ -23,7 +23,7 @@ import logging
 import math
 import os
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -150,8 +150,9 @@ class LaneCommunicator:
         wait is the blocking synchronize, unchanged.
 
         Falls through to the blocking wait when the stream is not something a
-        CUDA event can be recorded on - a test double, or a build without
-        torch. Those cannot hang on device work, so there is nothing to bound.
+        CUDA event can be recorded on, such as a test double. Without torch
+        (a JAX worker, for one) the event and the blocking wait both go
+        through the CUDA runtime bindings that nccl4py already depends on.
         """
         if timeout_s is not None and self._synchronize_bounded(timeout_s):
             return
@@ -160,7 +161,12 @@ class LaneCommunicator:
             stream.synchronize()
             return
 
-        import torch
+        try:
+            import torch
+        except ImportError:
+            with cuda_device(self.device):
+                _cudart_check(_cudart().cudaStreamSynchronize(_stream_handle(stream)))
+            return
 
         device_context = (
             torch.cuda.device(self.device) if self.device is not None else nullcontext()
@@ -181,7 +187,7 @@ class LaneCommunicator:
         try:
             import torch
         except ImportError:
-            return False
+            return self._synchronize_bounded_cudart(timeout_s)
         if not torch.cuda.is_available():
             return False
 
@@ -226,6 +232,102 @@ class LaneCommunicator:
                 )
             time.sleep(min(0.005, remaining))
         return True
+
+
+    def _synchronize_bounded_cudart(self, timeout_s: float) -> bool:
+        """The event-polling wait, through the CUDA runtime instead of torch."""
+        try:
+            runtime = _cudart()
+        except ImportError:
+            return False
+        with cuda_device(self.device):
+            error, event = runtime.cudaEventCreateWithFlags(
+                runtime.cudaEventDisableTiming
+            )
+            _cudart_check((error,))
+            try:
+                _cudart_check(
+                    runtime.cudaEventRecord(event, _stream_handle(self.stream))
+                )
+                deadline = time.monotonic() + timeout_s
+                while True:
+                    (status,) = runtime.cudaEventQuery(event)
+                    if status == runtime.cudaError_t.cudaSuccess:
+                        return True
+                    if status != runtime.cudaError_t.cudaErrorNotReady:
+                        _cudart_check((status,))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"lane {self.rank}/{self.world_size} did not finish its "
+                            f"enqueued work within {timeout_s:.1f}s"
+                        )
+                    time.sleep(min(0.005, remaining))
+            finally:
+                runtime.cudaEventDestroy(event)
+
+
+def _cudart() -> Any:
+    """The CUDA runtime bindings, which nccl4py pulls in through cuda.core."""
+    from cuda.bindings import runtime  # noqa: PLC0415
+
+    return runtime
+
+
+def _cudart_check(result: Any) -> Any:
+    """Raise on a failed cuda-python call, which reports status in slot 0."""
+    runtime = _cudart()
+    error = result[0]
+    if error != runtime.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"CUDA runtime call failed: {error!r}")
+    return result[1:] if len(result) > 1 else None
+
+
+def _stream_handle(stream: Any) -> int:
+    """A raw stream handle; None is the legacy default stream."""
+    if stream is None:
+        return 0
+    return int(getattr(stream, "cuda_stream", stream))
+
+
+def _device_ordinal(device: Any) -> int:
+    if isinstance(device, int):
+        return device
+    index = getattr(device, "index", None)
+    if isinstance(index, int):
+        return index
+    text = str(device)
+    if text.startswith("cuda:"):
+        return int(text.split(":", 1)[1])
+    return int(text)
+
+
+@contextmanager
+def cuda_device(device: Any):
+    """Make ``device`` current for the block, torch or not.
+
+    ``torch.cuda.device`` where torch is installed, so a torch worker behaves
+    exactly as before; otherwise the CUDA runtime's own set/restore, which is
+    what lets a worker whose framework is not torch run the refit path.
+    """
+    if device is None:
+        yield
+        return
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    if torch is not None:
+        with torch.cuda.device(device):
+            yield
+        return
+    runtime = _cudart()
+    (previous,) = _cudart_check(runtime.cudaGetDevice())
+    _cudart_check(runtime.cudaSetDevice(_device_ordinal(device)))
+    try:
+        yield
+    finally:
+        _cudart_check(runtime.cudaSetDevice(previous))
 
 
 def _wait_until_initialized(comm: Any, bindings: Any, timeout_s: float) -> None:
@@ -344,11 +446,7 @@ class CommunicatorCache:
             rank,
             world_size,
         )
-        device_context = nullcontext()
-        if device is not None:
-            import torch
-
-            device_context = torch.cuda.device(device)
+        device_context = cuda_device(device)
 
         comm = None
         try:
