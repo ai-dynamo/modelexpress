@@ -269,11 +269,10 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
                 logical_shard_id=metadata.logical_shard_id,
             )
         )
-        with pytest.raises(TypeError, match="tensors"):
+        with pytest.raises(RuntimeError, match="canonical-delta"):
             trainer.stage_shard(
                 version=WeightVersionRef("version-a"),
                 tensors="model-2",
-                hf_tensor_iter=iter([]),
             )
         with pytest.raises(RuntimeError, match="canonical-delta"):
             trainer.stage_shard(

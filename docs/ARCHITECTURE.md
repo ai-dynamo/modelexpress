@@ -582,7 +582,8 @@ engine integrations.
 - `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
   graph-safe installation through vLLM's layerwise reload and post-load path.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
-  through SGLang's native safetensors loader.
+  through SGLang's native safetensors loader, using `DefaultModelLoader.Source`
+  to retain the engine's source defaults, including weight-file pattern selection.
 
 Canonical preparation requests queue on a separate `.prepare.lock`. Once the
 leader has reconstructed a target, followers verify and attach to that READY
@@ -604,6 +605,36 @@ The corresponding trainer composition is owned by `TrainerRuntime`. Public
 full-tensor NIXL and canonical-checkpoint object-storage publication remain separate
 method implementations. This keeps transport, payload preparation, engine
 geometry, and framework orchestration independently replaceable.
+
+Canonical S3 publication accepts either `stage_shard(hf_tensor_iter=...)` for a
+complete weight stream or repeated `stage_shard(tensors=bucket)` calls for one
+version. The runtime dispatches these to the canonical method's `stage()` and
+`stage_bucket()` respectively. Both use the same bounded encoding pool for XOR
+deltas and full HF checkpoints. The iterator form finishes staging before returning; bucket calls
+enqueue work, and `publish()` drains it before publishing the complete version.
+
+```python
+# Each publisher has at least one bucket; the first initializes staging.
+for bucket in local_buckets:
+    staged = trainer.stage_shard(version=version, tensors=bucket)
+staged.publish()  # Collective across the configured publication process group.
+```
+
+Miles creates this process group from sender ranks only. Non-senders still join
+the framework's weight gathers and barriers, but do not create an MX trainer or
+call publication. The iterator and full-tensor NIXL workflows keep their existing
+staging contracts.
+
+Bucket staging retains the bucket and its tensors, so their contents must remain
+stable until publication finishes. Callers submit all buckets for one version
+before publishing, and retry failed uploads through the same publication handle.
+The base version advances only after successful publication.
+
+Staging initializes a fresh artifact and encoding pool for each new version;
+successful publication clears that state. Empty buckets initialize ranks with no
+local tensors so they can still participate in collective publication. A failed
+iterator is discarded and can be retried from the beginning. A failed bucket
+worker prevents publication until the staging operation is discarded or closed.
 
 `ModelExpressGeneratorConfig.staging_buffer_bytes` sets bounded-streaming
 capacity per arena, and `staging_buffers_count` defaults to one. The streaming
@@ -1159,7 +1190,7 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `inference/load_strategy.py` | RL cold-start policy: exact desired-version P2P, canonical S3 replay, and version-agnostic fallback when no desired version is configured |
 | `inference/version_chain.py` | Shared validation and resolution of immutable full-checkpoint and delta lineage |
 | `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable destination buffers, and verification |
-| `inference/engines/sglang/` | SGLang context and native checkpoint installer |
+| `inference/engines/sglang/` | Public SGLang generator factory, context, and native checkpoint installer |
 | `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |
 | `inference/engines/vllm/installer.py` | Private vLLM load-layout capture plus graph-safe tensor or prepared-checkpoint installation |
 | `inference/engines/vllm/weight_transfer_engine.py` | Native vLLM weight-transfer bridge for NIXL full-tensor and canonical S3 checkpoint refit |
@@ -1198,6 +1229,23 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `LoadContext` from vLLM config, initializes the model, runs the strategy chain, and updates global registries.
 
 **MTP two-pass load.** Multi-token-prediction models (Qwen3.5 MTP, DeepSeek MTP) call the loader twice on one worker: the target, then the draft head. `_is_speculative_draft()` detects the second pass via `model_config.runner_type == "draft"` and sets `ctx.p2p_enabled = False`. A P2P draft would collide on the target's NIXL metadata port, and since the merged draft shares the target's `SourceIdentity` it could poison source discovery, so registration, publication, and RDMA stay off for the draft while the target keeps serving. The draft uses the remaining eligible non-P2P strategies: server cache, InstantTensor, ModelStreamer, GDS, or the runtime's native loader. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors: it reads `model.safetensors.index.json` from the directory of the shards `_prepare_weights` already resolved, which is what makes a Hugging Face model ID work, and falls back to the model URI itself (local directory, then the runai streamer's `pull_files`) for object storage. It keeps shards whose tensor names start with `mtp.`. The draft's embedding and `lm_head` come from the target, so they are not streamed. An index that holds no `mtp.` tensors is expected on a checkpoint without a draft head and streams every shard; an index that cannot be resolved at all logs a warning and also streams every shard.
+
+### SGLang Refit Integration
+
+SGLang obtains its rank-local S3 refit client through the public factory:
+
+```python
+from modelexpress_rl.inference.engines.sglang import get_modelexpress_generator
+
+generator = get_modelexpress_generator(model_runner)
+```
+
+The factory reads `model_runner.server_args.modelexpress_config` as JSON or a
+dictionary, resolves the local seed checkpoint when no seed path is supplied,
+and reuses the client cached on `model_runner.modelexpress_generator`. Connection
+settings use `object_storage_endpoint_url` and `object_storage_region_name`,
+matching the vLLM integration. SGLang owns update coordination and closes the
+cached client during scheduler shutdown.
 
 ### vLLM Refit Installation
 
