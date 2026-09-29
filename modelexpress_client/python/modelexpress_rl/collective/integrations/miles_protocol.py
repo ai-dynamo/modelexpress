@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import operator
 import os
 from dataclasses import replace
 from typing import Any
@@ -50,13 +52,17 @@ def _arg(args: Any, name: str, default: Any = None) -> Any:
 
 
 def _endpoint(args: Any) -> str:
-    return _normalize_endpoint(
-        _arg(
-            args,
-            "modelexpress_server_address",
-            os.environ.get("MX_SERVER_ADDRESS", "127.0.0.1:50051"),
-        )
+    address = _arg(
+        args,
+        "modelexpress_server_address",
+        os.environ.get("MX_SERVER_ADDRESS"),
     )
+    if address is None:
+        raise ValueError(
+            "the ModelExpress M2N protocol needs the mx-server address: pass "
+            "--modelexpress-server-address <host:port> or set MX_SERVER_ADDRESS"
+        )
+    return _normalize_endpoint(address)
 
 
 def _publish_group_count(args: Any) -> int:
@@ -67,18 +73,24 @@ def _publish_group_count(args: Any) -> int:
     )
     if raw is None:
         return _DEFAULT_PUBLISH_GROUPS
-    try:
-        count = int(raw)
-    except (TypeError, ValueError):
-        raise ValueError(
-            "modelexpress_m2n_publish_groups must be a positive integer, "
-            f"got {raw!r}"
-        ) from None
-    if isinstance(raw, bool) or count < 1:
-        raise ValueError(
-            "modelexpress_m2n_publish_groups must be a positive integer, "
-            f"got {raw!r}"
-        )
+    invalid = ValueError(
+        "modelexpress_m2n_publish_groups must be a positive integer, "
+        f"got {raw!r}"
+    )
+    if isinstance(raw, bool):
+        raise invalid
+    if isinstance(raw, str):
+        try:
+            count = int(raw.strip(), 10)
+        except ValueError:
+            raise invalid from None
+    else:
+        try:
+            count = operator.index(raw)
+        except TypeError:
+            raise invalid from None
+    if count < 1:
+        raise invalid
     return count
 
 
@@ -97,7 +109,7 @@ def _connect_timeout_s(args: Any) -> float:
             "modelexpress_m2n_connect_timeout_s must be a positive number of "
             f"seconds, got {raw!r}"
         ) from None
-    if isinstance(raw, bool) or not timeout > 0:
+    if isinstance(raw, bool) or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError(
             "modelexpress_m2n_connect_timeout_s must be a positive number of "
             f"seconds, got {raw!r}"
@@ -166,9 +178,52 @@ def _check_response(response: Any) -> Any:
     else:
         success = getattr(response, "success", None)
         message = getattr(response, "message", "")
-    if success is False:
-        raise RuntimeError(str(message or "SGLang rejected the collective command"))
+    # Fail closed on a control boundary: only an explicit success=True is a
+    # success. A missing field or an unexpected shape is a broken receiver,
+    # not a quiet pass.
+    if success is not True:
+        raise RuntimeError(
+            str(message or "SGLang returned no success=true collective response")
+        )
     return response
+
+
+def _log_late_future_result(future: Any) -> None:
+    try:
+        future.result()
+    except BaseException:
+        logger.warning("a dropped MILES generator future failed late", exc_info=True)
+
+
+def _retire_dropped_futures(futures: list) -> None:
+    """Cancel or observe futures a failure arm will not await.
+
+    A dropped future that settles later would race teardown, and its
+    exception would never be retrieved. Cancel whatever has not started and
+    register an observer for the rest so late failures reach the log.
+    """
+    for future in futures:
+        cancelled = False
+        cancel = getattr(future, "cancel", None)
+        if callable(cancel):
+            try:
+                cancelled = bool(cancel())
+            except BaseException:
+                logger.warning(
+                    "cancelling a dropped MILES generator future failed",
+                    exc_info=True,
+                )
+        if cancelled:
+            continue
+        add_done_callback = getattr(future, "add_done_callback", None)
+        if callable(add_done_callback):
+            try:
+                add_done_callback(_log_late_future_result)
+            except BaseException:
+                logger.warning(
+                    "observing a dropped MILES generator future failed",
+                    exc_info=True,
+                )
 
 
 def _await_endpoint_ready(channel: Any, *, endpoint: str, timeout_s: float) -> None:
@@ -232,9 +287,10 @@ class MilesCollectiveProtocolCore:
         self.args = args
         self.rollout_engines = None
         self.is_sender: bool | None = None
+        # miles' updater reads protocol.group_name for its progress display;
+        # WeightTransferProtocol.__init__ sets "miles", so name this path.
         self.group_name = "modelexpress-m2n"
         self.update_weight_metrics: dict[str, float] = {}
-        self._placement = None
         self._parallel_state = None
         self._engine_gpu_counts: tuple[int, ...] = ()
         self._engine_gpu_offsets: tuple[int, ...] = ()
@@ -260,7 +316,6 @@ class MilesCollectiveProtocolCore:
         self._session: MilesTrainerSession | None = None
         self._channel = None
         self._rendezvous = None
-        self._generators_prepared = False
         self._closed = False
         self._round_version: str | None = None
         self._round_begun = False
@@ -320,7 +375,7 @@ class MilesCollectiveProtocolCore:
         if len(slots) != len(set(slots)):
             raise ValueError("engine GPU ranges must not overlap")
         if any(
-            getattr(getattr(parallel_state, name), "size", 1) != 1
+            getattr(getattr(parallel_state, name, None), "size", None) != 1
             for name in ("tp", "ep", "etp", "cp", "intra_dp", "indep_dp")
         ):
             raise ValueError(
@@ -331,7 +386,6 @@ class MilesCollectiveProtocolCore:
         self._engine_gpu_counts = counts
         self._engine_gpu_offsets = offsets
         self._parallel_state = parallel_state
-        self._placement = placement
         # Every trainer rank owns its PP partition's tensors and drives its
         # own lane, so every rank is a sender.
         self.is_sender = True
@@ -401,7 +455,7 @@ class MilesCollectiveProtocolCore:
                 prepared_tensors = self._tensors
                 for name, tensor in canonical.items():
                     prepared_tensors[name].copy_(tensor)
-        except BaseException as error:  # noqa: BLE001
+        except BaseException as error:
             local_exception = error
             local_error = repr(error)
         trainer_world = dist.get_world_size()
@@ -648,7 +702,7 @@ class MilesCollectiveProtocolCore:
                     version=version,
                     operation_id=operation_id,
                 )
-            except BaseException as error:  # noqa: BLE001
+            except BaseException as error:
                 submission_error = repr(error)
         submission_errors = [""] * dist.get_world_size()
         dist.all_gather_object(
@@ -722,16 +776,19 @@ class MilesCollectiveProtocolCore:
                     f"{self._next_group} completed; missing {missing[:5]}"
                 )
             self._session.finish_round(version=version)
-        except BaseException as error:  # noqa: BLE001
+        except BaseException as error:
             local_error = repr(error)
         errors = [""] * trainer_world
         dist.all_gather_object(errors, local_error, group=_gloo_group())
         futures_error = ""
-        if rank == 0 and not any(errors):
-            try:
-                self._wait_generator_futures(self._round_futures)
-            except BaseException as error:  # noqa: BLE001
-                futures_error = repr(error)
+        if rank == 0:
+            if any(errors):
+                _retire_dropped_futures(self._round_futures)
+            else:
+                try:
+                    self._wait_generator_futures(self._round_futures)
+                except BaseException as error:
+                    futures_error = repr(error)
         status = [futures_error]
         dist.broadcast_object_list(status, src=0, group=_gloo_group())
         failures = [error for error in errors + status if error]
@@ -791,7 +848,7 @@ class MilesCollectiveProtocolCore:
         coroutine = self._send_controls(requests)
         try:
             return [async_utils.submit(coroutine)]
-        except BaseException:  # noqa: BLE001
+        except BaseException:
             coroutine.close()
             raise
 
@@ -871,7 +928,7 @@ class MilesCollectiveProtocolCore:
         if rank == 0:
             try:
                 generator_futures = self._generator_futures("prepare")
-            except BaseException as error:  # noqa: BLE001
+            except BaseException as error:
                 submission_error = repr(error)
         submission_errors = [""] * dist.get_world_size()
         dist.all_gather_object(
@@ -895,14 +952,15 @@ class MilesCollectiveProtocolCore:
         local_error = ""
         try:
             session.prepare()
-        except BaseException as error:  # noqa: BLE001
+        except BaseException as error:
             local_error = repr(error)
-        if rank == 0 and not local_error:
-            try:
-                self._wait_generator_futures(generator_futures)
-                self._generators_prepared = True
-            except BaseException as error:  # noqa: BLE001
-                if not local_error:
+        if rank == 0:
+            if local_error:
+                _retire_dropped_futures(generator_futures)
+            else:
+                try:
+                    self._wait_generator_futures(generator_futures)
+                except BaseException as error:
                     local_error = repr(error)
         errors = [""] * dist.get_world_size()
         dist.all_gather_object(errors, local_error, group=_gloo_group())
@@ -924,7 +982,7 @@ class MilesCollectiveProtocolCore:
         """
         try:
             self.close()
-        except BaseException as close_error:  # noqa: BLE001
+        except BaseException as close_error:
             logger.warning(
                 "MILES NCCL M2N close() during failure handling failed: %r",
                 close_error,
@@ -938,36 +996,39 @@ class MilesCollectiveProtocolCore:
             return
         first_error: BaseException | None = None
         if dist.is_available() and dist.is_initialized() and dist.get_rank() == 0:
+            # Retire any round futures a failed round left un-awaited before the
+            # close fan-out runs; their late results are logged, never raised.
+            _retire_dropped_futures(self._round_futures)
+            self._round_futures = []
             try:
                 futures = self._generator_futures("close")
                 self._wait_generator_futures(futures)
-            except BaseException as error:  # noqa: BLE001
+            except BaseException as error:
                 first_error = error
         session = self._session
         self._session = None
         try:
             if session is not None:
                 session.close()
-        except BaseException as error:  # noqa: BLE001
+        except BaseException as error:
             if first_error is None:
                 first_error = error
         finally:
             if session is None and self._rendezvous is not None:
                 try:
                     self._rendezvous.close()
-                except BaseException as error:  # noqa: BLE001
+                except BaseException as error:
                     if first_error is None:
                         first_error = error
             self._rendezvous = None
             if self._channel is not None:
                 try:
                     self._channel.close()
-                except BaseException as error:  # noqa: BLE001
+                except BaseException as error:
                     if first_error is None:
                         first_error = error
                 finally:
                     self._channel = None
-            self._generators_prepared = False
         if first_error is not None:
             raise first_error
         self._closed = True

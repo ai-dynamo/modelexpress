@@ -578,7 +578,9 @@ def build_miles_reshard_plan(
     if not retained:
         raise ValueError("no complete atomic MILES update unit can use NCCL M2N")
 
-    retained.sort(key=lambda item: (item[0].partition_id, item[0].name))
+    # Canonical order is the wire contract for any consumer that publishes
+    # contiguous chunks of this plan (see miles_protocol._chunk_publish_groups).
+    retained.sort(key=lambda item: item[0].canonical())
     entries = [entry for entry, _ in retained]
     routes = tuple(route for _, route in retained)
     plan = ReshardPlan(

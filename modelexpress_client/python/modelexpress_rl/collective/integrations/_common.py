@@ -258,6 +258,11 @@ def _layer_groups(
         missing = sorted(set(expected_names) - set(flattened))
         unknown = sorted(set(flattened) - set(expected_names))
         duplicates = sorted({name for name in flattened if flattened.count(name) > 1})
+        if not missing and not unknown and not duplicates:
+            raise ValueError(
+                "layer groups must publish every bulk parameter in plan order; "
+                "the groups are a pure reordering of the right names"
+            )
         raise ValueError(
             "layer groups must cover every bulk parameter exactly once in plan "
             f"order (missing={missing[:5]}, unknown={unknown[:5]}, "
@@ -280,7 +285,7 @@ def _client_device(requested: Any, storage_device: str, label: str) -> Any:
         f"cuda:{requested}" if isinstance(requested, int) else str(requested)
     )
     if requested_label == "cuda":
-        import torch  # noqa: PLC0415
+        import torch
 
         requested_label = f"cuda:{torch.cuda.current_device()}"
     if requested_label != storage_device:
@@ -295,7 +300,7 @@ def _collective_streams(streams: list[Any] | None, *, device: Any) -> list[Any]:
     if streams:
         return list(streams)
 
-    import torch  # noqa: PLC0415
+    import torch
 
     if not torch.cuda.is_available():
         return [None]
@@ -315,7 +320,7 @@ def _order_current_cuda_stream_before(
     if not streams:
         return
 
-    import torch  # noqa: PLC0415
+    import torch
 
     if not torch.cuda.is_available():
         if all(stream is None for stream in streams):

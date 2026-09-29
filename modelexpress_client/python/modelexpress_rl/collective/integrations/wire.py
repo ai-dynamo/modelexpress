@@ -15,15 +15,10 @@ from .miles import CollectiveTopology
 CONTROL_PREFIX = "modelexpress:miles-m2n:v1:"
 _ACTIONS = frozenset({"prepare", "run_round", "close"})
 MAX_CONTROL_CHARS = 32 * 1024 * 1024
-MAX_TENSOR_NAME_CHARS = 1024
 
 
-def _bounded_text(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{name} must be a non-empty string")
-    if len(value) > MAX_TENSOR_NAME_CHARS:
-        raise ValueError(f"{name} exceeds the {MAX_TENSOR_NAME_CHARS} character limit")
-    return value
+def _optional_str(value: object) -> str | None:
+    return None if value is None else str(value)
 
 
 def _placement_to_wire(placement: Placement) -> dict[str, Any]:
@@ -215,9 +210,9 @@ def decode_control(value: object) -> CollectiveControl | None:
             if "generator_slot_offset" in raw
             else None
         ),
-        version=raw.get("version"),
-        operation_id=raw.get("operation_id"),
-        endpoint=raw.get("endpoint"),
+        version=_optional_str(raw.get("version")),
+        operation_id=_optional_str(raw.get("operation_id")),
+        endpoint=_optional_str(raw.get("endpoint")),
     )
 
 
@@ -225,7 +220,6 @@ __all__ = [
     "CONTROL_PREFIX",
     "CollectiveControl",
     "MAX_CONTROL_CHARS",
-    "MAX_TENSOR_NAME_CHARS",
     "decode_control",
     "encode_control",
     "plan_from_wire",

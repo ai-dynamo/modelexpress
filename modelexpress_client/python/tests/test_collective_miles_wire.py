@@ -3,6 +3,8 @@
 
 """Tests for the MILES/SGLang collective control wire."""
 
+import json
+
 import pytest
 
 from modelexpress_rl.collective.integrations import wire
@@ -87,3 +89,17 @@ def test_control_wire_rejects_an_oversized_payload_before_json_decode(monkeypatc
 
     with pytest.raises(ValueError, match="control exceeds"):
         decode_control(value)
+
+
+def test_decode_control_coerces_scalar_fields_to_strings():
+    encoded = wire.CONTROL_PREFIX + json.dumps(
+        {"action": "run_round", "version": 7, "operation_id": 3}
+    )
+
+    decoded = decode_control(encoded)
+
+    assert decoded is not None
+    assert decoded.version == "7"
+    assert decoded.operation_id == "3"
+    assert decoded.endpoint is None
+    assert decode_control(encode_control(decoded)) == decoded

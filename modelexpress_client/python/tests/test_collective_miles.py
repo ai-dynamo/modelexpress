@@ -959,69 +959,8 @@ def test_trainer_session_factory_resolves_bare_cuda_to_the_current_device(monkey
     assert captured["device"] == "cuda:0"
 
 
-def test_trainer_session_orders_the_producer_stream_before_lane_streams(monkeypatch):
-    events = []
-
-    class Stream:
-        def __init__(self, name):
-            self.name = name
-
-        def wait_event(self, event):
-            events.append(("wait", self.name, event))
-
-    class Event:
-        def record(self, stream):
-            events.append(("record", stream.name, self))
-
-    class Cuda:
-        @staticmethod
-        def is_available():
-            return True
-
-        @staticmethod
-        def current_stream(*, device):
-            assert device == "cuda:0"
-            return Stream("producer")
-
-        @staticmethod
-        def Event():
-            return Event()
-
-        @staticmethod
-        def ExternalStream(handle):
-            return Stream(f"external-{handle}")
-
-    Cuda.Stream = Stream
-
-    class DeviceContext:
-        def __enter__(self):
-            return None
-
-        def __exit__(self, *_):
-            return None
-
-    Cuda.device = staticmethod(lambda _device: DeviceContext())
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=Cuda))
-    client = FakeTrainerClient()
-    lane_streams = [Stream("lane-0"), Stream("lane-1")]
-    session = _session(client, streams=lane_streams)
-    session.prepare()
-
-    session.begin_round(version="version-1")
-
-    assert events[0][:2] == ("record", "producer")
-    assert [event[:2] for event in events[1:]] == [
-        ("wait", "lane-0"),
-        ("wait", "lane-1"),
-    ]
-    assert events[1][2] is events[0][2]
-    assert events[2][2] is events[0][2]
-
-
-def test_trainer_session_orders_the_producer_before_the_default_lane_stream(
-    monkeypatch,
-):
-    events = []
+def _install_fake_cuda(monkeypatch, events):
+    """Fake torch.cuda that records producer/lane stream ordering events."""
 
     class Stream:
         def __init__(self, name):
@@ -1053,6 +992,10 @@ def test_trainer_session_orders_the_producer_before_the_default_lane_stream(
         def Event():
             return Event()
 
+        @staticmethod
+        def ExternalStream(handle):
+            return Stream(f"external-{handle}")
+
     Cuda.Stream = Stream
 
     class DeviceContext:
@@ -1064,6 +1007,33 @@ def test_trainer_session_orders_the_producer_before_the_default_lane_stream(
 
     Cuda.device = staticmethod(lambda _device: DeviceContext())
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=Cuda))
+    return Stream
+
+
+def test_trainer_session_orders_the_producer_stream_before_lane_streams(monkeypatch):
+    events = []
+    Stream = _install_fake_cuda(monkeypatch, events)
+    client = FakeTrainerClient()
+    lane_streams = [Stream("lane-0"), Stream("lane-1")]
+    session = _session(client, streams=lane_streams)
+    session.prepare()
+
+    session.begin_round(version="version-1")
+
+    assert events[0][:2] == ("record", "producer")
+    assert [event[:2] for event in events[1:]] == [
+        ("wait", "lane-0"),
+        ("wait", "lane-1"),
+    ]
+    assert events[1][2] is events[0][2]
+    assert events[2][2] is events[0][2]
+
+
+def test_trainer_session_orders_the_producer_before_the_default_lane_stream(
+    monkeypatch,
+):
+    events = []
+    _install_fake_cuda(monkeypatch, events)
     client = FakeTrainerClient()
     session = _session(client)
     session.prepare()
@@ -1073,6 +1043,17 @@ def test_trainer_session_orders_the_producer_before_the_default_lane_stream(
     assert events[0][:2] == ("record", "producer")
     assert events[1][:2] == ("wait", "default")
     assert events[1][2] is events[0][2]
+
+
+def test_trainer_session_rejects_layer_groups_that_reorder_the_plan():
+    with pytest.raises(ValueError, match="pure reordering"):
+        _session(
+            FakeTrainerClient(),
+            layer_groups=(
+                ("model.layers.1.mlp.down_proj.weight",),
+                ("model.layers.0.mlp.gate_proj.weight",),
+            ),
+        )
 
 
 def test_trainer_session_preserves_the_round_error_while_aborting_and_closing():

@@ -12,7 +12,7 @@ from typing import Any
 
 from ..client import RefitClientTrainer
 from ..plan import DEFAULT_RECEIVER_PROTOCOL
-from ..rendezvous import CollectiveRendezvous
+from ..rendezvous import CollectiveRendezvous, Membership
 from ..spi import LocalParamSpec
 from .miles_topology import MilesReshardTopologyPlan
 from ._common import (
@@ -185,10 +185,7 @@ class CollectiveTopology:
             raise ValueError(
                 f"trainer slot projection is missing world ranks {missing}"
             )
-        unexpected = sorted(
-            actual_world_ranks - expected_world_ranks,
-            key=repr,
-        )
+        unexpected = sorted(actual_world_ranks - expected_world_ranks)
         if unexpected:
             raise ValueError(
                 f"trainer slot projection contains unexpected world ranks {unexpected}"
@@ -277,8 +274,8 @@ class MilesPublisher:
         ]
         if set(self._aliases.values()) != set(required):
             raise ValueError(
-                f"MILES aliases must exactly cover partition {source_partition} "
-                f"; expected {required}, got {list(self._aliases.values())}"
+                f"MILES aliases must exactly cover partition {source_partition}; "
+                f"expected {required}, got {list(self._aliases.values())}"
             )
         native_by_canonical = {
             canonical_name: native_name
@@ -349,7 +346,9 @@ class MilesPublisher:
         self._validate_stable()
 
     def cleanup(self) -> None:
-        return None
+        # Intentional no-op: the SPI cleanup hook has no publisher-side state
+        # to release; the trainer session owns lifecycle teardown.
+        pass
 
 
 class MilesTrainerSession:
@@ -420,7 +419,7 @@ class MilesTrainerSession:
             streams=streams,
         )
 
-    def prepare(self):
+    def prepare(self) -> Membership:
         if self._closed:
             raise RuntimeError("the MILES trainer session is closed")
         if self._prepared:
@@ -474,7 +473,7 @@ class MilesTrainerSession:
         try:
             _order_current_cuda_stream_before(self._streams, device=self._device)
             self._client.start_weight_update(version)
-        except BaseException as error:
+        except BaseException:
             self._fail_round()
             raise
         self._round_version = version
@@ -488,7 +487,7 @@ class MilesTrainerSession:
             )
         try:
             self._client.publish_weights(version, layer_group_id)
-        except BaseException as error:
+        except BaseException:
             self._fail_round()
             raise
 
@@ -496,7 +495,7 @@ class MilesTrainerSession:
         self._require_open_round(version, "finish_round")
         try:
             self._client.finish_weight_update(version)
-        except BaseException as error:
+        except BaseException:
             self._fail_round()
             raise
         finally:

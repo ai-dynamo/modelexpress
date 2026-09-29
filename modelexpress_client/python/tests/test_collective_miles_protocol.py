@@ -65,7 +65,7 @@ def _entries(sizes):
     ]
 
 
-def _install_fake_miles_async(monkeypatch, events):
+def _install_fake_miles_async(monkeypatch, events, *, submit=None, wait_futures=None):
     async_utils = ModuleType("miles.utils.async_utils")
 
     class Future:
@@ -78,13 +78,17 @@ def _install_fake_miles_async(monkeypatch, events):
             except StopIteration as stopped:
                 return stopped.value
 
-    async_utils.submit = lambda coroutine: Future(coroutine)
+    async_utils.submit = (
+        submit if submit is not None else (lambda coroutine: Future(coroutine))
+    )
 
-    def wait_futures(futures):
+    def default_wait_futures(futures):
         events.append("wait-generators")
         return [future.result() for future in futures]
 
-    async_utils.wait_futures = wait_futures
+    async_utils.wait_futures = (
+        wait_futures if wait_futures is not None else default_wait_futures
+    )
     utils = ModuleType("miles.utils")
     utils.async_utils = async_utils
     miles = ModuleType("miles")
@@ -217,6 +221,44 @@ def test_validate_args_rejects_a_bad_connect_timeout():
 
     with pytest.raises(ValueError, match="modelexpress_m2n_connect_timeout_s"):
         miles_protocol.build_protocol.validate_args(args)
+
+
+def test_endpoint_requires_an_address_when_neither_source_is_set(monkeypatch):
+    monkeypatch.delenv("MX_SERVER_ADDRESS", raising=False)
+
+    with pytest.raises(ValueError, match="--modelexpress-server-address"):
+        miles_protocol._endpoint(SimpleNamespace())
+
+
+def test_check_response_requires_an_explicit_success_field():
+    with pytest.raises(RuntimeError, match="no success=true"):
+        miles_protocol._check_response({})
+    with pytest.raises(RuntimeError, match="quiet failure"):
+        miles_protocol._check_response(SimpleNamespace(message="quiet failure"))
+    with pytest.raises(RuntimeError, match="boom"):
+        miles_protocol._check_response({"success": False, "message": "boom"})
+    with pytest.raises(RuntimeError, match="no success=true"):
+        miles_protocol._check_response(None)
+
+    assert miles_protocol._check_response({"success": True}) == {"success": True}
+    response = SimpleNamespace(success=True, message="ok")
+    assert miles_protocol._check_response(response) is response
+
+
+def test_connect_rejects_a_missing_parallel_state_dimension():
+    protocol = MilesCollectiveProtocolCore(_args())
+    state = _parallel_state(pp_size=1)
+    del state.tp
+
+    with pytest.raises(ValueError, match="one source rank per PP partition"):
+        protocol.connect(
+            [object()],
+            [1],
+            [0],
+            state,
+            _placement(),
+            "target",
+        )
 
 
 def test_publish_group_count_falls_back_to_the_env(monkeypatch):
@@ -1060,7 +1102,6 @@ def test_close_reports_generator_failure_and_allows_retry(monkeypatch, caplog):
 
 
 def test_generator_fan_out_uses_one_submit_for_multiple_engines(monkeypatch):
-    async_utils = ModuleType("miles.utils.async_utils")
     submissions = []
     executions = []
 
@@ -1075,15 +1116,12 @@ def test_generator_fan_out_uses_one_submit_for_multiple_engines(monkeypatch):
         submissions.append(coroutine)
         return Future(coroutine)
 
-    async_utils.submit = submit
-    async_utils.wait_futures = lambda futures: [future.result() for future in futures]
-    utils = ModuleType("miles.utils")
-    utils.async_utils = async_utils
-    miles = ModuleType("miles")
-    miles.utils = utils
-    monkeypatch.setitem(sys.modules, "miles", miles)
-    monkeypatch.setitem(sys.modules, "miles.utils", utils)
-    monkeypatch.setitem(sys.modules, "miles.utils.async_utils", async_utils)
+    _install_fake_miles_async(
+        monkeypatch,
+        [],
+        submit=submit,
+        wait_futures=lambda futures: [future.result() for future in futures],
+    )
 
     protocol = MilesCollectiveProtocolCore(_args())
     protocol.rollout_engines = (object(), object())
@@ -1103,3 +1141,100 @@ def test_generator_fan_out_uses_one_submit_for_multiple_engines(monkeypatch):
     assert len(submissions) == 1
     assert len(futures) == 1
     assert executions == [0, 2]
+
+
+class _DroppedFuture:
+    def __init__(self, *, cancellable=True):
+        self.cancellable = cancellable
+        self.cancelled = False
+        self.callbacks = []
+
+    def cancel(self):
+        if not self.cancellable:
+            return False
+        self.cancelled = True
+        return True
+
+    def add_done_callback(self, callback):
+        self.callbacks.append(callback)
+
+    def result(self):
+        raise RuntimeError("late generator failure")
+
+
+def test_retire_dropped_futures_observes_futures_that_refuse_to_cancel(caplog):
+    future = _DroppedFuture(cancellable=False)
+
+    with caplog.at_level("WARNING"):
+        miles_protocol._retire_dropped_futures([future])
+
+    assert future.cancelled is False
+    assert len(future.callbacks) == 1
+    future.callbacks[0](future)
+    assert "failed late" in caplog.text
+
+
+def test_finalize_retires_dropped_rank_zero_futures_when_the_round_fails(monkeypatch):
+    protocol, session, _events, tensors = _armed_protocol(monkeypatch)
+    for name in ("model.a", "model.b", "model.c"):
+        protocol.send_bucket([(name, tensors[name])])
+    dropped = _DroppedFuture()
+    protocol._round_futures = [dropped]
+
+    def finish_round(*, version):
+        raise RuntimeError("synthetic finish failure")
+
+    session.finish_round = finish_round
+
+    with pytest.raises(RuntimeError, match="round failed"):
+        protocol.finalize(1)
+
+    assert dropped.cancelled is True
+    assert dropped.callbacks == []
+
+
+def test_prepare_sessions_retires_dropped_generator_futures_on_failure(monkeypatch):
+    _install_fake_miles_async(monkeypatch, [])
+    protocol = MilesCollectiveProtocolCore(_args())
+    protocol._tensors = {"model.weight": torch.ones((1,), dtype=torch.bfloat16)}
+    protocol._topology = SimpleNamespace(trainer_slots=("trainer-0",))
+    protocol._plan = SimpleNamespace(
+        bulk=[SimpleNamespace(name="model.weight", partition_id=0)],
+        parameter_names=lambda: ("model.weight",),
+    )
+    protocol._publish_groups = (("model.weight",),)
+    dropped = _DroppedFuture()
+
+    class Channel:
+        def close(self):
+            pass
+
+    class Session:
+        def prepare(self):
+            raise RuntimeError("synthetic session prepare failure")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        miles_protocol.grpc, "insecure_channel", lambda _endpoint: Channel()
+    )
+    monkeypatch.setattr(miles_protocol.auth, "with_auth", lambda channel: channel)
+    monkeypatch.setattr(miles_protocol, "_await_endpoint_ready", lambda *a, **k: None)
+    monkeypatch.setattr(
+        miles_protocol, "CollectiveRendezvous", lambda channel: object()
+    )
+    monkeypatch.setattr(miles_protocol, "MilesPublisher", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        miles_protocol.MilesTrainerSession, "create", lambda **_kwargs: Session()
+    )
+    _stub_single_rank_collectives(monkeypatch)
+    monkeypatch.setattr(
+        protocol, "_generator_futures", lambda action, **kwargs: [dropped]
+    )
+
+    with pytest.raises(RuntimeError, match="session preparation failed"):
+        protocol._prepare_sessions()
+
+    assert dropped.cancelled is True
+    assert dropped.callbacks == []
