@@ -133,12 +133,17 @@ def _maybe_mock_vllm():
                 raise ValueError(f"Weight transfer engine {name!r} is registered")
             cls._registry[name] = (module_path_or_cls, class_name)
 
+    attention_layer_base = type("AttentionLayerBase", (), {})
+    mamba_base = type("MambaBase", (attention_layer_base,), {})
+
     # Build mock module tree
     vllm_mods = {
         "vllm": MagicMock(),
         "vllm.config": MagicMock(),
         "vllm.config.load": MagicMock(),
         "vllm.model_executor": MagicMock(),
+        "vllm.model_executor.layers.attention_layer_base": MagicMock(),
+        "vllm.model_executor.layers.mamba.abstract": MagicMock(),
         "vllm.model_executor.model_loader": MagicMock(),
         "vllm.model_executor.model_loader.base_loader": MagicMock(),
         "vllm.model_executor.model_loader.default_loader": MagicMock(),
@@ -153,6 +158,8 @@ def _maybe_mock_vllm():
     }
 
     # Wire up real objects where behavior matters
+    vllm_mods["vllm.model_executor.layers.attention_layer_base"].AttentionLayerBase = attention_layer_base
+    vllm_mods["vllm.model_executor.layers.mamba.abstract"].MambaBase = mamba_base
     vllm_mods["vllm.model_executor.model_loader.base_loader"].BaseModelLoader = BaseModelLoader
     vllm_mods["vllm.model_executor.model_loader"].register_model_loader = register_model_loader
     vllm_mods["vllm.model_executor.model_loader"].BaseModelLoader = BaseModelLoader
