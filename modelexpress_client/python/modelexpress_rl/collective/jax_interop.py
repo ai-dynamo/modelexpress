@@ -21,11 +21,64 @@ process that has never installed it.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 
+def expected_index(
+    global_shape: Sequence[int],
+    mesh: Any,
+    placements: Sequence[Any],
+    rank: int,
+) -> tuple[slice, ...]:
+    """The slice of a parameter that ``rank`` holds under a plan's source side.
+
+    ``mesh`` and ``placements`` are a ``ParamPlan``'s ``src_mesh`` and
+    ``src_placements``. Ranks map onto the mesh in row-major order, which is
+    the order ``MeshSpec.nested()`` hands the reshard op, so this is the slice
+    the collective will read from this rank. Every tensor dim is covered: a
+    dim named by a ``Shard`` placement is split across that mesh axis, and any
+    other dim is whole.
+    """
+    shape = tuple(int(extent) for extent in mesh.shape)
+    offset = rank - int(mesh.rank_offset)
+    size = 1
+    for extent in shape:
+        size *= extent
+    if not 0 <= offset < size:
+        raise ValueError(
+            f"rank {rank} is not in the source mesh {shape}@{mesh.rank_offset}"
+        )
+    coord = []
+    for extent in reversed(shape):
+        coord.append(offset % extent)
+        offset //= extent
+    coord.reverse()
+
+    index = [slice(0, int(extent)) for extent in global_shape]
+    for axis, placement in enumerate(placements):
+        dim = getattr(placement, "dim", None)
+        if dim is None:
+            continue
+        piece = int(global_shape[dim]) // shape[axis]
+        index[dim] = slice(coord[axis] * piece, (coord[axis] + 1) * piece)
+    return tuple(index)
+
+
+def _bounds(index: Sequence[slice], global_shape: Sequence[int]) -> tuple:
+    bounds = []
+    for dim, extent in enumerate(global_shape):
+        axis = index[dim] if dim < len(index) else slice(None)
+        start, stop, _ = axis.indices(int(extent))
+        bounds.append((start, stop))
+    return tuple(bounds)
+
+
 def local_shard(
-    array: Any, *, name: str = "array", expect_rows: int | None = None
+    array: Any,
+    *,
+    name: str = "array",
+    expect_index: Sequence[slice] | None = None,
 ) -> Any:
     """This process's single-device piece of a possibly-sharded array.
 
@@ -33,18 +86,24 @@ def local_shard(
     ``to_local()``: a ``jax.Array`` living on exactly one device, holding the
     slice named by ``shard.index``. A globally-sharded array cannot be
     addressed as one buffer, which is why the shard is the unit the wire op
-    receives.
+    receives. Whichever dim the array is split on, each device's piece is its
+    own allocation, so the pointer covers exactly that piece. Which splits a
+    refit can carry is the plan's rule rather than this function's: one
+    sharded dim per source tensor.
 
     One addressable shard is required rather than assumed. A process driving
     several local devices has several, and picking the first would silently
     transfer one device's weights under every rank's name.
 
-    ``expect_rows`` turns on the check that matters for a refit: that this
-    rank's piece is the dim-0 slice the plan promised, and the extent the plan
-    promised. Every rank would otherwise issue its agreed op over storage of
-    the wrong size, and the bytes would land wrong rather than erroring. The
-    shard's own ``index`` is read rather than the array's ``PartitionSpec``,
-    because the index describes what the transfer will actually cover.
+    ``expect_index`` (see ``expected_index``) turns on the check that matters
+    for a refit: that this rank holds the slice the plan says the collective
+    will read from it, on every dim, extent and position both. A mesh whose
+    device order differs from the plan's rank order, or a ``PartitionSpec``
+    that disagrees with the plan's placements, would otherwise have every rank
+    issue its agreed op over the wrong piece, and the bytes would land wrong
+    rather than erroring. The shard's own ``index`` is read rather than the
+    array's ``PartitionSpec``, because the index describes what the transfer
+    will actually cover.
     """
     shards = array.addressable_shards
     if len(shards) != 1:
@@ -54,22 +113,57 @@ def local_shard(
             "per local device rather than choosing a shard here."
         )
     shard = shards[0]
-    if expect_rows is None:
+    if expect_index is None:
         return shard.data
 
-    index = shard.index
-    if any(axis != slice(None) for axis in index[1:]):
+    global_shape = tuple(int(extent) for extent in array.shape)
+    held = _bounds(shard.index, global_shape)
+    wanted = _bounds(expect_index, global_shape)
+    if held != wanted:
         raise ValueError(
-            f"{name}: the plan declares a dim-0 shard but this rank holds "
-            f"{index}, which is split on another axis"
+            f"{name}: this rank holds {held} of {global_shape}, the plan expects "
+            f"{wanted} (start, stop per dim). The array's sharding or its mesh's "
+            "device order disagrees with the plan's source side"
         )
-    local = shard.data
-    if local.shape[0] != expect_rows:
-        raise ValueError(
-            f"{name}: local shard has {local.shape[0]} rows, the plan expects "
-            f"{expect_rows} (an uneven split would land wrong bytes silently)"
-        )
-    return local
+    return shard.data
+
+
+def plan_sharding(devices: Sequence[Any]) -> Any:
+    """Build ``NamedSharding`` objects that agree with a plan's source side.
+
+    Returns a function taking a ``ParamPlan`` entry. The JAX mesh is built
+    with ``devices`` in process order, reshaped row-major to the entry's
+    ``src_mesh``, which is the rank order ``MeshSpec.nested()`` hands the
+    collective; each ``Shard(d)`` placement names the mesh axis that splits
+    tensor dim ``d``. ``jax.make_mesh`` is deliberately not used: it is free to
+    reorder devices for the interconnect, and a mesh whose order differs from
+    the plan's puts every rank's bytes under another rank's name.
+    """
+    import numpy as np  # noqa: PLC0415
+    import jax  # noqa: PLC0415
+    from jax.sharding import PartitionSpec  # noqa: PLC0415
+
+    ordered = np.array(
+        sorted(devices, key=lambda device: (device.process_index, device.id)),
+        dtype=object,
+    )
+    meshes: dict[tuple[int, ...], Any] = {}
+
+    def sharding_for(entry: Any) -> Any:
+        shape = tuple(int(extent) for extent in entry.src_mesh.shape)
+        mesh = meshes.get(shape)
+        if mesh is None:
+            names = tuple(f"a{axis}" for axis in range(len(shape)))
+            mesh = jax.sharding.Mesh(ordered.reshape(shape), names)
+            meshes[shape] = mesh
+        spec: list[Any] = [None] * len(entry.global_shape)
+        for axis, placement in enumerate(entry.src_placements):
+            dim = getattr(placement, "dim", None)
+            if dim is not None:
+                spec[dim] = mesh.axis_names[axis]
+        return jax.sharding.NamedSharding(mesh, PartitionSpec(*spec))
+
+    return sharding_for
 
 
 class JaxDeviceBuffer:

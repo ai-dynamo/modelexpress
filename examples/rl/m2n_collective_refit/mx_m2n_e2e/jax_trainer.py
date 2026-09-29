@@ -37,7 +37,6 @@ import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
-from jax.sharding import PartitionSpec as P
 
 from modelexpress_rl.collective import LocalParamSpec, RefitClientTrainer
 from modelexpress_rl.collective import jax_interop
@@ -47,11 +46,11 @@ from .plan_from_hf import build_plan, safetensors_header
 
 
 class JaxPublisher:
-    """``Publisher`` over a dim-0-sharded JAX parameter tree.
+    """``Publisher`` over a sharded JAX parameter tree.
 
     ``params`` maps each canonical parameter name onto its **global**
     ``jax.Array``. The shard is taken here rather than by the caller so the
-    extent can be checked against what the plan promised.
+    slice it holds can be checked against what the plan promised.
     """
 
     def __init__(
@@ -59,14 +58,14 @@ class JaxPublisher:
         params: dict[str, Any],
         plan,
         groupings,
-        mesh_size: int,
+        rank: int,
     ) -> None:
         self._plan = plan
         self._groupings = groupings
         self._specs: dict[str, LocalParamSpec] = {}
         self._arrays: list[Any] = []
 
-        self._mesh_size = mesh_size
+        self._rank = rank
 
         missing = [entry.name for entry in plan.bulk if entry.name not in params]
         if missing:
@@ -89,7 +88,9 @@ class JaxPublisher:
             shard = jax_interop.local_shard(
                 params[entry.name],
                 name=entry.name,
-                expect_rows=entry.global_shape[0] // self._mesh_size,
+                expect_index=jax_interop.expected_index(
+                    entry.global_shape, entry.src_mesh, entry.src_placements, self._rank
+                ),
             )
             self._arrays.append(shard)
             self._specs[entry.name] = LocalParamSpec(
@@ -140,48 +141,46 @@ _NUMPY_DTYPE = {
 }
 
 
-def load_local_rows(
-    model_dir: str, entry, *, rank: int, trainers: int
-) -> np.ndarray:
-    """This rank's dim-0 slice, read straight out of the checkpoint bytes.
+def load_local_piece(model_dir: str, entry, *, rank: int) -> np.ndarray:
+    """This rank's slice of one parameter, read straight out of the checkpoint.
 
-    A safetensors tensor is stored dense and row-major, so a dim-0 slice is a
-    contiguous byte range and needs no framework to extract. Reading only the
-    rank's own rows is also what keeps a trainer process off the whole model.
+    The slice is the one the plan says the collective reads from this rank, on
+    every sharded dim. A safetensors tensor is stored dense and row-major, so a
+    memory map of its byte range is the whole tensor viewed in place, and
+    slicing it reads only this rank's piece off disk, which is what keeps a
+    trainer process off the whole model.
     """
     shard = _shard_files(model_dir)[entry.name]
     path = os.path.join(model_dir, shard)
     with open(path, "rb") as handle:
         (length,) = struct.unpack("<Q", handle.read(8))
         header = json.loads(handle.read(length))
-        data_start = 8 + length
-        meta = header[entry.name]
-        begin, end = meta["data_offsets"]
-        dtype = _NUMPY_DTYPE[entry.dtype]
-        rows = entry.global_shape[0] // trainers
-        trailing = 1
-        for extent in entry.global_shape[1:]:
-            trailing *= extent
-        row_bytes = trailing * np.dtype(dtype).itemsize
-        offset = data_start + begin + rank * rows * row_bytes
-        if offset + rows * row_bytes > data_start + end:
-            raise ValueError(
-                f"{entry.name}: rank {rank}'s rows run past the tensor's stored "
-                "bytes; the header and the plan disagree"
-            )
-        handle.seek(offset)
-        raw = handle.read(rows * row_bytes)
-    local = np.frombuffer(raw, dtype=dtype).reshape((rows, *entry.global_shape[1:]))
-    return local
+    begin, end = header[entry.name]["data_offsets"]
+    dtype = np.dtype(_NUMPY_DTYPE[entry.dtype])
+    if end - begin != _numel(entry.global_shape) * dtype.itemsize:
+        raise ValueError(
+            f"{entry.name}: stored bytes do not match the plan's shape and dtype"
+        )
+    whole = np.memmap(
+        path,
+        dtype=dtype,
+        mode="r",
+        offset=8 + length + begin,
+        shape=tuple(entry.global_shape),
+    )
+    index = jax_interop.expected_index(
+        entry.global_shape, entry.src_mesh, entry.src_placements, rank
+    )
+    return np.ascontiguousarray(whole[index])
 
 
-def build_params(model_dir: str, plan, sharding_for, *, rank: int, trainers: int):
+def build_params(model_dir: str, plan, sharding_for, *, rank: int):
     """Every planned parameter as a globally-sharded ``jax.Array``."""
     params = {}
     for entry in plan.bulk:
-        local = load_local_rows(model_dir, entry, rank=rank, trainers=trainers)
+        local = load_local_piece(model_dir, entry, rank=rank)
         params[entry.name] = jax.make_array_from_process_local_data(
-            sharding_for(len(entry.global_shape)),
+            sharding_for(entry),
             local,
             tuple(entry.global_shape),
         )
@@ -218,6 +217,9 @@ def main() -> int:
     parser.add_argument(
         "--dst-layout", default="replicate", choices=["replicate", "sharded"]
     )
+    parser.add_argument(
+        "--src-layout", default="dim0", choices=["dim0", "dim1", "2d"]
+    )
     parser.add_argument("--out", default="/work/out")
     args = parser.parse_args()
 
@@ -233,29 +235,24 @@ def main() -> int:
             f"expected {args.trainers} global JAX devices, got {len(devices)}; "
             "each trainer process must see exactly one"
         )
-    mesh = jax.make_mesh((args.trainers,), ("x",))
-
-    def sharding_for(ndim: int):
-        spec = P("x", *([None] * (ndim - 1)))
-        return jax.sharding.NamedSharding(mesh, spec)
+    sharding_for = jax_interop.plan_sharding(devices)
 
     plan, groupings = build_plan(
         args.model_dir,
         trainers=args.trainers,
         generators=args.generators,
         dst_layout=args.dst_layout,
+        src_layout=args.src_layout,
     )
 
     load_start = time.perf_counter()
-    params = build_params(
-        args.model_dir, plan, sharding_for, rank=rank, trainers=args.trainers
-    )
+    params = build_params(args.model_dir, plan, sharding_for, rank=rank)
     scale = jnp.asarray(1.0, dtype=jnp.float32)
     params = _step(params, scale)
     jax.block_until_ready(params)
     load_s = time.perf_counter() - load_start
 
-    publisher = JaxPublisher(params, plan, groupings, args.trainers)
+    publisher = JaxPublisher(params, plan, groupings, rank)
 
     channel = grpc.insecure_channel(args.endpoint)
     grpc.channel_ready_future(channel).result(timeout=120)
@@ -325,6 +322,7 @@ def main() -> int:
                 "role": "trainer",
                 "backend": "jax",
                 "dst_layout": args.dst_layout,
+                "src_layout": args.src_layout,
                 "model_dir": args.model_dir,
                 "model_load_s": load_s,
                 "bootstrap_s": bootstrap_s,

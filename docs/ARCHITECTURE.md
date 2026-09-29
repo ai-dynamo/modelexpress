@@ -503,9 +503,16 @@ property for bfloat16 and float8 buffers. `JaxDeviceBuffer` wraps a
 single-device array with the `data_ptr()` / `shape` / `dtype` trio the resolver
 reads, taking the address from `unsafe_buffer_pointer()`, which carries no
 dtype restriction. `local_shard()` is the counterpart of DTensor's
-`to_local()`: `addressable_shards[0].data`, with the shard's own `index` and
-extent checked against what the plan promised. `examples/rl/m2n_collective_refit/mx_m2n_e2e/jax_trainer.py`
-is the worked Publisher over it.
+`to_local()`: `addressable_shards[0].data`, with the shard's own `index`
+checked on every dim against `expected_index()`, the slice the plan's source
+mesh and placements assign that rank. The source may be split on any one tensor
+dim, over a mesh of up to two axes with the other axis replicated; the
+collective refuses a source split on two dims, and the plan rejects one when it
+is built. `plan_sharding()` builds the matching `NamedSharding`
+with devices in the plan's row-major rank order, since a mesh ordered any other
+way puts each rank's bytes under another rank's name.
+`examples/rl/m2n_collective_refit/mx_m2n_e2e/jax_trainer.py` is the worked
+Publisher over it, and takes `--src-layout dim0|dim1|2d`.
 
 There is no group-delete RPC, symmetrically with workers never creating one.
 Expired generations are fenced now; reclaiming the resulting empty group hashes

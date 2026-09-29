@@ -241,44 +241,122 @@ class TestJaxDeviceBuffer:
         assert buffer.data_ptr() == 0x2000
 
 
-class _Rows:
-    """A shard payload that only has to report a row count."""
+class _Piece:
+    """A shard payload that only has to report its shape."""
 
-    def __init__(self, rows):
-        self.shape = (rows, 8)
+    def __init__(self, shape):
+        self.shape = shape
+
+
+def _mesh(shape, rank_offset=0):
+    from modelexpress_rl.collective import MeshSpec
+
+    return MeshSpec(shape=shape, rank_offset=rank_offset)
+
+
+class TestExpectedIndex:
+    """The slice the collective reads from each rank, on every sharded dim."""
+
+    def test_dim0_over_a_flat_mesh(self):
+        from modelexpress_rl.collective import Placement
+
+        got = jax_interop.expected_index((8, 6), _mesh((4,)), (Placement.shard(0),), 2)
+        assert got == (slice(4, 6), slice(0, 6))
+
+    def test_dim1_over_a_flat_mesh(self):
+        from modelexpress_rl.collective import Placement
+
+        got = jax_interop.expected_index((8, 6), _mesh((2,)), (Placement.shard(1),), 1)
+        assert got == (slice(0, 8), slice(3, 6))
+
+    def test_two_dims_over_a_2d_mesh_is_row_major(self):
+        """Rank 1 on a (2, 2) mesh is coordinate (0, 1), matching nested()."""
+        from modelexpress_rl.collective import Placement
+
+        mesh = _mesh((2, 2))
+        placements = (Placement.shard(0), Placement.shard(1))
+        assert mesh.nested() == [[0, 1], [2, 3]]
+        got = [jax_interop.expected_index((8, 6), mesh, placements, r) for r in range(4)]
+        assert got == [
+            (slice(0, 4), slice(0, 3)),
+            (slice(0, 4), slice(3, 6)),
+            (slice(4, 8), slice(0, 3)),
+            (slice(4, 8), slice(3, 6)),
+        ]
+
+    def test_a_replicated_axis_leaves_the_tensor_whole_on_it(self):
+        from modelexpress_rl.collective import Placement
+
+        placements = (Placement.replicate(), Placement.shard(1))
+        got = jax_interop.expected_index((8, 6), _mesh((2, 2)), placements, 3)
+        assert got == (slice(0, 8), slice(3, 6))
+
+    def test_a_rank_offset_is_subtracted(self):
+        from modelexpress_rl.collective import Placement
+
+        mesh = _mesh((2,), rank_offset=4)
+        assert jax_interop.expected_index((8,), mesh, (Placement.shard(0),), 5) == (
+            slice(4, 8),
+        )
+
+    def test_a_rank_outside_the_mesh_is_refused(self):
+        from modelexpress_rl.collective import Placement
+
+        with pytest.raises(ValueError, match="not in the source mesh"):
+            jax_interop.expected_index((8,), _mesh((2,)), (Placement.shard(0),), 2)
 
 
 class TestLocalShardPlanChecks:
-    """``expect_rows`` is what stops a wrong-extent op landing silently."""
+    """``expect_index`` is what stops a wrong-slice op landing silently."""
 
     @staticmethod
-    def _array(rows, index):
-        return _Array(shards=[_Rows(rows)], indices=[index])
+    def _array(piece_shape, index, global_shape=(1024, 8)):
+        return _Array(shards=[_Piece(piece_shape)], indices=[index], shape=global_shape)
 
     def test_a_matching_dim0_shard_passes(self):
-        array = self._array(512, (slice(0, 512), slice(None)))
-        assert jax_interop.local_shard(array, name="w", expect_rows=512).shape == (512, 8)
+        array = self._array((512, 8), (slice(0, 512), slice(None)))
+        expect = (slice(0, 512), slice(0, 8))
+        assert jax_interop.local_shard(array, name="w", expect_index=expect).shape == (512, 8)
+
+    def test_a_matching_two_axis_shard_passes(self):
+        array = self._array((512, 4), (slice(512, 1024), slice(4, 8)))
+        expect = (slice(512, 1024), slice(4, 8))
+        assert jax_interop.local_shard(array, name="w", expect_index=expect).shape == (512, 4)
 
     def test_a_short_shard_is_refused(self):
-        array = self._array(511, (slice(0, 511), slice(None)))
-        with pytest.raises(ValueError, match="expects 512"):
-            jax_interop.local_shard(array, name="w", expect_rows=512)
-
-    def test_a_shard_split_on_another_axis_is_refused(self):
-        array = self._array(512, (slice(None), slice(0, 4)))
-        with pytest.raises(ValueError, match="split on another axis"):
-            jax_interop.local_shard(array, name="w", expect_rows=512)
-
-    def test_the_parameter_name_reaches_the_message(self):
-        array = self._array(1, (slice(0, 1), slice(None)))
-        with pytest.raises(ValueError, match="model.layers.0.weight"):
+        array = self._array((511, 8), (slice(0, 511), slice(None)))
+        with pytest.raises(ValueError, match="the plan expects"):
             jax_interop.local_shard(
-                array, name="model.layers.0.weight", expect_rows=512
+                array, name="w", expect_index=(slice(0, 512), slice(0, 8))
             )
 
-    def test_without_expect_rows_no_layout_check_runs(self):
+    def test_the_right_extent_at_the_wrong_position_is_refused(self):
+        """A mesh ordered differently from the plan's ranks: same size, wrong rows."""
+        array = self._array((512, 8), (slice(512, 1024), slice(None)))
+        with pytest.raises(ValueError, match="device order disagrees"):
+            jax_interop.local_shard(
+                array, name="w", expect_index=(slice(0, 512), slice(0, 8))
+            )
+
+    def test_a_shard_split_on_a_dim_the_plan_keeps_whole_is_refused(self):
+        array = self._array((1024, 4), (slice(None), slice(0, 4)))
+        with pytest.raises(ValueError, match="the plan expects"):
+            jax_interop.local_shard(
+                array, name="w", expect_index=(slice(0, 512), slice(0, 8))
+            )
+
+    def test_the_parameter_name_reaches_the_message(self):
+        array = self._array((1, 8), (slice(0, 1), slice(None)))
+        with pytest.raises(ValueError, match="model.layers.0.weight"):
+            jax_interop.local_shard(
+                array,
+                name="model.layers.0.weight",
+                expect_index=(slice(0, 512), slice(0, 8)),
+            )
+
+    def test_without_expect_index_no_layout_check_runs(self):
         """The plain lookup must stay usable where there is no plan to check."""
-        array = self._array(7, (slice(None), slice(0, 4)))
+        array = self._array((7, 8), (slice(None), slice(0, 4)))
         assert jax_interop.local_shard(array).shape == (7, 8)
 
 

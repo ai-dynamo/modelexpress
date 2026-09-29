@@ -17,17 +17,22 @@ RUN=${RUN:-e2e-$(date +%s)}
 OUT=${OUT:-/work/out/$RUN}
 TRAINER=${TRAINER:-fsdp2}   # fsdp2 | deepspeed | jax
 DST=${DST:-replicate}
+SRC=${SRC:-dim0}     # dim0 | dim1 | 2d; only the jax trainer takes the last two
+if [ "$SRC" != dim0 ] && [ "$TRAINER" != jax ]; then
+  echo "SRC=$SRC needs TRAINER=jax; the torch trainers hold dim-0 shards only" >&2
+  exit 2
+fi
 
 export PYTHONPATH=${PYTHONPATH:-$(cd "$(dirname "$0")" && pwd)}
 export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-WARNING}
 export MX_NCCL_REFIT_GROUP_TIMEOUT_S=${MX_NCCL_REFIT_GROUP_TIMEOUT_S:-900}
 mkdir -p "$OUT"
-echo "run=$RUN model=$MODEL trainer=$TRAINER dst=$DST trainers=$T generators=$G rounds=$ROUNDS out=$OUT"
+echo "run=$RUN model=$MODEL trainer=$TRAINER src=$SRC dst=$DST trainers=$T generators=$G rounds=$ROUNDS out=$OUT"
 
 ( CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((G-1))) \
   python3 -m mx_m2n_e2e.generator --model-dir "$MODEL" --endpoint "$MX_ENDPOINT" \
     --model-name "$RUN" --run-id "$RUN" --trainers "$T" --generators "$G" \
-    --rounds "$ROUNDS" --dst-layout "$DST" ${DIFF:+--diff-checkpoint} --out "$OUT" > "$OUT/generator.log" 2>&1
+    --rounds "$ROUNDS" --dst-layout "$DST" --src-layout "$SRC" ${DIFF:+--diff-checkpoint} --out "$OUT" > "$OUT/generator.log" 2>&1
   echo $? > "$OUT/generator.rc" ) &
 
 sleep 5
@@ -41,7 +46,7 @@ for rank in $(seq 0 $((T-1))); do
       XLA_PYTHON_CLIENT_PREALLOCATE=false \
       python3 -m mx_m2n_e2e.jax_trainer --model-dir "$MODEL" --endpoint "$MX_ENDPOINT" \
         --model-name "$RUN" --run-id "$RUN" --trainers "$T" --generators "$G" \
-        --rounds "$ROUNDS" --dst-layout "$DST" \
+        --rounds "$ROUNDS" --dst-layout "$DST" --src-layout "$SRC" \
         --out "$OUT" > "$OUT/trainer$rank.log" 2>&1
       echo $? > "$OUT/trainer$rank.rc" ) &
   else
