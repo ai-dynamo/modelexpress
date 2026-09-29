@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable
-from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -120,7 +119,6 @@ class TrainerRuntime:
                     process_group=process_group,
                     read_seed_tensor=read_seed_tensor,
                     s3=s3,
-                    clock=lambda: perf_counter(),
                 )
             except Exception:
                 s3.close()
@@ -221,21 +219,15 @@ class TrainerRuntime:
         tensors: Any,
         hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None,
     ) -> PublicationArtifact:
-        if self.method is None:
-            self._full_tensor()
-        if isinstance(self.method, FullTensorNixlPublicationMethod):
+        if isinstance(self.method, CanonicalDeltaPublicationMethod):
+            if (hf_tensor_iter is None) == (tensors is None):
+                raise ValueError("provide either hf_tensor_iter or a tensor bucket")
             if hf_tensor_iter is not None:
-                raise ValueError("hf_tensor_iter is only supported for object storage")
-            return self.method.stage(version=version, tensors=tensors)
-        if tensors is not None:
-            raise ValueError(
-                "object storage publication accepts hf_tensor_iter, not tensors"
-            )
-        if hf_tensor_iter is None:
-            raise ValueError(
-                "hf_tensor_iter is required for object storage publication"
-            )
-        return self.method.stage(version=version, hf_tensor_iter=hf_tensor_iter)
+                return self.method.stage(version=version, hf_tensor_iter=hf_tensor_iter)
+            return self.method.stage_bucket(version=version, bucket=tensors)
+        if hf_tensor_iter is not None:
+            raise ValueError("hf_tensor_iter is only supported for object storage")
+        return self._full_tensor().stage(version=version, tensors=tensors)
 
     def publish(
         self, *, version: WeightVersionRef, staged: PublicationArtifact
