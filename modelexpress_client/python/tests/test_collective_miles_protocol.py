@@ -226,6 +226,21 @@ def test_validate_args_rejects_secure_schemes():
         miles_protocol.build_protocol.validate_args(args)
 
 
+@pytest.mark.parametrize("delimiter", ["\0", "\n", "\r", "|", ","])
+def test_validate_args_rejects_run_id_record_delimiters(delimiter):
+    # The run id prefixes every trainer slot, and slot names live in Redis
+    # lane records as comma-separated lists. The server at this base rejects
+    # control characters and '|' in slot ids but not ',', so this check is
+    # the only comma protection.
+    args = _args()
+    args.modelexpress_m2n_run_id = f"run{delimiter}7"
+
+    with pytest.raises(ValueError, match="Redis record delimiters"):
+        miles_protocol.build_protocol.validate_args(args)
+    with pytest.raises(ValueError, match="Redis record delimiters"):
+        MilesCollectiveProtocolCore(args)
+
+
 @pytest.mark.parametrize("value", [0, -2, "two", True])
 def test_validate_args_rejects_non_positive_publish_groups(value):
     args = _args()

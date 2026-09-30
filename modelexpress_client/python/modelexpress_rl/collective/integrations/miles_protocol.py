@@ -132,6 +132,21 @@ def _abi_version(args: Any) -> str:
     return _text(requested, "modelexpress_m2n_abi_version")
 
 
+def _run_id(value: object, label: str) -> str:
+    text = _text(value, label)
+    # The run id prefixes every slot ("<run_id>:trainer-N"), and slot names
+    # are stored in Redis lane records as comma-separated lists. The server
+    # at this base rejects control characters and '|' in slot ids but not
+    # ',', so this check is the only protection against a comma splitting
+    # one participant into two slot names mid-bootstrap.
+    if any(delimiter in text for delimiter in ("\0", "\n", "\r", "|", ",")):
+        raise ValueError(
+            f"{label} must not contain Redis record delimiters "
+            f"(comma, pipe, or control characters): {text!r}"
+        )
+    return text
+
+
 def _entry_wire_bytes(entry: ParamPlan) -> int:
     if _dtype_label(entry.dtype) != "bfloat16":
         raise ValueError(f"{entry.name}: unsupported collective dtype {entry.dtype!r}")
@@ -254,7 +269,7 @@ def _validate_args(args: Any) -> None:
         raise ValueError(f"invalid modelexpress_server_address: {error}") from error
     run_id = _arg(args, "modelexpress_m2n_run_id", os.environ.get("MX_MILES_RUN_ID"))
     if run_id is not None:
-        _text(run_id, "modelexpress_m2n_run_id")
+        _run_id(run_id, "modelexpress_m2n_run_id")
     _publish_group_count(args)
     _connect_timeout_s(args)
     _abi_version(args)
@@ -297,7 +312,7 @@ class MilesCollectiveProtocolCore:
             os.environ.get("MX_MILES_RUN_ID"),
         )
         self._run_id = (
-            _text(requested_run_id, "modelexpress_m2n_run_id")
+            _run_id(requested_run_id, "modelexpress_m2n_run_id")
             if requested_run_id is not None
             else None
         )
@@ -587,7 +602,7 @@ class MilesCollectiveProtocolCore:
                 agreed_run_id = next(iter(configured_run_ids))
             else:
                 agreed_run_id = gathered[0][1]
-            self._run_id = _text(agreed_run_id, "modelexpress_m2n_run_id")
+            self._run_id = _run_id(agreed_run_id, "modelexpress_m2n_run_id")
             self._run_id_agreed = True
         if self._run_id is None:
             raise RuntimeError("MILES NCCL M2N run identity is unavailable")
@@ -775,11 +790,8 @@ class MilesCollectiveProtocolCore:
                 )
             except BaseException as error:
                 submission_error = repr(error)
-        # Track the submitted futures before the gather: every failure from
-        # here — the gather itself, a peer's submission failure, or
-        # begin_round — reaches the caller's terminal close, and the close
-        # path retires exactly this list. Assigning only after the gather
-        # would leak rank 0's futures whenever the gather raised.
+        # Tracked before the gather so the caller's terminal close retires
+        # them if anything below raises.
         self._round_futures = futures
         submission_errors = [""] * dist.get_world_size()
         dist.all_gather_object(
