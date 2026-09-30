@@ -2093,7 +2093,12 @@ mod tests {
             .await
             .expect("mark the operation failed");
         let terminal_replacement = backend
-            .join_group(&join(&terminal, "g3", "w-g3-new", CollectiveRole::Generator))
+            .join_group(&join(
+                &terminal,
+                "g3",
+                "w-g3-new",
+                CollectiveRole::Generator,
+            ))
             .await
             .expect("terminal replacement join");
         assert_eq!(terminal_replacement.epoch, terminal_created.epoch + 1);
