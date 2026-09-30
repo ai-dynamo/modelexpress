@@ -20,6 +20,11 @@ package model_express.refit_collective;
 service RefitCollectiveService {
   // Orchestrator-facing. `idempotency_key` makes a retried create return the
   // same operation rather than opening a second one against the same group.
+  // The match is scoped to the group's current epoch: after a membership
+  // change advances the epoch, a faithful replay reclaims the key and opens a
+  // new operation. The fence declaration is checked before the idempotency
+  // match, so a replay whose `requires_bootstrap_fence` differs from the
+  // group's is refused even when it otherwise matches.
   rpc CreateCollectiveTransfer(CreateCollectiveTransferRequest) returns (CollectiveTransfer);
   rpc GetCollectiveTransfer(GetCollectiveTransferRequest) returns (CollectiveTransfer);
   rpc DeleteCollectiveTransfer(DeleteCollectiveTransferRequest) returns (CollectiveTransfer);
