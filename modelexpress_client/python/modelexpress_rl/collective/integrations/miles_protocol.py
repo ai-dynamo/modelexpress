@@ -742,7 +742,11 @@ class MilesCollectiveProtocolCore:
                 except BaseException as error:
                     self._close_preserving(error)
                     raise
-            self._begin_round(version)
+            try:
+                self._begin_round(version)
+            except BaseException as error:
+                self._close_preserving(error)
+                raise
         try:
             for name in names:
                 self._round_seen.add(name)
@@ -771,6 +775,12 @@ class MilesCollectiveProtocolCore:
                 )
             except BaseException as error:
                 submission_error = repr(error)
+        # Track the submitted futures before the gather: every failure from
+        # here — the gather itself, a peer's submission failure, or
+        # begin_round — reaches the caller's terminal close, and the close
+        # path retires exactly this list. Assigning only after the gather
+        # would leak rank 0's futures whenever the gather raised.
+        self._round_futures = futures
         submission_errors = [""] * dist.get_world_size()
         dist.all_gather_object(
             submission_errors,
@@ -783,18 +793,11 @@ class MilesCollectiveProtocolCore:
             if error
         ]
         if submission_failures:
-            primary = RuntimeError(
+            raise RuntimeError(
                 "MILES NCCL M2N round generator submission failed: "
                 + "; ".join(submission_failures[:4])
             )
-            self._close_preserving(primary)
-            raise primary
-        self._round_futures = futures
-        try:
-            session.begin_round(version=version)
-        except BaseException as error:
-            self._close_preserving(error)
-            raise
+        session.begin_round(version=version)
         self._round_begun = True
 
     def _drain_ready_groups(self, version: str) -> tuple[tuple[str, ...], ...]:
