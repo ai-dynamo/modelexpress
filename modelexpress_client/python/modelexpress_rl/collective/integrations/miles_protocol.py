@@ -393,7 +393,8 @@ class MilesCollectiveProtocolCore:
     def begin_sync(self, weight_version: int, iter_buckets) -> bool:
         """Materialize and validate the base-weight stream and arm the round.
 
-        The canonical tensors are copied into stable wire buffers here;
+        Each canonical tensor is validated and copied into its stable wire
+        buffer as it arrives, so the materialized stream is never pinned whole;
         ``send_bucket`` only tracks arrival order against those buffers.
         Session preparation is deferred to the first ``send_bucket`` so the
         channel, rendezvous join, and NCCL bootstrap happen inside the engine
@@ -413,13 +414,26 @@ class MilesCollectiveProtocolCore:
                     f"the round for version {self._round_version!r} never "
                     "finalized"
                 )
-            canonical: dict[str, torch.Tensor] = {}
+            first_round = self._canonical_shapes is None
+            frozen: dict[str, tuple[int, ...]]
+            prepared: dict[str, torch.Tensor]
+            if first_round:
+                frozen = {}
+                prepared = {}
+            else:
+                if self._tensors is None:
+                    raise RuntimeError("wire buffers are unavailable")
+                frozen = self._canonical_shapes or {}
+                prepared = self._tensors
+            seen: set[str] = set()
+            shapes: dict[str, tuple[int, ...]] = {}
             for bucket in iter_buckets(materialize=True):
                 for name, tensor in bucket:
                     if ":" in name:
                         raise ValueError("LoRA/adaptor tensors are not supported")
-                    if name in canonical:
+                    if name in seen:
                         raise ValueError(f"duplicate HF weight name {name!r}")
+                    seen.add(name)
                     if tensor.ndim == 0:
                         raise ValueError(f"{name}: scalar weights are not supported")
                     if tensor.dtype is not torch.bfloat16:
@@ -430,31 +444,32 @@ class MilesCollectiveProtocolCore:
                         raise ValueError(
                             f"{name}: materialized HF weight is not contiguous"
                         )
-                    canonical[name] = tensor
-            if not canonical:
+                    shape = tuple(int(dim) for dim in tensor.shape)
+                    if first_round:
+                        wire = torch.empty(
+                            shape,
+                            dtype=tensor.dtype,
+                            device=tensor.device,
+                        )
+                        wire.copy_(tensor)
+                        prepared[name] = wire
+                    else:
+                        # A mid-stream failure can leave earlier wire buffers
+                        # already overwritten; that is safe because a failed
+                        # begin_sync never arms a round, and the next begin_sync
+                        # rewrites every buffer before use.
+                        if frozen.get(name) != shape:
+                            raise RuntimeError(
+                                "MILES tensor names or canonical shapes changed"
+                            )
+                        prepared[name].copy_(tensor)
+                    shapes[name] = shape
+            if not shapes:
                 raise ValueError("MILES produced no base-model tensors")
-            canonical_shapes = {
-                name: tuple(int(dim) for dim in tensor.shape)
-                for name, tensor in canonical.items()
-            }
-            if self._canonical_shapes is None:
-                prepared_tensors = {}
-                for name, tensor in canonical.items():
-                    wire = torch.empty(
-                        tuple(tensor.shape),
-                        dtype=tensor.dtype,
-                        device=tensor.device,
-                    )
-                    wire.copy_(tensor)
-                    prepared_tensors[name] = wire
-            else:
-                if canonical_shapes != self._canonical_shapes:
-                    raise RuntimeError("MILES tensor names or canonical shapes changed")
-                if self._tensors is None:
-                    raise RuntimeError("wire buffers are unavailable")
-                prepared_tensors = self._tensors
-                for name, tensor in canonical.items():
-                    prepared_tensors[name].copy_(tensor)
+            if not first_round and shapes.keys() != frozen.keys():
+                raise RuntimeError("MILES tensor names or canonical shapes changed")
+            canonical_shapes = shapes
+            prepared_tensors = prepared
         except BaseException as error:
             local_exception = error
             local_error = repr(error)

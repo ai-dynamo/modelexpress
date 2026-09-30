@@ -122,3 +122,12 @@ from this configuration. Certified performance numbers live on the full
 feature branch (`modelexpress-miles-nccl-m2n`). The one tuning lever exposed
 here is the publish-group count above, which trades per-group overhead
 against engine-side overlap granularity.
+
+Memory: the trainer pays two HF conversions per round — one materializing
+the bucket stream inside `begin_sync`, one by the MILES updater's own
+`send_bucket` pass (whose tensors this adapter ignores; the wire buffers
+were already filled). The wire buffers themselves are a persistent extra
+replica of this rank's PP-local BF16 weights, held for the protocol's
+lifetime. Size trainer memory accordingly: steady state is one extra
+partition replica, and `begin_sync` adds at most one bucket of transient on
+top.
