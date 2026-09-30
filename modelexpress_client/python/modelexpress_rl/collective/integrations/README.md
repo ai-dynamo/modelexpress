@@ -98,8 +98,10 @@ outside the supported envelope:
 - `--megatron-to-hf-mode raw` (the MILES default) is required: `bridge` mode
   forces `gather_pp=True`, and this adapter rejects that placement at
   `connect()` with "MILES NCCL M2N requires PP-local HF tensors". Raw mode
-  converts from a Megatron checkpoint, so the run also needs `--ref-load`
-  pointing at that checkpoint; bridge mode loads HF directly.
+  converts from a Megatron checkpoint, so the run needs one: a valid
+  Megatron checkpoint at `--load`, or `--ref-load` pointing at one as the
+  fallback MILES uses when `--load` is absent or not a valid Megatron
+  checkpoint; bridge mode loads HF directly.
 - Explicit engine GPU topology: `engine_gpu_counts`/`engine_gpu_offsets` must
   be provided; ambiguous engine placement is rejected.
 - Base-model rounds only: `supports_lora = False`; selector must be `"all"`
@@ -170,16 +172,15 @@ The adapter sends no tensor digests, so the receiver's
 `MX_MILES_VERIFY_TENSOR_EQUALITY` digest check must stay at its default (off);
 enabling it against this adapter fails loudly at round start.
 
-The rendezvous at this base has no bootstrap-fence RPCs, so this client cannot
-answer a fence: groups must form with `requires_bootstrap_fence=0`. A group
-formed with the fence required would deadlock at bootstrap, with receivers
-waiting at the fence for trainers that have no RPC to arrive with. The knob
-alone is not sufficient against full-branch receivers: the deployed 0.5.1
-client awaits the bootstrap fences unconditionally (the env only stamps its
-join spec), so a fenceless trainer paired with full-branch receivers deadlocks
-even in a fence-optional group. Every member of the group must run a fenceless
-client — stage this branch's (or the 795 base's) client over the receiver
-image's in-image client.
+This client has no bootstrap-fence machinery: the rendezvous at this base
+carries no fence RPCs, so it pairs only with fenceless receivers from the
+795 lineage. The full-branch 0.5.1 receiver awaits the per-lane bootstrap
+fences unconditionally (its env knob only stamps the join spec), so pairing
+this trainer with full-branch receivers deadlocks at bootstrap with zero
+weight bytes moved — observed twice on hardware. No fenceless build of the
+production sglang receiver exists: the receiver plugin and the fence landed
+together on the full integration branch, and staging this client library
+over the receiver image does not remove the plugin's own fence calls.
 
 ## Performance caveat
 
