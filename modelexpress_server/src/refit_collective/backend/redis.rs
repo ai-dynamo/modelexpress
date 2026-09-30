@@ -16,9 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use modelexpress_common::grpc::refit_collective::{
     CollectiveBootstrapFence, CollectiveGroup, CollectiveGroupMembership, CollectiveGroupSpec,
-    CollectiveGroupState, CollectiveLane, CollectiveParticipant, CollectiveRole, CollectiveTransfer,
-    CollectiveTransferState, CreateCollectiveTransferRequest, JoinCollectiveGroupRequest,
-    LaneAssignment, LaneKind, PlanSource, PublishGroupBootstrapRequest,
+    CollectiveGroupState, CollectiveLane, CollectiveParticipant, CollectiveRole,
+    CollectiveTransfer, CollectiveTransferState, CreateCollectiveTransferRequest,
+    JoinCollectiveGroupRequest, LaneAssignment, LaneKind, PlanSource, PublishGroupBootstrapRequest,
     ReachCollectiveBootstrapFenceRequest, ReportCollectiveTransferRequest,
 };
 use redis::aio::ConnectionManager;
@@ -1277,7 +1277,9 @@ mod tests {
     async fn bootstrap_fence_is_idempotent_epoch_fenced_and_reset_on_membership_change() {
         let url = std::env::var("MX_TEST_REDIS_URL")
             .expect("MX_TEST_REDIS_URL must point at an isolated Redis");
-        let backend = RedisCollectiveBackend::connect(&url).await.expect("connect");
+        let backend = RedisCollectiveBackend::connect(&url)
+            .await
+            .expect("connect");
         let mut redis = backend.connection.clone();
         redis::cmd("FLUSHDB")
             .query_async::<()>(&mut redis)
@@ -1636,7 +1638,9 @@ mod tests {
     async fn the_bootstrap_fence_gate_is_opt_in_per_group() {
         let url = std::env::var("MX_TEST_REDIS_URL")
             .expect("MX_TEST_REDIS_URL must point at an isolated Redis");
-        let backend = RedisCollectiveBackend::connect(&url).await.expect("connect");
+        let backend = RedisCollectiveBackend::connect(&url)
+            .await
+            .expect("connect");
         let mut redis = backend.connection.clone();
         redis::cmd("FLUSHDB")
             .query_async::<()>(&mut redis)
