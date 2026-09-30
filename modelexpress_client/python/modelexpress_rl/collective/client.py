@@ -332,12 +332,10 @@ class _RefitClientBase:
         # still initializing lane N; overlapping communicator creation can hang.
         # Every rank walks the FULL declared lane set, including lanes it is
         # not on, so the barriers line up; membership.lane raises for those.
-        # After its optional communicator creation each rank settles every
-        # local communicator, reaches a server-backed full-cohort fence, and
-        # only then enters the NCCL broadcast barrier. The control-plane fence
-        # closes the race where a fast nonmember could reuse broadcast while a
-        # lane member was still initializing. The broadcast step itself follows
-        # the same protocol so no rank can start the first reshard step early.
+        # After its optional creation each rank settles its local
+        # communicators and reaches a full-cohort fence before the NCCL
+        # broadcast barrier, closing the race where a fast nonmember reuses
+        # broadcast while a lane member is still initializing.
         lane_order = [membership.broadcast_lane.lane_id] + [
             lane.lane_id for lane in declared if lane.kind == "RESHARD"
         ]
@@ -364,11 +362,9 @@ class _RefitClientBase:
 
                 # A fresh non-blocking communicator can report Success at
                 # creation and still reject the barrier launch moments later
-                # when its scalable-init trailing phase fails. Poll every
-                # local lane of this group epoch -- including the one just
-                # created -- before the shared bootstrap barrier, so that
-                # failure surfaces here as a clean init error naming the lane
-                # instead of a rejected barrier launch on a peer.
+                # when its scalable-init trailing phase fails; settle every
+                # local lane of this epoch first so that failure surfaces here
+                # as a clean init error naming the lane.
                 self._cache.settle_group(membership.group_id, membership.epoch)
 
                 # UNCONDITIONAL: every rank arrives at this lane's fence
@@ -399,10 +395,9 @@ class _RefitClientBase:
                 _bootstrap_barrier(
                     broadcast, self._device, alloc=self._barrier_alloc
                 )
-            # Every lane's PRE_BARRIER fence released and every rank passed its
-            # barriers; the COMPLETE arrival tells MX this epoch finished its
-            # all-rank bootstrap, which is what lets a fenced group create
-            # transfers. Same unconditional arrival as above.
+            # The COMPLETE arrival tells MX this epoch finished its all-rank
+            # bootstrap, which is what lets a fenced group create transfers.
+            # Same unconditional arrival as above.
             self._rendezvous.await_bootstrap_fence(
                 group_id=membership.group_id,
                 epoch=membership.epoch,
