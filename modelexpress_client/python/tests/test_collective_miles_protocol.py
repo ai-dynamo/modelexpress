@@ -510,7 +510,7 @@ def _begin_sync_failure_worker(rank, world_size, rendezvous_path, results):
         world_size=world_size,
         timeout=timedelta(seconds=10),
     )
-    original_empty = torch.empty
+    original_clone = torch.Tensor.clone
     try:
         miles_protocol._gloo_group = lambda: dist.group.WORLD
         state = _parallel_state(pp_size=world_size)
@@ -528,14 +528,14 @@ def _begin_sync_failure_worker(rank, world_size, rendezvous_path, results):
         if rank == 1:
             failed = False
 
-            def fail_wire_allocation(*args, **kwargs):
+            def fail_wire_allocation(self, *args, **kwargs):
                 nonlocal failed
-                if not failed and args and tuple(args[0]) == (2, 2):
+                if not failed and tuple(self.shape) == (2, 2):
                     failed = True
                     raise torch.OutOfMemoryError("synthetic wire allocation failure")
-                return original_empty(*args, **kwargs)
+                return original_clone(self, *args, **kwargs)
 
-            torch.empty = fail_wire_allocation
+            torch.Tensor.clone = fail_wire_allocation
         try:
             protocol.begin_sync(
                 1,
@@ -546,7 +546,7 @@ def _begin_sync_failure_worker(rank, world_size, rendezvous_path, results):
         else:
             results.put((rank, "no-error", ""))
     finally:
-        torch.empty = original_empty
+        torch.Tensor.clone = original_clone
         dist.destroy_process_group()
 
 
@@ -677,6 +677,9 @@ def test_lazy_factory_uses_the_bucket_stream_seam(monkeypatch):
     protocol_module = ModuleType("miles.backends.training_utils.weight_update.protocol")
 
     class WeightTransferProtocol:
+        supports_lora = False
+        use_weight_update_session = True
+
         def __init__(self, args):
             self.args = args
 
@@ -731,6 +734,9 @@ def test_begin_sync_storage_does_not_scale_with_generator_count(
     monkeypatch.setattr(miles_protocol, "_gloo_group", lambda: object())
 
     def gather(output, value, **_kwargs):
+        if isinstance(value, tuple):
+            output[:] = [value, (value[0], "peer-generated")]
+            return
         if value is None:
             output[:] = [None, None]
             return
@@ -786,9 +792,9 @@ def test_begin_sync_storage_does_not_scale_with_generator_count(
 @pytest.mark.parametrize(
     ("requested_run_id", "gathered_run_ids"),
     [
-        (None, [None, "run-7"]),
-        ("run-7", [None, "run-7"]),
-        ("run-7", ["run-7", "run-8"]),
+        (None, [(None, "g0"), ("run-7", "g1")]),
+        ("run-7", [(None, "g0"), ("run-7", "g1")]),
+        ("run-7", [("run-7", "g0"), ("run-8", "g1")]),
     ],
 )
 def test_mixed_explicit_run_identity_is_rejected_on_every_rank(

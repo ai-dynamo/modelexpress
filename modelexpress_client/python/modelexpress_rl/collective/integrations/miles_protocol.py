@@ -21,7 +21,7 @@ import torch.distributed as dist
 from modelexpress import auth
 from ..rendezvous import CollectiveRendezvous
 from ..types import MeshSpec, ParamPlan, Placement, ReshardPlan
-from ._common import _DTYPE_BYTES
+from ._common import _dtype_label
 from ._common import _endpoint as _normalize_endpoint
 from ._common import _text
 from .miles import (
@@ -132,13 +132,11 @@ def _abi_version(args: Any) -> str:
 
 
 def _entry_wire_bytes(entry: ParamPlan) -> int:
-    try:
-        dtype_size = _DTYPE_BYTES[entry.dtype]
-    except KeyError:
+    if _dtype_label(entry.dtype) != "bfloat16":
         raise ValueError(
             f"{entry.name}: unsupported collective dtype {entry.dtype!r}"
-        ) from None
-    size = dtype_size
+        )
+    size = torch.bfloat16.itemsize
     for extent in entry.global_shape:
         size *= int(extent)
     return size
@@ -155,8 +153,11 @@ def _chunk_publish_groups(
     canonical-ordered plan yields the same per-lane tensor sequence on the
     wire. ``requested`` is a cap, not a quota: the result never exceeds the
     entry count, and an entry larger than the byte target forms its own
-    group. Every group is non-empty and the result covers every entry
-    exactly once, in canonical plan order.
+    group unless the group-count cap has already been reached — once it
+    binds, the remaining entries accumulate into the final group, which may
+    exceed the target (sizes [2, 100, 2, 100] with ``requested=3`` yield
+    ``([a], [b], [c, d])``). Every group is non-empty and the result covers
+    every entry exactly once, in canonical plan order.
     """
     if requested < 1:
         raise ValueError(f"publish group count must be positive, got {requested}")
@@ -217,27 +218,23 @@ def _retire_dropped_futures(futures: list) -> None:
     register an observer for the rest so late failures reach the log.
     """
     for future in futures:
-        cancelled = False
-        cancel = getattr(future, "cancel", None)
-        if callable(cancel):
-            try:
-                cancelled = bool(cancel())
-            except BaseException:
-                logger.warning(
-                    "cancelling a dropped MILES generator future failed",
-                    exc_info=True,
-                )
+        try:
+            cancelled = bool(future.cancel())
+        except BaseException:
+            logger.warning(
+                "cancelling a dropped MILES generator future failed",
+                exc_info=True,
+            )
+            cancelled = False
         if cancelled:
             continue
-        add_done_callback = getattr(future, "add_done_callback", None)
-        if callable(add_done_callback):
-            try:
-                add_done_callback(_log_late_future_result)
-            except BaseException:
-                logger.warning(
-                    "observing a dropped MILES generator future failed",
-                    exc_info=True,
-                )
+        try:
+            future.add_done_callback(_log_late_future_result)
+        except BaseException:
+            logger.warning(
+                "observing a dropped MILES generator future failed",
+                exc_info=True,
+            )
 
 
 def _await_endpoint_ready(channel: Any, *, endpoint: str, timeout_s: float) -> None:
@@ -276,17 +273,15 @@ def _validate_args(args: Any) -> None:
 class MilesCollectiveProtocolCore:
     """MILES bucket-stream bridge used by the lazy protocol factory.
 
-    Maps the 795 trainer client flow onto the MILES weight-transfer seam:
-    ``begin_sync`` materializes and validates the base-weight stream, freezes
-    the plan/topology contract, and arms the round. The first ``send_bucket``
-    prepares the trainer session and generator fan-out (inside the engine
-    pause window) and opens the round; each bucket drains the publish groups
-    its tensors complete, in canonical plan order. ``finalize`` finishes the
-    trainer round and waits for the generator fan-out.
+    Maps the ModelExpress trainer client flow onto the MILES weight-transfer
+    seam: ``begin_sync`` materializes and validates the base-weight stream,
+    freezes the plan/topology contract, and arms the round. The first
+    ``send_bucket`` prepares the trainer session and generator fan-out
+    (inside the engine pause window) and opens the round; each bucket drains
+    the publish groups its tensors complete, in canonical plan order.
+    ``finalize`` finishes the trainer round and waits for the generator
+    fan-out.
     """
-
-    supports_lora = False
-    use_weight_update_session = True
 
     def __init__(self, args: Any) -> None:
         self.args = args
@@ -295,7 +290,6 @@ class MilesCollectiveProtocolCore:
         # miles' updater reads protocol.group_name for its progress display;
         # WeightTransferProtocol.__init__ sets "miles", so name this path.
         self.group_name = "modelexpress-m2n"
-        self.update_weight_metrics: dict[str, float] = {}
         self._parallel_state = None
         self._engine_gpu_counts: tuple[int, ...] = ()
         self._engine_gpu_offsets: tuple[int, ...] = ()
@@ -386,7 +380,7 @@ class MilesCollectiveProtocolCore:
             for name in ("tp", "ep", "etp", "cp", "intra_dp", "indep_dp")
         ):
             raise ValueError(
-                "the initial MILES NCCL M2N path requires exactly one source "
+                "the MILES NCCL M2N path requires exactly one source "
                 "rank per PP partition (TP/EP/CP/DP must all be one)"
             )
         self.rollout_engines = tuple(rollout_engines)
@@ -402,10 +396,13 @@ class MilesCollectiveProtocolCore:
 
         Each canonical tensor is validated and copied into its stable wire
         buffer as it arrives, so the materialized stream is never pinned whole;
-        ``send_bucket`` only tracks arrival order against those buffers.
-        Session preparation is deferred to the first ``send_bucket`` so the
-        channel, rendezvous join, and NCCL bootstrap happen inside the engine
-        pause window rather than before it.
+        ``send_bucket`` only tracks arrival order against those buffers. The
+        copies run on the caller's current stream; the session orders that
+        producer stream before the lane streams at round begin, so every
+        begin_sync for a session must run on the same ambient stream. Session
+        preparation is deferred to the first ``send_bucket`` so the channel,
+        rendezvous join, and NCCL bootstrap happen inside the engine pause
+        window rather than before it.
         """
         canonical_shapes: dict[str, tuple[int, ...]] | None = None
         prepared_tensors: dict[str, torch.Tensor] | None = None
@@ -453,12 +450,7 @@ class MilesCollectiveProtocolCore:
                         )
                     shape = tuple(int(dim) for dim in tensor.shape)
                     if first_round:
-                        wire = torch.empty(
-                            shape,
-                            dtype=tensor.dtype,
-                            device=tensor.device,
-                        )
-                        wire.copy_(tensor)
+                        wire = tensor.clone(memory_format=torch.contiguous_format)
                         prepared[name] = wire
                     else:
                         # A mid-stream failure can leave earlier wire buffers
@@ -489,10 +481,13 @@ class MilesCollectiveProtocolCore:
         if failures:
             if trainer_world == 1 and local_exception is not None:
                 raise local_exception
-            raise RuntimeError(
+            error = RuntimeError(
                 "MILES NCCL M2N begin_sync preparation failed: "
                 + "; ".join(failures[:4])
             )
+            if local_exception is not None:
+                raise error from local_exception
+            raise error
         if canonical_shapes is None or prepared_tensors is None:
             raise RuntimeError("MILES NCCL M2N preparation produced no tensor state")
         if self._canonical_shapes is None:
@@ -541,18 +536,25 @@ class MilesCollectiveProtocolCore:
             )
         if not self._run_id_agreed:
             requested_run_id = self._run_id
-            run_id_candidates: list[str | None] = [None] * trainer_world
+            # One collective settles both branches: every rank contributes
+            # its requested run id (or None) plus a generated fallback, so
+            # the no-config case needs no second gather.
+            candidates: list[tuple[str | None, str] | None] = [None] * trainer_world
             dist.all_gather_object(
-                run_id_candidates,
-                requested_run_id,
+                candidates,
+                (requested_run_id, uuid4().hex),
                 group=_gloo_group(),
             )
+            gathered = [
+                candidate for candidate in candidates if candidate is not None
+            ]
+            requested_ids = [requested for requested, _generated in gathered]
             configured_run_ids = {
-                candidate for candidate in run_id_candidates if candidate is not None
+                run_id for run_id in requested_ids if run_id is not None
             }
             if configured_run_ids:
                 if len(configured_run_ids) != 1 or any(
-                    candidate is None for candidate in run_id_candidates
+                    run_id is None for run_id in requested_ids
                 ):
                     raise ValueError(
                         "modelexpress_m2n_run_id must be set identically on "
@@ -560,13 +562,7 @@ class MilesCollectiveProtocolCore:
                     )
                 agreed_run_id = next(iter(configured_run_ids))
             else:
-                generated_run_ids: list[str | None] = [None] * trainer_world
-                dist.all_gather_object(
-                    generated_run_ids,
-                    uuid4().hex,
-                    group=_gloo_group(),
-                )
-                agreed_run_id = generated_run_ids[0]
+                agreed_run_id = gathered[0][1]
             self._run_id = _text(agreed_run_id, "modelexpress_m2n_run_id")
             self._run_id_agreed = True
         if self._run_id is None:
@@ -785,6 +781,7 @@ class MilesCollectiveProtocolCore:
             )
         rank = dist.get_rank()
         trainer_world = dist.get_world_size()
+        local_exception: BaseException | None = None
         local_error = ""
         try:
             if not self._round_begun:
@@ -794,9 +791,9 @@ class MilesCollectiveProtocolCore:
             if self._closed or self._session is None:
                 raise RuntimeError("the MILES NCCL M2N protocol closed mid-round")
             self._drain_ready_groups(version)
-            if self._publish_groups is None or self._next_group != len(
-                self._publish_groups
-            ):
+            # _drain_ready_groups already rejected a missing publish plan, so
+            # the armed round has groups; the `or ()` only narrows the type.
+            if self._next_group != len(self._publish_groups or ()):
                 missing = sorted(self._pending[self._next_group])
                 raise RuntimeError(
                     "MILES NCCL M2N bucket stream ended before publish group "
@@ -804,6 +801,7 @@ class MilesCollectiveProtocolCore:
                 )
             self._session.finish_round(version=version)
         except BaseException as error:
+            local_exception = error
             local_error = repr(error)
         errors = [""] * trainer_world
         dist.all_gather_object(errors, local_error, group=_gloo_group())
@@ -825,6 +823,8 @@ class MilesCollectiveProtocolCore:
                 "MILES NCCL M2N round failed: " + "; ".join(failures[:4])
             )
             self._close_preserving(primary)
+            if local_exception is not None:
+                raise primary from local_exception
             raise primary
 
     def after_engines_resumed(self) -> None:
@@ -1127,10 +1127,6 @@ class MilesCollectiveProtocolCore:
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
         logger.info("MILES NCCL M2N teardown complete trainer_rank=%d", rank)
 
-    def pop_metrics(self) -> dict[str, float]:
-        metrics, self.update_weight_metrics = self.update_weight_metrics, {}
-        return metrics
-
 
 def build_protocol(args: Any):
     """Build a MILES protocol without importing MILES at package import time."""
@@ -1144,6 +1140,10 @@ def build_protocol(args: Any):
     class MilesModelExpressProtocol(
         MilesCollectiveProtocolCore, WeightTransferProtocol
     ):
+        # Restated deliberately: miles' updater plans its gathers from this
+        # placement, so the M2N no-PP-gather requirement stays explicit at
+        # the seam. The other ABC defaults (supports_lora,
+        # use_weight_update_session) are inherited without restatement.
         required_placement = WeightUpdatePlacement(gather_pp=False)
 
         def __init__(self, protocol_args: Any) -> None:

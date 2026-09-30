@@ -42,31 +42,13 @@ def _dtype_label(value: object) -> str:
     return str(value).removeprefix("torch.")
 
 
-# Element sizes for the dtypes a collective plan may carry. Anything absent is
-# rejected rather than guessed: a wrong size silently mis-groups the transfer.
-_DTYPE_BYTES = {
-    "bfloat16": 2,
-    "bool": 1,
-    "float8_e4m3fn": 1,
-    "float8_e5m2": 1,
-    "float16": 2,
-    "float32": 4,
-    "float64": 8,
-    "int8": 1,
-    "int16": 2,
-    "int32": 4,
-    "int64": 8,
-    "uint8": 1,
-}
-
-
 class _FrozenPlan:
     def __init__(self, plan: ReshardPlan) -> None:
         snapshot = copy.deepcopy(plan)
         snapshot.validate()
         if snapshot.misc:
             raise ValueError(
-                "the initial MILES/SGLang collective integration supports "
+                "the MILES/SGLang collective integration supports "
                 "all-bulk plans only"
             )
         names = snapshot.parameter_names()
@@ -83,7 +65,7 @@ class _FrozenPlan:
         ]
         if unsupported:
             raise ValueError(
-                "the initial MILES/SGLang collective integration supports BF16 "
+                "the MILES/SGLang collective integration supports BF16 "
                 f"base weights only; unsupported: {unsupported[:5]}"
             )
         self._plan = snapshot
@@ -120,18 +102,19 @@ class _FrozenPlan:
         )
         for entry in self._plan.bulk:
             src_ranks = entry.src_mesh.ranks()
+            # A rank list equal to range(start, start + len) is necessarily
+            # duplicate-free, so contiguity subsumes the duplicate check.
             contiguous = bool(src_ranks) and src_ranks == list(
                 range(src_ranks[0], src_ranks[0] + len(src_ranks))
             )
             if (
                 not contiguous
-                or len(src_ranks) != len(set(src_ranks))
                 or src_ranks[0] < 0
                 or src_ranks[-1] >= trainers_per_lane
             ):
                 raise ValueError(
-                    f"{entry.name}: src_mesh ranks {src_ranks} must be a non-empty, "
-                    "duplicate-free contiguous subset of the trainer membership "
+                    f"{entry.name}: src_mesh ranks {src_ranks} must be a non-empty "
+                    "contiguous subset of the trainer membership "
                     f"for reshard lane {entry.partition_id}: "
                     f"{list(range(trainers_per_lane))}"
                 )
@@ -225,18 +208,14 @@ def _check_stable(
         raise RuntimeError(
             f"{name}: stable tensor validation failed: {error}"
         ) from error
+    # Shape and dtype equality with the baseline is already guaranteed:
+    # _tensor_signature validated both against the same expected values the
+    # baseline was captured with. Only the storage address and device can
+    # drift between captures.
     if current.address != baseline.address:
         raise RuntimeError(
             f"{name}: tensor storage address changed from "
             f"{baseline.address:#x} to {current.address:#x}"
-        )
-    if current.shape != baseline.shape:
-        raise RuntimeError(
-            f"{name}: tensor shape changed from {baseline.shape} to {current.shape}"
-        )
-    if current.dtype != baseline.dtype:
-        raise RuntimeError(
-            f"{name}: tensor dtype changed from {baseline.dtype} to {current.dtype}"
         )
     if current.device != baseline.device:
         raise RuntimeError(
