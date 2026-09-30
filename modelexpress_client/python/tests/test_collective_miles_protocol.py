@@ -43,7 +43,6 @@ def _placement():
 
 def _args():
     return SimpleNamespace(
-        model="qwen",
         modelexpress_server_address="mx:50051",
     )
 
@@ -265,6 +264,25 @@ def test_publish_group_count_falls_back_to_the_env(monkeypatch):
     monkeypatch.setenv("MX_MILES_PUBLISH_GROUPS", "3")
 
     assert miles_protocol._publish_group_count(SimpleNamespace()) == 3
+
+
+def test_abi_version_defaults_and_falls_back_to_the_env(monkeypatch):
+    monkeypatch.delenv("MX_MILES_ABI_VERSION", raising=False)
+    assert (
+        miles_protocol._abi_version(SimpleNamespace())
+        == "miles-sglang-bf16-replicated-v1"
+    )
+
+    monkeypatch.setenv("MX_MILES_ABI_VERSION", "abi-9")
+    assert miles_protocol._abi_version(SimpleNamespace()) == "abi-9"
+
+
+def test_validate_args_rejects_an_empty_abi_version():
+    args = _args()
+    args.modelexpress_m2n_abi_version = " "
+
+    with pytest.raises(ValueError, match="modelexpress_m2n_abi_version"):
+        miles_protocol.build_protocol.validate_args(args)
 
 
 def test_chunk_publish_groups_balances_bytes_in_canonical_order():

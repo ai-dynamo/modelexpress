@@ -38,6 +38,7 @@ logger = logging.getLogger("modelexpress_rl.collective.integrations.miles_protoc
 
 _DEFAULT_CONNECT_TIMEOUT_S = 10.0
 _DEFAULT_PUBLISH_GROUPS = 1
+_DEFAULT_ABI_VERSION = "miles-sglang-bf16-replicated-v1"
 
 
 def _gloo_group():
@@ -115,6 +116,17 @@ def _connect_timeout_s(args: Any) -> float:
             f"seconds, got {raw!r}"
         )
     return timeout
+
+
+def _abi_version(args: Any) -> str:
+    requested = _arg(
+        args,
+        "modelexpress_m2n_abi_version",
+        os.environ.get("MX_MILES_ABI_VERSION"),
+    )
+    if requested is None:
+        return _DEFAULT_ABI_VERSION
+    return _text(requested, "modelexpress_m2n_abi_version")
 
 
 def _entry_wire_bytes(entry: ParamPlan) -> int:
@@ -256,6 +268,7 @@ def _validate_args(args: Any) -> None:
         _text(run_id, "modelexpress_m2n_run_id")
     _publish_group_count(args)
     _connect_timeout_s(args)
+    _abi_version(args)
 
 
 class MilesCollectiveProtocolCore:
@@ -567,19 +580,16 @@ class MilesCollectiveProtocolCore:
             for slot in range(offset, offset + count)
         )
         topology = CollectiveTopology(
-            model_name=str(_arg(self.args, "model", "miles-model")),
+            # The rendezvous model identity is an adapter constant, not the
+            # HF model id: miles' parser has no `model` argument, and the
+            # deployed receivers form groups against this exact value.
+            model_name="miles-model",
             trainer_slots=tuple(
                 f"{slot_prefix}trainer-{rank}" for rank in range(trainer_world)
             ),
             generator_slots=generator_slots,
             source_partition_count=partition_count,
-            m2n_abi_version=str(
-                _arg(
-                    self.args,
-                    "modelexpress_m2n_abi_version",
-                    "miles-sglang-bf16-replicated-v1",
-                )
-            ),
+            m2n_abi_version=_abi_version(self.args),
         )
         src_mesh = MeshSpec((1,), rank_offset=0)
         dst_mesh = MeshSpec((len(generator_slots),), rank_offset=1)
