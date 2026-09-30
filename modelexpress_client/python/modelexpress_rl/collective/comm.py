@@ -330,6 +330,15 @@ def cuda_device(device: Any):
         _cudart_check(runtime.cudaSetDevice(previous))
 
 
+def _resolve_timeout_s(timeout_s: float | None) -> float:
+    resolved = (
+        timeout_s if timeout_s is not None else envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S
+    )
+    if not math.isfinite(resolved) or resolved <= 0:
+        raise ValueError(f"timeout_s must be finite and positive, got {resolved!r}")
+    return resolved
+
+
 def _wait_until_initialized(comm: Any, bindings: Any, timeout_s: float) -> None:
     """Poll a non-blocking communicator until success or a bounded failure."""
     result = getattr(bindings, "Result", None)
@@ -417,15 +426,7 @@ class CommunicatorCache:
 
         _reject_forced_communicator_id()
         communicator, _, bindings = _nccl()
-        timeout_s = (
-            timeout_s
-            if timeout_s is not None
-            else envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S
-        )
-        if not math.isfinite(timeout_s) or timeout_s <= 0:
-            raise ValueError(
-                f"timeout_s must be finite and positive, got {timeout_s!r}"
-            )
+        timeout_s = _resolve_timeout_s(timeout_s)
         blocking_override = os.environ.get("NCCL_COMM_BLOCKING")
         if blocking_override not in (None, "", "0"):
             raise RuntimeError(
@@ -494,15 +495,7 @@ class CommunicatorCache:
         bootstrap barrier, including ranks that did not create the current
         reshard lane and therefore had no other readiness check in this step.
         """
-        timeout_s = (
-            timeout_s
-            if timeout_s is not None
-            else envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S
-        )
-        if not math.isfinite(timeout_s) or timeout_s <= 0:
-            raise ValueError(
-                f"timeout_s must be finite and positive, got {timeout_s!r}"
-            )
+        timeout_s = _resolve_timeout_s(timeout_s)
 
         _, _, bindings = _nccl()
         deadline = time.monotonic() + timeout_s
@@ -518,6 +511,11 @@ class CommunicatorCache:
                 )
             try:
                 _wait_until_initialized(lane.handle, bindings, remaining_s)
+            except TimeoutError as error:
+                raise TimeoutError(
+                    f"lane {key.lane_id} of group {group_id} at epoch {epoch} "
+                    f"did not settle within {timeout_s:.1f}s"
+                ) from error
             except Exception as error:
                 raise RuntimeError(
                     f"lane {key.lane_id} of group {group_id} at epoch {epoch} "

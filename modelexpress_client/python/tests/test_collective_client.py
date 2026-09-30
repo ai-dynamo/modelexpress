@@ -550,11 +550,93 @@ class TestCommunicatorBootstrap:
         )
 
         with pytest.raises(
-            RuntimeError,
-            match="lane 1 of group g at epoch 1 did not return to a usable state",
-        ) as caught:
+            TimeoutError,
+            match="lane 1 of group g at epoch 1 did not settle",
+        ):
             cache.settle_group("g", 1, timeout_s=0.05)
-        assert isinstance(caught.value.__cause__, TimeoutError)
+
+    def test_settle_group_re_polls_a_lane_still_initializing_after_create(
+        self, fake_nccl
+    ):
+        # create()'s own readiness check can pass while the communicator later
+        # reports ncclInProgress again; settle_group is the barrier that
+        # re-polls every cached lane, including the freshly created one.
+        bindings = sys.modules["nccl.bindings.nccl"]
+        communicator = sys.modules["nccl.core.communicator"]
+        polls = []
+
+        class Heals:
+            def get_async_error(self):
+                polls.append(1)
+                if len(polls) == 2:
+                    return bindings.Result.InProgress
+                return bindings.Result.Success
+
+            def get_last_error(self):
+                return ""
+
+            def abort(self):
+                pass
+
+        heals = Heals()
+        communicator.Communicator.init = lambda **kw: heals
+
+        cache = CommunicatorCache()
+        cache.create(
+            LaneKey("g", 1, 0),
+            rank=0,
+            world_size=2,
+            unique_id=b"x" * 128,
+            device=None,
+            stream=None,
+            timeout_s=5.0,
+        )
+        assert len(polls) == 1
+
+        settled = cache.settle_group("g", 1, timeout_s=5.0)
+
+        assert settled == 1
+        assert len(polls) == 3
+
+    def test_settle_group_timeout_for_a_lane_stuck_after_create_names_the_lane(
+        self, fake_nccl
+    ):
+        bindings = sys.modules["nccl.bindings.nccl"]
+        communicator = sys.modules["nccl.core.communicator"]
+        polls = []
+
+        class StuckAfterCreate:
+            def get_async_error(self):
+                polls.append(1)
+                if len(polls) == 1:
+                    return bindings.Result.Success
+                return bindings.Result.InProgress
+
+            def get_last_error(self):
+                return ""
+
+            def abort(self):
+                pass
+
+        stuck = StuckAfterCreate()
+        communicator.Communicator.init = lambda **kw: stuck
+
+        cache = CommunicatorCache()
+        cache.create(
+            LaneKey("g", 1, 2),
+            rank=0,
+            world_size=3,
+            unique_id=b"x" * 128,
+            device=None,
+            stream=None,
+            timeout_s=5.0,
+        )
+
+        with pytest.raises(
+            TimeoutError,
+            match="lane 2 of group g at epoch 1 did not settle",
+        ):
+            cache.settle_group("g", 1, timeout_s=0.05)
 
 
 class TestBootstrapBarrier:
