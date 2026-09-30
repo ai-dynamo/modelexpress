@@ -170,10 +170,16 @@ The adapter sends no tensor digests, so the receiver's
 `MX_MILES_VERIFY_TENSOR_EQUALITY` digest check must stay at its default (off);
 enabling it against this adapter fails loudly at round start.
 
-The rendezvous at this base has no bootstrap-fence RPCs, so this client cannot
-answer a fence: groups must form with `requires_bootstrap_fence=0`. A group
-formed with the fence required would deadlock at bootstrap, with receivers
-waiting at the fence for trainers that have no RPC to arrive with.
+The bootstrap fence is implemented on both sides of this base: the client
+arrives at every lane's PRE_BARRIER fence and at the final COMPLETE fence
+unconditionally, and the server answers `ReachCollectiveBootstrapFence`.
+Groups may form with `requires_bootstrap_fence` set either way — the client
+arrives regardless, because fence-capable peers await it unconditionally. The
+interop requirement cuts the other way: every peer must run a fence-capable
+client. The deployed engine images (modelexpress 0.5.1) await the fences
+unconditionally, so a mixed-generation group with a pre-fence client deadlocks
+at bootstrap by design, receivers holding the fence for a trainer that never
+arrives — proven on hardware with this adapter's pre-fence revision.
 
 ## Performance caveat
 
