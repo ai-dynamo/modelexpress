@@ -1432,7 +1432,10 @@ mod tests {
         let mut stream = request.into_inner();
         let headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            prefix.len() + 1
+            prefix
+                .len()
+                .checked_add(1)
+                .expect("test body length overflow")
         );
         stream.write_all(headers.as_bytes()).await.expect("headers");
         stream.write_all(prefix).await.expect("partial body");
