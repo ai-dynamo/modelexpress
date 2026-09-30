@@ -1314,23 +1314,32 @@ mod tests {
         // group, and an undeclared group keeps the historical ungated creates.
         let mut group_spec = spec("m", &["t0", "t1"], &["g0"], 1);
         group_spec.requires_bootstrap_fence = true;
-        let join =
-            |slot_id: &str, worker_id: &str, role: CollectiveRole| JoinCollectiveGroupRequest {
+        // One rank index per slot: real clients never share index_in_role 0
+        // across two slots of a role, and the join script rejects it as
+        // DUPLICATE_RANK. The reference test keeps 0 for both trainers and
+        // cannot pass against a live Redis as written.
+        let join = |slot_id: &str,
+                    worker_id: &str,
+                    role: CollectiveRole,
+                    index_in_role: u32|
+         -> JoinCollectiveGroupRequest {
+            JoinCollectiveGroupRequest {
                 spec: Some(group_spec.clone()),
                 slot_id: slot_id.to_string(),
                 worker_id: worker_id.to_string(),
                 role: role.into(),
-                index_in_role: 0,
+                index_in_role,
                 plan_digest: "digest".to_string(),
                 plan_source: (slot_id == "t0").then(|| PlanSource {
                     worker_id: worker_id.to_string(),
                     endpoint: "trainer:9000".to_string(),
                     digest: "digest".to_string(),
                 }),
-            };
-        let trainer = join("t0", "w-t0", CollectiveRole::Trainer);
-        let trainer_one = join("t1", "w-t1", CollectiveRole::Trainer);
-        let generator = join("g0", "w-g0", CollectiveRole::Generator);
+            }
+        };
+        let trainer = join("t0", "w-t0", CollectiveRole::Trainer, 0);
+        let trainer_one = join("t1", "w-t1", CollectiveRole::Trainer, 1);
+        let generator = join("g0", "w-g0", CollectiveRole::Generator, 0);
         let first = backend.join_group(&trainer).await.expect("trainer join");
         backend
             .join_group(&trainer_one)
@@ -1440,7 +1449,7 @@ mod tests {
         // epoch and wipes the fence, so the reset half of the reference test is
         // driven by a replacement join instead of AbortCollectiveBootstrap.
         let moved = backend
-            .join_group(&join("t1", "w-t1-replacement", CollectiveRole::Trainer))
+            .join_group(&join("t1", "w-t1-replacement", CollectiveRole::Trainer, 1))
             .await
             .expect("replacement trainer join moves the epoch");
         assert_eq!(moved.epoch, first.epoch + 1);
