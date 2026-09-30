@@ -1242,8 +1242,11 @@ def test_a_round_gather_failure_closes_and_retires_the_submitted_futures(
     # itself raises: the terminal close must retire the submitted futures
     # rather than leak them, and begin_round must never run.
     protocol = MilesCollectiveProtocolCore(_args())
+    protocol.rollout_engines = (object(),)
     monkeypatch.setattr(miles_protocol.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(miles_protocol.dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(miles_protocol.dist, "is_available", lambda: True)
+    monkeypatch.setattr(miles_protocol.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(miles_protocol, "_gloo_group", lambda: object())
 
     entered_round = False
