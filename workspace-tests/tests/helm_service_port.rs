@@ -85,13 +85,55 @@ fn deployment_template_derives_server_port_from_service_port() {
 }
 
 #[test]
-fn deployment_template_rejects_direct_server_port_env_override() {
+fn deployment_template_rejects_mismatched_server_port_env_value() {
     let contents = read(&helm_dir().join("templates/deployment.yaml"));
 
     assert!(
         contents.contains(r#"hasKey .Values.env "MODEL_EXPRESS_SERVER_PORT""#)
+            && contents.contains(
+                r#"ne (toString (index .Values.env "MODEL_EXPRESS_SERVER_PORT")) (toString $serverPort)"#
+            )
+            && contents.contains("fail \"env.MODEL_EXPRESS_SERVER_PORT does not match service.port"),
+        "deployment.yaml should fail the render only when env.MODEL_EXPRESS_SERVER_PORT disagrees with service.port, \
+         to avoid breaking upgrades for values files that still carry the legacy literal at the correct value"
+    );
+}
+
+#[test]
+fn deployment_template_rejects_direct_server_port_extra_env_override() {
+    let contents = read(&helm_dir().join("templates/deployment.yaml"));
+
+    assert!(
+        contents.contains("$hasServerPortInExtra")
             && contents
                 .contains("fail \"Set service.port rather than MODEL_EXPRESS_SERVER_PORT directly"),
-        "deployment.yaml should fail the render when MODEL_EXPRESS_SERVER_PORT is set directly via env or extraEnv"
+        "deployment.yaml should unconditionally fail the render when MODEL_EXPRESS_SERVER_PORT is set via extraEnv \
+         (extraEnv never shipped a legacy default, so there is no backward-compat population to accommodate)"
+    );
+}
+
+#[test]
+fn deployment_template_does_not_double_emit_server_port_from_env_loop() {
+    let contents = read(&helm_dir().join("templates/deployment.yaml"));
+
+    assert!(
+        contents.contains(
+            r#"{{- range $key, $value := .Values.env }}
+            {{- if ne $key "MODEL_EXPRESS_SERVER_PORT" }}"#
+        ),
+        "the generic .Values.env range loop should skip MODEL_EXPRESS_SERVER_PORT, since it is already \
+         emitted explicitly from $serverPort"
+    );
+}
+
+#[test]
+fn notes_warns_when_server_port_env_var_is_still_set() {
+    let contents = read(&helm_dir().join("templates/NOTES.txt"));
+
+    assert!(
+        contents.contains(r#"hasKey .Values.env "MODEL_EXPRESS_SERVER_PORT""#)
+            && contents.contains("WARNING: env.MODEL_EXPRESS_SERVER_PORT is deprecated"),
+        "NOTES.txt should warn whenever env.MODEL_EXPRESS_SERVER_PORT is set, even when it still matches \
+         service.port, so legacy users are nudged to remove it ahead of a future hard error"
     );
 }

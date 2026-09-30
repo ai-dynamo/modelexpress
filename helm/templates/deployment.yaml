@@ -88,9 +88,23 @@ spec:
               probes. Setting the env var directly would move only the server's
               actual bind, leaving Kubernetes routing traffic and probes at the
               old port -- desyncing "where the server listens" from "where the
-              cluster thinks it listens". Rejected rather than silently skipped.
+              cluster thinks it listens".
+
+              env.MODEL_EXPRESS_SERVER_PORT shipped as a values.yaml default
+              for chart versions before this fix, so existing users may still
+              carry a literal that happens to agree with service.port. That
+              case is allowed through (with a NOTES.txt deprecation warning,
+              see below) rather than breaking their upgrade; only a literal
+              that actually disagrees with service.port fails the render.
+              extraEnv never shipped a default here, so there is no legacy
+              population to accommodate and it is rejected outright.
             */}}
-            {{- if or (hasKey .Values.env "MODEL_EXPRESS_SERVER_PORT") $hasServerPortInExtra }}
+            {{- if hasKey .Values.env "MODEL_EXPRESS_SERVER_PORT" }}
+            {{- if ne (toString (index .Values.env "MODEL_EXPRESS_SERVER_PORT")) (toString $serverPort) }}
+            {{- fail "env.MODEL_EXPRESS_SERVER_PORT does not match service.port: the chart derives containerPort, the Service port and the probes from service.port, and an env-only override desynchronizes them. Remove env.MODEL_EXPRESS_SERVER_PORT and set service.port instead." }}
+            {{- end }}
+            {{- end }}
+            {{- if $hasServerPortInExtra }}
             {{- fail "Set service.port rather than MODEL_EXPRESS_SERVER_PORT directly: the chart derives containerPort, the Service port and the probes from service.port, and an env-only override desynchronizes them." }}
             {{- end }}
             - name: MODEL_EXPRESS_SERVER_PORT
@@ -120,8 +134,10 @@ spec:
               value: {{ .Release.Namespace | quote }}
             {{- end }}
             {{- range $key, $value := .Values.env }}
+            {{- if ne $key "MODEL_EXPRESS_SERVER_PORT" }}
             - name: {{ $key }}
               value: {{ $value | quote }}
+            {{- end }}
             {{- end }}
             {{- if .Values.extraEnv }}
             {{- toYaml .Values.extraEnv | nindent 12 }}
