@@ -73,9 +73,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MX_NCCL_REFIT_REGISTRATION_TTL_S",
         _int("MX_HEARTBEAT_INTERVAL_SECS", 30) * 3,
     ),
-    # Opt the group into the all-rank bootstrap fence gate. Off by default so
-    # mixed client/server generations keep working; every participant of one
-    # operation must run with the same value or joins are rejected.
+    # Opts the group into the server-side create gate for fenced bootstraps;
+    # fence arrivals happen regardless. Every participant of one operation
+    # must run with the same value or joins are rejected.
     "MX_NCCL_REFIT_REQUIRE_BOOTSTRAP_FENCE": lambda: _bool(
         "MX_NCCL_REFIT_REQUIRE_BOOTSTRAP_FENCE", False
     ),
