@@ -28,6 +28,60 @@ def _require(mapping: dict[str, Any], key: str, context: str) -> Any:
     return mapping[key]
 
 
+def _require_int(mapping: dict[str, Any], key: str, context: str) -> int:
+    """Read a mandatory integer wire field, rejecting bools and coercions."""
+    value = _require(mapping, key, context)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{context} field {key!r} must be an integer")
+    return value
+
+
+def _optional_int(mapping: dict[str, Any], key: str, context: str) -> int | None:
+    value = mapping.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{context} field {key!r} must be an integer or null")
+    return value
+
+
+def _require_str(mapping: dict[str, Any], key: str, context: str) -> str:
+    value = _require(mapping, key, context)
+    if not isinstance(value, str):
+        raise ValueError(f"{context} field {key!r} must be a string")
+    return value
+
+
+def _require_list(mapping: dict[str, Any], key: str, context: str) -> list[Any]:
+    """Read a mandatory list wire field; a string would iterate into characters."""
+    value = _require(mapping, key, context)
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{context} field {key!r} must be a list")
+    return list(value)
+
+
+def _require_int_list(
+    mapping: dict[str, Any], key: str, context: str
+) -> tuple[int, ...]:
+    items = []
+    for item in _require_list(mapping, key, context):
+        if not isinstance(item, int) or isinstance(item, bool):
+            raise ValueError(f"{context} field {key!r} must be a list of integers")
+        items.append(item)
+    return tuple(items)
+
+
+def _require_str_list(
+    mapping: dict[str, Any], key: str, context: str
+) -> tuple[str, ...]:
+    items = []
+    for item in _require_list(mapping, key, context):
+        if not isinstance(item, str):
+            raise ValueError(f"{context} field {key!r} must be a list of strings")
+        items.append(item)
+    return tuple(items)
+
+
 def _placement_to_wire(placement: Placement) -> dict[str, Any]:
     return {"kind": placement.kind.value, "dim": placement.dim}
 
@@ -35,9 +89,8 @@ def _placement_to_wire(placement: Placement) -> dict[str, Any]:
 def _placement_from_wire(value: object) -> Placement:
     if not isinstance(value, dict):
         raise ValueError("placement must be an object")
-    kind = PlacementKind(str(_require(value, "kind", "placement")))
-    dim = value.get("dim")
-    return Placement(kind=kind, dim=None if dim is None else int(dim))
+    kind = PlacementKind(_require_str(value, "kind", "placement"))
+    return Placement(kind=kind, dim=_optional_int(value, "dim", "placement"))
 
 
 def plan_to_wire(plan: ReshardPlan) -> dict[str, Any]:
@@ -90,34 +143,32 @@ def plan_from_wire(value: object) -> ReshardPlan:
             raise ValueError("plan meshes must be objects")
         bulk.append(
             ParamPlan(
-                name=str(_require(raw, "name", context)),
-                global_shape=tuple(
-                    int(dim) for dim in _require(raw, "global_shape", context)
-                ),
-                dtype=str(_require(raw, "dtype", context)),
-                partition_id=int(_require(raw, "partition_id", context)),
+                name=_require_str(raw, "name", context),
+                global_shape=_require_int_list(raw, "global_shape", context),
+                dtype=_require_str(raw, "dtype", context),
+                partition_id=_require_int(raw, "partition_id", context),
                 src_mesh=MeshSpec(
-                    tuple(int(dim) for dim in _require(src_mesh, "shape", context)),
-                    int(_require(src_mesh, "rank_offset", context)),
+                    _require_int_list(src_mesh, "shape", context),
+                    _require_int(src_mesh, "rank_offset", context),
                 ),
                 src_placements=tuple(
                     _placement_from_wire(item)
-                    for item in _require(raw, "src_placements", context)
+                    for item in _require_list(raw, "src_placements", context)
                 ),
                 dst_mesh=MeshSpec(
-                    tuple(int(dim) for dim in _require(dst_mesh, "shape", context)),
-                    int(_require(dst_mesh, "rank_offset", context)),
+                    _require_int_list(dst_mesh, "shape", context),
+                    _require_int(dst_mesh, "rank_offset", context),
                 ),
                 dst_placements=tuple(
                     _placement_from_wire(item)
-                    for item in _require(raw, "dst_placements", context)
+                    for item in _require_list(raw, "dst_placements", context)
                 ),
-                group_key=_require(raw, "group_key", context),
+                group_key=_optional_str(_require(raw, "group_key", context)),
             )
         )
     plan = ReshardPlan(
         bulk=bulk,
-        source_partition_count=int(_require(value, "source_partition_count", "plan")),
+        source_partition_count=_require_int(value, "source_partition_count", "plan"),
     )
     plan.validate()
     return plan
@@ -138,18 +189,14 @@ def topology_from_wire(value: object) -> CollectiveTopology:
     if not isinstance(value, dict):
         raise ValueError("topology must be an object")
     return CollectiveTopology(
-        model_name=str(_require(value, "model_name", "topology")),
-        trainer_slots=tuple(
-            str(slot) for slot in _require(value, "trainer_slots", "topology")
+        model_name=_require_str(value, "model_name", "topology"),
+        trainer_slots=_require_str_list(value, "trainer_slots", "topology"),
+        generator_slots=_require_str_list(value, "generator_slots", "topology"),
+        source_partition_count=_require_int(
+            value, "source_partition_count", "topology"
         ),
-        generator_slots=tuple(
-            str(slot) for slot in _require(value, "generator_slots", "topology")
-        ),
-        source_partition_count=int(
-            _require(value, "source_partition_count", "topology")
-        ),
-        m2n_abi_version=str(_require(value, "m2n_abi_version", "topology")),
-        receiver_protocol=str(_require(value, "receiver_protocol", "topology")),
+        m2n_abi_version=_require_str(value, "m2n_abi_version", "topology"),
+        receiver_protocol=_require_str(value, "receiver_protocol", "topology"),
     )
 
 
@@ -231,11 +278,13 @@ def decode_control(value: object) -> CollectiveControl | None:
     if not isinstance(raw, dict):
         raise ValueError("collective control payload must be an object")
     return CollectiveControl(
-        action=str(_require(raw, "action", "collective control")),
+        action=_require_str(raw, "action", "collective control"),
         plan=plan_from_wire(raw["plan"]) if "plan" in raw else None,
         topology=topology_from_wire(raw["topology"]) if "topology" in raw else None,
+        # The encoder only writes this field when it is set, so a present
+        # null is malformed rather than absent.
         generator_slot_offset=(
-            int(raw["generator_slot_offset"])
+            _require_int(raw, "generator_slot_offset", "collective control")
             if "generator_slot_offset" in raw
             else None
         ),
