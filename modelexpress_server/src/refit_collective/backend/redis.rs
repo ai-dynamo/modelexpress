@@ -1785,7 +1785,12 @@ mod tests {
             .await
             .expect("expire replacement registration");
         let replacement = backend
-            .join_group(&join(&unfenced, "g0", "w-g0-new", CollectiveRole::Generator))
+            .join_group(&join(
+                &unfenced,
+                "g0",
+                "w-g0-new",
+                CollectiveRole::Generator,
+            ))
             .await
             .expect("a replacement join with a fresh worker identity");
         assert_eq!(replacement.epoch, created.epoch + 1);
