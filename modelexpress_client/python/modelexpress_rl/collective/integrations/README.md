@@ -98,8 +98,10 @@ outside the supported envelope:
 - `--megatron-to-hf-mode raw` (the MILES default) is required: `bridge` mode
   forces `gather_pp=True`, and this adapter rejects that placement at
   `connect()` with "MILES NCCL M2N requires PP-local HF tensors". Raw mode
-  converts from a Megatron checkpoint, so the run also needs `--ref-load`
-  pointing at that checkpoint; bridge mode loads HF directly.
+  converts from a Megatron checkpoint, so the run needs one: a valid
+  Megatron checkpoint at `--load`, or `--ref-load` pointing at one as the
+  fallback MILES uses when `--load` is absent or not a valid Megatron
+  checkpoint; bridge mode loads HF directly.
 - Explicit engine GPU topology: `engine_gpu_counts`/`engine_gpu_offsets` must
   be provided; ambiguous engine placement is rejected.
 - Base-model rounds only: `supports_lora = False`; selector must be `"all"`
@@ -174,8 +176,9 @@ The bootstrap fence is implemented on both sides of this base: the client
 arrives at every lane's PRE_BARRIER fence and at the final COMPLETE fence
 unconditionally, and the server answers `ReachCollectiveBootstrapFence`.
 Because arrivals are unconditional, this client requires a fence-capable
-server: against a pre-fence server the first arrival fails loudly with
-UNIMPLEMENTED rather than skipping the fence. `requires_bootstrap_fence`
+server: against a pre-fence server the first arrival fails loudly — the
+server's UNIMPLEMENTED is translated into an upgrade instruction — rather
+than skipping the fence. `requires_bootstrap_fence`
 controls only the server-side create gate, and every participant of one
 operation must set it to the same value or joins are rejected. The same rule
 binds whoever creates the transfer row: a create — including an idempotent
