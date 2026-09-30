@@ -7,7 +7,7 @@
 #
 #   Build (this repo's existing definitions, reused via workflow_call):
 #     - production server container image (docker/Dockerfile), amd64 + arm64,
-#       pushed to the private NGC CI org with an immutable <date>-<sha7> tag;
+#       pushed to the private NGC CI org with an immutable run-unique tag;
 #       floating tags move only in release mode, post-approval
 #     - Python client wheels + sdist (build-wheels.yml) stamped with a PEP440
 #       .devYYYYMMDD version
@@ -26,7 +26,7 @@
 #   Stage (Dynamo release.yml pattern; unlike Dynamo, crates and helm are
 #   staged nightly too):
 #     - containers -> nvcr.io/<NGC_PUBLISH_ORG>/ai-dynamo/
-#         modelexpress-server-nightly:<date>-<sha7>  (immutable)
+#         modelexpress-server-nightly:<date>-<sha7>-<run_id>-<attempt>  (immutable)
 #         modelexpress-server-nightly:latest         (floating)
 #         modelexpress-server:nightly                (floating)
 #     - wheels + sdist and crates (.crate) -> Artifactory
@@ -191,16 +191,19 @@ jobs:
           #     zero (helm rejects `...-nightly.20260806.0123456`).
           #   - run_number.run_attempt disambiguates re-runs at the same sha.
           RUNSUF="${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}.g${SHA7}"
+          # Rebuilt images are not byte-identical, so the image tag must be
+          # run-unique too or a re-run overwrites an already-scanned tag.
+          RUN_KEY="${DATE}-${SHA7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           {
             echo "date=${DATE}"
             echo "sha7=${SHA7}"
-            echo "nightly_tag=${DATE}-${SHA7}"
+            echo "nightly_tag=${RUN_KEY}"
             echo "wheel_version=${WHEEL_BASE}.dev${DATE}"
             echo "crate_version=${CRATE_BASE}-nightly.${DATE}.${RUNSUF}"
             echo "chart_version=${CHART_BASE}-nightly.${DATE}.${RUNSUF}"
             # Single source of truth for the Artifactory staging folder;
             # every uploader and the GitLab handoff read this one value.
-            echo "artifactory_path=${ARTIFACTORY_NIGHTLY_FOLDER}/${DATE}-${SHA7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "artifactory_path=${ARTIFACTORY_NIGHTLY_FOLDER}/${RUN_KEY}"
           } | tee -a "$GITHUB_OUTPUT"
 
       - name: Compute release mode
@@ -413,7 +416,7 @@ jobs:
   # Production server image (docker/Dockerfile — the image released to
   # nvcr.io/nvidia/ai-dynamo/modelexpress-server), built natively per arch on
   # the existing builder runners and pushed to the CI org, Dynamo-ECR-style:
-  # immutable <date>-<sha7>-<arch> tags stitched into a multi-arch manifest.
+  # immutable run-unique <tag>-<arch> tags stitched into a multi-arch manifest.
   # ---------------------------------------------------------------------------
   build-server-image:
     name: Build server image (${{ matrix.arch }})
@@ -484,9 +487,8 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-    # Deliberately NO concurrency group. This job writes only the immutable
-    # <date>-<sha7> manifest, which is byte-identical for a given commit, so
-    # it needs no mutex — and a job-level group holds a single pending slot,
+    # Deliberately NO concurrency group. This job writes only its own
+    # run-unique manifest tag, so it needs no mutex — and a job-level group holds a single pending slot,
     # meaning a third overlapping run would CANCEL (not queue) a pending job
     # that a human-approved release depends on.
     steps:
@@ -543,7 +545,8 @@ jobs:
     if: >-
       ${{ !cancelled() &&
           needs.preflight.result == 'success' &&
-          ((github.event_name == 'schedule' && github.run_attempt == '1') ||
+          (needs.preflight.outputs.release != 'true' ||
+           (github.event_name == 'schedule' && github.run_attempt == '1') ||
            (needs.manual-release-approval.result == 'success' &&
             needs.manual-release-approval.outputs.approved_attempt == github.run_attempt)) }}
     uses: ./.github/workflows/build-wheels.yml
@@ -571,7 +574,8 @@ jobs:
     if: >-
       ${{ !cancelled() &&
           needs.preflight.result == 'success' &&
-          ((github.event_name == 'schedule' && github.run_attempt == '1') ||
+          (needs.preflight.outputs.release != 'true' ||
+           (github.event_name == 'schedule' && github.run_attempt == '1') ||
            (needs.manual-release-approval.result == 'success' &&
             needs.manual-release-approval.outputs.approved_attempt == github.run_attempt)) }}
     # Only claim the credential-bearing environment when the run will actually
@@ -773,7 +777,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # Stage the server image into the internal NGC staging org (Dynamo
   # release-publish pattern): dedicated -nightly repo with the immutable
-  # <date>-<sha7> tag, plus a floating :nightly on the stable repo name.
+  # run-unique tag, plus a floating :nightly on the stable repo name.
   # Source and destination are both nvcr.io but different orgs/credentials,
   # so the per-arch images are pulled under the CI key, re-tagged, and pushed
   # under the publish key.
@@ -1073,14 +1077,8 @@ jobs:
             echo "pipeline_status=${PIPELINE_STATUS}"
             echo "artifacts=${ARTIFACTS}"
           } >> "$GITHUB_OUTPUT"
-          echo "Triggered GitLab pipeline id: ${PIPELINE_ID} (status: ${PIPELINE_STATUS})"
-          {
-            echo "### GitLab release-automation"
-            echo ""
-            echo "- pipeline id: \`${PIPELINE_ID}\`"
-            echo "- initial status: \`${PIPELINE_STATUS}\`"
-            echo "- artifacts declared: \`${ARTIFACTS}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "GitLab release pipeline triggered: pipeline ID ${PIPELINE_ID}"
+          echo "GitLab release pipeline ID: \`${PIPELINE_ID}\`" >> "$GITHUB_STEP_SUMMARY"
 
           # HTTP 201 alone is not success: GitLab returns a pipeline object
           # with status "skipped" when no rule matched, i.e. the security scan

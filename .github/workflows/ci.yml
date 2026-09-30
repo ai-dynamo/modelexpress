@@ -95,7 +95,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+        sudo apt-get install -y protobuf-compiler build-essential
 
     - name: Check formatting
       if: matrix.rust == 'stable'
@@ -142,6 +142,9 @@ jobs:
 
     - name: Install uv
       run: pip install uv
+
+    - name: Install C toolchain
+      run: command -v cc >/dev/null || { sudo apt-get update && sudo apt-get install -y build-essential; }
 
     - name: Install dependencies
       working-directory: modelexpress_client/python
@@ -228,7 +231,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+        sudo apt-get install -y protobuf-compiler build-essential
 
     - name: Run artifact transfer contract tests
       run: |
@@ -279,7 +282,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+        sudo apt-get install -y protobuf-compiler build-essential
 
     - name: Build release
       run: cargo build --release
@@ -321,6 +324,9 @@ jobs:
     - name: Check Rust version
       run: rustc --version
 
+    - name: Install C toolchain
+      run: command -v cc >/dev/null || { sudo apt-get update && sudo apt-get install -y build-essential; }
+
     - name: Install cargo-audit
       run: cargo install cargo-audit
 
@@ -359,7 +365,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+        sudo apt-get install -y protobuf-compiler build-essential
 
     - name: Install cargo-llvm-cov
       run: cargo install cargo-llvm-cov

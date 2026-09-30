@@ -53,17 +53,18 @@ on:
         default: false
 
 concurrency:
-  # PR-mirror pushes still collapse onto one group per PR branch, so a new push
-  # cancels the previous build. Every other trigger — push to main/release and
-  # any workflow_call caller — gets a run-unique group: a concurrency group
-  # holds only ONE pending slot and cancels the previous occupant, so a shared
-  # group would let a third run silently cancel a nightly's pending wheel build.
-  # (github.run_id/run_attempt are the CALLER's under workflow_call.)
+  # Only a direct PR-mirror push shares a per-branch group with
+  # cancel-in-progress. A workflow_call inherits the caller's ref, so the
+  # nightly running on pull-request/<N> would otherwise land in that same
+  # group and cancel, or be cancelled by, the standalone run from the same
+  # push. inputs.wheel_version is set only by callers. Every other trigger
+  # gets a run-unique group (github.run_id is the CALLER's under
+  # workflow_call).
   group: >-
-    ${{ startsWith(github.ref, 'refs/heads/pull-request/')
+    ${{ (startsWith(github.ref, 'refs/heads/pull-request/') && inputs.wheel_version == '')
         && format('build-wheels-{0}', github.ref)
         || format('build-wheels-{0}-{1}-{2}', github.ref, github.run_id, github.run_attempt) }}
-  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && inputs.wheel_version == '' }}
 
 permissions:
   contents: read
