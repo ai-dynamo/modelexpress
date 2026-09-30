@@ -317,6 +317,7 @@ class MilesCollectiveProtocolCore:
         self._channel = None
         self._rendezvous = None
         self._closed = False
+        self._close_pending = False
         self._round_version: str | None = None
         self._round_begun = False
         self._round_seen: set[str] = set()
@@ -1021,8 +1022,9 @@ class MilesCollectiveProtocolCore:
 
         close() itself issues a rank-0 generator RPC, which is the most
         likely thing to be broken when a round just failed; never let that
-        secondary failure mask `primary`. `_closed` is left untouched on a
-        failed close so a later close() can still retry the cleanup.
+        secondary failure mask `primary`. A failed close leaves
+        ``_close_pending`` set so a later close() retries the remaining
+        cleanup; rounds stay rejected either way.
         """
         try:
             self.close()
@@ -1036,8 +1038,17 @@ class MilesCollectiveProtocolCore:
                 add_note(f"close() during failure handling failed: {close_error!r}")
 
     def close(self) -> None:
-        if self._closed:
+        """Tear down the generator fan-out, session, rendezvous, and channel.
+
+        The first close attempt is terminal: later rounds are rejected even
+        when teardown itself fails. A failed teardown sets ``_close_pending``
+        so a later ``close()`` retries the remaining cleanup; the protocol
+        never reopens for rounds either way.
+        """
+        if self._closed and not self._close_pending:
             return
+        self._closed = True
+        self._close_pending = True
         first_error: BaseException | None = None
         if dist.is_available() and dist.is_initialized() and dist.get_rank() == 0:
             # Retire any round futures a failed round left un-awaited before the
@@ -1075,9 +1086,9 @@ class MilesCollectiveProtocolCore:
                     self._channel = None
         if first_error is not None:
             raise first_error
-        self._closed = True
+        self._close_pending = False
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-        logger.info("MILES NCCL M2N clean shutdown complete trainer_rank=%d", rank)
+        logger.info("MILES NCCL M2N teardown complete trainer_rank=%d", rank)
 
     def pop_metrics(self) -> dict[str, float]:
         metrics, self.update_weight_metrics = self.update_weight_metrics, {}

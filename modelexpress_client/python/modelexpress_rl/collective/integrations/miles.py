@@ -357,11 +357,13 @@ class MilesTrainerSession:
     def close(self) -> None:
         if self._closed:
             return
+        # One-shot: even a failed teardown must not rerun cleanup or reopen
+        # the session.
+        self._closed = True
         try:
             self._client.cleanup()
         finally:
             self._rendezvous.close()
-            self._closed = True
 
 
 __all__ = [

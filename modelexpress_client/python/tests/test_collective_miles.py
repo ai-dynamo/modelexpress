@@ -681,3 +681,29 @@ def test_trainer_session_closes_after_a_finish_failure():
     assert client.events[-1] == ("cleanup",)
     assert rendezvous.reported == []
     assert rendezvous.closed == 1
+
+
+def test_trainer_session_close_is_one_shot_even_when_teardown_raises():
+    calls = []
+
+    class Client(FakeTrainerClient):
+        def cleanup(self):
+            calls.append("cleanup")
+            raise RuntimeError("cleanup failed")
+
+    class Rendezvous(FakeRendezvous):
+        def close(self):
+            calls.append("rendezvous")
+            raise RuntimeError("rendezvous close failed")
+
+    session = _session(Client(), Rendezvous())
+
+    with pytest.raises(RuntimeError, match="rendezvous close failed"):
+        session.close()
+
+    assert session._closed is True
+    assert calls == ["cleanup", "rendezvous"]
+
+    session.close()
+
+    assert calls == ["cleanup", "rendezvous"]

@@ -1081,24 +1081,37 @@ def test_close_reports_generator_failure_and_allows_retry(monkeypatch, caplog):
     with pytest.raises(RuntimeError, match="synthetic generator close failure"):
         protocol.close()
 
-    assert protocol._closed is False
+    # The first close attempt is terminal for rounds even though teardown
+    # itself failed; only the remaining cleanup may be retried.
+    assert protocol._closed is True
+    assert protocol._close_pending is True
     assert protocol._session is None
     assert protocol._channel is None
     assert events == ["session-close", "channel-close"]
+
+    monkeypatch.setattr(miles_protocol.dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(
+        miles_protocol.dist,
+        "all_gather_object",
+        lambda output, value, **_kwargs: output.__setitem__(0, value),
+    )
+    with pytest.raises(RuntimeError, match="protocol is closed"):
+        protocol.begin_sync(2, lambda *, materialize: iter([]))
 
     with caplog.at_level("INFO"):
         protocol.close()
 
     assert attempts == 2
     assert protocol._closed is True
+    assert protocol._close_pending is False
     assert (
-        caplog.text.count("MILES NCCL M2N clean shutdown complete trainer_rank=0") == 1
+        caplog.text.count("MILES NCCL M2N teardown complete trainer_rank=0") == 1
     )
 
     protocol.close()
 
     assert (
-        caplog.text.count("MILES NCCL M2N clean shutdown complete trainer_rank=0") == 1
+        caplog.text.count("MILES NCCL M2N teardown complete trainer_rank=0") == 1
     )
 
 
