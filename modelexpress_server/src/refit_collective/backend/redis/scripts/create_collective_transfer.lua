@@ -22,6 +22,14 @@
 local existing = redis.call('GET', KEYS[2])
 if existing then
   if redis.call('EXISTS', ARGV[8] .. existing) == 1 then
+    -- A replay still answers to the group's fence requirement; the gate is
+    -- only as strong as its retries. A missing group row reads as '0' here,
+    -- so a fenced replay against a deleted group fails loud instead of
+    -- reviving a stale operation.
+    local fence_required = redis.call('HGET', KEYS[3], 'requires_bootstrap_fence') or '0'
+    if fence_required ~= ARGV[9] then
+      return 'FENCEMISMATCH'
+    end
     return 'EXISTING:' .. existing
   end
   -- Recover an orphaned reservation left by partial/manual metadata cleanup.

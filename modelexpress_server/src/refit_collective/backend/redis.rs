@@ -1728,6 +1728,40 @@ mod tests {
             .expect("read unfenced group");
         assert!(!unfenced_group.requires_bootstrap_fence);
 
+        // A replay that flips only the fence flag hits the idempotency
+        // reservation, but still answers to the group's declared requirement.
+        let mut flipped = unfenced.clone();
+        flipped.requires_bootstrap_fence = true;
+        let flipped_replay = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(flipped),
+                version_id: "v1".to_string(),
+                idempotency_key: "unfenced".to_string(),
+            })
+            .await
+            .expect_err("a replay that flips the fence flag is refused");
+        assert!(matches!(
+            flipped_replay,
+            CollectiveBackendError::FailedPrecondition(_)
+        ));
+        assert!(
+            flipped_replay
+                .to_string()
+                .contains("requires_bootstrap_fence")
+        );
+
+        // A faithful replay still returns the original operation.
+        let replayed = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(unfenced.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "unfenced".to_string(),
+            })
+            .await
+            .expect("a faithful replay returns the existing operation");
+        assert_eq!(replayed.operation_id, created.operation_id);
+        assert_eq!(replayed.epoch, created.epoch);
+
         let mut fenced = spec("m2", &["t1"], &["g1"], 1);
         fenced.requires_bootstrap_fence = true;
         backend

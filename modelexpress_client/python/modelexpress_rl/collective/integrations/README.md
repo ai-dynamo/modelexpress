@@ -177,9 +177,14 @@ Because arrivals are unconditional, this client requires a fence-capable
 server: against a pre-fence server the first arrival fails loudly with
 UNIMPLEMENTED rather than skipping the fence. `requires_bootstrap_fence`
 controls only the server-side create gate, and every participant of one
-operation must set it to the same value or joins are rejected. The interop
+operation must set it to the same value or joins are rejected. The same rule
+binds whoever creates the transfer row: a create — including an idempotent
+replay — whose declared requirement differs from the group's is refused
+(FENCEMISMATCH). The interop
 requirement cuts the other way too: every peer must run a fence-capable
-client. The deployed engine images (modelexpress 0.5.1) await the fences
+client. The full-branch engine images used for hardware interop (built from
+`6669b02`; they report 0.5.1, the same version string a pre-fence build
+reports) await the fences
 unconditionally, so a mixed-generation group with a pre-fence client deadlocks
 at bootstrap by design, receivers holding the fence for a trainer that never
 arrives — proven on hardware with this adapter's pre-fence revision.
