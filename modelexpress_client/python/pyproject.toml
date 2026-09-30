@@ -91,3 +91,9 @@ include = ["modelexpress*"]
 
 [tool.setuptools.package-data]
 modelexpress = ["py.typed"]
+
+[tool.ruff]
+# Pin first-party detection: with no config, ruff derives `src` from the
+# invocation directory, so `modelexpress_rl` flips between first-party and
+# third-party (and I001 appears or vanishes) depending on where ruff runs.
+src = ["."]

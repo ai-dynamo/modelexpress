@@ -13,8 +13,9 @@ import sys
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
-import modelexpress_rl.collective.client as collective_client
 import pytest
+
+import modelexpress_rl.collective.client as collective_client
 from modelexpress_rl.collective import (
     CommunicatorCache,
     LaneCommunicator,
