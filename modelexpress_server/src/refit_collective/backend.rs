@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use modelexpress_common::grpc::refit_collective::{
-    CollectiveGroup, CollectiveGroupMembership, CollectiveTransfer,
+    CollectiveBootstrapFence, CollectiveGroup, CollectiveGroupMembership, CollectiveTransfer,
     CreateCollectiveTransferRequest, JoinCollectiveGroupRequest, PublishGroupBootstrapRequest,
-    ReportCollectiveTransferRequest,
+    ReachCollectiveBootstrapFenceRequest, ReportCollectiveTransferRequest,
 };
 
 use crate::backend_config::BackendConfig;
@@ -67,6 +67,12 @@ pub trait CollectiveBackend: Send + Sync {
         &self,
         request: &PublishGroupBootstrapRequest,
     ) -> CollectiveResult<CollectiveGroup>;
+
+    /// Idempotently record one admitted worker generation at a bootstrap step.
+    async fn reach_bootstrap_fence(
+        &self,
+        request: &ReachCollectiveBootstrapFenceRequest,
+    ) -> CollectiveResult<CollectiveBootstrapFence>;
 
     /// Idempotent on `idempotency_key`, so an orchestrator retry after a
     /// timeout returns the original operation instead of opening a second one

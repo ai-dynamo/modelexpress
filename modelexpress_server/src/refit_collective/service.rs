@@ -8,11 +8,11 @@
 use std::sync::Arc;
 
 use modelexpress_common::grpc::refit_collective::{
-    CollectiveGroup, CollectiveGroupMembership, CollectiveGroupSpec, CollectiveRole,
-    CollectiveTransfer, CreateCollectiveTransferRequest, DeleteCollectiveTransferRequest,
-    GetCollectiveGroupRequest, GetCollectiveTransferRequest, JoinCollectiveGroupRequest,
-    PublishGroupBootstrapRequest, ReportCollectiveTransferRequest,
-    refit_collective_service_server::RefitCollectiveService,
+    BootstrapFencePhase, CollectiveBootstrapFence, CollectiveGroup, CollectiveGroupMembership,
+    CollectiveGroupSpec, CollectiveRole, CollectiveTransfer, CreateCollectiveTransferRequest,
+    DeleteCollectiveTransferRequest, GetCollectiveGroupRequest, GetCollectiveTransferRequest,
+    JoinCollectiveGroupRequest, PublishGroupBootstrapRequest, ReachCollectiveBootstrapFenceRequest,
+    ReportCollectiveTransferRequest, refit_collective_service_server::RefitCollectiveService,
 };
 use tonic::{Request, Response, Status};
 
@@ -262,6 +262,33 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
             .map_err(backend_status)
     }
 
+    async fn reach_collective_bootstrap_fence(
+        &self,
+        request: Request<ReachCollectiveBootstrapFenceRequest>,
+    ) -> Result<Response<CollectiveBootstrapFence>, Status> {
+        let request = request.into_inner();
+        required(&request.group_id, "group_id")?;
+        required(&request.slot_id, "slot_id")?;
+        required(&request.worker_id, "worker_id")?;
+        delimiter_free(&request.slot_id, "slot_id", &['\0', '\n', '\r', '|'])?;
+        if request.epoch == 0 {
+            return Err(Status::invalid_argument(
+                "epoch must be the group's current epoch",
+            ));
+        }
+        if BootstrapFencePhase::try_from(request.phase).unwrap_or(BootstrapFencePhase::Unspecified)
+            == BootstrapFencePhase::Unspecified
+        {
+            return Err(Status::invalid_argument("phase must be specified"));
+        }
+
+        self.backend
+            .reach_bootstrap_fence(&request)
+            .await
+            .map(Response::new)
+            .map_err(backend_status)
+    }
+
     async fn report_collective_transfer(
         &self,
         request: Request<ReportCollectiveTransferRequest>,
@@ -306,6 +333,7 @@ mod tests {
                 trainer_slots: vec!["t0".to_string(), "t1".to_string()],
                 generator_slots: vec!["g0".to_string()],
             }],
+            requires_bootstrap_fence: false,
         }
     }
 

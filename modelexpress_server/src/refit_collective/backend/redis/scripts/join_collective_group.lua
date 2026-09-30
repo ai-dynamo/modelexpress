@@ -21,6 +21,7 @@
 -- ARGV[13]: expected_trainer_slots, newline separated
 -- ARGV[14]: expected_generator_slots, newline separated
 -- ARGV[15]: created_at_unix_ms
+-- ARGV[16]: requires_bootstrap_fence ('1' or '0')
 
 local function contains_slot(list, target)
   for slot in string.gmatch(list .. '\n', '([^\n]*)\n') do
@@ -73,6 +74,14 @@ local epoch = tonumber(redis.call('HGET', KEYS[1], 'epoch'))
 local changed = false
 local membership_change_requires_bump = false
 
+-- The fence requirement is fixed at creation and every participant must
+-- declare the same value; a mismatch means the cohort runs mixed clients, and
+-- rejecting the join beats a create that can never pass the gate.
+if epoch and (redis.call('HGET', KEYS[1], 'requires_bootstrap_fence') or '0')
+    ~= ARGV[16] then
+  return 'CONFLICTING_FENCE_REQUIREMENT'
+end
+
 if not epoch then
   epoch = 1
   -- The group hash and its derived hashes do not share a Redis lifetime. If the
@@ -82,6 +91,12 @@ if not epoch then
   redis.call('DEL', KEYS[3])
   for i = 1, lane_count do
     redis.call('DEL', KEYS[4 + i])
+  end
+  for line in string.gmatch(ARGV[3] .. '\n', '([^\n]*)\n') do
+    local lane_id = string.match(line, '^([^|]*)|')
+    if lane_id then
+      redis.call('DEL', KEYS[1] .. ':fence:' .. lane_id)
+    end
   end
   redis.call('HSET', KEYS[1],
     'group_id', ARGV[1],
@@ -93,6 +108,8 @@ if not epoch then
     'plan_digest', ARGV[9],
     'epoch', epoch,
     'state', 'FORMING',
+    'bootstrap_complete_epoch', 0,
+    'requires_bootstrap_fence', ARGV[16],
     'plan_source_worker_id', '',
     'plan_source_endpoint', '',
     'plan_source_digest', '',
@@ -193,11 +210,18 @@ if changed then
     'epoch', epoch,
     'plan_digest', ARGV[9],
     'state', 'FORMING',
+    'bootstrap_complete_epoch', 0,
     'plan_source_worker_id', '',
     'plan_source_endpoint', '',
     'plan_source_digest', '')
   for i = 1, lane_count do
     redis.call('DEL', KEYS[4 + i])
+  end
+  for line in string.gmatch(ARGV[3] .. '\n', '([^\n]*)\n') do
+    local lane_id = string.match(line, '^([^|]*)|')
+    if lane_id then
+      redis.call('DEL', KEYS[1] .. ':fence:' .. lane_id)
+    end
   end
 end
 

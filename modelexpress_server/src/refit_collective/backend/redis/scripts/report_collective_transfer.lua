@@ -69,11 +69,21 @@ if ARGV[5] == '0' then
   redis.call('HSET', KEYS[3],
     'epoch', next_epoch,
     'state', 'FORMING',
+    'bootstrap_complete_epoch', 0,
     'plan_source_worker_id', '',
     'plan_source_endpoint', '',
     'plan_source_digest', '')
   for i = 5, #KEYS do
     redis.call('DEL', KEYS[i])
+  end
+  local lanes = redis.call('HGET', KEYS[3], 'lanes')
+  if lanes then
+    for line in string.gmatch(lanes .. '\n', '([^\n]*)\n') do
+      local lane_id = string.match(line, '^([^|]*)|')
+      if lane_id then
+        redis.call('DEL', KEYS[3] .. ':fence:' .. lane_id)
+      end
+    end
   end
   return 'OK:FAILED'
 end

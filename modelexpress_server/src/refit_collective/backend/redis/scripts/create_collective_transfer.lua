@@ -4,13 +4,16 @@
 -- KEYS[2]: create-request idempotency key
 -- KEYS[3]: group hash
 -- ARGV: operation_id, group_id, version_id, model_name, idempotency_key,
---       state, created_at_unix_ms, operation_key_prefix
+--       state, created_at_unix_ms, operation_key_prefix,
+--       requires_bootstrap_fence ('1' or '0')
 --
 -- Returns:
 --   CREATED
 --   EXISTING:<operation_id>   another invocation already owns the key
 --   COLLISION                 the generated operation ID already exists
 --   NOGROUP                   no group exists for this membership
+--   FENCEMISMATCH             declared fence requirement differs from the group's
+--   NOTBOOTSTRAPPED           group requires the fence and has not completed it
 --
 -- The idempotency reservation is what makes an orchestrator retry safe: a
 -- create that timed out client-side but committed server-side returns the
@@ -33,6 +36,18 @@ end
 local epoch = redis.call('HGET', KEYS[3], 'epoch')
 if not epoch then
   return 'NOGROUP'
+end
+
+-- The gate is opt-in per group: only a cohort that declared the fence at
+-- formation is held to it, so pre-fence clients keep working against an
+-- upgraded server.
+local fence_required = redis.call('HGET', KEYS[3], 'requires_bootstrap_fence') or '0'
+if fence_required ~= ARGV[9] then
+  return 'FENCEMISMATCH'
+end
+if fence_required == '1'
+    and tonumber(redis.call('HGET', KEYS[3], 'bootstrap_complete_epoch')) ~= tonumber(epoch) then
+  return 'NOTBOOTSTRAPPED'
 end
 
 redis.call('HSET', KEYS[1],

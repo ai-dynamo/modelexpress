@@ -126,6 +126,7 @@ fn spec(model_name: &str, trainers: &[&str], generators: &[&str]) -> CollectiveG
                 generator_slots,
             },
         ],
+        requires_bootstrap_fence: false,
     }
 }
 

@@ -15,11 +15,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use modelexpress_common::grpc::refit_collective::{
-    CollectiveGroup, CollectiveGroupMembership, CollectiveGroupSpec, CollectiveGroupState,
-    CollectiveLane, CollectiveParticipant, CollectiveRole, CollectiveTransfer,
+    CollectiveBootstrapFence, CollectiveGroup, CollectiveGroupMembership, CollectiveGroupSpec,
+    CollectiveGroupState, CollectiveLane, CollectiveParticipant, CollectiveRole, CollectiveTransfer,
     CollectiveTransferState, CreateCollectiveTransferRequest, JoinCollectiveGroupRequest,
     LaneAssignment, LaneKind, PlanSource, PublishGroupBootstrapRequest,
-    ReportCollectiveTransferRequest,
+    ReachCollectiveBootstrapFenceRequest, ReportCollectiveTransferRequest,
 };
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
@@ -35,6 +35,8 @@ const CREATE_TRANSFER_LUA: &str = include_str!("redis/scripts/create_collective_
 const REPORT_TRANSFER_LUA: &str = include_str!("redis/scripts/report_collective_transfer.lua");
 const REFRESH_GROUP_LUA: &str = include_str!("redis/scripts/refresh_collective_group.lua");
 const DELETE_TRANSFER_LUA: &str = include_str!("redis/scripts/delete_collective_transfer.lua");
+const REACH_BOOTSTRAP_FENCE_LUA: &str =
+    include_str!("redis/scripts/reach_collective_bootstrap_fence.lua");
 
 fn group_key(group_id: &str) -> String {
     format!("mx:refitc:group:{group_id}")
@@ -50,6 +52,10 @@ fn digests_key(group_id: &str) -> String {
 
 fn lane_key(group_id: &str, lane_id: u32) -> String {
     format!("mx:refitc:group:{group_id}:lane:{lane_id}")
+}
+
+fn fence_key(group_id: &str, lane_id: u32) -> String {
+    format!("mx:refitc:group:{group_id}:fence:{lane_id}")
 }
 
 const OPERATION_KEY_PREFIX: &str = "mx:refitc:op:";
@@ -476,6 +482,9 @@ impl RedisCollectiveBackend {
             expected_generator_slots: generator_slots,
             created_at_unix_ms: parse_field(&fields, "created_at_unix_ms")?,
             disagreeing_slots,
+            requires_bootstrap_fence: fields
+                .get("requires_bootstrap_fence")
+                .is_some_and(|value| value == "1"),
         })
     }
 
@@ -631,6 +640,11 @@ impl CollectiveBackend for RedisCollectiveBackend {
             .arg(spec.expected_trainer_slots.join("\n"))
             .arg(spec.expected_generator_slots.join("\n"))
             .arg(now_unix_ms()?)
+            .arg(if spec.requires_bootstrap_fence {
+                "1"
+            } else {
+                "0"
+            })
             .invoke_async(&mut self.connection.clone())
             .await
             .map_err(redis_error)?;
@@ -677,6 +691,14 @@ impl CollectiveBackend for RedisCollectiveBackend {
                 return Err(CollectiveBackendError::Internal(
                     "collective group contains a malformed participant record".to_string(),
                 ));
+            }
+            "CONFLICTING_FENCE_REQUIREMENT" => {
+                return Err(CollectiveBackendError::FailedPrecondition(format!(
+                    "requires_bootstrap_fence={} conflicts with collective group {group_id}, \
+                     which was formed with the opposite requirement; every participant must \
+                     declare the same value",
+                    spec.requires_bootstrap_fence
+                )));
             }
             _ => {}
         }
@@ -807,6 +829,82 @@ impl CollectiveBackend for RedisCollectiveBackend {
         self.read_group(&request.group_id).await
     }
 
+    async fn reach_bootstrap_fence(
+        &self,
+        request: &ReachCollectiveBootstrapFenceRequest,
+    ) -> CollectiveResult<CollectiveBootstrapFence> {
+        let outcome: String = Script::new(REACH_BOOTSTRAP_FENCE_LUA)
+            .key(group_key(&request.group_id))
+            .key(participants_key(&request.group_id))
+            .key(fence_key(&request.group_id, request.lane_id))
+            .arg(request.epoch)
+            .arg(request.lane_id)
+            .arg(request.phase)
+            .arg(&request.slot_id)
+            .arg(&request.worker_id)
+            .invoke_async(&mut self.connection.clone())
+            .await
+            .map_err(redis_error)?;
+
+        match outcome.as_str() {
+            "NOTFOUND" => Err(CollectiveBackendError::NotFound(format!(
+                "collective group {} was not found",
+                request.group_id
+            ))),
+            "NOTREADY" => Err(CollectiveBackendError::FailedPrecondition(format!(
+                "collective group {} is not READY for bootstrap fence {}",
+                request.group_id, request.lane_id
+            ))),
+            "NOTADMITTED" | "NOTLIVE" => Err(CollectiveBackendError::FailedPrecondition(format!(
+                "worker {} is not the live admitted generation for slot {}",
+                request.worker_id, request.slot_id
+            ))),
+            "NOLANE" => Err(CollectiveBackendError::InvalidArgument(format!(
+                "lane {} is not declared by group {}",
+                request.lane_id, request.group_id
+            ))),
+            "NOPHASE" => Err(CollectiveBackendError::InvalidArgument(
+                "bootstrap fence phase must be specified".to_string(),
+            )),
+            other => {
+                if let Some(lane_id) = other.strip_prefix("PREINCOMPLETE:") {
+                    return Err(CollectiveBackendError::FailedPrecondition(format!(
+                        "bootstrap completion for group {} was rejected because lane {lane_id} has not released its PRE_BARRIER fence",
+                        request.group_id
+                    )));
+                }
+                if let Some(current) = other.strip_prefix("STALE:") {
+                    return Err(CollectiveBackendError::FailedPrecondition(format!(
+                        "bootstrap fence for epoch {} was rejected; the group is at epoch {current}",
+                        request.epoch
+                    )));
+                }
+                let Some(payload) = other.strip_prefix("OK:") else {
+                    return Err(CollectiveBackendError::Internal(format!(
+                        "unexpected bootstrap fence outcome {other}"
+                    )));
+                };
+                let (released, missing) = payload.split_once(':').ok_or_else(|| {
+                    CollectiveBackendError::Internal(
+                        "bootstrap fence outcome is missing release state".to_string(),
+                    )
+                })?;
+                Ok(CollectiveBootstrapFence {
+                    group_id: request.group_id.clone(),
+                    epoch: request.epoch,
+                    lane_id: request.lane_id,
+                    released: released == "1",
+                    missing_slots: if missing.is_empty() {
+                        Vec::new()
+                    } else {
+                        missing.lines().map(str::to_string).collect()
+                    },
+                    phase: request.phase,
+                })
+            }
+        }
+    }
+
     async fn create_transfer(
         &self,
         request: &CreateCollectiveTransferRequest,
@@ -838,6 +936,11 @@ impl CollectiveBackend for RedisCollectiveBackend {
             .arg("PENDING")
             .arg(now_unix_ms()?)
             .arg(OPERATION_KEY_PREFIX)
+            .arg(if spec.requires_bootstrap_fence {
+                "1"
+            } else {
+                "0"
+            })
             .invoke_async(&mut self.connection.clone())
             .await
             .map_err(redis_error)?;
@@ -850,6 +953,15 @@ impl CollectiveBackend for RedisCollectiveBackend {
             "NOGROUP" => Err(CollectiveBackendError::FailedPrecondition(
                 "no collective group has formed for this membership yet".to_string(),
             )),
+            "FENCEMISMATCH" => Err(CollectiveBackendError::FailedPrecondition(format!(
+                "requires_bootstrap_fence={} conflicts with collective group {group_id}, \
+                 which was formed with the opposite requirement; every participant must \
+                 declare the same value",
+                spec.requires_bootstrap_fence
+            ))),
+            "NOTBOOTSTRAPPED" => Err(CollectiveBackendError::FailedPrecondition(format!(
+                "collective group {group_id} has not completed all-rank bootstrap"
+            ))),
             other => match other.strip_prefix("EXISTING:") {
                 Some(existing) => {
                     let transfer = self.read_transfer(existing).await?;
@@ -985,7 +1097,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use modelexpress_common::grpc::refit_collective::LaneSpec;
+    use modelexpress_common::grpc::refit_collective::{BootstrapFencePhase, LaneSpec};
 
     /// One reshard lane per `lane_count`, splitting the trainers evenly across
     /// them, plus a broadcast lane spanning everyone. The split is the TEST's
@@ -1020,6 +1132,7 @@ mod tests {
             expected_trainer_slots: trainer_slots,
             expected_generator_slots: generator_slots,
             lanes,
+            requires_bootstrap_fence: false,
         }
     }
 
@@ -1065,6 +1178,19 @@ mod tests {
         assert_ne!(
             group_id_for(&spec("m", &["t0", "t1"], &["g0"], 1)),
             group_id_for(&spec("m", &["t0", "t1"], &["g0"], 2))
+        );
+    }
+
+    #[test]
+    fn group_id_ignores_the_fence_requirement() {
+        // The requirement must not split group identity: a cohort that
+        // disagrees about it is rejected at join with a clear error, not split
+        // into two groups that each wait forever for their missing half.
+        let mut fenced = spec("m", &["t0", "t1"], &["g0"], 1);
+        fenced.requires_bootstrap_fence = true;
+        assert_eq!(
+            group_id_for(&spec("m", &["t0", "t1"], &["g0"], 1)),
+            group_id_for(&fenced)
         );
     }
 
@@ -1144,5 +1270,576 @@ mod tests {
         assert_eq!(decode_lanes("").expect("empty"), Vec::new());
         assert!(decode_lanes("0|1|t0|g0|extra").is_err());
         assert!(decode_lanes("notanumber|1|t0|g0").is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MX_TEST_REDIS_URL pointing at an isolated Redis"]
+    async fn bootstrap_fence_is_idempotent_epoch_fenced_and_reset_on_membership_change() {
+        let url = std::env::var("MX_TEST_REDIS_URL")
+            .expect("MX_TEST_REDIS_URL must point at an isolated Redis");
+        let backend = RedisCollectiveBackend::connect(&url).await.expect("connect");
+        let mut redis = backend.connection.clone();
+        redis::cmd("FLUSHDB")
+            .query_async::<()>(&mut redis)
+            .await
+            .expect("flush");
+        for (worker_id, role) in [
+            ("w-t0", 1),
+            ("w-t1", 1),
+            ("w-t1-replacement", 1),
+            ("w-g0", 2),
+        ] {
+            redis::cmd("HSET")
+                .arg(worker_key(worker_id))
+                .arg("worker_id")
+                .arg(worker_id)
+                .arg("role")
+                .arg(role)
+                .arg("model_name")
+                .arg("m")
+                .query_async::<()>(&mut redis)
+                .await
+                .expect("register worker");
+            redis::cmd("EXPIRE")
+                .arg(worker_key(worker_id))
+                .arg(60)
+                .query_async::<()>(&mut redis)
+                .await
+                .expect("expire registration");
+        }
+
+        // The group opts in so the create gate applies: the gate is opt-in per
+        // group, and an undeclared group keeps the historical ungated creates.
+        let mut group_spec = spec("m", &["t0", "t1"], &["g0"], 1);
+        group_spec.requires_bootstrap_fence = true;
+        let join =
+            |slot_id: &str, worker_id: &str, role: CollectiveRole| JoinCollectiveGroupRequest {
+                spec: Some(group_spec.clone()),
+                slot_id: slot_id.to_string(),
+                worker_id: worker_id.to_string(),
+                role: role.into(),
+                index_in_role: 0,
+                plan_digest: "digest".to_string(),
+                plan_source: (slot_id == "t0").then(|| PlanSource {
+                    worker_id: worker_id.to_string(),
+                    endpoint: "trainer:9000".to_string(),
+                    digest: "digest".to_string(),
+                }),
+            };
+        let trainer = join("t0", "w-t0", CollectiveRole::Trainer);
+        let trainer_one = join("t1", "w-t1", CollectiveRole::Trainer);
+        let generator = join("g0", "w-g0", CollectiveRole::Generator);
+        let first = backend.join_group(&trainer).await.expect("trainer join");
+        backend
+            .join_group(&trainer_one)
+            .await
+            .expect("second trainer join");
+        backend
+            .join_group(&generator)
+            .await
+            .expect("generator join");
+        for lane_id in [0, 1] {
+            backend
+                .publish_bootstrap(&PublishGroupBootstrapRequest {
+                    group_id: first.group_id.clone(),
+                    epoch: first.epoch,
+                    lane_id,
+                    worker_id: "w-t0".to_string(),
+                    nccl_unique_id: vec![u8::try_from(lane_id).unwrap_or(0); 128],
+                })
+                .await
+                .expect("publish");
+        }
+
+        let trainer_arrival = ReachCollectiveBootstrapFenceRequest {
+            group_id: first.group_id.clone(),
+            epoch: first.epoch,
+            lane_id: 1,
+            slot_id: "t0".to_string(),
+            worker_id: "w-t0".to_string(),
+            phase: BootstrapFencePhase::PreBarrier.into(),
+        };
+        let waiting = backend
+            .reach_bootstrap_fence(&trainer_arrival)
+            .await
+            .expect("first arrival");
+        assert!(!waiting.released);
+        assert_eq!(waiting.missing_slots, ["g0", "t1"]);
+        assert_eq!(
+            backend
+                .reach_bootstrap_fence(&trainer_arrival)
+                .await
+                .expect("idempotent arrival"),
+            waiting
+        );
+
+        let still_waiting = backend
+            .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                group_id: first.group_id.clone(),
+                epoch: first.epoch,
+                lane_id: 1,
+                slot_id: "g0".to_string(),
+                worker_id: "w-g0".to_string(),
+                phase: BootstrapFencePhase::PreBarrier.into(),
+            })
+            .await
+            .expect("generator arrival");
+        assert!(!still_waiting.released);
+        assert_eq!(still_waiting.missing_slots, ["t1"]);
+        let released = backend
+            .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                group_id: first.group_id.clone(),
+                epoch: first.epoch,
+                lane_id: 1,
+                slot_id: "t1".to_string(),
+                worker_id: "w-t1".to_string(),
+                phase: BootstrapFencePhase::PreBarrier.into(),
+            })
+            .await
+            .expect("last arrival");
+        assert!(released.released);
+        assert!(released.missing_slots.is_empty());
+
+        let wrong_generation = backend
+            .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                worker_id: "w-t1".to_string(),
+                ..trainer_arrival.clone()
+            })
+            .await
+            .expect_err("wrong slot generation must be rejected");
+        assert!(matches!(
+            wrong_generation,
+            CollectiveBackendError::FailedPrecondition(_)
+        ));
+        let unknown_lane = backend
+            .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                lane_id: 99,
+                ..trainer_arrival.clone()
+            })
+            .await
+            .expect_err("undeclared lane must be rejected");
+        assert!(matches!(
+            unknown_lane,
+            CollectiveBackendError::InvalidArgument(_)
+        ));
+        let stale = backend
+            .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                epoch: first.epoch + 1,
+                ..trainer_arrival.clone()
+            })
+            .await
+            .expect_err("future epoch must be rejected");
+        assert!(matches!(
+            stale,
+            CollectiveBackendError::FailedPrecondition(_)
+        ));
+
+        // This port carries no abort RPC: a membership change is what moves the
+        // epoch and wipes the fence, so the reset half of the reference test is
+        // driven by a replacement join instead of AbortCollectiveBootstrap.
+        let moved = backend
+            .join_group(&join("t1", "w-t1-replacement", CollectiveRole::Trainer))
+            .await
+            .expect("replacement trainer join moves the epoch");
+        assert_eq!(moved.epoch, first.epoch + 1);
+        assert_eq!(moved.state, i32::from(CollectiveGroupState::Forming));
+        let fence_exists: bool = redis
+            .exists(fence_key(&first.group_id, 1))
+            .await
+            .expect("fence existence");
+        assert!(!fence_exists);
+        let old_arrival = backend
+            .reach_bootstrap_fence(&trainer_arrival)
+            .await
+            .expect_err("old arrival must not enter the new epoch");
+        assert!(matches!(
+            old_arrival,
+            CollectiveBackendError::FailedPrecondition(_)
+        ));
+
+        let retry_trainer = backend.join_group(&trainer).await.expect("retry trainer");
+        let retry_generator = backend
+            .join_group(&generator)
+            .await
+            .expect("retry generator");
+        assert_eq!(retry_trainer.epoch, moved.epoch);
+        assert_eq!(retry_generator.epoch, moved.epoch);
+        for lane_id in [0, 1] {
+            backend
+                .publish_bootstrap(&PublishGroupBootstrapRequest {
+                    group_id: first.group_id.clone(),
+                    epoch: moved.epoch,
+                    lane_id,
+                    worker_id: "w-t0".to_string(),
+                    nccl_unique_id: vec![u8::try_from(lane_id + 2).unwrap_or(0); 128],
+                })
+                .await
+                .expect("retry publish");
+        }
+        let completion_arrival = || ReachCollectiveBootstrapFenceRequest {
+            group_id: first.group_id.clone(),
+            epoch: moved.epoch,
+            lane_id: 1,
+            slot_id: "t0".to_string(),
+            worker_id: "w-t0".to_string(),
+            phase: BootstrapFencePhase::Complete.into(),
+        };
+        let complete_before_pre = backend
+            .reach_bootstrap_fence(&completion_arrival())
+            .await
+            .expect_err("COMPLETE before any PRE_BARRIER release must be rejected");
+        assert!(matches!(
+            complete_before_pre,
+            CollectiveBackendError::FailedPrecondition(_)
+        ));
+
+        let retry_waiting = backend
+            .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                epoch: moved.epoch,
+                ..trainer_arrival
+            })
+            .await
+            .expect("retry arrival");
+        assert!(!retry_waiting.released);
+        assert_eq!(retry_waiting.missing_slots, ["g0", "t1"]);
+        let complete_during_partial_pre = backend
+            .reach_bootstrap_fence(&completion_arrival())
+            .await
+            .expect_err("COMPLETE during a partial PRE_BARRIER must be rejected");
+        assert!(matches!(
+            complete_during_partial_pre,
+            CollectiveBackendError::FailedPrecondition(_)
+        ));
+
+        let before_completion = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(group_spec.clone()),
+                version_id: "v0".to_string(),
+                idempotency_key: "before-completion".to_string(),
+            })
+            .await
+            .expect_err("READY without all-rank completion must reject create");
+        assert!(matches!(
+            before_completion,
+            CollectiveBackendError::FailedPrecondition(_)
+        ));
+
+        for (slot_id, worker_id) in [("g0", "w-g0"), ("t1", "w-t1-replacement")] {
+            let released = backend
+                .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                    group_id: first.group_id.clone(),
+                    epoch: moved.epoch,
+                    lane_id: 1,
+                    slot_id: slot_id.to_string(),
+                    worker_id: worker_id.to_string(),
+                    phase: BootstrapFencePhase::PreBarrier.into(),
+                })
+                .await
+                .expect("finish retry pre-barrier fence");
+            if slot_id == "t1" {
+                assert!(released.released);
+            }
+        }
+        let complete_with_missing_lane = backend
+            .reach_bootstrap_fence(&completion_arrival())
+            .await
+            .expect_err("COMPLETE with an unreleased declared lane must be rejected");
+        assert!(matches!(
+            complete_with_missing_lane,
+            CollectiveBackendError::FailedPrecondition(_)
+        ));
+
+        let lane_zero_partial = backend
+            .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                group_id: first.group_id.clone(),
+                epoch: moved.epoch,
+                lane_id: 0,
+                slot_id: "t0".to_string(),
+                worker_id: "w-t0".to_string(),
+                phase: BootstrapFencePhase::PreBarrier.into(),
+            })
+            .await
+            .expect("partial lane zero PRE_BARRIER");
+        assert!(!lane_zero_partial.released);
+        let complete_with_partial_lane = backend
+            .reach_bootstrap_fence(&completion_arrival())
+            .await
+            .expect_err("COMPLETE with a partial declared lane must be rejected");
+        assert!(matches!(
+            complete_with_partial_lane,
+            CollectiveBackendError::FailedPrecondition(_)
+        ));
+        for (slot_id, worker_id) in [("g0", "w-g0"), ("t1", "w-t1-replacement")] {
+            let released = backend
+                .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                    group_id: first.group_id.clone(),
+                    epoch: moved.epoch,
+                    lane_id: 0,
+                    slot_id: slot_id.to_string(),
+                    worker_id: worker_id.to_string(),
+                    phase: BootstrapFencePhase::PreBarrier.into(),
+                })
+                .await
+                .expect("finish lane zero PRE_BARRIER");
+            if slot_id == "t1" {
+                assert!(released.released);
+            }
+        }
+        let mut completion = None;
+        for (slot_id, worker_id) in [("t0", "w-t0"), ("g0", "w-g0"), ("t1", "w-t1-replacement")] {
+            completion = Some(
+                backend
+                    .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                        group_id: first.group_id.clone(),
+                        epoch: moved.epoch,
+                        lane_id: 1,
+                        slot_id: slot_id.to_string(),
+                        worker_id: worker_id.to_string(),
+                        phase: BootstrapFencePhase::Complete.into(),
+                    })
+                    .await
+                    .expect("bootstrap completion arrival"),
+            );
+        }
+        assert!(completion.as_ref().is_some_and(|fence| fence.released));
+        let replayed_completion = backend
+            .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                group_id: first.group_id.clone(),
+                epoch: moved.epoch,
+                lane_id: 1,
+                slot_id: "t1".to_string(),
+                worker_id: "w-t1-replacement".to_string(),
+                phase: BootstrapFencePhase::Complete.into(),
+            })
+            .await
+            .expect("lost completion response is idempotent");
+        assert!(replayed_completion.released);
+
+        let bootstrap_complete_epoch: u64 = redis
+            .hget(group_key(&first.group_id), "bootstrap_complete_epoch")
+            .await
+            .expect("read bootstrap completion epoch");
+        assert_eq!(bootstrap_complete_epoch, moved.epoch);
+
+        backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(group_spec.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "after-completion".to_string(),
+            })
+            .await
+            .expect("a fenced group creates once the fence completes");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MX_TEST_REDIS_URL pointing at an isolated Redis"]
+    async fn the_bootstrap_fence_gate_is_opt_in_per_group() {
+        let url = std::env::var("MX_TEST_REDIS_URL")
+            .expect("MX_TEST_REDIS_URL must point at an isolated Redis");
+        let backend = RedisCollectiveBackend::connect(&url).await.expect("connect");
+        let mut redis = backend.connection.clone();
+        redis::cmd("FLUSHDB")
+            .query_async::<()>(&mut redis)
+            .await
+            .expect("flush");
+        for (worker_id, role, model) in [
+            ("w-t0", 1, "m"),
+            ("w-g0", 2, "m"),
+            ("w-t1", 1, "m2"),
+            ("w-g1", 2, "m2"),
+        ] {
+            redis::cmd("HSET")
+                .arg(worker_key(worker_id))
+                .arg("worker_id")
+                .arg(worker_id)
+                .arg("role")
+                .arg(role)
+                .arg("model_name")
+                .arg(model)
+                .query_async::<()>(&mut redis)
+                .await
+                .expect("register worker");
+            redis::cmd("EXPIRE")
+                .arg(worker_key(worker_id))
+                .arg(60)
+                .query_async::<()>(&mut redis)
+                .await
+                .expect("expire registration");
+        }
+
+        let join = |group_spec: &CollectiveGroupSpec,
+                    slot_id: &str,
+                    worker_id: &str,
+                    role: CollectiveRole| JoinCollectiveGroupRequest {
+            spec: Some(group_spec.clone()),
+            slot_id: slot_id.to_string(),
+            worker_id: worker_id.to_string(),
+            role: role.into(),
+            index_in_role: 0,
+            plan_digest: "digest".to_string(),
+            plan_source: None,
+        };
+
+        // A group that never declared the fence creates without a single fence
+        // arrival: the pre-fence client behavior an upgraded server must keep.
+        let unfenced = spec("m", &["t0"], &["g0"], 1);
+        backend
+            .join_group(&join(&unfenced, "t0", "w-t0", CollectiveRole::Trainer))
+            .await
+            .expect("unfenced trainer join");
+        let unfenced_membership = backend
+            .join_group(&join(&unfenced, "g0", "w-g0", CollectiveRole::Generator))
+            .await
+            .expect("unfenced generator join");
+        for lane_id in [0, 1] {
+            backend
+                .publish_bootstrap(&PublishGroupBootstrapRequest {
+                    group_id: unfenced_membership.group_id.clone(),
+                    epoch: unfenced_membership.epoch,
+                    lane_id,
+                    worker_id: "w-t0".to_string(),
+                    nccl_unique_id: vec![u8::try_from(lane_id).unwrap_or(0); 128],
+                })
+                .await
+                .expect("unfenced publish");
+        }
+        let created = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(unfenced.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "unfenced".to_string(),
+            })
+            .await
+            .expect("an unfenced group creates without reaching the fence");
+        assert_eq!(created.epoch, unfenced_membership.epoch);
+        let unfenced_group = backend
+            .read_group(&unfenced_membership.group_id)
+            .await
+            .expect("read unfenced group");
+        assert!(!unfenced_group.requires_bootstrap_fence);
+
+        let mut fenced = spec("m2", &["t1"], &["g1"], 1);
+        fenced.requires_bootstrap_fence = true;
+        backend
+            .join_group(&join(&fenced, "t1", "w-t1", CollectiveRole::Trainer))
+            .await
+            .expect("fenced trainer join");
+        let fenced_membership = backend
+            .join_group(&join(&fenced, "g1", "w-g1", CollectiveRole::Generator))
+            .await
+            .expect("fenced generator join");
+        for lane_id in [0, 1] {
+            backend
+                .publish_bootstrap(&PublishGroupBootstrapRequest {
+                    group_id: fenced_membership.group_id.clone(),
+                    epoch: fenced_membership.epoch,
+                    lane_id,
+                    worker_id: "w-t1".to_string(),
+                    nccl_unique_id: vec![u8::try_from(lane_id + 2).unwrap_or(0); 128],
+                })
+                .await
+                .expect("fenced publish");
+        }
+
+        // A create that under-declares is refused before the gate is consulted.
+        let mut under_declared = fenced.clone();
+        under_declared.requires_bootstrap_fence = false;
+        let mismatched_create = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(under_declared.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "mismatched".to_string(),
+            })
+            .await
+            .expect_err("a create that under-declares the fence is refused");
+        assert!(matches!(
+            mismatched_create,
+            CollectiveBackendError::FailedPrecondition(_)
+        ));
+        assert!(
+            mismatched_create
+                .to_string()
+                .contains("requires_bootstrap_fence")
+        );
+
+        let gated = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(fenced.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "gated".to_string(),
+            })
+            .await
+            .expect_err("a fenced group rejects creates before the fence completes");
+        assert!(matches!(
+            gated,
+            CollectiveBackendError::FailedPrecondition(_)
+        ));
+        assert!(
+            gated
+                .to_string()
+                .contains("has not completed all-rank bootstrap")
+        );
+
+        let rejected_join = backend
+            .join_group(&join(
+                &under_declared,
+                "g1",
+                "w-g1",
+                CollectiveRole::Generator,
+            ))
+            .await
+            .expect_err("a join that under-declares the fence is refused");
+        assert!(matches!(
+            rejected_join,
+            CollectiveBackendError::FailedPrecondition(_)
+        ));
+        assert!(
+            rejected_join
+                .to_string()
+                .contains("requires_bootstrap_fence")
+        );
+
+        for lane_id in [0, 1] {
+            for (slot_id, worker_id) in [("t1", "w-t1"), ("g1", "w-g1")] {
+                backend
+                    .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                        group_id: fenced_membership.group_id.clone(),
+                        epoch: fenced_membership.epoch,
+                        lane_id,
+                        slot_id: slot_id.to_string(),
+                        worker_id: worker_id.to_string(),
+                        phase: BootstrapFencePhase::PreBarrier.into(),
+                    })
+                    .await
+                    .expect("fenced PRE_BARRIER");
+            }
+        }
+        for (slot_id, worker_id) in [("t1", "w-t1"), ("g1", "w-g1")] {
+            backend
+                .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                    group_id: fenced_membership.group_id.clone(),
+                    epoch: fenced_membership.epoch,
+                    lane_id: 1,
+                    slot_id: slot_id.to_string(),
+                    worker_id: worker_id.to_string(),
+                    phase: BootstrapFencePhase::Complete.into(),
+                })
+                .await
+                .expect("fenced COMPLETE");
+        }
+        let created = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(fenced.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "fenced".to_string(),
+            })
+            .await
+            .expect("a fenced group creates once the fence completes");
+        assert_eq!(created.epoch, fenced_membership.epoch);
+        let fenced_group = backend
+            .read_group(&fenced_membership.group_id)
+            .await
+            .expect("read fenced group");
+        assert!(fenced_group.requires_bootstrap_fence);
     }
 }
