@@ -1127,6 +1127,7 @@ def test_close_reports_generator_failure_and_allows_retry(monkeypatch, caplog):
     assert events == ["session-close", "channel-close"]
 
     monkeypatch.setattr(miles_protocol.dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(miles_protocol, "_gloo_group", lambda: object())
     monkeypatch.setattr(
         miles_protocol.dist,
         "all_gather_object",
