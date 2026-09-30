@@ -341,6 +341,16 @@ class MilesCollectiveProtocolCore:
         placement,
         selector,
     ) -> None:
+        if self._closed:
+            raise RuntimeError(
+                "the MILES NCCL M2N protocol is closed; reconnecting requires a "
+                "new protocol instance"
+            )
+        if self._round_version is not None:
+            raise RuntimeError(
+                "cannot reconnect while the round for version "
+                f"{self._round_version!r} is in flight"
+            )
         self._validate_selector(selector)
         if getattr(placement, "gather_pp", True):
             raise ValueError(
@@ -378,6 +388,24 @@ class MilesCollectiveProtocolCore:
                 "the MILES NCCL M2N path requires exactly one source "
                 "rank per PP partition (TP/EP/CP/DP must all be one)"
             )
+        # miles re-calls connect() when the rollout engine set heals or the
+        # trainer goes stale. A stale session must not survive into the next
+        # round: the first send_bucket would skip preparation and fan
+        # run_round out to engines that never received prepare. Tear the live
+        # session down (best-effort; the old engines may already be broken)
+        # so the next begin_sync re-prepares against the new engine set. The
+        # frozen contract is re-validated at the next begin_sync, so a heal
+        # that changes the engine GPU topology fails closed there instead of
+        # silently publishing into a reshaped engine set.
+        if (
+            self._session is not None
+            or self._rendezvous is not None
+            or self._channel is not None
+        ):
+            logger.info(
+                "MILES NCCL M2N reconnect: tearing down the previous session"
+            )
+            self._teardown_for_reconnect()
         self.rollout_engines = tuple(rollout_engines)
         self._engine_gpu_counts = counts
         self._engine_gpu_offsets = offsets
@@ -1065,6 +1093,63 @@ class MilesCollectiveProtocolCore:
             add_note = getattr(primary, "add_note", None)
             if add_note is not None:
                 add_note(f"close() during failure handling failed: {close_error!r}")
+
+    def _teardown_for_reconnect(self) -> None:
+        """Best-effort teardown of the live session before a reconnect.
+
+        The old engine set may already be broken — that is why miles is
+        reconnecting — so every step is logged, never raised, and every
+        reference is dropped whether or not its close succeeded. The close
+        control fan-out still targets the engines this protocol is bound to
+        (the previous set); receivers treat a duplicate close as an
+        idempotent no-op. The protocol stays open: the next begin_sync
+        re-validates the frozen contract and the first send_bucket
+        re-prepares against the new engine set.
+        """
+        if (
+            self.rollout_engines is not None
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_rank() == 0
+        ):
+            _retire_dropped_futures(self._round_futures)
+            self._round_futures = []
+            try:
+                futures = self._generator_futures("close")
+                self._wait_generator_futures(futures)
+            except BaseException:
+                logger.warning(
+                    "MILES NCCL M2N reconnect close fan-out failed", exc_info=True
+                )
+        session = self._session
+        self._session = None
+        if session is not None:
+            try:
+                session.close()
+            except BaseException:
+                logger.warning(
+                    "MILES NCCL M2N reconnect session teardown failed",
+                    exc_info=True,
+                )
+        if self._rendezvous is not None:
+            try:
+                self._rendezvous.close()
+            except BaseException:
+                logger.warning(
+                    "MILES NCCL M2N reconnect rendezvous teardown failed",
+                    exc_info=True,
+                )
+            self._rendezvous = None
+        if self._channel is not None:
+            try:
+                self._channel.close()
+            except BaseException:
+                logger.warning(
+                    "MILES NCCL M2N reconnect channel teardown failed",
+                    exc_info=True,
+                )
+            self._channel = None
+        self._close_pending = False
 
     def close(self) -> None:
         """Tear down the generator fan-out, session, rendezvous, and channel.

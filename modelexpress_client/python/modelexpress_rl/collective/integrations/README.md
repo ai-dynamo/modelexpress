@@ -117,6 +117,20 @@ mid-teardown stays retryable — a later `close()` retries the remaining
 cleanup — but the protocol never reopens: once closed, every later
 `begin_sync` raises.
 
+## Reconnects (engine heal)
+
+MILES re-calls `connect(...)` when the rollout engine set heals or the
+trainer goes stale (for example an `indep_dp` reconfig or a rollout snapshot
+hash change). A `connect` that arrives with a live session tears that session
+down first — best-effort, because the old engine set may already be broken —
+and the next round re-prepares against the new engine set: the first
+`send_bucket` after the reconnect sends `prepare` to the healed engines
+before `run_round`. The frozen plan/topology contract is re-validated at the
+next `begin_sync`, so a heal that changes the engine GPU topology fails
+closed with "topology changed" instead of publishing into a reshaped engine
+set. `connect` during an armed round is rejected, and `connect` after
+`close()` is rejected: a closed protocol never reopens.
+
 ## Receiver-side deployment requirements
 
 The derived `operation_id` (`miles-<group>-weight-version-<version>`) names a

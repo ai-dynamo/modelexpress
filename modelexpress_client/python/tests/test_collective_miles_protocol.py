@@ -924,6 +924,108 @@ def test_connect_marks_every_trainer_rank_a_sender():
     assert protocol.is_sender is True
 
 
+def test_connect_with_a_live_session_tears_down_and_reprepares(monkeypatch):
+    protocol, session, events, tensors = _armed_protocol(monkeypatch)
+    for name in ("model.a", "model.b", "model.c"):
+        protocol.send_bucket([(name, tensors[name])])
+    protocol.finalize(1)
+    assert protocol._session is session
+
+    # miles re-calls connect when the rollout engine set heals: same GPU
+    # topology, new engine handles. The stale session must not survive.
+    protocol.connect(
+        [object()],
+        [1],
+        [0],
+        _parallel_state(pp_size=1),
+        _placement(),
+        "target",
+    )
+
+    assert events.count("session-close") == 1
+    assert protocol._session is None
+
+    class Session:
+        membership = SimpleNamespace(group_id="group-10")
+
+        def begin_round(self, *, version):
+            events.append(("begin", version))
+
+        def publish_group(self, *, version, layer_group_id):
+            events.append(("publish", version, layer_group_id))
+
+        def finish_round(self, *, version):
+            events.append(("finish", version))
+
+        def close(self):
+            events.append("session-2-close")
+
+    healed_session = Session()
+
+    def prepare_again():
+        events.append("reprepare")
+        protocol._session = healed_session
+
+    protocol._prepare_sessions = prepare_again
+
+    protocol.begin_sync(2, lambda *, materialize: iter([list(tensors.items())]))
+    for name in ("model.a", "model.b", "model.c"):
+        protocol.send_bucket([(name, tensors[name])])
+    protocol.finalize(2)
+
+    assert "reprepare" in events
+    assert protocol._session is healed_session
+    assert ("begin", "2") in events
+    assert ("finish", "2") in events
+
+
+def test_connect_with_a_changed_engine_topology_fails_closed_at_begin_sync(
+    monkeypatch,
+):
+    protocol, _session, _events, tensors = _armed_protocol(monkeypatch)
+    for name in ("model.a", "model.b", "model.c"):
+        protocol.send_bucket([(name, tensors[name])])
+    protocol.finalize(1)
+
+    protocol.connect(
+        [object(), object()],
+        [1, 1],
+        [0, 1],
+        _parallel_state(pp_size=1),
+        _placement(),
+        "target",
+    )
+
+    with pytest.raises(RuntimeError, match="topology changed"):
+        protocol.begin_sync(2, lambda *, materialize: iter([list(tensors.items())]))
+
+
+def test_connect_rejects_a_reconnect_mid_round_and_after_close(monkeypatch):
+    protocol, _session, _events, _tensors = _armed_protocol(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="in flight"):
+        protocol.connect(
+            [object()],
+            [1],
+            [0],
+            _parallel_state(pp_size=1),
+            _placement(),
+            "target",
+        )
+
+    protocol.close()
+
+    with pytest.raises(RuntimeError, match="protocol is closed"):
+        protocol.connect(
+            [object()],
+            [1],
+            [0],
+            _parallel_state(pp_size=1),
+            _placement(),
+            "target",
+        )
+
+
 def test_rank_one_rejects_tensor_ownership_from_rank_zero(monkeypatch):
     protocol = MilesCollectiveProtocolCore(_args())
     protocol._tensors = {"rank-zero.weight": torch.empty((6, 2))}
