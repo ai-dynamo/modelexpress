@@ -1750,7 +1750,6 @@ mod tests {
                 .contains("requires_bootstrap_fence")
         );
 
-        // A faithful replay still returns the original operation.
         let replayed = backend
             .create_transfer(&CreateCollectiveTransferRequest {
                 spec: Some(unfenced.clone()),
@@ -1815,8 +1814,6 @@ mod tests {
         ));
         assert!(superseded.failure_message.contains("superseded"));
 
-        // The reclaimed reservation now answers faithful replays with the new
-        // operation.
         let replayed_again = backend
             .create_transfer(&CreateCollectiveTransferRequest {
                 spec: Some(unfenced.clone()),
@@ -1951,5 +1948,336 @@ mod tests {
             .await
             .expect("read fenced group");
         assert!(fenced_group.requires_bootstrap_fence);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MX_TEST_REDIS_URL pointing at an isolated Redis"]
+    async fn a_superseded_epoch_replay_is_guarded_by_identity_terminal_state_and_the_fence() {
+        let url = std::env::var("MX_TEST_REDIS_URL")
+            .expect("MX_TEST_REDIS_URL must point at an isolated Redis");
+        let backend = RedisCollectiveBackend::connect(&url)
+            .await
+            .expect("connect");
+        let mut redis = backend.connection.clone();
+        redis::cmd("FLUSHDB")
+            .query_async::<()>(&mut redis)
+            .await
+            .expect("flush");
+        for (worker_id, role, model) in [
+            ("w-t2", 1, "m3"),
+            ("w-g2", 2, "m3"),
+            ("w-g2-new", 2, "m3"),
+            ("w-t3", 1, "m4"),
+            ("w-g3", 2, "m4"),
+            ("w-g3-new", 2, "m4"),
+            ("w-t4", 1, "m5"),
+            ("w-g4", 2, "m5"),
+            ("w-g4-new", 2, "m5"),
+        ] {
+            redis::cmd("HSET")
+                .arg(worker_key(worker_id))
+                .arg("worker_id")
+                .arg(worker_id)
+                .arg("role")
+                .arg(role)
+                .arg("model_name")
+                .arg(model)
+                .query_async::<()>(&mut redis)
+                .await
+                .expect("register worker");
+            redis::cmd("EXPIRE")
+                .arg(worker_key(worker_id))
+                .arg(60)
+                .query_async::<()>(&mut redis)
+                .await
+                .expect("expire registration");
+        }
+
+        let join = |group_spec: &CollectiveGroupSpec,
+                    slot_id: &str,
+                    worker_id: &str,
+                    role: CollectiveRole| JoinCollectiveGroupRequest {
+            spec: Some(group_spec.clone()),
+            slot_id: slot_id.to_string(),
+            worker_id: worker_id.to_string(),
+            role: role.into(),
+            index_in_role: 0,
+            plan_digest: "digest".to_string(),
+            plan_source: None,
+        };
+
+        // Phase A: a replay naming a different version is answered EXISTING
+        // (AlreadyExists) even when the group epoch has moved; the identity
+        // guard runs before any stale-epoch reclaim, so the old row is left
+        // intact.
+        let guard = spec("m3", &["t2"], &["g2"], 1);
+        backend
+            .join_group(&join(&guard, "t2", "w-t2", CollectiveRole::Trainer))
+            .await
+            .expect("guard trainer join");
+        let guard_membership = backend
+            .join_group(&join(&guard, "g2", "w-g2", CollectiveRole::Generator))
+            .await
+            .expect("guard generator join");
+        for lane_id in [0, 1] {
+            backend
+                .publish_bootstrap(&PublishGroupBootstrapRequest {
+                    group_id: guard_membership.group_id.clone(),
+                    epoch: guard_membership.epoch,
+                    lane_id,
+                    worker_id: "w-t2".to_string(),
+                    nccl_unique_id: vec![u8::try_from(lane_id).unwrap_or(0); 128],
+                })
+                .await
+                .expect("guard publish");
+        }
+        let guard_created = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(guard.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "guard".to_string(),
+            })
+            .await
+            .expect("guard create");
+        let guard_replacement = backend
+            .join_group(&join(&guard, "g2", "w-g2-new", CollectiveRole::Generator))
+            .await
+            .expect("guard replacement join");
+        assert_eq!(guard_replacement.epoch, guard_created.epoch + 1);
+
+        let different_version = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(guard.clone()),
+                version_id: "v2".to_string(),
+                idempotency_key: "guard".to_string(),
+            })
+            .await
+            .expect_err("a different-version replay is refused even after the epoch moved");
+        assert!(matches!(
+            different_version,
+            CollectiveBackendError::AlreadyExists(_)
+        ));
+        let guard_row = backend
+            .read_transfer(&guard_created.operation_id)
+            .await
+            .expect("guard row remains readable");
+        assert!(matches!(
+            CollectiveTransferState::try_from(guard_row.state),
+            Ok(CollectiveTransferState::Pending)
+        ));
+        assert!(guard_row.failure_message.is_empty());
+
+        // Phase B: a terminal row is never tombstoned by a stale-epoch
+        // reclaim — the reservation is recycled but the FAILED row keeps its
+        // state and its original failure message.
+        let terminal = spec("m4", &["t3"], &["g3"], 1);
+        backend
+            .join_group(&join(&terminal, "t3", "w-t3", CollectiveRole::Trainer))
+            .await
+            .expect("terminal trainer join");
+        let terminal_membership = backend
+            .join_group(&join(&terminal, "g3", "w-g3", CollectiveRole::Generator))
+            .await
+            .expect("terminal generator join");
+        for lane_id in [0, 1] {
+            backend
+                .publish_bootstrap(&PublishGroupBootstrapRequest {
+                    group_id: terminal_membership.group_id.clone(),
+                    epoch: terminal_membership.epoch,
+                    lane_id,
+                    worker_id: "w-t3".to_string(),
+                    nccl_unique_id: vec![u8::try_from(lane_id + 2).unwrap_or(0); 128],
+                })
+                .await
+                .expect("terminal publish");
+        }
+        let terminal_created = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(terminal.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "terminal".to_string(),
+            })
+            .await
+            .expect("terminal create");
+        redis::cmd("HSET")
+            .arg(operation_key(&terminal_created.operation_id))
+            .arg("state")
+            .arg("FAILED")
+            .arg("failure_message")
+            .arg("weights checksum mismatch on lane 1")
+            .query_async::<()>(&mut redis)
+            .await
+            .expect("mark the operation failed");
+        let terminal_replacement = backend
+            .join_group(&join(&terminal, "g3", "w-g3-new", CollectiveRole::Generator))
+            .await
+            .expect("terminal replacement join");
+        assert_eq!(terminal_replacement.epoch, terminal_created.epoch + 1);
+
+        let terminal_reclaimed = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(terminal.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "terminal".to_string(),
+            })
+            .await
+            .expect("a stale-epoch replay of a terminal row still reclaims the reservation");
+        assert_ne!(
+            terminal_reclaimed.operation_id,
+            terminal_created.operation_id
+        );
+        assert_eq!(terminal_reclaimed.epoch, terminal_replacement.epoch);
+        let failed_row = backend
+            .read_transfer(&terminal_created.operation_id)
+            .await
+            .expect("terminal row remains readable");
+        assert!(matches!(
+            CollectiveTransferState::try_from(failed_row.state),
+            Ok(CollectiveTransferState::Failed)
+        ));
+        assert_eq!(
+            failed_row.failure_message,
+            "weights checksum mismatch on lane 1"
+        );
+
+        // Phase C: a fenced group's stale-epoch replay tombstones the
+        // superseded row but the fresh create is held to the NEW epoch's
+        // fence — membership change reset it — until the fence completes
+        // again.
+        let mut fenced = spec("m5", &["t4"], &["g4"], 1);
+        fenced.requires_bootstrap_fence = true;
+        backend
+            .join_group(&join(&fenced, "t4", "w-t4", CollectiveRole::Trainer))
+            .await
+            .expect("fenced trainer join");
+        let fenced_membership = backend
+            .join_group(&join(&fenced, "g4", "w-g4", CollectiveRole::Generator))
+            .await
+            .expect("fenced generator join");
+        for lane_id in [0, 1] {
+            backend
+                .publish_bootstrap(&PublishGroupBootstrapRequest {
+                    group_id: fenced_membership.group_id.clone(),
+                    epoch: fenced_membership.epoch,
+                    lane_id,
+                    worker_id: "w-t4".to_string(),
+                    nccl_unique_id: vec![u8::try_from(lane_id + 4).unwrap_or(0); 128],
+                })
+                .await
+                .expect("fenced publish");
+        }
+        for lane_id in [0, 1] {
+            for (slot_id, worker_id) in [("t4", "w-t4"), ("g4", "w-g4")] {
+                backend
+                    .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                        group_id: fenced_membership.group_id.clone(),
+                        epoch: fenced_membership.epoch,
+                        lane_id,
+                        slot_id: slot_id.to_string(),
+                        worker_id: worker_id.to_string(),
+                        phase: BootstrapFencePhase::PreBarrier.into(),
+                    })
+                    .await
+                    .expect("fenced PRE_BARRIER");
+            }
+        }
+        for (slot_id, worker_id) in [("t4", "w-t4"), ("g4", "w-g4")] {
+            backend
+                .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                    group_id: fenced_membership.group_id.clone(),
+                    epoch: fenced_membership.epoch,
+                    lane_id: 1,
+                    slot_id: slot_id.to_string(),
+                    worker_id: worker_id.to_string(),
+                    phase: BootstrapFencePhase::Complete.into(),
+                })
+                .await
+                .expect("fenced COMPLETE");
+        }
+        let fenced_created = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(fenced.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "fenced-stale".to_string(),
+            })
+            .await
+            .expect("fenced create once the fence completes");
+        let fenced_replacement = backend
+            .join_group(&join(&fenced, "g4", "w-g4-new", CollectiveRole::Generator))
+            .await
+            .expect("fenced replacement join");
+        assert_eq!(fenced_replacement.epoch, fenced_created.epoch + 1);
+
+        let stale_replay = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(fenced.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "fenced-stale".to_string(),
+            })
+            .await
+            .expect_err("a stale-epoch replay is held to the new epoch's fence");
+        assert!(matches!(
+            stale_replay,
+            CollectiveBackendError::FailedPrecondition(_)
+        ));
+        assert!(
+            stale_replay
+                .to_string()
+                .contains("has not completed all-rank bootstrap")
+        );
+        let tombstoned = backend
+            .read_transfer(&fenced_created.operation_id)
+            .await
+            .expect("superseded row remains readable");
+        assert!(matches!(
+            CollectiveTransferState::try_from(tombstoned.state),
+            Ok(CollectiveTransferState::Aborted)
+        ));
+        assert!(tombstoned.failure_message.contains("superseded"));
+
+        // The trainer acknowledges the new epoch, the fence re-completes, and
+        // the reclaimed key opens a fresh operation in it.
+        backend
+            .join_group(&join(&fenced, "t4", "w-t4", CollectiveRole::Trainer))
+            .await
+            .expect("trainer acknowledges the new epoch");
+        for lane_id in [0, 1] {
+            for (slot_id, worker_id) in [("t4", "w-t4"), ("g4", "w-g4-new")] {
+                backend
+                    .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                        group_id: fenced_membership.group_id.clone(),
+                        epoch: fenced_replacement.epoch,
+                        lane_id,
+                        slot_id: slot_id.to_string(),
+                        worker_id: worker_id.to_string(),
+                        phase: BootstrapFencePhase::PreBarrier.into(),
+                    })
+                    .await
+                    .expect("re-fence PRE_BARRIER");
+            }
+        }
+        for (slot_id, worker_id) in [("t4", "w-t4"), ("g4", "w-g4-new")] {
+            backend
+                .reach_bootstrap_fence(&ReachCollectiveBootstrapFenceRequest {
+                    group_id: fenced_membership.group_id.clone(),
+                    epoch: fenced_replacement.epoch,
+                    lane_id: 1,
+                    slot_id: slot_id.to_string(),
+                    worker_id: worker_id.to_string(),
+                    phase: BootstrapFencePhase::Complete.into(),
+                })
+                .await
+                .expect("re-fence COMPLETE");
+        }
+        let refenced = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(fenced.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "fenced-stale".to_string(),
+            })
+            .await
+            .expect("the reclaimed key creates once the new epoch's fence completes");
+        assert_ne!(refenced.operation_id, fenced_created.operation_id);
+        assert_eq!(refenced.epoch, fenced_replacement.epoch);
     }
 }
