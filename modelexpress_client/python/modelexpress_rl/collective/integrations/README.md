@@ -8,8 +8,11 @@ SPDX-License-Identifier: Apache-2.0
 This package carries the MILES-side adapter that streams base-model weights
 from MILES trainer ranks to ModelExpress-managed inference engines over the
 NCCL M2N collective path. `miles_protocol.py` implements the MILES
-`WeightTransferProtocol` seam (duck-typed; MILES is never imported at module
-scope) on top of the ModelExpress refit client in this repository.
+`WeightTransferProtocol` seam on top of the ModelExpress refit client in this
+repository. MILES is never imported at module scope: `build_protocol` imports
+the ABC lazily inside the factory and subclasses it there, so importing this
+package never requires MILES, while the object MILES receives is a real
+`WeightTransferProtocol` subclass.
 
 ## Enabling the protocol in MILES
 
@@ -31,13 +34,25 @@ the round, each bucket publishes any completed publish groups in canonical
 plan order, and `finalize` finishes the round and waits for generator-side
 completion.
 
+Engine-side controls (`prepare`, `run_round`, `close`) travel as one canonical
+JSON string in the `group_name` field of the engines'
+`update_weights_from_distributed` RPC, produced by `wire.py`'s
+`encode_control`. The matching `decode_control` runs in the downstream SGLang
+consumer — the engine-side weight-update handler that receives that RPC — not
+in this package; this adapter is the encoder side only.
+
 ## Configuration
 
 All knobs are mx-namespaced. Each can be set by a MILES argument or an
 environment variable; the environment fallback is read only when the argument
-is unset. **The environment variables are the supported path**: stock MILES
-entry points parse their arguments strictly and reject the `--modelexpress-*`
-flags below, which are only reachable through a custom entry hook.
+is unset. Stock MILES entry points parse their arguments strictly, so the
+`--modelexpress-*` flags below reach the adapter in one of two ways: a custom
+entry hook that registers them, or a stock entry point's
+`--custom-config-path` YAML — MILES applies that file's keys to the args
+namespace (via `setattr`, so parser-unknown keys are accepted) before it
+resolves and runs this adapter's `validate_args` hook, both inside
+`miles_validate_args` in `miles/utils/arguments.py`. The environment
+variables work under every entry point.
 
 | Environment variable | MILES argument | Default | Notes |
 | --- | --- | --- | --- |

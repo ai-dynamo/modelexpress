@@ -752,6 +752,24 @@ stock behavior. Design: [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md).
 | `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams used to overlap per-pipeline-stage reshard lanes. |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS`, so `90` | How long a participant's registration stays alive without a heartbeat. Derived from `MX_HEARTBEAT_INTERVAL_SECS` (default `30`), so raising the heartbeat interval raises this with it. |
 
+#### MILES External Protocol Adapter (Trainer-Side)
+
+These variables configure the MILES-side adapter
+(`modelexpress_rl.collective.integrations.miles_protocol`) that streams base-model
+weights from MILES trainer ranks onto the collective path above. They are read
+inside the MILES trainer process, not by mx-server. Each knob also has a
+`--modelexpress-*` MILES argument; the environment variable is the fallback,
+read only when the argument is unset. Full semantics:
+[the adapter README](../modelexpress_client/python/modelexpress_rl/collective/integrations/README.md).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_SERVER_ADDRESS` | none (required) | mx-server `host:port` the adapter connects to. **This adapter reads only `MX_SERVER_ADDRESS`** — unlike the client paths covered by the transition guidance above, it has no `MODEL_EXPRESS_URL` fallback. Plain `host:port`; `grpc://`/`http://` prefixes are stripped and the secure schemes (`grpcs://`, `https://`) are rejected. |
+| `MX_MILES_RUN_ID` | unset | Optional run identity. When set it must be set identically on every trainer rank; a mix of set and unset ranks is rejected. |
+| `MX_MILES_ABI_VERSION` | `miles-sglang-bf16-replicated-v1` | M2N ABI identity stamped into the frozen topology contract. The deployed receivers form groups against this exact value, so override it only in step with the receiver build. |
+| `MX_MILES_PUBLISH_GROUPS` | `1` | Integer >= 1. Caps how many publish groups a round is chunked into along the canonical plan order; larger values give finer engine-side overlap granularity. Never splits a tensor. |
+| `MX_MILES_CONNECT_TIMEOUT_S` | `10.0` | Seconds the first round waits for the mx-server channel to become ready before failing. |
+
 ### NIXL Backend Selection
 
 `MX_NIXL_BACKEND` selects the NIXL plugin used for GPU-to-GPU RDMA.

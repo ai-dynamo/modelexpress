@@ -434,6 +434,13 @@ is exactly what the fused-parameter path already does.
 | `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Deadline for the transfer, i.e. `RUNNING -> ABORTED` above |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
 
+The MILES-side adapter (`modelexpress_rl.collective.integrations.miles_protocol`)
+has its own trainer-process knobs — `MX_SERVER_ADDRESS` (required; the adapter
+has no `MODEL_EXPRESS_URL` fallback), `MX_MILES_RUN_ID`, `MX_MILES_ABI_VERSION`,
+`MX_MILES_PUBLISH_GROUPS`, and `MX_MILES_CONNECT_TIMEOUT_S` — documented in
+[DEPLOYMENT.md](DEPLOYMENT.md) under "MILES External Protocol Adapter" and in
+the adapter's own README.
+
 Timing is reported through the existing `RefitTimingRecorder` stage vocabulary so
 NIXL-pull and NCCL-push refits are directly comparable. For this path, *setup and
 registration* is dominated by `Communicator.init` and is charged **once per
