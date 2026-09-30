@@ -15,6 +15,7 @@ import pytest
 from modelexpress_rl import refit_collective_pb2 as pb
 from modelexpress_rl.collective import rendezvous as rz
 from modelexpress_rl.collective.rendezvous import (
+    BootstrapFenceTimeoutError,
     CollectiveRendezvous,
     EpochChangedError,
     GroupNotReadyError,
@@ -27,10 +28,11 @@ from modelexpress_rl.collective.types import Role
 class FakeStub:
     """Stands in for RefitCollectiveServiceStub."""
 
-    def __init__(self, groups=None, membership=None, get_error=None):
+    def __init__(self, groups=None, membership=None, get_error=None, fence_error=None):
         self._groups = list(groups or [])
         self._membership = membership
         self._get_error = get_error
+        self._fence_error = fence_error
         self.joined = []
         self.registered = []
         self.published = []
@@ -38,6 +40,9 @@ class FakeStub:
         self.events = []
         self.get_calls = 0
         self.get_timeouts = []
+        self.reached_fences = []
+        self.fence_timeouts = []
+        self.fence_responses = []
 
     def JoinCollectiveGroup(self, request, timeout=None):  # noqa: N802 - gRPC naming
         self.events.append("join")
@@ -60,6 +65,21 @@ class FakeStub:
     def PublishGroupBootstrap(self, request, timeout=None):  # noqa: N802
         self.published.append(request)
         return pb.CollectiveGroup()
+
+    def ReachCollectiveBootstrapFence(self, request, timeout=None):  # noqa: N802
+        self.reached_fences.append(request)
+        self.fence_timeouts.append(timeout)
+        if self._fence_error is not None:
+            raise self._fence_error
+        if self.fence_responses:
+            return self.fence_responses.pop(0)
+        return pb.CollectiveBootstrapFence(
+            group_id=request.group_id,
+            epoch=request.epoch,
+            lane_id=request.lane_id,
+            released=True,
+            phase=request.phase,
+        )
 
     def ReportCollectiveTransfer(self, request, timeout=None):  # noqa: N802
         self.reported.append(request)
@@ -141,6 +161,163 @@ def group(*, epoch=1, state=pb.COLLECTIVE_GROUP_STATE_FORMING, admitted=(), lane
         p.slot_id = slot
         p.role = role
     return g
+
+
+class TestBootstrapFence:
+    def test_arrival_is_retried_idempotently_until_released(self, monkeypatch):
+        stub = FakeStub()
+        stub.fence_responses = [
+            pb.CollectiveBootstrapFence(
+                group_id="g1",
+                epoch=3,
+                lane_id=7,
+                missing_slots=["g0", "t1"],
+                phase=pb.BOOTSTRAP_FENCE_PHASE_PRE_BARRIER,
+            ),
+            pb.CollectiveBootstrapFence(
+                group_id="g1",
+                epoch=3,
+                lane_id=7,
+                released=True,
+                phase=pb.BOOTSTRAP_FENCE_PHASE_PRE_BARRIER,
+            ),
+        ]
+        monkeypatch.setattr(rz.time, "sleep", lambda _duration: None)
+
+        make_rendezvous(stub).await_bootstrap_fence(
+            group_id="g1",
+            epoch=3,
+            lane_id=7,
+            slot_id="t0",
+            worker_id="w0",
+            timeout_s=5.0,
+            poll_interval_s=0.01,
+        )
+
+        assert len(stub.reached_fences) == 2
+        assert stub.reached_fences[0] == stub.reached_fences[1]
+        assert stub.reached_fences[0].slot_id == "t0"
+        assert stub.reached_fences[0].phase == pb.BOOTSTRAP_FENCE_PHASE_PRE_BARRIER
+
+    def test_timeout_preserves_sorted_missing_slots(self, monkeypatch):
+        stub = FakeStub()
+        stub.fence_responses = [
+            pb.CollectiveBootstrapFence(
+                group_id="g1",
+                epoch=3,
+                lane_id=7,
+                missing_slots=["g0", "t1"],
+                phase=pb.BOOTSTRAP_FENCE_PHASE_PRE_BARRIER,
+            )
+        ]
+        moments = iter((10.0, 10.0, 10.1, 11.1))
+        monkeypatch.setattr(rz.time, "monotonic", lambda: next(moments))
+        monkeypatch.setattr(rz.time, "sleep", lambda _duration: None)
+
+        with pytest.raises(BootstrapFenceTimeoutError) as caught:
+            make_rendezvous(stub).await_bootstrap_fence(
+                group_id="g1",
+                epoch=3,
+                lane_id=7,
+                slot_id="t0",
+                worker_id="w0",
+                timeout_s=1.0,
+                poll_interval_s=0.01,
+            )
+
+        assert caught.value.missing == ["g0", "t1"]
+
+    def test_a_pre_fence_server_is_named_instead_of_leaking_unimplemented(self):
+        stub = FakeStub(fence_error=_rpc_error(grpc.StatusCode.UNIMPLEMENTED))
+
+        with pytest.raises(
+            RendezvousError, match="predates ReachCollectiveBootstrapFence"
+        ):
+            make_rendezvous(stub).await_bootstrap_fence(
+                group_id="g1",
+                epoch=3,
+                lane_id=7,
+                slot_id="t0",
+                worker_id="w0",
+                timeout_s=5.0,
+                poll_interval_s=0.01,
+            )
+
+    def test_a_mismatched_echo_is_rejected(self, monkeypatch):
+        # The full branch has no test for the echo guard, but the await trusts
+        # MX's response only after checking it names the requested group, epoch,
+        # lane, and phase; a fence for a different lane must not release us.
+        stub = FakeStub()
+        stub.fence_responses = [
+            pb.CollectiveBootstrapFence(
+                group_id="g1",
+                epoch=3,
+                lane_id=8,
+                released=True,
+                phase=pb.BOOTSTRAP_FENCE_PHASE_PRE_BARRIER,
+            )
+        ]
+        monkeypatch.setattr(rz.time, "sleep", lambda _duration: None)
+
+        with pytest.raises(RendezvousError, match="different group"):
+            make_rendezvous(stub).await_bootstrap_fence(
+                group_id="g1",
+                epoch=3,
+                lane_id=7,
+                slot_id="t0",
+                worker_id="w0",
+                timeout_s=5.0,
+                poll_interval_s=0.01,
+            )
+
+
+class TestFenceRequirementDeclaration:
+    """The join spec stamps the fence opt-in from the environment.
+
+    The full branch stamps CreateCollectiveTransfer specs too; this branch's
+    client has no create path, so the join spec is the only stamp site.
+    """
+
+    def _join(self, stub):
+        client = make_rendezvous(stub)
+        client.join(
+            model_name="m",
+            trainer_slots=["t0"],
+            generator_slots=["g0"],
+            lanes=lanes_for(["t0"], ["g0"]),
+            slot_id="t0",
+            worker_id="w0",
+            role=Role.TRAINER,
+            index_in_role=0,
+            plan_digest="d",
+        )
+
+    def _stub(self):
+        return FakeStub(
+            membership=membership(
+                assignments=[
+                    (0, pb.LANE_KIND_RESHARD, 0, 2),
+                    (1, pb.LANE_KIND_BROADCAST, 0, 2),
+                ],
+                leader=True,
+            )
+        )
+
+    def test_no_fence_requirement_is_declared_by_default(self, monkeypatch):
+        monkeypatch.delenv("MX_NCCL_REFIT_REQUIRE_BOOTSTRAP_FENCE", raising=False)
+        stub = self._stub()
+
+        self._join(stub)
+
+        assert stub.joined[0].spec.requires_bootstrap_fence is False
+
+    def test_the_environment_opts_join_into_the_fence(self, monkeypatch):
+        monkeypatch.setenv("MX_NCCL_REFIT_REQUIRE_BOOTSTRAP_FENCE", "yes")
+        stub = self._stub()
+
+        self._join(stub)
+
+        assert stub.joined[0].spec.requires_bootstrap_fence is True
 
 
 class TestJoin:

@@ -96,6 +96,36 @@ class EpochChangedError(RendezvousError):
         )
 
 
+class BootstrapFenceTimeoutError(RendezvousError):
+    """Not every admitted slot reached one bootstrap step before its deadline."""
+
+    def __init__(
+        self,
+        group_id: str,
+        lane_id: int,
+        missing: list[str],
+        waited_s: float,
+    ) -> None:
+        self.group_id = group_id
+        self.lane_id = lane_id
+        self.missing = missing
+        detail = ", ".join(missing[:8]) if missing else "no slot detail available"
+        super().__init__(
+            f"collective group {group_id} bootstrap fence {lane_id} did not release "
+            f"within {waited_s:.0f}s; still waiting on: {detail}"
+        )
+
+
+def _raise_if_fence_unimplemented(error: grpc.RpcError) -> None:
+    """Translate a pre-fence server's UNIMPLEMENTED into an upgrade instruction."""
+    if error.code() is grpc.StatusCode.UNIMPLEMENTED:
+        raise RendezvousError(
+            "the ModelExpress server does not implement the collective "
+            "bootstrap fence RPCs; it predates ReachCollectiveBootstrapFence, "
+            "so upgrade the server before running this client"
+        ) from error
+
+
 @dataclass(frozen=True)
 class LaneMembership:
     """This worker's placement in one lane."""
@@ -143,6 +173,10 @@ class _WorkerRegistrationSpec:
 _KIND_TO_PROTO = {
     "RESHARD": pb.LANE_KIND_RESHARD,
     "BROADCAST": pb.LANE_KIND_BROADCAST,
+}
+_FENCE_PHASE_TO_PROTO = {
+    "PRE_BARRIER": pb.BOOTSTRAP_FENCE_PHASE_PRE_BARRIER,
+    "COMPLETE": pb.BOOTSTRAP_FENCE_PHASE_COMPLETE,
 }
 
 
@@ -437,6 +471,7 @@ class CollectiveRendezvous:
                 )
                 for lane in lanes
             ],
+            requires_bootstrap_fence=envs.MX_NCCL_REFIT_REQUIRE_BOOTSTRAP_FENCE,
         )
         request = pb.JoinCollectiveGroupRequest(
             spec=spec,
@@ -603,6 +638,83 @@ class CollectiveRendezvous:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise GroupNotReadyError(group_id, _missing_slots(group), timeout_s)
+            time.sleep(min(poll_interval_s, remaining))
+
+    def await_bootstrap_fence(
+        self,
+        *,
+        group_id: str,
+        epoch: int,
+        lane_id: int,
+        slot_id: str,
+        worker_id: str,
+        timeout_s: float,
+        phase: str = "PRE_BARRIER",
+        poll_interval_s: float | None = None,
+    ) -> None:
+        """Idempotently arrive and wait for every admitted slot at one step."""
+        timeout_s = _positive_finite(timeout_s, "timeout_s")
+        poll_interval_s = _positive_finite(
+            poll_interval_s
+            if poll_interval_s is not None
+            else envs.MX_NCCL_REFIT_POLL_INTERVAL_S,
+            "poll_interval_s",
+        )
+        deadline = time.monotonic() + timeout_s
+        try:
+            phase_proto = _FENCE_PHASE_TO_PROTO[phase]
+        except KeyError as error:
+            raise ValueError(f"unsupported bootstrap fence phase {phase!r}") from error
+        missing: list[str] = []
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BootstrapFenceTimeoutError(group_id, lane_id, missing, timeout_s)
+            try:
+                fence = self._stub.ReachCollectiveBootstrapFence(
+                    pb.ReachCollectiveBootstrapFenceRequest(
+                        group_id=group_id,
+                        epoch=epoch,
+                        lane_id=lane_id,
+                        slot_id=slot_id,
+                        worker_id=worker_id,
+                        phase=phase_proto,
+                    ),
+                    timeout=min(self._rpc_timeout_s, remaining),
+                )
+            except grpc.RpcError as error:
+                _raise_if_fence_unimplemented(error)
+                if error.code() is grpc.StatusCode.FAILED_PRECONDITION:
+                    current = self._current_epoch(group_id)
+                    if current != epoch:
+                        raise EpochChangedError(group_id, epoch, current) from error
+                if error.code() not in _RETRYABLE_POLL_CODES:
+                    raise
+            else:
+                if (
+                    fence.group_id != group_id
+                    or fence.epoch != epoch
+                    or fence.lane_id != lane_id
+                    or fence.phase != phase_proto
+                ):
+                    raise RendezvousError(
+                        "MX returned a bootstrap fence for a different group, "
+                        "epoch, or lane"
+                    )
+                missing = list(fence.missing_slots)
+                if missing != sorted(missing):
+                    raise RendezvousError(
+                        "MX returned non-deterministically ordered missing fence slots"
+                    )
+                if fence.released:
+                    if missing:
+                        raise RendezvousError(
+                            "MX released a bootstrap fence with missing slots"
+                        )
+                    return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BootstrapFenceTimeoutError(group_id, lane_id, missing, timeout_s)
             time.sleep(min(poll_interval_s, remaining))
 
     def report(

@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S: float
     MX_NCCL_REFIT_TRANSFER_TIMEOUT_S: float
     MX_NCCL_REFIT_REGISTRATION_TTL_S: int
+    MX_NCCL_REFIT_REQUIRE_BOOTSTRAP_FENCE: bool
 
 
 def _int(name: str, default: int) -> int:
@@ -46,6 +47,18 @@ def _float(name: str, default: float) -> float:
     return value
 
 
+def _bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid {name}: {value!r}")
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     "MX_NCCL_REFIT_NUM_STREAMS": lambda: _int("MX_NCCL_REFIT_NUM_STREAMS", 2),
     "MX_NCCL_REFIT_GROUP_TIMEOUT_S": lambda: _float("MX_NCCL_REFIT_GROUP_TIMEOUT_S", 600.0),
@@ -59,6 +72,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_NCCL_REFIT_REGISTRATION_TTL_S": lambda: _int(
         "MX_NCCL_REFIT_REGISTRATION_TTL_S",
         _int("MX_HEARTBEAT_INTERVAL_SECS", 30) * 3,
+    ),
+    # Opt the group into the all-rank bootstrap fence gate. Off by default so
+    # mixed client/server generations keep working; every participant of one
+    # operation must run with the same value or joins are rejected.
+    "MX_NCCL_REFIT_REQUIRE_BOOTSTRAP_FENCE": lambda: _bool(
+        "MX_NCCL_REFIT_REQUIRE_BOOTSTRAP_FENCE", False
     ),
 }
 
