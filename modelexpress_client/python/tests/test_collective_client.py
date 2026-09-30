@@ -292,7 +292,7 @@ class TestBootstrap:
             (0, "COMPLETE"),
         ]
 
-    def test_fenced_bootstrap_forwards_the_framework_barrier_allocator(
+    def test_bootstrap_forwards_the_framework_barrier_allocator(
         self, fake_nccl, monkeypatch
     ):
         allocator = object()
@@ -332,8 +332,7 @@ class TestBootstrap:
         assert len(client._cache) == 0
         assert fake_nccl.count("abort") == 1
 
-        # There is no poisoned state on this base: a retry re-joins and walks
-        # the fences again.
+        # A retry re-joins and walks the fences again.
         client.compute_plan()
         assert rendezvous.joins == 2
         assert [(fence["lane_id"], fence["phase"]) for fence in rendezvous.fences] == [
@@ -398,8 +397,9 @@ class TestBootstrap:
             source_partition_count=2,
         )
         engine = FakeEngine(plan)
+        rendezvous = FakeRendezvousPP2()
         client = RefitClientTrainer(
-            rendezvous=FakeRendezvousPP2(),
+            rendezvous=rendezvous,
             model_name="m",
             trainer_slots=["t0", "t1", "t2", "t3"],
             generator_slots=["g0", "g1"],
@@ -413,6 +413,7 @@ class TestBootstrap:
         events = []
         original_create = client._cache.create
         original_settle = client._cache.settle_group
+        original_fence = rendezvous.await_bootstrap_fence
 
         def create(key, **kwargs):
             events.append(("create", key.lane_id))
@@ -422,8 +423,13 @@ class TestBootstrap:
             events.append(("settle", group_id, epoch))
             return original_settle(group_id, epoch, **kwargs)
 
+        def fence(**kwargs):
+            events.append(("fence", kwargs["lane_id"], kwargs["phase"]))
+            return original_fence(**kwargs)
+
         monkeypatch.setattr(client._cache, "create", create)
         monkeypatch.setattr(client._cache, "settle_group", settle)
+        monkeypatch.setattr(rendezvous, "await_bootstrap_fence", fence)
         monkeypatch.setattr(
             collective_client,
             "_bootstrap_barrier",
@@ -433,17 +439,23 @@ class TestBootstrap:
         client.compute_plan()
 
         # Every local lane -- including the one just created -- is polled back
-        # to ncclSuccess before each full-group barrier, and a rank off the
-        # current lane still settles before waiting at that lane's barrier.
+        # to ncclSuccess and fenced at PRE_BARRIER before each full-group
+        # barrier, a rank off the current lane still settles and fences before
+        # waiting at that lane's barrier, and the COMPLETE arrival closes the
+        # walk on the last lane.
         assert events == [
             ("create", 2),
             ("settle", "g", 1),
+            ("fence", 2, "PRE_BARRIER"),
             ("barrier", 2),
             ("settle", "g", 1),
+            ("fence", 0, "PRE_BARRIER"),
             ("barrier", 2),
             ("create", 1),
             ("settle", "g", 1),
+            ("fence", 1, "PRE_BARRIER"),
             ("barrier", 2),
+            ("fence", 1, "COMPLETE"),
         ]
 
 
