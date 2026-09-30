@@ -1762,6 +1762,67 @@ mod tests {
         assert_eq!(replayed.operation_id, created.operation_id);
         assert_eq!(replayed.epoch, created.epoch);
 
+        // A replacement join (same slot, fresh worker identity) bumps the
+        // epoch and wipes lane/fence state. A replay from the superseded
+        // epoch no longer returns the old operation: it reclaims the
+        // reservation into a fresh create that answers to the new epoch's
+        // gate, and tombstones the superseded row.
+        redis::cmd("HSET")
+            .arg(worker_key("w-g0-new"))
+            .arg("worker_id")
+            .arg("w-g0-new")
+            .arg("role")
+            .arg(2)
+            .arg("model_name")
+            .arg("m")
+            .query_async::<()>(&mut redis)
+            .await
+            .expect("register replacement worker");
+        redis::cmd("EXPIRE")
+            .arg(worker_key("w-g0-new"))
+            .arg(60)
+            .query_async::<()>(&mut redis)
+            .await
+            .expect("expire replacement registration");
+        let replacement = backend
+            .join_group(&join(&unfenced, "g0", "w-g0-new", CollectiveRole::Generator))
+            .await
+            .expect("a replacement join with a fresh worker identity");
+        assert_eq!(replacement.epoch, created.epoch + 1);
+
+        let reclaimed = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(unfenced.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "unfenced".to_string(),
+            })
+            .await
+            .expect("a replay from a superseded epoch reclaims the reservation");
+        assert_ne!(reclaimed.operation_id, created.operation_id);
+        assert_eq!(reclaimed.epoch, replacement.epoch);
+        let superseded = backend
+            .read_transfer(&created.operation_id)
+            .await
+            .expect("the superseded operation row remains readable");
+        assert!(matches!(
+            CollectiveTransferState::try_from(superseded.state),
+            Ok(CollectiveTransferState::Aborted)
+        ));
+        assert!(superseded.failure_message.contains("superseded"));
+
+        // The reclaimed reservation now answers faithful replays with the new
+        // operation.
+        let replayed_again = backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(unfenced.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: "unfenced".to_string(),
+            })
+            .await
+            .expect("the reclaimed reservation replays the new operation");
+        assert_eq!(replayed_again.operation_id, reclaimed.operation_id);
+        assert_eq!(replayed_again.epoch, replacement.epoch);
+
         let mut fenced = spec("m2", &["t1"], &["g1"], 1);
         fenced.requires_bootstrap_fence = true;
         backend
