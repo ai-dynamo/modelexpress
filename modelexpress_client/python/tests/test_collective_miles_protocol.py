@@ -1259,6 +1259,57 @@ def test_close_reports_generator_failure_and_allows_retry(monkeypatch, caplog):
     assert caplog.text.count("MILES NCCL M2N teardown complete trainer_rank=0") == 1
 
 
+def test_close_retains_a_resource_whose_teardown_failed_for_retry(monkeypatch):
+    protocol = MilesCollectiveProtocolCore(_args())
+    protocol.rollout_engines = (object(),)
+    protocol._engine_gpu_offsets = (0,)
+    channel_closes = 0
+
+    class Channel:
+        def close(self):
+            nonlocal channel_closes
+            channel_closes += 1
+            if channel_closes == 1:
+                raise RuntimeError("synthetic channel close failure")
+
+    protocol._channel = Channel()
+
+    def generator_futures(action, **_kwargs):
+        assert action == "close"
+        return []
+
+    protocol._generator_futures = generator_futures
+    monkeypatch.setattr(miles_protocol.dist, "is_available", lambda: True)
+    monkeypatch.setattr(miles_protocol.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(miles_protocol.dist, "get_rank", lambda: 0)
+
+    with pytest.raises(RuntimeError, match="synthetic channel close failure"):
+        protocol.close()
+
+    assert protocol._closed is True
+    assert protocol._close_pending is True
+    # The failed resource is retained, so the retry re-runs its close for
+    # real instead of only re-sending the generator fan-out.
+    assert protocol._channel is not None
+
+    protocol.close()
+
+    assert channel_closes == 2
+    assert protocol._channel is None
+    assert protocol._close_pending is False
+
+
+def test_close_on_a_never_connected_protocol_is_a_silent_no_op(caplog):
+    protocol = MilesCollectiveProtocolCore(_args())
+
+    with caplog.at_level("INFO"):
+        protocol.close()
+
+    assert protocol._closed is True
+    assert protocol._close_pending is False
+    assert "teardown complete" not in caplog.text
+
+
 def _seed_real_fan_out_contract(protocol):
     protocol._plan = miles_protocol.ReshardPlan(
         bulk=_entries([2]),

@@ -115,9 +115,14 @@ until the job is torn down.
 
 There is no happy-path close: MILES never calls `close()` on a protocol that
 finished its rounds, so the channel, rendezvous, and session are held until
-process exit. `close()` runs on the failure paths above; a close that fails
-mid-teardown stays retryable — a later `close()` retries the remaining
-cleanup — but the protocol never reopens: once closed, every later
+process exit. `close()` runs on the failure paths above. A close attempt
+runs every resource's teardown even when an earlier one fails and then
+propagates the first error; resources it could not close are kept, so a
+later `close()` re-sends the rank-0 generator close fan-out (an idempotent
+no-op on the receivers) and re-runs exactly the closes that did not
+complete. The session's own teardown is one-shot and is never re-run by a
+retry. "Teardown complete" is logged only by a call that actually finished
+remaining work. The protocol never reopens: once closed, every later
 `begin_sync` raises.
 
 ## Reconnects (engine heal)

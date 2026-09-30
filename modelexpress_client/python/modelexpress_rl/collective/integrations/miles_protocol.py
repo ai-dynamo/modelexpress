@@ -1121,11 +1121,8 @@ class MilesCollectiveProtocolCore:
             and dist.is_initialized()
             and dist.get_rank() == 0
         ):
-            _retire_dropped_futures(self._round_futures)
-            self._round_futures = []
             try:
-                futures = self._generator_futures("close")
-                self._wait_generator_futures(futures)
+                self._close_generator_fanout()
             except BaseException:
                 logger.warning(
                     "MILES NCCL M2N reconnect close fan-out failed", exc_info=True
@@ -1160,58 +1157,93 @@ class MilesCollectiveProtocolCore:
             self._channel = None
         self._close_pending = False
 
+    def _close_generator_fanout(self) -> None:
+        """Send the close control to every connected engine from rank 0.
+
+        Round futures a failed round left un-awaited are retired first; their
+        late results are logged, never raised. Receivers treat a duplicate
+        close as an idempotent no-op, so a retry may safely re-send this.
+        """
+        _retire_dropped_futures(self._round_futures)
+        self._round_futures = []
+        futures = self._generator_futures("close")
+        self._wait_generator_futures(futures)
+
     def close(self) -> None:
         """Tear down the generator fan-out, session, rendezvous, and channel.
 
         The first close attempt is terminal: later rounds are rejected even
-        when teardown itself fails. A failed teardown sets ``_close_pending``
-        so a later ``close()`` retries the remaining cleanup; the protocol
-        never reopens for rounds either way.
+        when teardown itself fails, and the protocol never reopens. Every
+        resource is attempted even when an earlier one fails, and the first
+        failure propagates after the rest settle.
+
+        Retry semantics are per resource. A failed attempt keeps the
+        resources it could not close: a later ``close()`` re-sends the rank-0
+        generator close fan-out (receivers treat a duplicate close as an
+        idempotent no-op) and re-runs exactly the closes that did not
+        complete. The session's own teardown is one-shot — it runs once
+        whether or not it raised — so a retry never re-runs it. When a call
+        completes everything that remained, ``_close_pending`` clears and
+        "teardown complete" is logged; a retry with nothing left to do
+        returns silently, and so does a close with nothing to tear down.
         """
         if self._closed and not self._close_pending:
             return
         self._closed = True
         self._close_pending = True
         first_error: BaseException | None = None
-        if dist.is_available() and dist.is_initialized() and dist.get_rank() == 0:
-            # Retire any round futures a failed round left un-awaited before the
-            # close fan-out runs; their late results are logged, never raised.
-            _retire_dropped_futures(self._round_futures)
-            self._round_futures = []
+        tore_down = False
+        if (
+            self.rollout_engines is not None
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_rank() == 0
+        ):
             try:
-                futures = self._generator_futures("close")
-                self._wait_generator_futures(futures)
+                self._close_generator_fanout()
             except BaseException as error:
                 first_error = error
+            else:
+                tore_down = True
         session = self._session
         self._session = None
-        try:
-            if session is not None:
+        if session is not None:
+            try:
                 session.close()
-        except BaseException as error:
-            if first_error is None:
-                first_error = error
-        finally:
-            if session is None and self._rendezvous is not None:
-                try:
-                    self._rendezvous.close()
-                except BaseException as error:
-                    if first_error is None:
-                        first_error = error
-            self._rendezvous = None
-            if self._channel is not None:
-                try:
-                    self._channel.close()
-                except BaseException as error:
-                    if first_error is None:
-                        first_error = error
-                finally:
-                    self._channel = None
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+            else:
+                tore_down = True
+        # The protocol created the rendezvous and owns the final close.
+        # CollectiveRendezvous.close() is idempotent, so this also covers a
+        # rendezvous the session's one-shot teardown already closed.
+        if self._rendezvous is not None:
+            try:
+                self._rendezvous.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+            else:
+                self._rendezvous = None
+                tore_down = True
+        if self._channel is not None:
+            try:
+                self._channel.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+            else:
+                self._channel = None
+                tore_down = True
         if first_error is not None:
             raise first_error
         self._close_pending = False
-        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-        logger.info("MILES NCCL M2N teardown complete trainer_rank=%d", rank)
+        if tore_down:
+            rank = (
+                dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            )
+            logger.info("MILES NCCL M2N teardown complete trainer_rank=%d", rank)
 
 
 def build_protocol(args: Any):
