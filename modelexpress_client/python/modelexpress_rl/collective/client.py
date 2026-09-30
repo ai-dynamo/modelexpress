@@ -133,7 +133,7 @@ class _RefitClientBase:
         self._plan: ReshardPlan | None = None
         self._digest: str | None = None
         self._membership: Membership | None = None
-        self._bootstrap_poisoned = False
+        self._is_bootstrap_poisoned = False
         self._half: NcclM2nSender | NcclM2nReceiver | None = None
         self._groupings: list[list[str]] | None = None
         self._round_started = False
@@ -244,14 +244,14 @@ class _RefitClientBase:
     def _join_and_bootstrap(
         self, role: Role, source_partition: int | None
     ) -> Membership:
-        if self._bootstrap_poisoned:
+        if self._is_bootstrap_poisoned:
             raise RuntimeError(
-                "this client joined an epoch whose bootstrap did not complete; "
-                "it cannot rejoin in place because the server retains that "
-                "epoch's lane and fence records under this worker identity, so "
-                "a same-identity rejoin would conflict with its own earlier "
-                "publish. Build a fresh client with a fresh worker identity; "
-                "the session layer does this on re-prepare."
+                "this client joined an epoch whose bootstrap did not "
+                "complete; it cannot rejoin in place because a same-identity "
+                "rejoin may conflict with this identity's server-side epoch "
+                "state. Build a fresh client with a fresh worker identity — "
+                "a new session (and, under MILES, a new protocol instance) "
+                "mints one."
             )
         if self._digest is None:
             raise RuntimeError("initialize must run before compute_plan")
@@ -269,16 +269,10 @@ class _RefitClientBase:
             index_in_role=self._index_in_role,
             plan_digest=self._digest,
         )
-        # Once the join is recorded, any failure before compute_plan returns
-        # can leave server-side epoch state (lane publishes, fence arrivals)
-        # that a same-identity retry conflicts with: the join script sees the
-        # same slot/worker/digest and keeps the epoch, so a leader re-minting
-        # and re-publishing an NCCL id is refused as a conflicting bootstrap.
-        # Poison in-place retry until compute_plan completes; the recovery
-        # path is a fresh client with a fresh worker identity, which the
-        # session layer builds on re-prepare. A failed join itself stays
-        # retryable: nothing was recorded under this identity.
-        self._bootstrap_poisoned = True
+        # Join recorded under this identity; poison in-place retry until
+        # compute_plan completes — recovery is a fresh identity. A failed
+        # join records nothing and stays retryable.
+        self._is_bootstrap_poisoned = True
         # Which reshard lanes this worker belongs on is a fact about what it
         # just declared, not a re-derivation of a rule the server also applies.
         expected_reshard = {
@@ -495,7 +489,7 @@ class RefitClientTrainer(_RefitClientBase):
             self._membership = None
             self._half = None
             raise
-        self._bootstrap_poisoned = False
+        self._is_bootstrap_poisoned = False
         return membership
 
     def start_weight_update(self, version: str) -> None:
@@ -594,7 +588,7 @@ class RefitClientGenerator(_RefitClientBase):
             self._membership = None
             self._half = None
             raise
-        self._bootstrap_poisoned = False
+        self._is_bootstrap_poisoned = False
         return membership
 
     def start_weight_update(self, version: str) -> None:
