@@ -13,6 +13,7 @@ from typing import Any
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClient
 
+from .. import envs as rl_envs
 from ..control import WeightVersion
 
 from .adapter import GeneratorEngineContext
@@ -310,6 +311,10 @@ def initialize_generator_runtime(
                 CanonicalDeltaUpdateMethod(
                     model_name=engine.model_name,
                     config=object_storage,
+                    stream_full_checkpoints=(
+                        rl_envs.MX_REFIT_FULL_STREAMING
+                        and engine.installer.capabilities.streamed_checkpoints
+                    ),
                 )
             )
         if any(

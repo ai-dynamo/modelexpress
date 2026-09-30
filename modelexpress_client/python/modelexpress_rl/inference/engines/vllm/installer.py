@@ -16,10 +16,12 @@ import copy
 import logging
 import time
 from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+from modelexpress import envs
 from modelexpress.accelerators import accelerator_backend_for
 from modelexpress.engines.vllm.host_quantization import (
     refresh_host_quantization_state,
@@ -31,6 +33,11 @@ from modelexpress.refit.reshard.geometry import (
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import refit_span
 
+from modelexpress_rl import envs as rl_envs
+from modelexpress_rl.inference.engines.vllm.stream_windows import (
+    layer_windows,
+    windowed_weights,
+)
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -42,6 +49,7 @@ from modelexpress_rl.inference.plan import (
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
 
 if TYPE_CHECKING:
+    from modelexpress_rl.inference.streaming_checkpoint import StreamedCheckpoint
     from modelexpress.refit.reshard.types import CaptureResult
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
@@ -95,7 +103,16 @@ class _VllmInstaller(EngineInstaller):
                     PreparedRuntimeTensors,
                     PreparedCheckpointArtifact,
                 }
-            )
+            ),
+            streamed_checkpoints=(
+                getattr(
+                    getattr(self._vllm_config, "parallel_config", None),
+                    "tensor_parallel_size",
+                    1,
+                )
+                == 1
+                or envs.MX_MS_DISTRIBUTED
+            ),
         )
 
     def install(self, prepared: PreparedArtifact) -> dict[str, float]:
@@ -109,7 +126,11 @@ class _VllmInstaller(EngineInstaller):
             checkpoint = prepared.checkpoint
             if not isinstance(checkpoint, PreparedCheckpoint):
                 raise TypeError("checkpoint preparation has an invalid value")
-            self.install_checkpoint(checkpoint.path)
+            if checkpoint.streaming is not None:
+                self.install_streamed_checkpoint(checkpoint.streaming)
+                metrics.update(checkpoint.streaming.cache_metrics)
+            else:
+                self.install_checkpoint(checkpoint.path)
         else:
             raise TypeError(
                 f"unsupported prepared artifact {type(prepared).__name__}"
@@ -217,6 +238,50 @@ class _VllmInstaller(EngineInstaller):
                     accelerator_backend_for(self._device),
                     allow_warm=True,
                 )
+
+    def install_streamed_checkpoint(self, checkpoint: StreamedCheckpoint) -> None:
+        """Stream once through graph-safe reload and tee to one writer per node."""
+        from vllm.distributed import get_world_group
+        from vllm.model_executor.model_loader.runai_streamer_loader import (
+            RunaiModelStreamerLoader,
+        )
+        from vllm.model_executor.model_loader.weight_utils import (
+            runai_safetensors_weights_iterator,
+        )
+
+        tp_size = getattr(
+            getattr(self._vllm_config, "parallel_config", None),
+            "tensor_parallel_size",
+            1,
+        )
+        load_config = copy.copy(self._vllm_config.load_config)
+        extra = dict(getattr(load_config, "model_loader_extra_config", None) or {})
+        extra["distributed"] = tp_size > 1 and envs.MX_MS_DISTRIBUTED
+        object.__setattr__(load_config, "model_loader_extra_config", extra)
+        loader = RunaiModelStreamerLoader(load_config)
+        window_layers = rl_envs.MX_REFIT_STREAM_WINDOW_LAYERS
+        if window_layers:
+            weights = windowed_weights(
+                list(checkpoint.shard_uris),
+                layer_windows(checkpoint.tensor_metadata, window_layers),
+                is_distributed=loader._is_distributed,
+            )
+        else:
+            weights = runai_safetensors_weights_iterator(
+                list(checkpoint.shard_uris),
+                load_config.use_tqdm_on_load,
+                is_distributed=loader._is_distributed,
+            )
+        cache = get_world_group().local_rank == 0
+        with (
+            closing(weights),
+            closing(checkpoint.validate(weights, cache=cache)) as verified,
+        ):
+            self._reload(lambda: self._model.load_weights(verified))
+        if not checkpoint._complete:
+            raise RuntimeError("full checkpoint stream was not completely consumed")
+        with refit_span("post_install"):
+            torch.cuda.synchronize(self._device)
 
     def install_checkpoint(self, path: str | Path) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""
