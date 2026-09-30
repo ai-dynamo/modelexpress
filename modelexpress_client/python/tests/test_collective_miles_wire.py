@@ -13,6 +13,10 @@ from modelexpress_rl.collective.integrations.wire import (
     CollectiveControl,
     decode_control,
     encode_control,
+    plan_from_wire,
+    plan_to_wire,
+    topology_from_wire,
+    topology_to_wire,
 )
 from modelexpress_rl.collective.types import (
     MeshSpec,
@@ -69,7 +73,7 @@ def test_control_wire_leaves_stock_sglang_group_names_untouched():
     assert decode_control("miles-pp-0") is None
 
 
-def test_run_round_control_preserves_the_unverified_production_path():
+def test_run_round_control_round_trips_a_plan_free_control():
     control = CollectiveControl(
         action="run_round",
         version="7",
@@ -77,6 +81,68 @@ def test_run_round_control_preserves_the_unverified_production_path():
     )
 
     assert decode_control(encode_control(control)) == control
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "name",
+        "global_shape",
+        "dtype",
+        "partition_id",
+        "src_mesh",
+        "src_placements",
+        "dst_mesh",
+        "dst_placements",
+        "group_key",
+    ],
+)
+def test_plan_decoder_rejects_a_bulk_entry_missing_a_required_key(key):
+    payload = plan_to_wire(_plan())
+    del payload["bulk"][0][key]
+
+    with pytest.raises(ValueError, match="missing"):
+        plan_from_wire(payload)
+
+
+def test_plan_decoder_rejects_a_plan_missing_bulk_or_partition_count():
+    with pytest.raises(ValueError, match="missing 'bulk'"):
+        plan_from_wire({"source_partition_count": 2})
+
+    payload = plan_to_wire(_plan())
+    del payload["source_partition_count"]
+
+    with pytest.raises(ValueError, match="missing 'source_partition_count'"):
+        plan_from_wire(payload)
+
+
+def test_plan_decoder_rejects_geometry_the_encoder_would_not_emit():
+    payload = plan_to_wire(_plan())
+    payload["source_partition_count"] = 0
+
+    with pytest.raises(ValueError, match="source_partition_count"):
+        plan_from_wire(payload)
+
+    payload = plan_to_wire(_plan())
+    payload["bulk"][0]["partition_id"] = 7
+
+    with pytest.raises(ValueError, match="partition_id"):
+        plan_from_wire(payload)
+
+
+def test_topology_decoder_rejects_missing_keys():
+    payload = topology_to_wire(_topology())
+    del payload["m2n_abi_version"]
+
+    with pytest.raises(ValueError, match="missing 'm2n_abi_version'"):
+        topology_from_wire(payload)
+
+
+def test_decode_control_rejects_a_payload_without_an_action():
+    encoded = wire.CONTROL_PREFIX + json.dumps({"version": "7"})
+
+    with pytest.raises(ValueError, match="missing 'action'"):
+        decode_control(encoded)
 
 
 def test_control_wire_rejects_an_oversized_payload_before_json_decode(monkeypatch):

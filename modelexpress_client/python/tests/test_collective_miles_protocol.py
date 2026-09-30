@@ -1146,6 +1146,20 @@ def test_close_reports_generator_failure_and_allows_retry(monkeypatch, caplog):
     )
 
 
+def _seed_real_fan_out_contract(protocol):
+    protocol._plan = miles_protocol.ReshardPlan(
+        bulk=_entries([2]),
+        source_partition_count=1,
+    )
+    protocol._topology = miles_protocol.CollectiveTopology(
+        model_name="miles-model",
+        trainer_slots=("trainer-0",),
+        generator_slots=("generator-0", "generator-1"),
+        source_partition_count=1,
+        m2n_abi_version="miles-sglang-bf16-replicated-v1",
+    )
+
+
 def test_generator_fan_out_uses_one_submit_for_multiple_engines(monkeypatch):
     submissions = []
     executions = []
@@ -1172,10 +1186,9 @@ def test_generator_fan_out_uses_one_submit_for_multiple_engines(monkeypatch):
     protocol.rollout_engines = (object(), object())
     protocol._engine_gpu_offsets = (0, 4)
     protocol._engine_gpu_counts = (2, 2)
-    protocol._plan = object()
-    protocol._topology = object()
+    _seed_real_fan_out_contract(protocol)
 
-    async def send_control(_client, control):
+    async def send_control(_client, control, **_kwargs):
         executions.append(control.generator_slot_offset)
 
     protocol._send_control = send_control
@@ -1209,10 +1222,9 @@ def test_generator_fan_out_settles_every_engine_before_raising(monkeypatch):
     protocol.rollout_engines = (object(), object())
     protocol._engine_gpu_offsets = (0, 4)
     protocol._engine_gpu_counts = (2, 2)
-    protocol._plan = object()
-    protocol._topology = object()
+    _seed_real_fan_out_contract(protocol)
 
-    async def send_control(_client, control):
+    async def send_control(_client, control, **_kwargs):
         executions.append(control.generator_slot_offset)
         if control.generator_slot_offset == 0:
             raise RuntimeError("engine 0 prepare failed")

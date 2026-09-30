@@ -21,6 +21,13 @@ def _optional_str(value: object) -> str | None:
     return None if value is None else str(value)
 
 
+def _require(mapping: dict[str, Any], key: str, context: str) -> Any:
+    """Read a mandatory wire field; a control boundary must not invent one."""
+    if key not in mapping:
+        raise ValueError(f"{context} is missing {key!r}")
+    return mapping[key]
+
+
 def _placement_to_wire(placement: Placement) -> dict[str, Any]:
     return {"kind": placement.kind.value, "dim": placement.dim}
 
@@ -28,7 +35,7 @@ def _placement_to_wire(placement: Placement) -> dict[str, Any]:
 def _placement_from_wire(value: object) -> Placement:
     if not isinstance(value, dict):
         raise ValueError("placement must be an object")
-    kind = PlacementKind(str(value.get("kind", "")))
+    kind = PlacementKind(str(_require(value, "kind", "placement")))
     dim = value.get("dim")
     return Placement(kind=kind, dim=None if dim is None else int(dim))
 
@@ -69,44 +76,51 @@ def plan_to_wire(plan: ReshardPlan) -> dict[str, Any]:
 def plan_from_wire(value: object) -> ReshardPlan:
     if not isinstance(value, dict):
         raise ValueError("plan must be an object")
-    raw_bulk = value.get("bulk")
+    raw_bulk = _require(value, "bulk", "plan")
     if not isinstance(raw_bulk, list):
         raise ValueError("plan.bulk must be a list")
     bulk = []
     for raw in raw_bulk:
         if not isinstance(raw, dict):
             raise ValueError("plan.bulk entries must be objects")
-        src_mesh = raw.get("src_mesh")
-        dst_mesh = raw.get("dst_mesh")
+        context = f"plan.bulk entry {raw.get('name')!r}"
+        src_mesh = _require(raw, "src_mesh", context)
+        dst_mesh = _require(raw, "dst_mesh", context)
         if not isinstance(src_mesh, dict) or not isinstance(dst_mesh, dict):
             raise ValueError("plan meshes must be objects")
         bulk.append(
             ParamPlan(
-                name=str(raw.get("name", "")),
-                global_shape=tuple(int(dim) for dim in raw.get("global_shape", [])),
-                dtype=str(raw.get("dtype", "")),
-                partition_id=int(raw.get("partition_id", -1)),
+                name=str(_require(raw, "name", context)),
+                global_shape=tuple(
+                    int(dim) for dim in _require(raw, "global_shape", context)
+                ),
+                dtype=str(_require(raw, "dtype", context)),
+                partition_id=int(_require(raw, "partition_id", context)),
                 src_mesh=MeshSpec(
-                    tuple(int(dim) for dim in src_mesh.get("shape", [])),
-                    int(src_mesh.get("rank_offset", 0)),
+                    tuple(int(dim) for dim in _require(src_mesh, "shape", context)),
+                    int(_require(src_mesh, "rank_offset", context)),
                 ),
                 src_placements=tuple(
-                    _placement_from_wire(item) for item in raw.get("src_placements", [])
+                    _placement_from_wire(item)
+                    for item in _require(raw, "src_placements", context)
                 ),
                 dst_mesh=MeshSpec(
-                    tuple(int(dim) for dim in dst_mesh.get("shape", [])),
-                    int(dst_mesh.get("rank_offset", 0)),
+                    tuple(int(dim) for dim in _require(dst_mesh, "shape", context)),
+                    int(_require(dst_mesh, "rank_offset", context)),
                 ),
                 dst_placements=tuple(
-                    _placement_from_wire(item) for item in raw.get("dst_placements", [])
+                    _placement_from_wire(item)
+                    for item in _require(raw, "dst_placements", context)
                 ),
-                group_key=raw.get("group_key"),
+                group_key=_require(raw, "group_key", context),
             )
         )
-    return ReshardPlan(
+    plan = ReshardPlan(
         bulk=bulk,
-        source_partition_count=int(value.get("source_partition_count", 0)),
+        source_partition_count=int(_require(value, "source_partition_count", "plan")),
     )
+    plan.validate()
+    return plan
 
 
 def topology_to_wire(topology: CollectiveTopology) -> dict[str, Any]:
@@ -124,12 +138,18 @@ def topology_from_wire(value: object) -> CollectiveTopology:
     if not isinstance(value, dict):
         raise ValueError("topology must be an object")
     return CollectiveTopology(
-        model_name=str(value.get("model_name", "")),
-        trainer_slots=tuple(str(slot) for slot in value.get("trainer_slots", [])),
-        generator_slots=tuple(str(slot) for slot in value.get("generator_slots", [])),
-        source_partition_count=int(value.get("source_partition_count", 0)),
-        m2n_abi_version=str(value.get("m2n_abi_version", "")),
-        receiver_protocol=str(value.get("receiver_protocol", "")),
+        model_name=str(_require(value, "model_name", "topology")),
+        trainer_slots=tuple(
+            str(slot) for slot in _require(value, "trainer_slots", "topology")
+        ),
+        generator_slots=tuple(
+            str(slot) for slot in _require(value, "generator_slots", "topology")
+        ),
+        source_partition_count=int(
+            _require(value, "source_partition_count", "topology")
+        ),
+        m2n_abi_version=str(_require(value, "m2n_abi_version", "topology")),
+        receiver_protocol=str(_require(value, "receiver_protocol", "topology")),
     )
 
 
@@ -164,12 +184,21 @@ class CollectiveControl:
                 raise ValueError("run_round requires an operation_id")
 
 
-def encode_control(control: CollectiveControl) -> str:
+def encode_control(
+    control: CollectiveControl,
+    *,
+    plan_wire: dict[str, Any] | None = None,
+    topology_wire: dict[str, Any] | None = None,
+) -> str:
     payload: dict[str, Any] = {"action": control.action}
     if control.plan is not None:
-        payload["plan"] = plan_to_wire(control.plan)
+        payload["plan"] = plan_to_wire(control.plan) if plan_wire is None else plan_wire
     if control.topology is not None:
-        payload["topology"] = topology_to_wire(control.topology)
+        payload["topology"] = (
+            topology_to_wire(control.topology)
+            if topology_wire is None
+            else topology_wire
+        )
     if control.generator_slot_offset is not None:
         payload["generator_slot_offset"] = control.generator_slot_offset
     if control.version is not None:
@@ -202,7 +231,7 @@ def decode_control(value: object) -> CollectiveControl | None:
     if not isinstance(raw, dict):
         raise ValueError("collective control payload must be an object")
     return CollectiveControl(
-        action=str(raw.get("action", "")),
+        action=str(_require(raw, "action", "collective control")),
         plan=plan_from_wire(raw["plan"]) if "plan" in raw else None,
         topology=topology_from_wire(raw["topology"]) if "topology" in raw else None,
         generator_slot_offset=(
