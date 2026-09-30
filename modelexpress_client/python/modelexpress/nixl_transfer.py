@@ -1038,6 +1038,7 @@ class NixlTransferManager:
         ranges: list[tuple[int, int, int, int]],
         mem_type: str | None = None,
         timeout_seconds: float | None = None,
+        local_mem_type: str | None = None,
     ) -> tuple[int, int, float]:
         """Issue one batched one-sided RDMA READ over arbitrary byte ranges.
 
@@ -1055,7 +1056,9 @@ class NixlTransferManager:
 
         Returns ``(total_bytes, num_reads, duration)``.
         """
-        posted = self.post_read_batch(remote_agent_name, ranges, mem_type=mem_type)
+        posted = self.post_read_batch(
+            remote_agent_name, ranges, mem_type=mem_type, local_mem_type=local_mem_type
+        )
         if posted is None:
             return 0, 0, 0.0
         return self.await_read_batches([posted], timeout_seconds=timeout_seconds)
@@ -1065,6 +1068,7 @@ class NixlTransferManager:
         remote_agent_name: str,
         ranges: list[tuple[int, int, int, int]],
         mem_type: str | None = None,
+        local_mem_type: str | None = None,
     ) -> PostedRead | None:
         """Prepare and post one batched RDMA READ **without** waiting for it.
 
@@ -1072,6 +1076,10 @@ class NixlTransferManager:
         when there are no bytes to move. Every returned :class:`PostedRead` must
         be handed to :meth:`await_read_batches`, which owns releasing the handle;
         dropping one leaks it.
+
+        ``mem_type`` describes the remote memory; ``local_mem_type`` describes
+        the destination and defaults to ``mem_type``. Pass ``"DRAM"`` to read
+        remote accelerator memory into a registered pinned host buffer.
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
@@ -1080,11 +1088,13 @@ class NixlTransferManager:
             return None
 
         mem = mem_type or self._accelerator_backend.nixl_mem_type
+        local_mem = local_mem_type or mem
+        local_dev = 0 if local_mem == NIXL_DRAM_MEM_TYPE else self._device_id
         remote_descs = [
             (remote_addr, nbytes, dev) for (remote_addr, _local, nbytes, dev) in ranges
         ]
         local_descs = [
-            (local_addr, nbytes, self._device_id)
+            (local_addr, nbytes, local_dev)
             for (_remote, local_addr, nbytes, _dev) in ranges
         ]
 
@@ -1119,7 +1129,7 @@ class NixlTransferManager:
             dst_prepped = self._agent.prep_xfer_dlist(
                 agent_name="",
                 xfer_list=local_descs,
-                mem_type=mem,
+                mem_type=local_mem,
                 backends=self._backends,
             )
             indices = list(range(len(ranges)))

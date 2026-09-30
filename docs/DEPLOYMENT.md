@@ -1359,7 +1359,147 @@ kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/co
 
 ## Performance Reference
 
+### Bounded GPU refit
+
+Framework integrations choose the public staging, installation and memory
+settings. The framework also owns the safe update point and the pause/restart
+policy described below.
+
+| Integration choice | Public setting or operation |
+| --- | --- |
+| Trainer storage | Set `ModelExpressTrainerConfig.staging_mode` explicitly. Prefer `IN_PLACE` when its lifetime and dtype requirements hold; otherwise start with `COPY_TO_HOST`. |
+| Generator installation | Use `stage_weight()` followed by `apply_weight()` for a complete staged copy, or `apply_weight_streaming()` for bounded installation into live weights. |
+| Receiver memory | Set `max_staging_bytes` for bounded installation. `staging_device` selects host or device receive memory; `staging_buffers` divides that budget across receive arenas. |
+
+For unquantized vLLM models whose weights leave insufficient memory for a second
+complete weight copy, initialize the generator with
+`source_order=(WeightSource.TRAINER,)` and call:
+
+```python
+# Pause generation on every replica before entering this operation.
+metrics = generator.apply_weight_streaming(
+    version=WeightVersionRef(version_uid),
+    max_staging_bytes=4 * 1024**3,
+    staging_device="cuda",  # or "cpu" for pinned host staging
+    staging_buffers=1,      # 2 overlaps the next transfer with the current commit
+)
+# Resume only after every replica completes successfully.
+```
+
+This API interleaves NIXL reads and per-module installation. It supports mixed
+floating-point wire/engine dtypes through the existing conversion planner. The
+limit covers receive, conversion, full-pull scratch, and alignment across all
+staging arenas together; with `staging_buffers=2` each arena receives half of
+it. A module larger than one arena's share fails during preparation. Engine
+post-load workspaces and live weights require additional headroom; the limit is
+not a total process-memory cap.
+
+`staging_device` selects where the arenas live. `"cuda"` (default) lands RDMA
+in VRAM and commits with a device copy. `"cpu"` allocates pinned host memory,
+registers it as NIXL DRAM, and commits with a host-to-device copy, so the arena
+costs no VRAM. Host staging adds a host-to-device copy and depends on the
+available host-memory and CPU-to-GPU bandwidth. `staging_buffers=2` posts the
+next batch's READ into the other arena before the current batch is committed,
+allowing transfer and installation to overlap. The benefit depends on the
+hardware and the relative transfer and installation times; it does not guarantee
+that the copy is hidden. Host arenas are an option for VRAM-constrained
+deployments. Changing either option between updates is a workspace switch (see
+below).
+
+Any failure requires keeping the deployment paused and restarting its engines.
+Some modules may already contain the new version, so a failed operation cannot
+be treated as a usable old version. The framework owns this pause/restart policy.
+Quantized engines, generator-peer publication, and object-storage delta replay
+are not supported by this API. `stage_weight()` keeps its full-copy behavior.
+After releasing an update, callers can switch between full-copy and bounded
+staging on the same trainer-only client. A mode switch disconnects the NIXL
+agent and deregisters its workspace before freeing the old buffers, then
+reinitializes registrations and plans for the new mode. Same-mode updates retain
+their reusable workspace. Never switch while an update handle remains active.
+
+Streaming preparation retries transient RPC, runtime, and manifest-validation
+failures up to `max_transfer_attempts`, keeping the version lease across attempts.
+Failed preparation storage is reset before retrying; a reset failure requires an
+engine restart. Once installation starts, failures are not automatically retried.
+Release errors remain visible to callers, but a locally released update no longer
+holds the client's active slot even when lease deletion fails.
+Metrics include `staging_peak_bytes`, `batches`, `bytes_received`, `wire_s`, and
+`reconstruct_s`. `wire_s` measures READ posting through completion observation;
+`wire_wait_s` measures the blocking completion wait. With two arenas, a READ can
+overlap the previous batch's installation, so wire and installation times must
+not be added as disjoint intervals. GPU validation is required for each target
+model and topology before performance qualification.
+
+Streaming reports independent `streaming_total_s`, `streaming_prepare_s`,
+`streaming_apply_s`, and `streaming_release_s` intervals. Preparation contains
+`source_metadata_s`, `layout_capture_s`, `transfer_planning_s`, and
+`connection_registration_s`; the remaining preparation time includes version
+discovery and lease/control operations. Application contains NIXL `wire_s`,
+`reconstruct_s`, `install_commit_s` (including CUDA completion), `reload_s`, and
+`post_install_sync_s`. In the generic installer, vLLM's post-load processing
+refreshes MLA derived weights within `reload_s`. The guarded GLM path bypasses
+general reload and reports its MLA refresh separately as `derived_refresh_s`;
+`direct_guard_s` records its pre-installation validation. The ordinary
+`perf/mx_receive_install_time` is not emitted for streaming or guarded DIRECT
+installation because their application intervals include network reads.
+Do not sum nested parent and child intervals or maxima from different ranks.
+Preserve raw samples and expose residual/unattributed time against the independent
+total rather than describing the entire streaming operation as wire or install.
+
+### Reference transfer results
+
 | Model | Total Data | Transfer Time | Per-Worker Speed |
 |-------|-----------|---------------|------------------|
 | DeepSeek-V3 (671B, FP8) | 681 GB (8 GPUs) | ~15 seconds | ~45 Gbps |
 | Llama 3.3 70B | 140 GB (8 GPUs) | ~5 seconds | ~28 Gbps |
+
+### Internal GLM qualification profile
+
+The pinned GLM benchmark fixes the following implementation switches in its
+experiment manifest. They are internal qualification controls, separate from
+the public integration choices above. Integrations should not expose cache
+algorithms or model-profile selection as application configuration. This table
+records the existing controls and defaults; it does not change their behavior
+or establish a stable configuration API.
+
+| Internal environment variable | Default | Qualification purpose |
+| --- | --- | --- |
+| `MX_REFIT_CACHE_RESOLVED_SOURCES` | `0` | Reuse decoded, merged source tables only when every ordered manifest byte matches. |
+| `MX_REFIT_CACHE_BOUNDED_PLANS` | `0` | Reuse physical plans when manifests, source geometry/addresses, load capture, destination layout, staging configuration, and planning controls match. |
+| `MX_REFIT_REUSE_COMPLETE_PLAN` | `0` | Use the already-built whole-model plan for bounded coverage validation. |
+| `MX_REFIT_COPY_PLAN_KEY_ON_MISS` | `0` | Snapshot callback inputs only on a plan-cache miss; reject overlapping compilation. |
+| `MX_REFIT_GLM_DIRECT` | `0` | Select the experimental pinned GLM-5 BF16 eager TP32/EP32 adapter. Unsupported runtime, configuration or layout fails before READ; there is no automatic generic fallback. |
+| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Existing descriptor budget before full-source reconstruction; changing it invalidates cached plans. |
+
+The GLM experiment requires the PrimeRL pause lifecycle through installation
+and verification, with one CUDA receive arena (`staging_device="cuda"`,
+`staging_buffers=1`). It copies bounded batches into existing live parameters
+and refreshes MLA state without general reload. Partial installation can change
+the live version. Trainer staging is a separate choice. Enabling this profile
+does not qualify a model or its performance; full-model correctness and timing
+checks are required. The source profile pins vLLM 0.30.0 and Torch 2.13.0;
+matching those files alone does not establish model compatibility.
+See the [private guarded direct copy core](ARCHITECTURE.md#private-guarded-direct-copy-core)
+for its implementation contract.
+
+The unquantized vLLM installer also reuses a successful load-layout capture while
+parameter identities, addresses, shapes, strides, dtypes, devices, original
+loaders, module identities/loaders, routing-buffer versions or contents, and
+the source converter match. Cache results are copied before returning them.
+Quantized and incomplete captures are never retained. Callers must keep model
+configuration and loader behavior fixed while using an installer.
+
+These caches hold layouts and plans, not weight values or readiness. Every
+update still obtains its version and lease, reads fresh tensor values, and runs
+coverage validation. The generic installer also checks live owners and scans for
+retained arena storage. The guarded GLM path validates its model bindings and
+destinations without general reload or arena-retention scans. Its vLLM 0.30
+admission checks also require the sparse attention layer, indexer, indexer
+operation, and backend to use the same logical top-k buffer.
+Workspace reset and close discard source and plan caches. Cache counters and
+lookup/build/validation times accompany streaming preparation metrics; a miss
+rebuilds the entry rather than using a stale layout.
+Wire-to-engine dtype conversion respects the captured destination slice, strides
+and arena storage offset, including padding surrounding the destination view.
+Bounded staging views are zeroed before each READ so untouched loader padding
+cannot retain bytes from a previous batch or version.

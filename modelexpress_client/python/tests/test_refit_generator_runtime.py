@@ -286,7 +286,8 @@ def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
     )
 
     assert transfer_kwargs["listen_port"] is None
-    assert set(method_kwargs) == {"transfer", "capture_layout"}
+    assert set(method_kwargs) == {"transfer", "capture_layout", "prepare_install"}
+    assert method_kwargs["prepare_install"].__self__ is runtime.engine.installer
     assert runtime.p2p_client is None
     runtime.close()
 

@@ -176,6 +176,7 @@ def _create_load_time_tensor_method(
     *,
     capability: FullTensorEngineCapability,
     worker_id: str,
+    installer: EngineInstaller,
 ) -> LoadTimeTensorNixlUpdateMethod:
     transfer = _NixlStagedTransfer(
         agent_name=f"mx-refit-load-time-{worker_id}",
@@ -186,6 +187,7 @@ def _create_load_time_tensor_method(
     return LoadTimeTensorNixlUpdateMethod(
         transfer=transfer,
         capture_layout=capability.capture_layout,
+        prepare_install=installer.prepare_streaming_artifact,
     )
 
 
@@ -325,6 +327,7 @@ def initialize_generator_runtime(
                         _create_load_time_tensor_method(
                             capability=engine.full_tensor,
                             worker_id=worker_id,
+                            installer=engine.installer,
                         )
                     )
                 if WeightSource.GENERATOR in resolved_source_order:

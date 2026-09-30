@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -128,6 +128,47 @@ class PreparedEngineTensors(PreparedArtifact):
 
 
 @dataclass(frozen=True)
+class PreparedStreamingTensors(PreparedArtifact):
+    """Deferred bounded transfer; payload is read only during installation."""
+
+    batches: Callable[[], Iterator[dict[str, Any]]]
+    parameter_names: frozenset[str]
+    transfer_metrics: dict[str, float]
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        return dict(self.transfer_metrics)
+
+
+@dataclass(frozen=True)
+class PreparedDirectGroupTensors(PreparedArtifact):
+    """Private copy-only transaction carrying an opaque engine-owned plan."""
+
+    version_id: str
+    plan: object
+    source: PreparedStreamingTensors
+    ownership: _DirectCopyOwnership = field(
+        default_factory=lambda: _DirectCopyOwnership()
+    )
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        return self.source.metrics
+
+
+@dataclass
+class _DirectCopyOwnership:
+    iterator: Iterator[dict[str, Any]] | None = None
+    drain_failed: bool = False
+    close_failed: bool = False
+    source_failed: bool = False
+
+    @property
+    def release_blocked(self) -> bool:
+        return self.drain_failed or self.close_failed or self.source_failed
+
+
+@dataclass(frozen=True)
 class PreparedRuntimeTensors(PreparedArtifact):
     """A peer read prepared to write directly into live runtime tensors."""
 
@@ -242,6 +283,23 @@ class EngineInstaller(ABC):
     @abstractmethod
     def capabilities(self) -> EngineCapabilities:
         """Return prepared artifact kinds accepted by this installer."""
+
+    def prepare_streaming_artifact(
+        self,
+        *,
+        version: WeightVersion,
+        source: PreparedStreamingTensors,
+        batch_names: tuple[frozenset[str], ...],
+        parameter_layout: dict,
+        staging_device: str,
+        staging_buffers: int,
+    ) -> PreparedArtifact:
+        """Select an install route from metadata without reading or writing weights.
+
+        A declined optimization returns the same unconsumed source. The caller
+        owns the engine safe point; this hook does not establish quiescence.
+        """
+        return source
 
     @abstractmethod
     def install(self, prepared: PreparedArtifact) -> Any:

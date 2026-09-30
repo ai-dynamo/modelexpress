@@ -544,6 +544,56 @@ engine integrations.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
   through SGLang's native safetensors loader.
 
+The explicit `apply_weight_streaming(version=..., max_staging_bytes=...)`
+generator API holds a version lease across metadata preparation and incremental
+installation. The NIXL receiver plans complete owning-module batches and uses
+one or two registered byte arenas (`staging_buffers`) on CUDA or pinned host
+memory (`staging_device`). Receive tensors, wire-dtype conversion buffers,
+full-source reconstruction buffers, and alignment all count toward the limit,
+which is split evenly across the arenas. With two arenas the READ for batch
+`i + 1` is posted before batch `i` is yielded for commit, so transfer overlaps
+installation; an arena is refilled only after the commit that read from it has
+synchronized. Host arenas are registered as NIXL DRAM and read with a DRAM local
+memory type while the remote side stays VRAM. The vLLM installer commits each
+batch into existing kernel storage and rejects retained references to the
+reusable arenas. Ordinary `stage_weight()` continues to transfer a full
+independent copy before any installation.
+
+`MX_REFIT_PACK_MODULES` coalesces consecutive owning-module batches up to the
+same staging limit, trading a larger arena residency for fewer of them. It never
+changes which bytes are read: the packed batch carries the same copies, planned
+bytes, and READ descriptors as the modules it replaces, and modules that pull the
+same complete source stay in separate batches. It is off by default because one
+module per batch is the smallest arena a model can refit through.
+
+Before vLLM rebuilds per-module load-time parameter skeletons, the adapter records
+shared parameter objects and reconnects those aliases afterward. Alias owners
+must remain at the same module paths during restoration and final processing;
+replacement or removal fails the refit, including owners with no separately
+published parameter and multiple paths to the same module. Capture then
+counts tied weights once, and installation preserves their shared kernel storage.
+Alias groups with inconsistent load-time shapes or dtypes are rejected.
+Streaming owner checks resolve aliases against the live parameter objects on
+each batch. An owner may reuse a shared parameter installed by an earlier batch
+only while it still points to that exact committed object; a missing or rebound
+parameter is rejected. Installation reconnects shared bindings after each
+managed owner's kernel-storage restoration, before dependent hooks execute.
+
+Released full-copy and bounded updates may alternate on one client. The transfer
+owner tears down its agent before clearing the mode-specific buffers and reloads
+source metadata into the new registrations. The update method invalidates cached
+full-copy descriptors before entering bounded preparation. Preparation retries
+retain one version lease and discard failed setup state; installation failures
+still fence the engine rather than retrying a partially committed update.
+
+Streaming is opt-in, trainer-only, and currently limited to unquantized vLLM
+models. It does not publish generator peers or roll back partially installed
+versions. An installation failure marks the client engine state uncertain and
+blocks further streaming updates. The hosting framework must keep all replicas
+paused and restart them after any failed update. Only completion of all replicas
+permits resuming generation. The staging limit excludes live model weights,
+engine-owned post-load workspace, CUDA allocator overhead, and transport metadata.
+
 The corresponding trainer composition is owned by `TrainerRuntime`. Public
 `FSDPTrainerContext` and `MegatronTrainerContext` select only engine capture;
 full-tensor NIXL and canonical-checkpoint object-storage publication remain separate
@@ -1491,3 +1541,106 @@ Optimization opportunities: contiguous regions (blocked), warm source pool, Deep
 ## Deployment and Configuration
 
 See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering server/client configuration, Docker, Kubernetes, Helm, P2P transfer setup, and debugging commands.
+
+
+### Private guarded direct copy core
+
+`inference/engines/vllm/direct_copy.py` contains a private copy transaction core
+for exact plain Torch containers, Linear and LayerNorm modules. Bounded NIXL
+preparation now calls the installer's private metadata-only selection hook,
+which can return `PreparedDirectGroupTensors` before opening the READ iterator.
+The shared artifact carries an opaque engine-owned plan; concrete plan types
+and their exact-type validation remain inside the engine adapter.
+The vLLM hook also compares every captured load-time shape and dtype with the
+live destinations. By default, GLM and other vLLM models still select the
+original generic streaming artifact. Plain-Torch admission inspects the
+whole model and
+requires complete, nonoverlapping destination coverage, canonical shared
+Parameters, unsplit owner groups, and no hooks, overrides, buffers or unknown
+state. A declined admission returns the original streaming artifact without
+opening its iterator and keeps the existing bounded receive workspace. An
+admitted transaction
+copies already prepared batch tensors into the original storage without parameter
+attachment, reload or post-load callbacks. Fresh model and dispatch guards run
+before opening the iterator and before every batch; this conservative prototype
+does not make a performance claim or provide GLM eligibility. Selection errors
+reset the unconsumed workspace before preparation retry; a returned artifact
+must retain the exact active streaming source. The hook does not replace the
+framework safe point or supply an engine-native update guard.
+`streaming_selection_s` reports the metadata selection cost and
+`direct_install_selected` distinguishes the chosen path in each update's metrics.
+
+The private optimized installer admits one CUDA receive arena only
+(`staging_device="cuda"`, `staging_buffers=1`). Host receive arenas or multiple
+arenas keep the generic installer when the GLM experiment is disabled. Explicit
+GLM opt-in rejects those configurations before opening READ. This restriction
+keeps receive geometry and transport cleanup within the supported direct-copy
+contract; transfer/install overlap on the optimized path needs separate
+qualification. Trainer-side staging mode is independent of receiver arena mode.
+
+`MX_REFIT_GLM_DIRECT=1` separately enables an experimental, source-pinned GLM-5
+adapter in `direct_glm.py`. It requires unquantized eager TP32/EP32 operation,
+the CUDA `DeepseekV32ForCausalLM` selected for GLM by vLLM 0.30,
+the reviewed module census, initialized TRITON experts without extra bias,
+quantization or LoRA state, preserved router aliases, and complete captured
+load-layout coverage of the 1,395 canonical input parameters. The 156 MLA
+derived parameters are checked separately and refreshed with their default
+scales after copying. The pinned NVIDIA runtime represents disabled ROCm AITER
+capabilities as `None`; the MLA guard accepts precisely `None` or `False` for
+those two flags, while DCP must remain `False`. Enabled or unknown values reject.
+MoE admission positively matches the pinned modular implementation, TRITON
+experts and prepare/finalize helper before inspecting their state. Routing-replay
+fields belong to the unsupported monolithic experts; their presence on any
+admitted modular kernel/helper rejects even when their value is `None`.
+Admission errors fail before READ instead of selecting a
+generic fallback. Every update checks live bindings before copying; source-file
+hashes are checked once per immutable worker process. The adapter relies on the
+registry selecting the reviewed class; merely importing the legacy GLM class is
+insufficient. Build qualification checks that registry selection, while full
+model admission checks the loaded module tree. Runtime-specific admission also
+checks helper state; a source-hash update alone cannot qualify a new runtime.
+The vLLM 0.30 checks exclude HiSparse KV caches, alternate indexer modes,
+embedding groups and elastic expert capacity. They require the ordinary
+single-layer sparse index group and its shared logical index buffer. The
+checked-in profile pins the inspected vLLM 0.30 and Torch 2.13 sources.
+Each deployment must pass full-model admission and forward/refit checks for its
+exact runtime profile; results from another runtime do not qualify that profile.
+The new `DeepseekV32Attention`
+inherits the reviewed MLA post-load method and is explicitly included in the
+derived-weight refresh. Replicated embeddings, sequence parallelism and
+speculative decoding are outside this campaign profile. The adapter relies on the
+framework's completed pause and serialized update RPC, additionally drains all
+CUDA streams, and rejects outstanding shared-expert outputs. It does not provide
+a new engine-native guard API. The first campaign uses PrimeRL's existing
+pause/keep-cache policy; cache invalidation policy is not changed here.
+
+This callback-free copy path does not attach received tensors or invoke general
+reload/PWAL, so it omits generic per-batch model retention scans. It reports
+`glm_direct_install`, `direct_guard_s`, `install_commit_s` and
+`derived_refresh_s`; guard time and streaming-selection time remain part of
+receiver E2E. Unsupported models keep the existing default route. Enabling the
+experiment is not evidence of whole-model correctness or improved performance;
+those require the full changing-version campaign and exact reference checks.
+
+The private artifact carries its version and streaming-source ownership through
+the normal client/session lease lifecycle. A copy failure fences the engine as
+uncertain and never falls back after writing. CUDA work must drain before the
+iterator closes and the source lease releases. Failed CUDA drain or iterator
+close retains the active handle, iterator, source and lease and requires process
+reset. A source factory/iteration exception is also conservatively retained:
+CUDA synchronization cannot establish that failed RDMA reads have completed.
+The same retention rule applies to a failed drain after refreshing MLA derived
+state. Simultaneous copy and cleanup failures preserve the original exception
+with the cleanup failure chained as its cause, including on Python 3.10.
+There is no rollback or in-process cleanup retry for this private path.
+
+`direct_mla.py` supplies a separate private refresh primitive for the known
+unquantized MLA post-load transition. It preserves existing source, derived and
+scale tensor bindings, recognizes exact source views, refreshes materialized
+`W_UK_T`/`W_UV` destinations, and resets both device scales and scalar/CPU mirrors
+to the upstream defaults. It validates the complete refresh geometry before any
+write and rejects changed bindings, alternate representations and unclassified
+storage overlap. This component does not admit a vLLM model, classify its helper
+state, synchronize CUDA work or select a production install route. An engine
+adapter still needs whole-model admission, trusted tensor/dispatch semantics,
+quiescence, source/version ownership and failure fencing before using it.

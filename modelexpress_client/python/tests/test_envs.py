@@ -8,6 +8,15 @@ import pytest
 from modelexpress import envs
 
 
+def test_glm_direct_is_explicit_and_read_live(monkeypatch):
+    monkeypatch.delenv("MX_REFIT_GLM_DIRECT", raising=False)
+    assert envs.MX_REFIT_GLM_DIRECT is False
+    monkeypatch.setenv("MX_REFIT_GLM_DIRECT", "1")
+    assert envs.MX_REFIT_GLM_DIRECT is True
+    monkeypatch.setenv("MX_REFIT_GLM_DIRECT", "0")
+    assert envs.MX_REFIT_GLM_DIRECT is False
+
+
 def test_defaults_when_unset(monkeypatch):
     for name in (
         "MX_NIXL_BACKEND",

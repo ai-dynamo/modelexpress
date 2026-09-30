@@ -18,6 +18,7 @@ from modelexpress.types import ManifestMismatchError
 from ..control import WeightVersion
 from .plan import (
     PreparedArtifact,
+    PreparedDirectGroupTensors,
     UpdateMethod,
     WeightSource,
     WeightUpdatePlan,
@@ -82,9 +83,7 @@ class WeightUpdateSession:
         *,
         planner: WeightUpdatePlanner,
         start_lease: Callable[[str], Any],
-        resolve_replay_chain: Callable[
-            [WeightVersion], tuple[WeightVersion, ...]
-        ]
+        resolve_replay_chain: Callable[[WeightVersion], tuple[WeightVersion, ...]]
         | None = None,
     ) -> None:
         self._planner = planner
@@ -285,6 +284,58 @@ class WeightUpdateSession:
             self._close_lease(lease_group, versions[-1].version_id, primary_error)
             raise
 
+    def prepare_streaming(
+        self,
+        version: WeightVersion,
+        *,
+        max_staging_bytes: int,
+        staging_device: str = "cuda",
+        staging_buffers: int = 1,
+    ) -> SessionUpdate:
+        """Hold the version lease across deferred transfer and installation."""
+        from .methods import LoadTimeTensorNixlUpdateMethod
+        from .plan import PreparedStreamingTensors, WeightSource
+
+        lease = self._start_lease(version.version_id)
+        try:
+            last_error: BaseException | None = None
+            for plan in self._planner.plans(version):
+                if plan.source.kind is not WeightSource.TRAINER:
+                    continue
+                if not isinstance(plan.method, LoadTimeTensorNixlUpdateMethod):
+                    continue
+                if (
+                    PreparedStreamingTensors
+                    not in plan.installer.capabilities.artifact_types
+                ):
+                    raise ValueError(
+                        "engine does not support bounded streaming installation"
+                    )
+                try:
+                    prepared = plan.method.prepare_streaming(
+                        version=version,
+                        source=plan.source,
+                        max_staging_bytes=max_staging_bytes,
+                        staging_device=staging_device,
+                        staging_buffers=staging_buffers,
+                    )
+                except (grpc.RpcError, RuntimeError, ManifestMismatchError) as error:
+                    last_error = error
+                    logger.warning(
+                        "Streaming preparation failed version=%s source=%s: %s",
+                        version.version_id,
+                        plan.source.kind.value,
+                        error,
+                    )
+                    continue
+                return SessionUpdate(plan=plan, prepared=prepared, lease=lease)
+            if last_error is not None:
+                raise last_error
+            raise ValueError("no NIXL trainer plan supports bounded streaming")
+        except BaseException as error:
+            self._close_lease(lease, version.version_id, error)
+            raise
+
     @staticmethod
     def _recover_preparation(
         method: UpdateMethod,
@@ -314,6 +365,12 @@ class WeightUpdateSession:
                 type(update.plan.installer).__name__,
             )
             with update.plan.method.installation_context(update.prepared):
+                if isinstance(update.prepared, PreparedDirectGroupTensors) and (
+                    update.prepared.version_id != update.plan.version.version_id
+                ):
+                    raise ValueError(
+                        "direct artifact does not belong to the leased version"
+                    )
                 update.installation_started = True
                 update.apply_result = update.plan.installer.install(update.prepared)
             update.applied = True
@@ -344,15 +401,26 @@ class WeightUpdateSession:
                     )
             raise
         finally:
-            self._close_lease(
-                update.lease,
-                update.plan.version.version_id,
-                primary_error,
-            )
+            if not (
+                isinstance(update.prepared, PreparedDirectGroupTensors)
+                and update.prepared.ownership.release_blocked
+            ):
+                self._close_lease(
+                    update.lease,
+                    update.plan.version.version_id,
+                    primary_error,
+                )
 
     def release(self, update: SessionUpdate) -> None:
         if update.released:
             return
+        if (
+            isinstance(update.prepared, PreparedDirectGroupTensors)
+            and update.prepared.ownership.release_blocked
+        ):
+            raise RuntimeError(
+                "direct cleanup is unproven; retain resources and reset the process"
+            )
         primary_error: BaseException | None = None
         try:
             update.plan.method.release(update.prepared)

@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
+from time import perf_counter
 
 from modelexpress.refit.timing import (
     add_refit_bytes,
@@ -24,7 +26,9 @@ from ..nixl_staged_transfer import (
 from ..plan import (
     MethodCapabilities,
     PreparedArtifact,
+    PreparedDirectGroupTensors,
     PreparedEngineTensors,
+    PreparedStreamingTensors,
     ResolvedSource,
     TrainerUpdateSource,
     UpdateMethod,
@@ -40,13 +44,17 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         *,
         transfer: _NixlStagedTransfer,
         capture_layout: Callable,
+        prepare_install: Callable | None = None,
     ) -> None:
         self._transfer = transfer
         self._capture_layout = capture_layout
+        self._prepare_install = prepare_install
         self._active_plan: _PreparedNixlTransfer | None = None
         self._active_fingerprint: tuple | None = None
         self._active_manifest_digests: tuple[str, ...] = ()
         self._active_staged: _StagedNixlWeights | None = None
+        self._active_streamed: PreparedStreamingTensors | None = None
+        self._active_direct: PreparedDirectGroupTensors | None = None
 
     @property
     def capabilities(self) -> MethodCapabilities:
@@ -58,7 +66,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
 
     def prepare(self, *, version, source: ResolvedSource) -> PreparedArtifact:
         del version
-        if self._active_staged is not None:
+        if self._active_staged is not None or self._active_streamed is not None:
             raise RuntimeError("release staged weight before staging another version")
         if not isinstance(source, TrainerUpdateSource):
             raise TypeError("load-time tensor method requires a trainer source")
@@ -103,7 +111,111 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         _attribute_transfer(self._active_staged.metrics)
         return PreparedEngineTensors(staged=self._active_staged)
 
+    def prepare_streaming(
+        self,
+        *,
+        version,
+        source: ResolvedSource,
+        max_staging_bytes: int,
+        staging_device: str = "cuda",
+        staging_buffers: int = 1,
+    ) -> PreparedArtifact:
+        """Prepare trainer metadata without transferring a full weight copy."""
+        if self._active_staged is not None or self._active_streamed is not None:
+            raise RuntimeError("release the active update before preparing another")
+        if not isinstance(source, TrainerUpdateSource) or any(
+            not isinstance(item.transport, NixlGeneratorSource)
+            for item in source.inputs.sources
+        ):
+            raise ValueError("bounded staging requires NIXL trainer sources")
+        # Streaming replaces the full-copy destinations, including any cached
+        # descriptors into them. Invalidate before a possibly failing switch.
+        self._active_plan = None
+        self._active_fingerprint = None
+        self._active_manifest_digests = ()
+        try:
+            prepared = self._transfer.prepare(
+                manifests=[item.transport.manifest for item in source.inputs.sources],
+                capture_layout=self._capture_layout,
+                max_staging_bytes=max_staging_bytes,
+                staging_device=staging_device,
+                staging_buffers=staging_buffers,
+            )
+            metrics = dict(prepared.metrics)
+            streamed = PreparedStreamingTensors(
+                batches=lambda: self._transfer.iter_bounded(prepared, metrics),
+                parameter_names=frozenset(
+                    name for batch in prepared.batches for name in batch.layouts[0]
+                ),
+                transfer_metrics=metrics,
+            )
+            selected = streamed
+            if self._prepare_install is not None:
+                selection_started = perf_counter()
+                selected = self._prepare_install(
+                    version=version,
+                    source=streamed,
+                    batch_names=tuple(
+                        frozenset(batch.layouts[0]) for batch in prepared.batches
+                    ),
+                    parameter_layout={
+                        name: layout
+                        for batch in prepared.batches
+                        for name, layout in batch.layouts[0].items()
+                    },
+                    staging_device=staging_device,
+                    staging_buffers=staging_buffers,
+                )
+                if selected is not streamed and not (
+                    isinstance(selected, PreparedDirectGroupTensors)
+                    and selected.source is streamed
+                ):
+                    raise ValueError("installer selected an unrelated streaming source")
+                metrics["streaming_selection_s"] = perf_counter() - selection_started
+            metrics["direct_install_selected"] = int(
+                isinstance(selected, PreparedDirectGroupTensors)
+            )
+        except Exception:
+            try:
+                self._transfer.reset_workspace()
+            except Exception as cleanup_error:
+                raise ValueError(
+                    "failed to reset streaming preparation; restart the generator engine"
+                ) from cleanup_error
+            raise
+        self._active_streamed = streamed
+        return selected
+
+    @contextmanager
+    def installation_context(self, prepared: PreparedArtifact):
+        if isinstance(prepared, PreparedDirectGroupTensors):
+            if (
+                prepared.source is not self._active_streamed
+                or self._active_direct is not None
+            ):
+                raise RuntimeError(
+                    "direct update does not own the active streaming source"
+                )
+            self._active_direct = prepared
+        yield
+
     def release(self, prepared: PreparedArtifact) -> None:
+        if self._active_direct is not None and prepared is not self._active_direct:
+            raise RuntimeError("release the direct owner, not its streaming source")
+        if isinstance(prepared, PreparedDirectGroupTensors):
+            if prepared.ownership.release_blocked:
+                raise RuntimeError(
+                    "direct cleanup is unproven; reset the process before release"
+                )
+            if self._active_direct is not None and self._active_direct is not prepared:
+                raise RuntimeError("direct update is no longer active")
+            self._active_direct = None
+            prepared = prepared.source
+        if isinstance(prepared, PreparedStreamingTensors):
+            if prepared is not self._active_streamed:
+                raise RuntimeError("streaming update is no longer active")
+            self._active_streamed = None
+            return
         if not isinstance(prepared, PreparedEngineTensors):
             raise TypeError("load-time tensor method requires staged engine tensors")
         if prepared.staged is not self._active_staged:
@@ -111,11 +223,21 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self._active_staged = None
 
     def close(self) -> None:
+        if (
+            self._active_direct is not None
+            and self._active_direct.ownership.release_blocked
+        ):
+            raise RuntimeError(
+                "direct cleanup is unproven; retain resources and reset the process"
+            )
+        self._active_direct = None
+        self._active_streamed = None
         self._active_staged = None
         self._active_plan = None
         self._active_fingerprint = None
         self._active_manifest_digests = ()
         self._transfer.close()
+
 
 def _attribute_transfer(metrics: dict[str, float]) -> None:
     add_refit_bytes(metrics.get("bytes_received", 0))
