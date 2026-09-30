@@ -1314,10 +1314,8 @@ mod tests {
         // group, and an undeclared group keeps the historical ungated creates.
         let mut group_spec = spec("m", &["t0", "t1"], &["g0"], 1);
         group_spec.requires_bootstrap_fence = true;
-        // One rank index per slot: real clients never share index_in_role 0
-        // across two slots of a role, and the join script rejects it as
-        // DUPLICATE_RANK. The reference test keeps 0 for both trainers and
-        // cannot pass against a live Redis as written.
+        // One rank index per slot: the join script rejects two slots of the
+        // same role sharing an index_in_role as DUPLICATE_RANK.
         let join = |slot_id: &str,
                     worker_id: &str,
                     role: CollectiveRole,
@@ -1445,9 +1443,8 @@ mod tests {
             CollectiveBackendError::FailedPrecondition(_)
         ));
 
-        // This port carries no abort RPC: a membership change is what moves the
-        // epoch and wipes the fence, so the reset half of the reference test is
-        // driven by a replacement join instead of AbortCollectiveBootstrap.
+        // A membership change moves the epoch and wipes the fence, so the
+        // reset is driven by a replacement join.
         let moved = backend
             .join_group(&join("t1", "w-t1-replacement", CollectiveRole::Trainer, 1))
             .await
