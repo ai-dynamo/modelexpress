@@ -117,7 +117,7 @@ class JaxPublisher:
         rather than per parameter, which the protocol allows because no
         parameter may change after the round opens.
         """
-        jax_interop.ready(*self._arrays)
+        jax.block_until_ready(self._arrays)
 
     def cleanup(self) -> None:
         self._specs.clear()

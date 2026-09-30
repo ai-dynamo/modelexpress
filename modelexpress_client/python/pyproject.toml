@@ -49,6 +49,11 @@ dev = [
     # [dev]; without this the metrics tests would error out on import rather
     # than run.
     "prometheus-client>=0.20.0",
+    # tests/test_collective_jax_real.py checks the JAX adapter against a real
+    # jax on forced host devices; without this CI skips it. 0.7.0 is the first
+    # release where Array.format.layout is the Layout carrying major_to_minor,
+    # which JaxDeviceBuffer reads; jax itself needs Python 3.11.
+    "jax>=0.7.0 ; python_version >= '3.11'",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]

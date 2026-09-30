@@ -276,6 +276,15 @@ class _Sharding:
         self.device_set = set(devices)
 
 
+class _Layout:
+    def __init__(self, major_to_minor, tiling):
+        self.major_to_minor = major_to_minor
+        self.tiling = tiling
+
+    def __repr__(self):
+        return f"Layout(major_to_minor={self.major_to_minor}, tiling={self.tiling})"
+
+
 class _Array:
     """Enough of a ``jax.Array`` to exercise the adapter's refusals."""
 
@@ -288,6 +297,7 @@ class _Array:
         dtype="bfloat16",
         ptr=0x1000,
         indices=None,
+        layout=None,
     ):
         self.addressable_shards = [
             _Shard(s, None if indices is None else indices[i])
@@ -300,6 +310,8 @@ class _Array:
         for extent in shape:
             self.size *= extent
         self._ptr = ptr
+        if layout is not None:
+            self.format = pytypes.SimpleNamespace(layout=layout, sharding=self.sharding)
 
     def unsafe_buffer_pointer(self):
         return self._ptr
@@ -344,16 +356,56 @@ class TestJaxDeviceBuffer:
     def test_it_does_not_define_is_contiguous(self):
         """The resolver checks contiguity only when the attribute is present.
 
-        Defining it would assert a property of XLA's device layout rather than
-        read one, so its absence is deliberate and worth pinning.
+        The layout is read and refused at construction instead; a constant
+        attribute would be an assertion on backends that cannot report one.
         """
         assert not hasattr(jax_interop.JaxDeviceBuffer(_Array(shards=["x"])), "is_contiguous")
 
-    def test_as_reshard_buffer_goes_through_the_shard(self):
-        inner = _Array(shards=["inner"], ptr=0x2000)
-        outer = _Array(shards=[inner], devices=("d0", "d1"))
-        buffer = jax_interop.as_reshard_buffer(outer)
-        assert buffer.data_ptr() == 0x2000
+    @pytest.mark.parametrize("shape", [(), (7,), (4, 8), (2, 3, 4)])
+    def test_the_default_row_major_layout_is_accepted(self, shape):
+        """JAX spells row-major as major_to_minor (0, ..., ndim-1), no tiling."""
+        layout = _Layout(tuple(range(len(shape))), ())
+        array = _Array(shards=["x"], shape=shape, layout=layout, ptr=0x3000)
+        assert jax_interop.JaxDeviceBuffer(array).data_ptr() == 0x3000
+
+    def test_a_none_tiling_is_accepted(self):
+        array = _Array(shards=["x"], layout=_Layout((0, 1), None))
+        jax_interop.JaxDeviceBuffer(array)
+
+    @pytest.mark.parametrize(
+        "major_to_minor, shape",
+        [((1, 0), (4, 8)), ((0, 2, 1), (2, 3, 4)), ((2, 1, 0), (2, 3, 4))],
+    )
+    def test_a_non_row_major_layout_is_refused(self, major_to_minor, shape):
+        """The wire op would read a transposed buffer as scrambled row-major bytes."""
+        array = _Array(shards=["x"], shape=shape, layout=_Layout(major_to_minor, ()))
+        with pytest.raises(ValueError, match="dense row-major"):
+            jax_interop.JaxDeviceBuffer(array)
+
+    def test_a_tiled_layout_is_refused(self):
+        array = _Array(shards=["x"], layout=_Layout((0, 1), ((8, 128),)))
+        with pytest.raises(ValueError, match="dense row-major"):
+            jax_interop.JaxDeviceBuffer(array)
+
+    def test_no_format_attribute_falls_through(self):
+        """jax without Array.format keeps the old behaviour."""
+        array = _Array(shards=["x"])
+        assert not hasattr(array, "format")
+        assert jax_interop.JaxDeviceBuffer(array).shape == (4, 8)
+
+    def test_a_backend_that_cannot_report_a_layout_falls_through(self):
+        """Array.format returns Format(None, sharding) on UNIMPLEMENTED."""
+        array = _Array(shards=["x"])
+        array.format = pytypes.SimpleNamespace(layout=None, sharding=array.sharding)
+        jax_interop.JaxDeviceBuffer(array)
+
+    def test_a_format_without_layout_falls_through(self):
+        """jax 0.6.2 has Array.format, but its field is device_local_layout."""
+        array = _Array(shards=["x"])
+        array.format = pytypes.SimpleNamespace(
+            device_local_layout=_Layout((1, 0), ()), sharding=array.sharding
+        )
+        jax_interop.JaxDeviceBuffer(array)
 
 
 class _Piece:
