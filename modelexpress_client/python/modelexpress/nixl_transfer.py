@@ -498,7 +498,27 @@ class NixlTransferManager:
             )
             for name, tensor in new_tensors.items()
         ]
-        registrable = [t for t in new_tensors.values() if t.numel() > 0]
+        # SGLang can expose the same runtime buffer under both the main and
+        # draft model names. NIXL 1.3 rejects duplicate remote descriptors
+        # with different registration metadata, so publish both names but
+        # register each exact memory region only once.
+        existing_regions = {
+            (t.data_ptr(), t.numel() * t.element_size())
+            for t in self._tensors.values()
+            if t.numel() > 0
+        }
+        registered_regions: set[tuple[int, int]] = set()
+        registrable = []
+        for tensor in new_tensors.values():
+            size = tensor.numel() * tensor.element_size()
+            region = (tensor.data_ptr(), size)
+            if (
+                size > 0
+                and region not in existing_regions
+                and region not in registered_regions
+            ):
+                registrable.append(tensor)
+                registered_regions.add(region)
         registration = None
         if registrable:
             registration = self._agent.register_memory(
@@ -521,8 +541,11 @@ class NixlTransferManager:
             self._registered_memory.append(registration)
         self._tensors = {**self._tensors, **new_tensors}
         self._tensor_descriptors = self._tensor_descriptors + new_descriptors
-        for name in new_tensors:
-            self._appended_registrations[name] = registration
+        for name, tensor in new_tensors.items():
+            region = (tensor.data_ptr(), tensor.numel() * tensor.element_size())
+            self._appended_registrations[name] = (
+                registration if region in registered_regions else None
+            )
         self._metadata = metadata
         logger.info(
             "Appended %d tensors (%d regions) to the registered catalog "

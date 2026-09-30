@@ -1339,6 +1339,37 @@ class TestNixlTransferManagerAppend:
         mgr.register_additional_tensors({"w": same})
         mgr._agent.register_memory.assert_not_called()
 
+    def test_append_alias_keeps_both_names_without_reregistering_memory(self):
+        mgr = self._make_manager()
+        main = self._tensor(0x1000)
+        alias = self._tensor(0x1000)
+        draft = self._tensor(0x9000)
+        mgr._tensors = {"_mx_pp_group_active_ranks_t": main}
+        mgr._tensor_descriptors = [
+            TensorDescriptor(
+                "_mx_pp_group_active_ranks_t", 0x1000, 8, 0, "torch.bfloat16"
+            )
+        ]
+
+        mgr.register_additional_tensors(
+            {
+                "mx_draft::_mx_pp_group_active_ranks_t": alias,
+                "mx_draft::weight": draft,
+            }
+        )
+
+        assert [d.name for d in mgr.tensor_descriptors] == [
+            "_mx_pp_group_active_ranks_t",
+            "mx_draft::_mx_pp_group_active_ranks_t",
+            "mx_draft::weight",
+        ]
+        mgr._agent.register_memory.assert_called_once_with([draft], backends=ANY)
+
+        handle = mgr._agent.register_memory.return_value
+        mgr.deregister_tensors(["mx_draft::weight"])
+        mgr._agent.deregister_memory.assert_called_once_with(handle)
+        assert "mx_draft::_mx_pp_group_active_ranks_t" in mgr._tensors
+
     def test_failed_metadata_refresh_rolls_back_draft_registration(self):
         mgr = self._make_manager()
         target = self._tensor(0x1000)
