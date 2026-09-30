@@ -766,7 +766,7 @@ read only when the argument is unset. Full semantics:
 |----------|---------|-------------|
 | `MX_SERVER_ADDRESS` | none (required) | mx-server `host:port` the adapter connects to. **This adapter reads only `MX_SERVER_ADDRESS`** — unlike the client paths covered by the transition guidance above, it has no `MODEL_EXPRESS_URL` fallback. Plain `host:port`; `grpc://`/`http://` prefixes are stripped and the secure schemes (`grpcs://`, `https://`) are rejected. |
 | `MX_MILES_RUN_ID` | unset | Optional run identity. When set it must be set identically on every trainer rank; a mix of set and unset ranks is rejected. |
-| `MX_MILES_ABI_VERSION` | `miles-sglang-bf16-replicated-v1` | M2N ABI identity stamped into the frozen topology contract. The deployed receivers form groups against this exact value, so override it only in step with the receiver build. |
+| `MX_MILES_ABI_VERSION` | `miles-sglang-bf16-replicated-v1` | M2N ABI identity hashed into the plan digest: peers that disagree never reach READY. The deployed full-branch receiver echoes the trainer's value and does not pin one of its own, so today this detects only trainer-vs-trainer disagreement; override it only in step with the receiver build. |
 | `MX_MILES_PUBLISH_GROUPS` | `1` | Integer >= 1. Caps how many publish groups a round is chunked into along the canonical plan order; larger values give finer engine-side overlap granularity. Never splits a tensor. |
 | `MX_MILES_CONNECT_TIMEOUT_S` | `10.0` | Seconds the first round waits for the mx-server channel to become ready before failing. |
 
