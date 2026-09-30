@@ -693,24 +693,33 @@ class MilesCollectiveProtocolCore:
             return
         version = self._round_version
         names = [name for name, _tensor in bucket]
-        unknown = [name for name in names if name not in self._group_of]
-        if unknown:
-            raise ValueError(
-                "MILES NCCL M2N bucket carries tensors outside the frozen plan: "
-                f"{unknown[:5]}"
-            )
-        foreign = [name for name in names if name not in self._local_names]
-        if foreign:
-            raise ValueError(
-                "MILES NCCL M2N bucket carries tensors owned by another PP "
-                f"partition: {foreign[:5]}"
-            )
-        repeated = [name for name in names if name in self._round_seen]
-        if repeated:
-            raise ValueError(
-                "MILES NCCL M2N bucket repeats tensors already seen in round "
-                f"{version}: {repeated[:5]}"
-            )
+        # A bucket that names unknown, foreign, or repeated tensors means the
+        # trainer's bucket stream diverged from the frozen contract — a bug,
+        # not a transient error. The generators are already paused mid-round,
+        # so continuing a diverged round would risk publishing a wrong-plan
+        # weight set; close the protocol like any other mid-round failure.
+        try:
+            unknown = [name for name in names if name not in self._group_of]
+            if unknown:
+                raise ValueError(
+                    "MILES NCCL M2N bucket carries tensors outside the frozen plan: "
+                    f"{unknown[:5]}"
+                )
+            foreign = [name for name in names if name not in self._local_names]
+            if foreign:
+                raise ValueError(
+                    "MILES NCCL M2N bucket carries tensors owned by another PP "
+                    f"partition: {foreign[:5]}"
+                )
+            repeated = [name for name in names if name in self._round_seen]
+            if repeated:
+                raise ValueError(
+                    "MILES NCCL M2N bucket repeats tensors already seen in round "
+                    f"{version}: {repeated[:5]}"
+                )
+        except BaseException as error:
+            self._close_preserving(error)
+            raise
         if not self._round_begun:
             if self._session is None:
                 try:

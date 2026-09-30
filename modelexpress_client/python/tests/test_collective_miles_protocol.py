@@ -1082,16 +1082,27 @@ def test_bucket_stream_publishes_groups_in_plan_order_and_finishes(monkeypatch):
     assert protocol._round_version == "2"
 
 
-def test_send_bucket_rejects_unknown_and_repeated_tensors(monkeypatch):
+def test_send_bucket_rejects_unknown_tensors_and_closes_the_protocol(monkeypatch):
     protocol, _session, _events, tensors = _armed_protocol(monkeypatch)
 
     with pytest.raises(ValueError, match="outside the frozen plan"):
         protocol.send_bucket([("model.unknown", tensors["model.a"])])
 
+    # A bucket stream that diverged from the frozen contract is a mid-round
+    # failure: the protocol closes rather than continuing a degraded round.
+    assert protocol._closed is True
+    with pytest.raises(RuntimeError, match="protocol is closed"):
+        protocol.send_bucket([("model.a", tensors["model.a"])])
+
+
+def test_send_bucket_rejects_repeated_tensors_and_closes_the_protocol(monkeypatch):
+    protocol, _session, _events, tensors = _armed_protocol(monkeypatch)
     protocol.send_bucket([("model.a", tensors["model.a"])])
 
     with pytest.raises(ValueError, match="repeats"):
         protocol.send_bucket([("model.a", tensors["model.a"])])
+
+    assert protocol._closed is True
 
 
 def test_send_bucket_rejects_tensors_owned_by_another_partition(monkeypatch):
@@ -1104,6 +1115,7 @@ def test_send_bucket_rejects_tensors_owned_by_another_partition(monkeypatch):
         protocol.send_bucket([("model.foreign", tensors["model.a"])])
 
     assert "model.foreign" not in protocol._round_seen
+    assert protocol._closed is True
 
 
 def test_send_bucket_and_finalize_require_an_armed_round():

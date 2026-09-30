@@ -99,12 +99,15 @@ outside the supported envelope:
 
 Any mid-round failure closes the protocol (channel, rendezvous, and session
 torn down) and the next `begin_sync` raises rather than silently continuing a
-degraded round. Failures raised inside `begin_sync` or `finalize` fan out to
-every trainer rank through gloo all-gathers. A failure raised out of the
-`send_bucket` path closes the local rank immediately and propagates out of
-miles' `update_weights`, so that rank never reaches `finalize`: its peers
-finish their bucket loop and then block in miles' gloo barrier until the
-process group errors or its timeout, the receiver's transfer deadline
+degraded round. That includes a `send_bucket` carrying tensors outside the
+frozen plan, owned by another PP partition, or already seen in the round:
+the bucket stream diverged from the frozen contract, so the round is torn
+down instead of continued. Failures raised inside `begin_sync` or `finalize`
+fan out to every trainer rank through gloo all-gathers. A failure raised out
+of the `send_bucket` path closes the local rank immediately and propagates
+out of miles' `update_weights`, so that rank never reaches `finalize`: its
+peers finish their bucket loop and then block in miles' gloo barrier until
+the process group errors or its timeout, the receiver's transfer deadline
 (`MX_NCCL_REFIT_TRANSFER_TIMEOUT_S`, default 600s), or job teardown releases
 them. When the failing rank is rank 0 (the driver),
 `end_weight_update`/`resume_engines` never run and the engines stay paused
