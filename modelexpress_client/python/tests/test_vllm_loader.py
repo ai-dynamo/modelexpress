@@ -1370,6 +1370,26 @@ class TestNixlTransferManagerAppend:
         mgr._agent.deregister_memory.assert_called_once_with(handle)
         assert "mx_draft::_mx_pp_group_active_ranks_t" in mgr._tensors
 
+    def test_later_alias_keeps_registration_until_last_name_is_removed(self):
+        mgr = self._make_manager()
+        mgr._agent.get_agent_metadata.side_effect = None
+        mgr._agent.get_agent_metadata.return_value = b"metadata"
+        tensor = self._tensor(0x9000)
+        alias = self._tensor(0x9000)
+
+        mgr.register_additional_tensors({"draft.weight": tensor})
+        mgr.register_additional_tensors({"draft.alias": alias})
+        mgr._agent.register_memory.assert_called_once_with([tensor], backends=ANY)
+
+        mgr.deregister_tensors(["draft.weight"])
+        mgr._agent.deregister_memory.assert_not_called()
+        assert "draft.alias" in mgr._tensors
+
+        mgr.deregister_tensors(["draft.alias"])
+        mgr._agent.deregister_memory.assert_called_once_with(
+            mgr._agent.register_memory.return_value
+        )
+
     def test_failed_metadata_refresh_rolls_back_draft_registration(self):
         mgr = self._make_manager()
         target = self._tensor(0x1000)

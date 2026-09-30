@@ -507,6 +507,14 @@ class NixlTransferManager:
             for t in self._tensors.values()
             if t.numel() > 0
         }
+        existing_handles = {
+            (
+                self._tensors[name].data_ptr(),
+                self._tensors[name].numel() * self._tensors[name].element_size(),
+            ): handle
+            for name, handle in self._appended_registrations.items()
+            if handle is not None
+        }
         registered_regions: set[tuple[int, int]] = set()
         registrable = []
         for tensor in new_tensors.values():
@@ -544,7 +552,9 @@ class NixlTransferManager:
         for name, tensor in new_tensors.items():
             region = (tensor.data_ptr(), tensor.numel() * tensor.element_size())
             self._appended_registrations[name] = (
-                registration if region in registered_regions else None
+                registration
+                if region in registered_regions
+                else existing_handles.get(region)
             )
         self._metadata = metadata
         logger.info(
