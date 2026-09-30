@@ -2235,12 +2235,25 @@ mod tests {
         ));
         assert!(tombstoned.failure_message.contains("superseded"));
 
-        // The trainer acknowledges the new epoch, the fence re-completes, and
+        // The trainer acknowledges the new epoch, both lanes re-publish (READY
+        // requires current-epoch bootstrap state), the fence re-completes, and
         // the reclaimed key opens a fresh operation in it.
         backend
             .join_group(&join(&fenced, "t4", "w-t4", CollectiveRole::Trainer))
             .await
             .expect("trainer acknowledges the new epoch");
+        for lane_id in [0, 1] {
+            backend
+                .publish_bootstrap(&PublishGroupBootstrapRequest {
+                    group_id: fenced_membership.group_id.clone(),
+                    epoch: fenced_replacement.epoch,
+                    lane_id,
+                    worker_id: "w-t4".to_string(),
+                    nccl_unique_id: vec![u8::try_from(lane_id + 6).unwrap_or(0); 128],
+                })
+                .await
+                .expect("re-publish at the new epoch");
+        }
         for lane_id in [0, 1] {
             for (slot_id, worker_id) in [("t4", "w-t4"), ("g4", "w-g4-new")] {
                 backend
