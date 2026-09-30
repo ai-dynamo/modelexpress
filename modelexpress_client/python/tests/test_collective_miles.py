@@ -43,16 +43,16 @@ class FakeTensor:
         return self.contiguous
 
 
-def _entry(name, *, partition, src_shard=0, dst_shard=1):
+def _entry(name, *, partition):
     return ParamPlan(
         name=name,
-        global_shape=(8, 4),
+        global_shape=(4, 4),
         dtype="bfloat16",
         partition_id=partition,
-        src_mesh=MeshSpec(shape=(2,), rank_offset=0),
-        src_placements=(Placement.shard(src_shard),),
-        dst_mesh=MeshSpec(shape=(2,), rank_offset=2),
-        dst_placements=(Placement.shard(dst_shard),),
+        src_mesh=MeshSpec(shape=(1,), rank_offset=0),
+        src_placements=(Placement.replicate(),),
+        dst_mesh=MeshSpec(shape=(2,), rank_offset=1),
+        dst_placements=(Placement.replicate(),),
         group_key=f"layer-{partition}",
     )
 
@@ -61,7 +61,7 @@ def _plan():
     return ReshardPlan(
         bulk=[
             _entry("model.layers.0.mlp.gate_proj.weight", partition=0),
-            _entry("model.layers.1.mlp.down_proj.weight", partition=1, src_shard=1),
+            _entry("model.layers.1.mlp.down_proj.weight", partition=1),
         ],
         source_partition_count=2,
     )
@@ -70,12 +70,7 @@ def _plan():
 def _topology():
     return CollectiveTopology(
         model_name="qwen",
-        trainer_slots=(
-            "trainer-pp0-tp0",
-            "trainer-pp0-tp1",
-            "trainer-pp1-tp0",
-            "trainer-pp1-tp1",
-        ),
+        trainer_slots=("trainer-0", "trainer-1"),
         generator_slots=("generator-tp0", "generator-tp1"),
         source_partition_count=2,
         m2n_abi_version="nccl-m2n-2.30.7",
@@ -125,8 +120,8 @@ def test_topology_requires_an_explicit_non_empty_abi_and_partitioned_slot_order(
 
     lanes = _lane_declarations(_topology())
 
-    assert lanes[0].trainer_slots == ("trainer-pp0-tp0", "trainer-pp0-tp1")
-    assert lanes[1].trainer_slots == ("trainer-pp1-tp0", "trainer-pp1-tp1")
+    assert lanes[0].trainer_slots == ("trainer-0",)
+    assert lanes[1].trainer_slots == ("trainer-1",)
     assert lanes[2].kind == "BROADCAST"
 
 
@@ -147,14 +142,13 @@ def test_topology_copies_mutable_slot_inputs():
     assert topology.generator_slots == ("g0",)
 
 
-def test_miles_publisher_maps_explicit_aliases_to_the_partition_local_buffers():
+def test_miles_publisher_maps_canonical_names_to_the_partition_local_buffers():
     plan = _plan()
     tensor = FakeTensor((4, 4))
     publisher = MilesPublisher(
         plan=plan,
         source_partition=0,
-        tensors={"decoder.layers.0.mlp.gate": tensor},
-        aliases={"decoder.layers.0.mlp.gate": "model.layers.0.mlp.gate_proj.weight"},
+        tensors={"model.layers.0.mlp.gate_proj.weight": tensor},
     )
     plan.bulk.clear()
 
@@ -170,7 +164,7 @@ def test_miles_publisher_maps_explicit_aliases_to_the_partition_local_buffers():
     assert specs["model.layers.0.mlp.gate_proj.weight"].base is tensor
 
 
-def test_miles_publisher_derives_wire_order_from_the_plan_not_mapping_order():
+def test_miles_publisher_derives_wire_order_from_the_plan_not_dict_order():
     plan = ReshardPlan(
         bulk=[
             _entry("model.a", partition=0),
@@ -183,8 +177,7 @@ def test_miles_publisher_derives_wire_order_from_the_plan_not_mapping_order():
     publisher = MilesPublisher(
         plan=plan,
         source_partition=0,
-        tensors={"native-b": second, "native-a": first},
-        aliases={"native-b": "model.b", "native-a": "model.a"},
+        tensors={"model.b": second, "model.a": first},
     )
 
     specs = publisher.local_params()
@@ -194,13 +187,58 @@ def test_miles_publisher_derives_wire_order_from_the_plan_not_mapping_order():
     assert specs["model.b"].base is second
 
 
-def test_miles_publisher_rejects_incomplete_alias_coverage_and_non_bulk_plans():
+def test_miles_publisher_rejects_sharded_placements_and_non_local_source_meshes():
+    plan = ReshardPlan(
+        bulk=[
+            ParamPlan(
+                name="model.a",
+                global_shape=(4, 4),
+                dtype="bfloat16",
+                partition_id=0,
+                src_mesh=MeshSpec(shape=(2,), rank_offset=0),
+                src_placements=(Placement.shard(0),),
+                dst_mesh=MeshSpec(shape=(2,), rank_offset=1),
+                dst_placements=(Placement.replicate(),),
+            )
+        ],
+        source_partition_count=1,
+    )
+    with pytest.raises(ValueError, match="replicated placements only"):
+        MilesPublisher(
+            plan=plan,
+            source_partition=0,
+            tensors={"model.a": FakeTensor((2, 4))},
+        )
+
+    plan = ReshardPlan(
+        bulk=[
+            ParamPlan(
+                name="model.a",
+                global_shape=(4, 4),
+                dtype="bfloat16",
+                partition_id=0,
+                src_mesh=MeshSpec(shape=(1,), rank_offset=1),
+                src_placements=(Placement.replicate(),),
+                dst_mesh=MeshSpec(shape=(2,), rank_offset=1),
+                dst_placements=(Placement.replicate(),),
+            )
+        ],
+        source_partition_count=1,
+    )
+    with pytest.raises(ValueError, match="src_mesh ranks"):
+        MilesPublisher(
+            plan=plan,
+            source_partition=0,
+            tensors={"model.a": FakeTensor((4, 4))},
+        )
+
+
+def test_miles_publisher_rejects_incomplete_tensor_coverage_and_non_bulk_plans():
     with pytest.raises(ValueError, match="exactly cover partition 0"):
         MilesPublisher(
             plan=_plan(),
             source_partition=0,
             tensors={"wrong": FakeTensor((4, 4))},
-            aliases={"wrong": "model.layers.1.mlp.down_proj.weight"},
         )
 
     plan = _plan()
@@ -215,8 +253,7 @@ def test_miles_publisher_rejects_incomplete_alias_coverage_and_non_bulk_plans():
         MilesPublisher(
             plan=plan,
             source_partition=0,
-            tensors={"native": FakeTensor((4, 4))},
-            aliases={"native": "model.layers.0.mlp.gate_proj.weight"},
+            tensors={"model.layers.0.mlp.gate_proj.weight": FakeTensor((4, 4))},
         )
 
 
@@ -227,8 +264,7 @@ def test_miles_publisher_rejects_cpu_and_mixed_device_storage():
         MilesPublisher(
             plan=_plan(),
             source_partition=0,
-            tensors={"native": cpu},
-            aliases={"native": "model.layers.0.mlp.gate_proj.weight"},
+            tensors={"model.layers.0.mlp.gate_proj.weight": cpu},
         )
 
     unindexed = FakeTensor((4, 4))
@@ -237,8 +273,7 @@ def test_miles_publisher_rejects_cpu_and_mixed_device_storage():
         MilesPublisher(
             plan=_plan(),
             source_partition=0,
-            tensors={"native": unindexed},
-            aliases={"native": "model.layers.0.mlp.gate_proj.weight"},
+            tensors={"model.layers.0.mlp.gate_proj.weight": unindexed},
         )
 
     plan = ReshardPlan(
@@ -255,8 +290,7 @@ def test_miles_publisher_rejects_cpu_and_mixed_device_storage():
         MilesPublisher(
             plan=plan,
             source_partition=0,
-            tensors={"a": first, "b": second},
-            aliases={"a": "model.a", "b": "model.b"},
+            tensors={"model.a": first, "model.b": second},
         )
 
 
@@ -274,8 +308,7 @@ def test_miles_publisher_rejects_storage_drift_before_a_new_round(change, messag
     publisher = MilesPublisher(
         plan=_plan(),
         source_partition=0,
-        tensors={"native": tensor},
-        aliases={"native": "model.layers.0.mlp.gate_proj.weight"},
+        tensors={"model.layers.0.mlp.gate_proj.weight": tensor},
     )
     change(tensor)
 
@@ -333,8 +366,7 @@ def _publisher():
     return MilesPublisher(
         plan=_plan(),
         source_partition=0,
-        tensors={"native": FakeTensor((4, 4))},
-        aliases={"native": "model.layers.0.mlp.gate_proj.weight"},
+        tensors={"model.layers.0.mlp.gate_proj.weight": FakeTensor((4, 4))},
     )
 
 
@@ -344,6 +376,7 @@ def _session(client, rendezvous=None, **kwargs):
         rendezvous=FakeRendezvous() if rendezvous is None else rendezvous,
         publisher=_publisher(),
         source_partition=0,
+        device="cuda:0",
         **kwargs,
     )
 
@@ -421,7 +454,7 @@ def test_trainer_session_factory_passes_the_frozen_topology_and_abi(monkeypatch)
         topology=_topology(),
         publisher=_publisher(),
         source_partition=0,
-        slot_id="trainer-pp0-tp0",
+        slot_id="trainer-0",
         worker_id="trainer-worker-0",
         index_in_role=0,
     )
@@ -469,25 +502,24 @@ def test_trainer_session_factory_rejects_plan_meshes_outside_topology():
         global_shape=plan.bulk[0].global_shape,
         dtype=plan.bulk[0].dtype,
         partition_id=plan.bulk[0].partition_id,
-        src_mesh=MeshSpec(shape=(2,), rank_offset=1),
+        src_mesh=plan.bulk[0].src_mesh,
         src_placements=plan.bulk[0].src_placements,
-        dst_mesh=plan.bulk[0].dst_mesh,
+        dst_mesh=MeshSpec(shape=(2,), rank_offset=2),
         dst_placements=plan.bulk[0].dst_placements,
     )
     publisher = MilesPublisher(
         plan=plan,
         source_partition=0,
-        tensors={"native": FakeTensor((4, 4))},
-        aliases={"native": "model.layers.0.mlp.gate_proj.weight"},
+        tensors={"model.layers.0.mlp.gate_proj.weight": FakeTensor((4, 4))},
     )
 
-    with pytest.raises(ValueError, match="src_mesh ranks"):
+    with pytest.raises(ValueError, match="dst_mesh ranks"):
         MilesTrainerSession.create(
             rendezvous=FakeRendezvous(),
             topology=_topology(),
             publisher=publisher,
             source_partition=0,
-            slot_id="trainer-pp0-tp0",
+            slot_id="trainer-0",
             worker_id="trainer-worker-0",
             index_in_role=0,
         )
@@ -500,7 +532,7 @@ def test_trainer_session_factory_rejects_a_device_mismatched_with_storage():
             topology=_topology(),
             publisher=_publisher(),
             source_partition=0,
-            slot_id="trainer-pp0-tp0",
+            slot_id="trainer-0",
             worker_id="trainer-worker-0",
             index_in_role=0,
             device="cuda:1",
@@ -523,7 +555,7 @@ def test_trainer_session_factory_resolves_bare_cuda_to_the_current_device(monkey
         topology=_topology(),
         publisher=_publisher(),
         source_partition=0,
-        slot_id="trainer-pp0-tp0",
+        slot_id="trainer-0",
         worker_id="trainer-worker-0",
         index_in_role=0,
         device=torch.device("cuda"),

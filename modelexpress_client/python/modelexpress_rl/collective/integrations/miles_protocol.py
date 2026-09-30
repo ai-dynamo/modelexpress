@@ -1000,7 +1000,6 @@ class MilesCollectiveProtocolCore:
                 plan=self._plan,
                 source_partition=rank,
                 tensors=local_tensors,
-                aliases={name: name for name in local_tensors},
             )
             self._session = MilesTrainerSession.create(
                 rendezvous=rendezvous,

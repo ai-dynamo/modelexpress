@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .. import envs
-from ..types import MeshSpec, PlacementKind, ReshardPlan
+from ..types import PlacementKind, ReshardPlan
 
 
 def _text(value: object, label: str) -> str:
@@ -67,6 +67,28 @@ class _FrozenPlan:
                 "the MILES/SGLang collective integration supports BF16 "
                 f"base weights only; unsupported: {unsupported[:5]}"
             )
+        sharded = [
+            entry.name
+            for entry in snapshot.bulk
+            if any(
+                placement.kind is not PlacementKind.REPLICATE
+                for placement in entry.src_placements + entry.dst_placements
+            )
+        ]
+        if sharded:
+            raise ValueError(
+                "the MILES/SGLang collective integration supports replicated "
+                f"placements only; sharded: {sharded[:5]}"
+            )
+        non_local = [
+            entry.name for entry in snapshot.bulk if entry.src_mesh.ranks() != [0]
+        ]
+        if non_local:
+            raise ValueError(
+                "the MILES/SGLang collective integration requires the "
+                "partition-local source mesh (src_mesh ranks [0]); got "
+                f"{non_local[:5]}"
+            )
         self._plan = snapshot
         self._by_name = {entry.name: entry for entry in snapshot.bulk}
 
@@ -90,50 +112,23 @@ class _FrozenPlan:
                 f"topology: {self.source_partition_count} != "
                 f"{topology.source_partition_count}"
             )
-        trainers_per_lane = (
-            len(topology.trainer_slots) // topology.source_partition_count
-        )
-        expected_dst_ranks = list(
-            range(
-                trainers_per_lane,
-                trainers_per_lane + len(topology.generator_slots),
+        # The integration requires exactly one source rank per PP partition,
+        # so a lane's trainer membership is the single partition-local rank
+        # and the generators always follow it at offset 1.
+        if len(topology.trainer_slots) != topology.source_partition_count:
+            raise ValueError(
+                "the collective topology must name exactly one trainer slot "
+                f"per source partition: {len(topology.trainer_slots)} != "
+                f"{topology.source_partition_count}"
             )
-        )
+        expected_dst_ranks = list(range(1, 1 + len(topology.generator_slots)))
         for entry in self._plan.bulk:
-            src_ranks = entry.src_mesh.ranks()
-            # A rank list equal to range(start, start + len) is necessarily
-            # duplicate-free, so contiguity subsumes the duplicate check.
-            contiguous = bool(src_ranks) and src_ranks == list(
-                range(src_ranks[0], src_ranks[0] + len(src_ranks))
-            )
-            if not contiguous or src_ranks[0] < 0 or src_ranks[-1] >= trainers_per_lane:
-                raise ValueError(
-                    f"{entry.name}: src_mesh ranks {src_ranks} must be a non-empty "
-                    "contiguous subset of the trainer membership "
-                    f"for reshard lane {entry.partition_id}: "
-                    f"{list(range(trainers_per_lane))}"
-                )
             if entry.dst_mesh.ranks() != expected_dst_ranks:
                 raise ValueError(
                     f"{entry.name}: dst_mesh ranks {entry.dst_mesh.ranks()} do "
                     "not match the generator membership of reshard lane "
                     f"{entry.partition_id}: {expected_dst_ranks}"
                 )
-
-
-def _local_shape(
-    global_shape: tuple[int, ...],
-    mesh: MeshSpec,
-    placements: tuple[Any, ...],
-) -> tuple[int, ...]:
-    shape = list(global_shape)
-    for axis, placement in enumerate(placements):
-        if placement.kind is PlacementKind.SHARD:
-            dim = placement.dim
-            if dim is None:
-                raise ValueError("a shard placement must name a tensor dimension")
-            shape[dim] //= mesh.shape[axis]
-    return tuple(shape)
 
 
 @dataclass(frozen=True)
@@ -310,13 +305,9 @@ def _order_current_cuda_stream_before(
                 target = torch.cuda.default_stream(device=device)
             elif isinstance(stream, torch.cuda.Stream):
                 target = stream
-            elif isinstance(stream, int):
-                target = torch.cuda.ExternalStream(stream)
-            elif hasattr(stream, "cuda_stream"):
-                target = torch.cuda.ExternalStream(int(stream.cuda_stream))
             else:
                 raise TypeError(
-                    "collective lane streams must be torch CUDA streams or raw "
-                    f"CUDA stream handles, got {type(stream).__name__}"
+                    "collective lane streams must be torch CUDA streams, got "
+                    f"{type(stream).__name__}"
                 )
             target.wait_event(ready)

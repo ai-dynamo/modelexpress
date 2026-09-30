@@ -20,7 +20,6 @@ from ._common import (
     _collective_streams,
     _FrozenPlan,
     _layer_groups,
-    _local_shape,
     _order_current_cuda_stream_before,
     _single_device,
     _tensor_signature,
@@ -79,7 +78,12 @@ class CollectiveTopology:
 
 
 class MilesPublisher:
-    """Bind explicit MILES aliases to stable partition-local trainer tensors."""
+    """Bind stable partition-local trainer tensors to their canonical plan names.
+
+    ``tensors`` is keyed by the canonical plan name directly: the only caller
+    (the MILES protocol) materializes the HF bucket stream under those names
+    already, so no alias mapping exists to keep consistent.
+    """
 
     def __init__(
         self,
@@ -87,7 +91,6 @@ class MilesPublisher:
         plan: ReshardPlan,
         source_partition: int,
         tensors: dict[str, Any],
-        aliases: dict[str, str],
     ) -> None:
         self._plan = _FrozenPlan(plan)
         if not 0 <= source_partition < self._plan.source_partition_count:
@@ -97,42 +100,26 @@ class MilesPublisher:
             )
         self._source_partition = source_partition
         self._tensors = dict(tensors)
-        self._aliases = dict(aliases)
-        if set(self._tensors) != set(self._aliases):
-            raise ValueError("every MILES tensor must have exactly one explicit alias")
-        if len(set(self._aliases.values())) != len(self._aliases):
-            raise ValueError("MILES canonical aliases must not contain duplicates")
 
         required = [
             name
             for name in self._plan.names()
             if self._plan.entry(name).partition_id == source_partition
         ]
-        if set(self._aliases.values()) != set(required):
+        if set(self._tensors) != set(required):
             raise ValueError(
-                f"MILES aliases must exactly cover partition {source_partition}; "
-                f"expected {required}, got {list(self._aliases.values())}"
+                f"MILES tensors must exactly cover partition {source_partition}; "
+                f"expected {required}, got {sorted(self._tensors)}"
             )
-        native_by_canonical = {
-            canonical_name: native_name
-            for native_name, canonical_name in self._aliases.items()
-        }
-        self._ordered_aliases = tuple(
-            (native_by_canonical[canonical_name], canonical_name)
-            for canonical_name in required
-        )
+        self._ordered_names = tuple(required)
 
         self._signatures = {}
-        for native_name, canonical_name in self._ordered_aliases:
-            entry = self._plan.entry(canonical_name)
-            self._signatures[native_name] = _tensor_signature(
-                canonical_name,
-                self._tensors[native_name],
-                expected_shape=_local_shape(
-                    entry.global_shape,
-                    entry.src_mesh,
-                    entry.src_placements,
-                ),
+        for name in self._ordered_names:
+            entry = self._plan.entry(name)
+            self._signatures[name] = _tensor_signature(
+                name,
+                self._tensors[name],
+                expected_shape=entry.global_shape,
                 expected_dtype=entry.dtype,
             )
         self._device = _single_device(self._signatures, "MILES publisher")
@@ -149,17 +136,13 @@ class MilesPublisher:
         self._plan.validate_topology(topology)
 
     def _validate_stable(self) -> None:
-        for native_name, canonical_name in self._ordered_aliases:
-            entry = self._plan.entry(canonical_name)
+        for name in self._ordered_names:
+            entry = self._plan.entry(name)
             _check_stable(
-                canonical_name,
-                self._tensors[native_name],
-                self._signatures[native_name],
-                expected_shape=_local_shape(
-                    entry.global_shape,
-                    entry.src_mesh,
-                    entry.src_placements,
-                ),
+                name,
+                self._tensors[name],
+                self._signatures[name],
+                expected_shape=entry.global_shape,
                 expected_dtype=entry.dtype,
             )
 
@@ -173,8 +156,8 @@ class MilesPublisher:
     def local_params(self) -> dict[str, LocalParamSpec]:
         self._validate_stable()
         return {
-            canonical_name: LocalParamSpec(base=self._tensors[native_name])
-            for native_name, canonical_name in self._ordered_aliases
+            name: LocalParamSpec(base=self._tensors[name])
+            for name in self._ordered_names
         }
 
     def start_new_round(self, version: str) -> None:
@@ -186,7 +169,18 @@ class MilesPublisher:
 
 
 class MilesTrainerSession:
-    """Own one trainer rank's reusable collective membership and lifecycle."""
+    """Own one trainer rank's reusable collective membership and lifecycle.
+
+    ``create`` resolves the lane device and streams exactly once, against the
+    publisher's storage device, and hands them here resolved; a direct
+    construction takes ``device``/``streams`` as given.
+
+    Rendezvous ownership is shared by design: the session closes the
+    rendezvous it is handed on every teardown path (``_fail_round`` and
+    ``close``), and the protocol that created it closes it again as the
+    final owner. ``CollectiveRendezvous.close()`` is idempotent, so the
+    double close is safe.
+    """
 
     def __init__(
         self,
@@ -204,8 +198,8 @@ class MilesTrainerSession:
         self._publisher = publisher
         self._source_partition = source_partition
         self._groups = _layer_groups(layer_groups, publisher.parameter_names())
-        self._device = _client_device(device, publisher.device, "MILES trainer")
-        self._streams = _collective_streams(streams, device=self._device)
+        self._device = device
+        self._streams = streams
         self._membership = None
         self._prepared = False
         self._closed = False
@@ -283,11 +277,14 @@ class MilesTrainerSession:
     def group_count(self) -> int:
         return len(self._groups)
 
-    def _require_open_round(self, version: str, method: str) -> None:
+    def _require_prepared(self, method: str) -> None:
         if not self._prepared or self._membership is None:
             raise RuntimeError(f"prepare must complete before {method}")
         if self._closed:
             raise RuntimeError("the MILES trainer session is closed")
+
+    def _require_open_round(self, version: str, method: str) -> None:
+        self._require_prepared(method)
         if self._round_version is None:
             raise RuntimeError(f"begin_round must run before {method}")
         if version != self._round_version:
@@ -297,10 +294,7 @@ class MilesTrainerSession:
             )
 
     def begin_round(self, *, version: str) -> None:
-        if not self._prepared or self._membership is None:
-            raise RuntimeError("prepare must complete before a trainer round")
-        if self._closed:
-            raise RuntimeError("the MILES trainer session is closed")
+        self._require_prepared("a trainer round")
         if self._round_version is not None:
             raise RuntimeError(
                 f"a round for version {self._round_version!r} is already in flight"
@@ -359,7 +353,8 @@ class MilesTrainerSession:
         if self._closed:
             return
         # One-shot: even a failed teardown must not rerun cleanup or reopen
-        # the session.
+        # the session. Repeating the rendezvous close from the protocol's own
+        # teardown is safe: CollectiveRendezvous.close() is idempotent.
         self._closed = True
         try:
             self._client.cleanup()
