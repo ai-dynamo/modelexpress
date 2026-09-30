@@ -675,7 +675,11 @@ defers initialization until object-storage fallback is needed. It resolves the
 full replay lineage and downloads a source-verified full root before applying
 deltas. This does not activate the disk checkpoint or change the serving UID;
 activation still follows successful engine installation. Recorded artifacts
-continue to undergo integrity verification.
+continue to undergo integrity verification. The bootstrap requirement is checked
+on every replay request. Once initialized, an object-storage-only runtime can
+resolve from its serving version instead of revisiting the full lineage. Mixed
+P2P/object-storage runtimes still resolve from the full root because their disk
+checkpoint may lag the serving version.
 
 The engine's serving version remains separate from checkpoint-cache state.
 vLLM constructs its Control server only after EngineCore and its workers finish
