@@ -149,3 +149,23 @@ def test_a_single_device_piece_passes_the_plan_check():
     assert jax_interop.local_shard(array, expect_index=expect) is (
         array.addressable_shards[0].data
     )
+
+
+def test_the_default_layout_of_a_real_array_is_accepted():
+    """What XLA hands back by default must pass the row-major check."""
+    for dtype in ("float32", "bfloat16", "float8_e4m3fn", "int8"):
+        array = jax.device_put(jnp.zeros((2, 3, 4), dtype), jax.devices("cpu")[0])
+        assert array.format.layout is not None, "the layout check would not run"
+        jax_interop.JaxDeviceBuffer(array)
+
+
+def test_a_real_transposed_layout_is_refused():
+    """A non-default device layout is caught before a pointer is handed out."""
+    from jax.experimental.layout import Format, Layout  # noqa: PLC0415
+
+    device = jax.devices("cpu")[0]
+    host = jax.device_put(jnp.arange(24.0).reshape(4, 6), device)
+    array = jax.device_put(host, Format(Layout((1, 0)), host.sharding))
+    assert array.format.layout.major_to_minor == (1, 0)
+    with pytest.raises(ValueError, match="dense row-major"):
+        jax_interop.JaxDeviceBuffer(array)

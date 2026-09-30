@@ -166,6 +166,29 @@ def plan_sharding(devices: Sequence[Any]) -> Any:
     return sharding_for
 
 
+def _check_row_major(array: Any) -> None:
+    """Refuse a buffer whose device layout is not dense row-major.
+
+    ``Array.format`` returns ``Format(None, sharding)`` when the backend
+    reports the layout query as unimplemented, and jax before 0.7.0 names the
+    field ``device_local_layout`` rather than ``layout``, so both read as
+    ``None`` here and the check is skipped rather than guessed at.
+    """
+    layout = getattr(getattr(array, "format", None), "layout", None)
+    if layout is None:
+        return
+    major_to_minor = getattr(layout, "major_to_minor", None)
+    if major_to_minor is None:
+        return
+    row_major = tuple(range(len(array.shape)))
+    if tuple(major_to_minor) != row_major or getattr(layout, "tiling", None):
+        raise ValueError(
+            f"a reshard buffer must be dense row-major, got {layout}. The wire op "
+            "reads the pointer as a row-major image of the shape; relayout the "
+            "array to the default layout before handing it over."
+        )
+
+
 class JaxDeviceBuffer:
     """A single-device ``jax.Array`` in the shape ``reshard`` resolves.
 
@@ -179,12 +202,19 @@ class JaxDeviceBuffer:
     so letting the array be collected would free the device allocation under a
     transfer already in flight.
 
-    ``is_contiguous`` is deliberately not defined. The resolver checks it only
-    when it is present, and defining it would be asserting a property of XLA's
-    device layout rather than reading one. It holds for every dtype and shape
-    measured -- float32, float16, bfloat16, int8 and float8_e4m3fn over six
-    shapes, byte-identical to the canonical row-major image -- and a dense
-    row-major layout is what XLA produces for these arrays on GPU.
+    The wire op reads ``prod(shape)`` elements from the pointer in row-major
+    order, so the device layout is read at construction and anything other
+    than dense row-major is refused: a transposed or tiled buffer would
+    otherwise ship scrambled bytes with no error anywhere. JAX spells
+    row-major as ``major_to_minor == (0, 1, ..., ndim - 1)`` with no tiling,
+    which is what XLA produces by default. Where the layout cannot be read --
+    an older jax without ``Array.format.layout``, or a backend that reports
+    the query as unimplemented -- the array is accepted as before.
+
+    ``is_contiguous`` is still not defined. The resolver checks it only when
+    it is present, and the refusal above is the real check; a constant
+    ``True`` would only restate it, and would be an assertion rather than a
+    reading on the backends that cannot report a layout.
     """
 
     __slots__ = ("_array", "_ptr", "shape", "dtype")
@@ -196,6 +226,7 @@ class JaxDeviceBuffer:
                 f"a reshard buffer must live on one device, got {len(devices)}. "
                 "Pass local_shard(array) rather than the global array."
             )
+        _check_row_major(array)
         self._array = array
         self._ptr = int(array.unsafe_buffer_pointer())
         self.shape = tuple(int(dim) for dim in array.shape)
@@ -209,11 +240,6 @@ class JaxDeviceBuffer:
             f"JaxDeviceBuffer(shape={self.shape}, dtype={self.dtype}, "
             f"ptr=0x{self._ptr:x})"
         )
-
-
-def as_reshard_buffer(array: Any) -> JaxDeviceBuffer:
-    """Wrap this process's shard of ``array`` for the wire op."""
-    return JaxDeviceBuffer(local_shard(array))
 
 
 class _ByteView:
@@ -264,25 +290,3 @@ def barrier_buffer(device: Any) -> Any:
         target = jax.local_devices()[device] if isinstance(device, int) else device
         zero = jax.device_put(zero, target)
     return _ByteView(jax.block_until_ready(zero))
-
-
-def ready(*arrays: Any) -> None:
-    """Block until every array's producing computation has completed.
-
-    JAX enqueues on its own stream and ``reshard`` takes a bare device pointer
-    with no stream handshake, so nothing orders the transfer against the
-    computation that produced the weights. This is not a precaution: the race
-    was measured. ``unsafe_buffer_pointer()`` returns in microseconds without
-    synchronizing, and a consumer reading those bytes on another stream while
-    the producing computation is still in flight observes intermediate values
-    -- in every trial, and even when the read itself took hundreds of
-    milliseconds. Skipping this transfers partially-computed weights with
-    nothing anywhere reporting an error.
-
-    One host synchronize per round is the cost, and it is negligible beside
-    the transfer; per-parameter synchronizing is not, which is why this takes
-    a batch.
-    """
-    import jax  # noqa: PLC0415
-
-    jax.block_until_ready(list(arrays))
