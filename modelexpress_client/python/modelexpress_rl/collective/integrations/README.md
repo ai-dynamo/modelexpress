@@ -36,14 +36,14 @@ completion.
 All knobs are mx-namespaced. Each can be set by a MILES argument or an
 environment variable; the environment fallback is read only when the argument
 is unset. **The environment variables are the supported path**: stock MILES
-entry points parse their arguments strictly and reject the four
-`--modelexpress-*` flags below, which are only reachable through a custom
-entry hook.
+entry points parse their arguments strictly and reject the `--modelexpress-*`
+flags below, which are only reachable through a custom entry hook.
 
 | Environment variable | MILES argument | Default | Notes |
 | --- | --- | --- | --- |
-| `MX_SERVER_ADDRESS` | `--modelexpress-server-address` | none (required) | mx-server `host:port`. `build_protocol.validate_args` fails loudly when neither the env var nor the argument is set. Plain `host:port` or `grpc://`; secure schemes are rejected. |
+| `MX_SERVER_ADDRESS` | `--modelexpress-server-address` | none (required) | mx-server `host:port`. `build_protocol.validate_args` fails loudly when neither the env var nor the argument is set. Plain `host:port` is expected; `grpc://` and `http://` prefixes are stripped, and the secure schemes (`grpcs://`, `https://`) are rejected — a configured MX auth token therefore travels unencrypted on this path. |
 | `MX_MILES_RUN_ID` | `--modelexpress-m2n-run-id` | unset | Optional run identity. When set it must be set identically on every trainer rank; a mix of set and unset ranks is rejected. |
+| `MX_MILES_ABI_VERSION` | `--modelexpress-m2n-abi-version` | `miles-sglang-bf16-replicated-v1` | M2N ABI identity stamped into the frozen topology contract. The deployed receivers form groups against this exact value, so override it only in step with the receiver build. |
 | `MX_MILES_PUBLISH_GROUPS` | `--modelexpress-m2n-publish-groups` | `1` | Integer >= 1. Caps how many publish groups a round is chunked into along the canonical plan order; larger values give finer engine-side overlap granularity. Never splits a tensor. |
 | `MX_MILES_CONNECT_TIMEOUT_S` | `--modelexpress-m2n-connect-timeout-s` | `10.0` | Seconds the first round waits for the mx-server channel to become ready before failing. |
 
@@ -57,24 +57,34 @@ remediation — not deep inside a round.
 ## Canonical plan order
 
 Publish groups are contiguous byte-balanced chunks of the weight plan sorted
-by the 795 canonical key (`ParamPlan.canonical()`), and every trainer rank
+by the canonical key (`ParamPlan.canonical()`), and every trainer rank
 publishes every group id in that order. The ordering is the wire contract: the
-795 receiver backend re-sorts `plan.bulk` canonically and executes each layer
+receiver backend re-sorts `plan.bulk` canonically and executes each layer
 group's active subset in canonical order regardless of caller order, so any
 contiguous chunking of a canonically ordered plan stays wire-safe — the
 receiver never has to reconcile two orderings of the same tensors.
+
+Canonical order is lexicographic by name (`layers.10` sorts before
+`layers.2`), so a publish group carrying late-layer tensors can complete
+later than the layer-ordered bucket stream would suggest. Correctness is
+unaffected: every weight is copied into its wire buffer during `begin_sync`,
+so a group publishes complete, current data whenever it drains.
 
 ## Supported geometry (fail-closed limits)
 
 The adapter validates the topology at `connect`/`begin_sync` time and raises
 outside the supported envelope:
 
-- One source rank per PP partition: TP/EP must be fully gathered on the
-  source rank (`required_placement` is `WeightUpdatePlacement(gather_pp=False)`
-  with TP/EP gather); every trainer rank is a sender for its own partition.
+- Exactly one source rank per PP partition (pure PP): TP, EP, ETP, CP, and
+  DP must all be size one on the source (`required_placement` is
+  `WeightUpdatePlacement(gather_pp=False)`, and `connect` rejects any
+  parallel group larger than one); every trainer rank is a sender for its
+  own partition.
 - `--megatron-to-hf-mode raw` (the MILES default) is required: `bridge` mode
   forces `gather_pp=True`, and this adapter rejects that placement at
-  `connect()` with "MILES NCCL M2N requires PP-local HF tensors".
+  `connect()` with "MILES NCCL M2N requires PP-local HF tensors". Raw mode
+  converts from a Megatron checkpoint, so the run also needs `--ref-load`
+  pointing at that checkpoint; bridge mode loads HF directly.
 - Explicit engine GPU topology: `engine_gpu_counts`/`engine_gpu_offsets` must
   be provided; ambiguous engine placement is rejected.
 - Base-model rounds only: `supports_lora = False`; selector must be `"all"`
@@ -82,8 +92,10 @@ outside the supported envelope:
   model and the `"target"` selector.
 - BF16 weights only; tensor names, shapes, and dtypes are frozen after the
   first `begin_sync` and any change across rounds is an error.
-- Contiguous, non-scalar tensors in stable storage: the bucket stream must
-  reference the wire buffers materialized during `begin_sync`.
+- Contiguous, non-scalar tensors in stable storage: the weights are copied
+  into the wire buffers during `begin_sync`, and `send_bucket` only tracks
+  name arrival order against those buffers — it never reads the bucket
+  tensors' storage.
 
 Any mid-round failure closes the protocol (channel, rendezvous, and session
 torn down) and the next `begin_sync` raises rather than silently continuing a
@@ -98,11 +110,18 @@ them. When the failing rank is rank 0 (the driver),
 `end_weight_update`/`resume_engines` never run and the engines stay paused
 until the job is torn down.
 
+There is no happy-path close: MILES never calls `close()` on a protocol that
+finished its rounds, so the channel, rendezvous, and session are held until
+process exit. `close()` runs on the failure paths above; a close that fails
+mid-teardown stays retryable — a later `close()` retries the remaining
+cleanup — but the protocol never reopens: once closed, every later
+`begin_sync` raises.
+
 ## Receiver-side deployment requirements
 
 The derived `operation_id` (`miles-<group>-weight-version-<version>`) names a
 transfer row this adapter never creates: `create_transfer` is not part of the
-795 client surface, and the trainer intentionally never reports. The deployed
+trainer client surface, and the trainer intentionally never reports. The deployed
 full-branch receiver reports with that `operation_id` at end of round, and
 mx-server maps a missing transfer row to NOTFOUND, which fails the receiver's
 round after the weights have landed. A deployment must therefore ensure a
@@ -114,16 +133,16 @@ The adapter sends no tensor digests, so the receiver's
 `MX_MILES_VERIFY_TENSOR_EQUALITY` digest check must stay at its default (off);
 enabling it against this adapter fails loudly at round start.
 
-The 795-base rendezvous has no bootstrap-fence RPCs, so this client cannot
+The rendezvous at this base has no bootstrap-fence RPCs, so this client cannot
 answer a fence: groups must form with `requires_bootstrap_fence=0`. A group
 formed with the fence required would deadlock at bootstrap, with receivers
 waiting at the fence for trainers that have no RPC to arrive with.
 
 ## Performance caveat
 
-This port targets the minimal 795-base client surface. The wide-lane and
-drain defaults at this base are **untuned**: do not read throughput numbers
-from this configuration. Certified performance numbers live on the full
+This port targets the minimal trainer client surface at this base. The
+wide-lane and drain defaults at this base are **untuned**: do not read
+throughput numbers from this configuration. Certified performance numbers live on the full
 feature branch (`modelexpress-miles-nccl-m2n`). The one tuning lever exposed
 here is the publish-group count above, which trades per-group overhead
 against engine-side overlap granularity.
