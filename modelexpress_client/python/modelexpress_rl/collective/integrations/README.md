@@ -58,7 +58,7 @@ variables work under every entry point.
 | --- | --- | --- | --- |
 | `MX_SERVER_ADDRESS` | `--modelexpress-server-address` | none (required) | mx-server `host:port`. `build_protocol.validate_args` fails loudly when neither the env var nor the argument is set. Plain `host:port` is expected; `grpc://` and `http://` prefixes are stripped, and the secure schemes (`grpcs://`, `https://`) are rejected — a configured MX auth token therefore travels unencrypted on this path. |
 | `MX_MILES_RUN_ID` | `--modelexpress-m2n-run-id` | unset | Optional run identity. When set it must be set identically on every trainer rank; a mix of set and unset ranks is rejected. |
-| `MX_MILES_ABI_VERSION` | `--modelexpress-m2n-abi-version` | `miles-sglang-bf16-replicated-v1` | M2N ABI identity stamped into the frozen topology contract. The deployed receivers form groups against this exact value, so override it only in step with the receiver build. |
+| `MX_MILES_ABI_VERSION` | `--modelexpress-m2n-abi-version` | `miles-sglang-bf16-replicated-v1` | M2N ABI identity hashed into the plan digest: peers that disagree never reach READY. That protection holds only when the deployed receiver pins a matching value of its own, so override it only in step with the receiver build. |
 | `MX_MILES_PUBLISH_GROUPS` | `--modelexpress-m2n-publish-groups` | `1` | Integer >= 1. Caps how many publish groups a round is chunked into along the canonical plan order; larger values give finer engine-side overlap granularity. Never splits a tensor. |
 | `MX_MILES_CONNECT_TIMEOUT_S` | `--modelexpress-m2n-connect-timeout-s` | `10.0` | Seconds the first round waits for the mx-server channel to become ready before failing. |
 

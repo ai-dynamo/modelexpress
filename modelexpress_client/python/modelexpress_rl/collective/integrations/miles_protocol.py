@@ -604,8 +604,9 @@ class MilesCollectiveProtocolCore:
         )
         topology = CollectiveTopology(
             # The rendezvous model identity is an adapter constant, not the
-            # HF model id: miles' parser has no `model` argument, and the
-            # deployed receivers form groups against this exact value.
+            # HF model id: miles' parser has no `model` argument. It is part of
+            # the frozen contract the receiver sees; keep it in step with the
+            # deployed receiver build.
             model_name="miles-model",
             trainer_slots=tuple(
                 f"{slot_prefix}trainer-{rank}" for rank in range(trainer_world)
