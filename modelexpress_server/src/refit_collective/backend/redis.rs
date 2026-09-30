@@ -1657,6 +1657,7 @@ mod tests {
             ("w-g0", 2, "m"),
             ("w-t1", 1, "m2"),
             ("w-g1", 2, "m2"),
+            ("w-g0-new", 2, "m"),
         ] {
             redis::cmd("HSET")
                 .arg(worker_key(worker_id))
@@ -1766,23 +1767,6 @@ mod tests {
         // epoch no longer returns the old operation: it reclaims the
         // reservation into a fresh create that answers to the new epoch's
         // gate, and tombstones the superseded row.
-        redis::cmd("HSET")
-            .arg(worker_key("w-g0-new"))
-            .arg("worker_id")
-            .arg("w-g0-new")
-            .arg("role")
-            .arg(2)
-            .arg("model_name")
-            .arg("m")
-            .query_async::<()>(&mut redis)
-            .await
-            .expect("register replacement worker");
-        redis::cmd("EXPIRE")
-            .arg(worker_key("w-g0-new"))
-            .arg(60)
-            .query_async::<()>(&mut redis)
-            .await
-            .expect("expire replacement registration");
         let replacement = backend
             .join_group(&join(
                 &unfenced,
