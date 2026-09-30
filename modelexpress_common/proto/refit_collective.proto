@@ -31,6 +31,7 @@ service RefitCollectiveService {
   rpc JoinCollectiveGroup(JoinCollectiveGroupRequest) returns (CollectiveGroupMembership);
   rpc GetCollectiveGroup(GetCollectiveGroupRequest) returns (CollectiveGroup);
   rpc PublishGroupBootstrap(PublishGroupBootstrapRequest) returns (CollectiveGroup);
+  rpc ReachCollectiveBootstrapFence(ReachCollectiveBootstrapFenceRequest) returns (CollectiveBootstrapFence);
   rpc ReportCollectiveTransfer(ReportCollectiveTransferRequest) returns (CollectiveTransfer);
 }
 
@@ -72,6 +73,15 @@ enum CollectiveTransferState {
   COLLECTIVE_TRANSFER_STATE_COMPLETE = 3;
   COLLECTIVE_TRANSFER_STATE_FAILED = 4;
   COLLECTIVE_TRANSFER_STATE_ABORTED = 5;
+}
+
+enum BootstrapFencePhase {
+  BOOTSTRAP_FENCE_PHASE_UNSPECIFIED = 0;
+  // Every rank has settled its local communicators before the lane step's
+  // shared NCCL broadcast barrier.
+  BOOTSTRAP_FENCE_PHASE_PRE_BARRIER = 1;
+  // Every rank has completed the final NCCL bootstrap barrier.
+  BOOTSTRAP_FENCE_PHASE_COMPLETE = 2;
 }
 
 // One admitted worker process inside one lane.
@@ -131,6 +141,10 @@ message CollectiveGroup {
   // with this non-empty; it exists so that a cohort which disagrees is
   // diagnosable instead of merely stuck in FORMING with no field to read.
   repeated string disagreeing_slots = 11;
+  // Echo of the requirement the group was formed with. False both for groups
+  // formed without the requirement and for groups stored by a server that
+  // predates the field, so a client that declared it can detect the downgrade.
+  bool requires_bootstrap_fence = 12;
 }
 
 // What a joining worker needs in order to build its communicators.
@@ -175,6 +189,16 @@ message CollectiveGroupSpec {
   repeated string expected_generator_slots = 3;
   // The communicators this operation needs. Declared, never inferred.
   repeated LaneSpec lanes = 4;
+  // Opt in to the all-rank bootstrap fence: when true, MX rejects
+  // CreateCollectiveTransfer until every admitted slot has reached the
+  // COMPLETE fence for the current epoch. Every participant of one operation
+  // must declare the same value; MX rejects a mismatched join/create rather
+  // than forming a group whose members disagree about the fence. Deliberately
+  // excluded from the group_id hash: a disagreement must surface as a clear
+  // rejection, not as two groups that each wait forever for their missing
+  // half. Clients that predate this field declare false and get the
+  // historical ungated behavior.
+  bool requires_bootstrap_fence = 5;
 }
 
 message JoinCollectiveGroupRequest {
@@ -202,6 +226,28 @@ message PublishGroupBootstrapRequest {
   uint32 lane_id = 3;
   string worker_id = 4;
   bytes nccl_unique_id = 5;
+}
+
+// One full-group control-plane fence between communicator initialization steps.
+// Every admitted slot reaches every declared lane step, even when that slot is
+// not a member of the lane being initialized.
+message ReachCollectiveBootstrapFenceRequest {
+  string group_id = 1;
+  uint64 epoch = 2;
+  uint32 lane_id = 3;
+  string slot_id = 4;
+  string worker_id = 5;
+  BootstrapFencePhase phase = 6;
+}
+
+message CollectiveBootstrapFence {
+  string group_id = 1;
+  uint64 epoch = 2;
+  uint32 lane_id = 3;
+  bool released = 4;
+  // Sorted for deterministic diagnostics and retry behavior.
+  repeated string missing_slots = 5;
+  BootstrapFencePhase phase = 6;
 }
 
 message CollectiveTransfer {
