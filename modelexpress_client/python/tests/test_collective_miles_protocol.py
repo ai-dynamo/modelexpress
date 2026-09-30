@@ -112,6 +112,27 @@ def _stub_single_rank_collectives(monkeypatch):
     )
 
 
+class _DroppedFuture:
+    """A future stub: cancel() reports rather than raises, like the real API."""
+
+    def __init__(self, *, cancellable=True):
+        self.cancellable = cancellable
+        self.cancelled = False
+        self.callbacks = []
+
+    def cancel(self):
+        if not self.cancellable:
+            return False
+        self.cancelled = True
+        return True
+
+    def add_done_callback(self, callback):
+        self.callbacks.append(callback)
+
+    def result(self):
+        raise RuntimeError("late generator failure")
+
+
 def _armed_protocol(monkeypatch, publish_groups=1):
     """A connected protocol with one begin_sync round armed and a fake session."""
     args = _args()
@@ -152,7 +173,7 @@ def _armed_protocol(monkeypatch, publish_groups=1):
 
     def generator_futures(action, **kwargs):
         events.append(("submit", action, kwargs))
-        return ["future"]
+        return [_DroppedFuture()]
 
     monkeypatch.setattr(protocol, "_generator_futures", generator_futures)
     monkeypatch.setattr(
@@ -1057,7 +1078,7 @@ def test_bucket_stream_publishes_groups_in_plan_order_and_finishes(monkeypatch):
     )
     protocol.finalize(1)
 
-    assert events == [
+    assert events[:-1] == [
         (
             "submit",
             "run_round",
@@ -1070,8 +1091,10 @@ def test_bucket_stream_publishes_groups_in_plan_order_and_finishes(monkeypatch):
         ("publish", "1", 0),
         ("publish", "1", 1),
         ("finish", "1"),
-        ("wait", ["future"]),
     ]
+    # The finalize waits on exactly the future the fan-out submitted.
+    assert events[-1][0] == "wait"
+    assert len(events[-1][1]) == 1
     assert protocol._round_version is None
 
     protocol.begin_sync(2, lambda *, materialize: iter([list(tensors.items())]))
@@ -1454,25 +1477,6 @@ def test_build_frozen_contract_rejects_a_rank_that_is_not_its_pp_partition(
 
     with pytest.raises(ValueError, match="must equal its PP partition"):
         protocol._build_frozen_contract()
-
-
-class _DroppedFuture:
-    def __init__(self, *, cancellable=True):
-        self.cancellable = cancellable
-        self.cancelled = False
-        self.callbacks = []
-
-    def cancel(self):
-        if not self.cancellable:
-            return False
-        self.cancelled = True
-        return True
-
-    def add_done_callback(self, callback):
-        self.callbacks.append(callback)
-
-    def result(self):
-        raise RuntimeError("late generator failure")
 
 
 def test_retire_dropped_futures_observes_futures_that_refuse_to_cancel(caplog):
