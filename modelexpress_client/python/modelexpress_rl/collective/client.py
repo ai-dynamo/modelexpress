@@ -332,6 +332,12 @@ class _RefitClientBase:
         # still initializing lane N; overlapping communicator creation can hang.
         # Every rank walks the FULL declared lane set, including lanes it is
         # not on, so the barriers line up; membership.lane raises for those.
+        # After its optional communicator creation each rank settles every
+        # local communicator, reaches a server-backed full-cohort fence, and
+        # only then enters the NCCL broadcast barrier. The control-plane fence
+        # closes the race where a fast nonmember could reuse broadcast while a
+        # lane member was still initializing. The broadcast step itself follows
+        # the same protocol so no rank can start the first reshard step early.
         lane_order = [membership.broadcast_lane.lane_id] + [
             lane.lane_id for lane in declared if lane.kind == "RESHARD"
         ]
@@ -365,6 +371,20 @@ class _RefitClientBase:
                 # instead of a rejected barrier launch on a peer.
                 self._cache.settle_group(membership.group_id, membership.epoch)
 
+                # UNCONDITIONAL: every rank arrives at this lane's fence
+                # whether or not the group opted into the create gate --
+                # fence-capable peers await it unconditionally, so skipping
+                # the arrival would hold the whole cohort at this lane.
+                self._rendezvous.await_bootstrap_fence(
+                    group_id=membership.group_id,
+                    epoch=membership.epoch,
+                    lane_id=lane_id,
+                    slot_id=self._slot_id,
+                    worker_id=self._worker_id,
+                    timeout_s=envs.MX_NCCL_REFIT_GROUP_TIMEOUT_S,
+                    phase="PRE_BARRIER",
+                )
+
                 broadcast = self._cache.get(
                     LaneKey(
                         group_id=membership.group_id,
@@ -379,6 +399,19 @@ class _RefitClientBase:
                 _bootstrap_barrier(
                     broadcast, self._device, alloc=self._barrier_alloc
                 )
+            # Every lane's PRE_BARRIER fence released and every rank passed its
+            # barriers; the COMPLETE arrival tells MX this epoch finished its
+            # all-rank bootstrap, which is what lets a fenced group create
+            # transfers. Same unconditional arrival as above.
+            self._rendezvous.await_bootstrap_fence(
+                group_id=membership.group_id,
+                epoch=membership.epoch,
+                lane_id=lane_order[-1],
+                slot_id=self._slot_id,
+                worker_id=self._worker_id,
+                timeout_s=envs.MX_NCCL_REFIT_GROUP_TIMEOUT_S,
+                phase="COMPLETE",
+            )
         except BaseException:
             self._cache.abort_group(membership.group_id)
             self._membership = None
