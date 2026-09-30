@@ -75,23 +75,26 @@ def _publish_group_count(args: Any) -> int:
     )
     if raw is None:
         return _DEFAULT_PUBLISH_GROUPS
-    invalid = ValueError(
-        f"modelexpress_m2n_publish_groups must be a positive integer, got {raw!r}"
-    )
+
+    def invalid() -> ValueError:
+        return ValueError(
+            f"modelexpress_m2n_publish_groups must be a positive integer, got {raw!r}"
+        )
+
     if isinstance(raw, bool):
-        raise invalid
+        raise invalid()
     if isinstance(raw, str):
         try:
             count = int(raw.strip(), 10)
         except ValueError:
-            raise invalid from None
+            raise invalid() from None
     else:
         try:
             count = operator.index(raw)
         except TypeError:
-            raise invalid from None
+            raise invalid() from None
     if count < 1:
-        raise invalid
+        raise invalid()
     return count
 
 
@@ -103,18 +106,19 @@ def _connect_timeout_s(args: Any) -> float:
     )
     if raw is None:
         return _DEFAULT_CONNECT_TIMEOUT_S
-    try:
-        timeout = float(raw)
-    except (TypeError, ValueError):
-        raise ValueError(
-            "modelexpress_m2n_connect_timeout_s must be a positive number of "
-            f"seconds, got {raw!r}"
-        ) from None
-    if isinstance(raw, bool) or not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError(
+
+    def invalid() -> ValueError:
+        return ValueError(
             "modelexpress_m2n_connect_timeout_s must be a positive number of "
             f"seconds, got {raw!r}"
         )
+
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        raise invalid() from None
+    if isinstance(raw, bool) or not math.isfinite(timeout) or timeout <= 0:
+        raise invalid()
     return timeout
 
 
@@ -210,19 +214,12 @@ def _retire_dropped_futures(futures: list) -> None:
     """Cancel or observe futures a failure arm will not await.
 
     A dropped future that settles later would race teardown, and its
-    exception would never be retrieved. Cancel whatever has not started and
-    register an observer for the rest so late failures reach the log.
+    exception would never be retrieved. Cancel whatever has not started
+    (``cancel()`` reports rather than raises) and register an observer for
+    the rest so late failures reach the log.
     """
     for future in futures:
-        try:
-            cancelled = bool(future.cancel())
-        except BaseException:
-            logger.warning(
-                "cancelling a dropped MILES generator future failed",
-                exc_info=True,
-            )
-            cancelled = False
-        if cancelled:
+        if future.cancel():
             continue
         try:
             future.add_done_callback(_log_late_future_result)
@@ -471,7 +468,9 @@ class MilesCollectiveProtocolCore:
                         )
                     shape = tuple(int(dim) for dim in tensor.shape)
                     if first_round:
-                        wire = tensor.clone(memory_format=torch.contiguous_format)
+                        # The contiguity check above already pins the memory
+                        # format, so clone() preserves it.
+                        wire = tensor.clone()
                         prepared[name] = wire
                     else:
                         # A mid-stream failure can leave earlier wire buffers
@@ -519,10 +518,7 @@ class MilesCollectiveProtocolCore:
         return True
 
     def _arm_round(self, weight_version: int) -> None:
-        if self._round_version is not None:
-            raise RuntimeError(
-                f"the round for version {self._round_version!r} never finalized"
-            )
+        # begin_sync already rejected an unfinalized round before arming.
         if self._plan is None or self._publish_groups is None:
             raise RuntimeError("the frozen plan is unavailable")
         rank = dist.get_rank()
@@ -554,6 +550,18 @@ class MilesCollectiveProtocolCore:
         if trainer_world != partition_count:
             raise ValueError(
                 "the trainer world must contain exactly one rank per PP partition"
+            )
+        # One rank source: dist.get_rank() is what _arm_round and
+        # _prepare_sessions use for ownership, so the manifest must agree.
+        # The pure-PP connect gate makes the two indices equal; if that gate
+        # is ever relaxed, fail closed here rather than publish under a
+        # partition id the rest of the round does not use.
+        rank = dist.get_rank()
+        pp_rank = int(self._parallel_state.pp.rank)
+        if pp_rank != rank:
+            raise ValueError(
+                "the trainer's distributed rank must equal its PP partition "
+                f"index: rank {rank} != pp.rank {pp_rank}"
             )
         if not self._run_id_agreed:
             requested_run_id = self._run_id
@@ -610,13 +618,12 @@ class MilesCollectiveProtocolCore:
         )
         src_mesh = MeshSpec((1,), rank_offset=0)
         dst_mesh = MeshSpec((len(generator_slots),), rank_offset=1)
-        pp_rank = int(self._parallel_state.pp.rank)
         local_manifest = [
             (
                 name,
                 tuple(int(dim) for dim in tensor.shape),
                 "bfloat16",
-                pp_rank,
+                rank,
             )
             for name, tensor in self._tensors.items()
         ]
@@ -781,18 +788,17 @@ class MilesCollectiveProtocolCore:
             raise
         self._round_begun = True
 
-    def _drain_ready_groups(self, version: str) -> None:
+    def _drain_ready_groups(self, version: str) -> tuple[tuple[str, ...], ...]:
         if self._session is None or self._publish_groups is None:
             raise RuntimeError("collective sessions were not prepared")
-        while (
-            self._next_group < len(self._publish_groups)
-            and not self._pending[self._next_group]
-        ):
+        groups = self._publish_groups
+        while self._next_group < len(groups) and not self._pending[self._next_group]:
             self._session.publish_group(
                 version=version,
                 layer_group_id=self._next_group,
             )
             self._next_group += 1
+        return groups
 
     def after_base_weights(self) -> None:
         """No-op hook: publish groups drain incrementally in send_bucket."""
@@ -818,10 +824,8 @@ class MilesCollectiveProtocolCore:
                 )
             if self._closed or self._session is None:
                 raise RuntimeError("the MILES NCCL M2N protocol closed mid-round")
-            self._drain_ready_groups(version)
-            # _drain_ready_groups already rejected a missing publish plan, so
-            # the armed round has groups; the `or ()` only narrows the type.
-            if self._next_group != len(self._publish_groups or ()):
+            groups = self._drain_ready_groups(version)
+            if self._next_group != len(groups):
                 missing = sorted(self._pending[self._next_group])
                 raise RuntimeError(
                     "MILES NCCL M2N bucket stream ended before publish group "
@@ -896,9 +900,12 @@ class MilesCollectiveProtocolCore:
             ),
             return_exceptions=True,
         )
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
+        errors = [result for result in results if isinstance(result, BaseException)]
+        # Only the first error propagates; the rest would vanish silently.
+        for error in errors[1:]:
+            logger.warning("MILES NCCL M2N generator control failed: %r", error)
+        if errors:
+            raise errors[0]
         return results
 
     def _generator_futures(self, action: str, **kwargs):
@@ -1246,9 +1253,6 @@ class MilesCollectiveProtocolCore:
 
 def build_protocol(args: Any):
     """Build a MILES protocol without importing MILES at package import time."""
-    from miles.backends.training_utils.weight_update.hf_weight_iterator import (
-        WeightUpdatePlacement,
-    )
     from miles.backends.training_utils.weight_update.protocol import (
         WeightTransferProtocol,
     )
@@ -1256,11 +1260,11 @@ def build_protocol(args: Any):
     class MilesModelExpressProtocol(
         MilesCollectiveProtocolCore, WeightTransferProtocol
     ):
-        # Restated deliberately: miles' updater plans its gathers from this
-        # placement, so the M2N no-PP-gather requirement stays explicit at
-        # the seam. The other ABC defaults (supports_lora,
-        # use_weight_update_session) are inherited without restatement.
-        required_placement = WeightUpdatePlacement(gather_pp=False)
+        # The ABC defaults carry the seam contract: required_placement is
+        # WeightUpdatePlacement(gather_pp=False) (miles protocol.py), and
+        # supports_lora / use_weight_update_session inherit likewise.
+        # connect() still rejects a gather_pp placement at runtime, so a
+        # miles-side default change fails closed there.
 
         def __init__(self, protocol_args: Any) -> None:
             WeightTransferProtocol.__init__(self, protocol_args)

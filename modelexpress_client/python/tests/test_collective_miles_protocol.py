@@ -675,7 +675,14 @@ def _round_generator_submission_failure_worker(
 def test_lazy_factory_uses_the_bucket_stream_seam(monkeypatch):
     protocol_module = ModuleType("miles.backends.training_utils.weight_update.protocol")
 
+    class WeightUpdatePlacement:
+        def __init__(self, *, gather_pp):
+            self.gather_pp = gather_pp
+
     class WeightTransferProtocol:
+        # Mirrors the miles ABC default (weight_update/protocol.py): the
+        # adapter inherits it instead of restating it.
+        required_placement = WeightUpdatePlacement(gather_pp=False)
         supports_lora = False
         use_weight_update_session = True
 
@@ -683,15 +690,6 @@ def test_lazy_factory_uses_the_bucket_stream_seam(monkeypatch):
             self.args = args
 
     protocol_module.WeightTransferProtocol = WeightTransferProtocol
-    iterator_module = ModuleType(
-        "miles.backends.training_utils.weight_update.hf_weight_iterator"
-    )
-
-    class WeightUpdatePlacement:
-        def __init__(self, *, gather_pp):
-            self.gather_pp = gather_pp
-
-    iterator_module.WeightUpdatePlacement = WeightUpdatePlacement
     module_names = [
         "miles",
         "miles.backends",
@@ -701,7 +699,6 @@ def test_lazy_factory_uses_the_bucket_stream_seam(monkeypatch):
     for module_name in module_names:
         monkeypatch.setitem(sys.modules, module_name, ModuleType(module_name))
     monkeypatch.setitem(sys.modules, protocol_module.__name__, protocol_module)
-    monkeypatch.setitem(sys.modules, iterator_module.__name__, iterator_module)
 
     protocol = miles_protocol.build_protocol(_args())
 
@@ -815,6 +812,7 @@ def test_mixed_explicit_run_identity_is_rejected_on_every_rank(
     )
     protocol._tensors = {"model.weight": torch.ones((4, 2), dtype=torch.bfloat16)}
     monkeypatch.setattr(miles_protocol.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(miles_protocol.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(miles_protocol, "_gloo_group", lambda: object())
     monkeypatch.setattr(
         miles_protocol.dist,
@@ -1399,6 +1397,63 @@ def test_generator_fan_out_settles_every_engine_before_raising(monkeypatch):
         protocol._wait_generator_futures(futures)
 
     assert executions == [0, 2]
+
+
+def test_generator_fan_out_logs_every_engine_failure(monkeypatch, caplog):
+    class Future:
+        def __init__(self, coroutine):
+            self.coroutine = coroutine
+
+        def result(self):
+            return __import__("asyncio").run(self.coroutine)
+
+    _install_fake_miles_async(
+        monkeypatch,
+        [],
+        submit=lambda coroutine: Future(coroutine),
+        wait_futures=lambda futures: [future.result() for future in futures],
+    )
+
+    protocol = MilesCollectiveProtocolCore(_args())
+    protocol.rollout_engines = (object(), object())
+    protocol._engine_gpu_offsets = (0, 4)
+    protocol._engine_gpu_counts = (2, 2)
+    _seed_real_fan_out_contract(protocol)
+
+    async def send_control(_client, control, **_kwargs):
+        raise RuntimeError(f"engine at offset {control.generator_slot_offset} failed")
+
+    protocol._send_control = send_control
+
+    futures = protocol._generator_futures("prepare")
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError, match="engine at offset 0 failed"):
+            protocol._wait_generator_futures(futures)
+
+    # The first failure propagates; the rest must still reach the log.
+    assert "engine at offset 2 failed" in caplog.text
+
+
+def test_build_frozen_contract_rejects_a_rank_that_is_not_its_pp_partition(
+    monkeypatch,
+):
+    protocol = MilesCollectiveProtocolCore(_args())
+    protocol.connect(
+        [object()],
+        [2],
+        [0],
+        _parallel_state(),
+        _placement(),
+        "target",
+    )
+    protocol._tensors = {"model.weight": torch.ones((4, 2), dtype=torch.bfloat16)}
+    monkeypatch.setattr(miles_protocol.dist, "get_world_size", lambda: 2)
+    # pp.rank stays 0 while the distributed rank says 1: ownership would be
+    # published under a partition id the rest of the round does not use.
+    monkeypatch.setattr(miles_protocol.dist, "get_rank", lambda: 1)
+
+    with pytest.raises(ValueError, match="must equal its PP partition"):
+        protocol._build_frozen_contract()
 
 
 class _DroppedFuture:
