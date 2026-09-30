@@ -227,6 +227,54 @@ class TestBootstrapFence:
 
         assert caught.value.missing == ["g0", "t1"]
 
+    def test_the_epoch_readback_spends_from_the_fence_budget(self, monkeypatch):
+        # A FAILED_PRECONDITION near the deadline does not buy the epoch
+        # readback a fresh full RPC timeout; it spends what the fence wait
+        # has left.
+        stub = FakeStub(
+            groups=[group(epoch=4)],
+            fence_error=_rpc_error(grpc.StatusCode.FAILED_PRECONDITION),
+        )
+        moments = iter((10.0, 10.0, 10.5))
+        monkeypatch.setattr(rz.time, "monotonic", lambda: next(moments))
+
+        with pytest.raises(EpochChangedError):
+            make_rendezvous(stub).await_bootstrap_fence(
+                group_id="g1",
+                epoch=3,
+                lane_id=7,
+                slot_id="t0",
+                worker_id="w0",
+                timeout_s=1.0,
+                poll_interval_s=0.01,
+            )
+
+        assert stub.get_timeouts == [0.5]
+
+    def test_an_exhausted_fence_budget_degrades_the_readback_not_the_rejection(
+        self, monkeypatch
+    ):
+        # With nothing left in the budget the readback never goes on the
+        # wire; the caller still gets an epoch answer chained from the
+        # server's own rejection.
+        stub = FakeStub(fence_error=_rpc_error(grpc.StatusCode.FAILED_PRECONDITION))
+        moments = iter((10.0, 10.9, 11.0))
+        monkeypatch.setattr(rz.time, "monotonic", lambda: next(moments))
+
+        with pytest.raises(EpochChangedError) as caught:
+            make_rendezvous(stub).await_bootstrap_fence(
+                group_id="g1",
+                epoch=3,
+                lane_id=7,
+                slot_id="t0",
+                worker_id="w0",
+                timeout_s=1.0,
+                poll_interval_s=0.01,
+            )
+
+        assert stub.get_calls == 0
+        assert caught.value.actual == -1
+
     def test_a_pre_fence_server_is_named_instead_of_leaking_unimplemented(self):
         stub = FakeStub(fence_error=_rpc_error(grpc.StatusCode.UNIMPLEMENTED))
 

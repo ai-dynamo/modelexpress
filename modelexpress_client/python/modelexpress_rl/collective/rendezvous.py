@@ -549,7 +549,15 @@ class CollectiveRendezvous:
                     raise EpochChangedError(group_id, epoch, current) from error
             raise
 
-    def _current_epoch(self, group_id: str) -> int:
+    def _bounded_rpc_timeout(self, deadline: float | None, operation: str) -> float:
+        if deadline is None:
+            return self._rpc_timeout_s
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            raise TimeoutError(f"{operation} exhausted its deadline")
+        return min(self._rpc_timeout_s, remaining_s)
+
+    def _current_epoch(self, group_id: str, *, deadline: float | None = None) -> int:
         """The group's epoch now, or ``-1`` when it cannot be read.
 
         MX reports the epoch that rejected a publication in the status detail
@@ -560,9 +568,11 @@ class CollectiveRendezvous:
         try:
             return self._stub.GetCollectiveGroup(
                 pb.GetCollectiveGroupRequest(group_id=group_id),
-                timeout=self._rpc_timeout_s,
+                timeout=self._bounded_rpc_timeout(
+                    deadline, "collective epoch readback"
+                ),
             ).epoch
-        except grpc.RpcError:
+        except (grpc.RpcError, TimeoutError):
             return -1
 
     def await_ready(
@@ -685,7 +695,7 @@ class CollectiveRendezvous:
             except grpc.RpcError as error:
                 _raise_if_fence_unimplemented(error)
                 if error.code() is grpc.StatusCode.FAILED_PRECONDITION:
-                    current = self._current_epoch(group_id)
+                    current = self._current_epoch(group_id, deadline=deadline)
                     if current != epoch:
                         raise EpochChangedError(group_id, epoch, current) from error
                 if error.code() not in _RETRYABLE_POLL_CODES:
