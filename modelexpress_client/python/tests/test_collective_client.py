@@ -228,7 +228,7 @@ def trainer(rz, engine, **kw):
         generator_slots=["g0", "g1"],
         source_partition_count=1,
         slot_id="t0",
-        worker_id="w0",
+        worker_id=kw.pop("worker_id", "w0"),
         index_in_role=0,
         **kw,
     )
