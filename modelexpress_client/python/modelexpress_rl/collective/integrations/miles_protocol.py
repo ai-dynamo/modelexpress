@@ -31,8 +31,6 @@ from .miles import (
 from .wire import (
     CollectiveControl,
     encode_control,
-    plan_to_wire,
-    topology_to_wire,
 )
 
 logger = logging.getLogger("modelexpress_rl.collective.integrations.miles_protocol")
@@ -879,17 +877,12 @@ class MilesCollectiveProtocolCore:
         self,
         client: Any,
         control: CollectiveControl,
-        *,
-        plan_wire: dict | None = None,
-        topology_wire: dict | None = None,
     ):
         response = await client.update_weights_from_distributed(
             names=[],
             dtypes=[],
             shapes=[],
-            group_name=encode_control(
-                control, plan_wire=plan_wire, topology_wire=topology_wire
-            ),
+            group_name=encode_control(control),
             flush_cache=False,
             selector="target",
         )
@@ -898,19 +891,11 @@ class MilesCollectiveProtocolCore:
     async def _send_controls(
         self,
         requests: list[tuple[Any, CollectiveControl]],
-        *,
-        plan_wire: dict | None = None,
-        topology_wire: dict | None = None,
     ):
         # return_exceptions=True: every engine settles before the first error
         # propagates, so teardown never races an in-flight control RPC.
         results = await asyncio.gather(
-            *(
-                self._send_control(
-                    client, control, plan_wire=plan_wire, topology_wire=topology_wire
-                )
-                for client, control in requests
-            ),
+            *(self._send_control(client, control) for client, control in requests),
             return_exceptions=True,
         )
         errors = [result for result in results if isinstance(result, BaseException)]
@@ -927,8 +912,8 @@ class MilesCollectiveProtocolCore:
         if self.rollout_engines is None:
             raise RuntimeError("rollout engines are not connected")
         prepare = action == "prepare"
-        # Every generator receives the same endpoint and the same encoded
-        # plan/topology; resolve and encode them once per fan-out.
+        # Every generator receives the same endpoint, plan, and topology; the
+        # wire encoding derives from each control at send time.
         endpoint = _server_endpoint(self.args) if prepare else None
         requests = []
         generator_slot_offset = 0
@@ -949,11 +934,7 @@ class MilesCollectiveProtocolCore:
             generator_slot_offset += count
         if not requests:
             return []
-        plan_wire = plan_to_wire(self._plan) if prepare else None
-        topology_wire = topology_to_wire(self._topology) if prepare else None
-        coroutine = self._send_controls(
-            requests, plan_wire=plan_wire, topology_wire=topology_wire
-        )
+        coroutine = self._send_controls(requests)
         try:
             return [async_utils.submit(coroutine)]
         except BaseException:

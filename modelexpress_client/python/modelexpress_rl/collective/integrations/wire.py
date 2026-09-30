@@ -231,21 +231,12 @@ class CollectiveControl:
                 raise ValueError("run_round requires an operation_id")
 
 
-def encode_control(
-    control: CollectiveControl,
-    *,
-    plan_wire: dict[str, Any] | None = None,
-    topology_wire: dict[str, Any] | None = None,
-) -> str:
+def encode_control(control: CollectiveControl) -> str:
     payload: dict[str, Any] = {"action": control.action}
     if control.plan is not None:
-        payload["plan"] = plan_to_wire(control.plan) if plan_wire is None else plan_wire
+        payload["plan"] = plan_to_wire(control.plan)
     if control.topology is not None:
-        payload["topology"] = (
-            topology_to_wire(control.topology)
-            if topology_wire is None
-            else topology_wire
-        )
+        payload["topology"] = topology_to_wire(control.topology)
     if control.generator_slot_offset is not None:
         payload["generator_slot_offset"] = control.generator_slot_offset
     if control.version is not None:
