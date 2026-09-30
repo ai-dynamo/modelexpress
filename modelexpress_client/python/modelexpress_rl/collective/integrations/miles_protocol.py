@@ -134,10 +134,10 @@ def _abi_version(args: Any) -> str:
 
 def _run_id(value: object, label: str) -> str:
     text = _text(value, label)
-    # The run id prefixes every slot ("<run_id>:trainer-N"), and slot names
-    # are stored in Redis lane records separated by these delimiters — the
-    # server rejects them in slot ids, so reject them here at validation
-    # time rather than corrupting a lane record mid-bootstrap.
+    # The run id prefixes every slot ("<run_id>:trainer-N"); the server
+    # rejects these Redis record delimiters in slot ids. Reject them here so
+    # a bad id fails at validation instead of as a late INVALID_ARGUMENT
+    # from the join.
     if any(delimiter in text for delimiter in ("\0", "\n", "\r", "|", ",")):
         raise ValueError(
             f"{label} must not contain Redis record delimiters "
@@ -789,11 +789,8 @@ class MilesCollectiveProtocolCore:
                 )
             except BaseException as error:
                 submission_error = repr(error)
-        # Track the submitted futures before the gather: every failure from
-        # here — the gather itself, a peer's submission failure, or
-        # begin_round — reaches the caller's terminal close, and the close
-        # path retires exactly this list. Assigning only after the gather
-        # would leak rank 0's futures whenever the gather raised.
+        # Tracked before the gather so the caller's terminal close retires
+        # them if anything below raises.
         self._round_futures = futures
         submission_errors = [""] * dist.get_world_size()
         dist.all_gather_object(

@@ -1309,18 +1309,14 @@ def test_a_round_gather_failure_closes_and_retires_the_submitted_futures(
     monkeypatch.setattr(miles_protocol.dist, "all_gather_object", raising_gather)
 
     with pytest.raises(RuntimeError, match="synthetic gather failure"):
-        protocol.send_bucket(
-            [("model.weight", torch.ones((1,), dtype=torch.bfloat16))]
-        )
+        protocol.send_bucket([("model.weight", torch.ones((1,), dtype=torch.bfloat16))])
 
     assert not entered_round
     assert submitted[0].cancelled
     assert protocol._round_futures == []
     # The protocol closed terminally; it never reopens.
     with pytest.raises(RuntimeError, match="protocol is closed"):
-        protocol.send_bucket(
-            [("model.weight", torch.ones((1,), dtype=torch.bfloat16))]
-        )
+        protocol.send_bucket([("model.weight", torch.ones((1,), dtype=torch.bfloat16))])
 
 
 def test_close_reports_generator_failure_and_allows_retry(monkeypatch, caplog):
