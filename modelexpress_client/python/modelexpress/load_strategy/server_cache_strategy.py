@@ -150,8 +150,8 @@ class ServerCacheStrategy(LoadStrategy):
 def _repo_id(ctx: LoadContext) -> str | None:
     """Resolve the repo id to ask the server for.
 
-    ``identity.model_name`` is whatever the engine put in ModelConfig, which
-    vLLM overwrites with the resolved local path while parsing engine args.
-    model_prefetch keeps the mapping back to the original repo id.
+    Use the engine's model path because the MX identity may be a logical name.
+    model_prefetch maps resolved cache paths back to their original repo ids.
     """
-    return model_prefetch.repo_id_for(ctx.identity.model_name)
+    model = getattr(ctx.model_config, "model", None) or ctx.identity.model_name
+    return model_prefetch.repo_id_for(model)

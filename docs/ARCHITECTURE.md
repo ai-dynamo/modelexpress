@@ -610,7 +610,16 @@ Without `enforce_eager`, peer refits retain the existing direct-copy behavior
 and do not run this host-scale refresh. Updating host mirrors alone cannot
 update scalar values already captured in CUDA graphs; graph-scale refresh and
 recapture remain outside this eager-mode fix.
-Cold RDMA loading retains its requirement that attention caches be uninitialized.
+Cold RDMA loading requires lazily populated attention caches to be uninitialized.
+Q/K/V-only attention paths, including MiniMax-M3 sparse attention, do not need an
+`_o_scale_float` field; that field is specific to output quantization. DeepSeek
+V4/V4.1 FlashInfer instead recomputes its constructor-initialized BMM scalars from
+the received custom Q/KV scale buffers. Its GPU scale buffers stay unchanged.
+Recognized DeepSeek packed KV attention (`fp8_ds_mla` / `nvfp4_ds_mla`) carries
+per-block scales in the cache format and needs no standard host mirrors. Each
+`AttentionLayerBase` owner declaring FP8 KV cache must have a recognized scale
+contract, even when another layer was refreshed or uses a supported packed format.
+Container modules and `MambaBase` state-space layers are not attention scale owners.
 
 An object-storage generator with full-tensor engine support defaults to a
 same-rank generator peer first and the version-level object-storage source
@@ -643,6 +652,11 @@ during reconstruction, and derived checkpoints can be rebuilt from the lineage.
 If an in-place delta fails, the cache remains `UPDATING` until the active refit
 session or the next initialization restores the immutable full root. The running
 engine retains its previously installed weights.
+
+The local checkpoint store caps its configured quota at the existing model cache
+size plus free disk space. It logs any cap applied at initialization and rechecks
+free space before known writes and copies. Capacity checks evict stale
+checkpoints or reject the update while preserving protected lineage.
 
 Under the local checkpoint lock, preparation state advances from `READY` to
 `UPDATING` before artifact construction and back to `READY(target)` only after
@@ -682,6 +696,11 @@ already-used caller-supplied UID returns `ALREADY_EXISTS`. For an `XOR_DELTA`,
 these UID strings as `metadata.version` and `metadata.base_version`. MX assigns
 no numeric ordering and requires no version-directory naming convention; the
 exact `object_storage.uri` identifies the version's global index.
+Generators use the registered MX IDs and base relationships for replay. A delta
+index's `metadata.version` and `metadata.base_version` are optional descriptive
+fields and may differ from the MX IDs. Cache paths and chain records use MX IDs;
+MX lineage checks and payload validation remain enabled. The registering caller
+is responsible for selecting the correct S3 artifacts and base mapping.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
 Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and
@@ -1064,7 +1083,12 @@ through `object_storage_endpoint_url` and `object_storage_region_name`. Each
 update carries the opaque MX `version_id`.
 `start_weight_update()` opens the update window, `receive_weights()` stages and
 applies the version through `ModelExpressGeneratorClient`, and
-`finish_weight_update()` releases its staged handle. Draft-model updates remain
+`finish_weight_update()` releases its staged handle. Each session accepts one
+version; calls before initialization, out-of-order calls, and a second update
+raise instead of reporting success. vLLM's reset hook releases staged resources
+and clears the session after an update error, including invalid payloads rejected
+before receiving weights. A failed finish retains the session so cleanup can be
+retried; already applied model weights are not rolled back. Draft-model updates remain
 unsupported, and trainer-pushed bytes are ignored because trainers publish
 WeightVersions through `ModelExpressTrainerClient`. After a successful apply,
 the bridge merges staging
@@ -1133,7 +1157,18 @@ work.
 trainer staging buffers, direct generator-peer transfer, and verification. The
 vLLM-specific
 `installer.py` captures trainer load-time geometry through layerwise reload and
-installs it through `process_weights_after_loading`. Generator peers instead
+installs it through `process_weights_after_loading`. For tensor and checkpoint
+reloads, vLLM owns quantization-aware refresh of MLA's `W_UV` and `W_UK_T`;
+ModelExpress preserves their graph-bound storage when post-load processing
+replaces these bare tensor attributes. The RL installer does not recompute MLA
+weights from `kv_b_proj.weight` or reject quantized MLA models. After reload,
+the installer checks that vLLM replaced each existing `W_UV` and `W_UK_T`
+before copying it back into its original graph-bound storage. An unchanged tensor
+identity raises `IncompleteRefit` rather than accepting a potentially stale update.
+Compatibility is checked through this post-load behavior, not a version-string
+gate, so nightly and source builds can be used. The check runs after weight
+loading; a failed refit requires engine recovery before serving resumes.
+Generator peers instead
 transfer the complete post-load runtime tensor set directly into existing live
 storage without re-running PWAL. The adapter rebuilds a trainer plan when
 validated source manifests change; an incompatible destination staging layout
@@ -1173,6 +1208,16 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 | p3 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
 | p4 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
 | p5 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
+
+When a vLLM loading attempt fails after mutating the model, retry cleanup
+unregisters its layers and clears the old model's tensor graph before allocating
+the replacement. Caller frames can still retain the old root object, so clearing
+only `LoadResult` cannot release its GPU storage. Cleanup also clears the state
+of child modules that own parameters: native tensor aliases can retain replaced
+parameters and their bound weight-loader callbacks outside Python's GC traversal.
+Shared parameterless caches, such as rotary embeddings, remain intact. Remaining
+cycles are collected before the allocator cache is emptied and initialization starts.
+If initialization fails, recovery aborts without attempting another loader.
 
 See [ModelExpress Benchmarks](BENCHMARKS.md) for measured loading-path, NIXL registration, and artifact-transfer results with explicit timing boundaries.
 
@@ -1395,7 +1440,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses it for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim |
+| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Feeds the torch compile cache `SourceIdentity`, adding compile configuration as a partitioning dimension for artifact discovery. Unset leaves the field empty, which drops it from the `mx_source_id` input, so workers whose other identity fields match — model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch — share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](DEPLOYMENT.md#pairing-workers-by-compile-configuration) |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |

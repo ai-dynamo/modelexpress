@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import shutil
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -14,6 +15,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from urllib.parse import quote
+
+logger = logging.getLogger(__name__)
 
 
 def _encode_cache_component(value: str) -> str:
@@ -148,6 +151,19 @@ class LocalCheckpointStore:
             self.materialized_cache,
         ):
             path.mkdir(exist_ok=True)
+
+        with self.locked(shared=True):
+            free_bytes = shutil.disk_usage(self.cache).free
+            disk_limit = self.cache_size_bytes() + free_bytes
+            if self.max_size_bytes is None or self.max_size_bytes > disk_limit:
+                self.max_size_bytes = disk_limit
+                logger.info(
+                    "Refit checkpoint cache %s capped at %.2f GB "
+                    "(free=%.2f GB)",
+                    self.cache,
+                    disk_limit / 1_000_000_000,
+                    free_bytes / 1_000_000_000,
+                )
 
     @contextmanager
     def _locked(self, path: Path, shared: bool) -> Iterator[None]:

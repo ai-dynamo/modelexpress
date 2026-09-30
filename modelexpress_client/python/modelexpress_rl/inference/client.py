@@ -51,7 +51,7 @@ class ModelExpressGeneratorConfig:
 
     # Live rank-local objects required by the selected inference engine adapter.
     engine_context: GeneratorEngineContext
-    # Logical model identity; defaults to MODEL_NAME.
+    # Logical model identity; defaults to MX_MODEL_NAME_OVERRIDE.
     model_name: str | None = None
     # Fresh process-lifetime identity; generated when omitted.
     worker_id: str | None = None
@@ -240,7 +240,9 @@ class ModelExpressGeneratorClient:
         """
         if not isinstance(config, ModelExpressGeneratorConfig):
             raise TypeError("config must be a ModelExpressGeneratorConfig")
-        model_name = _required(config.model_name or envs.MODEL_NAME or "", "model_name")
+        model_name = _required(
+            config.model_name or envs.MX_MODEL_NAME_OVERRIDE or "", "model_name"
+        )
         worker_id = _required(config.worker_id or uuid.uuid4().hex[:8], "worker_id")
         server_url = _get_server_url(config.server_url)
         registration_ttl_seconds = config.registration_ttl_seconds

@@ -196,7 +196,7 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     monkeypatch.setattr(
         runtime_module, "_create_trainer_adapter", lambda *_args, **_kwargs: adapter
     )
-    monkeypatch.setenv("MODEL_NAME", "test/model")
+    monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", "test/model")
     monkeypatch.setenv("MX_TRAINER_STAGING_MODE", "COPY_TO_DEVICE")
     monkeypatch.setenv("MX_WEIGHT_PAYLOAD_FORMAT", "FULL_TENSOR")
     monkeypatch.setenv("MX_WORKER_HOST", "127.0.0.1")

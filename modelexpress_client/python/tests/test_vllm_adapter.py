@@ -7,11 +7,14 @@ import json
 import os
 import sys
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 import torch.nn as nn
+
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 
 from modelexpress.engines.vllm.adapter import (
     DraftShardSelection,
@@ -25,6 +28,7 @@ from modelexpress.engines.vllm.adapter import (
     _select_draft_weight_files,
     build_vllm_load_context,
 )
+from modelexpress.engines.vllm.host_quantization import refresh_host_quantization_state
 from modelexpress.load_strategy.context import LoadResult
 
 
@@ -169,6 +173,42 @@ def test_vllm_adapter_discovery_uses_backend_predicate(
     assert list(tensors) == ["weight"]
 
 
+@pytest.mark.parametrize("model_name", [None, "", "mx_model_abc"])
+def test_identity_name_is_resolved_once_without_changing_loader_config(
+    monkeypatch, model_name
+):
+    """Freeze the MX name while native loading retains the original config."""
+    monkeypatch.setenv("MODEL_NAME", "unrelated-launch-script-variable")
+    if model_name is None:
+        monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
+    else:
+        monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", model_name)
+    model_path = "/root/.cache/vllm/assets/model_streamer/0088a9aa"
+    model_config = _model_config()
+    model_config.model = model_path
+    vllm_config = _context_config(load_device="cpu")
+    vllm_config.model_config = model_config
+    adapter = VllmAdapter(vllm_config, model_config)
+    identity = adapter.build_identity()
+
+    monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", "changed-after-initialization")
+    assert adapter.build_identity() == identity
+    assert identity.model_name == (model_name or model_path)
+
+    model = nn.Linear(2, 2)
+    loader = MagicMock()
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.model_loader.default_loader"],
+        "DefaultModelLoader",
+        loader,
+    )
+    adapter.load_via_native(LoadResult(value=model, model=model))
+
+    loader.return_value.load_weights.assert_called_once_with(model, model_config)
+    assert adapter.model_config is vllm_config.model_config is model_config
+    assert model_config.model == model_path
+
+
 def test_build_vllm_load_context_uses_current_platform_for_bare_cuda(monkeypatch):
     """Resolve a bare CUDA device through vLLM's current platform."""
     _stub_vllm_current_device(monkeypatch, current_device=2)
@@ -276,6 +316,215 @@ def test_after_rdma_receive_refreshes_host_attention_scale_mirrors(
         name: tensor.data_ptr()
         for name, tensor in model.attn.named_buffers(recurse=False)
     } == pointers
+
+
+
+@pytest.mark.parametrize("cache_dtype", ["fp8", "bfloat16"])
+@pytest.mark.parametrize("allow_warm", [False, True])
+def test_refreshes_minimax_m3_scales_without_output_quantization(
+    mock_accelerator_backend_cls, cache_dtype, allow_warm,
+):
+    """The sparse Q/K/V contract does not require an output-quantization field."""
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    model.attn.kv_cache_dtype = cache_dtype
+    model.attn.impl = SimpleNamespace()
+    del model.attn._o_scale_float
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        model_config=SimpleNamespace(enforce_eager=True),
+    )
+
+    refresh_host_quantization_state(
+        model, config,
+        mock_accelerator_backend_cls(torch_device_type="cpu"),
+        allow_warm=allow_warm,
+    )
+
+    assert model.attn._q_scale_float == pytest.approx(0.25)
+    assert model.attn._k_scale_float == model.attn._k_scale_cpu.item() == 0.5
+    assert model.attn._v_scale_float == model.attn._v_scale_cpu.item() == 0.75
+    assert not hasattr(model.attn, "_o_scale_float")
+
+
+@pytest.mark.parametrize("allow_warm", [False, True])
+@pytest.mark.parametrize("q_scale,kv_scale", [(1.0, 1.0), (0.25, 0.5)])
+def test_refreshes_deepseek_flashinfer_scales_from_received_tensors(
+    mock_accelerator_backend_cls, allow_warm, q_scale, kv_scale,
+):
+    """V4/V4.1 BMM scalars are initialized eagerly and use custom names."""
+    model = nn.Module()
+    model.attn = _DeepseekFlashInferScales(q_scale, kv_scale)
+    buffers = dict(model.attn.named_buffers())
+    pointers = {name: tensor.data_ptr() for name, tensor in buffers.items()}
+    values = {name: tensor.clone() for name, tensor in buffers.items()}
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype="fp8"),
+        model_config=SimpleNamespace(enforce_eager=True),
+    )
+
+    refresh_host_quantization_state(
+        model, config,
+        mock_accelerator_backend_cls(torch_device_type="cpu"),
+        allow_warm=allow_warm,
+    )
+
+    assert model.attn._flashinfer_fp8_bmm1_scale == pytest.approx(
+        model.attn.scale * q_scale * kv_scale
+    )
+    assert model.attn._flashinfer_fp8_bmm2_scale == pytest.approx(kv_scale)
+    for name, tensor in model.attn.named_buffers():
+        assert tensor.data_ptr() == pointers[name]
+        assert torch.equal(tensor, values[name])
+
+
+@pytest.mark.parametrize("invalid_scale", [
+    torch.tensor(0.0), torch.tensor(float("nan")), torch.ones(2),
+])
+def test_deepseek_flashinfer_rejects_invalid_received_scale(
+    mock_accelerator_backend_cls, invalid_scale,
+):
+    model = nn.Module()
+    model.attn = _DeepseekFlashInferScales(1.0, 1.0)
+    model.attn._flashinfer_fp8_kv_scale = invalid_scale
+    config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="fp8"))
+
+    with pytest.raises(RuntimeError, match="Invalid vLLM accelerator attention scale"):
+        refresh_host_quantization_state(
+            model, config,
+            mock_accelerator_backend_cls(torch_device_type="cpu"),
+        )
+    assert model.attn._flashinfer_fp8_bmm1_scale == 99.0
+    assert model.attn._flashinfer_fp8_bmm2_scale == 99.0
+
+
+def test_deepseek_flashinfer_rejects_missing_host_contract(
+    mock_accelerator_backend_cls,
+):
+    model = nn.Module()
+    model.attn = _DeepseekFlashInferScales(1.0, 1.0)
+    del model.attn._flashinfer_fp8_bmm2_scale
+    config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="fp8"))
+
+    with pytest.raises(RuntimeError, match="Incomplete.*_flashinfer_fp8_bmm2_scale"):
+        refresh_host_quantization_state(
+            model, config,
+            mock_accelerator_backend_cls(torch_device_type="cpu"),
+        )
+
+
+@pytest.mark.parametrize("namespace,cache_dtype", [
+    ("vllm.models.deepseek_v4.attention", "fp8_ds_mla"),
+    ("vllm.models.deepseek_v41.attention", "fp8_ds_mla"),
+    ("vllm.models.deepseek_v41.attention", "nvfp4_ds_mla"),
+])
+def test_deepseek_packed_cache_needs_no_standard_host_scales(
+    mock_accelerator_backend_cls, namespace, cache_dtype,
+):
+    """Packed DeepSeek records carry their scales inside the cache format."""
+    base = type("DeepseekV4Attention", (nn.Module,), {"__module__": namespace})
+    backend_class = type("DeepseekV4FlashMLAAttention", (base,), {})
+    model = nn.Module()
+    model.attn = backend_class()
+    model.attn.kv_cache_dtype = cache_dtype
+    config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="fp8"))
+
+    refresh_host_quantization_state(
+        model, config,
+        mock_accelerator_backend_cls(torch_device_type="cpu"),
+    )
+
+    assert not hasattr(model.attn, "_q_scale_float")
+
+
+@pytest.mark.parametrize("recognized_type", [False, True])
+def test_no_host_scale_bypass_for_unknown_or_incomplete_attention(
+    mock_accelerator_backend_cls, recognized_type,
+):
+    model = nn.Module()
+    if recognized_type:
+        layer_type = type("DeepseekV4Attention", (nn.Module,), {
+            "__module__": "vllm.models.deepseek_v4.attention",
+        })
+        model.attn = layer_type()
+        # Plain FP8 needs the custom FlashInfer fields; only packed KV is exempt.
+        model.attn.kv_cache_dtype = "fp8"
+    else:
+        model.attn = nn.Module()
+        model.attn.kv_cache_dtype = "fp8_ds_mla"
+    config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="fp8"))
+
+    with pytest.raises(RuntimeError, match="no attention module was refreshed"):
+        refresh_host_quantization_state(
+            model, config,
+            mock_accelerator_backend_cls(torch_device_type="cpu"),
+        )
+
+
+@pytest.mark.parametrize("known_kind", ["standard", "deepseek_flashinfer", "packed"])
+@pytest.mark.parametrize("unknown_first", [False, True])
+@pytest.mark.parametrize("allow_warm", [False, True])
+def test_known_attention_does_not_mask_unknown_fp8_owner(
+    mock_accelerator_backend_cls, known_kind, unknown_first, allow_warm,
+):
+    """Every FP8 owner needs a scale contract, regardless of other layers."""
+    if known_kind == "standard":
+        known = _AttentionWithStaleHostScales()
+    elif known_kind == "deepseek_flashinfer":
+        known = _DeepseekFlashInferScales(0.25, 0.5)
+    else:
+        layer_type = type("DeepseekV4Attention", (nn.Module,), {
+            "__module__": "vllm.models.deepseek_v4.attention",
+        })
+        known = layer_type()
+        known.kv_cache_dtype = "fp8_ds_mla"
+    unknown = _AttentionWithoutHostScales()
+    unknown.kv_cache_dtype = "fp8"
+    layers = [("known", known), ("unknown", unknown)]
+    model = nn.Module()
+    for name, layer in reversed(layers) if unknown_first else layers:
+        model.add_module(name, layer)
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype="fp8"),
+        model_config=SimpleNamespace(enforce_eager=True),
+    )
+
+    with pytest.raises(RuntimeError, match="Unrecognized FP8.*unknown"):
+        refresh_host_quantization_state(
+            model, config,
+            mock_accelerator_backend_cls(torch_device_type="cpu"),
+            allow_warm=allow_warm,
+        )
+
+
+@pytest.mark.parametrize("extra_kind", ["container", "state_space", "bf16_attention"])
+def test_host_scale_guard_ignores_non_fp8_attention_owners(
+    mock_accelerator_backend_cls, extra_kind,
+):
+    """A global FP8 setting does not make every module an FP8 attention owner."""
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    if extra_kind == "container":
+        model.extra = nn.Module()
+        model.extra.attn = _DeepseekFlashInferScales(0.25, 0.5)
+    elif extra_kind == "state_space":
+        layer_type = type("StateSpaceLayer", (nn.Module, MambaBase), {
+            "get_state_shape": lambda self: (),
+            "get_state_dtype": lambda self: (),
+            "mamba_type": None,
+        })
+        model.extra = layer_type()
+    else:
+        model.extra = _AttentionWithoutHostScales()
+    model.extra.kv_cache_dtype = "bfloat16" if extra_kind == "bf16_attention" else "fp8"
+    config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="fp8"))
+
+    refresh_host_quantization_state(
+        model, config,
+        mock_accelerator_backend_cls(torch_device_type="cpu"),
+    )
+
+    assert model.attn._k_scale_float == pytest.approx(0.5)
 
 
 def test_after_rdma_receive_refreshes_scales_after_model_finalizer(
@@ -644,6 +893,29 @@ class _AttentionWithStaleHostScales(torch.nn.Module):
             bmm2_scale=None,
             o_sf_scale=None,
         )
+
+
+
+class _AttentionWithoutHostScales(nn.Module, AttentionLayerBase):
+    def get_attn_backend(self):
+        return None
+
+    def get_kv_cache_spec(self, vllm_config):
+        raise AssertionError("KV cache sizing is not initialized during model loading")
+
+
+class _DeepseekFlashInferScales(torch.nn.Module):
+    def __init__(self, q_scale, kv_scale):
+        super().__init__()
+        self.kv_cache_dtype = "fp8"
+        self.scale = 0.125
+        self.register_buffer("_flashinfer_fp8_q_scale", torch.tensor([q_scale]))
+        self.register_buffer("_flashinfer_fp8_kv_scale", torch.tensor([kv_scale]))
+        self.register_buffer(
+            "_flashinfer_fp8_q_scale_inv", torch.tensor([1.0 / q_scale]),
+        )
+        self._flashinfer_fp8_bmm1_scale = 99.0
+        self._flashinfer_fp8_bmm2_scale = 99.0
 
 
 class _AttentionScaleFinalizerModel(torch.nn.Module):

@@ -145,7 +145,9 @@ class ModelExpressTrainerClient:
     ) -> ModelExpressTrainerClient:
         if not isinstance(config, ModelExpressTrainerConfig):
             raise TypeError("config must be a ModelExpressTrainerConfig")
-        model_name = _required(config.model_name or envs.MODEL_NAME or "", "model_name")
+        model_name = _required(
+            config.model_name or envs.MX_MODEL_NAME_OVERRIDE or "", "model_name"
+        )
         staging_mode = _staging_mode(config.staging_mode)
         payload_format = _payload_format(config.payload_format)
         worker_id = _required(config.worker_id or uuid.uuid4().hex[:8], "worker_id")
