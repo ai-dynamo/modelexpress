@@ -173,7 +173,13 @@ enabling it against this adapter fails loudly at round start.
 The rendezvous at this base has no bootstrap-fence RPCs, so this client cannot
 answer a fence: groups must form with `requires_bootstrap_fence=0`. A group
 formed with the fence required would deadlock at bootstrap, with receivers
-waiting at the fence for trainers that have no RPC to arrive with.
+waiting at the fence for trainers that have no RPC to arrive with. The knob
+alone is not sufficient against full-branch receivers: the deployed 0.5.1
+client awaits the bootstrap fences unconditionally (the env only stamps its
+join spec), so a fenceless trainer paired with full-branch receivers deadlocks
+even in a fence-optional group. Every member of the group must run a fenceless
+client — stage this branch's (or the 795 base's) client over the receiver
+image's in-image client.
 
 ## Performance caveat
 
