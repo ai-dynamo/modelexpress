@@ -1083,7 +1083,12 @@ through `object_storage_endpoint_url` and `object_storage_region_name`. Each
 update carries the opaque MX `version_id`.
 `start_weight_update()` opens the update window, `receive_weights()` stages and
 applies the version through `ModelExpressGeneratorClient`, and
-`finish_weight_update()` releases its staged handle. Draft-model updates remain
+`finish_weight_update()` releases its staged handle. Each session accepts one
+version; calls before initialization, out-of-order calls, and a second update
+raise instead of reporting success. vLLM's reset hook releases staged resources
+and clears the session after an update error, including invalid payloads rejected
+before receiving weights. A failed finish retains the session so cleanup can be
+retried; already applied model weights are not rolled back. Draft-model updates remain
 unsupported, and trainer-pushed bytes are ignored because trainers publish
 WeightVersions through `ModelExpressTrainerClient`. After a successful apply,
 the bridge merges staging
