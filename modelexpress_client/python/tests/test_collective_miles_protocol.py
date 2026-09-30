@@ -1018,6 +1018,28 @@ def test_connect_with_a_changed_engine_topology_fails_closed_at_begin_sync(
         protocol.begin_sync(2, lambda *, materialize: iter([list(tensors.items())]))
 
 
+def test_later_rounds_skip_the_manifest_all_gather(monkeypatch):
+    protocol, _session, _events, tensors = _armed_protocol(monkeypatch)
+    for name in ("model.a", "model.b", "model.c"):
+        protocol.send_bucket([(name, tensors[name])])
+    protocol.finalize(1)
+
+    gathered = []
+
+    def recording_gather(output, value, **_kwargs):
+        gathered.append(value)
+        output.__setitem__(0, value)
+
+    monkeypatch.setattr(
+        miles_protocol.dist, "all_gather_object", recording_gather
+    )
+    protocol.begin_sync(2, lambda *, materialize: iter([list(tensors.items())]))
+
+    # Only the begin_sync error fan-out runs in round two; the run-id
+    # agreement and the manifest all-gather ran once in round one.
+    assert gathered == [""]
+
+
 def test_connect_rejects_a_reconnect_mid_round_and_after_close(monkeypatch):
     protocol, _session, _events, _tensors = _armed_protocol(monkeypatch)
 

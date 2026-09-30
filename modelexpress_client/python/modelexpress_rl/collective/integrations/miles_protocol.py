@@ -616,6 +616,23 @@ class MilesCollectiveProtocolCore:
             source_partition_count=partition_count,
             m2n_abi_version=_abi_version(self.args),
         )
+        if self._plan is not None:
+            # Later rounds: the manifest all-gather and plan rebuild ran on
+            # the first round, and their inputs are frozen — the wire buffers
+            # and canonical shapes are pinned (begin_sync only copy_()s into
+            # them after revalidating names and shapes), the trainer world is
+            # static for the process group's lifetime, and the run id is
+            # agreed. Re-gathering would return the round-one manifest, so
+            # skip it; the skip decision itself is uniform because _plan is
+            # set on every rank or on none (the post-gather validation is a
+            # deterministic function of the identical gathered manifest). The
+            # topology is still rebuilt and compared every round: a reconnect
+            # that heals into a reshaped engine GPU topology must fail closed.
+            if topology != self._topology:
+                raise RuntimeError(
+                    "MILES tensor names, shapes, or topology changed"
+                )
+            return
         src_mesh = MeshSpec((1,), rank_offset=0)
         dst_mesh = MeshSpec((len(generator_slots),), rank_offset=1)
         local_manifest = [
@@ -672,10 +689,6 @@ class MilesCollectiveProtocolCore:
             ],
             source_partition_count=partition_count,
         )
-        if self._plan is not None and (
-            plan.bulk != self._plan.bulk or topology != self._topology
-        ):
-            raise RuntimeError("MILES tensor names, shapes, or topology changed")
         self._topology = topology
         self._plan = plan
         self._publish_groups = groups
