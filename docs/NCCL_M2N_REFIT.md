@@ -269,6 +269,7 @@ service RefitCollectiveService {
   rpc JoinCollectiveGroup(JoinCollectiveGroupRequest) returns (CollectiveGroupMembership);
   rpc GetCollectiveGroup(GetCollectiveGroupRequest) returns (CollectiveGroup);
   rpc PublishGroupBootstrap(PublishGroupBootstrapRequest) returns (CollectiveGroup);
+  rpc ReachCollectiveBootstrapFence(ReachCollectiveBootstrapFenceRequest) returns (CollectiveBootstrapFence);
   rpc ReportCollectiveTransfer(ReportCollectiveTransferRequest) returns (CollectiveTransfer);
 }
 
@@ -428,11 +429,12 @@ is exactly what the fused-parameter path already does.
 |---|---|---|
 | `MX_REFIT_TRANSPORT` | `nixl` | `nccl_m2n` selects this path. One deployment, one backend |
 | `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams for overlapping per-PP-stage reshard lanes |
-| `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
+| `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY`; each bootstrap-fence wait also gets a fresh budget of this size |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for one lane's non-blocking `Communicator.init` |
 | `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Deadline for the transfer, i.e. `RUNNING -> ABORTED` above |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
+| `MX_NCCL_REFIT_REQUIRE_BOOTSTRAP_FENCE` | `false` | Create gate: reject `CreateCollectiveTransfer` until every slot has arrived at the group's bootstrap fences. Arrivals happen regardless of this value; the group fixes it at formation and a participant declaring the opposite value is rejected |
 
 The MILES-side adapter (`modelexpress_rl.collective.integrations.miles_protocol`)
 has its own trainer-process knobs — `MX_SERVER_ADDRESS` (required; the adapter

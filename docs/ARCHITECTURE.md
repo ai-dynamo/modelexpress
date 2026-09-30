@@ -433,6 +433,7 @@ plan: MX stores only its digest and the endpoint that serves it.
 | `JoinCollectiveGroup` | Admit one worker, returning its MX-assigned rank in every lane it joins |
 | `GetCollectiveGroup` | Poll group state, lane bootstrap, and participants |
 | `PublishGroupBootstrap` | Record one lane's `ncclUniqueId`, stamped with the epoch it was generated for |
+| `ReachCollectiveBootstrapFence` | Idempotently arrive at one lane's bootstrap fence; the response reports whether the fence released and which slots are still missing |
 | `ReportCollectiveTransfer` | Record one participant's terminal result, fenced on operation, epoch and worker generation |
 
 A group is keyed by its declared membership, so every participant of one

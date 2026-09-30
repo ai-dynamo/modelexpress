@@ -745,12 +745,13 @@ stock behavior. Design: [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600.0` | Deadline for group formation, from join until the group reports `READY` with every participant admitted. |
+| `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600.0` | Deadline for group formation, from join until the group reports `READY` with every participant admitted. Also bounds each bootstrap-fence wait independently — every fence (one per lane at `PRE_BARRIER`, then the closing `COMPLETE`) gets a fresh budget of this size. |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | Backoff floor for `GetCollectiveGroup` polling while waiting for formation and for lane bootstrap ids to be published. |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300.0` | Deadline for bringing up one lane's NCCL communicator once its bootstrap id is published. Communicators are created non-blocking, and this bounds the poll to `ncclSuccess`. Setting `NCCL_COMM_BLOCKING` to anything other than `0` is rejected at startup, because blocking initialization would defeat this deadline. |
 | `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600.0` | Deadline for the reshard itself, armed per weight version. `READY` only means the group formed, so this bounds what happens after it; on expiry the group is aborted and has to re-form at a fresh epoch, because peers that disagree about which collectives completed cannot be recovered on the same communicator. |
 | `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams used to overlap per-pipeline-stage reshard lanes. |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS`, so `90` | How long a participant's registration stays alive without a heartbeat. Derived from `MX_HEARTBEAT_INTERVAL_SECS` (default `30`), so raising the heartbeat interval raises this with it. |
+| `MX_NCCL_REFIT_REQUIRE_BOOTSTRAP_FENCE` | `false` | Opts the group into the server-side create gate: `CreateCollectiveTransfer` is rejected until every slot has arrived at the group's bootstrap fences. Fence arrivals are unconditional either way, so every peer needs a fence-capable server; the value is fixed when the group forms and a participant declaring the opposite value is rejected. |
 
 #### MILES External Protocol Adapter (Trainer-Side)
 
