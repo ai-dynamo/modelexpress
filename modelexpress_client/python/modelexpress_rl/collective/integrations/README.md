@@ -189,6 +189,14 @@ unconditionally, so a mixed-generation group with a pre-fence client deadlocks
 at bootstrap by design, receivers holding the fence for a trainer that never
 arrives — proven on hardware with this adapter's pre-fence revision.
 
+A failed bootstrap is not retried in place: the server retains the epoch's
+lane and fence records under the failed worker's identity, so a same-identity
+rejoin would conflict with its own earlier publish. The client refuses it
+loudly, and recovery rebuilds the client with a fresh worker identity — the
+session layer does this on re-prepare — which the group admits as a
+replacement join: the epoch advances and the stale lane and fence records
+are wiped.
+
 ## Performance caveat
 
 This port targets the minimal trainer client surface at this base. The

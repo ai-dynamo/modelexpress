@@ -309,7 +309,9 @@ class TestBootstrap:
         assert len(seen) == 2
         assert all(call[3] is allocator for call in seen)
 
-    def test_a_fence_failure_aborts_the_group_and_a_retry_rejoins(self, fake_nccl):
+    def test_a_fence_failure_aborts_the_group_and_poisons_in_place_retry(
+        self, fake_nccl
+    ):
         class FailingFenceRendezvous(FakeRendezvous):
             def __init__(self):
                 super().__init__()
@@ -332,8 +334,19 @@ class TestBootstrap:
         assert len(client._cache) == 0
         assert fake_nccl.count("abort") == 1
 
-        # A retry re-joins and walks the fences again.
-        client.compute_plan()
+        # The same client cannot rejoin in place: it joined the epoch, and the
+        # server retains that epoch's lane and fence records under this worker
+        # identity, so a same-identity rejoin would conflict with its own
+        # earlier publish.
+        with pytest.raises(RuntimeError, match="cannot rejoin in place"):
+            client.compute_plan()
+        assert rendezvous.joins == 1
+
+        # The recovery path is a fresh client with a fresh worker identity,
+        # which the session layer builds on re-prepare: it joins as a
+        # replacement and walks the fences again.
+        recovered = trainer(rendezvous, FakeEngine(), worker_id="w0-b")
+        recovered.compute_plan()
         assert rendezvous.joins == 2
         assert [(fence["lane_id"], fence["phase"]) for fence in rendezvous.fences] == [
             (1, "PRE_BARRIER"),
