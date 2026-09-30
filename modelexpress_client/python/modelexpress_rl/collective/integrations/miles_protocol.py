@@ -322,6 +322,7 @@ class MilesCollectiveProtocolCore:
         self._round_begun = False
         self._round_seen: set[str] = set()
         self._pending: list[set[str]] = []
+        self._local_names: set[str] = set()
         self._next_group = 0
         self._round_futures: list = []
 
@@ -507,6 +508,7 @@ class MilesCollectiveProtocolCore:
         local_names = {
             entry.name for entry in self._plan.bulk if entry.partition_id == rank
         }
+        self._local_names = local_names
         self._pending = [set(group) & local_names for group in self._publish_groups]
         self._round_seen = set()
         self._next_group = 0
@@ -519,6 +521,7 @@ class MilesCollectiveProtocolCore:
         self._round_begun = False
         self._round_seen = set()
         self._pending = []
+        self._local_names = set()
         self._next_group = 0
         self._round_futures = []
 
@@ -677,6 +680,12 @@ class MilesCollectiveProtocolCore:
             raise ValueError(
                 "MILES NCCL M2N bucket carries tensors outside the frozen plan: "
                 f"{unknown[:5]}"
+            )
+        foreign = [name for name in names if name not in self._local_names]
+        if foreign:
+            raise ValueError(
+                "MILES NCCL M2N bucket carries tensors owned by another PP "
+                f"partition: {foreign[:5]}"
             )
         repeated = [name for name in names if name in self._round_seen]
         if repeated:

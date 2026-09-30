@@ -629,6 +629,7 @@ def _round_generator_submission_failure_worker(
         protocol._prepare_sessions = lambda: None
         protocol._publish_groups = (("model.weight",),)
         protocol._group_of = {"model.weight": 0}
+        protocol._local_names = {"model.weight"}
         protocol._round_version = "1"
         protocol._round_seen = set()
         protocol._pending = [{"model.weight"}]
@@ -967,6 +968,18 @@ def test_send_bucket_rejects_unknown_and_repeated_tensors(monkeypatch):
 
     with pytest.raises(ValueError, match="repeats"):
         protocol.send_bucket([("model.a", tensors["model.a"])])
+
+
+def test_send_bucket_rejects_tensors_owned_by_another_partition(monkeypatch):
+    protocol, _session, _events, tensors = _armed_protocol(monkeypatch)
+    # A name the global frozen plan knows (so it passes the unknown check)
+    # but that belongs to a different PP partition's lane.
+    protocol._group_of["model.foreign"] = 0
+
+    with pytest.raises(ValueError, match="another PP partition"):
+        protocol.send_bucket([("model.foreign", tensors["model.a"])])
+
+    assert "model.foreign" not in protocol._round_seen
 
 
 def test_send_bucket_and_finalize_require_an_armed_round():
