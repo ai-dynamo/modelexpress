@@ -48,8 +48,7 @@ class _FrozenPlan:
         snapshot.validate()
         if snapshot.misc:
             raise ValueError(
-                "the MILES/SGLang collective integration supports "
-                "all-bulk plans only"
+                "the MILES/SGLang collective integration supports all-bulk plans only"
             )
         names = snapshot.parameter_names()
         if not names:
@@ -107,11 +106,7 @@ class _FrozenPlan:
             contiguous = bool(src_ranks) and src_ranks == list(
                 range(src_ranks[0], src_ranks[0] + len(src_ranks))
             )
-            if (
-                not contiguous
-                or src_ranks[0] < 0
-                or src_ranks[-1] >= trainers_per_lane
-            ):
+            if not contiguous or src_ranks[0] < 0 or src_ranks[-1] >= trainers_per_lane:
                 raise ValueError(
                     f"{entry.name}: src_mesh ranks {src_ranks} must be a non-empty "
                     "contiguous subset of the trainer membership "

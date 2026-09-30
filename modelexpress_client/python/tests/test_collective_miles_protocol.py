@@ -943,9 +943,7 @@ def test_rank_one_rejects_tensor_ownership_from_rank_zero(monkeypatch):
 
 
 def test_bucket_stream_publishes_groups_in_plan_order_and_finishes(monkeypatch):
-    protocol, _session, events, tensors = _armed_protocol(
-        monkeypatch, publish_groups=2
-    )
+    protocol, _session, events, tensors = _armed_protocol(monkeypatch, publish_groups=2)
 
     assert protocol._publish_groups == (("model.a",), ("model.b", "model.c"))
     assert [entry.group_key for entry in protocol._plan.bulk] == [
@@ -1039,9 +1037,7 @@ def test_finalize_fails_loudly_when_no_buckets_arrived(monkeypatch):
 
 
 def test_finalize_fails_loudly_when_the_bucket_stream_is_incomplete(monkeypatch):
-    protocol, _session, events, tensors = _armed_protocol(
-        monkeypatch, publish_groups=2
-    )
+    protocol, _session, events, tensors = _armed_protocol(monkeypatch, publish_groups=2)
     protocol.send_bucket([("model.a", tensors["model.a"])])
 
     with pytest.raises(
@@ -1142,15 +1138,11 @@ def test_close_reports_generator_failure_and_allows_retry(monkeypatch, caplog):
     assert attempts == 2
     assert protocol._closed is True
     assert protocol._close_pending is False
-    assert (
-        caplog.text.count("MILES NCCL M2N teardown complete trainer_rank=0") == 1
-    )
+    assert caplog.text.count("MILES NCCL M2N teardown complete trainer_rank=0") == 1
 
     protocol.close()
 
-    assert (
-        caplog.text.count("MILES NCCL M2N teardown complete trainer_rank=0") == 1
-    )
+    assert caplog.text.count("MILES NCCL M2N teardown complete trainer_rank=0") == 1
 
 
 def _seed_real_fan_out_contract(protocol):

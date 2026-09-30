@@ -15,10 +15,10 @@ from ..rendezvous import CollectiveRendezvous, Membership
 from ..spi import LocalParamSpec
 from ..types import ReshardPlan
 from ._common import (
-    _FrozenPlan,
     _check_stable,
     _client_device,
     _collective_streams,
+    _FrozenPlan,
     _layer_groups,
     _local_shape,
     _order_current_cuda_stream_before,

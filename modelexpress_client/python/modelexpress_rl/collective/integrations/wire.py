@@ -247,8 +247,8 @@ def decode_control(value: object) -> CollectiveControl | None:
 
 __all__ = [
     "CONTROL_PREFIX",
-    "CollectiveControl",
     "MAX_CONTROL_CHARS",
+    "CollectiveControl",
     "decode_control",
     "encode_control",
     "plan_from_wire",

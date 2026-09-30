@@ -19,11 +19,11 @@ import torch
 import torch.distributed as dist
 
 from modelexpress import auth
+
 from ..rendezvous import CollectiveRendezvous
 from ..types import MeshSpec, ParamPlan, Placement, ReshardPlan
-from ._common import _dtype_label
+from ._common import _dtype_label, _text
 from ._common import _endpoint as _normalize_endpoint
-from ._common import _text
 from .miles import (
     CollectiveTopology,
     MilesPublisher,
@@ -77,8 +77,7 @@ def _publish_group_count(args: Any) -> int:
     if raw is None:
         return _DEFAULT_PUBLISH_GROUPS
     invalid = ValueError(
-        "modelexpress_m2n_publish_groups must be a positive integer, "
-        f"got {raw!r}"
+        f"modelexpress_m2n_publish_groups must be a positive integer, got {raw!r}"
     )
     if isinstance(raw, bool):
         raise invalid
@@ -133,9 +132,7 @@ def _abi_version(args: Any) -> str:
 
 def _entry_wire_bytes(entry: ParamPlan) -> int:
     if _dtype_label(entry.dtype) != "bfloat16":
-        raise ValueError(
-            f"{entry.name}: unsupported collective dtype {entry.dtype!r}"
-        )
+        raise ValueError(f"{entry.name}: unsupported collective dtype {entry.dtype!r}")
     size = torch.bfloat16.itemsize
     for extent in entry.global_shape:
         size *= int(extent)
@@ -259,9 +256,7 @@ def _validate_args(args: Any) -> None:
     try:
         _server_endpoint(args)
     except ValueError as error:
-        raise ValueError(
-            f"invalid modelexpress_server_address: {error}"
-        ) from error
+        raise ValueError(f"invalid modelexpress_server_address: {error}") from error
     run_id = _arg(args, "modelexpress_m2n_run_id", os.environ.get("MX_MILES_RUN_ID"))
     if run_id is not None:
         _text(run_id, "modelexpress_m2n_run_id")
@@ -415,8 +410,7 @@ class MilesCollectiveProtocolCore:
                 raise RuntimeError("the MILES NCCL M2N protocol is closed")
             if self._round_version is not None:
                 raise RuntimeError(
-                    f"the round for version {self._round_version!r} never "
-                    "finalized"
+                    f"the round for version {self._round_version!r} never finalized"
                 )
             first_round = self._canonical_shapes is None
             frozen: dict[str, tuple[int, ...]]
@@ -545,9 +539,7 @@ class MilesCollectiveProtocolCore:
                 (requested_run_id, uuid4().hex),
                 group=_gloo_group(),
             )
-            gathered = [
-                candidate for candidate in candidates if candidate is not None
-            ]
+            gathered = [candidate for candidate in candidates if candidate is not None]
             requested_ids = [requested for requested, _generated in gathered]
             configured_run_ids = {
                 run_id for run_id in requested_ids if run_id is not None
