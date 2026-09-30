@@ -1235,6 +1235,78 @@ def test_round_broadcasts_rank_zero_generator_submission_failure(tmp_path):
     assert [result[3] for result in results] == [False, False]
 
 
+def test_a_round_gather_failure_closes_and_retires_the_submitted_futures(
+    monkeypatch,
+):
+    # Rank 0's run_round submission succeeded, then the agreement gather
+    # itself raises: the terminal close must retire the submitted futures
+    # rather than leak them, and begin_round must never run.
+    protocol = MilesCollectiveProtocolCore(_args())
+    monkeypatch.setattr(miles_protocol.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(miles_protocol.dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(miles_protocol, "_gloo_group", lambda: object())
+
+    entered_round = False
+
+    class Session:
+        membership = SimpleNamespace(group_id="group-9")
+
+        def begin_round(self, *, version):
+            nonlocal entered_round
+            entered_round = True
+
+        def close(self):
+            pass
+
+    class Future:
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+            return True
+
+    submitted = []
+
+    def generator_futures(action, **_kwargs):
+        if action == "run_round":
+            future = Future()
+            submitted.append(future)
+            return [future]
+        return []
+
+    protocol._session = Session()
+    protocol._generator_futures = generator_futures
+    protocol._publish_groups = (("model.weight",),)
+    protocol._group_of = {"model.weight": 0}
+    protocol._local_names = {"model.weight"}
+    protocol._round_version = "1"
+    protocol._round_seen = set()
+    protocol._pending = [{"model.weight"}]
+    protocol._next_group = 0
+    protocol._round_begun = False
+    protocol._round_futures = []
+
+    def raising_gather(*_args, **_kwargs):
+        raise RuntimeError("synthetic gather failure")
+
+    monkeypatch.setattr(miles_protocol.dist, "all_gather_object", raising_gather)
+
+    with pytest.raises(RuntimeError, match="synthetic gather failure"):
+        protocol.send_bucket(
+            [("model.weight", torch.ones((1,), dtype=torch.bfloat16))]
+        )
+
+    assert not entered_round
+    assert submitted[0].cancelled
+    assert protocol._round_futures == []
+    # The protocol closed terminally; it never reopens.
+    with pytest.raises(RuntimeError, match="protocol is closed"):
+        protocol.send_bucket(
+            [("model.weight", torch.ones((1,), dtype=torch.bfloat16))]
+        )
+
+
 def test_close_reports_generator_failure_and_allows_retry(monkeypatch, caplog):
     protocol = MilesCollectiveProtocolCore(_args())
     protocol.rollout_engines = (object(),)
