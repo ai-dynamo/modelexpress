@@ -100,7 +100,7 @@ fn validate_spec(spec: Option<&CollectiveGroupSpec>) -> Result<&CollectiveGroupS
     ] {
         for slot in slots {
             required(slot, field)?;
-            delimiter_free(slot, field, &['\0', '\n', '\r', '|'])?;
+            delimiter_free(slot, field, &['\0', '\n', '\r', '|', ','])?;
         }
     }
     if spec
@@ -185,7 +185,7 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
         required(&request.slot_id, "slot_id")?;
         required(&request.worker_id, "worker_id")?;
         required(&request.plan_digest, "plan_digest")?;
-        delimiter_free(&request.slot_id, "slot_id", &['\0', '\n', '\r', '|'])?;
+        delimiter_free(&request.slot_id, "slot_id", &['\0', '\n', '\r', '|', ','])?;
         delimiter_free(&request.worker_id, "worker_id", &['\0', '|'])?;
 
         let role = CollectiveRole::try_from(request.role).unwrap_or(CollectiveRole::Unspecified);
@@ -270,7 +270,7 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
         required(&request.group_id, "group_id")?;
         required(&request.slot_id, "slot_id")?;
         required(&request.worker_id, "worker_id")?;
-        delimiter_free(&request.slot_id, "slot_id", &['\0', '\n', '\r', '|'])?;
+        delimiter_free(&request.slot_id, "slot_id", &['\0', '\n', '\r', '|', ','])?;
         if request.epoch == 0 {
             return Err(Status::invalid_argument(
                 "epoch must be the group's current epoch",
