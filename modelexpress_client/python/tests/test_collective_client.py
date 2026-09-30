@@ -87,6 +87,7 @@ class FakeRendezvous:
         self.published = []
         self.reports = []
         self.joins = 0
+        self.fences = []
 
     def join(self, **kwargs):
         epoch = self._epochs[min(self.joins, len(self._epochs) - 1)]
@@ -104,6 +105,9 @@ class FakeRendezvous:
 
     def publish_bootstrap(self, **kwargs):
         self.published.append(kwargs)
+
+    def await_bootstrap_fence(self, **kwargs):
+        self.fences.append(kwargs)
 
     def await_ready(self, *, group_id, epoch, **kwargs):
         lanes = [
@@ -274,6 +278,71 @@ class TestBootstrap:
         rz = FakeRendezvous(leader=False)
         trainer(rz, FakeEngine()).compute_plan()
         assert rz.published == []
+
+    def test_every_step_fences_before_barrier_and_completes_after_the_final_barrier(
+        self, fake_nccl
+    ):
+        rendezvous = FakeRendezvous()
+
+        trainer(rendezvous, FakeEngine()).compute_plan()
+
+        assert [(fence["lane_id"], fence["phase"]) for fence in rendezvous.fences] == [
+            (1, "PRE_BARRIER"),
+            (0, "PRE_BARRIER"),
+            (0, "COMPLETE"),
+        ]
+
+    def test_fenced_bootstrap_forwards_the_framework_barrier_allocator(
+        self, fake_nccl, monkeypatch
+    ):
+        allocator = object()
+        seen = []
+        client = trainer(FakeRendezvous(), FakeEngine(), barrier_alloc=allocator)
+
+        def barrier(lane, device, *, timeout_s=None, alloc=None):
+            seen.append((lane.rank, device, timeout_s, alloc))
+
+        monkeypatch.setattr(collective_client, "_bootstrap_barrier", barrier)
+
+        client.compute_plan()
+
+        assert len(seen) == 2
+        assert all(call[3] is allocator for call in seen)
+
+    def test_a_fence_failure_aborts_the_group_and_a_retry_rejoins(
+        self, fake_nccl
+    ):
+        class FailingFenceRendezvous(FakeRendezvous):
+            def __init__(self):
+                super().__init__()
+                self.fail_fence = True
+
+            def await_bootstrap_fence(self, **kwargs):
+                if self.fail_fence:
+                    self.fail_fence = False
+                    raise TimeoutError("bootstrap fence deadline expired")
+                return super().await_bootstrap_fence(**kwargs)
+
+        rendezvous = FailingFenceRendezvous()
+        client = trainer(rendezvous, FakeEngine())
+
+        # The fence raise unwinds compute_plan through the BaseException
+        # handler: every communicator of the epoch is aborted locally and the
+        # membership is dropped.
+        with pytest.raises(TimeoutError, match="fence deadline"):
+            client.compute_plan()
+        assert len(client._cache) == 0
+        assert fake_nccl.count("abort") == 1
+
+        # There is no poisoned state on this base: a retry re-joins and walks
+        # the fences again.
+        client.compute_plan()
+        assert rendezvous.joins == 2
+        assert [(fence["lane_id"], fence["phase"]) for fence in rendezvous.fences] == [
+            (1, "PRE_BARRIER"),
+            (0, "PRE_BARRIER"),
+            (0, "COMPLETE"),
+        ]
 
     def test_every_worker_barriers_between_global_pp_lane_initializations(
         self, fake_nccl, monkeypatch
