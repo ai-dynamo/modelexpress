@@ -334,16 +334,12 @@ class TestBootstrap:
         assert len(client._cache) == 0
         assert fake_nccl.count("abort") == 1
 
-        # The same client cannot rejoin in place: it joined the epoch, and the
-        # server retains that epoch's lane and fence records under this worker
-        # identity, so a same-identity rejoin would conflict with its own
-        # earlier publish.
+        # The same client is poisoned: no second join reaches the server.
         with pytest.raises(RuntimeError, match="cannot rejoin in place"):
             client.compute_plan()
         assert rendezvous.joins == 1
 
-        # The recovery path is a fresh client with a fresh worker identity,
-        # which the session layer builds on re-prepare: it joins as a
+        # A fresh client with a fresh worker identity recovers: it joins as a
         # replacement and walks the fences again.
         recovered = trainer(rendezvous, FakeEngine(), worker_id="w0-b")
         recovered.compute_plan()
@@ -353,6 +349,29 @@ class TestBootstrap:
             (0, "PRE_BARRIER"),
             (0, "COMPLETE"),
         ]
+
+    def test_a_failed_join_stays_retryable_in_place(self, fake_nccl):
+        class FailingJoinRendezvous(FakeRendezvous):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+
+            def join(self, **kwargs):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise TimeoutError("join deadline expired")
+                return super().join(**kwargs)
+
+        rendezvous = FailingJoinRendezvous()
+        client = trainer(rendezvous, FakeEngine())
+
+        with pytest.raises(TimeoutError, match="join deadline"):
+            client.compute_plan()
+
+        # The join never returned, so nothing was recorded under this
+        # identity: the same client retries in place instead of poisoning.
+        client.compute_plan()
+        assert rendezvous.attempts == 2
 
     def test_every_worker_barriers_between_global_pp_lane_initializations(
         self, fake_nccl, monkeypatch
