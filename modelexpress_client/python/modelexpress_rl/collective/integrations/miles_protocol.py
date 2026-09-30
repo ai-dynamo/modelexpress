@@ -886,57 +886,79 @@ class MilesCollectiveProtocolCore:
         ):
             raise RuntimeError("begin_sync must run before session preparation")
         rank = dist.get_rank()
-        local_tensors = dict(self._tensors)
-        expected_local_names = {
-            entry.name for entry in self._plan.bulk if entry.partition_id == rank
-        }
-        if set(local_tensors) != expected_local_names:
-            missing = sorted(expected_local_names - set(local_tensors))
-            unexpected = sorted(set(local_tensors) - expected_local_names)
-            raise ValueError(
-                f"PP partition {rank} tensor ownership does not match the global "
-                f"plan (missing={missing[:5]}, unexpected={unexpected[:5]})"
-            )
-        if not local_tensors:
-            raise ValueError(f"PP partition {rank} owns no collective parameters")
-        endpoint = _endpoint(self.args)
-        channel = auth.with_auth(grpc.insecure_channel(endpoint))
+        # Every local step is inside the fan-out: a failure on one rank must
+        # reach the shared gather instead of stranding its peers there.
+        local_error = ""
         try:
-            _await_endpoint_ready(
-                channel,
-                endpoint=endpoint,
-                timeout_s=self._connect_timeout_s,
-            )
-        except BaseException:
-            try:
-                channel.close()
-            except BaseException:
-                logger.warning(
-                    "closing the unreachable ModelExpress channel failed",
-                    exc_info=True,
+            local_tensors = dict(self._tensors)
+            expected_local_names = {
+                entry.name for entry in self._plan.bulk if entry.partition_id == rank
+            }
+            if set(local_tensors) != expected_local_names:
+                missing = sorted(expected_local_names - set(local_tensors))
+                unexpected = sorted(set(local_tensors) - expected_local_names)
+                raise ValueError(
+                    f"PP partition {rank} tensor ownership does not match the global "
+                    f"plan (missing={missing[:5]}, unexpected={unexpected[:5]})"
                 )
-            raise
-        self._channel = channel
-        rendezvous = CollectiveRendezvous(channel)
-        self._rendezvous = rendezvous
-        publisher = MilesPublisher(
-            plan=self._plan,
-            source_partition=rank,
-            tensors=local_tensors,
-            aliases={name: name for name in local_tensors},
-        )
-        session = MilesTrainerSession.create(
-            rendezvous=rendezvous,
-            topology=self._topology,
-            publisher=publisher,
-            source_partition=rank,
-            slot_id=self._topology.trainer_slots[rank],
-            worker_id=(f"miles-{self._topology.trainer_slots[rank]}-{uuid4().hex}"),
-            index_in_role=rank,
-            layer_groups=self._publish_groups,
-            device=next(iter(local_tensors.values())).device,
-        )
-        self._session = session
+            if not local_tensors:
+                raise ValueError(f"PP partition {rank} owns no collective parameters")
+            endpoint = _endpoint(self.args)
+            channel = auth.with_auth(grpc.insecure_channel(endpoint))
+            try:
+                _await_endpoint_ready(
+                    channel,
+                    endpoint=endpoint,
+                    timeout_s=self._connect_timeout_s,
+                )
+            except BaseException:
+                try:
+                    channel.close()
+                except BaseException:
+                    logger.warning(
+                        "closing the unreachable ModelExpress channel failed",
+                        exc_info=True,
+                    )
+                raise
+            self._channel = channel
+            rendezvous = CollectiveRendezvous(channel)
+            self._rendezvous = rendezvous
+            publisher = MilesPublisher(
+                plan=self._plan,
+                source_partition=rank,
+                tensors=local_tensors,
+                aliases={name: name for name in local_tensors},
+            )
+            self._session = MilesTrainerSession.create(
+                rendezvous=rendezvous,
+                topology=self._topology,
+                publisher=publisher,
+                source_partition=rank,
+                slot_id=self._topology.trainer_slots[rank],
+                worker_id=f"miles-{self._topology.trainer_slots[rank]}-{uuid4().hex}",
+                index_in_role=rank,
+                layer_groups=self._publish_groups,
+                device=next(iter(local_tensors.values())).device,
+            )
+        except BaseException as error:
+            local_error = repr(error)
+        setup_errors = [""] * dist.get_world_size()
+        dist.all_gather_object(setup_errors, local_error, group=_gloo_group())
+        setup_failures = [
+            f"rank {index}: {error}"
+            for index, error in enumerate(setup_errors)
+            if error
+        ]
+        if setup_failures:
+            primary = RuntimeError(
+                "MILES NCCL M2N local session setup failed: "
+                + "; ".join(setup_failures[:4])
+            )
+            self._close_preserving(primary)
+            raise primary
+        session = self._session
+        if session is None:
+            raise RuntimeError("collective session was not prepared")
 
         generator_futures = []
         submission_error = ""

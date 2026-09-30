@@ -425,7 +425,7 @@ def test_prepare_sessions_closes_the_channel_when_the_server_is_unreachable(
         miles_protocol.grpc, "insecure_channel", lambda _endpoint: Channel()
     )
     monkeypatch.setattr(miles_protocol.auth, "with_auth", lambda channel: channel)
-    monkeypatch.setattr(miles_protocol.dist, "get_rank", lambda: 0)
+    _stub_single_rank_collectives(monkeypatch)
 
     def refuse(_channel, *, endpoint, timeout_s):
         raise RuntimeError(f"cannot reach the ModelExpress server at {endpoint!r}")
@@ -910,9 +910,10 @@ def test_rank_one_rejects_tensor_ownership_from_rank_zero(monkeypatch):
         ]
     )
     protocol._publish_groups = (("rank-zero.weight", "rank-one.weight"),)
+    _stub_single_rank_collectives(monkeypatch)
     monkeypatch.setattr(miles_protocol.dist, "get_rank", lambda: 1)
 
-    with pytest.raises(ValueError, match="ownership does not match"):
+    with pytest.raises(RuntimeError, match="ownership does not match"):
         protocol._prepare_sessions()
 
 
