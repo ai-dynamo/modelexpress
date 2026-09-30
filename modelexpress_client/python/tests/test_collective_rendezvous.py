@@ -276,11 +276,12 @@ class TestBootstrapFence:
         assert caught.value.actual == -1
 
     def test_a_pre_fence_server_is_named_instead_of_leaking_unimplemented(self):
-        stub = FakeStub(fence_error=_rpc_error(grpc.StatusCode.UNIMPLEMENTED))
+        fence_error = _rpc_error(grpc.StatusCode.UNIMPLEMENTED)
+        stub = FakeStub(fence_error=fence_error)
 
         with pytest.raises(
             RendezvousError, match="predates ReachCollectiveBootstrapFence"
-        ):
+        ) as caught:
             make_rendezvous(stub).await_bootstrap_fence(
                 group_id="g1",
                 epoch=3,
@@ -290,6 +291,8 @@ class TestBootstrapFence:
                 timeout_s=5.0,
                 poll_interval_s=0.01,
             )
+
+        assert caught.value.__cause__ is fence_error
 
     def test_a_mismatched_echo_is_rejected(self, monkeypatch):
         # The full branch has no test for the echo guard, but the await trusts
