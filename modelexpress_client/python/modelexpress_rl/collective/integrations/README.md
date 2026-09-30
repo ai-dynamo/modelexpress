@@ -89,9 +89,14 @@ Any mid-round failure closes the protocol (channel, rendezvous, and session
 torn down) and the next `begin_sync` raises rather than silently continuing a
 degraded round. Failures raised inside `begin_sync` or `finalize` fan out to
 every trainer rank through gloo all-gathers. A failure raised out of the
-`send_bucket` path closes the local rank immediately; its peers observe it at
-the finalize fan-out or, when the round never reaches finalize, through the
-receiver's transfer deadline.
+`send_bucket` path closes the local rank immediately and propagates out of
+miles' `update_weights`, so that rank never reaches `finalize`: its peers
+finish their bucket loop and then block in miles' gloo barrier until the
+process group errors or its timeout, the receiver's transfer deadline
+(`MX_NCCL_REFIT_TRANSFER_TIMEOUT_S`, default 600s), or job teardown releases
+them. When the failing rank is rank 0 (the driver),
+`end_weight_update`/`resume_engines` never run and the engines stay paused
+until the job is torn down.
 
 ## Receiver-side deployment requirements
 
