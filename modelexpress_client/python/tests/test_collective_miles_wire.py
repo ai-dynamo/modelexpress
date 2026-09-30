@@ -6,7 +6,6 @@
 import json
 
 import pytest
-
 from modelexpress_rl.collective.integrations import wire
 from modelexpress_rl.collective.integrations.miles import CollectiveTopology
 from modelexpress_rl.collective.integrations.wire import (

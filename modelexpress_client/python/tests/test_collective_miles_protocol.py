@@ -12,7 +12,6 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
-
 from modelexpress_rl.collective.integrations import miles_protocol
 from modelexpress_rl.collective.integrations.miles_protocol import (
     MilesCollectiveProtocolCore,

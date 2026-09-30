@@ -4,10 +4,9 @@
 import sys
 from types import SimpleNamespace
 
+import modelexpress_rl.collective.integrations.miles as miles_integration
 import pytest
 import torch
-
-import modelexpress_rl.collective.integrations.miles as miles_integration
 from modelexpress_rl.collective import (
     MeshSpec,
     ParamPlan,

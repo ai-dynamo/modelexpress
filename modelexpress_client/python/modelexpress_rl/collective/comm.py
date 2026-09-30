@@ -500,7 +500,9 @@ class CommunicatorCache:
             else envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S
         )
         if not math.isfinite(timeout_s) or timeout_s <= 0:
-            raise ValueError(f"timeout_s must be finite and positive, got {timeout_s!r}")
+            raise ValueError(
+                f"timeout_s must be finite and positive, got {timeout_s!r}"
+            )
 
         _, _, bindings = _nccl()
         deadline = time.monotonic() + timeout_s
