@@ -178,27 +178,26 @@ unconditionally, and the server answers `ReachCollectiveBootstrapFence`.
 Because arrivals are unconditional, this client requires a fence-capable
 server: against a pre-fence server the first arrival fails loudly — the
 server's UNIMPLEMENTED is translated into an upgrade instruction — rather
-than skipping the fence. `requires_bootstrap_fence`
-controls only the server-side create gate, and every participant of one
-operation must set it to the same value or joins are rejected. The same rule
-binds whoever creates the transfer row: a create — including an idempotent
-replay — whose declared requirement differs from the group's is refused
-(FENCEMISMATCH). The interop
-requirement cuts the other way too: every peer must run a fence-capable
-client. The full-branch engine images used for hardware interop (built from
-`6669b02`; they report 0.5.1, the same version string a pre-fence build
-reports) await the fences
-unconditionally, so a mixed-generation group with a pre-fence client deadlocks
-at bootstrap by design, receivers holding the fence for a trainer that never
-arrives — proven on hardware with this adapter's pre-fence revision.
+than skipping the fence. `requires_bootstrap_fence` controls only the
+server-side create gate, and every participant of one operation must set it
+to the same value or joins are rejected. The same rule binds whoever creates
+the transfer row: a create — including an idempotent replay — whose declared
+requirement differs from the group's is refused with FAILED_PRECONDITION.
+The interop requirement cuts the other way too: every peer must run a
+fence-capable client. The full-branch engine images used for hardware
+interop (built from `6669b02`; they report 0.5.1, the same version string a
+pre-fence build reports) await the fences unconditionally, so a
+mixed-generation group with a pre-fence client deadlocks at bootstrap by
+design, receivers holding the fence for a trainer that never arrives —
+proven on hardware with this adapter's pre-fence revision.
 
-A failed bootstrap is not retried in place: the server retains the epoch's
-lane and fence records under the failed worker's identity, so a same-identity
-rejoin would conflict with its own earlier publish. The client refuses it
-loudly, and recovery rebuilds the client with a fresh worker identity — the
-session layer does this on re-prepare — which the group admits as a
+A failed bootstrap is not retried in place: the server may retain epoch
+state — lane publishes and fence arrivals — under the failed worker's
+identity, and an in-place rejoin may conflict with it. The client refuses it
+loudly. Recovery builds a fresh client with a fresh worker identity (a new
+session; under MILES, a new protocol instance), which the group admits as a
 replacement join: the epoch advances and the stale lane and fence records
-are wiped.
+are wiped whenever the failed epoch published any.
 
 ## Performance caveat
 
