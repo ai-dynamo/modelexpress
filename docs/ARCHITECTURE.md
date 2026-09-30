@@ -1206,26 +1206,39 @@ selection and source discovery remain inside the ModelExpress package.
 **Speculative draft pass.** SGLang's EAGLE worker builds a second ModelRunner
 for the draft on the same GPU. Its `ModelConfig` has `is_draft_model=True` and,
 unless `speculative_draft_load_format` names another format, it loads through the
-same `remote_instance` backend. `MxModelLoader` handles that second call the way
-the vLLM loader does (see "MTP two-pass load" above):
+same `remote_instance` backend. The generic MX draft path recognizes that
+second pass, reuses the main load's NIXL agent instead of binding the same
+metadata port again, and gives draft tensors a separate manifest namespace.
+Model-specific weight selection lives behind `DraftWeightAdapter`; the only
+implemented selector is Qwen3.5 MTP, whose raw-tensor predicate matches
+SGLang v0.5.16's `Qwen3_5ForCausalLMMTP.load_weights`. Actual tensor mapping,
+quantization, and loading still run through SGLang's model loader. The
+checkpoint's `model.safetensors.index.json` maps tensor names to shard files;
+it does not by itself define which tensors belong to every architecture's draft.
 
-- On `transport=nixl`, a draft with the main load's `SourceIdentity` (MTP /
-  NextN, same checkpoint) sets `p2p_role = "draft"` and adopts the main load's
-  NIXL agent. It registers and publishes its tensors as `mx_draft::<name>` in
-  the target's publication and merges them into `_tensor_registry[device_id]`.
-  It skips artifact install and publish. A draft with a different identity
-  (EAGLE from another checkpoint) stays out of P2P.
-- Discovery drops the draft's `model.embed_tokens.*` (single pipeline stage)
-  and `lm_head.*`, because `set_embed_and_head` replaces them with the target's.
-- A main load gets a `DraftPublicationGate` when SGLang's speculative settings
-  (`get_spec()`, or `get_global_server_args()` on older releases) name an
-  algorithm other than NGRAM and the draft load format is unset or
-  `remote_instance`. `MX_ARTIFACT_READY_URL` health gating takes precedence.
+- A Qwen3.5 draft may use P2P only when it shares the main `SourceIdentity`,
+  both passes select the same model adapter, pipeline parallelism is one, and
+  the source identity includes an explicit revision and SGLang package version.
+  A hash of these inputs and the model URI scopes its draft tensor names. The
+  receiver accepts only that namespace and verifies complete descriptor
+  coverage. Unknown or incompatible drafts fall back to SGLang's storage load.
+- After the main and draft loads, only draft-owned tensors are appended to the
+  main NIXL registration and metadata publication; target-shared embedding and
+  head storage is excluded using SGLang's `get_embed_and_head`, independent of
+  parameter names. The source's publication gate does not open for a recognized
+  Qwen3.5 draft until that extension succeeds. If a health URL is configured,
+  both draft publication and engine health must be ready.
+- On a cold source using ModelStreamer, optional `MX_DRAFT_SPOOL_DIR` captures
+  only Qwen3.5 draft raw tensors as SGLang streams the checkpoint for the main
+  pass. The second pass replays that bounded local spool into SGLang's own
+  `load_weights`, avoiding another object-store read. The spool is available
+  only after the main iterator finishes; read/write failure, byte-limit
+  exhaustion, or missing draft tensors fall back to SGLang ModelStreamer.
+  Sources loaded by other strategies do not produce a spool.
 - On `transport=transfer_engine`, the draft loads natively and never publishes.
   A second TransferEngine source would advertise the head under the target's
   identity and replace the target's heartbeat, and its same-named tensors would
-  match the target's manifest.
-- `MX_LOAD_STRATEGY_CHAIN=RL` rejects a draft.
+  match the target's manifest. `MX_LOAD_STRATEGY_CHAIN=RL` rejects a draft.
 
 **LoadStrategyChain** (`load_strategy/`):
 

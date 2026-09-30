@@ -208,7 +208,7 @@ class RdmaStrategy(LoadStrategy):
             if not self._accelerator_compatible(ctx, source_worker, worker_id):
                 continue
 
-            if _is_draft_pass(ctx) and not self._may_serve_draft(source_worker):
+            if _is_draft_pass(ctx) and not self._may_serve_draft(ctx, source_worker):
                 logger.info(
                     f"[Worker {ctx.global_rank}] Skipping source worker "
                     f"{worker_id}: its manifest has no speculative draft tensors"
@@ -434,7 +434,9 @@ class RdmaStrategy(LoadStrategy):
         return False
 
     @staticmethod
-    def _may_serve_draft(source_worker: p2p_pb2.WorkerMetadata) -> bool:
+    def _may_serve_draft(
+        ctx: LoadContext, source_worker: p2p_pb2.WorkerMetadata
+    ) -> bool:
         """False only when a known manifest carries no draft tensors.
 
         A source that served the target but not a draft (no speculative
@@ -445,7 +447,9 @@ class RdmaStrategy(LoadStrategy):
         descriptors = worker_tensor_descriptors(source_worker)
         if not descriptors:
             return True
-        return any(is_draft_tensor_name(t.name) for t in descriptors)
+        return any(
+            t.name.startswith(ctx.draft_tensor_namespace) for t in descriptors
+        )
 
     @staticmethod
     def _scope_source_tensors(
@@ -461,7 +465,10 @@ class RdmaStrategy(LoadStrategy):
         """
         if not _is_draft_pass(ctx):
             return [t for t in source_tensors if not is_draft_tensor_name(t.name)]
-        scoped = [t for t in source_tensors if is_draft_tensor_name(t.name)]
+        scoped = [
+            t for t in source_tensors
+            if t.name.startswith(ctx.draft_tensor_namespace)
+        ]
         missing = set(ctx.tensors) - {t.name for t in scoped}
         if missing:
             # Receiving a partial draft would leave the rest at dummy values;

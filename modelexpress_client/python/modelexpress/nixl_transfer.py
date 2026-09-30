@@ -504,13 +504,26 @@ class NixlTransferManager:
             registration = self._agent.register_memory(
                 registrable, backends=self._backends
             )
-            self._registered_memory.append(registration)
+        try:
+            metadata = self._agent.get_agent_metadata()
+        except BaseException:
+            if registration is not None:
+                try:
+                    self._agent.deregister_memory(registration)
+                except Exception:
+                    # Keep the handle reachable for shutdown even when the
+                    # immediate rollback fails.
+                    self._registered_memory.append(registration)
+                    logger.exception("Failed to roll back appended NIXL memory")
+            raise
 
+        if registration is not None:
+            self._registered_memory.append(registration)
         self._tensors = {**self._tensors, **new_tensors}
         self._tensor_descriptors = self._tensor_descriptors + new_descriptors
         for name in new_tensors:
             self._appended_registrations[name] = registration
-        self._metadata = self._agent.get_agent_metadata()
+        self._metadata = metadata
         logger.info(
             "Appended %d tensors (%d regions) to the registered catalog "
             "(%d tensors total)",

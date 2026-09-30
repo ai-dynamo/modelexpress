@@ -25,6 +25,12 @@ from ...tensor_utils import (
     capture_tensor_attrs,
     collect_module_tensors,
 )
+from .draft_spool import (
+    DraftSpool,
+    store_ready_spool,
+    take_ready_spool,
+)
+from .draft_weights import draft_weight_adapter_for
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
 
@@ -108,13 +114,19 @@ class SglangAdapter(EngineAdapter):
         adopt_hidden_tensors(result.model, self.accelerator_backend)
         tensors = collect_module_tensors(result.model, self.accelerator_backend)
         if is_sglang_draft_model(self.model_config):
-            prefixes = _target_shared_draft_prefixes(result.model)
-            if prefixes:
-                tensors = {
-                    name: tensor
-                    for name, tensor in tensors.items()
-                    if not name.startswith(prefixes)
-                }
+            selector = draft_weight_adapter_for(
+                type(result.model).__name__, role="draft"
+            )
+            if selector is not None:
+                tensors = selector.transferable_tensors(result.model, tensors)
+            else:
+                prefixes = _target_shared_draft_prefixes(result.model)
+                if prefixes:
+                    tensors = {
+                        name: tensor
+                        for name, tensor in tensors.items()
+                        if not name.startswith(prefixes)
+                    }
         return tensors
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
@@ -141,6 +153,44 @@ class SglangAdapter(EngineAdapter):
         if model is None:
             raise RuntimeError("SGLang ModelStreamer loading requires result.model")
 
+        is_draft = is_sglang_draft_model(self.model_config)
+        selector = draft_weight_adapter_for(
+            type(model).__name__, role="draft" if is_draft else "main"
+        )
+        spool_key = (
+            self.build_identity().SerializeToString(),
+            self.get_worker_rank(),
+            self.get_device_id(),
+            model_uri,
+        )
+        if (
+            envs.MX_DRAFT_SPOOL_DIR
+            and is_draft
+            and selector is not None
+        ):
+            spool = take_ready_spool(spool_key)
+            if spool is not None:
+                try:
+                    spool.validate()
+                except Exception as exc:
+                    logger.warning(
+                        "Qwen3.5 draft spool is unreadable; using SGLang "
+                        "ModelStreamer instead: %s", exc
+                    )
+                    spool.close()
+                else:
+                    logger.info(
+                        "[Worker %s] Replaying %d bytes of Qwen3.5 draft weights "
+                        "from the cold source's local spool",
+                        self.get_global_rank(),
+                        spool.size_bytes,
+                    )
+                    try:
+                        yield from spool.replay()
+                    finally:
+                        spool.close()
+                    return
+
         from sglang.srt.configs.load_config import LoadFormat
         from sglang.srt.model_loader.loader import RunaiModelStreamerLoader
 
@@ -158,7 +208,45 @@ class SglangAdapter(EngineAdapter):
 
         loader = RunaiModelStreamerLoader(stream_config)
         loader.target_device_str = str(self.target_device)
-        return loader._get_all_weights(stream_model_config, model)
+        weights = loader._get_all_weights(stream_model_config, model)
+        spool = None
+        if (
+            envs.MX_DRAFT_SPOOL_DIR
+            and not is_draft
+            and selector is not None
+        ):
+            try:
+                spool = DraftSpool(
+                    envs.MX_DRAFT_SPOOL_DIR,
+                    max_bytes=envs.MX_DRAFT_SPOOL_MAX_BYTES,
+                    memory_bytes=envs.MX_DRAFT_SPOOL_MEMORY_BYTES,
+                )
+            except (OSError, ValueError) as exc:
+                logger.warning("Qwen3.5 draft spool unavailable: %s", exc)
+
+        completed = False
+        try:
+            for name, tensor in weights:
+                if spool is not None and selector.includes(name):
+                    try:
+                        spool.capture(name, tensor)
+                    except Exception as exc:
+                        logger.warning("Qwen3.5 draft spool disabled: %s", exc)
+                        spool.close()
+                        spool = None
+                yield name, tensor
+            completed = True
+        finally:
+            if spool is not None:
+                if completed:
+                    try:
+                        spool.finish()
+                        store_ready_spool(spool_key, spool)
+                    except Exception as exc:
+                        logger.warning("Qwen3.5 draft spool discarded: %s", exc)
+                        spool.close()
+                else:
+                    spool.close()
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
         with capture_tensor_attrs(self.accelerator_backend):

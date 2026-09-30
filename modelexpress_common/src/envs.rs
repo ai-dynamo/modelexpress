@@ -78,6 +78,14 @@ pub const MODEL_EXPRESS_SERVER_ENDPOINT: &str = "MODEL_EXPRESS_SERVER_ENDPOINT";
 /// something to assume has already happened.
 pub const MX_METRICS_SCHEME: &str = "MX_METRICS_SCHEME";
 
+// ── Python SGLang client draft spool ────────────────────────────────────────
+/// Optional local directory for a cold source's Qwen3.5 draft replay.
+pub const MX_DRAFT_SPOOL_DIR: &str = "MX_DRAFT_SPOOL_DIR";
+/// Per-rank raw-tensor byte budget for the draft spool.
+pub const MX_DRAFT_SPOOL_MAX_BYTES: &str = "MX_DRAFT_SPOOL_MAX_BYTES";
+/// Portion of the draft spool kept in host memory before disk spill.
+pub const MX_DRAFT_SPOOL_MEMORY_BYTES: &str = "MX_DRAFT_SPOOL_MEMORY_BYTES";
+
 // ── HuggingFace ─────────────────────────────────────────────────────────────
 /// HuggingFace Hub auth token.
 pub const HF_TOKEN: &str = "HF_TOKEN";

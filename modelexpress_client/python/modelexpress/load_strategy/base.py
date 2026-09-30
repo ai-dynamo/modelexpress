@@ -17,7 +17,7 @@ from .. import envs
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import log_tensor_summary
 from ..metadata.publish import extend_published_tensors, publish_metadata_and_ready
-from .context import DRAFT_TENSOR_PREFIX, LoadContext, LoadResult
+from .context import LoadContext, LoadResult
 
 if TYPE_CHECKING:
     from ..accelerators import AcceleratorBackend
@@ -223,7 +223,7 @@ def register_tensors(
             ctx.tensors = ctx.adapter.discover_tensors(result)
             if ctx.p2p_role == "draft":
                 ctx.tensors = {
-                    DRAFT_TENSOR_PREFIX + name: tensor
+                    ctx.draft_tensor_namespace + name: tensor
                     for name, tensor in ctx.tensors.items()
                 }
             log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
@@ -319,6 +319,8 @@ def publish_metadata(ctx: LoadContext) -> None:
                 f"[Worker {ctx.global_rank}] No main publication on device "
                 f"{ctx.device_id} to extend, draft tensors are not served"
             )
+        else:
+            ctx.draft_published = True
         return
     try:
         publish_metadata_and_ready(

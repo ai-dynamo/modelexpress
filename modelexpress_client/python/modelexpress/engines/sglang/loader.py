@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
+from importlib.metadata import PackageNotFoundError, version as pkg_version
 from typing import TYPE_CHECKING
 
 import torch
@@ -29,6 +30,7 @@ from .adapter import (
     build_sglang_load_context,
     is_sglang_draft_model,
 )
+from .draft_weights import draft_tensor_namespace, draft_weight_adapter_for
 from .artifacts import (
     _sglang_health_ready,
     install_sglang_cache_artifacts,
@@ -48,6 +50,13 @@ _nixl_managers: dict[int, NixlTransferManager] = {}
 _loader_registry: dict[int, MxModelLoader] = {}
 # Main-pass publication gates awaiting this device's speculative draft pass.
 _draft_publication_gates: dict[int, DraftPublicationGate] = {}
+
+
+def _sglang_version() -> str:
+    try:
+        return pkg_version("sglang")
+    except PackageNotFoundError:
+        return ""
 
 
 def _speculative_server_args():
@@ -99,6 +108,8 @@ class MxModelLoader:
         # prove it came up. No-op unless enabled; never raises.
         enable_metrics()
         self._ctx: LoadContext | None = None
+        self._strict_draft_publication = False
+        self._draft_weight_adapter = None
 
     def load_model(
         self,
@@ -161,28 +172,66 @@ class MxModelLoader:
         is_draft = is_sglang_draft_model(model_config)
         ctx.p2p_role = "draft" if is_draft else "main"
         draft_gate: DraftPublicationGate | None = None
+        strict_draft = False
         if is_draft:
             main_loader = _loader_registry.get(ctx.device_id)
             main_ctx = main_loader._ctx if main_loader is not None else None
-            if main_ctx is not None and main_ctx.identity == ctx.identity:
+            draft_adapter = draft_weight_adapter_for(
+                type(model).__name__, role="draft"
+            )
+            same_checkpoint = main_ctx is not None and main_ctx.identity == ctx.identity
+            compatible_adapter = (
+                same_checkpoint
+                and draft_adapter is not None
+                and main_loader._draft_weight_adapter is not None
+                and draft_adapter.compatibility_tag
+                == main_loader._draft_weight_adapter.compatibility_tag
+            )
+            namespace = (
+                draft_tensor_namespace(
+                    ctx.identity,
+                    draft_adapter,
+                    type(model).__name__,
+                    _sglang_version(),
+                    envs.MX_MODEL_URI or ctx.identity.model_name,
+                )
+                if compatible_adapter and ctx.identity.pipeline_parallel_size == 1
+                else None
+            )
+            if namespace is not None:
                 # Same checkpoint (MTP / NextN): join the main load's
                 # publication through its NIXL agent instead of binding
                 # MX_METADATA_PORT + device_id a second time.
                 ctx.shared_nixl_manager = _nixl_managers.get(ctx.device_id)
+                ctx.draft_tensor_namespace = namespace
+                strict_draft = main_loader._strict_draft_publication
             else:
-                # A draft from a different checkpoint (e.g. EAGLE) has its own
-                # SourceIdentity, so peers could never find its tensors in the
-                # target's publication. Keep it out of P2P.
+                # Unknown layouts, an unpinned checkpoint or a different
+                # draft identity fall back to SGLang's storage loader.
                 ctx.p2p_enabled = False
             draft_gate = _draft_publication_gates.pop(ctx.device_id, None)
-        if envs.MX_ARTIFACT_READY_URL.strip():
-            # The engine is not healthy until the draft has loaded too, so this
-            # already keeps the main publication hidden until then.
+        elif _expects_draft_pass():
+            self._draft_weight_adapter = draft_weight_adapter_for(
+                type(model).__name__, role="main"
+            )
+            self._strict_draft_publication = self._draft_weight_adapter is not None
+            if self._strict_draft_publication or not envs.MX_ARTIFACT_READY_URL.strip():
+                main_gate = DraftPublicationGate(
+                    grace_secs=None if self._strict_draft_publication else 600.0
+                )
+                _draft_publication_gates[ctx.device_id] = main_gate
+                if envs.MX_ARTIFACT_READY_URL.strip():
+                    ctx.source_ready_fn = (
+                        lambda: main_gate.is_open() and _sglang_health_ready(ctx)
+                    )
+                else:
+                    ctx.source_ready_fn = main_gate.is_open
+        elif not is_draft:
+            self._draft_weight_adapter = draft_weight_adapter_for(
+                type(model).__name__, role="main"
+            )
+        if not is_draft and ctx.source_ready_fn is None and envs.MX_ARTIFACT_READY_URL.strip():
             ctx.source_ready_fn = lambda: _sglang_health_ready(ctx)
-        elif not is_draft and _expects_draft_pass():
-            main_gate = DraftPublicationGate()
-            _draft_publication_gates[ctx.device_id] = main_gate
-            ctx.source_ready_fn = main_gate.is_open
         if not is_draft:
             self._ctx = ctx
 
@@ -197,7 +246,9 @@ class MxModelLoader:
         try:
             model = self._run_nixl_load(model, ctx)
         finally:
-            if draft_gate is not None:
+            if draft_gate is not None and (
+                not strict_draft or ctx.draft_published
+            ):
                 draft_gate.release()
             main_gate_pending = _draft_publication_gates.get(ctx.device_id)
             if not is_draft and main_gate_pending is not None:

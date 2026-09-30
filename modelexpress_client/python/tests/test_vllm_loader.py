@@ -946,6 +946,21 @@ class TestMtpDrafterSecondLoad:
 
         extend.assert_called_once_with(ctx.tensors, device_id=2, worker_rank=5)
         publish.assert_not_called()
+        assert ctx.draft_published is True
+
+    def test_draft_publication_flag_stays_false_without_main_publication(self):
+        from modelexpress.load_strategy.base import publish_metadata
+
+        ctx = self._draft_ctx(self._populated_manager(), device_id=2, worker_rank=5)
+        ctx.nixl_manager = ctx.shared_nixl_manager
+        ctx.tensors = {"mx_draft::w": MagicMock()}
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}), patch(
+            "modelexpress.load_strategy.base.extend_published_tensors",
+            return_value=False,
+        ):
+            publish_metadata(ctx)
+
+        assert ctx.draft_published is False
 
     @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
     def test_rdma_available_for_draft(self, _mock):
@@ -1323,6 +1338,28 @@ class TestNixlTransferManagerAppend:
         mgr._tensors = {"w": same}
         mgr.register_additional_tensors({"w": same})
         mgr._agent.register_memory.assert_not_called()
+
+    def test_failed_metadata_refresh_rolls_back_draft_registration(self):
+        mgr = self._make_manager()
+        target = self._tensor(0x1000)
+        mgr._tensors = {"target.w": target}
+        mgr._tensor_descriptors = [
+            TensorDescriptor("target.w", 0x1000, 8, 0, "torch.bfloat16")
+        ]
+        mgr._metadata = b"main-metadata"
+        handle = MagicMock()
+        mgr._agent.register_memory.return_value = handle
+        mgr._agent.get_agent_metadata.side_effect = RuntimeError("metadata failed")
+
+        with pytest.raises(RuntimeError, match="metadata failed"):
+            mgr.register_additional_tensors({"mx_draft::w": self._tensor(0x9000)})
+
+        assert list(mgr._tensors) == ["target.w"]
+        assert [d.name for d in mgr.tensor_descriptors] == ["target.w"]
+        assert mgr.nixl_metadata == b"main-metadata"
+        assert mgr._appended_registrations == {}
+        assert mgr._registered_memory == []
+        mgr._agent.deregister_memory.assert_called_once_with(handle)
 
     def test_deregister_releases_only_appended_tensors(self):
         mgr = self._make_manager()

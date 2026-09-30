@@ -22,17 +22,19 @@ class DraftPublicationGate:
     """Keeps a main load undiscoverable until its draft has joined the manifest.
 
     Opens when the draft pass on the same device finishes, or after
-    ``grace_secs`` from the end of the main pass.
+    ``grace_secs`` from the end of the main pass. Passing ``None`` disables
+    expiry for a model adapter that requires draft publication.
     """
 
-    def __init__(self, grace_secs: float = DRAFT_PUBLICATION_GRACE_SECS):
+    def __init__(self, grace_secs: float | None = DRAFT_PUBLICATION_GRACE_SECS):
         self._released = threading.Event()
         self._grace_secs = grace_secs
         self._deadline: float | None = None
         self._expired_logged = False
 
     def arm(self) -> None:
-        self._deadline = time.monotonic() + self._grace_secs
+        if self._grace_secs is not None:
+            self._deadline = time.monotonic() + self._grace_secs
 
     def release(self) -> None:
         self._released.set()
