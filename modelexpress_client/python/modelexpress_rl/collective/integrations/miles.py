@@ -13,6 +13,7 @@ from ..client import RefitClientTrainer
 from ..plan import DEFAULT_RECEIVER_PROTOCOL
 from ..rendezvous import CollectiveRendezvous, Membership
 from ..spi import LocalParamSpec
+from ..types import ReshardPlan
 from ._common import (
     _FrozenPlan,
     _check_stable,
@@ -83,7 +84,7 @@ class MilesPublisher:
     def __init__(
         self,
         *,
-        plan,
+        plan: ReshardPlan,
         source_partition: int,
         tensors: dict[str, Any],
         aliases: dict[str, str],
@@ -162,7 +163,7 @@ class MilesPublisher:
                 expected_dtype=entry.dtype,
             )
 
-    def capture(self):
+    def capture(self) -> ReshardPlan:
         self._validate_stable()
         return self._plan.capture()
 
@@ -181,9 +182,7 @@ class MilesPublisher:
         self._validate_stable()
 
     def cleanup(self) -> None:
-        # Intentional no-op: the SPI cleanup hook has no publisher-side state
-        # to release; the trainer session owns lifecycle teardown.
-        pass
+        """No publisher-side state to release; the session owns teardown."""
 
 
 class MilesTrainerSession:
@@ -206,7 +205,7 @@ class MilesTrainerSession:
         self._source_partition = source_partition
         self._groups = _layer_groups(layer_groups, publisher.parameter_names())
         self._device = _client_device(device, publisher.device, "MILES trainer")
-        self._streams = list(streams) if streams else [None]
+        self._streams = _collective_streams(streams, device=self._device)
         self._membership = None
         self._prepared = False
         self._closed = False
@@ -269,11 +268,13 @@ class MilesTrainerSession:
             self._prepared = True
             return self._membership
         except BaseException:
-            self.close()
+            # Preserve the prepare error: _fail_round logs secondary teardown
+            # failures instead of letting them mask the primary exception.
+            self._fail_round()
             raise
 
     @property
-    def membership(self):
+    def membership(self) -> Membership:
         if self._membership is None:
             raise RuntimeError("prepare must complete before reading membership")
         return self._membership

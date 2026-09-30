@@ -84,7 +84,7 @@ def _topology():
 
 
 def _lane_declarations(topology):
-    """Mirror the lane set the 795 client declares for this topology.
+    """Mirror the lane set the trainer client declares for this topology.
 
     ``RefitClientTrainer`` declares its lanes internally; tests that drive
     ``rendezvous.join`` directly rebuild the same declaration here.
@@ -609,7 +609,7 @@ def test_trainer_session_orders_the_producer_before_the_default_lane_stream(
     events = []
     _install_fake_cuda(monkeypatch, events)
     client = FakeTrainerClient()
-    session = _session(client)
+    session = _session(client, streams=[None])
     session.prepare()
 
     session.begin_round(version="version-1")
@@ -655,6 +655,29 @@ def test_trainer_session_preserves_the_round_error_while_aborting_and_closing():
 
     with pytest.raises(RuntimeError, match="session is closed"):
         session.begin_round(version="version-2")
+
+
+def test_trainer_session_preserves_the_prepare_error_while_closing():
+    original = RuntimeError("collective initialize failed")
+
+    class Client(FakeTrainerClient):
+        def initialize(self, publisher, *, source_partition):
+            raise original
+
+    client = Client()
+    rendezvous = FakeRendezvous()
+    session = _session(client, rendezvous)
+
+    with pytest.raises(RuntimeError, match="collective initialize failed") as caught:
+        session.prepare()
+
+    assert caught.value is original
+    assert client.events[-1] == ("cleanup",)
+    assert rendezvous.reported == []
+    assert rendezvous.closed == 1
+
+    with pytest.raises(RuntimeError, match="session is closed"):
+        session.prepare()
 
 
 def test_trainer_session_closes_after_a_finish_failure():
