@@ -15,7 +15,7 @@ Extraction rules (per state_dict tensor, floating point only):
 - replicated DTensor: same as unsharded
 - sharded DTensor: this rank serves its per-dim local box (general: FSDP dim 0,
   tensor-parallel dim 1, or 2-D meshes) via compute_local_shape_and_global_offset
-- served as the wire dtype (WIRE_DTYPE), cast into the staging arena for
+- served in the selected per-tensor wire dtype, cast into the staging arena for
   COPY_TO_DEVICE only when the source differs
 """
 
@@ -39,10 +39,7 @@ from modelexpress_rl.train.adapter import NixlMetadataProvider
 
 logger = logging.getLogger("modelexpress_rl.train.engines.fsdp.publisher")
 
-# The dtype weights are served on the wire as. The cast only actually happens
-# when the source dtype differs (e.g. an fp32 master): a matching source copies
-# as-is, and IN_PLACE can serve a matching source with no copy at all.
-# TODO: make this configurable at client initialization; hardcoded to bf16 for now.
+# Default transfer dtype; FSDPTrainerContext can override it per tensor.
 WIRE_DTYPE = torch.bfloat16
 
 
@@ -53,8 +50,8 @@ class LocalTensorShard:
     ``source_tensor`` is the live (or detached) rank-local view. ``shard_offset``
     is the per-dim offset of this shard's box inside the global tensor (all-zero
     for unsharded/replicated). ``staging_tensor`` is set only for COPY_TO_DEVICE
-    and is the WIRE_DTYPE registered arena the source is copied into (copy_
-    converts only if the source dtype differs).
+    and uses the selected transfer dtype. Copying converts only when the source
+    dtype differs.
     """
 
     name: str
