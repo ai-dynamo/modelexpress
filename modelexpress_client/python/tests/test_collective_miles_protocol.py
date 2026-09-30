@@ -1031,9 +1031,7 @@ def test_later_rounds_skip_the_manifest_all_gather(monkeypatch):
         gathered.append(value)
         output.__setitem__(0, value)
 
-    monkeypatch.setattr(
-        miles_protocol.dist, "all_gather_object", recording_gather
-    )
+    monkeypatch.setattr(miles_protocol.dist, "all_gather_object", recording_gather)
     protocol.begin_sync(2, lambda *, materialize: iter([list(tensors.items())]))
 
     # Only the begin_sync error fan-out runs in round two; the run-id

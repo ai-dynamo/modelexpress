@@ -397,9 +397,7 @@ class MilesCollectiveProtocolCore:
             or self._rendezvous is not None
             or self._channel is not None
         ):
-            logger.info(
-                "MILES NCCL M2N reconnect: tearing down the previous session"
-            )
+            logger.info("MILES NCCL M2N reconnect: tearing down the previous session")
             self._teardown_for_reconnect()
         self.rollout_engines = tuple(rollout_engines)
         self._engine_gpu_counts = counts
@@ -629,9 +627,7 @@ class MilesCollectiveProtocolCore:
             # topology is still rebuilt and compared every round: a reconnect
             # that heals into a reshaped engine GPU topology must fail closed.
             if topology != self._topology:
-                raise RuntimeError(
-                    "MILES tensor names, shapes, or topology changed"
-                )
+                raise RuntimeError("MILES tensor names, shapes, or topology changed")
             return
         src_mesh = MeshSpec((1,), rank_offset=0)
         dst_mesh = MeshSpec((len(generator_slots),), rank_offset=1)
