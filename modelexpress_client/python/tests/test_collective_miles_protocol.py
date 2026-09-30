@@ -1144,6 +1144,44 @@ def test_generator_fan_out_uses_one_submit_for_multiple_engines(monkeypatch):
     assert executions == [0, 2]
 
 
+def test_generator_fan_out_settles_every_engine_before_raising(monkeypatch):
+    executions = []
+
+    class Future:
+        def __init__(self, coroutine):
+            self.coroutine = coroutine
+
+        def result(self):
+            return __import__("asyncio").run(self.coroutine)
+
+    _install_fake_miles_async(
+        monkeypatch,
+        [],
+        submit=lambda coroutine: Future(coroutine),
+        wait_futures=lambda futures: [future.result() for future in futures],
+    )
+
+    protocol = MilesCollectiveProtocolCore(_args())
+    protocol.rollout_engines = (object(), object())
+    protocol._engine_gpu_offsets = (0, 4)
+    protocol._engine_gpu_counts = (2, 2)
+    protocol._plan = object()
+    protocol._topology = object()
+
+    async def send_control(_client, control):
+        executions.append(control.generator_slot_offset)
+        if control.generator_slot_offset == 0:
+            raise RuntimeError("engine 0 prepare failed")
+
+    protocol._send_control = send_control
+
+    futures = protocol._generator_futures("prepare")
+    with pytest.raises(RuntimeError, match="engine 0 prepare failed"):
+        protocol._wait_generator_futures(futures)
+
+    assert executions == [0, 2]
+
+
 class _DroppedFuture:
     def __init__(self, *, cancellable=True):
         self.cancellable = cancellable

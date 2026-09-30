@@ -830,9 +830,16 @@ class MilesCollectiveProtocolCore:
         return _check_response(response)
 
     async def _send_controls(self, requests: list[tuple[Any, CollectiveControl]]):
-        return await asyncio.gather(
-            *(self._send_control(client, control) for client, control in requests)
+        # return_exceptions=True: every engine settles before the first error
+        # propagates, so teardown never races an in-flight control RPC.
+        results = await asyncio.gather(
+            *(self._send_control(client, control) for client, control in requests),
+            return_exceptions=True,
         )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results
 
     def _generator_futures(self, action: str, **kwargs):
         from miles.utils import async_utils
