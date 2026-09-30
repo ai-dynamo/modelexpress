@@ -51,7 +51,7 @@ def _arg(args: Any, name: str, default: Any = None) -> Any:
     return default if value is None else value
 
 
-def _endpoint(args: Any) -> str:
+def _server_endpoint(args: Any) -> str:
     address = _arg(
         args,
         "modelexpress_server_address",
@@ -245,21 +245,11 @@ def _validate_args(args: Any) -> None:
     missing or malformed mx-server address fails during argument validation
     instead of deep inside the first weight-update round.
     """
-    address = _arg(
-        args,
-        "modelexpress_server_address",
-        os.environ.get("MX_SERVER_ADDRESS"),
-    )
-    if address is None or not str(address).strip():
-        raise ValueError(
-            "the ModelExpress M2N protocol needs the mx-server address: pass "
-            "--modelexpress-server-address <host:port> or set MX_SERVER_ADDRESS"
-        )
     try:
-        _normalize_endpoint(address)
+        _server_endpoint(args)
     except ValueError as error:
         raise ValueError(
-            f"invalid modelexpress_server_address {address!r}: {error}"
+            f"invalid modelexpress_server_address: {error}"
         ) from error
     run_id = _arg(args, "modelexpress_m2n_run_id", os.environ.get("MX_MILES_RUN_ID"))
     if run_id is not None:
@@ -870,7 +860,7 @@ class MilesCollectiveProtocolCore:
                 generator_slot_offset=(
                     generator_slot_offset if action == "prepare" else None
                 ),
-                endpoint=_endpoint(self.args) if action == "prepare" else None,
+                endpoint=_server_endpoint(self.args) if action == "prepare" else None,
                 **kwargs,
             )
             requests.append((client, control))
@@ -920,7 +910,7 @@ class MilesCollectiveProtocolCore:
                 )
             if not local_tensors:
                 raise ValueError(f"PP partition {rank} owns no collective parameters")
-            endpoint = _endpoint(self.args)
+            endpoint = _server_endpoint(self.args)
             channel = auth.with_auth(grpc.insecure_channel(endpoint))
             try:
                 _await_endpoint_ready(

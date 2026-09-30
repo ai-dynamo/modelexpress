@@ -176,7 +176,7 @@ def test_endpoint_rejects_unsupported_secure_schemes():
         args.modelexpress_server_address = f"{scheme}://mx.example:50051"
 
         with pytest.raises(ValueError, match="secure ModelExpress endpoints"):
-            miles_protocol._endpoint(args)
+            miles_protocol._server_endpoint(args)
 
 
 def test_validate_args_requires_a_server_address(monkeypatch):
@@ -227,7 +227,7 @@ def test_endpoint_requires_an_address_when_neither_source_is_set(monkeypatch):
     monkeypatch.delenv("MX_SERVER_ADDRESS", raising=False)
 
     with pytest.raises(ValueError, match="--modelexpress-server-address"):
-        miles_protocol._endpoint(SimpleNamespace())
+        miles_protocol._server_endpoint(SimpleNamespace())
 
 
 def test_check_response_requires_an_explicit_success_field():
