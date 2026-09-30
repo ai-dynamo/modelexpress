@@ -1471,9 +1471,11 @@ def test_generator_fan_out_logs_every_engine_failure(monkeypatch, caplog):
     protocol._send_control = send_control
 
     futures = protocol._generator_futures("prepare")
-    with caplog.at_level("WARNING"):
-        with pytest.raises(RuntimeError, match="engine at offset 0 failed"):
-            protocol._wait_generator_futures(futures)
+    with (
+        caplog.at_level("WARNING"),
+        pytest.raises(RuntimeError, match="engine at offset 0 failed"),
+    ):
+        protocol._wait_generator_futures(futures)
 
     # The first failure propagates; the rest must still reach the log.
     assert "engine at offset 2 failed" in caplog.text
