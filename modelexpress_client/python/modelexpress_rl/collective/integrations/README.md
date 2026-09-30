@@ -179,8 +179,10 @@ fences unconditionally (its env knob only stamps the join spec), so pairing
 this trainer with full-branch receivers deadlocks at bootstrap with zero
 weight bytes moved — observed twice on hardware. No fenceless build of the
 production sglang receiver exists: the receiver plugin and the fence landed
-together on the full integration branch, and staging this client library
-over the receiver image does not remove the plugin's own fence calls.
+together on the full integration branch, and staging this client under the
+receiver breaks the plugin — it constructs the client with the full-branch
+signature and imports helpers absent from this tree — so a fenceless
+receiver would require porting the plugin.
 
 ## Performance caveat
 
