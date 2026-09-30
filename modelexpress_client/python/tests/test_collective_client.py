@@ -309,9 +309,7 @@ class TestBootstrap:
         assert len(seen) == 2
         assert all(call[3] is allocator for call in seen)
 
-    def test_a_fence_failure_aborts_the_group_and_a_retry_rejoins(
-        self, fake_nccl
-    ):
+    def test_a_fence_failure_aborts_the_group_and_a_retry_rejoins(self, fake_nccl):
         class FailingFenceRendezvous(FakeRendezvous):
             def __init__(self):
                 super().__init__()
