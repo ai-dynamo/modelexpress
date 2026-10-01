@@ -3,6 +3,9 @@
 
 from pathlib import Path
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -18,6 +21,7 @@ from modelexpress_rl.inference.plan import (
     PreparedEngineTensors,
     UpdateMethod,
 )
+from modelexpress_rl.inference.version_chain import resolve_replay_chain
 from modelexpress_rl.inference.receiver import ObjectStorageGeneratorConfig
 from modelexpress_rl.inference.runtime import (
     EngineRuntime,
@@ -39,6 +43,7 @@ class _Method(UpdateMethod):
     def __init__(self, sources):
         self._sources = frozenset(sources)
         self.closed = False
+        self.requires_full_root = False
 
     @property
     def capabilities(self):
@@ -137,6 +142,8 @@ def test_object_storage_runtime_preserves_source_order(
     )
     full_tensor = _Method({WeightSource.GENERATOR, WeightSource.TRAINER})
     canonical = _Method({WeightSource.OBJECT_STORAGE})
+    canonical.requires_full_root = True
+    resolve_chain = Mock(return_value=())
     monkeypatch.setattr(
         runtime_module,
         "RuntimeTensorNixlUpdateMethod",
@@ -164,7 +171,14 @@ def test_object_storage_runtime_preserves_source_order(
         rpc_timeout_seconds=30,
         service=lambda: object(),
         start_lease=lambda _version_id: object(),
+        resolve_replay_chain=resolve_chain,
     )
+
+    for needs_bootstrap in (True, False):
+        canonical.requires_full_root = needs_bootstrap
+        resolve_chain.reset_mock()
+        runtime.session._resolve_replay_chain(SimpleNamespace(version_id="target"))
+        resolve_chain.assert_called_once_with("target", True)
 
     assert runtime.methods == (canonical, full_tensor)
     assert runtime.session._planner.source_order == expected_source_order
@@ -186,6 +200,7 @@ def test_object_storage_runtime_preserves_source_order(
     assert p2p.closed
 
 
+@pytest.mark.parametrize("requires_full_root", [False, True])
 @pytest.mark.parametrize(
     "source_order",
     [None, (WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE)],
@@ -203,6 +218,7 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
     source_order,
     runtime_tensors,
     nixl_manager,
+    requires_full_root,
 ):
     context = GeneratorEngineContext()
     monkeypatch.setattr(
@@ -219,6 +235,8 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
         lambda **_kwargs: pytest.fail("P2P client must not be created"),
     )
     canonical = _Method({WeightSource.OBJECT_STORAGE})
+    canonical.requires_full_root = requires_full_root
+    resolve_chain = Mock(return_value=())
     monkeypatch.setattr(
         runtime_module,
         "CanonicalDeltaUpdateMethod",
@@ -241,10 +259,38 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
         rpc_timeout_seconds=30,
         service=lambda: object(),
         start_lease=lambda _version_id: object(),
+        resolve_replay_chain=resolve_chain,
     )
 
     assert runtime.session._planner.source_order == (WeightSource.OBJECT_STORAGE,)
     assert runtime.methods == (canonical,)
+    runtime.session._resolve_replay_chain(SimpleNamespace(version_id="target"))
+    resolve_chain.assert_called_once_with("target", requires_full_root)
+
+    canonical.requires_full_root = False
+    versions = {
+        f"v{index}": SimpleNamespace(
+            version_id=f"v{index}",
+            base_version_id=f"v{index - 1}" if index else None,
+            payload_format=(
+                WeightPayloadFormat.XOR_DELTA
+                if index else WeightPayloadFormat.FULL_HF_CHECKPOINT
+            ),
+            object_storage=object(),
+            layout_signature="",
+        )
+        for index in range(65)
+    }
+    fetched = Mock(side_effect=versions.__getitem__)
+    resolve_chain.side_effect = lambda target, from_full_root: resolve_replay_chain(
+        target_version_id=target,
+        fetch_ready_version=fetched,
+        max_chain_length=64,
+        stop_before_version_id=None if from_full_root else "v63",
+    )
+    chain = runtime.session._resolve_replay_chain(versions["v64"])
+    assert chain == (versions["v64"],)
+    fetched.assert_called_once_with("v64")
     runtime.close()
 
 

@@ -434,6 +434,9 @@ class LocalCheckpointStore:
             },
         )
 
+    def has_artifact_record(self, artifact: Path) -> bool:
+        return self._source_path(artifact).exists()
+
     def _verified_artifact_metadata(self, artifact: Path) -> dict:
         metadata = self._read_json(self._source_path(artifact))
         if metadata is None or metadata.get("files") != _artifact_files_state(

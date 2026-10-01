@@ -185,8 +185,11 @@ class _Adapter:
     def __init__(self, **kwargs):
         self.installed = []
         self._method = CanonicalDeltaUpdateMethod(**kwargs)
-        self._checkpoint = self._method._checkpoint
         self._active = None
+
+    @property
+    def _checkpoint(self):
+        return self._method._checkpoint
 
     def stage_weight(self, inputs):
         version = WeightVersion(
@@ -611,6 +614,76 @@ def test_implicit_cached_seed_restores_without_copying(monkeypatch, tmp_path):
     assert storage.calls == []
     copy_file.assert_not_called()
     copy_tree.assert_not_called()
+
+
+@pytest.mark.parametrize("explicit_cached_seed", [False, True])
+def test_p2p_startup_s3_bootstrap_retries_without_activating(
+    monkeypatch, tmp_path, explicit_cached_seed
+):
+    weights = torch.tensor([7.0, 8.0])
+    storage = _MemoryS3(_full_artifact(weights))
+    monkeypatch.setattr(canonical_delta_module, "S3Client", lambda **_kwargs: storage)
+    store = checkpoint_store_module.LocalCheckpointStore(
+        root=tmp_path / "cache", model_name="test/model"
+    )
+    adapter = _Adapter(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path=(
+                store.full_path("base-a") if explicit_cached_seed else None
+            ),
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="requires a full replay root"):
+            adapter.stage_weight(_inputs(None))
+        adapter._method.preparation_failed()
+        assert storage.calls == []
+        storage.fail_key_once = "s3://weights/test/v2/model-00001-of-00001.safetensors"
+        with pytest.raises(RuntimeError, match="full HF checkpoint download failed"):
+            adapter.stage_weight(_full_inputs())
+        adapter._method.preparation_failed()
+        assert adapter._method.requires_full_root
+        assert not store.active_path.exists()
+        staged = adapter.stage_weight(_full_inputs())
+        assert torch.equal(
+            load_file(staged.path / "model-00001-of-00001.safetensors")["weight"],
+            weights,
+        )
+        assert not store.active_path.exists()
+        assert not adapter._method.requires_full_root
+        adapter.apply_weight(staged)
+        assert store.active_version() == "full-a"
+        adapter.release_staged_weight(staged)
+    finally:
+        adapter.close()
+
+
+def test_p2p_startup_does_not_trust_corrupt_recorded_seed(monkeypatch, tmp_path):
+    storage = _MemoryS3({})
+    monkeypatch.setattr(canonical_delta_module, "S3Client", lambda **_kwargs: storage)
+    store = checkpoint_store_module.LocalCheckpointStore(
+        root=tmp_path / "cache", model_name="test/model"
+    )
+    seed = store.full_path("base-a")
+    seed.mkdir(parents=True)
+    save_file({"weight": torch.tensor([1.0, 2.0])}, seed / "model.safetensors")
+    store.record_artifact(seed)
+    (seed / "model.safetensors").write_bytes(b"corrupt")
+    with pytest.raises(ValueError, match="cached checkpoint artifact changed"):
+        CanonicalDeltaUpdateMethod(
+            model_name="test/model",
+            config=ObjectStorageGeneratorConfig(
+                storage_type=ObjectStorageType.S3,
+                initial_base_version_id="base-a",
+                seed_checkpoint_path=None,
+                refit_checkpoint_dir=tmp_path / "cache",
+            ),
+        )
+    assert storage.calls == []
 
 
 @pytest.mark.parametrize(
@@ -1868,10 +1941,11 @@ def test_full_lineage_replay_resumes_from_verified_local_checkpoint(
     adapter.close()
 
 
+@pytest.mark.parametrize("startup_seed", ["external", "missing", "unrecorded"])
 @pytest.mark.parametrize("use_peer_for_second_delta", [False, True])
 @pytest.mark.parametrize("aliased_manifest_ids", [False, True])
 def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
-    monkeypatch, tmp_path, use_peer_for_second_delta, aliased_manifest_ids
+    monkeypatch, tmp_path, use_peer_for_second_delta, aliased_manifest_ids, startup_seed
 ):
     tensors = [torch.tensor([float(i), float(i + 1)]) for i in (1, 3, 5, 7)]
     objects = _full_artifact(tensors[0], version_label=0)
@@ -1912,7 +1986,31 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
         )
         for item in inputs
     }
-    adapter, storage = _build(monkeypatch, tmp_path, objects)
+    if startup_seed == "external":
+        adapter, storage = _build(monkeypatch, tmp_path, objects)
+    else:
+        storage = _MemoryS3(objects)
+        monkeypatch.setattr(canonical_delta_module, "S3Client", lambda **_kwargs: storage)
+        store = checkpoint_store_module.LocalCheckpointStore(
+            root=tmp_path / "cache", model_name="test/model"
+        )
+        if startup_seed == "unrecorded":
+            seed = store.full_path("base-a")
+            seed.mkdir(parents=True)
+            save_file({"weight": torch.tensor([-1.0, -2.0])}, seed / "model.safetensors")
+        adapter = _Adapter(
+            model_name="test/model",
+            config=ObjectStorageGeneratorConfig(
+                storage_type=ObjectStorageType.S3,
+                initial_base_version_id="base-a",
+                seed_checkpoint_path=None,
+                refit_checkpoint_dir=tmp_path / "cache",
+            ),
+        )
+        assert adapter._method.requires_full_root
+        assert storage.calls == []
+        assert adapter._checkpoint.store.state() is None
+        assert not adapter._checkpoint.store.active_path.exists()
     generator = ModelExpressGeneratorClient()
     generator._serving_version_id = "base-a"
     generator._max_replay_chain_length = 64
