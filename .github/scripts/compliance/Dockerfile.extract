@@ -1,24 +1,7 @@
 # syntax=docker/dockerfile:1
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Lists the dpkg and Python packages installed in TARGET_IMAGE without running
-# it. Adapted from ai-dynamo/dynamo container/compliance/Dockerfile.extract.
-#
-# The extractor runs on the build platform and bind-mounts the target's
-# filesystem, so an arm64 image is read from an amd64 runner with no emulation.
-#
-#   docker buildx build --build-arg TARGET_IMAGE=<ref> \
-#     --build-arg TARGET_PLATFORM=linux/arm64 \
-#     --output type=local,dest=<dir> --pull --no-cache-filter extractor \
-#     -f .github/scripts/compliance/Dockerfile.extract .github/scripts/compliance/
-#
-# --no-cache-filter extractor is required: the cache key of a bind mount from a
-# stage does not reliably include that stage's digest, so a cache hit can
-# return the previous image's package list.
-#
-# Writes dpkg.tsv and python.tsv (name<TAB>version<TAB>spdx), their stderr
-# logs, and arch.txt (the extractor's own machine, for verification).
+# Build with --no-cache-filter extractor: a cached bind mount can return a stale package list.
 
 ARG TARGET_IMAGE=scratch
 ARG TARGET_PLATFORM=linux/amd64

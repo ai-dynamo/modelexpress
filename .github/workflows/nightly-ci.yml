@@ -1,96 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# ModelExpress Nightly CI — builds every release artifact from main HEAD,
-# runs the full existing test surface against the same commit, and stages the
-# artifacts internally following the ai-dynamo/dynamo nightly pattern:
-#
-#   Build (this repo's existing definitions, reused via workflow_call):
-#     - production server container image (docker/Dockerfile), amd64 + arm64,
-#       pushed to the private NGC CI org with an immutable run-unique tag;
-#       floating tags move only in release mode, post-approval
-#     - Python client wheels + sdist (build-wheels.yml) stamped with a PEP440
-#       .devYYYYMMDD version
-#     - Rust crates, validated + packaged by .github/scripts/stage_crates.py
-#       (ported from Dynamo's on-demand release), version
-#       <ver>-nightly.<date>.<run>.<attempt>.g<sha7>
-#     - helm chart, same prerelease version, stamped to reference the
-#       nightly server image (not the released image in helm/values.yaml)
-#     - CI harness images (mx-server + mx-worker-*) are rebuilt from the same
-#       sha inside the reused e2e workflow, exactly as on PR runs
-#
-#   Test (existing workflows, unchanged):
-#     - ci.yml            — Rust/Python/Go unit + integration suite
-#     - modelexpress-ci-tests.yml — full K8s/GPU e2e matrix on the vCluster
-#
-#   Stage (Dynamo release.yml pattern; unlike Dynamo, crates and helm are
-#   staged nightly too):
-#     - containers -> nvcr.io/<NGC_PUBLISH_ORG>/ai-dynamo/
-#         modelexpress-server-nightly:<date>-<sha7>-<run_id>-<attempt>  (immutable)
-#         modelexpress-server-nightly:latest         (floating)
-#         modelexpress-server:nightly                (floating)
-#     - wheels + sdist and crates (.crate) -> Artifactory
-#       wheels -> <ARTIFACTORY_PYPI_REPO_NAME>, crates -> <ARTIFACTORY_CARGO_REPO_NAME>,
-#       both under nightly/<date>-<sha7>-<run>-<attempt>/
-#       (attempt-unique subfolder computed once in preflight: date-only
-#       versions aren't commit-unique, so same-day runs must not overwrite;
-#       the exact path is forwarded to GitLab as ARTIFACTORY_NIGHTLY_PATH)
-#     - helm chart -> helm.ngc.nvidia.com/<NGC_PUBLISH_ORG>/ai-dynamo (chartmuseum)
-#     - trigger the internal GitLab release-automation pipeline
-#       (security scans / nSpect / OSRB) with the staged artifact names
-#     - Slack: thread seeded at start, staging status replied on the thread,
-#       failed jobs alerted via webhook
-#
-#   Like Dynamo's nightly, test results do NOT gate artifact staging — a red
-#   test lane alerts Slack while the (scan-gated) staging proceeds. Flip the
-#   `needs:` of stage-containers-ngc to include e2e-tests to change that.
-#
-#   Every job runs on the internal (velonix) runner pools — nothing lands on
-#   GitHub-hosted runners. Build/stage jobs and the hosted suite use
-#   prod-modelexpress-builder-amd-v1 (dind, maxRunners 64). The coordination
-#   jobs belong on a small pool, but prod-modelexpress-default-small-v1 has no
-#   runners serving this repo, so they share the builder pool for now.
-#
-# Triggers:
-#   - schedule: daily 09:00 UTC (01:00 PST) — release mode forced on
-#   - push to pull-request/<N> (copy-pr-bot mirrors): build-validation only —
-#     no tests (they run via their own PR triggers on the same commit), no
-#     wheels (same reason), no staging, no Slack paging
-#   - workflow_dispatch: release defaults OFF (build+test only); enabling it
-#     requires approval via the `manual-release-approval` environment.
-#     Dispatch is also the branch-testing path: velonix job-admission rules
-#     only admit push events from main/release/pull-request branches, so a
-#     push trigger on a dev branch would hang forever waiting for runners —
-#     workflow_dispatch is admitted from any branch.
-#
-# Required secrets (see workflow bodies for exact usage):
-#   repo scope:   MX_IMAGE_REPO, NGC_PUBLISH_ORG, NGC_API_KEY, HF_TOKEN,
-#                 AZURE_AKS_CI_KUBECONFIG_B64, SLACK_RELEASE_BOT_TOKEN,
-#                 SLACK_RELEASE_CHANNEL_ID, SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL
-#   MX_IMAGE_REPO and NGC_PUBLISH_ORG cannot be environment-scoped:
-#   build-server-image and package-helm-chart read them and declare no
-#   environment.
-#   automated-release environment: ARTIFACTORY_URL, ARTIFACTORY_TOKEN,
-#                 ARTIFACTORY_PYPI_REPO_NAME, ARTIFACTORY_CARGO_REPO_NAME,
-#                 NGC_PUBLISH_USERNAME, NGC_PUBLISH_TOKEN,
-#                 GITLAB_PIPELINE_URL, GITLAB_TRIGGER_TOKEN
-# Required vars (Slack mention text, full mention syntax e.g.
-#   "<!subteam^S123>" for a user group or "<@U456>" for a user/bot):
-#   SLACK_MENTION_OPS_SUPPORT, SLACK_MENTION_DYNAMO_BOT  — on every message
-#   SLACK_MENTION_MX_DEV_TEAM                            — added when red
-# Optional vars: GITLAB_RELEASE_AUTOMATION_REF (defaults to main)
 
 name: ModelExpress Nightly CI
 
 on:
   schedule:
     - cron: '0 9 * * *'   # 09:00 UTC = 01:00 PST daily
-  # copy-pr-bot pushes to pull-request/<N> are the only push refs the velonix
-  # runners admit; dev and feature branches are rejected at the admission hook.
-  # TEMPORARY(test): pinned to this PR's mirror branch and running in release
-  # mode so the full staging path can be rehearsed before merge, behind the
-  # manual-release-approval gate. Before merge, restore this to
-  # "pull-request/[0-9]+" and restore the build-only forcing in preflight.
+  # TEMPORARY(test): revert before merge.
   push:
     branches:
       - "pull-request/603"
@@ -117,19 +33,7 @@ on:
 permissions:
   contents: read
 
-# Concurrency: PR-mirror pushes group per PR branch with cancel-in-progress,
-# so consecutive pushes to one PR replace the previous validation run (the
-# same policy the e2e workflow uses). Scheduled and dispatched runs get a
-# run-unique group — deliberately NOT shared: a shared group keeps only ONE
-# pending slot and CANCELS the previous occupant, so it could kill a
-# human-approved release, and a dispatch parked on the approval environment
-# must never starve the cron. Shared state is safe by construction instead:
-# every tag/path/name this workflow writes is either immutable per commit or
-# run-unique, and floating-tag moves are last-writer-wins by design.
-# TEMPORARY(test): pull-request/603 now runs in release mode and can park on
-# the approval gate, so every event gets a run-unique group — the shared
-# per-branch push group would let the next push cancel a run awaiting a
-# reviewer. Restore the push branch to the shared group before merge.
+# TEMPORARY(test): revert before merge.
 concurrency:
   group: nightly-ci-${{ github.run_id }}-${{ github.run_attempt }}
   cancel-in-progress: false
@@ -138,9 +42,6 @@ env:
   ARTIFACTORY_NIGHTLY_FOLDER: nightly
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Resolve everything derived from "tonight": versions, tags, release mode.
-  # ---------------------------------------------------------------------------
   preflight:
     name: Compute nightly metadata
     runs-on: prod-modelexpress-builder-amd-v1
@@ -167,11 +68,6 @@ jobs:
           set -euo pipefail
           DATE=$(date -u +%Y%m%d)
           SHA7="${GITHUB_SHA:0:7}"
-          # Base versions come from the artifacts' own manifests so nightly
-          # tracks whatever the release process last bumped. Anchored,
-          # single-capture patterns: a version literal that is not a plain
-          # dotted string must fail here rather than flow into a tag, a
-          # shell command or (via GITHUB_OUTPUT) a later expression.
           WHEEL_BASE=$(sed -n 's/^version = "\([A-Za-z0-9._+-]*\)"$/\1/p' modelexpress_client/python/pyproject.toml | head -1)
           CRATE_BASE=$(sed -n 's/^version = "\([A-Za-z0-9._+-]*\)"$/\1/p' Cargo.toml | head -1)
           CHART_BASE=$(sed -n 's/^version: \([A-Za-z0-9._+-]*\)[[:space:]]*$/\1/p' helm/Chart.yaml | head -1)
@@ -182,17 +78,7 @@ jobs:
             fi
           done
 
-          # Run-unique identifiers. Date alone is NOT unique: a same-day
-          # re-run or a second push would collide on the immutable chart
-          # version (chartmuseum rejects a duplicate with 409) and mix
-          # artifacts in one Artifactory folder.
-          #   - `g<sha7>` uses the git-describe convention because a semver
-          #     prerelease identifier of only digits may not have a leading
-          #     zero (helm rejects `...-nightly.20260806.0123456`).
-          #   - run_number.run_attempt disambiguates re-runs at the same sha.
           RUNSUF="${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}.g${SHA7}"
-          # Rebuilt images are not byte-identical, so the image tag must be
-          # run-unique too or a re-run overwrites an already-scanned tag.
           RUN_KEY="${DATE}-${SHA7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           {
             echo "date=${DATE}"
@@ -201,8 +87,6 @@ jobs:
             echo "wheel_version=${WHEEL_BASE}.dev${DATE}"
             echo "crate_version=${CRATE_BASE}-nightly.${DATE}.${RUNSUF}"
             echo "chart_version=${CHART_BASE}-nightly.${DATE}.${RUNSUF}"
-            # Single source of truth for the Artifactory staging folder;
-            # every uploader and the GitLab handoff read this one value.
             echo "artifactory_path=${ARTIFACTORY_NIGHTLY_FOLDER}/${RUN_KEY}"
           } | tee -a "$GITHUB_OUTPUT"
 
@@ -211,8 +95,6 @@ jobs:
         env:
           DISPATCH_RELEASE: ${{ inputs.release }}
           DISPATCH_RUN_TESTS: ${{ inputs.run_tests }}
-          # Via env, never inlined into the script: a branch name can carry
-          # shell metacharacters.
           REF: ${{ github.ref }}
         run: |
           set -euo pipefail
@@ -220,14 +102,10 @@ jobs:
           RUN_TESTS=true
           case "${GITHUB_EVENT_NAME}" in
             schedule)
-              # The cron is the real nightly: always stage, always test.
               RELEASE=true
               ;;
             push)
-              # TEMPORARY(test): the pinned pull-request/603 mirror rehearses
-              # the full staging path behind manual-release-approval. Restore
-              # RELEASE=false / RUN_TESTS=false before merge so PR-mirror runs
-              # are build-only again.
+              # TEMPORARY(test): revert before merge.
               RELEASE=true
               RUN_TESTS=true
               ;;
@@ -237,14 +115,7 @@ jobs:
               ;;
           esac
 
-          # Staging is only ever legitimate from main (the real nightly) or
-          # from the temporary development branch. Without this, a dispatch
-          # from a release/* or feature branch would silently repoint the
-          # shared floating staging-org tags at older or unrelated code.
-          # The dev branch is TEMPORARY(test): it lets a workflow_dispatch
-          # with release=true exercise the full staging path (behind the
-          # manual-release-approval gate) before merge. Remove it from this
-          # allowlist when the branch merges.
+          # TEMPORARY(test): revert before merge.
           if [ "${RELEASE}" = "true" ]; then
             case "${REF}" in
               refs/heads/main|refs/heads/pvijayakrish/mx-nightly-ci|refs/heads/pull-request/603) ;;
@@ -260,14 +131,6 @@ jobs:
             echo "run_tests=${RUN_TESTS}"
           } | tee -a "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------------------
-  # Human gate for every release run that is not an unattended scheduled first
-  # attempt. Any other trigger, and any re-run of the cron, stops here until a
-  # required reviewer of the manual-release-approval environment approves.
-  # The approved attempt number is published so downstream jobs can bind to it:
-  # "Re-run failed jobs" cannot revive a skipped approval, so the gate fails
-  # closed and a re-run needs "Re-run all jobs".
-  # ---------------------------------------------------------------------------
   manual-release-approval:
     name: Manual release approval
     runs-on: prod-modelexpress-builder-amd-v1
@@ -283,19 +146,12 @@ jobs:
       approved_attempt: ${{ steps.approval.outputs.run_attempt }}
     steps:
       - name: Assert the approval environment is actually protected
-        # GitHub AUTO-CREATES a referenced environment with no protection
-        # rules, so a missing/misconfigured environment would silently pass
-        # this job and void the only human gate. Verify reviewers exist.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
           BODY="$(mktemp)"
           trap 'rm -f "${BODY}"' EXIT
-          # Branch on the HTTP status, not on the parsed body: a 403/404 error
-          # payload has no .protection_rules, and treating that as "zero
-          # reviewers" would hard-fail every release on a token-scope issue
-          # rather than warn as intended.
           CODE="$(curl -sS -o "${BODY}" -w '%{http_code}' \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
@@ -320,21 +176,12 @@ jobs:
           echo "Manual release approved for ${{ needs.preflight.outputs.nightly_tag }}"
           echo "run_attempt=${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------------------
-  # Seed the nightly Slack thread; downstream staging jobs and the GitLab
-  # pipeline reply on it. Step-level continue-on-error: a Slack outage never
-  # blocks the nightly — consumers skip on an empty thread_ts.
-  # ---------------------------------------------------------------------------
   notify-slack-start:
     name: Notify Slack — nightly started
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 10
     needs: [preflight]
-    # Every run, not just release runs: this thread is the anchor that the
-    # staging reply, the GitLab handoff reply and the GitLab pipeline itself
-    # all post into, so it has to exist before any of them run.
-    # TEMPORARY(test): silence Slack for the pull-request/603 rehearsal.
-    # Drop the push exclusion when the rehearsal pins come out.
+    # TEMPORARY(test): revert before merge.
     if: >-
       ${{ !cancelled() && needs.preflight.result == 'success' &&
           github.event_name != 'push' }}
@@ -384,16 +231,12 @@ jobs:
           fi
           echo "thread_ts=$(echo "${RESPONSE}" | jq -r '.ts')" >> "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------------------
-  # Tests — the existing suites, reused unchanged against main HEAD.
-  # ---------------------------------------------------------------------------
   hosted-tests:
     name: Hosted test suite
     needs: [preflight]
     if: ${{ needs.preflight.outputs.run_tests == 'true' }}
     uses: ./.github/workflows/ci.yml
     with:
-      # Keep the nightly off GitHub-hosted runners entirely.
       runs_on: prod-modelexpress-builder-amd-v1
     secrets: inherit
 
@@ -401,23 +244,11 @@ jobs:
     name: K8s/GPU e2e suite
     needs: [preflight]
     if: ${{ needs.preflight.outputs.run_tests == 'true' }}
-    # NOTE: no job-level concurrency group here. A group holds one pending
-    # slot and CANCELS (not queues) the previous pending entry, so a third
-    # overlapping nightly would kill a queued multi-hour GPU matrix outright.
-    # The called workflow instead opts out of cancellation via concurrency_key
-    # (see modelexpress-ci-tests.yml), and PR-vs-nightly GPU contention is
-    # bounded by that suite's own per-job max-parallel caps.
     uses: ./.github/workflows/modelexpress-ci-tests.yml
     with:
       concurrency_key: nightly-${{ github.run_id }}-${{ github.run_attempt }}
     secrets: inherit
 
-  # ---------------------------------------------------------------------------
-  # Production server image (docker/Dockerfile — the image released to
-  # nvcr.io/nvidia/ai-dynamo/modelexpress-server), built natively per arch on
-  # the existing builder runners and pushed to the CI org, Dynamo-ECR-style:
-  # immutable run-unique <tag>-<arch> tags stitched into a multi-arch manifest.
-  # ---------------------------------------------------------------------------
   build-server-image:
     name: Build server image (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -442,13 +273,6 @@ jobs:
           persist-credentials: false
 
       - name: Compute SERVER_IMAGE and scope docker credentials
-        # DOCKER_CONFIG must be set here rather than in a job-level `env:`:
-        # the `runner` context is not available at jobs.<id>.env (only
-        # github/needs/strategy/matrix/vars/secrets/inputs are), and using it
-        # there makes the whole workflow file invalid. Writing it to
-        # $GITHUB_ENV also exposes it to every later step, including the
-        # always() cleanup. Scoping the config keeps the registry credential
-        # out of the shared ~/.docker/config.json on the persistent builder.
         run: |
           echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-build-${{ matrix.arch }}" >> "$GITHUB_ENV"
           echo "SERVER_IMAGE=${{ secrets.MX_IMAGE_REPO }}/modelexpress-server:${{ needs.preflight.outputs.nightly_tag }}-${{ matrix.arch }}" >> "$GITHUB_ENV"
@@ -463,9 +287,7 @@ jobs:
 
       - name: Build and push
         run: |
-          # --provenance=false keeps the per-arch tag a plain single-platform
-          # manifest (not an OCI index with an attestation), so the staging
-          # job can pull/re-push it across orgs without index surprises.
+          # --provenance=false: a single-platform manifest the staging job can re-push.
           docker buildx build \
             --platform ${{ matrix.platform }} \
             --provenance=false \
@@ -487,17 +309,8 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-    # Deliberately NO concurrency group. This job writes only its own
-    # run-unique manifest tag, so it needs no mutex — and a job-level group
-    # holds a single pending slot, meaning a third overlapping run would
-    # CANCEL (not queue) a pending job that a human-approved release depends
-    # on.
     steps:
       - name: Scope docker credentials to this job
-        # `runner` is not an allowed context in a job-level `env:`,
-        # so the per-job config dir is exported here instead; it keeps the
-        # registry credential out of the shared ~/.docker/config.json on
-        # the persistent builder.
         run: |
           echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-manifest" >> "$GITHUB_ENV"
 
@@ -511,10 +324,6 @@ jobs:
           REPO: ${{ secrets.MX_IMAGE_REPO }}/modelexpress-server
           TAG: ${{ needs.preflight.outputs.nightly_tag }}
         run: |
-          # Immutable run-unique tag only. The floating :nightly tag is moved by
-          # stage-containers-ngc — behind release mode + approval — so a
-          # build-only dispatch (or a rejected release) never repoints what
-          # consumers of :nightly pull.
           docker buildx imagetools create \
             -t "${REPO}:${TAG}" \
             "${REPO}:${TAG}-amd64" \
@@ -526,23 +335,10 @@ jobs:
         run: |
           rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
-  # ---------------------------------------------------------------------------
-  # Client wheels — the existing build-wheels workflow, with the nightly dev
-  # version stamped in and the upload routed to nightly/<run_id>/. The upload
-  # is skipped when not in release mode (build-only validation).
-  # ---------------------------------------------------------------------------
   build-wheels:
     name: Client wheels
-    # Gated on the approval like every other artifact-staging leg: on schedule
-    # (and on release=false dispatches) the approval job is skipped and this
-    # runs immediately; on a release=true dispatch it waits for the reviewer,
-    # and a rejection skips it — no wheels reach Artifactory unapproved.
     needs: [preflight, manual-release-approval]
-    # TEMPORARY(test): the `github.event_name != 'push'` exclusion is lifted so
-    # the pinned pull-request/603 rehearsal exercises the nightly wheel lane
-    # and, through it, the GitLab handoff. Restore the exclusion before merge —
-    # build-wheels.yml already runs standalone on the same push event, so
-    # leaving this on doubles both arch builders for no PR signal.
+    # TEMPORARY(test): revert before merge.
     if: >-
       ${{ !cancelled() &&
           needs.preflight.result == 'success' &&
@@ -553,19 +349,11 @@ jobs:
     uses: ./.github/workflows/build-wheels.yml
     with:
       wheel_version: ${{ needs.preflight.outputs.wheel_version }}
-      # The path comes from preflight so the wheel upload and the GitLab
-      # handoff agree on one attempt-unique folder.
       upload_prefix: ${{ needs.preflight.outputs.artifactory_path }}
       skip_upload: ${{ needs.preflight.outputs.release != 'true' }}
     secrets: inherit
 
-  # ---------------------------------------------------------------------------
-  # Compliance: OSRB dependency lists, the only GitHub artifacts this workflow
-  # uploads. The GitLab osrb stage attaches them to the OSRB NVBugs, so the
-  # artifact names and file layout are the contract of release-automation's
-  # nvbug-attach-compliance.py (container) and nvbug-attach-license.py
-  # (source and crates). Change them only together with those scripts.
-  # ---------------------------------------------------------------------------
+  # Artifact names and layout must match release-automation's nvbug-attach-*.py.
   compliance:
     name: Compliance scan
     runs-on: prod-modelexpress-builder-amd-v1
@@ -596,7 +384,6 @@ jobs:
           python-version: '3.12'
 
       - name: Install Rust toolchain
-        # cargo tree only reads metadata, so no C toolchain is needed here.
         run: |
           set -euo pipefail
           if ! command -v cargo >/dev/null; then
@@ -611,8 +398,6 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # The diff baseline is the runtime stage's base, read from the
-          # Dockerfile so it cannot drift from what is actually built.
           BASE=$(sed -n 's/^FROM \([^ ]*\) AS runtime$/\1/p' docker/Dockerfile)
           if [ -z "${BASE}" ]; then
             echo "::error::no 'FROM <image> AS runtime' line in docker/Dockerfile"
@@ -645,8 +430,6 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # Resolves the wheel's runtime closure from package metadata without
-          # installing it. Markers resolve for this runner: linux x86_64.
           python3 -m pip install --quiet --dry-run --ignore-installed \
             --report "${RUNNER_TEMP}/pip-report.json" ./modelexpress_client/python
           python3 .github/scripts/compliance/osrb.py source \
@@ -673,15 +456,6 @@ jobs:
         if: always()
         run: rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
-  # ---------------------------------------------------------------------------
-  # Rust crates — validated and packaged by .github/scripts/stage_crates.py
-  # (adapted from ai-dynamo/dynamo's on-demand release script: cargo-metadata
-  # derived crate set, leaves-first order, expect-version gate, cargo check,
-  # fail-soft reporting), stamped with the -nightly.<date> prerelease version.
-  # Unlike Dynamo (crates stage on-demand only), MX stages crates every
-  # nightly: the .crate files are uploaded to the Artifactory nightly folder.
-  # Same approval gating as the wheels.
-  # ---------------------------------------------------------------------------
   stage-crates:
     name: Stage crates
     runs-on: prod-modelexpress-builder-amd-v1
@@ -693,9 +467,6 @@ jobs:
            (github.event_name == 'schedule' && github.run_attempt == '1') ||
            (needs.manual-release-approval.result == 'success' &&
             needs.manual-release-approval.outputs.approved_attempt == github.run_attempt)) }}
-    # Only claim the credential-bearing environment when the run will actually
-    # upload; a build-only dispatch validates packaging without holding
-    # ARTIFACTORY_TOKEN.
     environment: ${{ needs.preflight.outputs.release == 'true' && 'automated-release' || '' }}
     timeout-minutes: 45
     outputs:
@@ -709,8 +480,6 @@ jobs:
       - name: Install build prerequisites
         run: |
           set -euo pipefail
-          # build-essential: the builder image ships no cc, so every Rust
-          # build script fails to link without it.
           sudo apt-get update && sudo apt-get install -y protobuf-compiler build-essential
           if ! command -v cargo >/dev/null; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -723,11 +492,7 @@ jobs:
           STAGE_VERSION: ${{ needs.preflight.outputs.crate_version }}
           EXPECT_VERSION: ${{ needs.preflight.outputs.crate_version }}
         run: |
-          # GitHub runs un-shell'd steps as `bash -e {0}` — errexit is
-          # inherited. Deliberately no pipefail: the pipeline's status is
-          # tee's 0, so a python failure can't kill the step before the
-          # outputs are written; PIPESTATUS[0] still carries python's rc,
-          # which is propagated at the end.
+          # No pipefail: outputs must be written before python's rc (PIPESTATUS[0]) is returned.
           set -u
           python3 .github/scripts/stage_crates.py --output-dir crate-dist \
             2>&1 | tee stage_crates.log
@@ -736,9 +501,6 @@ jobs:
           echo "staged_crates=${STAGED}" >> "$GITHUB_OUTPUT"
           exit "${rc}"
 
-      # Fail-soft upload: runs even after a partial package failure so
-      # staged_crates stays truthful (whatever was packaged is actually on
-      # Artifactory); the job still exits red via the package step.
       - name: Set up JFrog CLI
         if: >-
           ${{ !cancelled() &&
@@ -763,16 +525,10 @@ jobs:
             echo "::error::ARTIFACTORY_CARGO_REPO_NAME is not set; refusing to upload to an empty repository path"
             exit 1
           fi
-          # Attempt-unique folder computed once in preflight, shared with the
-          # wheel upload and forwarded to GitLab.
           DEST="${ARTIFACTORY_NIGHTLY_REPO}/${ARTIFACTORY_PATH}/"
           echo "Uploading to: ${DEST}"
           jf rt upload --fail-no-op --flat "crate-dist/*.crate" "${DEST}"
 
-  # ---------------------------------------------------------------------------
-  # Helm chart — lint + package with a semver prerelease version. Runs on
-  # every event and keeps nothing; stage-helm-ngc rebuilds and pushes it.
-  # ---------------------------------------------------------------------------
   package-helm-chart:
     name: Package helm chart
     runs-on: prod-modelexpress-builder-amd-v1
@@ -787,9 +543,6 @@ jobs:
       - name: Install helm
         run: |
           set -euo pipefail
-          # Pinned versioned tarball (never the mutable get-helm-3 script),
-          # installed run-scoped so a shared builder's system helm is not
-          # clobbered for concurrent jobs.
           mkdir -p "${RUNNER_TEMP}/bin"
           curl -fsSL https://get.helm.sh/helm-v3.20.0-linux-amd64.tar.gz | tar xz -C "${RUNNER_TEMP}"
           install "${RUNNER_TEMP}/linux-amd64/helm" "${RUNNER_TEMP}/bin/helm"
@@ -802,17 +555,9 @@ jobs:
           NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
         run: bash .github/scripts/package_helm_chart.sh
 
-  # ---------------------------------------------------------------------------
-  # Push the packaged chart to the NGC staging org's helm registry (Dynamo's
-  # release-publish chartmuseum mechanism, enabled for nightly).
-  # ---------------------------------------------------------------------------
   stage-helm-ngc:
     name: Stage helm chart to NGC
     runs-on: prod-modelexpress-builder-amd-v1
-    # Also needs the image staging: the chart is stamped to reference
-    # modelexpress-server-nightly:<tag>, and a chartmuseum push is immutable
-    # (no --force). Publishing the chart when the image never reached
-    # the staging org would permanently pin a chart version to a missing image.
     needs: [preflight, package-helm-chart, stage-containers-ngc, manual-release-approval]
     if: >-
       ${{ !cancelled() &&
@@ -827,8 +572,6 @@ jobs:
     outputs:
       staged_helm: ${{ steps.push.outputs.staged_helm }}
     steps:
-      # The chart is rebuilt here, not downloaded: MX artifacts never pass
-      # through GitHub artifact storage.
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -837,9 +580,6 @@ jobs:
       - name: Install helm
         run: |
           set -euo pipefail
-          # Pinned versioned tarball — never pipe a mutable branch script to
-          # bash in the job holding the publish credential. Run-scoped install
-          # so a shared builder's system helm is untouched.
           mkdir -p "${RUNNER_TEMP}/bin"
           curl -fsSL https://get.helm.sh/helm-v3.20.0-linux-amd64.tar.gz | tar xz -C "${RUNNER_TEMP}"
           install "${RUNNER_TEMP}/linux-amd64/helm" "${RUNNER_TEMP}/bin/helm"
@@ -858,29 +598,19 @@ jobs:
           NGC_PUBLISH_USERNAME: ${{ secrets.NGC_PUBLISH_USERNAME }}
           NGC_PUBLISH_TOKEN: ${{ secrets.NGC_PUBLISH_TOKEN }}
           CHART_VERSION: ${{ needs.preflight.outputs.chart_version }}
-          # helm stores repo credentials in PLAINTEXT in repositories.yaml.
-          # Scope the config to a job-local dir (wiped by the always() step
-          # below) so the publish token never lands in $HOME on the shared
-          # builder, even when cm-push fails mid-script.
           HELM_CONFIG_HOME: ${{ runner.temp }}/helm-config
           HELM_PLUGINS: ${{ runner.temp }}/helm-config/plugins
           NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
         run: |
           set -euo pipefail
           REPO_ALIAS="ngc-staging-modelexpress"
-          # Pinned: this plugin runs inside the NGC-credentialed publish job.
           helm plugin install https://github.com/chartmuseum/helm-push --version 0.10.4 || true
-          # Do not blackhole stderr: the credential is on stdin, not in the
-          # output, and a silenced failure here exits non-zero with no clue.
           echo "${NGC_PUBLISH_TOKEN}" | helm repo add "${REPO_ALIAS}" \
             --username="${NGC_PUBLISH_USERNAME}" \
             --password-stdin \
             "https://helm.ngc.nvidia.com/${NGC_STAGING_ORG}/ai-dynamo"
           CHART_FILE="chart-dist/modelexpress-${CHART_VERSION}.tgz"
           ls -la chart-dist/
-          # The chart version is run-unique (date + run number/attempt + sha),
-          # so this can never collide with an earlier push; no --force, which
-          # would let a re-run silently replace a scanned artifact.
           helm cm-push "${CHART_FILE}" "${REPO_ALIAS}"
           echo "staged_helm=modelexpress:${CHART_VERSION}" >> "$GITHUB_OUTPUT"
 
@@ -889,14 +619,6 @@ jobs:
         run: |
           rm -rf "${{ runner.temp }}/helm-config"
 
-  # ---------------------------------------------------------------------------
-  # Stage the server image into the internal NGC staging org (Dynamo
-  # release-publish pattern): dedicated -nightly repo with the immutable
-  # run-unique tag, plus a floating :nightly on the stable repo name.
-  # Source and destination are both nvcr.io but different orgs/credentials,
-  # so the per-arch images are pulled under the CI key, re-tagged, and pushed
-  # under the publish key.
-  # ---------------------------------------------------------------------------
   stage-containers-ngc:
     name: Stage containers to NGC
     runs-on: prod-modelexpress-builder-amd-v1
@@ -912,20 +634,11 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
-    # No concurrency group: `imagetools create` is a single atomic manifest
-    # PUT per tag, so concurrent runs cannot corrupt a tag — worst case is
-    # last-writer-wins on a floating alias, which is already what "floating"
-    # means. A group would be strictly worse: it holds ONE pending slot, so a
-    # third overlapping run would cancel a human-approved release outright.
     outputs:
       staged_containers: ${{ steps.stage.outputs.staged_containers }}
       floated_tags: ${{ steps.stage.outputs.floated_tags }}
     steps:
       - name: Scope docker credentials to this job
-        # `runner` is not an allowed context in a job-level `env:`,
-        # so the per-job config dir is exported here instead; it keeps the
-        # registry credential out of the shared ~/.docker/config.json on
-        # the persistent builder.
         run: |
           echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-stage" >> "$GITHUB_ENV"
 
@@ -945,10 +658,6 @@ jobs:
           STAGED=""   # immutable refs — the nSpect/scan payload
           FLOATED=""  # floating aliases that actually landed
 
-          # Floating aliases are conveniences, not the deliverable. Moving one
-          # must never discard a fully staged immutable image, so alias moves
-          # are fail-soft (called in an if-condition, which also suspends
-          # errexit for the call).
           float_tag() {
             if docker buildx imagetools create -t "$1" "$2" "$3"; then
               FLOATED="${FLOATED:+${FLOATED},}${1##*/}"
@@ -959,32 +668,24 @@ jobs:
 
           echo "${NGC_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
 
-          # Pull per-arch images under the CI-org credential. --platform is
-          # required: without it the daemon resolves against the host arch and
-          # errors on the arm64 tag.
           for ARCH in amd64 arm64; do
             docker pull --platform "linux/${ARCH}" "${SRC_REPO}:${TAG}-${ARCH}"
             docker tag "${SRC_REPO}:${TAG}-${ARCH}" "${DEST_NIGHTLY}:${TAG}-${ARCH}"
           done
 
-          # CI-org floating alias, still under the CI credential.
           float_tag "${SRC_REPO}:nightly" "${SRC_REPO}:${TAG}-amd64" "${SRC_REPO}:${TAG}-arm64"
 
-          # Publish-org credential from here on.
           echo "${NGC_PUBLISH_TOKEN}" | docker login nvcr.io -u "${NGC_PUBLISH_USERNAME}" --password-stdin
           for ARCH in amd64 arm64; do
             docker push "${DEST_NIGHTLY}:${TAG}-${ARCH}"
           done
 
-          # THE deliverable: the immutable dated manifest. Fatal if it fails.
           docker buildx imagetools create \
             -t "${DEST_NIGHTLY}:${TAG}" \
             "${DEST_NIGHTLY}:${TAG}-amd64" \
             "${DEST_NIGHTLY}:${TAG}-arm64"
           STAGED="modelexpress-server-nightly:${TAG}"
 
-          # Convenience aliases: modelexpress-server-nightly:latest and the
-          # stable repo's :nightly. Best-effort by design.
           float_tag "${DEST_NIGHTLY}:latest" "${DEST_NIGHTLY}:${TAG}-amd64" "${DEST_NIGHTLY}:${TAG}-arm64"
           float_tag "${DEST_STABLE}:nightly" "${DEST_NIGHTLY}:${TAG}-amd64" "${DEST_NIGHTLY}:${TAG}-arm64"
 
@@ -1010,20 +711,14 @@ jobs:
             docker image rm -f "${SRC_REPO}:${TAG}-${ARCH}" 2>/dev/null || true
             docker image rm -f "nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/modelexpress-server-nightly:${TAG}-${ARCH}" 2>/dev/null || true
           done
-          # Job-scoped docker config: removing the directory drops the
-          # publish credential without touching a concurrent job's login.
           rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
-  # ---------------------------------------------------------------------------
-  # Reply on the nightly Slack thread with the staging outcome. Never blocks.
-  # ---------------------------------------------------------------------------
   notify-slack-staging:
     name: Notify Slack — staging status
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 10
     needs: [preflight, notify-slack-start, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc]
-    # TEMPORARY(test): silence Slack for the pull-request/603 rehearsal.
-    # Drop the push exclusion when the rehearsal pins come out.
+    # TEMPORARY(test): revert before merge.
     if: >-
       ${{ !cancelled() &&
           needs.preflight.outputs.release == 'true' &&
@@ -1062,23 +757,10 @@ jobs:
             -H "Content-type: application/json; charset=utf-8" \
             --data "${PAYLOAD}" | jq -r '.ok'
 
-  # ---------------------------------------------------------------------------
-  # Hand off to the internal GitLab release-automation pipeline (security
-  # scans, nSpect registration, OSRB attach) with the staged artifact names.
-  # Runs on a self-hosted runner — the GitLab endpoint is internal-only.
-  # Prerequisite outside this repo: a projects/modelexpress.yml definition in
-  # the release-automation GitLab project.
-  # ---------------------------------------------------------------------------
   trigger-gitlab-release:
     name: Trigger GitLab release pipeline
-    # The only runners with network access to the internal GitLab host; the
-    # velonix pools cannot resolve it (curl exit 6). Same group Dynamo uses.
     runs-on:
       group: gitlab_ci_runners
-    # Crates/helm are ordering-only needs (Dynamo treats optional stages the
-    # same way): their staged names are forwarded when available, but a crate
-    # or chart failure doesn't withhold the container/wheel scans. nightly-status
-    # still flags them red.
     needs: [preflight, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc, compliance, notify-slack-start]
     if: >-
       ${{ !cancelled() &&
@@ -1094,16 +776,11 @@ jobs:
       - name: Trigger GitLab pipeline
         id: trigger
         env:
-          # Both from the automated-release environment; the URL is a secret
-          # so the internal host stays masked and rotatable.
           GITLAB_TRIGGER_URL: ${{ secrets.GITLAB_PIPELINE_URL }}
           GITLAB_TRIGGER_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
           GITLAB_REF: ${{ vars.GITLAB_RELEASE_AUTOMATION_REF || 'main' }}
-          # TEMPORARY(test): rehearsal validates and scans without publishing.
-          # Set to false before merge.
+          # TEMPORARY(test): revert before merge.
           DRY_RUN: "true"
-          # Sonar files the analysis under this branch; it must track the ref
-          # actually built, not a fixed name.
           SONAR_BRANCH: ${{ github.ref_name }}
           ARTIFACTORY_PATH: ${{ needs.preflight.outputs.artifactory_path }}
           ARTIFACTORY_WHEEL_REPO: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
@@ -1126,8 +803,6 @@ jobs:
             exit 1
           fi
 
-          # Crates/helm are best-effort lanes: only declare what actually
-          # staged, so the GitLab scan never chases phantom artifacts.
           ARTIFACTS="wheel,container"
           if [ "${CRATES_RESULT}" = "success" ]; then
             ARTIFACTS="${ARTIFACTS},crate"
@@ -1141,17 +816,13 @@ jobs:
             HELM_CHART_VERSION=""
             STAGED_HELM=""
           fi
-          # GitHub only masks the EXACT secret value: the internal GitLab host
-          # would still leak via curl transport errors ("Could not resolve
-          # host: ...") and via the response's web_url. Mask the derived
-          # authority and bare host before anything can print them.
+          # Mask the derived GitLab host; only the exact secret value is masked automatically.
           AUTHORITY=$(printf '%s' "${GITLAB_TRIGGER_URL}" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://([^/]+).*#\1#')
           HOST="${AUTHORITY##*@}"
           HOST="${HOST%%:*}"
           echo "::add-mask::${AUTHORITY}"
           echo "::add-mask::${HOST}"
 
-          # Token via file form-field so it never appears in a process listing.
           TOKEN_FILE=$(mktemp)
           trap 'rm -f "${TOKEN_FILE}"' EXIT
           printf '%s' "${GITLAB_TRIGGER_TOKEN}" > "${TOKEN_FILE}"
@@ -1182,8 +853,6 @@ jobs:
             --form "variables[STAGED_HELM]=${STAGED_HELM}" \
             --form "variables[SLACK_THREAD_TS]=${SLACK_THREAD_TS}" \
             --form "variables[SLACK_CHANNEL_ID]=${SLACK_CHANNEL_ID}")
-          # id only — web_url embeds the internal host and project path,
-          # which the secret URL exists to keep out of public logs.
           PIPELINE_ID=$(echo "${RESPONSE}" | jq -r '.id // "unknown"')
           PIPELINE_STATUS=$(echo "${RESPONSE}" | jq -r '.status // "unknown"')
           # Must stay above the status gate below, which can exit non-zero.
@@ -1195,9 +864,6 @@ jobs:
           echo "GitLab release pipeline triggered: pipeline ID ${PIPELINE_ID}"
           echo "GitLab release pipeline ID: \`${PIPELINE_ID}\`" >> "$GITHUB_STEP_SUMMARY"
 
-          # HTTP 201 alone is not success: GitLab returns a pipeline object
-          # with status "skipped" when no rule matched, i.e. the security scan
-          # silently ran nothing. Treat that as a failure of the handoff.
           case "${PIPELINE_STATUS}" in
             created|pending|running|preparing|waiting_for_resource|scheduled) ;;
             *)
@@ -1217,8 +883,6 @@ jobs:
           PIPELINE_ID: ${{ steps.trigger.outputs.pipeline_id }}
           PIPELINE_STATUS: ${{ steps.trigger.outputs.pipeline_status }}
           ARTIFACTS: ${{ steps.trigger.outputs.artifacts }}
-          # The step runs on the failure path too, where the outputs above are
-          # empty; the headline must follow the outcome, not assume success.
           TRIGGER_OUTCOME: ${{ steps.trigger.outcome }}
         run: |
           set -euo pipefail
@@ -1227,7 +891,6 @@ jobs:
           else
             HEADLINE=":x: *GitLab release-automation handoff FAILED* — staged artifacts are not being scanned"
           fi
-          # Report the id only; web_url embeds the internal host.
           PAYLOAD=$(jq -n \
             --arg channel   "${SLACK_CHANNEL_ID}" \
             --arg thread_ts "${SLACK_THREAD_TS}" \
@@ -1258,11 +921,6 @@ jobs:
             exit 1
           fi
 
-  # ---------------------------------------------------------------------------
-  # Umbrella status (mirrors ci-status-check): one job to point dashboards and
-  # alerting at. Skipped dependencies (e.g. release jobs on a test-only
-  # dispatch) count as satisfied.
-  # ---------------------------------------------------------------------------
   nightly-status:
     name: Nightly status
     runs-on: prod-modelexpress-builder-amd-v1
@@ -1291,17 +949,11 @@ jobs:
         run: |
           set -uo pipefail
           echo "${RESULTS}" | jq .
-          # Baseline: every job must be success or intentionally skipped.
           FAILED=$(echo "${RESULTS}" | jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key')
-          # Release mode: staging jobs are mandatory — a skip there (rejected
-          # approval, broken condition) must read as red, not green.
           if [ "${RELEASE}" = "true" ]; then
             MANDATORY="build-server-image assemble-server-manifest build-wheels stage-crates package-helm-chart stage-helm-ngc stage-containers-ngc compliance"
             [ "${SKIP_GITLAB}" != "true" ] && MANDATORY="${MANDATORY} trigger-gitlab-release"
             for JOB in ${MANDATORY}; do
-              # A job id that does not exist in `needs` yields jq null, which
-              # would silently pass. Treat an unknown id as a hard error so a
-              # rename can never quietly disarm this gate.
               RESULT=$(echo "${RESULTS}" | jq -r --arg j "${JOB}" 'if has($j) then .[$j].result else "MISSING" end')
               if [ "${RESULT}" = "MISSING" ]; then
                 echo "::error::nightly-status references unknown job '${JOB}' — add it to needs: or fix the name."
@@ -1319,20 +971,10 @@ jobs:
           fi
           echo "All nightly jobs succeeded (or were intentionally skipped)."
 
-  # ---------------------------------------------------------------------------
-  # Failure alert: lists this run's failed jobs and posts to the nightly
-  # webhook. Runs every night; posts only when something actually failed.
-  # ---------------------------------------------------------------------------
   notify-slack-failure:
     name: Notify Slack — run status
-    # Depends on the umbrella job rather than running beside it: nightly-status
-    # already needs every other job, and waiting for it means (a) its own
-    # conclusion is visible to the jobs API query, and (b) its verdict — which
-    # catches red states the API cannot see, like a release-mandatory job that
-    # was skipped — can force the alert.
     needs: [nightly-status]
-    # TEMPORARY(test): silence Slack for the pull-request/603 rehearsal.
-    # Drop the push exclusion when the rehearsal pins come out.
+    # TEMPORARY(test): revert before merge.
     if: ${{ always() && github.event_name != 'push' }}
     uses: ./.github/workflows/notify-slack.yml
     permissions:
@@ -1341,12 +983,9 @@ jobs:
     with:
       pipeline_name: Nightly
       force_alert: ${{ needs.nightly-status.result != 'success' }}
-      # One channel message per run, green or red.
       always_post: true
       mention_always: ${{ vars.SLACK_MENTION_OPS_SUPPORT }} ${{ vars.SLACK_MENTION_DYNAMO_BOT }}
       mention_on_failure: ${{ vars.SLACK_MENTION_MX_DEV_TEAM }}
-      # continue-on-error jobs still report conclusion "failure" to the jobs
-      # API, so every allowed-to-fail job must be listed here or it alerts.
       ignored_jobs: |
         Test Suite (nightly)
         staging status

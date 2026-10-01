@@ -2,14 +2,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Stamp, lint, package and coherence-check the nightly helm chart.
-#
-# Called by nightly-ci.yml jobs package-helm-chart and stage-helm-ngc; keep
-# both callers on this script so they cannot package different charts.
-#
-# Requires helm on PATH. Reads NIGHTLY_TAG, CHART_VERSION and NGC_STAGING_ORG
-# from the environment; writes chart-dist/modelexpress-${CHART_VERSION}.tgz.
-
 set -euo pipefail
 
 : "${NIGHTLY_TAG:?NIGHTLY_TAG is required}"
@@ -18,9 +10,6 @@ set -euo pipefail
 
 NIGHTLY_REPO="nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/modelexpress-server-nightly"
 
-# values.yaml ships inside the packaged chart and points at the GA image, so
-# it must be repointed at tonight's image. The values-*.yaml overlays are
-# deploy-time inputs and do not ship in the chart.
 python3 - "$NIGHTLY_REPO" "$NIGHTLY_TAG" <<'PY'
 import re, sys
 repo, tag = sys.argv[1], sys.argv[2]
@@ -43,8 +32,6 @@ helm package helm/ \
   --destination chart-dist/
 ls -la chart-dist/
 
-# Checked on the packaged tarball, which is what gets pushed. A chartmuseum
-# push is immutable, so a chart pinned to a missing image cannot be corrected.
 EXPECTED="${NIGHTLY_REPO}:${NIGHTLY_TAG}"
 RENDERED=$(helm template mx "chart-dist/modelexpress-${CHART_VERSION}.tgz" | grep -E '^\s+image:' | head -1)
 echo "rendered: ${RENDERED}"

@@ -102,17 +102,12 @@ def rewrite_versions(root: Path, pkgs: dict[str, dict], old: str, new: str) -> i
     """
     members = sorted(pkgs, key=len, reverse=True)
     member_alt = "|".join(re.escape(m) for m in members)
-    # `<member> = { ... version = "<old>" ... }` on a single line. Note `=?`
-    # rather than a `{0,1}` quantifier: inside an f-string, braces would be
-    # parsed as a replacement field.
     dep_pat = re.compile(
         rf'(?m)^(\s*(?:{member_alt})\s*=\s*\{{[^}}\n]*?\bversion\s*=\s*")=?{re.escape(old)}(")'
     )
-    # `version = "<old>"` inside the [workspace.package] table only.
     wp_pat = re.compile(
         rf'(?ms)(\[workspace\.package\].*?\n\s*version\s*=\s*"){re.escape(old)}(")'
     )
-    # `version = "<old>"` inside a member manifest's [package] table.
     pkg_pat = re.compile(
         rf'(?ms)(\[package\].*?\n\s*version\s*=\s*"){re.escape(old)}(")'
     )
@@ -122,7 +117,6 @@ def rewrite_versions(root: Path, pkgs: dict[str, dict], old: str, new: str) -> i
         text = manifest.read_text()
         out = wp_pat.sub(lambda m: f"{m.group(1)}{new}{m.group(2)}", text, count=1)
         out = pkg_pat.sub(lambda m: f"{m.group(1)}{new}{m.group(2)}", out, count=1)
-        # Exact-match requirement for internal deps.
         out = dep_pat.sub(lambda m: f"{m.group(1)}={new}{m.group(2)}", out)
         if out != text:
             manifest.write_text(out)
@@ -168,16 +162,12 @@ def main() -> int:
             for nm in pkgs:
                 if pkgs[nm]["version"] == cur:
                     pkgs[nm]["version"] = stage_version
-            # Resync the lockfile; fail loudly here rather than as a confusing
-            # package error later.
             r = subprocess.run(["cargo", "update", "--workspace"], cwd=root)
             if r.returncode != 0:
                 print("::error::cargo update --workspace failed after the stage-version rewrite",
                       file=sys.stderr)
                 return 1
 
-    # Fail fast BEFORE any build if a crate carries an unexpected version (e.g. a
-    # hardcoded version the bump missed) — never silently stage wrong versions.
     if args.expect_version:
         mismatched = [(n, pkgs[n]["version"]) for n in order if pkgs[n]["version"] != args.expect_version]
         if mismatched:
@@ -186,8 +176,6 @@ def main() -> int:
                       file=sys.stderr)
             return 1
 
-    # Validate the whole workspace compiles at the stamped version before
-    # producing anything.
     print("=== cargo check --workspace ===", flush=True)
     if subprocess.run(["cargo", "check", "--workspace"], cwd=root).returncode != 0:
         print("::error::cargo check failed for the workspace at the staging version",
@@ -196,13 +184,7 @@ def main() -> int:
             print(f"FAILED_CRATE={name} cargo check failed", flush=True)
         return 1
 
-    # Package ALL crates in ONE invocation. This is load-bearing, not a
-    # micro-optimisation: with several `-p` targets cargo registers each
-    # just-packaged .crate into a temporary overlay registry that the others
-    # resolve against. Packaging crate-by-crate instead makes cargo resolve
-    # `modelexpress-common = "=<staging version>"` against crates.io, where
-    # that version does not exist, so every dependent crate fails (or, worse,
-    # silently embeds a lockfile pointing at the last public release).
+    # All crates in one cargo package call: each resolves its siblings from the others' just-packaged .crate.
     print(f"=== cargo package ({len(order)} crates, leaves first) ===", flush=True)
     pkg_args = []
     for name in order:
@@ -211,10 +193,6 @@ def main() -> int:
         ["cargo", "package", "--no-verify", "--allow-dirty", *pkg_args], cwd=root
     ).returncode
 
-    # Report per crate on what actually landed on disk, so a partial failure
-    # still tells the workflow (and Slack) exactly which crates are staged.
-    #   STAGED_CRATE=<name>            packaged into --output-dir
-    #   FAILED_CRATE=<name> <reason>   not produced
     staged: list[str] = []
     failed: dict[str, str] = {}
     for name in order:
