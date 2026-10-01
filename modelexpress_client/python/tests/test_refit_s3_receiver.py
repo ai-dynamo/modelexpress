@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import os
 import threading
 from contextlib import contextmanager
 from dataclasses import replace
@@ -1090,7 +1091,13 @@ def test_canonical_s3_preserves_active_checkpoint_when_disk_is_full(
 def test_canonical_s3_reseeds_a_modified_ready_checkpoint(monkeypatch, tmp_path):
     first, _storage = _build(monkeypatch, tmp_path, {})
     checkpoint_path = first._checkpoint.local_checkpoint / "model.safetensors"
+    previous = checkpoint_path.stat()
     save_file({"weight": torch.tensor([9.0, 10.0])}, checkpoint_path)
+    # Make the same-size overwrite visible on filesystems with coarse timestamps.
+    os.utime(
+        checkpoint_path,
+        ns=(previous.st_atime_ns, previous.st_mtime_ns + 1_000_000_000),
+    )
     first.close()
 
     second = _Adapter(
@@ -2374,11 +2381,17 @@ def test_canonical_s3_rejects_a_corrupt_cached_delta_during_replay(
         base.view(torch.uint8).numpy(),
         torch.tensor([9.0, 10.0]).view(torch.uint8).numpy(),
     )["s3://weights/test/v1/model-00000-of-00001.safetensors"]
-    (
+    delta_path = (
         adapter._checkpoint.store.delta_cache
         / "target-a"
         / "model-00000-of-00001.safetensors"
-    ).write_bytes(corrupt)
+    )
+    previous = delta_path.stat()
+    delta_path.write_bytes(corrupt)
+    os.utime(
+        delta_path,
+        ns=(previous.st_atime_ns, previous.st_mtime_ns + 1_000_000_000),
+    )
     objects.update(
         _artifact(
             middle.view(torch.uint8).numpy(),

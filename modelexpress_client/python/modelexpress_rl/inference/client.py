@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
@@ -162,12 +163,12 @@ class StagedWeightHandle:
         self._timing = timing
 
     def release(self) -> None:
-        """Release local staging buffers; repeated calls are idempotent."""
+        """Release this update; reusable receive buffers may remain allocated."""
         self._client._release_staged(self)
 
     @property
     def metrics(self) -> dict[str, float]:
-        """Return preparation metrics exposed by the selected adapter."""
+        """Return metrics recorded for this update by the selected adapter."""
         if self._update is None:
             return {}
         return self._update.prepared.metrics
@@ -307,7 +308,7 @@ class ModelExpressGeneratorClient:
         return client
 
     def stage_weight(self, *, version: WeightVersionRef) -> StagedWeightHandle:
-        """Synchronously transfer and verify one full-weight version."""
+        """Prepare an exact version without installing it into the live engine."""
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
         with self._operation_lock:
@@ -358,8 +359,96 @@ class ModelExpressGeneratorClient:
             )
             return self._active_handle
 
+    def apply_weight_streaming(
+        self,
+        *,
+        version: WeightVersionRef,
+        max_staging_bytes: int,
+        staging_device: str = "cuda",
+        staging_buffers: int = 1,
+    ) -> Any:
+        """Transfer and install bounded batches while inference is paused.
+
+        ``max_staging_bytes`` caps the staging arenas in total. ``staging_device``
+        selects where they live: ``"cuda"`` keeps RDMA landing in VRAM with a
+        device-to-device commit; ``"cpu"`` uses pinned host memory and commits
+        with a host-to-device copy, saving the arena's worth of VRAM.
+        ``staging_buffers=2`` splits the cap across two arenas so the next
+        batch's transfer can overlap the current commit. The benefit depends on
+        the hardware and the relative transfer and installation times.
+
+        The cap excludes live weights, engine-owned temporary tensors and
+        post-load workspaces.
+
+        This operation mutates weights incrementally. On any failure the caller
+        must keep inference paused and restart the engine; there is no rollback.
+        ``stage_weight`` still prepares an update without changing live weights.
+        """
+        if not isinstance(version, WeightVersionRef):
+            raise TypeError("version must be a WeightVersionRef")
+        if staging_device not in ("cuda", "cpu"):
+            raise ValueError("staging_device must be 'cuda' or 'cpu'")
+        if (
+            isinstance(staging_buffers, bool)
+            or not isinstance(staging_buffers, int)
+            or staging_buffers < 1
+        ):
+            raise ValueError("staging_buffers must be a positive integer")
+        with self._operation_lock:
+            if self._engine_state is _EngineState.UNCERTAIN:
+                raise RuntimeError(
+                    "engine weights are uncertain; restart before streaming refit"
+                )
+            if self._active_handle is not None:
+                raise RuntimeError("another generator update is still active")
+            runtime = self._require_runtime()
+            started = time.perf_counter()
+            recorder = timing.start_cycle(
+                version_id=version.version_id,
+                rank=rl_envs.LOCAL_RANK,
+            )
+            try:
+                with timing.active(recorder):
+                    with refit_span("control_discovery"):
+                        ready = self._get_ready_version(version.version_id)
+                    update = runtime.session.prepare_streaming(
+                        ready,
+                        max_staging_bytes=max_staging_bytes,
+                        staging_device=staging_device,
+                        staging_buffers=staging_buffers,
+                    )
+            except BaseException:
+                timing.emit(recorder, logger)
+                raise
+            prepare_s = time.perf_counter() - started
+            staged = StagedWeightHandle(
+                client=self,
+                version_id=version.version_id,
+                update=update,
+                timing=recorder,
+            )
+            self._active_handle = staged
+            try:
+                result = self.apply_weight(staged)
+                metrics = {**(result or {}), **staged.metrics}
+            except BaseException:
+                try:
+                    self._release_staged(staged)
+                except Exception:
+                    logger.exception(
+                        "failed to release streaming update after installation error"
+                    )
+                raise
+            else:
+                release_started = time.perf_counter()
+                self._release_staged(staged)
+                metrics["streaming_prepare_s"] = prepare_s
+                metrics["streaming_release_s"] = time.perf_counter() - release_started
+                metrics["streaming_total_s"] = time.perf_counter() - started
+                return metrics
+
     def apply_weight(self, staged: StagedWeightHandle) -> Any:
-        """Install a verified local staged version at the caller's safe point."""
+        """Install a prepared update at the caller's safe point."""
         if not isinstance(staged, StagedWeightHandle) or staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
@@ -546,9 +635,7 @@ class ModelExpressGeneratorClient:
             raise RuntimeError("MX GetWeightVersion response is missing version")
         version = _weight_version(response.version)
         if version.state is not WeightVersionState.READY:
-            raise RuntimeError(
-                f"initial serving version {version_id!r} is not READY"
-            )
+            raise RuntimeError(f"initial serving version {version_id!r} is not READY")
         if version.model_name != self.model_name:
             raise RuntimeError(
                 "initial serving version model_name does not match the generator"
@@ -620,6 +707,7 @@ class ModelExpressGeneratorClient:
         )
 
     def _release_staged(self, staged: StagedWeightHandle) -> None:
+        """Free the active slot once locally released, including cleanup errors."""
         if staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
@@ -634,7 +722,9 @@ class ModelExpressGeneratorClient:
                 elif staged._update is None:
                     staged._no_op_released = True
             finally:
-                if self._active_handle is staged:
+                if self._active_handle is staged and (
+                    staged._update is None or staged._update.released
+                ):
                     self._active_handle = None
 
 

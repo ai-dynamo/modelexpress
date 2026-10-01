@@ -510,11 +510,13 @@ Trainer integrations provide the matching `ObjectStorageConfig` through
 `ModelExpressTrainerConfig.object_storage`; the initial implementation rejects
 providers other than S3 before creating the storage client.
 
-The synchronous generator client returns a staged handle only after transfer
-and verification finish. That handle owns the version lease through graph-safe
-installation; applying the weights or releasing an unapplied handle ends the
-lease. There is no separate asynchronous wait or unimplemented direct-install
-API.
+The synchronous generator client returns a staged handle after source-specific
+preparation, without changing live weights. Trainer-source preparation receives
+a full copy; generator-peer preparation reserves a read that runs during apply.
+The handle owns the version lease through installation at the caller's safe
+point. Applying the weights or releasing an unapplied handle ends the lease.
+Bounded DIRECT combines preparation and installation in
+`apply_weight_streaming()` without exposing a staged handle to the caller.
 
 The initial worker manifest channel uses plaintext gRPC and does not authenticate
 the publishing worker. Manifest digests detect corruption but do not establish
@@ -543,6 +545,58 @@ engine integrations.
   graph-safe installation through vLLM's layerwise reload and post-load path.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
   through SGLang's native safetensors loader.
+
+The explicit `apply_weight_streaming(version=..., max_staging_bytes=...)`
+generator API holds a version lease across metadata preparation and incremental
+installation. The NIXL receiver plans complete owning-module batches and uses
+one or two registered byte arenas (`staging_buffers`) on CUDA or pinned host
+memory (`staging_device`). Receive tensors, wire-dtype conversion buffers,
+full-source reconstruction buffers, and alignment all count toward the limit,
+which is split evenly across the arenas. With two arenas the READ for batch
+`i + 1` is posted before batch `i` is yielded for commit, allowing asynchronous
+READs to overlap installation; an arena is refilled only after its commit has
+synchronized. Host arenas are registered as NIXL DRAM and read with a DRAM local
+memory type. The vLLM installer copies each batch into engine-owned load-time
+tensors, then uses native post-load processing to restore existing kernel
+storage. Receive-arena views are never passed to engine callbacks. For trainer
+sources, `stage_weight()` continues to transfer a full independent copy before
+installation.
+
+`MX_REFIT_PACK_MODULES` coalesces consecutive owning-module batches up to the
+same staging limit, trading a larger arena residency for fewer of them. It never
+changes which source bytes are read: the packed batch preserves source ranges,
+byte counts and descriptor counts, while destination offsets follow the packed
+arena layout. Modules that pull the same complete source stay in separate
+batches. It is off by default because one module per batch is the smallest arena
+a model can refit through.
+
+Before vLLM rebuilds per-module load-time parameter skeletons, the adapter records
+shared parameter objects and reconnects those aliases afterward. Alias owners
+must remain at the same module paths during restoration and final processing;
+replacement or removal fails the refit, including owners with no separately
+published parameter and multiple paths to the same module. Capture then
+counts tied weights once, and installation preserves their shared kernel storage.
+Alias groups with inconsistent load-time shapes or dtypes are rejected.
+Streaming owner checks resolve aliases against the live parameter objects on
+each batch. An owner may reuse a shared parameter installed by an earlier batch
+only while it still points to that exact committed object; a missing or rebound
+parameter is rejected. Installation reconnects shared bindings after each
+managed owner's kernel-storage restoration, before dependent hooks execute.
+
+Released full-copy and bounded updates may alternate on one client. The transfer
+owner tears down its agent before clearing the mode-specific buffers and reloads
+source metadata into the new registrations. The update method invalidates cached
+full-copy descriptors before entering bounded preparation. Preparation retries
+retain one version lease and discard failed setup state; installation failures
+still fence the engine rather than retrying a partially committed update.
+
+Streaming is opt-in, trainer-only, and currently limited to unquantized vLLM
+models. It does not publish generator peers or roll back partially installed
+versions. An installation failure marks the client engine state uncertain and
+blocks further streaming updates. The hosting framework must keep all replicas
+paused and restart them after any failed update. Only completion of all replicas
+permits resuming generation. The staging limit excludes live model weights,
+engine-owned post-load workspace, CUDA allocator overhead, and transport metadata.
 
 The corresponding trainer composition is owned by `TrainerRuntime`. Public
 `FSDPTrainerContext` and `MegatronTrainerContext` select only engine capture;
@@ -1508,3 +1562,121 @@ Optimization opportunities: contiguous regions (blocked), warm source pool, Deep
 ## Deployment and Configuration
 
 See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering server/client configuration, Docker, Kubernetes, Helm, P2P transfer setup, and debugging commands.
+
+
+### Bounded vLLM streaming installation
+
+The generator streams complete owning-module groups through reusable receive
+arenas. The transport planner derives those groups from captured loader geometry;
+applications do not select individual layers or depend on model-specific names.
+One installer uses vLLM's reload lifecycle for all supported unquantized models.
+
+```mermaid
+flowchart LR
+    T[Trainer shards in HBM or DRAM] -->|NIXL READ| A[Bounded receive arenas]
+    A -->|Copy complete module inputs| E[Engine-owned load-time tensors]
+    E --> P[vLLM post-load processing]
+    P --> L[Original live parameter storage]
+    L --> F[vLLM deferred attention finalization]
+    G[Framework update guard] -. held through transfer and installation .-> A
+    G -.-> F
+```
+
+The installer opens one reload window per update. For each completed group, it
+validates live owners, input coverage and shared parameters, materializes the
+engine's load-time destinations, and copies received values into them. vLLM then
+performs post-load processing, reconciles parameter state and restores the
+original kernel tensor bindings. Its finalization handles attention dependencies
+after all required inputs have arrived. Engine reload runs in its native device
+context: layer materialization selects its recorded device, while host bookkeeping
+can be recreated on CPU. Bare tensors on the installer device keep the storage
+referenced by graph consumers. MX does not implement model-family
+admission tables or attention-specific weight transformations.
+
+Receive-arena tensors are never attached to the model or passed to post-load
+callbacks. The copy boundary requires ordinary Tensor storage views and rejects
+custom dispatch modes instead of bypassing their semantics. A callback may retain an engine-owned tensor without preventing arena
+reuse. CUDA completion is still required before the next READ overwrites an
+arena. This ownership boundary removes receive-retention scans; it does not
+remove checks that a callback changed another module or a shared parameter.
+
+Alias validation distinguishes multiple paths to one parameter slot from ties
+between distinct slots. It records shared parent-to-child edges in reusable reload metadata,
+then checks every edge afresh after each callback, including ancestors and all
+incoming alias paths. Only distinct changed slots need reassignment. Custom
+attribute access, setters and parameter-registration hooks retain the original
+path lookup and assignment behavior; no validation verdict is cached across
+callbacks or updates.
+
+Warm load-layout capture keeps a private snapshot when records contain only
+ordinary immutable metadata. Each caller receives fresh mutable capture records
+and containers, with duplicate record references preserved. Slice-containing
+operation tuples are copied with a shared memo. Mutable or custom payloads and
+changed copy protocols use whole-result deep copying. The existing model,
+loader, routing and manifest keys still decide whether a capture can be reused.
+
+Alias validation uses Python module lookup and parameter registration semantics.
+Each streaming batch checks the current ownership structure and reuses the
+initial reload's alias metadata when paths, owners, ordering and classes still
+match. Native reload can reorder parameter groups without changing their members.
+Those batches retain fresh callback order while sharing per-owner views of the
+initial owners. Changed group membership, paths, classes or ancestors prevents
+that sharing. No validation verdict survives an engine callback. The initial
+metadata and its per-owner views live only for that reload window; plans referring
+to later owners are released with the batch.
+
+For ordinary layer-local materialization, a per-owner view restores each complete
+shared-parameter group touched by that layer. Ordinary tensor buffers and vLLM's
+stock parameter forwarding method are supported; the latter's function, code and
+inheritance are recorded when the installer is created and checked before use.
+Ordinary instance dictionaries inherited from mixins are also supported; custom
+dictionary descriptors use the full restoration path.
+Custom ancestor lookup, setters, registration hooks, tensor dispatch or restore
+contexts use the full restoration path. Post-load
+callbacks always retain whole-model alias validation and restoration, including
+changes to unrelated owners that a later callback could otherwise hide.
+This path adds no native extension or CPython-internal dependency.
+
+The staging limit bounds receive, conversion and transfer scratch allocations.
+Engine-owned materialized destinations and post-load workspaces consume
+additional memory, as do the live model and runtime state. The staging limit is
+therefore not a total GPU-memory bound. Two arenas can overlap the next READ with
+installation of the current group; the benefit must be measured on the target
+hardware. Trainer staging mode and receiver arena location are separate choices.
+
+Bounded transfer can reuse immutable READ addresses and sizes for the currently
+validated compiled plan. The one-entry cache checks the workspace generation and
+the identity, order and geometry of all receive arenas before every batch. It
+holds only weak arena references; source leases, tensor views and transport
+handles remain owned by the update. Preparation still validates current source
+metadata and coverage, and every batch still creates views, zeroes padding,
+posts fresh READs and completes the existing fences. Failed preparation,
+incomplete iteration and workspace teardown discard the descriptors. Private
+transfer counters report hits, misses and builds; descriptor work stays outside
+the wire timer on both cold and warm updates.
+
+The manifest-byte cache owns an immutable snapshot of ordinary parsed source
+and shard rows. A warm bounded-plan lookup reuses its structural key only while
+the resolved source table is the snapshot's table. All other resolved fields
+and maps keep their original schema and ownership. The snapshot contains only
+host metadata; it owns no tensors, transport handles or source leases. Custom
+or mutable source rows retain the original field-by-field checks. Ordered
+manifest bytes, agent and device maps,
+captured layouts and the staging configuration still participate in invalidation,
+and current source coverage is checked before transfer. Snapshot construction is
+charged to source preparation on a cache miss.
+
+The prepared streaming artifact owns its iterator and remains protected by the
+version lease. An installation failure fences the engine and never falls back
+after a possible write. CUDA work must drain before iterator cleanup and source
+release. A failed drain, iterator close or source iteration retains the active
+handle, receive workspace and source lease and requires a process restart: CUDA
+synchronization alone cannot prove failed RDMA reads have completed. Simultaneous
+installation and cleanup errors preserve the original exception with the cleanup
+failure chained as its cause. Partial installation has no rollback.
+
+The adapter depends on vLLM's layerwise reload helpers. Runtime compatibility must
+be qualified with changing weights, shared parameters, graph-bound addresses,
+post-load state and failure cleanup. Quantized bounded installation remains
+unsupported. The same generic path is used for small-model validation and GLM;
+passing the former does not establish full-model correctness or performance.
