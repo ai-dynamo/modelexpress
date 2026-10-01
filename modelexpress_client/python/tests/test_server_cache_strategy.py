@@ -148,7 +148,7 @@ def snapshot(tmp_path):
         path = cache.snapshot_path(COMMIT)
         path.mkdir(parents=True)
         (path / "config.json").write_text("{}")
-        cache._write_metadata_inventory(COMMIT, {"config.json": 2})
+        cache.write_metadata_inventory(COMMIT, {"config.json": 2})
     return path
 
 
@@ -234,7 +234,9 @@ class TestLoad:
         with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
             ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
 
-        assert FakeClient.instances[0].calls == [(REPO, snapshot)]
+        assert [
+            call for client in FakeClient.instances for call in client.calls
+        ] == [(REPO, snapshot)]
 
     def test_installs_weights_then_loads_natively(self, enabled, snapshot, fake_client):
         adapter = _FakeAdapter()
@@ -288,13 +290,13 @@ class TestLoad:
             cache = ModelSnapshotCache(repo_id, cache_directory)
             with cache.lock():
                 (snapshot / "config.json").write_bytes(b"{}")
-                cache._write_metadata_inventory(COMMIT, {"config.json": 2})
+                cache.write_metadata_inventory(COMMIT, {"config.json": 2})
             return snapshot
 
         original_weights = FakeClient.install_weight_files
 
         def install_weights(client, repo_id, path, *args, **kwargs):
-            assert ModelSnapshotCache(repo_id, root)._ready_metadata(COMMIT) == snapshot
+            assert ModelSnapshotCache(repo_id, root).ready_metadata(COMMIT) == snapshot
             events.append("weights")
             return original_weights(client, repo_id, path, *args, **kwargs)
 
@@ -390,7 +392,7 @@ class TestCacheRoot:
             with cache.lock():
                 engine_path.mkdir(parents=True)
                 (engine_path / "config.json").write_bytes(b"{}")
-                cache._write_metadata_inventory(COMMIT, {"config.json": 2})
+                cache.write_metadata_inventory(COMMIT, {"config.json": 2})
             return engine_path
 
         with patch.object(model_prefetch, "_ensure_metadata_snapshot", side_effect=install):
@@ -420,14 +422,15 @@ class TestCacheRoot:
         assert FakeClient.instances == []
 
     def test_disabled_resolved_preparation_is_a_clean_miss(
-        self, enabled, tmp_path, fake_client
+        self, tmp_path, fake_client
     ):
         engine_path = tmp_path / "models--org--model" / "snapshots" / COMMIT
-        ctx = _make_context(REPO, model_path=str(engine_path))
+        ctx = _make_context(str(engine_path), model_path=str(engine_path))
+        assert model_prefetch.is_enabled() is False
+        assert not engine_path.exists()
 
-        with patch.object(model_prefetch, "_ensure_resolved_metadata", return_value=None):
-            with pytest.raises(StrategyFailed, match="did not apply") as excinfo:
-                self._run(ctx)
+        with pytest.raises(StrategyFailed, match="did not apply") as excinfo:
+            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
 
         assert excinfo.value.mutated is False
         assert FakeClient.instances == []
@@ -442,7 +445,7 @@ class TestCacheRoot:
 
         with patch.object(
             model_prefetch,
-            "_ensure_resolved_metadata",
+            "ensure_resolved_metadata",
             side_effect=AssertionError("Ordinary local paths must not fetch metadata"),
         ):
             self._run(ctx)
@@ -491,8 +494,8 @@ class TestLegacySnapshotCompatibility:
         assert len(service.stream_requests) == 1
         assert not model_prefetch._revision_snapshots
         cache = ModelSnapshotCache(REPO, legacy_snapshot.parent.parent.parent)
-        assert cache._ready_metadata(COMMIT) is None
-        assert not cache._metadata_inventory_path(COMMIT).exists()
+        assert cache.ready_metadata(COMMIT) is None
+        assert not cache.metadata_inventory_path(COMMIT).exists()
 
     def test_legacy_directory_keeps_weight_path_when_another_commit_has_inventory(
         self, enabled, legacy_snapshot, monkeypatch
@@ -505,8 +508,8 @@ class TestLegacySnapshotCompatibility:
             other = cache.snapshot_path(other_commit)
             other.mkdir(parents=True)
             (other / "config.json").write_bytes(b"{}")
-            cache._write_metadata_inventory(other_commit, {"config.json": 2})
-        other_inventory = cache._metadata_inventory_path(other_commit)
+            cache.write_metadata_inventory(other_commit, {"config.json": 2})
+        other_inventory = cache.metadata_inventory_path(other_commit)
         assert other_inventory.is_file()
         assert other_inventory.parent.is_dir()
 
@@ -521,8 +524,8 @@ class TestLegacySnapshotCompatibility:
         assert adapter.native_calls == 1
         assert len(service.download_requests) == 1
         assert service.download_requests[0].ignore_weights is False
-        assert not cache._metadata_inventory_path(COMMIT).exists()
-        assert cache._ready_metadata(other_commit) == other
+        assert not cache.metadata_inventory_path(COMMIT).exists()
+        assert cache.ready_metadata(other_commit) == other
         assert not (other / "model.safetensors").exists()
 
     @pytest.mark.parametrize("pin_rpc_error", [False, True])
@@ -565,14 +568,14 @@ class TestLegacySnapshotCompatibility:
             (snapshot / "config.json").write_bytes(b"{}")
             if state == "missing-metadata":
                 with cache.lock():
-                    cache._write_metadata_inventory(COMMIT, {"config.json": 2})
+                    cache.write_metadata_inventory(COMMIT, {"config.json": 2})
                 (snapshot / "config.json").unlink()
             elif state == "directory-file":
                 # A regular file squatting on the inventory directory name makes
                 # lstat() fail with ENOTDIR rather than ENOENT.
-                cache._metadata_inventory_path(COMMIT).parent.write_bytes(b"x")
+                cache.metadata_inventory_path(COMMIT).parent.write_bytes(b"x")
             else:
-                inventory = cache._metadata_inventory_path(COMMIT)
+                inventory = cache.metadata_inventory_path(COMMIT)
                 inventory.parent.mkdir()
                 if state == "corrupt-inventory":
                     inventory.write_text("{")
@@ -594,7 +597,7 @@ class TestLegacySnapshotCompatibility:
         assert not (snapshot / "model.safetensors").exists()
         if state == "directory-file":
             assert "Cannot inspect metadata inventory" in caplog.text
-            assert cache._metadata_inventory_path(COMMIT).parent.read_bytes() == b"x"
+            assert cache.metadata_inventory_path(COMMIT).parent.read_bytes() == b"x"
 
 
 class TestChainOrder:

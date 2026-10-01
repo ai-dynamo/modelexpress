@@ -1134,8 +1134,8 @@ Requirements and limits:
 - `MX_MODEL_REVISION` does not pin anything. It labels the worker's P2P source identity and accepts any string, including one that names no Hugging Face revision at all. Pin through the engine's own revision setting instead.
 - Outside the inventoried immutable-pin shortcut, reusing a local snapshot requires the server to name its revision. A server that already holds an unpinned model may answer without naming one, so the worker restreams metadata rather than assume the copy on disk is current. A metadata inventory records paths and sizes, not content hashes that detect equal-size modifications.
 - On a cold server the metadata phase waits only for the non-weight files. The weights are downloaded later, and only if P2P found no source. The server keys its registry entry on the weight mode, so the metadata-only request does not mark the model complete.
-- Workers sharing one cache root serialize cold metadata installation and double-check pinned readiness after acquiring the lock. Workers with separate caches still need their own metadata copies; P2P misses may additionally stream weights. The server dedups upstream downloads, but independent receiver caches still consume server egress, so size the server's network accordingly or stagger large rollouts.
-- Cold RPC timeout behavior is unchanged. Uncached metadata can still wait for a slow or unreachable server, and a stalled cold request can hold the repository lock. The lock-free warm-pin shortcut does not add a download deadline or change weight-strategy fallback behavior.
+- The server dedups the upstream download but not the per-worker stream. Concurrent workers on a cold model all wait on one Hugging Face fetch, then each streams its own copy, so N replicas starting together cost N x model size in server egress. Size the server's network accordingly, or stagger large rollouts.
+- An unreachable server costs about 20 seconds per worker before loading falls through to the next strategy. That is the TCP connect timeout; a shorter deadline would abort legitimate cold-cache downloads, which can take minutes.
 
 ### InstantTensor (Fast Local Safetensors)
 

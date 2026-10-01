@@ -10,7 +10,11 @@ import pytest
 
 from modelexpress import model_pb2
 from modelexpress.model_client import ModelCacheClient, ModelCacheError
-from modelexpress.model_snapshot import ModelSnapshotCache, ModelSnapshotError
+from modelexpress.model_snapshot import (
+    _STAGING_PREFIX,
+    ModelSnapshotCache,
+    ModelSnapshotError,
+)
 
 COMMIT = "c" * 40
 MODEL = "org/model"
@@ -507,7 +511,7 @@ class TestInstallMetadataSnapshot:
         cache = ModelSnapshotCache(MODEL, tmp_path)
         assert cache.read_main_ref() is None
         leftovers = [
-            p.name for p in cache.repo_root.iterdir() if p.name.startswith(".modelexpress-")
+            p.name for p in cache.repo_root.iterdir() if p.name.startswith(_STAGING_PREFIX)
         ]
         assert leftovers == []
 
@@ -536,7 +540,7 @@ class TestMetadataInventoryReuse:
         self, tmp_path, metadata_snapshot
     ):
         cache = ModelSnapshotCache(MODEL, tmp_path)
-        inventory_path = cache._metadata_inventory_path(COMMIT)
+        inventory_path = cache.metadata_inventory_path(COMMIT)
 
         assert json.loads(inventory_path.read_text()) == {
             "version": 1,
@@ -566,7 +570,9 @@ class TestMetadataInventoryReuse:
         assert client._stub is None
         assert client._channel is None
 
-    def test_pin_is_checked_again_after_acquiring_the_lock(self, tmp_path, monkeypatch):
+    def test_snapshot_published_while_waiting_for_the_lock_is_reused(
+        self, tmp_path, monkeypatch
+    ):
         from contextlib import contextmanager
 
         original_lock = ModelSnapshotCache.lock
@@ -579,21 +585,70 @@ class TestMetadataInventoryReuse:
                 staging.write(b"{}")
                 staging.end_file()
                 staging.publish(COMMIT, {"config.json": 2}, requested_revision=COMMIT)
-                cache._write_metadata_inventory(COMMIT, {"config.json": 2})
                 yield
 
-        def forbidden(*args, **kwargs):
-            raise AssertionError("The second readiness check must avoid RPC")
-
         monkeypatch.setattr(ModelSnapshotCache, "lock", completed_while_waiting)
-        monkeypatch.setattr(ModelCacheClient, "stub", property(forbidden))
-        client = ModelCacheClient(server_url="localhost:1", cache_directory=tmp_path)
+        stub = FakeStub(files={"config.json": 2}, resolved_revision=COMMIT)
+        client = make_client(tmp_path, stub)
 
         snapshot = client.install_metadata_snapshot(MODEL, requested_revision=COMMIT)
 
-        assert snapshot == ModelSnapshotCache(MODEL, tmp_path).snapshot_path(COMMIT)
+        cache = ModelSnapshotCache(MODEL, tmp_path)
+        assert snapshot == cache.snapshot_path(COMMIT)
         assert (snapshot / "config.json").read_bytes() == b"{}"
-        assert client._stub is None
+        assert len(stub.download_requests) == 1
+        assert len(stub.list_requests) == 1
+        assert stub.stream_requests == []
+        assert json.loads(cache.metadata_inventory_path(COMMIT).read_text())["files"] == {
+            "config.json": 2
+        }
+
+    @pytest.mark.parametrize(
+        "revision", [None, "main", COMMIT], ids=["unpinned", "branch", "cold-pin"]
+    )
+    def test_metadata_rpcs_run_before_the_lock_and_stream_runs_under_it(
+        self, tmp_path, monkeypatch, revision
+    ):
+        from contextlib import contextmanager
+
+        events = []
+        original_lock = ModelSnapshotCache.lock
+
+        @contextmanager
+        def recorded_lock(cache):
+            with original_lock(cache):
+                events.append("lock-enter")
+                try:
+                    yield
+                finally:
+                    events.append("lock-exit")
+
+        class RecordingStub(FakeStub):
+            def EnsureModelDownloaded(self, request):
+                events.append("ensure")
+                yield from super().EnsureModelDownloaded(request)
+
+            def ListModelFiles(self, request):
+                events.append("list")
+                return super().ListModelFiles(request)
+
+            def StreamModelFiles(self, request):
+                events.append("stream")
+                yield from super().StreamModelFiles(request)
+
+        monkeypatch.setattr(ModelSnapshotCache, "lock", recorded_lock)
+        stub = RecordingStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+            resolved_revision=COMMIT,
+        )
+
+        snapshot = make_client(tmp_path, stub).install_metadata_snapshot(
+            MODEL, requested_revision=revision
+        )
+
+        assert (snapshot / "config.json").read_bytes() == b"{}"
+        assert events == ["ensure", "list", "lock-enter", "stream", "lock-exit"]
 
     def test_warm_pin_returns_while_another_process_holds_the_repo_lock(
         self, tmp_path, metadata_snapshot
@@ -674,9 +729,9 @@ class TestMetadataInventoryReuse:
     ):
         cache = ModelSnapshotCache(MODEL, tmp_path)
         if damage == "missing-inventory":
-            cache._metadata_inventory_path(COMMIT).unlink()
+            cache.metadata_inventory_path(COMMIT).unlink()
         elif damage == "corrupt-inventory":
-            cache._metadata_inventory_path(COMMIT).write_text("{")
+            cache.metadata_inventory_path(COMMIT).write_text("{")
         elif damage == "missing-file":
             (metadata_snapshot / "config.json").unlink()
         elif damage == "size":
@@ -743,7 +798,7 @@ class TestMetadataInventoryReuse:
         self, tmp_path, metadata_snapshot
     ):
         cache = ModelSnapshotCache(MODEL, tmp_path)
-        cache._metadata_inventory_path(COMMIT).unlink()
+        cache.metadata_inventory_path(COMMIT).unlink()
         stub = FakeStub(
             files={"config.json": 2, "tokenizer.model": 3}, resolved_revision=COMMIT
         )
@@ -751,7 +806,7 @@ class TestMetadataInventoryReuse:
         assert make_client(tmp_path, stub).install_metadata_snapshot(
             MODEL, requested_revision=COMMIT
         ) == metadata_snapshot
-        assert cache._ready_metadata(COMMIT) == metadata_snapshot
+        assert cache.ready_metadata(COMMIT) == metadata_snapshot
         assert len(stub.download_requests) == 1
         assert not stub.stream_requests
 
@@ -764,7 +819,7 @@ class TestMetadataInventoryReuse:
         cache = ModelSnapshotCache(MODEL, tmp_path)
 
         assert (snapshot / "config.json").read_bytes() == b"{}"
-        assert not cache._metadata_inventory_path(COMMIT).exists()
+        assert not cache.metadata_inventory_path(COMMIT).exists()
         with pytest.raises(ModelCacheError, match="did not confirm revision"):
             make_client(tmp_path, FakeStub()).install_metadata_snapshot(
                 MODEL, requested_revision=COMMIT
@@ -782,7 +837,7 @@ class TestMetadataInventoryReuse:
 
         assert snapshot.name == commit
         assert cache._read_metadata_inventory(commit) == {"config.json": 2}
-        assert cache._ready_metadata(commit) is None
+        assert cache.ready_metadata(commit) is None
         with pytest.raises(ModelCacheError, match="did not confirm revision"):
             make_client(tmp_path, FakeStub()).install_metadata_snapshot(
                 MODEL, requested_revision=commit
@@ -867,7 +922,7 @@ class TestMetadataInventoryPersistenceFailure:
 
         cache = ModelSnapshotCache(MODEL, tmp_path)
         snapshot = cache.snapshot_path(COMMIT)
-        inventory = cache._metadata_inventory_path(COMMIT)
+        inventory = cache.metadata_inventory_path(COMMIT)
         cache.repo_root.mkdir(parents=True)
         if reuse:
             snapshot.mkdir(parents=True)
@@ -927,7 +982,7 @@ class TestMetadataInventoryPersistenceFailure:
         ) == str(snapshot)
         assert len(stub.download_requests) == 1
         assert len(stub.stream_requests) == (0 if reuse else 1)
-        assert cache._ready_metadata(COMMIT) is None
+        assert cache.ready_metadata(COMMIT) is None
         assert "Could not persist metadata inventory" in caplog.text
         assert user_file.read_bytes() == b"preserve user data"
         if failure == "directory-file":

@@ -225,47 +225,48 @@ class ModelCacheClient:
         """
         cache = ModelSnapshotCache(model_name, self.cache_directory)
         if requested_revision and is_snapshot_commit_directory(requested_revision):
-            ready = cache._ready_metadata(requested_revision)
+            ready = cache.ready_metadata(requested_revision)
             if ready is not None:
                 return ready
 
-        with cache.lock():
-            if requested_revision and is_snapshot_commit_directory(requested_revision):
-                ready = cache._ready_metadata(requested_revision)
-                if ready is not None:
-                    return ready
-
-            revision = self.ensure_downloaded(
-                model_name, provider, ignore_weights=True, revision=requested_revision
-            )
-            if requested_revision is not None:
-                if revision is None:
-                    raise ModelCacheError(
-                        f"ModelExpress did not confirm revision {requested_revision!r} for "
-                        f"{model_name}; the server may predate pinned-revision support, and "
-                        "installing its default revision would not be what was asked for"
-                    )
-                # A branch or tag can move; a commit hash cannot name another commit.
-                if (
-                    _COMMIT_HASH_PATTERN.match(requested_revision)
-                    and requested_revision.lower() != revision.lower()
-                ):
-                    raise ModelCacheError(
-                        f"ModelExpress resolved {requested_revision!r} to commit {revision} "
-                        f"for {model_name}; a commit hash cannot resolve to another commit"
-                    )
-            # Follow-up calls use the confirmed commit, not a moving branch or tag.
-            manifest = self.list_files(
-                model_name, provider, ignore_weights=True, revision=revision
-            )
-            # Older servers may ignore ignore_weights.
-            metadata_paths, _ = split_by_weight(manifest.keys())
-            if not metadata_paths:
+        revision = self.ensure_downloaded(
+            model_name, provider, ignore_weights=True, revision=requested_revision
+        )
+        if requested_revision is not None:
+            if revision is None:
                 raise ModelCacheError(
-                    f"ModelExpress returned no non-weight files for {model_name}"
+                    f"ModelExpress did not confirm revision {requested_revision!r} for "
+                    f"{model_name}; the server may predate pinned-revision support, and "
+                    "installing its default revision would not be what was asked for"
                 )
-            expected = {path: manifest[path] for path in metadata_paths}
+            # A branch or tag legitimately resolves to some other string. A
+            # commit hash names one revision and cannot: resolving it to
+            # another would install that one and leave a ref pointing the
+            # engine's request at it.
+            if (
+                _COMMIT_HASH_PATTERN.match(requested_revision)
+                and requested_revision.lower() != revision.lower()
+            ):
+                raise ModelCacheError(
+                    f"ModelExpress resolved {requested_revision!r} to commit {revision} "
+                    f"for {model_name}; a commit hash cannot resolve to another commit"
+                )
+        # Follow-up calls carry the commit the server resolved, not the string
+        # the engine wrote: a branch or tag that moves between these calls would
+        # otherwise answer them from two different commits.
+        manifest = self.list_files(
+            model_name, provider, ignore_weights=True, revision=revision
+        )
+        # Still split: an older server ignores ignore_weights and answers with
+        # the whole repository.
+        metadata_paths, _ = split_by_weight(manifest.keys())
+        if not metadata_paths:
+            raise ModelCacheError(
+                f"ModelExpress returned no non-weight files for {model_name}"
+            )
+        expected = {path: manifest[path] for path in metadata_paths}
 
+        with cache.lock():
             if requested_revision is not None:
                 existing = cache.resolve_pinned_snapshot(expected, revision)
             else:
@@ -277,7 +278,7 @@ class ModelCacheClient:
                 # publish(), so record it here or the engine's lookup fails
                 # against a directory that is sitting right there.
                 cache.write_revision_ref(revision, requested_revision)
-                cache._write_metadata_inventory(existing.name, expected)
+                cache.write_metadata_inventory(existing.name, expected)
                 logger.info("Reusing local snapshot for %s at %s", model_name, existing)
                 return existing
 
@@ -296,7 +297,7 @@ class ModelCacheClient:
                     commit_hash, expected, requested_revision=requested_revision
                 )
                 if revision is not None:
-                    cache._write_metadata_inventory(commit_hash, expected)
+                    cache.write_metadata_inventory(commit_hash, expected)
                 else:
                     logger.debug(
                         "Not recording metadata inventory for %s: "

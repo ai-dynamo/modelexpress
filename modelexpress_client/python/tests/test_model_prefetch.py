@@ -27,7 +27,7 @@ def _publish_metadata(cache_directory, repo_id=REPO, commit=COMMIT):
         snapshot = staging.publish(
             commit, {"config.json": 2}, requested_revision=commit
         )
-        cache._write_metadata_inventory(commit, {"config.json": 2})
+        cache.write_metadata_inventory(commit, {"config.json": 2})
     return snapshot
 
 
@@ -176,7 +176,7 @@ class TestEnsureMetadata:
     ):
         snapshot = model_prefetch.ensure_metadata(REPO, COMMIT)
         config = snapshot / "config.json"
-        inventory = ModelSnapshotCache(REPO, tmp_path)._metadata_inventory_path(COMMIT)
+        inventory = ModelSnapshotCache(REPO, tmp_path).metadata_inventory_path(COMMIT)
         if damage == "missing":
             config.unlink()
         elif damage == "size":
@@ -192,7 +192,7 @@ class TestEnsureMetadata:
         assert model_prefetch.ensure_metadata(REPO, COMMIT) == snapshot
         assert len(FakeClient.instances) == 2
         assert config.read_bytes() == b"{}"
-        assert ModelSnapshotCache(REPO, tmp_path)._ready_metadata(COMMIT) == snapshot
+        assert ModelSnapshotCache(REPO, tmp_path).ready_metadata(COMMIT) == snapshot
 
     def test_invalidated_memo_does_not_hide_recovery_failure(
         self, enabled, fake_client, monkeypatch
@@ -374,8 +374,8 @@ class TestCacheDirectory:
 
         assert len(FakeClient.instances) == 2
         assert first != second
-        assert ModelSnapshotCache(REPO, tmp_path / "a")._ready_metadata(COMMIT) == first
-        assert ModelSnapshotCache(REPO, tmp_path / "b")._ready_metadata(COMMIT) == second
+        assert ModelSnapshotCache(REPO, tmp_path / "a").ready_metadata(COMMIT) == first
+        assert ModelSnapshotCache(REPO, tmp_path / "b").ready_metadata(COMMIT) == second
 
     def test_the_same_root_written_two_ways_is_one_install(
         self, enabled, fake_client, tmp_path, monkeypatch
@@ -391,7 +391,7 @@ class TestCacheDirectory:
 
 class TestEnsureResolvedMetadata:
     def test_disabled_does_not_prepare_a_resolved_path(self, fake_client, tmp_path):
-        assert model_prefetch._ensure_resolved_metadata(REPO, fake_client) is None
+        assert model_prefetch.ensure_resolved_metadata(REPO, fake_client) is None
         assert FakeClient.instances == []
         assert not fake_client.exists()
 
@@ -401,7 +401,7 @@ class TestEnsureResolvedMetadata:
         local = tmp_path / "local-model"
         local.mkdir()
 
-        assert model_prefetch._ensure_resolved_metadata(REPO, local) is None
+        assert model_prefetch.ensure_resolved_metadata(REPO, local) is None
         assert FakeClient.instances == []
         assert list(local.iterdir()) == []
 
@@ -413,7 +413,7 @@ class TestEnsureResolvedMetadata:
         commit = "a" * 40
         path = root / "models--org--model" / "snapshots" / commit
 
-        assert model_prefetch._ensure_resolved_metadata(REPO, path) == (path, root)
+        assert model_prefetch.ensure_resolved_metadata(REPO, path) == (path, root)
         assert FakeClient.instances[0].kwargs["cache_directory"] == root
         assert FakeClient.instances[0].revisions == [commit]
         assert (path / "config.json").read_bytes() == b"{}"
@@ -428,7 +428,7 @@ class TestEnsureResolvedMetadata:
         path = root / "models--org--model" / "snapshots" / COMMIT
 
         assert model_prefetch.ensure_metadata(REPO, COMMIT, cache_directory=root) is None
-        assert model_prefetch._ensure_resolved_metadata(REPO, path) == (path, root)
+        assert model_prefetch.ensure_resolved_metadata(REPO, path) == (path, root)
         assert FakeClient.instances[0].revisions == [COMMIT]
 
 

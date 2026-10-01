@@ -111,7 +111,7 @@ class ServerCacheStrategy(LoadStrategy):
             location = model_snapshot.snapshot_location(repo_id, candidate)
             if location is not None:
                 cache_root, commit = location
-                inventory_path = model_snapshot._metadata_inventory_path(
+                inventory_path = model_snapshot.metadata_inventory_path(
                     candidate.parent.parent, commit
                 )
                 if candidate.is_dir() and not inventory_path.parent.is_symlink():
@@ -131,7 +131,7 @@ class ServerCacheStrategy(LoadStrategy):
                             inventory_path,
                             exc,
                         )
-                prepared = model_prefetch._ensure_resolved_metadata(repo_id, candidate)
+                prepared = model_prefetch.ensure_resolved_metadata(repo_id, candidate)
                 if prepared is None:
                     raise StrategyFailed(
                         f"No local snapshot for {repo_id} and metadata prefetch "

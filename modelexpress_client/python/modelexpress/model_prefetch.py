@@ -134,7 +134,7 @@ def _ensure_metadata_snapshot(
         return snapshot_path
 
 
-def _ensure_resolved_metadata(
+def ensure_resolved_metadata(
     repo_id: str, resolved_path: str | os.PathLike[str]
 ) -> tuple[Path, Path] | None:
     """Prepare a standard snapshot at its own root and immutable commit."""
@@ -213,7 +213,7 @@ def _known_snapshot(repo_id: str, revision: str | None, root: Path) -> Path | No
     _, commit = location
     if revision and is_snapshot_commit_directory(revision) and commit != revision:
         return None
-    return ModelSnapshotCache(repo_id, root)._ready_metadata(commit)
+    return ModelSnapshotCache(repo_id, root).ready_metadata(commit)
 
 
 def _normalize(path: str | os.PathLike[str]) -> str:

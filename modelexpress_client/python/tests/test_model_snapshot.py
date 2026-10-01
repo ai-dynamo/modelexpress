@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from modelexpress.model_snapshot import (
+    _STAGING_PREFIX,
     MAIN_REF,
     ModelSnapshotCache,
     ModelSnapshotError,
@@ -48,7 +49,7 @@ def _write(cache, files, commit=COMMIT):
 def _write_metadata(cache, files, commit=COMMIT):
     with cache.lock():
         snapshot = _write(cache, files, commit)
-        cache._write_metadata_inventory(
+        cache.write_metadata_inventory(
             commit, {path: len(payload) for path, payload in files.items()}
         )
     return snapshot
@@ -158,7 +159,7 @@ class TestPublish:
     def test_no_staging_directory_left_behind(self, cache):
         _write(cache, {"config.json": b"{}"})
         leftovers = [
-            p.name for p in cache.repo_root.iterdir() if p.name.startswith(".modelexpress-")
+            p.name for p in cache.repo_root.iterdir() if p.name.startswith(_STAGING_PREFIX)
         ]
         assert leftovers == []
 
@@ -292,7 +293,7 @@ class TestMetadataInventory:
     ):
         files = {"config.json": b"{}", **tokenizer_files}
         snapshot = _write_metadata(cache, files)
-        inventory_path = cache._metadata_inventory_path(COMMIT)
+        inventory_path = cache.metadata_inventory_path(COMMIT)
 
         assert inventory_path == (
             cache.repo_root / ".modelexpress-metadata" / f"{COMMIT}.json"
@@ -303,14 +304,14 @@ class TestMetadataInventory:
             "commit": COMMIT,
             "files": {path: len(payload) for path, payload in files.items()},
         }
-        assert cache._ready_metadata(COMMIT) == snapshot
+        assert cache.ready_metadata(COMMIT) == snapshot
         assert sorted(path.name for path in snapshot.iterdir()) == sorted(files)
 
     def test_missing_inventory_is_a_quiet_miss(self, cache, caplog):
         _write(cache, {"config.json": b"{}"})
 
         with caplog.at_level(logging.WARNING):
-            assert cache._ready_metadata(COMMIT) is None
+            assert cache.ready_metadata(COMMIT) is None
 
         assert not caplog.records
 
@@ -328,7 +329,7 @@ class TestMetadataInventory:
             for path in metadata_snapshot.iterdir():
                 path.unlink()
 
-        assert cache._ready_metadata(COMMIT) is None
+        assert cache.ready_metadata(COMMIT) is None
 
     @pytest.mark.parametrize(
         "changes",
@@ -349,12 +350,12 @@ class TestMetadataInventory:
     def test_invalid_inventory_is_diagnosed(
         self, cache, metadata_snapshot, changes, caplog
     ):
-        inventory_path = cache._metadata_inventory_path(COMMIT)
+        inventory_path = cache.metadata_inventory_path(COMMIT)
         record = json.loads(inventory_path.read_text())
         record.update(changes)
         inventory_path.write_text(json.dumps(record))
 
-        assert cache._ready_metadata(COMMIT) is None
+        assert cache.ready_metadata(COMMIT) is None
         assert "Ignoring metadata inventory" in caplog.text
         assert str(inventory_path) in caplog.text
 
@@ -362,16 +363,16 @@ class TestMetadataInventory:
     def test_corrupt_inventory_is_diagnosed(
         self, cache, metadata_snapshot, contents, caplog
     ):
-        cache._metadata_inventory_path(COMMIT).write_bytes(contents)
+        cache.metadata_inventory_path(COMMIT).write_bytes(contents)
 
-        assert cache._ready_metadata(COMMIT) is None
+        assert cache.ready_metadata(COMMIT) is None
         assert "Ignoring metadata inventory" in caplog.text
 
     @pytest.mark.parametrize("operation", ["open", "lstat"])
     def test_inventory_io_failure_is_diagnosed(
         self, cache, metadata_snapshot, monkeypatch, caplog, operation
     ):
-        inventory_path = cache._metadata_inventory_path(COMMIT)
+        inventory_path = cache.metadata_inventory_path(COMMIT)
         original = getattr(Path, operation)
 
         def denied(path, *args, **kwargs):
@@ -381,21 +382,21 @@ class TestMetadataInventory:
 
         monkeypatch.setattr(Path, operation, denied)
 
-        assert cache._ready_metadata(COMMIT) is None
+        assert cache.ready_metadata(COMMIT) is None
         assert "inventory access denied" in caplog.text
 
     @pytest.mark.parametrize("kind", ["directory", "dangling-symlink"])
     def test_inventory_must_be_a_regular_file(
         self, cache, metadata_snapshot, kind, caplog
     ):
-        inventory_path = cache._metadata_inventory_path(COMMIT)
+        inventory_path = cache.metadata_inventory_path(COMMIT)
         inventory_path.unlink()
         if kind == "directory":
             inventory_path.mkdir()
         else:
             inventory_path.symlink_to("missing-inventory")
 
-        assert cache._ready_metadata(COMMIT) is None
+        assert cache.ready_metadata(COMMIT) is None
         assert "not a safe regular file" in caplog.text
 
     def test_symlinked_repo_cannot_bypass_cache_directory_checks(
@@ -405,7 +406,7 @@ class TestMetadataInventory:
         cache.repo_root.rename(actual)
         cache.repo_root.symlink_to(actual, target_is_directory=True)
 
-        assert cache._ready_metadata(COMMIT) is None
+        assert cache.ready_metadata(COMMIT) is None
         assert "not a safe regular file" in caplog.text
 
     def test_native_blob_symlinks_inside_the_cache_are_valid(self, cache):
@@ -416,9 +417,9 @@ class TestMetadataInventory:
         (snapshot / "config.json").unlink()
         (snapshot / "config.json").symlink_to(blob)
         with cache.lock():
-            cache._write_metadata_inventory(COMMIT, {"config.json": 2})
+            cache.write_metadata_inventory(COMMIT, {"config.json": 2})
 
-        assert cache._ready_metadata(COMMIT) == snapshot
+        assert cache.ready_metadata(COMMIT) == snapshot
 
     def test_same_commit_in_another_root_has_independent_readiness(
         self, cache, metadata_snapshot
@@ -426,26 +427,26 @@ class TestMetadataInventory:
         other = ModelSnapshotCache("org/model", cache.cache_root / "other-root")
         _write(other, {"config.json": b"{}", "tokenizer.model": b"spm"})
 
-        assert other._ready_metadata(COMMIT) is None
-        assert cache._ready_metadata(COMMIT) == metadata_snapshot
+        assert other.ready_metadata(COMMIT) is None
+        assert cache.ready_metadata(COMMIT) == metadata_snapshot
 
         other_snapshot = _write_metadata(
             other, {"config.json": b"{}", "tokenizer.model": b"spm"}
         )
-        assert other._ready_metadata(COMMIT) == other_snapshot
+        assert other.ready_metadata(COMMIT) == other_snapshot
         assert other_snapshot != metadata_snapshot
 
     def test_weights_are_not_part_of_metadata_readiness(self, cache, metadata_snapshot):
         weights = metadata_snapshot / "model.safetensors"
         weights.write_bytes(b"weights")
 
-        assert cache._ready_metadata(COMMIT) == metadata_snapshot
+        assert cache.ready_metadata(COMMIT) == metadata_snapshot
         with cache.lock():
             with pytest.raises(ModelSnapshotError, match="weight file"):
-                cache._write_metadata_inventory(COMMIT, {"model.safetensors": 7})
+                cache.write_metadata_inventory(COMMIT, {"model.safetensors": 7})
 
         assert weights.read_bytes() == b"weights"
-        assert cache._ready_metadata(COMMIT) == metadata_snapshot
+        assert cache.ready_metadata(COMMIT) == metadata_snapshot
 
     @pytest.mark.parametrize("files", [{}, {"config.json": 99}, {"tokenizer.model": 3}])
     def test_cannot_record_an_empty_or_incomplete_manifest(self, cache, files):
@@ -453,9 +454,9 @@ class TestMetadataInventory:
 
         with cache.lock():
             with pytest.raises(ModelSnapshotError):
-                cache._write_metadata_inventory(COMMIT, files)
+                cache.write_metadata_inventory(COMMIT, files)
 
-        assert not cache._metadata_inventory_path(COMMIT).exists()
+        assert not cache.metadata_inventory_path(COMMIT).exists()
 
     def test_synthetic_commit_does_not_become_an_immutable_pin(self, cache):
         commit = "legacy-snapshot"
@@ -463,13 +464,13 @@ class TestMetadataInventory:
 
         assert snapshot.is_dir()
         assert cache._read_metadata_inventory(commit) == {"config.json": 2}
-        assert cache._ready_metadata(commit) is None
+        assert cache.ready_metadata(commit) is None
 
     def test_inventory_publication_is_atomic_and_synced(self, cache, monkeypatch):
         from modelexpress import model_snapshot
 
         snapshot = _write(cache, {"config.json": b"{}"})
-        inventory_path = cache._metadata_inventory_path(COMMIT)
+        inventory_path = cache.metadata_inventory_path(COMMIT)
         original_replace = model_snapshot.os.replace
         original_fsync = model_snapshot.os.fsync
         events = []
@@ -489,18 +490,18 @@ class TestMetadataInventory:
         monkeypatch.setattr(model_snapshot.os, "fsync", fsync)
         monkeypatch.setattr(model_snapshot.os, "replace", replace)
         with cache.lock():
-            cache._write_metadata_inventory(COMMIT, {"config.json": 2})
+            cache.write_metadata_inventory(COMMIT, {"config.json": 2})
 
         assert events == ["fsync", "replace", "fsync"]
         assert list(inventory_path.parent.iterdir()) == [inventory_path]
-        assert cache._ready_metadata(COMMIT) == snapshot
+        assert cache.ready_metadata(COMMIT) == snapshot
 
     def test_failed_inventory_replace_keeps_the_previous_record(
         self, cache, metadata_snapshot, monkeypatch, caplog
     ):
         from modelexpress import model_snapshot
 
-        inventory_path = cache._metadata_inventory_path(COMMIT)
+        inventory_path = cache.metadata_inventory_path(COMMIT)
         previous = inventory_path.read_bytes()
         (metadata_snapshot / "chat_template.jinja").write_bytes(b"template")
 
@@ -509,7 +510,7 @@ class TestMetadataInventory:
 
         monkeypatch.setattr(model_snapshot.os, "replace", fail_replace)
         with cache.lock():
-            cache._write_metadata_inventory(
+            cache.write_metadata_inventory(
                 COMMIT,
                 {"config.json": 2, "tokenizer.model": 3, "chat_template.jinja": 8},
             )
@@ -527,7 +528,7 @@ class TestMetadataInventory:
         from modelexpress import model_snapshot
 
         snapshot = _write(cache, {"config.json": b"{}"})
-        inventory_path = cache._metadata_inventory_path(COMMIT)
+        inventory_path = cache.metadata_inventory_path(COMMIT)
         inventory_path.parent.mkdir()
         conflict = inventory_path.parent / ".modelexpress-tmp-collision"
         conflict.write_bytes(b"user data")
@@ -536,7 +537,7 @@ class TestMetadataInventory:
         )
 
         with cache.lock():
-            cache._write_metadata_inventory(COMMIT, {"config.json": 2})
+            cache.write_metadata_inventory(COMMIT, {"config.json": 2})
 
         assert conflict.read_bytes() == b"user data"
         assert not inventory_path.exists()
@@ -548,12 +549,12 @@ class TestMetadataInventory:
     )
     def test_inventory_collision_does_not_hide_invalid_metadata(self, cache, files):
         _write(cache, {"config.json": b"{}"})
-        conflict = cache._metadata_inventory_path(COMMIT).parent
+        conflict = cache.metadata_inventory_path(COMMIT).parent
         conflict.write_bytes(b"user data")
 
         with cache.lock():
             with pytest.raises(ModelSnapshotError):
-                cache._write_metadata_inventory(COMMIT, files)
+                cache.write_metadata_inventory(COMMIT, files)
 
         assert conflict.read_bytes() == b"user data"
 

@@ -145,7 +145,7 @@ def safe_commit_hash(commit_hash: str) -> str:
     return commit_hash
 
 
-def _metadata_inventory_path(repo_root: Path, commit_hash: str) -> Path:
+def metadata_inventory_path(repo_root: Path, commit_hash: str) -> Path:
     return repo_root / _METADATA_INVENTORY_DIR / f"{safe_commit_hash(commit_hash)}.json"
 
 
@@ -668,12 +668,12 @@ class ModelSnapshotCache:
             return False
         return True
 
-    def _metadata_inventory_path(self, commit_hash: str) -> Path:
-        return _metadata_inventory_path(self.repo_root, commit_hash)
+    def metadata_inventory_path(self, commit_hash: str) -> Path:
+        return metadata_inventory_path(self.repo_root, commit_hash)
 
     def _read_metadata_inventory(self, commit_hash: str) -> dict[str, int] | None:
         """Read a validated inventory without taking the repository lock."""
-        inventory_path = self._metadata_inventory_path(commit_hash)
+        inventory_path = self.metadata_inventory_path(commit_hash)
         try:
             if (
                 not S_ISREG(inventory_path.lstat().st_mode)
@@ -704,7 +704,7 @@ class ModelSnapshotCache:
             logger.warning("Ignoring metadata inventory %s: %s", inventory_path, exc)
             return None
 
-    def _ready_metadata(self, commit_hash: str) -> Path | None:
+    def ready_metadata(self, commit_hash: str) -> Path | None:
         """Reuse an immutable snapshot only while its inventory still matches."""
         if not is_snapshot_commit_directory(commit_hash):
             return None
@@ -719,7 +719,7 @@ class ModelSnapshotCache:
             )
         return snapshot_path
 
-    def _write_metadata_inventory(
+    def write_metadata_inventory(
         self, commit_hash: str, expected_files: Mapping[str, int]
     ) -> None:
         """Validate metadata, then best-effort persist its inventory under lock()."""
@@ -728,7 +728,7 @@ class ModelSnapshotCache:
             raise ModelSnapshotError(
                 f"Cannot record incomplete metadata snapshot for {self.model_name}"
             )
-        inventory_path = self._metadata_inventory_path(commit_hash)
+        inventory_path = self.metadata_inventory_path(commit_hash)
         pending_path = inventory_path.parent / f"{_TEMP_PREFIX}{uuid.uuid4().hex}"
         pending_created = False
         try:
