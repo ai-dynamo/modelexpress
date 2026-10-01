@@ -31,7 +31,12 @@ from .backend import (
 )
 from .comm import CommunicatorCache, LaneCommunicator, LaneKey, new_unique_id
 from .plan import DEFAULT_RECEIVER_PROTOCOL, plan_digest, validate_coverage
-from .rendezvous import CollectiveRendezvous, LaneDeclaration, Membership
+from .rendezvous import (
+    CollectiveRendezvous,
+    LaneDeclaration,
+    Membership,
+    RendezvousError,
+)
 from .spi import Loader, Publisher, resolve_specs
 from .types import ReshardPlan, Role
 
@@ -218,9 +223,7 @@ class _RefitClientBase:
         )
         return lanes
 
-    def _join_and_bootstrap(
-        self, role: Role, source_partition: int | None
-    ) -> Membership:
+    def _join_and_bootstrap(self, role: Role) -> Membership:
         if self._digest is None:
             raise RuntimeError("initialize must run before compute_plan")
         require_nccl_m2n()
@@ -294,6 +297,22 @@ class _RefitClientBase:
         group = self._rendezvous.await_ready(
             group_id=membership.group_id, epoch=membership.epoch
         )
+        # A same-slot replacement admitted in a clean FORMING epoch does not
+        # bump the epoch, so the displaced generation can still see READY at
+        # its own epoch. Confirm this process still holds its slot before it
+        # enters a communicator at the replacement's rank.
+        holders = {
+            participant.worker_id
+            for lane in group.lanes
+            for participant in lane.participants
+            if participant.slot_id == self._slot_id
+        }
+        if holders != {self._worker_id}:
+            raise RendezvousError(
+                f"slot {self._slot_id!r} in collective group {membership.group_id} "
+                f"is held by {sorted(holders)} rather than worker "
+                f"{self._worker_id!r}; this worker was superseded"
+            )
 
         by_lane_id = {lane.lane_id: lane for lane in group.lanes}
         declared = self._declared_lanes()
@@ -398,7 +417,7 @@ class RefitClientTrainer(_RefitClientBase):
         # Resolve storage before joining. READY must not include a worker that
         # will discover only afterward that it cannot issue the agreed ops.
         resolve_specs(self.plan, specs, required)
-        membership = self._join_and_bootstrap(Role.TRAINER, self._source_partition)
+        membership = self._join_and_bootstrap(Role.TRAINER)
         try:
             self._half = NcclM2nSender(
                 plan=self.plan,
@@ -497,7 +516,7 @@ class RefitClientGenerator(_RefitClientBase):
         self._capture(self._loader, self._expected_parameters)
         specs = self._loader.local_params()
         resolve_specs(self.plan, specs)
-        membership = self._join_and_bootstrap(Role.GENERATOR, None)
+        membership = self._join_and_bootstrap(Role.GENERATOR)
         try:
             self._half = NcclM2nReceiver(
                 plan=self.plan,

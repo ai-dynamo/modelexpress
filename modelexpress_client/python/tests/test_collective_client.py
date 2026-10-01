@@ -15,6 +15,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+import modelexpress_rl.collective.backend as collective_backend
 import modelexpress_rl.collective.client as collective_client
 from modelexpress_rl.collective import (
     CommunicatorCache,
@@ -26,6 +27,7 @@ from modelexpress_rl.collective import (
     Placement,
     RefitClientGenerator,
     RefitClientTrainer,
+    RendezvousError,
     ReshardPlan,
 )
 from modelexpress_rl.collective.comm import new_unique_id
@@ -90,6 +92,7 @@ class FakeRendezvous:
     def join(self, **kwargs):
         epoch = self._epochs[min(self.joins, len(self._epochs) - 1)]
         self.joins += 1
+        self._holder = (kwargs["slot_id"], kwargs["worker_id"])
         self._epoch = epoch
         return Membership(
             group_id="g",
@@ -104,10 +107,22 @@ class FakeRendezvous:
     def publish_bootstrap(self, **kwargs):
         self.published.append(kwargs)
 
+    def _participants(self):
+        slot_id, worker_id = self._holder
+        return [SimpleNamespace(slot_id=slot_id, worker_id=worker_id)]
+
     def await_ready(self, *, group_id, epoch, **kwargs):
         lanes = [
-            SimpleNamespace(lane_id=0, nccl_unique_id=b"\x00" * 128),
-            SimpleNamespace(lane_id=1, nccl_unique_id=b"\x01" * 128),
+            SimpleNamespace(
+                lane_id=0,
+                nccl_unique_id=b"\x00" * 128,
+                participants=self._participants(),
+            ),
+            SimpleNamespace(
+                lane_id=1,
+                nccl_unique_id=b"\x01" * 128,
+                participants=self._participants(),
+            ),
         ]
         return SimpleNamespace(group_id=group_id, epoch=epoch, lanes=lanes)
 
@@ -119,6 +134,7 @@ class FakeRendezvous:
 class FakeRendezvousPP2(FakeRendezvous):
     def join(self, **kwargs):
         self.joins += 1
+        self._holder = (kwargs["slot_id"], kwargs["worker_id"])
         # Four trainers over two reshard lanes, so the client must declare
         # lanes 0 and 1 plus a broadcast lane, and t2 leads lane 1.
         lanes = kwargs["lanes"]
@@ -142,7 +158,11 @@ class FakeRendezvousPP2(FakeRendezvous):
 
     def await_ready(self, *, group_id, epoch, **kwargs):
         lanes = [
-            SimpleNamespace(lane_id=i, nccl_unique_id=bytes([i]) * 128)
+            SimpleNamespace(
+                lane_id=i,
+                nccl_unique_id=bytes([i]) * 128,
+                participants=self._participants(),
+            )
             for i in range(3)
         ]
         return SimpleNamespace(group_id=group_id, epoch=epoch, lanes=lanes)
@@ -196,6 +216,11 @@ def fake_nccl(monkeypatch):
         ("nccl.m2n", m2n),
     ]:
         monkeypatch.setitem(sys.modules, name, mod)
+    # Same reason as the backend tests: the stub stands in for nccl.m2n, so the
+    # host's libnccl must not decide whether these CPU-only tests pass.
+    monkeypatch.setattr(
+        collective_backend, "loaded_nccl_version", lambda: collective_backend.MIN_NCCL
+    )
     monkeypatch.setattr(
         collective_client, "_bootstrap_barrier", lambda lane, device: None
     )
@@ -227,6 +252,22 @@ def trainer(rz, engine, **kw):
     )
     client.initialize(engine, source_partition=0)
     return client
+
+
+class TestSupersededSlot:
+    def test_a_displaced_generation_refuses_to_enter_the_collective(self, fake_nccl):
+        """A same-slot replacement in a clean FORMING epoch does not bump the
+        epoch, so the displaced worker still sees READY. It must notice that
+        its slot now belongs to someone else before building communicators."""
+
+        class Displaced(FakeRendezvous):
+            def _participants(self):
+                slot_id, _ = self._holder
+                return [SimpleNamespace(slot_id=slot_id, worker_id="w0-replacement")]
+
+        client = trainer(Displaced(), FakeEngine())
+        with pytest.raises(RendezvousError, match="superseded"):
+            client.compute_plan()
 
 
 class TestSequencing:

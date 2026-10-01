@@ -813,6 +813,61 @@ async fn an_expired_plan_source_owner_does_not_leave_its_endpoint_behind() {
 
 #[tokio::test]
 #[ignore = "requires a live Redis at REDIS_URL"]
+async fn a_lapse_in_a_clean_forming_epoch_does_not_bump_the_epoch() {
+    // Mirrors the join script's guard. With no READY and no current-epoch
+    // bootstrap there is no communicator state to fence, so the read path
+    // removes the lapsed participant without moving the epoch. Waiters then
+    // time out naming the missing slot instead of being told to rebuild.
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (stop_server, server) = start_server(port, &redis_url);
+    let (mut refit, mut collective) = connect(port).await;
+
+    let model = unique_id("forming-expiry");
+    let group_spec = spec(&model, &["t0", "t1"], &["g0"]);
+    let lapsing = unique_id("lapsing-trainer");
+    let generator = unique_id("live-generator");
+    register(&mut refit, &model, &lapsing, WorkerRole::Trainer, 1).await;
+    register(&mut refit, &model, &generator, WorkerRole::Generator, 60).await;
+
+    let membership = join(
+        &mut collective,
+        join_request(&group_spec, "t1", &lapsing, CollectiveRole::Trainer, 1),
+    )
+    .await;
+    join(
+        &mut collective,
+        join_request(&group_spec, "g0", &generator, CollectiveRole::Generator, 0),
+    )
+    .await;
+    assert_eq!(membership.epoch, 1);
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let refreshed = collective
+        .get_collective_group(GetCollectiveGroupRequest {
+            group_id: membership.group_id,
+        })
+        .await
+        .expect("refresh group after a FORMING lapse")
+        .into_inner();
+    assert_eq!(refreshed.epoch, 1);
+    assert_eq!(refreshed.state, i32::from(CollectiveGroupState::Forming));
+    let participant_slots: Vec<&str> = refreshed
+        .lanes
+        .last()
+        .expect("broadcast lane")
+        .participants
+        .iter()
+        .map(|participant| participant.slot_id.as_str())
+        .collect();
+    assert_eq!(participant_slots, vec!["g0"]);
+
+    stop(stop_server, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
 async fn expired_registration_revokes_ready_membership() {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());

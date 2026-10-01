@@ -100,7 +100,9 @@ fn validate_spec(spec: Option<&CollectiveGroupSpec>) -> Result<&CollectiveGroupS
     ] {
         for slot in slots {
             required(slot, field)?;
-            delimiter_free(slot, field, &['\0', '\n', '\r', '|'])?;
+            // `,` is the slot separator inside the stored lane set
+            // (`encode_lanes`); a slot carrying one would decode as two.
+            delimiter_free(slot, field, &['\0', '\n', '\r', '|', ','])?;
         }
     }
     if spec
@@ -185,7 +187,7 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
         required(&request.slot_id, "slot_id")?;
         required(&request.worker_id, "worker_id")?;
         required(&request.plan_digest, "plan_digest")?;
-        delimiter_free(&request.slot_id, "slot_id", &['\0', '\n', '\r', '|'])?;
+        delimiter_free(&request.slot_id, "slot_id", &['\0', '\n', '\r', '|', ','])?;
         delimiter_free(&request.worker_id, "worker_id", &['\0', '|'])?;
 
         let role = CollectiveRole::try_from(request.role).unwrap_or(CollectiveRole::Unspecified);
@@ -312,6 +314,16 @@ mod tests {
     #[test]
     fn a_valid_spec_passes() {
         assert!(validate_spec(Some(&spec())).is_ok());
+    }
+
+    #[test]
+    fn a_slot_id_carrying_the_lane_list_separator_is_rejected() {
+        let mut s = spec();
+        s.expected_trainer_slots[1] = "t,1".to_string();
+        assert_eq!(
+            validate_spec(Some(&s)).expect_err("comma in slot").code(),
+            tonic::Code::InvalidArgument
+        );
     }
 
     #[test]

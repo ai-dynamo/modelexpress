@@ -236,16 +236,12 @@ stateDiagram-v2
     [*] --> FORMING
     FORMING --> READY: all expected slots joined,<br/>every lane bootstrapped,<br/>every registration live
     READY --> FORMING: membership change (epoch += 1)
-    READY --> RELEASING: DeleteCollectiveGroup
-    FORMING --> RELEASING: DeleteCollectiveGroup
   }
   state "CollectiveTransfer" as T {
     [*] --> PENDING
     PENDING --> RUNNING: group READY
     RUNNING --> COMPLETE: all participants report ok
-    RUNNING --> FAILED: any participant reports failure
-    PENDING --> ABORTED: deadline
-    RUNNING --> ABORTED: deadline
+    RUNNING --> FAILED: any participant reports failure,<br/>including a client-side transfer deadline
   }
 ```
 
@@ -408,7 +404,7 @@ failure.
 
 | Failure | Detection | Behavior |
 |---|---|---|
-| A participant never joins | `READY` never reached; client-side deadline on `GetCollectiveGroup` | Operation `ABORTED`; the error names the missing slots |
+| A participant never joins | `READY` never reached; client-side deadline on `GetCollectiveGroup` | Nobody enters the collective; `GroupNotReadyError` names the missing slots |
 | A participant joined then died before the collective | Its `WorkerRegistration` TTL expires; re-checked at the `READY` transition | Group returns to `FORMING`, epoch bumps; nobody entered the collective |
 | A worker restarts and rejoins | New `worker_id` for the same slot | Admitted as a *different generation*; epoch bumps; cached communicators dropped |
 | A participant dies mid-collective | NCCL error or timeout on the surviving ranks | `ReportCollectiveTransfer(FAILED)`; operation `FAILED`; the epoch bumps so the next `compute_plan` rebuilds. Communicators are not reusable after an aborted collective |
@@ -431,7 +427,7 @@ is exactly what the fused-parameter path already does.
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for one lane's non-blocking `Communicator.init` |
-| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Deadline for the transfer, i.e. `RUNNING -> ABORTED` above |
+| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Client-side deadline for the transfer; an overrun aborts the lanes and reports `succeeded=false`, i.e. `RUNNING -> FAILED` above |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
 
 Timing is reported through the existing `RefitTimingRecorder` stage vocabulary so

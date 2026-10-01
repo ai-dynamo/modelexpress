@@ -84,15 +84,33 @@ class EpochChangedError(RendezvousError):
     plan fetched for it, no longer describes this group.
 
     ``actual`` is ``-1`` when the current epoch could not be read back.
+
+    ``disagreeing`` carries the group's ``disagreeing_slots`` when the move was
+    observed alongside a plan-digest disagreement. Every join with a different
+    digest bumps the epoch, so a cohort that genuinely disagrees lands here
+    rather than on the timeout path, and this is the only place it can be seen.
     """
 
-    def __init__(self, group_id: str, expected: int, actual: int) -> None:
+    def __init__(
+        self,
+        group_id: str,
+        expected: int,
+        actual: int,
+        disagreeing: Sequence[str] = (),
+    ) -> None:
         self.group_id = group_id
         self.expected = expected
         self.actual = actual
+        self.disagreeing = list(disagreeing)
+        detail = ""
+        if self.disagreeing:
+            detail = (
+                "; slots reporting a different plan digest: "
+                + ", ".join(self.disagreeing[:8])
+            )
         super().__init__(
             f"collective group {group_id} moved from epoch {expected} to {actual}; "
-            "the cached communicator and plan must be rebuilt"
+            f"the cached communicator and plan must be rebuilt{detail}"
         )
 
 
@@ -593,7 +611,9 @@ class CollectiveRendezvous:
                 )
                 continue
             if group.epoch != epoch:
-                raise EpochChangedError(group_id, epoch, group.epoch)
+                raise EpochChangedError(
+                    group_id, epoch, group.epoch, group.disagreeing_slots
+                )
             if group.state == pb.COLLECTIVE_GROUP_STATE_READY:
                 return group
             if group.state == pb.COLLECTIVE_GROUP_STATE_RELEASING:

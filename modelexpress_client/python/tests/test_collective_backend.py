@@ -62,6 +62,9 @@ def recorder(monkeypatch):
     parent = ModuleType("nccl")
     monkeypatch.setitem(sys.modules, "nccl", parent)
     monkeypatch.setitem(sys.modules, "nccl.m2n", module)
+    # The stubbed nccl.m2n says nothing about the host's libnccl, so pin the
+    # version probe too; TestNcclVersionFloor covers the probe itself.
+    monkeypatch.setattr(backend, "loaded_nccl_version", lambda: backend.MIN_NCCL)
     return rec
 
 

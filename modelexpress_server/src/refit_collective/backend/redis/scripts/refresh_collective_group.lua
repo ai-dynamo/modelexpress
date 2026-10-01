@@ -31,6 +31,24 @@ end
 
 local model_name = redis.call('HGET', KEYS[1], 'model_name')
 local changed = false
+
+-- Same guard join_collective_group.lua applies to its identical sweep. Only a
+-- membership that could already have communicator state needs fencing: a READY
+-- group, or one where some lane has published a current-epoch bootstrap. In a
+-- clean FORMING epoch a lapse just removes the participant, so waiters keep
+-- their epoch and time out naming the missing slot instead of being told to
+-- rebuild. This script runs on every GetCollectiveGroup poll.
+local membership_change_requires_bump = redis.call('HGET', KEYS[1], 'state') == 'READY'
+if not membership_change_requires_bump then
+  for i = 4, #KEYS do
+    local bootstrap_epoch = redis.call('HGET', KEYS[i], 'bootstrap_epoch')
+    if bootstrap_epoch and tonumber(bootstrap_epoch) == epoch then
+      membership_change_requires_bump = true
+      break
+    end
+  end
+end
+
 local records = redis.call('HGETALL', KEYS[2])
 for i = 1, #records, 2 do
   local slot_id = records[i]
@@ -38,7 +56,16 @@ for i = 1, #records, 2 do
   if not worker_id or not registration_matches(worker_id, role, model_name) then
     redis.call('HDEL', KEYS[2], slot_id)
     redis.call('HDEL', KEYS[3], slot_id)
-    changed = true
+    if worker_id
+        and redis.call('HGET', KEYS[1], 'plan_source_worker_id') == worker_id then
+      redis.call('HSET', KEYS[1],
+        'plan_source_worker_id', '',
+        'plan_source_endpoint', '',
+        'plan_source_digest', '')
+    end
+    if membership_change_requires_bump then
+      changed = true
+    end
   end
 end
 

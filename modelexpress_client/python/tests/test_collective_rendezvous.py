@@ -413,6 +413,20 @@ class TestAwaitReady:
             )
         assert caught.value.expected == 1
         assert caught.value.actual == 4
+        assert caught.value.disagreeing == []
+
+    def test_an_epoch_move_names_a_plan_digest_disagreement(self):
+        # Every join with a different digest bumps the epoch, so a cohort that
+        # truly disagrees surfaces here and never reaches the timeout path.
+        moved = group(epoch=3)
+        moved.disagreeing_slots.append("g0")
+        stub = FakeStub(groups=[moved])
+        with pytest.raises(EpochChangedError) as caught:
+            make_rendezvous(stub).await_ready(
+                group_id="g1", epoch=1, timeout_s=5, poll_interval_s=0.001
+            )
+        assert caught.value.disagreeing == ["g0"]
+        assert "g0" in str(caught.value)
 
     def test_the_timeout_names_the_slots_that_never_joined(self):
         # "The collective hung" is not actionable; "t1 never joined" is.

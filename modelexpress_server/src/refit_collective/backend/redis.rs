@@ -216,8 +216,8 @@ fn transfer_state_from_str(text: &str) -> CollectiveTransferState {
 
 /// The declared lane set, flattened for the group hash: one line per lane,
 /// `lane_id|kind|trainer_slots|generator_slots`, slot lists comma separated.
-/// Slot ids in this path are role-ordinal strings, so none of the three
-/// separators can occur inside one.
+/// `validate_spec` rejects `\n`, `|` and `,` in every slot id, so none of the
+/// three separators can occur inside one.
 fn encode_lanes(lanes: &[Lane]) -> String {
     lanes
         .iter()
