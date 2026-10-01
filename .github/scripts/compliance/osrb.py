@@ -1,24 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Build the OSRB dependency CSVs for the ModelExpress nightly.
-
-Two outputs, matching the two release-automation consumers:
-
-  container  osrb-modelexpress-server-<arch>-<sha8>.csv and .diff.csv for the
-             container OSRB bug (nvbug-attach-compliance.py). Lists the dpkg and
-             Python packages read from the image plus the Rust crates statically
-             linked into its binaries, which no filesystem scan can see. The
-             .diff.csv drops packages the base image already ships at the same
-             version.
-  source     osrb-modelexpress-deps-<sha8>.csv for the source and crates OSRB
-             bug (nvbug-attach-license.py): the Rust crate closure of the
-             published crates and the Python closure of the wheel.
-
-Columns everywhere: package_name, version, type, spdx_license. Every input
-must be non-empty; an empty scan fails the job rather than attaching an
-empty CSV.
-"""
+"""Build the OSRB dependency CSVs consumed by release-automation's nvbug-attach-*.py."""
 
 import argparse
 import csv
@@ -31,7 +14,6 @@ from pathlib import Path
 FIELDS = ["package_name", "version", "type", "spdx_license"]
 PUBLISHED_CRATES = ["modelexpress-common", "modelexpress-client", "modelexpress-server"]
 LINUX_TARGETS = {"amd64": "x86_64-unknown-linux-gnu", "arm64": "aarch64-unknown-linux-gnu"}
-# "name vX.Y.Z", optionally followed by " (source)" and/or " (*)".
 CARGO_PKG_RE = re.compile(r"^(?P<name>\S+) v(?P<version>\S+)(?: \((?P<source>[^)]*)\))?(?: \(\*\))?$")
 
 
@@ -56,10 +38,6 @@ def image_packages(directory: Path) -> list[dict]:
 
 
 def cargo_packages(manifest: Path, targets: list[str]) -> list[dict]:
-    """Normal and build dependencies of the published crates on Linux, which is
-    what ships in the binaries and on crates.io, for the given target
-    triples. Dev-dependencies and the
-    workspace's own crates are excluded."""
     cmd = ["cargo", "tree", "--locked", "--manifest-path", str(manifest),
            "-e", "normal,build", "--prefix", "none", "--format", "{p}\t{l}"]
     for crate in PUBLISHED_CRATES:
@@ -77,14 +55,13 @@ def cargo_packages(manifest: Path, targets: list[str]) -> list[dict]:
             fail(f"unparseable cargo tree line: {line!r}")
         source = m.group("source") or ""
         if source.startswith("/"):
-            continue  # a workspace member: ModelExpress's own code
+            continue  # workspace member
         key = (m.group("name"), m.group("version"))
         rows[key] = dict(zip(FIELDS, [key[0], key[1], "cargo", lic.strip() or "UNKNOWN"]))
     return list(rows.values())
 
 
 def python_license(meta: dict) -> str:
-    """PEP 639 License-Expression, then a short License field, then classifiers."""
     if meta.get("license_expression"):
         return meta["license_expression"]
     lic = (meta.get("license") or "").strip()
@@ -95,7 +72,6 @@ def python_license(meta: dict) -> str:
 
 
 def python_packages(report: Path, own_name: str) -> list[dict]:
-    """The wheel's runtime closure from `pip install --dry-run --report`."""
     data = json.loads(report.read_text())
     rows = []
     for item in data.get("install", []):

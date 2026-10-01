@@ -427,8 +427,9 @@ artifact.
 The image is scanned without running it: `.github/scripts/compliance/Dockerfile.extract`
 bind-mounts each arch's filesystem into an extractor on the runner's own
 platform. release-automation's `nvbug:attach-compliance` and
-`nvbug:attach-license` jobs attach these files when its `ENABLE_OSRB_ATTACH`
-project variable is `true`. The artifact names and layout are the contract of
+`nvbug:attach-license` jobs attach these files on every security nightly;
+when the trigger sends `DRY_RUN=true` they fetch and match the artifacts but
+write nothing to the OSRB bugs. The artifact names and layout are the contract of
 its `nvbug-attach-compliance.py` and `nvbug-attach-license.py`.
 
 After staging, the workflow triggers the internal GitLab

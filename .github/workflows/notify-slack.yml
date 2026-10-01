@@ -1,10 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Reusable Slack failure notifier (modeled on ai-dynamo/dynamo's
-# notify-slack.yml). Collects the calling run's failed jobs via the Actions
-# API and, if any are reportable, posts an alert to a Slack incoming webhook.
-# Called via `uses: ./.github/workflows/notify-slack.yml`.
 
 name: Notify Slack
 
@@ -77,8 +72,6 @@ jobs:
           IGNORED_JOBS: ${{ inputs.ignored_jobs }}
           FORCE_ALERT: ${{ inputs.force_alert }}
         run: |
-          # Fetch every page of the run's jobs — the API caps per_page at 100,
-          # so a run with >100 jobs would otherwise drop later failures.
           JOBS_JSON=$(mktemp)
           JOBS_ACC=$(mktemp)
           page=1
@@ -97,11 +90,6 @@ jobs:
 
           IGNORED_JSON=$(printf '%s\n' "$IGNORED_JOBS" | jq -R 'gsub("^\\s+|\\s+$";"")' | jq -s 'map(select(length > 0))')
 
-          # Denylist, not an allowlist of "failure": a job cancelled out of a
-          # concurrency group, one killed by timeout-minutes, or one that
-          # died on the runner all carry a non-failure conclusion and would
-          # otherwise page nobody. `skipped` and `neutral` stay excluded —
-          # skipping is a normal outcome of this workflow's release gating.
           FAILED_JOBS=$(jq -r --argjson ignored "$IGNORED_JSON" \
             '(.jobs // [])[]
              | select(.status == "completed")
@@ -122,8 +110,6 @@ jobs:
           if [ -n "$(echo "$FAILED_JOBS" | tr -d '[:space:]')" ]; then
             echo "has_failures=true" >> "$GITHUB_OUTPUT"
           elif [ "${FORCE_ALERT}" = "true" ]; then
-            # The caller's umbrella check is red but no job row explains it
-            # (pending-cancel, or a release-mandatory job that was skipped).
             {
               echo "FAILED_JOBS<<EOF"
               echo ":failed: run is red but no failing job row was reported — check the run summary (cancelled-while-pending, or a required job was skipped)."

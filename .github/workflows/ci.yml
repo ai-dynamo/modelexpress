@@ -10,9 +10,6 @@ on:
     branches:
       - main
       - 'release/*'
-  # Reused by nightly-ci.yml to re-run the hosted suite against main HEAD on a
-  # schedule — catches drift that per-merge runs can't (new cargo-audit
-  # advisories, rust beta/nightly toolchain breakage, upstream base images).
   workflow_call:
     inputs:
       runs_on:
@@ -53,11 +50,6 @@ jobs:
             can-fail: true
     continue-on-error: ${{ matrix.can-fail }}
     env:
-      # rust-toolchain.toml pins channel = "stable" and a toolchain file beats
-      # `rustup default`, so installing beta/nightly is not enough on its own —
-      # RUSTUP_TOOLCHAIN is the only override that wins. Without it the beta
-      # and nightly legs silently re-ran the stable build: triple the compute,
-      # zero extra coverage, and no early warning of a toolchain regression.
       RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
 
     steps:
@@ -74,14 +66,10 @@ jobs:
 
     - name: Check Rust version
       run: |
-        # Must report the matrix toolchain — if this prints the pinned stable
-        # version, RUSTUP_TOOLCHAIN is not taking effect and the leg is a
-        # duplicate of the stable one.
         rustc --version
         cargo --version
 
     - name: Cache dependencies
-      # Nightly calls pass runs_on: no build output goes to GitHub cache storage.
       if: inputs.runs_on == ''
       uses: actions/cache@v4
       with:
@@ -220,7 +208,6 @@ jobs:
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Cache dependencies
-      # Nightly calls pass runs_on: no build output goes to GitHub cache storage.
       if: inputs.runs_on == ''
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
@@ -251,8 +238,6 @@ jobs:
     services:
       redis:
         image: redis:7-alpine
-        # Container port only: Docker picks a free host port, so concurrent
-        # runs on a shared self-hosted daemon (nightly) can't collide on 6379.
         ports:
           - 6379
         options: >-
@@ -276,7 +261,6 @@ jobs:
       run: rustc --version
 
     - name: Cache dependencies
-      # Nightly calls pass runs_on: no build output goes to GitHub cache storage.
       if: inputs.runs_on == ''
       uses: actions/cache@v4
       with:
@@ -404,9 +388,6 @@ jobs:
 
     - name: Test Docker image
       run: |
-        # Run-scoped name, no fixed host port: concurrent runs on a shared
-        # self-hosted daemon (nightly) must not collide. Health check hits
-        # the container IP directly instead of a published host port.
         NAME="mx-test-server-${{ github.run_id }}"
         docker run --rm --detach --name "${NAME}" "model-express:${{ github.run_id }}"
         sleep 10
@@ -425,10 +406,6 @@ jobs:
     runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
     timeout-minutes: 45
     needs: test
-    # No concurrency group: every host-shared name this job used to collide on
-    # is now run-scoped (cluster name, kubeconfig, image tag), and a group
-    # holds a single pending slot — a third run would cancel the second rather
-    # than queue it.
 
     steps:
     - name: Checkout repository
@@ -437,14 +414,6 @@ jobs:
         persist-credentials: false
 
     - name: Install kubectl, Helm and kind
-      # Run-scoped, pinned installs. These jobs may run on a shared
-      # self-hosted builder (the nightly passes runs_on), where writing to
-      # /usr/local/bin would swap the kubectl/helm binaries out from under
-      # every other job on the host — including the vCluster e2e suite.
-      # kind is installed here too (same v0.31.0 the script would fetch) so
-      # it lands on $GITHUB_PATH and is therefore resolvable by the always()
-      # teardown step; the script's own installer puts it in ~/.local/bin,
-      # which is only on PATH inside the script's own process.
       run: |
         set -euo pipefail
         mkdir -p "${RUNNER_TEMP}/bin"
@@ -458,36 +427,24 @@ jobs:
 
     - name: Run gRPC transfer K8s test
       env:
-        # Run-scoped cluster name and kubeconfig: on a shared builder a fixed
-        # cluster name collides across runs and ~/.kube/config would be
-        # clobbered for other jobs.
         MX_KIND_CLUSTER_NAME: mx-grpc-${{ github.run_id }}-${{ github.run_attempt }}
         KUBECONFIG: ${{ runner.temp }}/kubeconfig-grpc
-        # Run-scoped image tag too: the local `modelexpress:test` tag is
-        # shared state on a persistent builder's daemon.
         MX_TEST_IMAGE_TAG: test-${{ github.run_id }}-${{ github.run_attempt }}
       run: |
         chmod +x test_grpc_transfer_k8s.sh
         ./test_grpc_transfer_k8s.sh
 
     - name: Tear down kind cluster
-      # Belt-and-braces with the script's own cleanup: a cancelled or timed-out
-      # job would otherwise leave a kind cluster resident on the builder
-      # forever, consuming memory and leaking into later runs.
       if: always()
       env:
         MX_KIND_CLUSTER_NAME: mx-grpc-${{ github.run_id }}-${{ github.run_attempt }}
         KUBECONFIG: ${{ runner.temp }}/kubeconfig-grpc
         MX_TEST_IMAGE_TAG: test-${{ github.run_id }}-${{ github.run_attempt }}
       run: |
-        # kind is on $GITHUB_PATH from the install step above. Fall back to
-        # deleting the node containers directly if the install step itself
-        # never ran (e.g. the job was cancelled during setup).
         if command -v kind >/dev/null 2>&1; then
           kind delete cluster --name "${MX_KIND_CLUSTER_NAME}" 2>/dev/null || true
         else
           docker rm -f $(docker ps -aq --filter "label=io.x-k8s.kind.cluster=${MX_KIND_CLUSTER_NAME}") 2>/dev/null || true
         fi
         rm -f "${KUBECONFIG}" 2>/dev/null || true
-        # Run-scoped tag, so `docker image prune` will not reclaim it.
         docker image rm -f "modelexpress:${MX_TEST_IMAGE_TAG}" 2>/dev/null || true

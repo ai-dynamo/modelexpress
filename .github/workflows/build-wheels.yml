@@ -25,9 +25,6 @@ on:
       - 'pull-request/*'
       - main
       - 'release/**'
-  # Reused by nightly-ci.yml (with `secrets: inherit`): stamps a PEP440 dev
-  # version into the package before building and lands the artifacts under
-  # nightly/<run_id>/... instead of the pr/ / post-merge/ namespaces.
   workflow_call:
     inputs:
       wheel_version:
@@ -53,13 +50,6 @@ on:
         default: false
 
 concurrency:
-  # Only a direct PR-mirror push shares a per-branch group with
-  # cancel-in-progress. A workflow_call inherits the caller's ref, so the
-  # nightly running on pull-request/<N> would otherwise land in that same
-  # group and cancel, or be cancelled by, the standalone run from the same
-  # push. inputs.wheel_version is set only by callers. Every other trigger
-  # gets a run-unique group (github.run_id is the CALLER's under
-  # workflow_call).
   group: >-
     ${{ (startsWith(github.ref, 'refs/heads/pull-request/') && inputs.wheel_version == '')
         && format('build-wheels-{0}', github.ref)
@@ -72,9 +62,6 @@ permissions:
 jobs:
   build-and-upload:
     name: Build & upload wheels (${{ matrix.arch }})
-    # Same condition as the two steps that read its secrets. A build-only
-    # nightly call must not claim it: its branch policy rejects the feature
-    # branches workflow_dispatch is used to test.
     environment: ${{ inputs.skip_upload != true && 'automated-release' || '' }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -123,8 +110,6 @@ jobs:
         env:
           WHEEL_VERSION: ${{ inputs.wheel_version }}
         run: |
-          # Stamp the dev version into the package before the docker build
-          # copies the source tree, so the built wheels report it.
           sed -i "s/^version = \".*\"/version = \"${WHEEL_VERSION}\"/" \
             modelexpress_client/python/pyproject.toml
           grep '^version = ' modelexpress_client/python/pyproject.toml
@@ -142,9 +127,6 @@ jobs:
             .
           echo "Built artifacts:"
           ls -la dist/
-          # An empty dist/ must never pass as success: the version guard below
-          # is vacuously true on an empty listing, and the upload would then
-          # publish nothing while the job stays green.
           WHEEL_COUNT=$(find dist/ -maxdepth 1 -name '*.whl' | wc -l)
           SDIST_COUNT=$(find dist/ -maxdepth 1 -name '*.tar.gz' | wc -l)
           echo "wheels=${WHEEL_COUNT} sdists=${SDIST_COUNT}"
@@ -153,8 +135,6 @@ jobs:
             exit 1
           fi
           if [ -n "${WHEEL_VERSION}" ]; then
-            # Guard against UTC-midnight drift between version computation and
-            # build: every artifact must carry the stamped version.
             if ls dist/ | grep -v -- "-${WHEEL_VERSION}-\|^modelexpress-${WHEEL_VERSION}" | grep -q .; then
               echo "::error::Artifacts in dist/ do not all carry version ${WHEEL_VERSION}"
               ls dist/
@@ -163,8 +143,6 @@ jobs:
           fi
 
       - name: Set up JFrog CLI
-        # `inputs.skip_upload != true` is also true for plain push events,
-        # where the inputs context is empty.
         if: inputs.skip_upload != true
         uses: jfrog/setup-jfrog-cli@279b1f629f43dd5bc658d8361ac4802a7ef8d2d5 # v4.9.1
         env:

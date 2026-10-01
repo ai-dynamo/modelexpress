@@ -118,10 +118,6 @@ on:
   push:
     branches:
       - "pull-request/[0-9]+"
-  # Reused by nightly-ci.yml (with `secrets: inherit`) to run the full build +
-  # e2e matrix against main HEAD. Safe to call as-is: image tags derive from
-  # github.sha and test namespaces from github.run_id, so a nightly run is
-  # fully isolated from copy-pr-bot PR runs.
   workflow_call:
     inputs:
       concurrency_key:
@@ -143,8 +139,6 @@ concurrency:
   # consecutive pushes to the same PR cancel earlier runs but pushes to
   # different PRs don't fight for the same group.
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ inputs.concurrency_key }}
-  # Only PR runs (which pass no key) cancel their predecessor. A keyed caller
-  # must never have its multi-hour GPU matrix killed mid-flight.
   cancel-in-progress: ${{ inputs.concurrency_key == '' }}
 
 env:
@@ -383,8 +377,6 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
-          # The decoded AKS host kubeconfig and vCluster admin kubeconfig are
-          # live credentials on disk — remove them before the job ends.
           rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
@@ -565,8 +557,6 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
-          # The decoded AKS host kubeconfig and vCluster admin kubeconfig are
-          # live credentials on disk — remove them before the job ends.
           rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
@@ -652,8 +642,6 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
-          # The decoded AKS host kubeconfig and vCluster admin kubeconfig are
-          # live credentials on disk — remove them before the job ends.
           rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
@@ -739,8 +727,6 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
-          # The decoded AKS host kubeconfig and vCluster admin kubeconfig are
-          # live credentials on disk — remove them before the job ends.
           rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
@@ -847,8 +833,6 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
-          # The decoded AKS host kubeconfig and vCluster admin kubeconfig are
-          # live credentials on disk — remove them before the job ends.
           rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
@@ -922,8 +906,6 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
-          # The decoded AKS host kubeconfig and vCluster admin kubeconfig are
-          # live credentials on disk — remove them before the job ends.
           rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
@@ -979,8 +961,6 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
-          # The decoded AKS host kubeconfig and vCluster admin kubeconfig are
-          # live credentials on disk — remove them before the job ends.
           rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
@@ -1050,8 +1030,6 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
-          # The decoded AKS host kubeconfig and vCluster admin kubeconfig are
-          # live credentials on disk — remove them before the job ends.
           rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
@@ -1121,8 +1099,6 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
-          # The decoded AKS host kubeconfig and vCluster admin kubeconfig are
-          # live credentials on disk — remove them before the job ends.
           rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
@@ -1159,10 +1135,6 @@ jobs:
 
     steps:
       - name: Scope docker credentials to this job
-        # `runner` is not an allowed context in a job-level `env:`,
-        # so the per-job config dir is exported here instead; it keeps the
-        # registry credential out of the shared ~/.docker/config.json on
-        # the persistent builder.
         run: |
           echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-streamer-${{ strategy.job-index }}" >> "$GITHUB_ENV"
 
@@ -1188,8 +1160,6 @@ jobs:
           test_model_streamer_fallback: ${{ matrix.test_model_streamer_fallback }}
 
       - name: Cleanup credentials
-        # Drop the NGC credential from the runner's docker config so it
-        # doesn't persist on the shared GPU runner after the job.
         if: always()
         run: |
           rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
@@ -1218,8 +1188,6 @@ jobs:
   # ---------------------------------------------------------------------------
   ci-status-check:
     name: CI status check
-    # Not the builder pool: this jq-only umbrella job is the branch-protection
-    # gate, so it must not queue behind image builds and GPU tests.
     runs-on: ubuntu-latest
     needs:
       - build-server
