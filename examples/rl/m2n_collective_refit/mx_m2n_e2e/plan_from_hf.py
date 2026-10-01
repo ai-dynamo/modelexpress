@@ -121,17 +121,39 @@ def engine_placement(name: str, shape: tuple[int, ...], generators: int):
     return None
 
 
+def source_layout(shape, src_layout: str, flat_mesh, grid_mesh):
+    """The trainer-side mesh and placements for one parameter, or None."""
+    if src_layout == "dim1" and len(shape) >= 2 and shape[1] % flat_mesh.shape[0] == 0:
+        return flat_mesh, (Placement.shard(1),)
+    if (
+        grid_mesh is not None
+        and len(shape) >= 2
+        and shape[1] % grid_mesh.shape[1] == 0
+    ):
+        return grid_mesh, (Placement.replicate(), Placement.shard(1))
+    if shape[0] % flat_mesh.shape[0] == 0:
+        return flat_mesh, (Placement.shard(0),)
+    return None
+
+
 def build_plan(
     model_dir: str,
     *,
     trainers: int,
     generators: int,
     dst_layout: str = "replicate",
+    src_layout: str = "dim0",
 ) -> tuple[ReshardPlan, list[list[str]]]:
     """Build the plan and its layer groups for one trainer/generator geometry.
 
-    The trainer holds each parameter sharded on dim 0, which is what a
-    dim-0-sharding data-parallel framework produces.
+    ``src_layout`` decides how the trainer holds each parameter. ``dim0`` is
+    what a dim-0-sharding data-parallel framework produces. ``dim1`` shards
+    every matrix on its second axis instead. ``2d`` lays the trainers out on a
+    ``(trainers // 2, 2)`` mesh, replicated over the first axis and split on
+    dim 1 over the second. A source split on two dims at once is not offered:
+    the collective accepts one sharded dim per source tensor. Tensors a layout cannot split evenly (the 1-D
+    norms, for a start) fall back to dim 0 over the flat trainer mesh, so one
+    plan mixes several source layouts, which is itself worth exercising.
 
     ``dst_layout`` decides what the generator receives. ``replicate`` hands each
     rank the whole tensor and lets the engine's own loader split it, which is
@@ -147,7 +169,14 @@ def build_plan(
     for name in tied_names(model_dir):
         tensors.pop(name, None)
 
-    src_mesh = MeshSpec(shape=(trainers,))
+    flat_mesh = MeshSpec(shape=(trainers,))
+    grid_mesh = None
+    if src_layout == "2d":
+        if trainers % 2 != 0:
+            raise ValueError(f"a 2d source layout needs an even trainer count, got {trainers}")
+        grid_mesh = MeshSpec(shape=(trainers // 2, 2))
+    elif src_layout not in ("dim0", "dim1"):
+        raise ValueError(f"unknown src_layout {src_layout!r}")
     dst_mesh = MeshSpec(shape=(generators,), rank_offset=trainers)
 
     bulk: list[ParamPlan] = []
@@ -157,12 +186,14 @@ def build_plan(
         if not shape:
             undivided.append(name)
             continue
-        if shape[0] % trainers != 0:
+        src = source_layout(shape, src_layout, flat_mesh, grid_mesh)
+        if src is None:
             # The plan rejects a placement that does not divide evenly, and
             # guessing a different shard dim here would move wrong bytes
             # silently. Name it instead.
             undivided.append(name)
             continue
+        src_mesh, src_placements = src
         dst = Placement.replicate()
         if dst_layout == "sharded":
             dst = engine_placement(name, shape, generators) or Placement.replicate()
@@ -173,15 +204,15 @@ def build_plan(
                 dtype=dtype,
                 partition_id=0,
                 src_mesh=src_mesh,
-                src_placements=(Placement.shard(0),),
+                src_placements=src_placements,
                 dst_mesh=dst_mesh,
                 dst_placements=(dst,),
             )
         )
     if undivided:
         raise ValueError(
-            f"{len(undivided)} checkpoint tensor(s) cannot be sharded on dim 0 across "
-            f"{trainers} trainers: {', '.join(undivided[:5])}"
+            f"{len(undivided)} checkpoint tensor(s) cannot be sharded as {src_layout!r} "
+            f"across {trainers} trainers: {', '.join(undivided[:5])}"
         )
 
     groups: dict[int, list[str]] = {}

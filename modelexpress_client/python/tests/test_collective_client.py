@@ -222,7 +222,9 @@ def fake_nccl(monkeypatch):
         collective_backend, "loaded_nccl_version", lambda: collective_backend.MIN_NCCL
     )
     monkeypatch.setattr(
-        collective_client, "_bootstrap_barrier", lambda lane, device: None
+        collective_client,
+        "_bootstrap_barrier",
+        lambda lane, device, **kwargs: None,
     )
     monkeypatch.setattr(
         "modelexpress_rl.collective.comm.LaneCommunicator.synchronize",
@@ -345,7 +347,7 @@ class TestBootstrap:
         monkeypatch.setattr(
             collective_client,
             "_bootstrap_barrier",
-            lambda lane, device: events.append(("barrier", lane.rank)),
+            lambda lane, device, **kwargs: events.append(("barrier", lane.rank)),
         )
 
         client.compute_plan()

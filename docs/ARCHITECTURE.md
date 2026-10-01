@@ -212,6 +212,7 @@ ModelExpress/
 │       │   ├── comm.py                 # Communicator cache keyed by (group_id, epoch)
 │       │   ├── backend.py              # NcclM2nSender / NcclM2nReceiver
 │       │   ├── client.py               # RefitClientTrainer / RefitClientGenerator
+│       │   ├── jax_interop.py          # JAX storage adapter (shard lookup, buffer shim)
 │       │   └── envs.py                 # Deadlines and stream count
 │       ├── refit_collective_pb2.py     # Generated protobuf stubs
 │       └── refit_collective_pb2_grpc.py # Generated gRPC stubs
@@ -486,6 +487,36 @@ sequence: a rank that skips a parameter its peers issue hangs the communicator
 rather than failing alone. The misc broadcast is one phase per refit in
 `finish_weight_update`, never per layer group, since its communicator spans
 every rank and overlaps every reshard lane.
+
+Neither half requires PyTorch. `Placement.to_wire()` prefers torch's DTensor
+placements so an MX-brokered call stays identical to NeMo RL's `xferdtensor`
+one wherever torch is installed, and falls back to the `Replicate`/`Shard`
+classes `nccl.m2n` ships otherwise; the library duck-types placements on the
+class name and normalizes every form to the same integer. `_bootstrap_barrier`
+takes an optional allocator for the one device byte it broadcasts, so a worker
+with no torch supplies its own, and the lane's stream waits and device switches
+go through the CUDA runtime bindings (`cuda.bindings.runtime`, which nccl4py
+already pulls in) whenever torch cannot be imported. This is about the code
+path only: the `modelexpress` distribution still lists torch as a dependency,
+so installing it brings torch along.
+
+`collective/jax_interop.py` is the JAX side of the engine boundary. A
+`jax.Array` cannot be handed to `nccl.m2n.reshard` directly: the resolver tries
+`data_ptr()` and then `__cuda_array_interface__`, and JAX raises from that
+property for bfloat16 and float8 buffers. `JaxDeviceBuffer` wraps a
+single-device array with the `data_ptr()` / `shape` / `dtype` trio the resolver
+reads, taking the address from `unsafe_buffer_pointer()`, which carries no
+dtype restriction. `local_shard()` is the counterpart of DTensor's
+`to_local()`: `addressable_shards[0].data`, with the shard's own `index`
+checked on every dim against `expected_index()`, the slice the plan's source
+mesh and placements assign that rank. The source may be split on any one tensor
+dim, over a mesh of up to two axes with the other axis replicated; the
+collective refuses a source split on two dims, and the plan rejects one when it
+is built. `plan_sharding()` builds the matching `NamedSharding`
+with devices in the plan's row-major rank order, since a mesh ordered any other
+way puts each rank's bytes under another rank's name.
+`examples/rl/m2n_collective_refit/mx_m2n_e2e/jax_trainer.py` is the worked
+Publisher over it, and takes `--src-layout dim0|dim1|2d`.
 
 There is no group-delete RPC, symmetrically with workers never creating one.
 Expired generations are fenced now; reclaiming the resulting empty group hashes
