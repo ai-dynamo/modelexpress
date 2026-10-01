@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -115,7 +115,7 @@ class PreparedArtifact(ABC):
     @property
     @abstractmethod
     def metrics(self) -> dict[str, float]:
-        """Return metrics recorded while preparing this artifact."""
+        """Return metrics recorded while preparing or applying this artifact."""
 
 
 @dataclass(frozen=True)
@@ -125,6 +125,39 @@ class PreparedEngineTensors(PreparedArtifact):
     @property
     def metrics(self) -> dict[str, float]:
         return dict(getattr(self.staged, "metrics", {}))
+
+
+@dataclass
+class _StreamingOwnership:
+    """Retain receive resources until both GPU work and transport are drained."""
+
+    iterator: Iterator[dict[str, Any]] | None = None
+    drain_failed: bool = False
+    close_failed: bool = False
+    source_failed: bool = False
+
+    @property
+    def release_blocked(self) -> bool:
+        return (
+            self.iterator is not None
+            or self.drain_failed
+            or self.close_failed
+            or self.source_failed
+        )
+
+
+@dataclass(frozen=True)
+class PreparedStreamingTensors(PreparedArtifact):
+    """Deferred bounded transfer; payload is read only during installation."""
+
+    batches: Callable[[], Iterator[dict[str, Any]]]
+    parameter_names: frozenset[str]
+    transfer_metrics: dict[str, float]
+    ownership: _StreamingOwnership = field(default_factory=_StreamingOwnership)
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        return dict(self.transfer_metrics)
 
 
 @dataclass(frozen=True)
@@ -201,7 +234,11 @@ class UpdateMethod(ABC):
         """Release method-owned staging for one prepared update."""
 
     def installation_context(self, prepared: PreparedArtifact):
-        """Enter the safe point; implementations may transfer into live storage."""
+        """Run method-specific work at the caller's safe point.
+
+        Implementations may transfer into live storage. The framework must
+        already have paused engine execution.
+        """
         del prepared
         return nullcontext()
 
@@ -230,6 +267,9 @@ class UpdateMethod(ABC):
 
     def installation_failed(self, prepared: PreparedArtifact) -> None:
         """Fence method-owned state after an engine installation failure."""
+
+    def validate_close(self) -> None:
+        """Reject teardown while transport or installation may still use resources."""
 
     def close(self) -> None:
         """Release method-owned process resources."""

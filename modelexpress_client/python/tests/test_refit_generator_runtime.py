@@ -2,15 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from pathlib import Path
-
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import pytest
-import torch
-
 import modelexpress_rl.inference.engines as engines_module
 import modelexpress_rl.inference.runtime as runtime_module
+import pytest
+import torch
 from modelexpress import p2p_pb2
 from modelexpress_rl import ObjectStorageType, WeightPayloadFormat, WeightSource
 from modelexpress_rl.inference.adapter import GeneratorEngineContext
@@ -21,13 +19,13 @@ from modelexpress_rl.inference.plan import (
     PreparedEngineTensors,
     UpdateMethod,
 )
-from modelexpress_rl.inference.version_chain import resolve_replay_chain
 from modelexpress_rl.inference.receiver import ObjectStorageGeneratorConfig
 from modelexpress_rl.inference.runtime import (
     EngineRuntime,
     FullTensorEngineCapability,
     initialize_generator_runtime,
 )
+from modelexpress_rl.inference.version_chain import resolve_replay_chain
 
 
 class _Installer(EngineInstaller):
@@ -183,9 +181,9 @@ def test_object_storage_runtime_preserves_source_order(
     assert runtime.methods == (canonical, full_tensor)
     assert runtime.session._planner.source_order == expected_source_order
     assert runtime.initial_version_id == "base-a"
-    assert [
-        resolver.kind for resolver in runtime.session._planner._resolvers
-    ] == list(expected_source_order)
+    assert [resolver.kind for resolver in runtime.session._planner._resolvers] == list(
+        expected_source_order
+    )
     generator_resolvers = [
         resolver
         for resolver in runtime.session._planner._resolvers
@@ -381,9 +379,9 @@ def test_object_storage_runtime_survives_p2p_initialization_failure(
 
     assert runtime.methods == (canonical,)
     assert runtime.session._planner.source_order == (WeightSource.OBJECT_STORAGE,)
-    assert [
-        resolver.kind for resolver in runtime.session._planner._resolvers
-    ] == [WeightSource.OBJECT_STORAGE]
+    assert [resolver.kind for resolver in runtime.session._planner._resolvers] == [
+        WeightSource.OBJECT_STORAGE
+    ]
     assert p2p.closed
     runtime.close()
     assert canonical.closed
@@ -428,3 +426,47 @@ def test_generator_runtime_closes_resources_when_resolver_creation_fails(
 
     assert full_tensor.closed
     assert p2p.closed
+
+
+@pytest.mark.parametrize("blocked_first", [False, True])
+@pytest.mark.parametrize(
+    "failure", ["drain_failed", "close_failed", "source_failed", "in_progress"]
+)
+def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
+    blocked_first, failure
+):
+    from types import SimpleNamespace
+
+    from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
+    from modelexpress_rl.inference.plan import PreparedStreamingTensors
+    from modelexpress_rl.inference.runtime import GeneratorRuntime
+
+    arena = torch.ones(2)
+    closed = []
+    transfer = SimpleNamespace(arena=arena, close=lambda: closed.append("transfer"))
+    method = LoadTimeTensorNixlUpdateMethod(transfer=transfer, capture_layout=None)
+    prepared = PreparedStreamingTensors(lambda: iter(()), frozenset({"weight"}), {})
+    prepared.ownership.iterator = iter(({"weight": arena},))
+    if failure != "in_progress":
+        setattr(prepared.ownership, failure, True)
+    method._active_streamed = prepared
+    other = _Method({WeightSource.GENERATOR})
+    p2p = _P2P(server_url="mx:8000")
+    runtime = GeneratorRuntime(
+        engine=_full_tensor_engine(),
+        methods=(method, other) if blocked_first else (other, method),
+        session=object(),
+        p2p_client=p2p,
+        initial_version_id=None,
+    )
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="reset the process"):
+            runtime.close()
+        assert not runtime._closed
+        assert not p2p.closed
+        assert not other.closed
+        assert closed == []
+        assert method._active_streamed is prepared
+        assert prepared.ownership.iterator is not None
+        assert transfer.arena is arena

@@ -35,12 +35,16 @@ class _StubManager:
     def __init__(self, fail_post_on: str | None = None):
         self.calls = []  # (remote_agent_name, ranges, mem_type, timeout)
         self.events = []  # ("post", agent) / ("await", n) / ("execute", agent)
+        self.local_mem_types = []
         self.released = 0
         self._fail_post_on = fail_post_on
 
-    def post_read_batch(self, remote_agent_name, ranges, mem_type=None):
+    def post_read_batch(
+        self, remote_agent_name, ranges, mem_type=None, local_mem_type=None
+    ):
         if remote_agent_name == self._fail_post_on:
             raise RuntimeError(f"prep failed for {remote_agent_name}")
+        self.local_mem_types.append(local_mem_type)
         self.calls.append((remote_agent_name, list(ranges), mem_type, None))
         self.events.append(("post", remote_agent_name))
         return _StubPosted(
@@ -60,8 +64,14 @@ class _StubManager:
         )
 
     def execute_read_batch(
-        self, remote_agent_name, ranges, mem_type=None, timeout_seconds=None
+        self,
+        remote_agent_name,
+        ranges,
+        mem_type=None,
+        timeout_seconds=None,
+        local_mem_type=None,
     ):
+        self.local_mem_types.append(local_mem_type)
         self.calls.append((remote_agent_name, list(ranges), mem_type, timeout_seconds))
         self.events.append(("execute", remote_agent_name))
         total = sum(n for (_r, _l, n, _d) in ranges)
@@ -203,3 +213,36 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_local_mem_type_reaches_every_read_path(monkeypatch):
+    mgr = _StubManager()
+    _transport(mgr, local_mem_type="DRAM").read(_two_session_descriptors())
+    assert mgr.local_mem_types == ["DRAM", "DRAM"]
+    assert all(call[2] == "VRAM" for call in mgr.calls)
+
+    monkeypatch.setenv("MX_RESHARD_SERIAL_READS", "1")
+    mgr = _StubManager()
+    _transport(mgr, local_mem_type="DRAM").read(_two_session_descriptors())
+    assert mgr.local_mem_types == ["DRAM", "DRAM"]
+    assert [e[0] for e in mgr.events] == ["execute", "execute"]
+
+
+def test_local_mem_type_defaults_to_none():
+    mgr = _StubManager()
+    _transport(mgr).read(_two_session_descriptors())
+    assert mgr.local_mem_types == [None, None]
+
+
+def test_post_and_await_are_separable():
+    mgr = _StubManager()
+    transport = _transport(mgr)
+    posted = transport.post_reads(_two_session_descriptors())
+    assert [e[0] for e in mgr.events] == ["post", "post"]
+    assert transport.bytes_moved == 0
+    transport.await_reads(posted)
+    assert mgr.events[-1] == ("await", 2)
+    assert transport.bytes_moved == 40
+    assert transport.reads_issued == 3
+    transport.await_reads([])
+    assert mgr.events[-1] == ("await", 2)
