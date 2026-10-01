@@ -76,7 +76,7 @@ jobs:
     # targets their Artifactory. In a fork this queues forever waiting for a
     # runner that never checks in.
     if: github.repository == 'ai-dynamo/modelexpress'
-    environment: automated-release
+    environment: ${{ inputs.skip_upload != true && 'automated-release' || '' }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Lists the dpkg and Python packages installed in TARGET_IMAGE without running
+# it. Adapted from ai-dynamo/dynamo container/compliance/Dockerfile.extract.
+#
+# The extractor runs on the build platform and bind-mounts the target's
+# filesystem, so an arm64 image is read from an amd64 runner with no emulation.
+#
+#   docker buildx build --build-arg TARGET_IMAGE=<ref> \
+#     --build-arg TARGET_PLATFORM=linux/arm64 \
+#     --output type=local,dest=<dir> --pull --no-cache-filter extractor \
+#     -f .github/scripts/compliance/Dockerfile.extract .github/scripts/compliance/
+#
+# --no-cache-filter extractor is required: the cache key of a bind mount from a
+# stage does not reliably include that stage's digest, so a cache hit can
+# return the previous image's package list.
+#
+# Writes dpkg.tsv and python.tsv (name<TAB>version<TAB>spdx), their stderr
+# logs, and arch.txt (the extractor's own machine, for verification).
+
+ARG TARGET_IMAGE=scratch
+ARG TARGET_PLATFORM=linux/amd64
+ARG EXTRACTOR_IMAGE=python:3.12-slim
+FROM --platform=${TARGET_PLATFORM} ${TARGET_IMAGE} AS target
+FROM --platform=${BUILDPLATFORM} ${EXTRACTOR_IMAGE} AS extractor
+RUN mkdir /output
+COPY helpers/dpkg_helper.py /helpers/dpkg_helper.py
+COPY helpers/python_helper.py /helpers/python_helper.py
+RUN --mount=type=bind,from=target,target=/target \
+    uname -m > /output/arch.txt ; \
+    python3 /helpers/dpkg_helper.py --root /target > /output/dpkg.tsv 2>/output/dpkg_err.txt ; \
+    python3 /helpers/python_helper.py --root /target > /output/python.tsv 2>/output/python_err.txt ; \
+    cat /output/dpkg_err.txt /output/python_err.txt >&2 ; \
+    [ -f /target/var/lib/dpkg/status ] || { echo "ERROR: /var/lib/dpkg/status missing in target" >&2; exit 1; } ; \
+    [ -s /output/dpkg.tsv ] || { echo "ERROR: dpkg extraction produced no output" >&2; exit 1; }
+
+FROM scratch
+COPY --from=extractor /output/ /

@@ -488,9 +488,10 @@ jobs:
     permissions:
       contents: read
     # Deliberately NO concurrency group. This job writes only its own
-    # run-unique manifest tag, so it needs no mutex — and a job-level group holds a single pending slot,
-    # meaning a third overlapping run would CANCEL (not queue) a pending job
-    # that a human-approved release depends on.
+    # run-unique manifest tag, so it needs no mutex — and a job-level group
+    # holds a single pending slot, meaning a third overlapping run would
+    # CANCEL (not queue) a pending job that a human-approved release depends
+    # on.
     steps:
       - name: Scope docker credentials to this job
         # `runner` is not an allowed context in a job-level `env:`,
@@ -510,7 +511,7 @@ jobs:
           REPO: ${{ secrets.MX_IMAGE_REPO }}/modelexpress-server
           TAG: ${{ needs.preflight.outputs.nightly_tag }}
         run: |
-          # Immutable date-sha tag only. The floating :nightly tag is moved by
+          # Immutable run-unique tag only. The floating :nightly tag is moved by
           # stage-containers-ngc — behind release mode + approval — so a
           # build-only dispatch (or a rejected release) never repoints what
           # consumers of :nightly pull.
@@ -557,6 +558,120 @@ jobs:
       upload_prefix: ${{ needs.preflight.outputs.artifactory_path }}
       skip_upload: ${{ needs.preflight.outputs.release != 'true' }}
     secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Compliance: OSRB dependency lists, the only GitHub artifacts this workflow
+  # uploads. The GitLab osrb stage attaches them to the OSRB NVBugs, so the
+  # artifact names and file layout are the contract of release-automation's
+  # nvbug-attach-compliance.py (container) and nvbug-attach-license.py
+  # (source and crates). Change them only together with those scripts.
+  # ---------------------------------------------------------------------------
+  compliance:
+    name: Compliance scan
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [preflight, build-server-image]
+    if: ${{ !cancelled() && needs.build-server-image.result == 'success' }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Log in to the CI image registry
+        run: |
+          set -euo pipefail
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-compliance" >> "$GITHUB_ENV"
+          export DOCKER_CONFIG="${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-compliance"
+          echo "${{ secrets.NGC_API_KEY }}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust toolchain
+        # cargo tree only reads metadata, so no C toolchain is needed here.
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Scan the server image
+        env:
+          IMAGE: ${{ secrets.MX_IMAGE_REPO }}/modelexpress-server
+          TAG: ${{ needs.preflight.outputs.nightly_tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # The diff baseline is the runtime stage's base, read from the
+          # Dockerfile so it cannot drift from what is actually built.
+          BASE=$(sed -n 's/^FROM \([^ ]*\) AS runtime$/\1/p' docker/Dockerfile)
+          if [ -z "${BASE}" ]; then
+            echo "::error::no 'FROM <image> AS runtime' line in docker/Dockerfile"
+            exit 1
+          fi
+          echo "Diff baseline: ${BASE}"
+          extract() {
+            docker buildx build \
+              --build-arg TARGET_IMAGE="$1" \
+              --build-arg TARGET_PLATFORM="linux/$2" \
+              --output "type=local,dest=$3" \
+              --pull \
+              --no-cache-filter extractor \
+              --progress=plain \
+              -f .github/scripts/compliance/Dockerfile.extract \
+              .github/scripts/compliance/
+          }
+          for ARCH in amd64 arm64; do
+            extract "${IMAGE}:${TAG}-${ARCH}" "${ARCH}" "${RUNNER_TEMP}/scan/image-${ARCH}"
+            extract "${BASE}" "${ARCH}" "${RUNNER_TEMP}/scan/base-${ARCH}"
+            python3 .github/scripts/compliance/osrb.py container \
+              --target-dir "${RUNNER_TEMP}/scan/image-${ARCH}" \
+              --base-dir "${RUNNER_TEMP}/scan/base-${ARCH}" \
+              --arch "${ARCH}" --sha "${SHA}" \
+              --out-dir "osrb-out/compliance/linux_${ARCH}"
+          done
+
+      - name: List the source and crate dependencies
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Resolves the wheel's runtime closure from package metadata without
+          # installing it. Markers resolve for this runner: linux x86_64.
+          python3 -m pip install --quiet --dry-run --ignore-installed \
+            --report "${RUNNER_TEMP}/pip-report.json" ./modelexpress_client/python
+          python3 .github/scripts/compliance/osrb.py source \
+            --pip-report "${RUNNER_TEMP}/pip-report.json" \
+            --sha "${SHA}" --out-dir osrb-out/license
+
+      - name: Upload container compliance results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: compliance-${{ github.sha }}-modelexpress-server
+          path: osrb-out/compliance/**/*.csv
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload source and crate compliance results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: license-${{ github.sha }}-modelexpress
+          path: osrb-out/license/*.csv
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove registry credentials
+        if: always()
+        run: rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
   # ---------------------------------------------------------------------------
   # Rust crates — validated and packaged by .github/scripts/stage_crates.py
@@ -964,7 +1079,7 @@ jobs:
     # same way): their staged names are forwarded when available, but a crate
     # or chart failure doesn't withhold the container/wheel scans. nightly-status
     # still flags them red.
-    needs: [preflight, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc, notify-slack-start]
+    needs: [preflight, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc, compliance, notify-slack-start]
     if: >-
       ${{ !cancelled() &&
           needs.preflight.outputs.release == 'true' &&
@@ -1164,6 +1279,7 @@ jobs:
       - package-helm-chart
       - stage-helm-ngc
       - stage-containers-ngc
+      - compliance
       - trigger-gitlab-release
     if: always()
     steps:
@@ -1180,7 +1296,7 @@ jobs:
           # Release mode: staging jobs are mandatory — a skip there (rejected
           # approval, broken condition) must read as red, not green.
           if [ "${RELEASE}" = "true" ]; then
-            MANDATORY="build-server-image assemble-server-manifest build-wheels stage-crates package-helm-chart stage-helm-ngc stage-containers-ngc"
+            MANDATORY="build-server-image assemble-server-manifest build-wheels stage-crates package-helm-chart stage-helm-ngc stage-containers-ngc compliance"
             [ "${SKIP_GITLAB}" != "true" ] && MANDATORY="${MANDATORY} trigger-gitlab-release"
             for JOB in ${MANDATORY}; do
               # A job id that does not exist in `needs` yields jq null, which
