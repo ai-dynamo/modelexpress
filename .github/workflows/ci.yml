@@ -81,6 +81,8 @@ jobs:
         cargo --version
 
     - name: Cache dependencies
+      # Nightly calls pass runs_on: no build output goes to GitHub cache storage.
+      if: inputs.runs_on == ''
       uses: actions/cache@v4
       with:
         path: |
@@ -144,7 +146,8 @@ jobs:
       run: pip install uv
 
     - name: Install C toolchain
-      run: command -v cc >/dev/null || { sudo apt-get update && sudo apt-get install -y build-essential; }
+      # setup.py builds _alloc_ext with $CXX (default g++), not cc.
+      run: command -v g++ >/dev/null || { sudo apt-get update && sudo apt-get install -y build-essential; }
 
     - name: Install dependencies
       working-directory: modelexpress_client/python
@@ -217,6 +220,8 @@ jobs:
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Cache dependencies
+      # Nightly calls pass runs_on: no build output goes to GitHub cache storage.
+      if: inputs.runs_on == ''
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: |
@@ -271,6 +276,8 @@ jobs:
       run: rustc --version
 
     - name: Cache dependencies
+      # Nightly calls pass runs_on: no build output goes to GitHub cache storage.
+      if: inputs.runs_on == ''
       uses: actions/cache@v4
       with:
         path: |

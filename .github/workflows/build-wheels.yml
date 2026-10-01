@@ -72,7 +72,10 @@ permissions:
 jobs:
   build-and-upload:
     name: Build & upload wheels (${{ matrix.arch }})
-    environment: automated-release
+    # Same condition as the two steps that read its secrets. A build-only
+    # nightly call must not claim it: its branch policy rejects the feature
+    # branches workflow_dispatch is used to test.
+    environment: ${{ inputs.skip_upload != true && 'automated-release' || '' }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

@@ -415,6 +415,22 @@ and `stage-helm-ngc` each build the chart through
 `.github/scripts/package_helm_chart.sh`; keep both on that script so they
 cannot package different charts.
 
+The `compliance` job uploads the two GitHub artifacts the nightly is allowed
+to produce, both dependency lists for OSRB review. Neither contains a build
+artifact.
+
+| Artifact | Contents | OSRB bug |
+|---|---|---|
+| `compliance-<sha>-modelexpress-server` | `linux_<arch>/osrb-modelexpress-server-<arch>-<sha8>.csv`: dpkg packages read from the image, plus the Rust crates statically linked into its binaries. `.diff.csv` drops packages the base image already ships. | container |
+| `license-<sha>-modelexpress` | `osrb-modelexpress-deps-<sha8>.csv`: the crate closure of the published crates and the Python closure of the wheel | source and crates |
+
+The image is scanned without running it: `.github/scripts/compliance/Dockerfile.extract`
+bind-mounts each arch's filesystem into an extractor on the runner's own
+platform. release-automation's `nvbug:attach-compliance` and
+`nvbug:attach-license` jobs attach these files when its `ENABLE_OSRB_ATTACH`
+project variable is `true`. The artifact names and layout are the contract of
+its `nvbug-attach-compliance.py` and `nvbug-attach-license.py`.
+
 After staging, the workflow triggers the internal GitLab
 release-automation pipeline (security scans) and reports to Slack. A
 thread is opened at the start of every run, and its `thread_ts` is
