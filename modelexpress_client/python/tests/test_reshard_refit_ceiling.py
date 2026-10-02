@@ -22,7 +22,6 @@ import json
 import logging
 
 import pytest
-import torch
 
 from tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
 
@@ -175,7 +174,6 @@ def _refit(monkeypatch, ceiling):
     monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "1")
     monkeypatch.setenv("MX_RESHARD_MAX_GBPS", str(ceiling))
     monkeypatch.delenv("MX_REFIT_STAGE_RECORD", raising=False)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     return _build(_RecordingTransport())
 
 
@@ -225,7 +223,6 @@ def test_a_bounded_plan_still_reaches_the_guard(monkeypatch):
     monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "0")
     monkeypatch.setenv("MX_RESHARD_MAX_GBPS", "0.000001")
     monkeypatch.delenv("MX_REFIT_STAGE_RECORD", raising=False)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     harness, keepalive = _build(_RecordingTransport())
     harness._plan.segments = []
 

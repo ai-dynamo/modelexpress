@@ -29,6 +29,7 @@ class MockAcceleratorBackend:
     pool_reg: bool = False
     vmm: bool = False
     gds: bool = False
+    classic_alloc_pool: bool = False
     set_device_calls: list[int] = field(default_factory=list)
     synchronize_calls: list[int | None] = field(default_factory=list)
     empty_cache_calls: int = 0
@@ -62,6 +63,9 @@ class MockAcceleratorBackend:
 
     def supports_gds(self) -> bool:
         return self.gds
+
+    def requires_classic_alloc_pool(self) -> bool:
+        return self.classic_alloc_pool
 
 
 @pytest.fixture
