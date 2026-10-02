@@ -1,0 +1,35 @@
+{
+  "context": null,
+  "kubeconfig": "/teleport/kubeconfig.yaml",
+  "namespace": null,
+  "service_account": "default",
+  "region": "us-west-2",
+  "bucket": "ai-dynamo-modelexpress-ci",
+  "endpoint_url": null,
+  "addressing_style": "auto",
+  "worker_node_selector": {
+    "kubernetes.io/arch": "amd64",
+    "nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3"
+  },
+  "control_node_selector": {
+    "kubernetes.io/arch": "amd64"
+  },
+  "worker_tolerations": [
+    {
+      "key": "nvidia.com/gpu",
+      "operator": "Exists",
+      "effect": "NoSchedule"
+    }
+  ],
+  "control_tolerations": [],
+  "extra_worker_resources": {},
+  "worker_env": {},
+  "priority_class": "ci-nightly-high-priority",
+  "image_pull_secrets": [
+    {
+      "name": "nvcr-imagepullsecret"
+    }
+  ],
+  "images": {},
+  "default_paths": "s3"
+}
