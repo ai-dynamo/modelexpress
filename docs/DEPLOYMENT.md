@@ -217,6 +217,8 @@ The CLI client also uses layered configuration: CLI args > env vars > config fil
 
 Cache directory resolution for HuggingFace: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CACHE` -> `~/.cache/huggingface/hub`.
 
+Hugging Face token resolution: `HF_TOKEN` -> the token file at `$HF_HOME/token`, default `~/.cache/huggingface/token`. Set `HF_HUB_DISABLE_IMPLICIT_TOKEN` to use `HF_TOKEN` only. `HF_TOKEN_PATH` is not consulted.
+
 Cache directory resolution for NGC: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `~/.cache/ngc`.
 
 GCS uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DIRECTORY` overrides it. Cached GCS models are stored under `<cache>/gcs/<bucket>/<object-prefix>`. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for provider internals.
