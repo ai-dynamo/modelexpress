@@ -399,6 +399,38 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 `RefitService` is a new RL-specific control plane. It does not reuse or modify the
 legacy `WeightSyncService`. The initial slice stores worker registrations,
 immutable weight versions, and compact physical shard publications in Redis.
+The control plane stores long-lived `TrainerMesh` membership as
+`workers: worker_id -> TrainerTensorsMetadata(logical_shard_id, metadata_endpoint)`.
+`bind_tensors()` computes address-independent coverage locally and returns
+this compact reference. Logical IDs hash canonical
+coverage, so equivalent replicas share an ID. The orchestrator supplies the complete
+trainer worker set and is responsible for logical-shard completeness. Mesh creation
+and update validate compact membership metadata without fetching coverage manifests;
+large manifests never live in Redis.
+`CreateTrainerMesh` is idempotent; `UpdateTrainerMesh` replaces the complete
+worker map with generation compare-and-swap while preserving logical coverage.
+Every member requires an active model-matching trainer registration whose
+`refit_endpoint` matches the binding endpoint. A worker-sharded `WeightVersion`
+requires a trainer mesh; MX checks its existence and model atomically with version
+creation. Object-storage versions omit the mesh. For worker-sharded versions,
+`logical_shard_id` identifies a logical shard. MX accepts publications only from
+workers in that shard's current membership, validates the publication manifest
+against its bound coverage, and marks the version READY
+when every logical shard has a current, live publication. Mesh-backed readiness
+is computed from physical publications and their binding endpoints, not historical
+coverage. Generator discovery reads the mesh
+for complete expected shard coverage and filters out publications from replaced
+workers and expired registrations. Generation changes invalidate cached transfer
+plans; version leases protect sources during installation. Mesh-backed trainers
+can release published buffers before version retirement after all reader leases
+drain. Removing a worker or rebinding its endpoint atomically retires its
+publications and rejects the update while those versions have reader leases.
+`ListWeightVersions` filters by model and optionally mesh, newest first. Mesh-filtered
+listing uses the mesh's version index; metadata reads are pipelined.
+`version_number` is optional caller correlation metadata, not version identity.
+Object-storage callers manage version state; mesh callers do not manage readiness.
+DIRECT installation and pipelined worker streaming are
+not implemented by this control-plane slice.
 NIXL manifest endpoints belong to their physical worker shards; a typed object
 storage source belongs directly to its durable `WeightVersion`. The protocol
 can identify S3, Azure Blob Storage, or GCS, while this initial implementation

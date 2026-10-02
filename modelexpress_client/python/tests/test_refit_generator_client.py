@@ -62,6 +62,8 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.lease_registrations = 0
         self.lease_deletions = 0
         self.list_calls = 0
+        self.mesh_calls = 0
+        self.mesh_generation_on_recheck = 1
         self.fail_lease_deletion = False
         self.omit_base_version = False
         self.additional_versions = {}
@@ -69,7 +71,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             uid="version-a",
             model_name="test/model",
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR,
-            expected_source_slots=["rank:0", "rank:1"],
+            trainer_mesh_id="mesh-a",
             layout_signature="layout-a",
             state=state or refit_pb2.WEIGHT_VERSION_STATE_READY,
         )
@@ -83,14 +85,14 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.shards = [
             refit_pb2.WeightVersionShard(
                 version_id="version-a",
-                source_slot_id=slot,
+                logical_shard_id=slot,
                 worker_id=f"trainer-{rank}",
                 tensor_count=2,
                 total_bytes=128,
                 manifest_digest=digest,
                 manifest_endpoint=endpoint,
             )
-            for rank, slot in enumerate(self.version.expected_source_slots)
+            for rank, slot in enumerate(("rank:0", "rank:1"))
         ]
 
     def RegisterWorker(self, request, _context):
@@ -116,6 +118,25 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.list_calls += 1
         return refit_pb2.ListWeightVersionShardsResponse(
             shards=self.shards if request.version_id == self.version.uid else []
+        )
+
+    def GetTrainerMesh(self, request, context):
+        self.mesh_calls += 1
+        if request.mesh_id != "mesh-a":
+            context.abort(grpc.StatusCode.NOT_FOUND, "mesh not found")
+        return refit_pb2.GetTrainerMeshResponse(
+            mesh=refit_pb2.TrainerMesh(
+                mesh_id="mesh-a",
+                model_name="test/model",
+                generation=1 if self.mesh_calls == 1 else self.mesh_generation_on_recheck,
+                workers={
+                    shard.worker_id: refit_pb2.TrainerTensorsMetadata(
+                        logical_shard_id=shard.logical_shard_id,
+                        metadata_endpoint=shard.manifest_endpoint,
+                    )
+                    for shard in self.shards
+                },
+            )
         )
 
     def RegisterVersionLease(self, request, context):
@@ -740,6 +761,41 @@ def test_generator_stages_applies_releases_and_reuses_valid_plan(monkeypatch):
     assert adapter.create_calls[0].payload_format is WeightPayloadFormat.FULL_TENSOR
 
 
+def test_generator_discovers_mesh_backed_version(monkeypatch):
+    server, endpoint, service = _start_server()
+    service.version.trainer_mesh_id = "mesh-a"
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter)
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        assert service.mesh_calls == 2
+        assert service.list_calls == 1
+        assert [source.source_slot_id for source in adapter.create_calls[0].sources] == [
+            "rank:0",
+            "rank:1",
+        ]
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+
+def test_generator_rejects_mesh_change_during_source_resolution(monkeypatch):
+    server, endpoint, service = _start_server()
+    service.version.trainer_mesh_id = "mesh-a"
+    service.mesh_generation_on_recheck = 2
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter)
+    try:
+        with pytest.raises(RuntimeError, match="trainer mesh generation changed"):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
+        assert adapter.create_calls == []
+        assert not service.active_leases
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+
 def test_generator_republishes_runtime_tensors_around_first_install(monkeypatch):
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
@@ -929,7 +985,6 @@ def test_generator_dispatches_canonical_s3_without_fetching_a_worker_manifest(
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
     service.version.base_version_id = "base-a"
-    service.version.expected_source_slots[:] = []
     service.version.object_storage.CopyFrom(
         refit_pb2.ObjectStorageSource(
             storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
@@ -978,7 +1033,6 @@ def test_generator_retries_canonical_s3_under_one_lease(monkeypatch):
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
     service.version.base_version_id = "base-a"
-    service.version.expected_source_slots[:] = []
     service.version.object_storage.CopyFrom(
         refit_pb2.ObjectStorageSource(
             storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
@@ -1186,7 +1240,6 @@ def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
     service.version.ClearField("base_version_id")
-    service.version.expected_source_slots[:] = []
     service.version.object_storage.CopyFrom(
         refit_pb2.ObjectStorageSource(
             storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
@@ -1219,7 +1272,6 @@ def test_generator_rejects_full_hf_checkpoint_with_a_base_before_leasing(
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
     service.version.base_version_id = "base-a"
-    service.version.expected_source_slots[:] = []
     service.version.object_storage.CopyFrom(
         refit_pb2.ObjectStorageSource(
             storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
@@ -1251,7 +1303,6 @@ def test_generator_rejects_missing_object_storage_before_adapter_mutation(
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
     service.version.base_version_id = "base-a"
-    service.version.expected_source_slots[:] = []
     adapter = _Adapter(service)
     generator = _initialize(
         monkeypatch,
@@ -1278,7 +1329,6 @@ def test_generator_skips_non_s3_object_storage_before_adapter_mutation(
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
     service.version.base_version_id = "base-a"
-    service.version.expected_source_slots[:] = []
     service.version.object_storage.CopyFrom(
         refit_pb2.ObjectStorageSource(
             storage_type=refit_pb2.OBJECT_STORAGE_TYPE_GCS,
@@ -1309,7 +1359,6 @@ def test_generator_rejects_wrong_delta_base_before_lease(monkeypatch):
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
     service.version.base_version_id = "other-base"
-    service.version.expected_source_slots[:] = []
     service.version.object_storage.CopyFrom(
         refit_pb2.ObjectStorageSource(
             storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,

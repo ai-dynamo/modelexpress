@@ -20,7 +20,7 @@ from modelexpress.client import _get_server_url
 from .. import envs as rl_envs
 from .. import refit_pb2, refit_pb2_grpc
 from ..object_storage import ObjectStorageType
-from ..version import WeightVersionRef
+from ..version import TrainerTensorsMetadata, WeightVersionRef
 from .adapter import (
     TrainerStagingMode,
     WeightPayloadFormat,
@@ -227,7 +227,7 @@ class ModelExpressTrainerClient:
     ) -> None:
         self._active_runtime().prepare_delta_base(hf_tensor_iter=hf_tensor_iter)
 
-    def bind_tensors(self, tensors: Any) -> str:
+    def bind_tensors(self, tensors: Any) -> TrainerTensorsMetadata:
         return self._active_runtime().bind_tensors(tensors)
 
     @property
@@ -245,6 +245,7 @@ class ModelExpressTrainerClient:
                     worker_id=self.worker_id,
                     role=refit_pb2.WORKER_ROLE_TRAINER,
                     model_name=self.model_name,
+                    refit_endpoint=self.worker_endpoint,
                 ),
                 ttl_seconds=self._registration_ttl_seconds,
             ),
@@ -263,8 +264,7 @@ class ModelExpressTrainerClient:
         self,
         *,
         version: WeightVersionRef,
-        tensors: Any = None,
-        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None = None,
+        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
     ) -> StagedWeightVersionShard:
         if self._closed:
             raise RuntimeError("trainer client is closed")
@@ -272,7 +272,6 @@ class ModelExpressTrainerClient:
             raise TypeError("version must be a WeightVersionRef")
         staged = self._active_runtime().stage(
             version=version,
-            tensors=tensors,
             hf_tensor_iter=hf_tensor_iter,
         )
         return StagedWeightVersionShard(client=self, version=version, staged=staged)

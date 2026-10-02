@@ -157,6 +157,9 @@ class TrainerEngineAdapter(ABC):
 class WeightVersionShardManifestPublisher(Protocol):
     """Worker endpoint that makes a manifest retrievable before advertisement."""
 
+    @property
+    def endpoint(self) -> str: ...
+
     def publish_manifest(
         self,
         *,

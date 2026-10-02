@@ -257,10 +257,15 @@ pub fn method_label(path: &str) -> &'static str {
         "/model_express.p2p.P2pService/GetMetadata" => "P2pService/GetMetadata",
         "/model_express.p2p.P2pService/UpdateStatus" => "P2pService/UpdateStatus",
 
+        "/model_express.refit.RefitService/CreateTrainerMesh" => "RefitService/CreateTrainerMesh",
+        "/model_express.refit.RefitService/GetTrainerMesh" => "RefitService/GetTrainerMesh",
+        "/model_express.refit.RefitService/UpdateTrainerMesh" => "RefitService/UpdateTrainerMesh",
+        "/model_express.refit.RefitService/DeleteTrainerMesh" => "RefitService/DeleteTrainerMesh",
         "/model_express.refit.RefitService/CreateWeightVersion" => {
             "RefitService/CreateWeightVersion"
         }
         "/model_express.refit.RefitService/GetWeightVersion" => "RefitService/GetWeightVersion",
+        "/model_express.refit.RefitService/ListWeightVersions" => "RefitService/ListWeightVersions",
         "/model_express.refit.RefitService/DeleteWeightVersion" => {
             "RefitService/DeleteWeightVersion"
         }
@@ -679,8 +684,8 @@ mod tests {
         // Guards the parser itself: a change that stopped matching `rpc` lines
         // would otherwise make this test pass by checking nothing.
         assert_eq!(
-            checked, 20,
-            "expected 20 routed server RPCs, parsed {checked}"
+            checked, 25,
+            "expected 25 routed server RPCs, parsed {checked}"
         );
     }
 
