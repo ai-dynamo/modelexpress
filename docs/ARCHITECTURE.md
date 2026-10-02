@@ -565,6 +565,14 @@ full-tensor NIXL and canonical-checkpoint object-storage publication remain sepa
 method implementations. This keeps transport, payload preparation, engine
 geometry, and framework orchestration independently replaceable.
 
+`train/frameworks/vime/modelexpress.py` owns Vime's ModelExpress weight updater,
+including version publication, checkpoint cadence, rollout refits, and metrics.
+Vime re-exports `UpdateWeightFromModelExpress` and imports it only when
+`--update-weight-transport modelexpress` is selected. The adapter reuses Vime's
+HF weight iterator and Gloo-group helper. Package initializers do not import the
+adapter, so ordinary SDK imports do not require Vime, Ray, or Megatron. Vime users
+need a ModelExpress build that includes this adapter.
+
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
 | `RegisterWorker` | `RegisterWorkerRequest` | `RegisterWorkerResponse` | Register or refresh one TTL-bound worker process |

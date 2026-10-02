@@ -1059,6 +1059,14 @@ for the next delta. The cadence is disabled by default. Slime exposes
 `full_hf_checkpoint_interval` in `--modelexpress-config`. In both cases, `N`
 counts published ModelExpress weight versions.
 
+The SDK-owned Vime adapter uses `object_storage_uri_prefix`,
+`object_storage_endpoint_url`, and `object_storage_region_name` in
+`--modelexpress-config`, matching the Miles integration. These replace the
+experimental `s3_*` keys. Set the URI prefix to `s3://<bucket>/<run-prefix>`;
+for MinIO, set its endpoint URL and region. For AWS S3, omit the endpoint URL
+and set the bucket's region. This path currently supports S3-compatible storage
+only; generic field names do not enable other providers.
+
 ### Server-Backed Model Cache (No Shared Storage)
 
 For workers that cannot reach the Hugging Face Hub themselves, ModelExpress Server can act as the only route to the model. The worker asks the server for repository files; the server downloads the model once on a cold miss and serves every later worker from its own cache.
