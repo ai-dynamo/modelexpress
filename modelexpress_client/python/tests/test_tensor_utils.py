@@ -183,6 +183,38 @@ class TestAdoptHiddenTensors:
         count = adopt_hidden_tensors(module, backend)
         assert count == 3  # w1, w2, buffers[0]
 
+    def test_reads_snapshotted_module_values_without_lazy_getattr(
+        self, mock_accelerator_backend_cls
+    ):
+        class LazyAttrModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.runtime_state = {"scale": torch.randn(4)}
+
+            def __getattribute__(self, name):
+                if name == "runtime_state":
+                    raise AssertionError("lazy attribute resolution must not run")
+                return super().__getattribute__(name)
+
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        module = LazyAttrModule()
+
+        assert adopt_hidden_tensors(module, backend) == 1
+        assert any("runtime_state" in name for name, _ in module.named_buffers())
+
+    def test_skips_runtime_objects_that_reject_introspection(
+        self, mock_accelerator_backend_cls
+    ):
+        class ExplodingDict(dict):
+            def items(self):
+                raise RuntimeError("lazy runtime object")
+
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        module = nn.Module()
+        module.runtime_state = ExplodingDict()
+
+        assert adopt_hidden_tensors(module, backend) == 0
+
     def test_cpu_tensors_ignored(self):
         module = ModuleWithQuant()  # CPU tensors by default
         # Default CUDA backend: CPU tensors must be ignored.

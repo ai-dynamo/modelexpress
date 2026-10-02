@@ -78,8 +78,10 @@ if TYPE_CHECKING:
     MX_RESHARD_PUBLISH_DIGEST: bool
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
+    MX_K8S_ARTIFACT_SERVICE_PATTERN: str
     MX_K8S_SOURCE_RETRIES: str
     MX_K8S_SOURCE_BACKOFF_SECONDS: str
+    MX_ARTIFACT_OWNER_DEVICE_ID: int
     # NIXL / transport
     MX_NIXL_BACKEND: str
     MX_POOL_REG: bool
@@ -342,8 +344,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_RESHARD_PUBLISH_DIGEST": lambda: _env_bool("MX_RESHARD_PUBLISH_DIGEST", False),
     # ── Kubernetes service backend ─────────────────────────────────────────
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get("MX_K8S_SERVICE_PATTERN", "mx-sources"),
+    "MX_K8S_ARTIFACT_SERVICE_PATTERN": lambda: os.environ.get(
+        "MX_K8S_ARTIFACT_SERVICE_PATTERN", ""
+    ).strip(),
     "MX_K8S_SOURCE_RETRIES": lambda: os.environ.get("MX_K8S_SOURCE_RETRIES", ""),
     "MX_K8S_SOURCE_BACKOFF_SECONDS": lambda: os.environ.get("MX_K8S_SOURCE_BACKOFF_SECONDS", ""),
+    "MX_ARTIFACT_OWNER_DEVICE_ID": lambda: _env_int("MX_ARTIFACT_OWNER_DEVICE_ID", 0),
     # ── NIXL / transport ───────────────────────────────────────────────────
     "MX_NIXL_BACKEND": lambda: os.environ.get("MX_NIXL_BACKEND", "UCX").strip().upper(),
     "MX_POOL_REG": lambda: os.environ.get("MX_POOL_REG", "0") == "1",

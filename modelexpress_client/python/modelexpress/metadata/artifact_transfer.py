@@ -604,6 +604,8 @@ def publish_artifact_source(
             bundle.artifact_id,
             bundle.manifest,
             artifact_chunk_manager,
+            node_rank=node_rank,
+            worker_grpc_endpoint=worker_grpc_endpoint,
         )
     except Exception:
         artifact_chunk_manager.close()
@@ -663,6 +665,19 @@ def discover_artifact_source(
     must not be installed. Empty means unknown and is accepted for backward
     compatibility, matching RDMA tensor source selection.
     """
+    service_resolver = getattr(mx_client, "discover_artifact_source", None)
+    if (
+        getattr(mx_client, "SERVICE_ROUTED_ARTIFACTS", False) is True
+        and callable(service_resolver)
+    ):
+        return service_resolver(
+            identity,
+            worker_rank=worker_rank,
+            node_rank=node_rank,
+            artifact_id=artifact_id,
+            accelerator=accelerator,
+        )
+
     sources = mx_client.list_sources(
         identity=identity,
         status_filter=p2p_pb2.SOURCE_STATUS_READY,
