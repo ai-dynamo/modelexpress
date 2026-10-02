@@ -5,7 +5,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 /// Install Ring before constructing clients that use a providerless Rustls transport.
-#[cfg(any(feature = "gcs", feature = "tls-rustls"))]
+#[cfg(any(feature = "gcs", all(feature = "s3", feature = "tls-rustls")))]
 pub(crate) fn ensure_crypto_provider() -> Result<()> {
     if rustls::crypto::CryptoProvider::get_default().is_some() {
         return Ok(());
@@ -18,7 +18,7 @@ pub(crate) fn ensure_crypto_provider() -> Result<()> {
     }
 }
 
-#[cfg(not(any(feature = "gcs", feature = "tls-rustls")))]
+#[cfg(all(feature = "s3", not(feature = "gcs"), not(feature = "tls-rustls")))]
 pub(crate) fn ensure_crypto_provider() -> Result<()> {
     Ok(())
 }
@@ -227,12 +227,72 @@ pub mod gcs;
 pub mod huggingface;
 pub(crate) mod lock_file;
 pub mod ngc;
+#[cfg(feature = "s3")]
 pub mod s3;
+#[cfg(all(feature = "s3", feature = "tls-native"))]
+pub(crate) mod s3_crypto;
 
 pub use gcs::GcsProvider;
 pub use huggingface::HuggingFaceProvider;
 pub use ngc::NgcProvider;
 pub use s3::S3Provider;
+
+#[cfg(not(feature = "s3"))]
+pub mod s3 {
+    use super::ModelProviderTrait;
+    use crate::cache::{ModelInfo, ProviderCache};
+    use anyhow::Result;
+    use std::path::{Path, PathBuf};
+
+    const FEATURE_DISABLED: &str = "S3 support is disabled; rebuild with the `s3` feature";
+
+    pub struct S3Provider;
+
+    pub(crate) struct S3ProviderCache;
+
+    #[async_trait::async_trait]
+    impl ModelProviderTrait for S3Provider {
+        async fn download_model(
+            &self,
+            _model_name: &str,
+            _cache_dir: Option<PathBuf>,
+            _ignore_weights: bool,
+        ) -> Result<PathBuf> {
+            anyhow::bail!(FEATURE_DISABLED)
+        }
+
+        async fn delete_model(&self, _model_name: &str, _cache_dir: PathBuf) -> Result<()> {
+            anyhow::bail!(FEATURE_DISABLED)
+        }
+
+        async fn get_model_path(&self, _model_name: &str, _cache_dir: PathBuf) -> Result<PathBuf> {
+            anyhow::bail!(FEATURE_DISABLED)
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "S3"
+        }
+    }
+
+    impl ProviderCache for S3ProviderCache {
+        fn clear_model(&self, _cache_root: &Path, _model_name: &str) -> Result<()> {
+            anyhow::bail!(FEATURE_DISABLED)
+        }
+
+        fn resolve_model_path(
+            &self,
+            _cache_root: &Path,
+            _model_name: &str,
+            _revision: Option<&str>,
+        ) -> Result<PathBuf> {
+            anyhow::bail!(FEATURE_DISABLED)
+        }
+
+        fn list_models(&self, _cache_root: &Path) -> Result<Vec<ModelInfo>> {
+            Ok(Vec::new())
+        }
+    }
+}
 
 #[cfg(not(feature = "gcs"))]
 pub mod gcs {
