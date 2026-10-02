@@ -470,6 +470,7 @@ def _initialize(
     adapter,
     *,
     object_storage=False,
+    storage_type=ObjectStorageType.S3,
     max_transfer_attempts=3,
     max_replay_chain_length=64,
     source_order=None,
@@ -494,7 +495,7 @@ def _initialize(
             lease_ttl_seconds=60,
             object_storage=(
                 ObjectStorageGeneratorConfig(
-                    storage_type=ObjectStorageType.S3,
+                    storage_type=storage_type,
                     initial_base_version_id="base-a",
                     seed_checkpoint_path="unused-launch",
                     refit_checkpoint_dir="unused-cache",
@@ -632,7 +633,7 @@ def test_generator_rejects_unsupported_object_storage_before_adapter_creation(
         lambda **_kwargs: pytest.fail("runtime must not be created"),
     )
 
-    with pytest.raises(ValueError, match="only S3 object storage"):
+    with pytest.raises(ValueError, match="only S3 and Azure object storage"):
         ModelExpressGeneratorClient.initialize(
             ModelExpressGeneratorConfig(
                 engine_context=VllmGeneratorContext(
@@ -1105,15 +1106,24 @@ def _add_generator_peer(service):
     )
 
 
-def test_generator_resolves_and_stages_target_replay_chain(monkeypatch):
+@pytest.mark.parametrize("provider", [ObjectStorageType.S3, ObjectStorageType.AZURE])
+def test_generator_resolves_and_stages_target_replay_chain(monkeypatch, provider):
     server, endpoint, service = _start_server()
     service.version.CopyFrom(_canonical_version("version-c", "version-b"))
     service.additional_versions = {
         "version-a": _canonical_version("version-a", "base-a"),
         "version-b": _canonical_version("version-b", "version-a"),
     }
+    if provider is ObjectStorageType.AZURE:
+        for version in [service.version, *service.additional_versions.values()]:
+            version.object_storage.storage_type = refit_pb2.OBJECT_STORAGE_TYPE_AZURE
+            version.object_storage.uri = version.object_storage.uri.replace(
+                "s3://", "az://", 1
+            )
     adapter = _Adapter(service)
-    generator = _initialize(monkeypatch, endpoint, adapter, object_storage=True)
+    generator = _initialize(
+        monkeypatch, endpoint, adapter, object_storage=True, storage_type=provider
+    )
 
     try:
         staged = generator.stage_weight(version=WeightVersionRef("version-c"))
@@ -1180,8 +1190,18 @@ def test_generator_rejects_excessive_replay_chain_before_leasing(monkeypatch):
     assert adapter.stage_calls == []
 
 
+@pytest.mark.parametrize(
+    ("storage_type", "proto_type", "scheme"),
+    [
+        (ObjectStorageType.S3, refit_pb2.OBJECT_STORAGE_TYPE_S3, "s3"),
+        (ObjectStorageType.AZURE, refit_pb2.OBJECT_STORAGE_TYPE_AZURE, "az"),
+    ],
+)
 def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
     monkeypatch,
+    storage_type,
+    proto_type,
+    scheme,
 ):
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
@@ -1189,8 +1209,8 @@ def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
     service.version.expected_source_slots[:] = []
     service.version.object_storage.CopyFrom(
         refit_pb2.ObjectStorageSource(
-            storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
-            uri="s3://weights/model.safetensors.index.json",
+            storage_type=proto_type,
+            uri=f"{scheme}://weights/model.safetensors.index.json",
         )
     )
     adapter = _Adapter(service)
@@ -1199,6 +1219,7 @@ def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
         endpoint,
         adapter,
         object_storage=True,
+        storage_type=storage_type,
     )
 
     try:
@@ -1206,6 +1227,7 @@ def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
         inputs = adapter.stage_calls[0]
         assert inputs.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
         assert inputs.base_version_id is None
+        assert inputs.object_storage.storage_type is storage_type
         assert service.list_calls == 0
         staged.release()
     finally:
@@ -1272,7 +1294,7 @@ def test_generator_rejects_missing_object_storage_before_adapter_mutation(
     assert service.lease_deletions == 0
 
 
-def test_generator_skips_non_s3_object_storage_before_adapter_mutation(
+def test_generator_skips_unsupported_storage_payload_before_adapter_mutation(
     monkeypatch,
 ):
     server, endpoint, service = _start_server()

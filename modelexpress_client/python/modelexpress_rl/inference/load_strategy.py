@@ -25,8 +25,8 @@ from .methods import CanonicalDeltaUpdateMethod
 from .plan import ObjectStorageUpdateSource, WeightSource, parse_weight_source_order
 from .receiver import (
     ObjectStorageGeneratorConfig,
-    _S3Version,
-    bootstrap_s3_checkpoint,
+    _ObjectStorageVersion,
+    bootstrap_object_storage_checkpoint,
 )
 from .version_chain import resolve_replay_chain
 
@@ -267,16 +267,16 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
         assert root.object_storage is not None
         s3 = S3Client()
         try:
-            seed_path = bootstrap_s3_checkpoint(
+            seed_path = bootstrap_object_storage_checkpoint(
                 model_name=ctx.identity.model_name,
-                version=_S3Version(
+                version=_ObjectStorageVersion(
                     version_id=root.version_id,
                     base_version_id=root.base_version_id,
                     payload_format=root.payload_format,
                     uri=root.object_storage.uri,
                 ),
                 refit_checkpoint_dir=checkpoint_dir,
-                s3=s3,
+                reader=s3,
             )
         finally:
             s3.close()
