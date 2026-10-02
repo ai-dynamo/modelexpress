@@ -19,7 +19,7 @@ versions exist in no registry), and the .crate files are collected into
 Version stamping: --stage-version rewrites `version = "<current>"` across the
 workspace manifests — [workspace.package].version and the internal path-dep
 pins in [workspace.dependencies] share the same literal — then resyncs
-Cargo.lock, so every staged nightly carries a distinct prerelease version.
+Cargo.lock, so the staged crates carry the nightly prerelease version.
 """
 from __future__ import annotations
 
@@ -134,7 +134,7 @@ def main() -> int:
                          "(evaluated after --stage-version stamping)")
     ap.add_argument("--stage-version", default=os.environ.get("STAGE_VERSION", ""),
                     help="rewrite every publishable crate's version to this exact value "
-                         "before packaging (e.g. 0.5.0-nightly.20260806); empty = as-is")
+                         "before packaging (e.g. 0.7.0-nightly.20261002.gf2d68fa); empty = as-is")
     ap.add_argument("--stamp-only", action="store_true",
                     help="stop after stamping and the version check; no cargo check or package")
     args = ap.parse_args()
