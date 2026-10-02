@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![allow(clippy::expect_used)]
+#![allow(clippy::result_large_err)]
 
 use modelexpress_client::{Client, ClientConfig};
 use modelexpress_common::{constants, download, models::ModelProvider};
