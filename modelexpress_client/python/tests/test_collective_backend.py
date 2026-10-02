@@ -156,6 +156,30 @@ def build(
 
 
 class TestOpOrdering:
+    def test_contiguous_trainer_groups_match_receiver_singleton_wire_order(
+        self, recorder
+    ):
+        plan = ReshardPlan(bulk=[entry(name) for name in ("a", "b", "c", "d")])
+        sender, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        sender.setup_layer_groups([["a", "b"], ["c", "d"]])
+        sender.start_weight_update("v1")
+        sender.publish_weights(0)
+        sender.publish_weights(1)
+        sender.finish_weight_update(broadcast_lane_id=1)
+        sent = [(op.src, op.comm._name) for op in recorder.ops if op.kind == "reshard"]
+
+        recorder.ops.clear()
+        receiver, _ = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
+        receiver.setup_layer_groups([[name] for name in ("a", "b", "c", "d")])
+        receiver.start_weight_update("v1")
+        for index in range(4):
+            receiver.update_weights(index)
+        receiver.finish_weight_update(broadcast_lane_id=1)
+        received = [
+            (op.dst, op.comm._name) for op in recorder.ops if op.kind == "reshard"
+        ]
+        assert sent == received == [(f"buf::{name}", "lane0") for name in "abcd"]
+
     def test_the_misc_broadcast_waits_for_every_layer_group(self, recorder):
         # The regression this guards: running the broadcast at the end of each
         # publish_weights call means entering the all-ranks communicator while
@@ -603,7 +627,9 @@ class TestTransferDeadline:
         half.publish_weights(0)
         half.finish_weight_update(1)
 
-        assert [op.comm._name for op in recorder.ops if op.kind == "reshard"] == ["lane0"]
+        assert [op.comm._name for op in recorder.ops if op.kind == "reshard"] == [
+            "lane0"
+        ]
         assert not any(lane.aborted for lane in cache._lanes.values())
 
     def test_the_deadline_is_rearmed_per_version_not_per_client(
@@ -641,6 +667,7 @@ class TestTransferDeadline:
         half, cache = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
 
         for key, live in list(cache._lanes.items()):
+
             def record(timeout_s=None, _live=live):
                 seen.append(timeout_s)
 
@@ -664,6 +691,7 @@ class TestTransferDeadline:
         half, cache = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
 
         for live in cache._lanes.values():
+
             def boom(timeout_s=None):
                 raise TimeoutError("stream never drained")
 
@@ -738,6 +766,40 @@ class TestBoundedSynchronizeFallback:
         assert any(op.kind == "sync" for op in recorder.ops), (
             "falling back must still drain the stream, not skip the wait"
         )
+
+
+class TestWaitEventBackoff:
+    """The bounded event poll backs off at transfer scale, not a fixed tick."""
+
+    def test_the_poll_backs_off_from_fifty_microseconds_to_a_millisecond(
+        self, recorder, monkeypatch
+    ):
+        from modelexpress_rl.collective import comm
+
+        sleeps = []
+        monkeypatch.setattr(comm.time, "sleep", sleeps.append)
+        fake = lane(recorder, "x")
+        answers = iter([False] * 8 + [True])
+        fake.wait_event(SimpleNamespace(query=lambda: next(answers)), 60.0)
+        assert sleeps == pytest.approx(
+            [50e-6, 100e-6, 200e-6, 400e-6, 800e-6, 1e-3, 1e-3, 1e-3]
+        )
+
+    def test_the_poll_never_sleeps_past_the_deadline(self, recorder, monkeypatch):
+        from modelexpress_rl.collective import comm
+
+        sleeps = []
+        monkeypatch.setattr(comm.time, "sleep", sleeps.append)
+        # Past the scripted ticks the clock lands past the deadline, so an
+        # extra monotonic read later fails as the intended TimeoutError rather
+        # than a StopIteration that names nothing.
+        clock = iter([100.0, 100.0, 100.0 + 0.0009999])
+        monkeypatch.setattr(comm.time, "monotonic", lambda: next(clock, 100.1))
+        fake = lane(recorder, "x")
+        with pytest.raises(TimeoutError):
+            fake.wait_event(SimpleNamespace(query=lambda: False), 0.001)
+        assert sleeps[0] == pytest.approx(50e-6)
+        assert sleeps[1] <= 1e-7 + 1e-9
 
 
 class TestNcclVersionFloor:
