@@ -134,6 +134,8 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
         artifact_id,
         manifest,
         object(),
+        node_rank=2,
+        worker_grpc_endpoint=endpoint,
     )
 
     try:
@@ -148,6 +150,7 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
             "artifact-source",
             artifact_id,
             timeout=1.0,
+            node_rank=2,
         )
         with pytest.raises(grpc.RpcError):
             artifact_transfer_module.fetch_artifact_manifest_header(
@@ -162,6 +165,84 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
     assert [tensor.name for tensor in tensors] == ["weight"]
     assert header.mx_source_id == "artifact-source"
     assert header.artifact_id == artifact_id
+    assert header.worker_grpc_endpoint == endpoint
+    assert header.worker_id == "weight-generation"
+    assert header.node_rank == 2
+
+
+def test_artifact_header_rejects_wrong_node_rank(tmp_path):
+    artifact_file = tmp_path / "cache.bin"
+    artifact_file.write_bytes(b"compiled-cache")
+    manifest = build_artifact_manifest(
+        tmp_path,
+        chunk_size=8,
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+    )
+    artifact_id = artifact_manifest_id(manifest)
+    server = WorkerGrpcServer(
+        tensor_protos=[],
+        mx_source_id="weight-source",
+        metadata_endpoint="127.0.0.1:5555",
+        worker_id="generation-1",
+    )
+    port = server.start()
+    endpoint = f"127.0.0.1:{port}"
+    server.register_artifact_source(
+        "artifact-source",
+        artifact_id,
+        manifest,
+        object(),
+        node_rank=2,
+        worker_grpc_endpoint=endpoint,
+    )
+
+    try:
+        with pytest.raises(grpc.RpcError) as exc_info:
+            artifact_transfer_module.fetch_artifact_manifest_header(
+                endpoint,
+                "artifact-source",
+                artifact_id,
+                timeout=1.0,
+                node_rank=1,
+            )
+    finally:
+        server.stop(grace=None)
+
+    assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+    assert "node_rank mismatch" in exc_info.value.details()
+
+
+def test_artifact_header_reports_unknown_source_as_not_found(tmp_path):
+    artifact_file = tmp_path / "cache.bin"
+    artifact_file.write_bytes(b"compiled-cache")
+    manifest = build_artifact_manifest(
+        tmp_path,
+        chunk_size=8,
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+    )
+    artifact_id = artifact_manifest_id(manifest)
+    server = WorkerGrpcServer(tensor_protos=[], mx_source_id="weight-source")
+    port = server.start()
+    endpoint = f"127.0.0.1:{port}"
+    server.register_artifact_source(
+        "known-artifact-source",
+        artifact_id,
+        manifest,
+        object(),
+    )
+
+    try:
+        with pytest.raises(grpc.RpcError) as exc_info:
+            artifact_transfer_module.fetch_artifact_manifest_header(
+                endpoint,
+                "missing-artifact-source",
+                artifact_id,
+                timeout=1.0,
+            )
+    finally:
+        server.stop(grace=None)
+
+    assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
 
 
 def test_tensor_read_drain_waits_for_inflight_lease_and_rejects_new_readers():
@@ -1867,8 +1948,9 @@ class _FakeWorkerGrpcServer:
         artifact_id,
         manifest,
         artifact_chunk_manager,
+        **kwargs,
     ):
-        del manifest
+        del manifest, kwargs
         self.artifact_chunk_manager = artifact_chunk_manager
         self.registered.append((mx_source_id, artifact_id))
 

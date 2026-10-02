@@ -167,6 +167,20 @@ def schedule_artifact_publish(
         )
         return
 
+    if (
+        getattr(ctx.mx_client, "SERVICE_ROUTED_ARTIFACTS", False) is True
+        and ctx.device_id != envs.MX_ARTIFACT_OWNER_DEVICE_ID
+    ):
+        log.debug(
+            "[Worker %s] Skipping %s artifact publish on device %s; "
+            "k8s-service artifact owner device is %s",
+            ctx.global_rank,
+            engine_label,
+            ctx.device_id,
+            envs.MX_ARTIFACT_OWNER_DEVICE_ID,
+        )
+        return
+
     for transfer, identity in transfers_factory():
         marker_path = mark_publish_scheduled(ctx, transfer, identity)
         if marker_path is None:
