@@ -400,6 +400,11 @@ message GetArtifactManifestHeaderRequest {
 
   // Optional artifact_id from ArtifactSourceMetadata for validation.
   string artifact_id = 2;
+
+  // Optional node rank expected by a decentralized artifact client. Service-
+  // routed discovery validates this on the selected worker before returning a
+  // pod-direct endpoint. Central-coordinator callers may leave it unset.
+  optional uint32 node_rank = 3;
 }
 
 message GetArtifactManifestHeaderResponse {
@@ -429,6 +434,20 @@ message GetArtifactManifestHeaderResponse {
   // paged separately. Very high file-count artifacts may need a future paged
   // file-table RPC.
   repeated ArtifactManifestFile files = 12;
+
+  // Pod-direct WorkerService endpoint. Decentralized clients first call this
+  // RPC through a Kubernetes Service, then pin all manifest-page and chunk-
+  // lease RPCs to this endpoint so they cannot land on different pods.
+  string worker_grpc_endpoint = 13;
+
+  // Runtime accelerator family of the serving worker.
+  string accelerator = 14;
+
+  // Runtime generation of the worker serving this sealed artifact.
+  string worker_id = 15;
+
+  // Distributed node rank that owns this node-scoped artifact.
+  uint32 node_rank = 16;
 }
 
 message GetArtifactManifestChunksRequest {

@@ -152,8 +152,9 @@ directories have stopped changing briefly. Supported cache roots are
 `TORCHINDUCTOR_CACHE_DIR` (or PyTorch Inductor's runtime `cache_dir()`),
 `TRITON_CACHE_DIR`, `TVM_FFI_CACHE_DIR`, `SGLANG_DG_CACHE_DIR`, `TILELANG_CACHE_DIR`,
 `CUTE_DSL_CACHE_DIR`, and `FLASHINFER_WORKSPACE_BASE`. This path requires
-`MX_P2P_METADATA=1` and a central-coordinator metadata backend (`redis` or
-`kubernetes`) for artifact discovery. Cache publication uses the same health
+the P2P metadata path and supports `redis`, `kubernetes`, and `k8s-service`
+metadata backends. With `k8s-service`, configure the artifact Service to route
+to the owner device's worker port. Cache publication uses the same health
 endpoint as weight publication.
 
 For Mooncake TransferEngine, use the same command shape and change only the
