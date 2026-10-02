@@ -1208,6 +1208,17 @@ storage-view naming used for non-contiguous SGLang parameters.
 The SGLang side does not expose separate source and target modes; transport
 selection and source discovery remain inside the ModelExpress package.
 
+**MTP two-pass load.** With speculative decoding on a checkpoint that carries
+its own draft head (DeepSeek and GLM NextN, Qwen3-Next MTP), SGLang builds a
+second `ModelConfig` flagged `is_draft_model=True` and runs the same loader
+again on the same device while the target keeps serving. The draft resolves the
+same `SourceIdentity` as the target and would bind the same NIXL metadata port,
+so `_is_speculative_draft()` sets `ctx.p2p_enabled = False` for that pass on
+both transports: no source discovery, no NIXL registration, no publication, no
+artifact install or publish, and the device registries keep the target's
+entries. The draft loads from disk through the engine's native loader, and its
+load is timed under `model_role="draft"` rather than `main`.
+
 **LoadStrategyChain** (`load_strategy/`):
 
 Auto-detects the best loading strategy with a prioritized chain. Each strategy is a subclass of `LoadStrategy` (ABC) with `is_available(ctx)` and `load(result, ctx)` methods. Engine-specific work is delegated to `ctx.adapter`; `LoadResult` carries the value returned to the engine plus the model used for tensor discovery and publication. The chain filters to eligible strategies and runs them in order until one succeeds:

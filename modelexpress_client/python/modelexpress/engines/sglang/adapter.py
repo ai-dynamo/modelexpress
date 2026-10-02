@@ -34,6 +34,16 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 
+def _is_speculative_draft(model_config) -> bool:
+    """True for the draft pass of an SGLang speculative load.
+
+    SGLang builds the MTP / NextN draft from the target's checkpoint with a
+    second ModelConfig flagged is_draft_model=True, so the same loader runs
+    twice in one process. Missing attribute means an ordinary target load.
+    """
+    return bool(getattr(model_config, "is_draft_model", False))
+
+
 class SglangAdapter(EngineAdapter):
     """Adapter that maps strategy hooks onto SGLang's native loader APIs."""
 

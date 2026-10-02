@@ -18,9 +18,14 @@ import torch.nn as nn
 from modelexpress import p2p_pb2
 from modelexpress.engines.sglang.adapter import (
     SglangAdapter,
+    _is_speculative_draft,
     build_sglang_load_context,
 )
-from modelexpress.engines.sglang.loader import MxModelLoader
+from modelexpress.engines.sglang.loader import (
+    MxModelLoader,
+    _nixl_managers,
+    _tensor_registry,
+)
 from modelexpress.load_strategy.context import LoadResult
 
 
@@ -594,6 +599,8 @@ def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain(
     ctx = run.call_args.args[1]
     assert ctx.adapter.__class__ is SglangAdapter
     assert ctx.identity.backend_framework == p2p_pb2.BACKEND_FRAMEWORK_SGLANG
+    assert ctx.p2p_enabled is True
+    assert loader.nixl_manager is ctx.nixl_manager
     if health_gated:
         # Bound to ctx so the URL resolves against this worker's node_rank
         # and head address, so identity is not asserted.
@@ -1112,3 +1119,148 @@ def test_te_find_source_records_the_funnel_on_success(monkeypatch):
         call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list
     }
     assert observed["listed"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Speculative (MTP / NextN) draft pass
+# ---------------------------------------------------------------------------
+
+
+def test_is_speculative_draft_reads_sglang_is_draft_model():
+    assert _is_speculative_draft(_model_config(is_draft_model=True)) is True
+    assert _is_speculative_draft(_model_config(is_draft_model=False)) is False
+    # Older SGLang ModelConfigs without the flag are ordinary target loads.
+    assert _is_speculative_draft(_model_config()) is False
+
+
+def test_mx_model_loader_nixl_path_keeps_draft_out_of_p2p(monkeypatch):
+    """The draft's second load must not touch NIXL, artifacts, or the
+    target's device registries."""
+    from modelexpress.engines.sglang import loader as loader_mod
+
+    target_tensors = {"target.weight": torch.randn(2, 2)}
+    target_manager = MagicMock(name="target-nixl-manager")
+    monkeypatch.setitem(_tensor_registry, 0, target_tensors)
+    monkeypatch.setitem(_nixl_managers, 0, target_manager)
+
+    model = nn.Linear(2, 2)
+    loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
+
+    with patch.dict(
+        os.environ, {"MX_ARTIFACT_READY_URL": "http://127.0.0.1:30000/health"}
+    ), patch(
+        "modelexpress.engines.sglang.loader.run_load_strategy_chain",
+        return_value=model,
+    ) as run, patch(
+        "modelexpress.engines.sglang.loader.install_sglang_cache_artifacts",
+    ) as install_artifacts, patch(
+        "modelexpress.engines.sglang.loader.schedule_sglang_cache_artifact_publish",
+    ) as schedule_artifacts:
+        loaded = loader._load_model_via_nixl(
+            model=model,
+            model_config=_model_config(is_draft_model=True),
+            device_config=_device_config(gpu_id=0),
+        )
+
+    assert loaded is model
+    ctx = run.call_args.args[1]
+    assert ctx.p2p_enabled is False
+    install_artifacts.assert_not_called()
+    schedule_artifacts.assert_not_called()
+    assert loader_mod._tensor_registry[0] is target_tensors
+    assert loader_mod._nixl_managers[0] is target_manager
+    assert loader.nixl_manager is None
+    assert loader.tensors == {}
+
+
+def test_rdma_strategy_is_not_eligible_for_draft_context():
+    from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+    ctx = build_sglang_load_context(
+        _load_config(), _model_config(is_draft_model=True), _device_config()
+    )
+    ctx.p2p_enabled = not _is_speculative_draft(ctx.model_config)
+
+    with patch(
+        "modelexpress.load_strategy.rdma_strategy.is_nixl_available",
+        return_value=True,
+    ):
+        assert RdmaStrategy().is_available(ctx) is False
+
+
+def test_transfer_engine_draft_loads_natively_without_discovery_or_publish():
+    transfer_engine = MagicMock()
+    load_config = _load_config(
+        modelexpress_transport="transfer_engine",
+        remote_instance_weight_loader_transfer_engine=transfer_engine,
+        remote_instance_weight_loader_transfer_engine_session_id="target-session",
+    )
+    loader = MxModelLoader(load_config)
+    initial_model = nn.Linear(2, 2)
+    native_model = nn.Linear(2, 2)
+    native_result = SimpleNamespace(value=native_model, model=native_model)
+    adapter = MagicMock()
+    adapter.load_via_native.return_value = native_result
+    ctx = SimpleNamespace(
+        global_rank=0,
+        identity=SimpleNamespace(model_name="model"),
+        adapter=adapter,
+        tensors={},
+    )
+
+    with patch(
+        "modelexpress.engines.sglang.loader.build_sglang_load_context",
+        return_value=ctx,
+    ), patch.object(
+        loader,
+        "_find_transfer_engine_source",
+    ) as find_source, patch.object(
+        loader,
+        "_publish_transfer_engine_source",
+    ) as publish:
+        loaded = loader._load_model_via_transfer_engine(
+            model=initial_model,
+            model_config=_model_config(is_draft_model=True),
+            device_config=_device_config(),
+        )
+
+    assert loaded is native_model
+    assert ctx.p2p_enabled is False
+    find_source.assert_not_called()
+    publish.assert_not_called()
+    adapter.load_via_native.assert_called_once()
+    assert adapter.load_via_native.call_args.args[0].model is initial_model
+    adapter.discover_tensors.assert_not_called()
+    adapter.before_rdma_receive.assert_not_called()
+    transfer_engine.register_memory.assert_not_called()
+    assert loader.remote_instance_transfer_engine_weight_info == {}
+    assert loader.nixl_manager is None
+
+
+def test_transfer_engine_draft_does_not_require_a_transfer_engine():
+    # SGLang only initializes a TransferEngine for the draft runner when its
+    # draft load format asks for one, so the draft pass must not insist on it.
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    native_model = nn.Linear(2, 2)
+    adapter = MagicMock()
+    adapter.load_via_native.return_value = SimpleNamespace(
+        value=native_model, model=native_model
+    )
+    ctx = SimpleNamespace(
+        global_rank=0,
+        identity=SimpleNamespace(model_name="model"),
+        adapter=adapter,
+        tensors={},
+    )
+
+    with patch(
+        "modelexpress.engines.sglang.loader.build_sglang_load_context",
+        return_value=ctx,
+    ):
+        loaded = loader._load_model_via_transfer_engine(
+            model=nn.Linear(2, 2),
+            model_config=_model_config(is_draft_model=True),
+            device_config=_device_config(),
+        )
+
+    assert loaded is native_model

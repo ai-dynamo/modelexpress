@@ -23,7 +23,11 @@ from ...metrics import enable_metrics
 from ...nixl_transfer import NixlTransferManager
 from ...metrics import metrics as selection_metrics
 from ...source_selection import configured_policy_label, get_configured_selector
-from .adapter import _get_model_name, build_sglang_load_context
+from .adapter import (
+    _get_model_name,
+    _is_speculative_draft,
+    build_sglang_load_context,
+)
 from .artifacts import (
     _sglang_health_ready,
     install_sglang_cache_artifacts,
@@ -73,12 +77,15 @@ class MxModelLoader:
         # reports a load duration. Instrumenting only the chain would leave that
         # whole deployment mode looking like it never loaded anything.
         #
-        # SGLang has no draft-model path through this loader, so model_role is
-        # always main.
+        # Under speculative decoding SGLang runs this loader twice per device,
+        # once for the target and once for the MTP / NextN draft. The draft
+        # finishes far sooner than the target, so timing them together makes the
+        # p99 of neither meaningful.
         # Same helper the load context uses, so the label matches the model name
         # every other client family reports for this process.
         model_id = _get_model_name(model_config)
-        with selection_metrics.time_load("sglang", model_id, "main"):
+        model_role = "draft" if _is_speculative_draft(model_config) else "main"
+        with selection_metrics.time_load("sglang", model_id, model_role):
             if transport == "nixl":
                 return self._load_model_via_nixl(
                     model=model,
@@ -110,37 +117,48 @@ class MxModelLoader:
             model_config,
             device_config,
         )
+        # The MTP / NextN draft is a second load on the same device while the
+        # target keeps serving. It shares the target's SourceIdentity and its
+        # NIXL listener port, so it must neither discover nor publish sources:
+        # RDMA would collide on the port and a published draft would poison the
+        # target's source pool. p2p_enabled=False switches all of that off
+        # before any NIXL manager is built; the draft loads from disk.
+        ctx.p2p_enabled = not _is_speculative_draft(model_config)
         if envs.MX_ARTIFACT_READY_URL.strip():
             ctx.source_ready_fn = lambda: _sglang_health_ready(ctx)
-        self._ctx = ctx
+        if ctx.p2p_enabled:
+            self._ctx = ctx
 
         logger.info(
-            "[Worker %s] SGLang MxModelLoader starting (model=%s)",
+            "[Worker %s] SGLang MxModelLoader starting (model=%s, p2p_enabled=%s)",
             ctx.global_rank,
             ctx.identity.model_name,
+            ctx.p2p_enabled,
         )
         # No model_init phase here, unlike vLLM: SGLang builds the module and
         # hands it in, so there is no initialization inside this window to time.
         # The phases still partition the load; this load simply has three.
-        with selection_metrics.time_load_phase(
-            "sglang", ctx.identity.model_name, "artifact_install"
-        ):
-            install_sglang_cache_artifacts(ctx)
+        if ctx.p2p_enabled:
+            with selection_metrics.time_load_phase(
+                "sglang", ctx.identity.model_name, "artifact_install"
+            ):
+                install_sglang_cache_artifacts(ctx)
         with selection_metrics.time_load_phase(
             "sglang", ctx.identity.model_name, "chain"
         ):
             model = run_load_strategy_chain(model, ctx)
 
-        _tensor_registry[ctx.device_id] = ctx.tensors
-        if ctx.nixl_manager is not None:
-            _nixl_managers[ctx.device_id] = ctx.nixl_manager
-        else:
-            _nixl_managers.pop(ctx.device_id, None)
+        if ctx.p2p_enabled:
+            _tensor_registry[ctx.device_id] = ctx.tensors
+            if ctx.nixl_manager is not None:
+                _nixl_managers[ctx.device_id] = ctx.nixl_manager
+            else:
+                _nixl_managers.pop(ctx.device_id, None)
 
-        with selection_metrics.time_load_phase(
-            "sglang", ctx.identity.model_name, "publish"
-        ):
-            schedule_sglang_cache_artifact_publish(ctx)
+            with selection_metrics.time_load_phase(
+                "sglang", ctx.identity.model_name, "publish"
+            ):
+                schedule_sglang_cache_artifact_publish(ctx)
 
         total_time = time.perf_counter() - load_start
         logger.info(
@@ -164,6 +182,26 @@ class MxModelLoader:
             model_config,
             device_config,
         )
+        ctx.p2p_enabled = not _is_speculative_draft(model_config)
+        if not ctx.p2p_enabled:
+            # Same reasoning as the nixl transport: the draft shares the
+            # target's identity, so it would pull the target's manifest and,
+            # after the inevitable mismatch, advertise itself into the
+            # target's source pool. Load it from disk and publish nothing.
+            logger.info(
+                "[Worker %s] SGLang MxModelLoader transfer_engine: speculative "
+                "draft load (model=%s), skipping source discovery and publication",
+                ctx.global_rank,
+                ctx.identity.model_name,
+            )
+            result = ctx.adapter.load_via_native(LoadResult(value=model, model=model))
+            self.remote_instance_transfer_engine_weight_info = {}
+            logger.info(
+                "[Worker %s] SGLang MxModelLoader transfer_engine COMPLETE in %.2fs",
+                ctx.global_rank,
+                time.perf_counter() - load_start,
+            )
+            return result.model.eval()
         self._ctx = ctx
 
         transfer_engine = getattr(
