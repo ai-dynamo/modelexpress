@@ -1264,3 +1264,163 @@ def test_transfer_engine_draft_does_not_require_a_transfer_engine():
         )
 
     assert loaded is native_model
+
+
+class _RecordingModel(nn.Module):
+    """Model whose load_weights records every tensor name it is handed."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen: list[str] = []
+
+    def load_weights(self, weights):
+        for name, _tensor in weights:
+            self.seen.append(name)
+
+
+def _install_sglang_default_loader_modules(monkeypatch, tmp_path, shard_tensors):
+    """Fake sglang.srt.model_loader.loader.DefaultModelLoader over shards on
+    disk under tmp_path. shard_tensors maps shard basename -> tensor names."""
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    configs_mod = ModuleType("sglang.srt.configs")
+    load_config_mod = ModuleType("sglang.srt.configs.load_config")
+    model_loader_mod = ModuleType("sglang.srt.model_loader")
+    loader_mod = ModuleType("sglang.srt.model_loader.loader")
+    load_config_mod.LoadFormat = SimpleNamespace(AUTO="auto")
+    calls: dict = {}
+
+    class DefaultModelLoader:
+        def __init__(self, load_config):
+            self.load_config = load_config
+
+        def _prepare_weights(self, model_name_or_path, revision, fall_back_to_pt):
+            calls["prepare"] = (model_name_or_path, revision, fall_back_to_pt)
+            files = sorted(
+                os.path.join(str(tmp_path), name) for name in shard_tensors
+            )
+            return str(tmp_path), files, True
+
+        def _get_weights_iterator(self, source):
+            _folder, files, _use_safetensors = self._prepare_weights(
+                source.model_or_path, source.revision, source.fall_back_to_pt
+            )
+            calls["files"] = files
+            for path in files:
+                for name in shard_tensors[os.path.basename(path)]:
+                    yield name, torch.zeros(1)
+
+        def _get_all_weights(self, model_config, model):
+            source = SimpleNamespace(
+                model_or_path=model_config.model_path,
+                revision=model_config.revision,
+                fall_back_to_pt=True,
+            )
+            yield from self._get_weights_iterator(source)
+
+        @staticmethod
+        def load_weights_and_postprocess(model, weights, target_device):
+            model.load_weights(weights)
+
+    loader_mod.DefaultModelLoader = DefaultModelLoader
+    loader_mod.device_loading_context = MagicMock()
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.configs", configs_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.configs.load_config", load_config_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader", model_loader_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader.loader", loader_mod)
+    return calls
+
+
+_NEXTN_SHARDS = {
+    "model-00001-of-00003.safetensors": [
+        "model.embed_tokens.weight",
+        "model.layers.0.mlp.weight",
+    ],
+    "model-00002-of-00003.safetensors": ["model.layers.1.mlp.weight", "lm_head.weight"],
+    "model-00003-of-00003.safetensors": [
+        "model.layers.2.eh_proj.weight",
+        "model.layers.2.enorm.weight",
+        "model.layers.2.embed_tokens.weight",
+    ],
+}
+
+
+def _write_nextn_checkpoint(tmp_path, shard_tensors, num_hidden_layers=2):
+    import json
+
+    weight_map = {
+        name: shard for shard, names in shard_tensors.items() for name in names
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8"
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Glm4MoeForCausalLM"],
+                "num_hidden_layers": num_hidden_layers,
+                "num_nextn_predict_layers": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    for shard in shard_tensors:
+        (tmp_path / shard).write_bytes(b"")
+
+
+def test_sglang_native_load_reads_only_draft_shards_for_draft(monkeypatch, tmp_path):
+    _write_nextn_checkpoint(tmp_path, _NEXTN_SHARDS)
+    calls = _install_sglang_default_loader_modules(monkeypatch, tmp_path, _NEXTN_SHARDS)
+    adapter = SglangAdapter(
+        _load_config(),
+        _model_config(model_path=str(tmp_path), is_draft_model=True),
+        _device_config(),
+    )
+    model = _RecordingModel()
+
+    adapter.load_via_native(SimpleNamespace(value=model, model=model))
+
+    assert calls["files"] == [
+        os.path.join(str(tmp_path), "model-00003-of-00003.safetensors")
+    ]
+    assert model.seen == _NEXTN_SHARDS["model-00003-of-00003.safetensors"]
+    # Loader identity is preserved for the wrapped class.
+    assert calls["prepare"] == (str(tmp_path), "abc123", True)
+
+
+def test_sglang_native_load_reads_every_shard_for_target(monkeypatch, tmp_path):
+    _write_nextn_checkpoint(tmp_path, _NEXTN_SHARDS)
+    calls = _install_sglang_default_loader_modules(monkeypatch, tmp_path, _NEXTN_SHARDS)
+    adapter = SglangAdapter(
+        _load_config(),
+        _model_config(model_path=str(tmp_path), is_draft_model=False),
+        _device_config(),
+    )
+    model = _RecordingModel()
+
+    adapter.load_via_native(SimpleNamespace(value=model, model=model))
+
+    assert len(calls["files"]) == 3
+    assert len(model.seen) == sum(len(v) for v in _NEXTN_SHARDS.values())
+
+
+def test_sglang_native_draft_load_falls_back_to_all_shards_without_index(
+    monkeypatch, tmp_path
+):
+    # No index and no config.json: the draft head cannot be located, so the
+    # loader must read every shard rather than nothing.
+    for shard in _NEXTN_SHARDS:
+        (tmp_path / shard).write_bytes(b"")
+    calls = _install_sglang_default_loader_modules(monkeypatch, tmp_path, _NEXTN_SHARDS)
+    adapter = SglangAdapter(
+        _load_config(),
+        _model_config(model_path=str(tmp_path), is_draft_model=True),
+        _device_config(),
+    )
+    model = _RecordingModel()
+
+    adapter.load_via_native(SimpleNamespace(value=model, model=model))
+
+    assert len(calls["files"]) == 3

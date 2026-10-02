@@ -1216,8 +1216,17 @@ same `SourceIdentity` as the target and would bind the same NIXL metadata port,
 so `_is_speculative_draft()` sets `ctx.p2p_enabled = False` for that pass on
 both transports: no source discovery, no NIXL registration, no publication, no
 artifact install or publish, and the device registries keep the target's
-entries. The draft loads from disk through the engine's native loader, and its
-load is timed under `model_role="draft"` rather than `main`.
+entries. The draft loads from disk through `load_via_native`, which for a draft
+wraps SGLang's `DefaultModelLoader` so `_prepare_weights` returns only the
+shards holding draft tensors. Selection (`draft_shards.py`) reads
+`model.safetensors.index.json` and `config.json` next to the resolved shards
+and keeps shards whose tensor names start with `model.layers.{num_hidden_layers
++ i}.` (extra-decoder-layer convention, derived from the on-disk config), or
+with `mtp.`, `model.mtp.` or `model.mtp_layers.` (fixed-prefix conventions).
+Because SGLang's page-cache prefetch consumes the same list, it is narrowed
+too. The draft's embedding and `lm_head` are shared from the target by SGLang's
+EAGLE worker and are not read. An index with no draft tensors, an unreadable
+index, or a non-local checkpoint folder falls back to loading every shard.
 
 **LoadStrategyChain** (`load_strategy/`):
 
