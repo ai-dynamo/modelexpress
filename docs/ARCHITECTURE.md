@@ -546,6 +546,12 @@ engine integrations.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
   through SGLang's native safetensors loader.
 
+The corresponding trainer composition is owned by `TrainerRuntime`. Public
+`FSDPTrainerContext` and `MegatronTrainerContext` select only engine capture;
+full-tensor NIXL and canonical-checkpoint object-storage publication remain separate
+method implementations. This keeps transport, payload preparation, engine
+geometry, and framework orchestration independently replaceable.
+
 The explicit `apply_weight_streaming(version=..., max_staging_bytes=...)`
 generator API holds a version lease across metadata preparation and incremental
 installation. The NIXL receiver plans complete owning-module batches and uses
@@ -597,12 +603,6 @@ blocks further streaming updates. The hosting framework must keep all replicas
 paused and restart them after any failed update. Only completion of all replicas
 permits resuming generation. The staging limit excludes live model weights,
 engine-owned post-load workspace, CUDA allocator overhead, and transport metadata.
-
-The corresponding trainer composition is owned by `TrainerRuntime`. Public
-`FSDPTrainerContext` and `MegatronTrainerContext` select only engine capture;
-full-tensor NIXL and canonical-checkpoint object-storage publication remain separate
-method implementations. This keeps transport, payload preparation, engine
-geometry, and framework orchestration independently replaceable.
 
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
