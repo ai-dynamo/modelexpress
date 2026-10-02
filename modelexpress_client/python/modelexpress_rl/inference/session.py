@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import grpc
-from modelexpress.refit.timing import refit_span
 from modelexpress.adapter import StrategyRecoveryError
+from modelexpress.refit.timing import refit_span
 from modelexpress.types import ManifestMismatchError
 
 from ..control import WeightVersion
@@ -298,7 +298,12 @@ class WeightUpdateSession:
                 f"failed: {primary_error}"
             ) from recovery_error
 
-    def apply(self, update: SessionUpdate) -> Any:
+    def apply(
+        self,
+        update: SessionUpdate,
+        *,
+        checkpoint_install: Callable[[], Any] | None = None,
+    ) -> Any:
         if update.released:
             raise RuntimeError("staged weight has already been released")
         if update.applied:
@@ -313,9 +318,13 @@ class WeightUpdateSession:
                 type(update.plan.method).__name__,
                 type(update.plan.installer).__name__,
             )
-            with update.plan.method.installation_context(update.prepared):
+            if checkpoint_install is not None:
                 update.installation_started = True
-                update.apply_result = update.plan.installer.install(update.prepared)
+                update.apply_result = checkpoint_install()
+            else:
+                with update.plan.method.installation_context(update.prepared):
+                    update.installation_started = True
+                    update.apply_result = update.plan.installer.install(update.prepared)
             update.applied = True
             logger.info(
                 "ModelExpress weight update version=%s installed "

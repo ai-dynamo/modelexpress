@@ -25,7 +25,9 @@ from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
 from .adapter import GeneratorEngineContext
-from .plan import WeightSource, parse_weight_source_order
+from .checkpoint_lifecycle import CheckpointCollectiveContext, run_checkpoint_lifecycle
+from .checkpoint_transaction import CheckpointTransactionError
+from .plan import PreparedCheckpointArtifact, WeightSource, parse_weight_source_order
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime, initialize_generator_runtime
 from .session import SessionUpdate
@@ -74,6 +76,7 @@ class ModelExpressGeneratorConfig:
     # Ordered source fallback. Canonical object storage may be used alone or
     # combined with generator P2P in either order.
     source_order: tuple[WeightSource, ...] | None = None
+    checkpoint_install_mode: str = "full"
 
     def __post_init__(self) -> None:
         """Validate explicit settings before client initialization."""
@@ -89,6 +92,26 @@ class ModelExpressGeneratorConfig:
                 "source_order",
                 parse_weight_source_order(source_order_env),
             )
+        if self.checkpoint_install_mode not in ("full", "partial_if_supported"):
+            raise ValueError("checkpoint_install_mode must be full or partial_if_supported")
+        if self.checkpoint_install_mode == "partial_if_supported":
+            from .engines.vllm.context import VllmGeneratorContext
+
+            if not isinstance(self.engine_context, VllmGeneratorContext) or not isinstance(
+                self.engine_context.checkpoint_collective, CheckpointCollectiveContext
+            ):
+                raise ValueError(
+                    "partial_if_supported requires VllmGeneratorContext with a "
+                    "CheckpointCollectiveContext providing serving pause, fence, "
+                    "and finite-timeout full-worker transport"
+                )
+            if self.object_storage is None or self.source_order != (
+                WeightSource.OBJECT_STORAGE,
+            ):
+                raise ValueError(
+                    "partial_if_supported requires object_storage and explicit "
+                    "source_order=(WeightSource.OBJECT_STORAGE,) on every rank"
+                )
         if self.registration_ttl_seconds is not None:
             rl_envs.require_positive_int(
                 self.registration_ttl_seconds, "registration_ttl_seconds"
@@ -227,6 +250,8 @@ class ModelExpressGeneratorClient:
         self._engine_state = _EngineState.READY
         self._runtime: GeneratorRuntime | None = None
         self._closed = False
+        self._checkpoint_collective: CheckpointCollectiveContext | None = None
+        self._checkpoint_failed = False
 
     @classmethod
     def initialize(
@@ -268,6 +293,8 @@ class ModelExpressGeneratorClient:
         client._lease_ttl_seconds = lease_ttl_seconds
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         client._max_replay_chain_length = config.max_replay_chain_length
+        if config.checkpoint_install_mode == "partial_if_supported":
+            client._checkpoint_collective = config.engine_context.checkpoint_collective
         try:
             runtime = initialize_generator_runtime(
                 engine_context=config.engine_context,
@@ -311,6 +338,7 @@ class ModelExpressGeneratorClient:
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
         with self._operation_lock:
+            self._require_checkpoint_healthy()
             if self._active_handle is not None:
                 if self._active_handle.version_id == version.version_id:
                     return self._active_handle
@@ -363,13 +391,18 @@ class ModelExpressGeneratorClient:
         if not isinstance(staged, StagedWeightHandle) or staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
+            self._require_checkpoint_healthy()
             if self._active_handle is not staged:
                 raise RuntimeError("staged weight has already been released")
+            if self._checkpoint_collective is not None:
+                self._agree_checkpoint_apply(staged)
             if staged._update is None:
                 return None
             if staged._update.released:
                 raise RuntimeError("staged weight has already been released")
             runtime = self._require_runtime()
+            if self._checkpoint_collective is not None:
+                return self._apply_checkpoint_collectively(staged, runtime)
             was_applied = staged._update.applied
             serving_version_id = self._serving_version_id
             if not was_applied:
@@ -406,6 +439,109 @@ class ModelExpressGeneratorClient:
                         staged.version_id,
                     )
             return result
+
+    def _agree_checkpoint_apply(self, staged: StagedWeightHandle) -> None:
+        context = self._checkpoint_collective
+        assert context is not None
+        state = (
+            "apply_checkpoint",
+            self._serving_version_id,
+            staged.version_id,
+            staged._update is not None,
+            staged.applied,
+        )
+        try:
+            peers = context.gather(state)
+            if len(peers) != context.world_size or any(peer != state for peer in peers):
+                raise CheckpointTransactionError("checkpoint apply state differs across ranks")
+        except BaseException:
+            self._fence_checkpoint(self._require_runtime())
+            raise
+
+    def _fence_checkpoint(self, runtime: GeneratorRuntime) -> None:
+        self._engine_state = _EngineState.UNCERTAIN
+        if self._checkpoint_failed:
+            return
+        self._checkpoint_failed = True
+        assert self._checkpoint_collective is not None
+        try:
+            self._checkpoint_collective.fence()
+        finally:
+            try:
+                runtime.unpublish_runtime_tensors()
+            except Exception:
+                logger.exception("failed to withdraw fenced checkpoint runtime")
+
+    def _apply_checkpoint_collectively(
+        self, staged: StagedWeightHandle, runtime: GeneratorRuntime
+    ) -> Any:
+        from .methods.canonical_delta import CanonicalDeltaUpdateMethod
+
+        context = self._checkpoint_collective
+        update = staged._update
+        assert context is not None and update is not None
+        def fence() -> None:
+            self._fence_checkpoint(runtime)
+
+        def validate() -> None:
+            if not self._serving_version_id:
+                raise ValueError("collective checkpoint requires a known serving version")
+            if not isinstance(
+                update.prepared, PreparedCheckpointArtifact
+            ) or not isinstance(update.plan.method, CanonicalDeltaUpdateMethod):
+                raise TypeError("partial mode requires a canonical checkpoint artifact")
+            if not callable(
+                getattr(update.plan.installer, "install_checkpoint_collectively", None)
+            ):
+                raise TypeError("engine does not support collective checkpoint installation")
+            if update.prepared.checkpoint.target_version != staged.version_id:
+                raise ValueError("prepared checkpoint target differs from staged version")
+
+        def commit_version() -> None:
+            self._serving_version_id = staged.version_id
+
+        def install_checkpoint() -> str:
+            mode = update.plan.installer.install_checkpoint_collectively(
+                update.prepared.checkpoint,
+                serving_version=self._serving_version_id,
+                world_size=context.world_size,
+                all_gather=context.gather,
+                installation_context=lambda: update.plan.method.installation_context(
+                    update.prepared, activate=False
+                ),
+                activate=lambda: update.plan.method.activate(update.prepared),
+                commit_version=commit_version,
+                fence=fence,
+            )
+            logger.info(
+                "ModelExpress checkpoint version=%s install_mode=%s",
+                staged.version_id,
+                mode,
+            )
+            return mode
+
+        try:
+            with timing.active(staged._timing):
+                result = run_checkpoint_lifecycle(
+                    context,
+                    serving_version=self._serving_version_id,
+                    target_version=staged.version_id,
+                    validate=validate,
+                    unpublish=runtime.unpublish_runtime_tensors,
+                    install=lambda: runtime.session.apply(
+                        update, checkpoint_install=install_checkpoint
+                    ),
+                    publish=lambda: runtime.publish_runtime_tensors(staged.version_id),
+                    fence=fence,
+                )
+            self._engine_state = _EngineState.READY
+            return result
+        finally:
+            timing.emit(staged._timing, logger)
+
+    def _require_checkpoint_healthy(self) -> None:
+        if self._checkpoint_failed:
+            raise RuntimeError("checkpoint transaction failed; worker recovery required")
 
     def close(self) -> None:
         """Stop renewal and release control-plane and adapter resources."""

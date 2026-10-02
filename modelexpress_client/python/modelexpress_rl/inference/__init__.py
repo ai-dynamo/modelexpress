@@ -3,6 +3,7 @@
 
 """Inference-side ModelExpress RL integrations."""
 
+from .checkpoint_lifecycle import CheckpointCollectiveContext
 from .client import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
@@ -14,6 +15,7 @@ from .engines.vllm import VllmGeneratorContext
 from .receiver import ObjectStorageGeneratorConfig
 
 __all__ = [
+    "CheckpointCollectiveContext",
     "ModelExpressGeneratorClient",
     "ModelExpressGeneratorConfig",
     "ObjectStorageGeneratorConfig",

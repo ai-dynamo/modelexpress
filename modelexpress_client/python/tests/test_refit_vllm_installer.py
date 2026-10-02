@@ -507,3 +507,83 @@ def test_installer_rejects_missing_mla_refresh(monkeypatch, stale_name):
 
     with pytest.raises(IncompleteRefit, match=rf"{stale_name} was not refreshed"):
         installer._reload(lambda: model.projection.data.fill_(7))
+
+
+@pytest.mark.parametrize("fail_sync", [False, True])
+def test_collective_checkpoint_api_commits_or_permanently_fences(
+    monkeypatch, tmp_path, fail_sync
+):
+    from modelexpress_rl.inference.checkpoint_transaction import (
+        CheckpointTransactionError,
+    )
+
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    installer = _VllmInstaller(
+        model=nn.Module(), vllm_config=object(), model_config=object(),
+        device=torch.device("cpu"),
+    )
+    events = []
+    checkpoint = PreparedCheckpoint("target", tmp_path, {})
+    monkeypatch.setattr(installer, "install_checkpoint", lambda _path: events.append("full"))
+
+    @contextmanager
+    def locked():
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    def synchronize(_device):
+        events.append("sync")
+        if fail_sync:
+            raise RuntimeError("injected sync failure")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+
+    def apply():
+        return installer.install_checkpoint_collectively(
+            checkpoint, serving_version="base", world_size=1,
+            all_gather=lambda value: (value,), installation_context=locked,
+            activate=lambda: events.append("activate"),
+            commit_version=lambda: events.append("commit"),
+            fence=lambda: events.append("fence"),
+        )
+
+    if fail_sync:
+        with pytest.raises(CheckpointTransactionError, match="installed"):
+            apply()
+        assert events == ["enter", "full", "sync", "fence"]
+        with pytest.raises(IncompleteRefit, match="recovery required"):
+            installer.install(PreparedCheckpointArtifact(checkpoint))
+        with pytest.raises(IncompleteRefit, match="recovery required"):
+            apply()
+    else:
+        assert apply() == "full"
+        assert events == ["enter", "full", "sync", "exit", "activate", "commit"]
+
+
+def test_collective_checkpoint_rejects_different_rank_mappings(monkeypatch, tmp_path):
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    installer = _VllmInstaller(
+        model=nn.Module(), vllm_config=object(), model_config=object(),
+        device=torch.device("cpu"), checkpoint_tensor_mapping={"weight": "tokens"},
+    )
+    events = []
+
+    @contextmanager
+    def locked():
+        pytest.fail("mapping disagreement must fence before installation")
+        yield
+
+    def gather(value):
+        return (value, ({"weight": "different_tokens"}, value[1]))
+
+    with pytest.raises(IncompleteRefit, match="mappings differ"):
+        installer.install_checkpoint_collectively(
+            PreparedCheckpoint("target", tmp_path, {}), serving_version="base",
+            world_size=2, all_gather=gather, installation_context=locked,
+            activate=lambda: events.append("activate"),
+            commit_version=lambda: events.append("commit"),
+            fence=lambda: events.append("fence"),
+        )
+    assert events == ["fence"]
+    assert installer._checkpoint_fenced
