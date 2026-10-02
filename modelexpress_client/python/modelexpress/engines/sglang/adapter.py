@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import gc
 import logging
+import os
 import uuid
 from importlib.metadata import version as pkg_version
 from typing import TYPE_CHECKING, Iterator
@@ -373,6 +374,26 @@ def _get_sglang_worker_rank(load_config: LoadConfig) -> int:
         return int(getattr(load_config, "tp_rank", 0) or 0)
 
 
+def _get_sglang_node_rank(load_config: LoadConfig, global_rank: int) -> int:
+    """Return the physical node rank used for node-local artifact routing."""
+    configured = getattr(load_config, "node_rank", None)
+    if configured is not None:
+        return int(configured)
+
+    # SGLang's LoadConfig does not currently retain ServerArgs.node_rank.  Use
+    # the launcher-provided equivalents, including LeaderWorkerSet's stable
+    # per-group worker index used by the Kubernetes multi-node deployment.
+    for name in ("NODE_RANK", "LWS_WORKER_INDEX", "GROUP_RANK"):
+        value = os.getenv(name)
+        if value is not None:
+            return int(value)
+
+    local_world_size = os.getenv("LOCAL_WORLD_SIZE")
+    if local_world_size and int(local_world_size) > 0:
+        return global_rank // int(local_world_size)
+    return 0
+
+
 def build_sglang_load_context(
     load_config: LoadConfig,
     model_config: ModelConfig,
@@ -383,6 +404,7 @@ def build_sglang_load_context(
     adapter = SglangAdapter(load_config, model_config, device_config)
     worker_rank = adapter.get_worker_rank()
     global_rank = adapter.get_global_rank()
+    node_rank = _get_sglang_node_rank(load_config, global_rank)
     server_url = getattr(load_config, "modelexpress_url", None)
     return LoadContext(
         model_config=model_config,
@@ -398,6 +420,8 @@ def build_sglang_load_context(
             server_url=server_url,
         ),
         worker_id=uuid.uuid4().hex[:8],
+        node_rank=node_rank,
+        head_addr=os.getenv("LWS_LEADER_ADDRESS") or os.getenv("MASTER_ADDR"),
         adapter=adapter,
         accelerator_backend=adapter.accelerator_backend,
     )
