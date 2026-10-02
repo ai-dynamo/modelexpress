@@ -6,7 +6,11 @@
 ``base`` defines the engine-neutral read interface (:class:`Transport`,
 :class:`ReadDescriptor`) plus an in-memory reference implementation for tests;
 ``nixl`` is the production NIXL/RDMA backend. The receiver depends only on the
-``Transport`` protocol, so a non-NIXL backend is a new module here."""
+``Transport`` protocol, so a non-NIXL backend is a new module here.
+
+``nccl_m2n`` is an optional collective backend (install the ``[nccl-m2n]`` extra)
+and is imported explicitly by callers; it is not re-exported here.
+"""
 
 from modelexpress.refit.reshard.transport.base import (
     InMemoryReferenceTransport,
