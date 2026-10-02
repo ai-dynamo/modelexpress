@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if and .Values.metrics .Values.metrics.dashboard .Values.metrics.dashboard.enabled -}}
+{{- /*
+  A plain ConfigMap, so this one needs no Prometheus Operator and no capability
+  gate -- the Grafana sidecar watches for the discovery label and loads whatever
+  carries it.
+
+  The JSON arrives through .Files.Get, which does NOT render its contents as a
+  template. That is load-bearing: Grafana's own legend syntax is {{ label }},
+  which the Helm engine would otherwise try to evaluate and fail on.
+*/}}
+{{- $cfg := .Values.metrics.dashboard }}
+{{- $json := .Files.Get "dashboards/modelexpress.json" }}
+{{- if not $json }}
+{{- fail "metrics.dashboard.enabled but dashboards/modelexpress.json is missing from the chart: it is packaged from helm/dashboards, so check .helmignore if you repackaged this chart." }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "modelexpress.fullname" . }}-dashboard
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "modelexpress.labels" . | nindent 4 }}
+    {{ $cfg.label | default "grafana_dashboard" }}: {{ $cfg.labelValue | default "1" | quote }}
+    {{- with $cfg.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+data:
+  modelexpress.json: |
+{{ $json | indent 4 }}
+{{- end }}

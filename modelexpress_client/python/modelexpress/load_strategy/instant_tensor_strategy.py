@@ -21,6 +21,14 @@ from .context import LoadResult
 
 logger = logging.getLogger("modelexpress.strategy_instant_tensor")
 
+_OBJECT_STORE_URI_PREFIXES = ("s3://", "gs://", "az://")
+
+
+def _has_object_store_model_uri() -> bool:
+    """Return whether MX_MODEL_URI targets a supported object store."""
+    model_uri = (envs.MX_MODEL_URI or "").strip().lower()
+    return model_uri.startswith(_OBJECT_STORE_URI_PREFIXES)
+
 
 class InstantTensorStrategy(LoadStrategy):
     """Load weights from local safetensors via the instanttensor library.
@@ -30,9 +38,10 @@ class InstantTensorStrategy(LoadStrategy):
     ModelStreamer, GDS, or the default loader. Unlike ModelStreamer it needs no
     streaming URI; the engine resolves the model's own weight files.
 
-    Enabled by default and gated by ``MX_INSTANT_TENSOR``. Also requires the
-    ``instanttensor`` package, a CUDA-like device, and an engine adapter that
-    implements the InstantTensor iterator.
+    Enabled by default and gated by ``MX_INSTANT_TENSOR``. An object-store
+    ``MX_MODEL_URI`` skips this strategy so ModelStreamer handles the remote
+    source directly. InstantTensor also requires the ``instanttensor`` package,
+    a CUDA-like device, and an engine adapter that implements its iterator.
     """
 
     name = "instant_tensor"
@@ -47,6 +56,12 @@ class InstantTensorStrategy(LoadStrategy):
         if not envs.MX_INSTANT_TENSOR:
             logger.info(
                 f"[Worker {ctx.global_rank}] MX_INSTANT_TENSOR disabled, skipping instant tensor"
+            )
+            return False
+        if _has_object_store_model_uri():
+            logger.info(
+                f"[Worker {ctx.global_rank}] MX_MODEL_URI points to object storage, "
+                "skipping instant tensor in favor of model streamer"
             )
             return False
         if importlib.util.find_spec("instanttensor") is None:

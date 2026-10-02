@@ -18,6 +18,8 @@ without disconnecting leaves it holding a QP nothing can clean up.
 Run: pytest tests/test_nixl_peer_lifecycle.py
 """
 
+import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -30,6 +32,7 @@ class FakeAgent:
 
     def __init__(self, fail_remove: bool = False):
         self.removed: list[str] = []
+        self.deregistered: list[object] = []
         self.fail_remove = fail_remove
         self._fetched: set[str] = set()
 
@@ -46,6 +49,9 @@ class FakeAgent:
         if self.fail_remove:
             raise RuntimeError(f"remote metadata for agent '{name}' not found")
         self.removed.append(name)
+
+    def deregister_memory(self, registered):
+        self.deregistered.append(registered)
 
 
 def _manager(agent=None, metadata=b"md", accelerator=None):
@@ -153,6 +159,26 @@ class TestDisconnect:
         mgr.shutdown()
 
         assert seen["agent_alive"] is True
+        assert mgr._agent is None
+
+    def test_registered_memory_is_released_before_agent_is_dropped(self):
+        agent = FakeAgent()
+        mgr = _manager(agent=agent)
+        first, second = object(), object()
+        mgr._registered_memory = [first, second]
+        seen = []
+        real_deregister = agent.deregister_memory
+
+        def spy(registered):
+            seen.append((registered, mgr._agent is agent))
+            real_deregister(registered)
+
+        agent.deregister_memory = spy
+        mgr.shutdown()
+
+        assert seen == [(second, True), (first, True)]
+        assert agent.deregistered == [second, first]
+        assert mgr._registered_memory == []
         assert mgr._agent is None
 
     def test_removing_a_peer_twice_is_harmless(self):
@@ -277,3 +303,122 @@ class TestHealthReflectsDataPlane:
         source = _manager()
         assert source.data_plane_error is None
         assert source.is_healthy() is True
+
+
+class TestHealthReflectsTheBatchDataPlane:
+    """The same contract on the batched wait.
+
+    ``_wait_for_xfer`` records data-plane failures; ``_wait_for_xfers`` did not, and
+    it is the only wait a reshard refit performs. So the health signal that demotes a
+    worker existed on the classic load path and was absent on the refit path, which
+    is the path that pulls whole checkpoints across the fabric.
+    """
+
+    def test_a_batch_timeout_makes_the_agent_unhealthy(self):
+        class Stuck:
+            def check_xfer_state(self, handle):
+                return "PROC"
+
+        mgr = _manager(agent=Stuck())
+        with pytest.raises(TimeoutError):
+            mgr._wait_for_xfers([object(), object()], 0.02, "READ batch")
+
+        assert mgr.is_healthy() is False
+        assert "timed out" in (mgr.data_plane_error or "")
+
+    def test_a_batch_error_status_makes_the_agent_unhealthy(self):
+        class Failing:
+            def check_xfer_state(self, handle):
+                return "ERR"
+
+        mgr = _manager(agent=Failing())
+        with pytest.raises(RuntimeError):
+            mgr._wait_for_xfers([object()], 5.0, "READ batch")
+
+        assert mgr.is_healthy() is False
+        assert "ERR" in (mgr.data_plane_error or "")
+
+    def test_a_completed_batch_leaves_health_untouched(self):
+        class Done:
+            def check_xfer_state(self, handle):
+                return "DONE"
+
+        mgr = _manager(agent=Done())
+        mgr._wait_for_xfers([object(), object()], 5.0, "READ batch")
+
+        assert mgr.is_healthy() is True
+        assert mgr.data_plane_error is None
+
+    def test_a_later_successful_batch_clears_an_earlier_failure(self):
+        """Health must not latch on the batch path either."""
+
+        class Flaky:
+            def __init__(self):
+                self.state = "PROC"
+
+            def check_xfer_state(self, handle):
+                return self.state
+
+        agent = Flaky()
+        mgr = _manager(agent=agent)
+        with pytest.raises(TimeoutError):
+            mgr._wait_for_xfers([object()], 0.02, "READ batch")
+        assert mgr.is_healthy() is False
+
+        agent.state = "DONE"
+        mgr._wait_for_xfers([object()], 5.0, "READ batch")
+
+        assert mgr.is_healthy() is True
+        assert mgr.data_plane_error is None
+
+    def test_one_failed_handle_in_a_batch_is_not_cleared_by_its_siblings(self):
+        """The reason health is cleared once for the set rather than per completed
+        handle. A batch where most handles succeed and one fails is a failed batch."""
+
+        class OneBad:
+            def __init__(self):
+                self.seen = 0
+
+            def check_xfer_state(self, handle):
+                self.seen += 1
+                return "ERR" if self.seen == 3 else "DONE"
+
+        mgr = _manager(agent=OneBad())
+        with pytest.raises(RuntimeError):
+            mgr._wait_for_xfers([object(), object(), object()], 5.0, "READ batch")
+
+        assert mgr.is_healthy() is False
+
+    def test_waiting_on_nothing_does_not_clear_an_earlier_failure(self):
+        """An empty set proves nothing about the fabric, so it must not restore
+        health. ``await_read_batches`` returns early today, so this pins the helper
+        rather than that caller."""
+        mgr = _manager()
+        mgr._data_plane_error = "an earlier timeout"
+
+        mgr._wait_for_xfers([], 5.0, "READ batch")
+
+        assert mgr.is_healthy() is False
+        assert mgr.data_plane_error == "an earlier timeout"
+
+    def test_the_refit_wait_records_a_failure_through_the_public_entry_point(self):
+        """The gap reached health through `await_read_batches`, so cover it there and
+        not only on the private helper."""
+
+        class Stuck:
+            def check_xfer_state(self, handle):
+                return "PROC"
+
+            def release_xfer_handle(self, handle):
+                pass
+
+        mgr = _manager(agent=Stuck())
+        posted = SimpleNamespace(
+            handle=object(), total_bytes=1, num_ranges=1, posted_at=time.perf_counter()
+        )
+
+        with pytest.raises(TimeoutError):
+            mgr.await_read_batches([posted], timeout_seconds=0.02)
+
+        assert mgr.is_healthy() is False
+        assert "timed out" in (mgr.data_plane_error or "")

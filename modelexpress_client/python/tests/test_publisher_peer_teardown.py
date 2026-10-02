@@ -58,11 +58,20 @@ def publisher(mx_client, nixl_manager):
 
 
 def _status_calls(mx_client, status):
+    # Match on the identity/status kwargs this test is about, not on the whole
+    # call signature: the heartbeat also carries advisory telemetry (source_load),
+    # and asserting an exact `call(...)` would couple these lifecycle tests to
+    # every future field added to update_status.
+    expected = {
+        "mx_source_id": "abc123",
+        "worker_id": "w1",
+        "worker_rank": 0,
+        "status": status,
+    }
     return [
         c
         for c in mx_client.update_status.call_args_list
-        if c
-        == call(mx_source_id="abc123", worker_id="w1", worker_rank=0, status=status)
+        if all(c.kwargs.get(k) == v for k, v in expected.items())
     ]
 
 

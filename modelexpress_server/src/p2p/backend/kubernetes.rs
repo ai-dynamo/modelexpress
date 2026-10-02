@@ -327,6 +327,8 @@ impl MetadataBackend for KubernetesBackend {
             agent_name: worker_record.agent_name.clone(),
             worker_grpc_endpoint: worker_record.worker_grpc_endpoint.clone(),
             accelerator: worker_record.accelerator.clone(),
+            source_load: worker_record.source_load,
+            topology: worker_record.topology.clone(),
             artifact_source: worker_record
                 .artifact_source
                 .clone()
@@ -478,6 +480,8 @@ impl MetadataBackend for KubernetesBackend {
                 agent_name: worker_status.agent_name.clone(),
                 worker_grpc_endpoint: worker_status.worker_grpc_endpoint.clone(),
                 accelerator: worker_status.accelerator.clone(),
+                source_load: worker_status.source_load,
+                topology: worker_status.topology.clone(),
                 artifact_source: worker_status
                     .artifact_source
                     .clone()
@@ -593,6 +597,18 @@ impl MetadataBackend for KubernetesBackend {
                 .and_then(|s| s.worker.as_ref())
                 .map(|w| w.accelerator.clone())
                 .unwrap_or_default();
+            let source_load = cr
+                .status
+                .as_ref()
+                .and_then(|s| s.worker.as_ref())
+                .and_then(|w| w.source_load);
+
+            let topology = cr
+                .status
+                .as_ref()
+                .and_then(|s| s.worker.as_ref())
+                .map(|w| w.topology.clone())
+                .unwrap_or_default();
 
             result.push(super::SourceInstanceInfo {
                 source_id: sid,
@@ -602,6 +618,8 @@ impl MetadataBackend for KubernetesBackend {
                 status,
                 updated_at,
                 accelerator,
+                source_load,
+                topology,
                 // The current CRD list shape does not round-trip
                 // SourceIdentity.extra_parameters.
                 training_step: None,
@@ -705,6 +723,7 @@ impl MetadataBackend for KubernetesBackend {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
+        source_load: Option<f32>,
     ) -> MetadataResult<()> {
         let api = self.model_metadata_api();
         let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
@@ -732,6 +751,7 @@ impl MetadataBackend for KubernetesBackend {
 
             worker.status = status_name.clone();
             worker.updated_at = Some(updated_at_rfc3339.clone());
+            worker.source_load = source_load;
 
             crd_status.update_ready_condition(status as i32);
 
@@ -862,6 +882,26 @@ mod tests {
         };
 
         assert!(ArtifactSourceMetadataRecord::try_from(status).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn worker_status_topology_survives_serde_round_trip() {
+        // The k8s backend stores WorkerStatus as CR JSON, so a non-empty
+        // topology must survive the round trip. The deployed CRD schema must
+        // also carry status.worker.topology (examples/crds.yaml) or the API
+        // server prunes it.
+        let status = WorkerStatus {
+            topology: std::collections::HashMap::from([
+                ("rack".to_string(), "r3".to_string()),
+                ("block".to_string(), "b1".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status).expect("serialize");
+        let back: WorkerStatus = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.topology, status.topology);
+        assert_eq!(back.topology.get("rack").map(String::as_str), Some("r3"));
     }
 
     #[test]

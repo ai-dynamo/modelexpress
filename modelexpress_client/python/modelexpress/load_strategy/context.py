@@ -57,8 +57,13 @@ class LoadContext:
     model_config: EngineModelConfig
     load_config: EngineLoadConfig
     target_device: torch.device
+    # Unique process rank in the engine's distributed world.
     global_rank: int
+    # Model-shard key used to match compatible MX source and target workers.
     worker_rank: int
+    # Process rank within its node; local rank 0 coordinates node-local state.
+    local_rank: int
+    # Local accelerator ordinal; topology must not be inferred from this value.
     device_id: int
     identity: p2p_pb2.SourceIdentity
     mx_client: MxClientBase
@@ -75,6 +80,8 @@ class LoadContext:
     )
     # False keeps a secondary in-process load (the MTP drafter) out of P2P.
     p2p_enabled: bool = True
+    # RL cold start snapshots this once after distributed rank agreement.
+    desired_version_uid: str | None = None
     # Optional engine-level gate checked before weight metadata is advertised.
     source_ready_fn: Callable[[], bool] | None = None
     nixl_manager: NixlTransferManager | None = None

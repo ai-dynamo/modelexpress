@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::models::ModelProvider;
-use crate::providers::{GcsProvider, HuggingFaceProvider, ModelProviderTrait, NgcProvider};
+use crate::providers::{
+    GcsProvider, HuggingFaceProvider, ModelDownloadOutcome, ModelProviderTrait, NgcProvider,
+    S3Provider,
+};
 use anyhow::Result;
 use std::path::PathBuf;
 use tracing::{info, warn};
@@ -14,6 +17,7 @@ pub fn get_provider(provider: ModelProvider) -> Box<dyn ModelProviderTrait> {
         ModelProvider::HuggingFace => Box::new(HuggingFaceProvider),
         ModelProvider::Ngc => Box::new(NgcProvider),
         ModelProvider::Gcs => Box::new(GcsProvider),
+        ModelProvider::S3 => Box::new(S3Provider),
     }
 }
 
@@ -42,6 +46,53 @@ pub async fn download_model(
 
     provider_impl
         .download_model(model_name, cache_dir, ignore_weights)
+        .await
+}
+
+/// Download a model at a specific revision, reporting the revision it resolved to.
+///
+/// A `None` revision downloads the provider's default revision; providers that expose
+/// revisions still report the immutable revision they picked.
+pub async fn download_model_revision(
+    model_name: &str,
+    provider: ModelProvider,
+    cache_dir: Option<PathBuf>,
+    ignore_weights: bool,
+    revision: Option<&str>,
+) -> Result<ModelDownloadOutcome> {
+    let provider_impl = get_provider(provider);
+    match revision {
+        Some(revision) => info!(
+            "Downloading model '{}' at revision '{}' using provider: {}",
+            model_name,
+            revision,
+            provider_impl.provider_name()
+        ),
+        None => info!(
+            "Downloading model '{}' using provider: {}",
+            model_name,
+            provider_impl.provider_name()
+        ),
+    }
+
+    if ignore_weights {
+        warn!("`ignore_weights` is set to true. All the model weight files will be ignored!");
+    }
+
+    provider_impl
+        .download_model_revision(model_name, cache_dir, ignore_weights, revision)
+        .await
+}
+
+/// Resolve a requested revision to the provider's immutable identifier for it.
+pub async fn resolve_revision(
+    model_name: &str,
+    provider: ModelProvider,
+    cache_dir: Option<PathBuf>,
+    revision: Option<&str>,
+) -> Result<Option<String>> {
+    get_provider(provider)
+        .resolve_revision(model_name, cache_dir, revision)
         .await
 }
 
@@ -112,6 +163,9 @@ mod tests {
 
         let provider = get_provider(ModelProvider::Gcs);
         assert_eq!(provider.provider_name(), "GCS");
+
+        let provider = get_provider(ModelProvider::S3);
+        assert_eq!(provider.provider_name(), "S3");
     }
 
     #[test]
@@ -125,6 +179,11 @@ mod tests {
             canonical_model_name("gs://test-bucket/org/model/rev-1/", ModelProvider::Gcs)
                 .expect("Expected canonical model name"),
             "gs://test-bucket/org/model/rev-1"
+        );
+        assert_eq!(
+            canonical_model_name("s3://test-bucket/org/model/rev-1/", ModelProvider::S3)
+                .expect("Expected canonical model name"),
+            "s3://test-bucket/org/model/rev-1"
         );
     }
 

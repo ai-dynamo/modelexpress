@@ -11,15 +11,53 @@ or override env.REDIS_URL to point at your own instance.
 {{- end }}
 {{- if eq .Values.env.MX_METADATA_BACKEND "kubernetes" }}
 
-IMPORTANT: The Kubernetes backend requires the ModelExpress CRDs to be installed
-cluster-wide (examples/crds.yaml) and serviceAccount.rbac.enabled=true so the
-server can manage ModelMetadata and ModelCacheEntry resources.
+IMPORTANT: Helm installs missing CRDs from this chart, but does not update CRDs
+that already exist. Before upgrading, or when installing on a cluster with an
+older ModelExpress installation, apply the CRDs shipped with this chart:
+
+From a source checkout:
+
+  kubectl apply -f helm/crds/modelexpress-crds.yaml
+
+For a packaged or remote chart, extract the CRDs from the same chart version:
+
+  helm show crds CHART_REFERENCE --version {{ .Chart.Version }} | kubectl apply -f -
+
+Set serviceAccount.rbac.enabled=true so the server can manage ModelMetadata and
+ModelCacheEntry resources with the Kubernetes backend.
 {{- end }}
 {{- else }}
 
 WARNING: MX_METADATA_BACKEND is not set in values. The server will fail to start —
 set env.MX_METADATA_BACKEND to "redis" or "kubernetes" (with the matching
 connection settings) and re-run `helm upgrade`.
+{{- end }}
+{{- if .Values.metrics }}
+{{- /*
+  Checked per resource, not once for the set. A shared flag would let labels on
+  one resource suppress the warning for another that is still unlabelled — and
+  an unlabelled resource is ignored silently, which is the whole problem.
+*/}}
+{{- $unlabelled := list }}
+{{- range $key := (list "podMonitor" "clientPodMonitor" "rules") }}
+{{- $section := index $.Values.metrics $key }}
+{{- if and $section $section.enabled (not $section.additionalLabels) }}
+{{- $unlabelled = append $unlabelled (printf "metrics.%s.additionalLabels" $key) }}
+{{- end }}
+{{- end }}
+{{- if $unlabelled }}
+
+IMPORTANT: These values were left empty: {{ join ", " $unlabelled }}
+
+Prometheus only adopts a PodMonitor or PrometheusRule whose labels match its
+podMonitorSelector / ruleSelector, and kube-prometheus-stack defaults both to
+`release: <its own release name>`. An unmatched resource is ignored silently —
+no error, no targets, no alerts. Check what yours expects:
+
+  kubectl get prometheus -A -o jsonpath='{.items[*].spec.podMonitorSelector}'
+
+then set the values listed above to match.
+{{- end }}
 {{- end }}
 
 1. Get the gRPC service endpoint by running these commands:

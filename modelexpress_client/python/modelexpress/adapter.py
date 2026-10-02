@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import functools
 import os
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
 
@@ -32,6 +32,15 @@ class StrategyFailed(RuntimeError):
     def __init__(self, message: str, *, mutated: bool = False):
         super().__init__(message)
         self.mutated = mutated
+
+
+class StrategyRecoveryError(RuntimeError):
+    """Raised when a failed strategy cannot restore a safe model state.
+
+    The strategy chain must stop immediately: trying another loader with a
+    partially cleared or otherwise unrecoverable model would hide the original
+    recovery failure and may publish invalid weights.
+    """
 
 
 def gated_capability(method):
@@ -154,7 +163,12 @@ class EngineAdapter:
 
     @gated_capability
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
-        """Replace a possibly-mutated model with a fresh engine model instance."""
+        """Restore a possibly-mutated model to freshly initialized state.
+
+        Adapters may return a different model object, or preserve the root
+        object's identity while replacing its complete internal state when an
+        engine-owned caller retains the original root reference.
+        """
         ...
 
     def get_unique_id(self) -> str:
@@ -194,3 +208,11 @@ class EngineAdapter:
     def after_native_load(self, result: LoadResult) -> LoadResult:
         """Run engine post-processing after load_via_native() succeeds."""
         return result
+
+    def all_gather_state(self, state: Any) -> tuple[Any, ...]:
+        """All-gather one state value from every engine rank."""
+        return (state,)
+
+    def broadcast_state(self, state: Any) -> Any:
+        """Broadcast one state value from global rank zero."""
+        return state

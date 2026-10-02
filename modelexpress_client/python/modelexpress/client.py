@@ -41,6 +41,10 @@ class MxClientBase(ABC):
 
     REQUIRES_P2P_METADATA: bool = False
 
+    def worker_rpc_retry_policy(self) -> tuple[int, float]:
+        """Return fresh-channel retries and backoff for worker RPCs."""
+        return 0, 0.0
+
     @abstractmethod
     def publish_metadata(
         self,
@@ -73,6 +77,7 @@ class MxClientBase(ABC):
         worker_id: str,
         worker_rank: int,
         status: "p2p_pb2.SourceStatus",
+        source_load: float | None = None,
     ) -> bool:
         """Update a source worker's lifecycle status."""
 
@@ -96,8 +101,9 @@ def _get_server_url(explicit_url: str | None = None) -> str:
 
     Priority:
     1. Explicit ``server_url`` argument
-    2. ``MODEL_EXPRESS_URL`` env var (Dynamo-consistent)
-    3. ``MX_SERVER_ADDRESS`` env var (backward compat)
+    2. ``MODEL_EXPRESS_URL`` env var (deprecated, but still takes precedence:
+       the TRT-LLM live-transfer integration reads only this name)
+    3. ``MX_SERVER_ADDRESS`` env var (the name ModelExpress is standardizing on)
     4. Default ``localhost:8001``
     """
     if explicit_url:
@@ -218,6 +224,7 @@ class MxClient(MxClientBase):
         worker_id: str,
         worker_rank: int,
         status: "p2p_pb2.SourceStatus",
+        source_load: float | None = None,
     ) -> bool:
         """Update worker status.  Returns *True* on success."""
         request = p2p_pb2.UpdateStatusRequest(
@@ -226,6 +233,10 @@ class MxClient(MxClientBase):
             worker_rank=worker_rank,
             status=status,
         )
+        # Leave the optional field unset when there is no reading: presence is
+        # how the server and pullers tell "unknown" from a measured 0.0.
+        if source_load is not None:
+            request.source_load = source_load
         response = self.stub.UpdateStatus(request, timeout=30)
         if not response.success:
             logger.error("UpdateStatus failed: %s", response.message)

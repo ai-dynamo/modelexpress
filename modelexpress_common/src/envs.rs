@@ -45,10 +45,6 @@ pub const MODEL_EXPRESS_CACHE_DIRECTORY: &str = "MODEL_EXPRESS_CACHE_DIRECTORY";
 pub const MODEL_EXPRESS_LOG_LEVEL: &str = "MODEL_EXPRESS_LOG_LEVEL";
 /// Log output format (client and server).
 pub const MODEL_EXPRESS_LOG_FORMAT: &str = "MODEL_EXPRESS_LOG_FORMAT";
-/// Maximum connection/request retries (`ClientArgs::max_retries`).
-pub const MODEL_EXPRESS_MAX_RETRIES: &str = "MODEL_EXPRESS_MAX_RETRIES";
-/// Delay between retries in seconds (`ClientArgs::retry_delay`).
-pub const MODEL_EXPRESS_RETRY_DELAY: &str = "MODEL_EXPRESS_RETRY_DELAY";
 /// Disable shared-storage mode (`ClientArgs::no_shared_storage`).
 pub const MODEL_EXPRESS_NO_SHARED_STORAGE: &str = "MODEL_EXPRESS_NO_SHARED_STORAGE";
 /// File-transfer chunk size in bytes (`ClientArgs::transfer_chunk_size`).
@@ -57,10 +53,30 @@ pub const MODEL_EXPRESS_TRANSFER_CHUNK_SIZE: &str = "MODEL_EXPRESS_TRANSFER_CHUN
 pub const MODEL_EXPRESS_SERVER_PORT: &str = "MODEL_EXPRESS_SERVER_PORT";
 /// Server host/bind address (`ServerArgs::host`).
 pub const MODEL_EXPRESS_SERVER_HOST: &str = "MODEL_EXPRESS_SERVER_HOST";
+/// Prometheus `/metrics` listen port (`ServerArgs::metrics_port`).
+///
+/// Read **only** through the clap `#[arg(env = ...)]` attribute, never through
+/// the layered config loader. [`crate::config::load_layered_config`] builds its
+/// environment source as `Environment::with_prefix("MODEL_EXPRESS").separator("_")`,
+/// so this name resolves to the key path `server.metrics.port` — which no field
+/// matches — and serde drops it without a warning. The clap override is the only
+/// path that reaches `ServerSettings::metrics_port`.
+pub const MODEL_EXPRESS_SERVER_METRICS_PORT: &str = "MODEL_EXPRESS_SERVER_METRICS_PORT";
 /// Toggle the background cache-eviction sweeper (`ServerArgs::cache_eviction_enabled`).
 pub const MODEL_EXPRESS_CACHE_EVICTION_ENABLED: &str = "MODEL_EXPRESS_CACHE_EVICTION_ENABLED";
 /// Server endpoint used by the cache module's default-endpoint helper.
 pub const MODEL_EXPRESS_SERVER_ENDPOINT: &str = "MODEL_EXPRESS_SERVER_ENDPOINT";
+
+// ── Metrics ─────────────────────────────────────────────────────────────────
+/// Benchmark run label carried by `mx_build_info`.
+///
+/// Shared verbatim with the Python client's `MX_METRICS_SCHEME`, so one run
+/// label covers both halves of a deployment. Note the asymmetry: the server
+/// carries it only on `mx_build_info`, while the client also carries it on every
+/// `mx_p2p_*` family. It is process-constant either way, so consolidating the
+/// client onto `mx_build_info` alone is a follow-on taxonomy change, not
+/// something to assume has already happened.
+pub const MX_METRICS_SCHEME: &str = "MX_METRICS_SCHEME";
 
 // ── HuggingFace ─────────────────────────────────────────────────────────────
 /// HuggingFace Hub auth token.
@@ -93,7 +109,9 @@ pub const DEFAULT_NGC_AUTHN_BASE: &str = "https://authn.nvidia.com";
 // ── Redis / metadata backend (server) ───────────────────────────────────────
 /// Selects the metadata backend implementation (`redis`, `kubernetes`, `memory`).
 pub const MX_METADATA_BACKEND: &str = "MX_METADATA_BACKEND";
-/// Full Redis connection URL for the redis metadata backend.
+/// Full Redis connection URL (preferred) for the redis metadata backend.
+pub const MX_REDIS_URL: &str = "MX_REDIS_URL";
+/// Full Redis connection URL alias for charts predating the `MX_` prefix.
 pub const REDIS_URL: &str = "REDIS_URL";
 /// Redis host (preferred) when building the URL from host + port.
 pub const MX_REDIS_HOST: &str = "MX_REDIS_HOST";
@@ -107,14 +125,12 @@ pub const REDIS_PORT: &str = "REDIS_PORT";
 pub const MX_METADATA_NAMESPACE: &str = "MX_METADATA_NAMESPACE";
 /// Kubernetes namespace injected via the downward API for in-cluster pods.
 pub const POD_NAMESPACE: &str = "POD_NAMESPACE";
-/// Kubernetes pod name injected via the downward API (used by clients).
-pub const POD_NAME: &str = "POD_NAME";
-/// Kubernetes pod UID injected via the downward API (used by clients).
-pub const POD_UID: &str = "POD_UID";
 
 // ── Reaper (server) ─────────────────────────────────────────────────────────
 /// Interval (seconds) between reaper scans for stale/GC worker sweeps.
 pub const MX_REAPER_SCAN_INTERVAL_SECS: &str = "MX_REAPER_SCAN_INTERVAL_SECS";
+/// Interval (seconds) between registry-statistics refresh passes.
+pub const MX_REGISTRY_STATS_INTERVAL_SECS: &str = "MX_REGISTRY_STATS_INTERVAL_SECS";
 /// Age (seconds) after which an active worker's heartbeat is considered stale.
 pub const MX_HEARTBEAT_TIMEOUT_SECS: &str = "MX_HEARTBEAT_TIMEOUT_SECS";
 /// Age (seconds) after which a STALE worker is garbage-collected.
@@ -147,6 +163,10 @@ pub const KUBECONFIG: &str = "KUBECONFIG";
 
 // ── Default reaper timings ───────────────────────────────────────────────────
 const DEFAULT_REAPER_SCAN_INTERVAL_SECS: u64 = 30;
+/// Default registry-statistics refresh interval. Each pass walks the keyspace,
+/// so this is deliberately coarser than a scrape: the gauges it writes change
+/// on the timescale of downloads, not of scrapes.
+const DEFAULT_REGISTRY_STATS_INTERVAL_SECS: u64 = 60;
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_GC_TIMEOUT_SECS: u64 = 3600;
 
@@ -179,6 +199,14 @@ pub fn cache_directory() -> Option<PathBuf> {
 pub fn server_endpoint_or_default() -> String {
     env::var(MODEL_EXPRESS_SERVER_ENDPOINT)
         .unwrap_or_else(|_| format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT))
+}
+
+/// Benchmark run label from [`MX_METRICS_SCHEME`]; empty string when unset.
+///
+/// Empty is a valid value, not a missing one: outside a benchmark there is no
+/// scheme, and `mx_build_info` still needs its one series.
+pub fn metrics_scheme() -> String {
+    env::var(MX_METRICS_SCHEME).unwrap_or_default()
 }
 
 /// HuggingFace Hub token from [`HF_TOKEN`].
@@ -233,9 +261,9 @@ pub fn metadata_backend() -> String {
     env::var(MX_METADATA_BACKEND).unwrap_or_default()
 }
 
-/// Full Redis URL from [`REDIS_URL`].
+/// Full Redis URL from [`MX_REDIS_URL`], then [`REDIS_URL`].
 pub fn redis_url() -> Option<String> {
-    env::var(REDIS_URL).ok()
+    env::var(MX_REDIS_URL).or_else(|_| env::var(REDIS_URL)).ok()
 }
 
 /// Redis host from [`MX_REDIS_HOST`], then [`REDIS_HOST`].
@@ -265,6 +293,19 @@ pub fn reaper_scan_interval_secs() -> u64 {
         MX_REAPER_SCAN_INTERVAL_SECS,
         DEFAULT_REAPER_SCAN_INTERVAL_SECS,
     )
+}
+
+/// Registry-statistics refresh interval in seconds
+/// ([`MX_REGISTRY_STATS_INTERVAL_SECS`], default 60).
+///
+/// Clamped to at least 1: `tokio::time::interval` panics on a zero period, so a
+/// deployment that set this to 0 would take the refresh task down at startup.
+pub fn registry_stats_interval_secs() -> u64 {
+    env_u64(
+        MX_REGISTRY_STATS_INTERVAL_SECS,
+        DEFAULT_REGISTRY_STATS_INTERVAL_SECS,
+    )
+    .max(1)
 }
 
 /// Heartbeat staleness timeout in seconds ([`MX_HEARTBEAT_TIMEOUT_SECS`], default 90).
@@ -302,8 +343,6 @@ mod tests {
         );
         assert_eq!(MODEL_EXPRESS_LOG_LEVEL, "MODEL_EXPRESS_LOG_LEVEL");
         assert_eq!(MODEL_EXPRESS_LOG_FORMAT, "MODEL_EXPRESS_LOG_FORMAT");
-        assert_eq!(MODEL_EXPRESS_MAX_RETRIES, "MODEL_EXPRESS_MAX_RETRIES");
-        assert_eq!(MODEL_EXPRESS_RETRY_DELAY, "MODEL_EXPRESS_RETRY_DELAY");
         assert_eq!(
             MODEL_EXPRESS_NO_SHARED_STORAGE,
             "MODEL_EXPRESS_NO_SHARED_STORAGE"
@@ -315,6 +354,10 @@ mod tests {
         assert_eq!(MODEL_EXPRESS_SERVER_PORT, "MODEL_EXPRESS_SERVER_PORT");
         assert_eq!(MODEL_EXPRESS_SERVER_HOST, "MODEL_EXPRESS_SERVER_HOST");
         assert_eq!(
+            MODEL_EXPRESS_SERVER_METRICS_PORT,
+            "MODEL_EXPRESS_SERVER_METRICS_PORT"
+        );
+        assert_eq!(
             MODEL_EXPRESS_CACHE_EVICTION_ENABLED,
             "MODEL_EXPRESS_CACHE_EVICTION_ENABLED"
         );
@@ -322,6 +365,7 @@ mod tests {
             MODEL_EXPRESS_SERVER_ENDPOINT,
             "MODEL_EXPRESS_SERVER_ENDPOINT"
         );
+        assert_eq!(MX_METRICS_SCHEME, "MX_METRICS_SCHEME");
         assert_eq!(HF_TOKEN, "HF_TOKEN");
         assert_eq!(HF_HUB_CACHE, "HF_HUB_CACHE");
         assert_eq!(HF_HUB_OFFLINE, "HF_HUB_OFFLINE");
@@ -332,6 +376,7 @@ mod tests {
         assert_eq!(NGC_CLI_API_KEY, "NGC_CLI_API_KEY");
         assert_eq!(NGC_CLI_HOME, "NGC_CLI_HOME");
         assert_eq!(MX_METADATA_BACKEND, "MX_METADATA_BACKEND");
+        assert_eq!(MX_REDIS_URL, "MX_REDIS_URL");
         assert_eq!(REDIS_URL, "REDIS_URL");
         assert_eq!(MX_REDIS_HOST, "MX_REDIS_HOST");
         assert_eq!(REDIS_HOST, "REDIS_HOST");
@@ -340,6 +385,10 @@ mod tests {
         assert_eq!(MX_METADATA_NAMESPACE, "MX_METADATA_NAMESPACE");
         assert_eq!(POD_NAMESPACE, "POD_NAMESPACE");
         assert_eq!(MX_REAPER_SCAN_INTERVAL_SECS, "MX_REAPER_SCAN_INTERVAL_SECS");
+        assert_eq!(
+            MX_REGISTRY_STATS_INTERVAL_SECS,
+            "MX_REGISTRY_STATS_INTERVAL_SECS"
+        );
         assert_eq!(MX_HEARTBEAT_TIMEOUT_SECS, "MX_HEARTBEAT_TIMEOUT_SECS");
         assert_eq!(MX_GC_TIMEOUT_SECS, "MX_GC_TIMEOUT_SECS");
         assert_eq!(MODEL_EXPRESS_SECURITY_MODE, "MODEL_EXPRESS_SECURITY_MODE");
@@ -360,8 +409,6 @@ mod tests {
         assert_eq!(HOME, "HOME");
         assert_eq!(USERPROFILE, "USERPROFILE");
         assert_eq!(KUBECONFIG, "KUBECONFIG");
-        assert_eq!(POD_NAME, "POD_NAME");
-        assert_eq!(POD_UID, "POD_UID");
     }
 
     #[test]
@@ -415,6 +462,16 @@ mod tests {
         assert_eq!(redis_host().as_deref(), Some("legacy-host"));
         let _h1 = EnvVarGuard::set(&lock, MX_REDIS_HOST, "mx-host");
         assert_eq!(redis_host().as_deref(), Some("mx-host"));
+
+        let _u1 = EnvVarGuard::remove(&lock, MX_REDIS_URL);
+        let _u2 = EnvVarGuard::set(&lock, REDIS_URL, "redis://legacy:6379/0");
+        assert_eq!(redis_url().as_deref(), Some("redis://legacy:6379/0"));
+        let _u1 = EnvVarGuard::set(&lock, MX_REDIS_URL, "redis://mx:6379/0");
+        assert_eq!(redis_url().as_deref(), Some("redis://mx:6379/0"));
+        let _u2 = EnvVarGuard::remove(&lock, REDIS_URL);
+        assert_eq!(redis_url().as_deref(), Some("redis://mx:6379/0"));
+        let _u1 = EnvVarGuard::remove(&lock, MX_REDIS_URL);
+        assert_eq!(redis_url(), None);
 
         let _n1 = EnvVarGuard::remove(&lock, MX_METADATA_NAMESPACE);
         let _n2 = EnvVarGuard::set(&lock, POD_NAMESPACE, "pod-ns");

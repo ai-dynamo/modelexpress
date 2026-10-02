@@ -5,6 +5,7 @@
 
 import os
 import sys
+import weakref
 from contextlib import contextmanager
 from types import ModuleType
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from modelexpress.engines.sglang.adapter import (
     build_sglang_load_context,
 )
 from modelexpress.engines.sglang.loader import MxModelLoader
+from modelexpress.load_strategy.context import LoadResult
 
 
 def _load_config(**overrides):
@@ -92,12 +94,14 @@ def test_sglang_context_uses_tp_rank_for_matching_and_url_override():
 
 
 def test_sglang_context_separates_worker_rank_from_global_rank(monkeypatch):
+    """Keep SGLang's engine worker rank separate from the distributed rank."""
     sglang_mod = ModuleType("sglang")
     srt_mod = ModuleType("sglang.srt")
     distributed_mod = ModuleType("sglang.srt.distributed")
     distributed_mod.get_tensor_model_parallel_rank = lambda: 1
     distributed_mod.get_pipeline_model_parallel_rank = lambda: 2
     distributed_mod.get_tensor_model_parallel_world_size = lambda: 4
+    distributed_mod.get_world_group = lambda: SimpleNamespace(local_rank=3)
     srt_mod.distributed = distributed_mod
 
     monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
@@ -115,6 +119,7 @@ def test_sglang_context_separates_worker_rank_from_global_rank(monkeypatch):
 
     assert ctx.worker_rank == 9
     assert ctx.global_rank == 17
+    assert ctx.local_rank == 3
     assert ctx.mx_client.server_url == "mx.example:9000"
 
 
@@ -381,6 +386,8 @@ def test_sglang_retry_initializes_model_with_configured_dtype(monkeypatch):
     loader_mod = ModuleType("sglang.srt.model_loader.loader")
     model_loader_utils_mod = ModuleType("sglang.srt.model_loader.utils")
     observed_dtypes = []
+    initial_model = nn.Linear(2, 2)
+    initial_weight_ref = weakref.ref(initial_model.weight)
 
     @contextmanager
     def set_default_torch_dtype(dtype):
@@ -394,6 +401,7 @@ def test_sglang_retry_initializes_model_with_configured_dtype(monkeypatch):
     loader_mod._get_quantization_config = lambda *_: None
 
     def initialize_model(*_):
+        assert initial_weight_ref() is None
         observed_dtypes.append(torch.get_default_dtype())
         return nn.Linear(2, 2)
 
@@ -411,16 +419,124 @@ def test_sglang_retry_initializes_model_with_configured_dtype(monkeypatch):
 
     model_config = _model_config(dtype=torch.bfloat16)
     adapter = SglangAdapter(_load_config(), model_config, _device_config())
-    result = SimpleNamespace(
-        value=nn.Linear(2, 2),
-        model=nn.Linear(2, 2),
+    result = LoadResult(
+        value=initial_model,
+        model=initial_model,
         publishable=True,
     )
 
-    adapter.reinit_for_retry(result)
+    retried = adapter.reinit_for_retry(result)
 
     assert observed_dtypes == [torch.bfloat16]
     assert torch.get_default_dtype() == original_dtype
+    assert retried.value is initial_model
+    assert retried.model is initial_model
+    assert list(initial_model.parameters())
+
+
+def test_sglang_retry_failure_restores_envelope_and_original_error(monkeypatch):
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    model_loader_mod = ModuleType("sglang.srt.model_loader")
+    loader_mod = ModuleType("sglang.srt.model_loader.loader")
+    model_loader_utils_mod = ModuleType("sglang.srt.model_loader.utils")
+
+    @contextmanager
+    def set_default_torch_dtype(_dtype):
+        yield
+
+    failure = RuntimeError("fresh initialization failed")
+    loader_mod._get_quantization_config = lambda *_: None
+    loader_mod._initialize_model = MagicMock(side_effect=failure)
+    model_loader_utils_mod.set_default_torch_dtype = set_default_torch_dtype
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader", model_loader_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader.loader", loader_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.model_loader.utils",
+        model_loader_utils_mod,
+    )
+
+    model = nn.Linear(2, 2)
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    result = LoadResult(value=model, model=model, metadata={"attempt": 1})
+
+    with pytest.raises(RuntimeError) as exc:
+        adapter.reinit_for_retry(result)
+
+    assert exc.value is failure
+    assert result.value is model
+    assert result.model is model
+    assert result.metadata == {"attempt": 1}
+    assert model.__dict__ == {}
+
+
+def test_sglang_retry_reuses_root_for_native_fallback(monkeypatch):
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    model_loader_mod = ModuleType("sglang.srt.model_loader")
+    loader_mod = ModuleType("sglang.srt.model_loader.loader")
+    model_loader_utils_mod = ModuleType("sglang.srt.model_loader.utils")
+    configs_mod = ModuleType("sglang.srt.configs")
+    load_config_mod = ModuleType("sglang.srt.configs.load_config")
+
+    @contextmanager
+    def set_default_torch_dtype(_dtype):
+        yield
+
+    initial_model = nn.Linear(2, 2)
+    initial_weight_ref = weakref.ref(initial_model.weight)
+    native_roots = []
+
+    loader_mod._get_quantization_config = lambda *_: None
+
+    def initialize_model(*_):
+        assert initial_weight_ref() is None
+        return nn.Linear(2, 2)
+
+    class DefaultModelLoader:
+        def __init__(self, _load_config):
+            pass
+
+        def _get_all_weights(self, _model_config, model):
+            native_roots.append(model)
+            return iter([])
+
+        @staticmethod
+        def load_weights_and_postprocess(model, _weights, _target_device):
+            model.weight.data.fill_(7)
+
+    loader_mod._initialize_model = initialize_model
+    loader_mod.DefaultModelLoader = DefaultModelLoader
+    model_loader_utils_mod.set_default_torch_dtype = set_default_torch_dtype
+    load_config_mod.LoadFormat = SimpleNamespace(AUTO="auto")
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader", model_loader_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader.loader", loader_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.model_loader.utils",
+        model_loader_utils_mod,
+    )
+    monkeypatch.setitem(sys.modules, "sglang.srt.configs", configs_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.configs.load_config",
+        load_config_mod,
+    )
+
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    result = LoadResult(value=initial_model, model=initial_model)
+
+    retried = adapter.reinit_for_retry(result)
+    loaded = adapter.load_via_native(retried)
+
+    assert loaded.model is initial_model
+    assert native_roots == [initial_model]
+    assert torch.all(initial_model.weight == 7)
 
 
 def test_mx_model_loader_delegates_to_shared_strategy_chain():
@@ -459,7 +575,7 @@ def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain(
     loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
 
     with patch.dict(os.environ, {"MX_ARTIFACT_READY_URL": ready_url}), patch(
-        "modelexpress.engines.sglang.loader.LoadStrategyChain.run",
+        "modelexpress.engines.sglang.loader.run_load_strategy_chain",
         return_value=model,
     ) as run, patch(
         "modelexpress.engines.sglang.loader.install_sglang_cache_artifacts",
@@ -939,3 +1055,60 @@ def test_te_find_source_skips_not_found(monkeypatch):
     assert [
         c.kwargs["worker_id"] for c in ctx.mx_client.get_metadata.call_args_list
     ] == ["w0", "w1"]
+
+
+# ---------------------------------------------------------------------------
+# TransferEngine source discovery -> selection metrics
+#
+# This transport bypasses LoadStrategyChain and RdmaStrategy, so the D8
+# instrumentation added to RdmaStrategy._find_source_instances does not reach
+# it. Without its own recording, a mooncake/transfer_engine pod exports
+# mx_build_info and nothing else in every state, and a metadata-backend outage
+# is indistinguishable from a cluster that has published no peers.
+# ---------------------------------------------------------------------------
+
+
+def _patched_te_metrics(monkeypatch):
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.engines.sglang.loader.selection_metrics", m)
+    return m
+
+
+def test_te_find_source_records_a_list_sources_error(monkeypatch):
+    m = _patched_te_metrics(monkeypatch)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx([])
+    ctx.mx_client.list_sources.side_effect = RuntimeError("grpc down")
+
+    assert loader._find_transfer_engine_source(ctx) is None
+
+    assert m.record_list_sources.call_args.args[1] == "error"
+
+
+def test_te_find_source_records_a_zero_funnel_when_no_peers(monkeypatch):
+    m = _patched_te_metrics(monkeypatch)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+
+    assert loader._find_transfer_engine_source(_te_ctx([])) is None
+
+    assert m.record_list_sources.call_args.args[1] == "empty"
+    observed = {
+        call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list
+    }
+    assert observed == {"listed": 0, "rank_matched": 0}
+
+
+def test_te_find_source_records_the_funnel_on_success(monkeypatch):
+    m = _patched_te_metrics(monkeypatch)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx(
+        [_te_ref("s0aaaaaaaaaaaaaa", "w0"), _te_ref("s1aaaaaaaaaaaaaa", "w1")]
+    )
+
+    loader._find_transfer_engine_source(ctx)
+
+    assert m.record_list_sources.call_args.args[1] == "ok"
+    observed = {
+        call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list
+    }
+    assert observed["listed"] == 2

@@ -9,6 +9,7 @@ import logging
 import os
 import subprocess
 import tarfile
+import tempfile
 import threading
 import time
 from concurrent import futures
@@ -21,6 +22,7 @@ import grpc
 import torch
 
 from .. import p2p_pb2
+from ..metrics import metrics as install_metrics
 from ..nixl_transfer import NIXL_DRAM_MEM_TYPE, NixlTransferManager
 from .artifact_manifest import (
     _crc32c_hex,
@@ -48,6 +50,7 @@ _DEFAULT_MAX_INFLIGHT_CHUNKS = 4
 _DEFAULT_LEASE_TTL_SECONDS = 300.0
 _RESOURCE_EXHAUSTED_PREPARE_ATTEMPTS = 3
 _RESOURCE_EXHAUSTED_PREPARE_DELAY_SECONDS = 0.05
+_SKIPPED_ENTRY_PREVIEW = 5
 
 
 @dataclass
@@ -233,8 +236,9 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
                 with tarfile.open(tar_path, "w"):
                     pass
                 continue
-            _reject_symlinked_source_entries(resolved_source)
-            _run_tar(["-cf", str(tar_path), "-C", str(resolved_source), "."])
+            entries, skipped = _tar_source_entries(resolved_source)
+            _log_skipped_entries(tar_name, skipped)
+            _write_tar_from_entries(tar_path, resolved_source, entries)
 
         manifest = build_artifact_manifest(
             bundle_path,
@@ -330,20 +334,48 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
                 f"{sorted(files_by_name)} != {sorted(expected_names)}"
             )
         installed_targets = []
+        validate_total = 0.0
+        extract_total = 0.0
         for tar_name, root in root_archives:
             tar_file = Path(files_by_name[tar_name].path).resolve(strict=True)
             output_path = root.target_root.resolve()
             output_path.mkdir(parents=True, exist_ok=True)
-            _validate_tar_members(tar_file)
-            _run_tar(["-xf", str(tar_file), "-C", str(output_path)])
+            archive_bytes = tar_file.stat().st_size
+            # The two steps are timed separately because they fail differently:
+            # validate is a Python walk over the member list and scales with
+            # file count; extract is `tar -xf` and scales with bytes and with
+            # the target filesystem. One number could not say which is slow.
+            step_start = time.perf_counter()
+            with install_metrics.time_artifact_install_step(self.name, root.name, "validate"):
+                _validate_tar_members(tar_file)
+            validate_seconds = time.perf_counter() - step_start
+            step_start = time.perf_counter()
+            with install_metrics.time_artifact_install_step(self.name, root.name, "extract"):
+                _run_tar(["-xf", str(tar_file), "-C", str(output_path)])
+            extract_seconds = time.perf_counter() - step_start
+            install_metrics.record_artifact_install_bytes(self.name, root.name, archive_bytes)
+            validate_total += validate_seconds
+            extract_total += extract_seconds
+            logger.info(
+                "[TIMING] Artifact archive extracted: name=%s archive=%s target=%s "
+                "size=%.2f MiB validate=%.3fs extract=%.3fs",
+                self.name,
+                root.name,
+                output_path,
+                _mib(archive_bytes),
+                validate_seconds,
+                extract_seconds,
+            )
             installed_targets.append(str(output_path))
         elapsed = time.perf_counter() - start
         logger.info(
             "[TIMING] Artifact install complete: artifact_id=%s targets=%s "
-            "size=%.2f MiB elapsed=%.3fs",
+            "size=%.2f MiB validate=%.3fs extract=%.3fs elapsed=%.3fs",
             header.artifact_id,
             installed_targets,
             _mib(header.total_size),
+            validate_total,
+            extract_total,
             elapsed,
         )
 
@@ -1021,10 +1053,125 @@ def _close_target_buffers(
             logger.warning("Failed to deregister target artifact buffer", exc_info=True)
 
 
-def _reject_symlinked_source_entries(source_root: Path) -> None:
-    for path in source_root.rglob("*"):
-        if path.is_symlink():
-            raise ValueError(f"tarred artifact source contains symlink: {path}")
+@dataclass(frozen=True)
+class _SkippedEntry:
+    path: Path
+    kind: str
+    detail: str
+
+
+def _tar_source_entries(source_root: Path) -> tuple[bytes, list[_SkippedEntry]]:
+    """Enumerate the archive members under source_root for tar --null -T.
+
+    Only regular files and directories are listed, which keeps the
+    file-or-directory invariant that _validate_tar_members enforces on the
+    receiving side. Anything else is reported back so the caller can log it.
+
+    Symlinks are left out rather than followed or copied verbatim: in the JIT
+    caches this packs they are derived state that the engine rebuilds. Both
+    this walk and tar stop at a symlinked directory, so dropping one costs the
+    link entry alone, never a subtree tar would otherwise have archived.
+    """
+    names: list[str] = []
+    skipped: list[_SkippedEntry] = []
+    for dirpath, dirnames, filenames in os.walk(source_root, followlinks=False):
+        directory = Path(dirpath)
+        names.append(_tar_member_name(directory, source_root))
+        kept: list[str] = []
+        for name in sorted(dirnames):
+            path = directory / name
+            if path.is_symlink():
+                skipped.append(_classify_skipped_entry(path, source_root))
+                continue
+            kept.append(name)
+        dirnames[:] = kept
+        for name in sorted(filenames):
+            path = directory / name
+            if path.is_symlink() or not path.is_file():
+                skipped.append(_classify_skipped_entry(path, source_root))
+                continue
+            names.append(_tar_member_name(path, source_root))
+    return b"\0".join(name.encode() for name in names) + b"\0", skipped
+
+
+def _tar_member_name(path: Path, source_root: Path) -> str:
+    relative = path.relative_to(source_root).as_posix()
+    return "./" if relative == "." else f"./{relative}"
+
+
+def _classify_skipped_entry(path: Path, source_root: Path) -> _SkippedEntry:
+    if not path.is_symlink():
+        return _SkippedEntry(path=path, kind="not a file or directory", detail="")
+    try:
+        detail = os.readlink(path)
+    except OSError:
+        detail = ""
+    resolved = path.resolve()
+    if not resolved.exists():
+        return _SkippedEntry(path=path, kind="broken symlink", detail=detail)
+    if resolved.is_relative_to(source_root):
+        return _SkippedEntry(path=path, kind="internal symlink", detail=detail)
+    return _SkippedEntry(path=path, kind="external symlink", detail=detail)
+
+
+def _log_skipped_entries(archive_name: str, skipped: list[_SkippedEntry]) -> None:
+    if not skipped:
+        return
+    internal = [entry for entry in skipped if entry.kind == "internal symlink"]
+    if internal:
+        logger.debug(
+            "Artifact archive %s skipped %d symlink(s) resolving inside the "
+            "source root; their targets are archived under their real paths",
+            archive_name,
+            len(internal),
+        )
+    notable = [entry for entry in skipped if entry.kind != "internal symlink"]
+    if not notable:
+        return
+    preview = ", ".join(
+        f"{entry.path} ({entry.kind}{f' -> {entry.detail}' if entry.detail else ''})"
+        for entry in notable[:_SKIPPED_ENTRY_PREVIEW]
+    )
+    remaining = len(notable) - _SKIPPED_ENTRY_PREVIEW
+    if remaining > 0:
+        preview = f"{preview}, ... {remaining} more"
+    logger.warning(
+        "Artifact archive %s skipped %d path(s) that a tar archive cannot "
+        "carry as a file or directory; engines that need them rebuild them on "
+        "demand: %s",
+        archive_name,
+        len(notable),
+        preview,
+    )
+
+
+def _write_tar_from_entries(
+    tar_path: Path,
+    source_root: Path,
+    entries: bytes,
+) -> None:
+    with tempfile.NamedTemporaryFile(
+        prefix="mx-artifact-",
+        suffix=".members",
+        delete=False,
+    ) as handle:
+        handle.write(entries)
+        member_list = Path(handle.name)
+    try:
+        _run_tar(
+            [
+                "-cf",
+                str(tar_path),
+                "-C",
+                str(source_root),
+                "--null",
+                "--no-recursion",
+                "-T",
+                str(member_list),
+            ]
+        )
+    finally:
+        member_list.unlink(missing_ok=True)
 
 
 def _validate_tar_members(tar_path: Path) -> None:

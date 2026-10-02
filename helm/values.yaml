@@ -10,10 +10,10 @@ replicaCount: 1
 image:
   repository: nvcr.io/nvidia/ai-dynamo/modelexpress-server
   pullPolicy: IfNotPresent
-  tag: "0.3.0"
+  # Overrides the image tag whose default is the chart appVersion
+  tag: ""
 
-imagePullSecrets:
-  - name: nvcr-secret
+imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
@@ -23,7 +23,7 @@ serviceAccount:
   name: ""
   automount: false
   rbac:
-    # Enable Role + RoleBinding for the Kubernetes metadata backend.
+    # Enable ClusterRole + ClusterRoleBinding for the Kubernetes metadata backend.
     # Required when MX_METADATA_BACKEND=kubernetes.
     enabled: false
 
@@ -46,9 +46,14 @@ podAnnotations: {}
 
 podLabels: {}
 
+# Must match the uid the image runs as (docker/Dockerfile USER 1000:1000).
+# fsGroup makes the mounted cache volume writable to that uid.
 podSecurityContext:
   runAsNonRoot: true
-  # fsGroup: 2000
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
 
 securityContext:
   runAsNonRoot: true
@@ -62,6 +67,127 @@ securityContext:
 service:
   type: ClusterIP
   port: 8001
+
+# Prometheus metrics.
+#
+# The server serves /metrics over HTTP/1.1 on its own port, deliberately not on
+# service.port. service.port is the tonic gRPC listener, and tonic speaks HTTP/2
+# only: a scrape aimed at it can never complete, so the target reports up == 0
+# permanently. That is worse than no annotation at all, because a permanently
+# down target is indistinguishable from a crashed pod. Point scrapes here.
+metrics:
+  enabled: true
+  port: 9401
+  # Emit prometheus.io/{scrape,port,path} pod annotations pointing at the port
+  # above. Anything in .Values.podAnnotations still wins over these.
+  #
+  # These are honoured by the prometheus-community/prometheus chart and ignored
+  # entirely by kube-prometheus-stack, which discovers targets only through the
+  # PodMonitor below. Turn this off when you enable metrics.podMonitor: on a
+  # cluster that honours both, the same pod is scraped twice under different job
+  # labels and every sum() over the result double-counts.
+  podAnnotations: true
+  # Publish the metrics port on the Service as well. Off by default: pod
+  # annotations and PodMonitors both scrape pod IPs directly, and a Service
+  # would load-balance scrapes across replicas.
+  service: false
+
+  # Prometheus Operator integration.
+  #
+  # kube-prometheus-stack ignores the prometheus.io/* annotations above
+  # entirely — it discovers targets only through PodMonitor resources. On such
+  # a cluster the endpoint is served and never scraped, which looks exactly
+  # like a broken exporter. Enable this instead of podAnnotations there.
+  #
+  # podMonitor, clientPodMonitor and rules each render a monitoring.coreos.com/v1
+  # resource and are gated on that API being present. Enabling one on a cluster
+  # without the Operator FAILS the install rather than skipping silently: a
+  # silent skip leaves you believing monitoring is configured while nothing
+  # collects, which is the failure these resources exist to prevent. Use
+  # skipApiVersionCheck if the CRDs arrive in the same apply.
+  #
+  # dashboard is a plain ConfigMap and needs none of that.
+  podMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    # Enabling this without the Operator's CRDs is an install-time failure, not
+    # a silent skip — see the templates for why. Set this when the CRDs are
+    # applied in the same operation as this chart, which is the one case the
+    # capability check gets wrong.
+    skipApiVersionCheck: false
+    # Labels the Operator's podMonitorSelector matches on. kube-prometheus-stack
+    # defaults that selector to `release: <its own release name>`, so a
+    # PodMonitor without a matching label installs cleanly and is then silently
+    # ignored. If targets never appear in Prometheus, this is almost always why.
+    additionalLabels: {}
+    relabelings: []
+    metricRelabelings: []
+
+  # Scrape ModelExpress *client* metrics.
+  #
+  # The client is a Python library loaded inside the inference engine's pod
+  # (vLLM, TRT-LLM, Dynamo). This chart does not deploy those pods and cannot
+  # label them, so unlike the server PodMonitor there is no sensible default
+  # selector and you have to supply one. The chart refuses to render an empty
+  # selector, which would otherwise match every pod in the namespace.
+  #
+  # The client is also opt-in inside the workload. MX_METRICS_ENABLED=1 and
+  # MX_METRICS_PORT are what create an endpoint at all -- without the port there
+  # is nothing to scrape. PROMETHEUS_MULTIPROC_DIR is separate: without it the
+  # client still serves, but only one rank of the pod is represented, which for
+  # TP=8 loses seven eighths of it. See docs/METRICS.md for the manifest side.
+  clientPodMonitor:
+    enabled: false
+    # Required when enabled. Selects the inference pods running the client.
+    selector:
+      matchLabels: {}
+    # Empty selects the release namespace only. Use `any: true` for all.
+    namespaceSelector: {}
+    # PodMonitor selects by port NAME, never by number. This is the name your
+    # engine manifest gave the port; the shipped example uses mx-metrics.
+    portName: mx-metrics
+    interval: 30s
+    scrapeTimeout: 10s
+    additionalLabels: {}
+    relabelings: []
+    metricRelabelings: []
+    skipApiVersionCheck: false
+
+  # Alerts, as a PrometheusRule. No recording rules: they would make the
+  # dashboard depend on this resource being installed, so enabling one and not
+  # the other would give empty panels with no error.
+  rules:
+    enabled: false
+    # Same selector caveat as podMonitor.additionalLabels above, via ruleSelector.
+    additionalLabels: {}
+    # Client alerts fire on series that exist only when the client is enabled
+    # and P2P is actually in use. Off by default so a server-only deployment
+    # does not carry alerts on metrics it will never produce.
+    client: false
+    skipApiVersionCheck: false
+    thresholds:
+      # Seconds since the registry-stats task last succeeded. The task runs on
+      # MX_REGISTRY_STATS_INTERVAL_SECS (default 60), so this is ~10 missed runs.
+      registryStatsStaleSeconds: 600
+      # Fraction of requests/operations failing before the ratio alerts fire.
+      grpcErrorRatio: 0.05
+      backendErrorRatio: 0.05
+      downloadFailureRatio: 0.1
+      # Entries in a never-evicted in-process map. The OOM early warning.
+      stateEntriesLimit: 10000
+      # Fraction of NIXL receives returning partial or empty data. Both report
+      # success today, so this is the only signal that surfaces them.
+      nixlSilentFailureRatio: 0.01
+
+  # Grafana dashboard, as a ConfigMap for the Grafana sidecar to discover.
+  dashboard:
+    enabled: false
+    # The sidecar's discovery label. This is `grafana.sidecar.dashboards.label`
+    # in kube-prometheus-stack; change both if your Grafana differs.
+    label: grafana_dashboard
+    labelValue: "1"
+    additionalLabels: {}
 
 ingress:
   enabled: false
@@ -93,7 +219,7 @@ persistence:
 
 env:
   MODEL_EXPRESS_SERVER_PORT: "8001"
-  MODEL_EXPRESS_LOGGING_LEVEL: "info"
+  MODEL_EXPRESS_LOG_LEVEL: "info"
   MODEL_EXPRESS_CACHE_DIRECTORY: "/root"
   # Distributed backend selection. Required — the server fails to start without it.
   # Set MX_METADATA_BACKEND to "redis" or "kubernetes"; it drives both the P2P metadata
@@ -101,16 +227,22 @@ env:
   #
   # When "redis": also set REDIS_URL to your cluster's Redis service (e.g.
   # "redis://redis.default.svc:6379"). The chart does not bundle a Redis sub-chart.
-  # When "kubernetes": apply examples/crds.yaml as a cluster-admin and set
-  # serviceAccount.rbac.enabled=true to grant the server access to the CRDs.
+  # When "kubernetes": set serviceAccount.rbac.enabled=true to grant the server
+  # access to ModelMetadata and ModelCacheEntry resources.
   #
   # MX_METADATA_BACKEND: "redis"
   # REDIS_URL: "redis://redis.default.svc:6379"
 
+# Both probes target the gRPC listener. Leave tcpSocket unset and they follow
+# service.port, which is the only place the port should be written: a literal
+# here is a third copy that can silently disagree with service.port and the
+# containerPort, and a probe pointed at a port nothing listens on does not just
+# fail readiness — the liveness probe restarts the container, so the pod
+# CrashLoopBackOffs with no clue as to why.
 livenessProbe:
   enabled: true
-  tcpSocket:
-    port: 8001
+  # tcpSocket:
+  #   port: 8001
   initialDelaySeconds: 15
   periodSeconds: 10
   timeoutSeconds: 5
@@ -118,8 +250,8 @@ livenessProbe:
 
 readinessProbe:
   enabled: true
-  tcpSocket:
-    port: 8001
+  # tcpSocket:
+  #   port: 8001
   initialDelaySeconds: 15
   periodSeconds: 10
   timeoutSeconds: 5

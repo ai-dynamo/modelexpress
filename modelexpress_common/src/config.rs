@@ -197,22 +197,6 @@ impl FromStr for LogFormat {
     }
 }
 
-/// Base trait for configuration loading with layered approach
-pub trait ConfigLoader<T> {
-    /// Load configuration from multiple sources in order of precedence:
-    /// 1. Command line arguments (highest priority)
-    /// 2. Environment variables
-    /// 3. Configuration file
-    /// 4. Default values (lowest priority)
-    fn load_layered(
-        config_file: Option<PathBuf>,
-        env_prefix: &str,
-        defaults: T,
-    ) -> Result<T, ConfigError>
-    where
-        T: serde::de::DeserializeOwned + Default;
-}
-
 /// Load configuration file strictly without any fallbacks to defaults.
 /// This function will return an error if the file doesn't exist, has invalid syntax,
 /// or contains invalid values. Use this for validation purposes.
@@ -329,12 +313,6 @@ pub struct ConnectionConfig {
 
     /// Timeout in seconds for requests
     pub timeout_secs: Option<u64>,
-
-    /// Maximum retries for failed requests
-    pub max_retries: Option<u32>,
-
-    /// Retry delay in seconds
-    pub retry_delay_secs: Option<u64>,
 }
 
 pub fn normalize_grpc_endpoint(endpoint: impl Into<String>) -> String {
@@ -352,8 +330,6 @@ impl Default for ConnectionConfig {
         Self {
             endpoint: format!("http://localhost:{}", crate::constants::DEFAULT_GRPC_PORT),
             timeout_secs: Some(crate::constants::DEFAULT_TIMEOUT_SECS),
-            max_retries: Some(3),
-            retry_delay_secs: Some(1),
         }
     }
 }
@@ -363,19 +339,11 @@ impl ConnectionConfig {
         Self {
             endpoint: normalize_grpc_endpoint(endpoint),
             timeout_secs: Some(crate::constants::DEFAULT_TIMEOUT_SECS),
-            max_retries: Some(3),
-            retry_delay_secs: Some(1),
         }
     }
 
     pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = Some(timeout_secs);
-        self
-    }
-
-    pub fn with_retries(mut self, max_retries: u32, delay_secs: u64) -> Self {
-        self.max_retries = Some(max_retries);
-        self.retry_delay_secs = Some(delay_secs);
         self
     }
 }
@@ -448,14 +416,10 @@ mod tests {
 
     #[test]
     fn test_connection_config_builder() {
-        let config = ConnectionConfig::new("http://test.com:8080")
-            .with_timeout(60)
-            .with_retries(5, 2);
+        let config = ConnectionConfig::new("http://test.com:8080").with_timeout(60);
 
         assert_eq!(config.endpoint, "http://test.com:8080");
         assert_eq!(config.timeout_secs, Some(60));
-        assert_eq!(config.max_retries, Some(5));
-        assert_eq!(config.retry_delay_secs, Some(2));
     }
 
     #[test]
@@ -481,8 +445,6 @@ mod tests {
         let valid_config = r#"
             endpoint: "http://localhost:9999"
             timeout_secs: 60
-            max_retries: 5
-            retry_delay_secs: 2
         "#;
 
         fs::write(&config_file, valid_config).expect("Failed to write config file");
@@ -493,8 +455,6 @@ mod tests {
         let config = result.expect("Expected successful config parsing");
         assert_eq!(config.endpoint, "http://localhost:9999");
         assert_eq!(config.timeout_secs, Some(60));
-        assert_eq!(config.max_retries, Some(5));
-        assert_eq!(config.retry_delay_secs, Some(2));
     }
 
     #[test]

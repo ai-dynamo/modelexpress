@@ -103,6 +103,12 @@ spec:
             - "1024"
             - --kv-cache-memory-bytes
             - "1073741824"
+            # Source and target run the same compile configuration, but vLLM's
+            # auto-generated cache key includes runtime-resolved factors that
+            # differ across these two pods. Pin the directory so this test
+            # exercises reuse of the transferred cache, not just installation.
+            - --compilation-config
+            - '{"cache_dir":"/root/.cache/vllm/torch_compile_cache/mx-ci"}'
             - --trust-remote-code
             - --port
             - "${WORKER_PORT}"

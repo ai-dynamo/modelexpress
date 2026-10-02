@@ -3,14 +3,13 @@
 
 # RBAC for the Kubernetes metadata backend.
 # Required when MX_METADATA_BACKEND=kubernetes so the server can manage
-# ModelMetadata CRDs and tensor descriptor ConfigMaps in its namespace.
+# ModelMetadata CRDs and tensor descriptor ConfigMaps across namespaces.
 {{- if and .Values.serviceAccount.create .Values.serviceAccount.rbac.enabled }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: {{ include "modelexpress.fullname" . }}
-  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "modelexpress.labels" . | nindent 4 }}
 rules:
@@ -27,15 +26,14 @@ rules:
     verbs: ["get", "list", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: {{ include "modelexpress.fullname" . }}
-  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "modelexpress.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
+  kind: ClusterRole
   name: {{ include "modelexpress.fullname" . }}
 subjects:
   - kind: ServiceAccount

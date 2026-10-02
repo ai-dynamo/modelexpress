@@ -28,6 +28,10 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates libssl-dev gpgv && \
     rm -rf /var/lib/apt/lists/*
 
+# Run as the base image's unprivileged uid so the Helm chart's runAsNonRoot
+# default admits the container; the cache directory has to belong to it.
+RUN mkdir -p /app/cache && chown 1000:1000 /app/cache
+
 # Copy all built binaries
 COPY --from=builder /app/target/release/modelexpress-server .
 COPY --from=builder /app/target/release/modelexpress-cli .
@@ -48,6 +52,10 @@ ENV HF_HUB_CACHE=/app/cache
 # Distributed backend is required; operators must set MX_METADATA_BACKEND (drives both
 # the P2P and registry backends) plus the relevant connection env vars (REDIS_URL for
 # Redis, or POD_NAMESPACE for the Kubernetes backend).
+
+# Numeric on purpose: the kubelet verifies runAsNonRoot against the image user
+# and cannot resolve a name.
+USER 1000:1000
 
 # Run the server by default
 CMD ["./modelexpress-server"]

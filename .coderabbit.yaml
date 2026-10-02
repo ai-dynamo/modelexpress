@@ -22,6 +22,117 @@ reviews:
   sequence_diagrams: false
   related_issues: false
   related_prs: false
+  path_instructions:
+    - path: "modelexpress_client/python/modelexpress/**"
+      instructions: |
+        Enforce package architecture boundaries in changed code.
+
+        Engine-specific code must live under `engines/<engine>/`. This includes
+        imports of engine runtime packages, interpretation of engine-specific
+        configuration, engine lifecycle hooks, and engine-specific artifact
+        discovery or installation.
+
+        Code outside `engines/` must remain engine-agnostic. It should use shared
+        protocols, load contexts, and adapter hooks rather than importing vLLM,
+        SGLang, TRT-LLM, or branching on an engine name.
+
+        Flag a boundary violation only when the changed code introduces or
+        expands it. Identify the engine-specific code and its expected
+        `engines/<engine>/` destination.
+    - path: "modelexpress_client/python/modelexpress/engines/**"
+      instructions: |
+        Keep engine integrations as thin adapters around shared ModelExpress
+        mechanisms.
+
+        Engine directories own engine API mapping, lifecycle ordering, and
+        engine-specific artifact discovery and installation. They must not
+        duplicate generic source selection, metadata publication, NIXL transfer,
+        artifact byte transport, or load-strategy orchestration.
+
+        Verify that changes preserve the upstream engine's required lifecycle
+        ordering, especially post-load processing and derived-state
+        initialization. Require focused tests when hook ordering or tensor
+        lifetime changes.
+    - path: "modelexpress_client/python/modelexpress/load_strategy/**"
+      instructions: |
+        Load strategies must remain engine-agnostic.
+
+        Strategies may select and execute a loading mechanism, register
+        transferable state, and coordinate shared publication. Engine lifecycle
+        behavior must be delegated through the adapter in the load context.
+
+        A failed strategy may fall through only while the model remains safe for
+        the next strategy. If a strategy can partially mutate model state, the
+        change must either restore or reinitialize that state, or fail without
+        silently continuing the chain.
+
+        Flag direct engine imports, engine-name conditionals, duplicated adapter
+        behavior, or fallback paths that can reuse partially mutated state.
+    - path: "modelexpress_client/python/modelexpress/metadata/**"
+      instructions: |
+        Preserve metadata compatibility and lifecycle invariants.
+
+        Fields affecting weight bytes, tensor layout, or runtime compatibility
+        must participate consistently in source identity and compatibility
+        checks. Source selection must use compatible Ready workers, and fetched
+        metadata must still match the selected source and worker generation.
+
+        Generic artifact manifest, byte-transfer, and publication mechanisms
+        belong in `metadata/`; engine-specific artifact discovery and
+        installation belong in `engines/<engine>/`.
+
+        Worker lifecycle cleanup must allow both `Initializing` and `Ready`
+        workers to transition to `Stale`, with deletion owned by the server
+        reaper and garbage collector. Do not introduce client-side deletion of
+        `ModelMetadata`, tensor ConfigMaps, `ModelCacheEntry`, or related
+        ModelExpress records.
+    - path: "modelexpress_client/python/modelexpress/accelerators/**"
+      instructions: |
+        Accelerator-specific device operations and capability gates belong
+        behind `AcceleratorBackend`.
+
+        Generic loading, metadata, and transfer code must not branch directly on
+        CUDA, XPU, or another accelerator when the distinction can be expressed
+        through the accelerator backend.
+
+        Flag duplicated accelerator detection, direct device-specific behavior
+        outside the backend boundary, or fast paths that bypass capability gates.
+    - path: "modelexpress_server/src/{p2p,registry,refit}/**"
+      instructions: |
+        Preserve server subsystem and persistence-backend boundaries.
+
+        P2P, registry, and refit are separate subsystems. Each subsystem's
+        service and state layers must remain backend-neutral and access
+        persistence through its backend trait. Redis- and Kubernetes-specific
+        storage behavior belongs under that subsystem's `backend/` directory.
+
+        Do not allow backend-specific records, commands, or assumptions to leak
+        into gRPC service semantics. Stale detection, reaping, and garbage
+        collection remain server-owned lifecycle responsibilities.
+    - path: "modelexpress_common/**"
+      instructions: |
+        Preserve the workspace dependency direction: `modelexpress-common` is
+        shared by the client and server and must not depend on either of them.
+
+        Common code may own shared protocol types, configuration, environment
+        names, provider abstractions, and generated service contracts. It must
+        not contain inference-engine integrations, server persistence behavior,
+        or client application orchestration.
+
+        Flag changes that introduce a reverse dependency or move
+        subsystem-specific behavior into the common crate.
+    - path: "modelexpress_common/proto/p2p.proto"
+      instructions: |
+        Treat P2P protocol changes as cross-language compatibility changes.
+
+        Preserve protobuf field numbers and wire compatibility. When changing
+        `SourceIdentity` or compatibility-related fields, verify that the Rust
+        and Python identity implementations, generated bindings, and
+        cross-language contract tests are updated together.
+
+        New identity fields must distinguish sources only when they affect
+        transferable content or layout. Reference fields must continue to
+        identify the exact selected source and worker generation.
   finishing_touches:
     docstrings:
       enabled: false

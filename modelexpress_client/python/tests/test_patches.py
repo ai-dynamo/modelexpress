@@ -66,6 +66,11 @@ def test_vllm_entrypoint_configures_logging_before_patches(monkeypatch):
         "register_plugin_model_loader",
         lambda: calls.append(("loader", None)),
     )
+    monkeypatch.setattr(
+        registration,
+        "register_plugin_weight_transfer_engine",
+        lambda: calls.append(("weight_transfer", None)),
+    )
 
     vllm_integration.register_modelexpress_loaders()
 
@@ -73,6 +78,7 @@ def test_vllm_entrypoint_configures_logging_before_patches(monkeypatch):
         ("logging", None),
         ("patches", vllm_integration.VLLM_PATCHES),
         ("loader", None),
+        ("weight_transfer", None),
     ]
 
 

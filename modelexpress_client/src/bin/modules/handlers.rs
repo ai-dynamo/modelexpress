@@ -5,7 +5,7 @@ use super::args::{DownloadStrategy, ModelCommands, OutputFormat};
 use super::output::{print_human_readable, print_output};
 use super::payload::read_payload;
 use colored::*;
-use modelexpress_client::{Client, ClientConfig, ModelProvider};
+use modelexpress_client::{Client, ClientConfig, ModelDownloadResult, ModelProvider};
 use modelexpress_common::{
     cache::{CacheConfig, CacheStats, ModelInfo, resolve_model_path},
     download,
@@ -55,17 +55,6 @@ fn model_json(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> serde_js
     }
 }
 
-fn infer_provider_from_model_name(model_name: &str) -> ModelProvider {
-    let model_name = model_name.trim_start();
-    if strip_ascii_prefix_ignore_case(model_name, "gs://").is_some() {
-        ModelProvider::Gcs
-    } else if strip_ascii_prefix_ignore_case(model_name, "ngc://").is_some() {
-        ModelProvider::Ngc
-    } else {
-        ModelProvider::HuggingFace
-    }
-}
-
 fn strip_ascii_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     let candidate = value.get(..prefix.len())?;
     if candidate.eq_ignore_ascii_case(prefix) {
@@ -79,6 +68,8 @@ fn normalize_model_name_scheme(model_name: &str) -> Cow<'_, str> {
     let model_name = model_name.trim_start();
     if let Some(rest) = strip_ascii_prefix_ignore_case(model_name, "gs://") {
         Cow::Owned(format!("gs://{rest}"))
+    } else if let Some(rest) = strip_ascii_prefix_ignore_case(model_name, "s3://") {
+        Cow::Owned(format!("s3://{rest}"))
     } else if let Some(rest) = strip_ascii_prefix_ignore_case(model_name, "ngc://") {
         Cow::Owned(format!("ngc://{rest}"))
     } else {
@@ -88,10 +79,21 @@ fn normalize_model_name_scheme(model_name: &str) -> Cow<'_, str> {
 
 fn resolve_validation_model_path(cache_root: &Path, model_name: &str) -> (ModelProvider, PathBuf) {
     let normalized_name = normalize_model_name_scheme(model_name);
-    let provider = infer_provider_from_model_name(normalized_name.as_ref());
+    let provider = ModelProvider::resolve_provider_for_model_name(
+        normalized_name.as_ref(),
+        ModelProvider::HuggingFace,
+    );
     let model_path = resolve_model_path(cache_root, provider, normalized_name.as_ref(), None)
         .unwrap_or_else(|_| cache_root.join(normalized_name.as_ref()));
     (provider, model_path)
+}
+
+fn resolve_download_options(
+    model_name: &str,
+    default_provider: ModelProvider,
+) -> (ModelProvider, bool) {
+    let provider = ModelProvider::resolve_provider_for_model_name(model_name, default_provider);
+    (provider, provider == ModelProvider::S3)
 }
 
 fn has_huggingface_weights(model_path: &Path) -> bool {
@@ -156,12 +158,14 @@ pub async fn handle_model_command(
             model_name,
             provider,
             strategy,
+            revision,
         } => {
             download_model(
                 storage_path_override,
                 model_name,
                 provider,
                 strategy,
+                revision,
                 server_config,
                 format,
             )
@@ -205,9 +209,11 @@ async fn download_model(
     model_name: String,
     provider: ModelProvider,
     strategy: DownloadStrategy,
+    revision: Option<String>,
     config: ClientConfig,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let (provider, ignore_weights) = resolve_download_options(&model_name, provider);
     debug!(
         "Starting model download: {} with provider {:?} and strategy {:?}",
         model_name, provider, strategy
@@ -218,6 +224,9 @@ async fn download_model(
         println!("  {}: {}", "Model".cyan().bold(), model_name);
         println!("  {}: {}", "Provider".cyan().bold(), provider);
         println!("  {}: {:?}", "Strategy".cyan().bold(), strategy);
+        if let Some(revision) = &revision {
+            println!("  {}: {}", "Revision".cyan().bold(), revision);
+        }
         println!();
     }
 
@@ -238,6 +247,7 @@ async fn download_model(
         c
     });
 
+    let revision = revision.as_deref();
     let result = match strategy {
         DownloadStrategy::SmartFallback => {
             debug!("Using smart fallback strategy");
@@ -245,9 +255,14 @@ async fn download_model(
             if let Some(cache_config) = cache_config {
                 config.cache = cache_config;
             }
-            Client::request_model_with_smart_fallback(model_name.clone(), provider, config, false)
-                .await
-                .map(|_| ())
+            Client::request_model_with_smart_fallback_revision(
+                model_name.clone(),
+                provider,
+                config,
+                ignore_weights,
+                revision,
+            )
+            .await
         }
         DownloadStrategy::ServerOnly => {
             debug!("Using server-only strategy");
@@ -257,20 +272,20 @@ async fn download_model(
                 Client::new(config.clone()).await?
             };
             client
-                .request_model(&model_name, provider, false)
+                .request_model_revision(&model_name, provider, ignore_weights, revision)
                 .await
-                .map(|_| ())
         }
         DownloadStrategy::Direct => {
             debug!("Using direct download strategy");
-            download::download_model(
+            download::download_model_revision(
                 &model_name,
                 provider,
                 cache_config.map(|config| config.local_path),
-                false,
+                ignore_weights,
+                revision,
             )
             .await
-            .map(|_| ())
+            .map(ModelDownloadResult::from)
             .map_err(|e| {
                 modelexpress_common::Error::Generic(format!("Direct download failed: {e}")).into()
             })
@@ -278,13 +293,19 @@ async fn download_model(
     };
 
     match result {
-        Ok(()) => {
+        Ok(outcome) => {
             info!("Model download completed successfully: {}", model_name);
             let success_msg = format!("Model '{model_name}' downloaded successfully");
             match format {
                 OutputFormat::Human => {
                     println!("{}", "✅ SUCCESS".green().bold());
                     println!("  {success_msg}");
+                    if let Some(resolved) = &outcome.resolved_revision {
+                        println!("  {}: {}", "Resolved revision".cyan().bold(), resolved);
+                    }
+                    if let Some(path) = &outcome.path {
+                        println!("  {}: {}", "Path".cyan().bold(), path.display());
+                    }
                 }
                 _ => {
                     let output = serde_json::json!({
@@ -292,7 +313,9 @@ async fn download_model(
                         "message": success_msg,
                         "model_name": model_name,
                         "provider": provider.to_string(),
-                        "strategy": format!("{:?}", strategy)
+                        "strategy": format!("{:?}", strategy),
+                        "resolved_revision": outcome.resolved_revision,
+                        "path": outcome.path.as_ref().map(|path| path.display().to_string())
                     });
                     print_output(&output, format);
                 }
@@ -821,19 +844,51 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_provider_inference_keeps_ambiguous_names_hugging_face() {
-        assert_eq!(
-            infer_provider_from_model_name("nvidia/model/version"),
-            ModelProvider::HuggingFace
-        );
-        assert_eq!(
-            infer_provider_from_model_name("ngc://nvidia/model/version"),
-            ModelProvider::Ngc
-        );
-        assert_eq!(
-            infer_provider_from_model_name("NgC://nvidia/model/version"),
-            ModelProvider::Ngc
-        );
+    fn test_validate_resolves_s3_model_name_to_s3_cache_path() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let model_name = "S3://bucket/foo/bar";
+        let expected_path = temp_dir
+            .path()
+            .join("s3")
+            .join("bucket")
+            .join("foo")
+            .join("bar");
+        fs::create_dir_all(&expected_path).expect("Failed to create S3 cache path");
+
+        let (provider, model_path) = resolve_validation_model_path(temp_dir.path(), model_name);
+
+        assert_eq!(provider, ModelProvider::S3);
+        assert_eq!(model_path, expected_path);
+        assert!(model_path.exists());
+        assert!(!temp_dir.path().join("S3://bucket/foo/bar").exists());
+    }
+
+    #[test]
+    fn test_validate_provider_resolution_keeps_ambiguous_names_hugging_face() {
+        let (provider, _) =
+            resolve_validation_model_path(Path::new("/tmp/mx-cache"), "nvidia/model/version");
+        assert_eq!(provider, ModelProvider::HuggingFace);
+
+        let (provider, _) =
+            resolve_validation_model_path(Path::new("/tmp/mx-cache"), "ngc://nvidia/model/version");
+        assert_eq!(provider, ModelProvider::Ngc);
+
+        let (provider, _) =
+            resolve_validation_model_path(Path::new("/tmp/mx-cache"), "NgC://nvidia/model/version");
+        assert_eq!(provider, ModelProvider::Ngc);
+    }
+
+    #[test]
+    fn test_s3_download_options_enable_metadata_only_mode() {
+        let (provider, ignore_weights) =
+            resolve_download_options("s3://bucket/org/model", ModelProvider::HuggingFace);
+        assert_eq!(provider, ModelProvider::S3);
+        assert!(ignore_weights);
+
+        let (provider, ignore_weights) =
+            resolve_download_options("org/model", ModelProvider::HuggingFace);
+        assert_eq!(provider, ModelProvider::HuggingFace);
+        assert!(!ignore_weights);
     }
 
     #[test]

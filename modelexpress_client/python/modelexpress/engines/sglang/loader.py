@@ -13,14 +13,17 @@ import torch
 import torch.nn as nn
 
 from ... import envs, p2p_pb2
-from ...load_strategy import LoadContext, LoadStrategyChain
+from ...load_strategy import LoadContext, run_load_strategy_chain
+from ...load_strategy.base import clear_exception_tracebacks
 from ...load_strategy.context import LoadResult
 from ...metadata.publisher import PublisherThread
 from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
 from ...metadata.publish import _heartbeat_threads
+from ...metrics import enable_metrics
 from ...nixl_transfer import NixlTransferManager
-from ...source_selection import get_configured_selector
-from .adapter import build_sglang_load_context
+from ...metrics import metrics as selection_metrics
+from ...source_selection import configured_policy_label, get_configured_selector
+from .adapter import _get_model_name, build_sglang_load_context
 from .artifacts import (
     _sglang_health_ready,
     install_sglang_cache_artifacts,
@@ -50,6 +53,10 @@ class MxModelLoader:
 
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
+        # Off the load path, but still before any transport or strategy choice:
+        # a run that records nothing must leave the exporter up, so a scrape can
+        # prove it came up. No-op unless enabled; never raises.
+        enable_metrics()
         self._ctx: LoadContext | None = None
 
     def load_model(
@@ -61,23 +68,34 @@ class MxModelLoader:
     ) -> nn.Module:
         """Load model weights through the shared ModelExpress strategy chain."""
         transport = getattr(self.load_config, "modelexpress_transport", "nixl")
-        if transport == "nixl":
-            return self._load_model_via_nixl(
-                model=model,
-                model_config=model_config,
-                device_config=device_config,
+        # L0 wraps the dispatcher rather than each transport, so the
+        # transfer_engine path -- which never touches the strategy chain -- still
+        # reports a load duration. Instrumenting only the chain would leave that
+        # whole deployment mode looking like it never loaded anything.
+        #
+        # SGLang has no draft-model path through this loader, so model_role is
+        # always main.
+        # Same helper the load context uses, so the label matches the model name
+        # every other client family reports for this process.
+        model_id = _get_model_name(model_config)
+        with selection_metrics.time_load("sglang", model_id, "main"):
+            if transport == "nixl":
+                return self._load_model_via_nixl(
+                    model=model,
+                    model_config=model_config,
+                    device_config=device_config,
+                )
+            if transport == "transfer_engine":
+                return self._load_model_via_transfer_engine(
+                    model=model,
+                    model_config=model_config,
+                    device_config=device_config,
+                )
+            raise ValueError(
+                "SGLang ModelExpress integration currently supports "
+                f"modelexpress transports 'nixl' and 'transfer_engine', "
+                f"got {transport!r}."
             )
-        if transport == "transfer_engine":
-            return self._load_model_via_transfer_engine(
-                model=model,
-                model_config=model_config,
-                device_config=device_config,
-            )
-        raise ValueError(
-            "SGLang ModelExpress integration currently supports "
-            f"modelexpress transports 'nixl' and 'transfer_engine', "
-            f"got {transport!r}."
-        )
 
     def _load_model_via_nixl(
         self,
@@ -101,8 +119,17 @@ class MxModelLoader:
             ctx.global_rank,
             ctx.identity.model_name,
         )
-        install_sglang_cache_artifacts(ctx)
-        model = LoadStrategyChain.run(model, ctx)
+        # No model_init phase here, unlike vLLM: SGLang builds the module and
+        # hands it in, so there is no initialization inside this window to time.
+        # The phases still partition the load; this load simply has three.
+        with selection_metrics.time_load_phase(
+            "sglang", ctx.identity.model_name, "artifact_install"
+        ):
+            install_sglang_cache_artifacts(ctx)
+        with selection_metrics.time_load_phase(
+            "sglang", ctx.identity.model_name, "chain"
+        ):
+            model = run_load_strategy_chain(model, ctx)
 
         _tensor_registry[ctx.device_id] = ctx.tensors
         if ctx.nixl_manager is not None:
@@ -110,7 +137,10 @@ class MxModelLoader:
         else:
             _nixl_managers.pop(ctx.device_id, None)
 
-        schedule_sglang_cache_artifact_publish(ctx)
+        with selection_metrics.time_load_phase(
+            "sglang", ctx.identity.model_name, "publish"
+        ):
+            schedule_sglang_cache_artifact_publish(ctx)
 
         total_time = time.perf_counter() - load_start
         logger.info(
@@ -197,6 +227,9 @@ class MxModelLoader:
                     exc,
                     exc_info=True,
                 )
+                registered_tensors = None
+                tensors = {}
+                clear_exception_tracebacks(exc)
                 result = ctx.adapter.reinit_for_retry(result)
                 result = ctx.adapter.load_via_native(result)
                 tensors = ctx.adapter.discover_tensors(result)
@@ -242,6 +275,13 @@ class MxModelLoader:
         return result.model.eval()
 
     def _find_transfer_engine_source(self, ctx: LoadContext):
+        # This path bypasses LoadStrategyChain and RdmaStrategy entirely, so it
+        # needs its own instrumentation: without it a mooncake/transfer_engine
+        # pod exports mx_build_info and nothing else in every state, and a
+        # metadata-backend outage is indistinguishable from a cluster that has
+        # published no peers -- the exact pair the ListSources counter exists to
+        # separate.
+        policy = configured_policy_label()
         try:
             response = ctx.mx_client.list_sources(
                 identity=ctx.identity,
@@ -254,11 +294,21 @@ class MxModelLoader:
                 ctx.global_rank,
                 exc,
             )
+            selection_metrics.record_list_sources(policy, "error")
+            return None
+
+        if not response.instances:
+            selection_metrics.record_list_sources(policy, "empty")
+            for stage in ("listed", "rank_matched"):
+                selection_metrics.observe_candidates(policy, stage, 0)
             return None
 
         candidates = [
             inst for inst in response.instances if inst.worker_rank == ctx.worker_rank
         ]
+        selection_metrics.record_list_sources(policy, "ok")
+        selection_metrics.observe_candidates(policy, "listed", len(response.instances))
+        selection_metrics.observe_candidates(policy, "rank_matched", len(candidates))
         # The nixl transport (and vLLM) order sources in the shared
         # RdmaStrategy; this is SGLang's separate transfer_engine path, which
         # discovers sources itself, so it applies the same selector here.

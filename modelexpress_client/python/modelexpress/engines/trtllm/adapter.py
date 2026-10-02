@@ -264,6 +264,7 @@ def build_trtllm_load_context(
         target_device=adapter.get_target_device(),
         global_rank=adapter.get_global_rank(),
         worker_rank=worker_rank,
+        local_rank=int(mapping.local_rank),
         device_id=adapter.get_device_id(),
         identity=adapter.build_identity(),
         mx_client=create_metadata_client(

@@ -14,6 +14,9 @@ have reached Running state.  Asserts:
      are loaded and the model is serving correctly on each.
   4. When enabled by the workflow, target peak and final VRAM do not materially
      exceed source VRAM.
+  5. When --expect-mtp is set, the target transfers the main model through P2P
+     before loading the MTP draft model locally, and source/target greedy
+     completions for a small prompt match exactly.
 
 Invoked by the workflow as:
   pytest ci/k8s/client/test_p2p_k8s.py -v \
@@ -23,7 +26,8 @@ Invoked by the workflow as:
       --worker-port $WORKER_PORT \
       --tp-size $TP_SIZE \
       [--dp-size $DP_SIZE] \
-      [--p2p-marker "framework-specific transfer complete string"]
+      [--p2p-marker "framework-specific transfer complete string"] \
+      [--expect-mtp]
 
 --p2p-marker defaults:
   vLLM: "RDMA transfer complete" (emitted by vLLM's RdmaStrategy)
@@ -39,6 +43,7 @@ target's data-parallel size (e.g. 2 for the DP=2 job) so the range widens to
 
 import json
 import re
+import time
 import urllib.request
 
 import pytest
@@ -104,17 +109,27 @@ def _all_pod_logs(namespace: str, job_name: str, container: str) -> str:
     `.items[*]` has exactly one element and the regex/assertions in the
     callers operate on one concatenated string either way.
     """
+    return "\n".join(_pod_logs_by_pod(namespace, job_name, container).values())
+
+
+def _pod_logs_by_pod(namespace: str, job_name: str, container: str) -> dict[str, str]:
+    """Same fetch as `_all_pod_logs`, keyed by pod name instead of concatenated.
+
+    Assertions about "every pod did X" cannot be expressed on the concatenated
+    string: one matching line anywhere satisfies a substring check no matter how
+    many pods are missing it.
+    """
     pod_list = kubectl(
         "get", "pods",
         "-l", f"job-name={job_name}",
         "-o", "jsonpath={.items[*].metadata.name}",
         namespace=namespace,
     ).stdout.split()
-    chunks = []
+    out: dict[str, str] = {}
     for pod in pod_list:
         r = kubectl("logs", pod, "-c", container, "--tail=-1", namespace=namespace)
-        chunks.append(r.stdout)
-    return "\n".join(chunks)
+        out[pod] = r.stdout
+    return out
 
 
 def _ready_artifact_source_types(namespace: str) -> set[str]:
@@ -141,7 +156,15 @@ def _ready_artifact_source_types(namespace: str) -> set[str]:
     return source_types
 
 
-def _assert_inference(namespace: str, job_name: str, model: str, remote_port: int, local_port: int) -> None:
+def _assert_inference(
+    namespace: str,
+    job_name: str,
+    model: str,
+    remote_port: int,
+    local_port: int,
+    *,
+    deterministic: bool = False,
+) -> str:
     # Pin to pod-0 explicitly. For multi-node StatefulSets, only the head
     # pod (apps.kubernetes.io/pod-index=0) runs the vLLM HTTP API server;
     # the worker pod has no HTTP listener. For single-pod Jobs, _pod_name
@@ -151,11 +174,14 @@ def _assert_inference(namespace: str, job_name: str, model: str, remote_port: in
     print(f"\n[{job_name}] pod={pod} remote_port={remote_port} local_port={local_port}")
     # TODO: replace with a more complex prompt that exercises multi-token reasoning
     # to better validate model correctness beyond a single-word completion.
-    payload = json.dumps({
+    request_payload = {
         "model": model,
         "prompt": "The capital of France is",
         "max_tokens": 8,
-    }).encode()
+    }
+    if deterministic:
+        request_payload.update({"temperature": 0, "seed": 0})
+    payload = json.dumps(request_payload).encode()
     with port_forward(namespace, pod, local_port=local_port, remote_port=remote_port) as port:
         req = urllib.request.Request(
             f"http://localhost:{port}/v1/completions",
@@ -175,6 +201,7 @@ def _assert_inference(namespace: str, job_name: str, model: str, remote_port: in
     text = choices[0].get("text", "")
     print(f"[{job_name}] completion text: {text!r}")
     assert text, f"Empty completion text from {job_name}: {body}"
+    return text
 
 
 def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
@@ -193,6 +220,36 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
     assert p2p_marker in logs, (
         f"P2P marker {p2p_marker!r} not found in target logs.\n"
         f"Last 50 log lines:\n" + "\n".join(logs.splitlines()[-50:])
+    )
+
+
+def test_mtp_load_phases(namespace: str, expect_mtp: bool) -> None:
+    """MTP must use P2P only for the main model, never for its draft head."""
+    if not expect_mtp:
+        pytest.skip("MTP phase assertion not enabled")
+
+    logs = _all_pod_logs(namespace, "mx-target", "mx-target")
+    main_marker = "p2p_enabled=True"
+    transfer_marker = "RDMA transfer complete"
+    draft_marker = "p2p_enabled=False"
+    main_index = logs.find(main_marker)
+    transfer_index = logs.find(transfer_marker, main_index + 1)
+    draft_index = logs.find(draft_marker, transfer_index + 1)
+    phase_lines = [
+        line
+        for line in logs.splitlines()
+        if any(marker in line for marker in (main_marker, transfer_marker, draft_marker))
+    ]
+    print("[mx-target] MTP load phases:\n" + "\n".join(phase_lines))
+    assert main_index >= 0, "Target did not start a P2P-enabled main-model load"
+    assert transfer_index > main_index, (
+        "Target did not complete RDMA transfer after starting the main-model load"
+    )
+    assert draft_index > transfer_index, (
+        "Target did not load the MTP draft locally after the main-model transfer"
+    )
+    assert logs.find(transfer_marker, draft_index + 1) < 0, (
+        "Target performed another RDMA transfer while loading the MTP draft"
     )
 
 
@@ -265,6 +322,63 @@ def test_per_rank_source_agents(
     )
 
 
+EFFECTIVENESS_TIMEOUT_SECS = 180
+EFFECTIVENESS_POLL_SECS = 10
+
+# Either outcome ends the wait: the hit line means the cache was reused, the
+# warning means it was not. Both are emitted from the same call site, so seeing
+# one proves the publisher thread ran and the snapshot is no longer premature.
+_EFFECTIVENESS_MARKERS = (
+    "which ModelExpress installed",
+    "was not reused and the engine recompiled",
+)
+
+
+_COMPILE_INSTALL_MARKER = "vLLM artifact install complete: name=torch_compile_cache"
+
+
+def _pods_pending_effectiveness(per_pod: dict[str, str]) -> set[str]:
+    """Pods that installed a torch.compile cache but have not logged the check.
+
+    The granularity is per pod, not per worker rank: `mark_publish_scheduled` is
+    documented as pod-scoped, so in a TP>1 pod exactly one rank schedules the
+    publisher and therefore exactly one rank runs the check. Requiring a line per
+    rank would fail every multi-rank deployment by construction.
+    """
+    return {
+        pod
+        for pod, logs in per_pod.items()
+        if _COMPILE_INSTALL_MARKER in logs
+        and not any(marker in logs for marker in _EFFECTIVENESS_MARKERS)
+    }
+
+
+def _await_effectiveness_check(namespace: str) -> dict[str, str]:
+    """Re-read target logs until every installing pod logged the check.
+
+    Returns the freshest per-pod logs either way; the caller still asserts on
+    content, so a timeout surfaces as a named-pod assertion failure rather than a
+    bare TimeoutError with no context.
+    """
+    per_pod = _pod_logs_by_pod(namespace, "mx-target", "mx-target")
+    pending = _pods_pending_effectiveness(per_pod)
+    if not pending:
+        return per_pod
+    deadline = time.monotonic() + EFFECTIVENESS_TIMEOUT_SECS
+    while time.monotonic() < deadline:
+        time.sleep(EFFECTIVENESS_POLL_SECS)
+        per_pod = _pod_logs_by_pod(namespace, "mx-target", "mx-target")
+        pending = _pods_pending_effectiveness(per_pod)
+        if not pending:
+            print("[mx-target] every installing pod logged the effectiveness check")
+            return per_pod
+    print(
+        f"[mx-target] {len(pending)} pod(s) still missing the effectiveness check "
+        f"after {EFFECTIVENESS_TIMEOUT_SECS}s: {sorted(pending)}"
+    )
+    return per_pod
+
+
 def test_artifact_transfer(
     namespace: str,
     require_artifact_transfer: bool,
@@ -284,13 +398,64 @@ def test_artifact_transfer(
         f"got {sorted(source_types)}"
     )
 
-    logs = _all_pod_logs(namespace, "mx-target", "mx-target")
+    # The effectiveness check runs on each target's own publisher thread, gated on
+    # /health plus a cache-settle interval. The composite action only waits for the
+    # *source* to publish before starting targets, so at this point a target's
+    # publisher may not have fired yet. Poll rather than asserting on one snapshot.
+    per_pod = _await_effectiveness_check(namespace)
+    logs = "\n".join(per_pod.values())
+
     install_lines = [line for line in logs.splitlines() if "artifact install complete" in line]
     print("[mx-target] artifact install lines:\n" + "\n".join(install_lines))
     assert install_lines, "Target did not log artifact installation"
     for source_type in expected_artifact_source_types:
         assert f"name={source_type}" in logs, (
             f"Target did not log artifact installation for {source_type}"
+        )
+
+    # A successful install only means the bytes arrived. The engine still has to
+    # pick the installed cache, and it will not if the source was compiled under
+    # a different configuration - it silently recompiles instead. Without this
+    # assertion the test passes on a deployment that gets no artifact benefit.
+    unused_lines = [
+        line
+        for line in logs.splitlines()
+        if "was not reused and the engine recompiled" in line
+    ]
+    assert not unused_lines, (
+        "Target installed a torch.compile cache that vLLM did not use, so it "
+        "recompiled. The source and target compile configurations differ; "
+        "partition the artifact source pool with "
+        "MX_ARTIFACT_COMPILE_CONFIG_DIGEST.\n" + "\n".join(unused_lines)
+    )
+
+    # Per pod, not across the concatenation: one matching line anywhere would
+    # otherwise satisfy the check no matter how many pods skipped it.
+    pending = _pods_pending_effectiveness(per_pod)
+    assert not pending, (
+        f"{len(pending)} target pod(s) installed a torch.compile cache but never "
+        f"logged the effectiveness check: {sorted(pending)}. The engine may not "
+        "have reached the publish path, or the check regressed."
+    )
+
+    # Every target in this fleet runs the same configuration, so each artifact
+    # type must resolve to one identity. Divergence means identity construction
+    # is not deterministic across pods - the failure mode that turns an artifact
+    # pool into a set of singletons.
+    ids_by_type: dict[str, set[str]] = {}
+    for line in install_lines:
+        fields = dict(
+            token.split("=", 1)
+            for token in line.split()
+            if token.count("=") >= 1 and token.split("=", 1)[0] in {"name", "mx_source_id"}
+        )
+        if "name" in fields and "mx_source_id" in fields:
+            ids_by_type.setdefault(fields["name"], set()).add(fields["mx_source_id"])
+    for source_type, source_ids in sorted(ids_by_type.items()):
+        assert len(source_ids) == 1, (
+            f"Targets resolved {len(source_ids)} distinct mx_source_ids for "
+            f"{source_type}: {sorted(source_ids)}. Identically configured "
+            "workers must agree on the artifact identity."
         )
 
 
@@ -302,6 +467,39 @@ def test_source_inference_produces_output(namespace: str, model: str, source_por
 def test_target_inference_produces_output(namespace: str, model: str, worker_port: int) -> None:
     """Target server must return a valid completion response after P2P transfer."""
     _assert_inference(namespace, "mx-target", model, remote_port=worker_port, local_port=18000)
+
+
+def test_mtp_source_target_outputs_match(
+    namespace: str,
+    model: str,
+    source_port: int,
+    worker_port: int,
+    expect_mtp: bool,
+) -> None:
+    """Disk-loaded source and P2P-loaded target must produce identical output."""
+    if not expect_mtp:
+        pytest.skip("MTP output consistency assertion not enabled")
+
+    source_text = _assert_inference(
+        namespace,
+        "mx-source",
+        model,
+        remote_port=source_port,
+        local_port=18003,
+        deterministic=True,
+    )
+    target_text = _assert_inference(
+        namespace,
+        "mx-target",
+        model,
+        remote_port=worker_port,
+        local_port=18004,
+        deterministic=True,
+    )
+    assert target_text == source_text, (
+        "MTP source/target completions differ for the deterministic prompt: "
+        f"source={source_text!r}, target={target_text!r}"
+    )
 
 
 def _assert_target_vram_matches_source(

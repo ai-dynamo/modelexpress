@@ -53,6 +53,7 @@ class TestHeartbeatSendsReady:
             worker_id="w1",
             worker_rank=0,
             status=2,  # SOURCE_STATUS_READY
+            source_load=None,
         )
 
     def test_skips_when_unhealthy(self, heartbeat, mx_client, nixl_manager):
@@ -69,6 +70,7 @@ class TestHeartbeatSendsReady:
                 worker_id="w1",
                 worker_rank=0,
                 status=2,
+                source_load=None,
             )
         ]
         assert len(ready_calls) == 0
@@ -86,6 +88,7 @@ class TestHeartbeatSendsReady:
                 worker_id="w1",
                 worker_rank=0,
                 status=2,
+                source_load=None,
             )
         ]
         assert len(ready_calls) >= 2
@@ -111,6 +114,59 @@ class TestPublisherPublishAndReady:
                 worker_id="w1",
                 worker_rank=0,
                 status=2,
+                source_load=None,
+            )
+        ]
+
+    def test_tick_publishes_provider_source_load(self, mx_client, nixl_manager):
+        # A non-zero source_load_provider value is forwarded on update_status.
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=lambda: "abc123",
+            interval_secs=1,
+            source_load_provider=lambda: 0.73,
+        )
+
+        publisher._tick()
+
+        assert mx_client.update_status.call_args_list == [
+            call(
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                status=2,
+                source_load=0.73,
+            )
+        ]
+
+    def test_tick_provider_error_falls_back_to_none(self, mx_client, nixl_manager):
+        # A provider that raises must not break the heartbeat; it leaves the
+        # load unset (None), never a fake 0.0 that would read as idle.
+        def boom() -> float:
+            raise RuntimeError("sampler exploded")
+
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=lambda: "abc123",
+            interval_secs=1,
+            source_load_provider=boom,
+        )
+
+        publisher._tick()
+
+        assert mx_client.update_status.call_args_list == [
+            call(
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                status=2,
+                source_load=None,
             )
         ]
 
@@ -189,6 +245,7 @@ class TestHeartbeatStop:
                 worker_id="w1",
                 worker_rank=0,
                 status=3,  # SOURCE_STATUS_STALE
+                source_load=None,
             )
         ]
         assert len(stale_calls) == 1
@@ -207,6 +264,7 @@ class TestHeartbeatStop:
                 worker_id="w1",
                 worker_rank=0,
                 status=3,
+                source_load=None,
             )
         ]
         assert len(stale_calls) == 0
@@ -224,6 +282,7 @@ class TestHeartbeatStop:
                 worker_id="w1",
                 worker_rank=0,
                 status=3,
+                source_load=None,
             )
         ]
         assert len(stale_calls) == 1
@@ -242,6 +301,7 @@ class TestHeartbeatOnExit:
                 worker_id="w1",
                 worker_rank=0,
                 status=3,
+                source_load=None,
             )
         ]
         assert len(stale_calls) == 1
@@ -277,6 +337,226 @@ class TestHeartbeatOnExit:
         assert statuses == [2, 3]
 
 
+class TestHeartbeatReRegistration:
+    """Recovery when the server rejects heartbeats (e.g. its store was reset)."""
+
+    def _publisher(self, mx_client, nixl_manager, publish):
+        return PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=publish,
+            interval_secs=1,
+        )
+
+    def test_consecutive_rejections_trigger_republish(self, mx_client, nixl_manager):
+        publish = MagicMock(side_effect=["id1", "id2"])
+        publisher = self._publisher(mx_client, nixl_manager, publish)
+        # Publish succeeds, then the server loses the registration: two
+        # rejected heartbeats, then the re-published source heartbeats fine.
+        mx_client.update_status.side_effect = [True, False, False, True]
+
+        publisher._tick()  # publish id1 + READY accepted
+        publisher._tick()  # rejected (1/2)
+        assert publisher.mx_source_id == "id1"
+        publisher._tick()  # rejected (2/2) -> re-registration scheduled
+        assert publisher.mx_source_id is None
+        publisher._tick()  # re-publish id2 + READY accepted
+
+        assert publish.call_count == 2
+        assert publisher.mx_source_id == "id2"
+        ready_ids = [
+            c.kwargs["mx_source_id"]
+            for c in mx_client.update_status.call_args_list
+            if c.kwargs["status"] == 2
+        ]
+        assert ready_ids == ["id1", "id1", "id1", "id2"]
+
+    def test_single_rejection_does_not_republish(self, mx_client, nixl_manager):
+        publish = MagicMock(return_value="id1")
+        publisher = self._publisher(mx_client, nixl_manager, publish)
+        # Rejections never happen twice in a row.
+        mx_client.update_status.side_effect = [True, False, True, False, True]
+
+        for _ in range(5):
+            publisher._tick()
+
+        publish.assert_called_once_with()
+        assert publisher.mx_source_id == "id1"
+
+    def test_accepted_heartbeat_resets_rejection_count(self, mx_client, nixl_manager):
+        publish = MagicMock(return_value="id1")
+        publisher = self._publisher(mx_client, nixl_manager, publish)
+        mx_client.update_status.side_effect = [True, False, True, False, False]
+
+        for _ in range(4):
+            publisher._tick()
+        assert publisher.mx_source_id == "id1"  # count was reset by tick 3
+        publisher._tick()  # second consecutive rejection -> re-register
+
+        assert publisher.mx_source_id is None
+
+    def test_republish_resets_publish_timeout_window(self, mx_client, nixl_manager):
+        publish = MagicMock(side_effect=["id1", "id2"])
+        publisher = self._publisher(mx_client, nixl_manager, publish)
+        mx_client.update_status.side_effect = [True, False, False, True]
+        # Pretend the initial publish already used up its timeout.
+        publisher._tick()
+        publisher._publish_started_at = time.monotonic() - 10_000
+        publisher._publish_given_up = True
+
+        publisher._tick()
+        publisher._tick()  # triggers re-registration
+        assert publisher._publish_started_at is None
+        assert publisher._publish_given_up is False
+        publisher._tick()
+
+        assert publisher.mx_source_id == "id2"
+        assert not publisher._stop_event.is_set()
+
+    def test_rejections_without_publish_fn_warn_once_and_keep_heartbeating(
+        self, mx_client, nixl_manager, caplog
+    ):
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            mx_source_id="abc123",
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            interval_secs=1,
+        )
+        mx_client.update_status.return_value = False
+
+        with caplog.at_level("WARNING", logger="modelexpress.metadata.publisher"):
+            for _ in range(6):
+                publisher._tick()
+
+        # Cannot recover, but keeps trying and stays on the cached id.
+        assert publisher.mx_source_id == "abc123"
+        assert mx_client.update_status.call_count == 6
+        warnings = [
+            r for r in caplog.records if "no publish_fn" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
+    def test_transport_error_does_not_trigger_republish(self, mx_client, nixl_manager):
+        publish = MagicMock(return_value="id1")
+        publisher = self._publisher(mx_client, nixl_manager, publish)
+        mx_client.update_status.side_effect = [
+            True,
+            RuntimeError("unreachable"),
+            RuntimeError("unreachable"),
+            True,
+        ]
+
+        publisher._tick()
+        for _ in range(2):
+            with pytest.raises(RuntimeError):
+                publisher._tick()
+        publisher._tick()
+
+        # Server was unreachable, not rejecting: keep the cached id.
+        publish.assert_called_once_with()
+        assert publisher.mx_source_id == "id1"
+
+    def test_stop_while_reregistration_pending_does_not_raise(
+        self, mx_client, nixl_manager
+    ):
+        publish = MagicMock(return_value="id1")
+        publisher = self._publisher(mx_client, nixl_manager, publish)
+        mx_client.update_status.side_effect = [True, False, False]
+
+        for _ in range(3):
+            publisher._tick()
+        assert publisher.mx_source_id is None
+
+        mx_client.update_status.side_effect = None
+        mx_client.update_status.reset_mock()
+        publisher.stop()
+
+        # No mx_source_id left, so no STALE update is sent.
+        stale_calls = [
+            c for c in mx_client.update_status.call_args_list
+            if c.kwargs.get("status") == 3
+        ]
+        assert stale_calls == []
+
+
+class TestPublishTimeout:
+    """Publication timeout behavior for bounded and resident sources."""
+
+    def _publisher(self, mx_client, nixl_manager, publish, **overrides):
+        """Build a publishing thread with a short 10s publish timeout."""
+        kwargs = dict(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=publish,
+            interval_secs=1,
+            publish_timeout_secs=10,
+        )
+        kwargs.update(overrides)
+        return PublisherThread(**kwargs)
+
+    def _overdue(self, publisher):
+        """Pretend the publish window is long gone."""
+        publisher._publish_started_at = time.monotonic() - 10_000
+        return publisher
+
+    def test_zero_timeout_keeps_trying(self, mx_client, nixl_manager):
+        """A zero timeout retries indefinitely."""
+        publish = MagicMock(side_effect=RuntimeError("server down"))
+        with patch.dict("os.environ", {"MX_PUBLISH_TIMEOUT_SECS": "0"}):
+            publisher = self._overdue(
+                self._publisher(
+                    mx_client, nixl_manager, publish, publish_timeout_secs=None
+                )
+            )
+
+        publisher._tick()
+
+        assert not publisher._stop_event.is_set()
+        assert publish.call_count == 1
+
+    def test_zero_timeout_recovers_when_server_returns(
+        self, mx_client, nixl_manager
+    ):
+        """An unlimited publisher recovers once the server returns."""
+        publish = MagicMock(side_effect=[RuntimeError("server down"), "id1"])
+        with patch.dict("os.environ", {"MX_PUBLISH_TIMEOUT_SECS": "0"}):
+            publisher = self._overdue(
+                self._publisher(
+                    mx_client, nixl_manager, publish, publish_timeout_secs=None
+                )
+            )
+
+        publisher._tick()  # overdue but keeps going
+        publisher._tick()  # server back: publishes
+
+        assert publisher.mx_source_id == "id1"
+        assert not publisher._stop_event.is_set()
+        ready_calls = [
+            c
+            for c in mx_client.update_status.call_args_list
+            if c.kwargs.get("status") == 2
+        ]
+        assert len(ready_calls) == 1
+
+    def test_positive_timeout_still_gives_up(self, mx_client, nixl_manager):
+        """A positive timeout stops the thread after its deadline."""
+        publish = MagicMock(side_effect=RuntimeError("server down"))
+        publisher = self._overdue(
+            self._publisher(mx_client, nixl_manager, publish)
+        )
+
+        publisher._tick()
+
+        assert publisher._stop_event.is_set()
+        assert publish.call_count == 0
+
+
 class TestHeartbeatDaemon:
     def test_thread_is_daemon(self, heartbeat):
         heartbeat.start()
@@ -292,3 +572,32 @@ class TestHeartbeatDaemon:
         time.sleep(2.5)
 
         assert heartbeat._thread.is_alive()
+
+
+class TestSourceLoadPresence:
+    """The publisher forwards exactly what the provider knows: a reading, or None."""
+
+    def test_provider_reading_is_forwarded(self, mx_client, nixl_manager):
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            mx_source_id="abc123",
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            source_load_provider=lambda: 0.3,
+        )
+        publisher._update_status(2)
+        kwargs = mx_client.update_status.call_args.kwargs
+        assert kwargs["source_load"] == 0.3
+
+    def test_provider_none_is_forwarded_as_none(self, mx_client, nixl_manager):
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            mx_source_id="abc123",
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            source_load_provider=lambda: None,
+        )
+        publisher._update_status(2)
+        assert mx_client.update_status.call_args.kwargs["source_load"] is None

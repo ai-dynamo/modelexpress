@@ -50,6 +50,7 @@ See [`server/`](server/) for backend-specific server manifests:
 
 See [`client/`](client/) for engine deployment manifests:
 - **Single-node** (TP only): [`client/vllm/vllm-single-node.yaml`](client/vllm/vllm-single-node.yaml)
+- **GLM-5.2 MTP speculative decoding**: [`client/vllm/vllm-mtp.yaml`](client/vllm/vllm-mtp.yaml)
 - **Multi-node** (TP + PP): [`client/vllm/vllm-multi-node.yaml`](client/vllm/vllm-multi-node.yaml)
 - **SGLang single-node NIXL**: [`client/sglang/sglang-single-node-p2p.yaml`](client/sglang/sglang-single-node-p2p.yaml)
 - **SGLang single-node Mooncake TransferEngine**: [`client/sglang/sglang-single-node-transfer-engine.yaml`](client/sglang/sglang-single-node-transfer-engine.yaml)
@@ -68,6 +69,26 @@ TP=4 and native `checkpoint_format="MX"`. See
 deployment instructions.
 
 For ModelStreamer-only startup examples that stream weights from Azure Blob Storage, S3, or a local PVC, see [`../model_streamer_k8s/`](../model_streamer_k8s/).
+
+### Optional: client Prometheus metrics
+
+Client metrics are opt-in and off by default. To try them, deploy
+[`client/vllm/vllm-single-node-metrics.yaml`](client/vllm/vllm-single-node-metrics.yaml)
+instead of the standard single-node manifest — it is the same fleet plus the
+four things metrics need, each marked `# metrics:` in the file.
+
+The one part that is not obvious: a TP=8 pod runs eight worker processes, and
+`prometheus_client` needs a shared directory (`PROMETHEUS_MULTIPROC_DIR`) for one
+endpoint to serve all of them. Any writable container path works — the ranks
+share the container filesystem — but it has to be set in the manifest rather than
+in code, because `prometheus_client` fixes its value class at import and an
+in-process assignment lands too late to take effect. Without it nothing breaks;
+the client falls back to one endpoint per rank and warns, so only one of the
+eight is represented.
+
+The engine images already ship `prometheus-client`, so no image change is needed.
+See [`docs/METRICS.md`](../../docs/METRICS.md) for the families, the PromQL, and a
+diagnosis table.
 
 ## Environment Variables
 

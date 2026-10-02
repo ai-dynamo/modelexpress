@@ -71,6 +71,7 @@ def _make_load_context(**overrides):
         target_device=torch.device("cpu"),
         global_rank=0,
         worker_rank=0,
+        local_rank=0,
         device_id=0,
         identity=p2p_pb2.SourceIdentity(
             model_name="test-model",
@@ -106,6 +107,44 @@ class TestInstantTensorIsAvailable:
         ctx = _make_load_context()
         strategy = _make_strategy()
         with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "1"}):
+            with patch("importlib.util.find_spec", return_value=MagicMock()):
+                assert strategy.is_available(ctx) is True
+
+    @pytest.mark.parametrize(
+        "model_uri",
+        [
+            "s3://bucket/model",
+            "gs://bucket/model",
+            "az://container/model",
+            "  S3://bucket/model  ",
+        ],
+    )
+    def test_unavailable_for_object_store_model_uri(self, model_uri):
+        ctx = _make_load_context()
+        strategy = _make_strategy()
+        with patch.dict(
+            "os.environ",
+            {"MX_INSTANT_TENSOR": "1", "MX_MODEL_URI": model_uri},
+            clear=True,
+        ):
+            with patch("importlib.util.find_spec", return_value=MagicMock()):
+                assert strategy.is_available(ctx) is False
+
+    @pytest.mark.parametrize(
+        "model_uri",
+        [
+            "/models/org/model",
+            "org/model",
+        ],
+    )
+    def test_available_for_non_object_store_model_uri(self, model_uri):
+        ctx = _make_load_context()
+        strategy = _make_strategy()
+        with patch.dict(
+            "os.environ",
+            {"MX_INSTANT_TENSOR": "1", "MX_MODEL_URI": model_uri},
+            clear=True,
+        ):
             with patch("importlib.util.find_spec", return_value=MagicMock()):
                 assert strategy.is_available(ctx) is True
 

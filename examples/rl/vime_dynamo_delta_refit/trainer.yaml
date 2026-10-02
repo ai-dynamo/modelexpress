@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vime-delta-refit-trainer
+  labels:
+    app: vime-delta-refit-trainer
+spec:
+  restartPolicy: Never
+  imagePullSecrets:
+  - {name: nvcr-imagepullsecret}
+  tolerations:
+  - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+  containers:
+  - name: trainer
+    image: TRAINER_IMAGE
+    imagePullPolicy: Always
+    env:
+    - name: AWS_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_USER}
+    - name: AWS_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_PASSWORD}
+    resources:
+      requests: {cpu: "8", memory: 32Gi, nvidia.com/gpu: "2"}
+      limits: {memory: 128Gi, nvidia.com/gpu: "2"}
+    volumeMounts:
+    - {name: model, mountPath: /models, subPath: MODEL_SUBPATH, readOnly: true}
+    - {name: mxdelta, mountPath: /mxdelta}
+    - {name: dshm, mountPath: /dev/shm}
+  volumes:
+  - name: model
+    persistentVolumeClaim: {claimName: shared-model-cache}
+  - name: mxdelta
+    emptyDir: {sizeLimit: 8Gi}
+  - name: dshm
+    emptyDir: {medium: Memory, sizeLimit: 16Gi}

@@ -14,12 +14,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
-from fcntl import LOCK_EX, LOCK_UN, flock
+from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from getpass import getuser
 from hashlib import sha256
 from importlib.metadata import version as pkg_version
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, TextIO
 
 import torch
 
@@ -36,6 +36,7 @@ from .artifact_transfer import (
 )
 from .publisher import PublisherThread
 from .publish import _get_worker_server, _is_p2p_metadata_enabled
+from .source_id import compute_mx_source_id
 
 logger = logging.getLogger("modelexpress.metadata.artifact_lifecycle")
 
@@ -43,6 +44,8 @@ READY_POLL_SECS = 5
 CACHE_SETTLE_SECS = 5
 
 ArtifactEntry = tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]
+InstallCompleted = Callable[[P2PArtifactTransfer, p2p_pb2.SourceIdentity], None]
+_publish_leases: dict[Path, TextIO] = {}
 
 
 def install_artifacts(
@@ -50,6 +53,7 @@ def install_artifacts(
     transfers_factory: Callable[[], list[ArtifactEntry]],
     *,
     engine_label: str,
+    on_install_completed: InstallCompleted | None = None,
     log: logging.Logger = logger,
 ) -> None:
     """Best-effort install of compatible artifacts before model loading."""
@@ -84,6 +88,7 @@ def install_artifacts(
                 transfer,
                 identity,
                 engine_label=engine_label,
+                on_install_completed=on_install_completed,
             )
             elapsed = time.perf_counter() - start
             if header is None:
@@ -96,20 +101,28 @@ def install_artifacts(
                 continue
             log.info(
                 "[Worker %s] [TIMING] %s artifact install complete: "
-                "name=%s artifact_id=%s size=%.2f MiB elapsed=%.3fs",
+                "name=%s artifact_id=%s mx_source_id=%s size=%.2f MiB elapsed=%.3fs",
                 ctx.global_rank,
                 engine_label,
                 transfer.name,
                 header.artifact_id,
+                compute_mx_source_id(identity),
                 header.total_size / (1024 * 1024),
                 elapsed,
             )
         except LookupError:
-            log.debug(
-                "[Worker %s] No ready %s artifact source for %s",
+            # Logged at INFO, not DEBUG: a miss here is the difference between a
+            # warm start and a full recompile, and the mx_source_id plus digest
+            # are what an operator needs to diff two pods that fail to pair.
+            log.info(
+                "[Worker %s] No ready %s artifact source for %s "
+                "(mx_source_id=%s compile_config_digest=%r); "
+                "the engine will rebuild this cache locally",
                 ctx.global_rank,
                 engine_label,
                 transfer.name,
+                compute_mx_source_id(identity),
+                identity.compile_config_digest,
             )
         except Exception as exc:
             log.warning(
@@ -200,6 +213,7 @@ def install_artifact_once(
     identity: p2p_pb2.SourceIdentity,
     *,
     engine_label: str,
+    on_install_completed: InstallCompleted | None = None,
 ) -> p2p_pb2.GetArtifactManifestHeaderResponse | None:
     """Install one artifact at most once per pod."""
     marker_path = artifact_marker_path(transfer, identity, "install-attempted")
@@ -220,6 +234,8 @@ def install_artifact_once(
             accelerator=ctx.accelerator_backend.name,
         )
         transfer.install(header)
+        if on_install_completed is not None:
+            on_install_completed(transfer, identity)
         write_marker(marker_path, header.artifact_id)
         return header
 
@@ -323,9 +339,9 @@ def artifact_ready_fn(
     return ready
 
 
-def artifact_health_ready(url: str) -> bool:
+def artifact_health_ready(url: str, *, timeout_secs: float = 1.0) -> bool:
     try:
-        with urllib.request.urlopen(url, timeout=1.0) as response:
+        with urllib.request.urlopen(url, timeout=timeout_secs) as response:
             return 200 <= response.status < 400
     except (OSError, urllib.error.URLError, TimeoutError):
         return False
@@ -428,23 +444,33 @@ def mark_publish_scheduled(
     transfer: P2PArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
 ) -> Path | None:
-    """Mark one pod-scoped publisher as scheduled."""
-    marker_path = artifact_marker_path(transfer, identity, "publish-scheduled")
-    with artifact_lock(marker_path):
-        if marker_path.exists():
-            return None
-        write_marker(marker_path, str(ctx.global_rank))
-        return marker_path
+    """Acquire one process-owned artifact publication lease."""
+    lease_path = artifact_marker_path(transfer, identity, "publish-scheduled")
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease = lease_path.open("a+")
+    try:
+        flock(lease.fileno(), LOCK_EX | LOCK_NB)
+    except BlockingIOError:
+        lease.close()
+        return None
+    _publish_leases[lease_path] = lease
+    logger.debug(
+        "[Worker %s] Acquired artifact publish lease: name=%s",
+        ctx.global_rank,
+        transfer.name,
+    )
+    return lease_path
 
 
 def clear_publish_scheduled(
     publisher: PublisherThread | None,
-    marker_path: Path,
+    lease_path: Path,
 ) -> None:
     if publisher is None or publisher.mx_source_id is not None:
         return
-    with artifact_lock(marker_path):
-        marker_path.unlink(missing_ok=True)
+    lease = _publish_leases.pop(lease_path, None)
+    if lease is not None:
+        lease.close()
 
 
 def artifact_marker_path(

@@ -13,36 +13,50 @@ def test_defaults_when_unset(monkeypatch):
         "MX_NIXL_BACKEND",
         "MX_METADATA_PORT",
         "MX_WORKER_GRPC_PORT",
+        "MX_GENERATOR_SOURCE_ORDER",
         "MX_POOL_REG",
         "MX_VMM_ARENA",
         "MX_MS_DISTRIBUTED",
+        "MX_LOAD_STRATEGY_CHAIN",
         "MX_INSTANT_TENSOR",
         "VLLM_ATTENTION_BACKEND",
         "SGLANG_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "MODEL_EXPRESS_URL",
         "MX_SERVER_ADDRESS",
+        "MODEL_EXPRESS_CACHE_DIRECTORY",
+        "MODEL_EXPRESS_NO_SHARED_STORAGE",
+        "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE",
         "MX_GDS_TIMEOUT",
         "MX_HEARTBEAT_INTERVAL_SECS",
         "MX_RESHARD_FUSED_WIRE",
+        "MX_RESHARD_BATCH_INSTALL",
+        "MX_RESHARD_CACHE_DESCRIPTORS",
     ):
         monkeypatch.delenv(name, raising=False)
 
     assert envs.MX_NIXL_BACKEND == "UCX"
     assert envs.MX_METADATA_PORT == 5555
     assert envs.MX_WORKER_GRPC_PORT == 6555
+    assert envs.MX_GENERATOR_SOURCE_ORDER is None
     assert envs.MX_POOL_REG is False
     assert envs.MX_VMM_ARENA is False
     assert envs.MX_MS_DISTRIBUTED is True
+    assert envs.MX_LOAD_STRATEGY_CHAIN == "INFERENCE"
     assert envs.MX_INSTANT_TENSOR is True
     assert envs.VLLM_ATTENTION_BACKEND == "auto"
     assert envs.SGLANG_CACHE_DIR is None
     assert envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR is None
     assert envs.MODEL_EXPRESS_URL is None
     assert envs.MX_SERVER_ADDRESS is None
+    assert envs.MODEL_EXPRESS_CACHE_DIRECTORY is None
+    assert envs.MODEL_EXPRESS_NO_SHARED_STORAGE is False
+    assert envs.MODEL_EXPRESS_TRANSFER_CHUNK_SIZE is None
     assert envs.MX_GDS_TIMEOUT == pytest.approx(120.0)
     assert envs.MX_HEARTBEAT_INTERVAL_SECS == 30
     assert envs.MX_RESHARD_FUSED_WIRE is True
+    assert envs.MX_RESHARD_BATCH_INSTALL is True
+    assert envs.MX_RESHARD_CACHE_DESCRIPTORS is True
 
 
 def test_int_and_float_parsing(monkeypatch):
@@ -52,6 +66,11 @@ def test_int_and_float_parsing(monkeypatch):
     assert envs.MX_METADATA_PORT == 1234
     assert envs.MX_GDS_TIMEOUT == pytest.approx(1.5)
     assert envs.MX_SOURCE_QUERY_TIMEOUT == 42
+
+
+def test_generator_source_order_is_read_raw(monkeypatch):
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "TRAINER,GENERATOR")
+    assert envs.MX_GENERATOR_SOURCE_ORDER == "TRAINER,GENERATOR"
 
 
 def test_invalid_int_falls_back_to_default(monkeypatch):
@@ -79,6 +98,15 @@ def test_bool_parsing(monkeypatch, caplog):
     assert envs.MX_VMM_ARENA is True
 
     for truthy in ("1", "TRUE", "yes", "On"):
+        monkeypatch.setenv("MODEL_EXPRESS_NO_SHARED_STORAGE", truthy)
+        assert envs.MODEL_EXPRESS_NO_SHARED_STORAGE is True
+    for falsy in ("0", "FALSE", "no", "Off"):
+        monkeypatch.setenv("MODEL_EXPRESS_NO_SHARED_STORAGE", falsy)
+        assert envs.MODEL_EXPRESS_NO_SHARED_STORAGE is False
+    monkeypatch.setenv("MODEL_EXPRESS_NO_SHARED_STORAGE", "maybe")
+    assert envs.MODEL_EXPRESS_NO_SHARED_STORAGE is False
+
+    for truthy in ("1", "TRUE", "yes", "On"):
         monkeypatch.setenv("MX_ARTIFACT_TRANSFER", truthy)
         assert envs.MX_ARTIFACT_TRANSFER is True
     monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "maybe")
@@ -93,6 +121,11 @@ def test_bool_parsing(monkeypatch, caplog):
     monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "maybe")
     assert envs.MX_RESHARD_FUSED_WIRE is True
     assert "Invalid MX_RESHARD_FUSED_WIRE='maybe'; using default True" in caplog.text
+
+
+def test_load_strategy_chain_is_normalized(monkeypatch):
+    monkeypatch.setenv("MX_LOAD_STRATEGY_CHAIN", " rl ")
+    assert envs.MX_LOAD_STRATEGY_CHAIN == "RL"
 
 
 def test_normalization(monkeypatch):

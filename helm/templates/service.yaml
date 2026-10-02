@@ -15,5 +15,11 @@ spec:
       targetPort: http
       protocol: TCP
       name: http
+    {{- if and .Values.metrics .Values.metrics.enabled .Values.metrics.service }}
+    - port: {{ .Values.metrics.port | default 9401 }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- end }}
   selector:
     {{- include "modelexpress.selectorLabels" . | nindent 4 }}

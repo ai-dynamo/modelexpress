@@ -64,14 +64,6 @@ pub struct ClientArgs {
     #[arg(long, short = 'q')]
     pub quiet: bool,
 
-    /// Maximum number of retries
-    #[arg(long, env = crate::envs::MODEL_EXPRESS_MAX_RETRIES)]
-    pub max_retries: Option<u32>,
-
-    /// Retry delay in seconds
-    #[arg(long, env = crate::envs::MODEL_EXPRESS_RETRY_DELAY)]
-    pub retry_delay: Option<u64>,
-
     /// Disable shared storage mode (will transfer files from server to client)
     #[arg(long, env = crate::envs::MODEL_EXPRESS_NO_SHARED_STORAGE)]
     pub no_shared_storage: bool,
@@ -138,14 +130,6 @@ impl ClientConfig {
 
         if let Some(timeout) = args.timeout {
             config.connection.timeout_secs = Some(timeout);
-        }
-
-        if let Some(max_retries) = args.max_retries {
-            config.connection.max_retries = Some(max_retries);
-        }
-
-        if let Some(retry_delay) = args.retry_delay {
-            config.connection.retry_delay_secs = Some(retry_delay);
         }
 
         // Cache settings
@@ -235,14 +219,6 @@ impl ClientConfig {
             cache: CacheConfig::default(),
             logging: LoggingConfig::default(),
         }
-    }
-
-    /// Apply cache path override if provided
-    pub fn with_cache_path(mut self, cache_path: Option<PathBuf>) -> Self {
-        if let Some(path) = cache_path {
-            self.cache.local_path = path;
-        }
-        self
     }
 
     /// Set timeout for the connection
@@ -407,8 +383,6 @@ mod tests {
             log_level: None,
             log_format: None,
             quiet: true,
-            max_retries: Some(5),
-            retry_delay: Some(10),
             no_shared_storage: true,
             transfer_chunk_size: Some(2097152),
         };
@@ -418,8 +392,6 @@ mod tests {
         assert_eq!(config.connection.endpoint, "http://cli-override:7777");
         assert_eq!(config.connection.timeout_secs, Some(120));
         assert!(config.logging.quiet);
-        assert_eq!(config.connection.max_retries, Some(5));
-        assert_eq!(config.connection.retry_delay_secs, Some(10));
         assert!(!config.cache.shared_storage);
         assert_eq!(config.cache.transfer_chunk_size, 2097152);
     }

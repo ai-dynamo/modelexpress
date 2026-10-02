@@ -12,15 +12,21 @@ homepage.workspace = true
 repository.workspace = true
 keywords.workspace = true
 
+[features]
+default = ["modelexpress-common/default"]
+openssl = ["modelexpress-common/openssl"]
+gcs = ["modelexpress-common/gcs"]
+tls-native = ["modelexpress-common/tls-native"]
+tls-rustls = ["modelexpress-common/tls-rustls"]
+
 [dependencies]
-modelexpress-common = { workspace = true }
+modelexpress-common = { workspace = true, default-features = false }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tonic = { workspace = true }
-prost = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
@@ -29,9 +35,7 @@ clap = { workspace = true }
 colored = { workspace = true }
 
 [dev-dependencies]
-modelexpress-common = { workspace = true, features = ["test-support"] }
-tokio-test = "0.4"
-tonic-build = { workspace = true }
+modelexpress-common = { workspace = true, default-features = false, features = ["test-support"] }
 tempfile = "3.20"
 
 [lints]

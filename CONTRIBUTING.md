@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Contributing to ModelExpress
 
-For technical architecture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). For AI assistant instructions, see `CLAUDE.md`.
+For technical architecture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). For AI coding-agent instructions, see [`AGENTS.md`](AGENTS.md).
 
 ## Development Setup
 
@@ -125,7 +125,6 @@ MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 cargo run -p modelexp
 | `MODEL_EXPRESS_ENDPOINT` | `http://localhost:8001` | Server endpoint |
 | `MODEL_EXPRESS_TIMEOUT` | `30` | Request timeout in seconds |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | (see below) | Cache path override |
-| `MODEL_EXPRESS_MAX_RETRIES` | (none) | Max retry attempts |
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Disable shared storage mode |
 
 Cache directory resolution order: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CACHE` -> `~/.cache/huggingface/hub`.
@@ -135,7 +134,7 @@ Cache directory resolution order: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CAC
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration (registers cudaMalloc blocks instead of individual tensors) |
 | `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
 | `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |
@@ -224,4 +223,9 @@ Signed-off-by: Jane Smith <jane.smith@email.com>
 
 You can use `-s` or `--signoff` to add the `Signed-off-by` line automatically.
 
-If your pull request fails the DCO check, see the [DCO Troubleshooting Guide](DCO.md).
+If your pull request fails the DCO check, add the trailer to the existing commits and force-push:
+
+```bash
+git rebase --signoff origin/main
+git push --force-with-lease
+```

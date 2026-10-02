@@ -99,12 +99,57 @@ def _maybe_mock_vllm():
             return cls
         return _wrapper
 
+    @dataclass
+    class WeightTransferInitInfo:
+        pass
+
+    @dataclass
+    class WeightTransferUpdateInfo:
+        pass
+
+    class WeightTransferEngine(ABC):
+        def __init__(self, config, vllm_config, device, model):
+            self.config = config
+            self.vllm_config = vllm_config
+            self.parallel_config = vllm_config.parallel_config
+            self.model_config = vllm_config.model_config
+            self.device = device
+            self.model = model
+            self._default_model = model
+            self._default_model_config = self.model_config
+
+        def reset_weight_update_target(self):
+            self.model = self._default_model
+            self.model_config = self._default_model_config
+
+        def update_weights(self, update_info):
+            self.receive_weights(self.update_info_cls(**update_info))
+
+        @staticmethod
+        @abstractmethod
+        def trainer_send_weights(iterator, trainer_args):
+            raise NotImplementedError
+
+    class WeightTransferEngineFactory:
+        _registry = {}
+
+        @classmethod
+        def register_engine(cls, name, module_path_or_cls, class_name=None):
+            if name in cls._registry:
+                raise ValueError(f"Weight transfer engine {name!r} is registered")
+            cls._registry[name] = (module_path_or_cls, class_name)
+
+    attention_layer_base = type("AttentionLayerBase", (), {})
+    mamba_base = type("MambaBase", (attention_layer_base,), {})
+
     # Build mock module tree
     vllm_mods = {
         "vllm": MagicMock(),
         "vllm.config": MagicMock(),
         "vllm.config.load": MagicMock(),
         "vllm.model_executor": MagicMock(),
+        "vllm.model_executor.layers.attention_layer_base": MagicMock(),
+        "vllm.model_executor.layers.mamba.abstract": MagicMock(),
         "vllm.model_executor.model_loader": MagicMock(),
         "vllm.model_executor.model_loader.base_loader": MagicMock(),
         "vllm.model_executor.model_loader.default_loader": MagicMock(),
@@ -113,12 +158,29 @@ def _maybe_mock_vllm():
         "vllm.utils": MagicMock(),
         "vllm.utils.torch_utils": MagicMock(),
         "vllm.distributed": MagicMock(),
+        "vllm.distributed.weight_transfer": MagicMock(),
+        "vllm.distributed.weight_transfer.base": MagicMock(),
+        "vllm.distributed.weight_transfer.factory": MagicMock(),
     }
 
     # Wire up real objects where behavior matters
+    vllm_mods["vllm.model_executor.layers.attention_layer_base"].AttentionLayerBase = attention_layer_base
+    vllm_mods["vllm.model_executor.layers.mamba.abstract"].MambaBase = mamba_base
     vllm_mods["vllm.model_executor.model_loader.base_loader"].BaseModelLoader = BaseModelLoader
     vllm_mods["vllm.model_executor.model_loader"].register_model_loader = register_model_loader
     vllm_mods["vllm.model_executor.model_loader"].BaseModelLoader = BaseModelLoader
+    vllm_mods["vllm.distributed.weight_transfer"].WeightTransferEngine = (
+        WeightTransferEngine
+    )
+    vllm_mods["vllm.distributed.weight_transfer.base"].WeightTransferInitInfo = (
+        WeightTransferInitInfo
+    )
+    vllm_mods["vllm.distributed.weight_transfer.base"].WeightTransferUpdateInfo = (
+        WeightTransferUpdateInfo
+    )
+    vllm_mods["vllm.distributed.weight_transfer.factory"].WeightTransferEngineFactory = (
+        WeightTransferEngineFactory
+    )
 
     # set_default_torch_dtype needs to be a real context manager
     from contextlib import contextmanager

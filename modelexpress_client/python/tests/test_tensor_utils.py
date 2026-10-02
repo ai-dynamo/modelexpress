@@ -3,6 +3,8 @@
 
 """Tests for tensor_utils: hidden tensor adoption, capture_tensor_attrs, checksums."""
 
+import types
+
 import torch
 import torch.nn as nn
 
@@ -347,3 +349,73 @@ class TestCollectModuleTensors:
         model.register_buffer("nc_view", view, persistent=False)
         tensors = collect_module_tensors(model, backend)
         assert "nc_view.__storage" in tensors
+
+
+# ---------------------------------------------------------------------------
+# Traversal robustness. Both shapes below were hit on SGLang + Kimi-K3, where
+# they aborted registration entirely and left the worker serving without its
+# container-held tensors. The trigger in each case is an attribute lookup made
+# by the walk itself: on an object with no real __dict__, the `hasattr` probe
+# reaches __getattr__, which is where lazy-import machinery runs.
+# ---------------------------------------------------------------------------
+
+
+class LazyProxy:
+    """No real __dict__; __getattr__ raises for anything it cannot resolve.
+
+    Mirrors transformers' _LazyModule asked for a class the installed version
+    does not ship:
+      Could not find VoxtralRealtimeTextModel neither in <module 'transformers.models'>
+    """
+
+    __slots__ = ()
+
+    def __getattr__(self, name):
+        raise RuntimeError(
+            f"Could not find {name} neither in <module 'transformers.models'>"
+        )
+
+
+class CachingProxy:
+    """No real __dict__; the lookup caches into the container being walked."""
+
+    __slots__ = ("_parent",)
+
+    def __init__(self, parent):
+        object.__setattr__(self, "_parent", parent)
+
+    def __getattr__(self, name):
+        self._parent[f"cached_{len(self._parent)}"] = torch.zeros(1)
+        raise AttributeError(name)
+
+
+class TestTraversalRobustness:
+    def test_raising_proxy_does_not_abort_the_scan(
+        self, mock_accelerator_backend_cls
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        holder = {"weight": torch.randn(4), "proxy": LazyProxy()}
+        found = _find_hidden_accel_tensors(
+            holder, visited=set(), accelerator_backend=backend
+        )
+        assert [t.numel() for _, t in found] == [4]
+
+    def test_container_mutated_during_scan(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        holder = {"weight": torch.randn(4)}
+        holder["proxy"] = CachingProxy(holder)
+        found = _find_hidden_accel_tensors(
+            holder, visited=set(), accelerator_backend=backend
+        )
+        assert any(t.numel() == 4 for _, t in found)
+
+    def test_module_objects_are_not_walked(self, mock_accelerator_backend_cls):
+        """A module is an import registry; walking it runs lazy imports."""
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        mod = types.ModuleType("fake_transformers_models")
+        mod.lazy = LazyProxy()
+        holder = {"weight": torch.randn(4), "mod": mod}
+        found = _find_hidden_accel_tensors(
+            holder, visited=set(), accelerator_backend=backend
+        )
+        assert [t.numel() for _, t in found] == [4]

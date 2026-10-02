@@ -39,10 +39,11 @@ mod fields {
 }
 
 /// Every provider, for enumerating candidate keys in name-addressed lookups.
-const ALL_PROVIDERS: [ModelProvider; 3] = [
+const ALL_PROVIDERS: [ModelProvider; 4] = [
     ModelProvider::HuggingFace,
     ModelProvider::Ngc,
     ModelProvider::Gcs,
+    ModelProvider::S3,
 ];
 
 /// Provider-scoped key: `mx:model:{Provider}:{model_name}`.
@@ -72,6 +73,7 @@ fn provider_str(p: ModelProvider) -> &'static str {
         ModelProvider::HuggingFace => "HuggingFace",
         ModelProvider::Ngc => "Ngc",
         ModelProvider::Gcs => "Gcs",
+        ModelProvider::S3 => "S3",
     }
 }
 
@@ -80,6 +82,7 @@ fn provider_from_str(s: &str) -> RegistryResult<ModelProvider> {
         "HuggingFace" => Ok(ModelProvider::HuggingFace),
         "Ngc" => Ok(ModelProvider::Ngc),
         "Gcs" => Ok(ModelProvider::Gcs),
+        "S3" => Ok(ModelProvider::S3),
         other => Err(format!("unknown provider in Redis record: {other:?}").into()),
     }
 }
@@ -402,10 +405,10 @@ impl RegistryBackend for RedisRegistryBackend {
         let key = model_key(provider, model_name);
         let legacy = legacy_model_key(model_name);
         let now = Utc::now().to_rfc3339();
-        // Single atomic EVAL: returns CLAIM_WON_SENTINEL if we created the record or took
-        // over an expired lease, else the existing status, so callers know which replica
-        // owns the download (status alone can't — both see DOWNLOADING). KEYS[2] is the
-        // legacy key for migration (see below).
+        // Single atomic EVAL: returns CLAIM_WON_SENTINEL if we created the record,
+        // CLAIM_TAKEOVER_SENTINEL if we took over an expired lease, else the existing
+        // status, so callers know which replica owns the download (status alone can't —
+        // both see DOWNLOADING). KEYS[2] is the legacy key for migration (see below).
         let result: String = redis::Script::new(CLAIM_LUA)
             .key(&key)
             .key(&legacy)
@@ -417,12 +420,15 @@ impl RegistryBackend for RedisRegistryBackend {
             .arg(claim_id)
             .arg(lease_duration_millis(lease_duration))
             .arg("Taking over expired download lease...")
+            .arg(CLAIM_TAKEOVER_SENTINEL)
             .invoke_async(&mut conn)
             .await?;
-        if result == CLAIM_WON_SENTINEL {
-            Ok(ClaimOutcome::Claimed)
-        } else {
-            Ok(ClaimOutcome::AlreadyExists(status_from_str(&result)?))
+        // The legacy-migration arm routes through `claim_existing`, so a migrated
+        // record with a dead lease reports a takeover without extra handling.
+        match result.as_str() {
+            CLAIM_WON_SENTINEL => Ok(ClaimOutcome::Claimed),
+            CLAIM_TAKEOVER_SENTINEL => Ok(ClaimOutcome::TookOver),
+            status => Ok(ClaimOutcome::AlreadyExists(status_from_str(status)?)),
         }
     }
 
@@ -505,9 +511,15 @@ impl RegistryBackend for RedisRegistryBackend {
     }
 }
 
-/// Sentinel string returned by [`CLAIM_LUA`] when the caller won the claim. Picked so
-/// it cannot be confused with any real `ModelStatus` string.
+/// Sentinel string returned by [`CLAIM_LUA`] when the caller created the record.
+/// Picked so it cannot be confused with any real `ModelStatus` string.
 const CLAIM_WON_SENTINEL: &str = "__MX_CLAIM_WON__";
+
+/// Sentinel returned by [`CLAIM_LUA`] when the caller took over an expired lease
+/// rather than creating the record. Both outcomes mean the caller owns the
+/// download; they are separated because a takeover re-pulls bytes that were
+/// already fetched once.
+const CLAIM_TAKEOVER_SENTINEL: &str = "__MX_CLAIM_TAKEOVER__";
 
 /// Atomic claim against the provider-scoped key, lazily migrating legacy records:
 ///   1. provider-scoped key exists -> return its status (normal hit);
@@ -520,7 +532,7 @@ const CLAIM_WON_SENTINEL: &str = "__MX_CLAIM_WON__";
 ///
 /// KEYS = [provider-scoped, legacy]
 /// ARGV = [win_sentinel, status, provider, now, message, claim_id, lease_ttl_ms,
-///         takeover_message]
+///         takeover_message, takeover_sentinel]
 const CLAIM_LUA: &str = r#"
 local clock = redis.call("TIME")
 local now_ms = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
@@ -535,7 +547,7 @@ local function claim_existing(key, status)
         "message", ARGV[8],
         "claim_id", ARGV[6],
         "lease_expires_at", lease_expires_at)
-    return ARGV[1]
+    return ARGV[9]
 end
 local existing = redis.call("HGET", KEYS[1], "status")
 if existing then return claim_existing(KEYS[1], existing) end
@@ -709,10 +721,10 @@ mod tests {
     #[test]
     fn candidate_keys_cover_all_providers_and_legacy() {
         let keys = candidate_keys("org/model");
-        assert_eq!(keys.len(), 4);
-        assert!(keys.contains(&"mx:model:HuggingFace:org/model".to_string()));
-        assert!(keys.contains(&"mx:model:Ngc:org/model".to_string()));
-        assert!(keys.contains(&"mx:model:Gcs:org/model".to_string()));
+        assert_eq!(keys.len(), ALL_PROVIDERS.len() + 1);
+        for provider in ALL_PROVIDERS {
+            assert!(keys.contains(&model_key(provider, "org/model")));
+        }
         assert!(keys.contains(&"mx:model:org/model".to_string())); // legacy
     }
 
@@ -793,7 +805,7 @@ mod tests {
                 )
                 .await
                 .expect("takeover"),
-            ClaimOutcome::Claimed
+            ClaimOutcome::TookOver
         );
         assert!(
             !backend

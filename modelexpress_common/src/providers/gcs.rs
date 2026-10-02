@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::providers::ModelProviderTrait;
+use crate::providers::{ModelProviderTrait, ensure_crypto_provider};
 use anyhow::{Context, Result};
 use google_cloud_storage::client::{Storage, StorageControl};
 use std::fs;
@@ -23,18 +23,6 @@ use model_dir::ModelDir;
 use model_name::ModelName;
 
 pub use provider_cache::GcsProviderCache;
-
-fn ensure_crypto_provider() -> Result<()> {
-    if rustls::crypto::CryptoProvider::get_default().is_some() {
-        return Ok(());
-    }
-
-    match rustls::crypto::ring::default_provider().install_default() {
-        Ok(()) => Ok(()),
-        Err(_) if rustls::crypto::CryptoProvider::get_default().is_some() => Ok(()),
-        Err(_) => anyhow::bail!("Failed to install rustls ring CryptoProvider for GCS"),
-    }
-}
 
 pub struct GcsProvider;
 

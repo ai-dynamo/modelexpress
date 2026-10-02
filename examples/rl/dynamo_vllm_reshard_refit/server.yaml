@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-vllm-refit-server
+spec:
+  selector:
+    app: mx-vllm-refit-server
+  ports:
+  - name: grpc
+    port: 8000
+    targetPort: grpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-vllm-refit-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-vllm-refit-server
+  template:
+    metadata:
+      labels:
+        app: mx-vllm-refit-server
+    spec:
+      initContainers:
+      - name: redis
+        image: redis:7-alpine
+        args: ["--save", "", "--appendonly", "no"]
+        restartPolicy: Always
+        startupProbe:
+          tcpSocket:
+            port: 6379
+          periodSeconds: 1
+          failureThreshold: 30
+      containers:
+      - name: modelexpress-server
+        image: ${MX_SERVER_IMAGE}
+        command: ["./modelexpress-server"]
+        args: ["--port", "8000"]
+        env:
+        - name: MX_METADATA_BACKEND
+          value: redis
+        - name: REDIS_URL
+          value: redis://localhost:6379
+        ports:
+        - name: grpc
+          containerPort: 8000
+        readinessProbe:
+          grpc:
+            port: 8000
+          periodSeconds: 2
+          failureThreshold: 30

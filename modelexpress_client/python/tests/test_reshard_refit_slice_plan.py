@@ -227,6 +227,88 @@ def test_dtype_mismatch_raises():
         )
 
 
+def test_select_expert_slab_reconstructs_bit_for_bit():
+    # MoE unstack: stacked experts [E=3, out=2, in=4]; select(0, 1) -> expert 1's
+    # [2,4] slab. Contiguous dim-0 slice -> a single run.
+    import torch
+
+    src = torch.arange(3 * 2 * 4, dtype=torch.float32).reshape(3, 2, 4)
+    ground_truth = src.select(0, 1)  # [2,4]
+    copy = _copy((("select", (0, 1), ()),), "e1", 0, (2, 4), (4, 1))
+    shard = Shard(
+        shard_offset=(0, 0, 0), shape=(3, 2, 4), session="s0", addr=0, elsize=EL
+    )
+    segs = plan_pull(
+        copy, global_shape=(3, 2, 4), src_dtype=F32, elsize=EL, shards=[shard]
+    )
+    assert len(segs) == 1  # contiguous slab
+    assert torch.equal(_reconstruct(src, copy, [shard], segs), ground_truth)
+
+
+def test_unbind_piece_reconstructs_bit_for_bit():
+    # unbind(0)[2] is select(0, 2): same rank-reducing slab, via the tuple path.
+    import torch
+
+    src = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
+    ground_truth = src.unbind(0)[2]  # [3]
+    copy = _copy(
+        (("unbind", (0,), ()), ("__getitem__", (2,), ())),
+        "u2",
+        0,
+        (3,),
+        (1,),
+    )
+    shard = Shard(shard_offset=(0, 0), shape=(4, 3), session="s0", addr=0, elsize=EL)
+    segs = plan_pull(
+        copy, global_shape=(4, 3), src_dtype=F32, elsize=EL, shards=[shard]
+    )
+    assert torch.equal(_reconstruct(src, copy, [shard], segs), ground_truth)
+
+
+def test_split_piece_reconstructs_bit_for_bit():
+    # split(2, dim=1)[1] is the second column-block of [4,4] -> rank-preserving,
+    # strided (one run per row), like the existing column-slice case.
+    import torch
+
+    src = torch.arange(4 * 4, dtype=torch.float32).reshape(4, 4)
+    ground_truth = src.split(2, dim=1)[1]  # cols [2:4] -> [4,2]
+    copy = _copy(
+        (("split", (2, 1), ()), ("__getitem__", (1,), ())), "s1", 0, (4, 2), (2, 1)
+    )
+    shard = Shard(shard_offset=(0, 0), shape=(4, 4), session="s0", addr=0, elsize=EL)
+    segs = plan_pull(
+        copy, global_shape=(4, 4), src_dtype=F32, elsize=EL, shards=[shard]
+    )
+    assert len(segs) == 4  # strided column-block: one run per row
+    assert torch.equal(_reconstruct(src, copy, [shard], segs), ground_truth)
+
+
+def test_select_reads_only_the_expert_owning_shard():
+    # Experts sharded across EP ranks: 0-1 on 'a', 2-3 on 'b'. select(0, 3) must
+    # read only 'b', at its local slab, as one run.
+    copy = _copy((("select", (0, 3), ()),), "e3", 0, (2, 3), (3, 1))
+    a = Shard(shard_offset=(0, 0, 0), shape=(2, 2, 3), session="a", addr=0, elsize=EL)
+    b = Shard(
+        shard_offset=(2, 0, 0), shape=(2, 2, 3), session="b", addr=5000, elsize=EL
+    )
+    segs = plan_pull(
+        copy, global_shape=(4, 2, 3), src_dtype=F32, elsize=EL, shards=[a, b]
+    )
+    assert {s.session for s in segs} == {"b"}
+    assert len(segs) == 1
+    # expert 3 is local row 1 of shard b -> element offset (3-2)*2*3 = 6.
+    assert (segs[0].src_addr - 5000) // EL == 6
+    assert segs[0].nbytes == 6 * EL and segs[0].dst_byte == 0
+
+
+def test_unsqueeze_rank_increase_unsupported():
+    # A net rank INCREASE isn't a box scatter -> fail closed.
+    copy = _copy((("unsqueeze", (0,), ()),), "w", 0, (1, 4), (4, 1))
+    shard = Shard(shard_offset=(0,), shape=(4,), session="s0", addr=0, elsize=EL)
+    with pytest.raises(UnsupportedReshard):
+        plan_pull(copy, global_shape=(4,), src_dtype=F32, elsize=EL, shards=[shard])
+
+
 def test_int_index_collapse_unsupported():
     with pytest.raises(UnsupportedReshard):
         op_chain_to_box((("__getitem__", (0,), ()),), (8, 4))

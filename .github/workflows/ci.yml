@@ -45,7 +45,7 @@ jobs:
           - rust: stable
             can-fail: false
           - rust: beta
-            can-fail: false
+            can-fail: true
           - rust: nightly
             can-fail: true
     continue-on-error: ${{ matrix.can-fail }}
@@ -54,14 +54,18 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         persist-credentials: false
+
+    - name: Check Helm CRD manifest sync
+      if: matrix.rust == 'stable'
+      run: cmp examples/crds.yaml helm/crds/modelexpress-crds.yaml
 
     - name: Install Rust toolchain
       run: |
         set -euo pipefail
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${{ matrix.rust }}
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "${{ matrix.rust }}"
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Check Rust version
@@ -71,7 +75,7 @@ jobs:
 
     - name: Cache dependencies
       if: inputs.runs_on == ''
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
@@ -86,6 +90,10 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler build-essential
+
+    - name: Check CRDs are up to date with Rust types
+      if: matrix.rust == 'stable'
+      run: cargo run --quiet -p modelexpress-server --bin crdgen | diff -u examples/crds.yaml -
 
     - name: Check formatting
       if: matrix.rust == 'stable'
@@ -109,24 +117,107 @@ jobs:
       run: cargo test -p modelexpress-server --features integration-tests --test in_process_server
 
     - name: Build release
+      if: matrix.rust == 'stable'
       run: cargo build --release --verbose
 
     - name: Run doc tests
       run: cargo test --doc
 
-  python-test:
-    name: Python Tests
+  tls-feature-matrix:
+    name: TLS Feature Matrix
     runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    strategy:
+      matrix:
+        features:
+          - --no-default-features --features tls-rustls
+          - --no-default-features --features openssl
+          - --no-default-features --features tls-rustls,gcs
+          - --no-default-features --features openssl,gcs
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Install Rust toolchain
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Cache dependencies
+      if: inputs.runs_on == ''
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target/
+        key: ${{ runner.os }}-cargo-tls-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-tls-
+          ${{ runner.os }}-cargo-
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler pkg-config libssl-dev build-essential
+
+    - name: Lint with clippy
+      run: cargo clippy --workspace --all-targets ${{ matrix.features }} -- -D warnings
+
+    - name: Build
+      run: cargo build --workspace ${{ matrix.features }} --verbose
+
+  tls-no-backend-rejected:
+    name: TLS No-Backend Rejected
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Install Rust toolchain
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler build-essential
+
+    - name: Building with no TLS backend must fail
+      run: |
+        if cargo check -p modelexpress-common --no-default-features 2>build.log; then
+          echo "expected the build to be rejected when no TLS backend is selected"
+          exit 1
+        fi
+        grep -q "no TLS backend selected" build.log
+
+  python-test:
+    name: Python Tests (protobuf ${{ matrix.protobuf_major }})
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - protobuf_major: 5
+            protobuf_spec: "protobuf==5.27.2"
+          - protobuf_major: 6
+            protobuf_spec: "protobuf>=6.30.2,<7.0.0"
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
       with:
         persist-credentials: false
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v7
       with:
         python-version: "3.12"
 
@@ -141,12 +232,55 @@ jobs:
       working-directory: modelexpress_client/python
       run: |
         uv venv .venv --python 3.12
-        uv pip install -e ".[dev]"
+        uv pip install -e ".[dev]" '${{ matrix.protobuf_spec }}'
 
     - name: Run tests
       working-directory: modelexpress_client/python
       run: |
         .venv/bin/python -m pytest tests/ -v
+
+  python-proto-bindings:
+    name: Python Generated Bindings
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    # Install only the codegen extra, not the project: modelexpress depends on
+    # torch, which is a large download this job has no use for. The pin is
+    # still read from pyproject.toml so it stays single-sourced.
+    - name: Install codegen dependencies
+      run: |
+        pins=$(python - <<'EOF'
+        import pathlib, tomllib
+        pyproject = pathlib.Path("modelexpress_client/python/pyproject.toml")
+        data = tomllib.loads(pyproject.read_text())
+        print(" ".join(data["project"]["optional-dependencies"]["codegen"]))
+        EOF
+        )
+        echo "Installing: ${pins}"
+        pip install ${pins}
+
+    - name: Validate generated bindings
+      run: |
+        modelexpress_client/python/generate_proto.sh
+        if [ -n "$(git status --porcelain -- modelexpress_client/python)" ]; then
+          echo "Generated Python bindings are out of date with modelexpress_common/proto."
+          echo "Run modelexpress_client/python/generate_proto.sh and commit the result."
+          git status --porcelain -- modelexpress_client/python
+          git diff -- modelexpress_client/python
+          exit 1
+        fi
 
   go-test:
     name: Go Bindings
@@ -155,14 +289,14 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         persist-credentials: false
 
     - name: Set up Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v7
       with:
-        go-version: "1.24.x"
+        go-version-file: modelexpress_client/go/go.mod
         cache-dependency-path: modelexpress_client/go/go.sum
 
     - name: Install system dependencies
@@ -198,7 +332,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      uses: actions/checkout@v7
       with:
         persist-credentials: false
 
@@ -209,7 +343,7 @@ jobs:
 
     - name: Cache dependencies
       if: inputs.runs_on == ''
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
@@ -248,7 +382,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         persist-credentials: false
 
@@ -262,13 +396,16 @@ jobs:
 
     - name: Cache dependencies
       if: inputs.runs_on == ''
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
           target/
-        key: ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-stable-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-stable-
+          ${{ runner.os }}-cargo-
 
     - name: Install system dependencies
       run: |
@@ -286,6 +423,22 @@ jobs:
           --test registry_backend_redis \
           -- --include-ignored --test-threads=1
 
+    - name: Run P2P Redis status ordering test
+      env:
+        MX_TEST_REDIS_URL: redis://localhost:6379
+      run: |
+        cargo test -p modelexpress-server --lib \
+          p2p::backend::redis::tests::older_status_update_does_not_replace_newer_status \
+          -- --ignored --exact --test-threads=1
+
+    - name: Run Refit service Redis integration tests
+      env:
+        REDIS_URL: redis://localhost:6379
+      run: |
+        cargo test -p model-express-workspace-tests \
+          --test refit_service_redis \
+          -- --include-ignored --test-threads=1
+
     - name: Run integration test script
       env:
         MX_METADATA_BACKEND: redis
@@ -293,8 +446,9 @@ jobs:
       run: |
         if [ -f run_integration_tests.sh ]; then
           chmod +x run_integration_tests.sh
-          ./run_integration_tests.sh || echo "Integration test script failed (expected in CI)"
+          ./run_integration_tests.sh
         fi
+      continue-on-error: true
 
   security-audit:
     name: Security Audit
@@ -303,7 +457,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         persist-credentials: false
 
@@ -319,7 +473,7 @@ jobs:
       run: command -v cc >/dev/null || { sudo apt-get update && sudo apt-get install -y build-essential; }
 
     - name: Install cargo-audit
-      run: cargo install cargo-audit
+      run: cargo install cargo-audit --locked
 
     - name: Run security audit
       run: cargo audit
@@ -334,10 +488,13 @@ jobs:
     runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
     timeout-minutes: 60
     needs: test
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         persist-credentials: false
 
@@ -365,8 +522,9 @@ jobs:
       run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@v7
       with:
+        use_oidc: true
         files: lcov.info
         fail_ci_if_error: false
 
@@ -378,7 +536,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         persist-credentials: false
 
@@ -409,7 +567,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         persist-credentials: false
 

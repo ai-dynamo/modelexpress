@@ -4,6 +4,9 @@
 //! Lazy-connect wrapper around `RegistryBackend`, parallel to [`crate::p2p::state`].
 
 use crate::backend_config::BackendConfig;
+use crate::metrics::backend::{BackendMetrics, Store};
+use crate::metrics::registry::RegistryMetrics;
+use crate::registry::backend::instrumented::InstrumentedRegistryBackend;
 use crate::registry::backend::{
     ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult, create_registry_backend,
 };
@@ -16,6 +19,8 @@ use tracing::info;
 pub struct RegistryManager {
     backend: Arc<RwLock<Option<Arc<dyn RegistryBackend>>>>,
     config: Option<BackendConfig>,
+    metrics: Option<BackendMetrics>,
+    lifecycle: Option<RegistryMetrics>,
 }
 
 impl RegistryManager {
@@ -23,7 +28,39 @@ impl RegistryManager {
         Self {
             backend: Arc::new(RwLock::new(None)),
             config: Some(config),
+            metrics: None,
+            lifecycle: None,
         }
+    }
+
+    /// Record backend operations against `metrics`. See
+    /// [`crate::p2p::state::P2pStateManager::with_metrics`] for why this is
+    /// opt-in rather than a `with_config` parameter.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: BackendMetrics, lifecycle: RegistryMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self.lifecycle = Some(lifecycle);
+        self
+    }
+
+    /// Build the backend for `config`, wrapping it when metrics are configured.
+    async fn build_backend(
+        &self,
+        config: BackendConfig,
+    ) -> RegistryResult<Arc<dyn RegistryBackend>> {
+        let (Some(metrics), Some(lifecycle)) = (self.metrics.clone(), self.lifecycle.clone())
+        else {
+            return create_registry_backend(config).await;
+        };
+        // Timed around the factory for the same reason as
+        // [`crate::p2p::state::P2pStateManager::build_backend`]: the concrete
+        // backend is already connected by the time it can be wrapped.
+        let backend = metrics
+            .time(Store::Registry, "connect", create_registry_backend(config))
+            .await?;
+        Ok(InstrumentedRegistryBackend::wrap(
+            backend, metrics, lifecycle,
+        ))
     }
 
     /// Inject a pre-built backend directly (tests only).
@@ -32,6 +69,8 @@ impl RegistryManager {
         Self {
             backend: Arc::new(RwLock::new(Some(backend))),
             config: None,
+            metrics: None,
+            lifecycle: None,
         }
     }
 
@@ -58,7 +97,7 @@ impl RegistryManager {
             return Ok(config.to_string());
         }
         let backend_name = config.to_string();
-        let backend = create_registry_backend(config).await?;
+        let backend = self.build_backend(config).await?;
         *guard = Some(backend);
         info!("RegistryManager connected (backend: {})", backend_name);
         Ok(backend_name)
@@ -81,7 +120,7 @@ impl RegistryManager {
         // Use Display (redacts connection URLs for Redis) — Debug would print the full
         // `BackendConfig` including the unredacted URL.
         let backend_name = config.to_string();
-        let backend = create_registry_backend(config).await?;
+        let backend = self.build_backend(config).await?;
         info!("RegistryManager lazily connected ({})", backend_name);
         *guard = Some(backend.clone());
         Ok(backend)
@@ -196,6 +235,8 @@ mod tests {
         let mgr = RegistryManager {
             backend: Arc::new(RwLock::new(None)),
             config: None,
+            metrics: None,
+            lifecycle: None,
         };
         assert!(mgr.connect().await.is_err());
     }

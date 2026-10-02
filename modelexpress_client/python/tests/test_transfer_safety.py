@@ -3,14 +3,9 @@
 
 """Tests for transfer safety checks."""
 
-import json
-
-import pytest
 import torch
 
 from modelexpress.transfer_safety import (
-    TransferFingerprint,
-    _compute_manifest_hash,
     check_transfer_allowed,
     detect_model_features,
 )
@@ -161,52 +156,3 @@ class TestCheckTransferAllowed:
         )
         allowed, _ = check_transfer_allowed(config)
         assert allowed
-
-
-# ---------------------------------------------------------------------------
-# Transfer fingerprint
-# ---------------------------------------------------------------------------
-
-class TestTransferFingerprint:
-    def test_round_trip_json(self):
-        fp = TransferFingerprint(
-            vllm_version="0.17.1",
-            torch_version="2.10.0",
-            cuda_version="12.9",
-            deep_gemm_version="2.3.0",
-            attention_backend="FLASHINFER_MLA",
-            manifest_hash="abc123",
-            tensor_count=729,
-        )
-        json_str = fp.to_json()
-        fp2 = TransferFingerprint.from_json(json_str)
-        assert fp2.vllm_version == "0.17.1"
-        assert fp2.tensor_count == 729
-        assert fp2.manifest_hash == "abc123"
-
-
-# ---------------------------------------------------------------------------
-# Manifest hash
-# ---------------------------------------------------------------------------
-
-class TestManifestHash:
-    def test_same_tensors_same_hash(self):
-        t1 = {"a": torch.zeros(10, dtype=torch.float32), "b": torch.zeros(20, dtype=torch.bfloat16)}
-        t2 = {"a": torch.ones(10, dtype=torch.float32), "b": torch.ones(20, dtype=torch.bfloat16)}
-        # Same shapes and dtypes, different values -> same hash
-        assert _compute_manifest_hash(t1) == _compute_manifest_hash(t2)
-
-    def test_different_shapes_different_hash(self):
-        t1 = {"a": torch.zeros(10, dtype=torch.float32)}
-        t2 = {"a": torch.zeros(20, dtype=torch.float32)}
-        assert _compute_manifest_hash(t1) != _compute_manifest_hash(t2)
-
-    def test_different_names_different_hash(self):
-        t1 = {"a": torch.zeros(10, dtype=torch.float32)}
-        t2 = {"b": torch.zeros(10, dtype=torch.float32)}
-        assert _compute_manifest_hash(t1) != _compute_manifest_hash(t2)
-
-    def test_different_dtypes_different_hash(self):
-        t1 = {"a": torch.zeros(10, dtype=torch.float32)}
-        t2 = {"a": torch.zeros(10, dtype=torch.float16)}
-        assert _compute_manifest_hash(t1) != _compute_manifest_hash(t2)
