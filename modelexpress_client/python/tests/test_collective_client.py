@@ -10,7 +10,7 @@ blocked on peers that will never arrive.
 """
 
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -19,6 +19,7 @@ import modelexpress_rl.collective.backend as collective_backend
 import modelexpress_rl.collective.client as collective_client
 from modelexpress_rl.collective import (
     CommunicatorCache,
+    LaneCommunicator,
     LaneKey,
     LocalParamSpec,
     MeshSpec,
@@ -246,7 +247,7 @@ def trainer(rz, engine, **kw):
         generator_slots=["g0", "g1"],
         source_partition_count=1,
         slot_id="t0",
-        worker_id="w0",
+        worker_id=kw.pop("worker_id", "w0"),
         index_in_role=0,
         **kw,
     )
@@ -360,6 +361,60 @@ class TestBootstrap:
             ("barrier", 2),
         ]
 
+    def test_every_worker_settles_local_lanes_before_each_bootstrap_barrier(
+        self, fake_nccl, monkeypatch
+    ):
+        plan = ReshardPlan(
+            bulk=[entry("a", partition=0), entry("b", partition=1)],
+            misc=[MiscParam("m", (4,), "bfloat16")],
+            source_partition_count=2,
+        )
+        engine = FakeEngine(plan)
+        client = RefitClientTrainer(
+            rendezvous=FakeRendezvousPP2(),
+            model_name="m",
+            trainer_slots=["t0", "t1", "t2", "t3"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=2,
+            slot_id="t2",
+            worker_id="w2",
+            index_in_role=2,
+        )
+        client.initialize(engine, source_partition=1)
+
+        events = []
+        original_create = client._cache.create
+        original_settle = client._cache.settle_group
+
+        def create(key, **kwargs):
+            events.append(("create", key.lane_id))
+            return original_create(key, **kwargs)
+
+        def settle(group_id, epoch, **kwargs):
+            events.append(("settle", group_id, epoch))
+            return original_settle(group_id, epoch, **kwargs)
+
+        monkeypatch.setattr(client._cache, "create", create)
+        monkeypatch.setattr(client._cache, "settle_group", settle)
+        monkeypatch.setattr(
+            collective_client,
+            "_bootstrap_barrier",
+            lambda lane, device, **kwargs: events.append(("barrier", lane.rank)),
+        )
+
+        client.compute_plan()
+
+        assert events == [
+            ("create", 2),
+            ("settle", "g", 1),
+            ("barrier", 2),
+            ("settle", "g", 1),
+            ("barrier", 2),
+            ("create", 1),
+            ("settle", "g", 1),
+            ("barrier", 2),
+        ]
+
 
 class TestCommunicatorBootstrap:
     def test_init_is_nonblocking_bounded_and_device_scoped(
@@ -459,6 +514,165 @@ class TestCommunicatorBootstrap:
                 stream=None,
                 timeout_s=0.1,
             )
+
+    def test_settle_group_polls_every_local_lane_including_the_fresh_one(
+        self, fake_nccl
+    ):
+        bindings = sys.modules["nccl.bindings.nccl"]
+        polls = []
+
+        class Flapping:
+            def __init__(self, name, in_progress_polls):
+                self.name = name
+                self.remaining = in_progress_polls
+
+            def get_async_error(self):
+                polls.append(self.name)
+                if self.remaining:
+                    self.remaining -= 1
+                    return bindings.Result.InProgress
+                return bindings.Result.Success
+
+            def get_last_error(self):
+                return ""
+
+        cache = CommunicatorCache()
+        cache._lanes[LaneKey("g", 1, 0)] = LaneCommunicator(
+            Flapping("lane-0", 0), rank=0, world_size=3, stream=None
+        )
+        cache._lanes[LaneKey("g", 1, 2)] = LaneCommunicator(
+            Flapping("lane-2", 2), rank=0, world_size=4, stream=None
+        )
+        # A lane from another epoch is not this barrier's concern.
+        cache._lanes[LaneKey("g", 0, 1)] = LaneCommunicator(
+            Flapping("stale", 0), rank=0, world_size=3, stream=None
+        )
+
+        settled = cache.settle_group("g", 1, timeout_s=5.0)
+
+        assert settled == 2
+        assert polls == ["lane-0", "lane-2", "lane-2", "lane-2"]
+
+    def test_settle_group_raises_a_clean_error_naming_the_lane_on_async_failure(
+        self, fake_nccl
+    ):
+        class Broken:
+            def get_async_error(self):
+                return 3
+
+            def get_last_error(self):
+                return "ncclInternalError"
+
+        cache = CommunicatorCache()
+        cache._lanes[LaneKey("g", 1, 2)] = LaneCommunicator(
+            Broken(), rank=1, world_size=4, stream=None
+        )
+
+        with pytest.raises(RuntimeError, match="lane 2 of group g at epoch 1"):
+            cache.settle_group("g", 1, timeout_s=5.0)
+
+    def test_settle_group_times_out_naming_the_lane(self, fake_nccl):
+        bindings = sys.modules["nccl.bindings.nccl"]
+
+        class Stuck:
+            def get_async_error(self):
+                return bindings.Result.InProgress
+
+            def get_last_error(self):
+                return ""
+
+        cache = CommunicatorCache()
+        cache._lanes[LaneKey("g", 1, 1)] = LaneCommunicator(
+            Stuck(), rank=0, world_size=3, stream=None
+        )
+
+        with pytest.raises(
+            TimeoutError,
+            match="lane 1 of group g at epoch 1 did not settle",
+        ):
+            cache.settle_group("g", 1, timeout_s=0.05)
+
+    def test_settle_group_re_polls_a_lane_still_initializing_after_create(
+        self, fake_nccl
+    ):
+        # create()'s readiness check can pass while the communicator later
+        # reports ncclInProgress again; settle_group must re-poll it.
+        bindings = sys.modules["nccl.bindings.nccl"]
+        communicator = sys.modules["nccl.core.communicator"]
+        polls = []
+
+        class Heals:
+            def get_async_error(self):
+                polls.append(1)
+                if len(polls) == 2:
+                    return bindings.Result.InProgress
+                return bindings.Result.Success
+
+            def get_last_error(self):
+                return ""
+
+            def abort(self):
+                pass
+
+        heals = Heals()
+        communicator.Communicator.init = lambda **kw: heals
+
+        cache = CommunicatorCache()
+        cache.create(
+            LaneKey("g", 1, 0),
+            rank=0,
+            world_size=2,
+            unique_id=b"x" * 128,
+            device=None,
+            stream=None,
+            timeout_s=5.0,
+        )
+        assert len(polls) == 1
+
+        settled = cache.settle_group("g", 1, timeout_s=5.0)
+
+        assert settled == 1
+        assert len(polls) == 3
+
+    def test_settle_group_timeout_for_a_lane_stuck_after_create_names_the_lane(
+        self, fake_nccl
+    ):
+        bindings = sys.modules["nccl.bindings.nccl"]
+        communicator = sys.modules["nccl.core.communicator"]
+        polls = []
+
+        class StuckAfterCreate:
+            def get_async_error(self):
+                polls.append(1)
+                if len(polls) == 1:
+                    return bindings.Result.Success
+                return bindings.Result.InProgress
+
+            def get_last_error(self):
+                return ""
+
+            def abort(self):
+                pass
+
+        stuck = StuckAfterCreate()
+        communicator.Communicator.init = lambda **kw: stuck
+
+        cache = CommunicatorCache()
+        cache.create(
+            LaneKey("g", 1, 2),
+            rank=0,
+            world_size=3,
+            unique_id=b"x" * 128,
+            device=None,
+            stream=None,
+            timeout_s=5.0,
+        )
+
+        with pytest.raises(
+            TimeoutError,
+            match="lane 2 of group g at epoch 1 did not settle",
+        ):
+            cache.settle_group("g", 1, timeout_s=0.05)
 
 
 class TestBootstrapBarrier:
@@ -654,6 +868,31 @@ class TestRefitRound:
 
 
 class TestReporting:
+    def test_early_round_failure_uses_admitted_identity(self, fake_nccl):
+        rz = FakeRendezvous()
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.report_failure("server-op", RuntimeError("publish failed"))
+        assert rz.reports == [
+            {
+                "operation_id": "server-op",
+                "group_id": "g",
+                "epoch": 1,
+                "worker_id": "w0",
+                "succeeded": False,
+                "message": "RuntimeError('publish failed')",
+            }
+        ]
+
+    def test_reporting_before_any_join_is_a_named_error(self, fake_nccl):
+        # Without an admitted membership the report would raise an opaque
+        # AttributeError on None or attach the failure to a group this
+        # client never joined.
+        client = trainer(FakeRendezvous(), FakeEngine())
+        with pytest.raises(RendezvousError, match="compute_plan has not admitted"):
+            client.report_failure("server-op", RuntimeError("publish failed"))
+        assert client._rendezvous.reports == []
+
     def test_success_is_reported_against_the_admitted_epoch(self, fake_nccl):
         rz = FakeRendezvous()
         client = trainer(rz, FakeEngine())
