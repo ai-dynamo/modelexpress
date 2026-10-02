@@ -1363,3 +1363,188 @@ kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/co
 |-------|-----------|---------------|------------------|
 | DeepSeek-V3 (671B, FP8) | 681 GB (8 GPUs) | ~15 seconds | ~45 Gbps |
 | Llama 3.3 70B | 140 GB (8 GPUs) | ~5 seconds | ~28 Gbps |
+
+## ModelExpress benchmark CI harness
+
+[`ci/bench/`](../ci/bench/) runs native vLLM cold-load and refit checks using
+registered, pinned model profiles. `profiles.json` lists supported profile keys
+and the default (`nemotron`). Add a profile to the catalog to extend the harness;
+the trigger and lifecycle scripts do not contain model-specific allowlists.
+
+| Profile | Pinned model | Resources per worker |
+| --- | --- | --- |
+| `nemotron` | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4`, revision `bee7596271d1495f6992ae224aefde4410e816b8` | TP1, 16 CPU, 128 GiB RAM |
+| `kimi` | `moonshotai/Kimi-K2.7-Code`, revision `74797c9c62378b951a1f6fcf5c4631024e9b8bef` | TP8, 64 CPU, 1 TiB RAM |
+
+There has been **no live AWS validation**. Profile support means the model can be
+selected, rendered, and tested; it does not establish GPU/kernel or refit
+compatibility. Kimi requires eight GPUs on one node with sufficient host RAM.
+Its quantized MLA refit path needs qualification; the experimental WNA16 workaround
+is not included or applied. Failures remain failures and stop before resume.
+
+### Trigger benchmark CI with a PR comment
+
+After the workflow lands on the default branch, a repository writer can post:
+
+```text
+/bench
+/bench --model kimi
+/bench --model nemotron --sha <full-40-character-PR-head-SHA>
+```
+
+Bare `/bench` uses the catalog's default profile. `--model` selects a registered
+profile and `--sha` optionally binds the request to an explicit PR head. Otherwise
+the authorization job resolves the current head once. In both cases that exact
+revision must match copy-pr-bot's `pull-request/<PR-number>` mirror. First use the
+existing `/ok to test <SHA>` approval process if needed, wait for mirroring, then
+post the benchmark comment. The new command does not grant copy-pr-bot approval. Closed
+PRs, edited comments, stale explicit SHAs, unmirrored heads, unknown models/options,
+and commenters without write permission are rejected. New revisions need new
+requests. Labels do not trigger this workflow.
+
+The hosted gate checks permission and resolves immutable source/model outputs.
+Privileged jobs build that approved ModelExpress revision using trusted
+default-branch Dockerfiles and harness scripts. Per-model runtime bases are
+configured by digest; built images are also consumed by digest. Harness edits in
+a PR have CPU-only tests; GPU runs use the default-branch harness until the edits
+merge. `issue_comment` requires the workflow on the default branch, as documented
+by [GitHub](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#issue_comment).
+
+Configure these repository Actions variables:
+
+| Variable | Required value |
+| --- | --- |
+| `MX_BENCH_KUBE_CONTEXT` | AWS Kubernetes context available in `/teleport/kubeconfig.yaml` |
+| `MX_BENCH_S3_ROLE_ARN` | IAM role trusted for the cluster's IRSA identity and `mx-bench` service account in run namespaces |
+| `MX_BENCH_S3_BUCKET` | Bucket holding each selected profile's complete pinned snapshot |
+| `MX_BENCH_S3_REGION` | Bucket region |
+| `MX_BENCH_RUNTIME_BASES` | JSON mapping profile keys to compatible digest-pinned vLLM base images, e.g. `{"nemotron":"registry/runtime@sha256:...","kimi":"registry/kimi-runtime@sha256:..."}` with full digests |
+
+A runtime mapping is required only for profiles being run. Each image must include
+compatible Torch, vLLM, NIXL, NumPy, requests, and safetensors; the build installs
+ModelExpress and verifies imports. Compatibility with each model's quantization
+and refit path still requires hardware qualification. The existing `NGC_API_KEY`
+secret supplies registry access.
+
+The cluster must support IRSA injection. IAM trust must cover
+`mx-ci-bench-<run-id>-<attempt>` namespaces and service account `mx-bench`; access must
+allow snapshot reads/listing and delta-prefix writes/deletes. The CI runner's
+identity is not inherited by workload pods. Populate all checkpoint shards and
+`snapshot-manifest.json` under the profile's `seed_prefix` beforehand. CI checks
+manifest access from the CPU control pod before requesting GPUs. It does not
+provision IAM, mirror snapshots, deploy MinIO, or use the Vime job's FSx cache.
+
+The separate `ModelExpress benchmark CI` workflow invokes the renderer/run CLI for the
+selected profile. It stays outside the required GPU CI aggregate; offline
+contracts run on every PR. The namespace GPU quota follows the rendered profile's
+TP size (one for Nemotron, eight for Kimi). Image builds have a 60-minute timeout;
+the test job has a 60-minute timeout, its experiment step 45 minutes, and pods a
+55-minute lifetime. Large models may exceed this initial qualification budget;
+a timeout is a failure. Requests serialize per PR without canceling active runs, with up to 100 pending
+runs retained in the concurrency queue.
+Actions runs expose the tested SHA and artifacts; the workflow does not post PR
+comments or add a required PR-head status check.
+
+### Manual CLI and environments
+
+```bash
+export KUBE_CONTEXT='<aws-context>' NAMESPACE='<existing-run-namespace>'
+export SERVER_IMAGE='<registry/server:full-commit-sha>'
+export WORKER_IMAGE='<registry/runtime:full-commit-sha>'
+export MX_CI_S3_BUCKET='<snapshot-bucket>' MX_CI_S3_REGION='<aws-region>'
+export RESULTS_DIR=/tmp/mx-bench-unique-run
+python3 ci/bench/scripts/prepare.py kimi "$RESULTS_DIR" \
+  --environment aws-ci --run-id kimi-unique-run
+# Inspect rendered manifests before deploying.
+python3 ci/bench/scripts/lifecycle.py run "$RESULTS_DIR"
+python3 ci/bench/scripts/lifecycle.py collect "$RESULTS_DIR"
+python3 ci/bench/scripts/lifecycle.py cleanup "$RESULTS_DIR"
+```
+
+Manual callers provision their namespace, service account, secrets, and mirror.
+The Python `lifecycle.py` CLI reads the rendered JSON configuration directly.
+Seed download and publication share a two-hour deadline from process startup;
+either process failing stops the run, including during worker readiness.
+The Python `ci.py` entry point manages CI setup, execution, and namespace cleanup.
+
+Use a fresh run ID/output directory; run IDs begin with the selected profile key.
+`KUBECONFIG` overrides `/teleport/kubeconfig.yaml`. CLI overrides take precedence
+over environment variables and environment-file values. Images require full
+commit SHA tags or digests. The AWS preset selects H100 80 GB nodes,
+0.70 GPU memory utilization, `ci-nightly-high-priority`, and `nvcr-imagepullsecret`.
+S3 is the default with no custom endpoint or RDMA device. Profile defaults supply
+TP/CPU/memory and object prefixes.
+
+Use `--environment /path/to/environment.json` for placement/storage changes.
+Fields include worker/control node selectors, tolerations, control resources,
+service account, image-pull secrets, security context, `addressing_style`,
+`pod_env` (including Secret references), `pod_env_from`, and image references.
+CLI options include context, namespace, region, bucket, endpoint URL, service
+account, seed/delta prefixes, TP, CPU, memory, and GPU memory utilization. Literal
+credentials must not enter the environment file: resolved settings are retained
+as evidence. `--endpoint-url ''` clears an inherited endpoint.
+
+Peer coverage remains manual: `--paths both` requires two suitable nodes plus
+explicit `extra_worker_resources`, `worker_env.MX_NIXL_BACKEND`, and
+`peer_transfer_marker`. See the [EFA example](../examples/p2p_transfer_k8s/client/vllm/aws_efa/).
+Setting these fields does not qualify transport. Each worker's TP ranks stay on
+one node. The report rejects peer fallback to S3, ModelStreamer, or InstantTensor
+and requires different donor/peer nodes.
+
+### Validation, timing, and cleanup
+
+The benchmark uses vLLM’s default execution mode without forcing eager execution.
+
+The CI-only `BenchWorkerExtension` in `ci/bench/common/bench_worker.py` extends
+each vLLM worker with refit timing and weight/checkpoint validation RPC methods.
+
+The driver checks every rank's tensor hashes, reconstructed checkpoint embedding,
+refit source/version, preserved tensor addresses, and resumed inference. Shared
+validation checks GPU/CPU/host scale agreement for profiles with configured scale
+counts. Model-specific scale-change counts and FlashInfer cache invalidation are
+not asserted. A failed rank stops before resume. Native HTTP
+pause/resume is not Dynamo administration. The publisher preserves the selected
+checkpoint tensor's stored dtype and changes low-order bits to produce a delta.
+The configured payload size (64 MiB for Nemotron, 1 GiB for Kimi) is a best-effort
+target; reports include actual bytes, and size differences do not fail validation.
+Peer refit transfers full runtime tensors.
+Each rank verifies the reconstructed checkpoint tensor hash against the publisher's
+expected hash. Runtime tensor inventories must change after refit and match between
+S3 and peer workers when both paths run. The harness does not assume a runtime
+embedding name or TP sharding layout, and does not independently compare GPU
+embedding slices with the checkpoint. Profiles still select a checkpoint tensor;
+its dtype must be supported by the installed safetensors/PyTorch and refit stack.
+
+`report.json` retains model-load seconds, RPC and per-rank stage/install/total
+seconds, failures, image IDs, and restarts. Loading excludes
+scheduling, image pulls, engine warmup, and the separately downloaded reconstruction
+seed. Stage timing covers the stage operation and completion synchronization;
+installation timing covers apply plus CUDA synchronization. Total refit time is
+stage plus installation; logging, pointer verification, hashing, and inference
+are outside these intervals. The separate RPC duration includes those additional
+operations and must not be compared as the same interval.
+
+The report separates `validation_status` (`PASS`/`FAILED`) from
+`measurement_status` (`VALID`/`INVALID`). Overall `status` passes only when both
+pass. Successful `latency_summary` entries include the model-load time, RPC time,
+each rank's stage/install/total, and the maximum per-rank total. Every required
+duration must be finite and nonnegative; missing timings invalidate a benchmark.
+Failed runs keep raw measurements as evidence but have an empty summary.
+
+This is one trial per run,
+with no percentiles, baseline comparison, or performance threshold.
+No AWS performance baseline has been established. Do not run assertion-based
+validators with Python `-O`.
+
+CI uploads evidence on success/failure and runs a separate cleanup job. It stops
+publisher/workers, removes objects under exactly the profile's delta-prefix/run-ID
+(including partial publications), and deletes the namespace after checking its
+ownership label. Cleanup logs are retained separately; artifacts expire after
+14 days. Cluster outages or forced workflow stops can still require manual
+exact-run cleanup. S3 version history follows bucket lifecycle policy.
+
+Run resources use the `mx-benchmark` label for selection and cleanup.
+Manual cleanup uses the publication report and preserves the namespace, snapshot,
+and local evidence. If publication never wrote its report, manual cleanup stops
+for inspection. Never delete the shared model prefix or bucket. Every fresh run
+has isolated server/Redis state and empty worker volumes.
