@@ -20,6 +20,7 @@ from ...adapter import EngineAdapter
 from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
+from ...metadata.source_domain import apply_source_domain
 from ...tensor_utils import (
     adopt_hidden_tensors,
     capture_tensor_attrs,
@@ -305,7 +306,7 @@ def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIde
     except Exception:
         mx_version = "0.0.0"
 
-    return p2p_pb2.SourceIdentity(
+    identity = p2p_pb2.SourceIdentity(
         mx_version=mx_version,
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
         model_name=_get_model_name(model_config),
@@ -323,6 +324,7 @@ def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIde
         quantization=_get_quantization(model_config),
         revision=_get_revision(model_config),
     )
+    return apply_source_domain(identity)
 
 
 def _get_model_name(model_config: ModelConfig) -> str:
