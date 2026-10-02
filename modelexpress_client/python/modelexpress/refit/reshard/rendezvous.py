@@ -363,9 +363,18 @@ class RendezvousPayload(NamedTuple):
     permanently behind, and a consumer that excuses lagging publishers would then
     excuse all of its shards, going quiet instead of strict. It carries a default
     so that reading the stamp is a new field rather than a second unwrap function,
-    which is also why unpacking must now name six values. ``tensor_count`` keeps
+    which is also why unpacking must now name seven values. ``tensor_count`` keeps
     the published table size available when ``with_tensors=False`` deliberately
     leaves ``tensors`` empty; ``None`` preserves direct and older callers.
+
+    ``accelerator`` is the publisher's runtime accelerator family (``"cuda"``,
+    ``"xpu"``), empty when the publisher did not declare one. It does NOT come
+    from the blob: it rides on ``WorkerMetadata.accelerator`` alongside it, so
+    ``unwrap_rendezvous_blob`` cannot fill it and leaves the default. Only a
+    caller holding the fetched ``WorkerMetadata`` can, which is why
+    ``discover_trainers`` attaches it. Kept last so existing keyword and
+    positional construction still work; tuple unpacking of a payload does not,
+    since it now names one more value.
     """
 
     agent_metadata: bytes
@@ -374,6 +383,7 @@ class RendezvousPayload(NamedTuple):
     tensors: list
     publisher_step: int | None = None
     tensor_count: int | None = None
+    accelerator: str = ""
 
     def entry_count(self) -> int:
         """How many shard-table entries this rank published.
@@ -424,6 +434,11 @@ class MxReshardRendezvous:
     ranks and merge their shard tables. Delegates all gRPC to ``MxClient`` and
     distinguishes roles via ``SourceIdentity.extra_parameters['role']`` so they
     hash to different ``mx_source_id``s.
+
+    A publisher passes its own ``accelerator`` family, which ``publish`` puts on the
+    worker record and ``discover_trainers`` reads back onto each
+    ``RendezvousPayload``. Nothing here compares the two ends: this only makes the
+    source family observable to a consumer that wants to.
     """
 
     def __init__(
@@ -433,6 +448,7 @@ class MxReshardRendezvous:
         rank: int,
         model_name: str,
         worker_id: str = "",
+        accelerator: str = "",
     ) -> None:
         self.client = client
         self.role = role
@@ -441,6 +457,14 @@ class MxReshardRendezvous:
         # inference inherit) - a shared identity field both sides derive equally.
         self.model_name = model_name
         self.worker_id = worker_id or str(uuid.uuid4())
+        # The publisher's runtime accelerator family, taken from the caller rather
+        # than probed here. This class does not own a device: a publisher serves
+        # buffers on the device its engine placed them on, and inferring a family
+        # from process-global torch state would report whichever runtime happens to
+        # be importable rather than where the registered memory actually lives.
+        # Empty means the publisher declared none, which consumers must read as
+        # unknown rather than as a family.
+        self.accelerator = accelerator
         self._mx_source_id: str | None = None
         self._publisher: PublisherThread | None = None
 
@@ -478,10 +502,16 @@ class MxReshardRendezvous:
             # identity and worker ID resolve to the same source.
             self._publisher.stop()
             self._publisher = None
+        # ``accelerator`` rides on the worker record, not in the identity: the
+        # identity is hash material both sides must derive identically, and the
+        # receiver builds it to DISCOVER the trainer, before it knows anything the
+        # trainer served. The worker record is per-publisher payload, so it can
+        # carry what only the publisher knows.
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=self.rank,
             nixl_metadata=blob,
             status=p2p_pb2.SOURCE_STATUS_READY,
+            accelerator=self.accelerator,
         )
         self._mx_source_id = self.client.publish_metadata(
             self._identity(self.role), worker, self.worker_id
@@ -604,6 +634,11 @@ class MxReshardRendezvous:
                 payload = unwrap_rendezvous_blob(
                     meta.worker.nixl_metadata, with_tensors=with_tensors
                 )
+                # The publisher's family sits beside the blob rather than inside it,
+                # so it is attached here instead of in the unwrap. Carried whatever
+                # its value: an empty string is the publisher declaring nothing, and
+                # a consumer has to be able to tell that apart from a family.
+                payload = payload._replace(accelerator=meta.worker.accelerator)
                 parse_s += time.perf_counter() - parse_t0
                 if payload.entry_count() == 0:
                     empty += 1
@@ -646,6 +681,7 @@ class MxReshardRendezvous:
             f" ({empty} skipped as empty)" if empty else "",
             ", ".join(
                 f"{p.agent_name}@{p.metadata_endpoint}[{len(p.tensors)}]"
+                f"{'/' + p.accelerator if p.accelerator else ''}"
                 for p in payloads
             ),
         )
