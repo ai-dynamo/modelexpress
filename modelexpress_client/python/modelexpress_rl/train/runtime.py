@@ -16,7 +16,7 @@ from .. import envs as rl_envs
 from .. import timing
 from ..s3 import S3Client
 from ..utils import make_tensor_reader
-from ..version import WeightVersionRef
+from ..version import TrainerTensorsMetadata, WeightVersionRef
 from .adapter import (
     StagedWeightVersionShardData,
     TrainerStagingMode,
@@ -200,7 +200,7 @@ class TrainerRuntime:
     def source_slot_id(self) -> str:
         return self._full_tensor().source_slot_id
 
-    def bind_tensors(self, tensors: Any) -> str:
+    def bind_tensors(self, tensors: Any) -> TrainerTensorsMetadata:
         if tensors is None:
             raise ValueError("tensors must not be None")
         if self._bound_tensors is not None:
@@ -218,24 +218,13 @@ class TrainerRuntime:
         self,
         *,
         version: WeightVersionRef,
-        tensors: Any,
-        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None,
+        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
     ) -> PublicationArtifact:
-        if self.method is None:
-            self._full_tensor()
-        if isinstance(self.method, FullTensorNixlPublicationMethod):
-            if hf_tensor_iter is not None:
-                raise ValueError("hf_tensor_iter is only supported for object storage")
-            return self.method.stage(version=version, tensors=tensors)
-        if tensors is not None:
-            raise ValueError(
-                "object storage publication accepts hf_tensor_iter, not tensors"
-            )
         if hf_tensor_iter is None:
             raise ValueError(
                 "hf_tensor_iter is required for object storage publication"
             )
-        return self.method.stage(version=version, hf_tensor_iter=hf_tensor_iter)
+        return self._canonical_delta().stage(version=version, hf_tensor_iter=hf_tensor_iter)
 
     def publish(
         self, *, version: WeightVersionRef, staged: PublicationArtifact

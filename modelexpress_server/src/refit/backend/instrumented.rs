@@ -15,13 +15,15 @@
 //! count the call twice under two op names -- all without failing to compile.
 
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::metrics::backend::{BackendMetrics, Store};
 use crate::refit::backend::{RefitBackend, RefitResult};
 use modelexpress_common::grpc::refit::{
-    CreateWeightVersionRequest, DeleteVersionLeaseRequest, DeleteWeightVersionShardRequest,
-    RegisterVersionLeaseRequest, UpdateWeightVersionStateRequest, VersionLease, WeightVersion,
+    CreateTrainerMeshRequest, CreateWeightVersionRequest, DeleteVersionLeaseRequest,
+    DeleteWeightVersionShardRequest, RegisterVersionLeaseRequest, TrainerMesh,
+    TrainerTensorsMetadata, UpdateWeightVersionStateRequest, VersionLease, WeightVersion,
     WeightVersionShard, WorkerRegistration,
 };
 
@@ -41,6 +43,68 @@ impl InstrumentedRefitBackend {
 
 #[async_trait]
 impl RefitBackend for InstrumentedRefitBackend {
+    async fn create_trainer_mesh(
+        &self,
+        request: &CreateTrainerMeshRequest,
+    ) -> RefitResult<TrainerMesh> {
+        self.metrics
+            .time(
+                Store::Refit,
+                "create_trainer_mesh",
+                self.inner.create_trainer_mesh(request),
+            )
+            .await
+    }
+
+    async fn get_trainer_mesh(&self, mesh_id: &str) -> RefitResult<TrainerMesh> {
+        self.metrics
+            .time(
+                Store::Refit,
+                "get_trainer_mesh",
+                self.inner.get_trainer_mesh(mesh_id),
+            )
+            .await
+    }
+
+    async fn find_trainer_mesh_for_request(
+        &self,
+        request: &CreateTrainerMeshRequest,
+    ) -> RefitResult<Option<TrainerMesh>> {
+        self.metrics
+            .time(
+                Store::Refit,
+                "find_trainer_mesh_for_request",
+                self.inner.find_trainer_mesh_for_request(request),
+            )
+            .await
+    }
+
+    async fn update_trainer_mesh(
+        &self,
+        mesh_id: &str,
+        expected_generation: u64,
+        workers: HashMap<String, TrainerTensorsMetadata>,
+    ) -> RefitResult<TrainerMesh> {
+        self.metrics
+            .time(
+                Store::Refit,
+                "update_trainer_mesh",
+                self.inner
+                    .update_trainer_mesh(mesh_id, expected_generation, workers),
+            )
+            .await
+    }
+
+    async fn delete_trainer_mesh(&self, mesh_id: &str) -> RefitResult<()> {
+        self.metrics
+            .time(
+                Store::Refit,
+                "delete_trainer_mesh",
+                self.inner.delete_trainer_mesh(mesh_id),
+            )
+            .await
+    }
+
     async fn register_worker(
         &self,
         worker: WorkerRegistration,
@@ -84,6 +148,20 @@ impl RefitBackend for InstrumentedRefitBackend {
                 Store::Refit,
                 "delete_weight_version",
                 self.inner.delete_weight_version(uid),
+            )
+            .await
+    }
+
+    async fn list_weight_versions(
+        &self,
+        model_name: &str,
+        trainer_mesh_id: Option<&str>,
+    ) -> RefitResult<Vec<WeightVersion>> {
+        self.metrics
+            .time(
+                Store::Refit,
+                "list_weight_versions",
+                self.inner.list_weight_versions(model_name, trainer_mesh_id),
             )
             .await
     }
@@ -200,6 +278,30 @@ mod tests {
 
     #[async_trait]
     impl RefitBackend for StubRefitBackend {
+        async fn create_trainer_mesh(
+            &self,
+            _request: &CreateTrainerMeshRequest,
+        ) -> RefitResult<TrainerMesh> {
+            self.outcome()
+        }
+
+        async fn get_trainer_mesh(&self, _mesh_id: &str) -> RefitResult<TrainerMesh> {
+            self.outcome()
+        }
+
+        async fn update_trainer_mesh(
+            &self,
+            _mesh_id: &str,
+            _expected_generation: u64,
+            _workers: HashMap<String, TrainerTensorsMetadata>,
+        ) -> RefitResult<TrainerMesh> {
+            self.outcome()
+        }
+
+        async fn delete_trainer_mesh(&self, _mesh_id: &str) -> RefitResult<()> {
+            self.outcome()
+        }
+
         async fn register_worker(
             &self,
             _worker: WorkerRegistration,
@@ -216,6 +318,21 @@ mod tests {
         }
 
         async fn get_weight_version(&self, _uid: &str) -> RefitResult<WeightVersion> {
+            self.outcome()
+        }
+
+        async fn find_trainer_mesh_for_request(
+            &self,
+            _request: &CreateTrainerMeshRequest,
+        ) -> RefitResult<Option<TrainerMesh>> {
+            self.outcome()
+        }
+
+        async fn list_weight_versions(
+            &self,
+            _model_name: &str,
+            _trainer_mesh_id: Option<&str>,
+        ) -> RefitResult<Vec<WeightVersion>> {
             self.outcome()
         }
 
@@ -327,6 +444,16 @@ mod tests {
             .create_weight_version(&CreateWeightVersionRequest::default())
             .await;
         let _ = backend.get_weight_version("v1").await;
+        let _ = backend.list_weight_versions("model", None).await;
+        let _ = backend
+            .create_trainer_mesh(&CreateTrainerMeshRequest::default())
+            .await;
+        let _ = backend
+            .find_trainer_mesh_for_request(&CreateTrainerMeshRequest::default())
+            .await;
+        let _ = backend.get_trainer_mesh("mesh").await;
+        let _ = backend.update_trainer_mesh("mesh", 1, HashMap::new()).await;
+        let _ = backend.delete_trainer_mesh("mesh").await;
         let _ = backend.delete_weight_version("v1").await;
         let _ = backend
             .update_weight_version_state(&UpdateWeightVersionStateRequest::default())
@@ -350,6 +477,12 @@ mod tests {
             "register_worker",
             "create_weight_version",
             "get_weight_version",
+            "list_weight_versions",
+            "create_trainer_mesh",
+            "find_trainer_mesh_for_request",
+            "get_trainer_mesh",
+            "update_trainer_mesh",
+            "delete_trainer_mesh",
             "delete_weight_version",
             "update_weight_version_state",
             "create_weight_version_shard",
@@ -362,6 +495,6 @@ mod tests {
                 format!(r#"mx_backend_ops_total{{store="refit",op="{op}",result="ok"}} 1"#);
             assert!(encoded.contains(&expected), "missing {op}: {encoded}");
         }
-        assert_eq!(stub.calls.load(Ordering::Relaxed), 10);
+        assert_eq!(stub.calls.load(Ordering::Relaxed), 16);
     }
 }

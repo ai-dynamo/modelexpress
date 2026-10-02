@@ -100,6 +100,19 @@ class TrainerSourceResolver(SourceResolver):
         return version.payload_format
 
     def candidates(self, version: WeightVersion) -> Iterator[ResolvedSource]:
+        if version.trainer_mesh_id is None:
+            raise RuntimeError("trainer publication requires trainer_mesh_id")
+        mesh_response = self._service().GetTrainerMesh(
+            refit_pb2.GetTrainerMeshRequest(mesh_id=version.trainer_mesh_id),
+            timeout=self._rpc_timeout_seconds,
+        )
+        if not mesh_response.HasField("mesh"):
+            raise RuntimeError("MX GetTrainerMesh response is missing mesh")
+        expected_slots = tuple(sorted({
+            metadata.logical_shard_id for metadata in mesh_response.mesh.workers.values()
+        }))
+        mesh_workers = mesh_response.mesh.workers
+        mesh_generation = mesh_response.mesh.generation
         try:
             with refit_span(
                 "source_preparation",
@@ -123,10 +136,13 @@ class TrainerSourceResolver(SourceResolver):
             return
         published = defaultdict(list)
         for shard in response.shards:
-            published[shard.source_slot_id].append(shard)
+            metadata = mesh_workers.get(shard.worker_id)
+            if metadata is None or metadata.logical_shard_id != shard.logical_shard_id:
+                continue
+            published[shard.logical_shard_id].append(shard)
 
         slots = []
-        for source_slot_id in version.expected_source_slots:
+        for source_slot_id in expected_slots:
             ordered = sorted(
                 published[source_slot_id], key=lambda item: item.worker_id
             )
@@ -160,6 +176,12 @@ class TrainerSourceResolver(SourceResolver):
                 (source.source_slot_id, source.worker_id) for source in selected
             )
             if selection not in seen:
+                current = self._service().GetTrainerMesh(
+                    refit_pb2.GetTrainerMeshRequest(mesh_id=version.trainer_mesh_id),
+                    timeout=self._rpc_timeout_seconds,
+                )
+                if not current.HasField("mesh") or current.mesh.generation != mesh_generation:
+                    raise RuntimeError("trainer mesh generation changed during source resolution")
                 seen.add(selection)
                 yield TrainerUpdateSource(
                     inputs=GeneratorTransferInputs(
@@ -168,6 +190,8 @@ class TrainerSourceResolver(SourceResolver):
                         layout_signature=version.layout_signature,
                         payload_format=version.payload_format,
                         sources=tuple(selected),
+                        trainer_mesh_id=version.trainer_mesh_id,
+                        trainer_mesh_generation=mesh_generation,
                     )
                 )
             deepest = max((slot.usable_count for slot in slots), default=1)
@@ -182,7 +206,7 @@ class TrainerSourceResolver(SourceResolver):
             raise RuntimeError("NIXL source is missing its manifest endpoint")
         if not shard.manifest_digest:
             raise RuntimeError("source is missing its manifest digest")
-        key = (shard.source_slot_id, shard.worker_id)
+        key = (shard.logical_shard_id, shard.worker_id)
         cached = self._manifest_cache.get(key)
         reusable = (
             cached is not None
@@ -216,7 +240,7 @@ class TrainerSourceResolver(SourceResolver):
                 counters["manifest_fetch_count"] = 1
             counters["manifest_bytes"] = len(manifest)
         return GeneratorSource(
-            source_slot_id=shard.source_slot_id,
+            source_slot_id=shard.logical_shard_id,
             worker_id=shard.worker_id,
             manifest_digest=shard.manifest_digest,
             transport=NixlGeneratorSource(
@@ -254,7 +278,7 @@ class TrainerSourceResolver(SourceResolver):
             ).GetWeightVersionShardManifest(
                 refit_pb2.GetWeightVersionShardManifestRequest(
                     version_id=shard.version_id,
-                    source_slot_id=shard.source_slot_id,
+                    logical_shard_id=shard.logical_shard_id,
                 ),
                 timeout=self._rpc_timeout_seconds,
             )
@@ -269,7 +293,7 @@ class TrainerSourceResolver(SourceResolver):
             or digest != shard.manifest_digest
         ):
             raise RuntimeError(
-                f"manifest digest mismatch for source slot {shard.source_slot_id!r}"
+                f"manifest digest mismatch for source slot {shard.logical_shard_id!r}"
             )
         try:
             with refit_span(
@@ -280,7 +304,7 @@ class TrainerSourceResolver(SourceResolver):
                 structure_digest = structural_manifest_digest(response.manifest)
         except (AttributeError, KeyError, TypeError, ValueError) as error:
             raise RuntimeError(
-                f"invalid manifest for source slot {shard.source_slot_id!r}"
+                f"invalid manifest for source slot {shard.logical_shard_id!r}"
             ) from error
         return response.manifest, structure_digest
 
