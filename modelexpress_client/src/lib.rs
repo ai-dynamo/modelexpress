@@ -15,7 +15,10 @@ use modelexpress_common::{
         },
     },
     models::{ModelStatus, Status},
-    providers::ModelDownloadOutcome,
+    providers::{
+        ModelDownloadOutcome,
+        oci::{DownloadMode, OciCacheWrite, OciProvider},
+    },
 };
 use std::collections::HashMap;
 use std::path::{Component, PathBuf};
@@ -384,6 +387,22 @@ impl Client {
             .await?
             .into_inner();
 
+        let oci_transfer = if provider == ModelProvider::Oci {
+            Some(
+                OciCacheWrite::new(
+                    &local_cache_path,
+                    model_name,
+                    DownloadMode::from(ignore_weights),
+                )
+                .await
+                .map_err(|e| {
+                    modelexpress_common::Error::Io(format!("Failed to stage OCI transfer: {e:#}"))
+                })?,
+            )
+        } else {
+            None
+        };
+
         // Model directory will be set after receiving the first chunk.
         let mut model_dir: Option<PathBuf> = None;
         let mut canonical_model_dir: Option<PathBuf> = None;
@@ -405,12 +424,22 @@ impl Client {
 
             saw_chunk = true;
             if model_dir.is_none() {
-                let (dir, canonical_dir) = prepare_stream_model_dir(
-                    &local_cache_path,
-                    provider,
-                    model_name,
-                    chunk_result.commit_hash.as_deref(),
-                )?;
+                let (dir, canonical_dir) = if let Some(transfer) = &oci_transfer {
+                    let dir = transfer.files_dir();
+                    let canonical = dir.canonicalize().map_err(|e| {
+                        modelexpress_common::Error::Io(format!(
+                            "Failed to resolve OCI staging directory: {e}"
+                        ))
+                    })?;
+                    (dir, canonical)
+                } else {
+                    prepare_stream_model_dir(
+                        &local_cache_path,
+                        provider,
+                        model_name,
+                        chunk_result.commit_hash.as_deref(),
+                    )?
+                };
                 model_dir = Some(dir);
                 canonical_model_dir = Some(canonical_dir);
             }
@@ -613,6 +642,13 @@ impl Client {
             files_received, bytes_received, model_name
         );
 
+        if let Some(transfer) = oci_transfer {
+            return transfer.publish().map_err(|e| {
+                modelexpress_common::Error::Io(format!("Failed to publish OCI cache entry: {e:#}"))
+                    .into()
+            });
+        }
+
         model_dir.ok_or_else(|| {
             modelexpress_common::Error::Server(format!(
                 "Server streamed no model directory for model {model_name}"
@@ -778,6 +814,22 @@ impl Client {
             self.finish_streamed_install(&model_name, provider, revision, &resolved_revision)
                 .await;
             Some(dir)
+        } else if provider == ModelProvider::Oci {
+            self.cache_config
+                .as_ref()
+                .map(|cache| {
+                    OciProvider::cached_model_path(
+                        &cache.local_path,
+                        &model_name,
+                        DownloadMode::from(ignore_weights),
+                    )
+                })
+                .transpose()
+                .map_err(|e| {
+                    modelexpress_common::Error::Io(format!(
+                        "Failed to resolve OCI cache entry: {e:#}"
+                    ))
+                })?
         } else {
             self.local_snapshot_path(&model_name, provider, resolved_revision.as_deref())
         };
@@ -1542,6 +1594,59 @@ mod tests {
                 .is_symlink(),
             "Expected replacement file to no longer be a symlink"
         );
+    }
+
+    #[tokio::test]
+    async fn oci_stream_publishes_only_after_the_final_marker() {
+        let cache = TempDir::new().expect("cache");
+        let model = "registry.example.com/team/model:v1";
+        for complete in [false, true] {
+            let (addr, server) = spawn_model_service(ChunkSequenceModelService {
+                chunks: vec![FileChunk {
+                    relative_path: "config.json".into(),
+                    data: b"{}".to_vec(),
+                    offset: 0,
+                    total_size: 2,
+                    is_last_chunk: true,
+                    is_last_file: complete,
+                    commit_hash: None,
+                }],
+            })
+            .await;
+            let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+            config.cache.local_path = cache.path().to_path_buf();
+            let mut client = Client::new(config).await.expect("client");
+            let result = client
+                .stream_model_files_from_server(model, ModelProvider::Oci, false, None)
+                .await;
+            server.abort();
+            let _ = server.await;
+            if complete {
+                let path = result.expect("completed stream");
+                assert_eq!(
+                    std::fs::read(path.join("config.json")).expect("file"),
+                    b"{}"
+                );
+                assert_eq!(
+                    OciProvider::cached_model_path(cache.path(), model, DownloadMode::Full)
+                        .expect("cache hit"),
+                    path
+                );
+            } else {
+                assert!(
+                    result
+                        .expect_err("interrupted stream")
+                        .to_string()
+                        .contains("final file marker")
+                );
+                assert!(
+                    OciProvider::cached_model_path(cache.path(), model, DownloadMode::Full)
+                        .expect_err("no published entry")
+                        .to_string()
+                        .contains("not found in cache")
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -22,6 +22,8 @@ repository = "https://github.com/ai-dynamo/modelexpress.git"
 keywords = ["llm", "inference", "nvidia"]
 
 [workspace.dependencies]
+docker_credential = "1.4.0"
+google-cloud-auth = { version = "1.7.0", default-features = false }
 anyhow = { version = "1.0.98", features = ["backtrace"] }
 async-trait = "0.1"
 # Default features off deliberately. axum already reaches the lock as a
@@ -42,6 +44,7 @@ jiff = { version = "0.2.15", features = ["serde"] }
 modelexpress-common = { path = "modelexpress_common", version = "0.7.0", default-features = false }
 modelexpress-client = { path = "modelexpress_client", version = "0.7.0", default-features = false }
 modelexpress-server = { path = "modelexpress_server", version = "0.7.0", default-features = false }
+oci-client = { version = "0.16.1", default-features = false, features = ["rustls-tls"] }
 once_cell = "1.21.3"
 object_store = { version = "0.14.1", default-features = false, features = ["aws-base", "reqwest"] }
 object-store-reqwest = { package = "reqwest", version = "0.13", default-features = false }
@@ -55,6 +58,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 mockall = "0.14.0"
 tempfile = "3.20"
+tar = "0.4"
 tokio = { version = "1.46", features = ["full"] }
 tokio-stream = "0.1"
 tonic = "0.13"
@@ -64,6 +68,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 uuid = { version = "1.17", features = ["v4", "serde"] }
+zstd = "0.13"
 thiserror = "2.0"
 tower = { version = "0.5.3", features = ["util"] }
 http = "1.4.1"
