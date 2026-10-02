@@ -135,6 +135,8 @@ def main() -> int:
     ap.add_argument("--stage-version", default=os.environ.get("STAGE_VERSION", ""),
                     help="rewrite every publishable crate's version to this exact value "
                          "before packaging (e.g. 0.5.0-nightly.20260806); empty = as-is")
+    ap.add_argument("--stamp-only", action="store_true",
+                    help="stop after stamping and the version check; no cargo check or package")
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -175,6 +177,9 @@ def main() -> int:
                 print(f"::error::crate {n} is at version {v}, expected {args.expect_version}",
                       file=sys.stderr)
             return 1
+
+    if args.stamp_only:
+        return 0
 
     print("=== cargo check --workspace ===", flush=True)
     if subprocess.run(["cargo", "check", "--workspace"], cwd=root).returncode != 0:

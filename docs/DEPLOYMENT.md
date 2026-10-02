@@ -430,7 +430,7 @@ Every job runs on the velonix self-hosted runners.
 | Server image (amd64 + arm64) | tag `<date>-<sha7>-<run_id>-<run_attempt>` | `nvcr.io/${NGC_PUBLISH_ORG}/ai-dynamo/modelexpress-server-nightly` (+ floating `:latest`, and `modelexpress-server:nightly`) |
 | Python wheels + sdist | `<base>.dev<date>` | `${ARTIFACTORY_PYPI_REPO_NAME}/nightly/<date>-<sha7>-<run_id>-<run_attempt>/` |
 | Rust crates (`.crate`) | `<base>-nightly.<date>.<run>.<attempt>.g<sha7>` | `${ARTIFACTORY_CARGO_REPO_NAME}/nightly/<date>-<sha7>-<run_id>-<run_attempt>/` |
-| Helm chart | `<base>-nightly.<date>.<run>.<attempt>.g<sha7>` | `helm.ngc.nvidia.com/${NGC_PUBLISH_ORG}/ai-dynamo` |
+| Helm chart `modelexpress-nightly` | `<base>-nightly.<date>.<run>.<attempt>.g<sha7>` | `helm.ngc.nvidia.com/${NGC_PUBLISH_ORG}/ai-dynamo` |
 
 The packaged nightly chart is stamped to reference the nightly server
 image, so `helm install` of a nightly chart deploys nightly code — it does

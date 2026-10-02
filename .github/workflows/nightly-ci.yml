@@ -609,10 +609,10 @@ jobs:
             --username="${NGC_PUBLISH_USERNAME}" \
             --password-stdin \
             "https://helm.ngc.nvidia.com/${NGC_STAGING_ORG}/ai-dynamo"
-          CHART_FILE="chart-dist/modelexpress-${CHART_VERSION}.tgz"
+          CHART_FILE="chart-dist/modelexpress-nightly-${CHART_VERSION}.tgz"
           ls -la chart-dist/
           helm cm-push "${CHART_FILE}" "${REPO_ALIAS}"
-          echo "staged_helm=modelexpress:${CHART_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "staged_helm=modelexpress-nightly:${CHART_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Remove helm registry credentials
         if: always()
@@ -779,7 +779,7 @@ jobs:
           GITLAB_TRIGGER_URL: ${{ secrets.GITLAB_PIPELINE_URL }}
           GITLAB_TRIGGER_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
           GITLAB_REF: ${{ vars.GITLAB_RELEASE_AUTOMATION_REF || 'main' }}
-          # TEMPORARY(test): revert before merge.
+          # GitLab publishes nothing while true.
           DRY_RUN: "true"
           SONAR_BRANCH: ${{ github.ref_name }}
           ARTIFACTORY_PATH: ${{ needs.preflight.outputs.artifactory_path }}
