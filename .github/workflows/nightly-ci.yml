@@ -235,6 +235,9 @@ jobs:
     name: Hosted test suite
     needs: [preflight]
     if: ${{ needs.preflight.outputs.run_tests == 'true' }}
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/ci.yml
     with:
       runs_on: prod-modelexpress-builder-amd-v1
