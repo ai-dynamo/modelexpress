@@ -598,6 +598,7 @@ class RdmaStrategy(LoadStrategy):
                             remote_agent_name=agent_name,
                             ip=host,
                             port=int(port_str),
+                            timeout_seconds=envs.MX_NIXL_METADATA_TIMEOUT,
                         )
                 except BaseException:
                     ctx.nixl_manager.remove_remote_agent(remote_agent_name)
