@@ -21,8 +21,8 @@ use modelexpress_common::grpc::refit::{
 use modelexpress_common::grpc::refit_collective::{
     CollectiveGroup, CollectiveGroupSpec, CollectiveGroupState, CollectiveRole, CollectiveTransfer,
     CollectiveTransferState, CreateCollectiveTransferRequest, DeleteCollectiveTransferRequest,
-    GetCollectiveGroupRequest, JoinCollectiveGroupRequest, LaneKind, LaneSpec, PlanSource,
-    PublishGroupBootstrapRequest, ReportCollectiveTransferRequest,
+    GetCollectiveGroupRequest, GetCollectiveTransferRequest, JoinCollectiveGroupRequest, LaneKind,
+    LaneSpec, PlanSource, PublishGroupBootstrapRequest, ReportCollectiveTransferRequest,
     refit_collective_service_client::RefitCollectiveServiceClient,
 };
 use modelexpress_server::backend_config::BackendConfig;
@@ -937,6 +937,178 @@ async fn expired_registration_revokes_ready_membership() {
         .map(|participant| participant.slot_id.as_str())
         .collect();
     assert_eq!(participant_slots, vec!["t0"]);
+
+    stop(stop_server, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn join_triggered_epoch_bump_aborts_and_releases_stranded_transfer() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (stop_server, server) = start_server(port, &redis_url);
+    let (mut refit, mut collective) = connect(port).await;
+
+    let model = unique_id("join-abort");
+    let group_spec = spec(&model, &["t0"], &["g0"]);
+    let worker_t0 = unique_id("worker-t0");
+    let worker_g0 = unique_id("worker-g0");
+    register(&mut refit, &model, &worker_t0, WorkerRole::Trainer, 60).await;
+    register(&mut refit, &model, &worker_g0, WorkerRole::Generator, 60).await;
+
+    let t0 = join(
+        &mut collective,
+        join_request(&group_spec, "t0", &worker_t0, CollectiveRole::Trainer, 0),
+    )
+    .await;
+    join(
+        &mut collective,
+        join_request(&group_spec, "g0", &worker_g0, CollectiveRole::Generator, 0),
+    )
+    .await;
+    publish(&mut collective, &t0.group_id, 1, RESHARD_LANE, &worker_t0, 5).await;
+    let ready = publish(&mut collective, &t0.group_id, 1, BROADCAST_LANE, &worker_t0, 6).await;
+    assert_eq!(ready.state, i32::from(CollectiveGroupState::Ready));
+
+    let transfer = create_transfer(
+        &mut collective,
+        &group_spec,
+        "version-1",
+        &unique_id("join-abort-operation"),
+    )
+    .await;
+    assert_eq!(transfer.state, i32::from(CollectiveTransferState::Pending));
+    assert_eq!(transfer.epoch, 1);
+
+    // Replacing a single slot's worker bumps the group epoch, which strands
+    // the operation admitted against the prior epoch: it can no longer be
+    // reported (the epoch gate rejects it) and was not yet terminal, so
+    // without the producer under test it would also be undeletable.
+    let replacement_worker = unique_id("worker-t0-replacement");
+    register(
+        &mut refit,
+        &model,
+        &replacement_worker,
+        WorkerRole::Trainer,
+        60,
+    )
+    .await;
+    let replacement = join(
+        &mut collective,
+        join_request(
+            &group_spec,
+            "t0",
+            &replacement_worker,
+            CollectiveRole::Trainer,
+            0,
+        ),
+    )
+    .await;
+    assert_eq!(replacement.epoch, 2);
+    assert_eq!(replacement.state, i32::from(CollectiveGroupState::Forming));
+
+    let stranded = collective
+        .get_collective_transfer(GetCollectiveTransferRequest {
+            operation_id: transfer.operation_id.clone(),
+        })
+        .await
+        .expect("read stranded transfer after join-triggered epoch bump")
+        .into_inner();
+    assert_eq!(stranded.state, i32::from(CollectiveTransferState::Aborted));
+
+    let deleted = collective
+        .delete_collective_transfer(DeleteCollectiveTransferRequest {
+            operation_id: transfer.operation_id.clone(),
+        })
+        .await
+        .expect("delete an aborted transfer")
+        .into_inner();
+    assert_eq!(deleted.state, i32::from(CollectiveTransferState::Aborted));
+
+    stop(stop_server, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn refresh_triggered_epoch_bump_aborts_and_releases_stranded_transfer() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (stop_server, server) = start_server(port, &redis_url);
+    let (mut refit, mut collective) = connect(port).await;
+
+    let model = unique_id("refresh-abort");
+    let group_spec = spec(&model, &["t0"], &["g0"]);
+    let trainer = unique_id("live-trainer");
+    let generator = unique_id("expiring-generator");
+    register(&mut refit, &model, &trainer, WorkerRole::Trainer, 60).await;
+    register(&mut refit, &model, &generator, WorkerRole::Generator, 1).await;
+
+    let membership = join(
+        &mut collective,
+        join_request(&group_spec, "t0", &trainer, CollectiveRole::Trainer, 0),
+    )
+    .await;
+    join(
+        &mut collective,
+        join_request(&group_spec, "g0", &generator, CollectiveRole::Generator, 0),
+    )
+    .await;
+    publish(&mut collective, &membership.group_id, 1, RESHARD_LANE, &trainer, 5).await;
+    let ready = publish(
+        &mut collective,
+        &membership.group_id,
+        1,
+        BROADCAST_LANE,
+        &trainer,
+        6,
+    )
+    .await;
+    assert_eq!(ready.state, i32::from(CollectiveGroupState::Ready));
+
+    let transfer = create_transfer(
+        &mut collective,
+        &group_spec,
+        "version-1",
+        &unique_id("refresh-abort-operation"),
+    )
+    .await;
+    assert_eq!(transfer.state, i32::from(CollectiveTransferState::Pending));
+    assert_eq!(transfer.epoch, 1);
+
+    // The generator's registration expires; the next group read triggers a
+    // server-side refresh that revokes the stale membership and bumps the
+    // epoch, stranding the operation exactly as a membership-changing join
+    // would, but via the refresh producer instead.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let refreshed = collective
+        .get_collective_group(GetCollectiveGroupRequest {
+            group_id: membership.group_id.clone(),
+        })
+        .await
+        .expect("refresh group after registration expiry")
+        .into_inner();
+    assert_eq!(refreshed.epoch, 2);
+    assert_eq!(refreshed.state, i32::from(CollectiveGroupState::Forming));
+
+    let stranded = collective
+        .get_collective_transfer(GetCollectiveTransferRequest {
+            operation_id: transfer.operation_id.clone(),
+        })
+        .await
+        .expect("read stranded transfer after refresh-triggered epoch bump")
+        .into_inner();
+    assert_eq!(stranded.state, i32::from(CollectiveTransferState::Aborted));
+
+    let deleted = collective
+        .delete_collective_transfer(DeleteCollectiveTransferRequest {
+            operation_id: transfer.operation_id.clone(),
+        })
+        .await
+        .expect("delete an aborted transfer")
+        .into_inner();
+    assert_eq!(deleted.state, i32::from(CollectiveTransferState::Aborted));
 
     stop(stop_server, server).await;
 }
