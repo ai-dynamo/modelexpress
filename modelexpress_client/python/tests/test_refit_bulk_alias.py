@@ -318,6 +318,57 @@ def test_alias_plan_rechecks_mro_after_initial_compilation():
     assert _select_alias_plan(first, model) is not first
 
 
+def test_alias_signature_observes_mro_changes_during_iteration():
+    class Base(torch.nn.Module):
+        pass
+
+    class Alternative(torch.nn.Module):
+        pass
+
+    class Owner(Base):
+        pass
+
+    owner = Owner()
+    before = tuple(map(id, Owner.__mro__))
+
+    class ChangingGroup:
+        def __len__(self):
+            return 2
+
+        def __iter__(self):
+            yield ("first", owner, "weight")
+            Owner.__bases__ = (Alternative,)
+            yield ("second", owner, "weight")
+
+    structure = api._alias_structure([ChangingGroup()])
+    assert structure[0][0][-1] == before
+    assert structure[0][1][-1] == tuple(map(id, Owner.__mro__)) != before
+
+
+@pytest.mark.parametrize("custom", ["hash", "equality", "neither"])
+def test_owner_signatures_preserve_custom_hashing_fallback(monkeypatch, custom):
+    class Owner(torch.nn.Linear):
+        pass
+
+    if custom == "hash":
+        Owner.__hash__ = lambda self: object.__hash__(self)
+    elif custom == "equality":
+        Owner.__eq__ = lambda self, other: self is other
+
+    model, _ = _fixture()
+    model.branch = model.alias = Owner(2, 2)
+    model.other = model.other_alias = Owner(2, 2)
+    model.other.weight = model.branch.weight
+    aliases = _select_alias_plan(None, model)
+    assert api._ordinary_owner_hashes(aliases.writers) is (custom == "neither")
+    actual = aliases.by_owner
+    monkeypatch.setattr(api, "_ordinary_owner_hashes", lambda writers: False)
+    expected = _select_alias_plan(None, model).by_owner
+    assert list(actual) == list(expected)
+    for owner in actual:
+        assert actual[owner] == expected[owner]
+
+
 def test_alias_plan_rechecks_class_changed_during_initial_compilation(monkeypatch):
     class Changed(torch.nn.Module):
         pass

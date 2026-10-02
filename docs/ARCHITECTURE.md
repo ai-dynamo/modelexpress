@@ -1624,6 +1624,10 @@ initial owners. Changed group membership, paths, classes or ancestors prevents
 that sharing. No validation verdict survives an engine callback. The initial
 metadata and its per-owner views live only for that reload window; plans referring
 to later owners are released with the batch.
+Within one signature calculation, entries with the same current inheritance
+chain share its identity tuple. For owners with ordinary object hashing and
+equality, complete group signatures are also shared when building per-owner
+cache keys. Custom hashing or equality retains per-owner signature calculation.
 
 For ordinary layer-local materialization, a per-owner view restores each complete
 shared-parameter group touched by that layer. Ordinary tensor buffers and vLLM's
