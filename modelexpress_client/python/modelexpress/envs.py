@@ -73,6 +73,12 @@ if TYPE_CHECKING:
     MX_RESHARD_HANDSHAKE_ATTEMPT_S: float
     MX_RESHARD_HANDSHAKE_BACKOFF_S: float
     MX_REFIT_STAGE_RECORD: bool
+    MX_REFIT_PACK_MODULES: bool
+    MX_REFIT_REUSE_COMPLETE_PLAN: bool
+    MX_REFIT_CACHE_RESOLVED_SOURCES: bool
+    MX_REFIT_CACHE_BOUNDED_PLANS: bool
+    MX_REFIT_COPY_PLAN_KEY_ON_MISS: bool
+    MX_RESHARD_MAX_SEGMENTS_PER_COPY: int
     MX_RESHARD_MAX_GBPS: float
     MX_RESHARD_MIN_GBPS: float
     MX_RESHARD_PUBLISH_DIGEST: bool
@@ -225,8 +231,7 @@ def _env_positive_float(name: str, default: float) -> float:
     value = _env_float(name, default)
     if not math.isfinite(value) or value <= 0.0:
         logger.warning(
-            "Invalid %s=%r; a bound must be a finite positive number, using "
-            "default %s",
+            "Invalid %s=%r; a bound must be a finite positive number, using default %s",
             name,
             os.environ.get(name),
             default,
@@ -243,8 +248,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Site-varying defaults: return raw (None when unset), callers add defaults.
     "MODEL_EXPRESS_URL": lambda: os.environ.get("MODEL_EXPRESS_URL"),
     "MX_SERVER_ADDRESS": lambda: os.environ.get("MX_SERVER_ADDRESS"),
-    "MODEL_EXPRESS_CACHE_DIRECTORY": lambda: os.environ.get("MODEL_EXPRESS_CACHE_DIRECTORY"),
-    "MODEL_EXPRESS_NO_SHARED_STORAGE": lambda: _env_bool("MODEL_EXPRESS_NO_SHARED_STORAGE", False),
+    "MODEL_EXPRESS_CACHE_DIRECTORY": lambda: os.environ.get(
+        "MODEL_EXPRESS_CACHE_DIRECTORY"
+    ),
+    "MODEL_EXPRESS_NO_SHARED_STORAGE": lambda: _env_bool(
+        "MODEL_EXPRESS_NO_SHARED_STORAGE", False
+    ),
     "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE": lambda: os.environ.get(
         "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE"
     ),
@@ -254,10 +263,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_AUTH_TOKEN_PATH": lambda: os.environ.get("MX_AUTH_TOKEN_PATH"),
     "MX_AUTH_TOKEN_TTL_SECONDS": lambda: os.environ.get("MX_AUTH_TOKEN_TTL_SECONDS"),
     # ── Runtime compatibility ──────────────────────────────────────────────
-    "MX_DISABLE_PATCHES": lambda: os.environ.get("MX_DISABLE_PATCHES", "").strip().lower()
-    in _TRUTHY,
+    "MX_DISABLE_PATCHES": lambda: (
+        os.environ.get("MX_DISABLE_PATCHES", "").strip().lower() in _TRUTHY
+    ),
     # ── Metadata / worker ──────────────────────────────────────────────────
-    "MX_METADATA_BACKEND": lambda: os.environ.get("MX_METADATA_BACKEND", "").lower().strip(),
+    "MX_METADATA_BACKEND": lambda: (
+        os.environ.get("MX_METADATA_BACKEND", "").lower().strip()
+    ),
     "MX_METADATA_PORT": lambda: _env_int("MX_METADATA_PORT", 5555),
     "MX_WORKER_GRPC_PORT": lambda: _env_int("MX_WORKER_GRPC_PORT", 6555),
     "MX_WORKER_HOST": lambda: os.environ.get("MX_WORKER_HOST", ""),
@@ -291,12 +303,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # complete refit scores is engine- and model-specific, so the default is set
     # loose enough to pass any complete refit and still catch a gross hole; see
     # modelexpress.refit.reshard.receiver._coverage_floor.
-    "MX_RESHARD_REQUIRE_FULL_COVERAGE": lambda: os.environ.get(
-        "MX_RESHARD_REQUIRE_FULL_COVERAGE", ""
-    )
-    .strip()
-    .lower()
-    in _TRUTHY,
+    "MX_RESHARD_REQUIRE_FULL_COVERAGE": lambda: (
+        os.environ.get("MX_RESHARD_REQUIRE_FULL_COVERAGE", "").strip().lower()
+        in _TRUTHY
+    ),
     "MX_RESHARD_COVERAGE_FLOOR": lambda: _env_float("MX_RESHARD_COVERAGE_FLOOR", 0.995),
     # Bounds for the reshard peer handshake; see
     # modelexpress.refit.reshard.receiver.handshake_with_peers.
@@ -320,6 +330,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # One JSON stage record per refit. On by default: the timings are already
     # computed, and at INFO they were never captured by a benchmark run.
     "MX_REFIT_STAGE_RECORD": lambda: _env_bool("MX_REFIT_STAGE_RECORD", True),
+    "MX_REFIT_REUSE_COMPLETE_PLAN": lambda: _env_bool(
+        "MX_REFIT_REUSE_COMPLETE_PLAN", False
+    ),
+    "MX_REFIT_CACHE_RESOLVED_SOURCES": lambda: _env_bool(
+        "MX_REFIT_CACHE_RESOLVED_SOURCES", False
+    ),
+    "MX_REFIT_CACHE_BOUNDED_PLANS": lambda: _env_bool(
+        "MX_REFIT_CACHE_BOUNDED_PLANS", False
+    ),
+    "MX_REFIT_COPY_PLAN_KEY_ON_MISS": lambda: _env_bool(
+        "MX_REFIT_COPY_PLAN_KEY_ON_MISS", False
+    ),
+    "MX_RESHARD_MAX_SEGMENTS_PER_COPY": lambda: int(
+        os.environ.get("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "64")
+    ),
+    # Coalesce consecutive owning-module batches up to the staging budget. Off by
+    # default: one module per batch is the conservative arena bound, and packing
+    # trades higher per-batch arena residency for fewer batches.
+    "MX_REFIT_PACK_MODULES": lambda: _env_bool("MX_REFIT_PACK_MODULES", False),
     # Per-rank fabric ceiling in Gbps used to reject impossible wire rates. Zero
     # disables the check, and is the default because only the operator knows the
     # real per-rank limit for their fabric.
@@ -341,9 +370,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # modelexpress.refit.reshard.verify.
     "MX_RESHARD_PUBLISH_DIGEST": lambda: _env_bool("MX_RESHARD_PUBLISH_DIGEST", False),
     # ── Kubernetes service backend ─────────────────────────────────────────
-    "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get("MX_K8S_SERVICE_PATTERN", "mx-sources"),
+    "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get(
+        "MX_K8S_SERVICE_PATTERN", "mx-sources"
+    ),
     "MX_K8S_SOURCE_RETRIES": lambda: os.environ.get("MX_K8S_SOURCE_RETRIES", ""),
-    "MX_K8S_SOURCE_BACKOFF_SECONDS": lambda: os.environ.get("MX_K8S_SOURCE_BACKOFF_SECONDS", ""),
+    "MX_K8S_SOURCE_BACKOFF_SECONDS": lambda: os.environ.get(
+        "MX_K8S_SOURCE_BACKOFF_SECONDS", ""
+    ),
     # ── NIXL / transport ───────────────────────────────────────────────────
     "MX_NIXL_BACKEND": lambda: os.environ.get("MX_NIXL_BACKEND", "UCX").strip().upper(),
     "MX_POOL_REG": lambda: os.environ.get("MX_POOL_REG", "0") == "1",
@@ -353,37 +386,50 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "UCX_MEM_EVENTS": lambda: os.environ.get("UCX_MEM_EVENTS"),
     "MX_UCX_DISABLE_MEM_EVENTS": lambda: _env_bool("MX_UCX_DISABLE_MEM_EVENTS", False),
     "MX_RDMA_NIC_PIN": lambda: os.environ.get("MX_RDMA_NIC_PIN", "").strip(),
-    "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": lambda: os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS"),
+    "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": lambda: os.environ.get(
+        "MX_RDMA_NIC_PIN_MIN_RATE_GBPS"
+    ),
     # ── GPUDirect Storage ──────────────────────────────────────────────────
     "MX_GDS_MAX_CHUNK_KB": lambda: os.environ.get("MX_GDS_MAX_CHUNK_KB"),
     "MX_GDS_THREADS": lambda: _env_int("MX_GDS_THREADS", 8),
     "MX_GDS_TIMEOUT": lambda: _env_float("MX_GDS_TIMEOUT", 120.0),
     # ── Model streamer ─────────────────────────────────────────────────────
-    "MX_MS_DISTRIBUTED": lambda: os.environ.get("MX_MS_DISTRIBUTED", "1").lower() in ("1", "true"),
+    "MX_MS_DISTRIBUTED": lambda: (
+        os.environ.get("MX_MS_DISTRIBUTED", "1").lower() in ("1", "true")
+    ),
     # ── InstantTensor loader ───────────────────────────────────────────────
     # Enabled by default; the strategy is still gated on the instanttensor
     # package and a CUDA device, so opting out is only needed to force a
     # different local-load path. Set MX_INSTANT_TENSOR=0 to disable.
-    "MX_INSTANT_TENSOR": lambda: os.environ.get("MX_INSTANT_TENSOR", "1").lower() in ("1", "true"),
+    "MX_INSTANT_TENSOR": lambda: (
+        os.environ.get("MX_INSTANT_TENSOR", "1").lower() in ("1", "true")
+    ),
     # ── TRT-LLM live transfer ──────────────────────────────────────────────
     "MX_SOURCE_QUERY_TIMEOUT": lambda: _env_int("MX_SOURCE_QUERY_TIMEOUT", 3600),
     "MX_TRANSFER_TIMEOUT": lambda: _env_int("MX_TRANSFER_TIMEOUT", 900),
-    "MX_TRANSFER_LOG_DIR": lambda: os.environ.get("MX_TRANSFER_LOG_DIR", "/tmp/mx_logs"),
+    "MX_TRANSFER_LOG_DIR": lambda: os.environ.get(
+        "MX_TRANSFER_LOG_DIR", "/tmp/mx_logs"
+    ),
     # ── VMM arena ──────────────────────────────────────────────────────────
     "MX_VMM_ARENA": lambda: os.environ.get("MX_VMM_ARENA") == "1",
     "MX_ARENA_SINGLE_MR": lambda: os.environ.get("MX_ARENA_SINGLE_MR") == "1",
     # ── Framework artifact (JIT cache) transfer ────────────────────────────
-    "MX_ARTIFACT_TRANSFER": lambda: os.environ.get("MX_ARTIFACT_TRANSFER", "").strip().lower()
-    in _TRUTHY,
+    "MX_ARTIFACT_TRANSFER": lambda: (
+        os.environ.get("MX_ARTIFACT_TRANSFER", "").strip().lower() in _TRUTHY
+    ),
     "MX_ARTIFACT_BUNDLE_ROOT": lambda: os.environ.get("MX_ARTIFACT_BUNDLE_ROOT"),
     "MX_ARTIFACT_COMPILE_CONFIG_DIGEST": lambda: os.environ.get(
         "MX_ARTIFACT_COMPILE_CONFIG_DIGEST", ""
     ),
     "MX_ARTIFACT_READY_URL": lambda: os.environ.get("MX_ARTIFACT_READY_URL", ""),
-    "MX_ARTIFACT_READY_TIMEOUT_SECS": lambda: _env_int("MX_ARTIFACT_READY_TIMEOUT_SECS", 1800),
+    "MX_ARTIFACT_READY_TIMEOUT_SECS": lambda: _env_int(
+        "MX_ARTIFACT_READY_TIMEOUT_SECS", 1800
+    ),
     # Raw string: artifact_manifest.artifact_transfer_chunk_size() owns the
     # int parse plus its non-positive/max-bound validation and default param.
-    "MX_ARTIFACT_TRANSFER_CHUNK_SIZE": lambda: os.environ.get("MX_ARTIFACT_TRANSFER_CHUNK_SIZE"),
+    "MX_ARTIFACT_TRANSFER_CHUNK_SIZE": lambda: os.environ.get(
+        "MX_ARTIFACT_TRANSFER_CHUNK_SIZE"
+    ),
     # ── Trainer pull (live weight sync from a running trainer) ─────────────
     "MX_REDIS_URL": lambda: os.environ.get("MX_REDIS_URL", "redis://localhost:6379"),
     # ── Generator weight sync ──────────────────────────────────────────────
@@ -403,22 +449,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
         0.0, _env_float("MX_P2P_TOPOLOGY_LOAD_WEIGHT", 0.0)
     ),
     # ── Opt-in metrics collector ───────────────────────────────────────────
-    "MX_METRICS_ENABLED": lambda: os.environ.get("MX_METRICS_ENABLED", "0").strip().lower()
-    in _TRUTHY,
+    "MX_METRICS_ENABLED": lambda: (
+        os.environ.get("MX_METRICS_ENABLED", "0").strip().lower() in _TRUTHY
+    ),
     "MX_METRICS_PORT": lambda: os.environ.get("MX_METRICS_PORT"),
     "MX_METRICS_PUSHGATEWAY": lambda: os.environ.get("MX_METRICS_PUSHGATEWAY"),
     "MX_METRICS_SCHEME": lambda: os.environ.get("MX_METRICS_SCHEME", ""),
     # Interval at which a rank that lost the /metrics bind re-attempts it, so
     # endpoint ownership migrates when the winning rank exits.
-    "MX_METRICS_BIND_RETRY_SECS": lambda: _env_float("MX_METRICS_BIND_RETRY_SECS", 15.0),
+    "MX_METRICS_BIND_RETRY_SECS": lambda: _env_float(
+        "MX_METRICS_BIND_RETRY_SECS", 15.0
+    ),
     # Restore the per-peer source_worker_id label on
     # mx_p2p_source_selections_total. Benchmark runs only: the id is a
     # per-process uuid, so its label domain grows with process count over time
     # rather than with cluster size.
-    "MX_METRICS_SOURCE_ID_LABEL": lambda: os.environ.get("MX_METRICS_SOURCE_ID_LABEL", "0")
-    .strip()
-    .lower()
-    in _TRUTHY,
+    "MX_METRICS_SOURCE_ID_LABEL": lambda: (
+        os.environ.get("MX_METRICS_SOURCE_ID_LABEL", "0").strip().lower() in _TRUTHY
+    ),
     # prometheus_client multiprocess directory. Read-only here: it MUST be set
     # in the pod manifest, never assigned in Python. get_value_class() latches at
     # prometheus_client import time, so an in-process assignment lands after the
@@ -445,7 +493,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LWS_LEADER_ADDRESS": lambda: os.environ.get("LWS_LEADER_ADDRESS", ""),
     "POD_NAMESPACE": lambda: os.environ.get("POD_NAMESPACE", ""),
     "POD_NAME": lambda: os.environ.get("POD_NAME", ""),
-    "POD_UID": lambda: os.environ.get("POD_UID", "")
+    "POD_UID": lambda: os.environ.get("POD_UID", ""),
 }
 
 
