@@ -3,6 +3,7 @@
 
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -2194,6 +2195,42 @@ def test_canonical_s3_in_place_delta_failure_requires_recovery(
     assert state.version == "base-a"
     assert adapter._checkpoint.store.active_version() == "target-a"
     adapter.close()
+
+
+@pytest.mark.parametrize("payload", ["full", "delta"])
+def test_prepared_target_can_be_reused_during_installation(
+    monkeypatch, tmp_path, payload
+):
+    if payload == "full":
+        objects = _full_artifact(torch.tensor([7.0, 8.0]))
+        inputs = _full_inputs()
+    else:
+        objects = _artifact(
+            torch.tensor([1.0, 2.0]).view(torch.uint8).numpy(),
+            torch.tensor([7.0, 8.0]).view(torch.uint8).numpy(),
+        )
+        inputs = _inputs(None)
+    first, storage = _build(monkeypatch, tmp_path, objects)
+    second = _Adapter(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path=tmp_path / "launch",
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+    )
+    first_staged = first.stage_weight(inputs)
+    downloads = list(storage.calls)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with first._method.installation_context(first._active):
+            second_staged = pool.submit(second.stage_weight, inputs).result(timeout=2)
+            assert second_staged.path == first_staged.path
+            assert storage.calls == downloads
+    first.release_staged_weight(first_staged)
+    second.release_staged_weight(second_staged)
+    first.close()
+    second.close()
 
 
 def test_installation_fence_blocks_prepare_until_activation(monkeypatch, tmp_path):

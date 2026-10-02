@@ -544,6 +544,21 @@ engine integrations.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
   through SGLang's native safetensors loader.
 
+Canonical preparation requests queue on a separate `.prepare.lock`. Once the
+leader has reconstructed a target, followers verify and attach to that READY
+checkpoint with shared installation and cache locks. They can therefore prepare
+while another rank loads the same checkpoint. A cache miss releases the shared
+locks, acquires the exclusive installation/cache fences, and rechecks the state
+before reconstructing. Cache-hit attachment performs no eviction; capacity is
+enforced by initialization, reconstruction, and activation.
+
+| Canonical checkpoint operation | `.prepare.lock` | `.install.lock` | `.lock` |
+|---|---|---|---|
+| Attach to an already prepared target | Exclusive | Shared | Shared |
+| Reconstruct a target | Exclusive | Exclusive | Exclusive |
+| Load engine weights | None | Shared | Shared |
+| Commit activation when the installation context exits | None | Shared | Exclusive |
+
 The corresponding trainer composition is owned by `TrainerRuntime`. Public
 `FSDPTrainerContext` and `MegatronTrainerContext` select only engine capture;
 full-tensor NIXL and canonical-checkpoint object-storage publication remain separate
