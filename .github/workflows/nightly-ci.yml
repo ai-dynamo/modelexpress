@@ -78,16 +78,14 @@ jobs:
             fi
           done
 
-          RUNSUF="${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}.g${SHA7}"
-          RUN_KEY="${DATE}-${SHA7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           {
             echo "date=${DATE}"
             echo "sha7=${SHA7}"
-            echo "nightly_tag=${RUN_KEY}"
+            echo "nightly_tag=${DATE}-${SHA7}"
             echo "wheel_version=${WHEEL_BASE}.dev${DATE}"
-            echo "crate_version=${CRATE_BASE}-nightly.${DATE}.${RUNSUF}"
-            echo "chart_version=${CHART_BASE}-nightly.${DATE}.${RUNSUF}"
-            echo "artifactory_path=${ARTIFACTORY_NIGHTLY_FOLDER}/${RUN_KEY}"
+            echo "crate_version=${CRATE_BASE}-nightly.${DATE}.g${SHA7}"
+            echo "chart_version=${CHART_BASE}-nightly.${DATE}.g${SHA7}"
+            echo "artifactory_path=${ARTIFACTORY_NIGHTLY_FOLDER}/${GITHUB_RUN_ID}"
           } | tee -a "$GITHUB_OUTPUT"
 
       - name: Compute release mode
@@ -614,7 +612,12 @@ jobs:
             "https://helm.ngc.nvidia.com/${NGC_STAGING_ORG}/ai-dynamo"
           CHART_FILE="chart-dist/modelexpress-nightly-${CHART_VERSION}.tgz"
           ls -la chart-dist/
-          helm cm-push "${CHART_FILE}" "${REPO_ALIAS}"
+          SEARCH_OUT=$(helm search repo "${REPO_ALIAS}/modelexpress-nightly" --version "${CHART_VERSION}" -o yaml)
+          if grep -qF "version: ${CHART_VERSION}" <<< "${SEARCH_OUT}"; then
+            echo "::notice::modelexpress-nightly ${CHART_VERSION} is already in the NGC helm registry; skipping the push"
+          else
+            helm cm-push "${CHART_FILE}" "${REPO_ALIAS}"
+          fi
           echo "staged_helm=modelexpress-nightly:${CHART_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Remove helm registry credentials
@@ -658,14 +661,14 @@ jobs:
           set -euo pipefail
           DEST_NIGHTLY="nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/modelexpress-server-nightly"
           DEST_STABLE="nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/modelexpress-server"
-          STAGED=""   # immutable refs — the nSpect/scan payload
+          STAGED=""   # dated refs — the nSpect/scan payload
           FLOATED=""  # floating aliases that actually landed
 
           float_tag() {
             if docker buildx imagetools create -t "$1" "$2" "$3"; then
               FLOATED="${FLOATED:+${FLOATED},}${1##*/}"
             else
-              echo "::warning::floating tag $1 was not updated; the immutable ${TAG} manifest is unaffected"
+              echo "::warning::floating tag $1 was not updated; the ${TAG} manifest is unaffected"
             fi
           }
 
@@ -699,7 +702,7 @@ jobs:
           {
             echo "### Container staging"
             echo ""
-            echo "- immutable: \`${STAGED}\`"
+            echo "- dated: \`${STAGED}\`"
             echo "- floating: \`${FLOATED:-<none>}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
