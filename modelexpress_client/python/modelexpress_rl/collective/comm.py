@@ -20,17 +20,18 @@ Two rules here exist because their absence turns a failure into a hang:
 from __future__ import annotations
 
 import logging
-import math
 import os
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
+from .. import envs as rl_envs
 from . import envs
 
 logger = logging.getLogger("modelexpress_rl.collective.comm")
 
+#: Event-poll backoff for bounded waits, in seconds.
 _POLL_MIN_S = 20e-6
 _POLL_MAX_S = 1e-3
 
@@ -201,11 +202,9 @@ class LaneCommunicator:
         device_context = (
             torch.cuda.device(self.device) if self.device is not None else nullcontext()
         )
-        # Resolving and recording is attempted rather than predicted. An object
-        # merely CARRYING a cuda_stream attribute is not necessarily one torch
-        # can record against - the test doubles in this repo have exactly that
-        # shape - and a wrong guess here would raise on a GPU box while every
-        # CPU box stayed green.
+        # Attempt the record rather than predict the stream's shape: carrying a
+        # cuda_stream attribute does not make it recordable, and a wrong guess
+        # only raises on GPU hosts -- CPU-only boxes never reach the record.
         try:
             with device_context:
                 if stream is None:
@@ -222,20 +221,25 @@ class LaneCommunicator:
                 event.record(target)
         except Exception as error:  # noqa: BLE001 - any resolve failure means fall back
             logger.debug(
-                "this lane's stream cannot carry a CUDA event, falling back to a "
-                "blocking wait: %r",
+                "this lane's stream cannot carry a CUDA event; the caller must "
+                "fall back to a blocking wait: %r",
                 error,
             )
             return None
         return event
 
-    def wait_event(self, event: Any, timeout_s: float) -> None:
+    def wait_event(self, event: Any, timeout_s: float | None) -> None:
         """Poll ``event`` until it completes, raising once ``timeout_s`` passes.
+
+        None applies no bound: the wait is ``event.synchronize()`` itself.
 
         The poll backs off from tens of microseconds to a millisecond. A refit
         waits once per layer group, so a fixed multi-millisecond sleep would be
         paid on every group and can exceed the transfer it is waiting for.
         """
+        if timeout_s is None:
+            event.synchronize()
+            return
         deadline = time.monotonic() + timeout_s
         delay = _POLL_MIN_S
         while not event.query():
@@ -247,6 +251,13 @@ class LaneCommunicator:
                 )
             time.sleep(min(delay, remaining))
             delay = min(delay * 2, _POLL_MAX_S)
+
+
+def _resolve_timeout_s(timeout_s: float | None) -> float:
+    return rl_envs.require_positive_float(
+        timeout_s if timeout_s is not None else envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S,
+        "timeout_s",
+    )
 
 
 def _wait_until_initialized(comm: Any, bindings: Any, timeout_s: float) -> None:
@@ -355,15 +366,7 @@ class CommunicatorCache:
 
         _reject_forced_communicator_id()
         communicator, _, bindings = _nccl()
-        timeout_s = (
-            timeout_s
-            if timeout_s is not None
-            else envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S
-        )
-        if not math.isfinite(timeout_s) or timeout_s <= 0:
-            raise ValueError(
-                f"timeout_s must be finite and positive, got {timeout_s!r}"
-            )
+        timeout_s = _resolve_timeout_s(timeout_s)
         blocking_override = os.environ.get("NCCL_COMM_BLOCKING")
         if blocking_override not in (None, "", "0"):
             raise RuntimeError(
@@ -424,28 +427,52 @@ class CommunicatorCache:
             control=comm if data is not None else None,
         )
         self._lanes[key] = lane
-        # Bringing a new communicator up puts every other live one back into
-        # ncclInProgress, and a non-blocking communicator refuses collectives
-        # until it has been polled to ncclSuccess again. The lanes of a group
-        # are created one at a time with a full-group barrier between them, so
-        # without this the barrier after the second lane fails with
-        # ncclInvalidArgument on every rank. Poll here rather than on every
-        # handle access: creation is rare and is what causes the transition.
-        self._settle_others(key, bindings, timeout_s)
         return lane
 
-    def _settle_others(self, created: LaneKey, bindings: Any, timeout_s: float) -> None:
-        """Return every other live lane to ncclSuccess after a new init."""
+    def settle_group(
+        self,
+        group_id: str,
+        epoch: int,
+        *,
+        timeout_s: float | None = None,
+    ) -> int:
+        """Wait until every live lane in one group epoch is usable.
+
+        NCCL rejects a collective while the communicator still reports
+        ``ncclInProgress``, so every rank polls here before the next shared
+        bootstrap barrier - including ranks that created no lane in this
+        step and otherwise have no readiness check.
+        """
+        timeout_s = _resolve_timeout_s(timeout_s)
+
+        _, _, bindings = _nccl()
+        deadline = time.monotonic() + timeout_s
+        settled = 0
         for key, lane in list(self._lanes.items()):
-            if key == created or lane.aborted:
+            if key.group_id != group_id or key.epoch != epoch or lane.aborted:
                 continue
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                raise TimeoutError(
+                    f"lane {key.lane_id} of group {group_id} at epoch {epoch} "
+                    f"did not settle: the shared {timeout_s:.3f}s budget was "
+                    f"already exhausted"
+                )
             try:
-                _wait_until_initialized(lane.handle, bindings, timeout_s)
+                _wait_until_initialized(lane.handle, bindings, remaining_s)
+            except TimeoutError as error:
+                raise TimeoutError(
+                    f"lane {key.lane_id} of group {group_id} at epoch {epoch} "
+                    f"did not settle within its remaining {remaining_s:.3f}s "
+                    f"of the shared {timeout_s:.3f}s budget"
+                ) from error
             except Exception as error:
                 raise RuntimeError(
-                    f"lane {key.lane_id} of group {key.group_id} did not return to a "
-                    f"usable state after lane {created.lane_id} was initialized: {error!r}"
+                    f"lane {key.lane_id} of group {group_id} at epoch {epoch} "
+                    f"did not return to a usable state: {error!r}"
                 ) from error
+            settled += 1
+        return settled
 
     def invalidate_epoch(self, group_id: str, epoch: int) -> int:
         """Drop every lane not at ``epoch``. Returns how many were dropped."""
