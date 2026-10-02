@@ -188,83 +188,104 @@ class MxModelLoader:
         )
 
         result = LoadResult(value=model, model=model)
-        source_worker = self._find_transfer_engine_source(ctx)
+        model_id = ctx.identity.model_name
         weight_info = None
-        if source_worker is None:
-            logger.info(
-                "[Worker %s] No TransferEngine source available, loading natively",
-                ctx.global_rank,
-            )
-            result = ctx.adapter.load_via_native(result)
-            tensors = ctx.adapter.discover_tensors(result)
-        else:
+        # This transport never enters the strategy chain, but it is one by hand:
+        # try the transfer, and on failure re-initialize and load natively. It
+        # gets the same phases and attempt spans from the same context managers,
+        # so the panels read it like any other load. No artifact_install and no
+        # model_init, because neither happens on this path.
+        with selection_metrics.time_load_phase("sglang", model_id, "chain"):
             registered_tensors = None
-            try:
-                result = ctx.adapter.before_rdma_receive(result)
-                tensors = ctx.adapter.discover_tensors(result)
-                weight_info = self._register_transfer_engine_tensors(
-                    tensors,
-                    transfer_engine,
-                )
-                registered_tensors = tensors
-                self._receive_via_transfer_engine(
-                    tensors,
-                    transfer_engine,
-                    source_worker,
-                    ctx,
-                )
-                result = ctx.adapter.after_rdma_receive(result)
-            except Exception as exc:
-                if registered_tensors is not None:
-                    self._unregister_transfer_engine_tensors(
-                        registered_tensors,
+            with selection_metrics.time_load_strategy(
+                "sglang", model_id, "transfer_engine"
+            ) as attempt:
+                source_worker = self._find_transfer_engine_source(ctx)
+                if source_worker is None:
+                    logger.info(
+                        "[Worker %s] No TransferEngine source available, "
+                        "loading natively",
+                        ctx.global_rank,
+                    )
+                    attempt.outcome = "fallback"
+                else:
+                    try:
+                        result = ctx.adapter.before_rdma_receive(result)
+                        tensors = ctx.adapter.discover_tensors(result)
+                        weight_info = self._register_transfer_engine_tensors(
+                            tensors,
+                            transfer_engine,
+                        )
+                        registered_tensors = tensors
+                        self._receive_via_transfer_engine(
+                            tensors,
+                            transfer_engine,
+                            source_worker,
+                            ctx,
+                        )
+                        result = ctx.adapter.after_rdma_receive(result)
+                        attempt.outcome = "success"
+                    except Exception as exc:
+                        # Pessimistic until the re-init completes, as in the
+                        # chain: a failure inside it is a dead load, not a
+                        # fallback.
+                        attempt.outcome = "recovery_error"
+                        if registered_tensors is not None:
+                            self._unregister_transfer_engine_tensors(
+                                registered_tensors,
+                                transfer_engine,
+                            )
+                        logger.warning(
+                            "[Worker %s] TransferEngine load failed, falling back "
+                            "to native load: %s",
+                            ctx.global_rank,
+                            exc,
+                            exc_info=True,
+                        )
+                        registered_tensors = None
+                        weight_info = None
+                        clear_exception_tracebacks(exc)
+                        result = ctx.adapter.reinit_for_retry(result)
+                        attempt.outcome = "fallback_dirty"
+            if attempt.outcome != "success":
+                with selection_metrics.time_load_strategy(
+                    "sglang", model_id, "default"
+                ) as native:
+                    result = ctx.adapter.load_via_native(result)
+                    tensors = ctx.adapter.discover_tensors(result)
+                    native.outcome = "success"
+
+        with selection_metrics.time_load_phase("sglang", model_id, "publish"):
+            if weight_info is None:
+                try:
+                    weight_info = self._register_transfer_engine_tensors(
+                        tensors,
                         transfer_engine,
                     )
-                logger.warning(
-                    "[Worker %s] TransferEngine load failed, falling back "
-                    "to native load: %s",
-                    ctx.global_rank,
-                    exc,
-                    exc_info=True,
-                )
-                registered_tensors = None
-                tensors = {}
-                clear_exception_tracebacks(exc)
-                result = ctx.adapter.reinit_for_retry(result)
-                result = ctx.adapter.load_via_native(result)
-                tensors = ctx.adapter.discover_tensors(result)
-                weight_info = None
-
-        if weight_info is None:
-            try:
-                weight_info = self._register_transfer_engine_tensors(
-                    tensors,
-                    transfer_engine,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[Worker %s] TransferEngine source registration failed; "
-                    "model load will continue without source publication: %s",
-                    ctx.global_rank,
-                    exc,
-                    exc_info=True,
-                )
-                ctx.tensors = tensors
-                self.remote_instance_transfer_engine_weight_info = {}
-                return result.model.eval()
-        ctx.tensors = tensors
-        self.remote_instance_transfer_engine_weight_info = weight_info
-        publish_ok = self._publish_transfer_engine_source(
-            ctx=ctx,
-            session_id=session_id,
-            weight_info=weight_info,
-        )
-        if not publish_ok:
-            logger.warning(
-                "[Worker %s] TransferEngine source advertisement failed; "
-                "model load will continue",
-                ctx.global_rank,
+                except Exception as exc:
+                    logger.warning(
+                        "[Worker %s] TransferEngine source registration failed; "
+                        "model load will continue without source publication: %s",
+                        ctx.global_rank,
+                        exc,
+                        exc_info=True,
+                    )
+                    ctx.tensors = tensors
+                    self.remote_instance_transfer_engine_weight_info = {}
+                    return result.model.eval()
+            ctx.tensors = tensors
+            self.remote_instance_transfer_engine_weight_info = weight_info
+            publish_ok = self._publish_transfer_engine_source(
+                ctx=ctx,
+                session_id=session_id,
+                weight_info=weight_info,
             )
+            if not publish_ok:
+                logger.warning(
+                    "[Worker %s] TransferEngine source advertisement failed; "
+                    "model load will continue",
+                    ctx.global_rank,
+                )
 
         total_time = time.perf_counter() - load_start
         logger.info(
