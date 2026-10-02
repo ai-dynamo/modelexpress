@@ -20,6 +20,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from functools import cached_property
+from inspect import getattr_static
 from pathlib import Path
 from types import GetSetDescriptorType
 from typing import TYPE_CHECKING
@@ -93,24 +94,55 @@ class _ParameterAliases:
         for edge in self.edges:
             modules[edge.path] = edge.child
         owners = iter(self.owners)
-        groups_by_owner = {}
+        named_groups, groups_by_owner = [], {}
         for group in self.groups:
             named = tuple((next(owners)[0], module, leaf) for module, leaf in group)
+            index = len(named_groups)
+            named_groups.append(named)
             for module in dict.fromkeys(module for module, _ in group):
-                groups_by_owner.setdefault(module, []).append(named)
+                groups_by_owner.setdefault(module, []).append(index)
+        structures = (
+            # Custom owner hashing can change classes between dictionary writes.
+            _alias_structure(named_groups)
+            if _ordinary_owner_hashes(self.writers)
+            else None
+        )
         result = {}
-        for module, groups in groups_by_owner.items():
-            structure = _alias_structure(groups)
-            plan = self._owner_plans.get(structure)
+        for module, indices in groups_by_owner.items():
+            groups = [named_groups[index] for index in indices]
+            structure = (
+                tuple(structures[index] for index in indices)
+                if structures is not None
+                else _alias_structure(groups)
+            )
+            plan = self._owner_plans.get(structure) if structure is not None else None
             if plan is None:
                 plan = _compile_parameter_aliases(self.root, groups, modules)
-                self._owner_plans[structure] = plan
+                if structure is not None:
+                    self._owner_plans[structure] = plan
             result[module] = plan
         return result
 
 
+def _ordinary_owner_hashes(writers):
+    checked = set()
+    for module, _captured_class in writers:
+        cls = type(module)
+        if type(cls) is not type:
+            return False
+        if cls not in checked:
+            if (
+                getattr_static(cls, "__hash__") is not object.__hash__
+                or getattr_static(cls, "__eq__") is not object.__eq__
+            ):
+                return False
+            checked.add(cls)
+    return True
+
+
 def _alias_structure(groups):
     result = []
+    inheritance = {}
     for group in groups:
         if len(group) < 2:
             continue
@@ -122,14 +154,13 @@ def _alias_structure(groups):
                 or type(type(module)) is not type
             ):
                 return None
-            entries.append(
-                (
-                    path,
-                    id(module),
-                    leaf,
-                    tuple(id(base) for base in type(module).__mro__),
-                )
-            )
+            cls = type(module)
+            bases = cls.__mro__
+            cached = inheritance.get(cls)
+            if cached is None or cached[0] is not bases:
+                cached = (bases, tuple(map(id, bases)))
+                inheritance[cls] = cached
+            entries.append((path, id(module), leaf, cached[1]))
         result.append(tuple(entries))
     return tuple(result)
 
