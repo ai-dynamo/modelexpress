@@ -96,6 +96,9 @@ if TYPE_CHECKING:
     MX_GDS_TIMEOUT: float
     # Model streamer
     MX_MS_DISTRIBUTED: bool
+    MX_DRAFT_SPOOL_DIR: Optional[str]
+    MX_DRAFT_SPOOL_MAX_BYTES: int
+    MX_DRAFT_SPOOL_MEMORY_BYTES: int
     # InstantTensor loader
     MX_INSTANT_TENSOR: bool
     # TRT-LLM live transfer
@@ -360,6 +363,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_GDS_TIMEOUT": lambda: _env_float("MX_GDS_TIMEOUT", 120.0),
     # ── Model streamer ─────────────────────────────────────────────────────
     "MX_MS_DISTRIBUTED": lambda: os.environ.get("MX_MS_DISTRIBUTED", "1").lower() in ("1", "true"),
+    "MX_DRAFT_SPOOL_DIR": lambda: os.environ.get("MX_DRAFT_SPOOL_DIR"),
+    "MX_DRAFT_SPOOL_MAX_BYTES": lambda: _env_int(
+        "MX_DRAFT_SPOOL_MAX_BYTES", 4 * 1024**3
+    ),
+    "MX_DRAFT_SPOOL_MEMORY_BYTES": lambda: _env_int(
+        "MX_DRAFT_SPOOL_MEMORY_BYTES", 256 * 1024**2
+    ),
     # ── InstantTensor loader ───────────────────────────────────────────────
     # Enabled by default; the strategy is still gated on the instanttensor
     # package and a CUDA device, so opting out is only needed to force a

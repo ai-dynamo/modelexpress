@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
+from importlib.metadata import PackageNotFoundError, version as pkg_version
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,6 +17,7 @@ from ... import envs, p2p_pb2
 from ...load_strategy import LoadContext, run_load_strategy_chain
 from ...load_strategy.base import clear_exception_tracebacks
 from ...load_strategy.context import LoadResult
+from ...load_strategy.draft_gate import DraftPublicationGate
 from ...metadata.publisher import PublisherThread
 from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
 from ...metadata.publish import _heartbeat_threads
@@ -23,7 +25,12 @@ from ...metrics import enable_metrics
 from ...nixl_transfer import NixlTransferManager
 from ...metrics import metrics as selection_metrics
 from ...source_selection import configured_policy_label, get_configured_selector
-from .adapter import _get_model_name, build_sglang_load_context
+from .adapter import (
+    _get_model_name,
+    build_sglang_load_context,
+    is_sglang_draft_model,
+)
+from .draft_weights import draft_tensor_namespace, draft_weight_adapter_for
 from .artifacts import (
     _sglang_health_ready,
     install_sglang_cache_artifacts,
@@ -40,6 +47,49 @@ if TYPE_CHECKING:
 
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
+_loader_registry: dict[int, MxModelLoader] = {}
+# Main-pass publication gates awaiting this device's speculative draft pass.
+_draft_publication_gates: dict[int, DraftPublicationGate] = {}
+
+
+def _sglang_version() -> str:
+    try:
+        return pkg_version("sglang")
+    except PackageNotFoundError:
+        return ""
+
+
+def _speculative_server_args():
+    """Return SGLang's speculative settings for this process, if available."""
+    try:
+        from sglang.srt.runtime_context import get_spec
+
+        return get_spec()
+    except Exception:
+        pass
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return get_global_server_args()
+    except Exception:
+        return None
+
+
+def _expects_draft_pass() -> bool:
+    """True when SGLang will run a draft ModelRunner load through this loader.
+
+    NGRAM speculation has no draft model, and a draft with its own
+    ``speculative_draft_load_format`` never reaches the remote_instance
+    backend.
+    """
+    spec = _speculative_server_args()
+    algorithm = getattr(spec, "speculative_algorithm", None)
+    algorithm = str(getattr(algorithm, "name", algorithm) or "").upper()
+    if algorithm in ("", "NONE", "NGRAM"):
+        return False
+    draft_format = getattr(spec, "speculative_draft_load_format", None)
+    draft_format = getattr(draft_format, "value", draft_format)
+    return draft_format is None or str(draft_format) == "remote_instance"
 
 
 class MxModelLoader:
@@ -58,6 +108,8 @@ class MxModelLoader:
         # prove it came up. No-op unless enabled; never raises.
         enable_metrics()
         self._ctx: LoadContext | None = None
+        self._strict_draft_publication = False
+        self._draft_weight_adapter = None
 
     def load_model(
         self,
@@ -73,12 +125,19 @@ class MxModelLoader:
         # reports a load duration. Instrumenting only the chain would leave that
         # whole deployment mode looking like it never loaded anything.
         #
-        # SGLang has no draft-model path through this loader, so model_role is
-        # always main.
+        # SGLang's speculative draft ModelRunner loads through this same path
+        # on the same worker; label it separately so the target's load-time
+        # percentiles stay meaningful.
+        is_draft = is_sglang_draft_model(model_config)
+        if is_draft and envs.MX_LOAD_STRATEGY_CHAIN == "RL":
+            raise ValueError(
+                "RL initial loading does not support speculative draft models"
+            )
+        model_role = "draft" if is_draft else "main"
         # Same helper the load context uses, so the label matches the model name
         # every other client family reports for this process.
         model_id = _get_model_name(model_config)
-        with selection_metrics.time_load("sglang", model_id, "main"):
+        with selection_metrics.time_load("sglang", model_id, model_role):
             if transport == "nixl":
                 return self._load_model_via_nixl(
                     model=model,
@@ -110,27 +169,123 @@ class MxModelLoader:
             model_config,
             device_config,
         )
-        if envs.MX_ARTIFACT_READY_URL.strip():
+        is_draft = is_sglang_draft_model(model_config)
+        ctx.p2p_role = "draft" if is_draft else "main"
+        draft_gate: DraftPublicationGate | None = None
+        strict_draft = False
+        if is_draft:
+            main_loader = _loader_registry.get(ctx.device_id)
+            main_ctx = main_loader._ctx if main_loader is not None else None
+            draft_adapter = draft_weight_adapter_for(
+                type(model).__name__, role="draft"
+            )
+            same_checkpoint = main_ctx is not None and main_ctx.identity == ctx.identity
+            compatible_adapter = (
+                same_checkpoint
+                and draft_adapter is not None
+                and main_loader._draft_weight_adapter is not None
+                and draft_adapter.compatibility_tag
+                == main_loader._draft_weight_adapter.compatibility_tag
+            )
+            namespace = (
+                draft_tensor_namespace(
+                    ctx.identity,
+                    draft_adapter,
+                    type(model).__name__,
+                    _sglang_version(),
+                    envs.MX_MODEL_URI or ctx.identity.model_name,
+                )
+                if compatible_adapter and ctx.identity.pipeline_parallel_size == 1
+                else None
+            )
+            if namespace is not None:
+                # Same checkpoint (MTP / NextN): join the main load's
+                # publication through its NIXL agent instead of binding
+                # MX_METADATA_PORT + device_id a second time.
+                ctx.shared_nixl_manager = _nixl_managers.get(ctx.device_id)
+                ctx.draft_tensor_namespace = namespace
+                strict_draft = main_loader._strict_draft_publication
+            else:
+                # Unknown layouts, an unpinned checkpoint or a different
+                # draft identity fall back to SGLang's storage loader.
+                ctx.p2p_enabled = False
+            draft_gate = _draft_publication_gates.pop(ctx.device_id, None)
+        elif _expects_draft_pass():
+            self._draft_weight_adapter = draft_weight_adapter_for(
+                type(model).__name__, role="main"
+            )
+            self._strict_draft_publication = self._draft_weight_adapter is not None
+            if self._strict_draft_publication or not envs.MX_ARTIFACT_READY_URL.strip():
+                main_gate = DraftPublicationGate(
+                    grace_secs=None if self._strict_draft_publication else 600.0
+                )
+                _draft_publication_gates[ctx.device_id] = main_gate
+                if envs.MX_ARTIFACT_READY_URL.strip():
+                    ctx.source_ready_fn = (
+                        lambda: main_gate.is_open() and _sglang_health_ready(ctx)
+                    )
+                else:
+                    ctx.source_ready_fn = main_gate.is_open
+        elif not is_draft:
+            self._draft_weight_adapter = draft_weight_adapter_for(
+                type(model).__name__, role="main"
+            )
+        if not is_draft and ctx.source_ready_fn is None and envs.MX_ARTIFACT_READY_URL.strip():
             ctx.source_ready_fn = lambda: _sglang_health_ready(ctx)
-        self._ctx = ctx
+        if not is_draft:
+            self._ctx = ctx
 
         logger.info(
-            "[Worker %s] SGLang MxModelLoader starting (model=%s)",
+            "[Worker %s] SGLang MxModelLoader starting (model=%s, "
+            "p2p_enabled=%s, p2p_role=%s)",
             ctx.global_rank,
             ctx.identity.model_name,
+            ctx.p2p_enabled,
+            ctx.p2p_role,
         )
+        try:
+            model = self._run_nixl_load(model, ctx)
+        finally:
+            if draft_gate is not None and (
+                not strict_draft or ctx.draft_published
+            ):
+                draft_gate.release()
+            main_gate_pending = _draft_publication_gates.get(ctx.device_id)
+            if not is_draft and main_gate_pending is not None:
+                main_gate_pending.arm()
+
+        total_time = time.perf_counter() - load_start
+        logger.info(
+            "[Worker %s] SGLang MxModelLoader.load_model() COMPLETE in %.2fs",
+            ctx.global_rank,
+            total_time,
+        )
+        return model.eval()
+
+    def _run_nixl_load(self, model: nn.Module, ctx: LoadContext) -> nn.Module:
+        is_main = ctx.p2p_role == "main"
         # No model_init phase here, unlike vLLM: SGLang builds the module and
         # hands it in, so there is no initialization inside this window to time.
         # The phases still partition the load; this load simply has three.
-        with selection_metrics.time_load_phase(
-            "sglang", ctx.identity.model_name, "artifact_install"
-        ):
-            install_sglang_cache_artifacts(ctx)
+        if is_main:
+            with selection_metrics.time_load_phase(
+                "sglang", ctx.identity.model_name, "artifact_install"
+            ):
+                install_sglang_cache_artifacts(ctx)
         with selection_metrics.time_load_phase(
             "sglang", ctx.identity.model_name, "chain"
         ):
             model = run_load_strategy_chain(model, ctx)
 
+        if not is_main:
+            if ctx.p2p_enabled and ctx.nixl_manager is not None:
+                # Same checkpoint, same SourceIdentity: extend the main load's
+                # manifest instead of registering a second source under a
+                # colliding mx_source_id.
+                _tensor_registry.setdefault(ctx.device_id, {}).update(ctx.tensors)
+            return model
+
+        _loader_registry[ctx.device_id] = self
         _tensor_registry[ctx.device_id] = ctx.tensors
         if ctx.nixl_manager is not None:
             _nixl_managers[ctx.device_id] = ctx.nixl_manager
@@ -141,14 +296,7 @@ class MxModelLoader:
             "sglang", ctx.identity.model_name, "publish"
         ):
             schedule_sglang_cache_artifact_publish(ctx)
-
-        total_time = time.perf_counter() - load_start
-        logger.info(
-            "[Worker %s] SGLang MxModelLoader.load_model() COMPLETE in %.2fs",
-            ctx.global_rank,
-            total_time,
-        )
-        return model.eval()
+        return model
 
     def _load_model_via_transfer_engine(
         self,
@@ -164,6 +312,24 @@ class MxModelLoader:
             model_config,
             device_config,
         )
+        if is_sglang_draft_model(model_config):
+            # TransferEngine publishes a separate source per load, so a draft
+            # would advertise its head under the target's SourceIdentity (same
+            # checkpoint) and replace the target's heartbeat, and its
+            # same-named tensors would match the target's manifest. SGLang's
+            # own transfer_engine backend likewise never publishes the draft.
+            # Load it natively; the nixl transport serves drafts over P2P.
+            logger.info(
+                "[Worker %s] Speculative draft on the transfer_engine "
+                "transport; loading natively without source publication",
+                ctx.global_rank,
+            )
+            result = ctx.adapter.load_via_native(
+                LoadResult(value=model, model=model)
+            )
+            ctx.tensors = {}
+            self.remote_instance_transfer_engine_weight_info = {}
+            return result.model.eval()
         self._ctx = ctx
 
         transfer_engine = getattr(
