@@ -52,6 +52,7 @@ def _server_address(monkeypatch):
     # isolate from the deprecated alias a developer shell might export.
     monkeypatch.setenv("MX_SERVER_ADDRESS", "mx:50051")
     monkeypatch.delenv("MODEL_EXPRESS_URL", raising=False)
+    monkeypatch.delenv("MX_MILES_DST_LAYOUT", raising=False)
 
 
 class _Group:
@@ -299,7 +300,7 @@ def test_connect_rejects_a_missing_parallel_state_dimension():
     state = _parallel_state(pp_size=1)
     del state.tp
 
-    with pytest.raises(ValueError, match="single trainer rank"):
+    with pytest.raises(ValueError, match="parallel state 'tp'"):
         protocol.connect(
             [object()],
             [1],
@@ -313,7 +314,7 @@ def test_connect_rejects_a_missing_parallel_state_dimension():
 def test_connect_rejects_more_than_one_pipeline_stage():
     protocol = MilesCollectiveProtocolCore(_args())
 
-    with pytest.raises(ValueError, match="single trainer rank"):
+    with pytest.raises(ValueError, match="DP x TP trainer only"):
         protocol.connect(
             [object()],
             [1],
@@ -610,13 +611,19 @@ def test_frozen_plan_is_one_publish_group_in_canonical_order():
     assert protocol._plan.source_partition_count == 1
     topology = protocol._topology
     assert topology.source_partition_count == 1
-    assert topology.m2n_abi_version == miles_protocol._ABI_VERSION
+    assert topology.m2n_abi_version == miles_protocol.REPLICATED_DESTINATION_ABI
     run_id = protocol._run_id
     assert len(run_id) == 32
     assert topology.trainer_slots == (f"{run_id}:trainer-0",)
     assert topology.generator_slots == tuple(
         f"{run_id}:generator-{slot}" for slot in range(3)
     )
+    # The replicate plan a single-rank trainer builds is unchanged.
+    for entry in protocol._plan.bulk:
+        assert entry.src_mesh == miles_protocol.MeshSpec((1,), rank_offset=0)
+        assert entry.src_placements == (miles_protocol.Placement.replicate(),)
+        assert entry.dst_mesh == miles_protocol.MeshSpec((3,), rank_offset=1)
+        assert entry.dst_placements == (miles_protocol.Placement.replicate(),)
 
 
 def test_begin_sync_preserves_pp_one_validation_error():
@@ -659,15 +666,24 @@ def test_connect_rejects_ambiguous_or_non_full_gather_topologies():
             SimpleNamespace(gather_pp=True),
             "target",
         )
-    with pytest.raises(ValueError, match="single trainer rank"):
+    with pytest.raises(ValueError, match="DP x TP trainer only"):
         state = _parallel_state()
-        state.tp = _Group(2)
+        state.ep = _Group(2)
         protocol.connect(
             [object()],
             [6],
             [0],
             state,
             _placement(),
+            "target",
+        )
+    with pytest.raises(ValueError, match="TP and EP gathering"):
+        protocol.connect(
+            [object()],
+            [6],
+            [0],
+            _parallel_state(),
+            SimpleNamespace(gather_pp=False, gather_tp=False),
             "target",
         )
 
@@ -945,6 +961,7 @@ def test_a_begin_round_failure_closes_and_retires_the_submitted_futures(
     protocol = MilesCollectiveProtocolCore(_args())
     protocol.rollout_engines = (object(),)
     monkeypatch.setattr(miles_protocol.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(miles_protocol.dist, "get_world_size", lambda: 1)
     monkeypatch.setattr(miles_protocol.dist, "is_available", lambda: True)
     monkeypatch.setattr(miles_protocol.dist, "is_initialized", lambda: True)
 
@@ -1034,6 +1051,7 @@ def test_close_reports_generator_failure_and_allows_retry(monkeypatch, caplog):
     monkeypatch.setattr(miles_protocol.dist, "is_available", lambda: True)
     monkeypatch.setattr(miles_protocol.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(miles_protocol.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(miles_protocol.dist, "get_world_size", lambda: 1)
 
     with pytest.raises(RuntimeError, match="synthetic generator close failure"):
         protocol.close()
@@ -1085,6 +1103,7 @@ def test_close_retains_a_resource_whose_teardown_failed_for_retry(monkeypatch):
     monkeypatch.setattr(miles_protocol.dist, "is_available", lambda: True)
     monkeypatch.setattr(miles_protocol.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(miles_protocol.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(miles_protocol.dist, "get_world_size", lambda: 1)
 
     with pytest.raises(RuntimeError, match="synthetic channel close failure"):
         protocol.close()
@@ -1536,21 +1555,23 @@ def test_a_failed_first_begin_sync_leaves_no_committed_state(monkeypatch):
     )
     calls = 0
 
-    def flaky(tensors):
+    def flaky(facts, layouts):
         nonlocal calls
         calls += 1
         if calls == 1:
             raise RuntimeError("synthetic contract failure")
-        MilesCollectiveProtocolCore._build_frozen_contract(protocol, tensors)
+        MilesCollectiveProtocolCore._build_frozen_contract(protocol, facts, layouts)
 
     monkeypatch.setattr(protocol, "_build_frozen_contract", flaky)
     first = torch.full((2, 2), 1, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="synthetic contract failure"):
         protocol.begin_sync(1, lambda *, materialize: iter([[("model.old", first)]]))
 
-    assert protocol._canonical_shapes is None
+    assert protocol._local_shapes is None
     assert protocol._tensors is None
+    assert protocol._layouts is None
     assert protocol._plan is None
+    assert protocol._run_id is None
 
     # The retry is a fresh first round, not a shape-check against the failed
     # attempt's tensors.
@@ -1563,6 +1584,65 @@ def test_a_failed_first_begin_sync_leaves_no_committed_state(monkeypatch):
     )
     assert [entry.name for entry in protocol._plan.bulk] == ["model.new"]
     assert protocol._round_version == "2"
+
+
+def test_a_failed_later_begin_sync_keeps_the_committed_contract(monkeypatch):
+    # A DP x TP world stand-in: the contract build's collectives run on both
+    # ranks while a contract failure on round two leaves round one's state.
+    def all_gather(value):
+        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], list):
+            return [(rank, value[1]) for rank in range(2)]
+        return [value, value]
+
+    monkeypatch.setattr(miles_protocol, "_rank_and_world", lambda: (0, 2))
+    monkeypatch.setattr(miles_protocol, "_all_gather", all_gather)
+    monkeypatch.setattr(miles_protocol, "_broadcast_from_rank_zero", lambda v: v)
+    protocol = MilesCollectiveProtocolCore(_args())
+    protocol.connect(
+        [object()],
+        [2],
+        [0],
+        SimpleNamespace(
+            pp=SimpleNamespace(size=1, rank=0),
+            tp=SimpleNamespace(size=2, rank=0),
+            ep=SimpleNamespace(size=1, rank=0),
+            etp=SimpleNamespace(size=1, rank=0),
+            cp=SimpleNamespace(size=1, rank=0),
+            intra_dp=SimpleNamespace(size=1, rank=0),
+            indep_dp=SimpleNamespace(size=1, rank=0),
+        ),
+        _placement(),
+        "target",
+    )
+    tensors = [
+        (name, torch.full((2, 2), index + 1, dtype=torch.bfloat16))
+        for index, name in enumerate(("model.a", "model.b"))
+    ]
+    protocol.begin_sync(1, lambda *, materialize: iter([tensors]))
+    protocol._disarm_round()
+    plan = protocol._plan
+    shapes = dict(protocol._local_shapes)
+    buffers = dict(protocol._tensors)
+    layouts = dict(protocol._layouts)
+    run_id = protocol._run_id
+
+    protocol.connect(
+        [object()],
+        [1],
+        [0],
+        protocol._parallel_state,
+        _placement(),
+        "target",
+    )
+    with pytest.raises(RuntimeError, match="topology changed"):
+        protocol.begin_sync(2, lambda *, materialize: iter([tensors]))
+
+    assert protocol._plan is plan
+    assert protocol._local_shapes == shapes
+    assert protocol._tensors == buffers
+    assert protocol._layouts == layouts
+    assert protocol._run_id == run_id
+    assert protocol._round_version is None
 
 
 def test_retire_dropped_futures_observes_futures_that_refuse_to_cancel(caplog):
@@ -1673,7 +1753,7 @@ def test_prepare_sessions_retires_dropped_generator_futures_on_failure(monkeypat
         protocol, "_generator_futures", lambda action, **kwargs: [dropped]
     )
 
-    # The underlying failure propagates unwrapped; send_bucket closes.
+    # The failure fans out to the shared error wrapper; send_bucket closes.
     with pytest.raises(RuntimeError, match="synthetic session prepare failure"):
         protocol._prepare_sessions()
 

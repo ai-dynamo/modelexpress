@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .. import envs
-from ..types import PlacementKind, ReshardPlan
+from ..types import MeshSpec, Placement, PlacementKind, ReshardPlan
 
 
 def _text(value: object, label: str) -> str:
@@ -44,6 +44,59 @@ def _dtype_label(value: object) -> str:
     return str(value).removeprefix("torch.")
 
 
+#: The receiver build each destination layout needs; part of the plan digest,
+#: so a trainer and a receiver that disagree never form a group.
+REPLICATED_DESTINATION_ABI = "miles-sglang-bf16-replicated-v1"
+SHARDED_DESTINATION_ABI = "miles-sglang-bf16-sharded-v1"
+
+
+def _expected_index(
+    global_shape: tuple[int, ...],
+    mesh: MeshSpec,
+    placements: tuple[Placement, ...],
+    rank: int,
+) -> tuple[slice, ...]:
+    """The slice of a parameter that lane rank ``rank`` holds on one plan side.
+
+    Ranks map onto the mesh in row-major order (the order ``MeshSpec.nested()``
+    hands the reshard op); a ``Shard`` placement splits that dim evenly.
+    """
+    offset = rank - mesh.rank_offset
+    if not 0 <= offset < mesh.size:
+        raise ValueError(f"rank {rank} is not in the mesh {mesh.canonical()}")
+    coord = []
+    for extent in reversed(mesh.shape):
+        coord.append(offset % extent)
+        offset //= extent
+    coord.reverse()
+    index = [slice(0, int(extent)) for extent in global_shape]
+    for axis, placement in enumerate(placements):
+        if placement.kind is not PlacementKind.SHARD:
+            continue
+        piece = int(global_shape[placement.dim]) // mesh.shape[axis]
+        index[placement.dim] = slice(coord[axis] * piece, (coord[axis] + 1) * piece)
+    return tuple(index)
+
+
+def _local_shape(index: tuple[slice, ...]) -> tuple[int, ...]:
+    return tuple(axis.stop - axis.start for axis in index)
+
+
+def _check_layout_placements(
+    name: str,
+    side: str,
+    mesh: MeshSpec,
+    placements: tuple[Placement, ...],
+) -> None:
+    """One sharded tensor dim at most, on the innermost mesh axis only."""
+    outer = placements[:-1]
+    if any(placement.kind is not PlacementKind.REPLICATE for placement in outer):
+        raise ValueError(
+            f"{name}: {side} placements {[p.canonical() for p in placements]} "
+            f"over mesh {mesh.canonical()} may shard only the innermost axis"
+        )
+
+
 class _FrozenPlan:
     def __init__(self, plan: ReshardPlan) -> None:
         snapshot = copy.deepcopy(plan)
@@ -71,40 +124,96 @@ class _FrozenPlan:
                 "the MILES/SGLang collective integration supports BF16 "
                 f"base weights only; unsupported: {unsupported[:5]}"
             )
-        sharded = [
+        if snapshot.source_partition_count != 1:
+            raise ValueError(
+                "the MILES/SGLang collective integration uses one reshard lane "
+                f"(source_partition_count 1), got {snapshot.source_partition_count}"
+            )
+        # One lane holds every trainer rank, so every entry shares one source
+        # mesh starting at lane rank 0 and one destination mesh right after it.
+        src_meshes = {entry.src_mesh for entry in snapshot.bulk}
+        dst_meshes = {entry.dst_mesh for entry in snapshot.bulk}
+        if len(src_meshes) != 1 or len(dst_meshes) != 1:
+            raise ValueError(
+                "every MILES/SGLang plan entry must share one source mesh and "
+                f"one destination mesh; got {sorted(m.canonical() for m in src_meshes)}"
+                f" and {sorted(m.canonical() for m in dst_meshes)}"
+            )
+        src_mesh = next(iter(src_meshes))
+        dst_mesh = next(iter(dst_meshes))
+        if src_mesh.rank_offset != 0:
+            raise ValueError(
+                f"the source mesh must start at lane rank 0, got {src_mesh.canonical()}"
+            )
+        if dst_mesh.rank_offset != src_mesh.size:
+            raise ValueError(
+                "the destination mesh must start right after the trainer ranks: "
+                f"{dst_mesh.canonical()} after {src_mesh.canonical()}"
+            )
+        sharded_sources = [
             entry.name
             for entry in snapshot.bulk
             if any(
                 placement.kind is not PlacementKind.REPLICATE
-                for placement in entry.src_placements + entry.dst_placements
+                for placement in entry.src_placements
             )
         ]
-        if sharded:
+        if sharded_sources:
             raise ValueError(
-                "the MILES/SGLang collective integration supports replicated "
-                f"placements only; sharded: {sharded[:5]}"
+                "the MILES/SGLang collective integration takes a gathered "
+                "(replicated) trainer source only; trainer-local shards are "
+                f"not supported: {sharded_sources[:5]}"
             )
-        non_local = [
-            entry.name for entry in snapshot.bulk if entry.src_mesh.ranks() != [0]
-        ]
-        if non_local:
-            raise ValueError(
-                "the MILES/SGLang collective integration requires the "
-                "partition-local source mesh (src_mesh ranks [0]); got "
-                f"{non_local[:5]}"
+        for entry in snapshot.bulk:
+            _check_layout_placements(
+                entry.name, "src", entry.src_mesh, entry.src_placements
+            )
+            _check_layout_placements(
+                entry.name, "dst", entry.dst_mesh, entry.dst_placements
             )
         self._plan = snapshot
         self._by_name = {entry.name: entry for entry in snapshot.bulk}
+        self._src_mesh = src_mesh
+        self._dst_mesh = dst_mesh
+        self._sharded_destination = any(
+            placement.kind is PlacementKind.SHARD
+            for entry in snapshot.bulk
+            for placement in entry.dst_placements
+        )
 
     @property
     def source_partition_count(self) -> int:
         return self._plan.source_partition_count
+
+    @property
+    def src_mesh(self) -> MeshSpec:
+        return self._src_mesh
+
+    @property
+    def dst_mesh(self) -> MeshSpec:
+        return self._dst_mesh
+
+    @property
+    def sharded_destination(self) -> bool:
+        return self._sharded_destination
 
     def names(self) -> list[str]:
         return self._plan.parameter_names()
 
     def entry(self, name: str):
         return self._by_name[name]
+
+    def source_index(self, name: str, rank: int) -> tuple[slice, ...]:
+        entry = self._by_name[name]
+        return _expected_index(
+            entry.global_shape, entry.src_mesh, entry.src_placements, rank
+        )
+
+    def destination_index(self, name: str, rank: int) -> tuple[slice, ...]:
+        entry = self._by_name[name]
+        return _expected_index(
+            entry.global_shape, entry.dst_mesh, entry.dst_placements, rank
+        )
 
     def capture(self) -> ReshardPlan:
         return copy.deepcopy(self._plan)
@@ -116,23 +225,29 @@ class _FrozenPlan:
                 f"topology: {self.source_partition_count} != "
                 f"{topology.source_partition_count}"
             )
-        # The integration requires exactly one source rank per PP partition,
-        # so a lane's trainer membership is the single partition-local rank
-        # and the generators always follow it at offset 1.
-        if len(topology.trainer_slots) != topology.source_partition_count:
+        # The single lane holds every trainer slot in source-mesh order, then
+        # every generator slot in destination-mesh order.
+        if len(topology.trainer_slots) != self._src_mesh.size:
             raise ValueError(
-                "the collective topology must name exactly one trainer slot "
-                f"per source partition: {len(topology.trainer_slots)} != "
-                f"{topology.source_partition_count}"
+                "the collective topology must name one trainer slot per "
+                f"source-mesh rank: {len(topology.trainer_slots)} != "
+                f"{self._src_mesh.size} ({self._src_mesh.canonical()})"
             )
-        expected_dst_ranks = list(range(1, 1 + len(topology.generator_slots)))
-        for entry in self._plan.bulk:
-            if entry.dst_mesh.ranks() != expected_dst_ranks:
-                raise ValueError(
-                    f"{entry.name}: dst_mesh ranks {entry.dst_mesh.ranks()} do "
-                    "not match the generator membership of reshard lane "
-                    f"{entry.partition_id}: {expected_dst_ranks}"
-                )
+        if len(topology.generator_slots) != self._dst_mesh.size:
+            raise ValueError(
+                "the collective topology must name one generator slot per "
+                f"destination-mesh rank: {len(topology.generator_slots)} != "
+                f"{self._dst_mesh.size} ({self._dst_mesh.canonical()})"
+            )
+        if (
+            self._sharded_destination
+            and topology.m2n_abi_version != SHARDED_DESTINATION_ABI
+        ):
+            raise ValueError(
+                "a plan with sharded destinations requires the "
+                f"{SHARDED_DESTINATION_ABI!r} receiver ABI, got "
+                f"{topology.m2n_abi_version!r}"
+            )
 
 
 @dataclass(frozen=True)

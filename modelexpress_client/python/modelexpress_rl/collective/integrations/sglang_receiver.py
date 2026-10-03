@@ -149,6 +149,7 @@ def create_receiver(context: Any) -> ModelExpressM2NReceiver:
         device=context.device,
         generator_slot_offset=rank_offset,
         tp_rank=tp_rank,
+        tp_size=tp_size,
     )
     channel = rendezvous = session = None
     try:

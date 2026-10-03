@@ -184,13 +184,24 @@ class TestSglangLoader:
         with pytest.raises(RuntimeError, match="storage address changed"):
             loader.start_new_round("v1")
 
-    def test_sharded_plans_are_refused(self, fake_buffers):
-        with pytest.raises(ValueError, match="replicated placements only"):
+    def test_sharded_plans_need_the_engine_rank_and_a_provable_view(self, fake_buffers):
+        plan = _plan(dst_placement=Placement.shard(0))
+        with pytest.raises(ValueError, match="needs this generator's index"):
+            SglangLoader(plan=plan, model=FakeModel(), device="cuda:0")
+        with pytest.raises(ValueError, match="engine runs TP 1"):
             SglangLoader(
-                plan=_plan(dst_placement=Placement.shard(0)),
+                plan=plan, model=FakeModel(), device="cuda:0", generator_index=0
+            )
+        with pytest.raises(ValueError, match="needs the SGLang model's HF config"):
+            SglangLoader(
+                plan=plan,
                 model=FakeModel(),
                 device="cuda:0",
+                generator_index=1,
+                tp_rank=1,
+                tp_size=2,
             )
+        assert fake_buffers == []
 
     def test_topology_must_match_the_plan_meshes(self, fake_buffers):
         loader = _loader()
@@ -202,7 +213,7 @@ class TestSglangLoader:
             source_partition_count=1,
             m2n_abi_version="abi",
         )
-        with pytest.raises(ValueError, match="dst_mesh ranks"):
+        with pytest.raises(ValueError, match="one generator slot per"):
             loader.validate_topology(wider)
 
 

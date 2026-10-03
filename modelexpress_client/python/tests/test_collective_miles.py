@@ -14,6 +14,10 @@ from modelexpress_rl.collective import (
     Placement,
     ReshardPlan,
 )
+from modelexpress_rl.collective.integrations._common import (
+    REPLICATED_DESTINATION_ABI,
+    SHARDED_DESTINATION_ABI,
+)
 from modelexpress_rl.collective.integrations.miles import (
     CollectiveTopology,
     MilesPublisher,
@@ -44,28 +48,34 @@ class FakeTensor:
         return self.contiguous
 
 
-def _entry(name, *, partition):
+GATE = "model.layers.0.mlp.gate_proj.weight"
+DOWN = "model.layers.1.mlp.down_proj.weight"
+
+
+def _entry(name, *, src_placement=None, dst_placement=None):
+    # One lane: two trainer ranks (a TP2 or DP2 source), then two generators.
     return ParamPlan(
         name=name,
         global_shape=(4, 4),
         dtype="bfloat16",
-        partition_id=partition,
-        src_mesh=MeshSpec(shape=(1,), rank_offset=0),
-        src_placements=(Placement.replicate(),),
-        dst_mesh=MeshSpec(shape=(2,), rank_offset=1),
-        dst_placements=(Placement.replicate(),),
-        group_key=f"layer-{partition}",
+        partition_id=0,
+        src_mesh=MeshSpec(shape=(2,), rank_offset=0),
+        src_placements=(src_placement or Placement.replicate(),),
+        dst_mesh=MeshSpec(shape=(2,), rank_offset=2),
+        dst_placements=(dst_placement or Placement.replicate(),),
+        group_key="publish-group-0",
     )
 
 
 def _plan():
     return ReshardPlan(
-        bulk=[
-            _entry("model.layers.0.mlp.gate_proj.weight", partition=0),
-            _entry("model.layers.1.mlp.down_proj.weight", partition=1),
-        ],
-        source_partition_count=2,
+        bulk=[_entry(GATE), _entry(DOWN)],
+        source_partition_count=1,
     )
+
+
+def _tensors():
+    return {GATE: FakeTensor((4, 4)), DOWN: FakeTensor((4, 4), address=0x2000)}
 
 
 def _topology():
@@ -73,7 +83,7 @@ def _topology():
         model_name="qwen",
         trainer_slots=("trainer-0", "trainer-1"),
         generator_slots=("generator-tp0", "generator-tp1"),
-        source_partition_count=2,
+        source_partition_count=1,
         m2n_abi_version="nccl-m2n-2.30.7",
     )
 
@@ -121,9 +131,11 @@ def test_topology_requires_an_explicit_non_empty_abi_and_partitioned_slot_order(
 
     lanes = _lane_declarations(_topology())
 
-    assert lanes[0].trainer_slots == ("trainer-0",)
-    assert lanes[1].trainer_slots == ("trainer-1",)
-    assert lanes[2].kind == "BROADCAST"
+    # One reshard lane carries every trainer rank, then the broadcast lane.
+    assert lanes[0].trainer_slots == ("trainer-0", "trainer-1")
+    assert lanes[0].kind == "RESHARD"
+    assert lanes[1].kind == "BROADCAST"
+    assert len(lanes) == 2
 
 
 def test_topology_copies_mutable_slot_inputs():
@@ -143,34 +155,25 @@ def test_topology_copies_mutable_slot_inputs():
     assert topology.generator_slots == ("g0",)
 
 
-def test_miles_publisher_maps_canonical_names_to_the_partition_local_buffers():
+def test_miles_publisher_maps_canonical_names_to_the_rank_local_buffers():
     plan = _plan()
-    tensor = FakeTensor((4, 4))
-    publisher = MilesPublisher(
-        plan=plan,
-        source_partition=0,
-        tensors={"model.layers.0.mlp.gate_proj.weight": tensor},
-    )
+    tensors = _tensors()
+    publisher = MilesPublisher(plan=plan, source_partition=0, tensors=tensors)
     plan.bulk.clear()
 
     captured = publisher.capture()
 
-    assert captured.parameter_names() == [
-        "model.layers.0.mlp.gate_proj.weight",
-        "model.layers.1.mlp.down_proj.weight",
-    ]
+    assert captured.parameter_names() == [GATE, DOWN]
     assert publisher.parameter_names() == captured.parameter_names()
     specs = publisher.local_params()
-    assert list(specs) == ["model.layers.0.mlp.gate_proj.weight"]
-    assert specs["model.layers.0.mlp.gate_proj.weight"].base is tensor
+    assert list(specs) == [GATE, DOWN]
+    assert specs[GATE].base is tensors[GATE]
+    assert specs[DOWN].base is tensors[DOWN]
 
 
 def test_miles_publisher_derives_wire_order_from_the_plan_not_dict_order():
     plan = ReshardPlan(
-        bulk=[
-            _entry("model.a", partition=0),
-            _entry("model.b", partition=0),
-        ],
+        bulk=[_entry("model.a"), _entry("model.b")],
         source_partition_count=1,
     )
     first = FakeTensor((4, 4))
@@ -188,50 +191,161 @@ def test_miles_publisher_derives_wire_order_from_the_plan_not_dict_order():
     assert specs["model.b"].base is second
 
 
-def test_miles_publisher_rejects_sharded_placements_and_non_local_source_meshes():
-    plan = ReshardPlan(
-        bulk=[
-            ParamPlan(
-                name="model.a",
-                global_shape=(4, 4),
-                dtype="bfloat16",
-                partition_id=0,
-                src_mesh=MeshSpec(shape=(2,), rank_offset=0),
-                src_placements=(Placement.shard(0),),
-                dst_mesh=MeshSpec(shape=(2,), rank_offset=1),
-                dst_placements=(Placement.replicate(),),
-            )
-        ],
-        source_partition_count=1,
+def _one_entry_plan(**kwargs):
+    defaults = {
+        "name": "model.a",
+        "global_shape": (4, 4),
+        "dtype": "bfloat16",
+        "partition_id": 0,
+        "src_mesh": MeshSpec(shape=(2,), rank_offset=0),
+        "src_placements": (Placement.replicate(),),
+        "dst_mesh": MeshSpec(shape=(2,), rank_offset=2),
+        "dst_placements": (Placement.replicate(),),
+    }
+    defaults.update(kwargs)
+    return ReshardPlan(bulk=[ParamPlan(**defaults)], source_partition_count=1)
+
+
+@pytest.mark.parametrize(
+    ("src_mesh", "rank"),
+    [
+        (MeshSpec((2,)), 1),
+        (MeshSpec((2, 2)), 3),
+    ],
+)
+def test_miles_publisher_validates_this_ranks_slice_of_a_replicated_source(
+    src_mesh, rank
+):
+    plan = _one_entry_plan(
+        src_mesh=src_mesh,
+        src_placements=(Placement.replicate(),) * len(src_mesh.shape),
+        dst_mesh=MeshSpec((2,), rank_offset=src_mesh.size),
     )
-    with pytest.raises(ValueError, match="replicated placements only"):
+    tensor = FakeTensor((4, 4))
+
+    publisher = MilesPublisher(
+        plan=plan, source_partition=0, tensors={"model.a": tensor}, source_rank=rank
+    )
+
+    assert publisher.local_params()["model.a"].base is tensor
+    with pytest.raises(ValueError, match="expected local shape"):
         MilesPublisher(
             plan=plan,
             source_partition=0,
             tensors={"model.a": FakeTensor((2, 4))},
+            source_rank=rank,
         )
-
-    plan = ReshardPlan(
-        bulk=[
-            ParamPlan(
-                name="model.a",
-                global_shape=(4, 4),
-                dtype="bfloat16",
-                partition_id=0,
-                src_mesh=MeshSpec(shape=(1,), rank_offset=1),
-                src_placements=(Placement.replicate(),),
-                dst_mesh=MeshSpec(shape=(2,), rank_offset=1),
-                dst_placements=(Placement.replicate(),),
-            )
-        ],
-        source_partition_count=1,
-    )
-    with pytest.raises(ValueError, match="src_mesh ranks"):
+    with pytest.raises(ValueError, match="source_rank must be in"):
         MilesPublisher(
             plan=plan,
             source_partition=0,
+            tensors={"model.a": tensor},
+            source_rank=src_mesh.size,
+        )
+
+
+def test_miles_publisher_rejects_sharded_sources():
+    for src_mesh, placements in (
+        (MeshSpec((2,)), (Placement.shard(0),)),
+        (MeshSpec((2, 2)), (Placement.replicate(), Placement.shard(1))),
+    ):
+        plan = _one_entry_plan(
+            src_mesh=src_mesh,
+            src_placements=placements,
+            dst_mesh=MeshSpec((2,), rank_offset=src_mesh.size),
+        )
+        with pytest.raises(
+            ValueError, match="gathered \\(replicated\\) trainer source"
+        ):
+            MilesPublisher(
+                plan=plan,
+                source_partition=0,
+                tensors={"model.a": FakeTensor((4, 4))},
+            )
+
+
+def test_miles_publisher_rejects_meshes_outside_the_one_lane_geometry():
+    with pytest.raises(ValueError, match="innermost axis"):
+        MilesPublisher(
+            plan=_one_entry_plan(
+                dst_mesh=MeshSpec((2, 2), rank_offset=2),
+                dst_placements=(Placement.shard(0), Placement.replicate()),
+            ),
+            source_partition=0,
             tensors={"model.a": FakeTensor((4, 4))},
         )
+    with pytest.raises(ValueError, match="start at lane rank 0"):
+        MilesPublisher(
+            plan=_one_entry_plan(
+                src_mesh=MeshSpec((1,), rank_offset=1),
+                dst_mesh=MeshSpec((2,), rank_offset=2),
+            ),
+            source_partition=0,
+            tensors={"model.a": FakeTensor((4, 4))},
+        )
+    with pytest.raises(ValueError, match="right after the trainer ranks"):
+        MilesPublisher(
+            plan=_one_entry_plan(dst_mesh=MeshSpec((2,), rank_offset=1)),
+            source_partition=0,
+            tensors={"model.a": FakeTensor((4, 4))},
+        )
+    with pytest.raises(ValueError, match="one reshard lane"):
+        MilesPublisher(
+            plan=ReshardPlan(
+                bulk=[_entry("model.a")],
+                source_partition_count=2,
+            ),
+            source_partition=0,
+            tensors={"model.a": FakeTensor((4, 4))},
+        )
+    mixed = ReshardPlan(
+        bulk=[
+            _entry("model.a"),
+            ParamPlan(
+                name="model.b",
+                global_shape=(4, 4),
+                dtype="bfloat16",
+                partition_id=0,
+                src_mesh=MeshSpec((2, 1)),
+                src_placements=(Placement.replicate(), Placement.replicate()),
+                dst_mesh=MeshSpec((2,), rank_offset=2),
+                dst_placements=(Placement.replicate(),),
+            ),
+        ],
+        source_partition_count=1,
+    )
+    with pytest.raises(ValueError, match="share one source mesh"):
+        MilesPublisher(
+            plan=mixed,
+            source_partition=0,
+            tensors={"model.a": FakeTensor((4, 4)), "model.b": FakeTensor((4, 4))},
+        )
+
+
+def test_frozen_plan_requires_the_sharded_abi_for_sharded_destinations():
+    plan = _one_entry_plan(dst_placements=(Placement.shard(0),))
+    publisher = MilesPublisher(
+        plan=plan, source_partition=0, tensors={"model.a": FakeTensor((4, 4))}
+    )
+    topology = CollectiveTopology(
+        model_name="qwen",
+        trainer_slots=("trainer-0", "trainer-1"),
+        generator_slots=("generator-0", "generator-1"),
+        source_partition_count=1,
+        m2n_abi_version=REPLICATED_DESTINATION_ABI,
+    )
+
+    with pytest.raises(ValueError, match="sharded destinations requires"):
+        publisher.validate_topology(topology)
+    publisher.validate_topology(
+        CollectiveTopology(
+            model_name="qwen",
+            trainer_slots=topology.trainer_slots,
+            generator_slots=topology.generator_slots,
+            source_partition_count=1,
+            m2n_abi_version=SHARDED_DESTINATION_ABI,
+        )
+    )
 
 
 def test_miles_publisher_rejects_incomplete_tensor_coverage_and_non_bulk_plans():
@@ -239,7 +353,7 @@ def test_miles_publisher_rejects_incomplete_tensor_coverage_and_non_bulk_plans()
         MilesPublisher(
             plan=_plan(),
             source_partition=0,
-            tensors={"wrong": FakeTensor((4, 4))},
+            tensors={GATE: FakeTensor((4, 4)), "wrong": FakeTensor((4, 4))},
         )
 
     plan = _plan()
@@ -251,37 +365,22 @@ def test_miles_publisher_rejects_incomplete_tensor_coverage_and_non_bulk_plans()
         )
     )
     with pytest.raises(ValueError, match="all-bulk"):
-        MilesPublisher(
-            plan=plan,
-            source_partition=0,
-            tensors={"model.layers.0.mlp.gate_proj.weight": FakeTensor((4, 4))},
-        )
+        MilesPublisher(plan=plan, source_partition=0, tensors=_tensors())
 
 
 def test_miles_publisher_rejects_cpu_and_mixed_device_storage():
-    cpu = FakeTensor((4, 4))
-    cpu.device = "cpu"
+    cpu = _tensors()
+    cpu[GATE].device = "cpu"
     with pytest.raises(ValueError, match="indexed CUDA device"):
-        MilesPublisher(
-            plan=_plan(),
-            source_partition=0,
-            tensors={"model.layers.0.mlp.gate_proj.weight": cpu},
-        )
+        MilesPublisher(plan=_plan(), source_partition=0, tensors=cpu)
 
-    unindexed = FakeTensor((4, 4))
-    unindexed.device = "cuda"
+    unindexed = _tensors()
+    unindexed[GATE].device = "cuda"
     with pytest.raises(ValueError, match="indexed CUDA device"):
-        MilesPublisher(
-            plan=_plan(),
-            source_partition=0,
-            tensors={"model.layers.0.mlp.gate_proj.weight": unindexed},
-        )
+        MilesPublisher(plan=_plan(), source_partition=0, tensors=unindexed)
 
     plan = ReshardPlan(
-        bulk=[
-            _entry("model.a", partition=0),
-            _entry("model.b", partition=0),
-        ],
+        bulk=[_entry("model.a"), _entry("model.b")],
         source_partition_count=1,
     )
     first = FakeTensor((4, 4))
@@ -302,8 +401,8 @@ def test_mixed_device_error_lists_devices_in_numeric_order():
     second.device = "cuda:10"
     plan = ReshardPlan(
         bulk=[
-            _entry("model.a", partition=0),
-            _entry("model.b", partition=0),
+            _entry("model.a"),
+            _entry("model.b"),
         ],
         source_partition_count=1,
     )
@@ -326,13 +425,9 @@ def test_mixed_device_error_lists_devices_in_numeric_order():
     ],
 )
 def test_miles_publisher_rejects_storage_drift_before_a_new_round(change, message):
-    tensor = FakeTensor((4, 4))
-    publisher = MilesPublisher(
-        plan=_plan(),
-        source_partition=0,
-        tensors={"model.layers.0.mlp.gate_proj.weight": tensor},
-    )
-    change(tensor)
+    tensors = _tensors()
+    publisher = MilesPublisher(plan=_plan(), source_partition=0, tensors=tensors)
+    change(tensors[GATE])
 
     with pytest.raises(RuntimeError, match=message):
         publisher.start_new_round("version-2")
@@ -385,11 +480,7 @@ class FakeTrainerClient:
 
 
 def _publisher():
-    return MilesPublisher(
-        plan=_plan(),
-        source_partition=0,
-        tensors={"model.layers.0.mlp.gate_proj.weight": FakeTensor((4, 4))},
-    )
+    return MilesPublisher(plan=_plan(), source_partition=0, tensors=_tensors())
 
 
 def _session(client, rendezvous=None, **kwargs):
@@ -410,8 +501,8 @@ def test_trainer_session_runs_every_group_in_order_and_reports_nothing():
         client,
         rendezvous,
         layer_groups=(
-            ("model.layers.0.mlp.gate_proj.weight",),
-            ("model.layers.1.mlp.down_proj.weight",),
+            (GATE,),
+            (DOWN,),
         ),
     )
     session.prepare()
@@ -494,7 +585,7 @@ def test_trainer_session_factory_passes_the_frozen_topology_and_abi(monkeypatch)
     assert captured["rendezvous"] is rendezvous
     assert captured["trainer_slots"] == list(_topology().trainer_slots)
     assert captured["generator_slots"] == list(_topology().generator_slots)
-    assert captured["source_partition_count"] == 2
+    assert captured["source_partition_count"] == 1
     assert captured["m2n_abi_version"] == "nccl-m2n-2.30.7"
     assert captured["receiver_protocol"] == _topology().receiver_protocol
     assert captured["device"] == "cuda:0"
@@ -535,16 +626,22 @@ def test_trainer_session_factory_rejects_plan_meshes_outside_topology():
         partition_id=plan.bulk[0].partition_id,
         src_mesh=plan.bulk[0].src_mesh,
         src_placements=plan.bulk[0].src_placements,
-        dst_mesh=MeshSpec(shape=(2,), rank_offset=2),
+        dst_mesh=MeshSpec(shape=(3,), rank_offset=2),
         dst_placements=plan.bulk[0].dst_placements,
     )
-    publisher = MilesPublisher(
-        plan=plan,
-        source_partition=0,
-        tensors={"model.layers.0.mlp.gate_proj.weight": FakeTensor((4, 4))},
+    plan.bulk[1] = ParamPlan(
+        name=plan.bulk[1].name,
+        global_shape=plan.bulk[1].global_shape,
+        dtype=plan.bulk[1].dtype,
+        partition_id=plan.bulk[1].partition_id,
+        src_mesh=plan.bulk[1].src_mesh,
+        src_placements=plan.bulk[1].src_placements,
+        dst_mesh=MeshSpec(shape=(3,), rank_offset=2),
+        dst_placements=plan.bulk[1].dst_placements,
     )
+    publisher = MilesPublisher(plan=plan, source_partition=0, tensors=_tensors())
 
-    with pytest.raises(ValueError, match="dst_mesh ranks"):
+    with pytest.raises(ValueError, match="one generator slot per"):
         MilesTrainerSession.create(
             rendezvous=FakeRendezvous(),
             topology=_topology(),
@@ -686,8 +783,8 @@ def test_trainer_session_rejects_layer_groups_that_reorder_the_plan():
         _session(
             FakeTrainerClient(),
             layer_groups=(
-                ("model.layers.1.mlp.down_proj.weight",),
-                ("model.layers.0.mlp.gate_proj.weight",),
+                (DOWN,),
+                (GATE,),
             ),
         )
 
@@ -700,8 +797,8 @@ def test_trainer_session_preserves_the_round_error_while_aborting_and_closing():
         client,
         rendezvous,
         layer_groups=(
-            ("model.layers.0.mlp.gate_proj.weight",),
-            ("model.layers.1.mlp.down_proj.weight",),
+            (GATE,),
+            (DOWN,),
         ),
     )
     session.prepare()
@@ -750,8 +847,8 @@ def test_trainer_session_closes_after_a_finish_failure():
         client,
         rendezvous,
         layer_groups=(
-            ("model.layers.0.mlp.gate_proj.weight",),
-            ("model.layers.1.mlp.down_proj.weight",),
+            (GATE,),
+            (DOWN,),
         ),
     )
     session.prepare()
