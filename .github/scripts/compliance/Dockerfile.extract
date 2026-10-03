@@ -12,11 +12,11 @@ RUN mkdir /output
 COPY helpers/dpkg_helper.py /helpers/dpkg_helper.py
 COPY helpers/python_helper.py /helpers/python_helper.py
 RUN --mount=type=bind,from=target,target=/target \
-    uname -m > /output/arch.txt ; \
-    python3 /helpers/dpkg_helper.py --root /target > /output/dpkg.tsv 2>/output/dpkg_err.txt ; \
-    python3 /helpers/python_helper.py --root /target > /output/python.tsv 2>/output/python_err.txt ; \
-    cat /output/dpkg_err.txt /output/python_err.txt >&2 ; \
+    set -e ; \
     [ -f /target/var/lib/dpkg/status ] || { echo "ERROR: /var/lib/dpkg/status missing in target" >&2; exit 1; } ; \
+    awk '/^Package: libc6$/ {f=1} f && /^Architecture:/ {print $2; exit}' /target/var/lib/dpkg/status > /output/arch.txt ; \
+    python3 /helpers/dpkg_helper.py --root /target > /output/dpkg.tsv ; \
+    python3 /helpers/python_helper.py --root /target > /output/python.tsv ; \
     [ -s /output/dpkg.tsv ] || { echo "ERROR: dpkg extraction produced no output" >&2; exit 1; }
 
 FROM scratch
