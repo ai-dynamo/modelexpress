@@ -429,13 +429,20 @@ is exactly what the fused-parameter path already does.
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for one lane's non-blocking `Communicator.init` |
 | `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Client-side deadline for the transfer; an overrun aborts the lanes and reports `succeeded=false`, i.e. `RUNNING -> FAILED` above |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
+| `MX_NCCL_REFIT_STACK_BYTES` | `0` | Equal-geometry stacking budget in bytes (non-negative). `0` keeps one M2N reshard per tensor, with the plan and digest unchanged; above `0`, the MILES trainer stacks every set of tensors that share their plan geometry into one `nccl.m2n.reshard` per stack. The stacks ride in the plan and its digest and the receiver ABI gains a `+stack1` suffix, so engines never read this variable. Semantics, tuning guidance and the fail-closed rules are in [DEPLOYMENT.md](DEPLOYMENT.md#equal-geometry-stacking)'s "Equal-geometry stacking" section |
+
 
 The MILES integration (`modelexpress_rl.collective.integrations`) resolves
 the mx-server endpoint in the trainer process through the shared client
 resolver (`MODEL_EXPRESS_URL` takes precedence, then `MX_SERVER_ADDRESS`; one
 of the two is required, with no localhost default), alongside the inherited
-`MX_NCCL_REFIT_*` variables above. See [DEPLOYMENT.md](DEPLOYMENT.md) under
-"MILES Integration (NCCL M2N)" and the integration README.
+`MX_NCCL_REFIT_*` variables above. `MX_NCCL_REFIT_STACK_BYTES` (default `0`)
+turns on equal-geometry stacking: the trainer reads it once when it builds
+the plan, and the stacks travel inside the plan and its digest, so engines
+follow the trainer and never read it themselves. See [DEPLOYMENT.md](DEPLOYMENT.md)
+under "MILES Integration (NCCL M2N)" for the endpoint variables, its
+["Equal-geometry stacking" section](DEPLOYMENT.md#equal-geometry-stacking)
+for the stacking semantics, and the integration README.
 
 Timing is reported through the existing `RefitTimingRecorder` stage vocabulary so
 NIXL-pull and NCCL-push refits are directly comparable. For this path, *setup and
@@ -459,7 +466,10 @@ part of `nccl4py`, under the same `nccl` namespace: install
 toolkit. Reshard needs NCCL 2.30.7 or newer. Importing
 `modelexpress_rl.collective` without it raises at `initialize()` with an
 actionable message; the torch-free plan and rendezvous modules import and test
-cleanly without NCCL, CUDA, or torch.
+cleanly without NCCL, CUDA, or torch. Maintainer note: the Python preflight
+that sizes one (stacked) reshard call against the PACK staging pool mirrors
+the native `NCCL_RESHARD_PACK_BUFFSIZES` parser in `nccl_m2n/src/m2n_config.cc`
+by hand and must be kept in sync with it when the native grammar changes.
 
 ## 11. Proposed implementation slices
 

@@ -739,7 +739,8 @@ exercised against a real engine.
 Client-side policy for the NCCL M2N collective refit path
 (`modelexpress_rl.collective`), which is a sibling of the NIXL pull path
 rather than a mode of it. Every value is validated when it is read: a
-non-numeric, zero or negative setting raises rather than falling back to the
+non-numeric or out-of-range setting (zero or negative, except
+`MX_NCCL_REFIT_STACK_BYTES`, which accepts `0`) raises rather than falling back to the
 default, so a typo fails loudly at startup instead of silently restoring
 stock behavior. Design: [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md).
 
@@ -751,6 +752,31 @@ stock behavior. Design: [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md).
 | `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600.0` | Deadline for the reshard itself, armed per weight version. `READY` only means the group formed, so this bounds what happens after it; on expiry the group is aborted and has to re-form at a fresh epoch, because peers that disagree about which collectives completed cannot be recovered on the same communicator. |
 | `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams used to overlap per-pipeline-stage reshard lanes. |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS`, so `90` | How long a participant's registration stays alive without a heartbeat. Derived from `MX_HEARTBEAT_INTERVAL_SECS` (default `30`), so raising the heartbeat interval raises this with it. |
+| `MX_NCCL_REFIT_STACK_BYTES` | `0` | Equal-geometry stacking budget in bytes (non-negative). `0` keeps one M2N reshard per tensor, with the plan and digest unchanged. Above `0`, the **MILES trainer** stacks every set of tensors that share their plan geometry (global shape, dtype, lane, both meshes and both placement lists; plan facts only, never names) along a new leading dimension and sends each stack as one `nccl.m2n.reshard`, so the call count per round is the number of stacks plus the plain leftovers instead of the tensor count. Within a class, members in canonical order fill a stack while `members x area <= budget`, where a member's area is the larger of its source-local and destination-local bytes; a lone member, an oversize member and any tensor of rank 3 or more stay plain. The stack's placements are the members' with each shard dim moved up by one. Members are labelled `group_key = "m2n-stack1-<id>"` in the plan, and both ends derive the same stacked wire entries from it, so the key is in the plan digest and the receiver ABI gains a `+stack1` suffix: an engine that cannot derive stacks refuses the topology at prepare instead of stalling at `READY`. Engines never read this variable. Stacks are submitted ungrouped, one wire entry per publish group. Each end checks at prepare that every stack fits the largest `NCCL_RESHARD_PACK_BUFFSIZES` bucket (2 GiB when unset), because an oversize request fails fatally inside the collective. The trainer adds no copy and no steady-state memory (each wire buffer becomes a view of its stack); a replicated destination likewise; a sharded (aliased) destination adds one reusable receive scratch, up to the budget, and one device copy per stack. See "Equal-geometry stacking" below. |
+
+#### Equal-geometry stacking
+
+Per-call host cost, not bandwidth, dominates a
+round of many small tensors, so `MX_NCCL_REFIT_STACK_BYTES` above `0` puts
+more bytes in each call. The membership rule uses plan facts only (shape,
+dtype, lane, both meshes, both placements), so it is model-agnostic. Because
+a stack is itself a real tensor with one shard placement, the native library
+does the TP-to-TP' block arithmetic for it. The receiver derives its wire
+plan from the keys in the plan and fails closed (no session is created) on
+malformed or non-contiguous ids, a stack with fewer than two members, members
+that disagree on any class field, a member above rank 2, or a real tensor
+named with the reserved `m2n-stack` prefix. Stacks are submitted ungrouped,
+one wire entry per publish group, and the SGLang loader installs each stack's
+staged members with one `load_weights` call. A sharded destination cannot
+alias a stack onto SGLang's per-parameter storage, so it receives into one
+scratch per lane stream and copies each member into place on that stream; the
+engine views of one stack must be pairwise disjoint. Start at `536870912`
+(512 MiB), the value the bring-up measurements used. The failure mode of a
+bad value is loud and early: a malformed or negative value raises at startup
+like every other `MX_NCCL_REFIT_*` variable here, and a stack that outgrows
+the largest `NCCL_RESHARD_PACK_BUFFSIZES` bucket fails at prepare with an
+actionable error, before any session or buffer exists, instead of failing
+fatally inside the collective mid-run.
 
 #### MILES Integration (NCCL M2N)
 

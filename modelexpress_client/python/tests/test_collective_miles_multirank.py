@@ -127,6 +127,8 @@ def _install_fakes(miles_protocol, rank, scenario, record):
             record["events"].append(("begin", version))
 
         def publish_group(self, *, version, layer_group_id):
+            if scenario == "publish_fails" and rank == 3:
+                raise RuntimeError("synthetic publish failure on rank 3")
             specs = self._publisher.local_params()
             record["published"][version] = {
                 name: hashlib.sha256(
@@ -164,6 +166,8 @@ def _run(rank, scenario, record):
     names = list(_SHAPES)
     if scenario == "diverged_manifest" and rank == 3:
         names.remove("model.norm.weight")
+    if scenario == "stacked":
+        os.environ["MX_NCCL_REFIT_STACK_BYTES"] = str(1 << 20)
     protocol = miles_protocol.MilesCollectiveProtocolCore(SimpleNamespace())
     protocol.connect(
         [object()],
@@ -202,6 +206,18 @@ def _run(rank, scenario, record):
         tensors = [(name, _global(name, version)) for name in names]
         protocol.begin_sync(version, lambda *, materialize, t=tensors: iter([t]))
         record["run_id"] = protocol._run_id
+        record["stack_views"] = {
+            stack.name: [
+                protocol._tensors[member].untyped_storage().data_ptr()
+                == protocol._stack_storage[stack.name].untyped_storage().data_ptr()
+                and protocol._tensors[member].data_ptr()
+                == protocol._stack_storage[stack.name].data_ptr()
+                + index * protocol._tensors[member].numel() * 2
+                for index, member in enumerate(stack.members)
+            ]
+            for stack in protocol._stacks
+        }
+        record["abi"] = protocol._topology.m2n_abi_version
         for index, (name, tensor) in enumerate(tensors):
             if scenario == "diverged_bucket" and rank == 3 and index == 0:
                 # One rank's bucket stream alone diverges from the frozen plan.
@@ -384,6 +400,31 @@ def test_a_diverged_bucket_stream_fails_send_bucket_on_every_rank(tmp_path):
     assert all(record["generator_actions"] == [] for record in records[1:])
 
 
+def test_a_publish_failure_fails_send_bucket_on_every_rank(tmp_path):
+    # _launch's wall deadline is the no-hang guard; below, the failure vote.
+    records = _launch(tmp_path, "publish_fails")
+
+    for record in records:
+        assert record["error_type"] == "RuntimeError", record.get("traceback")
+        assert "publish failed" in record["error"]
+        assert "rank 3:" in record["error"]
+        assert record["rounds"] == 0
+        # The round began, but the publish group never finished on rank 3 and
+        # the vote stops every rank at the same bucket: nobody finalizes.
+        assert not any(
+            isinstance(event, list) and event[0] == "finish"
+            for event in record["events"]
+        )
+    # Rank 0 submitted the round, then the terminal close retires the
+    # futures and destroys the engine group.
+    assert records[0]["generator_actions"] == [
+        ["prepare", None],
+        ["run_round", "operation-1"],
+        ["close", None],
+    ]
+    assert all(record["generator_actions"] == [] for record in records[1:])
+
+
 def test_a_finish_failure_on_one_rank_fails_finalize_on_every_rank(tmp_path):
     records = _launch(tmp_path, "finish_fails")
 
@@ -403,3 +444,54 @@ def test_a_finish_failure_on_one_rank_fails_finalize_on_every_rank(tmp_path):
     ]
     assert "cancel-run_round" in records[0]["events"]
     assert all(record["generator_actions"] == [] for record in records[1:])
+
+
+def test_dp2_tp2_stacked_ranks_agree_and_publish_the_stacks(tmp_path):
+    records = _launch(tmp_path, "stacked")
+
+    for record in records:
+        assert "error" not in record, record.get("traceback")
+        assert record["rounds"] == 2
+        assert record["abi"] == "miles-sglang-bf16-replicated-v1+stack1"
+    # One wire plan on every rank: the two norms are one stacked entry.
+    assert len({json.dumps(record["plan"]) for record in records}) == 1
+    plan = [json.loads(entry) for entry in records[0]["plan"]]
+    stacked = [entry for entry in plan if entry[0].startswith("m2n-stack1/")]
+    assert len(plan) == len(_SHAPES) - 1
+    assert len(stacked) == 1
+    assert stacked[0][1] == [2, 8]
+    assert stacked[0][4] == "2x2@0"
+    assert stacked[0][5] == ["R", "R"]
+    assert stacked[0][6] == "2@4"
+    assert stacked[0][7] == ["R"]
+    assert stacked[0][8] == "m2n-stack1-0"
+    members = ("model.layers.0.input_layernorm.weight", "model.norm.weight")
+    for record in records:
+        (virtual,) = record["stack_views"]
+        assert virtual == stacked[0][0]
+        assert record["stack_views"][virtual] == [True, True]
+        assert record["local_shapes"][virtual] == [2, 8]
+        assert set(record["local_shapes"]) == {
+            name for name in _SHAPES if name not in members
+        } | {virtual}
+        for version in ("1", "2"):
+            stack = torch.stack([_global(name, int(version)) for name in members])
+            published = record["published"][version]
+            assert (
+                published[virtual]
+                == hashlib.sha256(stack.view(torch.uint8).numpy().tobytes()).hexdigest()
+            )
+            for name in _SHAPES:
+                if name in members:
+                    continue
+                assert (
+                    published[name]
+                    == hashlib.sha256(
+                        _global(name, int(version)).view(torch.uint8).numpy().tobytes()
+                    ).hexdigest()
+                )
+    assert records[0]["generator_actions"] == [
+        ["prepare", None],
+        ["run_round", "operation-1"],
+        ["run_round", "operation-2"],
+    ]

@@ -27,11 +27,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from dataclasses import replace
 from torch import nn
 
 import modelexpress_rl.collective.integrations._common as common
 import modelexpress_rl.collective.integrations.sglang as sglang_integration
-from modelexpress_rl.collective.integrations._common import _expected_index
+from modelexpress_rl.collective.integrations._common import (
+    _derive_wire_plan,
+    _expected_index,
+    _stack_classes,
+    _stack_trainer_buffers,
+)
 from modelexpress_rl.collective.integrations.sglang import SglangLoader, _engine_view
 from modelexpress_rl.collective.integrations.sglang_layout import (
     SglangModelFacts,
@@ -41,6 +47,7 @@ from modelexpress_rl.collective.types import (
     MeshSpec,
     ParamPlan,
     Placement,
+    PlacementKind,
     ReshardPlan,
 )
 
@@ -552,3 +559,270 @@ def test_the_loader_refuses_sharded_entries_it_cannot_prove(
             tp_rank=rank,
             tp_size=tp,
         )
+
+
+# --- equal-geometry stacks over the same live layers ------------------------
+
+
+def _more_norms(tensors):
+    tensors = _norm_tensors(tensors)
+    for index, name in enumerate(
+        (
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+        )
+    ):
+        tensors[name] = torch.full((HIDDEN,), float(index + 2), dtype=torch.bfloat16)
+    return tensors
+
+
+def _with_stacks(plan, budget=1 << 20):
+    keys = _stack_classes(plan.bulk, budget)
+    return ReshardPlan(
+        bulk=[
+            replace(entry, group_key=keys[entry.name]) if entry.name in keys else entry
+            for entry in plan.bulk
+        ],
+        source_partition_count=1,
+    )
+
+
+def _receive(loader, tensors, rank):
+    """Receive one round the way the backend does, then install each group."""
+    wire = loader.capture()
+    stacks = {
+        stack.name: stack for stack in _derive_wire_plan(loader._plan.capture())[1]
+    }
+    specs = loader.local_params()
+    loader.start_new_round("v1")
+    for group_id, entry in enumerate(wire.bulk):
+        if entry.name in stacks:
+            full = torch.stack([tensors[name] for name in stacks[entry.name].members])
+        else:
+            full = tensors[entry.name]
+        index = _expected_index(
+            entry.global_shape, entry.dst_mesh, entry.dst_placements, 1 + rank
+        )
+        spec = specs[entry.name]
+        ctx = spec.enter()
+        ctx.buf.copy_(full[index])
+        spec.leave(ctx)
+        loader.install(group_id)
+    loader.finish()
+    return wire
+
+
+def _loader_for(plan, model, *, tp, rank):
+    wire, _ = _derive_wire_plan(plan)
+    return SglangLoader(
+        plan=plan,
+        model=model,
+        device="cpu",
+        layer_groups=tuple((entry.name,) for entry in wire.bulk),
+        generator_index=rank,
+        tp_rank=rank,
+        tp_size=tp,
+    )
+
+
+@pytest.mark.parametrize("build", BACKENDS)
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_a_stacked_receive_installs_exactly_what_a_per_tensor_receive_does(
+    cpu_storage, build, tp
+):
+    kv_heads = 4
+    tensors = _more_norms(_hf_tensors(kv_heads))
+    for rank in range(tp):
+        per_tensor = _sharded_plan(tensors, tp=tp, kv_heads=kv_heads)
+        stacked = _with_stacks(per_tensor)
+        wire, stacks = _derive_wire_plan(stacked)
+        # k/v, gate/up and the three norms stack; everything else stays plain.
+        assert sorted(len(stack.members) for stack in stacks) == [2, 2, 3]
+        assert len(wire.bulk) == len(per_tensor.bulk) - 4
+
+        ref_layers = build(kv_heads, rank, tp, VOCAB)
+        ref_model = _model(ref_layers, kv_heads=kv_heads)
+        _receive(_loader_for(per_tensor, ref_model, tp=tp, rank=rank), tensors, rank)
+
+        layers = build(kv_heads, rank, tp, VOCAB)
+        model = _model(layers, kv_heads=kv_heads)
+        loader = _loader_for(stacked, model, tp=tp, rank=rank)
+        _receive(loader, tensors, rank)
+
+        stock = build(kv_heads, rank, tp, VOCAB)
+        _stock_load(stock, {k: v for k, v in tensors.items() if "norm" not in k})
+        for key, module in stock.items():
+            # At TP1 every entry is staged and only recorded by this model's
+            # stand-in load_weights, so the live layers are untouched; the
+            # staged inputs are compared below instead.
+            if tp > 1:
+                assert torch.equal(module.weight, layers[key].weight), (key, rank)
+            assert torch.equal(ref_layers[key].weight, layers[key].weight), (
+                key,
+                rank,
+            )
+        loaded = {
+            name: tensor.clone() for call in model.loaded for name, tensor in call
+        }
+        reference = {
+            name: tensor.clone() for call in ref_model.loaded for name, tensor in call
+        }
+        assert loaded.keys() == reference.keys()
+        for name, tensor in loaded.items():
+            assert torch.equal(tensor, reference[name]), name
+            assert torch.equal(tensor, tensors[name]), name
+        # The staged members of a stack go through one load_weights call.
+        norm_calls = [
+            [name for name, _ in call] for call in model.loaded if "norm" in call[0][0]
+        ]
+        assert [len(call) for call in norm_calls] == [3]
+        # TP1 keeps every entry whole, so every stack is staged; at TP>1 the
+        # sharded stacks are received through the scratch instead.
+        assert (loader._scratch_elements > 0) == (tp > 1)
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+def test_a_sharded_stack_never_installs_through_load_weights(cpu_storage, tp):
+    kv_heads = 4
+    tensors = _more_norms(_hf_tensors(kv_heads))
+    plan = _with_stacks(_sharded_plan(tensors, tp=tp, kv_heads=kv_heads))
+    layers = _reproduced_layers(kv_heads, 0, tp, VOCAB)
+    loader = _loader_for(plan, _model(layers, kv_heads=kv_heads), tp=tp, rank=0)
+    flags = {
+        tuple(group): bool(loader._staged_members(index))
+        for index, group in enumerate(loader.layer_groups)
+    }
+    stacks = {stack.name: stack for stack in _derive_wire_plan(plan)[1]}
+    for (name,), reads in flags.items():
+        if name in stacks and "norm" in stacks[name].members[0]:
+            assert reads is True
+        else:
+            assert reads is False, name
+
+
+def test_a_stack_whose_engine_views_overlap_is_refused(cpu_storage, monkeypatch):
+    kv_heads, tp, rank = 4, 2, 0
+    tensors = _more_norms(_hf_tensors(kv_heads))
+    plan = _with_stacks(_sharded_plan(tensors, tp=tp, kv_heads=kv_heads))
+    layers = _reproduced_layers(kv_heads, rank, tp, VOCAB)
+    original = sglang_integration._engine_view
+
+    def overlapping(model, name, global_shape, tp_rank, tp_size):
+        # up_proj resolves to gate_proj's slice: two members, one memory range.
+        name = name.replace("up_proj", "gate_proj")
+        return original(model, name, global_shape, tp_rank, tp_size)
+
+    monkeypatch.setattr(sglang_integration, "_engine_view", overlapping)
+    with pytest.raises(ValueError, match="overlap in memory"):
+        _loader_for(plan, _model(layers, kv_heads=kv_heads), tp=tp, rank=rank)
+
+
+def test_a_non_bf16_sharded_stack_is_refused_with_the_stack_named(
+    cpu_storage, monkeypatch
+):
+    kv_heads, tp, rank = 4, 2, 0
+    tensors = _more_norms(_hf_tensors(kv_heads))
+    plan = _with_stacks(_sharded_plan(tensors, tp=tp, kv_heads=kv_heads))
+    layers = _reproduced_layers(kv_heads, rank, tp, VOCAB)
+    original = sglang_integration._derive_wire_plan
+
+    def doctored(frozen):
+        # The plan's bf16 gate sits in front of this path; doctoring only the
+        # sharded stacks proves the scratch path names its own failure if a
+        # non-bf16 wire dtype ever arrives past it.
+        wire, stacks = original(frozen)
+        out = []
+        for stack in stacks:
+            if stack.entry.dst_placements[-1].kind is PlacementKind.SHARD:
+                stack = replace(stack, entry=replace(stack.entry, dtype="float32"))
+            out.append(stack)
+        return wire, tuple(out)
+
+    monkeypatch.setattr(sglang_integration, "_derive_wire_plan", doctored)
+    with pytest.raises(ValueError, match="bfloat16 scratch"):
+        _loader_for(plan, _model(layers, kv_heads=kv_heads), tp=tp, rank=rank)
+
+
+def test_each_stream_gets_its_own_receive_scratch(cpu_storage, monkeypatch):
+    kv_heads, tp, rank = 4, 2, 0
+    tensors = _more_norms(_hf_tensors(kv_heads))
+    plan = _with_stacks(_sharded_plan(tensors, tp=tp, kv_heads=kv_heads))
+    layers = _reproduced_layers(kv_heads, rank, tp, VOCAB)
+    loader = _loader_for(plan, _model(layers, kv_heads=kv_heads), tp=tp, rank=rank)
+    specs = loader.local_params()
+    (sharded,) = [
+        specs[name]
+        for name, stack in loader._stacks.items()
+        if name not in loader._stack_buffers and "gate_proj" in stack.members[0]
+    ]
+    key = {"value": 1}
+    monkeypatch.setattr(sglang_integration, "_current_stream_key", lambda: key["value"])
+
+    first = sharded.enter().buf
+    # The stream allocated at prepare claims the scratch that was made then.
+    assert (
+        first.untyped_storage().data_ptr()
+        == loader._scratch_primary.untyped_storage().data_ptr()
+    )
+    assert sharded.enter().buf.untyped_storage().data_ptr() == (
+        first.untyped_storage().data_ptr()
+    )
+    key["value"] = 2
+    second = sharded.enter().buf
+    assert second.untyped_storage().data_ptr() != first.untyped_storage().data_ptr()
+    assert tuple(second.shape) == tuple(first.shape)
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_trainer_and_engine_agree_on_the_wire_plan_and_abi(
+    cpu_storage, monkeypatch, tp
+):
+    import modelexpress_rl.collective.integrations.miles as miles_integration
+    from modelexpress_rl.collective.integrations._common import (
+        REPLICATED_DESTINATION_ABI,
+        SHARDED_DESTINATION_ABI,
+        STACK_ABI_SUFFIX,
+    )
+    from modelexpress_rl.collective.integrations.miles import (
+        CollectiveTopology,
+        MilesPublisher,
+    )
+    from modelexpress_rl.collective.plan import plan_digest
+
+    monkeypatch.setattr(
+        miles_integration, "_tensor_signature", common._tensor_signature
+    )
+    kv_heads, rank = 4, 0
+    tensors = _more_norms(_hf_tensors(kv_heads))
+    plan = _with_stacks(_sharded_plan(tensors, tp=tp, kv_heads=kv_heads))
+    wire, stacks = _derive_wire_plan(plan)
+    local = {name: tensor.clone() for name, tensor in tensors.items()}
+    storage = _stack_trainer_buffers(stacks, local)
+    members = {name for stack in stacks for name in stack.members}
+    wire_tensors = {n: t for n, t in local.items() if n not in members}
+    wire_tensors.update(storage)
+    publisher = MilesPublisher(
+        plan=wire, source_partition=0, tensors=wire_tensors, source_rank=0
+    )
+    layers = _reproduced_layers(kv_heads, rank, tp, VOCAB)
+    loader = _loader_for(plan, _model(layers, kv_heads=kv_heads), tp=tp, rank=rank)
+
+    abi = (SHARDED_DESTINATION_ABI if tp > 1 else REPLICATED_DESTINATION_ABI) + (
+        STACK_ABI_SUFFIX
+    )
+    topology = CollectiveTopology(
+        model_name="m",
+        trainer_slots=("t0",),
+        generator_slots=tuple(f"g{i}" for i in range(tp)),
+        source_partition_count=1,
+        m2n_abi_version=abi,
+    )
+    publisher.validate_topology(topology)
+    loader.validate_topology(topology)
+    assert plan_digest(publisher.capture(), m2n_abi_version=abi) == plan_digest(
+        loader.capture(), m2n_abi_version=abi
+    )
+    # The trainer sends the stacks it keeps; the members are views of them.
+    assert sorted(publisher.parameter_names()) == sorted(loader.parameter_names())
+    for stack in stacks:
+        assert tuple(storage[stack.name].shape)[0] == len(stack.members)

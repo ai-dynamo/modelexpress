@@ -53,6 +53,8 @@ def _server_address(monkeypatch):
     monkeypatch.setenv("MX_SERVER_ADDRESS", "mx:50051")
     monkeypatch.delenv("MODEL_EXPRESS_URL", raising=False)
     monkeypatch.delenv("MX_MILES_DST_LAYOUT", raising=False)
+    monkeypatch.delenv("MX_NCCL_REFIT_STACK_BYTES", raising=False)
+    monkeypatch.delenv("NCCL_RESHARD_PACK_BUFFSIZES", raising=False)
 
 
 class _Group:
@@ -1555,12 +1557,14 @@ def test_a_failed_first_begin_sync_leaves_no_committed_state(monkeypatch):
     )
     calls = 0
 
-    def flaky(facts, layouts):
+    def flaky(facts, layouts, tensors):
         nonlocal calls
         calls += 1
         if calls == 1:
             raise RuntimeError("synthetic contract failure")
-        MilesCollectiveProtocolCore._build_frozen_contract(protocol, facts, layouts)
+        MilesCollectiveProtocolCore._build_frozen_contract(
+            protocol, facts, layouts, tensors
+        )
 
     monkeypatch.setattr(protocol, "_build_frozen_contract", flaky)
     first = torch.full((2, 2), 1, dtype=torch.bfloat16)
@@ -1759,3 +1763,249 @@ def test_prepare_sessions_retires_dropped_generator_futures_on_failure(monkeypat
 
     assert dropped.cancelled is True
     assert dropped.callbacks == []
+
+
+# --- equal-geometry stacking (MX_NCCL_REFIT_STACK_BYTES) -----------------------
+
+# plan_digest of the default plan _frozen() builds, measured on the stack's
+# base before stacking existed: the zero default must never move it.
+_BASE_DEFAULT_DIGEST = (
+    "7058181e271136afab2879dbbe0ac6957305237e82f526443615aa0a493e6688"
+)
+
+
+def _frozen(monkeypatch, budget=None, count=4):
+    if budget is not None:
+        monkeypatch.setenv("MX_NCCL_REFIT_STACK_BYTES", str(budget))
+    protocol = MilesCollectiveProtocolCore(_args())
+    protocol.connect([object()], [2], [0], _parallel_state(), _placement(), "target")
+    # 4 bf16 elements = 8 global bytes per tensor.
+    tensors = [
+        (f"model.{index}", torch.zeros((4,), dtype=torch.bfloat16))
+        for index in range(count)
+    ]
+    protocol.begin_sync(1, lambda *, materialize: iter([tensors]))
+    return protocol
+
+
+def _digest_abi(protocol):
+    from modelexpress_rl.collective.plan import plan_digest
+
+    return plan_digest(
+        protocol._plan, m2n_abi_version=protocol._topology.m2n_abi_version
+    )
+
+
+def test_the_stack_bytes_env_and_the_zero_default(monkeypatch):
+    assert miles_protocol._stack_bytes() == 0
+    assert MilesCollectiveProtocolCore(_args())._stack_bytes == 0
+    monkeypatch.setenv("MX_NCCL_REFIT_STACK_BYTES", "64")
+    assert miles_protocol._stack_bytes() == 64
+    assert MilesCollectiveProtocolCore(_args())._stack_bytes == 64
+
+
+@pytest.mark.parametrize("bad", ["abc", "-1"])
+def test_a_bad_stack_bytes_env_names_the_variable_at_startup(monkeypatch, bad):
+    monkeypatch.setenv("MX_NCCL_REFIT_STACK_BYTES", bad)
+    with pytest.raises(ValueError, match="MX_NCCL_REFIT_STACK_BYTES"):
+        MilesCollectiveProtocolCore(_args())
+
+
+def test_stacking_off_leaves_the_plan_digest_and_abi_byte_identical(monkeypatch):
+    for budget in (None, 0):
+        protocol = _frozen(monkeypatch, budget)
+        assert _digest_abi(protocol) == _BASE_DEFAULT_DIGEST
+        assert protocol._topology.m2n_abi_version == "miles-sglang-bf16-replicated-v1"
+        assert protocol._publish_groups == (
+            ("model.0", "model.1", "model.2", "model.3"),
+        )
+        assert {entry.group_key for entry in protocol._plan.bulk} == {"publish-group-0"}
+        assert protocol._stacks == ()
+        assert protocol._wire_plan is None
+        assert protocol._wire_groups is None
+        assert protocol._stack_storage == {}
+        # Every wire buffer is its own tensor.
+        pointers = {
+            tensor.untyped_storage().data_ptr() for tensor in protocol._tensors.values()
+        }
+        assert len(pointers) == 4
+
+
+def test_stacking_marks_the_members_and_changes_the_wire_digest_and_abi(
+    monkeypatch,
+):
+    from modelexpress_rl.collective.plan import plan_digest
+
+    default = _frozen(monkeypatch)
+    stacked = _frozen(monkeypatch, 16)  # 8 bytes per member: two per stack
+
+    keys = [entry.group_key for entry in stacked._plan.bulk]
+    assert keys == ["m2n-stack1-0", "m2n-stack1-0", "m2n-stack1-1", "m2n-stack1-1"]
+    assert [entry.name for entry in stacked._plan.bulk] == [
+        entry.name for entry in default._plan.bulk
+    ]
+    assert stacked._topology.m2n_abi_version == "miles-sglang-bf16-replicated-v1+stack1"
+    assert [stack.members for stack in stacked._stacks] == [
+        ("model.0", "model.1"),
+        ("model.2", "model.3"),
+    ]
+    wire_names = [entry.name for entry in stacked._wire_plan.bulk]
+    assert all(name.startswith("m2n-stack1/") for name in wire_names)
+    wire_digest = plan_digest(
+        stacked._wire_plan, m2n_abi_version=stacked._topology.m2n_abi_version
+    )
+    assert wire_digest != _BASE_DEFAULT_DIGEST
+    assert _digest_abi(stacked) != _digest_abi(default)
+    # Pending tracking names the per-tensor members; the session names wire entries.
+    assert stacked._publish_groups == (
+        ("model.0", "model.1"),
+        ("model.2", "model.3"),
+    )
+    assert stacked._wire_groups == tuple((name,) for name in wire_names)
+    assert sorted(stacked._group_of) == [f"model.{i}" for i in range(4)]
+
+
+def test_wire_buffers_are_views_into_stack_storage_with_stable_addresses(
+    monkeypatch,
+):
+    protocol = _frozen(monkeypatch, 1 << 20)
+    (stack,) = protocol._stacks
+    storage = protocol._stack_storage[stack.name]
+    assert tuple(storage.shape) == (4, 4)
+    for index, name in enumerate(stack.members):
+        view = protocol._tensors[name]
+        assert view.data_ptr() == storage.data_ptr() + index * 4 * 2
+        assert view.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
+    pointers = {name: protocol._tensors[name].data_ptr() for name in stack.members}
+    storage_ptr = storage.data_ptr()
+
+    # Round two refills through the same views; the stack follows, no re-copy.
+    refill = [
+        (f"model.{index}", torch.full((4,), float(index + 7), dtype=torch.bfloat16))
+        for index in range(4)
+    ]
+    protocol._disarm_round()
+    protocol.begin_sync(2, lambda *, materialize: iter([refill]))
+    assert protocol._stack_storage[stack.name].data_ptr() == storage_ptr
+    assert {n: protocol._tensors[n].data_ptr() for n in stack.members} == pointers
+    for index, name in enumerate(stack.members):
+        assert torch.equal(storage[index], refill[int(name.split(".")[1])][1])
+
+
+def test_prepare_sessions_hands_the_publisher_the_wire_plan_and_stacks(
+    monkeypatch,
+):
+    _install_fake_miles_async(monkeypatch, [])
+    seen = {}
+
+    class Session:
+        def prepare(self):
+            pass
+
+        def close(self):
+            pass
+
+    def create_session(**kwargs):
+        seen["session"] = kwargs
+        return Session()
+
+    class Channel:
+        def close(self):
+            pass
+
+    def publisher(**kwargs):
+        seen["publisher"] = kwargs
+        return object()
+
+    monkeypatch.setattr(miles_protocol.grpc, "insecure_channel", lambda e: Channel())
+    monkeypatch.setattr(miles_protocol.auth, "with_auth", lambda channel: channel)
+    monkeypatch.setattr(miles_protocol, "_await_endpoint_ready", lambda *a, **k: None)
+    monkeypatch.setattr(miles_protocol, "CollectiveRendezvous", lambda c: object())
+    monkeypatch.setattr(miles_protocol, "MilesPublisher", publisher)
+    monkeypatch.setattr(miles_protocol.MilesTrainerSession, "create", create_session)
+
+    protocol = _frozen(monkeypatch, 16)
+    monkeypatch.setattr(protocol, "_generator_futures", lambda action, **kw: [])
+    monkeypatch.setattr(protocol, "_wait_generator_futures", lambda futures: None)
+    protocol._prepare_sessions()
+
+    wire_names = [entry.name for entry in protocol._wire_plan.bulk]
+    assert seen["publisher"]["plan"] is protocol._wire_plan
+    assert sorted(seen["publisher"]["tensors"]) == sorted(wire_names)
+    for stack in protocol._stacks:
+        assert (
+            seen["publisher"]["tensors"][stack.name]
+            is protocol._stack_storage[stack.name]
+        )
+    assert seen["session"]["layer_groups"] == tuple((name,) for name in wire_names)
+
+
+def test_the_stacked_bucket_stream_publishes_each_stack_once_complete(monkeypatch):
+    monkeypatch.setenv("MX_NCCL_REFIT_STACK_BYTES", "16")
+    protocol = MilesCollectiveProtocolCore(_args())
+    protocol.connect([object()], [2], [0], _parallel_state(), _placement(), "target")
+    events = []
+
+    class Session:
+        def begin_round(self, *, version):
+            events.append(("begin", version))
+
+        def publish_group(self, *, version, layer_group_id):
+            events.append(("publish", layer_group_id))
+
+        def create_transfer(self, *, version):
+            return "845aaea0-f64b-4f2e-b212-5af940b4c169"
+
+        def finish_round(self, *, version, operation_id):
+            events.append(("finish", version))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        protocol, "_prepare_sessions", lambda: setattr(protocol, "_session", Session())
+    )
+    monkeypatch.setattr(protocol, "_generator_futures", lambda a, **k: [])
+    monkeypatch.setattr(protocol, "_wait_generator_futures", lambda f: None)
+    tensors = [
+        (f"model.{index}", torch.zeros((4,), dtype=torch.bfloat16))
+        for index in range(4)
+    ]
+    protocol.begin_sync(1, lambda *, materialize: iter([tensors]))
+    members = protocol._publish_groups
+    # Feed group 1's members first: nothing publishes until group 0 completes.
+    for name in members[1]:
+        protocol.send_bucket([(name, protocol._tensors[name])])
+    assert [e for e in events if e[0] == "publish"] == []
+    for name in members[0]:
+        protocol.send_bucket([(name, protocol._tensors[name])])
+    assert [e for e in events if e[0] == "publish"] == [("publish", 0), ("publish", 1)]
+    protocol.finalize(1)
+
+
+def test_a_stack_over_the_pack_bucket_fails_the_prepare_before_any_session(
+    monkeypatch,
+):
+    created = []
+    monkeypatch.setattr(
+        miles_protocol.MilesTrainerSession,
+        "create",
+        lambda **kwargs: created.append(kwargs),
+    )
+    monkeypatch.setattr(miles_protocol, "_await_endpoint_ready", lambda *a, **k: None)
+    monkeypatch.setenv("MX_NCCL_REFIT_STACK_BYTES", str(1 << 20))
+    protocol = MilesCollectiveProtocolCore(_args())
+    protocol.connect([object()], [2], [0], _parallel_state(), _placement(), "target")
+    # Four 4-KiB tensors make one 16-KiB stack; the largest PACK bucket this
+    # process runs with is 2 KiB, so the stack could never be carried.
+    tensors = [
+        (f"model.{index}", torch.zeros((2048,), dtype=torch.bfloat16))
+        for index in range(4)
+    ]
+    protocol.begin_sync(1, lambda *, materialize: iter([tensors]))
+    assert [stack.area_bytes for stack in protocol._stacks] == [4 * 4096]
+    monkeypatch.setenv("NCCL_RESHARD_PACK_BUFFSIZES", "2048")
+    monkeypatch.setattr(protocol, "_generator_futures", lambda action, **kw: [])
+    with pytest.raises(RuntimeError, match="largest PACK staging bucket of 2048"):
+        protocol._prepare_sessions()
+    assert created == []
