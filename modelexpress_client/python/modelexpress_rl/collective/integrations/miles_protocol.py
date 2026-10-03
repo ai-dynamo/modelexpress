@@ -27,8 +27,14 @@ from ..types import MeshSpec, ParamPlan, Placement, ReshardPlan
 from ._common import (
     REPLICATED_DESTINATION_ABI,
     SHARDED_DESTINATION_ABI,
+    STACK_ABI_SUFFIX,
+    _check_stack_budget,
     _counted_names,
+    _derive_wire_plan,
     _endpoint as _normalize_endpoint,
+    _Stack,
+    _stack_classes,
+    _stack_trainer_buffers,
 )
 from .miles import (
     CollectiveTopology,
@@ -54,6 +60,11 @@ _DST_LAYOUT_ABI = {
 #: An engine mid-receive serves the destroy only after its own round fails, so
 #: a long wait just delays the trainer's failure surfacing.
 _FAILURE_DESTROY_WAIT_S = 15.0
+
+
+def _stack_bytes() -> int:
+    """The stacking budget: ``MX_NCCL_REFIT_STACK_BYTES``, 0 (the default) off."""
+    return envs.MX_NCCL_REFIT_STACK_BYTES
 
 
 @dataclass(frozen=True)
@@ -283,9 +294,17 @@ class MilesCollectiveProtocolCore:
         self._plan: ReshardPlan | None = None
         self._publish_groups: tuple[tuple[str, ...], ...] | None = None
         self._group_of: dict[str, int] = {}
+        # Equal-geometry stacking: the derived wire plan and its stacks, the
+        # session's layer groups (one per wire entry), and each stack's
+        # storage. All empty/None unless stacking is on and a stack formed.
+        self._stacks: tuple[_Stack, ...] = ()
+        self._wire_plan: ReshardPlan | None = None
+        self._wire_groups: tuple[tuple[str, ...], ...] | None = None
+        self._stack_storage: dict[str, torch.Tensor] = {}
         # Resolve and check the endpoint now so a missing or unparseable
         # address fails when MILES builds the protocol, not inside the first
-        # weight update.
+        # weight update. The stacking budget resolves here for the same
+        # reason: a malformed MX_NCCL_REFIT_STACK_BYTES is a startup error.
         self._endpoint = _server_endpoint()
         _server_host_port(self._endpoint)
         # The engine-side receiver group, named at prepare.
@@ -293,6 +312,7 @@ class MilesCollectiveProtocolCore:
         self._retired_engine_groups: list[tuple[tuple[Any, ...], str]] = []
         self._connection_generation = 0
         self._dst_layout = _dst_layout()
+        self._stack_bytes = _stack_bytes()
         # Agreed across trainer ranks at the first begin_sync: rank 0's fresh
         # hex id prefixes every slot, and hex can never contain the Redis
         # lane-record delimiters.
@@ -562,7 +582,7 @@ class MilesCollectiveProtocolCore:
             raise RuntimeError("MILES NCCL M2N preparation produced no tensor state")
         # The contract build reads the new layouts and shapes from arguments;
         # nothing commits until it returns successfully.
-        self._build_frozen_contract(facts, layouts)
+        self._build_frozen_contract(facts, layouts, prepared_tensors)
         if self._local_shapes is None:
             self._local_shapes = local_shapes
             self._tensors = prepared_tensors
@@ -590,7 +610,10 @@ class MilesCollectiveProtocolCore:
         self._round_futures = []
 
     def _build_frozen_contract(
-        self, facts: SglangModelFacts | None, layouts: dict[str, TensorLayout]
+        self,
+        facts: SglangModelFacts | None,
+        layouts: dict[str, TensorLayout],
+        tensors: dict[str, torch.Tensor],
     ) -> None:
         """Vote local contract checks before agreeing identity and manifests."""
         _rank, trainer_world = _rank_and_world()
@@ -606,7 +629,7 @@ class MilesCollectiveProtocolCore:
                 (name, layout.global_shape, layout.shard_dim)
                 for name, layout in layouts.items()
             )
-            topology, plan = self._local_frozen_contract(
+            topology, plan, wire_plan, stacks = self._local_frozen_contract(
                 facts, local_manifest, trainer_world, run_id
             )
         except BaseException as error:
@@ -682,12 +705,50 @@ class MilesCollectiveProtocolCore:
                 agreed_run_id + slot[len(run_id):] for slot in topology.generator_slots
             ),
         )
-        group = tuple(entry.name for entry in plan.bulk)
+        groups: tuple[tuple[str, ...], ...] = (tuple(entry.name for entry in plan.bulk),)
+        if stacks and wire_plan is not None:
+            # One publish group per wire entry: a stack publishes once all
+            # its members have arrived, strictly in wire order. The session
+            # groups name the wire entries; the pending tracking names the
+            # per-tensor members that complete each of them.
+            by_stack = {stack.name: stack for stack in stacks}
+            groups = tuple(
+                by_stack[entry.name].members
+                if entry.name in by_stack
+                else (entry.name,)
+                for entry in wire_plan.bulk
+            )
+            self._wire_groups = tuple((entry.name,) for entry in wire_plan.bulk)
+            # Every rank derived the same stacks, so every rank reaches this
+            # gather; an allocation failure on one rank fails them all.
+            local_exception: BaseException | None = None
+            local_error = ""
+            storage: dict[str, torch.Tensor] = {}
+            try:
+                storage = _stack_trainer_buffers(stacks, tensors)
+            except BaseException as error:
+                local_exception = error
+                local_error = repr(error)
+            failures = _gathered_failures(local_error)
+            if failures:
+                error = RuntimeError(
+                    "MILES NCCL M2N stack buffer allocation failed: "
+                    + "; ".join(failures[:4])
+                )
+                if local_exception is not None:
+                    raise error from local_exception
+                raise error
+            self._stack_storage = storage
+            self._wire_plan = wire_plan
+            self._stacks = stacks
+        # Commit only here: every local probe and collective check passed.
         self._run_id = agreed_run_id
         self._topology = topology
         self._plan = plan
-        self._publish_groups = (group,)
-        self._group_of = dict.fromkeys(group, 0)
+        self._publish_groups = groups
+        self._group_of = {
+            name: index for index, group in enumerate(groups) for name in group
+        }
 
     def _local_frozen_contract(
         self,
@@ -695,7 +756,7 @@ class MilesCollectiveProtocolCore:
         local_manifest: list[tuple[str, tuple[int, ...], int | None]],
         trainer_world: int,
         run_id: str,
-    ) -> tuple[CollectiveTopology, ReshardPlan]:
+    ) -> tuple[CollectiveTopology, ReshardPlan, ReshardPlan | None, tuple[_Stack, ...]]:
         """Prepare all fallible local inputs without entering collectives."""
         if trainer_world != self._dp_size * self._tp_size:
             raise ValueError(
@@ -724,7 +785,8 @@ class MilesCollectiveProtocolCore:
             ),
             generator_slots=generator_slots,
             source_partition_count=1,
-            m2n_abi_version=_DST_LAYOUT_ABI[self._dst_layout],
+            m2n_abi_version=_DST_LAYOUT_ABI[self._dst_layout]
+            + (STACK_ABI_SUFFIX if self._stacks else ""),
         )
         src_mesh = (
             MeshSpec((self._tp_size,))
@@ -742,7 +804,7 @@ class MilesCollectiveProtocolCore:
                 for entry in self._plan.bulk
             ):
                 raise RuntimeError("MILES tensor names, shapes, or topology changed")
-            return topology, self._plan
+            return topology, self._plan, self._wire_plan, self._stacks
         entries = []
         for name, global_shape, shard_dim in local_manifest:
             inner = (
@@ -780,7 +842,28 @@ class MilesCollectiveProtocolCore:
         # Canonical order is the wire contract: the receiver canonical-sorts
         # too, so both sides post the same per-lane tensor sequence.
         entries.sort(key=lambda entry: entry.canonical())
-        return topology, ReshardPlan(bulk=entries, source_partition_count=1)
+        stacks: tuple[_Stack, ...] = ()
+        wire_plan: ReshardPlan | None = None
+        if self._stack_bytes:
+            # Equal-geometry stacks ride in group_key: the plan, its digest
+            # and the manifest carry the membership, and every engine derives
+            # the same stacked wire entries from it.
+            keys = _stack_classes(entries, self._stack_bytes)
+            entries = [
+                replace(entry, group_key=keys[entry.name])
+                if entry.name in keys
+                else entry
+                for entry in entries
+            ]
+        plan = ReshardPlan(bulk=entries, source_partition_count=1)
+        if self._stack_bytes:
+            wire_plan, stacks = _derive_wire_plan(plan)
+        topology = replace(
+            topology,
+            m2n_abi_version=_DST_LAYOUT_ABI[self._dst_layout]
+            + (STACK_ABI_SUFFIX if stacks else ""),
+        )
+        return topology, plan, wire_plan, stacks
 
     def _destination_mesh(
         self, generator_count: int, trainer_count: int
@@ -1297,8 +1380,24 @@ class MilesCollectiveProtocolCore:
         # reaches the shared gather; from there send_bucket closes the protocol.
         local_error = ""
         try:
+            stacked = bool(self._stacks) and self._wire_plan is not None
+            plan = self._wire_plan if stacked else self._plan
+            session_groups = self._wire_groups if stacked else self._publish_groups
             local_tensors = dict(self._tensors)
-            expected_names = {entry.name for entry in self._plan.bulk}
+            if stacked:
+                # The wire entries are the plain tensors plus one stack
+                # tensor per stack; the members are views into the stacks.
+                members = {name for stack in self._stacks for name in stack.members}
+                local_tensors = {
+                    name: tensor
+                    for name, tensor in local_tensors.items()
+                    if name not in members
+                }
+                local_tensors.update(self._stack_storage)
+                # A stack the native PACK staging cannot carry must fail
+                # before any round, never after protocol entry.
+                _check_stack_budget(self._stacks)
+            expected_names = {entry.name for entry in plan.bulk}
             if set(local_tensors) != expected_names:
                 missing = sorted(expected_names - set(local_tensors))
                 unexpected = sorted(set(local_tensors) - expected_names)
@@ -1327,7 +1426,7 @@ class MilesCollectiveProtocolCore:
             rendezvous = CollectiveRendezvous(channel)
             self._rendezvous = rendezvous
             publisher = MilesPublisher(
-                plan=self._plan,
+                plan=plan,
                 source_partition=0,
                 tensors=local_tensors,
                 source_rank=lane_rank,
@@ -1346,7 +1445,7 @@ class MilesCollectiveProtocolCore:
                 slot_id=slot_id,
                 worker_id=self._slot_worker_id,
                 index_in_role=lane_rank,
-                layer_groups=self._publish_groups,
+                layer_groups=session_groups,
                 device=next(iter(local_tensors.values())).device,
             )
         except BaseException as error:

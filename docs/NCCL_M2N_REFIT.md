@@ -795,6 +795,7 @@ reports the round FAILED.
 | `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Client-side transfer deadline, checked between submissions; a submission that blocks the host is not bounded by it and falls under the runner exit contract of section 8.2. An overrun aborts the local lanes. It is reported to MX as `succeeded=false` (`RUNNING -> FAILED`, which moves the epoch) against the operation bound by `start_weight_update`, from whichever round call it surfaces in. If that report cannot be delivered, the abort alone leaves the group at its epoch |
 | `MX_NCCL_REFIT_ABORT_TIMEOUT_S` | `10` | Shared budget for tearing down every lane of a group (data and control `ncclCommAbort`, run one at a time on daemon threads) before the remaining communicators are declared wedged (section 8.2). An overrun raises `CommunicatorWedgedError`; the runner must treat it as a fatal process exit. Relevant only on libnccl below v2.33, where abort cannot interrupt a running M2N kernel |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
+| `MX_NCCL_REFIT_STACK_BYTES` | `0` | Equal-geometry stacking budget in bytes (non-negative). `0` keeps one M2N reshard per tensor, with the plan and digest unchanged; above `0`, the MILES trainer stacks every set of tensors that share their plan geometry into one `nccl.m2n.reshard` per stack. The stacks ride in the plan and its digest and the receiver ABI gains a `+stack1` suffix, so engines never read this variable. Semantics, tuning guidance and the fail-closed rules are in [RL configuration guide](rl/CONFIGURATION.md#equal-geometry-stacking)'s "Equal-geometry stacking" section |
 
 Proposed timing contract (not implemented): the collective clients do not
 record `RefitTimingRecorder` stages today, and the collective benchmark
@@ -820,3 +821,7 @@ the host CUDA toolkit. Reshard needs NCCL 2.30.7 or newer. Without it,
 `modelexpress_rl.collective` raises `NcclUnavailableError` at `compute_plan()`, before joining. The
 torch-free plan and rendezvous modules import and test without NCCL, CUDA, or
 torch.
+
+Maintainer note: the Python preflight that sizes one stacked reshard call
+against the PACK staging pool mirrors the native `NCCL_RESHARD_PACK_BUFFSIZES`
+parser in `nccl_m2n/src/m2n_config.cc` and must stay in sync with its grammar.
