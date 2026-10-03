@@ -21,6 +21,7 @@ from ._common import (
     _FrozenPlan,
     _layer_groups,
     _local_m2n_abi,
+    _local_shape,
     _order_current_cuda_stream_before,
     _single_device,
     _tensor_signature,
@@ -79,11 +80,11 @@ class CollectiveTopology:
 
 
 class MilesPublisher:
-    """Bind stable partition-local trainer tensors to their canonical plan names.
+    """Bind stable rank-local trainer tensors to their canonical plan names.
 
-    ``tensors`` is keyed by the canonical plan name directly: the only caller
-    (the MILES protocol) materializes the HF bucket stream under those names
-    already, so no alias mapping exists to keep consistent.
+    Each tensor is the slice ``source_rank`` holds under the entry's source
+    mesh and placements: the whole tensor for the gathered (replicated)
+    stream.
     """
 
     def __init__(
@@ -92,12 +93,18 @@ class MilesPublisher:
         plan: ReshardPlan,
         source_partition: int,
         tensors: dict[str, Any],
+        source_rank: int = 0,
     ) -> None:
         self._plan = _FrozenPlan(plan)
         if not 0 <= source_partition < self._plan.source_partition_count:
             raise ValueError(
                 f"source_partition must be in [0, "
                 f"{self._plan.source_partition_count}), got {source_partition}"
+            )
+        if not 0 <= source_rank < self._plan.src_mesh.size:
+            raise ValueError(
+                f"source_rank must be in [0, {self._plan.src_mesh.size}), "
+                f"got {source_rank}"
             )
         self._source_partition = source_partition
         self._tensors = dict(tensors)
@@ -113,6 +120,10 @@ class MilesPublisher:
                 f"expected {required}, got {sorted(self._tensors)}"
             )
         self._ordered_names = tuple(required)
+        self._local_shapes = {
+            name: _local_shape(self._plan.source_index(name, source_rank))
+            for name in self._ordered_names
+        }
 
         self._signatures = {}
         for name in self._ordered_names:
@@ -120,7 +131,7 @@ class MilesPublisher:
             self._signatures[name] = _tensor_signature(
                 name,
                 self._tensors[name],
-                expected_shape=entry.global_shape,
+                expected_shape=self._local_shapes[name],
                 expected_dtype=entry.dtype,
             )
         self._device = _single_device(self._signatures, "MILES publisher")
@@ -143,7 +154,7 @@ class MilesPublisher:
                 name,
                 self._tensors[name],
                 self._signatures[name],
-                expected_shape=entry.global_shape,
+                expected_shape=self._local_shapes[name],
                 expected_dtype=entry.dtype,
             )
 
