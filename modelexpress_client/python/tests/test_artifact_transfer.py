@@ -1269,6 +1269,69 @@ def test_publish_artifact_source_registers_mx_discovery_metadata(tmp_path):
     assert mx_client.published_worker.artifact_source.file_count == 1
 
 
+def test_published_artifact_source_reregisters_after_rejected_heartbeats(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        artifact_transfer_module.PublisherThread, "start", lambda self: None
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "kernel.bin").write_bytes(b"compiled-cache")
+    transfer = torch_compile_cache_artifact_transfer(
+        source,
+        tmp_path / "target",
+        tmp_path / "bundle",
+        chunk_size=8,
+    )
+    bundle = transfer.prepare_source()
+    identity = p2p_pb2.SourceIdentity(
+        mx_version="0.7.0",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+        model_name="test/model",
+    )
+    mx_client = _FakeMxClient(mx_source_id="server-artifact-source-id")
+    published = publish_artifact_source(
+        mx_client,
+        transfer,
+        bundle,
+        identity,
+        _FakeSourceNixlManager(listen_port=7010),
+        worker_id="source-worker-0",
+        worker_grpc_server=_FakeWorkerGrpcServer(),
+        host="127.0.0.1",
+    )
+    first_worker = mx_client.published_worker
+    mx_client.published_worker = None
+
+    # The server lost the record: it rejects two heartbeats, then accepts again.
+    replies = iter([False, False])
+    record_status = mx_client.update_status
+
+    def update_status(**kwargs):
+        record_status(**kwargs)
+        return next(replies, True)
+
+    mx_client.update_status = update_status
+    heartbeat = published.heartbeat
+    try:
+        heartbeat._tick()
+        heartbeat._tick()
+        assert heartbeat.mx_source_id is None
+        heartbeat._tick()
+    finally:
+        published.stop()
+
+    assert heartbeat.mx_source_id == "server-artifact-source-id"
+    assert mx_client.published_worker == first_worker
+    assert mx_client.status_updates[2] == (
+        "server-artifact-source-id",
+        "source-worker-0",
+        0,
+        p2p_pb2.SOURCE_STATUS_READY,
+    )
+
+
 def test_discover_artifact_source_does_not_rank_match_by_default(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -1815,7 +1878,10 @@ class _FakeMxClient:
             worker_id=worker_id,
         )
 
-    def update_status(self, mx_source_id, worker_id, worker_rank, status):
+    def update_status(
+        self, mx_source_id, worker_id, worker_rank, status, source_load=None
+    ):
+        del source_load
         self.status_updates.append((mx_source_id, worker_id, worker_rank, status))
         return True
 
