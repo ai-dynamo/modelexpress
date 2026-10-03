@@ -25,10 +25,36 @@ on:
       - 'pull-request/*'
       - main
       - 'release/**'
+  workflow_call:
+    inputs:
+      wheel_version:
+        description: >-
+          Full PEP440 version to stamp into modelexpress_client/python/pyproject.toml
+          before building (e.g. 0.5.0.dev20260805). Empty keeps the checked-in version.
+        required: false
+        type: string
+        default: ''
+      upload_prefix:
+        description: >-
+          Artifactory subpath overriding the pr/ / post-merge/ computation,
+          used verbatim (e.g. nightly). Wheel filenames are arch-unique; the
+          py3-none-any wheel and sdist are uploaded identically by both arch
+          jobs and simply overwrite each other.
+        required: false
+        type: string
+        default: ''
+      skip_upload:
+        description: Build the wheels but skip the Artifactory upload (dry runs).
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
-  group: build-wheels-${{ github.ref }}
-  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+  group: >-
+    ${{ (startsWith(github.ref, 'refs/heads/pull-request/') && inputs.wheel_version == '')
+        && format('build-wheels-{0}', github.ref)
+        || format('build-wheels-{0}-{1}-{2}', github.ref, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && inputs.wheel_version == '' }}
 
 permissions:
   contents: read
@@ -40,7 +66,7 @@ jobs:
     # targets their Artifactory. In a fork this queues forever waiting for a
     # runner that never checks in.
     if: github.repository == 'ai-dynamo/modelexpress'
-    environment: automated-release
+    environment: ${{ inputs.skip_upload != true && 'automated-release' || '' }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -55,27 +81,46 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.11.1
 
       - name: Compute artifactory subpath
         id: dest
+        env:
+          UPLOAD_PREFIX: ${{ inputs.upload_prefix }}
         run: |
-          case "${GITHUB_REF_NAME}" in
-            pull-request/*)
-              PR_ID="${GITHUB_REF_NAME#pull-request/}"
-              SUBPATH="pr/${PR_ID}/${{ github.sha }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.arch }}"
-              ;;
-            *)
-              SUBPATH="post-merge/${{ github.sha }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.arch }}"
-              ;;
-          esac
+          if [ -n "${UPLOAD_PREFIX}" ]; then
+            SUBPATH="${UPLOAD_PREFIX}"
+          else
+            case "${GITHUB_REF_NAME}" in
+              pull-request/*)
+                PR_ID="${GITHUB_REF_NAME#pull-request/}"
+                SUBPATH="pr/${PR_ID}/${{ github.sha }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.arch }}"
+                ;;
+              *)
+                SUBPATH="post-merge/${{ github.sha }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.arch }}"
+                ;;
+            esac
+          fi
           echo "subpath=${SUBPATH}" >> "$GITHUB_OUTPUT"
           echo "Destination subpath: ${SUBPATH}"
 
+      - name: Apply wheel version override
+        if: inputs.wheel_version != ''
+        env:
+          WHEEL_VERSION: ${{ inputs.wheel_version }}
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${WHEEL_VERSION}\"/" \
+            modelexpress_client/python/pyproject.toml
+          grep '^version = ' modelexpress_client/python/pyproject.toml
+
       - name: Build wheels
+        env:
+          WHEEL_VERSION: ${{ inputs.wheel_version }}
         run: |
           mkdir -p dist
           docker buildx build \
@@ -86,16 +131,39 @@ jobs:
             .
           echo "Built artifacts:"
           ls -la dist/
+          WHEEL_COUNT=$(find dist/ -maxdepth 1 -name '*.whl' | wc -l)
+          SDIST_COUNT=$(find dist/ -maxdepth 1 -name '*.tar.gz' | wc -l)
+          echo "wheels=${WHEEL_COUNT} sdists=${SDIST_COUNT}"
+          if [ "${WHEEL_COUNT}" -lt 1 ] || [ "${SDIST_COUNT}" -lt 1 ]; then
+            echo "::error::expected at least one wheel and one sdist in dist/, got ${WHEEL_COUNT}/${SDIST_COUNT}"
+            exit 1
+          fi
+          if [ -n "${WHEEL_VERSION}" ]; then
+            if ls dist/ | grep -v -- "-${WHEEL_VERSION}-\|^modelexpress-${WHEEL_VERSION}" | grep -q .; then
+              echo "::error::Artifacts in dist/ do not all carry version ${WHEEL_VERSION}"
+              ls dist/
+              exit 1
+            fi
+          fi
 
       - name: Set up JFrog CLI
-        uses: jfrog/setup-jfrog-cli@v4
+        if: inputs.skip_upload != true
+        uses: jfrog/setup-jfrog-cli@279b1f629f43dd5bc658d8361ac4802a7ef8d2d5 # v4.9.1
         env:
           JF_URL: ${{ secrets.ARTIFACTORY_URL }}
           JF_ACCESS_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
 
       - name: Upload to Artifactory
+        if: inputs.skip_upload != true
+        env:
+          UPLOAD_REPO: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
         run: |
-          DEST="${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}/${{ steps.dest.outputs.subpath }}/"
+          set -euo pipefail
+          if [ -z "${UPLOAD_REPO}" ]; then
+            echo "::error::ARTIFACTORY_PYPI_REPO_NAME is not set; refusing to upload to an empty repository path"
+            exit 1
+          fi
+          DEST="${UPLOAD_REPO}/${{ steps.dest.outputs.subpath }}/"
           echo "Uploading to: ${DEST}"
           jf rt upload --flat "dist/*.whl" "${DEST}"
           jf rt upload --flat "dist/*.tar.gz" "${DEST}"

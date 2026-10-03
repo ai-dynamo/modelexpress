@@ -10,6 +10,16 @@ on:
     branches:
       - main
       - 'release/*'
+  workflow_call:
+    inputs:
+      runs_on:
+        description: >-
+          Runner label for every job (the nightly passes the self-hosted
+          builder so nothing lands on GitHub-hosted runners). Empty keeps
+          ubuntu-latest for direct push/pull_request runs.
+        required: false
+        type: string
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,9 +33,8 @@ concurrency:
 jobs:
   test:
     name: Test Suite
-    runs-on: ubuntu-latest
-    env:
-      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 90
     strategy:
       matrix:
         rust:
@@ -40,6 +49,8 @@ jobs:
           - rust: nightly
             can-fail: true
     continue-on-error: ${{ matrix.can-fail }}
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
 
     steps:
     - name: Checkout repository
@@ -53,28 +64,32 @@ jobs:
 
     - name: Install Rust toolchain
       run: |
+        set -euo pipefail
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "${{ matrix.rust }}"
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Check Rust version
-      run: rustc --version
+      run: |
+        rustc --version
+        cargo --version
 
     - name: Cache dependencies
+      if: inputs.runs_on == ''
       uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
           target/
-        key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-cargo-${{ matrix.rust }}-
-          ${{ runner.os }}-cargo-
+          ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-${{ matrix.rust }}-
+          ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-
 
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+        sudo apt-get install -y protobuf-compiler build-essential
 
     - name: Check CRDs are up to date with Rust types
       if: matrix.rust == 'stable'
@@ -110,7 +125,7 @@ jobs:
 
   tls-feature-matrix:
     name: TLS Feature Matrix
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
     strategy:
       matrix:
         features:
@@ -131,6 +146,7 @@ jobs:
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Cache dependencies
+      if: inputs.runs_on == ''
       uses: actions/cache@v6
       with:
         path: |
@@ -145,7 +161,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+        sudo apt-get install -y protobuf-compiler pkg-config libssl-dev build-essential
 
     - name: Lint with clippy
       run: cargo clippy --workspace --all-targets ${{ matrix.features }} -- -D warnings
@@ -155,7 +171,7 @@ jobs:
 
   tls-no-backend-rejected:
     name: TLS No-Backend Rejected
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
 
     steps:
     - name: Checkout repository
@@ -171,7 +187,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+        sudo apt-get install -y protobuf-compiler build-essential
 
     - name: Building with no TLS backend must fail
       run: |
@@ -183,7 +199,8 @@ jobs:
 
   python-test:
     name: Python Tests (protobuf ${{ matrix.protobuf_major }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -206,6 +223,10 @@ jobs:
 
     - name: Install uv
       run: pip install uv
+
+    - name: Install C toolchain
+      # setup.py builds _alloc_ext with $CXX (default g++), not cc.
+      run: command -v g++ >/dev/null || { sudo apt-get update && sudo apt-get install -y build-essential; }
 
     - name: Install dependencies
       working-directory: modelexpress_client/python
@@ -263,7 +284,8 @@ jobs:
 
   go-test:
     name: Go Bindings
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 20
 
     steps:
     - name: Checkout repository
@@ -303,7 +325,8 @@ jobs:
 
   artifact-transfer-contract:
     name: Artifact Transfer Contract
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 45
     permissions:
       contents: read
 
@@ -319,21 +342,22 @@ jobs:
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Cache dependencies
+      if: inputs.runs_on == ''
       uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
           target/
-        key: ${{ runner.os }}-cargo-artifact-transfer-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-artifact-transfer-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-cargo-artifact-transfer-
-          ${{ runner.os }}-cargo-
+          ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-artifact-transfer-
+          ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-
 
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+        sudo apt-get install -y protobuf-compiler build-essential
 
     - name: Run artifact transfer contract tests
       run: |
@@ -341,14 +365,15 @@ jobs:
 
   integration-test:
     name: Integration Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 60
     needs: test
 
     services:
       redis:
         image: redis:7-alpine
         ports:
-          - 6379:6379
+          - 6379
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s
@@ -370,6 +395,7 @@ jobs:
       run: rustc --version
 
     - name: Cache dependencies
+      if: inputs.runs_on == ''
       uses: actions/cache@v6
       with:
         path: |
@@ -384,14 +410,14 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+        sudo apt-get install -y protobuf-compiler build-essential
 
     - name: Build release
       run: cargo build --release
 
     - name: Run registry backend Redis integration tests
       env:
-        REDIS_URL: redis://localhost:6379
+        REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
       run: |
         cargo test -p model-express-workspace-tests \
           --test registry_backend_redis \
@@ -416,7 +442,7 @@ jobs:
     - name: Run integration test script
       env:
         MX_METADATA_BACKEND: redis
-        REDIS_URL: redis://localhost:6379
+        REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
       run: |
         if [ -f run_integration_tests.sh ]; then
           chmod +x run_integration_tests.sh
@@ -426,7 +452,8 @@ jobs:
 
   security-audit:
     name: Security Audit
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 30
 
     steps:
     - name: Checkout repository
@@ -442,6 +469,9 @@ jobs:
     - name: Check Rust version
       run: rustc --version
 
+    - name: Install C toolchain
+      run: command -v cc >/dev/null || { sudo apt-get update && sudo apt-get install -y build-essential; }
+
     - name: Install cargo-audit
       run: cargo install cargo-audit --locked
 
@@ -455,7 +485,8 @@ jobs:
 
   code-coverage:
     name: Code Coverage
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 60
     needs: test
     permissions:
       contents: read
@@ -482,7 +513,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+        sudo apt-get install -y protobuf-compiler build-essential
 
     - name: Install cargo-llvm-cov
       run: cargo install cargo-llvm-cov
@@ -499,7 +530,8 @@ jobs:
 
   docker-build:
     name: Docker Build
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 45
     needs: test
 
     steps:
@@ -510,19 +542,27 @@ jobs:
 
     - name: Build Docker image
       run: |
-        docker build -f docker/Dockerfile -t model-express:latest .
+        docker build -f docker/Dockerfile -t "model-express:${{ github.run_id }}" .
 
     - name: Test Docker image
       run: |
-        docker run --rm --detach --name test-server -p 8001:8001 model-express:latest
+        NAME="mx-test-server-${{ github.run_id }}"
+        docker run --rm --detach --name "${NAME}" "model-express:${{ github.run_id }}"
         sleep 10
+        IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${NAME}")
         # Test that the server is responding (basic health check)
-        timeout 30 bash -c 'until curl -s http://localhost:8001/health; do sleep 1; done' || echo "Health check failed (expected for gRPC)"
-        docker stop test-server || true
+        timeout 30 bash -c "until curl -s http://${IP}:8001/health; do sleep 1; done" || echo "Health check failed (expected for gRPC)"
+
+    - name: Cleanup Docker image
+      if: always()
+      run: |
+        docker rm -f "mx-test-server-${{ github.run_id }}" 2>/dev/null || true
+        docker image rm -f "model-express:${{ github.run_id }}" 2>/dev/null || true
 
   k8s-grpc-test:
     name: Kubernetes gRPC Transfer Test
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 45
     needs: test
 
     steps:
@@ -531,17 +571,38 @@ jobs:
       with:
         persist-credentials: false
 
-    - name: Install kubectl
+    - name: Install kubectl, Helm and kind
       run: |
-        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-        chmod +x kubectl
-        sudo mv kubectl /usr/local/bin/
-
-    - name: Install Helm
-      run: |
-        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        set -euo pipefail
+        mkdir -p "${RUNNER_TEMP}/bin"
+        curl -fsSLo "${RUNNER_TEMP}/bin/kubectl" "https://dl.k8s.io/release/v1.31.4/bin/linux/amd64/kubectl"
+        chmod +x "${RUNNER_TEMP}/bin/kubectl"
+        curl -fsSLo "${RUNNER_TEMP}/bin/kind" "https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64"
+        chmod +x "${RUNNER_TEMP}/bin/kind"
+        curl -fsSL https://get.helm.sh/helm-v3.20.0-linux-amd64.tar.gz | tar xz -C "${RUNNER_TEMP}"
+        install "${RUNNER_TEMP}/linux-amd64/helm" "${RUNNER_TEMP}/bin/helm"
+        echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
     - name: Run gRPC transfer K8s test
+      env:
+        MX_KIND_CLUSTER_NAME: mx-grpc-${{ github.run_id }}-${{ github.run_attempt }}
+        KUBECONFIG: ${{ runner.temp }}/kubeconfig-grpc
+        MX_TEST_IMAGE_TAG: test-${{ github.run_id }}-${{ github.run_attempt }}
       run: |
         chmod +x test_grpc_transfer_k8s.sh
         ./test_grpc_transfer_k8s.sh
+
+    - name: Tear down kind cluster
+      if: always()
+      env:
+        MX_KIND_CLUSTER_NAME: mx-grpc-${{ github.run_id }}-${{ github.run_attempt }}
+        KUBECONFIG: ${{ runner.temp }}/kubeconfig-grpc
+        MX_TEST_IMAGE_TAG: test-${{ github.run_id }}-${{ github.run_attempt }}
+      run: |
+        if command -v kind >/dev/null 2>&1; then
+          kind delete cluster --name "${MX_KIND_CLUSTER_NAME}" 2>/dev/null || true
+        else
+          docker rm -f $(docker ps -aq --filter "label=io.x-k8s.kind.cluster=${MX_KIND_CLUSTER_NAME}") 2>/dev/null || true
+        fi
+        rm -f "${KUBECONFIG}" 2>/dev/null || true
+        docker image rm -f "modelexpress:${MX_TEST_IMAGE_TAG}" 2>/dev/null || true
