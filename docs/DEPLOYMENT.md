@@ -445,12 +445,23 @@ cannot package different charts.
 
 The `compliance` job uploads the two GitHub artifacts the nightly is allowed
 to produce, both dependency lists for OSRB review. Neither contains a build
-artifact.
+artifact. Both use Dynamo's OSRB CSV columns
+(`ecosystem,name,version,spdx,source_url,notes`).
 
 | Artifact | Contents | OSRB bug |
 |---|---|---|
-| `compliance-<sha>-modelexpress-server` | `linux_<arch>/osrb-modelexpress-server-<arch>-<sha8>.csv`: dpkg packages read from the image, plus the Rust crates statically linked into its binaries. `.diff.csv` drops packages the base image already ships. | container |
-| `license-<sha>-modelexpress` | `osrb-modelexpress-deps-<sha8>.csv`: the crate closure of the published crates and the Python closure of the wheel | source and crates |
+| `compliance-<sha>-modelexpress-server` | `linux_<arch>/osrb-modelexpress-server-<arch>-<sha8>.csv`: the dpkg and Python packages the image adds on top of its base image, plus the Rust crates compiled into its binaries. `.diff.csv`: what changed since the previous scheduled nightly, with a `change` column. `baseline/`: the baseline's provenance and CSV. | container |
+| `license-<sha>-modelexpress` | `osrb-modelexpress-deps-<sha8>.csv`: the crate closure of the published crates with all features, and the Python closure of the wheel with its user-facing extras on Python 3.10 to 3.13. `.diff.csv` and `baseline/BASELINE.md` as above. | source and crates |
+
+The diff baseline is the newest earlier scheduled `nightly-ci.yml` run on
+`main` whose GitLab trigger succeeded and that still has the same artifact
+(`.github/scripts/compliance/baseline.py`). Without one, the diff holds a
+single `baseline_unavailable` row; a failed lookup fails the job, and GitLab
+is only triggered when the compliance scan succeeds. Every row needs a valid
+SPDX expression. Add an entry with a source link to
+`.github/scripts/compliance/license_overrides.toml` to set a dpkg or image
+Python license, or to fill one that a crate or wheel dependency's metadata
+lacks.
 
 The image is scanned without running it: `.github/scripts/compliance/Dockerfile.extract`
 bind-mounts each arch's filesystem into an extractor on the runner's own

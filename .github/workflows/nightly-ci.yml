@@ -50,6 +50,7 @@ jobs:
       date: ${{ steps.meta.outputs.date }}
       sha7: ${{ steps.meta.outputs.sha7 }}
       nightly_tag: ${{ steps.meta.outputs.nightly_tag }}
+      build_tag: ${{ steps.meta.outputs.build_tag }}
       wheel_version: ${{ steps.meta.outputs.wheel_version }}
       crate_version: ${{ steps.meta.outputs.crate_version }}
       chart_version: ${{ steps.meta.outputs.chart_version }}
@@ -82,6 +83,7 @@ jobs:
             echo "date=${DATE}"
             echo "sha7=${SHA7}"
             echo "nightly_tag=${DATE}-${SHA7}"
+            echo "build_tag=${DATE}-${SHA7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
             echo "wheel_version=${WHEEL_BASE}.dev${DATE}"
             echo "crate_version=${CRATE_BASE}-nightly.${DATE}.g${SHA7}"
             echo "chart_version=${CHART_BASE}-nightly.${DATE}.g${SHA7}"
@@ -276,7 +278,7 @@ jobs:
       - name: Compute SERVER_IMAGE and scope docker credentials
         run: |
           echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-build-${{ matrix.arch }}" >> "$GITHUB_ENV"
-          echo "SERVER_IMAGE=${{ secrets.MX_IMAGE_REPO }}/modelexpress-server:${{ needs.preflight.outputs.nightly_tag }}-${{ matrix.arch }}" >> "$GITHUB_ENV"
+          echo "SERVER_IMAGE=${{ secrets.MX_IMAGE_REPO }}/modelexpress-server:${{ needs.preflight.outputs.build_tag }}-${{ matrix.arch }}" >> "$GITHUB_ENV"
 
       - name: Log in to image registry
         run: |
@@ -323,7 +325,7 @@ jobs:
       - name: Create multi-arch manifest
         env:
           REPO: ${{ secrets.MX_IMAGE_REPO }}/modelexpress-server
-          TAG: ${{ needs.preflight.outputs.nightly_tag }}
+          TAG: ${{ needs.preflight.outputs.build_tag }}
         run: |
           docker buildx imagetools create \
             -t "${REPO}:${TAG}" \
@@ -363,11 +365,68 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          # Keep in step with the cp310-cp313 wheels built by docker/Dockerfile.client-wheel.
+          python-version: |
+            3.10
+            3.11
+            3.12
+            3.13
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install the SPDX validator
+        run: python3 -m pip install --quiet 'packaging>=24.2'
+
+      - name: Fetch the previous nightly's evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for KIND in compliance license; do
+            case "${KIND}" in
+              compliance) NAME='compliance-{sha}-modelexpress-server' ;;
+              license) NAME='license-{sha}-modelexpress' ;;
+            esac
+            python3 .github/scripts/compliance/baseline.py \
+              --repo "${GITHUB_REPOSITORY}" --run-id "${GITHUB_RUN_ID}" \
+              --artifact "${NAME}" \
+              --require-job "Trigger GitLab release pipeline" \
+              --dest "${RUNNER_TEMP}/baseline/${KIND}" \
+              --info "${RUNNER_TEMP}/baseline/${KIND}.json"
+          done
+
+      - name: List the source and crate dependencies
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          EXTRAS=$(python3 -c 'import tomllib; d = tomllib.load(open("modelexpress_client/python/pyproject.toml", "rb"))["project"].get("optional-dependencies", {}); print(",".join(sorted(set(d) - {"dev", "codegen"})))')
+          WHEEL_SRC="./modelexpress_client/python${EXTRAS:+[${EXTRAS}]}"
+          REPORTS=()
+          for PY in 3.10 3.11 3.12 3.13; do
+            "python${PY}" -m pip install --quiet --dry-run --ignore-installed \
+              --report "${RUNNER_TEMP}/pip-report-${PY}.json" "${WHEEL_SRC}"
+            REPORTS+=(--pip-report "${RUNNER_TEMP}/pip-report-${PY}.json")
+          done
+          python3 .github/scripts/compliance/osrb.py source "${REPORTS[@]}" \
+            --sha "${SHA}" --baseline "${RUNNER_TEMP}/baseline/license.json" \
+            --out-dir osrb-out/license
 
       - name: Log in to the CI image registry
         run: |
@@ -379,23 +438,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: '3.12'
-
-      - name: Install Rust toolchain
-        run: |
-          set -euo pipefail
-          if ! command -v cargo >/dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
       - name: Scan the server image
         env:
           IMAGE: ${{ secrets.MX_IMAGE_REPO }}/modelexpress-server
-          TAG: ${{ needs.preflight.outputs.nightly_tag }}
+          TAG: ${{ needs.preflight.outputs.build_tag }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -404,7 +450,7 @@ jobs:
             echo "::error::no 'FROM <image> AS runtime' line in docker/Dockerfile"
             exit 1
           fi
-          echo "Diff baseline: ${BASE}"
+          echo "Base image: ${BASE}"
           extract() {
             docker buildx build \
               --build-arg TARGET_IMAGE="$1" \
@@ -423,35 +469,27 @@ jobs:
               --target-dir "${RUNNER_TEMP}/scan/image-${ARCH}" \
               --base-dir "${RUNNER_TEMP}/scan/base-${ARCH}" \
               --arch "${ARCH}" --sha "${SHA}" \
+              --baseline "${RUNNER_TEMP}/baseline/compliance.json" \
               --out-dir "osrb-out/compliance/linux_${ARCH}"
           done
-
-      - name: List the source and crate dependencies
-        env:
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          python3 -m pip install --quiet --dry-run --ignore-installed \
-            --report "${RUNNER_TEMP}/pip-report.json" ./modelexpress_client/python
-          python3 .github/scripts/compliance/osrb.py source \
-            --pip-report "${RUNNER_TEMP}/pip-report.json" \
-            --sha "${SHA}" --out-dir osrb-out/license
 
       - name: Upload container compliance results
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: compliance-${{ github.sha }}-modelexpress-server
-          path: osrb-out/compliance/**/*.csv
+          path: osrb-out/compliance/
           if-no-files-found: error
           retention-days: 30
+          overwrite: true
 
       - name: Upload source and crate compliance results
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: license-${{ github.sha }}-modelexpress
-          path: osrb-out/license/*.csv
+          path: osrb-out/license/
           if-no-files-found: error
           retention-days: 30
+          overwrite: true
 
       - name: Remove registry credentials
         if: always()
@@ -657,6 +695,7 @@ jobs:
           NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
           NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
           TAG: ${{ needs.preflight.outputs.nightly_tag }}
+          BUILD_TAG: ${{ needs.preflight.outputs.build_tag }}
         run: |
           set -euo pipefail
           DEST_NIGHTLY="nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/modelexpress-server-nightly"
@@ -675,11 +714,11 @@ jobs:
           echo "${NGC_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
 
           for ARCH in amd64 arm64; do
-            docker pull --platform "linux/${ARCH}" "${SRC_REPO}:${TAG}-${ARCH}"
-            docker tag "${SRC_REPO}:${TAG}-${ARCH}" "${DEST_NIGHTLY}:${TAG}-${ARCH}"
+            docker pull --platform "linux/${ARCH}" "${SRC_REPO}:${BUILD_TAG}-${ARCH}"
+            docker tag "${SRC_REPO}:${BUILD_TAG}-${ARCH}" "${DEST_NIGHTLY}:${TAG}-${ARCH}"
           done
 
-          float_tag "${SRC_REPO}:nightly" "${SRC_REPO}:${TAG}-amd64" "${SRC_REPO}:${TAG}-arm64"
+          float_tag "${SRC_REPO}:nightly" "${SRC_REPO}:${BUILD_TAG}-amd64" "${SRC_REPO}:${BUILD_TAG}-arm64"
 
           echo "${NGC_PUBLISH_TOKEN}" | docker login nvcr.io -u "${NGC_PUBLISH_USERNAME}" --password-stdin
           for ARCH in amd64 arm64; do
@@ -712,9 +751,10 @@ jobs:
           SRC_REPO: ${{ secrets.MX_IMAGE_REPO }}/modelexpress-server
           NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
           TAG: ${{ needs.preflight.outputs.nightly_tag }}
+          BUILD_TAG: ${{ needs.preflight.outputs.build_tag }}
         run: |
           for ARCH in amd64 arm64; do
-            docker image rm -f "${SRC_REPO}:${TAG}-${ARCH}" 2>/dev/null || true
+            docker image rm -f "${SRC_REPO}:${BUILD_TAG}-${ARCH}" 2>/dev/null || true
             docker image rm -f "nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/modelexpress-server-nightly:${TAG}-${ARCH}" 2>/dev/null || true
           done
           rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
@@ -773,7 +813,8 @@ jobs:
           needs.preflight.outputs.release == 'true' &&
           inputs.skip_gitlab_pipeline != true &&
           needs.stage-containers-ngc.result == 'success' &&
-          needs.build-wheels.result == 'success' }}
+          needs.build-wheels.result == 'success' &&
+          needs.compliance.result == 'success' }}
     environment: automated-release
     timeout-minutes: 15
     permissions:
