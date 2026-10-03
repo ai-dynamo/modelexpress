@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -19,21 +21,133 @@ from modelexpress.client import _get_server_url
 
 from ..rendezvous import CollectiveRendezvous
 from ..types import MeshSpec, ParamPlan, Placement, ReshardPlan
-from ._common import _endpoint as _normalize_endpoint
+from ._common import (
+    REPLICATED_DESTINATION_ABI,
+    SHARDED_DESTINATION_ABI,
+    _endpoint as _normalize_endpoint,
+)
 from .miles import (
     CollectiveTopology,
     MilesPublisher,
     MilesTrainerSession,
 )
+from .sglang_layout import SglangModelFacts, destination_shard_dim
 from .sglang_receiver import RECEIVER_PATH
 from .manifest import manifest_to_wire
 
 logger = logging.getLogger("modelexpress_rl.collective.integrations.miles_protocol")
 
-# Fixed for the basic path: one trainer rank, one publish group, and the
-# receiver build's ABI identity. Change them only in step with the receiver.
+# Fixed: one publish group per round and the connect probe deadline.
 _CONNECT_TIMEOUT_S = 10.0
-_ABI_VERSION = "miles-sglang-bf16-replicated-v1"
+_DST_LAYOUT_ENV = "MX_MILES_DST_LAYOUT"
+_DST_LAYOUT_ABI = {
+    "replicate": REPLICATED_DESTINATION_ABI,
+    "sharded": SHARDED_DESTINATION_ABI,
+}
+
+
+@dataclass(frozen=True)
+class TensorLayout:
+    """One HF-canonical tensor's shape and the dim the trainer's TP ranks
+    split evenly (None: every rank holds the identical whole tensor)."""
+
+    global_shape: tuple[int, ...]
+    shard_dim: int | None
+
+    def __post_init__(self) -> None:
+        shape = tuple(self.global_shape)
+        if not shape or any(
+            not isinstance(extent, int) or isinstance(extent, bool) or extent <= 0
+            for extent in shape
+        ):
+            raise ValueError(
+                f"global_shape must be non-empty positive integers, got {shape!r}"
+            )
+        object.__setattr__(self, "global_shape", shape)
+        dim = self.shard_dim
+        if dim is not None and (
+            not isinstance(dim, int)
+            or isinstance(dim, bool)
+            or not 0 <= dim < len(shape)
+        ):
+            raise ValueError(f"shard_dim must be None or a dim of {shape}, got {dim!r}")
+
+
+def _dst_layout() -> str:
+    layout = os.environ.get(_DST_LAYOUT_ENV, "replicate").strip() or "replicate"
+    if layout not in _DST_LAYOUT_ABI:
+        raise ValueError(
+            f"{_DST_LAYOUT_ENV} must be one of {sorted(_DST_LAYOUT_ABI)}, "
+            f"got {layout!r}"
+        )
+    return layout
+
+
+def _gloo_group():
+    from miles.utils.distributed_utils import get_gloo_group
+
+    return get_gloo_group()
+
+
+def _rank_and_world() -> tuple[int, int]:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
+def _all_gather(value: Any) -> list[Any]:
+    """Every trainer rank's ``value``, in rank order, over the Gloo group."""
+    _rank, world = _rank_and_world()
+    if world == 1:
+        return [value]
+    gathered: list[Any] = [None] * world
+    dist.all_gather_object(gathered, value, group=_gloo_group())
+    return gathered
+
+
+def _broadcast_from_rank_zero(value: Any) -> Any:
+    _rank, world = _rank_and_world()
+    if world == 1:
+        return value
+    box = [value]
+    dist.broadcast_object_list(box, src=0, group=_gloo_group())
+    return box[0]
+
+
+def _gathered_failures(local_error: str) -> list[str]:
+    """Fan one local error string out; return every rank's non-empty error."""
+    return [
+        f"rank {rank}: {error}"
+        for rank, error in enumerate(_all_gather(local_error))
+        if error
+    ]
+
+
+def _group_size_and_rank(parallel_state: Any, name: str) -> tuple[int, int]:
+    group = getattr(parallel_state, name, None)
+    size = getattr(group, "size", None)
+    rank = getattr(group, "rank", None)
+    if (
+        not isinstance(size, int)
+        or not isinstance(rank, int)
+        or size < 1
+        or not 0 <= rank < size
+    ):
+        raise ValueError(
+            f"MILES parallel state {name!r} needs an integer size >= 1 and a "
+            f"rank in [0, size), got size={size!r} rank={rank!r}"
+        )
+    return size, rank
+
+
+def _model_facts(args: Any) -> SglangModelFacts:
+    checkpoint = getattr(args, "hf_checkpoint", None)
+    if not checkpoint:
+        raise ValueError(
+            f"{_DST_LAYOUT_ENV}=sharded reads the model's head counts and "
+            "vocabulary from the HF config; pass --hf-checkpoint"
+        )
+    return SglangModelFacts.from_checkpoint(str(checkpoint))
 
 
 def _server_endpoint() -> str:
@@ -132,8 +246,9 @@ def _await_endpoint_ready(channel: Any, *, endpoint: str, timeout_s: float) -> N
 class MilesCollectiveProtocolCore:
     """MILES bucket-stream bridge used by the lazy protocol factory.
 
-    Maps the ModelExpress trainer client flow onto the MILES weight-transfer
-    seam; the integration README carries the round lifecycle.
+    Every trainer rank of a DP x TP trainer is a sender in one reshard lane;
+    rank 0 alone drives the generator fan-out, and local failures fan out
+    over the trainer's Gloo group. Round flow: see the integrations README.
     """
 
     def __init__(self, args: Any) -> None:
@@ -147,8 +262,13 @@ class MilesCollectiveProtocolCore:
         self._selector = "target"
         self._engine_gpu_counts: tuple[int, ...] = ()
         self._engine_gpu_offsets: tuple[int, ...] = ()
+        self._dp_size = 1
+        self._tp_size = 1
+        self._lane_rank = 0
+        self._iterator_layouts: Any = None
         self._tensors: dict[str, torch.Tensor] | None = None
-        self._canonical_shapes: dict[str, tuple[int, ...]] | None = None
+        self._local_shapes: dict[str, tuple[int, ...]] | None = None
+        self._layouts: dict[str, TensorLayout] | None = None
         self._topology: CollectiveTopology | None = None
         self._plan: ReshardPlan | None = None
         self._publish_groups: tuple[tuple[str, ...], ...] | None = None
@@ -160,9 +280,11 @@ class MilesCollectiveProtocolCore:
         _server_host_port(self._endpoint)
         # The engine-side receiver group, named at prepare.
         self._engine_group_name: str | None = None
-        # A fresh hex id per protocol: it prefixes every slot, and hex can
-        # never contain the Redis lane-record delimiters.
-        self._run_id = uuid4().hex
+        self._dst_layout = _dst_layout()
+        # Agreed across trainer ranks at the first begin_sync: rank 0's fresh
+        # hex id prefixes every slot, and hex can never contain the Redis
+        # lane-record delimiters.
+        self._run_id: str | None = None
         self._session: MilesTrainerSession | None = None
         self._channel = None
         self._rendezvous = None
@@ -177,10 +299,8 @@ class MilesCollectiveProtocolCore:
         self._round_futures: list = []
 
     def _validate_selector(self, selector: str) -> None:
-        # SG-1 rejects every receiver round while a speculative draft model
-        # exists, whatever selector the round carries; detect the
-        # misconfiguration here so connect fails fast with an actionable
-        # error instead of the first round failing on every engine.
+        # SG-1 rejects every receiver round while a draft model exists; fail
+        # here at connect instead of in the first round on every engine.
         if getattr(self.args, "sglang_speculative_algorithm", None):
             raise ValueError(
                 "MILES NCCL M2N does not support speculative decoding: SGLang "
@@ -190,6 +310,15 @@ class MilesCollectiveProtocolCore:
             )
         if selector not in ("all", "target"):
             raise ValueError("MILES NCCL M2N supports the base target model only")
+
+    def configure_model(self, iterator: Any) -> None:
+        """Record the trainer's HF weight iterator for ``_tensor_layouts``.
+
+        Nothing calls this at the pinned MILES revision, so the
+        ``_tensor_layouts`` gate is inert; ``connect``'s gather rejection is
+        the live guard against trainer-local sources.
+        """
+        self._iterator_layouts = getattr(iterator, "tensor_layouts", None)
 
     def connect(
         self,
@@ -239,20 +368,24 @@ class MilesCollectiveProtocolCore:
         ]
         if len(slots) != len(set(slots)):
             raise ValueError("engine GPU ranges must not overlap")
-        # Every parallel dimension at one means exactly one trainer rank.
+        if self._dst_layout == "sharded" and len(set(counts)) != 1:
+            raise ValueError(
+                f"{_DST_LAYOUT_ENV}=sharded requires every engine to have the "
+                f"same TP size, got engine GPU counts {list(counts)}"
+            )
+        # The source mesh is (DP, TP): every other parallel dimension is one.
         if any(
             getattr(getattr(parallel_state, name, None), "size", None) != 1
-            for name in ("pp", "tp", "ep", "etp", "cp", "intra_dp", "indep_dp")
+            for name in ("pp", "ep", "etp", "cp", "indep_dp")
         ):
             raise ValueError(
-                "the MILES NCCL M2N path supports a single trainer rank "
-                "(PP/TP/EP/CP/DP must all be one)"
+                "the MILES NCCL M2N path supports a DP x TP trainer only "
+                "(PP/EP/ETP/CP must be one, and DP must be intra-DP)"
             )
-        # miles re-calls connect() when the rollout engine set heals; a stale
-        # session must not survive (its engines never received prepare).
-        # Reachable only before any round has failed: a failed round closes
-        # the protocol terminally, and a mid-round reconnect is rejected
-        # above.
+        dp_size, dp_rank = _group_size_and_rank(parallel_state, "intra_dp")
+        tp_size, tp_rank = _group_size_and_rank(parallel_state, "tp")
+        # Reconnect tears the stale session down: a skipped re-prepare would
+        # fan run_round out to engines that never received prepare.
         if (
             self._session is not None
             or self._rendezvous is not None
@@ -265,81 +398,134 @@ class MilesCollectiveProtocolCore:
         self._engine_gpu_offsets = offsets
         self._parallel_state = parallel_state
         self._selector = selector
-        # The single trainer rank owns every tensor and drives the lane.
+        self._dp_size = dp_size
+        self._tp_size = tp_size
+        self._lane_rank = dp_rank * tp_size + tp_rank
+        # Every trainer rank holds every tensor whole (TP is gathered) and
+        # posts it in the one reshard lane, so every rank is a sender.
         self.is_sender = True
+
+    def _tensor_layouts(
+        self, local_shapes: dict[str, tuple[int, ...]]
+    ) -> dict[str, TensorLayout]:
+        """The layout of every tensor this rank's stream yielded, by HF name.
+
+        ``tensor_layouts`` None is the gathered-stream contract: whole tensors
+        on every rank. An iterator carrying ``tensor_layouts`` is asking for
+        trainer-local shards, which this build does not support.
+        """
+        if self._iterator_layouts is not None:
+            raise ValueError(
+                "the MILES iterator's tensor_layouts describe trainer-local TP "
+                "shards; MILES NCCL M2N needs a gathered stream (tensor_layouts "
+                "absent or None) because trainer-local sources are not supported"
+            )
+        return {name: TensorLayout(shape, None) for name, shape in local_shapes.items()}
 
     def begin_sync(self, weight_version: int, iter_buckets) -> bool:
         """Materialize and validate the base-weight stream and arm the round.
 
-        Round one freezes the plan/topology contract; later calls revalidate
-        the stream against it and copy into its stable wire buffers.
+        Each tensor is validated and copied into its stable wire buffer as it
+        arrives; ``send_bucket`` only tracks arrival order. A local failure
+        fans out over the trainer's Gloo group before the contract build's
+        collectives so no peer strands inside one.
         """
-        if self.rollout_engines is None:
-            raise RuntimeError("connect must run before begin_sync")
-        if self._closed:
-            raise RuntimeError("the MILES NCCL M2N protocol is closed")
-        if self._round_version is not None:
-            raise RuntimeError(
-                f"the round for version {self._round_version!r} never finalized"
-            )
-        canonical = self._canonical_shapes
-        first_round = canonical is None
-        frozen: dict[str, tuple[int, ...]]
-        prepared: dict[str, torch.Tensor]
-        if first_round:
-            frozen = {}
-            prepared = {}
-        else:
-            if self._tensors is None or canonical is None:
-                raise RuntimeError("wire buffers are unavailable")
-            frozen = canonical
-            prepared = self._tensors
-        seen: set[str] = set()
-        shapes: dict[str, tuple[int, ...]] = {}
-        for bucket in iter_buckets(materialize=True):
-            for name, tensor in bucket:
-                if ":" in name:
-                    raise ValueError("LoRA/adaptor tensors are not supported")
-                if name in seen:
-                    raise ValueError(f"duplicate HF weight name {name!r}")
-                seen.add(name)
-                if tensor.ndim == 0:
-                    raise ValueError(f"{name}: scalar weights are not supported")
-                if tensor.dtype is not torch.bfloat16:
-                    raise ValueError(f"{name}: only BF16 base weights are supported")
-                if not tensor.is_contiguous():
-                    raise ValueError(
-                        f"{name}: materialized HF weight is not contiguous"
-                    )
-                shape = tuple(int(dim) for dim in tensor.shape)
-                if first_round:
-                    # The contiguity check above already pins the memory
-                    # format, so clone() preserves it.
-                    prepared[name] = tensor.clone()
-                else:
-                    # A mid-stream failure can leave earlier wire buffers
-                    # already overwritten; that is safe because a failed
-                    # begin_sync never arms a round, and the next begin_sync
-                    # rewrites every buffer before use.
-                    if frozen.get(name) != shape:
-                        raise RuntimeError(
-                            "MILES tensor names or canonical shapes changed"
+        local_shapes: dict[str, tuple[int, ...]] | None = None
+        prepared_tensors: dict[str, torch.Tensor] | None = None
+        layouts: dict[str, TensorLayout] | None = None
+        facts: SglangModelFacts | None = None
+        local_exception: BaseException | None = None
+        local_error = ""
+        try:
+            if self.rollout_engines is None:
+                raise RuntimeError("connect must run before begin_sync")
+            if self._closed:
+                raise RuntimeError("the MILES NCCL M2N protocol is closed")
+            if self._round_version is not None:
+                raise RuntimeError(
+                    f"the round for version {self._round_version!r} never finalized"
+                )
+            first_round = self._local_shapes is None
+            frozen: dict[str, tuple[int, ...]]
+            prepared: dict[str, torch.Tensor]
+            if first_round:
+                frozen = {}
+                prepared = {}
+            else:
+                if self._tensors is None:
+                    raise RuntimeError("wire buffers are unavailable")
+                frozen = self._local_shapes or {}
+                prepared = self._tensors
+            seen: set[str] = set()
+            shapes: dict[str, tuple[int, ...]] = {}
+            for bucket in iter_buckets(materialize=True):
+                for name, tensor in bucket:
+                    if ":" in name:
+                        raise ValueError("LoRA/adaptor tensors are not supported")
+                    if name in seen:
+                        raise ValueError(f"duplicate HF weight name {name!r}")
+                    seen.add(name)
+                    if tensor.ndim == 0:
+                        raise ValueError(f"{name}: scalar weights are not supported")
+                    if tensor.dtype is not torch.bfloat16:
+                        raise ValueError(
+                            f"{name}: only BF16 base weights are supported"
                         )
-                    prepared[name].copy_(tensor)
-                shapes[name] = shape
-        if not shapes:
-            raise ValueError("MILES produced no base-model tensors")
-        if not first_round and shapes.keys() != frozen.keys():
-            raise RuntimeError("MILES tensor names or canonical shapes changed")
-        if first_round:
-            # Nothing is committed until the contract builds: a failed first
-            # call leaves first_round true, so a retry revalidates the whole
-            # stream instead of inheriting the failed attempt's shapes.
-            self._build_frozen_contract(prepared)
-            self._canonical_shapes = shapes
-            self._tensors = prepared
-        else:
-            self._build_frozen_contract(None)
+                    if not tensor.is_contiguous():
+                        raise ValueError(
+                            f"{name}: materialized HF weight is not contiguous"
+                        )
+                    shape = tuple(int(dim) for dim in tensor.shape)
+                    if first_round:
+                        # The contiguity check above already pins the memory
+                        # format, so clone() preserves it.
+                        prepared[name] = tensor.clone()
+                    else:
+                        # A mid-stream failure can leave earlier wire buffers
+                        # already overwritten; that is safe because a failed
+                        # begin_sync never arms a round, and the next begin_sync
+                        # rewrites every buffer before use.
+                        if frozen.get(name) != shape:
+                            raise RuntimeError(
+                                "MILES tensor names or canonical shapes changed"
+                            )
+                        prepared[name].copy_(tensor)
+                    shapes[name] = shape
+            if not shapes:
+                raise ValueError("MILES produced no base-model tensors")
+            if not first_round and shapes.keys() != frozen.keys():
+                raise RuntimeError("MILES tensor names or canonical shapes changed")
+            layouts = self._tensor_layouts(shapes)
+            if not first_round and layouts != self._layouts:
+                raise RuntimeError("MILES tensor layouts changed")
+            if first_round and self._dst_layout == "sharded":
+                facts = _model_facts(self.args)
+            local_shapes = shapes
+            prepared_tensors = prepared
+        except BaseException as error:
+            local_exception = error
+            local_error = repr(error)
+        failures = _gathered_failures(local_error)
+        if failures:
+            _rank, world = _rank_and_world()
+            if world == 1 and local_exception is not None:
+                raise local_exception
+            error = RuntimeError(
+                "MILES NCCL M2N begin_sync preparation failed: "
+                + "; ".join(failures[:4])
+            )
+            if local_exception is not None:
+                raise error from local_exception
+            raise error
+        if local_shapes is None or prepared_tensors is None or layouts is None:
+            raise RuntimeError("MILES NCCL M2N preparation produced no tensor state")
+        # The contract build reads the new layouts and shapes from arguments;
+        # nothing commits until it returns successfully.
+        self._build_frozen_contract(facts, layouts)
+        if self._local_shapes is None:
+            self._local_shapes = local_shapes
+            self._tensors = prepared_tensors
+            self._layouts = layouts
         self._arm_round(weight_version)
         return True
 
@@ -362,8 +548,27 @@ class MilesCollectiveProtocolCore:
         self._next_group = 0
         self._round_futures = []
 
-    def _build_frozen_contract(self, tensors: dict[str, torch.Tensor] | None) -> None:
-        slot_prefix = f"{self._run_id}:"
+    def _build_frozen_contract(
+        self, facts: SglangModelFacts | None, layouts: dict[str, TensorLayout]
+    ) -> None:
+        """Build or re-check the frozen topology/plan without committing state.
+
+        Everything the collectives need (``layouts`` for the manifest) comes
+        in as an argument; ``self._run_id`` runs through a local so a failed
+        build leaves no protocol state behind.
+        """
+        _rank, trainer_world = _rank_and_world()
+        if trainer_world != self._dp_size * self._tp_size:
+            raise ValueError(
+                f"the trainer world ({trainer_world}) must be exactly DP x TP "
+                f"({self._dp_size} x {self._tp_size})"
+            )
+        run_id = self._run_id
+        if run_id is None:
+            # Every rank proposes a fresh id and rank 0's wins, so every rank
+            # names the same slots without any configuration.
+            run_id = _all_gather(uuid4().hex)[0]
+        slot_prefix = f"{run_id}:"
         generator_slots = tuple(
             f"{slot_prefix}generator-{slot}"
             for offset, count in zip(
@@ -379,46 +584,116 @@ class MilesCollectiveProtocolCore:
             # the frozen contract the receiver sees; keep it in step with the
             # deployed receiver build.
             model_name="miles-model",
-            trainer_slots=(f"{slot_prefix}trainer-0",),
+            trainer_slots=tuple(
+                f"{slot_prefix}trainer-{lane_rank}"
+                for lane_rank in range(trainer_world)
+            ),
             generator_slots=generator_slots,
             source_partition_count=1,
-            m2n_abi_version=_ABI_VERSION,
+            m2n_abi_version=_DST_LAYOUT_ABI[self._dst_layout],
         )
         if self._plan is not None:
-            # Later rounds reuse the round-one plan: the wire buffers and
-            # canonical shapes are pinned (begin_sync only copy_()s into them
-            # after revalidating names and shapes). The topology is still
-            # rebuilt and compared every round: a reconnect that heals into a
-            # reshaped engine GPU topology must fail closed.
+            # Later rounds rebuild only the topology and compare it: a
+            # reconnect that heals into a reshaped engine GPU topology fails
+            # closed. The skip is uniform because _plan is set on every rank
+            # or on none.
             if topology != self._topology:
                 raise RuntimeError("MILES tensor names, shapes, or topology changed")
             return
-        if tensors is None:
-            raise RuntimeError("begin_sync has not materialized weights")
-        src_mesh = MeshSpec((1,), rank_offset=0)
-        dst_mesh = MeshSpec((len(generator_slots),), rank_offset=1)
-        entries = [
-            ParamPlan(
-                name=name,
-                global_shape=tuple(int(dim) for dim in tensor.shape),
-                dtype="bfloat16",
-                partition_id=0,
-                src_mesh=src_mesh,
-                src_placements=(Placement.replicate(),),
-                dst_mesh=dst_mesh,
-                dst_placements=(Placement.replicate(),),
-                group_key="publish-group-0",
+        local_manifest = sorted(
+            (name, layout.global_shape, layout.shard_dim)
+            for name, layout in layouts.items()
+        )
+        manifests = _all_gather((self._lane_rank, local_manifest))
+        lane_ranks = sorted(lane_rank for lane_rank, _manifest in manifests)
+        if lane_ranks != list(range(trainer_world)):
+            raise ValueError(
+                "trainer ranks must cover every (DP, TP) coordinate exactly once; "
+                f"got lane ranks {lane_ranks}"
             )
-            for name, tensor in tensors.items()
+        reference = manifests[0][1]
+        diverged = [
+            rank
+            for rank, (_lane_rank, manifest) in enumerate(manifests)
+            if manifest != reference
         ]
+        if diverged:
+            raise ValueError(
+                "every trainer rank must report the same HF names, global shapes, "
+                f"and shard dims; ranks {diverged[:5]} differ from rank 0"
+            )
+        src_mesh = (
+            MeshSpec((self._tp_size,))
+            if self._dp_size == 1
+            else MeshSpec((self._dp_size, self._tp_size))
+        )
+        dst_mesh, engine_tp = self._destination_mesh(
+            len(generator_slots), src_mesh.size
+        )
+        entries = []
+        for name, global_shape, shard_dim in reference:
+            inner = (
+                Placement.replicate()
+                if shard_dim is None
+                else Placement.shard(shard_dim)
+            )
+            src_placements = (Placement.replicate(),) * (len(src_mesh.shape) - 1) + (
+                inner,
+            )
+            dst_dim = None
+            if self._dst_layout == "sharded":
+                if facts is None:
+                    raise RuntimeError("sharded destinations need the model facts")
+                dst_dim = destination_shard_dim(name, global_shape, engine_tp, facts)
+            dst_inner = (
+                Placement.replicate() if dst_dim is None else Placement.shard(dst_dim)
+            )
+            dst_placements = (Placement.replicate(),) * (len(dst_mesh.shape) - 1) + (
+                dst_inner,
+            )
+            entries.append(
+                ParamPlan(
+                    name=name,
+                    global_shape=global_shape,
+                    dtype="bfloat16",
+                    partition_id=0,
+                    src_mesh=src_mesh,
+                    src_placements=src_placements,
+                    dst_mesh=dst_mesh,
+                    dst_placements=dst_placements,
+                    group_key="publish-group-0",
+                )
+            )
         # Canonical order is the wire contract: the receiver canonical-sorts
         # too, so both sides post the same per-lane tensor sequence.
         entries.sort(key=lambda entry: entry.canonical())
         group = tuple(entry.name for entry in entries)
+        # Commit only here: every check above passed.
+        self._run_id = run_id
         self._topology = topology
         self._plan = ReshardPlan(bulk=entries, source_partition_count=1)
         self._publish_groups = (group,)
         self._group_of = dict.fromkeys(group, 0)
+
+    def _destination_mesh(
+        self, generator_count: int, trainer_count: int
+    ) -> tuple[MeshSpec, int]:
+        """The generator mesh and the TP size a sharded entry splits over.
+
+        ``replicate``: a flat ``(generators,)`` mesh. ``sharded``: ``(TP,)``
+        for one engine, ``(engines, TP)`` with a replicated engine axis for
+        several, in slot order.
+        """
+        if self._dst_layout == "replicate":
+            return MeshSpec((generator_count,), rank_offset=trainer_count), 1
+        engine_tp = self._engine_gpu_counts[0]
+        engines = len(self._engine_gpu_counts)
+        if engines == 1:
+            return MeshSpec((engine_tp,), rank_offset=trainer_count), engine_tp
+        return (
+            MeshSpec((engines, engine_tp), rank_offset=trainer_count),
+            engine_tp,
+        )
 
     def send_bucket(self, bucket: list[tuple[str, torch.Tensor]]) -> None:
         """Publish each frozen plan group as soon as this bucket completes it.
@@ -441,6 +716,8 @@ class MilesCollectiveProtocolCore:
         # not a transient error. The generators are already paused mid-round,
         # so continuing a diverged round would risk publishing a wrong-plan
         # weight set; close the protocol like any other mid-round failure.
+        local_exception: BaseException | None = None
+        local_error = ""
         try:
             unknown = [name for name in names if name not in self._group_of]
             if unknown:
@@ -461,8 +738,24 @@ class MilesCollectiveProtocolCore:
                     f"{version}: {repeated[:5]}"
                 )
         except BaseException as error:
+            local_exception = error
+            local_error = repr(error)
+        # Every rank joins the vote even with no local divergence, so one
+        # rank's diverged stream fails its peers here instead of stranding
+        # them inside the round-setup collectives below.
+        failures = _gathered_failures(local_error)
+        if failures:
+            _rank, world = _rank_and_world()
+            if world == 1 and local_exception is not None:
+                self._close_preserving(local_exception)
+                raise local_exception
+            error = RuntimeError(
+                "MILES NCCL M2N bucket stream diverged: " + "; ".join(failures[:4])
+            )
             self._close_preserving(error)
-            raise
+            if local_exception is not None:
+                raise error from local_exception
+            raise error
         if not self._round_begun:
             if self._session is None:
                 try:
@@ -488,17 +781,40 @@ class MilesCollectiveProtocolCore:
         session = self._session
         if session is None:
             raise RuntimeError("collective sessions were not prepared")
-        operation_id = session.create_transfer(version=version)
+        rank, _world = _rank_and_world()
+        futures: list = []
+        submission_error = ""
+        operation_id = None
+        if rank == 0:
+            try:
+                operation_id = session.create_transfer(version=version)
+                if not operation_id:
+                    raise RuntimeError("MX did not create a transfer operation")
+                # Set before the fan-out so the terminal close can still
+                # report the created operation if the submission fails.
+                self._round_operation_id = operation_id
+                futures = self._generator_futures(
+                    "run_round",
+                    version=version,
+                    operation_id=operation_id,
+                )
+            except BaseException as error:
+                submission_error = repr(error)
+        # Tracked before the gather so the caller's terminal close retires
+        # them if anything below raises.
+        self._round_futures = futures
+        submission_failures = _gathered_failures(submission_error)
+        if submission_failures:
+            raise RuntimeError(
+                "MILES NCCL M2N round generator submission failed: "
+                + "; ".join(submission_failures[:4])
+            )
+        operation_id = _broadcast_from_rank_zero(operation_id)
         if not operation_id:
             raise RuntimeError("MX did not create a transfer operation")
-        self._round_operation_id = operation_id
-        # Tracked before begin_round so the caller's terminal close retires
-        # them if anything below raises.
-        self._round_futures = self._generator_futures(
-            "run_round",
-            version=version,
-            operation_id=operation_id,
-        )
+        if rank != 0:
+            # Rank 0 assigned above, from create_transfer.
+            self._round_operation_id = operation_id
         session.begin_round(version=version)
         self._round_begun = True
 
@@ -527,7 +843,9 @@ class MilesCollectiveProtocolCore:
                 f"finalize names version {version!r}, but the round in flight "
                 f"is {self._round_version!r}"
             )
+        rank, _world = _rank_and_world()
         local_exception: BaseException | None = None
+        local_error = ""
         try:
             if not self._round_begun:
                 raise RuntimeError(
@@ -547,21 +865,30 @@ class MilesCollectiveProtocolCore:
             )
         except BaseException as error:
             local_exception = error
-        futures_exception: BaseException | None = None
-        if local_exception is not None:
-            _retire_dropped_futures(self._round_futures)
-        else:
-            try:
-                self._wait_generator_futures(self._round_futures)
-            except BaseException as error:
-                futures_exception = error
-        failure = local_exception or futures_exception
-        if failure is not None:
-            primary = RuntimeError(f"MILES NCCL M2N round failed: {failure!r}")
+            local_error = repr(error)
+        failures = _gathered_failures(local_error)
+        futures_error = ""
+        if rank == 0:
+            if failures:
+                _retire_dropped_futures(self._round_futures)
+            else:
+                try:
+                    self._wait_generator_futures(self._round_futures)
+                except BaseException as error:
+                    futures_error = repr(error)
+        futures_error = _broadcast_from_rank_zero(futures_error)
+        if futures_error:
+            failures.append(f"generators: {futures_error}")
+        if failures:
+            primary = RuntimeError(
+                "MILES NCCL M2N round failed: " + "; ".join(failures[:4])
+            )
             self._report_round_failure(primary)
             self._disarm_round()
             self._close_preserving(primary)
-            raise primary from failure
+            if local_exception is not None:
+                raise primary from local_exception
+            raise primary
         self._disarm_round()
 
     def after_engines_resumed(self) -> None:
@@ -731,54 +1058,103 @@ class MilesCollectiveProtocolCore:
             or self._publish_groups is None
         ):
             raise RuntimeError("begin_sync must run before session preparation")
-        # Failures propagate to send_bucket, which closes the protocol and so
-        # releases whatever of the channel/rendezvous/session was created.
-        endpoint = self._endpoint
-        channel = auth.with_auth(grpc.insecure_channel(endpoint))
+        rank, _world = _rank_and_world()
+        lane_rank = self._lane_rank
+        # Every local step is inside the failure fan-out so one rank's error
+        # reaches the shared gather; from there send_bucket closes the protocol.
+        local_error = ""
         try:
-            _await_endpoint_ready(
-                channel,
-                endpoint=endpoint,
-                timeout_s=_CONNECT_TIMEOUT_S,
-            )
-        except BaseException:
-            try:
-                channel.close()
-            except BaseException:
-                logger.warning(
-                    "closing the unreachable ModelExpress channel failed",
-                    exc_info=True,
+            local_tensors = dict(self._tensors)
+            expected_names = {entry.name for entry in self._plan.bulk}
+            if set(local_tensors) != expected_names:
+                missing = sorted(expected_names - set(local_tensors))
+                unexpected = sorted(set(local_tensors) - expected_names)
+                raise ValueError(
+                    f"lane rank {lane_rank} tensors do not match the global plan "
+                    f"(missing={missing[:5]}, unexpected={unexpected[:5]})"
                 )
-            raise
-        self._channel = channel
-        rendezvous = CollectiveRendezvous(channel)
-        self._rendezvous = rendezvous
-        publisher = MilesPublisher(
-            plan=self._plan,
-            source_partition=0,
-            tensors=dict(self._tensors),
-        )
-        slot_id = self._topology.trainer_slots[0]
-        session = MilesTrainerSession.create(
-            rendezvous=rendezvous,
-            topology=self._topology,
-            publisher=publisher,
-            source_partition=0,
-            slot_id=slot_id,
-            worker_id=f"miles-{slot_id}-{uuid4().hex}",
-            index_in_role=0,
-            layer_groups=self._publish_groups,
-            device=next(iter(self._tensors.values())).device,
-        )
-        self._session = session
+            endpoint = self._endpoint
+            channel = auth.with_auth(grpc.insecure_channel(endpoint))
+            try:
+                _await_endpoint_ready(
+                    channel,
+                    endpoint=endpoint,
+                    timeout_s=_CONNECT_TIMEOUT_S,
+                )
+            except BaseException:
+                try:
+                    channel.close()
+                except BaseException:
+                    logger.warning(
+                        "closing the unreachable ModelExpress channel failed",
+                        exc_info=True,
+                    )
+                raise
+            self._channel = channel
+            rendezvous = CollectiveRendezvous(channel)
+            self._rendezvous = rendezvous
+            publisher = MilesPublisher(
+                plan=self._plan,
+                source_partition=0,
+                tensors=local_tensors,
+                source_rank=lane_rank,
+            )
+            slot_id = self._topology.trainer_slots[lane_rank]
+            self._session = MilesTrainerSession.create(
+                rendezvous=rendezvous,
+                topology=self._topology,
+                publisher=publisher,
+                source_partition=0,
+                slot_id=slot_id,
+                worker_id=f"miles-{slot_id}-{uuid4().hex}",
+                index_in_role=lane_rank,
+                layer_groups=self._publish_groups,
+                device=next(iter(local_tensors.values())).device,
+            )
+        except BaseException as error:
+            local_error = repr(error)
+        setup_failures = _gathered_failures(local_error)
+        if setup_failures:
+            raise RuntimeError(
+                "MILES NCCL M2N local session setup failed: "
+                + "; ".join(setup_failures[:4])
+            )
+        session = self._session
+        if session is None:
+            raise RuntimeError("collective session was not prepared")
 
-        generator_futures = self._generator_futures("prepare")
+        generator_futures = []
+        submission_error = ""
+        if rank == 0:
+            try:
+                generator_futures = self._generator_futures("prepare")
+            except BaseException as error:
+                submission_error = repr(error)
+        submission_failures = _gathered_failures(submission_error)
+        if submission_failures:
+            raise RuntimeError(
+                "MILES NCCL M2N generator preparation submission failed: "
+                + "; ".join(submission_failures[:4])
+            )
+
+        local_error = ""
         try:
             session.prepare()
-        except BaseException:
-            _retire_dropped_futures(generator_futures)
-            raise
-        self._wait_generator_futures(generator_futures)
+        except BaseException as error:
+            local_error = repr(error)
+        if rank == 0:
+            if local_error:
+                _retire_dropped_futures(generator_futures)
+            else:
+                try:
+                    self._wait_generator_futures(generator_futures)
+                except BaseException as error:
+                    local_error = repr(error)
+        failures = _gathered_failures(local_error)
+        if failures:
+            raise RuntimeError(
+                "MILES NCCL M2N session preparation failed: " + "; ".join(failures[:4])
+            )
 
     def _report_round_failure(self, primary: BaseException) -> None:
         if self._session is None or self._round_operation_id is None:
@@ -962,4 +1338,4 @@ def build_protocol(args: Any):
     return MilesModelExpressProtocol(args)
 
 
-__all__ = ["MilesCollectiveProtocolCore", "build_protocol"]
+__all__ = ["MilesCollectiveProtocolCore", "TensorLayout", "build_protocol"]

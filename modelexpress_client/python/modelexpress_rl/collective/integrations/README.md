@@ -5,9 +5,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # MILES over the ModelExpress NCCL M2N collective path
 
-Basic MILES support for the NCCL M2N collective refit path: one MILES trainer
-rank streams BF16 base-model weights to SGLang rollout engines, brokered by
-the ModelExpress server.
+MILES support for the NCCL M2N collective refit path: a DP x TP MILES trainer
+streams gathered (whole-tensor) BF16 base weights to SGLang rollout engines,
+brokered by the ModelExpress server. Engines receive either whole tensors or,
+in sharded mode, only the slice each engine TP rank keeps.
 
 - Trainer side: `miles_protocol.py` implements the MILES
   `WeightTransferProtocol` seam. MILES is never imported at module scope:
@@ -18,6 +19,8 @@ the ModelExpress server.
   currently only on the `sglang-miles` branch and not yet merged.
 - `manifest.py` is the manifest codec both sides share (`m2n_manifest` /
   `receiver_init_payload`: plan plus topology under a single schema tag).
+- `sglang_layout.py` is the one rule both sides use to decide which tensors
+  an SGLang engine receives pre-split.
 
 ## Enabling it
 
@@ -39,6 +42,20 @@ constructing the protocol without one fails. Plain `host:port` is expected;
 (`grpcs://`, `https://`) are rejected, so a configured MX auth token travels
 unencrypted on this path. An unreachable server fails the first round's
 connect probe within 10 s with an error naming the endpoint.
+
+`MX_MILES_DST_LAYOUT` picks the destination layout:
+
+- `replicate` (default): every generator receives every tensor whole and
+  installs it through SGLang's own `load_weights`.
+- `sharded`: each engine TP rank receives only the slice it keeps, written
+  straight into SGLang's live (fused) parameter storage; tensors the shared
+  rule leaves whole still go through `load_weights`. Every engine must have
+  the same TP size, and the trainer reads the head counts, vocabulary size,
+  and embedding tying from `--hf-checkpoint`'s `config.json`.
+
+The mode is part of the receiver ABI identity and so of the plan digest; a
+trainer and engines that disagree never form a group. An unknown layout fails
+when MILES builds the protocol.
 
 Engines (SGLang with the SG-1 hook, unmerged as of this writing): install
 this package in the engine image and allowlist the factory on the engine
@@ -63,23 +80,25 @@ same file the trainer side reads.
 MILES calls `connect(...)` once, then per weight version `begin_sync`, one
 `send_bucket` per HF bucket, and `finalize`. `begin_sync` runs before MILES
 pauses the engines; the `send_bucket`/`finalize` pass runs inside the pause
-window.
+window. Every trainer rank is a sender in one reshard lane; its lane rank is
+`dp.rank * tp.size + tp.rank`, its coordinate in the `(DP, TP)` source mesh.
 
 - `begin_sync` validates every tensor and copies it into a persistent wire
-  buffer; round one freezes the plan (names, shapes, canonical order) and the
-  topology. The copies run on the caller's ambient stream — the session
-  orders that producer stream before the lane streams at round begin — so
-  every `begin_sync` of one session must run on the same stream.
+  buffer. Round one agrees a run id (rank 0's), all-gathers every rank's
+  manifest of names and shapes over the trainer's Gloo group, checks they
+  are identical and cover every `(DP, TP)` coordinate once, and freezes the
+  plan and topology. A failure on any rank fails `begin_sync` on all of them.
 - The first `send_bucket` opens the mx-server channel, joins the collective
-  group, and sends `init_weights_update_group` with `receiver` and the
-  manifest as `receiver_init_payload` to every engine. Each round, the
-  trainer creates the transfer operation bound to the joined group and
-  epoch, sends `update_weights_from_distributed` with empty
-  names/dtypes/shapes and a `receiver_payload` of exactly
-  `{"operation_id", "version"}`, and publishes the single publish group once
-  all of its tensors have arrived.
-- `finalize` finishes the round and waits for every engine's response. A
-  failed round is reported to mx-server before the protocol closes.
+  group with this rank's trainer slot, and rank 0 sends
+  `init_weights_update_group` with `receiver` and the manifest as
+  `receiver_init_payload` to every engine. Each round, rank 0 creates the
+  transfer operation bound to the joined group and epoch, sends
+  `update_weights_from_distributed` with empty names/dtypes/shapes and a
+  `receiver_payload` of exactly `{"operation_id", "version"}`, and every rank
+  publishes the single publish group once all of its tensors have arrived.
+- `finalize` finishes the round on every rank and rank 0 waits for every
+  engine's response. A failure on any rank fails the round on all of them; it
+  is reported to mx-server before the protocol closes.
 - `close()` destroys the engine groups with `destroy_weights_update_group`
   and releases the session, rendezvous, and channel. Every resource is
   attempted even when an earlier close fails; the first failure propagates
@@ -96,11 +115,22 @@ No private SGLang patching or entry point is involved: the receiver group
 creates no torch process group, and SGLang forwards the payload untouched.
 
 The plan is sorted by `ParamPlan.canonical()`, and the receiver re-sorts
-canonically too, so both sides post the same per-lane tensor sequence.
+canonically too, so both sides post the same per-lane tensor sequence. The
+source mesh is `(TP,)` when DP is one and `(DP, TP)` otherwise, all
+`Replicate` (the trainer gathers TP). The destination mesh is `(generators,)`
+in `replicate` mode; in `sharded` mode it is `(TP,)` for one engine and
+`(engines, TP)` for several, with the engine axis replicated, because a split
+is valid only inside one engine.
 
 ## Supported envelope (fail-closed)
 
-- One trainer rank: PP, TP, EP, ETP, CP, and DP must all be one.
+- A DP x TP trainer gathering TP: PP, EP, ETP and CP must be one, DP must be
+  intra-DP (`indep_dp` one), and the trainer world must be exactly DP x TP.
+  The resolved placement must gather TP (all MILES iterators do), so every
+  rank yields every tensor whole. Trainer-local sources — MILES yielding
+  TP-local shards via the iterator's `tensor_layouts` — are not supported;
+  they fail closed at connect and at the layout contract. That is phase-2
+  work (MILES-P2 / MX-3b).
 - `--megatron-to-hf-mode raw` (the MILES default): `bridge` mode forces
   `gather_pp=True`, which `connect()` rejects. Raw mode converts from a
   Megatron checkpoint, so the run needs a valid one at `--load` (or
@@ -112,8 +142,20 @@ canonically too, so both sides post the same per-lane tensor sequence.
   decoding: SGLang rejects receiver rounds while a draft model exists, so
   the adapter refuses to connect when `sglang_speculative_algorithm` is
   set.
-- BF16, contiguous, non-scalar tensors; names and shapes are frozen after the
-  first round, and any change is an error.
+- BF16, contiguous, non-scalar tensors; names, local shapes and layouts are
+  frozen after the first round, and any change is an error.
+- Sharded destinations (`MX_MILES_DST_LAYOUT=sharded`): dense BF16
+  Qwen2/Qwen3-style SGLang layers on the stock (unquantized, non-presharded)
+  weight loaders, and the embedding on the engine's full TP group (no DP
+  attention). q/k/v split only when the KV heads divide the engine TP size,
+  and the embedding only when SGLang's vocabulary padding is a no-op;
+  otherwise those tensors stay whole. A receiver that cannot prove a sharded
+  entry's slice refuses `prepare`; it never stages a shard. The aliased
+  storage is re-checked (address, shape, stride) at every round start. An
+  upstream SGLang refactor that invalidates any of these proofs degrades
+  to a hard refusal, never silent corruption.
+  Sharded sources stay rejected: a plan that shards the source side fails
+  closed on both ends.
 
 Any mid-round failure closes the protocol (engines, session, rendezvous, and
 channel) and later rounds raise. MILES never calls `close()` after successful
@@ -133,13 +175,13 @@ topology fails closed at the next `begin_sync`.
 
 ## Memory and performance
 
-The wire buffers are a persistent extra BF16 replica of the trainer's
-weights, and engine-side one persistent scratch buffer per parameter stays
-mapped across rounds for the same reason: a refit loop must not re-measure
-either allocator. Each round runs two HF conversions: one in `begin_sync`,
-one in the MILES updater's own `send_bucket` pass, whose tensors this
-adapter does not read. The lane topology and install defaults at this base
-are untuned; do not read throughput numbers from this configuration.
+The wire buffers are a persistent extra BF16 copy of each trainer rank's
+whole tensors, and each round runs two HF conversions: one in `begin_sync`,
+one in the MILES updater's own `send_bucket` pass, whose tensors this adapter
+does not read. Sharded destinations receive into the live model storage, so
+sharded entries carry no receive buffer at all; replicated entries keep one
+per canonical tensor. The lane topology and install defaults at this base are
+untuned; do not read throughput numbers from this configuration.
 
 ## Testing
 
@@ -150,3 +192,7 @@ from `modelexpress_client/python`. The `TestAgainstSglang` classes in
 `MX_TEST_SGLANG_PYTHON` names the `python/` tree of an SGLang checkout with
 the SG-1 receiver hook, which runs them against SG-1's real
 `WeightUpdateReceiverContext` and `WeightUpdater`.
+`tests/test_collective_sglang_engine_view.py` pins the sharded slice
+arithmetic against the fork's real layer classes (same
+`MX_TEST_SGLANG_PYTHON` gate); run it against every new fork base — it is
+the canary that turns upstream drift into a visible test failure.

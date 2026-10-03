@@ -12,30 +12,235 @@ from typing import Any
 from ..client import RefitClientGenerator
 from ..rendezvous import CollectiveRendezvous, Membership
 from ..spi import LocalParamSpec
-from ..types import ReshardPlan
+from ..types import PlacementKind, ReshardPlan
 from ._common import (
     _check_stable,
     _client_device,
     _collective_streams,
     _FrozenPlan,
     _layer_groups,
+    _local_shape,
     _order_current_cuda_stream_before,
     _single_device,
     _tensor_signature,
     _text,
 )
 from .miles import CollectiveTopology
+from .sglang_layout import SglangModelFacts, destination_shard_dim
 
 logger = logging.getLogger("modelexpress_rl.collective.integrations.sglang")
 
+# HF projection -> (SGLang fused module, the shard id its weight_loader takes).
+# Qwen2/Qwen3 stacked_params_mapping at the pinned fork base.
+_FUSED_MEMBERS = {
+    "q_proj": ("qkv_proj", "q"),
+    "k_proj": ("qkv_proj", "k"),
+    "v_proj": ("qkv_proj", "v"),
+    "gate_proj": ("gate_up_proj", 0),
+    "up_proj": ("gate_up_proj", 1),
+}
+_ROW_PARALLEL = ("o_proj", "down_proj")
+_VOCAB_PARALLEL = {
+    "model.embed_tokens.weight": "model.embed_tokens",
+    "lm_head.weight": "lm_head",
+}
+
+
+class _NotProvable(ValueError):
+    """The engine slice of a sharded destination cannot be established."""
+
+
+def _attr(module: Any, name: str, label: str) -> Any:
+    if not hasattr(module, name):
+        raise _NotProvable(f"{label} has no {name!r} attribute")
+    return getattr(module, name)
+
+
+def _require(condition: bool, label: str, message: str) -> None:
+    if not condition:
+        raise _NotProvable(f"{label}: {message}")
+
+
+def _plain_bf16_weight(module: Any, label: str, *, split_dim: int) -> Any:
+    """The module's dense BF16 weight, loaded by its own stock weight_loader;
+    quantized, packed, presharded or fused-foreign weights are not modelled."""
+    import torch
+
+    weight = _attr(module, "weight", label)
+    _require(weight.dtype is torch.bfloat16, label, f"weight is {weight.dtype}")
+    _require(weight.is_contiguous(), label, "weight is not contiguous")
+    _require(
+        getattr(weight, "weight_loader", None) == module.weight_loader,
+        label,
+        "weight is not loaded by the module's stock weight_loader",
+    )
+    _require(
+        not getattr(module, "use_presharded_weights", False),
+        label,
+        "presharded weights",
+    )
+    for flag in ("packed_dim", "use_bitsandbytes_4bit", "is_gguf_weight"):
+        _require(not getattr(weight, flag, None), label, f"weight carries {flag}")
+    dim_attr = "input_dim" if split_dim == 1 else "output_dim"
+    _require(
+        getattr(weight, dim_attr, None) == split_dim,
+        label,
+        f"weight {dim_attr} is {getattr(weight, dim_attr, None)!r}, not {split_dim}",
+    )
+    return weight
+
+
+def _require_tp(module: Any, label: str, tp_rank: int, tp_size: int) -> None:
+    _require(
+        _attr(module, "tp_size", label) == tp_size,
+        label,
+        f"module tp_size {module.tp_size} is not the engine TP size {tp_size}",
+    )
+    if hasattr(module, "tp_rank"):
+        _require(
+            module.tp_rank == tp_rank,
+            label,
+            f"module tp_rank {module.tp_rank} is not this rank {tp_rank}",
+        )
+
+
+def _engine_view(
+    model: Any,
+    name: str,
+    global_shape: tuple[int, ...],
+    tp_rank: int,
+    tp_size: int,
+) -> Any:
+    """This TP rank's slice of ``name`` inside SGLang's live storage.
+
+    Every number comes from the live module and reproduces where the module's
+    own weight_loader would copy rank ``tp_rank``'s even slice. Anything
+    unproven raises ``_NotProvable``; this never guesses.
+    """
+    rows, cols = global_shape
+    module_path, _, leaf = name.rpartition(".")
+    if leaf != "weight":
+        raise _NotProvable(f"{name}: only weights are delivered pre-split")
+    parent, _, member = module_path.rpartition(".")
+    if name in _VOCAB_PARALLEL:
+        label = _VOCAB_PARALLEL[name]
+        module = model.get_submodule(label)
+        _require_tp(module, label, tp_rank, tp_size)
+        weight = _plain_bf16_weight(module, label, split_dim=0)
+        _require(rows % tp_size == 0, label, f"{rows} rows over TP {tp_size}")
+        piece = rows // tp_size
+        indices = _attr(module, "shard_indices", label)
+        _require(
+            _attr(module, "org_vocab_size", label) == rows
+            and _attr(module, "num_embeddings_padded", label) == rows
+            and _attr(module, "num_added_embeddings", label) == 0,
+            label,
+            "the vocabulary is padded or extended",
+        )
+        _require(
+            indices.org_vocab_start_index == tp_rank * piece
+            and indices.org_vocab_end_index == (tp_rank + 1) * piece,
+            label,
+            "the rank's vocabulary range is not its even slice",
+        )
+        _require(
+            tuple(weight.shape) == (piece, cols),
+            label,
+            f"local weight {tuple(weight.shape)} is not {(piece, cols)}",
+        )
+        return weight.data
+    if member in _FUSED_MEMBERS:
+        fused, shard_id = _FUSED_MEMBERS[member]
+        label = f"{parent}.{fused}"
+        module = model.get_submodule(label)
+        _require_tp(module, label, tp_rank, tp_size)
+        weight = _plain_bf16_weight(module, label, split_dim=0)
+        if fused == "qkv_proj":
+            _require(
+                _attr(module, "kv_tp_size", label) == tp_size
+                and _attr(module, "kv_tp_rank", label) == tp_rank
+                and _attr(module, "num_kv_head_replicas", label) == 1,
+                label,
+                "key/value heads are replicated or on a separate TP group",
+            )
+            head = _attr(module, "head_size", label)
+            v_head = _attr(module, "v_head_size", label)
+            heads = _attr(module, "num_heads", label)
+            kv_heads = _attr(module, "num_kv_heads", label)
+            _require(
+                heads * tp_size == _attr(module, "total_num_heads", label)
+                and kv_heads * tp_size == _attr(module, "total_num_kv_heads", label),
+                label,
+                "head counts do not split evenly over the TP size",
+            )
+            local = {"q": heads * head, "k": kv_heads * head, "v": kv_heads * v_head}
+            offsets = {"q": 0, "k": local["q"], "v": local["q"] + local["k"]}
+            _require(
+                local[shard_id] * tp_size == rows,
+                label,
+                f"{member} has {rows} rows, the module expects "
+                f"{local[shard_id] * tp_size}",
+            )
+            total = sum(local.values())
+            offset, extent = offsets[shard_id], local[shard_id]
+        else:
+            sizes = list(_attr(module, "output_sizes", label))
+            _require(len(sizes) == 2, label, f"output_sizes {sizes}")
+            _require(
+                all(size % tp_size == 0 for size in sizes),
+                label,
+                f"output_sizes {sizes} do not split over TP {tp_size}",
+            )
+            _require(
+                sizes[shard_id] == rows,
+                label,
+                f"{member} has {rows} rows, the module expects {sizes[shard_id]}",
+            )
+            total = sum(sizes) // tp_size
+            offset = sum(sizes[:shard_id]) // tp_size
+            extent = sizes[shard_id] // tp_size
+        _require(
+            tuple(weight.shape) == (total, cols),
+            label,
+            f"local weight {tuple(weight.shape)} is not {(total, cols)}",
+        )
+        return weight.data[offset : offset + extent]
+    if member in _ROW_PARALLEL:
+        label = module_path
+        module = model.get_submodule(label)
+        _require_tp(module, label, tp_rank, tp_size)
+        weight = _plain_bf16_weight(module, label, split_dim=1)
+        _require(
+            _attr(module, "input_size", label) == cols
+            and _attr(module, "output_size", label) == rows
+            and cols % tp_size == 0,
+            label,
+            "module sizes do not match the canonical tensor",
+        )
+        _require(
+            tuple(weight.shape) == (rows, cols // tp_size),
+            label,
+            f"local weight {tuple(weight.shape)} is not {(rows, cols // tp_size)}",
+        )
+        return weight.data
+    raise _NotProvable(f"{name}: SGLang has no proven split for this tensor")
+
+
+def _view_signature(view: Any) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+    return (
+        int(view.data_ptr()),
+        tuple(int(dim) for dim in view.shape),
+        tuple(int(stride) for stride in view.stride()),
+    )
+
 
 class SglangLoader:
-    """``Loader`` over a live SGLang model, one layer group at a time.
+    """``Loader`` over a live SGLang model.
 
-    Every canonical parameter lands in a persistent scratch buffer handed to
-    the model's own ``load_weights``, which owns fusion and TP layout. A
-    failed ``install`` can leave a partially written model, so it poisons the
-    loader.
+    Replicated entries land in persistent scratch buffers installed through
+    the model's own ``load_weights``; sharded entries go straight into this
+    rank's live-storage slice that ``_engine_view`` proves. A failed install
+    poisons the loader: later rounds are refused.
     """
 
     def __init__(
@@ -45,29 +250,104 @@ class SglangLoader:
         model: Any,
         device: Any,
         layer_groups: tuple[tuple[str, ...], ...] = (),
+        generator_index: int | None = None,
+        tp_rank: int = 0,
+        tp_size: int = 1,
     ) -> None:
         import torch
 
         self._plan = _FrozenPlan(plan)
         self._model = model
         self._groups = _layer_groups(layer_groups, self._plan.names())
+        self._tp_rank = tp_rank
+        self._tp_size = tp_size
         self._buffers: dict[str, Any] = {}
+        self._views: dict[str, tuple[int, tuple[int, ...], tuple[int, ...]]] = {}
+        self._local_shapes: dict[str, tuple[int, ...]] = {}
         self._signatures = {}
+        if self._plan.sharded_destination:
+            self._check_engine_rank(generator_index)
+            facts = self._model_facts()
         for name in self._plan.names():
             entry = self._plan.entry(name)
-            buffer = torch.empty(
-                entry.global_shape, dtype=torch.bfloat16, device=device
-            )
+            placement = entry.dst_placements[-1]
+            if placement.kind is PlacementKind.SHARD:
+                generator_rank = self._plan.dst_mesh.rank_offset + generator_index
+                local_shape = _local_shape(
+                    self._plan.destination_index(name, generator_rank)
+                )
+                expected_dim = destination_shard_dim(
+                    name, entry.global_shape, tp_size, facts
+                )
+                if expected_dim != placement.dim:
+                    raise ValueError(
+                        f"{name}: the plan splits dim {placement.dim}, but SGLang "
+                        f"at TP {tp_size} needs {expected_dim}; trainer and "
+                        "receiver disagree on the destination rule"
+                    )
+                buffer = self._resolve_view(name)
+                if tuple(int(dim) for dim in buffer.shape) != local_shape:
+                    raise ValueError(
+                        f"{name}: engine slice {tuple(buffer.shape)} is not the "
+                        f"plan's destination shard {local_shape}"
+                    )
+                self._views[name] = _view_signature(buffer)
+            else:
+                local_shape = entry.global_shape
+                buffer = torch.empty(
+                    entry.global_shape, dtype=torch.bfloat16, device=device
+                )
             self._buffers[name] = buffer
+            self._local_shapes[name] = local_shape
             self._signatures[name] = _tensor_signature(
                 name,
                 buffer,
-                expected_shape=entry.global_shape,
+                expected_shape=local_shape,
                 expected_dtype=entry.dtype,
             )
         self._device = _single_device(self._signatures, "SGLang loader")
         self._round_version: str | None = None
         self._poisoned = False
+
+    def _check_engine_rank(self, generator_index: int | None) -> None:
+        dst_mesh = self._plan.dst_mesh
+        if generator_index is None or not 0 <= generator_index < dst_mesh.size:
+            raise ValueError(
+                "a sharded-destination plan needs this generator's index in "
+                f"[0, {dst_mesh.size}), got {generator_index!r}"
+            )
+        engine_tp = dst_mesh.shape[-1]
+        if engine_tp != self._tp_size:
+            raise ValueError(
+                f"the plan splits destinations over TP {engine_tp}, but this "
+                f"engine runs TP {self._tp_size}"
+            )
+        if generator_index % engine_tp != self._tp_rank:
+            raise ValueError(
+                f"generator index {generator_index} is TP coordinate "
+                f"{generator_index % engine_tp} in the destination mesh, but "
+                f"this scheduler is TP rank {self._tp_rank}"
+            )
+
+    def _model_facts(self) -> SglangModelFacts:
+        config = getattr(self._model, "config", None)
+        if config is None:
+            raise ValueError(
+                "a sharded-destination plan needs the SGLang model's HF config"
+            )
+        return SglangModelFacts.from_config(config)
+
+    def _resolve_view(self, name: str) -> Any:
+        entry = self._plan.entry(name)
+        try:
+            return _engine_view(
+                self._model, name, entry.global_shape, self._tp_rank, self._tp_size
+            )
+        except (_NotProvable, AttributeError) as error:
+            raise ValueError(
+                f"{name}: cannot prove this TP rank's slice of SGLang's live "
+                f"storage, so the sharded destination is refused: {error}"
+            ) from error
 
     @property
     def source_partition_count(self) -> int:
@@ -102,9 +382,20 @@ class SglangLoader:
                 name,
                 buffer,
                 self._signatures[name],
-                expected_shape=entry.global_shape,
+                expected_shape=self._local_shapes[name],
                 expected_dtype=entry.dtype,
             )
+        for name, frozen in self._views.items():
+            try:
+                current = _view_signature(self._resolve_view(name))
+            except ValueError as error:
+                raise RuntimeError(str(error)) from error
+            if current != frozen:
+                raise RuntimeError(
+                    f"{name}: SGLang moved or reshaped the live storage this "
+                    f"receiver aliases (address, shape, stride {frozen} -> "
+                    f"{current})"
+                )
 
     # --- Loader protocol -------------------------------------------------
 
@@ -142,7 +433,11 @@ class SglangLoader:
                 f"layer_group_id {layer_group_id} is outside the "
                 f"{len(self._groups)} declared layer groups"
             )
-        names = self._groups[layer_group_id]
+        names = [
+            name for name in self._groups[layer_group_id] if name not in self._views
+        ]
+        if not names:
+            return
         try:
             self._model.load_weights([(name, self._buffers[name]) for name in names])
         except BaseException:
@@ -164,6 +459,7 @@ class SglangLoader:
     def cleanup(self) -> None:
         self._round_version = None
         self._buffers.clear()
+        self._views.clear()
 
 
 class SglangGeneratorSession:
@@ -348,11 +644,14 @@ def build_generator_loader(
     device: Any,
     generator_slot_offset: int,
     tp_rank: int,
+    tp_size: int,
 ) -> GeneratorLoader:
     """Build one SGLang scheduler's loader and its session inputs from a plan.
 
     Used by the public receiver factory; it owns the slot and the layer
-    groups.
+    groups. An engine's generator slots are its TP ranks in order, so
+    ``local_index`` is also this scheduler's coordinate in a sharded
+    destination mesh.
     """
     local_index = generator_slot_offset + tp_rank
     try:
@@ -370,6 +669,9 @@ def build_generator_loader(
         model=model,
         device=device,
         layer_groups=tuple((entry.name,) for entry in plan.bulk),
+        generator_index=local_index,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
     )
     return GeneratorLoader(
         loader=loader,
