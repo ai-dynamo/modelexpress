@@ -430,6 +430,13 @@ is exactly what the fused-parameter path already does.
 | `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Client-side deadline for the transfer; an overrun aborts the lanes and reports `succeeded=false`, i.e. `RUNNING -> FAILED` above |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
 
+The MILES integration (`modelexpress_rl.collective.integrations`) resolves
+the mx-server endpoint in the trainer process through the shared client
+resolver (`MODEL_EXPRESS_URL` takes precedence, then `MX_SERVER_ADDRESS`; one
+of the two is required, with no localhost default), alongside the inherited
+`MX_NCCL_REFIT_*` variables above. See [DEPLOYMENT.md](DEPLOYMENT.md) under
+"MILES Integration (NCCL M2N)" and the integration README.
+
 Timing is reported through the existing `RefitTimingRecorder` stage vocabulary so
 NIXL-pull and NCCL-push refits are directly comparable. For this path, *setup and
 registration* is dominated by `Communicator.init` and is charged **once per
