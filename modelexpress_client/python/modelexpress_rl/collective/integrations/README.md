@@ -57,6 +57,20 @@ The mode is part of the receiver ABI identity and so of the plan digest; a
 trainer and engines that disagree never form a group. An unknown layout fails
 when MILES builds the protocol.
 
+`MX_NCCL_REFIT_STACK_BYTES` (non-negative integer, bytes of one stacked
+call's area) turns on equal-geometry stacking. `0` (the default) keeps one
+M2N call per tensor, with the plan and digest unchanged. Above `0`, the
+trainer stacks the tensors that share their plan geometry (shape, dtype,
+meshes, placements; only plan facts) along a new leading dimension and labels
+the members `group_key = "m2n-stack1-<id>"`. The keys are part
+of the plan digest and the receiver ABI gains a `+stack1` suffix, so an
+engine without the derivation refuses the topology at prepare. Each end
+checks that every stack fits the largest `NCCL_RESHARD_PACK_BUFFSIZES` bucket
+(2 GiB when unset). Stacks are submitted ungrouped, one call per publish
+group. A sharded destination receives into one reusable scratch per lane
+stream and copies each member into SGLang's live storage; a replicated one
+reads each stack's members in place.
+
 Engines (SGLang with the SG-1 hook, unmerged as of this writing): install
 this package in the engine image and allowlist the factory on the engine
 launch. The SGLang engine arg is `--weight-update-receivers`; in a MILES

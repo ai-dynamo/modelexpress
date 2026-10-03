@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
 from itertools import count
 from types import SimpleNamespace
 from typing import ClassVar
@@ -34,6 +35,14 @@ class FakeTensor:
 
     def is_contiguous(self):
         return True
+
+    def __getitem__(self, index):
+        # stack[i]: a contiguous view of the leading dimension.
+        inner = self.shape[1:]
+        size = 1
+        for extent in inner:
+            size *= extent
+        return FakeTensor(inner, address=self.address + index * size * 2)
 
 
 @pytest.fixture
@@ -215,6 +224,130 @@ class TestSglangLoader:
         )
         with pytest.raises(ValueError, match="one generator slot per"):
             loader.validate_topology(wider)
+
+
+_STACK_NAMES = tuple(f"model.layers.0.p{index}.weight" for index in range(4))
+_STACK_KEYS = ("m2n-stack1-0", "m2n-stack1-0", "m2n-stack1-1", "m2n-stack1-1")
+
+
+def _stacked_plan(keys=_STACK_KEYS):
+    return ReshardPlan(
+        bulk=[
+            replace(_entry(name), group_key=key)
+            for name, key in zip(_STACK_NAMES, keys, strict=True)
+        ],
+        source_partition_count=1,
+    )
+
+
+def _stack_topology(abi_suffix="+stack1"):
+    base = _topology()
+    return replace(base, m2n_abi_version="miles-sglang-bf16-replicated-v1" + abi_suffix)
+
+
+class TestStackedLoader:
+    def test_a_stack_is_one_receive_buffer_and_its_members_are_views(
+        self, fake_buffers
+    ):
+        loader = SglangLoader(plan=_stacked_plan(), model=FakeModel(), device="cuda:0")
+
+        specs = loader.local_params()
+        wire = loader.capture()
+
+        assert loader.parameter_names() == [entry.name for entry in wire.bulk]
+        assert all(name.startswith("m2n-stack1/") for name in specs)
+        assert len(specs) == 2
+        # Two stack tensors were allocated, not one buffer per tensor.
+        stacks = [spec.base for spec in specs.values()]
+        assert [tuple(stack.shape) for stack in stacks] == [(2, 4, 4), (2, 4, 4)]
+        assert [stack in fake_buffers for stack in stacks] == [True, True]
+        assert len(fake_buffers) == 2
+        # Members read the stack in place.
+        assert loader._buffers[_STACK_NAMES[1]].address == stacks[0].address + 4 * 4 * 2
+        assert loader._buffers[_STACK_NAMES[3]].address == stacks[1].address + 4 * 4 * 2
+
+    def test_each_stack_is_one_load_weights_call_over_its_member_views(
+        self, fake_buffers
+    ):
+        model = FakeModel()
+        loader = SglangLoader(plan=_stacked_plan(), model=model, device="cuda:0")
+        assert loader.layer_groups == (tuple(loader.parameter_names()),)
+        wire_names = loader.parameter_names()
+        loader = SglangLoader(
+            plan=_stacked_plan(),
+            model=model,
+            device="cuda:0",
+            layer_groups=tuple((name,) for name in wire_names),
+        )
+
+        loader.start_new_round("v1")
+        assert loader._staged_members(0)
+        loader.install(0)
+        loader.install(1)
+        loader.finish()
+
+        assert [[name for name, _ in call] for call in model.loaded] == [
+            list(_STACK_NAMES[:2]),
+            list(_STACK_NAMES[2:]),
+        ]
+        for call, members in zip(
+            model.loaded, (_STACK_NAMES[:2], _STACK_NAMES[2:]), strict=True
+        ):
+            assert [tensor.address for _, tensor in call] == [
+                loader._buffers[name].address for name in members
+            ]
+
+    def test_the_loader_digests_the_same_wire_plan_as_the_trainer(self, fake_buffers):
+        from modelexpress_rl.collective.integrations._common import _derive_wire_plan
+
+        loader = SglangLoader(plan=_stacked_plan(), model=FakeModel(), device="cuda:0")
+        trainer_wire, _ = _derive_wire_plan(_stacked_plan())
+        assert loader.capture().bulk == trainer_wire.bulk
+
+    def test_a_stacked_plan_needs_the_stack_abi_and_an_unstacked_one_refuses_it(
+        self, fake_buffers
+    ):
+        stacked = SglangLoader(plan=_stacked_plan(), model=FakeModel(), device="cuda:0")
+        stacked.validate_topology(_stack_topology())
+        with pytest.raises(ValueError, match="requires the"):
+            stacked.validate_topology(_stack_topology(""))
+        plain = _loader()
+        with pytest.raises(ValueError, match="disagree on stacking"):
+            plain.validate_topology(_stack_topology())
+
+    def test_a_reserved_name_or_a_bad_stack_plan_fails_before_allocating(
+        self, fake_buffers
+    ):
+        reserved = ReshardPlan(
+            bulk=[_entry("m2n-stack-real"), _entry("zz")], source_partition_count=1
+        )
+        with pytest.raises(ValueError, match="reserved"):
+            SglangLoader(plan=reserved, model=FakeModel(), device="cuda:0")
+        gap = _stacked_plan(
+            ("m2n-stack1-0", "m2n-stack1-0", "m2n-stack1-2", "m2n-stack1-2")
+        )
+        with pytest.raises(ValueError, match="exactly 0..K-1"):
+            SglangLoader(plan=gap, model=FakeModel(), device="cuda:0")
+        assert fake_buffers == []
+
+    def test_a_stack_over_the_pack_bucket_is_refused_at_construction(
+        self, fake_buffers, monkeypatch
+    ):
+        big = ReshardPlan(
+            bulk=[
+                replace(
+                    _entry(name),
+                    global_shape=(64, 64),
+                    group_key="m2n-stack1-0",
+                )
+                for name in _STACK_NAMES[:2]
+            ],
+            source_partition_count=1,
+        )
+        monkeypatch.setenv("NCCL_RESHARD_PACK_BUFFSIZES", "2048")
+        with pytest.raises(ValueError, match="largest PACK staging bucket of 2048"):
+            SglangLoader(plan=big, model=FakeModel(), device="cuda:0")
+        assert fake_buffers == []
 
 
 class FakeRendezvous:

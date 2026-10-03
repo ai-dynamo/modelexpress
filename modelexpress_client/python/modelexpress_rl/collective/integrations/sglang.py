@@ -6,22 +6,27 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
 from ..client import RefitClientGenerator
 from ..rendezvous import CollectiveRendezvous, Membership
-from ..spi import LocalParamSpec
+from ..spi import LocalParamSpec, RefitCtx
 from ..types import PlacementKind, ReshardPlan
 from ._common import (
     _check_stable,
     _client_device,
     _collective_streams,
+    _check_stack_budget,
+    _derive_wire_plan,
+    _dtype_label,
     _FrozenPlan,
     _layer_groups,
     _local_shape,
     _order_current_cuda_stream_before,
     _single_device,
+    _Stack,
     _tensor_signature,
     _text,
 )
@@ -234,6 +239,32 @@ def _view_signature(view: Any) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
     )
 
 
+def _current_stream_key() -> int | None:
+    """Identity of the CUDA stream the calling hook runs on, None without CUDA."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return None
+    return int(torch.cuda.current_stream().cuda_stream)
+
+
+def _check_disjoint(stack: str, views: list[Any]) -> None:
+    """Fail unless the views of one stack occupy pairwise disjoint memory."""
+    spans = sorted(
+        (
+            int(view.data_ptr()),
+            int(view.data_ptr()) + view.numel() * view.element_size(),
+        )
+        for view in views
+    )
+    for (_, end), (start, _) in zip(spans, spans[1:], strict=False):
+        if start < end:
+            raise ValueError(
+                f"{stack}: the engine views of one stack overlap in memory, so "
+                "the stacked receive could not install them independently"
+            )
+
+
 class SglangLoader:
     """``Loader`` over a live SGLang model.
 
@@ -258,9 +289,31 @@ class SglangLoader:
 
         self._plan = _FrozenPlan(plan)
         self._model = model
-        self._groups = _layer_groups(layer_groups, self._plan.names())
+        # Equal-geometry stacking: ``plan`` stays the per-tensor contract that
+        # view resolution and staging follow; the wire plan (what is digested,
+        # published and walked as reshard calls) replaces each stack's members
+        # with one stacked entry. Without stack keys the two are the same.
+        wire_plan, stacks = _derive_wire_plan(self._plan.capture())
+        self._stacks: dict[str, _Stack] = {stack.name: stack for stack in stacks}
+        self._wire = _FrozenPlan(wire_plan) if stacks else self._plan
+        self._member_stack = {
+            member: (stack, index)
+            for stack in stacks
+            for index, member in enumerate(stack.members)
+        }
+        self._groups = _layer_groups(layer_groups, self._wire.names())
         self._tp_rank = tp_rank
         self._tp_size = tp_size
+        # A stack's size is checked before any buffer exists, at prepare.
+        _check_stack_budget(stacks)
+        self._alloc_device = device
+        self._stack_buffers: dict[str, Any] = {}
+        self._stack_signatures: dict[str, Any] = {}
+        self._scratch: dict[int | None, Any] = {}
+        self._scratch_primary: Any = None
+        self._scratch_primary_claimed = False
+        self._scratch_signature: Any = None
+        self._scratch_elements = 0
         self._buffers: dict[str, Any] = {}
         self._views: dict[str, tuple[int, tuple[int, ...], tuple[int, ...]]] = {}
         self._local_shapes: dict[str, tuple[int, ...]] = {}
@@ -268,6 +321,23 @@ class SglangLoader:
         if self._plan.sharded_destination:
             self._check_engine_rank(generator_index)
             facts = self._model_facts()
+        # A stack whose destination is whole on this rank is received into one
+        # persistent stack; its members are views of it, so load_weights reads
+        # them in place. A sharded destination cannot be a stack (live storage
+        # is one tensor per parameter) and is received through scratch instead.
+        for stack in stacks:
+            if stack.entry.dst_placements[-1].kind is PlacementKind.SHARD:
+                continue
+            stacked = torch.empty(
+                stack.entry.global_shape, dtype=torch.bfloat16, device=device
+            )
+            self._stack_buffers[stack.name] = stacked
+            self._stack_signatures[stack.name] = _tensor_signature(
+                stack.name,
+                stacked,
+                expected_shape=stack.entry.global_shape,
+                expected_dtype=stack.entry.dtype,
+            )
         for name in self._plan.names():
             entry = self._plan.entry(name)
             placement = entry.dst_placements[-1]
@@ -294,9 +364,13 @@ class SglangLoader:
                 self._views[name] = _view_signature(buffer)
             else:
                 local_shape = entry.global_shape
-                buffer = torch.empty(
-                    entry.global_shape, dtype=torch.bfloat16, device=device
-                )
+                if name in self._member_stack:
+                    stack, index = self._member_stack[name]
+                    buffer = self._stack_buffers[stack.name][index]
+                else:
+                    buffer = torch.empty(
+                        entry.global_shape, dtype=torch.bfloat16, device=device
+                    )
             self._buffers[name] = buffer
             self._local_shapes[name] = local_shape
             self._signatures[name] = _tensor_signature(
@@ -306,8 +380,85 @@ class SglangLoader:
                 expected_dtype=entry.dtype,
             )
         self._device = _single_device(self._signatures, "SGLang loader")
+        for stack in stacks:
+            if stack.name in self._stack_buffers:
+                continue
+            # The scratch below is hardcoded bfloat16. Refuse a non-bf16 wire
+            # dtype here, with the stack named, so the sharded path fails at
+            # prepare like the replicated path's buffer signature instead of
+            # only at the native transfer's dtype rejection.
+            if _dtype_label(stack.entry.dtype) != "bfloat16":
+                raise ValueError(
+                    f"{stack.name}: a sharded stack is received through a "
+                    "bfloat16 scratch, but its wire dtype is "
+                    f"{_dtype_label(stack.entry.dtype)}"
+                )
+            _check_disjoint(stack.name, [self._buffers[m] for m in stack.members])
+            elements = len(stack.members) * math.prod(
+                self._local_shapes[stack.members[0]]
+            )
+            self._scratch_elements = max(self._scratch_elements, elements)
+        if self._scratch_elements:
+            # Stacks run in order on a lane stream and the post hook's copy
+            # out of the scratch is enqueued on that stream before the next
+            # stack's receive, so one scratch per stream suffices. The
+            # primary scratch is allocated here so its failure fails prepare;
+            # which stream a hook runs on is only known when the engine drives
+            # the round, so a hook on another lane stream allocates that
+            # stream's own scratch on first use and two streams never share.
+            self._scratch_primary = torch.empty(
+                self._scratch_elements, dtype=torch.bfloat16, device=device
+            )
+            self._scratch_signature = _tensor_signature(
+                "stacked receive scratch",
+                self._scratch_primary,
+                expected_shape=(self._scratch_elements,),
+                expected_dtype="bfloat16",
+            )
         self._round_version: str | None = None
         self._poisoned = False
+
+    def _scratch_for_current_stream(self) -> Any:
+        """The receive scratch for the stream the hook runs on.
+
+        The single-lane integration has one stream, which claims the scratch
+        allocated at prepare. Should a hook ever run on another stream, it
+        gets its own scratch, so two streams never share one.
+        """
+        import torch
+
+        key = _current_stream_key()
+        scratch = self._scratch.get(key)
+        if scratch is None:
+            if not self._scratch_primary_claimed:
+                scratch = self._scratch_primary
+                self._scratch_primary_claimed = True
+            else:
+                scratch = torch.empty(
+                    self._scratch_elements,
+                    dtype=torch.bfloat16,
+                    device=self._alloc_device,
+                )
+            self._scratch[key] = scratch
+        return scratch
+
+    def _scratch_spec(self, stack: _Stack) -> LocalParamSpec:
+        """Receive a sharded stack into scratch, then copy each member into place."""
+        views = [self._buffers[member] for member in stack.members]
+        shape = (len(stack.members), *self._local_shapes[stack.members[0]])
+        elements = math.prod(shape)
+
+        def pre(_base: Any) -> RefitCtx:
+            scratch = self._scratch_for_current_stream()
+            return RefitCtx(buf=scratch[:elements].view(shape))
+
+        def post(ctx: RefitCtx) -> None:
+            # Each copy_ enqueues on the current stream in order, so the
+            # members land before whatever the stream runs next.
+            for view, received in zip(views, ctx.buf.unbind(0), strict=True):
+                view.copy_(received)
+
+        return LocalParamSpec(base=None, pre=pre, post=post)
 
     def _check_engine_rank(self, generator_index: int | None) -> None:
         dst_mesh = self._plan.dst_mesh
@@ -366,7 +517,7 @@ class SglangLoader:
         return tuple(tuple(group) for group in self._groups)
 
     def validate_topology(self, topology: CollectiveTopology) -> None:
-        self._plan.validate_topology(topology)
+        self._wire.validate_topology(topology)
 
     def _require_healthy(self) -> None:
         if self._poisoned:
@@ -385,6 +536,22 @@ class SglangLoader:
                 expected_shape=self._local_shapes[name],
                 expected_dtype=entry.dtype,
             )
+        for name, stacked in self._stack_buffers.items():
+            _check_stable(
+                name,
+                stacked,
+                self._stack_signatures[name],
+                expected_shape=self._stacks[name].entry.global_shape,
+                expected_dtype=self._stacks[name].entry.dtype,
+            )
+        if self._scratch_signature is not None and self._scratch_primary is not None:
+            _check_stable(
+                "stacked receive scratch",
+                self._scratch_primary,
+                self._scratch_signature,
+                expected_shape=(self._scratch_elements,),
+                expected_dtype="bfloat16",
+            )
         for name, frozen in self._views.items():
             try:
                 current = _view_signature(self._resolve_view(name))
@@ -401,17 +568,37 @@ class SglangLoader:
 
     def capture(self) -> ReshardPlan:
         self._validate_stable()
-        return self._plan.capture()
+        return self._wire.capture()
 
     def parameter_names(self) -> list[str]:
-        return self._plan.names()
+        return self._wire.names()
 
     def local_params(self) -> dict[str, LocalParamSpec]:
         self._require_healthy()
         self._validate_stable()
-        return {
-            name: LocalParamSpec(base=buffer) for name, buffer in self._buffers.items()
-        }
+        specs: dict[str, LocalParamSpec] = {}
+        for name in self._wire.names():
+            stack = self._stacks.get(name)
+            if stack is None:
+                specs[name] = LocalParamSpec(base=self._buffers[name])
+            elif name in self._stack_buffers:
+                specs[name] = LocalParamSpec(base=self._stack_buffers[name])
+            else:
+                specs[name] = self._scratch_spec(stack)
+        return specs
+
+    def _staged_members(self, layer_group_id: int) -> list[str]:
+        """The per-tensor names of a group that install reads from a receive buffer.
+
+        A group names wire entries; a stacked entry stands for its members.
+        Aliased members already landed in the live storage during receive.
+        """
+        names: list[str] = []
+        for wire_name in self._groups[layer_group_id]:
+            stack = self._stacks.get(wire_name)
+            members = stack.members if stack is not None else (wire_name,)
+            names.extend(member for member in members if member not in self._views)
+        return names
 
     def start_new_round(self, version: str) -> None:
         self._require_healthy()
@@ -433,9 +620,7 @@ class SglangLoader:
                 f"layer_group_id {layer_group_id} is outside the "
                 f"{len(self._groups)} declared layer groups"
             )
-        names = [
-            name for name in self._groups[layer_group_id] if name not in self._views
-        ]
+        names = self._staged_members(layer_group_id)
         if not names:
             return
         try:
@@ -459,6 +644,9 @@ class SglangLoader:
     def cleanup(self) -> None:
         self._round_version = None
         self._buffers.clear()
+        self._stack_buffers.clear()
+        self._scratch.clear()
+        self._scratch_primary = None
         self._views.clear()
 
 
@@ -664,11 +852,18 @@ def build_generator_loader(
 
     # Both boundaries require canonical plan order; contiguous trainer groups
     # and receiver singletons therefore traverse the same per-lane sequence.
+    # A stacking plan (MX_NCCL_REFIT_STACK_BYTES on the trainer) carries its
+    # stacks in group_key; each wire entry is then one publish group.
+    wire_plan, stacks = _derive_wire_plan(plan)
+    if stacks:
+        publish_groups = tuple((entry.name,) for entry in wire_plan.bulk)
+    else:
+        publish_groups = tuple((entry.name,) for entry in plan.bulk)
     loader = SglangLoader(
         plan=plan,
         model=model,
         device=device,
-        layer_groups=tuple((entry.name,) for entry in plan.bulk),
+        layer_groups=publish_groups,
         generator_index=local_index,
         tp_rank=tp_rank,
         tp_size=tp_size,

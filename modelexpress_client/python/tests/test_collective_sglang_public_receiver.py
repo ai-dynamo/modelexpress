@@ -37,6 +37,9 @@ from modelexpress_rl.collective.integrations.manifest import (
 )
 from tests.test_collective_sglang_receiver import (
     _NAMES,
+    _STACK_KEYS,
+    _stack_topology,
+    _stacked_plan,
     FakeChannel,
     FakeTensor,
     FakeModel,
@@ -151,6 +154,14 @@ class TestFactory:
     def test_rank_offset_selects_the_generator_slot(self, fake_mx):
         context = _context(rank_offset=1, tp_rank=0, tp_size=2)
         assert create_receiver(context).slot_id == "run:generator-1"
+
+    def test_a_stacking_plan_uses_one_group_per_wire_entry(self, fake_mx):
+        manifest = manifest_to_wire(_stacked_plan(_STACK_KEYS), _stack_topology())
+        create_receiver(_context(init_payload=manifest))
+        kwargs = FakeSession.instances[0].kwargs
+        loader = kwargs["loader"]
+        assert loader.layer_groups == tuple((n,) for n in loader.parameter_names())
+        assert len(loader.layer_groups) == 2
 
     def test_a_round_runs_under_its_version_and_operation(
         self,
