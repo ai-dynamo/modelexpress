@@ -1135,6 +1135,10 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `LoadContext` from vLLM config, initializes the model, runs the strategy chain, and updates global registries.
 
+After successful RDMA receive and target-local finalization, the vLLM adapter
+synchronizes the accelerator and clears unused allocator cache before subsequent
+initialization. Live model tensors remain allocated.
+
 **MTP two-pass load.** Multi-token-prediction models (Qwen3.5 MTP, DeepSeek MTP) call the loader twice on one worker: the target, then the draft head. `_is_speculative_draft()` detects the second pass via `model_config.runner_type == "draft"` and sets `ctx.p2p_enabled = False`. A P2P draft would collide on the target's NIXL metadata port, and since the merged draft shares the target's `SourceIdentity` it could poison source discovery, so registration, publication, and RDMA stay off for the draft while the target keeps serving. The draft uses the remaining eligible non-P2P strategies: server cache, InstantTensor, ModelStreamer, GDS, or the runtime's native loader. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors: it reads `model.safetensors.index.json` from the directory of the shards `_prepare_weights` already resolved, which is what makes a Hugging Face model ID work, and falls back to the model URI itself (local directory, then the runai streamer's `pull_files`) for object storage. It keeps shards whose tensor names start with `mtp.`. The draft's embedding and `lm_head` come from the target, so they are not streamed. An index that holds no `mtp.` tensors is expected on a checkpoint without a draft head and streams every shard; an index that cannot be resolved at all logs a warning and also streams every shard.
 
 ### vLLM Refit Installation
@@ -1289,14 +1293,6 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 | p3 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
 | p4 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
 | p5 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
-
-After a successful vLLM RDMA receive and target-local finalization, the adapter
-synchronizes the accelerator and releases unused cached allocations. Quantized
-weight post-processing can leave substantial idle storage in PyTorch's allocator;
-releasing it makes memory available to external allocators, including NCCL setup
-for a later speculative draft load. Live tensors and registered weight storage
-remain allocated. This does not reduce live model memory, and is separate from
-cleanup after a failed loading attempt.
 
 When a vLLM loading attempt fails after mutating the model, retry cleanup
 unregisters its layers and clears the old model's tensor graph before allocating
