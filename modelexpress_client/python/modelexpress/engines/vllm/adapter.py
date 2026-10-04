@@ -324,7 +324,13 @@ class VllmAdapter(EngineAdapter):
         result = self._finalize_model_specific_weights(
             result, _VLLM_POST_RDMA_FINALIZER_NAMES
         )
-        return self._refresh_host_quantization_state(result)
+        result = self._refresh_host_quantization_state(result)
+        # Release idle post-processing storage after the receive is complete,
+        # before later loaders (for example an MTP draft) allocate NCCL buffers.
+        # Live tensors, including registered weight storage, stay allocated.
+        self.accelerator_backend.synchronize()
+        self.accelerator_backend.empty_cache()
+        return result
 
     def apply_weight_iter(
         self,

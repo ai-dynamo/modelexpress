@@ -1290,6 +1290,14 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 | p4 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
 | p5 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
 
+After a successful vLLM RDMA receive and target-local finalization, the adapter
+synchronizes the accelerator and releases unused cached allocations. Quantized
+weight post-processing can leave substantial idle storage in PyTorch's allocator;
+releasing it makes memory available to external allocators, including NCCL setup
+for a later speculative draft load. Live tensors and registered weight storage
+remain allocated. This does not reduce live model memory, and is separate from
+cleanup after a failed loading attempt.
+
 When a vLLM loading attempt fails after mutating the model, retry cleanup
 unregisters its layers and clears the old model's tensor graph before allocating
 the replacement. Caller frames can still retain the old root object, so clearing
