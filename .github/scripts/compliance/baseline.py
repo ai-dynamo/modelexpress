@@ -37,10 +37,14 @@ def get(url: str, token: str, raw: bool = False):
 
 
 def unavailable(args: argparse.Namespace, checked: int) -> dict:
-    reason = (f"none of {checked} earlier {args.event} runs of {args.workflow} on {args.branch} in the last "
-              f"{args.max_age_days} days passed '{args.require_job}' and has an artifact named {args.artifact}")
+    where = f"of {args.workflow} on {args.branch} in the last {args.max_age_days} days"
     if checked:
+        artifact = args.artifact.replace("{sha}", "<sha>")
+        reason = (f"none of the {checked} earlier {args.event} runs {where} passed '{args.require_job}' "
+                  f"and has artifact {artifact}")
         print(f"::warning::{reason}")
+    else:
+        reason = f"first nightly to diff: no earlier {args.event} run {where}"
     return {"available": False, "reason": reason, "runs_checked": checked}
 
 
