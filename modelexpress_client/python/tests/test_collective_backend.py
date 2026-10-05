@@ -855,3 +855,43 @@ class TestNcclVersionFloor:
             assert backend.loaded_nccl_version() == (2, 30, 7)
         finally:
             backend.loaded_nccl_version.cache_clear()
+
+
+class TestBlockedReshardWatch:
+    """v14/v16: a reshard call blocked on a peer that never entered it gave
+    no sign of life; the deadline is only checked between calls."""
+
+    @staticmethod
+    def _parts():
+        from types import SimpleNamespace
+
+        entry = SimpleNamespace(name="layers.0.w", partition_id=3)
+        lane = SimpleNamespace(rank=1, world_size=18)
+        return entry, lane
+
+    def test_a_blocked_call_is_reported_while_it_blocks(self, monkeypatch, caplog):
+        import time as _time
+
+        from modelexpress_rl.collective import backend
+
+        monkeypatch.setattr(backend, "_SLOW_RESHARD_WARN_S", 0.02)
+        entry, lane = self._parts()
+        with caplog.at_level("WARNING", logger="modelexpress_rl.collective.backend"):
+            with backend._blocked_reshard_watch(entry, lane, _time.monotonic()):
+                _time.sleep(0.15)
+        assert "'layers.0.w' on lane 3 (rank 1 of 18) still blocks the host" in (
+            caplog.text
+        )
+
+    def test_a_prompt_call_logs_nothing_and_leaves_no_thread(self, monkeypatch, caplog):
+        import threading
+        import time as _time
+
+        from modelexpress_rl.collective import backend
+
+        entry, lane = self._parts()
+        with caplog.at_level("WARNING", logger="modelexpress_rl.collective.backend"):
+            with backend._blocked_reshard_watch(entry, lane, _time.monotonic()):
+                pass
+        assert "still blocks" not in caplog.text
+        assert not any(t.name == "mx-reshard-watch" for t in threading.enumerate())
