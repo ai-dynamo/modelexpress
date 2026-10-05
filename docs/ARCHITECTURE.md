@@ -607,9 +607,16 @@ method implementations. This keeps transport, payload preparation, engine
 geometry, and framework orchestration independently replaceable.
 
 `train/frameworks/miles/modelexpress.py` implements Miles' `WeightTransferProtocol`.
-Miles re-exports `UpdateWeightFromModelExpress` and loads it when the
-`modelexpress` transfer mode is selected. Shared package initializers do not load
-this adapter, so other frameworks can use the SDK without Miles installed.
+The Miles integration package exposes the adapter as:
+
+```python
+from modelexpress_rl.train.frameworks.miles import UpdateWeightFromModelExpress
+```
+
+Miles re-exports this class and loads it when the `modelexpress` transfer mode is
+selected. Importing this integration requires Miles; shared SDK package
+initializers do not import it, so other frameworks can use the SDK without Miles
+installed.
 
 Canonical S3 publication accepts either `stage_shard(hf_tensor_iter=...)` for a
 complete weight stream or repeated `stage_shard(tensors=bucket)` calls for one
