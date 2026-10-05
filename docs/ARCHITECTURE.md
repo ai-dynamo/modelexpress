@@ -169,6 +169,7 @@ ModelExpress/
 │       ├── load_strategy/              # Loading strategy chain
 │       │   ├── __init__.py             # LoadStrategyChain.run()
 │       │   ├── context.py              # LoadContext and LoadResult
+│       │   ├── draft_gate.py           # DraftPublicationGate (main publication waits for the draft pass)
 │       │   ├── base.py                 # LoadStrategy ABC and shared helpers
 │       │   ├── rdma_strategy.py        # RdmaStrategy (P2P GPU transfer via NIXL)
 │       │   ├── server_cache_strategy.py # ServerCacheStrategy (weights from MX Server)
@@ -187,7 +188,9 @@ ModelExpress/
 │       │   │       └── installer.py    # Mapped Direct Load installer
 │       │   └── sglang/                 # SGLang integration
 │       │       ├── __init__.py
-│       │       ├── adapter.py          # SglangAdapter and context builder
+│       │       ├── adapter.py          # SglangAdapter; delegates cold reads to SGLang
+│       │       ├── checkpoint_selection.py # Role-specific shard filtering before reads
+│       │       ├── draft_weights.py    # Model-specific main/draft selection rules
 │       │       └── loader.py           # MxModelLoader for remote_instance backend
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
 │       ├── transfer_safety.py          # Model feature detection for the P2P gate
@@ -1067,7 +1070,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `model_snapshot.py` | Hugging Face cache layout: path validation, atomic snapshot publication, revision refs |
 | `model_prefetch.py` | Pre-engine metadata prefetch and repo-id resolution for server-backed loading |
 | `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map strategy hooks to vLLM loader APIs; `refit/` contains the separate vLLM-specific MDL installer |
-| `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
+| `engines/sglang/` | `SglangAdapter` and `MxModelLoader` map strategy hooks to SGLang's `remote_instance` backend; `draft_weights.py` owns model-specific role rules and `checkpoint_selection.py` filters complete safetensors shards before ModelStreamer reads them |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
 | `vllm_worker.py` | `ModelExpressWorker` - compatibility worker class for older manual-registration workflows |
@@ -1123,6 +1126,8 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 | `__init__(agent_name, device_id, listen_port, accelerator_backend)` | Create NIXL agent with UCX backend; `listen_port` enables P2P listen thread; `accelerator_backend` owns torch device operations and accelerator capability gates |
 | `register_tensors(tensors)` | Register GPU tensors for RDMA, return serialized metadata. With `MX_POOL_REG=1` on a backend that supports pool registration, registers each unique cudaMalloc allocation backing the tensors instead of registering each tensor individually |
 | `register_arena(arena, tensors)` | Register the used VMM arena range once through dmabuf when the active accelerator backend supports the VMM arena fast path, then publish every tensor descriptor against that single MR. Falls back to per-tensor registration when a tensor lies outside the arena range, or when the arena spans several `cuMemCreate` handles (a single MR cannot be addressed by cuda_ipc then; override with `MX_ARENA_SINGLE_MR=1`) |
+| `register_additional_tensors(tensors)` | Append tensors to an already-registered catalog instead of replacing it (`register_tensors` / `register_arena` replace the name -> tensor catalog). Each call registers its tensors per-tensor, refreshes the agent metadata so it covers every registration, skips names already registered at the same address, and rejects a name registered at a different address. Used by the speculative draft pass on the main load's agent |
+| `deregister_tensors(names)` | Release tensors added by `register_additional_tensors` (catalog entries and, once unused, their registration handle). Base-catalog names are ignored; `shutdown()` releases those |
 | `fetch_remote_and_wait(agent_name, ip, port)` | P2P: fetch remote NIXL metadata via listen thread (polls until loaded) |
 | `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P) |
 | `shutdown()` | Clean up NIXL agent and resources |
@@ -1276,6 +1281,69 @@ loading, quantized-weight post-processing, and tensor discovery, including the
 storage-view naming used for non-contiguous SGLang parameters.
 The SGLang side does not expose separate source and target modes; transport
 selection and source discovery remain inside the ModelExpress package.
+
+**Speculative draft pass.** SGLang's EAGLE worker builds a second ModelRunner
+for the draft on the same GPU. Its `ModelConfig` has `is_draft_model=True` and,
+unless `speculative_draft_load_format` names another format, it loads through the
+same `remote_instance` backend. The generic MX draft path recognizes that
+second pass, reuses the main load's NIXL agent instead of binding the same
+metadata port again, and gives draft tensors a separate manifest namespace.
+Model-specific weight selection lives behind `DraftWeightAdapter`; the only
+implemented selector is Qwen3.5 MTP, whose raw-tensor predicate matches
+SGLang v0.5.16's `Qwen3_5ForCausalLMMTP.load_weights`. Actual tensor mapping,
+quantization, and loading still run through SGLang's model loader. The
+checkpoint's `model.safetensors.index.json` maps tensor names to shard files;
+it does not by itself define which tensors belong to every architecture's draft.
+
+- A Qwen3.5 draft may use P2P only when it shares the main `SourceIdentity`,
+  both passes select the same model adapter, pipeline parallelism is one, and
+  the source identity includes an explicit revision and SGLang package version.
+  A hash of these inputs and the model URI scopes its draft tensor names. The
+  receiver accepts only that namespace and verifies complete descriptor
+  coverage. Unknown or incompatible drafts fall back to SGLang's storage load.
+- After the main and draft loads, only draft-owned tensors are appended to the
+  main NIXL registration and metadata publication; target-shared embedding and
+  head storage is excluded using SGLang's `get_embed_and_head`, independent of
+  parameter names. The source's publication gate does not open for a recognized
+  Qwen3.5 draft until that extension succeeds. If a health URL is configured,
+  both draft publication and engine health must be ready.
+- On a cold source using ModelStreamer, the recognized Qwen3.5 adapter selects
+  **files** separately for the main and draft passes. MX first lets SGLang's
+  `RunaiModelStreamerLoader._prepare_weights` resolve the checkpoint and its
+  normal file list. An override then reads `model.safetensors.index.json` from
+  the root of that resolved local directory or object-store URI, maps the role-specific
+  tensor names to shard filenames, and intersects them with SGLang's file
+  list **before** SGLang creates its streamer iterator. SGLang still owns
+  `Source` handling, `draft_model_idx`, name prefixing, tensor mapping,
+  quantization, and `load_weights`. Only the primary model URI is filtered;
+  unrelated `secondary_weights` sources retain SGLang's original file list.
+  Missing/malformed index data, a role with
+  no matches, or a selected filename absent from SGLang's list leaves the
+  original full-file list unchanged. Unsupported model classes also use the
+  unmodified SGLang loader. A mixed shard containing both main and draft
+  tensors is selected by both passes, so file-level selection does **not**
+  guarantee disjoint object-store bytes or eliminate every duplicate read.
+- Cold loading uses shard selection without a persistent local draft staging
+  directory. For object storage, the index reader uses a temporary directory for
+  `model.safetensors.index.json` only and removes it after parsing; the
+  selected weight shards still flow through SGLang's ModelStreamer. This does
+  not change the warm target's role-scoped GPU P2P path.
+- On `transport=transfer_engine`, the draft loads natively and never publishes.
+  A second TransferEngine source would advertise the head under the target's
+  identity and replace the target's heartbeat, and its same-named tensors would
+  match the target's manifest. `MX_LOAD_STRATEGY_CHAIN=RL` rejects a draft.
+
+```mermaid
+flowchart LR
+    I[Checkpoint index<br/>tensor to shard] --> S[Qwen3.5 role selector]
+    R[SGLang resolves URI<br/>and available shards] --> S
+    S -->|main shard subset| M[SGLang ModelStreamer<br/>main load_weights]
+    S -->|draft shard subset| D[SGLang ModelStreamer<br/>draft load_weights]
+    S -. unsupported or incomplete .-> F[SGLang full-shard fallback]
+    M --> P[One NIXL agent<br/>one READY source]
+    D -->|append draft-namespaced tensors| P
+    P -->|one manifest, two role-scoped tensor sets| T[New replica<br/>main and draft P2P]
+```
 
 **LoadStrategyChain** (`load_strategy/`):
 
