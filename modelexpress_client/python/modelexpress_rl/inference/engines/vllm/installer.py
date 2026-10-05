@@ -37,7 +37,12 @@ from modelexpress.refit.reshard.geometry import (
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import refit_span
 
+from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.engines.vllm._capture_snapshot import _CaptureSnapshot
+from modelexpress_rl.inference.engines.vllm.surgical import (
+    changed_since,
+    module_groups,
+)
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -48,6 +53,7 @@ from modelexpress_rl.inference.plan import (
     PreparedStreamingTensors,
 )
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
+from modelexpress_rl.utils import index_checkpoint_tensors
 
 if TYPE_CHECKING:
     from modelexpress.refit.reshard.types import CaptureResult
@@ -55,6 +61,23 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
 
 logger = logging.getLogger("modelexpress_rl.inference.engines.vllm.installer")
+_LAYERWISE_LOGGER = "vllm.model_executor.model_loader.reload.layerwise"
+
+
+class _UnloadedLayerFilter(logging.Filter):
+    """Count vLLM's per-layer warning for layers a delta leaves untouched."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.count = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.msg == "%s: Failed to load weights":
+            self.count += 1
+            return False
+        return True
+
+
 _MODULE_GETATTRIBUTE = torch.nn.Module.__getattribute__
 _MODULE_GETATTR = torch.nn.Module.__getattr__
 _MODULE_GET_SUBMODULE = torch.nn.Module.get_submodule
@@ -576,6 +599,8 @@ class _VllmInstaller(EngineInstaller):
         self._device = device
         self._convert_native_to_hf = convert_native_to_hf
         self._runtime_tensors = runtime_tensors
+        # Version whose checkpoint bytes the engine holds; None when unknown.
+        self._live_version: str | None = None
         self._capture_cache = None
         self._native_parameter_dispatch = _native_parameter_dispatch()
 
@@ -656,6 +681,7 @@ class _VllmInstaller(EngineInstaller):
     def install(self, prepared: PreparedArtifact) -> dict[str, float]:
         started = time.perf_counter()
         metrics = prepared.metrics
+        live_version, self._live_version = self._live_version, None
         if isinstance(prepared, PreparedEngineTensors):
             self.install_tensors(prepared.staged.tensors)
         elif isinstance(prepared, PreparedStreamingTensors):
@@ -670,7 +696,20 @@ class _VllmInstaller(EngineInstaller):
             checkpoint = prepared.checkpoint
             if not isinstance(checkpoint, PreparedCheckpoint):
                 raise TypeError("checkpoint preparation has an invalid value")
-            self.install_checkpoint(checkpoint.path)
+            changed = (
+                changed_since(
+                    checkpoint.delta_changes,
+                    live_version=live_version,
+                    target_version=checkpoint.target_version,
+                )
+                if rl_envs.MX_REFIT_DELTA_SURGICAL
+                else None
+            )
+            if changed is None:
+                self.install_checkpoint(checkpoint.path)
+            else:
+                metrics.update(self.install_changed_tensors(checkpoint.path, changed))
+            self._live_version = checkpoint.target_version
         else:
             raise TypeError(f"unsupported prepared artifact {type(prepared).__name__}")
         if not isinstance(prepared, PreparedStreamingTensors):
@@ -1022,6 +1061,94 @@ class _VllmInstaller(EngineInstaller):
         # reports the stage too rather than charging it to the caller's total.
         with refit_span("post_install"):
             torch.cuda.synchronize(self._device)
+
+    def install_changed_tensors(
+        self, path: str | Path, changed: frozenset[str]
+    ) -> dict[str, float]:
+        """Reload only the modules whose checkpoint tensors a delta changed.
+
+        Untouched layers receive no weights, so vLLM's finalize places their
+        existing kernel tensors back. If a fed module is still incomplete, the
+        rest of the checkpoint is streamed through the same reload, which is
+        then exactly a full reload.
+        """
+        from safetensors import safe_open
+        from vllm.model_executor.layers.attention import is_deferred_attention_layer
+        from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
+
+        started = time.perf_counter()
+        _, locations, _ = index_checkpoint_tensors(path)
+        packed: dict[str, list[str]] = {}
+        for module in self._model.modules():
+            packed.update(getattr(module, "packed_modules_mapping", None) or {})
+        names = module_groups(changed, locations, packed)
+        by_file: dict[Path, list[str]] = {}
+        for name in sorted(
+            names, key=lambda n: (str(locations[n][0]), locations[n][1])
+        ):
+            by_file.setdefault(locations[name][0], []).append(name)
+        fallback = False
+
+        def subset():
+            for file, file_names in by_file.items():
+                with safe_open(str(file), framework="pt") as tensors:
+                    for name in file_names:
+                        yield name, tensors.get_tensor(name)
+
+        def load(_aliases: _ParameterAliases) -> None:
+            nonlocal fallback
+            self._model.load_weights(subset())
+            incomplete = [
+                type(layer).__name__
+                for layer, info in LAYERWISE_INFO.items()
+                if info.can_load()
+                and 0 < info.load_numel < info.load_numel_total
+                and not is_deferred_attention_layer(layer)
+            ]
+            if not incomplete:
+                return
+            fallback = True
+            logger.warning(
+                "Surgical checkpoint install left %d modules incomplete (%s); "
+                "loading the rest of the checkpoint",
+                len(incomplete),
+                sorted(set(incomplete))[:5],
+            )
+            load_config = copy.copy(self._vllm_config.load_config)
+            object.__setattr__(load_config, "load_format", "safetensors")
+            model_config = copy.copy(self._model_config)
+            model_config.model = str(path)
+            model_config.revision = None
+            rest = DefaultModelLoader(load_config).get_all_weights(
+                model_config, self._model
+            )
+            self._model.load_weights(
+                (name, tensor) for name, tensor in rest if name not in names
+            )
+
+        unloaded = _UnloadedLayerFilter()
+        layerwise_logger = logging.getLogger(_LAYERWISE_LOGGER)
+        layerwise_logger.addFilter(unloaded)
+        try:
+            self._reload(load)
+        finally:
+            layerwise_logger.removeFilter(unloaded)
+        with refit_span("post_install"):
+            torch.cuda.synchronize(self._device)
+        logger.info(
+            "Surgical checkpoint install changed=%d loaded=%d untouched_layers=%d "
+            "fallback=%s seconds=%.3f",
+            len(changed),
+            len(names),
+            unloaded.count,
+            fallback,
+            time.perf_counter() - started,
+        )
+        return {
+            "perf/mx_receive_surgical_tensors": float(len(names)),
+            "perf/mx_receive_surgical_fallback": float(fallback),
+        }
 
     @torch.no_grad()
     def _process_and_commit(

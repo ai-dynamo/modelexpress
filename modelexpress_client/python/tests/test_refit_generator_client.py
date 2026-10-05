@@ -2352,6 +2352,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
             self._device = torch.device("cpu")
             self._vllm_config = SimpleNamespace(quant_config=None)
             self._model_config = SimpleNamespace(dtype=torch.float32)
+            self._live_version = None
             self.copy_count = 0
 
         def _reload(self, load):

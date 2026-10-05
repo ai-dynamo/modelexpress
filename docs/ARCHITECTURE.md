@@ -711,6 +711,14 @@ background, so the local checkpoint may lag the engine's serving version.
 Fallback therefore resumes from the local checkpoint version. Object storage
 is consulted only when a later refit cannot use P2P.
 
+With `MX_REFIT_DELTA_SURGICAL=true` (default `false`), vLLM checkpoint refits
+track delta tensor names and the last completely installed checkpoint version.
+Known lineage selects whole destination modules for graph-safe layerwise reload;
+unknown lineage or a partially loaded module falls back to a full reload. Peer,
+bounded tensor streaming, and failed installs clear the tracked checkpoint version.
+When disabled, the receiver skips delta-name lineage reads and the installer uses
+the full checkpoint path. See [the delta refit guide](S3_DELTA_WEIGHT_REFIT.md).
+
 The canonical receiver retains each full checkpoint and delta payload under its
 version, then writes a resolved chain manifest. A full target is directly
 installable. The first delta after a full checkpoint copies that immutable full
