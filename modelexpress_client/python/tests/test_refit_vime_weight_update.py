@@ -232,6 +232,12 @@ def updater(monkeypatch, mx_module, control, trainer, **config_overrides):
     return instance
 
 
+def test_vime_package_reexports_updater(mx_module):
+    from modelexpress_rl.train.frameworks.vime import UpdateWeightFromModelExpress
+
+    assert UpdateWeightFromModelExpress is mx_module.UpdateWeightFromModelExpress
+
+
 def test_vime_builds_generic_trainer_object_storage_config_and_normalizes_nulls(
     monkeypatch, mx_module
 ):
@@ -504,6 +510,84 @@ def test_reconnecting_the_same_vllm_cohort_is_a_noop(monkeypatch, mx_module):
     instance.connect_rollout_engines([engine], object())
 
     assert [event for event, _payload in events if event == "init"] == ["init"]
+
+
+@pytest.mark.parametrize("full_checkpoint_interval", [None, 2])
+def test_replacement_engine_keeps_seed_identity_and_restores_current_version(
+    monkeypatch, mx_module, full_checkpoint_interval
+):
+    control = FakeControl()
+    trainer = FakeTrainer()
+    instance = updater(
+        monkeypatch,
+        mx_module,
+        control,
+        trainer,
+        full_hf_checkpoint_interval=full_checkpoint_interval,
+    )
+    surviving_events = []
+    surviving = FakeEngine(surviving_events)
+    instance.connect_rollout_engines([surviving, FakeEngine([])], object())
+    instance.update_weights()
+    instance.update_weights()
+    instance.update_weights()
+    surviving_events.clear()
+
+    replacement_events = []
+    replacement = FakeEngine(replacement_events)
+    instance.connect_rollout_engines([surviving, replacement], object())
+
+    init_info = replacement_events[0][1]["init_info"]
+    assert (
+        init_info["initial_base_version_id"],
+        init_info["seed_checkpoint_path"],
+    ) == ("base-uid", "/models/seed")
+    assert [event for event, _payload in replacement_events] == [
+        "init", "pause", "flush", "start", "update:opaque-2", "finish", "continue"
+    ]
+    assert surviving_events == []
+    assert len(control.created) == 3
+    assert len(trainer.publishes) == 2
+
+    instance.update_weights()
+
+    assert control.created[-1]["base_version_id"] == "opaque-2"
+    assert [event for event, _payload in replacement_events[-6:]] == [
+        "pause", "flush", "start", "update:opaque-3", "finish", "continue"
+    ]
+    assert [event for event, _payload in surviving_events] == [
+        "pause", "flush", "start", "update:opaque-3", "finish", "continue"
+    ]
+
+
+def test_failed_reconnect_does_not_resume_or_accept_replacement(
+    monkeypatch, mx_module
+):
+    control = FakeControl()
+    trainer = FakeTrainer()
+    instance = updater(monkeypatch, mx_module, control, trainer)
+    instance.connect_rollout_engines([FakeEngine([])], object())
+    instance.update_weights()
+    instance.update_weights()
+    instance.disconnect_rollout_engines()
+    events = []
+
+    with pytest.raises(RuntimeError, match="restore failed"):
+        instance.connect_rollout_engines(
+            [FakeEngine(events, update_error="restore failed")], object()
+        )
+
+    assert not any(event == "continue" for event, _payload in events)
+    assert instance.rollout_engines is None
+    assert (instance.weight_version, instance._current_version_id) == (1, "opaque-1")
+    assert len(control.created) == 2
+    assert len(trainer.publishes) == 1
+
+    replacement_events = []
+    instance.connect_rollout_engines([FakeEngine(replacement_events)], object())
+    assert [event for event, _payload in replacement_events] == [
+        "init", "pause", "flush", "start", "update:opaque-1", "finish", "continue"
+    ]
 
 
 def test_failed_vllm_initialization_is_retried_for_the_same_cohort(

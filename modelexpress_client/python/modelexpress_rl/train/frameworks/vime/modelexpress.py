@@ -126,6 +126,10 @@ class UpdateWeightFromModelExpress:
         connected = tuple(rollout_engines)
         if self.rollout_engines == connected:
             return
+        new_engines = tuple(
+            engine for engine in connected if engine not in (self.rollout_engines or ())
+        )
+        seed_version_id = self._object_storage_config.initial_base_version_id
 
         if not self._baseline_captured:
             base_uri = (
@@ -134,7 +138,7 @@ class UpdateWeightFromModelExpress:
             )
             self._rank_zero_call(
                 lambda: self._control.create_weight_version(
-                    uid=self._current_version_id,
+                    uid=seed_version_id,
                     model_name=self._trainer.model_name,
                     idempotency_key=f"vime:{base_uri}",
                     payload_format=WeightPayloadFormat.FULL_TENSOR,
@@ -144,7 +148,7 @@ class UpdateWeightFromModelExpress:
                     ),
                     state=WeightVersionState.READY,
                 ),
-                f"ModelExpress baseline version {self._current_version_id} registration failed",
+                f"ModelExpress baseline version {seed_version_id} registration failed",
             )
 
         registration_ttl = self._config.get("registration_ttl_seconds")
@@ -153,7 +157,7 @@ class UpdateWeightFromModelExpress:
         init_info = {
             "model_name": self._trainer.model_name,
             "server_url": self._trainer.server_url,
-            "initial_base_version_id": self._current_version_id,
+            "initial_base_version_id": seed_version_id,
             "seed_checkpoint_path": self._object_storage_config.seed_checkpoint_path,
             "refit_checkpoint_dir": self._config.get("refit_checkpoint_dir"),
             "object_storage_type": self._object_storage_config.storage_type.value,
@@ -173,11 +177,18 @@ class UpdateWeightFromModelExpress:
             lambda: ray.get(
                 [
                     engine.init_weight_transfer_engine.remote({"init_info": init_info})
-                    for engine in connected
+                    for engine in new_engines
                 ]
             ),
             "vLLM ModelExpress initialization failed",
         )
+        if new_engines and self._current_version_id != seed_version_id:
+            self._rank_zero_call(
+                lambda: self._update_engine_weights(
+                    self._current_version_id, engines=new_engines
+                ),
+                f"ModelExpress version {self._current_version_id} restore failed",
+            )
         self.rollout_engines = connected
 
     def disconnect_rollout_engines(self) -> None:
@@ -337,9 +348,16 @@ class UpdateWeightFromModelExpress:
             "perf/mx_update_engine_weights_time": update_engine_weights_time,
         }
 
-    def _update_engine_weights(self, target_version_id: str) -> None:
+    def _update_engine_weights(
+        self,
+        target_version_id: str,
+        *,
+        engines: Sequence[ActorHandle] | None = None,
+    ) -> None:
         """Pause rollout engines, install one version, and resume generation."""
-        engines = tuple(self.rollout_engines or ())
+        if engines is None:
+            engines = self.rollout_engines or ()
+        engines = tuple(engines)
         if not engines:
             raise RuntimeError("ModelExpress requires rollout engines")
         phase_started = perf_counter()

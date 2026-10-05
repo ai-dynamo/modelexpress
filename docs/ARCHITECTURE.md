@@ -565,14 +565,6 @@ full-tensor NIXL and canonical-checkpoint object-storage publication remain sepa
 method implementations. This keeps transport, payload preparation, engine
 geometry, and framework orchestration independently replaceable.
 
-`train/frameworks/vime/modelexpress.py` owns Vime's ModelExpress weight updater,
-including version publication, checkpoint cadence, rollout refits, and metrics.
-Vime re-exports `UpdateWeightFromModelExpress` and imports it only when
-`--update-weight-transport modelexpress` is selected. The adapter reuses Vime's
-HF weight iterator and Gloo-group helper. Package initializers do not import the
-adapter, so ordinary SDK imports do not require Vime, Ray, or Megatron. Vime users
-need a ModelExpress build that includes this adapter.
-
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
 | `RegisterWorker` | `RegisterWorkerRequest` | `RegisterWorkerResponse` | Register or refresh one TTL-bound worker process |
@@ -1055,6 +1047,27 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |
 | `inference/engines/vllm/installer.py` | Private vLLM load-layout capture plus graph-safe tensor or prepared-checkpoint installation |
 | `inference/engines/vllm/weight_transfer_engine.py` | Native vLLM weight-transfer bridge for NIXL full-tensor and canonical S3 checkpoint refit |
+
+### Vime trainer integration
+
+`train/frameworks/vime/modelexpress.py` owns Vime's ModelExpress weight updater,
+including version publication, checkpoint cadence, rollout refits, and metrics.
+The framework package exposes it lazily:
+
+```python
+from modelexpress_rl.train.frameworks.vime import UpdateWeightFromModelExpress
+```
+
+Only requesting the updater loads Vime, Ray, and Megatron; ordinary SDK and
+framework-package imports do not. The existing `.vime.modelexpress` import path
+remains supported. Vime selects the adapter with
+`--update-weight-transport modelexpress`, and the adapter reuses Vime's HF weight
+iterator and Gloo-group helper.
+
+Replacement rollout engines keep the original seed's version ID. Once training
+has advanced, they install the latest published version before generation
+resumes, using canonical replay or a full checkpoint. Surviving engines are not
+reinitialized, and a failed restore does not resume the replacement engines.
 
 ### MxClient
 

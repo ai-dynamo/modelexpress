@@ -36,7 +36,10 @@ import modelexpress_rl
 import modelexpress_rl.train.frameworks
 import modelexpress_rl.train.frameworks.vime
 
+assert modelexpress_rl.train.frameworks.vime.__all__ == ["UpdateWeightFromModelExpress"]
+assert not hasattr(modelexpress_rl.train.frameworks.vime, "unknown_export")
 assert "vime" not in sys.modules
+assert "miles" not in sys.modules
 assert "ray" not in sys.modules
 assert "megatron" not in sys.modules
 assert "modelexpress_rl.train.frameworks.vime.modelexpress" not in sys.modules
