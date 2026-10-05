@@ -38,7 +38,7 @@ standalone Docker build for another cluster. You need permission to read the
 following task root and create new run/output directories there:
 
 ```bash
-export GLM_ASSETS=/lustre/fsw/coreai_tritoninference_triton3/kavink/glm-eos-investigation
+export GLM_ASSETS=/absolute/shared/path/to/glm-eos-investigation
 ```
 
 | Path under GLM_ASSETS | Purpose |
@@ -69,11 +69,12 @@ previous reservation or date remains valid. This full run needs 36 H100 nodes;
 the small gate needs one node. Follow the site's login-node and session-lock rules.
 
 ```bash
-git clone --branch kavink/glm-eos-reproduction-20261005 --single-branch \
+export GLM_BRANCH=YOUR_REPRODUCTION_BRANCH
+git clone --branch "$GLM_BRANCH" --single-branch \
   https://github.com/ai-dynamo/modelexpress.git modelexpress-glm
 cd modelexpress-glm
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
-export GLM_ASSETS=/lustre/fsw/coreai_tritoninference_triton3/kavink/glm-eos-investigation
+export GLM_ASSETS=/absolute/shared/path/to/glm-eos-investigation
 export GLM_RESERVATION=YOUR_ACTIVE_RESERVATION
 export GLM_PREFIX=glm-repro-20261005a
 export GLM_LAUNCH="$GLM_ASSETS/launchers/$GLM_PREFIX"

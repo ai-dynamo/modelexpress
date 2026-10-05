@@ -1,7 +1,8 @@
+: "${GLM_ASSETS:?Set GLM_ASSETS to the shared benchmark asset directory}"
 export RUN_ID=glm030-clean-v2
-export RUN_HOST=/lustre/fsw/coreai_tritoninference_triton3/kavink/glm-eos-investigation/runs/glm030-clean-v2
-export DATA_HOST=/lustre/fsw/coreai_tritoninference_triton3/kavink/glm-eos-investigation/data
-export MODELS_HOST=/lustre/fsw/coreai_tritoninference_triton3/kavink/glm-eos-investigation/models
+export RUN_HOST="$GLM_ASSETS/runs/glm030-clean-v2"
+export DATA_HOST="$GLM_ASSETS/data"
+export MODELS_HOST="$GLM_ASSETS/models"
 export TRAIN_NODES=32
 export INFER_NODES=4
 export GPUS_PER_NODE=8
@@ -29,11 +30,11 @@ export CONVERSION_PRIME_SHA=e58f238a3b0348e8d3a92745e077bd3015b0db93
 export MODEL_PATH=/models/hub/models--zai-org--GLM-5/snapshots/c183ef8c61faee82855eca1ed9bb3a9a7ce3b0b2
 export PRIME_SHA=700c8c4979805eb53fd87e75d9895bc67bf5450e
 export MX_SHA=e562c84988325a242d7a9d4a8834243bd4f7e8c8
-export IMAGE_PRIME=/lustre/fsw/coreai_tritoninference_triton3/kavink/glm-eos-investigation/optimized-pr-completion-20260929-v1/runtime.sqsh
+export IMAGE_PRIME="$GLM_ASSETS/optimized-pr-completion-20260929-v1/runtime.sqsh"
 export IMAGE_PRIME_SHA256=56b4c754ec16c6a202482acffcfecb29dd412f7b0c2068ff59fe6729c65b8803
-export IMAGE_SERVER=/lustre/fsw/coreai_tritoninference_triton3/kavink/glm-eos-investigation/optimized-pr-completion-20260929-v1/runtime.sqsh
+export IMAGE_SERVER="$IMAGE_PRIME"
 export IMAGE_SERVER_SHA256=56b4c754ec16c6a202482acffcfecb29dd412f7b0c2068ff59fe6729c65b8803
-export IMAGE_REDIS=/lustre/fsw/coreai_tritoninference_triton3/kavink/glm-eos-investigation/optimized-pr-completion-20260929-v1/runtime.sqsh
+export IMAGE_REDIS="$IMAGE_PRIME"
 export IMAGE_REDIS_SHA256=56b4c754ec16c6a202482acffcfecb29dd412f7b0c2068ff59fe6729c65b8803
 export ENABLE_PREFIX_CACHING=false
 export SAVE_CHECKPOINTS=false
