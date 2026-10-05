@@ -1128,6 +1128,15 @@ their non-tensor derived state cannot currently be refreshed by a direct copy.
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
+Worker metadata endpoints may use DNS hostnames or numeric IPv4/IPv6 addresses.
+Before fetching NIXL metadata, the client resolves hostnames using the system
+resolver and selects the first IPv4 or IPv6 address in resolver order; it does
+not retry other addresses if the connection fails. Numeric addresses bypass
+DNS, bracketed IPv6 literals are normalized, and IPv6 scope IDs are preserved.
+DNS failures are reported before calling NIXL. IPv6 socket metadata exchange
+requires a NIXL build containing
+[IPv6 support from PR #2236](https://github.com/ai-dynamo/nixl/pull/2236).
+
 ### Artifact Transfer Backends
 
 Set `MX_ARTIFACT_TRANSFER=1` on source and target workers. The vLLM and SGLang
