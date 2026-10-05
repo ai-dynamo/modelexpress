@@ -68,6 +68,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.fail_mesh_lookup = False
         self.fail_lease_deletion = False
         self.fail_registration = False
+        self.lease_events = []
         self.omit_base_version = False
         self.additional_versions = {}
         self.version = refit_pb2.WeightVersion(
@@ -148,7 +149,9 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
 
     def RegisterVersionLease(self, request, context):
         worker = self.registrations.get(request.worker_id)
-        if worker is None or worker.role != refit_pb2.WORKER_ROLE_GENERATOR:
+        accepted = worker is not None and worker.role == refit_pb2.WORKER_ROLE_GENERATOR
+        self.lease_events.append((time.monotonic(), accepted))
+        if not accepted:
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION, "generator not registered"
             )
@@ -869,22 +872,30 @@ def test_generator_does_not_stage_when_reregistration_fails(monkeypatch):
 def test_generator_lease_renewal_reregisters_lost_worker(monkeypatch):
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
-    generator = _initialize(monkeypatch, endpoint, adapter, lease_ttl_seconds=1)
+    # Renewal ticks every lease_ttl / 3 = 1 s.
+    generator = _initialize(monkeypatch, endpoint, adapter, lease_ttl_seconds=3)
 
     try:
         staged = generator.stage_weight(version=WeightVersionRef("version-a"))
         service.registrations.clear()
-        renewals = service.lease_registrations
+        start = len(service.lease_events)
         deadline = time.monotonic() + 5
-        while service.lease_registrations == renewals and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            events = service.lease_events[start:]
+            if any(not ok for _, ok in events) and events[-1][1]:
+                break
             time.sleep(0.05)
         staged.release()
     finally:
         generator.close()
         server.stop(grace=None).wait()
 
-    assert service.lease_registrations > renewals
+    events = service.lease_events[start:]
+    rejected_at = next(at for at, ok in events if not ok)
+    restored_at = next(at for at, ok in events if ok and at > rejected_at)
     assert "generator-0" in service.registrations
+    # The lease is restored on the rejecting tick, not one interval later.
+    assert restored_at - rejected_at < 0.5
 
 
 def test_generator_republishes_runtime_tensors_around_first_install(monkeypatch):
