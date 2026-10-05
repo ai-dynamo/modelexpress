@@ -617,6 +617,8 @@ version. The runtime dispatches these to the canonical method's `stage()` and
 `stage_bucket()` respectively. Both use the same bounded encoding pool for XOR
 deltas and full HF checkpoints. The iterator form finishes staging before returning; bucket calls
 enqueue work, and `publish()` drains it before publishing the complete version.
+Submitting a bucket for a different version before publication is rejected
+without modifying the staged payload.
 
 ```python
 # Each publisher has at least one bucket; the first initializes staging.

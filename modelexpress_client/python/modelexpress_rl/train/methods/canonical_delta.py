@@ -215,6 +215,10 @@ class CanonicalDeltaPublicationMethod:
         """Enqueue one bucket; an empty bucket initializes a non-contributing rank."""
         if self._staged is None:
             self._begin_stage(version)
+        elif self._staged.target_version_id != version.version_id:
+            raise RuntimeError(
+                "publish the staged canonical checkpoint before staging another"
+            )
         if bucket:
             process = (
                 self._process_full_checkpoint_bucket

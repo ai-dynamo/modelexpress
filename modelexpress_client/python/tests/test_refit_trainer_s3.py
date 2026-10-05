@@ -1259,6 +1259,50 @@ def test_s3_incremental_buckets_process_concurrently_and_publish_once(
 
 
 @pytest.mark.parametrize("full", [False, True])
+def test_s3_incremental_rejects_another_version_without_changing_payload(
+    monkeypatch, tmp_path, refit_server, full
+):
+    service, server_url = refit_server
+    if full:
+        service.target.payload_format = (
+            refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+        )
+        service.target.ClearField("base_version_id")
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+    expected = torch.tensor([3.0, 4.0])
+    try:
+        staged = trainer.stage_shard(
+            version=WeightVersionRef("target-a"), tensors=[("weight", expected)]
+        )
+        with pytest.raises(RuntimeError, match="publish the staged canonical checkpoint"):
+            trainer.stage_shard(
+                version=WeightVersionRef("target-b"),
+                tensors=[("weight", torch.tensor([5.0, 6.0]))],
+            )
+        staged.publish()
+        index = json.loads(
+            storage.objects["s3://weights/tests/v1/model.safetensors.index.json"]
+        )
+        shard = storage.objects[
+            f"s3://weights/tests/v1/{index['weight_map']['weight']}"
+        ]
+        if full:
+            actual = safetensors.torch.load(shard)["weight"].view(torch.uint8).numpy()
+        else:
+            encoded = safetensors.numpy.load(shard)["weight"]
+            delta = np.frombuffer(
+                zstandard.ZstdDecompressor().decompress(encoded), dtype=np.uint8
+            )
+            actual = np.bitwise_xor(
+                torch.tensor([1.0, 2.0]).view(torch.uint8).numpy(), delta
+            )
+        assert np.array_equal(actual, expected.view(torch.uint8).numpy())
+        assert trainer._runtime.method.current_base_version_id == "target-a"
+    finally:
+        trainer.close()
+
+
+@pytest.mark.parametrize("full", [False, True])
 def test_s3_incremental_publish_failure_keeps_complete_payload_retryable(
     monkeypatch, tmp_path, refit_server, full
 ):

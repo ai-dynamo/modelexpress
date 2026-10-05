@@ -241,12 +241,16 @@ class UpdateWeightFromModelExpress(WeightTransferProtocol):
     def _rank_zero_call(self, action):
         # Broadcast control-plane failures so peers do not wait at the next barrier.
         result = [None, None]
+        original_error = None
         if dist.get_rank() == 0:
             try:
                 result[0] = action()
             except Exception as error:  # noqa: BLE001 - broadcast failures to peers.
+                original_error = error
                 result[1] = "\n".join([str(error), *getattr(error, "__notes__", [])])
         dist.broadcast_object_list(result, src=0, group=get_gloo_group())
         if result[1] is not None:
-            raise RuntimeError(f"ModelExpress control operation failed: {result[1]}")
+            raise RuntimeError(
+                f"ModelExpress control operation failed: {result[1]}"
+            ) from original_error
         return result[0]
