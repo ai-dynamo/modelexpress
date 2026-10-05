@@ -2,3 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Miles trainer integration for ModelExpress RL."""
+
+from .modelexpress import UpdateWeightFromModelExpress
+
+__all__ = ["UpdateWeightFromModelExpress"]
