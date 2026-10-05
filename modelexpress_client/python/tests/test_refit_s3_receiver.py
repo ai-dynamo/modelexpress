@@ -200,7 +200,6 @@ class _Adapter:
             payload_format=inputs.payload_format,
             base_version_id=inputs.base_version_id,
             object_storage=inputs.object_storage,
-            expected_source_slots=(),
             layout_signature=inputs.layout_signature,
             state=WeightVersionState.READY,
             created_at_unix_ms=0,
@@ -223,7 +222,6 @@ class _Adapter:
                 payload_format=item.payload_format,
                 base_version_id=item.base_version_id,
                 object_storage=item.object_storage,
-                expected_source_slots=(),
                 layout_signature=item.layout_signature,
                 state=WeightVersionState.READY,
                 created_at_unix_ms=0,
@@ -1987,7 +1985,6 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
             payload_format=item.payload_format,
             base_version_id=item.base_version_id,
             object_storage=item.object_storage,
-            expected_source_slots=(),
             layout_signature="",
             state=WeightVersionState.READY,
             created_at_unix_ms=0,
@@ -2022,6 +2019,9 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
     generator = ModelExpressGeneratorClient()
     generator._serving_version_id = "base-a"
     generator._max_replay_chain_length = 64
+    generator._staging_buffer_bytes = None
+    generator._staging_buffers_count = 1
+    generator._staging_device = "cuda"
     monkeypatch.setattr(
         generator,
         "_fetch_ready_version",

@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 import grpc
 from modelexpress import auth, envs
@@ -68,6 +68,12 @@ class ModelExpressGeneratorConfig:
     max_replay_chain_length: int = 64
     # Deadline applied independently to each control-plane or manifest RPC.
     rpc_timeout_seconds: float = 30.0
+    # Capacity per bounded-streaming arena; None stages a full update.
+    staging_buffer_bytes: int | None = None
+    # One arena serializes reads and installs; two allow their overlap.
+    staging_buffers_count: int = 1
+    # Receive arenas use CUDA memory or pinned host memory.
+    staging_device: Literal["cuda", "cpu"] = "cuda"
     # Canonical object-storage checkpoint settings.
     object_storage: ObjectStorageGeneratorConfig | None = None
     # Version read from the engine's serving-version API after cold start.
@@ -103,6 +109,23 @@ class ModelExpressGeneratorConfig:
             self.max_replay_chain_length, "max_replay_chain_length"
         )
         rl_envs.require_positive_float(self.rpc_timeout_seconds, "rpc_timeout_seconds")
+        if self.staging_buffer_bytes is not None:
+            if isinstance(self.staging_buffer_bytes, bool) or not isinstance(
+                self.staging_buffer_bytes, int
+            ):
+                raise ValueError("staging_buffer_bytes must be a positive integer")
+            rl_envs.require_positive_int(
+                self.staging_buffer_bytes, "staging_buffer_bytes"
+            )
+        if isinstance(self.staging_buffers_count, bool) or not isinstance(
+            self.staging_buffers_count, int
+        ):
+            raise ValueError("staging_buffers_count must be a positive integer")
+        rl_envs.require_positive_int(
+            self.staging_buffers_count, "staging_buffers_count"
+        )
+        if self.staging_device not in ("cuda", "cpu"):
+            raise ValueError("staging_device must be 'cuda' or 'cpu'")
         if self.source_order is not None:
             if not isinstance(self.source_order, tuple) or not self.source_order:
                 raise ValueError("source_order must be a non-empty tuple")
@@ -269,6 +292,9 @@ class ModelExpressGeneratorClient:
         client._lease_ttl_seconds = lease_ttl_seconds
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         client._max_replay_chain_length = config.max_replay_chain_length
+        client._staging_buffer_bytes = config.staging_buffer_bytes
+        client._staging_buffers_count = config.staging_buffers_count
+        client._staging_device = config.staging_device
         try:
             runtime = initialize_generator_runtime(
                 engine_context=config.engine_context,
@@ -308,10 +334,20 @@ class ModelExpressGeneratorClient:
         return client
 
     def stage_weight(self, *, version: WeightVersionRef) -> StagedWeightHandle:
-        """Prepare an exact version without installing it into the live engine."""
+        """Prepare an exact version without installing it into the live engine.
+
+        With ``staging_buffer_bytes`` configured, reserve bounded buffers and
+        prepare deferred reads. ``apply_weight`` then pipelines read/install.
+        Otherwise, trainer sources transfer a complete independent staged copy.
+        """
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
         with self._operation_lock:
+            if (
+                self._staging_buffer_bytes is not None
+                and self._engine_state is _EngineState.UNCERTAIN
+            ):
+                raise RuntimeError("engine weights are uncertain; restart before refit")
             if self._active_handle is not None:
                 if self._active_handle.version_id == version.version_id:
                     return self._active_handle
@@ -343,7 +379,17 @@ class ModelExpressGeneratorClient:
                 with timing.active(recorder):
                     with refit_span("control_discovery"):
                         ready = self._get_ready_version(version.version_id)
-                    update = runtime.session.stage(ready)
+                    if self._staging_buffer_bytes is None:
+                        update = runtime.session.stage(ready)
+                    else:
+                        update = runtime.session.prepare_streaming(
+                            ready,
+                            max_staging_bytes=(
+                                self._staging_buffer_bytes * self._staging_buffers_count
+                            ),
+                            staging_device=self._staging_device,
+                            staging_buffers=self._staging_buffers_count,
+                        )
             except BaseException:
                 # Nothing else will report this cycle: the recorder is handed on
                 # through the staged handle, and staging failed before there was
@@ -358,94 +404,6 @@ class ModelExpressGeneratorClient:
                 timing=recorder,
             )
             return self._active_handle
-
-    def apply_weight_streaming(
-        self,
-        *,
-        version: WeightVersionRef,
-        max_staging_bytes: int,
-        staging_device: str = "cuda",
-        staging_buffers: int = 1,
-    ) -> Any:
-        """Transfer and install bounded batches while inference is paused.
-
-        ``max_staging_bytes`` caps the staging arenas in total. ``staging_device``
-        selects where they live: ``"cuda"`` keeps RDMA landing in VRAM with a
-        device-to-device commit; ``"cpu"`` uses pinned host memory and commits
-        with a host-to-device copy, saving the arena's worth of VRAM.
-        ``staging_buffers=2`` splits the cap across two arenas so the next
-        batch's transfer can overlap the current commit. The benefit depends on
-        the hardware and the relative transfer and installation times.
-
-        The cap excludes live weights, engine-owned temporary tensors and
-        post-load workspaces.
-
-        This operation mutates weights incrementally. On any failure the caller
-        must keep inference paused and restart the engine; there is no rollback.
-        ``stage_weight`` still prepares an update without changing live weights.
-        """
-        if not isinstance(version, WeightVersionRef):
-            raise TypeError("version must be a WeightVersionRef")
-        if staging_device not in ("cuda", "cpu"):
-            raise ValueError("staging_device must be 'cuda' or 'cpu'")
-        if (
-            isinstance(staging_buffers, bool)
-            or not isinstance(staging_buffers, int)
-            or staging_buffers < 1
-        ):
-            raise ValueError("staging_buffers must be a positive integer")
-        with self._operation_lock:
-            if self._engine_state is _EngineState.UNCERTAIN:
-                raise RuntimeError(
-                    "engine weights are uncertain; restart before streaming refit"
-                )
-            if self._active_handle is not None:
-                raise RuntimeError("another generator update is still active")
-            runtime = self._require_runtime()
-            started = time.perf_counter()
-            recorder = timing.start_cycle(
-                version_id=version.version_id,
-                rank=rl_envs.LOCAL_RANK,
-            )
-            try:
-                with timing.active(recorder):
-                    with refit_span("control_discovery"):
-                        ready = self._get_ready_version(version.version_id)
-                    update = runtime.session.prepare_streaming(
-                        ready,
-                        max_staging_bytes=max_staging_bytes,
-                        staging_device=staging_device,
-                        staging_buffers=staging_buffers,
-                    )
-            except BaseException:
-                timing.emit(recorder, logger)
-                raise
-            prepare_s = time.perf_counter() - started
-            staged = StagedWeightHandle(
-                client=self,
-                version_id=version.version_id,
-                update=update,
-                timing=recorder,
-            )
-            self._active_handle = staged
-            try:
-                result = self.apply_weight(staged)
-                metrics = {**(result or {}), **staged.metrics}
-            except BaseException:
-                try:
-                    self._release_staged(staged)
-                except Exception:
-                    logger.exception(
-                        "failed to release streaming update after installation error"
-                    )
-                raise
-            else:
-                release_started = time.perf_counter()
-                self._release_staged(staged)
-                metrics["streaming_prepare_s"] = prepare_s
-                metrics["streaming_release_s"] = time.perf_counter() - release_started
-                metrics["streaming_total_s"] = time.perf_counter() - started
-                return metrics
 
     def apply_weight(self, staged: StagedWeightHandle) -> Any:
         """Install a prepared update at the caller's safe point."""

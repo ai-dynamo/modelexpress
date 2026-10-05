@@ -1,19 +1,17 @@
--- Atomically delete one source shard after logical version release.
+-- Atomically delete one source shard when no active reader lease protects it.
 --
 -- KEYS[1]: version hash
 -- KEYS[2]: source worker registration hash
 -- KEYS[3]: physical shards hash
 -- KEYS[4]: active lease expiry sorted set for the version
--- ARGV: publication key, encoded shard, releasing_state
+-- KEYS[5]: publication endpoint index
+-- ARGV: publication key, encoded shard
 --
 -- Expired leases are removed using Redis time. Any remaining lease protects
 -- every shard of the version, independent of which source was selected.
 
 if redis.call('EXISTS', KEYS[1]) == 0 then
   return 'VERSION_NOT_FOUND'
-end
-if redis.call('HGET', KEYS[1], 'state') ~= ARGV[3] then
-  return 'VERSION_NOT_RELEASING'
 end
 if redis.call('EXISTS', KEYS[2]) == 0 then
   return 'WORKER_NOT_FOUND'
@@ -34,4 +32,5 @@ if redis.call('ZCARD', KEYS[4]) > 0 then
 end
 
 redis.call('HDEL', KEYS[3], ARGV[1])
+redis.call('HDEL', KEYS[5], ARGV[1])
 return 'DELETED'

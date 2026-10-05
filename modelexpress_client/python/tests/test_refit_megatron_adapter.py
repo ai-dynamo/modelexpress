@@ -68,6 +68,11 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.registration_ttl = request.ttl_seconds
         return refit_pb2.RegisterWorkerResponse(worker=request.worker)
 
+    def GetWeightVersion(self, request, _context):
+        return refit_pb2.GetWeightVersionResponse(
+            version=refit_pb2.WeightVersion(uid=request.uid, trainer_mesh_id="mesh-a")
+        )
+
     def CreateWeightVersionShard(self, request, _context):
         self.events.append("publish-version-shard")
         self.shard = request.shard
@@ -212,7 +217,8 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
                 registration_ttl_seconds=60,
             )
         )
-        source_slot_id = refit_client.bind_tensors(tensors)
+        metadata = refit_client.bind_tensors(tensors)
+        source_slot_id = refit_client.source_slot_id
         selected_adapter = refit_client._runtime.method._adapter
         refit_client.publish_version(version=WeightVersionRef("version-a"))
         worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
@@ -221,7 +227,7 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
         fetched = worker_stub.GetWeightVersionShardManifest(
             refit_pb2.GetWeightVersionShardManifestRequest(
                 version_id="version-a",
-                source_slot_id=source_slot_id,
+                logical_shard_id=metadata.logical_shard_id,
             )
         )
     finally:
@@ -239,7 +245,8 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     assert len(resources.manager.registered) == 1
     assert refit_service.shard.version_id == "version-a"
     assert source_slot_id.startswith("megatron:partition:")
-    assert refit_service.shard.source_slot_id == source_slot_id
+    assert len(metadata.logical_shard_id) == 64
+    assert refit_service.shard.logical_shard_id == metadata.logical_shard_id
     assert refit_service.shard.worker_id == "worker-3"
     assert refit_service.shard.tensor_count == 1
     assert refit_service.shard.total_bytes == 128

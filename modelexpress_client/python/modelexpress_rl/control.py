@@ -14,7 +14,7 @@ from modelexpress.client import _get_server_url
 from . import refit_pb2, refit_pb2_grpc
 from .object_storage import ObjectStorageSource, ObjectStorageType
 from .train import WeightPayloadFormat
-from .version import WeightVersionRef
+from .version import TrainerTensorsMetadata, WeightVersionRef
 
 
 class WeightVersionState(str, Enum):
@@ -26,18 +26,29 @@ class WeightVersionState(str, Enum):
 
 
 @dataclass(frozen=True)
+class TrainerMesh:
+    """Expected logical shards and physical trainers for one refit group."""
+
+    mesh_id: str
+    model_name: str
+    generation: int
+    workers: dict[str, TrainerTensorsMetadata]
+
+
+@dataclass(frozen=True)
 class WeightVersion:
     """Framework-facing representation of one MX weight version."""
 
     version_id: str
     model_name: str
     payload_format: WeightPayloadFormat
-    base_version_id: str | None
-    object_storage: ObjectStorageSource | None
-    expected_source_slots: tuple[str, ...]
     layout_signature: str
     state: WeightVersionState
     created_at_unix_ms: int
+    base_version_id: str | None = None
+    object_storage: ObjectStorageSource | None = None
+    trainer_mesh_id: str | None = None
+    version_number: int | None = None
 
     @property
     def ref(self) -> WeightVersionRef:
@@ -49,6 +60,45 @@ def _required(value: str, name: str) -> str:
     if not value.strip():
         raise ValueError(f"{name} is required")
     return value
+
+
+def _mesh(mesh: refit_pb2.TrainerMesh) -> TrainerMesh:
+    return TrainerMesh(
+        mesh_id=mesh.mesh_id,
+        model_name=mesh.model_name,
+        generation=mesh.generation,
+        workers={
+            worker_id: TrainerTensorsMetadata(
+                logical_shard_id=metadata.logical_shard_id,
+                metadata_endpoint=metadata.metadata_endpoint,
+            )
+            for worker_id, metadata in mesh.workers.items()
+        },
+    )
+
+
+def _response_mesh(response, rpc_name: str) -> TrainerMesh:
+    if not response.HasField("mesh"):
+        raise RuntimeError(f"MX {rpc_name} response is missing mesh")
+    return _mesh(response.mesh)
+
+
+def _mesh_workers(
+    workers: dict[str, TrainerTensorsMetadata],
+) -> dict[str, refit_pb2.TrainerTensorsMetadata]:
+    if not isinstance(workers, dict):
+        raise TypeError("workers must be a dict")
+    if not workers:
+        raise ValueError("workers must not be empty")
+    encoded = {}
+    for worker_id, metadata in workers.items():
+        if not isinstance(metadata, TrainerTensorsMetadata):
+            raise TypeError("workers values must be TrainerTensorsMetadata")
+        encoded[_required(worker_id, "worker_id")] = refit_pb2.TrainerTensorsMetadata(
+            logical_shard_id=_required(metadata.logical_shard_id, "logical_shard_id"),
+            metadata_endpoint=_required(metadata.metadata_endpoint, "metadata_endpoint"),
+        )
+    return encoded
 
 
 def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
@@ -94,10 +144,13 @@ def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
             version.base_version_id if version.HasField("base_version_id") else None
         ),
         object_storage=object_storage,
-        expected_source_slots=tuple(version.expected_source_slots),
         layout_signature=version.layout_signature,
         state=state,
         created_at_unix_ms=version.created_at_unix_ms,
+        trainer_mesh_id=(
+            version.trainer_mesh_id if version.HasField("trainer_mesh_id") else None
+        ),
+        version_number=version.version_number if version.HasField("version_number") else None,
     )
 
 
@@ -137,13 +190,63 @@ class ModelExpressControlClient:
         assert self._stub is not None
         return self._stub
 
+    def create_trainer_mesh(
+        self,
+        *,
+        model_name: str,
+        idempotency_key: str,
+        workers: dict[str, TrainerTensorsMetadata],
+    ) -> TrainerMesh:
+        """Declare complete expected trainer membership for a refit group."""
+        response = self._service.CreateTrainerMesh(
+            refit_pb2.CreateTrainerMeshRequest(
+                model_name=_required(model_name, "model_name"),
+                idempotency_key=_required(idempotency_key, "idempotency_key"),
+                workers=_mesh_workers(workers),
+            ),
+            timeout=self._rpc_timeout_seconds,
+        )
+        return _response_mesh(response, "CreateTrainerMesh")
+
+    def get_trainer_mesh(self, mesh_id: str) -> TrainerMesh:
+        response = self._service.GetTrainerMesh(
+            refit_pb2.GetTrainerMeshRequest(mesh_id=_required(mesh_id, "mesh_id")),
+            timeout=self._rpc_timeout_seconds,
+        )
+        return _response_mesh(response, "GetTrainerMesh")
+
+    def update_trainer_mesh(
+        self,
+        *,
+        mesh_id: str,
+        expected_generation: int,
+        workers: dict[str, TrainerTensorsMetadata],
+    ) -> TrainerMesh:
+        """Replace physical members if the mesh generation still matches."""
+        response = self._service.UpdateTrainerMesh(
+            refit_pb2.UpdateTrainerMeshRequest(
+                mesh_id=_required(mesh_id, "mesh_id"),
+                expected_generation=expected_generation,
+                workers=_mesh_workers(workers),
+            ),
+            timeout=self._rpc_timeout_seconds,
+        )
+        return _response_mesh(response, "UpdateTrainerMesh")
+
+    def delete_trainer_mesh(self, mesh_id: str) -> None:
+        self._service.DeleteTrainerMesh(
+            refit_pb2.DeleteTrainerMeshRequest(mesh_id=_required(mesh_id, "mesh_id")),
+            timeout=self._rpc_timeout_seconds,
+        )
+
     def create_weight_version(
         self,
         *,
         model_name: str,
         idempotency_key: str,
         payload_format: WeightPayloadFormat,
-        expected_source_slots: list[str] | None = None,
+        trainer_mesh_id: str | None = None,
+        version_number: int | None = None,
         uid: str | None = None,
         base_version_id: str | None = None,
         object_storage: ObjectStorageSource | None = None,
@@ -160,6 +263,12 @@ class ModelExpressControlClient:
             object_storage, ObjectStorageSource
         ):
             raise TypeError("object_storage must be an ObjectStorageSource")
+        if trainer_mesh_id is not None:
+            _required(trainer_mesh_id, "trainer_mesh_id")
+            if object_storage is not None:
+                raise ValueError("trainer_mesh_id is not valid for object storage")
+        if object_storage is None and trainer_mesh_id is None:
+            raise ValueError("trainer_mesh_id is required for worker publication")
         request = refit_pb2.CreateWeightVersionRequest(
             model_name=model_name,
             idempotency_key=idempotency_key,
@@ -170,7 +279,6 @@ class ModelExpressControlClient:
                     refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
                 ),
             }[payload_format],
-            expected_source_slots=expected_source_slots or [],
             state={
                 WeightVersionState.STAGING: refit_pb2.WEIGHT_VERSION_STATE_STAGING,
                 WeightVersionState.READY: refit_pb2.WEIGHT_VERSION_STATE_READY,
@@ -178,6 +286,10 @@ class ModelExpressControlClient:
         )
         if uid is not None:
             request.uid = _required(uid, "uid")
+        if trainer_mesh_id is not None:
+            request.trainer_mesh_id = trainer_mesh_id
+        if version_number is not None:
+            request.version_number = version_number
         if base_version_id is not None:
             request.base_version_id = _required(base_version_id, "base_version_id")
         if object_storage is not None:
@@ -222,6 +334,15 @@ class ModelExpressControlClient:
         )
         return _response_version(response, "UpdateWeightVersionState")
 
+    def list_weight_versions(
+        self, *, model_name: str, trainer_mesh_id: str | None = None,
+    ) -> list[WeightVersion]:
+        request = refit_pb2.ListWeightVersionsRequest(model_name=_required(model_name, "model_name"))
+        if trainer_mesh_id is not None:
+            request.trainer_mesh_id = _required(trainer_mesh_id, "trainer_mesh_id")
+        response = self._service.ListWeightVersions(request, timeout=self._rpc_timeout_seconds)
+        return [_weight_version(version) for version in response.versions]
+
     def delete_weight_version(self, version_id: str) -> WeightVersion:
         """Move a STAGING or READY version to RELEASING."""
         response = self._service.DeleteWeightVersion(
@@ -250,6 +371,8 @@ __all__ = [
     "ModelExpressControlClient",
     "ObjectStorageSource",
     "ObjectStorageType",
+    "TrainerMesh",
+    "TrainerTensorsMetadata",
     "WeightVersion",
     "WeightVersionState",
 ]
