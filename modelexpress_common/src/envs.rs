@@ -89,6 +89,13 @@ pub const HF_HUB_OFFLINE: &str = "HF_HUB_OFFLINE";
 /// registered here for reference (ModelExpress only sets it in tests).
 pub const HF_ENDPOINT: &str = "HF_ENDPOINT";
 
+// OCI registry credentials.
+pub const MODEL_EXPRESS_OCI_BEARER_TOKEN: &str = "MODEL_EXPRESS_OCI_BEARER_TOKEN";
+pub const MODEL_EXPRESS_OCI_USERNAME: &str = "MODEL_EXPRESS_OCI_USERNAME";
+pub const MODEL_EXPRESS_OCI_PASSWORD: &str = "MODEL_EXPRESS_OCI_PASSWORD";
+pub const MODEL_EXPRESS_OCI_TOKEN: &str = "MODEL_EXPRESS_OCI_TOKEN";
+pub const DOCKER_CONFIG: &str = "DOCKER_CONFIG";
+
 // ── NGC ─────────────────────────────────────────────────────────────────────
 /// Base URL for the NGC artifact/download API.
 pub const NGC_API_ENDPOINT: &str = "NGC_API_ENDPOINT";

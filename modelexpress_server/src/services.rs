@@ -20,7 +20,10 @@ use modelexpress_common::{
         },
     },
     models::{ModelProvider, ModelStatus},
-    providers::is_weight_file,
+    providers::{
+        is_weight_file,
+        oci::{DownloadMode, OciProvider},
+    },
 };
 use std::{
     collections::HashMap,
@@ -60,14 +63,34 @@ async fn model_files_present(
     model_name: &str,
     provider: ModelProvider,
     revision: Option<&str>,
+    ignore_weights: bool,
 ) -> bool {
     let Some(cache_dir) = cache_dir else {
         return true;
     };
-    download::get_provider(provider)
-        .get_model_path_revision(model_name, cache_dir, revision)
+    model_path_for_request(&cache_dir, model_name, provider, revision, ignore_weights)
         .await
         .is_ok()
+}
+
+async fn model_path_for_request(
+    cache_dir: &Path,
+    model_name: &str,
+    provider: ModelProvider,
+    revision: Option<&str>,
+    ignore_weights: bool,
+) -> anyhow::Result<PathBuf> {
+    if provider == ModelProvider::Oci {
+        modelexpress_common::providers::reject_unsupported_revision("OCI", revision)?;
+        return OciProvider::cached_model_path(
+            cache_dir,
+            model_name,
+            DownloadMode::from(ignore_weights),
+        );
+    }
+    download::get_provider(provider)
+        .get_model_path_revision(model_name, cache_dir.to_path_buf(), revision)
+        .await
 }
 
 /// A model download request reduced to the identity the registry and the provider need.
@@ -430,8 +453,6 @@ impl ModelService for ModelServiceImpl {
         let provider = ModelProvider::from(grpc_provider);
         let model_name = download::canonical_model_name(&files_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let provider_impl = download::get_provider(provider);
-
         info!(
             "Starting file stream for model: {} with chunk size: {} bytes",
             model_name, chunk_size
@@ -443,14 +464,15 @@ impl ModelService for ModelServiceImpl {
 
         // Get the model path using the provider from the request. A requested revision
         // selects that exact snapshot instead of whichever one is newest on disk.
-        let model_path = provider_impl
-            .get_model_path_revision(
-                &model_name,
-                cache_dir.clone(),
-                files_request.revision.as_deref(),
-            )
-            .await
-            .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
+        let model_path = model_path_for_request(
+            &cache_dir,
+            &model_name,
+            provider,
+            files_request.revision.as_deref(),
+            files_request.ignore_weights,
+        )
+        .await
+        .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
 
         debug!("Model path resolved to: {:?}", model_path);
 
@@ -621,8 +643,6 @@ impl ModelService for ModelServiceImpl {
         let provider = ModelProvider::from(grpc_provider);
         let model_name = download::canonical_model_name(&files_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let provider_impl = download::get_provider(provider);
-
         info!("Listing files for model: {}", model_name);
 
         // Get the cache directory
@@ -630,10 +650,15 @@ impl ModelService for ModelServiceImpl {
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
 
         // Get the model path using the provider from the request
-        let model_path = provider_impl
-            .get_model_path_revision(&model_name, cache_dir, files_request.revision.as_deref())
-            .await
-            .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
+        let model_path = model_path_for_request(
+            &cache_dir,
+            &model_name,
+            provider,
+            files_request.revision.as_deref(),
+            files_request.ignore_weights,
+        )
+        .await
+        .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
 
         // Collect all files
         let files = collect_model_files(
@@ -1115,6 +1140,7 @@ impl ModelDownloadTracker {
                             model_name,
                             provider,
                             target.revision.as_deref(),
+                            target.ignore_weights,
                         )
                         .await
                     {
@@ -2099,7 +2125,8 @@ mod tests {
                 Some(cache_dir.clone()),
                 "test/model",
                 ModelProvider::HuggingFace,
-                None
+                None,
+                false
             )
             .await
         );
@@ -2113,9 +2140,38 @@ mod tests {
                 Some(cache_dir),
                 "test/model",
                 ModelProvider::HuggingFace,
-                None
+                None,
+                false
             )
             .await
+        );
+    }
+
+    #[tokio::test]
+    async fn oci_file_requests_use_the_requested_cache_mode() {
+        let cache = TempDir::new().expect("cache");
+        let model = "registry.example.com/team/model:v1";
+        let transfer = modelexpress_common::providers::oci::OciCacheWrite::new(
+            cache.path(),
+            model,
+            DownloadMode::Metadata,
+        )
+        .await
+        .expect("metadata transfer");
+        std::fs::write(transfer.files_dir().join("config.json"), b"{}").expect("metadata");
+        let path = transfer.publish().expect("publish metadata");
+        assert_eq!(
+            model_path_for_request(cache.path(), model, ModelProvider::Oci, None, true)
+                .await
+                .expect("metadata lookup"),
+            path
+        );
+        assert!(
+            model_path_for_request(cache.path(), model, ModelProvider::Oci, None, false)
+                .await
+                .expect_err("full lookup")
+                .to_string()
+                .contains("not found in cache")
         );
     }
 
@@ -2123,7 +2179,9 @@ mod tests {
     async fn test_model_files_present_assumes_present_without_cache_dir() {
         // With no configured cache directory we cannot verify, so we must not force a
         // re-download loop: assume the files are present.
-        assert!(model_files_present(None, "test/model", ModelProvider::HuggingFace, None).await);
+        assert!(
+            model_files_present(None, "test/model", ModelProvider::HuggingFace, None, false).await
+        );
     }
 
     #[tokio::test]
