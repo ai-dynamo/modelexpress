@@ -520,10 +520,15 @@ for bucket in hf_tensor_buckets():
 staged.publish()
 ```
 
-Each participating publisher submits at least one nonempty bucket. All calls for
-the same version share one staged payload; `publish()` waits for pending bucket
-processing before uploading. Submitted tensors must remain stable until
-publication finishes. The iterator form completes staging before returning.
+Each rank in the configured publication process group must stage and publish a
+contribution. A rank with no tensors submits `stage_shard(version=version,
+tensors=[])` once and publishes the returned handle. Miles uses a sender-only
+publication group, so its non-sender ranks do not stage or publish.
+
+All calls for the same version share one staged payload; `publish()` waits for
+pending bucket processing before uploading. Submitted tensors must remain stable until
+publication finishes. Publish the current version before staging another.
+The iterator form completes staging before returning.
 
 The next delta must be `v2` with `base_version_id="v1"`. An integration may
 instead create a `FULL_HF_CHECKPOINT` version without `base_version_id`; that
