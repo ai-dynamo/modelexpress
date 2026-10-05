@@ -3,6 +3,7 @@
 
 import hashlib
 import logging
+import time
 from concurrent import futures
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -66,6 +67,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.mesh_generation_on_recheck = 1
         self.fail_mesh_lookup = False
         self.fail_lease_deletion = False
+        self.fail_registration = False
         self.omit_base_version = False
         self.additional_versions = {}
         self.version = refit_pb2.WeightVersion(
@@ -96,7 +98,9 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             for rank, slot in enumerate(("rank:0", "rank:1"))
         ]
 
-    def RegisterWorker(self, request, _context):
+    def RegisterWorker(self, request, context):
+        if self.fail_registration:
+            context.abort(grpc.StatusCode.UNAVAILABLE, "server restarting")
         worker = request.worker
         worker.expires_at_unix_ms = 1234
         self.registrations[worker.worker_id] = worker
@@ -501,6 +505,7 @@ def _initialize(
     staging_buffer_bytes=None,
     staging_buffers_count=1,
     staging_device="cuda",
+    lease_ttl_seconds=60,
 ):
     """Initialize a generator client backed by the test runtime."""
     monkeypatch.setattr(
@@ -518,7 +523,7 @@ def _initialize(
             worker_id="generator-0",
             server_url=endpoint,
             registration_ttl_seconds=60,
-            lease_ttl_seconds=60,
+            lease_ttl_seconds=lease_ttl_seconds,
             object_storage=(
                 ObjectStorageGeneratorConfig(
                     storage_type=ObjectStorageType.S3,
@@ -826,6 +831,60 @@ def test_generator_rejects_mesh_change_during_source_resolution(monkeypatch):
     finally:
         generator.close()
         server.stop(grace=None).wait()
+
+
+def test_generator_reregisters_before_each_update(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter)
+    # A restarted MX server has lost the registration before the next renewal.
+    service.registrations.clear()
+
+    try:
+        generator.stage_weight(version=WeightVersionRef("version-a")).release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert service.registrations["generator-0"].role == refit_pb2.WORKER_ROLE_GENERATOR
+
+
+def test_generator_does_not_stage_when_reregistration_fails(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter)
+    service.fail_registration = True
+
+    try:
+        with pytest.raises(grpc.RpcError):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert service.lease_registrations == 0
+    assert adapter.stage_calls == []
+
+
+def test_generator_lease_renewal_reregisters_lost_worker(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter, lease_ttl_seconds=1)
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        service.registrations.clear()
+        renewals = service.lease_registrations
+        deadline = time.monotonic() + 5
+        while service.lease_registrations == renewals and time.monotonic() < deadline:
+            time.sleep(0.05)
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert service.lease_registrations > renewals
+    assert "generator-0" in service.registrations
 
 
 def test_generator_republishes_runtime_tensors_around_first_install(monkeypatch):
