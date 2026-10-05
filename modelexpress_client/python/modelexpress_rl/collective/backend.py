@@ -36,6 +36,46 @@ _SLOW_RESHARD_WARN_S = 10.0
 DEFAULT_LAYER_GROUP = 0
 _M2N_CALL_LOCK = threading.Lock()
 
+
+class _blocked_reshard_watch:
+    """Log while one nccl.m2n reshard call still blocks the host.
+
+    The transfer deadline is checked only between calls, and a call blocked
+    on a peer that never enters the same collective returns never; without
+    this the trainer stays silent for as long as it is stuck.
+    """
+
+    def __init__(self, entry: ParamPlan, lane: LaneCommunicator, started: float):
+        self._entry = entry
+        self._lane = lane
+        self._started = started
+        self._done = threading.Event()
+        self._thread = threading.Thread(
+            target=self._watch, name="mx-reshard-watch", daemon=True
+        )
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._done.set()
+        self._thread.join()
+        return False
+
+    def _watch(self) -> None:
+        while not self._done.wait(_SLOW_RESHARD_WARN_S):
+            logger.warning(
+                "nccl.m2n reshard of %r on lane %s (rank %s of %s) still blocks "
+                "the host after %.0fs",
+                self._entry.name,
+                self._entry.partition_id,
+                self._lane.rank,
+                self._lane.world_size,
+                time.monotonic() - self._started,
+            )
+
+
 #: The reshard entry points were added in this NCCL release. An older library
 #: fails inside the native call rather than at import, so importability alone
 #: does not establish the runtime is usable.
@@ -364,7 +404,8 @@ class _CollectiveHalf:
             # is not sufficient for engine-owned or external buffers.
             self._pending_contexts.append(ctx)
             started = time.monotonic()
-            _reshard(comm=lane, entry=entry, src=src(ctx), dst=dst(ctx))
+            with _blocked_reshard_watch(entry, lane, started):
+                _reshard(comm=lane, entry=entry, src=src(ctx), dst=dst(ctx))
             elapsed = time.monotonic() - started
             if elapsed >= _SLOW_RESHARD_WARN_S:
                 # nccl.m2n issues host-blocking collectives inside a call
