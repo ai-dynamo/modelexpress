@@ -1,0 +1,39 @@
+metric,category,definition
+receiver_e2e_s,Integration,Candidate worker duration; maximum local receiver per update. Cold includes initial verification.
+trainer_max_local_s,Integration,"Maximum local trainer duration: handshake, publication, waiting for inference completion, release. Excludes the outer framework memory-reclaim and offer/cleanup wrapper. No warm reference replay is installed in this clean arm."
+framework_broadcast_s,Integration,"PrimeRL root time/broadcast_weights: memory reclamation plus the full sender.broadcast call, including offer/cleanup bookkeeping, coordination, publication, waiting for inference completion and release. Broader than pause/update/resume or receiver E2E. No warm reference replay is installed in this clean arm."
+ready_observed_to_resumed_s,Integration,Orchestrator update_rpc after READY observation: pause/update/resume through acknowledgement for warm updates. Cold also includes generation/restoration controls. No server READY-transition timestamp. No warm reference replay is installed in this clean arm.
+wait_for_ready_s,Integration,Orchestrator discovery before READY observation. Overlaps trainer readiness/publication; not MX internal source discovery.
+root_handshake_s,Integration,Root trainer handshake including coordination with trainers arriving at the synchronization point.
+root_publish_s,Integration,"Root trainer publication phase, including source preparation and publication barrier/RPC."
+root_source_preparation_s,MX internal,"Root source shard capture, validation, staging and synchronization; nested in root_publish_s."
+root_publish_client_s,MX API,Root MX trainer client publication call including source preparation; nested in root_publish_s.
+admin_pause_s,Integration,Pause RPC duration; not total generator paused dwell.
+admin_update_s,Integration,Inference update RPC duration. No warm reference replay is installed in this clean arm.
+admin_resume_s,Integration,Resume RPC duration through acknowledgement.
+streaming_total_s,MX API,Candidate apply_weight_streaming total including prepare/apply/release.
+streaming_prepare_s,MX API,"Candidate streaming preparation; parent of source metadata, capture, planning, registration and prepare_other_s."
+streaming_apply_s,MX API,Candidate streaming apply including transfer and installation; overlaps its component timers.
+streaming_release_s,MX API,Candidate streaming handle release.
+source_metadata_s,MX internal,Source manifest/source-table preparation after the version is ready; nested in streaming_prepare_s.
+layout_capture_s,MX internal,Engine load-layout capture; nested in streaming_prepare_s.
+transfer_planning_s,MX internal,Physical transfer planning; nested in streaming_prepare_s.
+connection_registration_s,MX internal,Connections and memory registration; nested in streaming_prepare_s.
+prepare_other_s,Derived,"streaming_prepare_s minus its four recorded children; same receiver, same update."
+wire_s,MX internal,"Sum of batch READ API durations; includes preparation/posting/polling overhead, not NIC-counter-only wire time."
+wire_wait_s,MX internal,READ completion wait subset of wire_s; never add again.
+reconstruct_s,MX internal,Received shard reconstruction/conversion and its synchronization.
+install_commit_s,MX internal,"Per-batch coverage/geometry validation, engine-owned materialization, receive copies, native module post-load processing, copying/restoring live destinations and synchronization. Deferred attention processing is in reload_s."
+reload_s,MX internal,"Outer vLLM layerwise reload, including MLA derived-weight refresh, excluding the streaming load callback."
+post_install_sync_s,MX internal,Final CUDA synchronization after native reload finalization; separate from reload_s and install_commit_s.
+receiver_other_s,Derived,"Receiver E2E minus disjoint prepare, wire, reconstruct, commit, reload, final synchronization and release. Cold includes verification."
+trainer_receiver_duration_gap_s,Derived,"Difference of maximum local trainer and receiver durations, with different boundaries; not pure MX overhead or a clock-aligned wait."
+bytes_received,MX internal,Planned READ descriptor bytes; not measured unique useful coverage or a NIC counter.
+installation_total_s,Derived,"Same-rank per-update sum of install_commit_s + reload_s + post_install_sync_s. Includes engine native materialization, post-load processing, live destination restoration and all installation CUDA drains; excludes wire/reconstruction."
+read_api_gbps,Derived,"8 * this receiver's planned READ bytes / wire_s / 1e9; per rank, not aggregate fabric throughput."
+diagnostic_replay,Sampling,False for every update in this separate clean run; no warm reference replay instrumentation is installed. Initial verification remains at cold step 0.
+critical_receiver_rank,Sampling,Rank with maximum candidate receiver E2E in this update; every receiver component in this row comes from that rank.
+batches,MX internal,Packed transfer/installation batches per candidate update.
+staging_peak_bytes,MX internal,Peak candidate staging arena bytes; excludes model weights and CPU verification snapshots.
+source_cache_hits,MX internal,1 when immutable decoded source metadata was reused; required on each warm receiver.
+plan_cache_hits,MX internal,1 when the physical transfer plan was reused after validation; required on each warm receiver.

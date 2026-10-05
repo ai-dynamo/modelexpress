@@ -1,0 +1,67 @@
+# Reference: Qwen3-30B-A3B-Instruct-2507 BF16, FSDP4/EP4 -> vLLM TP4/EP4.
+# Split into trainer, inference and CPU orchestrator by prime-role.sh.
+max_steps = 20
+seq_len = 2048
+
+[deployment]
+
+[model]
+name = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+[monitors.wandb]
+project = "prime-rl-mx-refit"
+name = "qwen3-30b-mx-instrumented"
+
+[trainer.model]
+# Custom Qwen3MoeForCausalLM implements the native->HF conversion chain + EP.
+impl = "custom"
+ep = "auto"
+
+[trainer.model.ac]
+# Activation checkpointing to keep 30B trainer activations in budget.
+freq = 1
+
+[trainer.optim]
+lr = 3e-6
+
+[ckpt]
+
+[orchestrator]
+batch_size = 64
+group_size = 8
+
+[orchestrator.train.sampling]
+max_completion_tokens = 128
+
+[[orchestrator.train.source]]
+name = "reverse-text"
+
+[orchestrator.train.source.env.taskset]
+id = "reverse-text"
+
+[orchestrator.train.source.env.agent.harness]
+id = "null"
+
+[orchestrator.train.source.env.agent.runtime]
+type = "subprocess"
+
+[inference.vllm]
+gpu_memory_utilization = 0.8
+max_model_len = 2048
+tensor_parallel_size = 4
+enable_expert_parallel = true
+
+# reverse-text isn't in MODEL_RENDERER_MAP for Qwen3-30B; use the default renderer.
+[orchestrator.renderer]
+name = "default"
+
+[slurm]
+project_dir = "/app"
+
+[trainer.model.fusions]
+enabled = []
+
+[trainer.loss]
+type = "ipo"
+eps = 0.1
+kl_tau = 0.001
