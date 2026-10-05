@@ -31,7 +31,11 @@ from modelexpress_rl.collective import (
     ReshardPlan,
 )
 from modelexpress_rl.collective.comm import new_unique_id
-from modelexpress_rl.collective.rendezvous import LaneMembership, Membership
+from modelexpress_rl.collective.rendezvous import (
+    EpochChangedError,
+    LaneMembership,
+    Membership,
+)
 
 
 def entry(name, partition=0):
@@ -88,6 +92,8 @@ class FakeRendezvous:
         self.published = []
         self.reports = []
         self.joins = 0
+        self.freshness_reads = []
+        self.stale = None
 
     def join(self, **kwargs):
         epoch = self._epochs[min(self.joins, len(self._epochs) - 1)]
@@ -125,6 +131,11 @@ class FakeRendezvous:
             ),
         ]
         return SimpleNamespace(group_id=group_id, epoch=epoch, lanes=lanes)
+
+    def check_current(self, *, group_id, epoch):
+        self.freshness_reads.append((group_id, epoch))
+        if self.stale is not None:
+            raise self.stale
 
     def report(self, **kwargs):
         self.reports.append(kwargs)
@@ -769,6 +780,48 @@ class TestStreams:
         client = trainer(FakeRendezvous(), FakeEngine())
         assert client._stream_for(0) is None
         assert client._stream_for(5) is None
+
+
+class TestFreshnessAtStart:
+    """A membership change between refits moves the epoch. start_weight_update
+    reads it once, before the engine prepares anything."""
+
+    def test_a_trainer_reads_the_group_before_preparing(self, fake_nccl):
+        rz, engine = FakeRendezvous(epochs=(3,)), FakeEngine()
+        client = trainer(rz, engine)
+        client.compute_plan()
+        client.start_weight_update("v1")
+        assert rz.freshness_reads == [("g", 3)]
+
+    def test_a_moved_group_is_refused_before_the_engine_prepares(self, fake_nccl):
+        rz, engine = FakeRendezvous(), FakeEngine()
+        client = trainer(rz, engine)
+        client.compute_plan()
+        rz.stale = EpochChangedError("g", 1, 2)
+        with pytest.raises(EpochChangedError):
+            client.start_weight_update("v1")
+        assert ("start", "v1") not in engine.calls
+        with pytest.raises(RuntimeError, match="start_weight_update must run"):
+            client.publish_weights("v1")
+
+    def test_a_generator_is_refused_too(self, fake_nccl):
+        rz, engine = FakeRendezvous(), FakeEngine()
+        client = RefitClientGenerator(
+            rendezvous=rz,
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=1,
+            slot_id="g0",
+            worker_id="w9",
+            index_in_role=0,
+        )
+        client.initialize(engine)
+        client.compute_plan()
+        rz.stale = EpochChangedError("g", 1, 2)
+        with pytest.raises(EpochChangedError):
+            client.start_weight_update("v1")
+        assert ("start", "v1") not in engine.calls
 
 
 class TestCleanup:

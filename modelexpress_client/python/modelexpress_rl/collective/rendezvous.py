@@ -548,6 +548,27 @@ class CollectiveRendezvous:
         except grpc.RpcError:
             return -1
 
+    def check_current(self, *, group_id: str, epoch: int) -> pb.CollectiveGroup:
+        """One read confirming the group is still READY at ``epoch``.
+
+        Raises :class:`EpochChangedError` if the epoch moved and
+        :class:`RendezvousError` if the group is no longer READY at it. RPC
+        errors propagate: nothing has been staged yet, so failing here is safe.
+        """
+        group = self._stub.GetCollectiveGroup(
+            pb.GetCollectiveGroupRequest(group_id=group_id),
+            timeout=self._rpc_timeout_s,
+        )
+        if group.epoch != epoch:
+            raise EpochChangedError(
+                group_id, epoch, group.epoch, group.disagreeing_slots
+            )
+        if group.state != pb.COLLECTIVE_GROUP_STATE_READY:
+            raise RendezvousError(
+                f"collective group {group_id} is no longer READY at epoch {epoch}"
+            )
+        return group
+
     def await_ready(
         self,
         *,
@@ -654,8 +675,8 @@ class CollectiveRendezvous:
 def _missing_slots(group: pb.CollectiveGroup) -> list[str]:
     """Which expected slots have not been admitted yet.
 
-    Read off the broadcast lane, which is the only one every participant joins,
-    so it is the single place the full admitted set is visible.
+    Read off the broadcast lane if one is declared, since every participant
+    joins it, otherwise off the union of all lanes.
     """
     # A digest disagreement is the CAUSE, not a symptom: every lane bootstrap
     # will also look stale, so reporting the lanes would point at the wrong

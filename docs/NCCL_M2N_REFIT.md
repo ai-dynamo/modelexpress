@@ -390,8 +390,8 @@ Two invariants the collective imposes on top of the layering doc:
 ![Timing waterfall of one warm refit: two trainer PP stages stack grouped MoE experts and co-call nccl.m2n.reshard with the generator ranks on independent per-stage communicators that overlap on separate CUDA streams, after which the misc packed broadcast is serialized behind every reshard lane, then the loader installs and both sides report](images/nccl-m2n-refit-waterfall.svg)
 
 Per-PP-stage lanes are independent communicators, so stage 0's and stage 1's
-reshards overlap on separate CUDA streams (`MX_NCCL_REFIT_NUM_STREAMS`, default 2,
-matching NeMo RL's `NRL_REFIT_NUM_STREAMS`). The misc broadcast is strictly
+reshards can overlap on separate CUDA streams. The caller supplies them as
+`streams=`; without that every lane runs on the current stream. The misc broadcast is strictly
 serialized after all bulk lanes: it uses the all-participants communicator, which
 overlaps every reshard lane, and concurrent traffic on overlapping communicators
 can deadlock.
@@ -405,10 +405,10 @@ failure.
 | Failure | Detection | Behavior |
 |---|---|---|
 | A participant never joins | `READY` never reached; client-side deadline on `GetCollectiveGroup` | Nobody enters the collective; `GroupNotReadyError` names the missing slots |
-| A participant joined then died before the collective | Its `WorkerRegistration` TTL expires; re-checked at the `READY` transition | Group returns to `FORMING`, epoch bumps; nobody entered the collective |
-| A worker restarts and rejoins | New `worker_id` for the same slot | Admitted as a *different generation*; epoch bumps; cached communicators dropped |
+| A participant joined then died before the collective | Its `WorkerRegistration` TTL expires; re-checked at the `READY` transition | Group returns to `FORMING`; epoch bumps if the group was `READY` or any lane already has a current-epoch bootstrap, otherwise (a clean `FORMING` epoch) the slot is just dropped. Nobody entered the collective |
+| A worker restarts and rejoins | New `worker_id` for the same slot | Admitted as a *different generation*; epoch bumps under the same rule (the first change from `READY` opens a clean `FORMING` epoch and further replacements in it only acknowledge that epoch); cached communicators dropped |
 | A participant dies mid-collective | NCCL error or timeout on the surviving ranks | `ReportCollectiveTransfer(FAILED)`; operation `FAILED`; the epoch bumps so the next `compute_plan` rebuilds. Communicators are not reusable after an aborted collective |
-| Membership changes between refits | Epoch mismatch on `start_weight_update` | `FAILED_PRECONDITION`; the caller re-runs `compute_plan` — the layering doc's stated trigger |
+| Membership changes between refits | One `GetCollectiveGroup` read in `start_weight_update`, before the engine prepares | `EpochChangedError` (or `RendezvousError` if the group is no longer `READY`); the caller re-runs `compute_plan`, the layering doc's stated trigger. A change that lands after that read surfaces at the transfer deadline or in the report |
 | Plan digest mismatch | Generator verifies the fetched plan against `plan_source.digest` | Fail closed before any wire op |
 
 Installation failure follows the V2 design's `DIRECT` semantics: a collective push
@@ -423,7 +423,7 @@ is exactly what the fused-parameter path already does.
 | Variable | Default | Purpose |
 |---|---|---|
 | `MX_REFIT_TRANSPORT` | `nixl` | `nccl_m2n` selects this path. One deployment, one backend |
-| `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams for overlapping per-PP-stage reshard lanes |
+| `MX_NCCL_REFIT_NUM_STREAMS` | `2` | Size of the stream pool an integration builds when it does not pass its own `streams`. `RefitClientTrainer`/`RefitClientGenerator` do not read it |
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for one lane's non-blocking `Communicator.init` |

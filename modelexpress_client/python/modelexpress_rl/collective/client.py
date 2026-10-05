@@ -138,9 +138,9 @@ class _RefitClientBase:
     ) -> NcclM2nSender | NcclM2nReceiver:
         """Reject a call that does not belong to the round now in flight.
 
-        ``version`` was accepted and ignored, so a call naming a version other
-        than the one ``start_weight_update`` opened moved that round's tensors
-        under the label of a different one -- silently, and on every rank.
+        Every per-round call names the version ``start_weight_update`` opened,
+        so a mismatch is refused here rather than moving one round's tensors
+        under another version's label on every rank.
         """
         if self._half is None:
             raise RuntimeError(f"compute_plan must run before {method}")
@@ -152,6 +152,19 @@ class _RefitClientBase:
                 f"{self._version!r}"
             )
         return self._half
+
+    def _check_still_current(self) -> None:
+        """One freshness read before a round prepares the engine.
+
+        A membership change between refits moves the epoch, so this catches a
+        cohort that already moved before anything is staged. It is a single
+        read, not a lease: a change that lands after it still surfaces at the
+        transfer deadline or in the report.
+        """
+        membership = self.membership
+        self._rendezvous.check_current(
+            group_id=membership.group_id, epoch=membership.epoch
+        )
 
     def _capture(self, engine: Publisher | Loader, expected: list[str] | None) -> None:
         plan = engine.capture()
@@ -440,6 +453,7 @@ class RefitClientTrainer(_RefitClientBase):
             raise RuntimeError("compute_plan must run before start_weight_update")
         if self._publisher is None:
             raise RuntimeError("initialize must run before start_weight_update")
+        self._check_still_current()
         self._publisher.start_new_round(version)
         self._half.start_weight_update(version)
         self._round_started = True
@@ -538,6 +552,7 @@ class RefitClientGenerator(_RefitClientBase):
             raise RuntimeError("compute_plan must run before start_weight_update")
         if self._loader is None:
             raise RuntimeError("initialize must run before start_weight_update")
+        self._check_still_current()
         self._loader.start_new_round(version)
         self._half.start_weight_update(version)
         self._round_started = True
@@ -597,7 +612,3 @@ class RefitClientGenerator(_RefitClientBase):
             self._loader.cleanup()
         self._loader = None
         super().cleanup()
-
-
-def num_streams() -> int:
-    return envs.MX_NCCL_REFIT_NUM_STREAMS

@@ -686,7 +686,7 @@ the ModelExpress server**. It brokers admission, rank assignment and the NCCL
 | Role | Count | Runs where | Needs |
 |---|---|---|---|
 | ModelExpress server | one endpoint | any node with network reach; for this path it needs no GPU and no fast fabric | gRPC reachable from every rank, plus a metadata backend |
-| Metadata backend | one | beside the server | Redis for more than one server replica, or for group state that survives a server restart. The in-memory backend is single-replica and forgets on exit |
+| Metadata backend | one | beside the server | **Redis, required.** The collective service is only registered on a Redis backend; with the in-memory or Kubernetes backend the server starts without it |
 | Trainer ranks | one per trainer GPU | inside the training job's own worker processes | the policy weights, the framework's own process group, gRPC to the server, NCCL to the generator ranks |
 | Generator ranks | one per inference-engine GPU | **inside the inference engine's own worker processes** | gRPC to the server, NCCL to the trainer ranks |
 | Coordinator | one | anywhere with gRPC reach | drives `start_weight_update` / publish / `finish_weight_update` on both sides in lockstep |
@@ -749,7 +749,7 @@ stock behavior. Design: [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md).
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | Backoff floor for `GetCollectiveGroup` polling while waiting for formation and for lane bootstrap ids to be published. |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300.0` | Deadline for bringing up one lane's NCCL communicator once its bootstrap id is published. Communicators are created non-blocking, and this bounds the poll to `ncclSuccess`. Setting `NCCL_COMM_BLOCKING` to anything other than `0` is rejected at startup, because blocking initialization would defeat this deadline. |
 | `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600.0` | Deadline for the reshard itself, armed per weight version. `READY` only means the group formed, so this bounds what happens after it; on expiry the group is aborted and has to re-form at a fresh epoch, because peers that disagree about which collectives completed cannot be recovered on the same communicator. |
-| `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams used to overlap per-pipeline-stage reshard lanes. |
+| `MX_NCCL_REFIT_NUM_STREAMS` | `2` | Size of the CUDA stream pool an integration builds when it does not pass its own `streams`. `RefitClientTrainer` and `RefitClientGenerator` do not read it: they use the `streams` the caller passes, or the current stream. |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS`, so `90` | How long a participant's registration stays alive without a heartbeat. Derived from `MX_HEARTBEAT_INTERVAL_SECS` (default `30`), so raising the heartbeat interval raises this with it. |
 
 ### NIXL Backend Selection

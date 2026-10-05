@@ -81,8 +81,8 @@ fn worker_key(worker_id: &str) -> String {
 /// then never reaches its expected count -- a bounded timeout naming the
 /// missing slots, rather than one group with inconsistent geometry.
 fn group_id_for(spec: &CollectiveGroupSpec) -> String {
-    let mut trainers = spec.expected_trainer_slots.clone();
-    let mut generators = spec.expected_generator_slots.clone();
+    let mut trainers: Vec<&String> = spec.expected_trainer_slots.iter().collect();
+    let mut generators: Vec<&String> = spec.expected_generator_slots.iter().collect();
     trainers.sort();
     generators.sort();
 
@@ -657,7 +657,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             }
             "CONFLICTING_ASSIGNMENT" => {
                 return Err(CollectiveBackendError::AlreadyExists(format!(
-                    "slot {} is already bound to a different role, ordinal, or partition",
+                    "slot {} is already bound to a different role or ordinal",
                     request.slot_id
                 )));
             }
@@ -723,24 +723,14 @@ impl CollectiveBackend for RedisCollectiveBackend {
         let group = self.read_group(&request.group_id).await?;
         // Lane ids are whatever the caller declared, so membership is the
         // test, not a range check against the count.
-        if !group
-            .lanes
-            .iter()
-            .any(|lane| lane.lane_id == request.lane_id)
-        {
-            return Err(CollectiveBackendError::InvalidArgument(format!(
-                "lane {} is not declared by this group",
-                request.lane_id
-            )));
-        }
         let lane = group
             .lanes
             .iter()
             .find(|lane| lane.lane_id == request.lane_id)
             .ok_or_else(|| {
-                CollectiveBackendError::Internal(format!(
-                    "collective group {} is missing lane {}",
-                    request.group_id, request.lane_id
+                CollectiveBackendError::InvalidArgument(format!(
+                    "lane {} is not declared by this group",
+                    request.lane_id
                 ))
             })?;
         let leader_slot = lane

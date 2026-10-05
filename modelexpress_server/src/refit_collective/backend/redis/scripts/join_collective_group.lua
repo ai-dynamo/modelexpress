@@ -42,8 +42,8 @@ local function registration_key(worker_id)
   return 'mx:refit:worker:' .. worker_id
 end
 
-local function registration_matches(worker_id, role, model_name)
-  local key = registration_key(worker_id)
+local function registration_matches(worker_id, role, model_name, key)
+  key = key or registration_key(worker_id)
   if redis.call('EXISTS', key) ~= 1 then
     return false
   end
@@ -59,7 +59,7 @@ if not contains_slot(expected_slots, ARGV[5]) then
   return 'UNEXPECTED_SLOT'
 end
 
-if not registration_matches(ARGV[6], ARGV[7], ARGV[2]) then
+if not registration_matches(ARGV[6], ARGV[7], ARGV[2], KEYS[4]) then
   return 'UNREGISTERED'
 end
 

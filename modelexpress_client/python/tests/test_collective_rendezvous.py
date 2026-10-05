@@ -660,6 +660,24 @@ class TestPublishBootstrap:
         assert stub.published == []
 
 
+class TestCheckCurrent:
+    def test_a_ready_group_at_the_same_epoch_passes(self):
+        stub = FakeStub(groups=[group(epoch=2, state=pb.COLLECTIVE_GROUP_STATE_READY)])
+        make_rendezvous(stub).check_current(group_id="g1", epoch=2)
+        assert stub.get_calls == 1
+
+    def test_a_moved_epoch_is_reported_as_such(self):
+        stub = FakeStub(groups=[group(epoch=3, state=pb.COLLECTIVE_GROUP_STATE_READY)])
+        with pytest.raises(EpochChangedError) as caught:
+            make_rendezvous(stub).check_current(group_id="g1", epoch=2)
+        assert (caught.value.expected, caught.value.actual) == (2, 3)
+
+    def test_a_group_no_longer_ready_is_refused(self):
+        stub = FakeStub(groups=[group(epoch=2, state=pb.COLLECTIVE_GROUP_STATE_FORMING)])
+        with pytest.raises(RendezvousError, match="no longer READY"):
+            make_rendezvous(stub).check_current(group_id="g1", epoch=2)
+
+
 class TestReport:
     def test_a_successful_report_needs_no_message(self):
         stub = FakeStub()
