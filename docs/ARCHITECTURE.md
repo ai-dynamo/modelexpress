@@ -1127,6 +1127,11 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 | `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P) |
 | `shutdown()` | Clean up NIXL agent and resources |
 
+For socket metadata exchange, `fetch_remote_and_wait` resolves worker hostnames
+to numeric IPv4 or IPv6 addresses before calling NIXL. Numeric addresses bypass
+DNS, bracketed IPv6 literals are unwrapped, and IPv6 scope IDs are preserved.
+The resolved endpoint is retained with the loaded peer for lifecycle tracking.
+
 **Optional NIC pinning.** `MX_RDMA_NIC_PIN=auto` probes PCIe topology at agent init and pins `UCX_NET_DEVICES` to a NUMA-local IB NIC per worker. Workaround for [openucx/ucx#11259](https://github.com/openucx/ucx/issues/11259); see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for details.
 
 ### vLLM Loader
