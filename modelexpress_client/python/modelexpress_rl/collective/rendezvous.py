@@ -70,11 +70,38 @@ class GroupNotReadyError(RendezvousError):
     def __init__(self, group_id: str, missing: list[str], waited_s: float) -> None:
         self.group_id = group_id
         self.missing = missing
-        detail = ", ".join(missing[:8]) if missing else "no slot detail available"
         super().__init__(
             f"collective group {group_id} did not reach READY within {waited_s:.0f}s; "
-            f"still waiting on: {detail}"
+            f"still waiting on: {_describe_missing(missing)}"
         )
+
+
+#: How often ``await_ready`` logs who it is still waiting on.
+_AWAIT_PROGRESS_LOG_INTERVAL_S = 30.0
+
+#: How many missing slots a diagnostic names before summarizing the rest.
+_MISSING_DETAIL_LIMIT = 32
+
+
+def _state_name(state: int) -> str:
+    try:
+        return pb.CollectiveGroupState.Name(state)
+    except ValueError:
+        return str(state)
+
+
+def _describe_missing(missing: list[str]) -> str:
+    """Name the missing slots with an explicit count; never a silent cut.
+
+    v8 printed only the first eight of seventeen missing slots, which read as
+    "gen-7..gen-15 joined" when no generator had joined at all.
+    """
+    if not missing:
+        return "no slot detail available"
+    shown = ", ".join(missing[:_MISSING_DETAIL_LIMIT])
+    more = len(missing) - _MISSING_DETAIL_LIMIT
+    suffix = f" (+{more} more not shown)" if more > 0 else ""
+    return f"{len(missing)} missing: {shown}{suffix}"
 
 
 class EpochChangedError(RendezvousError):
@@ -642,7 +669,9 @@ class CollectiveRendezvous:
             else envs.MX_NCCL_REFIT_POLL_INTERVAL_S,
             "poll_interval_s",
         )
-        deadline = time.monotonic() + timeout_s
+        started = time.monotonic()
+        deadline = started + timeout_s
+        next_progress_log = started + _AWAIT_PROGRESS_LOG_INTERVAL_S
         group = None
 
         while True:
@@ -684,6 +713,20 @@ class CollectiveRendezvous:
                 raise RendezvousError(
                     f"collective group {group_id} is releasing and cannot become READY"
                 )
+            now = time.monotonic()
+            if now >= next_progress_log:
+                # A stalled join is otherwise silent until the deadline (600s
+                # in v8); name who is missing while there is time to act.
+                logger.warning(
+                    "collective group %s not READY after %.0fs of %.0fs "
+                    "(state=%s); still waiting on: %s",
+                    group_id,
+                    now - started,
+                    timeout_s,
+                    _state_name(group.state),
+                    _describe_missing(_missing_slots(group)),
+                )
+                next_progress_log = now + _AWAIT_PROGRESS_LOG_INTERVAL_S
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise GroupNotReadyError(group_id, _missing_slots(group), timeout_s)
