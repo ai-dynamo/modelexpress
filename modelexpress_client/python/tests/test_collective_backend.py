@@ -876,9 +876,11 @@ class TestBlockedReshardWatch:
 
         monkeypatch.setattr(backend, "_SLOW_RESHARD_WARN_S", 0.02)
         entry, lane = self._parts()
-        with caplog.at_level("WARNING", logger="modelexpress_rl.collective.backend"):
-            with backend._blocked_reshard_watch(entry, lane, _time.monotonic()):
-                _time.sleep(0.15)
+        with (
+            caplog.at_level("WARNING", logger="modelexpress_rl.collective.backend"),
+            backend._blocked_reshard_watch(entry, lane, _time.monotonic()),
+        ):
+            _time.sleep(0.15)
         assert "'layers.0.w' on lane 3 (rank 1 of 18) still blocks the host" in (
             caplog.text
         )
@@ -890,8 +892,10 @@ class TestBlockedReshardWatch:
         from modelexpress_rl.collective import backend
 
         entry, lane = self._parts()
-        with caplog.at_level("WARNING", logger="modelexpress_rl.collective.backend"):
-            with backend._blocked_reshard_watch(entry, lane, _time.monotonic()):
-                pass
+        with (
+            caplog.at_level("WARNING", logger="modelexpress_rl.collective.backend"),
+            backend._blocked_reshard_watch(entry, lane, _time.monotonic()),
+        ):
+            pass
         assert "still blocks" not in caplog.text
         assert not any(t.name == "mx-reshard-watch" for t in threading.enumerate())
