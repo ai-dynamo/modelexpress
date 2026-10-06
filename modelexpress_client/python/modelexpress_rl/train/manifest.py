@@ -14,11 +14,10 @@ from .. import refit_pb2, refit_pb2_grpc
 from .adapter import WeightVersionShardManifest
 
 
-def bound_tensor_manifest(manifest: bytes) -> bytes:
+def bound_tensor_manifest(tensor_coverage: list[dict]) -> bytes:
     """Canonical address- and content-independent coverage of one binding."""
-    payload = json.loads(manifest)
     tensors = []
-    for tensor in payload["tensors"]:
+    for tensor in tensor_coverage:
         shards = sorted(
             (
                 {"shard_offset": shard["shard_offset"], "shape": shard["shape"]}

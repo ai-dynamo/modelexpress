@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import json
 from concurrent import futures
 from dataclasses import replace
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from modelexpress_rl import (
     refit_pb2_grpc,
 )
 from modelexpress_rl.train.adapter import TrainerEngineAdapter
+from modelexpress_rl.train.manifest import bound_tensor_manifest
 from modelexpress_rl.train.engines.megatron import (
     MegatronTensorSpec,
     MegatronTrainerAdapter,
@@ -244,7 +246,7 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     assert refit_service.registration_ttl == 60
     assert len(resources.manager.registered) == 1
     assert refit_service.shard.version_id == "version-a"
-    assert source_slot_id.startswith("megatron:partition:")
+    assert source_slot_id == metadata.logical_shard_id
     assert len(metadata.logical_shard_id) == 64
     assert refit_service.shard.logical_shard_id == metadata.logical_shard_id
     assert refit_service.shard.worker_id == "worker-3"
@@ -256,6 +258,9 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     )
     assert refit_service.shard.manifest_endpoint == f"127.0.0.1:{port}"
     assert fetched.manifest_digest == refit_service.shard.manifest_digest
+    assert metadata.logical_shard_id == hashlib.sha256(
+        bound_tensor_manifest(json.loads(fetched.manifest)["tensors"])
+    ).hexdigest()
     payload = unwrap_rendezvous_blob(fetched.manifest)
     assert payload.metadata_endpoint == "10.0.0.3:19003"
     assert payload.tensors[0].shards[0].addr == 0x1234

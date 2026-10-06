@@ -184,6 +184,7 @@ class TrainerSourceResolver(SourceResolver):
                 (source.source_slot_id, source.worker_id) for source in selected
             )
             if selection not in seen:
+                # Fetching worker manifests can outlive the original mesh snapshot.
                 current = self._service().GetTrainerMesh(
                     refit_pb2.GetTrainerMeshRequest(mesh_id=version.trainer_mesh_id),
                     timeout=self._rpc_timeout_seconds,

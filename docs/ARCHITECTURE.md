@@ -402,7 +402,9 @@ immutable weight versions, and compact physical shard publications in Redis.
 The control plane stores long-lived `TrainerMesh` membership as
 `workers: worker_id -> TrainerTensorsMetadata(logical_shard_id, metadata_endpoint)`.
 `bind_tensors()` computes address-independent coverage locally and returns
-this compact reference. Logical IDs hash canonical
+this compact reference. Adapters derive wire coverage without copying weights,
+registering source buffers, or publishing a version. The adapter binding and
+trainer `source_slot_id` identify the same logical shard. Logical IDs hash canonical
 coverage, so equivalent replicas share an ID. The orchestrator supplies the complete
 trainer worker set and is responsible for logical-shard completeness. Mesh creation
 and update validate compact membership metadata without fetching coverage manifests;
@@ -421,7 +423,11 @@ is computed from physical publications and their binding endpoints, not historic
 coverage. Generator discovery reads the mesh
 for complete expected shard coverage and filters out publications from replaced
 workers and expired registrations. Generation changes invalidate cached transfer
-plans; version leases protect sources during installation. Mesh-backed trainers
+plans; discovery rechecks the mesh generation after fetching worker manifests
+to reject a snapshot that changed during resolution. Version leases protect
+sources during installation. Publication release retries only the active-reader
+lease rejection until its RPC deadline, retaining source buffers until deletion
+succeeds. Mesh-backed trainers
 can release published buffers before version retirement after all reader leases
 drain. Removing a worker or rebinding its endpoint atomically retires its
 publications and rejects the update while those versions have reader leases.

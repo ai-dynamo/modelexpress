@@ -74,7 +74,17 @@ class _Manager:
 
 
 class _Adapter(TrainerEngineAdapter):
-    source_slot_id = "rank:0"
+    source_slot_id = hashlib.sha256(
+        bound_tensor_manifest([
+            {
+                "name": "weight",
+                "dtype": "torch.bfloat16",
+                "elsize": 2,
+                "full_shape": [4],
+                "shards": [{"shard_offset": [0], "shape": [4]}],
+            }
+        ])
+    ).hexdigest()
     supported_staging_modes = frozenset({TrainerStagingMode.COPY_TO_DEVICE})
     supported_payload_formats = frozenset({WeightPayloadFormat.FULL_TENSOR})
 
@@ -240,6 +250,8 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         metadata = trainer.bind_tensors("model")
         assert metadata.metadata_endpoint == f"127.0.0.1:{port}"
         assert len(metadata.logical_shard_id) == 64
+        assert trainer.source_slot_id == metadata.logical_shard_id
+        assert adapter.calls == []
         with pytest.raises(RuntimeError, match="already bound"):
             trainer.bind_tensors("replacement")
         assert service.shards == []
@@ -300,11 +312,6 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
             TrainerStagingMode.COPY_TO_DEVICE,
             WeightPayloadFormat.FULL_TENSOR,
         ),
-        (
-            "model",
-            TrainerStagingMode.COPY_TO_DEVICE,
-            WeightPayloadFormat.FULL_TENSOR,
-        ),
     ]
     assert retained_owners == ["model", "model"]
     assert len(service.shards) == 2
@@ -319,7 +326,9 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     assert service.shards[0].total_bytes == 128
     assert service.shards[0].manifest_endpoint == f"127.0.0.1:{port}"
     assert json.loads(fetched.manifest)["tensors"][0]["name"] == "weight"
-    assert metadata.logical_shard_id == hashlib.sha256(bound_tensor_manifest(fetched.manifest)).hexdigest()
+    assert metadata.logical_shard_id == hashlib.sha256(
+        bound_tensor_manifest(json.loads(fetched.manifest)["tensors"])
+    ).hexdigest()
 
 
 def test_bound_manifest_excludes_process_addresses_and_weight_content():
@@ -331,9 +340,9 @@ def test_bound_manifest_excludes_process_addresses_and_weight_content():
     second = json.loads(json.dumps(first))
     second["agent_name"] = "worker-b"
     second["tensors"][0]["shards"][0].update(addr=5678, device_id=1, agent_name="worker-b", digest="new")
-    assert bound_tensor_manifest(json.dumps(first).encode()) == bound_tensor_manifest(json.dumps(second).encode())
+    assert bound_tensor_manifest(first["tensors"]) == bound_tensor_manifest(second["tensors"])
     second["tensors"][0]["shards"][0]["shard_offset"] = [2]
-    assert bound_tensor_manifest(json.dumps(first).encode()) != bound_tensor_manifest(json.dumps(second).encode())
+    assert bound_tensor_manifest(first["tensors"]) != bound_tensor_manifest(second["tensors"])
 
 
 def test_trainer_initialization_rejects_unspecified_fixed_settings(monkeypatch):
@@ -449,7 +458,10 @@ def test_trainer_client_owns_default_transport_resources(monkeypatch):
         )
     )
     adapter_factory.assert_not_called()
-    assert trainer.source_slot_id == "rank:0"
+    with pytest.raises(RuntimeError, match="bind_tensors"):
+        _ = trainer.source_slot_id
+    metadata = trainer.bind_tensors("model")
+    assert trainer.source_slot_id == metadata.logical_shard_id
     assert len(adapter_factory.call_args.args) == 1
     assert isinstance(adapter_factory.call_args.args[0], FSDPTrainerContext)
     assert adapter_factory.call_args.kwargs == {

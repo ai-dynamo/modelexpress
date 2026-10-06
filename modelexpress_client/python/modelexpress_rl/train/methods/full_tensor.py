@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable
 from typing import Any
 from time import monotonic, sleep
@@ -23,7 +22,6 @@ from ..adapter import (
     WeightPayloadFormat,
     WeightVersionShardManifestPublisher,
 )
-from ..manifest import bound_tensor_manifest
 
 
 class FullTensorNixlPublicationMethod:
@@ -60,21 +58,13 @@ class FullTensorNixlPublicationMethod:
 
     @property
     def source_slot_id(self) -> str:
-        return self._adapter.source_slot_id
+        if self._binding is None:
+            raise RuntimeError("bind_tensors() must be called before source_slot_id")
+        return self._binding.logical_shard_id
 
     def bind_tensors(self, tensors: Any) -> TrainerTensorsMetadata:
-        self._adapter.bind_tensors(tensors)
-        staged = self._adapter.stage_shard(
-            tensors=tensors,
-            staging_mode=self._staging_mode,
-            payload_format=self._payload_format,
-        )
-        staged.publish_ready.wait()
-        logical_shard_id = hashlib.sha256(
-            bound_tensor_manifest(staged.manifest.data)
-        ).hexdigest()
         self._binding = TrainerTensorsMetadata(
-            logical_shard_id=logical_shard_id,
+            logical_shard_id=self._adapter.bind_tensors(tensors),
             metadata_endpoint=self._manifest_publisher.endpoint,
         )
         return self._binding
@@ -168,20 +158,14 @@ class FullTensorNixlPublicationMethod:
     def release(self, *, version: WeightVersionRef) -> None:
         if version.version_id not in self.published:
             return
-        version_response = self._service().GetWeightVersion(
-            refit_pb2.GetWeightVersionRequest(uid=version.version_id),
-            timeout=self._rpc_timeout_seconds,
-        )
         source_slot_id = self.source_slot_id
-        if version_response.version.HasField("trainer_mesh_id"):
-            assert self._binding is not None
-            source_slot_id = self._binding.logical_shard_id
         request = refit_pb2.DeleteWeightVersionShardRequest(
             version_id=version.version_id,
             logical_shard_id=source_slot_id,
             worker_id=self._worker_id,
         )
         deadline = monotonic() + self._rpc_timeout_seconds
+        # Publication buffers must outlive every generator reader lease.
         while True:
             try:
                 self._service().DeleteWeightVersionShard(

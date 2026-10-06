@@ -339,6 +339,8 @@ class ModelExpressGeneratorClient:
         With ``staging_buffer_bytes`` configured, reserve bounded buffers and
         prepare deferred reads. ``apply_weight`` then pipelines read/install.
         Otherwise, trainer sources transfer a complete independent staged copy.
+        Staging prepares an update; it does not guarantee that weight bytes have
+        been transferred. Streaming transfers start during ``apply_weight``.
         """
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
