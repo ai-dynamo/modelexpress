@@ -849,3 +849,67 @@ class TestMembershipLookup:
             m.lane(0)
         with pytest.raises(KeyError):
             _ = m.broadcast_lane
+
+
+class TestMissingSlotDiagnostics:
+    """v8 printed eight of seventeen missing slots, which read as the other
+    nine generators having joined when no generator had joined at all."""
+
+    def _v8_group(self):
+        trainers = [f"trainer-{i}" for i in range(16)]
+        gens = [f"gen-{i}" for i in range(16)]
+        g = pb.CollectiveGroup(
+            group_id="a0fd",
+            epoch=1,
+            state=pb.COLLECTIVE_GROUP_STATE_FORMING,
+            expected_trainer_slots=trainers,
+            expected_generator_slots=gens,
+        )
+        broadcast = g.lanes.add()
+        broadcast.lane_id = 8
+        broadcast.kind = pb.LANE_KIND_BROADCAST
+        for slot in trainers[1:]:
+            p = broadcast.participants.add()
+            p.slot_id = slot
+            p.role = pb.COLLECTIVE_ROLE_TRAINER
+        return g
+
+    def test_the_timeout_names_every_missing_slot_with_a_count(self):
+        stub = FakeStub(groups=[self._v8_group()])
+        with pytest.raises(GroupNotReadyError) as caught:
+            make_rendezvous(stub).await_ready(
+                group_id="a0fd", epoch=1, timeout_s=0.05, poll_interval_s=0.001
+            )
+        message = str(caught.value)
+        assert "17 missing:" in message
+        assert "trainer slot trainer-0" in message
+        for i in range(16):
+            assert f"generator slot gen-{i}," in message + ","
+        assert "more not shown" not in message
+        assert len(caught.value.missing) == 17
+
+    def test_a_large_missing_set_is_summarized_never_silently_cut(self):
+        missing = [f"generator slot gen-{i}" for i in range(40)]
+        error = GroupNotReadyError("g", missing, 600)
+        assert "40 missing:" in str(error)
+        assert "gen-31" in str(error) and "gen-32" not in str(error)
+        assert "(+8 more not shown)" in str(error)
+
+    def test_a_stalled_wait_logs_who_is_missing_before_the_deadline(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(rz, "_AWAIT_PROGRESS_LOG_INTERVAL_S", 0.0)
+        stub = FakeStub(groups=[self._v8_group()])
+        with caplog.at_level("WARNING", logger="modelexpress_rl.collective.rendezvous"):
+            with pytest.raises(GroupNotReadyError):
+                make_rendezvous(stub).await_ready(
+                    group_id="a0fd", epoch=1, timeout_s=0.05, poll_interval_s=0.01
+                )
+        stalls = [
+            r.getMessage()
+            for r in caplog.records
+            if "not READY after" in r.getMessage()
+        ]
+        assert stalls
+        assert "COLLECTIVE_GROUP_STATE_FORMING" in stalls[0]
+        assert "17 missing: trainer slot trainer-0, generator slot gen-0" in stalls[0]
