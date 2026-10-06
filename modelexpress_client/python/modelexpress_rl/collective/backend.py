@@ -30,6 +30,9 @@ from .types import ParamPlan, ReshardPlan
 
 logger = logging.getLogger("modelexpress_rl.collective.backend")
 
+#: A single nccl.m2n reshard call that holds the host this long is logged.
+_SLOW_RESHARD_WARN_S = 10.0
+
 DEFAULT_LAYER_GROUP = 0
 _M2N_CALL_LOCK = threading.Lock()
 
@@ -389,7 +392,24 @@ class _CollectiveHalf:
             # work is complete. Relying only on an allocator's stream tracking
             # is not sufficient for engine-owned or external buffers.
             self._pending_contexts.append(ctx)
+            started = time.monotonic()
             _reshard(comm=lane, entry=entry, src=src(ctx), dst=dst(ctx))
+            elapsed = time.monotonic() - started
+            if elapsed >= _SLOW_RESHARD_WARN_S:
+                # nccl.m2n issues host-blocking collectives inside a call
+                # (DevComm creation, window registration) that wait for every
+                # lane rank to enter them; a call that blocks this long is a
+                # peer that has not reached the same entry (v14 recorded
+                # nothing between the bootstrap and a 10-minute stall).
+                logger.warning(
+                    "nccl.m2n reshard of %r on lane %s (rank %s of %s) blocked "
+                    "the host for %.1fs",
+                    entry.name,
+                    entry.partition_id,
+                    lane.rank,
+                    lane.world_size,
+                    elapsed,
+                )
             spec.leave(ctx)
 
     def _finish_misc(self, broadcast_lane_id: int) -> None:
@@ -433,8 +453,16 @@ class NcclM2nSender(_CollectiveHalf):
         communicators with operations in flight in different orders, which is
         the case that deadlocks.
         """
-        for entry in self._claim_group(layer_group_id):
+        started = time.monotonic()
+        entries = self._claim_group(layer_group_id)
+        for entry in entries:
             self._issue_reshard(entry, src=lambda ctx: ctx.buf, dst=lambda ctx: None)
+        logger.info(
+            "collective sender issued layer group %s (%d entries) in %.2fs",
+            layer_group_id,
+            len(entries),
+            time.monotonic() - started,
+        )
 
     def finish_weight_update(self, broadcast_lane_id: int) -> None:
         """Drain every reshard lane, then broadcast the misc parameters once."""
@@ -461,14 +489,22 @@ class NcclM2nReceiver(_CollectiveHalf):
         receive, so wait_weights can wait for this group alone while later
         groups are already queued on the same streams.
         """
+        started = time.monotonic()
         first = len(self._pending_contexts)
         lanes: OrderedDict[int, LaneCommunicator] = OrderedDict()
-        for entry in self._claim_group(layer_group_id):
+        entries = self._claim_group(layer_group_id)
+        for entry in entries:
             lane = self._lane(entry.partition_id)
             lanes[id(lane)] = lane
             self._issue_reshard(entry, src=lambda ctx: None, dst=lambda ctx: ctx.buf)
         marks = [(lane, lane.record_event()) for lane in lanes.values()]
         self._in_flight[layer_group_id] = (marks, self._pending_contexts[first:])
+        logger.info(
+            "collective receiver issued layer group %s (%d entries) in %.2fs",
+            layer_group_id,
+            len(entries),
+            time.monotonic() - started,
+        )
 
     def wait_weights(self, layer_group_id: int) -> None:
         """Block until one issued layer group's receives and post hooks are done.
@@ -482,6 +518,7 @@ class NcclM2nReceiver(_CollectiveHalf):
             raise RuntimeError(
                 f"layer group {layer_group_id} was not issued, or was already waited on"
             )
+        started = time.monotonic()
         marks, contexts = self._in_flight.pop(layer_group_id)
         for lane, event in marks:
             remaining = self._remaining()
@@ -506,6 +543,11 @@ class NcclM2nReceiver(_CollectiveHalf):
         self._pending_contexts = [
             ctx for ctx in self._pending_contexts if id(ctx) not in done
         ]
+        logger.info(
+            "collective receiver landed layer group %s: drained in %.2fs",
+            layer_group_id,
+            time.monotonic() - started,
+        )
 
     def finish_weight_update(self, broadcast_lane_id: int) -> None:
         self._require_every_group()
