@@ -14,8 +14,8 @@ have reached Running state.  Asserts:
      are loaded and the model is serving correctly on each.
   4. When enabled by the workflow, target peak and final VRAM do not materially
      exceed source VRAM.
-  5. When --expect-mtp is set, the target transfers the main model through P2P
-     before loading the MTP draft model locally, and source/target greedy
+  5. When --expect-mtp is set, every target rank transfers both the main model
+     and the MTP draft through P2P, and source/target greedy
      completions for a small prompt match exactly.
 
 Invoked by the workflow as:
@@ -223,34 +223,44 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
     )
 
 
-def test_mtp_load_phases(namespace: str, expect_mtp: bool) -> None:
-    """MTP must use P2P only for the main model, never for its draft head."""
+def test_mtp_load_phases(namespace: str, expect_mtp: bool, tp_size: int) -> None:
+    """Every target rank must finish main and draft loads through RDMA."""
     if not expect_mtp:
         pytest.skip("MTP phase assertion not enabled")
 
     logs = _all_pod_logs(namespace, "mx-target", "mx-target")
-    main_marker = "p2p_enabled=True"
     transfer_marker = "RDMA transfer complete"
-    draft_marker = "p2p_enabled=False"
-    main_index = logs.find(main_marker)
-    transfer_index = logs.find(transfer_marker, main_index + 1)
-    draft_index = logs.find(draft_marker, transfer_index + 1)
+    start_marker = "MxModelLoader starting"
+    complete_marker = "MxModelLoader.load_model() COMPLETE"
     phase_lines = [
         line
         for line in logs.splitlines()
-        if any(marker in line for marker in (main_marker, transfer_marker, draft_marker))
+        if any(marker in line for marker in (start_marker, transfer_marker, complete_marker))
     ]
     print("[mx-target] MTP load phases:\n" + "\n".join(phase_lines))
-    assert main_index >= 0, "Target did not start a P2P-enabled main-model load"
-    assert transfer_index > main_index, (
-        "Target did not complete RDMA transfer after starting the main-model load"
-    )
-    assert draft_index > transfer_index, (
-        "Target did not load the MTP draft locally after the main-model transfer"
-    )
-    assert logs.find(transfer_marker, draft_index + 1) < 0, (
-        "Target performed another RDMA transfer while loading the MTP draft"
-    )
+    for rank in range(tp_size):
+        rank_logs = "\n".join(
+            line for line in logs.splitlines() if f"[Worker {rank}]" in line
+        )
+        cursor = 0
+        for role in ("main", "draft"):
+            start = rank_logs.find(start_marker, cursor)
+            assert start >= 0, f"Rank {rank}: missing {role} load"
+            header = rank_logs[start:].splitlines()[0]
+            assert f"p2p_enabled=True, p2p_role={role}" in header, (
+                f"Rank {rank}: expected P2P-enabled {role} load, got {header}"
+            )
+            end = rank_logs.find(complete_marker, start)
+            assert end > start, f"Rank {rank}: incomplete {role} load"
+            phase = rank_logs[start:end]
+            assert phase.count(start_marker) == 1, (
+                f"Rank {rank}: another load started before {role} completed"
+            )
+            assert transfer_marker in phase, f"Rank {rank}: no {role} RDMA transfer"
+            assert "Streaming weights from" not in phase, (
+                f"Rank {rank}: {role} fell back to ModelStreamer"
+            )
+            cursor = end + len(complete_marker)
 
 
 def test_per_rank_source_agents(
