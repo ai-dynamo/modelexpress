@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import TimeoutError as _FutureTimeoutError
 from typing import Any
 from uuid import uuid4
 
@@ -17,8 +19,10 @@ from modelexpress import auth
 from modelexpress import envs as mx_envs
 from modelexpress.client import _get_server_url
 
-from ..rendezvous import CollectiveRendezvous
+from .. import envs
+from ..rendezvous import CollectiveRendezvous, EpochChangedError
 from ..types import MeshSpec, ParamPlan, Placement, ReshardPlan
+from ._common import _counted_names
 from ._common import _endpoint as _normalize_endpoint
 from .miles import (
     CollectiveTopology,
@@ -34,6 +38,42 @@ logger = logging.getLogger("modelexpress_rl.collective.integrations.miles_protoc
 # receiver build's ABI identity. Change them only in step with the receiver.
 _CONNECT_TIMEOUT_S = 10.0
 _ABI_VERSION = "miles-sglang-bf16-replicated-v1"
+
+#: After a failure, how long close() waits for the engines' receiver destroys.
+#: An engine mid-receive serves the destroy only after its own round fails, so
+#: a long wait just delays the trainer's failure surfacing.
+_FAILURE_DESTROY_WAIT_S = 15.0
+
+
+def _gloo_group():
+    from miles.utils.distributed_utils import get_gloo_group
+
+    return get_gloo_group()
+
+
+def _rank_and_world() -> tuple[int, int]:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
+def _all_gather(value: Any) -> list[Any]:
+    """Every trainer rank's ``value``, in rank order, over the Gloo group."""
+    _rank, world = _rank_and_world()
+    if world == 1:
+        return [value]
+    gathered: list[Any] = [None] * world
+    dist.all_gather_object(gathered, value, group=_gloo_group())
+    return gathered
+
+
+def _gathered_failures(local_error: str) -> list[str]:
+    """Fan one local error string out; return every rank's non-empty error."""
+    return [
+        f"rank {rank}: {error}"
+        for rank, error in enumerate(_all_gather(local_error))
+        if error
+    ]
 
 
 def _server_endpoint() -> str:
@@ -166,6 +206,12 @@ class MilesCollectiveProtocolCore:
         self._session: MilesTrainerSession | None = None
         self._channel = None
         self._rendezvous = None
+        # The worker identity for this trainer slot is stable across prepares:
+        # a fresh id per prepare re-presents an already-held slot as a new
+        # generation, which the server turns into an epoch bump -- so a
+        # re-prepare with a fresh id would force (or be rejected as) an epoch
+        # move every time.
+        self._slot_worker_id: str | None = None
         self._closed = False
         self._close_pending = False
         self._round_version: str | None = None
@@ -387,9 +433,12 @@ class MilesCollectiveProtocolCore:
         if self._plan is not None:
             # Later rounds reuse the round-one plan: the wire buffers and
             # canonical shapes are pinned (begin_sync only copy_()s into them
-            # after revalidating names and shapes). The topology is still
-            # rebuilt and compared every round: a reconnect that heals into a
-            # reshaped engine GPU topology must fail closed.
+            # after revalidating names and shapes), and the publish groups are
+            # likewise derived only on round one -- re-deriving them per round
+            # against the settled session risks collapsing the group set the
+            # engines prepared for. The topology is still rebuilt and compared
+            # every round: a reconnect that heals into a reshaped engine GPU
+            # topology must fail closed.
             if topology != self._topology:
                 raise RuntimeError("MILES tensor names, shapes, or topology changed")
             return
@@ -446,34 +495,34 @@ class MilesCollectiveProtocolCore:
             if unknown:
                 raise ValueError(
                     "MILES NCCL M2N bucket carries tensors outside the frozen plan: "
-                    f"{unknown[:5]}"
+                    f"{_counted_names(unknown)}"
                 )
             within_bucket = sorted({name for name in names if names.count(name) > 1})
             if within_bucket:
                 raise ValueError(
                     "MILES NCCL M2N bucket repeats a tensor within one bucket: "
-                    f"{within_bucket[:5]}"
+                    f"{_counted_names(within_bucket)}"
                 )
             repeated = [name for name in names if name in self._round_seen]
             if repeated:
                 raise ValueError(
                     "MILES NCCL M2N bucket repeats tensors already seen in round "
-                    f"{version}: {repeated[:5]}"
+                    f"{version}: {_counted_names(repeated)}"
                 )
         except BaseException as error:
-            self._close_preserving(error)
+            self._close_preserving(error, phase="send_bucket")
             raise
         if not self._round_begun:
             if self._session is None:
                 try:
                     self._prepare_sessions()
                 except BaseException as error:
-                    self._close_preserving(error)
+                    self._close_preserving(error, phase="prepare_sessions")
                     raise
             try:
                 self._begin_round(version)
             except BaseException as error:
-                self._close_preserving(error)
+                self._close_preserving(error, phase="begin_round")
                 raise
         try:
             for name in names:
@@ -481,7 +530,7 @@ class MilesCollectiveProtocolCore:
                 self._pending[self._group_of[name]].discard(name)
             self._drain_ready_groups(version)
         except BaseException as error:
-            self._close_preserving(error)
+            self._close_preserving(error, phase="publish_groups")
             raise
 
     def _begin_round(self, version: str) -> None:
@@ -540,7 +589,7 @@ class MilesCollectiveProtocolCore:
                 missing = sorted(self._pending[self._next_group])
                 raise RuntimeError(
                     "MILES NCCL M2N bucket stream ended before publish group "
-                    f"{self._next_group} completed; missing {missing[:5]}"
+                    f"{self._next_group} completed; missing {_counted_names(missing)}"
                 )
             self._session.finish_round(
                 version=version, operation_id=self._round_operation_id
@@ -552,20 +601,34 @@ class MilesCollectiveProtocolCore:
             _retire_dropped_futures(self._round_futures)
         else:
             try:
-                self._wait_generator_futures(self._round_futures)
+                # The engines bound their own round by the transfer deadline,
+                # so a wedged engine never wedges the trainer past it.
+                self._wait_generator_futures(
+                    self._round_futures,
+                    timeout_s=envs.MX_NCCL_REFIT_TRANSFER_TIMEOUT_S,
+                )
             except BaseException as error:
                 futures_exception = error
         failure = local_exception or futures_exception
         if failure is not None:
             primary = RuntimeError(f"MILES NCCL M2N round failed: {failure!r}")
-            self._report_round_failure(primary)
+            # Report/log while the round is still armed so the failure record
+            # carries its version and operation id.
+            self._close_preserving(primary, phase="finalize")
             self._disarm_round()
-            self._close_preserving(primary)
             raise primary from failure
         self._disarm_round()
 
     def after_engines_resumed(self) -> None:
-        """No-op hook: the generator fan-out already settled in finalize."""
+        """Keep the settled session for the next round (no-op hook).
+
+        The generator fan-out already settled in finalize. Tearing the
+        session down here would make the next round's prepare re-publish each
+        lane's bootstrap at the SAME epoch, which the rendezvous server
+        rejects as a duplicate. The session's own freshness guards every
+        round's begin_sync; a genuine epoch move rebuilds through
+        ``_prepare_sessions``.
+        """
 
     @staticmethod
     async def _call_engine(client: Any, endpoint: str, payload: dict[str, Any]):
@@ -714,14 +777,77 @@ class MilesCollectiveProtocolCore:
         return futures
 
     @staticmethod
-    def _wait_generator_futures(futures) -> None:
+    def _wait_generator_futures(futures, *, timeout_s: float | None = None) -> None:
+        """Settle every generator future under one absolute deadline.
+
+        Keeps MILES's ``wait_futures`` contract -- every future is settled,
+        each failure is logged, the first error raises -- but each wait is
+        bounded by the time left on one shared clock
+        (``MX_NCCL_REFIT_GROUP_TIMEOUT_S`` unless the caller names another).
+        An engine parked mid-receive cannot answer until its own round fails,
+        so an unbounded wait wedges the trainer behind the engine's transfer
+        deadline. On expiry the unsettled futures are retired (cancelled or
+        observed) so their late failures still reach the log, and the raise
+        says the remote completion is uncertain.
+        """
         if not futures:
             return
-        from miles.utils import async_utils
-
-        async_utils.wait_futures(futures)
+        if timeout_s is None:
+            timeout_s = envs.MX_NCCL_REFIT_GROUP_TIMEOUT_S
+        deadline = time.monotonic() + timeout_s
+        first_error: BaseException | None = None
+        for index, future in enumerate(futures):
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    future.result(timeout=remaining)
+                    continue
+                except (TimeoutError, _FutureTimeoutError):
+                    pass  # the deadline fired mid-wait; fall through
+                except BaseException as error:
+                    logger.warning(
+                        "generator fan-out index=%d failed", index, exc_info=error
+                    )
+                    if first_error is None:
+                        first_error = error
+                    continue
+            _retire_dropped_futures(futures[index:])
+            raise TimeoutError(
+                f"MILES NCCL M2N generator fan-out deadline expired "
+                f"({timeout_s:.1f}s); unsettled engines are abandoned to "
+                "their own recovery"
+            ) from first_error
+        if first_error is not None:
+            raise first_error
 
     def _prepare_sessions(self) -> None:
+        if self._session is not None:
+            return
+        try:
+            self._prepare_new_sessions()
+        except EpochChangedError as error:
+            # The group moved epochs since this rank's last join (its lease
+            # lapsed between rounds, or a member joined with a new identity),
+            # so the freshly created lane communicators are already stale.
+            # Every rank must rebuild; the move is gathered across ranks so a
+            # rank whose own prepare succeeded still rebuilds when a peer saw
+            # the move -- otherwise that peer strands in its re-prepare.
+            failures = _gathered_failures(repr(error))
+            if not failures:
+                raise
+            logger.warning(
+                "collective group moved epochs while preparing sessions (%s); "
+                "tearing down and re-preparing at the current epoch",
+                error,
+            )
+            # The engines' first-attempt prepare handlers are parked in
+            # await_ready on the old epoch; their scheduler threads are held,
+            # so a destroy waits forever. Abandon the engine futures instead
+            # of waiting (their transfer deadline recovers them).
+            self._teardown_for_epoch_rebuild()
+            self._prepare_new_sessions()
+
+    def _prepare_new_sessions(self) -> None:
         if self._session is not None:
             return
         if (
@@ -759,13 +885,18 @@ class MilesCollectiveProtocolCore:
             tensors=dict(self._tensors),
         )
         slot_id = self._topology.trainer_slots[0]
+        # The slot's worker id is stable for the life of this protocol: a
+        # fresh id per prepare would re-present an already-held slot as a new
+        # generation, which the server turns into an epoch bump.
+        if self._slot_worker_id is None:
+            self._slot_worker_id = f"miles-{slot_id}-{uuid4().hex}"
         session = MilesTrainerSession.create(
             rendezvous=rendezvous,
             topology=self._topology,
             publisher=publisher,
             source_partition=0,
             slot_id=slot_id,
-            worker_id=f"miles-{slot_id}-{uuid4().hex}",
+            worker_id=self._slot_worker_id,
             index_in_role=0,
             layer_groups=self._publish_groups,
             device=next(iter(self._tensors.values())).device,
@@ -778,7 +909,11 @@ class MilesCollectiveProtocolCore:
         except BaseException:
             _retire_dropped_futures(generator_futures)
             raise
-        self._wait_generator_futures(generator_futures)
+        # The engine-side prepare is itself bounded by the rendezvous
+        # await_ready deadline; bound the fan-out wait by the group clock.
+        self._wait_generator_futures(
+            generator_futures, timeout_s=envs.MX_NCCL_REFIT_GROUP_TIMEOUT_S
+        )
 
     def _report_round_failure(self, primary: BaseException) -> None:
         if self._session is None or self._round_operation_id is None:
@@ -788,15 +923,27 @@ class MilesCollectiveProtocolCore:
         except BaseException:
             logger.warning("reporting the trainer round failure failed", exc_info=True)
 
-    def _close_preserving(self, primary: BaseException) -> None:
+    def _close_preserving(self, primary: BaseException, *, phase: str) -> None:
         """Best-effort close while ``primary`` propagates.
 
-        close() re-contacts the engines — the likeliest breakage after a
-        failed round — so its failure is logged, never masking ``primary``.
+        The triggering failure is named NOW, with its traceback: it would
+        otherwise surface only through the updater's all-rank agreement vote,
+        which prints nothing until every rank arrives, so a peer stuck
+        elsewhere hides the cause on every rank. close() re-contacts the
+        engines — the likeliest breakage after a failed round — so it runs on
+        the failure path (session first, bounded destroy fan-out) and its own
+        failure is logged, never masking ``primary``.
         """
+        logger.error(
+            "MILES NCCL M2N failed in %s (round %r): %r",
+            phase,
+            self._round_version,
+            primary,
+            exc_info=(type(primary), primary, primary.__traceback__),
+        )
         self._report_round_failure(primary)
         try:
-            self.close()
+            self.close(failing=True)
         except BaseException as close_error:
             logger.warning(
                 "MILES NCCL M2N close() during failure handling failed: %r",
@@ -806,20 +953,70 @@ class MilesCollectiveProtocolCore:
             if add_note is not None:
                 add_note(f"close() during failure handling failed: {close_error!r}")
 
+    def _teardown_for_epoch_rebuild(self) -> None:
+        """Release local state for an epoch-move rebuild WITHOUT waiting on engines.
+
+        The epoch move means the engines' first-attempt prepare handlers are
+        parked in ``await_ready`` on the old epoch, holding their scheduler
+        threads; a destroy request queues behind them. Waiting on that fan-out
+        deadlocks (the trainer awaits the destroy response; the engine awaits
+        the lane bootstrap only the re-prepare publishes). So abandon the
+        engine futures -- the engines' own transfer deadline fails their
+        parked prepare and they recover -- and close session/rendezvous/
+        channel locally so the re-prepare starts from nothing.
+        """
+        _retire_dropped_futures(self._round_futures)
+        self._round_futures = []
+        # Fire destroy without waiting: best-effort release of any engine that
+        # CAN answer now; a parked one recovers on its own deadline.
+        try:
+            futures = self._generator_futures("close")
+            _retire_dropped_futures(futures)
+        except BaseException:
+            logger.warning(
+                "MILES NCCL M2N epoch rebuild could not submit the engine destroy",
+                exc_info=True,
+            )
+        self._engine_group_name = None
+        session = self._session
+        self._session = None
+        if session is not None:
+            try:
+                session.close()
+            except BaseException:
+                logger.warning(
+                    "MILES NCCL M2N epoch rebuild session close failed",
+                    exc_info=True,
+                )
+        if self._rendezvous is not None:
+            try:
+                self._rendezvous.close()
+            except BaseException:
+                logger.warning(
+                    "MILES NCCL M2N epoch rebuild rendezvous close failed",
+                    exc_info=True,
+                )
+            self._rendezvous = None
+        if self._channel is not None:
+            try:
+                self._channel.close()
+            except BaseException:
+                logger.warning(
+                    "MILES NCCL M2N epoch rebuild channel close failed",
+                    exc_info=True,
+                )
+            self._channel = None
+
     def _teardown_for_reconnect(self) -> None:
         """Tear down the live session before a reconnect, best effort.
 
         The old engines may be why miles is reconnecting, so every step is
         logged rather than raised; the next round re-prepares under a fresh
-        group name.
+        group name. The session closes FIRST: an engine mid-receive cannot
+        answer destroys until its own round fails, so the destroy fan-out
+        fires after the session close under the short failure bound (expiry
+        is a warning, and the group name stays set so a later close retries).
         """
-        if self._drives_destroy_fan_out():
-            try:
-                self._close_generator_fanout()
-            except BaseException:
-                logger.warning(
-                    "MILES NCCL M2N reconnect close fan-out failed", exc_info=True
-                )
         session = self._session
         self._session = None
         if session is not None:
@@ -829,6 +1026,13 @@ class MilesCollectiveProtocolCore:
                 logger.warning(
                     "MILES NCCL M2N reconnect session teardown failed",
                     exc_info=True,
+                )
+        if self._drives_destroy_fan_out():
+            try:
+                self._close_generator_fanout(failing=True)
+            except BaseException:
+                logger.warning(
+                    "MILES NCCL M2N reconnect close fan-out failed", exc_info=True
                 )
         if self._rendezvous is not None:
             try:
@@ -865,27 +1069,56 @@ class MilesCollectiveProtocolCore:
             return False
         return True
 
-    def _close_generator_fanout(self) -> None:
+    def _close_generator_fanout(self, *, failing: bool = False) -> None:
         """Destroy the receiver group on every connected engine from rank 0.
 
         Retires unsettled round futures first; SG-1's destroy is not
         idempotent, so an already-gone group is accepted as done
         (``_destroy_on_engine``). The group name clears only once every
-        engine answered.
+        engine answered. On the failure path the wait is the short
+        ``_FAILURE_DESTROY_WAIT_S``: an engine mid-receive answers the destroy
+        only after its own round fails, so expiry is a warning and the group
+        name stays set for a later close to retry. The normal path bounds the
+        wait by ``MX_NCCL_REFIT_TRANSFER_TIMEOUT_S``.
         """
         _retire_dropped_futures(self._round_futures)
         self._round_futures = []
-        futures = self._generator_futures("close")
-        self._wait_generator_futures(futures)
+        try:
+            futures = self._generator_futures("close")
+            self._wait_generator_futures(
+                futures,
+                timeout_s=(
+                    _FAILURE_DESTROY_WAIT_S
+                    if failing
+                    else envs.MX_NCCL_REFIT_TRANSFER_TIMEOUT_S
+                ),
+            )
+        except BaseException as error:
+            if failing:
+                logger.warning(
+                    "MILES NCCL M2N engine receiver destroy did not settle "
+                    "within %.0fs after a failure (%r); the engines destroy "
+                    "the group once their in-flight receive fails",
+                    _FAILURE_DESTROY_WAIT_S,
+                    error,
+                )
+                return
+            raise
         self._engine_group_name = None
 
-    def close(self) -> None:
+    def close(self, *, failing: bool = False) -> None:
         """Tear down the generator fan-out, session, rendezvous, and channel.
 
         Terminal for rounds even when teardown fails, best effort across
         resources, retried per retained resource: a retry re-runs the closes
         that failed and can still make progress (rendezvous, channel, fan-out).
         The session's own close is one-shot, so a retry would no-op.
+
+        On the failure path (``failing=True``) the session closes FIRST,
+        aborting this rank's lane communicators, and the engine destroys then
+        wait only the short failure bound: an engine mid-receive cannot serve
+        destroy_weights_update_group until its own round fails (its transfer
+        deadline), so a long wait just delays the failure surfacing.
         """
         if self._closed and not self._close_pending:
             return
@@ -893,23 +1126,35 @@ class MilesCollectiveProtocolCore:
         self._close_pending = True
         first_error: BaseException | None = None
         tore_down = False
+        if failing:
+            session = self._session
+            self._session = None
+            if session is not None:
+                try:
+                    session.close()
+                except BaseException as error:
+                    first_error = error
+                else:
+                    tore_down = True
         if self._drives_destroy_fan_out():
             try:
-                self._close_generator_fanout()
-            except BaseException as error:
-                first_error = error
-            else:
-                tore_down = True
-        session = self._session
-        self._session = None
-        if session is not None:
-            try:
-                session.close()
+                self._close_generator_fanout(failing=failing)
             except BaseException as error:
                 if first_error is None:
                     first_error = error
             else:
                 tore_down = True
+        if not failing:
+            session = self._session
+            self._session = None
+            if session is not None:
+                try:
+                    session.close()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                else:
+                    tore_down = True
         # The protocol owns the rendezvous' final close;
         # CollectiveRendezvous.close() is idempotent.
         if self._rendezvous is not None:

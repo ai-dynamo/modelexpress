@@ -118,10 +118,21 @@ def _install_fake_miles_async(monkeypatch, events, *, submit=None, wait_futures=
                     "the fake async loop only supports non-suspending coroutines"
                 )
 
-        def result(self):
+        def result(self, timeout=None):
+            # The fake settles eagerly at submission, so the deadline the
+            # protocol passes never binds.
             if self._error is not None:
                 raise self._error
             return self._value
+
+        def cancel(self):
+            # Settled at submission: cancellation is impossible, like a
+            # finished concurrent future.
+            return False
+
+        def add_done_callback(self, callback):
+            # Settled futures invoke observers immediately.
+            callback(self)
 
     async_utils.submit = (
         submit if submit is not None else (lambda coroutine: Future(coroutine))
@@ -225,7 +236,9 @@ def _armed_protocol(monkeypatch):
     monkeypatch.setattr(
         protocol,
         "_wait_generator_futures",
-        lambda futures: events.append(("wait", list(futures))),
+        lambda futures, **kwargs: events.append(
+            ("wait", list(futures), kwargs.get("timeout_s"))
+        ),
     )
     tensors = {
         name: torch.full((2, 2), index + 1, dtype=torch.bfloat16)
@@ -1362,7 +1375,7 @@ def test_generator_fan_out_logs_every_engine_failure(monkeypatch, caplog):
 
     # The first failure propagates; the rest must still reach the log with
     # their response bodies.
-    assert "wait_futures index=1 failed" in caplog.text
+    assert "generator fan-out index=1 failed" in caplog.text
     assert "engine at offset 2 failed" in caplog.text
 
 
@@ -1679,3 +1692,461 @@ def test_prepare_sessions_retires_dropped_generator_futures_on_failure(monkeypat
 
     assert dropped.cancelled is True
     assert dropped.callbacks == []
+
+
+# --- multi-round survival: epoch rebuild, stable worker id, kept session ----
+
+
+def _epoch_move(error_on_first_prepare=True):
+    """Session doubles whose first prepare reports the group's epoch move."""
+    from modelexpress_rl.collective.rendezvous import EpochChangedError
+
+    sessions = []
+
+    class Session:
+        def __init__(self, stale):
+            self.stale = stale
+            self.closed = False
+
+        def prepare(self):
+            if self.stale:
+                raise EpochChangedError("033a014bf2d5", 2, 3)
+
+        def close(self):
+            self.closed = True
+
+    def create(**kwargs):
+        session = Session(stale=error_on_first_prepare and not sessions)
+        sessions.append(session)
+        return session
+
+    return create, sessions
+
+
+def _prepare_harness(monkeypatch, create):
+    """Real ``_prepare_sessions`` over a fully faked server/engine boundary."""
+    _install_fake_miles_async(monkeypatch, [])
+
+    class Channel:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    channels = []
+
+    def insecure_channel(_endpoint):
+        channel = Channel()
+        channels.append(channel)
+        return channel
+
+    class Rendezvous:
+        def __init__(self, channel):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(miles_protocol.grpc, "insecure_channel", insecure_channel)
+    monkeypatch.setattr(miles_protocol.auth, "with_auth", lambda channel: channel)
+    monkeypatch.setattr(miles_protocol, "_await_endpoint_ready", lambda *a, **k: None)
+    monkeypatch.setattr(miles_protocol, "CollectiveRendezvous", Rendezvous)
+    monkeypatch.setattr(miles_protocol, "MilesPublisher", lambda **_kwargs: object())
+    monkeypatch.setattr(miles_protocol.MilesTrainerSession, "create", create)
+    return channels
+
+
+def _frozen_protocol(monkeypatch):
+    """A connected protocol with the round-one contract built, session-less."""
+    protocol = MilesCollectiveProtocolCore(_args())
+    protocol.connect(
+        [object()],
+        [1],
+        [0],
+        _parallel_state(),
+        _placement(),
+        "target",
+    )
+    protocol.begin_sync(
+        1,
+        lambda *, materialize: iter(
+            [[("model.weight", torch.ones((2,), dtype=torch.bfloat16))]]
+        ),
+    )
+    protocol._disarm_round()
+    monkeypatch.setattr(protocol, "_generator_futures", lambda action, **kw: [])
+    monkeypatch.setattr(protocol, "_wait_generator_futures", lambda futures, **kw: None)
+    return protocol
+
+
+def test_prepare_sessions_rebuilds_after_an_epoch_move(monkeypatch):
+    """The soak's round 2 found the group at a newer epoch; the seam treated
+    EpochChangedError as fatal. Prepare must tear down and re-prepare at the
+    server's current epoch instead."""
+    create, sessions = _epoch_move()
+    channels = _prepare_harness(monkeypatch, create)
+    protocol = _frozen_protocol(monkeypatch)
+    monkeypatch.setattr(protocol, "_drives_destroy_fan_out", lambda: False)
+
+    protocol._prepare_sessions()
+
+    assert len(sessions) == 2
+    assert sessions[0].closed  # the stale session was torn down
+    assert channels[0].closed
+    assert protocol._session is sessions[1]
+    assert not sessions[1].closed
+
+
+def test_prepare_sessions_reraises_the_move_when_the_gather_is_empty(monkeypatch):
+    """The rebuild is gated on the gathered failures: an empty vote (no rank
+    reports a failure) cannot justify a rebuild, so the move propagates."""
+    from modelexpress_rl.collective.rendezvous import EpochChangedError
+
+    create, sessions = _epoch_move()
+    _prepare_harness(monkeypatch, create)
+    protocol = _frozen_protocol(monkeypatch)
+    monkeypatch.setattr(protocol, "_drives_destroy_fan_out", lambda: False)
+    monkeypatch.setattr(miles_protocol, "_gathered_failures", lambda _error: [])
+
+    with pytest.raises(EpochChangedError):
+        protocol._prepare_sessions()
+
+    assert len(sessions) == 1  # no rebuild happened
+
+
+def test_epoch_rebuild_abandons_engine_futures_instead_of_waiting(monkeypatch):
+    """The engine's scheduler thread is parked in the receive handler, so a
+    destroy queues behind it; waiting on that fan-out deadlocks. The rebuild
+    must retire the futures, never wait on them."""
+    create, sessions = _epoch_move()
+    _prepare_harness(monkeypatch, create)
+    protocol = _frozen_protocol(monkeypatch)
+    monkeypatch.setattr(protocol, "_drives_destroy_fan_out", lambda: False)
+
+    class ParkedFuture:
+        def result(self, timeout=None):
+            raise AssertionError("the rebuild waited on a dropped future")
+
+        def cancel(self):
+            return False
+
+        def add_done_callback(self, _callback):
+            pass
+
+    # The first prepare's engine fan-out is parked behind the epoch move.
+    submissions = []
+
+    def generator_futures(action, **kwargs):
+        submissions.append(action)
+        return [ParkedFuture()]
+
+    monkeypatch.setattr(protocol, "_generator_futures", generator_futures)
+    monkeypatch.setattr(protocol, "_wait_generator_futures", lambda futures, **kw: None)
+
+    protocol._prepare_sessions()
+
+    assert len(sessions) == 2
+    assert protocol._session is sessions[1]
+    # The parked destroy was submitted (best effort) but never waited on.
+    assert "close" in submissions
+
+
+def test_the_slot_worker_id_is_stable_across_prepares(monkeypatch):
+    """A fresh worker_id per prepare re-presents the slot as a new generation,
+    which the server turns into an epoch bump."""
+    _install_fake_miles_async(monkeypatch, [])
+    worker_ids = []
+
+    class Session:
+        def prepare(self):
+            pass
+
+        def close(self):
+            pass
+
+    def create(**kwargs):
+        worker_ids.append(kwargs["worker_id"])
+        return Session()
+
+    _prepare_harness(monkeypatch, create)
+    protocol = _frozen_protocol(monkeypatch)
+
+    protocol._prepare_sessions()
+    protocol._session = None  # force the next round's re-prepare
+    protocol._prepare_sessions()
+
+    assert len(worker_ids) == 2
+    assert worker_ids[0] == worker_ids[1]
+    # The slot id is run-id-namespaced; the worker id embeds it and adds a
+    # per-protocol generation suffix.
+    run_id = protocol._run_id
+    assert worker_ids[0].startswith(f"miles-{run_id}:trainer-0-")
+
+
+def test_after_engines_resumed_keeps_the_session_for_the_next_round(monkeypatch):
+    """A per-round teardown re-publishes each lane's bootstrap at the same
+    epoch and the server rejects the duplicate; the settled session stays."""
+    create, sessions = _epoch_move(error_on_first_prepare=False)
+    _prepare_harness(monkeypatch, create)
+    protocol = _frozen_protocol(monkeypatch)
+
+    protocol._prepare_sessions()
+    first = protocol._session
+    protocol.after_engines_resumed()
+
+    assert protocol._session is first, "the session must survive into round 2"
+    assert len(sessions) == 1, "no re-prepare, so no duplicate bootstrap"
+
+    # The next round's prepare is a no-op against the kept session.
+    protocol._prepare_sessions()
+    assert protocol._session is first
+    assert len(sessions) == 1
+
+
+def test_a_settled_session_re_arms_the_full_publish_plan_for_round_2(monkeypatch):
+    """Round 2 on the reused session presents NO new bootstrap and publishes
+    the full plan through the same session."""
+    events = []
+    created = []
+
+    class Session:
+        def prepare(self):
+            pass
+
+        def create_transfer(self, *, version):
+            return f"op-{version}"
+
+        def begin_round(self, *, version):
+            events.append(("begin", version))
+
+        def publish_group(self, *, version, layer_group_id):
+            events.append(("publish", version, layer_group_id))
+
+        def finish_round(self, *, version, operation_id):
+            events.append(("finish", version, operation_id))
+
+        def close(self):
+            pass
+
+    def create(**kwargs):
+        session = Session()
+        created.append(session)
+        return session
+
+    _prepare_harness(monkeypatch, create)
+    protocol = MilesCollectiveProtocolCore(_args())
+    protocol.connect(
+        [object()],
+        [1],
+        [0],
+        _parallel_state(),
+        _placement(),
+        "target",
+    )
+    monkeypatch.setattr(protocol, "_generator_futures", lambda action, **kw: [])
+    monkeypatch.setattr(protocol, "_wait_generator_futures", lambda futures, **kw: None)
+
+    names = ("model.a", "model.b", "model.c")
+
+    def round_of(version, fill):
+        tensors = [
+            (name, torch.full((2, 2), fill, dtype=torch.bfloat16)) for name in names
+        ]
+        protocol.begin_sync(version, lambda *, materialize: iter([tensors]))
+        for name in names:
+            protocol.send_bucket([(name, protocol._tensors[name])])
+        protocol.finalize(version)
+        protocol.after_engines_resumed()
+
+    round_of(1, 1)
+    round_of(2, 2)
+
+    assert len(created) == 1, "round 2 must not re-bootstrap the session"
+    assert protocol._session is created[0]
+    for version in ("1", "2"):
+        # One flat publish group covers the whole plan each round.
+        assert ("begin", version) in events
+        assert ("publish", version, 0) in events
+        assert ("finish", version, f"op-{version}") in events
+
+
+# --- failure-path close: session first, bounded destroy wait, named failure --
+
+
+class _BusyDestroy(Exception):
+    """Marks an engine call that stays pending (the engine is mid-receive)."""
+
+
+class _BusyDestroyEngine:
+    """destroy_weights_update_group never settles: the engine serves it only
+    after its in-flight round fails."""
+
+    def __init__(self, executions):
+        self.executions = executions
+
+    async def _make_request(self, endpoint, payload=None):
+        if endpoint == "destroy_weights_update_group":
+            self.executions.append("destroy")
+            raise _BusyDestroy()
+        self.executions.append(endpoint)
+        return {"success": True}
+
+
+def _pending_aware_async(monkeypatch, waits):
+    """A fake async submit whose busy-destroy future stays pending: its
+    result(timeout) records the wait and raises the bare TimeoutError a
+    concurrent.futures wait raises."""
+    import sys
+
+    async_utils = sys.modules["miles.utils.async_utils"]
+    original = async_utils.submit
+
+    class Pending:
+        def result(self, timeout=None):
+            waits.append(timeout)
+            raise TimeoutError()
+
+        def cancel(self):
+            return False
+
+        def add_done_callback(self, _callback):
+            pass
+
+    def submit(coroutine):
+        future = original(coroutine)
+        if isinstance(getattr(future, "_error", None), _BusyDestroy):
+            return Pending()
+        return future
+
+    monkeypatch.setattr(async_utils, "submit", submit)
+
+
+def _failure_close_protocol(monkeypatch, executions, waits):
+    """An armed protocol mid-round with a busy-destroy engine attached."""
+    _install_fake_miles_async(monkeypatch, [])
+    _pending_aware_async(monkeypatch, waits)
+    engine = _BusyDestroyEngine(executions)
+    protocol = MilesCollectiveProtocolCore(_args())
+    protocol.connect(
+        [engine],
+        [1],
+        [0],
+        _parallel_state(),
+        _placement(),
+        "target",
+    )
+    tensors = {
+        name: torch.full((2, 2), index + 1, dtype=torch.bfloat16)
+        for index, name in enumerate(("model.a", "model.b"))
+    }
+    protocol.begin_sync(1, lambda *, materialize: iter([list(tensors.items())]))
+    # The session is faked below; the first send_bucket must not prepare.
+    monkeypatch.setattr(protocol, "_prepare_sessions", lambda: None)
+
+    class Session:
+        def create_transfer(self, *, version):
+            return "op-1"
+
+        def begin_round(self, *, version):
+            pass
+
+        def publish_group(self, *, version, layer_group_id):
+            pass
+
+        def finish_round(self, *, version, operation_id):
+            pass
+
+        def report_failure(self, operation_id, error):
+            pass
+
+        def close(self):
+            executions.append("session-close")
+
+    protocol._session = Session()
+    # The engine group name is what a completed prepare fan-out leaves.
+    protocol._engine_group_name = "mx-m2n-group"
+    monkeypatch.setattr(miles_protocol.dist, "is_available", lambda: True)
+    monkeypatch.setattr(miles_protocol.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(miles_protocol.dist, "get_rank", lambda: 0)
+    # A frozen clock makes the remaining-time arithmetic exact.
+    monkeypatch.setattr(miles_protocol.time, "monotonic", lambda: 100.0)
+    return protocol, tensors
+
+
+def test_a_round_failure_is_named_at_once_and_close_bounds_the_busy_destroy(
+    monkeypatch, caplog
+):
+    executions, waits = [], []
+    protocol, tensors = _failure_close_protocol(monkeypatch, executions, waits)
+    protocol.send_bucket([("model.a", tensors["model.a"])])
+
+    with (
+        caplog.at_level("WARNING", logger=miles_protocol.logger.name),
+        pytest.raises(RuntimeError, match="bucket stream ended"),
+    ):
+        protocol.finalize(1)
+
+    errors = [record for record in caplog.records if record.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "failed in finalize" in errors[0].getMessage()
+    assert "bucket stream ended" in errors[0].getMessage()
+    assert errors[0].exc_info is not None  # the traceback is in the log
+    # The trainer session (this rank's lanes) closes BEFORE the engine
+    # destroy, and the destroy wait is the short failure bound, not the full
+    # group timeout an engine mid-receive would burn.
+    assert executions.index("session-close") < executions.index("destroy")
+    assert waits == [miles_protocol._FAILURE_DESTROY_WAIT_S]
+    assert miles_protocol._FAILURE_DESTROY_WAIT_S <= 30
+    assert "did not settle within 15s after a failure" in caplog.text
+    assert "close() during failure handling failed" not in caplog.text
+    # The destroy never settled, so the group name survives for a later retry.
+    assert protocol._engine_group_name == "mx-m2n-group"
+    assert protocol._closed
+
+
+def test_a_normal_close_bounds_the_destroy_wait_by_the_transfer_timeout(
+    monkeypatch,
+):
+    from modelexpress_rl.collective import envs
+
+    executions, waits = [], []
+    protocol, _tensors = _failure_close_protocol(monkeypatch, executions, waits)
+
+    with pytest.raises(TimeoutError, match="deadline expired"):
+        protocol.close()
+
+    assert waits == [envs.MX_NCCL_REFIT_TRANSFER_TIMEOUT_S]
+    # The failing close did not clear the group name; a retry can re-drive it.
+    assert protocol._engine_group_name == "mx-m2n-group"
+    assert protocol._close_pending is True
+
+
+def test_finalize_waits_the_round_fan_out_on_the_transfer_clock(monkeypatch):
+    protocol, _session, events, tensors = _armed_protocol(monkeypatch)
+    for name in ("model.a", "model.b", "model.c"):
+        protocol.send_bucket([(name, tensors[name])])
+    protocol.finalize(1)
+
+    from modelexpress_rl.collective import envs
+
+    waits = [event for event in events if event[0] == "wait"]
+    assert waits
+    assert all(
+        event[2] == envs.MX_NCCL_REFIT_TRANSFER_TIMEOUT_S for event in waits
+    )
+
+
+# --- counted truncation: every list detail names its total -------------------
+
+
+def test_bucket_refusals_count_the_unshown_names(monkeypatch):
+    protocol, _session, _events, tensors = _armed_protocol(monkeypatch)
+    unknown = [(f"model.unknown.{index}", tensors["model.a"]) for index in range(7)]
+
+    with pytest.raises(ValueError, match="outside the frozen plan") as raised:
+        protocol.send_bucket(unknown)
+
+    # Not a silent [:5] cut: the detail counts the set and names the elision.
+    assert "7 total:" in str(raised.value)
+    assert "(+2 more)" in str(raised.value)
