@@ -1161,6 +1161,8 @@ All storage backends (S3, GCS, Azure) are included as core dependencies — no e
 
 With vLLM, `MX_MODEL_URI` can also be a Hugging Face model ID. vLLM first downloads the safetensors into its local Hugging Face cache, then ModelStreamer reads those local files; ModelStreamer does not stream directly from the Hub.
 
+For vLLM MTP with a shared checkpoint, configure both the main and speculative draft loads through ModelExpress and use the same pinned checkpoint, revision, vLLM build, and MX build on source and target. One main NIXL listener serves both role-scoped tensor sets; do not allocate a second metadata port for the draft. On cold start, ModelStreamer skips draft-only shard files for the main pass and selects draft-containing shard files for the draft pass when a usable `model.safetensors.index.json` and recognized weight naming are available. Mixed shards are read by both passes, and unknown layouts fall back to full-file loading. With `MX_VMM_ARENA=1`, the main weights use the arena while draft tensors are registered individually; the draft must not replace the live main arena.
+
 **S3 / S3-compatible:**
 
 | Variable | Description |

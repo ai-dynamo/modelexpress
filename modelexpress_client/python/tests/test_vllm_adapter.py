@@ -26,6 +26,7 @@ from modelexpress.engines.vllm.adapter import (
     _mtp_layer_prefixes,
     _read_safetensors_index,
     _select_draft_weight_files,
+    _select_main_weight_files,
     build_vllm_load_context,
 )
 from modelexpress.engines.vllm.host_quantization import refresh_host_quantization_state
@@ -1029,6 +1030,20 @@ class TestDraftWeightFileSelection:
             [os.path.join(str(tmp_path), "model-mtp.safetensors")],
         )
 
+    def test_missing_required_draft_shard_falls_back(self, tmp_path):
+        self._write_index(
+            tmp_path,
+            {
+                "mtp.0.weight": "draft-a.safetensors",
+                "mtp.1.weight": "draft-b.safetensors",
+            },
+        )
+        files = [str(tmp_path / "draft-a.safetensors")]
+        assert _select_draft_weight_files(str(tmp_path), files, ("mtp.",)) == (
+            DraftShardSelection.UNRESOLVED,
+            [],
+        )
+
     def test_selects_draft_shard_for_hf_repo_id(self, tmp_path):
         """HF repo-id URI: the index is found next to the resolved shard files."""
         self._write_index(
@@ -1110,6 +1125,97 @@ class TestDraftWeightFileSelection:
                 DraftShardSelection.UNRESOLVED,
                 [],
             )
+
+
+class TestMainWeightFileSelection:
+    def _write_index(self, tmp_path, weight_map):
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map}), encoding="utf-8"
+        )
+
+    def test_excludes_only_draft_only_shards(self, tmp_path):
+        self._write_index(
+            tmp_path,
+            {
+                "model.layers.0.weight": "main.safetensors",
+                "model.layers.78.weight": "draft.safetensors",
+                "model.layers.77.weight": "mixed.safetensors",
+                "model.layers.78.bias": "mixed.safetensors",
+            },
+        )
+        files = [
+            str(tmp_path / name)
+            for name in ("main.safetensors", "mixed.safetensors", "draft.safetensors")
+        ]
+        assert _select_main_weight_files(
+            str(tmp_path), files, _union_prefixes(78, 1)
+        ) == [
+            files[0], files[1]
+        ]
+
+    def test_unknown_index_keeps_every_shard(self, tmp_path):
+        files = [str(tmp_path / "main.safetensors"), str(tmp_path / "draft.safetensors")]
+        assert _select_main_weight_files(str(tmp_path), files, ("mtp.",)) == files
+
+    def test_unindexed_file_is_preserved(self, tmp_path):
+        self._write_index(tmp_path, {"mtp.0.weight": "draft.safetensors"})
+        files = [str(tmp_path / "draft.safetensors"), str(tmp_path / "extra.safetensors")]
+        assert _select_main_weight_files(str(tmp_path), files, ("mtp.",)) == [files[1]]
+
+    @pytest.mark.parametrize(
+        ("runner_type", "expected_name"),
+        [("generate", "main.safetensors"), ("draft", "draft.safetensors")],
+    )
+    def test_model_streamer_reads_only_selected_role_shard(
+        self, tmp_path, monkeypatch, runner_type, expected_name
+    ):
+        (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+        self._write_index(
+            tmp_path,
+            {
+                "model.layers.0.weight": "main.safetensors",
+                "mtp.0.weight": "draft.safetensors",
+            },
+        )
+        files = [
+            str(tmp_path / name)
+            for name in ("main.safetensors", "draft.safetensors")
+        ]
+        streamer_module = MagicMock()
+        streamer = streamer_module.RunaiModelStreamerLoader.return_value
+        streamer._prepare_weights.return_value = files
+        streamer._is_distributed = False
+        weight_utils = MagicMock()
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm.model_executor.model_loader.runai_streamer_loader",
+            streamer_module,
+        )
+        monkeypatch.setitem(
+            sys.modules, "vllm.model_executor.model_loader.weight_utils", weight_utils
+        )
+        monkeypatch.setattr(
+            VllmAdapter, "_model_streamer_distributed_enabled", lambda self: False
+        )
+        adapter = VllmAdapter.__new__(VllmAdapter)
+        adapter.load_config = SimpleNamespace(
+            model_loader_extra_config={}, use_tqdm_on_load=False
+        )
+        adapter.model_config = SimpleNamespace(
+            runner_type=runner_type, revision="test-revision"
+        )
+        adapter.vllm_config = SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                draft_model_config=SimpleNamespace(runner_type="draft")
+            )
+        )
+
+        adapter.build_model_streamer_weight_iter(str(tmp_path))
+
+        weight_utils.runai_safetensors_weights_iterator.assert_called_once_with(
+            [str(tmp_path / expected_name)], False, False
+        )
+        streamer._get_weights_iterator.assert_not_called()
 
 
 class TestMtpLayerPrefixes:
@@ -1238,4 +1344,57 @@ class TestReadSafetensorsIndexObjectStore:
         ) == (
             DraftShardSelection.SELECTED,
             ["s3://bucket/model/model-mtp.safetensors"],
+        )
+
+
+class TestTargetSharedDraftPrefixes:
+    def _mtp_model(self):
+        class _SharedHead(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = torch.nn.Linear(2, 2)
+
+        class _Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.shared_head = _SharedHead()
+
+        class _Mtp(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([_Layer()])
+
+        return _Mtp()
+
+    def test_mtp_draft_drops_embed_lm_head_and_shared_heads(self):
+        from types import SimpleNamespace
+
+        from modelexpress.engines.vllm.adapter import _target_shared_draft_prefixes
+
+        config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=1))
+        assert _target_shared_draft_prefixes(self._mtp_model(), config) == (
+            "model.embed_tokens.",
+            "lm_head.",
+            "layers.0.shared_head.head.",
+        )
+
+    def test_draft_owning_its_heads_keeps_everything(self):
+        from types import SimpleNamespace
+
+        from modelexpress.engines.vllm.adapter import _target_shared_draft_prefixes
+
+        model = self._mtp_model()
+        model.has_own_embed_tokens = True
+        model.has_own_lm_head = True
+        config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=1))
+        assert _target_shared_draft_prefixes(model, config) == ()
+
+    def test_pipeline_parallel_keeps_draft_embedding(self):
+        from types import SimpleNamespace
+
+        from modelexpress.engines.vllm.adapter import _target_shared_draft_prefixes
+
+        config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=2))
+        assert "model.embed_tokens." not in _target_shared_draft_prefixes(
+            self._mtp_model(), config
         )

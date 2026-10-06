@@ -76,6 +76,34 @@ def _is_speculative_draft(vllm_config, model_config) -> bool:
     return getattr(model_config, "runner_type", None) == "draft"
 
 
+def _target_shared_draft_prefixes(model, vllm_config) -> tuple[str, ...]:
+    """Tensor-name prefixes vLLM swaps for the target's after an MTP draft loads.
+
+    Mirrors the MTP branch of vLLM's proposer ``_maybe_share_embeddings`` /
+    ``_maybe_share_lm_head``: a draft without ``has_own_embed_tokens`` always
+    takes the target's embedding (single pipeline stage), and one without
+    ``has_own_lm_head`` always takes the target's ``lm_head``, including every
+    MTP layer's ``shared_head.head``. Those draft copies are discarded, so
+    they are neither served nor received over P2P; holding them for NIXL
+    would pin memory vLLM frees to size the KV cache. EAGLE drafts carry the
+    ``has_own_*`` attributes and are compared by content, so nothing is
+    dropped for them.
+    """
+    prefixes: list[str] = []
+    parallel = getattr(vllm_config, "parallel_config", None)
+    if (
+        not hasattr(model, "has_own_embed_tokens")
+        and getattr(parallel, "pipeline_parallel_size", 1) == 1
+    ):
+        prefixes.append("model.embed_tokens.")
+    if not hasattr(model, "has_own_lm_head"):
+        prefixes.append("lm_head.")
+        for name, module in model.named_modules():
+            if name.endswith("shared_head") and hasattr(module, "head"):
+                prefixes.append(f"{name}.head.")
+    return tuple(prefixes)
+
+
 class DraftShardSelection(Enum):
     """Outcome of picking the draft's own shards out of a checkpoint."""
 
@@ -221,12 +249,54 @@ def _select_draft_weight_files(
         if not wanted:
             return DraftShardSelection.NO_DRAFT_WEIGHTS, []
         subset = [f for f in hf_weights_files if os.path.basename(f) in wanted]
-        if not subset:
+        if {os.path.basename(f) for f in subset} != wanted:
             return DraftShardSelection.UNRESOLVED, []
         return DraftShardSelection.SELECTED, subset
     except Exception as exc:
         logger.warning("Draft weight-file selection failed: %s", exc)
         return DraftShardSelection.UNRESOLVED, []
+
+
+def _select_main_weight_files(
+    model_uri: str,
+    hf_weights_files: list[str],
+    draft_prefixes: tuple[str, ...],
+) -> list[str]:
+    """Skip only shards whose indexed tensors all belong to the draft.
+
+    A shard holding both roles remains in both reads. Without a usable index
+    or an unambiguous resolved file list, preserve vLLM's full-load behavior.
+    """
+    if not draft_prefixes:
+        return hf_weights_files
+    try:
+        index = _load_safetensors_index(model_uri, hf_weights_files)
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            return hf_weights_files
+        filenames = [os.path.basename(path) for path in hf_weights_files]
+        if len(set(filenames)) != len(filenames):
+            return hf_weights_files
+        roles_by_file: dict[str, set[bool]] = {}
+        for tensor_name, filename in weight_map.items():
+            if not isinstance(tensor_name, str) or not isinstance(filename, str):
+                return hf_weights_files
+            roles_by_file.setdefault(filename, set()).add(
+                tensor_name.startswith(draft_prefixes)
+            )
+        if not any(True in roles for roles in roles_by_file.values()):
+            return hf_weights_files
+        selected = [
+            path
+            for path in hf_weights_files
+            if roles_by_file.get(os.path.basename(path)) != {True}
+        ]
+        if not selected:
+            return hf_weights_files
+        return selected
+    except Exception as exc:
+        logger.warning("Main weight-file selection failed: %s", exc)
+        return hf_weights_files
 
 
 class VllmAdapter(EngineAdapter):
@@ -287,7 +357,16 @@ class VllmAdapter(EngineAdapter):
         if result.model is None:
             raise RuntimeError("vLLM tensor discovery requires result.model")
         adopt_hidden_tensors(result.model, self.accelerator_backend)
-        return collect_module_tensors(result.model, self.accelerator_backend)
+        tensors = collect_module_tensors(result.model, self.accelerator_backend)
+        if _is_speculative_draft(self.vllm_config, self.model_config):
+            prefixes = _target_shared_draft_prefixes(result.model, self.vllm_config)
+            if prefixes:
+                tensors = {
+                    name: tensor
+                    for name, tensor in tensors.items()
+                    if not name.startswith(prefixes)
+                }
+        return tensors
 
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         if result.model is None:
@@ -354,7 +433,10 @@ class VllmAdapter(EngineAdapter):
         loader = RunaiModelStreamerLoader(load_config)
         revision = getattr(self.model_config, "revision", None)
 
-        if not _is_speculative_draft(self.vllm_config, self.model_config):
+        is_draft = _is_speculative_draft(self.vllm_config, self.model_config)
+        speculative_config = getattr(self.vllm_config, "speculative_config", None)
+        draft_config = getattr(speculative_config, "draft_model_config", None)
+        if not is_draft and getattr(draft_config, "runner_type", None) != "draft":
             return loader._get_weights_iterator(model_uri, revision)
 
         # An MTP draft shares the target's checkpoint but needs only its own
@@ -367,6 +449,19 @@ class VllmAdapter(EngineAdapter):
         hf_weights_files = loader._prepare_weights(model_uri, revision)
         config = _load_config(model_uri, hf_weights_files)
         draft_prefixes = _DRAFT_WEIGHT_PREFIXES + _mtp_layer_prefixes(config)
+        if not is_draft:
+            subset = _select_main_weight_files(
+                model_uri, hf_weights_files, draft_prefixes
+            )
+            if len(subset) == len(hf_weights_files):
+                return loader._get_weights_iterator(model_uri, revision)
+            logger.info(
+                "[main] streaming %d of %d safetensors shards; skipped draft-only shards",
+                len(subset), len(hf_weights_files),
+            )
+            return runai_safetensors_weights_iterator(
+                subset, load_config.use_tqdm_on_load, loader._is_distributed
+            )
         selection, subset = _select_draft_weight_files(
             model_uri, hf_weights_files, draft_prefixes
         )
