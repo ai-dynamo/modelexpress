@@ -470,7 +470,9 @@ class _TiedEmbeddingModel(torch.nn.Module):
 
 def _alias_plan(*names):
     return ReshardPlan(
-        bulk=sorted((_entry(name) for name in names), key=lambda entry: entry.canonical()),
+        bulk=sorted(
+            (_entry(name) for name in names), key=lambda entry: entry.canonical()
+        ),
         source_partition_count=1,
     )
 
@@ -502,9 +504,7 @@ def fake_receiver_backend(monkeypatch):
     monkeypatch.setattr(
         receiver_module.SglangGeneratorSession, "create", staticmethod(FakeSession)
     )
-    monkeypatch.setattr(
-        receiver_module.grpc, "insecure_channel", FakeChannel
-    )
+    monkeypatch.setattr(receiver_module.grpc, "insecure_channel", FakeChannel)
     monkeypatch.setattr(receiver_module.auth, "with_auth", lambda channel: channel)
     monkeypatch.setattr(
         receiver_module, "CollectiveRendezvous", lambda channel: FakeRendezvous()
@@ -516,9 +516,9 @@ class TestTiedAliasReceiver:
     def test_the_alias_map_names_each_alias_load_visible_registration(self):
         import modelexpress_rl.collective.integrations.sglang_receiver as receiver_module
 
-        assert receiver_module._registered_parameter_aliases(
-            _TiedEmbeddingModel()
-        ) == {"lm_head.weight": "model.embed_tokens.weight"}
+        assert receiver_module._registered_parameter_aliases(_TiedEmbeddingModel()) == {
+            "lm_head.weight": "model.embed_tokens.weight"
+        }
 
     def test_a_tied_lm_head_model_is_accepted(self, caplog):
         # Qwen3-0.6B's shape: the trainer stream carries the shared table

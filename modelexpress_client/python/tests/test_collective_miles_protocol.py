@@ -2132,9 +2132,7 @@ def test_finalize_waits_the_round_fan_out_on_the_transfer_clock(monkeypatch):
 
     waits = [event for event in events if event[0] == "wait"]
     assert waits
-    assert all(
-        event[2] == envs.MX_NCCL_REFIT_TRANSFER_TIMEOUT_S for event in waits
-    )
+    assert all(event[2] == envs.MX_NCCL_REFIT_TRANSFER_TIMEOUT_S for event in waits)
 
 
 # --- counted truncation: every list detail names its total -------------------
