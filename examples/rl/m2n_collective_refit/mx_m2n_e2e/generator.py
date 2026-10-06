@@ -39,6 +39,9 @@ def main() -> int:
     parser.add_argument(
         "--dst-layout", default="replicate", choices=["replicate", "sharded"]
     )
+    parser.add_argument(
+        "--src-layout", default="dim0", choices=["dim0", "dim1", "2d"]
+    )
     parser.add_argument("--diff-checkpoint", action="store_true")
     parser.add_argument("--out", default="/work/out")
     args = parser.parse_args()
@@ -117,6 +120,7 @@ def main() -> int:
             "model_name": args.model_name,
             "run_id": args.run_id,
             "dst_layout": args.dst_layout,
+            "src_layout": args.src_layout,
         },
     )
     print(f"[gen] joined: {joined}", flush=True)
@@ -172,6 +176,7 @@ def main() -> int:
         "model_dir": args.model_dir,
         "role": "generator",
         "dst_layout": args.dst_layout,
+        "src_layout": args.src_layout,
         "engine_start_s": engine_s,
         "tensor_parallel_size": args.generators,
         "trainers": args.trainers,
