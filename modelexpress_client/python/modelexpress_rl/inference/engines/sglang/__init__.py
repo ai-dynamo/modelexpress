@@ -28,7 +28,10 @@ def get_modelexpress_generator(model_runner: Any) -> ModelExpressGeneratorClient
 
     from ....object_storage import ObjectStorageType
     from ...client import ModelExpressGeneratorClient, ModelExpressGeneratorConfig
-    from ...receiver import ObjectStorageGeneratorConfig
+    from ...receiver import (
+        DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB,
+        ObjectStorageGeneratorConfig,
+    )
 
     config = model_runner.server_args.modelexpress_config
     if isinstance(config, str):
@@ -57,7 +60,8 @@ def get_modelexpress_generator(model_runner: Any) -> ModelExpressGeneratorClient
                 seed_checkpoint_path=checkpoint,
                 refit_checkpoint_dir=config["refit_checkpoint_dir"],
                 refit_checkpoint_max_size_gb=config.get(
-                    "refit_checkpoint_max_size_gb", 500
+                    "refit_checkpoint_max_size_gb",
+                    DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB,
                 ),
                 endpoint_url=config.get("object_storage_endpoint_url"),
                 region_name=config.get("object_storage_region_name"),

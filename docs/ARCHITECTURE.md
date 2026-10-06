@@ -647,8 +647,9 @@ The base version advances only after successful publication.
 Staging initializes a fresh artifact and encoding pool for each new version;
 successful publication clears that state. Empty buckets initialize ranks with no
 local tensors so they can still participate in collective publication. A failed
-iterator is discarded and can be retried from the beginning. A failed bucket
-worker prevents publication until the staging operation is discarded or closed.
+iterator is discarded automatically and can be retried from the beginning. For
+incremental bucket submissions, a worker failure prevents publication. Use
+`trainer.close()` to discard the staged work and close the client.
 
 `ModelExpressGeneratorConfig.staging_buffer_bytes` sets bounded-streaming
 capacity per arena, and `staging_buffers_count` defaults to one. The streaming

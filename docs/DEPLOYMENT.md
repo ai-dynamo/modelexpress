@@ -240,10 +240,11 @@ for trainer publication. See the [backend setup examples](S3_DELTA_WEIGHT_REFIT.
 
 ### Generator refit checkpoint cache
 
-`refit_checkpoint_max_size_gb` defaults to 2000 GB per model. At initialization,
-the generator caps this quota at existing cache bytes plus free disk space and
-logs any reduction. Free space is checked again before known writes and copies,
-including when `null` disables the configured quota. See the
+`refit_checkpoint_max_size_gb` defaults to 2000 GB per model in the SDK, vLLM,
+and SGLang. At initialization, the generator caps this quota at existing
+cache bytes plus free disk space and logs any reduction. Free space is checked
+again before known writes and copies, including when `null` disables the
+configured quota. See the
 [S3 refit cache configuration](S3_DELTA_WEIGHT_REFIT.md#refit_checkpoint_dir)
 for setup and eviction behavior.
 

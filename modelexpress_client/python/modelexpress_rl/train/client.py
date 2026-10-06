@@ -276,7 +276,7 @@ class ModelExpressTrainerClient:
         An empty bucket initializes a rank with no tensors to contribute.
         The SDK retains the bucket and its tensors; keep their contents stable
         until publish() finishes. The iterator form completes staging before
-        returning, as before. Use one input form per version.
+        returning. Use one input form per version.
         """
         if self._closed:
             raise RuntimeError("trainer client is closed")

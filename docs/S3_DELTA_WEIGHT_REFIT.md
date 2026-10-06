@@ -657,9 +657,9 @@ The corresponding generator configuration would use:
 
 `refit_checkpoint_max_size_gb` is a positive per-model quota in decimal
 gigabytes (`1 GB = 1,000,000,000 bytes`) for payload files under `full/`,
-`deltas/`, and `materialized/`. The SDK and vLLM backend default to 2000 GB;
-the SGLang factory defaults to 500 GB. Set it explicitly to use the same quota
-across backends, or set it to `null` to disable the configured quota.
+`deltas/`, and `materialized/`. The SDK, vLLM, and SGLang default to 2000 GB.
+Set it explicitly to override the quota, or set it to `null` to disable the
+configured quota.
 At initialization, ModelExpress caps the quota at the existing model cache size
 plus available filesystem space. A short INFO log reports the cap and free space
 when this reduces the configured quota or replaces `null` with a disk-based
