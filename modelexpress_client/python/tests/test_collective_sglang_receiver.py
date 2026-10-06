@@ -453,7 +453,12 @@ class _TiedEmbeddingModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         inner = torch.nn.Module()
-        inner.embed_tokens = torch.nn.Embedding(4, 4, dtype=torch.bfloat16)
+        inner.embed_tokens = torch.nn.Module()
+        # A plain registered parameter: the same ``_parameters`` shape an
+        # nn.Embedding carries, without a device allocation.
+        inner.embed_tokens.weight = torch.nn.Parameter(
+            torch.zeros((4, 4), dtype=torch.bfloat16)
+        )
         self.model = inner
         self.lm_head = inner.embed_tokens
 
