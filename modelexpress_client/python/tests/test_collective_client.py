@@ -868,6 +868,46 @@ class TestRefitRound:
 
 
 class TestReporting:
+    @pytest.mark.parametrize("phase", ["start", "publish"])
+    def test_session_failure_reports_original_identity_after_cleanup(
+        self, fake_nccl, monkeypatch, phase
+    ):
+        from modelexpress_rl.collective.integrations.miles import MilesTrainerSession
+
+        rz = FakeRendezvous()
+        monkeypatch.setattr(rz, "close", lambda: None, raising=False)
+        engine = FakeEngine()
+        client = trainer(rz, engine)
+        admitted = client.compute_plan()
+        session = MilesTrainerSession(
+            client=client, rendezvous=rz, publisher=engine, source_partition=0
+        )
+        session._membership = admitted
+        session._prepared = True
+        method = "start_weight_update" if phase == "start" else "publish_weights"
+
+        def fail(*args):
+            raise RuntimeError(f"{phase} failed")
+
+        monkeypatch.setattr(client, method, fail)
+        if phase == "publish":
+            session.begin_round(version="v1")
+        with pytest.raises(RuntimeError, match=f"{phase} failed") as failure:
+            if phase == "start":
+                session.begin_round(version="v1")
+            else:
+                session.publish_group(version="v1", layer_group_id=0)
+        assert client._membership is None
+        session.report_failure("server-op", failure.value)
+        assert rz.reports[-1] == {
+            "operation_id": "server-op",
+            "group_id": admitted.group_id,
+            "epoch": admitted.epoch,
+            "worker_id": "w0",
+            "succeeded": False,
+            "message": repr(failure.value),
+        }
+
     def test_early_round_failure_uses_admitted_identity(self, fake_nccl):
         rz = FakeRendezvous()
         client = trainer(rz, FakeEngine())

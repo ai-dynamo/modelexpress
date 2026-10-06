@@ -212,7 +212,8 @@ ModelExpress/
 │       │   ├── comm.py                 # Communicator cache keyed by (group_id, epoch)
 │       │   ├── backend.py              # NcclM2nSender / NcclM2nReceiver
 │       │   ├── client.py               # RefitClientTrainer / RefitClientGenerator
-│       │   └── envs.py                 # Deadlines and stream count
+│       │   ├── envs.py                 # Deadlines and stream count
+│       │   └── integrations/           # MILES trainer protocol, SGLang external receiver, manifest wire
 │       ├── refit_collective_pb2.py     # Generated protobuf stubs
 │       └── refit_collective_pb2_grpc.py # Generated gRPC stubs
 │

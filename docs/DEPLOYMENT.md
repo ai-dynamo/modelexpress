@@ -752,6 +752,25 @@ stock behavior. Design: [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md).
 | `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams used to overlap per-pipeline-stage reshard lanes. |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS`, so `90` | How long a participant's registration stays alive without a heartbeat. Derived from `MX_HEARTBEAT_INTERVAL_SECS` (default `30`), so raising the heartbeat interval raises this with it. |
 
+#### MILES Integration (NCCL M2N)
+
+The MILES trainer-side adapter
+(`modelexpress_rl.collective.integrations.miles_protocol`) resolves the
+mx-server endpoint in the MILES trainer process through the shared client
+resolver, with no localhost default; the trainer and engine processes also
+honor the inherited `MX_NCCL_REFIT_*` deadline/stream variables documented
+above. The SGLang side needs no endpoint variable: it is an
+allowlisted external receiver (requires the SG-1 hook, not yet on upstream
+SGLang; launched via `--weight-update-receivers
+modelexpress_rl.collective.integrations.sglang_receiver.create_receiver`)
+and it gets the server endpoint from the trainer's
+`init_weights_update_group` request. Full semantics:
+[the integration README](../modelexpress_client/python/modelexpress_rl/collective/integrations/README.md).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_SERVER_ADDRESS` | none (one of the two endpoint variables is required) | mx-server `host:port` the adapter connects to. **Endpoint configuration resolves through the shared client resolver** (`modelexpress.client._get_server_url`): a set `MODEL_EXPRESS_URL` takes precedence, then `MX_SERVER_ADDRESS`; unlike the client paths covered by the transition guidance above there is no localhost default. Plain `host:port`; `grpc://`/`http://` prefixes are stripped and the secure schemes (`grpcs://`, `https://`) are rejected. |
+
 ### NIXL Backend Selection
 
 `MX_NIXL_BACKEND` selects the NIXL plugin used for GPU-to-GPU RDMA.
