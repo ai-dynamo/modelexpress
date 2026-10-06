@@ -182,11 +182,17 @@ def test_generator_factory_reuses_client_and_shared_config(
         runner.loader._prepare_weights.assert_not_called()
 
 
-def test_generator_factory_preserves_sglang_defaults(tmp_path, monkeypatch):
+@pytest.mark.parametrize("as_json", [False, True])
+def test_generator_factory_uses_shared_defaults(tmp_path, monkeypatch, as_json):
     initialize = Mock()
     monkeypatch.setattr(ModelExpressGeneratorClient, "initialize", initialize)
+    runner = _runner(tmp_path)
+    if as_json:
+        runner.server_args.modelexpress_config = json.dumps(
+            runner.server_args.modelexpress_config
+        )
 
-    get_modelexpress_generator(_runner(tmp_path))
+    get_modelexpress_generator(runner)
 
     config = initialize.call_args.args[0]
     assert (
@@ -194,7 +200,27 @@ def test_generator_factory_preserves_sglang_defaults(tmp_path, monkeypatch):
         config.max_replay_chain_length,
         config.rpc_timeout_seconds,
         config.object_storage.refit_checkpoint_max_size_gb,
-    ) == (3, 64, 30.0, 500)
+    ) == (3, 64, 30.0, 2000)
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+@pytest.mark.parametrize("quota", [200, None])
+def test_generator_factory_preserves_explicit_cache_quota(
+    tmp_path, monkeypatch, as_json, quota
+):
+    initialize = Mock()
+    monkeypatch.setattr(ModelExpressGeneratorClient, "initialize", initialize)
+    runner = _runner(tmp_path)
+    runner.server_args.modelexpress_config["refit_checkpoint_max_size_gb"] = quota
+    if as_json:
+        runner.server_args.modelexpress_config = json.dumps(
+            runner.server_args.modelexpress_config
+        )
+
+    get_modelexpress_generator(runner)
+
+    config = initialize.call_args.args[0]
+    assert config.object_storage.refit_checkpoint_max_size_gb == quota
 
 
 def test_generator_factory_can_retry_initialization(tmp_path, monkeypatch):
