@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 from itertools import count
 from types import SimpleNamespace
 from typing import ClassVar
@@ -413,3 +414,140 @@ class FakeSession:
 
     def close(self):
         self.closed += 1
+
+
+# --- counted truncation in the shared helpers --------------------------------
+
+
+def test_layer_group_coverage_errors_count_the_unshown_names(fake_buffers):
+    plan = ReshardPlan(
+        bulk=[_entry(f"model.{index}") for index in range(7)],
+        source_partition_count=1,
+    )
+    with pytest.raises(ValueError, match="missing=6 total") as raised:
+        SglangLoader(
+            plan=plan,
+            model=FakeModel(),
+            device="cuda:0",
+            layer_groups=(("model.0",),),
+        )
+
+    # Not a silent [:5] cut: the detail counts the set and names the elision.
+    assert "(+1 more)" in str(raised.value)
+    assert "model.5" in str(raised.value)
+    assert "model.6" not in str(raised.value)
+    assert "unknown=0 total: -" in str(raised.value)
+
+
+# --- tied-alias detection (Qwen3-0.6B class: lm_head IS embed_tokens) --------
+
+
+class _TiedEmbeddingModel(torch.nn.Module):
+    """A tied-embedding stand-in: ``lm_head`` IS ``model.embed_tokens``.
+
+    Mirrors SGLang's Qwen3 wiring (``self.lm_head = self.model.embed_tokens``),
+    so ``named_parameters()`` dedupes ``lm_head.weight`` away and the model's
+    ``load_weights`` resolution cannot see a write aimed at it.
+    """
+
+    def __init__(self):
+        super().__init__()
+        inner = torch.nn.Module()
+        inner.embed_tokens = torch.nn.Embedding(4, 4, dtype=torch.bfloat16)
+        self.model = inner
+        self.lm_head = inner.embed_tokens
+
+    def load_weights(self, weights):
+        # Same contract the real models give: a deduplicated name lookup.
+        params = dict(self.named_parameters())
+        self.loaded = [(name, name in params) for name, _weight in weights]
+
+
+def _alias_plan(*names):
+    return ReshardPlan(
+        bulk=sorted((_entry(name) for name in names), key=lambda entry: entry.canonical()),
+        source_partition_count=1,
+    )
+
+
+def _alias_context(model, plan):
+    import modelexpress_rl.collective.integrations.sglang_receiver as receiver_module
+    from modelexpress_rl.collective.integrations.manifest import manifest_to_wire
+
+    return receiver_module, SimpleNamespace(
+        master_address="mx-server",
+        master_port=8001,
+        rank_offset=0,
+        world_size=2,
+        init_payload=manifest_to_wire(plan, _topology()),
+        model=model,
+        device="cuda:0",
+        tp_rank=1,
+        tp_size=2,
+    )
+
+
+@pytest.fixture
+def fake_receiver_backend(monkeypatch):
+    """Fake the server/engine boundary so create_receiver runs off-cluster."""
+    import modelexpress_rl.collective.integrations.sglang_receiver as receiver_module
+
+    FakeSession.instances = []
+
+    monkeypatch.setattr(
+        receiver_module.SglangGeneratorSession, "create", staticmethod(FakeSession)
+    )
+    monkeypatch.setattr(
+        receiver_module.grpc, "insecure_channel", FakeChannel
+    )
+    monkeypatch.setattr(receiver_module.auth, "with_auth", lambda channel: channel)
+    monkeypatch.setattr(
+        receiver_module, "CollectiveRendezvous", lambda channel: FakeRendezvous()
+    )
+
+
+@pytest.mark.usefixtures("fake_buffers", "fake_receiver_backend")
+class TestTiedAliasReceiver:
+    def test_the_alias_map_names_each_alias_load_visible_registration(self):
+        import modelexpress_rl.collective.integrations.sglang_receiver as receiver_module
+
+        assert receiver_module._registered_parameter_aliases(
+            _TiedEmbeddingModel()
+        ) == {"lm_head.weight": "model.embed_tokens.weight"}
+
+    def test_a_tied_lm_head_model_is_accepted(self, caplog):
+        # Qwen3-0.6B's shape: the trainer stream carries the shared table
+        # under its load-visible name; lm_head.weight is the registered alias.
+        model = _TiedEmbeddingModel()
+        plan = _alias_plan("model.embed_tokens.weight", "model.norm.weight")
+        receiver_module, context = _alias_context(model, plan)
+
+        with caplog.at_level(logging.DEBUG, logger=receiver_module.logger.name):
+            receiver = receiver_module.create_receiver(context)
+
+        assert isinstance(receiver, receiver_module.ModelExpressM2NReceiver)
+        assert "lm_head.weight<-model.embed_tokens.weight" in caplog.text
+
+    def test_a_plan_carrying_both_tied_names_is_accepted(self):
+        model = _TiedEmbeddingModel()
+        plan = _alias_plan("model.embed_tokens.weight", "lm_head.weight")
+        receiver_module, context = _alias_context(model, plan)
+
+        receiver = receiver_module.create_receiver(context)
+
+        assert isinstance(receiver, receiver_module.ModelExpressM2NReceiver)
+
+    def test_a_plan_naming_only_the_load_hidden_alias_is_refused(self):
+        # The engine's deduplicated lookup would silently drop the received
+        # alias bytes; with the shared registration absent from the plan the
+        # table would never be written. Refuse by name instead.
+        model = _TiedEmbeddingModel()
+        plan = _alias_plan("lm_head.weight", "model.norm.weight")
+        receiver_module, context = _alias_context(model, plan)
+
+        with pytest.raises(ValueError, match="silently dropped") as raised:
+            receiver_module.create_receiver(context)
+
+        assert "lm_head.weight (alias of model.embed_tokens.weight)" in str(
+            raised.value
+        )

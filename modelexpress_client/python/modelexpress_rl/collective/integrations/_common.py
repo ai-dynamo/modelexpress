@@ -44,6 +44,21 @@ def _dtype_label(value: object) -> str:
     return str(value).removeprefix("torch.")
 
 
+def _counted_names(names: list[str], *, limit: int = 5) -> str:
+    """``N total: a, b, c (+M more)`` -- a count with every silent cut named.
+
+    A bare ``names[:5]`` reads as if the shown names were the whole list, the
+    same misreading the rendezvous missing-slot detail caused.
+    """
+    total = len(names)
+    if total == 0:
+        return "0 total: -"
+    shown = ", ".join(str(name) for name in names[:limit])
+    more = total - limit
+    suffix = f" (+{more} more)" if more > 0 else ""
+    return f"{total} total: {shown}{suffix}"
+
+
 class _FrozenPlan:
     def __init__(self, plan: ReshardPlan) -> None:
         snapshot = copy.deepcopy(plan)
@@ -69,7 +84,7 @@ class _FrozenPlan:
         if unsupported:
             raise ValueError(
                 "the MILES/SGLang collective integration supports BF16 "
-                f"base weights only; unsupported: {unsupported[:5]}"
+                f"base weights only; unsupported: {_counted_names(unsupported)}"
             )
         sharded = [
             entry.name
@@ -82,7 +97,7 @@ class _FrozenPlan:
         if sharded:
             raise ValueError(
                 "the MILES/SGLang collective integration supports replicated "
-                f"placements only; sharded: {sharded[:5]}"
+                f"placements only; sharded: {_counted_names(sharded)}"
             )
         non_local = [
             entry.name for entry in snapshot.bulk if entry.src_mesh.ranks() != [0]
@@ -91,7 +106,7 @@ class _FrozenPlan:
             raise ValueError(
                 "the MILES/SGLang collective integration requires the "
                 "partition-local source mesh (src_mesh ranks [0]); got "
-                f"{non_local[:5]}"
+                f"{_counted_names(non_local)}"
             )
         self._plan = snapshot
         self._by_name = {entry.name: entry for entry in snapshot.bulk}
@@ -238,8 +253,9 @@ def _layer_groups(
             )
         raise ValueError(
             "layer groups must cover every bulk parameter exactly once in plan "
-            f"order (missing={missing[:5]}, unknown={unknown[:5]}, "
-            f"duplicates={duplicates[:5]})"
+            f"order (missing={_counted_names(missing)}, "
+            f"unknown={_counted_names(unknown)}, "
+            f"duplicates={_counted_names(duplicates)})"
         )
     return normalized
 

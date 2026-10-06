@@ -11,6 +11,7 @@ names it in ``receiver`` and the engine allowlisted it in
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
@@ -20,7 +21,7 @@ import grpc
 from modelexpress import auth
 
 from ..rendezvous import CollectiveRendezvous
-from ._common import _endpoint
+from ._common import _counted_names, _endpoint
 from .sglang import (
     SglangGeneratorSession,
     build_generator_loader,
@@ -28,11 +29,87 @@ from .sglang import (
 )
 from .manifest import manifest_from_wire
 
+logger = logging.getLogger("modelexpress_rl.collective.integrations.sglang_receiver")
+
 #: The dotted path to pass in ``receiver`` and ``--weight-update-receivers``.
 RECEIVER_PATH = (
     "modelexpress_rl.collective.integrations.sglang_receiver.create_receiver"
 )
 _ROUND_KEYS = frozenset({"operation_id", "version"})
+
+
+def _registered_parameter_aliases(model: Any) -> dict[str, str]:
+    """Map each tied-alias parameter name to its load-visible registration.
+
+    A parameter registered under two names (tied embeddings: SGLang ties
+    ``lm_head`` to ``model.embed_tokens``) appears once in
+    ``named_parameters()`` -- under the FIRST registered name, which is the
+    only key the model's ``load_weights`` name resolution can see. Walking
+    every registration (``remove_duplicate=False``, the same pattern the RAW
+    receiver's alias detection uses) exposes the hidden halves: the returned
+    map's keys are the load-hidden alias names and its values are the
+    registrations that ``load_weights`` actually resolves.
+
+    A model without a module tree (test doubles) has no aliases to find.
+    """
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return {}
+    seen: dict[int, str] = {}
+    aliases: dict[str, str] = {}
+    for path, module in named_modules(remove_duplicate=False):
+        parameters = getattr(module, "_parameters", None)
+        if not parameters:
+            continue
+        for local, parameter in parameters.items():
+            if parameter is None:
+                continue
+            name = f"{path}.{local}" if path else local
+            owner = seen.setdefault(id(parameter), name)
+            if owner != name:
+                aliases[name] = owner
+    return aliases
+
+
+def _verify_tied_alias_coverage(plan_names: list[str], model: Any) -> None:
+    """Accept tied-alias models; refuse alias writes the engine cannot land.
+
+    The plan's names drive the receiver's ``load_weights`` calls, and the
+    engine resolves them through its deduplicated parameter dict. A write
+    aimed at a load-HIDDEN tied alias (``lm_head.weight`` when that parameter
+    was first registered as ``model.embed_tokens.weight``) is dropped by that
+    resolution: the received bytes never land. The round is still correct
+    when the load-visible registration is itself in the plan -- the shared
+    storage is written through it -- so the only refusal is a hidden alias
+    whose registration the plan never covers: a silent-corruption hole.
+    """
+    aliases = _registered_parameter_aliases(model)
+    if not aliases:
+        return
+    planned = set(plan_names)
+    dropped = sorted(
+        f"{name} (alias of {aliases[name]})"
+        for name in planned
+        if name in aliases and aliases[name] not in planned
+    )
+    if dropped:
+        raise ValueError(
+            "the M2N plan's tied-alias parameters cannot be written by the "
+            "engine's load_weights: its name resolution exposes only the "
+            "first registration, so the received bytes would be silently "
+            f"dropped: {_counted_names(dropped)}; name the load-visible "
+            "registration in the plan (or send both)"
+        )
+    covered = sorted(
+        f"{alias}<-{owner}"
+        for alias, owner in aliases.items()
+        if alias not in planned and owner in planned
+    )
+    if covered:
+        logger.debug(
+            "tied parameter aliases covered by their shared registration: %s",
+            ", ".join(covered),
+        )
 
 
 def _tp_coordinate(context: Any, name: str) -> int:
@@ -141,6 +218,11 @@ def create_receiver(context: Any) -> ModelExpressM2NReceiver:
     if not 0 <= tp_rank < tp_size:
         raise ValueError(f"tp_rank {tp_rank} is outside tp_size {tp_size}")
     endpoint = mx_server_endpoint(context.master_address, context.master_port)
+
+    # Tied-embedding models (Qwen3-0.6B class) register lm_head.weight as an
+    # alias of embed_tokens.weight; verify every plan name is landable before
+    # the first round depends on it.
+    _verify_tied_alias_coverage(list(plan.parameter_names()), context.model)
 
     prepared = build_generator_loader(
         plan=plan,
