@@ -18,10 +18,10 @@ import logging
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from inspect import getattr_static
-from contextlib import closing
 from pathlib import Path
 from types import GetSetDescriptorType
 from typing import TYPE_CHECKING
@@ -39,10 +39,8 @@ from modelexpress.refit.reshard.geometry import (
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import refit_span
 
-from modelexpress_rl.inference.engines.vllm._capture_snapshot import _CaptureSnapshot
-
-
 from modelexpress_rl import envs as rl_envs
+from modelexpress_rl.inference.engines.vllm._capture_snapshot import _CaptureSnapshot
 from modelexpress_rl.inference.engines.vllm.stream_windows import (
     layer_windows,
     windowed_weights,

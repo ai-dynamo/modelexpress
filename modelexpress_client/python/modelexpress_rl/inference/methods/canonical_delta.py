@@ -5,9 +5,9 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 
 from ...control import WeightVersion
 from ...object_storage import ObjectStorageType

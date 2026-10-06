@@ -1321,10 +1321,12 @@ requires an engine restart.
 
 With `MX_REFIT_FULL_STREAMING=true`, vLLM can stream a new, non-checksummed full
 HF checkpoint directly from indexed S3 shards through its existing graph-safe
-layerwise reload. `inference/streaming_checkpoint.py` verifies names, shapes,
-dtypes, byte sizes, uniqueness and complete iterator consumption. Declared
-checksums keep the existing canonical verified download path. Partial engine
-mutation retains the normal refit failure fencing; it never silently falls back.
+layerwise reload. Workers without a cached seed first use the canonical S3
+bootstrap path to establish tensor metadata. `inference/streaming_checkpoint.py`
+verifies names, shapes, dtypes, byte sizes, uniqueness and complete iterator
+consumption. Declared checksums keep the existing canonical verified download
+path. Partial engine mutation retains the normal refit failure fencing; it never
+silently falls back.
 
 Distributed ModelStreamer shares the S3 payload read across TP ranks. Local rank
 zero snapshots the yielded tensors to owned CPU buffers before model loading can
@@ -1344,9 +1346,11 @@ unchanged; `0` restores the single stream.
 
 The writer uses the existing cache locks, quota, source records and atomic directory
 promotion. It publishes only after complete streaming and successful installation,
-and never changes `state.json` or `active.json`. The next canonical replay waits
-for local writer completion and can reuse its full ancestor without another payload
-download. A writer failure is logged and reported before the owning rank prepares
+and adopts the checkpoint in `state.json` and `active.json` when activated.
+Deferred activation waits for cache publication before adopting it. The next
+canonical replay waits for local writer completion and can reuse its full ancestor
+without another payload download. A writer failure is logged and reported before
+the owning rank prepares
 a subsequent canonical update. Shutdown drains or discards outstanding writes.
 The operation lease already covers all remote reads; the disk tail consumes only
 owned local snapshots. Cache readiness is logged separately from serving readiness.
