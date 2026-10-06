@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -35,6 +36,19 @@ const CREATE_TRANSFER_LUA: &str = include_str!("redis/scripts/create_collective_
 const REPORT_TRANSFER_LUA: &str = include_str!("redis/scripts/report_collective_transfer.lua");
 const REFRESH_GROUP_LUA: &str = include_str!("redis/scripts/refresh_collective_group.lua");
 const DELETE_TRANSFER_LUA: &str = include_str!("redis/scripts/delete_collective_transfer.lua");
+
+// `Script::new` hashes and copies the source, and the scripts never change,
+// so each is built once per process.
+static JOIN_GROUP_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(JOIN_GROUP_LUA));
+static PUBLISH_BOOTSTRAP_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::new(PUBLISH_BOOTSTRAP_LUA));
+static CREATE_TRANSFER_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::new(CREATE_TRANSFER_LUA));
+static REPORT_TRANSFER_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::new(REPORT_TRANSFER_LUA));
+static REFRESH_GROUP_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(REFRESH_GROUP_LUA));
+static DELETE_TRANSFER_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::new(DELETE_TRANSFER_LUA));
 
 fn group_key(group_id: &str) -> String {
     format!("mx:refitc:group:{group_id}")
@@ -492,8 +506,7 @@ impl RedisCollectiveBackend {
         };
         let lanes = decode_lanes(&stored)?;
 
-        let refresh_script = Script::new(REFRESH_GROUP_LUA);
-        let mut script = refresh_script.prepare_invoke();
+        let mut script = REFRESH_GROUP_SCRIPT.prepare_invoke();
         script.key(group_key(group_id));
         script.key(participants_key(group_id));
         script.key(digests_key(group_id));
@@ -608,10 +621,10 @@ impl CollectiveBackend for RedisCollectiveBackend {
             }
         };
         let expected_total = layout.trainer_count.saturating_add(layout.generator_count);
-        let plan_source = request.plan_source.clone().unwrap_or_default();
+        let default_source = PlanSource::default();
+        let plan_source = request.plan_source.as_ref().unwrap_or(&default_source);
 
-        let join_script = Script::new(JOIN_GROUP_LUA);
-        let mut script = join_script.prepare_invoke();
+        let mut script = JOIN_GROUP_SCRIPT.prepare_invoke();
         for key in &keys {
             script.key(key);
         }
@@ -745,8 +758,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
                 ))
             })?;
 
-        let publish_script = Script::new(PUBLISH_BOOTSTRAP_LUA);
-        let mut script = publish_script.prepare_invoke();
+        let mut script = PUBLISH_BOOTSTRAP_SCRIPT.prepare_invoke();
         script.key(group_key(&request.group_id));
         script.key(participants_key(&request.group_id));
         script.key(digests_key(&request.group_id));
@@ -813,7 +825,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             Err(error) => return Err(error),
         }
 
-        let outcome: String = Script::new(CREATE_TRANSFER_LUA)
+        let outcome: String = CREATE_TRANSFER_SCRIPT
             .key(operation_key(&operation_id))
             .key(operation_idempotency_key(
                 &spec.model_name,
@@ -880,7 +892,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             )));
         }
 
-        let outcome: String = Script::new(DELETE_TRANSFER_LUA)
+        let outcome: String = DELETE_TRANSFER_SCRIPT
             .key(operation_key(operation_id))
             .key(reported_key(operation_id))
             .key(operation_idempotency_key(
@@ -910,8 +922,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
         request: &ReportCollectiveTransferRequest,
     ) -> CollectiveResult<CollectiveTransfer> {
         let group = self.read_group(&request.group_id).await?;
-        let report_script = Script::new(REPORT_TRANSFER_LUA);
-        let mut script = report_script.prepare_invoke();
+        let mut script = REPORT_TRANSFER_SCRIPT.prepare_invoke();
         script.key(operation_key(&request.operation_id));
         script.key(reported_key(&request.operation_id));
         script.key(group_key(&request.group_id));
@@ -1108,8 +1119,8 @@ mod tests {
         assert_eq!(generator.worker_id, "w2");
 
         assert!(participant_from_record("x", "w|BOGUS|0|7").is_err());
-        // A record carrying the retired partition component has one field too
-        // many and must be refused rather than silently re-parsed.
+        // A record has exactly four fields; anything longer is refused rather
+        // than parsed from a prefix.
         assert!(participant_from_record("x", "w|TRAINER|3|1|7").is_err());
     }
 

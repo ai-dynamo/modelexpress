@@ -700,6 +700,7 @@ class TestReporting:
         client = trainer(rz, FakeEngine())
         client.compute_plan()
         client.start_weight_update("v1")
+        client.publish_weights("v1")
         client.finish_weight_update("v1")
         assert rz.reports == []
 
@@ -766,6 +767,115 @@ class TestReporting:
             client.finish_weight_update("v1", operation_id="op1")
 
         assert len(client._cache) == 0
+
+
+class TestPerGroupFailure:
+    def test_a_failed_publish_aborts_the_lanes_and_closes_the_round(
+        self, fake_nccl, monkeypatch
+    ):
+        client = trainer(FakeRendezvous(), FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1")
+        assert len(client._cache) > 0
+        monkeypatch.setattr(
+            collective_backend, "_reshard", _raises(RuntimeError("enqueue failed"))
+        )
+        with pytest.raises(RuntimeError, match="enqueue failed"):
+            client.publish_weights("v1")
+        assert len(client._cache) == 0
+        with pytest.raises(RuntimeError, match="start_weight_update must run"):
+            client.finish_weight_update("v1")
+
+    def test_a_failed_install_aborts_the_lanes_and_closes_the_round(
+        self, fake_nccl, monkeypatch
+    ):
+        engine = FakeEngine()
+        client = RefitClientGenerator(
+            rendezvous=FakeRendezvous(),
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=1,
+            slot_id="g0",
+            worker_id="w9",
+            index_in_role=0,
+        )
+        client.initialize(engine)
+        client.compute_plan()
+        client.start_weight_update("v1")
+        monkeypatch.setattr(engine, "install", _raises(RuntimeError("install failed")))
+        with pytest.raises(RuntimeError, match="install failed"):
+            client.update_weights("v1")
+        assert len(client._cache) == 0
+        with pytest.raises(RuntimeError, match="start_weight_update must run"):
+            client.update_weights("v1")
+
+
+class TestLayerGroupContract:
+    def test_a_repeated_group_is_refused_and_aborts_the_round(self, fake_nccl):
+        client = trainer(FakeRendezvous(), FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1")
+        client.publish_weights("v1")
+        with pytest.raises(RuntimeError, match="already ran in this round"):
+            client.publish_weights("v1")
+        assert len(client._cache) == 0
+
+    def test_a_finish_that_skipped_a_group_fails_and_reports(self, fake_nccl):
+        rz = FakeRendezvous()
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1")
+        with pytest.raises(RuntimeError, match="before layer group"):
+            client.finish_weight_update("v1", operation_id="op1")
+        assert rz.reports[0]["succeeded"] is False
+        assert len(client._cache) == 0
+
+    def test_the_grouping_is_part_of_the_admitted_digest(self):
+        engine = FakeEngine()
+        ungrouped = trainer(FakeRendezvous(), engine)
+        grouped = RefitClientTrainer(
+            rendezvous=FakeRendezvous(),
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=1,
+            slot_id="t0",
+            worker_id="w0",
+            index_in_role=0,
+        )
+        names = [entry.name for entry in engine.capture().bulk]
+        grouped.setup_layer_groups([names])
+        grouped.initialize(engine, source_partition=0)
+        assert grouped._digest != ungrouped._digest
+
+    def test_regrouping_after_compute_plan_is_refused(self, fake_nccl):
+        client = trainer(FakeRendezvous(), FakeEngine())
+        client.compute_plan()
+        with pytest.raises(RuntimeError, match="before compute_plan"):
+            client.setup_layer_groups(None)
+
+
+class TestSourcePartition:
+    def _client(self, slot_id):
+        return RefitClientTrainer(
+            rendezvous=FakeRendezvous(),
+            model_name="m",
+            trainer_slots=["t0", "t1", "t2", "t3"],
+            generator_slots=["g0"],
+            source_partition_count=2,
+            slot_id=slot_id,
+            worker_id="w0",
+            index_in_role=0,
+        )
+
+    def test_a_partition_off_this_slots_lane_is_refused_before_joining(self):
+        with pytest.raises(ValueError, match="does not match the reshard lane"):
+            self._client("t0").initialize(FakeEngine(), source_partition=1)
+
+    def test_a_slot_outside_the_trainer_slots_is_refused(self):
+        with pytest.raises(ValueError, match="not on any reshard lane"):
+            self._client("g0").initialize(FakeEngine(), source_partition=0)
 
 
 class TestStreams:

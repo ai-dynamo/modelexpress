@@ -194,11 +194,21 @@ class TestCoverage:
 
 class TestDigest:
     def test_the_digest_depends_on_bulk_operation_order(self):
-        # Both sides execute this list in order. If different orders shared a
-        # digest, they could reach READY and enter different NCCL collectives.
+        # Admission is ordered even though the backend issues bulk entries in
+        # canonical order, so peers that enumerate bulk differently are refused.
         a = ReshardPlan(bulk=[param("a"), param("b")])
         b = ReshardPlan(bulk=[param("b"), param("a")])
         assert plan_digest(a) != plan_digest(b)
+
+    def test_the_digest_depends_on_layer_grouping_but_not_order_within_a_group(self):
+        plan = ReshardPlan(bulk=[param("a"), param("b")])
+        assert plan_digest(plan, layer_groups=[["a"], ["b"]]) != plan_digest(
+            plan, layer_groups=[["b"], ["a"]]
+        )
+        assert plan_digest(plan, layer_groups=[["a", "b"]]) == plan_digest(
+            plan, layer_groups=[["b", "a"]]
+        )
+        assert plan_digest(plan, layer_groups=[["a", "b"]]) != plan_digest(plan)
 
     def test_the_digest_depends_on_misc_ordering(self):
         # The misc order is the broadcast payload layout, so two orders are
@@ -230,7 +240,8 @@ class TestDigest:
         assert plan_digest(moved) != plan_digest(base)
 
     def test_structurally_distinct_records_cannot_alias_through_delimiters(self):
-        # These produced the same string under the old unescaped ``|`` format.
+        # Field values may contain the record delimiter, so the encoding must
+        # keep these two records distinct.
         left = ReshardPlan(misc=[MiscParam("x|1", (2,), "f")])
         right = ReshardPlan(misc=[MiscParam("x", (1,), "2|f")])
         assert plan_digest(left) != plan_digest(right)

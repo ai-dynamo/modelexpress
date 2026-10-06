@@ -153,6 +153,18 @@ class _RefitClientBase:
             )
         return self._half
 
+    def _abort_round(self) -> None:
+        """Leave a round whose per-group call failed.
+
+        Peers may already be inside the collective waiting on this rank, so the
+        lanes are aborted rather than left live, and the round is closed so a
+        later call cannot continue it.
+        """
+        if self._half is not None:
+            self._half.abort()
+        self._round_started = False
+        self._version = None
+
     def _check_still_current(self) -> None:
         """One freshness read before a round prepares the engine.
 
@@ -187,13 +199,26 @@ class _RefitClientBase:
             plan,
             receiver_protocol=self._receiver_protocol,
             m2n_abi_version=self._m2n_abi_version,
+            layer_groups=self._groupings,
         )
 
     def setup_layer_groups(self, groupings: list[list[str]] | None) -> None:
-        """Optional. Without it every bulk parameter is in layer group 0."""
-        self._groupings = groupings
-        if self._half is not None:
-            self._half.setup_layer_groups(groupings)
+        """Optional. Without it every bulk parameter is in layer group 0.
+
+        The grouping is part of the readiness digest, so it is fixed before
+        ``compute_plan`` and peers that split bulk differently are not admitted
+        together. Invoking each group exactly once per round, in the same order
+        on every participant, is the caller's contract; the backend refuses a
+        repeated group and a finish that skipped one.
+        """
+        if self._membership is not None:
+            raise RuntimeError(
+                "setup_layer_groups must run before compute_plan; the grouping "
+                "is part of the digest this worker was admitted with"
+            )
+        self._groupings = (
+            [list(group) for group in groupings] if groupings is not None else None
+        )
 
     def _stream_for(self, lane_id: int) -> Any:
         """Spread reshard lanes over the configured streams.
@@ -410,6 +435,27 @@ class RefitClientTrainer(_RefitClientBase):
                 f"source_partition must be in [0, {self._source_partition_count}), "
                 f"got {source_partition}"
             )
+        # The lanes are derived from this slot's position in trainer_slots, so a
+        # partition that disagrees would pass READY and then fail on the first
+        # publish with peers already inside the collective.
+        own_lane = next(
+            (
+                lane.lane_id
+                for lane in self._declared_lanes()
+                if lane.kind == "RESHARD" and self._slot_id in lane.trainer_slots
+            ),
+            None,
+        )
+        if own_lane is None:
+            raise ValueError(
+                f"slot {self._slot_id!r} is not on any reshard lane; it must be "
+                "one of the trainer slots"
+            )
+        if own_lane != source_partition:
+            raise ValueError(
+                f"source_partition {source_partition} does not match the reshard "
+                f"lane of slot {self._slot_id!r}, which is {own_lane}"
+            )
         self._publisher = publisher
         self._source_partition = source_partition
         self._expected_parameters = (
@@ -463,7 +509,11 @@ class RefitClientTrainer(_RefitClientBase):
         self, version: str, layer_group_id: int = DEFAULT_LAYER_GROUP
     ) -> None:
         half = self._require_round(version, "publish_weights")
-        half.publish_weights(layer_group_id)
+        try:
+            half.publish_weights(layer_group_id)
+        except Exception:
+            self._abort_round()
+            raise
 
     def finish_weight_update(
         self, version: str, operation_id: str | None = None
@@ -564,8 +614,12 @@ class RefitClientGenerator(_RefitClientBase):
         half = self._require_round(version, "update_weights")
         if self._loader is None:
             raise RuntimeError("initialize must run before update_weights")
-        half.update_weights(layer_group_id)
-        self._loader.install(layer_group_id)
+        try:
+            half.update_weights(layer_group_id)
+            self._loader.install(layer_group_id)
+        except Exception:
+            self._abort_round()
+            raise
 
     def finish_weight_update(
         self, version: str, operation_id: str | None = None

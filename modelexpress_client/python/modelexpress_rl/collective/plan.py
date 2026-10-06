@@ -101,6 +101,7 @@ def plan_digest(
     *,
     receiver_protocol: str = DEFAULT_RECEIVER_PROTOCOL,
     m2n_abi_version: str = "",
+    layer_groups: list[list[str]] | None = None,
 ) -> str:
     """A canonical digest over the whole plan.
 
@@ -113,11 +114,18 @@ def plan_digest(
     that disagree on either produce different digests, so the group never
     reaches READY instead of meeting inside a collective and finding out.
 
-    Both lists are hashed in order. The backend walks bulk entries as collective
-    operations and misc entries as broadcast payloads, so either ordering is
-    part of the wire contract. Treating bulk as a set would let two participants
-    reach READY and then enter different NCCL operations at the same sequence
-    number.
+    Both lists are hashed in order. Misc order is the broadcast payload layout,
+    so it is part of the wire contract. Bulk order is not: the backend sorts
+    bulk entries canonically before issuing them, so two orderings of the same
+    entries produce identical wire traffic. Bulk is still hashed in order as a
+    conservative admission rule, which means peers that enumerate the same
+    entries differently are refused rather than admitted.
+
+    ``layer_groups`` is the bulk grouping from ``setup_layer_groups``. Each
+    layer group id names a set of wire operations, so peers that split bulk
+    differently would issue different operations under the same id. Group
+    order is hashed; names within a group are not, since the backend issues a
+    group in canonical order.
     """
     plan.validate()
     hasher = hashlib.sha256()
@@ -140,6 +148,15 @@ def plan_digest(
     for entry in plan.misc:
         hasher.update(entry.canonical().encode())
         hasher.update(b"\0")
+
+    if layer_groups is not None:
+        hasher.update(f"groups\0{len(layer_groups)}\0".encode())
+        for group in layer_groups:
+            hasher.update(f"{len(group)}\0".encode())
+            for name in sorted(group):
+                encoded = name.encode()
+                hasher.update(f"{len(encoded)}:".encode())
+                hasher.update(encoded)
 
     return hasher.hexdigest()
 

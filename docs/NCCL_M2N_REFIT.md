@@ -160,7 +160,15 @@ the three things a `TCPStore` structurally cannot: admission, fencing, and a
 readiness state that a *third* party — the trainer that must launch the
 collective — can observe.
 
-![Timing waterfall of group formation: the orchestrator creates the transfer and fans out actor RPCs, every worker joins, the lane leader publishes the NCCL unique id, MX flips the group to READY, and only then do all ranks pay the one-time Communicator.init cost before generators fetch the reshard plan](images/nccl-m2n-group-formation.svg)
+![Timing waterfall of group formation: the orchestrator fans out actor RPCs, every worker joins, the lane leader publishes the NCCL unique id, MX flips the group to READY, all ranks pay the one-time Communicator.init cost, and only then does the orchestrator create the transfer for the first refit](images/nccl-m2n-group-formation.svg)
+
+Ordering. `CreateCollectiveTransfer` requires the group to exist and stamps the
+operation with the group's current epoch, so on first formation the workers come
+first: `compute_plan` on every worker (join, `READY`, communicators), then
+`CreateCollectiveTransfer`, then `start_weight_update`. On later refits the group
+already exists, and the orchestrator creates each operation before invoking
+`start_weight_update`. An operation created before a membership change carries
+the old epoch and is rejected when reported.
 
 ## 5. Control plane
 
@@ -241,7 +249,7 @@ stateDiagram-v2
     [*] --> PENDING
     PENDING --> RUNNING: group READY
     RUNNING --> COMPLETE: all participants report ok
-    RUNNING --> FAILED: any participant reports failure,<br/>including a client-side transfer deadline
+    RUNNING --> FAILED: any participant reports failure,<br/>including a reported client-side transfer deadline
   }
 ```
 
@@ -268,8 +276,9 @@ service RefitCollectiveService {
   rpc ReportCollectiveTransfer(ReportCollectiveTransferRequest) returns (CollectiveTransfer);
 }
 
-// Worker-to-worker. The trainer coordinator serves the reshard plan; MX stores
-// only its digest and endpoint, exactly as the pull path does for manifests.
+// Worker-to-worker, reserved. A trainer coordinator would serve the reshard
+// plan and MX would store only its digest and endpoint, as the pull path does
+// for manifests. The in-tree clients capture the plan locally instead.
 service RefitCollectiveWorkerService {
   rpc GetReshardPlan(GetReshardPlanRequest) returns (GetReshardPlanResponse);
 }
@@ -288,12 +297,14 @@ kilobytes. The pull path already established the rule, in §4.2 of the V2 design
 the full sealed manifest stays worker-served so that CRD or etcd records stay
 small, while `manifest_digest` verifies that fetched content matches.
 
-The same rule applies here. MX stores `plan_source = {worker_id, endpoint,
-digest}` on the group; generators fetch the plan from the trainer coordinator over
-`RefitCollectiveWorkerService` and verify the digest. Because the plan is a
-function of `(model layout, trainer parallelism, admitted generator set)` and not
-of the weights, it is keyed by `(group_id, epoch)` and fetched **once per epoch**,
-never per refit.
+The same rule applies here. The protocol reserves `plan_source = {worker_id,
+endpoint, digest}` on the group and `RefitCollectiveWorkerService` for a generator
+to fetch the plan from the trainer coordinator and verify the digest. The in-tree
+clients do not use that path yet: each side captures the plan from its own engine,
+and the readiness digest is what proves they agree. Because the plan is a function
+of `(model layout, trainer parallelism, admitted generator set)` and not of the
+weights, it is keyed by `(group_id, epoch)` and agreed **once per epoch**, never
+per refit.
 
 ## 6. The plan: mesh and placement contract
 
@@ -369,11 +380,11 @@ rules are the contract; the right-hand column is what this backend does with the
 | Call | Layering-doc rule | NCCL M2N backend |
 |---|---|---|
 | `initialize` | Once per worker; before `setup_layer_groups`; unordered across workers | Publisher/Loader `capture()`; register with MX; `Sender/Receiver.initialize()` records local shard geometry |
-| `setup_layer_groups` | Once per worker; groups must be disjoint and cover the model | Map each `layer_group_id` to its bulk `ParamPlan` subset and misc subset |
-| `compute_plan` | After all workers finish `initialize`+`setup_layer_groups`; re-run on membership change | **Join the group, wait for READY, create the communicators, fetch and verify the plan.** Membership change = new epoch = new communicators |
+| `setup_layer_groups` | Once per worker; groups must be disjoint and cover the model | Map each `layer_group_id` to its bulk `ParamPlan` subset. The grouping is folded into the plan digest, so it is fixed before `compute_plan` and every participant must supply the same one |
+| `compute_plan` | After all workers finish `initialize`+`setup_layer_groups`; re-run on membership change | **Join the group with the plan digest, wait for READY, create the communicators.** Membership change = new epoch = new communicators |
 | `start_weight_update(version, worker_ids)` | Once per refit; all `compute_plan` done; no overlapping refits | `Publisher.start_new_round(version)`; the backend binds the operation and the admitted destination subset |
-| `publish_weights` / `update_weights(version, layer_group_id)` | Multiple per refit; concurrency across affected workers is desirable | The co-called `nccl.m2n.reshard` sequence for that group's bulk params, then its misc broadcast |
-| `finish_weight_update(version)` | After all `*_weight_update` calls for this refit | `Loader.finish()`; stream sync; `ReportCollectiveTransfer` |
+| `publish_weights` / `update_weights(version, layer_group_id)` | Multiple per refit; concurrency across affected workers is desirable | The co-called `nccl.m2n.reshard` sequence for that group's bulk params. Every group runs exactly once per refit, in the same order on every participant; that order is the caller's to keep, and the backend refuses a repeated group and a finish that skipped one. A failure aborts the lanes and closes the round |
+| `finish_weight_update(version)` | After all `*_weight_update` calls for this refit | The misc broadcast; `Loader.finish()`; stream sync; `ReportCollectiveTransfer` |
 | `cleanup` | Terminal | Release buffers, destroy communicators, deregister |
 
 Two invariants the collective imposes on top of the layering doc:
@@ -409,7 +420,7 @@ failure.
 | A worker restarts and rejoins | New `worker_id` for the same slot | Admitted as a *different generation*; epoch bumps under the same rule (the first change from `READY` opens a clean `FORMING` epoch and further replacements in it only acknowledge that epoch); cached communicators dropped |
 | A participant dies mid-collective | NCCL error or timeout on the surviving ranks | `ReportCollectiveTransfer(FAILED)`; operation `FAILED`; the epoch bumps so the next `compute_plan` rebuilds. Communicators are not reusable after an aborted collective |
 | Membership changes between refits | One `GetCollectiveGroup` read in `start_weight_update`, before the engine prepares | `EpochChangedError` (or `RendezvousError` if the group is no longer `READY`); the caller re-runs `compute_plan`, the layering doc's stated trigger. A change that lands after that read surfaces at the transfer deadline or in the report |
-| Plan digest mismatch | Generator verifies the fetched plan against `plan_source.digest` | Fail closed before any wire op |
+| Plan digest mismatch | Every participant reports its digest at join; MX compares them at the `READY` transition | The group stays `FORMING` and names the disagreeing slots; nobody enters the collective |
 
 Installation failure follows the V2 design's `DIRECT` semantics: a collective push
 writes into destinations the Loader prepared, so a partial failure may have already
@@ -427,7 +438,7 @@ is exactly what the fused-parameter path already does.
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for one lane's non-blocking `Communicator.init` |
-| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Client-side deadline for the transfer; an overrun aborts the lanes and reports `succeeded=false`, i.e. `RUNNING -> FAILED` above |
+| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Client-side deadline for the transfer; an overrun aborts the local lanes. It reaches MX as `succeeded=false` (`RUNNING -> FAILED` above, which moves the epoch) only when it surfaces in `finish_weight_update` with an `operation_id`; the abort alone leaves the group at its epoch |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
 
 Timing is reported through the existing `RefitTimingRecorder` stage vocabulary so

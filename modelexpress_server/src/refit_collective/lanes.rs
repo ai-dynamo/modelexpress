@@ -222,13 +222,9 @@ impl LaneLayout {
         u32::try_from(self.lanes.len()).unwrap_or(u32::MAX)
     }
 
-    #[must_use]
-    pub fn lane(&self, lane_id: u32) -> Option<&Lane> {
-        self.lanes.iter().find(|lane| lane.lane_id == lane_id)
-    }
-
-    /// The lane the caller declared as spanning every participant, if any. MX
-    /// reads it only to report which slots have not been admitted yet.
+    /// The lane the caller declared as spanning every participant, if any.
+    /// Layout validation admits at most one. Nothing on the server path reads
+    /// it; missing-slot reporting is done by the client from the group view.
     #[must_use]
     pub fn broadcast_lane_id(&self) -> Option<u32> {
         self.lanes
@@ -519,8 +515,8 @@ mod tests {
         assert!(matches!(error, LaneError::UnknownParticipant { .. }));
     }
 
-    /// An uneven split is the case the derived layout used to refuse outright.
-    /// Nothing about it is MX's business once the caller declares the lanes.
+    /// An uneven split is a valid declaration. MX accepts whatever lane shape
+    /// the caller declares as long as every slot is placed consistently.
     #[test]
     fn an_uneven_split_is_just_another_declaration() {
         let layout = LaneLayout::new(

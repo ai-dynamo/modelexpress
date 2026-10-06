@@ -187,9 +187,8 @@ class _CollectiveHalf:
         self._group_id = group_id
         self._epoch = epoch
         self._cache = cache
-        # The admitted digest on the current stack historically treated bulk as
-        # a set. Canonicalizing here keeps the per-communicator op order stable
-        # even if two engines enumerate that set differently.
+        # Wire order is canonical, independent of how the engine enumerated
+        # bulk. The digest is stricter and also pins the declared order.
         self._all_bulk = sorted(plan.bulk, key=lambda entry: entry.canonical())
         self._bulk = [
             entry
@@ -203,6 +202,7 @@ class _CollectiveHalf:
         self._groups: OrderedDict[int, list[ParamPlan]] = OrderedDict()
         self.setup_layer_groups(None)
         self._pending_misc = False
+        self._groups_run: set[int] = set()
         self._active_lanes: OrderedDict[int, LaneCommunicator] = OrderedDict()
         self._pending_contexts: list[RefitCtx] = []
         self._deadline: float | None = None
@@ -260,6 +260,24 @@ class _CollectiveHalf:
             raise KeyError(f"no layer group {layer_group_id}")
         return self._groups[layer_group_id]
 
+    def _claim_group(self, layer_group_id: int) -> list[ParamPlan]:
+        """Each layer group runs once per round; a repeat would desync peers."""
+        entries = self.entries(layer_group_id)
+        if layer_group_id in self._groups_run:
+            raise RuntimeError(
+                f"layer group {layer_group_id} already ran in this round"
+            )
+        self._groups_run.add(layer_group_id)
+        return entries
+
+    def _require_every_group(self) -> None:
+        """A skipped group leaves peers waiting on operations never issued."""
+        skipped = [g for g in self._groups if g not in self._groups_run]
+        if skipped:
+            raise RuntimeError(
+                f"finish_weight_update called before layer group(s) {skipped} ran"
+            )
+
     def _lane(self, lane_id: int) -> LaneCommunicator:
         key = LaneKey(group_id=self._group_id, epoch=self._epoch, lane_id=lane_id)
         lane = self._cache.get(key)
@@ -279,6 +297,7 @@ class _CollectiveHalf:
         hang with no owner.
         """
         self._pending_misc = True
+        self._groups_run = set()
         self._version = version
         self._timeout_s = transfer_timeout()
         self._deadline = time.monotonic() + self._timeout_s
@@ -354,6 +373,9 @@ class _CollectiveHalf:
         self._remaining()
         lane = self._lane(entry.partition_id)
         spec = self._specs[entry.name]
+        # Recorded before anything is enqueued, so a hook or reshard that raises
+        # partway still leaves the lane in the drain set.
+        self._record_lane(lane)
         with self._stream_context(lane, spec):
             ctx = spec.enter()
             # Retain staging buffers and hook state until the asynchronous CUDA
@@ -362,7 +384,6 @@ class _CollectiveHalf:
             self._pending_contexts.append(ctx)
             _reshard(comm=lane, entry=entry, src=src(ctx), dst=dst(ctx))
             spec.leave(ctx)
-        self._record_lane(lane)
 
     def _finish_misc(self, broadcast_lane_id: int) -> None:
         if not self._pending_misc:
@@ -405,11 +426,12 @@ class NcclM2nSender(_CollectiveHalf):
         communicators with operations in flight in different orders, which is
         the case that deadlocks.
         """
-        for entry in self.entries(layer_group_id):
+        for entry in self._claim_group(layer_group_id):
             self._issue_reshard(entry, src=lambda ctx: ctx.buf, dst=lambda ctx: None)
 
     def finish_weight_update(self, broadcast_lane_id: int) -> None:
         """Drain every reshard lane, then broadcast the misc parameters once."""
+        self._require_every_group()
         self._finish_misc(broadcast_lane_id)
 
 
@@ -421,7 +443,7 @@ class NcclM2nReceiver(_CollectiveHalf):
         logger.debug("collective receiver starting version %s", version)
 
     def update_weights(self, layer_group_id: int) -> None:
-        for entry in self.entries(layer_group_id):
+        for entry in self._claim_group(layer_group_id):
             self._issue_reshard(entry, src=lambda ctx: None, dst=lambda ctx: ctx.buf)
         # Loader.install runs immediately after this method. It may read or
         # release receive buffers, so the group's transfers and post hooks must
@@ -429,6 +451,7 @@ class NcclM2nReceiver(_CollectiveHalf):
         self._drain_active_lanes()
 
     def finish_weight_update(self, broadcast_lane_id: int) -> None:
+        self._require_every_group()
         self._finish_misc(broadcast_lane_id)
 
 
