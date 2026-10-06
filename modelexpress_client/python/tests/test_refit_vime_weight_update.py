@@ -5,8 +5,9 @@ import importlib
 import sys
 import types
 from argparse import Namespace
+from traceback import extract_tb
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -108,7 +109,9 @@ class FakeEngine:
         self.events = events
         self.update_error = update_error
         self.init_error = init_error
+        self.initialized = False
         self.active = False
+        self.weight_version = None
         self.init_weight_transfer_engine = RemoteMethod(self._init)
         self.pause_generation = RemoteMethod(lambda: self._event("pause"))
         self.flush_cache = RemoteMethod(lambda: self._event("flush"))
@@ -122,9 +125,12 @@ class FakeEngine:
         return {"ok": True}
 
     def _init(self, payload):
+        if self.initialized:
+            raise RuntimeError("weight transfer engine is already initialized")
         self.events.append(("init", payload))
         if self.init_error:
             raise RuntimeError(self.init_error)
+        self.initialized = True
         return {"ok": True}
 
     def _start(self):
@@ -141,10 +147,12 @@ class FakeEngine:
             raise RuntimeError(self.update_error)
         return {"ok": True}
 
-    def _finish(self):
+    def _finish(self, weight_version=None):
         if not self.active:
             raise RuntimeError("not active")
         self.active = False
+        if weight_version is not None:
+            self.weight_version = str(weight_version)
         return self._event("finish")
 
 
@@ -349,7 +357,8 @@ def test_vime_initializes_vllm_and_publishes_version_owned_s3_delta(
     trainer = FakeTrainer()
     instance = updater(monkeypatch, mx_module, control, trainer)
     events = []
-    instance.connect_rollout_engines([FakeEngine(events)], object())
+    engine = FakeEngine(events)
+    instance.connect_rollout_engines([engine], object())
     base_version = {
         "uid": "base-uid",
         "model_name": "policy",
@@ -425,6 +434,7 @@ def test_vime_initializes_vllm_and_publishes_version_owned_s3_delta(
         "continue",
     ]
     assert instance.weight_version == 1
+    assert engine.weight_version == "opaque-1"
     assert instance._current_version_id == "opaque-1"
     assert instance.pop_metrics() == {
         "perf/update_weights_density": 0.25,
@@ -457,6 +467,64 @@ def test_vime_forwards_refit_checkpoint_cache_limit(
     instance.connect_rollout_engines([FakeEngine(events)], object())
 
     assert events[0][1]["init_info"]["refit_checkpoint_max_size_gb"] == max_size_gb
+
+
+@pytest.mark.parametrize("config", [{}, {"max_replay_chain_length": 128}])
+def test_vime_forwards_replay_limit_when_configured(monkeypatch, mx_module, config):
+    instance = updater(monkeypatch, mx_module, FakeControl(), FakeTrainer(), **config)
+    events = []
+    instance.connect_rollout_engines([FakeEngine(events)], object())
+
+    init_info = events[0][1]["init_info"]
+    assert {
+        key: value
+        for key, value in init_info.items()
+        if key == "max_replay_chain_length"
+    } == config
+
+
+def test_rank_zero_failure_preserves_local_exception(monkeypatch, mx_module):
+    instance = updater(monkeypatch, mx_module, FakeControl(), FakeTrainer())
+    original = ValueError("invalid publication")
+    broadcast = []
+    monkeypatch.setattr(
+        mx_module.dist,
+        "broadcast_object_list",
+        lambda result, **_kwargs: broadcast.append(tuple(result)),
+    )
+
+    def fail():
+        raise original
+
+    with pytest.raises(
+        RuntimeError, match="publish failed: invalid publication"
+    ) as caught:
+        instance._rank_zero_call(fail, "publish failed")
+
+    assert caught.value.__cause__ is original
+    assert any(frame.name == "fail" for frame in extract_tb(original.__traceback__))
+    assert broadcast == [(None, "invalid publication")]
+
+
+def test_other_ranks_receive_only_the_serialized_failure(monkeypatch, mx_module):
+    instance = updater(monkeypatch, mx_module, FakeControl(), FakeTrainer())
+    monkeypatch.setattr(mx_module.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(
+        mx_module.dist,
+        "broadcast_object_list",
+        lambda result, **_kwargs: result.__setitem__(
+            slice(None), [None, "invalid publication"]
+        ),
+    )
+    action = Mock()
+
+    with pytest.raises(
+        RuntimeError, match="publish failed: invalid publication"
+    ) as caught:
+        instance._rank_zero_call(action, "publish failed")
+
+    action.assert_not_called()
+    assert caught.value.__cause__ is None
 
 
 def test_vime_publishes_periodic_full_hf_checkpoints(monkeypatch, mx_module):
@@ -512,6 +580,32 @@ def test_reconnecting_the_same_vllm_cohort_is_a_noop(monkeypatch, mx_module):
     assert [event for event, _payload in events if event == "init"] == ["init"]
 
 
+def test_trainer_sleep_reconnects_initialized_engine_without_reinitializing(
+    monkeypatch, mx_module
+):
+    instance = updater(monkeypatch, mx_module, FakeControl(), FakeTrainer())
+    events = []
+    engine = FakeEngine(events)
+    instance.connect_rollout_engines([engine], object())
+    instance.update_weights()
+
+    for version in range(1, 4):
+        instance.disconnect_rollout_engines()
+        assert instance.rollout_engines == (engine,)
+        events.clear()
+
+        instance.connect_rollout_engines([engine], object())
+
+        assert instance.rollout_engines == (engine,)
+        assert events == []
+        instance.update_weights()
+        assert instance.weight_version == version
+        assert engine.weight_version == f"opaque-{version}"
+        assert [event for event, _payload in events] == [
+            "pause", "flush", "start", f"update:opaque-{version}", "finish", "continue"
+        ]
+
+
 @pytest.mark.parametrize("full_checkpoint_interval", [None, 2])
 def test_replacement_engine_keeps_seed_identity_and_restores_current_version(
     monkeypatch, mx_module, full_checkpoint_interval
@@ -532,6 +626,7 @@ def test_replacement_engine_keeps_seed_identity_and_restores_current_version(
     instance.update_weights()
     instance.update_weights()
     surviving_events.clear()
+    instance.disconnect_rollout_engines()
 
     replacement_events = []
     replacement = FakeEngine(replacement_events)
@@ -546,12 +641,14 @@ def test_replacement_engine_keeps_seed_identity_and_restores_current_version(
         "init", "pause", "flush", "start", "update:opaque-2", "finish", "continue"
     ]
     assert surviving_events == []
+    assert replacement.weight_version == "opaque-2"
     assert len(control.created) == 3
     assert len(trainer.publishes) == 2
 
     instance.update_weights()
 
     assert control.created[-1]["base_version_id"] == "opaque-2"
+    assert surviving.weight_version == replacement.weight_version == "opaque-3"
     assert [event for event, _payload in replacement_events[-6:]] == [
         "pause", "flush", "start", "update:opaque-3", "finish", "continue"
     ]
@@ -566,7 +663,8 @@ def test_failed_reconnect_does_not_resume_or_accept_replacement(
     control = FakeControl()
     trainer = FakeTrainer()
     instance = updater(monkeypatch, mx_module, control, trainer)
-    instance.connect_rollout_engines([FakeEngine([])], object())
+    original = FakeEngine([])
+    instance.connect_rollout_engines([original], object())
     instance.update_weights()
     instance.update_weights()
     instance.disconnect_rollout_engines()
@@ -578,7 +676,7 @@ def test_failed_reconnect_does_not_resume_or_accept_replacement(
         )
 
     assert not any(event == "continue" for event, _payload in events)
-    assert instance.rollout_engines is None
+    assert instance.rollout_engines == (original,)
     assert (instance.weight_version, instance._current_version_id) == (1, "opaque-1")
     assert len(control.created) == 2
     assert len(trainer.publishes) == 1
@@ -702,3 +800,4 @@ def test_update_engine_weights_runs_in_bulk_phases(monkeypatch, mx_module):
         "continue",
     ]
     assert instance._update_engine_weights_time >= 0
+    assert first.weight_version == second.weight_version == "opaque-target"

@@ -36,9 +36,7 @@ from modelexpress_rl import (
 class UpdateWeightFromModelExpress:
     """Publish Megatron weights through ModelExpress and install them in vLLM.
 
-    The current path publishes canonical S3 XOR deltas with optional periodic full
-    checkpoints. Future integrations may add P2P NIXL/RDMA transfer formats behind
-    the same updater lifecycle.
+    Publishes canonical S3 XOR deltas with optional periodic full HF checkpoints.
     """
 
     def __init__(
@@ -168,10 +166,9 @@ class UpdateWeightFromModelExpress:
             "max_transfer_attempts": self._config.get("max_transfer_attempts", 3),
             "rpc_timeout_seconds": self._rpc_timeout_seconds,
         }
-        if "refit_checkpoint_max_size_gb" in self._config:
-            init_info["refit_checkpoint_max_size_gb"] = self._config[
-                "refit_checkpoint_max_size_gb"
-            ]
+        for key in ("refit_checkpoint_max_size_gb", "max_replay_chain_length"):
+            if key in self._config:
+                init_info[key] = self._config[key]
 
         self._rank_zero_call(
             lambda: ray.get(
@@ -192,8 +189,8 @@ class UpdateWeightFromModelExpress:
         self.rollout_engines = connected
 
     def disconnect_rollout_engines(self) -> None:
-        """Forget the current rollout-engine cohort."""
-        self.rollout_engines = None
+        """Keep rollout handles; S3 has no transfer group to tear down."""
+        return
 
     def pop_metrics(self) -> dict[str, int | float]:
         """Return and clear metrics from the latest weight update."""
@@ -203,14 +200,16 @@ class UpdateWeightFromModelExpress:
     def _rank_zero_call(self, action: Callable[[], Any], description: str) -> Any:
         """Run an action on rank zero and broadcast its result or failure."""
         result = [None, None]
+        local_error = None
         if dist.get_rank() == 0:
             try:
                 result[0] = action()
             except Exception as error:
+                local_error = error
                 result[1] = str(error)
         dist.broadcast_object_list(result, src=0, group=get_gloo_group())
         if result[1] is not None:
-            raise RuntimeError(f"{description}: {result[1]}")
+            raise RuntimeError(f"{description}: {result[1]}") from local_error
         return result[0]
 
     @torch.no_grad()
@@ -370,6 +369,11 @@ class UpdateWeightFromModelExpress:
                 for engine in engines
             ]
         )
-        ray.get([engine.finish_weight_update.remote() for engine in engines])
+        ray.get(
+            [
+                engine.finish_weight_update.remote(weight_version=target_version_id)
+                for engine in engines
+            ]
+        )
         ray.get([engine.continue_generation.remote() for engine in engines])
         self._update_engine_weights_time = perf_counter() - phase_started

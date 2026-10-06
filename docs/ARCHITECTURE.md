@@ -1059,15 +1059,18 @@ from modelexpress_rl.train.frameworks.vime import UpdateWeightFromModelExpress
 ```
 
 Only requesting the updater loads Vime, Ray, and Megatron; ordinary SDK and
-framework-package imports do not. The existing `.vime.modelexpress` import path
-remains supported. Vime selects the adapter with
+framework-package imports do not. The `.vime.modelexpress` submodule import
+also works. Vime selects the adapter with
 `--update-weight-transport modelexpress`, and the adapter reuses Vime's HF weight
 iterator and Gloo-group helper.
 
 Replacement rollout engines keep the original seed's version ID. Once training
 has advanced, they install the latest published version before generation
-resumes, using canonical replay or a full checkpoint. Surviving engines are not
-reinitialized, and a failed restore does not resume the replacement engines.
+resumes, using canonical replay or a full checkpoint. Disconnect is a no-op for
+this S3 transport: trainer sleep preserves rollout handles, so reconnecting the
+same cohort does not reinitialize its weight-transfer backend or replay weights.
+A failed restore does not resume the replacement engines. Successful installs
+publish the exact MX version ID through vLLM's weight-version metadata.
 
 ### MxClient
 

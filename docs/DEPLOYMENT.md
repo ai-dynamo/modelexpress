@@ -1067,6 +1067,13 @@ for MinIO, set its endpoint URL and region. For AWS S3, omit the endpoint URL
 and set the bucket's region. This path currently supports S3-compatible storage
 only; generic field names do not enable other providers.
 
+Vime also forwards `max_replay_chain_length` when provided in
+`--modelexpress-config`. Omission keeps the receiver's default of 64 versions.
+This limits a recovery replay chain, not the total number of training updates.
+For longer cold-recovery chains, set a larger positive integer (for example,
+128), or set `full_hf_checkpoint_interval` no higher than the replay limit.
+The full-checkpoint root counts toward that limit.
+
 ### Server-Backed Model Cache (No Shared Storage)
 
 For workers that cannot reach the Hugging Face Hub themselves, ModelExpress Server can act as the only route to the model. The worker asks the server for repository files; the server downloads the model once on a cold miss and serves every later worker from its own cache.
