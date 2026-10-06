@@ -25,6 +25,7 @@ from modelexpress_rl.version import WeightVersionRef
 from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
+from ..train import WeightPayloadFormat
 from .adapter import GeneratorEngineContext
 from .plan import WeightSource, parse_weight_source_order
 from .receiver import ObjectStorageGeneratorConfig
@@ -203,6 +204,12 @@ class StagedWeightHandle:
             return True
         return self._update.applied
 
+    @property
+    def _installation_failed(self) -> bool:
+        if self._update is None:
+            return False
+        return self._update.installation_started and not self._update.applied
+
 
 class _VersionLease:
     """Keep one version protected through installation or staged release."""
@@ -345,15 +352,13 @@ class ModelExpressGeneratorClient:
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
         with self._operation_lock:
-            if (
-                self._staging_buffer_bytes is not None
-                and self._engine_state is _EngineState.UNCERTAIN
-            ):
-                raise RuntimeError("engine weights are uncertain; restart before refit")
             if self._active_handle is not None:
-                if self._active_handle.version_id == version.version_id:
-                    return self._active_handle
-                raise RuntimeError("another generator update is still active")
+                if self._active_handle._installation_failed:
+                    self._release_staged(self._active_handle)
+                else:
+                    if self._active_handle.version_id == version.version_id:
+                        return self._active_handle
+                    raise RuntimeError("another generator update is still active")
             runtime = self._require_runtime()
             if (
                 (
@@ -384,6 +389,14 @@ class ModelExpressGeneratorClient:
                     if self._staging_buffer_bytes is None:
                         update = runtime.session.stage(ready)
                     else:
+                        if (
+                            self._engine_state is _EngineState.UNCERTAIN
+                            and ready.payload_format
+                            is not WeightPayloadFormat.FULL_TENSOR
+                        ):
+                            raise RuntimeError(
+                                "uncertain streaming engine requires a full tensor update"
+                            )
                         update = runtime.session.prepare_streaming(
                             ready,
                             max_staging_bytes=(
@@ -418,24 +431,30 @@ class ModelExpressGeneratorClient:
                 return None
             if staged._update.released:
                 raise RuntimeError("staged weight has already been released")
+            if staged._installation_failed:
+                raise RuntimeError(
+                    "staged weight installation failed; stage a fresh transaction"
+                )
             runtime = self._require_runtime()
             was_applied = staged._update.applied
-            serving_version_id = self._serving_version_id
+            restore_version_id = None
+            if self._engine_state is _EngineState.READY:
+                restore_version_id = self._serving_version_id
             if not was_applied:
                 runtime.unpublish_runtime_tensors()
             try:
                 with timing.active(staged._timing):
                     result = runtime.session.apply(staged._update)
             except BaseException:
-                if staged._update.installation_started and not staged._update.applied:
+                if staged._installation_failed:
                     self._engine_state = _EngineState.UNCERTAIN
-                elif not was_applied and serving_version_id is not None:
+                elif not was_applied and restore_version_id is not None:
                     try:
-                        runtime.publish_runtime_tensors(serving_version_id)
+                        runtime.publish_runtime_tensors(restore_version_id)
                     except Exception:
                         logger.exception(
                             "failed to republish unchanged runtime tensors for %s",
-                            serving_version_id,
+                            restore_version_id,
                         )
                 raise
             finally:

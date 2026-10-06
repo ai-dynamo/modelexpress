@@ -1727,6 +1727,7 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
     )
     installed = []
     prepare_calls = []
+    recovered = False
 
     class Transfer:
         def reset_workspace(self):
@@ -1790,11 +1791,39 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
                 _stage_and_apply(generator, version=WeightVersionRef("version-a"))
             assert installed == []
         elif fail_second:
+            failed = generator.stage_weight(version=WeightVersionRef("version-a"))
             with pytest.raises(RuntimeError, match="partial streaming failure"):
-                _stage_and_apply(generator, version=WeightVersionRef("version-a"))
-            with pytest.raises(RuntimeError, match="uncertain"):
-                _stage_and_apply(generator, version=WeightVersionRef("version-a"))
+                generator.apply_weight(failed)
             assert installed == ["a.weight"]
+            assert not service.active_leases
+            assert generator._engine_state.value == "UNCERTAIN"
+            with pytest.raises(RuntimeError, match="fresh transaction"):
+                generator.apply_weight(failed)
+            assert installed == ["a.weight"]
+
+            endpoint = service.shards[0].manifest_endpoint
+            service.shards[0].manifest_endpoint = ""
+            with pytest.raises(ValueError, match="no NIXL trainer plan"):
+                generator.stage_weight(version=WeightVersionRef("version-a"))
+            assert failed._update.released
+            assert generator._active_handle is None
+            assert not service.active_leases
+            assert generator._engine_state.value == "UNCERTAIN"
+            assert installed == ["a.weight"]
+
+            service.shards[0].manifest_endpoint = endpoint
+            fail_second = False
+            recovery = generator.stage_weight(version=WeightVersionRef("version-a"))
+            assert recovery is not failed
+            assert service.active_leases
+            assert generator._engine_state.value == "UNCERTAIN"
+            with pytest.raises(RuntimeError, match="released"):
+                generator.apply_weight(failed)
+            generator.apply_weight(recovery)
+            assert installed == ["a.weight", "a.weight", "b.weight"]
+            assert generator._engine_state.value == "READY"
+            recovery.release()
+            recovered = True
         else:
             metrics = _stage_and_apply(generator, version=WeightVersionRef("version-a"))
             assert metrics["staging_peak_bytes"] == 512
@@ -1804,9 +1833,9 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
         assert generator._active_handle is None
         assert method._active_streamed is None
         assert len(prepare_calls) == (
-            1 if reset_failure else min(prepare_failures + 1, 3)
+            (1 if reset_failure else min(prepare_failures + 1, 3)) + int(recovered)
         )
-        assert service.lease_registrations == 1
+        assert service.lease_registrations == (3 if recovered else 1)
     finally:
         generator.close()
         server.stop(grace=None).wait()
@@ -2421,7 +2450,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
         def prepare_streaming(self, **kwargs):
             prepared = super().prepare_streaming(**kwargs)
             prepared_updates.append(prepared)
-            assert "iterator_open" not in events
+            assert events.count("iterator_open") == len(prepared_updates) - 1
             return prepared
 
         @contextmanager
@@ -2498,8 +2527,10 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
             )
             if case != "iterator":
                 assert torch.equal(model[0].weight, torch.full_like(model[0].weight, 5))
-            with pytest.raises(RuntimeError, match="uncertain"):
-                _stage_and_apply(generator, version=WeightVersionRef("version-a"))
+            assert generator._engine_state.value == "UNCERTAIN"
+            if uncertain_cleanup:
+                with pytest.raises(RuntimeError, match="reset the process"):
+                    generator.stage_weight(version=WeightVersionRef("version-a"))
         assert events.count("prepare") == 1
         assert events.count("iterator_open") == 1
         assert events.count("guard_enter") == events.count("guard_exit") == 1
@@ -2535,6 +2566,17 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
             assert not prepared.ownership.release_blocked
             assert "iterator_close" in events
         assert service.lease_registrations == 1
+        if case == "partial":
+            _stage_and_apply(generator, version=WeightVersionRef("version-a"))
+            assert all(
+                torch.equal(parameter, torch.full_like(parameter, 5))
+                for parameter in model.parameters()
+            )
+            assert generator._engine_state.value == "READY"
+            assert service.lease_registrations == service.lease_deletions == 2
+            assert events.count("prepare") == events.count("iterator_open") == 2
+            assert events.count("guard_enter") == events.count("guard_exit") == 2
+            assert not service.active_leases
     finally:
         # Only synchronous CPU copies exist in this fixture; clear injected
         # failure state to tear down the local server, not as a recovery API.

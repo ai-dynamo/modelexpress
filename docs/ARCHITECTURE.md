@@ -657,8 +657,13 @@ still fence the engine rather than retrying a partially committed update.
 Streaming is opt-in, trainer-only, and currently limited to unquantized vLLM
 models. It does not publish generator peers or roll back partially installed
 versions. An installation failure marks the client engine state uncertain and
-blocks further streaming updates. The hosting framework must keep all replicas
-paused and restart them after any failed update. Only completion of all replicas
+makes the failed handle unusable for another installation. A subsequent
+`stage_weight()` releases the failed transaction after proven cleanup, acquires
+a new version lease, rediscovers sources, and prepares a complete full-tensor
+replay. The engine stays uncertain until that fresh transaction installs
+successfully. Unproven transport or GPU cleanup retains resources and leases
+and requires a process restart. The hosting framework must keep all replicas
+paused throughout recovery. Only completion of all replicas
 permits resuming generation. The staging limit excludes live model weights,
 engine-owned post-load workspace, CUDA allocator overhead, and transport metadata.
 
