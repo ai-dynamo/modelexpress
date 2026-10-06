@@ -23,6 +23,7 @@ from ...metrics import enable_metrics
 from ...nixl_transfer import NixlTransferManager
 from ...metrics import metrics as selection_metrics
 from ...source_selection import configured_policy_label, get_configured_selector
+from ...topology import apply_policy, blocks_selection, count_in_domain, resolve_policy
 from .adapter import _get_model_name, build_sglang_load_context
 from .artifacts import (
     _sglang_health_ready,
@@ -282,6 +283,15 @@ class MxModelLoader:
         # published no peers -- the exact pair the ListSources counter exists to
         # separate.
         policy = configured_policy_label()
+        topology_policy = resolve_policy()
+        if blocks_selection(topology_policy):
+            logger.warning(
+                "[Worker %s] Topology domain %r is required but unknown for this "
+                "node, falling back to native load",
+                ctx.global_rank,
+                topology_policy.domain,
+            )
+            return None
         try:
             response = ctx.mx_client.list_sources(
                 identity=ctx.identity,
@@ -313,14 +323,19 @@ class MxModelLoader:
         # RdmaStrategy; this is SGLang's separate transfer_engine path, which
         # discovers sources itself, so it applies the same selector here.
         selector = get_configured_selector()
-        candidates = selector.order(candidates, ctx)
+        rank_matched = len(candidates)
+        candidates = apply_policy(selector.order(candidates, ctx), topology_policy)
+        topology_matched = count_in_domain(candidates, topology_policy)
+        selection_metrics.observe_candidates(policy, "topology_matched", topology_matched)
         logger.info(
             "[Worker %s] TransferEngine source selection: source_selector=%s "
-            "source_candidates_total=%d source_candidates_rank_matched=%d",
+            "source_candidates_total=%d source_candidates_rank_matched=%d "
+            "source_candidates_topology_matched=%d",
             ctx.global_rank,
             selector.name,
             len(response.instances),
-            len(candidates),
+            rank_matched,
+            topology_matched,
         )
         for source_ref in candidates:
             metadata = ctx.mx_client.get_metadata(

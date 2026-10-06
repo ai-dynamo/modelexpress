@@ -23,6 +23,7 @@ from ..source_selection import (
     configured_policy_label,
     get_configured_selector,
 )
+from ..topology import apply_policy, blocks_selection, count_in_domain, resolve_policy
 from ..transfer_safety import check_transfer_allowed
 from ..types import TensorDescriptor
 from .base import (
@@ -285,6 +286,14 @@ class RdmaStrategy(LoadStrategy):
         caller in load(), so the selector controls ordering only.
         """
         policy = configured_policy_label()
+        topology_policy = resolve_policy()
+        if blocks_selection(topology_policy):
+            logger.warning(
+                f"[Worker {ctx.global_rank}] Topology domain "
+                f"{topology_policy.domain!r} is required but unknown for this "
+                f"node, skipping RDMA"
+            )
+            return []
         try:
             list_resp = ctx.mx_client.list_sources(
                 identity=ctx.identity,
@@ -300,7 +309,12 @@ class RdmaStrategy(LoadStrategy):
                 # every one filtered out" was unreachable, so the two looked
                 # identical on a dashboard.
                 selection_metrics.record_list_sources(policy, "empty")
-                for stage in ("listed", "rank_matched", "accelerator_matched"):
+                for stage in (
+                    "listed",
+                    "rank_matched",
+                    "accelerator_matched",
+                    "topology_matched",
+                ):
                     selection_metrics.observe_candidates(policy, stage, 0)
                 return []
 
@@ -330,7 +344,8 @@ class RdmaStrategy(LoadStrategy):
 
             selector = get_configured_selector()
             select_start = time.perf_counter()
-            ordered = selector.order(candidates, ctx)
+            ordered = apply_policy(selector.order(candidates, ctx), topology_policy)
+            topology_matched = count_in_domain(ordered, topology_policy)
             select_seconds = time.perf_counter() - select_start
 
             selection_metrics.record_list_sources(selector.name, "ok")
@@ -342,6 +357,9 @@ class RdmaStrategy(LoadStrategy):
             )
             selection_metrics.observe_candidates(
                 selector.name, "accelerator_matched", len(candidates)
+            )
+            selection_metrics.observe_candidates(
+                selector.name, "topology_matched", topology_matched
             )
             selection_metrics.observe_selection_seconds(selector.name, select_seconds)
 
@@ -355,7 +373,8 @@ class RdmaStrategy(LoadStrategy):
                 f"source_selector={selector.name} "
                 f"source_candidates_total={len(list_resp.instances)} "
                 f"source_candidates_rank_matched={len(rank_matched)} "
-                f"source_candidates_accelerator_matched={len(candidates)}"
+                f"source_candidates_accelerator_matched={len(candidates)} "
+                f"source_candidates_topology_matched={topology_matched}"
             )
             if ordered:
                 logger.debug(

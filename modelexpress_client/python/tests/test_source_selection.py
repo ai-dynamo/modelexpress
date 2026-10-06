@@ -11,6 +11,7 @@ metadata-miss fallback, and the no-retry-after-transfer-start rule).
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import weakref
 from types import SimpleNamespace
@@ -285,7 +286,12 @@ def test_no_peers_published_records_a_zero_funnel(monkeypatch):
 
     m.record_list_sources.assert_called_once_with("random", "empty")
     observed = {call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list}
-    assert observed == {"listed": 0, "rank_matched": 0, "accelerator_matched": 0}
+    assert observed == {
+        "listed": 0,
+        "rank_matched": 0,
+        "accelerator_matched": 0,
+        "topology_matched": 0,
+    }
 
 
 def test_list_sources_rpc_failure_is_recorded_not_silent(monkeypatch):
@@ -332,6 +338,87 @@ def test_find_source_instances_filters_incompatible_accelerator():
     ctx.accelerator_backend.name = "cuda"
     out = RdmaStrategy()._find_source_instances(ctx)
     assert {c.worker_id for c in out} == {"match-0"}
+
+
+def _zone_ref(mx_source_id, worker_id, zone):
+    ref = _ref(mx_source_id, worker_id)
+    if zone:
+        ref.topology["zone"] = zone
+    return ref
+
+
+def _require_zone(monkeypatch, local_zone, enforcement="required"):
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "zone")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_ENFORCEMENT", enforcement)
+    if local_zone:
+        monkeypatch.setenv("MX_P2P_TOPOLOGY", json.dumps({"zone": local_zone}))
+    else:
+        monkeypatch.setenv("MX_P2P_TOPOLOGY", "{}")
+    monkeypatch.setattr("modelexpress.topology.DOMAIN_WAIT_TIMEOUT_S", 0.0)
+
+
+def test_find_source_instances_required_zone_survives_retry_slice(monkeypatch):
+    # Same-zone sources must not be pushed past MAX_SOURCE_RETRIES by
+    # cross-zone ones the selector happens to rank first.
+    monkeypatch.setenv(ENV_SELECTOR, "rendezvous_hash")
+    _require_zone(monkeypatch, "az1")
+    instances = [
+        _zone_ref("s0aaaaaaaaaaaaaa", "far-0", "az2"),
+        _zone_ref("s1aaaaaaaaaaaaaa", "far-1", "az2"),
+        _zone_ref("s2aaaaaaaaaaaaaa", "far-2", "az3"),
+        _zone_ref("s3aaaaaaaaaaaaaa", "legacy", None),
+        _zone_ref("s4aaaaaaaaaaaaaa", "near-0", "az1"),
+    ]
+    out = RdmaStrategy()._find_source_instances(_rdma_ctx(instances))
+    assert [c.worker_id for c in out] == ["near-0"]
+
+
+def test_find_source_instances_required_zone_unknown_locally_skips_listing(monkeypatch):
+    _require_zone(monkeypatch, None)
+    ctx = _rdma_ctx([_zone_ref("s0aaaaaaaaaaaaaa", "near-0", "az1")])
+    assert RdmaStrategy()._find_source_instances(ctx) == []
+    ctx.mx_client.list_sources.assert_not_called()
+
+
+def test_find_source_instances_preferred_zone_orders_same_zone_first(monkeypatch):
+    monkeypatch.setenv(ENV_SELECTOR, "rendezvous_hash")
+    _require_zone(monkeypatch, "az1", enforcement="preferred")
+    instances = [_zone_ref(f"s{i}aaaaaaaaaaaaaa", f"far-{i}", "az2") for i in range(4)]
+    instances.append(_zone_ref("s9aaaaaaaaaaaaaa", "near-0", "az1"))
+    out = RdmaStrategy()._find_source_instances(_rdma_ctx(instances))
+    assert out[0].worker_id == "near-0"
+    assert len(out) == 5
+
+
+def test_find_source_instances_required_zone_records_funnel(monkeypatch):
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    _require_zone(monkeypatch, "az1")
+    instances = [
+        _zone_ref("s0aaaaaaaaaaaaaa", "far-0", "az2"),
+        _zone_ref("s1aaaaaaaaaaaaaa", "near-0", "az1"),
+    ]
+    RdmaStrategy()._find_source_instances(_rdma_ctx(instances))
+    observed = {call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list}
+    assert observed["accelerator_matched"] == 2
+    assert observed["topology_matched"] == 1
+
+
+def test_find_source_instances_preferred_zone_funnel_counts_same_zone(monkeypatch):
+    # preferred keeps every candidate; the funnel stage must still report how
+    # many share the zone, or it would read as all-local.
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    _require_zone(monkeypatch, "az1", enforcement="preferred")
+    instances = [
+        _zone_ref("s0aaaaaaaaaaaaaa", "far-0", "az2"),
+        _zone_ref("s1aaaaaaaaaaaaaa", "near-0", "az1"),
+        _zone_ref("s2aaaaaaaaaaaaaa", "legacy", None),
+    ]
+    out = RdmaStrategy()._find_source_instances(_rdma_ctx(instances))
+    observed = {call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list}
+    assert len(out) == 3
+    assert observed["topology_matched"] == 1
 
 
 def test_find_source_instances_empty_accelerator_is_compatible():

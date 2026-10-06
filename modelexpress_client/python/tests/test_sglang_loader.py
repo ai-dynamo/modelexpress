@@ -1029,6 +1029,38 @@ def test_te_find_source_iterates_in_selector_order_and_none_when_no_match(monkey
     assert order == ["w2", "w1", "w0"]
 
 
+def test_te_find_source_required_zone_never_queries_other_zones(monkeypatch, tmp_path):
+    monkeypatch.setenv("DYN_TOPOLOGY_MOUNT_PATH", str(tmp_path / "absent"))
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "zone")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", '{"zone": "az1"}')
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_ENFORCEMENT", raising=False)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    far = _te_ref("s0aaaaaaaaaaaaaa", "far")
+    far.topology["zone"] = "az2"
+    near = _te_ref("s1aaaaaaaaaaaaaa", "near")
+    near.topology["zone"] = "az1"
+    ctx = _te_ctx([far, near])
+    ctx.mx_client.get_metadata.side_effect = lambda mx_source_id, worker_id: _te_meta(
+        transfer_engine=True
+    )
+
+    assert loader._find_transfer_engine_source(ctx) is not None
+    queried = [c.kwargs["worker_id"] for c in ctx.mx_client.get_metadata.call_args_list]
+    assert queried == ["near"]
+
+
+def test_te_find_source_required_zone_unknown_locally_falls_back(monkeypatch, tmp_path):
+    monkeypatch.setenv("DYN_TOPOLOGY_MOUNT_PATH", str(tmp_path / "absent"))
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "zone")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", "{}")
+    monkeypatch.setattr("modelexpress.topology.DOMAIN_WAIT_TIMEOUT_S", 0.0)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx([_te_ref("s0aaaaaaaaaaaaaa", "w0")])
+
+    assert loader._find_transfer_engine_source(ctx) is None
+    ctx.mx_client.list_sources.assert_not_called()
+
+
 def test_te_find_source_skips_not_found(monkeypatch):
     # Force identity order so w0 (not-found) is queried first and the
     # `if not metadata.found: continue` branch is actually exercised.
