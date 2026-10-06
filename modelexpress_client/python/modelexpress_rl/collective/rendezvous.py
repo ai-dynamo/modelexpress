@@ -70,11 +70,38 @@ class GroupNotReadyError(RendezvousError):
     def __init__(self, group_id: str, missing: list[str], waited_s: float) -> None:
         self.group_id = group_id
         self.missing = missing
-        detail = ", ".join(missing[:8]) if missing else "no slot detail available"
         super().__init__(
             f"collective group {group_id} did not reach READY within {waited_s:.0f}s; "
-            f"still waiting on: {detail}"
+            f"still waiting on: {_describe_missing(missing)}"
         )
+
+
+#: How often ``await_ready`` logs who it is still waiting on.
+_AWAIT_PROGRESS_LOG_INTERVAL_S = 30.0
+
+#: How many missing slots a diagnostic names before summarizing the rest.
+_MISSING_DETAIL_LIMIT = 32
+
+
+def _state_name(state: int) -> str:
+    try:
+        return pb.CollectiveGroupState.Name(state)
+    except ValueError:
+        return str(state)
+
+
+def _describe_missing(missing: list[str]) -> str:
+    """Name the missing slots with an explicit count; never a silent cut.
+
+    v8 printed only the first eight of seventeen missing slots, which read as
+    "gen-7..gen-15 joined" when no generator had joined at all.
+    """
+    if not missing:
+        return "no slot detail available"
+    shown = ", ".join(missing[:_MISSING_DETAIL_LIMIT])
+    more = len(missing) - _MISSING_DETAIL_LIMIT
+    suffix = f" (+{more} more not shown)" if more > 0 else ""
+    return f"{len(missing)} missing: {shown}{suffix}"
 
 
 class EpochChangedError(RendezvousError):
@@ -104,9 +131,8 @@ class EpochChangedError(RendezvousError):
         self.disagreeing = list(disagreeing)
         detail = ""
         if self.disagreeing:
-            detail = (
-                "; slots reporting a different plan digest: "
-                + ", ".join(self.disagreeing[:8])
+            detail = "; slots reporting a different plan digest: " + ", ".join(
+                self.disagreeing[:8]
             )
         super().__init__(
             f"collective group {group_id} moved from epoch {expected} to {actual}; "
@@ -248,7 +274,9 @@ def _validate_assignments(
     expected_leader: bool,
 ) -> tuple[LaneMembership, ...]:
     if not response.group_id or response.epoch <= 0:
-        raise RendezvousError("MX returned an invalid collective group identity or epoch")
+        raise RendezvousError(
+            "MX returned an invalid collective group identity or epoch"
+        )
 
     actual = tuple(
         LaneMembership(
@@ -309,6 +337,7 @@ class CollectiveRendezvous:
         self._registration_thread: threading.Thread | None = None
         self._registration: _WorkerRegistrationSpec | None = None
         self._closed = False
+        self._group_specs: dict[str, pb.CollectiveGroupSpec] = {}
 
     def _register_worker(self, registration: _WorkerRegistrationSpec) -> None:
         self._registration_stub.RegisterWorker(
@@ -334,7 +363,9 @@ class CollectiveRendezvous:
         )
         self._registration_thread.start()
 
-    def _ensure_worker_registration(self, registration: _WorkerRegistrationSpec) -> None:
+    def _ensure_worker_registration(
+        self, registration: _WorkerRegistrationSpec
+    ) -> None:
         """Synchronously establish liveness before joining the collective group."""
         with self._registration_lock:
             if self._closed:
@@ -429,7 +460,9 @@ class CollectiveRendezvous:
             raise ValueError("collective slot ids must not be empty")
         role_slots = trainer_slots if role is Role.TRAINER else generator_slots
         if slot_id not in role_slots:
-            raise ValueError(f"slot_id {slot_id!r} is not declared for role {role.value}")
+            raise ValueError(
+                f"slot_id {slot_id!r} is not declared for role {role.value}"
+            )
         if index_in_role != role_slots.index(slot_id):
             raise ValueError(
                 f"index_in_role {index_in_role} does not match the declared position "
@@ -439,8 +472,12 @@ class CollectiveRendezvous:
             lanes=lanes,
             slot_id=slot_id,
         )
-        if plan_endpoint is not None and not (role is Role.TRAINER and index_in_role == 0):
-            raise ValueError("only trainer index 0 may advertise the reshard plan endpoint")
+        if plan_endpoint is not None and not (
+            role is Role.TRAINER and index_in_role == 0
+        ):
+            raise ValueError(
+                "only trainer index 0 may advertise the reshard plan endpoint"
+            )
 
         spec = pb.CollectiveGroupSpec(
             model_name=model_name,
@@ -481,13 +518,69 @@ class CollectiveRendezvous:
             )
         )
         response = self._stub.JoinCollectiveGroup(request, timeout=self._rpc_timeout_s)
-        assignments = _validate_assignments(response, expected_assignments, expected_leader)
+        assignments = _validate_assignments(
+            response, expected_assignments, expected_leader
+        )
+        self._group_specs[response.group_id] = spec
         return Membership(
             group_id=response.group_id,
             epoch=response.epoch,
             lanes=assignments,
             is_bootstrap_leader=response.is_bootstrap_leader,
         )
+
+    def create_transfer(
+        self, membership: Membership, version: str, *, key_prefix: str
+    ) -> pb.CollectiveTransfer:
+        """Create a transfer fenced to the caller's joined group and READY epoch.
+
+        ``key_prefix`` namespaces the idempotency key so two integrations
+        sharing one server never replay over each other's keys.
+        """
+        if not key_prefix or not key_prefix.strip():
+            raise RendezvousError(
+                "key_prefix must name the caller's replay namespace: an empty "
+                "prefix would collapse two integrations onto the same "
+                "idempotency keys"
+            )
+        spec = self._group_specs.get(membership.group_id)
+        if spec is None:
+            raise RendezvousError(
+                f"this client never joined group {membership.group_id!r}; a "
+                "transfer can only be created against a group this client "
+                "joined"
+            )
+        group = self._stub.GetCollectiveGroup(
+            pb.GetCollectiveGroupRequest(group_id=membership.group_id),
+            timeout=self._rpc_timeout_s,
+        )
+        if (
+            group.group_id != membership.group_id
+            or group.epoch != membership.epoch
+            or group.state != pb.COLLECTIVE_GROUP_STATE_READY
+        ):
+            raise RendezvousError("the transfer requires the joined READY epoch")
+        key = (
+            f"{key_prefix}-{membership.group_id}"
+            f"-epoch-{membership.epoch}-version-{version}"
+        )
+        transfer = self._stub.CreateCollectiveTransfer(
+            pb.CreateCollectiveTransferRequest(
+                spec=spec, version_id=version, idempotency_key=key
+            ),
+            timeout=self._rpc_timeout_s,
+        )
+        if (
+            not transfer.operation_id
+            or transfer.group_id != membership.group_id
+            or transfer.epoch != membership.epoch
+            or transfer.version_id != version
+            or transfer.model_name != spec.model_name
+            or transfer.idempotency_key != key
+            or transfer.state != pb.COLLECTIVE_TRANSFER_STATE_PENDING
+        ):
+            raise RendezvousError("MX returned an incorrectly bound transfer")
+        return transfer
 
     def publish_bootstrap(
         self,
@@ -597,7 +690,9 @@ class CollectiveRendezvous:
             else envs.MX_NCCL_REFIT_POLL_INTERVAL_S,
             "poll_interval_s",
         )
-        deadline = time.monotonic() + timeout_s
+        started = time.monotonic()
+        deadline = started + timeout_s
+        next_progress_log = started + _AWAIT_PROGRESS_LOG_INTERVAL_S
         group = None
 
         while True:
@@ -627,9 +722,7 @@ class CollectiveRendezvous:
                         _missing_slots(group) if group is not None else [],
                         timeout_s,
                     ) from error
-                time.sleep(
-                    max(0.0, min(poll_interval_s, deadline - time.monotonic()))
-                )
+                time.sleep(max(0.0, min(poll_interval_s, deadline - time.monotonic())))
                 continue
             if group.epoch != epoch:
                 raise EpochChangedError(
@@ -641,6 +734,20 @@ class CollectiveRendezvous:
                 raise RendezvousError(
                     f"collective group {group_id} is releasing and cannot become READY"
                 )
+            now = time.monotonic()
+            if now >= next_progress_log:
+                # A stalled join is otherwise silent until the deadline (600s
+                # in v8); name who is missing while there is time to act.
+                logger.warning(
+                    "collective group %s not READY after %.0fs of %.0fs "
+                    "(state=%s); still waiting on: %s",
+                    group_id,
+                    now - started,
+                    timeout_s,
+                    _state_name(group.state),
+                    _describe_missing(_missing_slots(group)),
+                )
+                next_progress_log = now + _AWAIT_PROGRESS_LOG_INTERVAL_S
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise GroupNotReadyError(group_id, _missing_slots(group), timeout_s)
@@ -683,7 +790,8 @@ def _missing_slots(group: pb.CollectiveGroup) -> list[str]:
     # subsystem. Say what actually happened.
     if group.disagreeing_slots:
         return [
-            f"plan digest disagreement on slot {slot}" for slot in group.disagreeing_slots
+            f"plan digest disagreement on slot {slot}"
+            for slot in group.disagreeing_slots
         ]
 
     # The broadcast lane is the one place the full admitted set is visible in

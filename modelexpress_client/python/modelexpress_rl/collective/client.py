@@ -221,7 +221,11 @@ class _RefitClientBase:
             LaneDeclaration(
                 partition,
                 "RESHARD",
-                tuple(self._trainer_slots[partition * per_lane : (partition + 1) * per_lane]),
+                tuple(
+                    self._trainer_slots[
+                        partition * per_lane : (partition + 1) * per_lane
+                    ]
+                ),
                 tuple(self._generator_slots),
             )
             for partition in range(self._source_partition_count)
@@ -366,6 +370,13 @@ class _RefitClientBase:
                         stream=self._stream_for(lane_id),
                     )
 
+                # A fresh non-blocking communicator can report Success at
+                # creation and still fail moments later in its scalable-init
+                # trailing phase. Polling every local lane here turns that
+                # into a clean init error naming the lane instead of a
+                # rejected barrier launch on a peer.
+                self._cache.settle_group(membership.group_id, membership.epoch)
+
                 broadcast = self._cache.get(
                     LaneKey(
                         group_id=membership.group_id,
@@ -488,15 +499,38 @@ class RefitClientTrainer(_RefitClientBase):
             self._version = None
         self._report(operation_id, succeeded=True)
 
+    def report_failure(
+        self,
+        operation_id: str,
+        error: BaseException,
+        *,
+        membership: Membership | None = None,
+    ) -> None:
+        """Report using the admitted round identity, including after transport cleanup."""
+        self._report(
+            operation_id, succeeded=False, message=repr(error), membership=membership
+        )
+
     def _report(
-        self, operation_id: str | None, *, succeeded: bool, message: str = ""
+        self,
+        operation_id: str | None,
+        *,
+        succeeded: bool,
+        message: str = "",
+        membership: Membership | None = None,
     ) -> None:
         if operation_id is None:
             return
+        admitted = self._membership if membership is None else membership
+        if admitted is None:
+            raise RendezvousError(
+                "a transfer can only be reported against a group this client "
+                "joined; compute_plan has not admitted this worker yet"
+            )
         self._rendezvous.report(
             operation_id=operation_id,
-            group_id=self.membership.group_id,
-            epoch=self.membership.epoch,
+            group_id=admitted.group_id,
+            epoch=admitted.epoch,
             worker_id=self._worker_id,
             succeeded=succeeded,
             message=message,

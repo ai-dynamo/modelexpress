@@ -30,8 +30,51 @@ from .types import ParamPlan, ReshardPlan
 
 logger = logging.getLogger("modelexpress_rl.collective.backend")
 
+#: A single nccl.m2n reshard call that holds the host this long is logged.
+_SLOW_RESHARD_WARN_S = 10.0
+
 DEFAULT_LAYER_GROUP = 0
 _M2N_CALL_LOCK = threading.Lock()
+
+
+class _blocked_reshard_watch:
+    """Log while one nccl.m2n reshard call still blocks the host.
+
+    The transfer deadline is checked only between calls, and a call blocked
+    on a peer that never enters the same collective returns never; without
+    this the trainer stays silent for as long as it is stuck.
+    """
+
+    def __init__(self, entry: ParamPlan, lane: LaneCommunicator, started: float):
+        self._entry = entry
+        self._lane = lane
+        self._started = started
+        self._done = threading.Event()
+        self._thread = threading.Thread(
+            target=self._watch, name="mx-reshard-watch", daemon=True
+        )
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._done.set()
+        self._thread.join()
+        return False
+
+    def _watch(self) -> None:
+        while not self._done.wait(_SLOW_RESHARD_WARN_S):
+            logger.warning(
+                "nccl.m2n reshard of %r on lane %s (rank %s of %s) still blocks "
+                "the host after %.0fs",
+                self._entry.name,
+                self._entry.partition_id,
+                self._lane.rank,
+                self._lane.world_size,
+                time.monotonic() - self._started,
+            )
+
 
 #: The reshard entry points were added in this NCCL release. An older library
 #: fails inside the native call rather than at import, so importability alone
@@ -360,7 +403,25 @@ class _CollectiveHalf:
             # work is complete. Relying only on an allocator's stream tracking
             # is not sufficient for engine-owned or external buffers.
             self._pending_contexts.append(ctx)
-            _reshard(comm=lane, entry=entry, src=src(ctx), dst=dst(ctx))
+            started = time.monotonic()
+            with _blocked_reshard_watch(entry, lane, started):
+                _reshard(comm=lane, entry=entry, src=src(ctx), dst=dst(ctx))
+            elapsed = time.monotonic() - started
+            if elapsed >= _SLOW_RESHARD_WARN_S:
+                # nccl.m2n issues host-blocking collectives inside a call
+                # (DevComm creation, window registration) that wait for every
+                # lane rank to enter them; a call that blocks this long is a
+                # peer that has not reached the same entry (v14 recorded
+                # nothing between the bootstrap and a 10-minute stall).
+                logger.warning(
+                    "nccl.m2n reshard of %r on lane %s (rank %s of %s) blocked "
+                    "the host for %.1fs",
+                    entry.name,
+                    entry.partition_id,
+                    lane.rank,
+                    lane.world_size,
+                    elapsed,
+                )
             spec.leave(ctx)
         self._record_lane(lane)
 
@@ -405,8 +466,16 @@ class NcclM2nSender(_CollectiveHalf):
         communicators with operations in flight in different orders, which is
         the case that deadlocks.
         """
-        for entry in self.entries(layer_group_id):
+        started = time.monotonic()
+        entries = self.entries(layer_group_id)
+        for entry in entries:
             self._issue_reshard(entry, src=lambda ctx: ctx.buf, dst=lambda ctx: None)
+        logger.info(
+            "collective sender issued layer group %s (%d entries) in %.2fs",
+            layer_group_id,
+            len(entries),
+            time.monotonic() - started,
+        )
 
     def finish_weight_update(self, broadcast_lane_id: int) -> None:
         """Drain every reshard lane, then broadcast the misc parameters once."""
@@ -421,12 +490,23 @@ class NcclM2nReceiver(_CollectiveHalf):
         logger.debug("collective receiver starting version %s", version)
 
     def update_weights(self, layer_group_id: int) -> None:
-        for entry in self.entries(layer_group_id):
+        started = time.monotonic()
+        entries = self.entries(layer_group_id)
+        for entry in entries:
             self._issue_reshard(entry, src=lambda ctx: None, dst=lambda ctx: ctx.buf)
+        issued = time.monotonic() - started
         # Loader.install runs immediately after this method. It may read or
         # release receive buffers, so the group's transfers and post hooks must
         # be complete before returning.
         self._drain_active_lanes()
+        logger.info(
+            "collective receiver landed layer group %s (%d entries): issued in "
+            "%.2fs, drained in %.2fs",
+            layer_group_id,
+            len(entries),
+            issued,
+            time.monotonic() - started - issued,
+        )
 
     def finish_weight_update(self, broadcast_lane_id: int) -> None:
         self._finish_misc(broadcast_lane_id)
