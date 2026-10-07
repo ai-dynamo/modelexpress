@@ -488,9 +488,12 @@ def test_report_preserves_measured_refit_latency_and_failed_rank(tmp_path):
     assert build_report(tmp_path)["status"] == "FAILED"
 
 
-@pytest.mark.parametrize("outside", [False, True])
+@pytest.mark.parametrize(
+    "scenario",
+    ["success", "outside", "partial", "NoSuchKey", "wrong-size", "AccessDenied"],
+)
 def test_cleanup_deletes_only_published_objects_in_exact_run(
-    tmp_path, monkeypatch, outside
+    tmp_path, monkeypatch, scenario
 ):
     import runpy
     import types
@@ -500,8 +503,16 @@ def test_cleanup_deletes_only_published_objects_in_exact_run(
         "bucket": "test-bucket",
         "storage": {"endpoint_url": None, "region": "test", "addressing_style": "auto"},
     }
-    key = "deltas/nemotron-other/payload" if outside else "deltas/nemotron-test/payload"
-    publication = {"run": "nemotron-test", "objects": [{"key": key, "bytes": 8}]}
+    key = (
+        "deltas/nemotron-other/payload"
+        if scenario == "outside"
+        else "deltas/nemotron-test/payload"
+    )
+    objects = [{"key": key, "bytes": 8}]
+    if scenario == "partial":
+        objects.append({"key": key + "-2", "bytes": 8})
+    remaining = {item["key"] for item in objects}
+    publication = {"run": "nemotron-test", "objects": objects}
     report = tmp_path / "publication.json"
     report.write_text(json.dumps(publication))
     real_read = Path.read_text
@@ -516,18 +527,26 @@ def test_cleanup_deletes_only_published_objects_in_exact_run(
     deleted = []
 
     class ClientError(Exception):
-        def __init__(self):
-            self.response = {"Error": {"Code": "404"}}
+        def __init__(self, code="404"):
+            self.response = {"Error": {"Code": code}}
 
     class Storage:
         def head_object(self, **kwargs):
-            assert kwargs == {"Bucket": "test-bucket", "Key": key}
-            if deleted:
-                raise ClientError()
-            return {"ContentLength": 8}
+            assert kwargs["Bucket"] == "test-bucket"
+            if scenario == "AccessDenied":
+                raise ClientError("AccessDenied")
+            if kwargs["Key"] not in remaining:
+                raise ClientError("NoSuchKey" if scenario == "NoSuchKey" else "404")
+            return {"ContentLength": 9 if scenario == "wrong-size" else 8}
 
         def delete_objects(self, **kwargs):
             deleted.append(kwargs)
+            if scenario == "partial" and len(deleted) == 1:
+                remaining.remove(key)
+                return {"Errors": [{"Key": key + "-2", "Code": "InternalError"}]}
+            remaining.difference_update(
+                item["Key"] for item in kwargs["Delete"]["Objects"]
+            )
             return {}
 
     monkeypatch.setitem(sys.modules, "config", types.SimpleNamespace(CONFIG=config))
@@ -543,15 +562,31 @@ def test_cleanup_deletes_only_published_objects_in_exact_run(
         "botocore.exceptions",
         types.SimpleNamespace(ClientError=ClientError),
     )
-    if outside:
+    if scenario in ("outside", "wrong-size"):
         with pytest.raises(AssertionError):
             runpy.run_path(str(ROOT / "common/cleanup_objects.py"))
         assert not deleted
+    elif scenario == "AccessDenied":
+        with pytest.raises(ClientError) as error:
+            runpy.run_path(str(ROOT / "common/cleanup_objects.py"))
+        assert error.value.response["Error"]["Code"] == "AccessDenied"
+        assert not deleted
     else:
+        if scenario == "partial":
+            with pytest.raises(AssertionError):
+                runpy.run_path(str(ROOT / "common/cleanup_objects.py"))
+            assert remaining == {key + "-2"}
         runpy.run_path(str(ROOT / "common/cleanup_objects.py"))
-        assert deleted == [
-            {"Bucket": "test-bucket", "Delete": {"Objects": [{"Key": key}]}}
-        ]
+        runpy.run_path(str(ROOT / "common/cleanup_objects.py"))
+        assert not remaining
+        assert all(
+            call
+            == {
+                "Bucket": "test-bucket",
+                "Delete": {"Objects": [{"Key": item["key"]} for item in objects]},
+            }
+            for call in deleted
+        )
 
 
 @pytest.mark.parametrize("bad_value", [None, -1, float("nan"), float("inf"), True])

@@ -25,9 +25,13 @@ s3 = boto3.client(
 )
 bucket = CONFIG["bucket"]
 for item in objects:
-    assert (
-        s3.head_object(Bucket=bucket, Key=item["key"])["ContentLength"] == item["bytes"]
-    )
+    try:
+        head = s3.head_object(Bucket=bucket, Key=item["key"])
+    except ClientError as error:
+        if error.response["Error"]["Code"] not in ("404", "NoSuchKey"):
+            raise
+    else:
+        assert head["ContentLength"] == item["bytes"]
 response = s3.delete_objects(
     Bucket=bucket, Delete={"Objects": [{"Key": x["key"]} for x in objects]}
 )

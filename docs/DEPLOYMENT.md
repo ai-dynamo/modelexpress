@@ -1653,6 +1653,8 @@ validators with Python `-O`.
 
 Run resources use the `mx-benchmark` label for selection and cleanup.
 Manual cleanup uses the publication report and preserves the namespace, snapshot,
-and local evidence. If publication never wrote its report, manual cleanup stops
-for inspection. Never delete the shared model prefix or bucket. Every fresh run
-has isolated server/Redis state and empty worker volumes.
+and local evidence. Object cleanup can be retried after partial deletion: missing
+objects count as already removed, while remaining objects must match their recorded
+sizes. Other storage errors still stop cleanup. If publication never wrote its
+report, manual cleanup stops for inspection. Never delete the shared model prefix
+or bucket. Every fresh run has isolated server/Redis state and empty worker volumes.
