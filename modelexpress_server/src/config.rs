@@ -188,6 +188,8 @@ pub enum ServerConfigError {
     File(#[from] ConfigError),
     #[error(transparent)]
     Tls(#[from] TlsConfigError),
+    #[error(transparent)]
+    TlsSetup(#[from] crate::tls::TlsError),
     #[error("cache directory parent does not exist: {}", .0.display())]
     MissingCacheParent(PathBuf),
     #[error("{field} {value} is not a valid address: {source}")]
@@ -437,9 +439,12 @@ impl ServerConfig {
 
     /// Load and validate configuration file strictly without fallbacks.
     /// This method should be used when validating configuration files.
-    /// It will return an error if the file has invalid syntax or values.
+    /// It will return an error if the file has invalid syntax or values, or if
+    /// the TLS backend cannot load the certificate, key, ciphers or groups.
     pub fn load_and_validate_strict(args: ServerArgs) -> Result<Self, ServerConfigError> {
-        Self::load_internal(args, true)
+        let config = Self::load_internal(args, true)?;
+        crate::tls::build_acceptor(&config.tls)?;
+        Ok(config)
     }
 
     /// Internal method to load configuration with optional strict mode
@@ -639,15 +644,15 @@ impl ServerConfig {
                 info!("  Key: {}", key.display());
                 match self.tls.min_version {
                     Some(version) => info!("  Min version: {version}"),
-                    None => info!("  Min version: OpenSSL default"),
+                    None => info!("  Min version: TLS1.2 (default)"),
                 }
                 if self.tls.cipher_suites.is_empty() {
-                    info!("  Cipher suites: OpenSSL default");
+                    info!("  Cipher suites: TLS backend default");
                 } else {
                     info!("  Cipher suites: {}", self.tls.cipher_suites.join(":"));
                 }
                 if self.tls.groups.is_empty() {
-                    info!("  Groups: OpenSSL default");
+                    info!("  Groups: TLS backend default");
                 } else {
                     info!("  Groups: {}", self.tls.groups.join(":"));
                 }
@@ -1111,6 +1116,79 @@ mod tests {
             service_account: "worker".to_string(),
         }];
         assert!(security.validate_resolved(AuthMode::Enforce).is_ok());
+    }
+
+    fn args_with_tls(tls: TlsArgs) -> ServerArgs {
+        ServerArgs {
+            config: None,
+            port: None,
+            host: None,
+            metrics_port: None,
+            log_level: None,
+            log_format: None,
+            cache_directory: None,
+            cache_eviction_enabled: None,
+            security: SecurityArgs::default(),
+            tls,
+            validate_config: true,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn strict_validation_loads_the_certificate() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let cert_file = temp_dir.path().join("tls.crt");
+        let key_file = temp_dir.path().join("tls.key");
+        fs::write(&cert_file, "not a certificate").expect("write cert");
+        fs::write(&key_file, "not a key").expect("write key");
+
+        let config = ServerConfig::load(args_with_tls(TlsArgs {
+            cert_file: Some(cert_file.clone()),
+            key_file: Some(key_file.clone()),
+            ..TlsArgs::default()
+        }));
+        assert!(config.is_ok(), "the files exist, so plain loading passes");
+
+        let strict = ServerConfig::load_and_validate_strict(args_with_tls(TlsArgs {
+            cert_file: Some(cert_file),
+            key_file: Some(key_file),
+            ..TlsArgs::default()
+        }));
+        assert!(
+            matches!(strict, Err(ServerConfigError::TlsSetup(_))),
+            "{strict:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn strict_validation_rejects_a_cipher_list_the_backend_cannot_honor() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let issuer = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("self-signed cert");
+        let cert_file = temp_dir.path().join("tls.crt");
+        let key_file = temp_dir.path().join("tls.key");
+        fs::write(&cert_file, issuer.cert.pem()).expect("write cert");
+        fs::write(&key_file, issuer.signing_key.serialize_pem()).expect("write key");
+
+        let valid = ServerConfig::load_and_validate_strict(args_with_tls(TlsArgs {
+            cert_file: Some(cert_file.clone()),
+            key_file: Some(key_file.clone()),
+            ..TlsArgs::default()
+        }));
+        assert!(valid.is_ok(), "{valid:?}");
+
+        let strict = ServerConfig::load_and_validate_strict(args_with_tls(TlsArgs {
+            cert_file: Some(cert_file),
+            key_file: Some(key_file),
+            cipher_suites: Some("NOT-A-CIPHER".parse().expect("cipher list")),
+            ..TlsArgs::default()
+        }));
+        assert!(
+            matches!(strict, Err(ServerConfigError::TlsSetup(_))),
+            "{strict:?}"
+        );
     }
 
     /// A file that does not parse must not fall back to defaults: the defaults
