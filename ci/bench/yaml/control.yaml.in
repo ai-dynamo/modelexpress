@@ -27,7 +27,7 @@ items:
         - name: aws-config
           configMap: {name: ${AWS_CONFIG_NAME}}
         - name: benchmark
-          configMap: {name: ${HARNESS_NAME}}
+          configMap: {name: ${HARNESS_NAME}, items: ${HARNESS_ITEMS}}
       containers:
         - name: main
           image: ${MX_MAIN_RUNTIME_IMAGE}

@@ -4,17 +4,13 @@
 """Exercise benchmark process and evidence handling without a cluster."""
 
 import subprocess
-from pathlib import Path
 
 import pytest
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
 def lifecycle(monkeypatch):
-    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
-    import lifecycle
+    from harness import lifecycle
 
     return lifecycle
 

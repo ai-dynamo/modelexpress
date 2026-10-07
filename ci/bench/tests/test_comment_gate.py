@@ -36,7 +36,11 @@ def request(*, body=None, permission="write", head=SHA, mirror=SHA, state="open"
 
 def test_authorized_comment_returns_only_approved_immutable_sha():
     event, get = request()
-    assert gate.authorize(event, REPO, get) == {"sha": SHA, "model": "nemotron"}
+    assert gate.authorize(event, REPO, get) == {
+        "sha": SHA,
+        "model": "nemotron",
+        "scenario": "delta",
+    }
 
 
 @pytest.mark.parametrize(
@@ -48,6 +52,7 @@ def test_authorized_comment_returns_only_approved_immutable_sha():
         {"mirror": "b" * 40},
         {"state": "closed"},
         {"body": "/bench --sha main"},
+        {"body": "/bench --sha '" + SHA + " --sha " + SHA + "'"},
         {"body": "/bench --sha " + SHA + "\necho hacked"},
         {"body": "/bench --sha " + SHA[:7]},
         {"body": "/ok to test " + SHA},
@@ -85,11 +90,20 @@ def test_only_new_pr_comments_are_accepted(change):
 
 
 @pytest.mark.parametrize(
-    "command,model", [("/bench", "nemotron"), ("/bench --model kimi", "kimi")]
+    "command,model",
+    [
+        ("/bench", "nemotron"),
+        ("/bench --model kimi", "kimi"),
+        ("/bench --scenario delta", "nemotron"),
+    ],
 )
 def test_command_resolves_current_approved_head_and_model(command, model):
     event, get = request(body=command)
-    assert gate.authorize(event, REPO, get) == {"sha": SHA, "model": model}
+    assert gate.authorize(event, REPO, get) == {
+        "sha": SHA,
+        "model": model,
+        "scenario": "delta",
+    }
 
 
 @pytest.mark.parametrize(
@@ -98,9 +112,65 @@ def test_command_resolves_current_approved_head_and_model(command, model):
         "/bench --model unknown",
         "/bench --model ../kimi",
         "/bench --paths both",
+        "/bench --scenario reshard",
+        "/bench --scenario ../delta",
     ],
 )
 def test_unsupported_options_fail_closed(command):
     event, get = request(body=command)
     with pytest.raises(ValueError):
         gate.authorize(event, REPO, get)
+
+
+def workflow_environment():
+    return {
+        "KUBE_CONTEXT": "ci",
+        "MX_BENCH_S3_ROLE_ARN": "arn:aws:iam::123:role/test",
+        "MX_CI_S3_BUCKET": "ci",
+        "MX_CI_S3_REGION": "us-west-2",
+        "TEST_SHA": SHA,
+        "RUNTIME_BASE": "registry/runtime@sha256:" + "b" * 64,
+        "PR_NUMBER": "42",
+        "MODEL_PROFILE": "nemotron",
+        "SCENARIO": "delta",
+        "GITHUB_ACTOR": "maintainer",
+        "GITHUB_REPOSITORY": REPO,
+    }
+
+
+def test_reusable_workflow_resolves_the_same_authorized_revision():
+    _, get = request()
+    assert gate.authorize_workflow(workflow_environment(), get) == {
+        "sha": SHA,
+        "model": "nemotron",
+        "scenario": "delta",
+    }
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"TEST_SHA": ""},
+        {"TEST_SHA": "main"},
+        {"TEST_SHA": SHA + " --sha " + SHA},
+        {"RUNTIME_BASE": "registry/runtime:latest"},
+        {"PR_NUMBER": "0"},
+        {"PR_NUMBER": "../42"},
+        {"MODEL_PROFILE": "nemotron --sha " + SHA},
+        {"SCENARIO": "reshard"},
+        {"KUBE_CONTEXT": ""},
+    ],
+)
+def test_reusable_workflow_rejects_invalid_inputs(change):
+    _, get = request()
+    with pytest.raises(ValueError):
+        gate.authorize_workflow({**workflow_environment(), **change}, get)
+
+
+@pytest.mark.parametrize(
+    "change", [{"permission": "read"}, {"mirror": "b" * 40}, {"head": "b" * 40}]
+)
+def test_reusable_workflow_cannot_bypass_permission_or_mirroring(change):
+    _, get = request(**change)
+    with pytest.raises(ValueError):
+        gate.authorize_workflow(workflow_environment(), get)

@@ -26,16 +26,23 @@ def authorize(event, repository, get):
     parser.add_argument(
         "--model", choices=catalog["models"], default=catalog["default_model"]
     )
+    parser.add_argument(
+        "--scenario", choices=catalog["scenarios"], default=catalog["default_scenario"]
+    )
     parser.add_argument("--sha")
     words = shlex.split(event["comment"]["body"].strip())
     if not words or words[0] != "/bench" or "\n" in event["comment"]["body"].strip():
-        raise ValueError("Use /bench [--model PROFILE] [--sha FULL_SHA]")
+        raise ValueError(
+            "Use /bench [--model PROFILE] [--scenario SCENARIO] [--sha FULL_SHA]"
+        )
     try:
         args, unknown = parser.parse_known_args(words[1:])
     except argparse.ArgumentError as error:
         raise ValueError(str(error)) from error
     if unknown or (args.sha and not re.fullmatch(r"[0-9a-f]{40}", args.sha)):
-        raise ValueError("Use /bench [--model PROFILE] [--sha FULL_SHA]")
+        raise ValueError(
+            "Use /bench [--model PROFILE] [--scenario SCENARIO] [--sha FULL_SHA]"
+        )
     number = event["issue"]["number"]
     login = event["comment"]["user"]["login"]
     permission = get(f"repos/{repository}/collaborators/{login}/permission")
@@ -52,10 +59,53 @@ def authorize(event, repository, get):
         raise ValueError(
             "Wait for copy-pr-bot approval/mirroring of this SHA, then comment again"
         )
-    return {"sha": sha, "model": args.model}
+    return {"sha": sha, "model": args.model, "scenario": args.scenario}
+
+
+def authorize_workflow(environment, get):
+    for key in [
+        "KUBE_CONTEXT",
+        "MX_BENCH_S3_ROLE_ARN",
+        "MX_CI_S3_BUCKET",
+        "MX_CI_S3_REGION",
+    ]:
+        if not environment.get(key):
+            raise ValueError("Missing repository configuration: " + key)
+    sha = environment.get("TEST_SHA", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("sha must be a full lowercase commit SHA")
+    runtime = environment.get("RUNTIME_BASE", "")
+    if not re.fullmatch(r"[a-zA-Z0-9./:_-]+@sha256:[0-9a-f]{64}", runtime):
+        raise ValueError("runtime must be digest-pinned")
+    number = int(environment["PR_NUMBER"])
+    if number < 1:
+        raise ValueError("pull_request must be a positive PR number")
+    event = {
+        "action": "created",
+        "issue": {"number": number, "pull_request": {"number": number}},
+        "comment": {
+            "body": shlex.join(
+                [
+                    "/bench",
+                    "--sha",
+                    sha,
+                    "--model",
+                    environment["MODEL_PROFILE"],
+                    "--scenario",
+                    environment["SCENARIO"],
+                ]
+            ),
+            "user": {"login": environment["GITHUB_ACTOR"]},
+        },
+    }
+    return authorize(event, environment["GITHUB_REPOSITORY"], get)
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--workflow-call", action="store_true")
+    args = parser.parse_args()
+
     def get(path):
         request = urllib.request.Request(
             f"https://api.github.com/{path}",
@@ -68,8 +118,11 @@ def main():
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.load(response)
 
-    event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-    result = authorize(event, os.environ["GITHUB_REPOSITORY"], get)
+    if args.workflow_call:
+        result = authorize_workflow(os.environ, get)
+    else:
+        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+        result = authorize(event, os.environ["GITHUB_REPOSITORY"], get)
     with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
         output.writelines(f"{key}={value}\n" for key, value in result.items())
     print(f"Authorized benchmark run: {result}")

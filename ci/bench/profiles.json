@@ -3,5 +3,9 @@
   "models": [
     "nemotron",
     "kimi"
+  ],
+  "default_scenario": "delta",
+  "scenarios": [
+    "delta"
   ]
 }

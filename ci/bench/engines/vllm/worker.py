@@ -12,10 +12,10 @@ import traceback
 from pathlib import Path
 
 import torch
-from config import CONFIG
+from harness.config import load_config
 
 
-class BenchWorkerExtension:
+class RefitWorkerExtension:
     def _record(self, phase, body):
         p = Path("/refit/benchmark")
         p.mkdir(exist_ok=True)
@@ -27,7 +27,7 @@ class BenchWorkerExtension:
         tmp.replace(dest)
         print("HOTLOAD_BENCHMARK " + json.dumps(body), flush=True)
 
-    def _hotload_init_impl(self, run_id, source="OBJECT_STORAGE"):
+    def hotload_init(self, initial_version_id, source):
         try:
             from modelexpress.engines.vllm.loader import get_model_loader
             from modelexpress_rl.inference.client import (
@@ -41,12 +41,12 @@ class BenchWorkerExtension:
             from modelexpress_rl.inference.receiver import ObjectStorageGeneratorConfig
             from modelexpress_rl.object_storage import ObjectStorageType
 
+            config = load_config()
             cfg = copy.copy(self.vllm_config)
             cfg.load_config = copy.copy(cfg.load_config)
             cfg.load_config.model_loader_extra_config = {}
-            self._hotload_run = run_id
             live = get_model_loader(self.local_rank).tensors
-            BenchWorkerExtension._record(
+            RefitWorkerExtension._record(
                 self,
                 "capability",
                 {
@@ -65,12 +65,12 @@ class BenchWorkerExtension:
             storage = (
                 ObjectStorageGeneratorConfig(
                     storage_type=ObjectStorageType.S3,
-                    initial_base_version_id=run_id + "-base",
+                    initial_base_version_id=initial_version_id,
                     seed_checkpoint_path="/models",
                     refit_checkpoint_dir="/refit",
-                    refit_checkpoint_max_size_gb=CONFIG["refit_checkpoint_max_size_gb"],
-                    endpoint_url=CONFIG["storage"]["endpoint_url"],
-                    region_name=CONFIG["storage"]["region"],
+                    refit_checkpoint_max_size_gb=config["refit_checkpoint_max_size_gb"],
+                    endpoint_url=config["storage"]["endpoint_url"],
+                    region_name=config["storage"]["region"],
                 )
                 if source == "OBJECT_STORAGE"
                 else None
@@ -81,8 +81,8 @@ class BenchWorkerExtension:
                         model=self.model_runner.get_model(), vllm_config=cfg
                     ),
                     model_name=os.environ["BENCH_MODEL"],
-                    server_url=CONFIG["resource_prefix"] + "-control:8000",
-                    initial_serving_version_id=run_id + "-base",
+                    server_url=config["resource_prefix"] + "-control:8000",
+                    initial_serving_version_id=initial_version_id,
                     object_storage=storage,
                     source_order=(WeightSource[source],),
                 )
@@ -91,11 +91,11 @@ class BenchWorkerExtension:
             loader = get_model_loader(self.local_rank)
             rt = loader.tensors
             self._initial_weight_ptrs = {n: t.data_ptr() for n, t in rt.items()}
-            BenchWorkerExtension._record(
+            RefitWorkerExtension._record(
                 self,
                 "init",
                 {
-                    "version": run_id + "-base",
+                    "version": initial_version_id,
                     "source": source,
                     "quant_config": str(cfg.quant_config),
                     "registered_runtime_tensors_available": bool(live),
@@ -109,14 +109,16 @@ class BenchWorkerExtension:
                 },
             )
         except Exception as e:  # noqa: BLE001 -- Preserve runtime failure evidence.
-            BenchWorkerExtension._record(
+            RefitWorkerExtension._record(
                 self,
                 "init-failed",
                 {"error": repr(e), "traceback": traceback.format_exc()},
             )
 
-    def _hotload_impl(self, weight_path):
-        version = weight_path
+        return self._last_record
+
+    def hotload(self, version_id):
+        version = version_id
         t = time.perf_counter()
         try:
             from modelexpress_rl.version import WeightVersionRef
@@ -129,7 +131,7 @@ class BenchWorkerExtension:
             torch.cuda.synchronize(self.device)
             stage_seconds = time.perf_counter() - stage_start
             metrics = dict(staged.metrics)
-            BenchWorkerExtension._record(
+            RefitWorkerExtension._record(
                 self,
                 version + "-staged",
                 {
@@ -158,7 +160,7 @@ class BenchWorkerExtension:
                 metrics.update(dict(staged.metrics))
                 if isinstance(applied, dict):
                     metrics.update(applied)
-                BenchWorkerExtension._record(
+                RefitWorkerExtension._record(
                     self,
                     version,
                     {
@@ -175,7 +177,7 @@ class BenchWorkerExtension:
             finally:
                 staged.release()
         except Exception as e:  # noqa: BLE001 -- Preserve runtime failure evidence.
-            BenchWorkerExtension._record(
+            RefitWorkerExtension._record(
                 self,
                 version + "-failed",
                 {
@@ -186,7 +188,9 @@ class BenchWorkerExtension:
                 },
             )
 
-    def hotload_verify(self, phase):
+        return self._last_record
+
+    def tensor_hashes(self, phase):
         try:
             from modelexpress.engines.vllm.loader import get_model_loader
 
@@ -212,47 +216,53 @@ class BenchWorkerExtension:
                     "shape": list(t.shape),
                     "dtype": str(t.dtype),
                 }
-            BenchWorkerExtension._record(self, phase, {"tensors": results})
+            RefitWorkerExtension._record(self, phase, {"tensors": results})
         except Exception as e:  # noqa: BLE001 -- Preserve runtime failure evidence.
-            BenchWorkerExtension._record(
+            RefitWorkerExtension._record(
                 self,
                 phase + "-failed",
                 {"error": repr(e), "traceback": traceback.format_exc()},
             )
 
-    def _hotload_verify_checkpoint_impl(self, version_id):
+        return self._last_record
+
+    def verify_host_scales(self):
         try:
-            if version_id == "host-scales":
-                rows = []
-                for name, module in self.model_runner.get_model().named_modules():
-                    for key in ["q", "k", "v"]:
-                        tensor = getattr(module, "_" + key + "_scale", None)
-                        host = getattr(module, "_" + key + "_scale_float", None)
-                        if tensor is not None and host is not None:
-                            cpu = getattr(module, "_" + key + "_scale_cpu", None)
-                            rows.append(
-                                {
-                                    "module": name,
-                                    "scale": key,
-                                    "gpu": float(tensor.item()),
-                                    "host": float(host),
-                                    "cpu": float(cpu.item())
-                                    if cpu is not None
-                                    else None,
-                                }
-                            )
-                BenchWorkerExtension._record(
-                    self,
-                    "host-scales",
-                    {
-                        "scales": rows,
-                        "enforce_eager": self.vllm_config.model_config.enforce_eager,
-                    },
-                )
-                return self._last_record
-            if version_id.startswith("hashes:"):
-                BenchWorkerExtension.hotload_verify(self, version_id.split(":", 1)[1])
-                return self._last_record
+            rows = []
+            for name, module in self.model_runner.get_model().named_modules():
+                for key in ["q", "k", "v"]:
+                    tensor = getattr(module, "_" + key + "_scale", None)
+                    host = getattr(module, "_" + key + "_scale_float", None)
+                    if tensor is not None and host is not None:
+                        cpu = getattr(module, "_" + key + "_scale_cpu", None)
+                        rows.append(
+                            {
+                                "module": name,
+                                "scale": key,
+                                "gpu": float(tensor.item()),
+                                "host": float(host),
+                                "cpu": float(cpu.item()) if cpu is not None else None,
+                            }
+                        )
+            RefitWorkerExtension._record(
+                self,
+                "host-scales",
+                {
+                    "scales": rows,
+                    "enforce_eager": self.vllm_config.model_config.enforce_eager,
+                },
+            )
+            return self._last_record
+        except Exception as e:  # noqa: BLE001 -- Preserve runtime failure evidence.
+            RefitWorkerExtension._record(
+                self,
+                "host-scales-failed",
+                {"error": repr(e), "traceback": traceback.format_exc()},
+            )
+        return self._last_record
+
+    def verify_checkpoint(self, version_id, tensor_name):
+        try:
             from modelexpress.tensor_utils import collect_module_tensors
 
             actual_ptrs = {
@@ -267,7 +277,7 @@ class BenchWorkerExtension:
                 if actual_ptrs.get(n) != p
             ]
             extra = sorted(set(actual_ptrs) - set(self._initial_weight_ptrs))
-            BenchWorkerExtension._record(
+            RefitWorkerExtension._record(
                 self,
                 "addresses-verified",
                 {
@@ -278,41 +288,38 @@ class BenchWorkerExtension:
                 },
             )
             assert not changed and not extra, {"changed": changed, "extra": extra}
-            if version_id.startswith("addresses:"):
-                return
             from modelexpress_rl.inference.checkpoint_store import LocalCheckpointStore
             from safetensors import safe_open
 
-            if CONFIG["embedding"]:
-                checkpoint = LocalCheckpointStore(
-                    root="/refit", model_name=os.environ["BENCH_MODEL"]
-                ).checkpoint_path(version_id)
-                index = json.loads(
-                    (checkpoint / "model.safetensors.index.json").read_text()
-                )
-                name = CONFIG["embedding"]
-                with safe_open(
-                    str(checkpoint / index["weight_map"][name]), framework="pt"
-                ) as sf:
-                    raw = sf.get_tensor(name)
-                    checkpoint_sha256 = hashlib.sha256(
-                        raw.contiguous().view(torch.uint8).numpy().tobytes()
-                    ).hexdigest()
-                BenchWorkerExtension._record(
-                    self,
-                    "checkpoint-verified",
-                    {
-                        "version": version_id,
-                        "checkpoint_tensor": name,
-                        "checkpoint_sha256": checkpoint_sha256,
-                        "shape": list(raw.shape),
-                        "dtype": str(raw.dtype),
-                        "verified": True,
-                    },
-                )
-                return self._last_record
+            checkpoint = LocalCheckpointStore(
+                root="/refit", model_name=os.environ["BENCH_MODEL"]
+            ).checkpoint_path(version_id)
+            index = json.loads(
+                (checkpoint / "model.safetensors.index.json").read_text()
+            )
+            name = tensor_name
+            with safe_open(
+                str(checkpoint / index["weight_map"][name]), framework="pt"
+            ) as sf:
+                raw = sf.get_tensor(name)
+                checkpoint_sha256 = hashlib.sha256(
+                    raw.contiguous().view(torch.uint8).numpy().tobytes()
+                ).hexdigest()
+            RefitWorkerExtension._record(
+                self,
+                "checkpoint-verified",
+                {
+                    "version": version_id,
+                    "checkpoint_tensor": name,
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "shape": list(raw.shape),
+                    "dtype": str(raw.dtype),
+                    "verified": True,
+                },
+            )
+            return self._last_record
         except Exception as e:  # noqa: BLE001 -- Preserve runtime failure evidence.
-            BenchWorkerExtension._record(
+            RefitWorkerExtension._record(
                 self,
                 "checkpoint-verified-failed",
                 {
@@ -324,31 +331,70 @@ class BenchWorkerExtension:
 
         return self._last_record
 
-    def hotload_init(self, run_id, source="OBJECT_STORAGE"):
-        import importlib
+    def verify_runtime_tensor(self, version_id, tensor_name):
+        try:
+            from modelexpress_rl.inference.checkpoint_store import LocalCheckpointStore
+            from safetensors import safe_open
+            from vllm.model_executor.layers.vocab_parallel_embedding import (
+                VocabParallelEmbedding,
+            )
 
-        import bench_worker
-
-        importlib.reload(bench_worker).BenchWorkerExtension._hotload_init_impl(
-            self, run_id, source
-        )
+            module_name, parameter_name = tensor_name.rsplit(".", 1)
+            module = self.model_runner.get_model().get_submodule(module_name)
+            if (
+                not isinstance(module, VocabParallelEmbedding)
+                or parameter_name != "weight"
+            ):
+                raise ValueError(
+                    f"unsupported runtime tensor verification: {tensor_name}"
+                )
+            actual = module.weight
+            if getattr(actual, "packed_dim", None) is not None:
+                raise ValueError("packed embedding verification is unsupported")
+            checkpoint = LocalCheckpointStore(
+                root="/refit", model_name=os.environ["BENCH_MODEL"]
+            ).checkpoint_path(version_id)
+            index = json.loads(
+                (checkpoint / "model.safetensors.index.json").read_text()
+            )
+            with safe_open(
+                str(checkpoint / index["weight_map"][tensor_name]), framework="pt"
+            ) as sf:
+                raw = sf.get_tensor(tensor_name)
+            expected = torch.nn.Parameter(
+                torch.empty_like(actual, device="cpu"), requires_grad=False
+            )
+            expected.output_dim = getattr(actual, "output_dim", None)
+            module.weight_loader(expected, raw)
+            actual_cpu = actual.detach().cpu().contiguous()
+            expected_cpu = expected.detach().contiguous()
+            RefitWorkerExtension._record(
+                self,
+                "runtime-tensor-verified",
+                {
+                    "version": version_id,
+                    "checkpoint_tensor": tensor_name,
+                    "shape": list(actual.shape),
+                    "dtype": str(actual.dtype),
+                    "expected_sha256": hashlib.sha256(
+                        expected_cpu.view(torch.uint8).numpy().tobytes()
+                    ).hexdigest(),
+                    "actual_sha256": hashlib.sha256(
+                        actual_cpu.view(torch.uint8).numpy().tobytes()
+                    ).hexdigest(),
+                    "verified": torch.equal(actual_cpu, expected_cpu),
+                },
+            )
+        except Exception as e:  # noqa: BLE001 -- Preserve runtime failure evidence.
+            RefitWorkerExtension._record(
+                self,
+                "runtime-tensor-verified-failed",
+                {
+                    "version": version_id,
+                    "checkpoint_tensor": tensor_name,
+                    "verified": False,
+                    "error": repr(e),
+                    "traceback": traceback.format_exc(),
+                },
+            )
         return self._last_record
-
-    def hotload(self, weight_path):
-        import importlib
-
-        import bench_worker
-
-        importlib.reload(bench_worker).BenchWorkerExtension._hotload_impl(
-            self, weight_path
-        )
-        return self._last_record
-
-    def hotload_verify_checkpoint(self, version_id):
-        import importlib
-
-        import bench_worker
-
-        return importlib.reload(
-            bench_worker
-        ).BenchWorkerExtension._hotload_verify_checkpoint_impl(self, version_id)

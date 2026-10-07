@@ -58,9 +58,11 @@ When a row moves status, update this table in the same PR so the doc stays the s
 ## Comment-triggered model benchmark CI
 
 `ci/bench/` contains registered Nemotron and Kimi-K2.7-Code profiles. Offline
-contracts run on every PR. `bench-ci.yml` accepts `/bench [--model PROFILE]
-[--sha FULL_SHA]` from repository writers after copy-pr-bot mirrors the current
-head. S3-only GPU runs use profile-derived quotas and configured per-model runtime
+contracts run on every PR in `RL refit harness tests`. `bench-ci.yml` accepts `/bench [--model PROFILE]
+[--scenario delta] [--sha FULL_SHA]` from repository writers after copy-pr-bot mirrors the current
+head. It calls reusable `rl-refit-ci.yml`, which independently repeats authorization
+before building the requested SHA. Only delta is registered; no reshard CI case
+is introduced. S3-only GPU runs use profile-derived quotas and configured per-model runtime
 images. No live AWS validation has been performed; Kimi refit compatibility is
 not established. Peer coverage stays manual. See
 [usage and limitations](../docs/DEPLOYMENT.md#modelexpress-benchmark-ci-harness).

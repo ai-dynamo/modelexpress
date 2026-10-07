@@ -8,11 +8,12 @@ import re
 import sys
 from pathlib import Path
 
-import validation
+from harness import scenario, validation
 
 
 def build_report(root):
     config = json.loads((root / "config.json").read_text())
+    case = scenario.load(config)
     log = (
         (root / "bench-driver.log").read_text()
         if (root / "bench-driver.log").exists()
@@ -59,8 +60,10 @@ def build_report(root):
                 seconds = float(match[1])
                 times.append(seconds)
                 rank_match = re.search(r"\bWorker_TP(\d+)\b", line)
-                rank = int(rank_match[1]) if rank_match else (
-                    0 if config["tp"] == 1 else -1
+                rank = (
+                    int(rank_match[1])
+                    if rank_match
+                    else (0 if config["tp"] == 1 else -1)
                 )
                 times_by_rank.setdefault(rank, []).append(seconds)
         wire = [
@@ -103,7 +106,6 @@ def build_report(root):
         for role in config["roles"]:
             baseline[role] = validation.hashes(result(role, "base-hashes"), config)
             updated[role] = validation.hashes(result(role, "updated-hashes"), config)
-            assert baseline[role] != updated[role], "No updated tensors"
             validation.refit(result(role, "refit"), config, role)
             validation.inference(result(role, "post-refit-inference"))
             if config["expected_host_scales_per_rank"] is not None:
@@ -114,34 +116,14 @@ def build_report(root):
                 ]:
                     validation.scales(result(role, step), config)
             worker = report["workers"][role]
-            text = (root / f"{role}-worker.log").read_text()
-            if role == "s3":
-                assert "Streaming weights from s3://" in text
-            else:
-                assert worker["rdma_transfer_records"], "No RDMA completion evidence"
-                assert not any(
-                    x in text
-                    for x in [
-                        "Trying strategy: model_streamer",
-                        "Streaming weights from s3://",
-                        "Trying strategy: instant_tensor",
-                    ]
-                ), "Peer cold load fell back"
             pod = worker["pod"]
             assert pod["status"].get("containerStatuses")
             assert all(
                 x["restartCount"] == 0 and "terminated" not in x["state"]
                 for x in pod["status"]["containerStatuses"]
             )
-        validation.checkpoint(result("s3", "verify-checkpoint"), config, publication)
-        if "peer" in config["roles"]:
-            assert (
-                baseline["s3"] == baseline["peer"] and updated["s3"] == updated["peer"]
-            )
-            assert (
-                report["workers"]["s3"]["pod"]["spec"]["nodeName"]
-                != report["workers"]["peer"]["pod"]["spec"]["nodeName"]
-            )
+        case.validate_inventory(baseline, updated, publication)
+        case.validate_report(result, report, root)
         report["validation_status"] = "PASS"
         summary = {
             role: validation.latency(

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CI cleanup of the exact run prefix, including incomplete publications."""
+"""Delete the exact benchmark run prefix, including incomplete publications."""
 
 import re
 
@@ -13,10 +13,9 @@ def cleanup(s3, config):
         re.escape(key) + r"-[a-z0-9-]{1,32}", run
     ):
         raise ValueError("Invalid cleanup run ID")
-    base = config["delta_prefix"]
-    if not base or not base.endswith("/"):
-        raise ValueError("Cleanup requires a nonempty delta prefix ending in /")
-    prefix = base + run + "/"
+    prefix = config["artifact_prefix"]
+    if not prefix.endswith("/" + run + "/") or prefix == run + "/":
+        raise ValueError("Cleanup requires an exact run artifact prefix")
     seed = config["seed_prefix"]
     if prefix.startswith(seed) or seed.startswith(prefix):
         raise ValueError("Cleanup prefix overlaps the model snapshot")
@@ -38,17 +37,24 @@ def cleanup(s3, config):
     return {"prefix": prefix, "deleted": deleted, "verified_absent": True}
 
 
-if __name__ == "__main__":
+def main():
     import json
 
     import boto3
     from botocore.config import Config
-    from config import CONFIG
+
+    from harness.config import load_config
+
+    config = load_config()
 
     client = boto3.client(
         "s3",
-        region_name=CONFIG["storage"]["region"],
-        endpoint_url=CONFIG["storage"]["endpoint_url"],
-        config=Config(s3={"addressing_style": CONFIG["storage"]["addressing_style"]}),
+        region_name=config["storage"]["region"],
+        endpoint_url=config["storage"]["endpoint_url"],
+        config=Config(s3={"addressing_style": config["storage"]["addressing_style"]}),
     )
-    print(json.dumps(cleanup(client, CONFIG)))
+    print(json.dumps(cleanup(client, config)))
+
+
+if __name__ == "__main__":
+    main()

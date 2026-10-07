@@ -10,7 +10,9 @@ from pathlib import Path
 
 
 def main():
-    from config import CONFIG
+    from harness.config import load_config
+
+    config = load_config()
     from vllm import LLM, SamplingParams
 
     root = Path("/refit/benchmark")
@@ -21,15 +23,15 @@ def main():
         revision=os.environ["BENCH_REVISION"],
         load_format="modelexpress",
         model_loader_extra_config={"memory_limit": 8589934592, "concurrency": 8},
-        tensor_parallel_size=CONFIG["tp"],
-        limit_mm_per_prompt=CONFIG["limit_mm_per_prompt"],
+        tensor_parallel_size=config["tp"],
+        limit_mm_per_prompt=config["limit_mm_per_prompt"],
         enable_prefix_caching=False,
         trust_remote_code=True,
         dtype="bfloat16",
-        gpu_memory_utilization=CONFIG["gpu_memory_utilization"],
+        gpu_memory_utilization=config["gpu_memory_utilization"],
         max_model_len=4096,
         max_num_seqs=8,
-        worker_extension_cls="bench_worker.BenchWorkerExtension",
+        worker_extension_cls="engines.vllm.worker.RefitWorkerExtension",
     )
     (root / "startup.json").write_text(
         json.dumps(
@@ -65,7 +67,7 @@ def main():
                 elif self.path == "/rpc":
                     assert paused or body["method"] in [
                         "hotload_init",
-                        "hotload_verify",
+                        "tensor_hashes",
                     ], "pause required"
                     out = llm.collective_rpc(
                         body["method"], kwargs=body.get("kwargs", {})

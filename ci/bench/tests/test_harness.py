@@ -3,7 +3,6 @@
 
 """Offline contracts: rendered workloads, multi-rank validation, and failure reports."""
 
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -12,14 +11,9 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "common"))
-validation = __import__("validation")
-build_report = __import__("report").build_report
-
-spec = importlib.util.spec_from_file_location("prepare", ROOT / "scripts/prepare.py")
-prepare = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(prepare)
-
+from harness import render as prepare
+from harness import validation
+from harness.report import build_report
 
 PORTABLE_ENV = {
     "context": "test-cluster",
@@ -75,6 +69,14 @@ def test_rendered_workloads_share_profile_and_mount_all_runtime_code(
     config = render(model, out, model + "-test", paths)
     cm = json.loads((out / "harness.json").read_text())
     assert json.loads(cm["data"]["config.json"]) == config
+    assert config["scenario"] == "delta"
+    assert config["target_version"] == model + "-test-d1"
+    assert config["sources"]["s3"] == "OBJECT_STORAGE"
+    assert {"harness__scenario.py", "scenarios__delta__scenario.py"} <= cm[
+        "data"
+    ].keys()
+    assert "harness__render.py" not in cm["data"]
+    assert "harness__lifecycle.py" not in cm["data"]
     assert "apply_patch.py" not in cm["data"]
     for name, text in cm["data"].items():
         if name.endswith(".py"):
@@ -138,6 +140,9 @@ def saved_run(tmp_path):
         "tp": 2,
         "roles": ["s3", "peer"],
         "run": "nemotron-test",
+        "initial_version": "nemotron-test-base",
+        "target_version": "nemotron-test-d1",
+        "sources": {"s3": "OBJECT_STORAGE", "peer": "GENERATOR"},
         "revision": "revision",
         "expected_tensors_per_rank": None,
         "expected_host_scales_per_rank": None,
@@ -248,6 +253,22 @@ def saved_run(tmp_path):
                 "verified": True,
             }
             for r in range(2)
+        ],
+    )
+    result(
+        "s3",
+        "verify-runtime-tensor",
+        [
+            {
+                "rank": rank,
+                "phase": "runtime-tensor-verified",
+                "version": config["target_version"],
+                "checkpoint_tensor": "embedding",
+                "expected_sha256": "c" * 64,
+                "actual_sha256": "c" * 64,
+                "verified": True,
+            }
+            for rank in range(config["tp"])
         ],
     )
     (tmp_path / "bench-driver.log").write_text("\n".join(lines) + "\nBENCH_PASS\n")
@@ -422,10 +443,10 @@ def test_kubectl_uses_rendered_target_instead_of_local_default(tmp_path):
             "-c",
             (
                 "import sys; sys.path.insert(0, sys.argv[1]); "
-                "from lifecycle import Benchmark; "
+                "from harness.lifecycle import Benchmark; "
                 "print(Benchmark(sys.argv[2]).k.call('get', 'pods'), end='')"
             ),
-            str(ROOT / "scripts"),
+            str(ROOT),
             str(out),
         ],
         env={**os.environ, "PATH": str(bin_dir) + ":" + os.environ["PATH"]},
@@ -489,72 +510,6 @@ def test_report_preserves_measured_refit_latency_and_failed_rank(tmp_path):
         )
     )
     assert build_report(tmp_path)["status"] == "FAILED"
-
-
-@pytest.mark.parametrize("outside", [False, True])
-def test_cleanup_deletes_only_published_objects_in_exact_run(
-    tmp_path, monkeypatch, outside
-):
-    import runpy
-    import types
-
-    config = {
-        "delta_prefix": "deltas/",
-        "bucket": "test-bucket",
-        "storage": {"endpoint_url": None, "region": "test", "addressing_style": "auto"},
-    }
-    key = "deltas/nemotron-other/payload" if outside else "deltas/nemotron-test/payload"
-    publication = {"run": "nemotron-test", "objects": [{"key": key, "bytes": 8}]}
-    report = tmp_path / "publication.json"
-    report.write_text(json.dumps(publication))
-    real_read = Path.read_text
-    monkeypatch.setattr(
-        Path,
-        "read_text",
-        lambda path, *a, **k: real_read(
-            report if str(path) == "/tmp/mx-delta/report.json" else path, *a, **k
-        ),
-    )
-    monkeypatch.setenv("DELTA_RUN", "nemotron-test")
-    deleted = []
-
-    class ClientError(Exception):
-        def __init__(self):
-            self.response = {"Error": {"Code": "404"}}
-
-    class Storage:
-        def head_object(self, **kwargs):
-            assert kwargs == {"Bucket": "test-bucket", "Key": key}
-            if deleted:
-                raise ClientError()
-            return {"ContentLength": 8}
-
-        def delete_objects(self, **kwargs):
-            deleted.append(kwargs)
-            return {}
-
-    monkeypatch.setitem(sys.modules, "config", types.SimpleNamespace(CONFIG=config))
-    monkeypatch.setitem(
-        sys.modules, "boto3", types.SimpleNamespace(client=lambda *a, **k: Storage())
-    )
-    monkeypatch.setitem(sys.modules, "botocore", types.ModuleType("botocore"))
-    monkeypatch.setitem(
-        sys.modules, "botocore.config", types.SimpleNamespace(Config=lambda **k: k)
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "botocore.exceptions",
-        types.SimpleNamespace(ClientError=ClientError),
-    )
-    if outside:
-        with pytest.raises(AssertionError):
-            runpy.run_path(str(ROOT / "common/cleanup_objects.py"))
-        assert not deleted
-    else:
-        runpy.run_path(str(ROOT / "common/cleanup_objects.py"))
-        assert deleted == [
-            {"Bucket": "test-bucket", "Delete": {"Objects": [{"Key": key}]}}
-        ]
 
 
 @pytest.mark.parametrize("bad_value", [None, -1, float("nan"), float("inf"), True])
@@ -725,3 +680,95 @@ def test_report_retains_malformed_result_evidence(tmp_path, line):
     assert len(report["record_errors"]) == 1
     assert report["record_errors"][0]["line"] > 0
     assert "Malformed RESULT" in report["failure_reason"]
+
+
+def test_refit_uses_explicit_version_and_source():
+    config = {
+        "tp": 1,
+        "target_version": "update-42",
+        "sources": {"receiver": "GENERATOR"},
+    }
+    row = {
+        "rank": 0,
+        "phase": "update-42",
+        "version": "update-42",
+        "serving_version": "update-42",
+        "source": "GENERATOR",
+        "weight_addresses_preserved": True,
+    }
+    validation.refit([row], config, "receiver")
+    with pytest.raises(AssertionError):
+        validation.refit([{**row, "source": "OBJECT_STORAGE"}], config, "receiver")
+    with pytest.raises(AssertionError):
+        validation.refit([{**row, "serving_version": "old"}], config, "receiver")
+
+
+@pytest.mark.parametrize("case", ["mismatch", "missing", "failed-rank"])
+def test_report_requires_installed_runtime_tensor_evidence(tmp_path, case):
+    saved_run(tmp_path)
+    path = tmp_path / "bench-driver.log"
+    lines = []
+    for line in path.read_text().splitlines():
+        if line.startswith("RESULT s3 verify-runtime-tensor "):
+            if case == "missing":
+                continue
+            record = json.loads(line.split(" ", 3)[3])
+            row = record["response"]["result"][1]
+            if case == "mismatch":
+                row["actual_sha256"] = "d" * 64
+                row["verified"] = False
+            else:
+                row["phase"] += "-failed"
+                row["error"] = "unsupported runtime tensor"
+            line = "RESULT s3 verify-runtime-tensor " + json.dumps(record)
+        lines.append(line)
+    path.write_text("\n".join(lines) + "\n")
+    report = build_report(tmp_path)
+    assert report["validation_status"] == "FAILED"
+    assert report["status"] == "FAILED"
+    assert report["latency_summary"] == {}
+
+
+def test_configmap_projection_imports_packages_without_running_benchmark(tmp_path):
+    import subprocess
+
+    rendered = tmp_path / "rendered"
+    config = render("nemotron", rendered, "nemotron-packages", "s3")
+    manifest = json.loads((rendered / "harness.json").read_text())
+    control = yaml.safe_load((rendered / "control.yaml").read_text())
+    pod = next(item for item in control["items"] if item["kind"] == "Pod")
+    volume = next(
+        item for item in pod["spec"]["volumes"] if item["name"] == "benchmark"
+    )
+    projected = tmp_path / "projected"
+    for item in volume["configMap"]["items"]:
+        path = projected / item["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(manifest["data"][item["key"]])
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; from harness.config import load_config; "
+                "from harness.runner import RefitRunner; from harness.scenario import load; "
+                "from harness.report import build_report; "
+                "config = load_config(); assert load(config).config == config; "
+                "print(json.dumps(config))"
+            ),
+        ],
+        cwd=projected,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(result.stdout) == config
+    assert not (projected / "PASS").exists()
+    assert not (projected / "FAIL").exists()
+    assert not (projected / "harness/render.py").exists()
+    assert not (projected / "harness/lifecycle.py").exists()
+    worker = yaml.safe_load((rendered / "worker-s3.yaml").read_text())["items"][0]
+    worker_volume = next(
+        item for item in worker["spec"]["volumes"] if item["name"] == "benchmark"
+    )
+    assert worker_volume["configMap"]["items"] == volume["configMap"]["items"]

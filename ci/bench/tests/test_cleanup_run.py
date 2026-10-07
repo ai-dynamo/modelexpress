@@ -3,16 +3,8 @@
 
 """Incomplete publications must clean only their run's objects."""
 
-import importlib.util
-from pathlib import Path
-
 import pytest
-
-spec = importlib.util.spec_from_file_location(
-    "cleanup_run", Path(__file__).resolve().parents[1] / "common/cleanup_run.py"
-)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+from harness import cleanup as module
 
 
 class Storage:
@@ -51,7 +43,7 @@ def config():
     return {
         "key": "nemotron",
         "run": "nemotron-test",
-        "delta_prefix": "deltas/",
+        "artifact_prefix": "deltas/nemotron-test/",
         "seed_prefix": "models/",
         "bucket": "ci",
     }
@@ -66,10 +58,44 @@ def test_partial_publication_cleanup_preserves_snapshot_and_neighbor_run():
 
 
 @pytest.mark.parametrize(
-    "change", [{"delta_prefix": ""}, {"run": "../"}, {"seed_prefix": "deltas/"}]
+    "change", [{"artifact_prefix": ""}, {"run": "../"}, {"seed_prefix": "deltas/"}]
 )
 def test_unsafe_cleanup_scope_is_rejected(change):
     storage = Storage()
     with pytest.raises(ValueError):
         module.cleanup(storage, {**config(), **change})
     assert len(storage.objects) == 3
+
+
+def test_partial_delete_failure_can_retry_remaining_objects():
+    class PartiallyFailingStorage(Storage):
+        def __init__(self):
+            super().__init__()
+            self.objects["deltas/nemotron-test/remaining"] = 1
+            self.fail = True
+
+        def paginate(self, *, Bucket, Prefix):
+            yield {
+                "Contents": [
+                    {"Key": key} for key in self.objects if key.startswith(Prefix)
+                ]
+            }
+
+        def delete_objects(self, *, Bucket, Delete):
+            if self.fail:
+                self.fail = False
+                del self.objects[Delete["Objects"][0]["Key"]]
+                return {
+                    "Errors": [
+                        {"Key": Delete["Objects"][1]["Key"], "Code": "AccessDenied"}
+                    ]
+                }
+            return super().delete_objects(Bucket=Bucket, Delete=Delete)
+
+    storage = PartiallyFailingStorage()
+    with pytest.raises(RuntimeError, match="AccessDenied"):
+        module.cleanup(storage, config())
+    assert "deltas/nemotron-test/remaining" in storage.objects
+    report = module.cleanup(storage, config())
+    assert report["deleted"] == 1 and report["verified_absent"]
+    assert set(storage.objects) == {"deltas/nemotron-test2/keep", "models/keep"}

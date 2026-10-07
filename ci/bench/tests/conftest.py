@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Resolved per-run profile, mounted with the benchmark code."""
+"""Make the benchmark packages importable without installing GPU dependencies."""
 
-import json
+import sys
 from pathlib import Path
 
-CONFIG = json.loads(Path(__file__).with_name("config.json").read_text())
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))

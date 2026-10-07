@@ -6,11 +6,16 @@
 import argparse
 import json
 import os
+import shutil
+import sys
+import tempfile
 from pathlib import Path
 
 import yaml
-from lifecycle import Benchmark, Kubernetes
-from prepare import prepare
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from harness.lifecycle import Benchmark, Kubernetes
+from harness.render import prepare
 
 OWNER_LABEL = "ci.modelexpress.nvidia.com/run-id"
 
@@ -39,17 +44,22 @@ def ci(mode):
         namespace,
         env.get("KUBECONFIG", "/teleport/kubeconfig.yaml"),
     )
-    control = "mx-" + env["RUN_ID"] + "-control"
 
     def render():
-        return prepare(
-            env["MODEL_PROFILE"],
-            root,
-            env["RUN_ID"],
-            "s3",
-            environment="aws-ci",
-            service_account="mx-bench",
-        )
+        with tempfile.TemporaryDirectory(prefix="mx-bench-render-") as temporary:
+            rendered = Path(temporary) / "run"
+            config = prepare(
+                env["MODEL_PROFILE"],
+                rendered,
+                env["RUN_ID"],
+                "s3",
+                environment="aws-ci",
+                scenario_name=env.get("SCENARIO", "delta"),
+                service_account="mx-bench",
+            )
+            root.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(rendered, root, dirs_exist_ok=True)
+            return config
 
     def owned():
         actual = k.call(
@@ -111,20 +121,6 @@ def ci(mode):
                 if item["kind"] == "Pod":
                     item["spec"]["activeDeadlineSeconds"] = 3300
             path.write_text(yaml.safe_dump(manifest))
-        k.call(
-            "apply", "-f", str(root / "harness.json"), "-f", str(root / "control.yaml")
-        )
-        k.call("wait", "--for=condition=Ready", "pod/" + control, "--timeout=5m")
-        k.call(
-            "exec",
-            control,
-            "-c",
-            "main",
-            "--",
-            "python3",
-            "-c",
-            'import boto3; from config import CONFIG; boto3.client("s3", region_name=CONFIG["storage"]["region"]).head_object(Bucket=CONFIG["bucket"], Key=CONFIG["seed_prefix"] + "snapshot-manifest.json")',
-        )
     elif mode == "run":
         owned()
         Benchmark(root).run()
@@ -134,48 +130,9 @@ def ci(mode):
         ).strip():
             return
         owned()
-        try:
-            k.call(
-                "delete",
-                "pod",
-                control,
-                "mx-" + env["RUN_ID"] + "-s3",
-                "--ignore-not-found",
-                "--wait=true",
-                "--timeout=2m",
-            )
-            render()
-            k.call("apply", "-f", str(root / "harness.json"))
-            items = yaml.safe_load((root / "control.yaml").read_text())["items"]
-            configmap = next(x for x in items if x["kind"] == "ConfigMap")
-            pod = next(x for x in items if x["kind"] == "Pod")
-            pod["metadata"]["name"] += "-cleanup"
-            pod["spec"]["activeDeadlineSeconds"] = 300
-            main = pod["spec"]["containers"][0]
-            main["command"] = ["python3", "-u", "/opt/benchmark/cleanup_run.py"]
-            main["resources"] = {
-                "requests": {"cpu": "100m", "memory": "256Mi"},
-                "limits": {"cpu": "1", "memory": "1Gi"},
-            }
-            pod["spec"]["containers"] = [main]
-            try:
-                k.manifest(
-                    "apply",
-                    {"apiVersion": "v1", "kind": "List", "items": [configmap, pod]},
-                )
-                k.call(
-                    "wait",
-                    "--for=jsonpath={.status.phase}=Succeeded",
-                    "pod/" + control + "-cleanup",
-                    "--timeout=6m",
-                )
-            finally:
-                k.call(
-                    "logs", control + "-cleanup", output=root / "cleanup-objects.log"
-                )
-                print((root / "cleanup-objects.log").read_text())
-        finally:
-            k.call("delete", "namespace", namespace, "--wait=true", "--timeout=2m")
+        render()
+        Benchmark(root).cleanup()
+        k.call("delete", "namespace", namespace, "--wait=true", "--timeout=2m")
 
 
 def main():

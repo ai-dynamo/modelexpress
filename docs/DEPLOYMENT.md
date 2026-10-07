@@ -1571,7 +1571,8 @@ cannot retain bytes from a previous batch or version.
 
 [`ci/bench/`](../ci/bench/) runs native vLLM cold-load and refit checks using
 registered, pinned model profiles. `profiles.json` lists supported profile keys
-and the default (`nemotron`). Add a profile to the catalog to extend the harness;
+and the defaults (`nemotron`, scenario `delta`). Only delta refit is implemented.
+Add a profile to the catalog to extend the harness;
 the trigger and lifecycle scripts do not contain model-specific allowlists.
 
 | Profile | Pinned model | Resources per worker |
@@ -1591,21 +1592,27 @@ After the workflow lands on the default branch, a repository writer can post:
 
 ```text
 /bench
-/bench --model kimi
+/bench --model kimi --scenario delta
 /bench --model nemotron --sha <full-40-character-PR-head-SHA>
 ```
 
 Bare `/bench` uses the catalog's default profile. `--model` selects a registered
-profile and `--sha` optionally binds the request to an explicit PR head. Otherwise
+profile, `--scenario` selects a registered experiment, and `--sha` optionally binds the request to an explicit PR head. Otherwise
 the authorization job resolves the current head once. In both cases that exact
 revision must match copy-pr-bot's `pull-request/<PR-number>` mirror. First use the
 existing `/ok to test <SHA>` approval process if needed, wait for mirroring, then
 post the benchmark comment. The new command does not grant copy-pr-bot approval. Closed
-PRs, edited comments, stale explicit SHAs, unmirrored heads, unknown models/options,
+PRs, edited comments, stale explicit SHAs, unmirrored heads, unknown models/scenarios/options,
 and commenters without write permission are rejected. New revisions need new
 requests. Labels do not trigger this workflow.
 
-The hosted gate checks permission and resolves immutable source/model outputs.
+The hosted gate checks permission and resolves immutable source/model/scenario outputs.
+`bench-ci.yml` handles comment authorization and configured runtime selection, then
+calls `rl-refit-ci.yml`. The reusable workflow accepts PR number, exact source SHA,
+model, scenario and digest-pinned runtime inputs. It repeats the caller permission,
+current-head and mirror checks before privileged builds, so direct workflow callers
+cannot bypass approval. One trusted default-branch harness revision is resolved on
+the hosted runner and reused by the build, test and cleanup jobs.
 Privileged jobs build that approved ModelExpress revision using trusted
 default-branch Dockerfiles and harness scripts. Per-model runtime bases are
 configured by digest; built images are also consumed by digest. Harness edits in
@@ -1633,13 +1640,13 @@ The cluster must support IRSA injection. IAM trust must cover
 `mx-ci-bench-<run-id>-<attempt>` namespaces and service account `mx-bench`; access must
 allow snapshot reads/listing and delta-prefix writes/deletes. The CI runner's
 identity is not inherited by workload pods. Populate all checkpoint shards and
-`snapshot-manifest.json` under the profile's `seed_prefix` beforehand. CI checks
-manifest access from the CPU control pod before requesting GPUs. It does not
+`snapshot-manifest.json` under the profile's `seed_prefix` beforehand. The worker seed-download step reads
+the snapshot manifest and checks downloaded file sizes against S3 object sizes. CI does not
 provision IAM, mirror snapshots, deploy MinIO, or use the Vime job's FSx cache.
 
-The separate `ModelExpress benchmark CI` workflow invokes the renderer/run CLI for the
-selected profile. It stays outside the required GPU CI aggregate; offline
-contracts run on every PR. The namespace GPU quota follows the rendered profile's
+The `ModelExpress benchmark CI` comment workflow delegates execution to the shared
+`RL refit benchmark CI` workflow for the selected profile and scenario. It stays outside the required GPU CI aggregate; offline
+contracts run on every PR in the `RL refit harness tests` job. The namespace GPU quota follows the rendered profile's
 TP size (one for Nemotron, eight for Kimi). Image builds have a 60-minute timeout;
 the test job has a 60-minute timeout, its experiment step 45 minutes, and pods a
 55-minute lifetime. Large models may exceed this initial qualification budget;
@@ -1700,14 +1707,36 @@ Setting these fields does not qualify transport. Each worker's TP ranks stay on
 one node. The report rejects peer fallback to S3, ModelStreamer, or InstantTensor
 and requires different donor/peer nodes.
 
+### Shared RL refit experiment contract
+
+The shared `harness/lifecycle.py` owns Kubernetes deployment, process deadlines, evidence collection
+and cleanup. `harness/runner.py` exposes `RefitRunner`, which owns the shared pause/refit/verify/resume sequence.
+Rendered configuration supplies explicit initial and target versions, sources by
+worker role, publication evidence path and preparation commands. These values
+keep the sequence independent of delta version naming and S3/peer role names.
+
+Runtime code uses the `harness`, `scenarios.delta` and `engines.vllm` Python
+packages. ConfigMap item mappings preserve these paths inside `/opt/benchmark`;
+pods invoke tasks with `python3 -m`. The renderer mounts shared runtime code,
+the selected scenario and the engine adapter, excluding host-only rendering and
+Kubernetes lifecycle code. CLI paths under `scripts/` remain the same.
+
+The `DeltaScenario` class stores its configuration and has four methods: `configure`, `verify_refit`,
+`validate_inventory` and `validate_report`. It prepares the changed checkpoint
+and validates delta-specific evidence while shared validation checks rank
+completeness, source/version, addresses and timing. Reshard can add an experiment
+through this contract later; there is no reshard implementation or CI case in
+this PR. Comment-triggered GPU runs currently exercise delta over S3 only.
+
 ### Validation, timing, and cleanup
 
 The benchmark uses vLLM’s default execution mode without forcing eager execution.
 
-The CI-only `BenchWorkerExtension` in `ci/bench/common/bench_worker.py` extends
+The CI-only `RefitWorkerExtension` in `ci/bench/engines/vllm/worker.py` extends
 each vLLM worker with refit timing and weight/checkpoint validation RPC methods.
 
-The driver checks every rank's tensor hashes, reconstructed checkpoint embedding,
+The driver checks every rank's tensor hashes, reconstructed checkpoint embedding
+and its corresponding installed vocabulary embedding,
 refit source/version, preserved tensor addresses, and resumed inference. Shared
 validation checks GPU/CPU/host scale agreement for profiles with configured scale
 counts. Model-specific scale-change counts and FlashInfer cache invalidation are
@@ -1719,9 +1748,9 @@ target; reports include actual bytes, and size differences do not fail validatio
 Peer refit transfers full runtime tensors.
 Each rank verifies the reconstructed checkpoint tensor hash against the publisher's
 expected hash. Runtime tensor inventories must change after refit and match between
-S3 and peer workers when both paths run. The harness does not assume a runtime
-embedding name or TP sharding layout, and does not independently compare GPU
-embedding slices with the checkpoint. Profiles still select a checkpoint tensor;
+S3 and peer workers when both paths run. Installed embedding validation resolves the engine vocabulary embedding and
+checks each TP rank against the corresponding checkpoint slice, including
+vocabulary padding. Profiles still select a checkpoint tensor;
 its dtype must be supported by the installed safetensors/PyTorch and refit stack.
 
 `report.json` retains model-load seconds, RPC and per-rank stage/install/total
@@ -1756,14 +1785,19 @@ No AWS performance baseline has been established. Do not run assertion-based
 validators with Python `-O`.
 
 CI uploads evidence on success/failure and runs a separate cleanup job. It stops
-publisher/workers, removes objects under exactly the profile's delta-prefix/run-ID
-(including partial publications), and deletes the namespace after checking its
-ownership label. Cleanup logs are retained separately; artifacts expire after
+publisher/workers, removes objects under the rendered `artifact_prefix`
+(delta-prefix/run-ID for the delta scenario, including partial publications), and deletes the namespace after checking its
+ownership label and verifying S3 deletion. Cleanup logs are retained separately; artifacts expire after
 14 days. Cluster outages or forced workflow stops can still require manual
 exact-run cleanup. S3 version history follows bucket lifecycle policy.
 
 Run resources use the `mx-benchmark` label for selection and cleanup.
-Manual cleanup uses the publication report and preserves the namespace, snapshot,
-and local evidence. If publication never wrote its report, manual cleanup stops
-for inspection. Never delete the shared model prefix or bucket. Every fresh run
+Manual and CI cleanup share exact-run prefix deletion, including incomplete
+publication and retries after partial deletion. Manual cleanup preserves the
+namespace, snapshot and local evidence. CI deletes its owned namespace only after
+object deletion is verified; failures release benchmark GPU pods and retain the
+namespace and service account for a retry. Retry `ci.py cleanup` with the original
+run ID, namespace, GitHub run ID/attempt and image/environment settings. Rerunning
+the whole GitHub workflow uses a new attempt and does not recover an older retained
+namespace. Never delete the shared model prefix or bucket. Every fresh run
 has isolated server/Redis state and empty worker volumes.

@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   benchmark:
-    name: Benchmark
+    name: RL refit harness tests
     permissions:
       contents: read
     runs-on: ubuntu-latest

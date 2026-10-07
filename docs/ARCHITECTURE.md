@@ -1768,3 +1768,46 @@ be qualified with changing weights, shared parameters, graph-bound addresses,
 post-load state and failure cleanup. Quantized bounded installation remains
 unsupported. The same generic path is used for small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
+
+
+## RL refit CI harness
+
+`ci/bench/` shares one Kubernetes lifecycle and pause/refit/verify/resume protocol
+between manual runs and the reusable `.github/workflows/rl-refit-ci.yml` workflow.
+The comment-triggered `bench-ci.yml` authorizes requests and selects inputs; the
+reusable workflow independently verifies the caller, approved PR revision, model,
+scenario and runtime before building images. `scripts/ci.py` owns namespace
+ownership, GPU quotas, IRSA and image credentials. `harness/lifecycle.py` owns
+workload execution, evidence collection and cleanup for both entry points.
+
+`harness/scenario.py` selects the registered scenario. The implemented delta/S3
+scenario in `scenarios/delta/scenario.py` configures preparation modules,
+publication location, initial/target versions and explicit worker sources. The
+`DeltaScenario` instance owns checkpoint, installed tensor and inventory validation.
+`RefitRunner` holds the run configuration, HTTP endpoints and evidence directory
+without executing the protocol at import time. The shared driver does not derive
+versions or dispatch sources from role names. Another refit scenario can supply
+its own preparation and verification without changing the common RL protocol;
+no reshard scenario or CI case is registered yet.
+
+The worker extension exposes direct RPCs for initialization, refit, tensor hashes,
+host scales, checkpoint verification and installed runtime tensor verification.
+Installed embedding verification uses vLLM's vocabulary-parallel weight loader
+on a separate CPU parameter, preserving its sharding, padding and dtype rules.
+Unsupported packed embeddings fail verification. Validation remains outside
+transfer and installation timing.
+
+Cleanup stops all benchmark producers before deleting the exact run's S3 artifact
+prefix, including incomplete publications. A separate CPU pod performs cleanup,
+so failed or expired benchmark pods are not required for recovery. CI deletes the
+owned namespace only after cleanup is verified; a failed attempt releases GPUs
+and preserves namespace credentials for retry.
+
+Runtime code is organized into `harness/` for shared orchestration and validation,
+`scenarios/delta/` for seed download, delta publication and delta-specific checks,
+and `engines/vllm/` for the vLLM server and worker extension. `scripts/` contains
+CLI entry points and CI authorization/provisioning. The renderer bundles shared
+runtime code, the selected scenario and the vLLM adapter; host rendering and
+Kubernetes lifecycle code are not mounted in workload pods. ConfigMap item paths
+preserve Python packages, and pod commands use `python3 -m` with ordinary package
+imports. Configuration is loaded explicitly when a command starts.
