@@ -118,6 +118,22 @@ where
 }
 
 fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersion> {
+    // Keep the legacy URI field; records without a provider were written as S3.
+    let object_storage = fields
+        .get("s3_uri")
+        .filter(|uri| !uri.is_empty())
+        .map(|uri| -> RefitResult<ObjectStorageSource> {
+            let storage_type = if fields.contains_key("object_storage_type") {
+                parse_hash_field(&fields, "object_storage_type")?
+            } else {
+                ObjectStorageType::S3.into()
+            };
+            Ok(ObjectStorageSource {
+                uri: uri.clone(),
+                storage_type,
+            })
+        })
+        .transpose()?;
     Ok(WeightVersion {
         uid: hash_field(&fields, "uid")?.to_string(),
         model_name: hash_field(&fields, "model_name")?.to_string(),
@@ -134,13 +150,7 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
         layout_signature: hash_field(&fields, "layout_signature")?.to_string(),
         state: parse_hash_field(&fields, "state")?,
         created_at_unix_ms: parse_hash_field(&fields, "created_at_unix_ms")?,
-        object_storage: fields
-            .get("s3_uri")
-            .filter(|uri| !uri.is_empty())
-            .map(|uri| ObjectStorageSource {
-                uri: uri.clone(),
-                storage_type: ObjectStorageType::S3.into(),
-            }),
+        object_storage,
     })
 }
 
@@ -253,7 +263,15 @@ impl RedisRefitBackend {
             )
             .arg(request.state)
             .arg(request.state)
-            .arg(now_unix_ms()?);
+            .arg(now_unix_ms()?)
+            .arg(
+                request
+                    .object_storage
+                    .as_ref()
+                    .map_or(i32::from(ObjectStorageType::Unspecified), |source| {
+                        source.storage_type
+                    }),
+            );
         for source_slot_id in &request.expected_source_slots {
             invocation.arg(source_slot_id);
         }
@@ -619,6 +637,34 @@ impl RefitBackend for RedisRefitBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_s3_version_metadata_remains_readable() -> RefitResult<()> {
+        let fields = HashMap::from([
+            ("uid", "legacy-s3"),
+            ("model_name", "test/model"),
+            ("idempotency_key", "legacy-request"),
+            ("payload_format", "3"),
+            ("base_version_id", ""),
+            ("expected_source_slots", "[]"),
+            ("layout_signature", ""),
+            ("state", "2"),
+            ("created_at_unix_ms", "1234"),
+            ("s3_uri", "s3://weights/run/model.safetensors.index.json"),
+        ])
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let version = version_from_hash(fields)?;
+        assert_eq!(
+            version.object_storage,
+            Some(ObjectStorageSource {
+                uri: "s3://weights/run/model.safetensors.index.json".to_string(),
+                storage_type: ObjectStorageType::S3.into(),
+            })
+        );
+        Ok(())
+    }
 
     #[test]
     fn version_ids_cannot_collide_with_derived_keys() {
