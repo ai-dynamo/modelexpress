@@ -1609,15 +1609,18 @@ requests. Labels do not trigger this workflow.
 The hosted gate checks permission and resolves immutable source/model/scenario outputs.
 `bench-ci.yml` handles comment authorization and configured runtime selection, then
 calls `rl-refit-ci.yml`. The reusable workflow accepts PR number, exact source SHA,
-model, scenario and digest-pinned runtime inputs. It repeats the caller permission,
-current-head and mirror checks before privileged builds, so direct workflow callers
-cannot bypass approval. One trusted default-branch harness revision is resolved on
-the hosted runner and reused by the build, test and cleanup jobs.
-Privileged jobs build that approved ModelExpress revision using trusted
-default-branch Dockerfiles and harness scripts. Per-model runtime bases are
+model, scenario and digest-pinned runtime inputs. Comment runs repeat the caller
+permission, current-head and mirror checks before privileged builds. Automatic
+runs derive the PR number from the upstream `pull-request/<N>` push and require
+the event SHA to match the current open PR and approved mirror. One trusted harness
+revision is resolved on the hosted runner and reused by build, test and cleanup:
+the approved mirrored SHA for automatic runs, or the default branch for comments.
+Privileged jobs build that approved ModelExpress revision using the selected
+trusted Dockerfiles and harness scripts. Per-model runtime bases are
 configured by digest; built images are also consumed by digest. Harness edits in
-a PR have CPU-only tests; GPU runs use the default-branch harness until the edits
-merge. `issue_comment` requires the workflow on the default branch, as documented
+a PR run on GPUs after copy-pr-bot approval in automatic Nemotron CI. Opt-in
+comment runs use the default-branch harness until the edits merge.
+`issue_comment` requires the workflow on the default branch, as documented
 by [GitHub](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#issue_comment).
 
 Configure these repository Actions variables:
@@ -1644,8 +1647,16 @@ identity is not inherited by workload pods. Populate all checkpoint shards and
 the snapshot manifest and checks downloaded file sizes against S3 object sizes. CI does not
 provision IAM, mirror snapshots, deploy MinIO, or use the Vime job's FSx cache.
 
-The `ModelExpress benchmark CI` comment workflow delegates execution to the shared
-`RL refit benchmark CI` workflow for the selected profile and scenario. It stays outside the required GPU CI aggregate; offline
+The `RL weight refit CI` comment workflow delegates execution to the shared
+`RL refit CI` workflow for the selected profile and scenario. The GPU job is named
+`RL refit / S3 delta-weight refit (PROFILE)` for the delta scenario. Every trusted
+PR automatically calls the same workflow for Nemotron, under
+`Small model S3 refit / S3 delta-weight refit (nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4)`.
+Workflow callers can pass a profile key or its registered full model name; validation
+resolves it to the profile key for resource names and configuration. The required `CI status check`
+depends on this workflow, including cleanup; missing runtime, IAM, or seed configuration
+fails the gate. Kimi remains opt-in. Automatic runs check out the approved mirrored
+SHA for the harness; comment runs use the default-branch harness. Offline
 contracts run on every PR in the `RL refit harness tests` job. The namespace GPU quota follows the rendered profile's
 TP size (one for Nemotron, eight for Kimi). Image builds have a 60-minute timeout;
 the test job has a 60-minute timeout, its experiment step 45 minutes, and pods a
@@ -1653,7 +1664,8 @@ the test job has a 60-minute timeout, its experiment step 45 minutes, and pods a
 a timeout is a failure. Requests serialize per PR without canceling active runs, with up to 100 pending
 runs retained in the concurrency queue.
 Actions runs expose the tested SHA and artifacts; the workflow does not post PR
-comments or add a required PR-head status check.
+comments. Automatic trusted-PR runs serialize per PR so a newer push cannot cancel
+S3 cleanup.
 
 ### Manual CLI and environments
 

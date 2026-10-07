@@ -127,10 +127,10 @@ on:
 
 concurrency:
   # github.ref_name is the bot-created branch (e.g. `pull-request/123`), so
-  # consecutive pushes to the same PR cancel earlier runs but pushes to
-  # different PRs don't fight for the same group.
+  # Serialize each PR so a later push cannot cancel S3 cleanup.
   group: ${{ github.workflow }}-${{ github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: false
+  queue: max
 
 env:
   MX_CI_MODEL: Qwen/Qwen2.5-0.5B
@@ -142,6 +142,19 @@ env:
   MX_IMAGE_REPO: nvcr.io/0980761089281446
 
 jobs:
+  nemotron-s3-refit:
+    name: Small model S3 refit
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/rl-refit-ci.yml
+    with:
+      model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+      scenario: delta
+      sha: ${{ github.sha }}
+      runtime: ${{ fromJSON(vars.MX_BENCH_RUNTIME_BASES || '{}').nemotron || '' }}
+    secrets: inherit
+
   # ---------------------------------------------------------------------------
   # Build the MX coordination server image from source.
   # Image tag convention: <MX_IMAGE_REPO>/mx-server:<sha>
@@ -1335,6 +1348,7 @@ jobs:
       - test-rolling-update
       - test-stale-metadata
       - model-streamer
+      - nemotron-s3-refit
     if: always()
     steps:
       - name: All dependent jobs succeeded

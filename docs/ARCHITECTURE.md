@@ -1776,8 +1776,11 @@ passing the former does not establish full-model correctness or performance.
 between manual runs and the reusable `.github/workflows/rl-refit-ci.yml` workflow.
 The comment-triggered `bench-ci.yml` authorizes requests and selects inputs; the
 reusable workflow independently verifies the caller, approved PR revision, model,
-scenario and runtime before building images. `scripts/ci.py` owns namespace
-ownership, GPU quotas, IRSA and image credentials. `harness/lifecycle.py` owns
+scenario and runtime before building images.
+The trusted-PR GPU workflow also calls it automatically for Nemotron S3 delta refit,
+using the approved mirrored harness revision. Its result, including cleanup, gates
+the required `CI status check`; Kimi remains comment-triggered.
+`scripts/ci.py` owns namespace ownership, GPU quotas, IRSA and image credentials. `harness/lifecycle.py` owns
 workload execution, evidence collection and cleanup for both entry points.
 
 `harness/scenario.py` selects the registered scenario. The implemented delta/S3

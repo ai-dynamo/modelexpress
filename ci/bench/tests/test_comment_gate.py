@@ -174,3 +174,64 @@ def test_reusable_workflow_cannot_bypass_permission_or_mirroring(change):
     _, get = request(**change)
     with pytest.raises(ValueError):
         gate.authorize_workflow(workflow_environment(), get)
+
+
+def mirror_environment():
+    return {
+        **workflow_environment(),
+        "GITHUB_EVENT_NAME": "push",
+        "GITHUB_REF": "refs/heads/pull-request/42",
+        "GITHUB_SHA": SHA,
+        "GITHUB_ACTOR": "copy-pr-bot[bot]",
+        "PR_NUMBER": "0",
+    }
+
+
+def test_trusted_mirror_push_does_not_require_bot_writer_permission():
+    _, get = request(permission="read")
+    assert gate.authorize_workflow(mirror_environment(), get) == {
+        "sha": SHA,
+        "model": "nemotron",
+        "scenario": "delta",
+    }
+
+
+@pytest.mark.parametrize("environment", [workflow_environment, mirror_environment])
+def test_workflow_accepts_full_model_name_and_returns_safe_profile_key(environment):
+    _, get = request()
+    result = gate.authorize_workflow(
+        {
+            **environment(),
+            "MODEL_PROFILE": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+        },
+        get,
+    )
+    assert result == {"sha": SHA, "model": "nemotron", "scenario": "delta"}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"GITHUB_REPOSITORY": "contributor/modelexpress"},
+        {"GITHUB_REF": "refs/heads/main"},
+        {"GITHUB_REF": "refs/heads/pull-request/042"},
+        {"GITHUB_REF": "refs/pull/42/merge"},
+        {"GITHUB_SHA": "b" * 40},
+        {"PR_NUMBER": "43"},
+        {"MODEL_PROFILE": "unknown"},
+        {"SCENARIO": "reshard"},
+    ],
+)
+def test_reusable_workflow_rejects_untrusted_push(change):
+    _, get = request()
+    with pytest.raises(ValueError):
+        gate.authorize_workflow({**mirror_environment(), **change}, get)
+
+
+@pytest.mark.parametrize(
+    "change", [{"mirror": "b" * 40}, {"head": "b" * 40}, {"state": "closed"}]
+)
+def test_mirror_push_still_requires_current_approved_open_pr(change):
+    _, get = request(**change)
+    with pytest.raises(ValueError):
+        gate.authorize_workflow(mirror_environment(), get)

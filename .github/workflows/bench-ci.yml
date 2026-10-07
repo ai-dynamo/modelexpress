@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-name: ModelExpress benchmark CI
-run-name: "Benchmark PR #${{ github.event.issue.number }} requested by @${{ github.actor }}"
+name: RL weight refit CI
+run-name: "RL weight refit PR #${{ github.event.issue.number }} requested by @${{ github.actor }}"
 
 on:
   issue_comment:
@@ -67,6 +67,7 @@ jobs:
           PY
 
   benchmark:
+    name: RL refit
     needs: authorize
     permissions:
       contents: read

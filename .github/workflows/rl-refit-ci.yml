@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-name: RL refit benchmark CI
+name: RL refit CI
 
 on:
   workflow_call:
     inputs:
       pull_request:
         type: number
-        required: true
+        default: 0
       model:
         type: string
         required: true
@@ -37,7 +37,6 @@ env:
   RESULTS_DIR: ${{ github.workspace }}/bench-results
   MODEL_PROFILE: ${{ inputs.model }}
   SCENARIO: ${{ inputs.scenario }}
-  RUN_ID: ${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   validate:
@@ -48,11 +47,12 @@ jobs:
       pull-requests: read
     outputs:
       harness_sha: ${{ steps.inputs.outputs.harness_sha }}
+      model: ${{ steps.inputs.outputs.model }}
     steps:
       - name: Checkout trusted harness
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.event_name == 'push' && inputs.sha || github.event.repository.default_branch }}
           persist-credentials: false
       - name: Validate immutable source and registered experiment
         id: inputs
@@ -106,12 +106,13 @@ jobs:
           echo "worker=$repo/mx-bench-worker@$(jq -r '."containerimage.digest"' worker-build.json)" >> "$GITHUB_OUTPUT"
 
   test:
+    name: "${{ inputs.scenario == 'delta' && 'S3 delta-weight refit' || format('RL refit ({0})', inputs.scenario) }} (${{ inputs.model }})"
     needs: [validate, build]
     runs-on: prod-deploy-tester-v1
     timeout-minutes: 60
     env:
-      MODEL_PROFILE: ${{ inputs.model }}
-      RUN_ID: ${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
+      MODEL_PROFILE: ${{ needs.validate.outputs.model }}
+      RUN_ID: ${{ needs.validate.outputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
       SERVER_IMAGE: ${{ needs.build.outputs.server }}
       WORKER_IMAGE: ${{ needs.build.outputs.worker }}
     steps:
@@ -125,7 +126,7 @@ jobs:
         env:
           NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
         run: python3 ci/bench/scripts/ci.py setup
-      - name: Benchmark cold load and refit
+      - name: Verify refitted GPU weights and measure cold-load and refit latency
         timeout-minutes: 45
         run: python3 ci/bench/scripts/ci.py run
       - name: Collect evidence
@@ -143,7 +144,7 @@ jobs:
         if: always()
         env:
           TEST_SHA: ${{ inputs.sha }}
-        run: echo "ModelExpress benchmark CI of $TEST_SHA; evidence is attached to this run." >> "$GITHUB_STEP_SUMMARY"
+        run: echo "RL weight refit CI of $TEST_SHA; evidence is attached to this run." >> "$GITHUB_STEP_SUMMARY"
 
   cleanup:
     needs: [validate, build, test]
@@ -151,8 +152,8 @@ jobs:
     runs-on: prod-deploy-tester-v1
     timeout-minutes: 15
     env:
-      MODEL_PROFILE: ${{ inputs.model }}
-      RUN_ID: ${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
+      MODEL_PROFILE: ${{ needs.validate.outputs.model }}
+      RUN_ID: ${{ needs.validate.outputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
       SERVER_IMAGE: ${{ needs.build.outputs.server }}
       WORKER_IMAGE: ${{ needs.build.outputs.worker }}
     steps:

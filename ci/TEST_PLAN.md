@@ -60,8 +60,10 @@ When a row moves status, update this table in the same PR so the doc stays the s
 `ci/bench/` contains registered Nemotron and Kimi-K2.7-Code profiles. Offline
 contracts run on every PR in `RL refit harness tests`. `bench-ci.yml` accepts `/bench [--model PROFILE]
 [--scenario delta] [--sha FULL_SHA]` from repository writers after copy-pr-bot mirrors the current
-head. It calls reusable `rl-refit-ci.yml`, which independently repeats authorization
-before building the requested SHA. Only delta is registered; no reshard CI case
+head. Every trusted PR also runs the one-GPU Nemotron S3 delta-weight refit through
+`rl-refit-ci.yml`; `CI status check` requires its build, GPU test, and cleanup to succeed.
+Kimi remains opt-in. The reusable workflow independently validates the current
+approved mirror before building the requested SHA. Only delta is registered; no reshard CI case
 is introduced. S3-only GPU runs use profile-derived quotas and configured per-model runtime
 images. No live AWS validation has been performed; Kimi refit compatibility is
 not established. Peer coverage stays manual. See
