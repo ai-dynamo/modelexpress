@@ -142,6 +142,34 @@ async fn wait_for_listener(port: u16) {
     panic!("server never listened on {port}");
 }
 
+/// The error and every source under it, joined, since tonic's transport error
+/// prints only "transport error" at the top.
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(inner) = source {
+        parts.push(inner.to_string());
+        source = inner.source();
+    }
+    parts.join(": ")
+}
+
+/// The client refused the server certificate, rather than failing to connect
+/// at all. OpenSSL reports every verification failure the same way, so only
+/// the rustls build can check `rustls_reason` too.
+fn assert_certificate_rejected(chain: &str, rustls_reason: &str) {
+    #[cfg(feature = "tls-openssl")]
+    {
+        let _ = rustls_reason;
+        assert!(chain.contains("certificate verify failed"), "{chain}");
+    }
+    #[cfg(not(feature = "tls-openssl"))]
+    {
+        assert!(chain.contains("invalid peer certificate"), "{chain}");
+        assert!(chain.contains(rustls_reason), "{chain}");
+    }
+}
+
 async fn stop(tx: oneshot::Sender<()>, handle: JoinHandle<ServerResult>) {
     tx.send(()).expect("server still running");
     tokio::time::timeout(Duration::from_secs(10), handle)
@@ -219,17 +247,46 @@ async fn client_with_the_wrong_ca_is_refused() {
     );
     wait_for_listener(port).await;
 
-    let outcome = Client::new(client_config("https", port, Some(&other_pair.ca))).await;
-    assert!(
-        outcome.is_err(),
-        "a CA that did not issue the server cert must fail verification"
-    );
+    let Err(error) = Client::new(client_config("https", port, Some(&other_pair.ca))).await else {
+        panic!("a CA that did not issue the server cert must fail verification");
+    };
+    let chain = error_chain(error.as_ref());
+    assert_certificate_rejected(&chain, "UnknownIssuer");
 
     stop(tx, handle).await;
 }
 
 #[tokio::test]
-async fn modern_profile_is_honored_end_to_end() {
+async fn certificate_for_another_name_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let server_pair = chain(&dir, "server");
+    let [port] = free_ports::<1>();
+    let (tx, handle) = start_server(
+        port,
+        TlsConfig {
+            cert_file: Some(server_pair.cert.clone()),
+            key_file: Some(server_pair.key.clone()),
+            ..TlsConfig::default()
+        },
+    );
+    wait_for_listener(port).await;
+
+    let Err(error) = Client::new(client_config_for(
+        &format!("https://localhost:{port}"),
+        Some(&server_pair.ca),
+    ))
+    .await
+    else {
+        panic!("a leaf with only IP SANs must not verify for localhost");
+    };
+    let chain = error_chain(error.as_ref());
+    assert_certificate_rejected(&chain, "not valid for name \"localhost\"");
+
+    stop(tx, handle).await;
+}
+
+#[tokio::test]
+async fn modern_profile_serves_a_tls13_client() {
     let dir = TempDir::new().expect("tempdir");
     let server_pair = chain(&dir, "server");
     let [port] = free_ports::<1>();
