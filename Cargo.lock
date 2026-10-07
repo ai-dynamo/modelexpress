@@ -2615,6 +2615,7 @@ dependencies = [
  "hyper-util",
  "modelexpress-common",
  "openssl",
+ "rcgen",
  "rustls",
  "rustls-native-certs 0.8.3",
  "serde",

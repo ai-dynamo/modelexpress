@@ -63,6 +63,7 @@ http = { workspace = true, optional = true }
 [dev-dependencies]
 modelexpress-common = { workspace = true, default-features = false, features = ["test-support"] }
 tempfile = "3.20"
+rcgen = { workspace = true }
 
 [lints]
 workspace = true

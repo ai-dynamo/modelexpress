@@ -399,7 +399,7 @@ endpoint from `MODEL_EXPRESS_ENDPOINT` or `--endpoint`; the Python client reads
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
-| `MODEL_EXPRESS_TLS_CA_FILE` | (system roots) | PEM CA bundle that issued the server certificate. Setting it also turns TLS on for a bare `host:port` address in the Python client. |
+| `MODEL_EXPRESS_TLS_CA_FILE` | (system roots) | PEM CA bundle that issued the server certificate. Both clients trust only this bundle when it is set, not the system roots. Setting it also turns TLS on for a bare `host:port` address in the Python client. |
 
 A certificate from an in-cluster signer verifies against that signer's CA bundle. Mount the
 bundle into the worker pod and point the variable at it.
