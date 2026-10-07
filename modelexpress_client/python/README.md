@@ -27,12 +27,28 @@ SGLang, Dynamo, and NemoRL runtime images all ship `nixl-cu12` or
 `nixl-cu13`). For a bare-environment install, run `pip install nixl-cu12`
 or `pip install nixl-cu13` separately, matching your host CUDA toolkit.
 
+The collective refit path in `modelexpress_rl.collective` needs NCCL M2N,
+which ships separately from `nccl4py` as the `nccl-extensions` distribution
+under the same `nccl` namespace. Run `pip install "nccl-extensions[cu12]"`
+or `pip install "nccl-extensions[cu13]"`, matching your host CUDA toolkit.
+The CUDA major has to be named: a bare `pip install nccl-extensions`
+resolves and then fails to import, because `cuda-bindings` only arrives
+through one of those two extras. Nothing else in the client imports it, so
+an installation that never uses collective refit does not need it.
+
+Reshard needs NCCL 2.30.7 or newer, and an image that ships its own older
+libnccl will win the load over the one pip installed. That failure surfaces
+inside the reshard call rather than at import, so check which library the
+process resolves rather than which one is on disk. The NGC PyTorch 26.06
+image ships 2.30.5 and needs the newer library preloaded.
+
 ### Requirements
 
 - Python >= 3.10
 - protobuf >= 5.27.2 and < 7
 - NVIDIA GPUs with RDMA/InfiniBand support
 - [NIXL](https://github.com/ai-dynamo/nixl) (NVIDIA Interconnect eXchange Library)
+- [NCCL M2N](https://pypi.org/project/nccl-extensions/) (`nccl-extensions`, collective refit only)
 - A running [ModelExpress server](https://github.com/ai-dynamo/modelexpress/tree/main/modelexpress_server) (Rust gRPC service backed by Redis)
 
 ## Quick Start with vLLM
