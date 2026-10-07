@@ -42,8 +42,9 @@ pub fn tcp(stream: &Stream) -> &TcpStream {
     stream.get_ref().0
 }
 
-/// OpenSSL cipher names rustls implements, with the suite each one names.
-const CIPHERS: [(&str, CipherSuite); 9] = [
+/// Cipher names rustls implements, with the suite each one names: the OpenSSL
+/// names, then the IANA names OpenSSL also accepts for the TLS 1.2 suites.
+const CIPHERS: [(&str, CipherSuite); 15] = [
     (
         "TLS_AES_128_GCM_SHA256",
         CipherSuite::TLS13_AES_128_GCM_SHA256,
@@ -78,6 +79,30 @@ const CIPHERS: [(&str, CipherSuite); 9] = [
     ),
     (
         "ECDHE-RSA-CHACHA20-POLY1305",
+        CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    ),
+    (
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    ),
+    (
+        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+    ),
+    (
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    ),
+    (
+        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+    ),
+    (
+        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+    ),
+    (
+        "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
         CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
     ),
 ];
@@ -598,6 +623,31 @@ mod tests {
     async fn cipher_suites_restrict_tls12_negotiation() {
         let restrict = |config: &mut TlsConfig| {
             config.cipher_suites = strings(&["ECDHE-ECDSA-AES256-GCM-SHA384"]);
+        };
+        let negotiated = handshake(
+            server(restrict),
+            tls12_only(&[CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384]),
+        )
+        .await
+        .expect("listed suite");
+        assert_eq!(
+            negotiated.suite,
+            CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        );
+        assert!(
+            handshake(
+                server(restrict),
+                tls12_only(&[CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256]),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn iana_tls12_cipher_names_restrict_negotiation() {
+        let restrict = |config: &mut TlsConfig| {
+            config.cipher_suites = strings(&["TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"]);
         };
         let negotiated = handshake(
             server(restrict),

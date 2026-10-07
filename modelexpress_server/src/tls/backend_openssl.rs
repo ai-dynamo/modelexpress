@@ -6,6 +6,7 @@
 use std::pin::Pin;
 
 use modelexpress_common::tls::{TlsVersion, split_cipher_suites};
+use openssl::error::ErrorStack;
 use openssl::ssl::{
     AlpnError, Ssl, SslContext, SslContextBuilder, SslFiletype, SslMethod, SslVersion,
     select_next_proto,
@@ -54,9 +55,11 @@ pub fn build(config: &TlsConfig) -> Result<Option<Acceptor>, TlsError> {
     builder.check_private_key()?;
     builder.set_min_proto_version(Some(ssl_version(min_version(config.min_version))))?;
     let (tls12, tls13) = split_cipher_suites(&config.cipher_suites);
+    let tls12 = supported_names(&tls12, "TLS1.2 cipher", SslContextBuilder::set_cipher_list)?;
     if !tls12.is_empty() {
         builder.set_cipher_list(&tls12.join(":"))?;
     }
+    let tls13 = supported_names(&tls13, "TLS1.3 cipher", SslContextBuilder::set_ciphersuites)?;
     if !tls13.is_empty() {
         builder.set_ciphersuites(&tls13.join(":"))?;
     }
@@ -86,30 +89,46 @@ fn min_version(configured: Option<TlsVersion>) -> TlsVersion {
 }
 
 /// The subset of `groups` this OpenSSL can negotiate, in the order given, or
-/// none when `groups` is empty, which leaves the OpenSSL defaults. Each name
-/// is probed separately, since `set_groups_list` rejects a whole list
-/// containing one unknown name. A list naming no supported group is an error:
-/// falling back to the defaults would widen the key exchange policy the list
-/// asked for.
+/// none when `groups` is empty, which leaves the OpenSSL defaults.
 fn supported_groups(groups: &[String]) -> Result<Vec<String>, TlsError> {
-    let groups: Vec<&str> = groups
+    supported_names(groups, "group", SslContextBuilder::set_groups_list)
+}
+
+/// The names in `names` that `set` accepts on its own, in the order given.
+/// Each name is probed separately: `set_groups_list` rejects a whole list
+/// containing one unknown name, while `set_cipher_list` and `set_ciphersuites`
+/// skip unknown names without a word as long as one matches. Cipher string
+/// operators (`!aNULL`, `-RSA`, `+AES`, `@STRENGTH`) pass through unprobed,
+/// since they match nothing on their own. A list naming nothing supported is
+/// an error: falling back to the defaults would widen the policy the list
+/// asked for.
+fn supported_names(
+    names: &[String],
+    kind: &str,
+    set: fn(&mut SslContextBuilder, &str) -> Result<(), ErrorStack>,
+) -> Result<Vec<String>, TlsError> {
+    let names: Vec<&str> = names
         .iter()
-        .map(|g| g.trim())
-        .filter(|g| !g.is_empty())
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
         .collect();
     let mut probe = SslContextBuilder::new(SslMethod::tls_server())?;
-    let mut supported = Vec::with_capacity(groups.len());
-    for group in groups.iter().copied() {
-        if probe.set_groups_list(group).is_ok() {
-            supported.push(group.to_string());
+    let mut supported = Vec::with_capacity(names.len());
+    let mut matched = false;
+    for name in names.iter().copied() {
+        if name.starts_with(['!', '-', '+', '@']) {
+            supported.push(name.to_string());
+        } else if set(&mut probe, name).is_ok() {
+            matched = true;
+            supported.push(name.to_string());
         } else {
-            warn!("TLS group {group} is not supported by the linked OpenSSL; dropping it");
+            warn!("TLS {kind} {name} is not supported by the linked OpenSSL; dropping it");
         }
     }
-    if supported.is_empty() && !groups.is_empty() {
+    if !names.is_empty() && !matched {
         return Err(TlsError::Unsupported(format!(
-            "none of the groups {} are supported by the linked OpenSSL",
-            groups.join(":")
+            "none of the {kind}s {} are supported by the linked OpenSSL",
+            names.join(":")
         )));
     }
     Ok(supported)
@@ -444,7 +463,10 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut config = config(&dir);
         config.cipher_suites = vec!["NOT-A-CIPHER".to_string()];
-        assert!(matches!(context(&config), Err(TlsError::OpenSsl(_))));
+        let Err(TlsError::Unsupported(message)) = context(&config) else {
+            panic!("expected an unsupported-ciphers error");
+        };
+        assert!(message.contains("NOT-A-CIPHER"), "{message}");
     }
 
     #[test]
@@ -452,6 +474,96 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut config = config(&dir);
         config.cipher_suites = vec!["TLS_NOT_A_SUITE".to_string()];
-        assert!(matches!(context(&config), Err(TlsError::OpenSsl(_))));
+        let Err(TlsError::Unsupported(message)) = context(&config) else {
+            panic!("expected an unsupported-suites error");
+        };
+        assert!(message.contains("TLS_NOT_A_SUITE"), "{message}");
+    }
+
+    #[test]
+    fn unknown_cipher_names_are_dropped_beside_known_ones() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = config(&dir);
+        config.min_version = Some(TlsVersion::Tls12);
+        config.cipher_suites = vec![
+            "NOT-A-CIPHER".to_string(),
+            "ECDHE-RSA-AES256-GCM-SHA384".to_string(),
+            "TLS_NOT_A_SUITE".to_string(),
+            "TLS_AES_256_GCM_SHA384".to_string(),
+        ];
+        let ctx = context(&config).expect("build").expect("enabled");
+        assert!(
+            handshake_with(
+                &ctx,
+                SslVersion::TLS1_2,
+                Some("ECDHE-RSA-AES256-GCM-SHA384")
+            )
+            .is_ok()
+        );
+        assert!(
+            handshake_with(
+                &ctx,
+                SslVersion::TLS1_2,
+                Some("ECDHE-RSA-AES128-GCM-SHA256")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn iana_tls12_cipher_names_restrict_negotiation() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = config(&dir);
+        config.min_version = Some(TlsVersion::Tls12);
+        config.cipher_suites = vec![
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384".to_string(),
+            "TLS_AES_256_GCM_SHA384".to_string(),
+        ];
+        let ctx = context(&config).expect("build").expect("enabled");
+        assert!(
+            handshake_with(
+                &ctx,
+                SslVersion::TLS1_2,
+                Some("ECDHE-RSA-AES256-GCM-SHA384")
+            )
+            .is_ok()
+        );
+        assert!(
+            handshake_with(
+                &ctx,
+                SslVersion::TLS1_2,
+                Some("ECDHE-RSA-AES128-GCM-SHA256")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cipher_string_operators_pass_through() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = config(&dir);
+        config.min_version = Some(TlsVersion::Tls12);
+        config.cipher_suites = vec![
+            "ECDHE-RSA-AES256-GCM-SHA384".to_string(),
+            "ECDHE-RSA-AES128-GCM-SHA256".to_string(),
+            "!AES128".to_string(),
+        ];
+        let ctx = context(&config).expect("build").expect("enabled");
+        assert!(
+            handshake_with(
+                &ctx,
+                SslVersion::TLS1_2,
+                Some("ECDHE-RSA-AES256-GCM-SHA384")
+            )
+            .is_ok()
+        );
+        assert!(
+            handshake_with(
+                &ctx,
+                SslVersion::TLS1_2,
+                Some("ECDHE-RSA-AES128-GCM-SHA256")
+            )
+            .is_err()
+        );
     }
 }
