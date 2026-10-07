@@ -37,6 +37,11 @@ impl Acceptor {
     }
 }
 
+#[cfg(test)]
+pub fn tcp(stream: &Stream) -> &TcpStream {
+    stream.get_ref().0
+}
+
 /// OpenSSL cipher names rustls implements, with the suite each one names.
 const CIPHERS: [(&str, CipherSuite); 9] = [
     (
