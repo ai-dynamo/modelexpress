@@ -118,6 +118,8 @@ jobs:
           - --no-default-features --features openssl
           - --no-default-features --features tls-rustls,gcs
           - --no-default-features --features openssl,gcs
+          - --no-default-features --features tls-rustls,s3
+          - --no-default-features --features openssl,s3
 
     steps:
     - name: Checkout repository
