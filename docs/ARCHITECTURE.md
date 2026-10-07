@@ -1623,6 +1623,13 @@ attribute access, setters and parameter-registration hooks retain the original
 path lookup and assignment behavior; no validation verdict is cached across
 callbacks or updates.
 
+Before reload initialization, alias restoration uses vLLM's recorded parameter
+metadata to separate load-time ties from runtime-only aliases such as WNA16's
+`w13_weight` and `w2_weight`. Capture and checkpoint loading reconnect only the
+load-time slots; native post-processing recreates runtime aliases. Missing
+load-time slots still fail restoration, and final runtime identity and storage
+validation remains required.
+
 Warm load-layout capture keeps a private snapshot when records contain only
 ordinary immutable metadata. Each caller receives fresh mutable capture records
 and containers, with duplicate record references preserved. Slice-containing
