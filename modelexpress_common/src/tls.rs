@@ -70,6 +70,8 @@ impl std::str::FromStr for TlsVersion {
 
 /// Split a mixed cipher list into what OpenSSL configures through
 /// `set_cipher_list` (TLS 1.2 and below) and `set_ciphersuites` (TLS 1.3).
+/// IANA-spelled TLS 1.2 names (`TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`) start
+/// with `TLS_` too, but contain `_WITH_`, which no TLS 1.3 suite name does.
 #[must_use]
 pub fn split_cipher_suites(names: &[String]) -> (Vec<String>, Vec<String>) {
     names
@@ -77,7 +79,7 @@ pub fn split_cipher_suites(names: &[String]) -> (Vec<String>, Vec<String>) {
         .map(|name| name.trim())
         .filter(|name| !name.is_empty())
         .map(str::to_string)
-        .partition(|name| !name.starts_with("TLS_"))
+        .partition(|name| !name.starts_with("TLS_") || name.contains("_WITH_"))
 }
 
 #[cfg(test)]
@@ -167,6 +169,27 @@ mod tests {
                 "TLS_CHACHA20_POLY1305_SHA256",
             ]
         );
+    }
+
+    #[test]
+    fn iana_tls12_names_stay_out_of_the_tls13_list() {
+        let names: Vec<String> = [
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            "TLS_AES_128_GCM_SHA256",
+            "ECDHE-RSA-AES256-GCM-SHA384",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let (tls12, tls13) = split_cipher_suites(&names);
+        assert_eq!(
+            tls12,
+            [
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                "ECDHE-RSA-AES256-GCM-SHA384",
+            ]
+        );
+        assert_eq!(tls13, ["TLS_AES_128_GCM_SHA256"]);
     }
 
     #[test]
