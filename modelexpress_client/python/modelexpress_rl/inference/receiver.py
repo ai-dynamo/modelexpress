@@ -436,7 +436,8 @@ class _LocalCheckpoint:
         self.locations: dict[str, tuple[Path, int, int]] = {}
         self.tensor_metadata: dict[str, dict] = {}
 
-    def initialize(self) -> None:
+    def initialize(self, *, allow_unrecorded_seed: bool = False) -> bool:
+        """Initialize the disk seed, or return False if bootstrap is deferred."""
         self.store.initialize()
         with self.store.installation_locked(), self.store.locked():
             initial_checkpoint = self.store.full_path(self.initial_version)
@@ -444,6 +445,13 @@ class _LocalCheckpoint:
             cached_seed = (
                 self.seed_checkpoint_path.resolve() == initial_checkpoint.resolve()
             )
+            if (
+                allow_unrecorded_seed
+                and cached_seed
+                and not self.store.has_artifact_record(initial_checkpoint)
+                and self.store.state() is None
+            ):
+                return False
             if cached_seed and not initial_checkpoint.is_dir():
                 raise FileNotFoundError(
                     f"cached seed checkpoint for {self.initial_version!r} "
@@ -459,6 +467,8 @@ class _LocalCheckpoint:
             self.store.enforce_capacity(
                 protected_versions=_protected_versions(self.store, version),
             )
+
+        return True
 
     def _initialize_checkpoint_state(
         self,
@@ -618,39 +628,45 @@ class _LocalCheckpoint:
         """Prepare an ordered chain into one immutable target checkpoint."""
         if not versions:
             raise ValueError("canonical replay chain is empty")
-        with self.store.installation_locked(), self.store.locked():
-            target = versions[-1]
-            state, active_version = self._load_ready_state()
-            prepared = self._reuse_prepared_target(
-                state=state,
-                target=target,
-                active_version=active_version,
-            )
-            if prepared is not None:
-                return prepared
-            # P2P can advance the engine without advancing this disk checkpoint.
-            # Choose the replay suffix from the verified cache head under lock.
-            for position, version in enumerate(versions[:-1]):
-                if version.version_id != state.version:
-                    continue
-                source = self.store.artifact_source(self._artifact_path(version))
-                if source is None:
+        target = versions[-1]
+        # Queue preparers separately so followers can reuse the target while
+        # the leader installs it, without first waiting for an exclusive fence.
+        with self.store.preparation_locked():
+            with self.store.installation_locked(shared=True), self.store.locked(
+                shared=True
+            ):
+                state, _active_version = self._load_ready_state()
+                prepared = self._reuse_prepared_target(state=state, target=target)
+                if prepared is not None:
+                    return prepared
+            with self.store.installation_locked(), self.store.locked():
+                state, active_version = self._load_ready_state()
+                prepared = self._reuse_prepared_target(state=state, target=target)
+                if prepared is not None:
+                    return prepared
+                # P2P can advance the engine without advancing this disk checkpoint.
+                # Choose the replay suffix from the verified cache head under lock.
+                for position, version in enumerate(versions[:-1]):
+                    if version.version_id != state.version:
+                        continue
+                    source = self.store.artifact_source(self._artifact_path(version))
+                    if source is None:
+                        break
+                    if source != _source_identity(version):
+                        raise ValueError("prepared checkpoint has different source identity")
+                    versions = versions[position + 1 :]
                     break
-                if source != _source_identity(version):
-                    raise ValueError("prepared checkpoint has different source identity")
-                versions = versions[position + 1 :]
-                break
-            manifests, index_download_time = self._download_replay_manifests(
-                versions=versions,
-                target=target,
-                base_version=state.version,
-            )
-            return self._reconstruct_target(
-                manifests=manifests,
-                target=target,
-                active_version=active_version,
-                index_download_time=index_download_time,
-            )
+                manifests, index_download_time = self._download_replay_manifests(
+                    versions=versions,
+                    target=target,
+                    base_version=state.version,
+                )
+                return self._reconstruct_target(
+                    manifests=manifests,
+                    target=target,
+                    active_version=active_version,
+                    index_download_time=index_download_time,
+                )
 
     def _load_ready_state(self) -> tuple[CheckpointRecord, str]:
         state = self.store.state()
@@ -671,15 +687,11 @@ class _LocalCheckpoint:
         *,
         state: CheckpointRecord,
         target: _S3Version,
-        active_version: str,
     ) -> PreparedCheckpoint | None:
         if state.version != target.version_id:
             return None
         # Followers reach this after the lock holder has reconstructed the
         # target. Source identity prevents attaching to a reused UID artifact.
-        self.store.enforce_capacity(
-            protected_versions={active_version, target.version_id},
-        )
         self.store.verify_artifact_source(
             self._artifact_path(target),
             _source_identity(target),

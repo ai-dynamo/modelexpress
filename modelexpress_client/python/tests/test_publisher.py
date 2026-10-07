@@ -483,6 +483,80 @@ class TestHeartbeatReRegistration:
         assert stale_calls == []
 
 
+class TestPublishTimeout:
+    """Publication timeout behavior for bounded and resident sources."""
+
+    def _publisher(self, mx_client, nixl_manager, publish, **overrides):
+        """Build a publishing thread with a short 10s publish timeout."""
+        kwargs = dict(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=publish,
+            interval_secs=1,
+            publish_timeout_secs=10,
+        )
+        kwargs.update(overrides)
+        return PublisherThread(**kwargs)
+
+    def _overdue(self, publisher):
+        """Pretend the publish window is long gone."""
+        publisher._publish_started_at = time.monotonic() - 10_000
+        return publisher
+
+    def test_zero_timeout_keeps_trying(self, mx_client, nixl_manager):
+        """A zero timeout retries indefinitely."""
+        publish = MagicMock(side_effect=RuntimeError("server down"))
+        with patch.dict("os.environ", {"MX_PUBLISH_TIMEOUT_SECS": "0"}):
+            publisher = self._overdue(
+                self._publisher(
+                    mx_client, nixl_manager, publish, publish_timeout_secs=None
+                )
+            )
+
+        publisher._tick()
+
+        assert not publisher._stop_event.is_set()
+        assert publish.call_count == 1
+
+    def test_zero_timeout_recovers_when_server_returns(
+        self, mx_client, nixl_manager
+    ):
+        """An unlimited publisher recovers once the server returns."""
+        publish = MagicMock(side_effect=[RuntimeError("server down"), "id1"])
+        with patch.dict("os.environ", {"MX_PUBLISH_TIMEOUT_SECS": "0"}):
+            publisher = self._overdue(
+                self._publisher(
+                    mx_client, nixl_manager, publish, publish_timeout_secs=None
+                )
+            )
+
+        publisher._tick()  # overdue but keeps going
+        publisher._tick()  # server back: publishes
+
+        assert publisher.mx_source_id == "id1"
+        assert not publisher._stop_event.is_set()
+        ready_calls = [
+            c
+            for c in mx_client.update_status.call_args_list
+            if c.kwargs.get("status") == 2
+        ]
+        assert len(ready_calls) == 1
+
+    def test_positive_timeout_still_gives_up(self, mx_client, nixl_manager):
+        """A positive timeout stops the thread after its deadline."""
+        publish = MagicMock(side_effect=RuntimeError("server down"))
+        publisher = self._overdue(
+            self._publisher(mx_client, nixl_manager, publish)
+        )
+
+        publisher._tick()
+
+        assert publisher._stop_event.is_set()
+        assert publish.call_count == 0
+
+
 class TestHeartbeatDaemon:
     def test_thread_is_daemon(self, heartbeat):
         heartbeat.start()

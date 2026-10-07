@@ -288,35 +288,60 @@ def test_weight_transfer_engine_logs_receiver_metrics(monkeypatch, caplog):
     staged.release.assert_called_once_with()
 
 
-def test_weight_transfer_engine_warns_for_out_of_order_updates(monkeypatch, caplog):
-    engine, _client = _engine(monkeypatch)
-
-    engine.update_weights({"version_id": "version-a"})
-
-    engine.start_weight_update()
-    engine.update_weights({"version_id": "version-a"})
-    engine.update_weights({"version_id": "version-b"})
-
-    assert "weight update has not been started" in caplog.text
-    assert "weight update already received a version" in caplog.text
-
-
-def test_weight_transfer_engine_warns_for_duplicate_lifecycle_calls(
-    monkeypatch, caplog
-):
+def test_weight_transfer_engine_rejects_out_of_order_updates(monkeypatch):
     engine, client = _engine(monkeypatch)
 
-    engine.init_transfer_engine(engine.init_info_cls())
+    with pytest.raises(RuntimeError, match="has not been started"):
+        engine.update_weights({"version_id": "version-a"})
+
     engine.start_weight_update()
-    engine.start_weight_update()
-    engine.finish_weight_update()
+    engine.update_weights({"version_id": "version-a"})
+    with pytest.raises(RuntimeError, match="already received a version"):
+        engine.update_weights({"version_id": "version-b"})
+    client.stage_weight.assert_called_once()
     engine.finish_weight_update()
 
-    assert client.stage_weight.call_count == 0
-    assert "weight transfer engine is already initialized" in caplog.text
-    assert "weight update is already active" in caplog.text
-    assert "weight update has not received a version" in caplog.text
-    assert "weight update has not been started" in caplog.text
+
+def test_weight_transfer_engine_rejects_duplicate_lifecycle_calls(monkeypatch):
+    engine, client = _engine(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="already initialized"):
+        engine.init_transfer_engine(engine.init_info_cls())
+    engine.start_weight_update()
+    with pytest.raises(RuntimeError, match="already active"):
+        engine.start_weight_update()
+    with pytest.raises(RuntimeError, match="has not received a version"):
+        engine.finish_weight_update()
+    engine.update_weights({"version_id": "version-a"})
+    engine.finish_weight_update()
+    with pytest.raises(RuntimeError, match="has not been started"):
+        engine.finish_weight_update()
+
+    client.stage_weight.assert_called_once()
+
+
+def test_weight_transfer_engine_rejects_start_before_initialization(monkeypatch):
+    engine, client = _engine(monkeypatch, initialize=False)
+
+    with pytest.raises(RuntimeError, match="not initialized"):
+        engine.start_weight_update()
+
+    client.stage_weight.assert_not_called()
+
+
+def test_weight_transfer_engine_reset_releases_staged_version(monkeypatch):
+    engine, client = _engine(monkeypatch)
+    staged = client.stage_weight.return_value
+    engine.start_weight_update()
+    engine.update_weights({"version_id": "version-a"})
+
+    engine.reset_weight_update_target()
+    engine.reset_weight_update_target()
+
+    staged.release.assert_called_once_with()
+    engine.start_weight_update()
+    engine.update_weights({"version_id": "version-b"})
+    assert client.stage_weight.call_args.kwargs["version"].version_id == "version-b"
 
 
 def test_weight_transfer_engine_releases_failed_update(monkeypatch):
@@ -365,7 +390,10 @@ def test_weight_transfer_engine_shutdown_before_initialization(monkeypatch):
     engine, client = _engine(monkeypatch, initialize=False)
 
     engine.shutdown()
-    engine.start_weight_update()
+    with pytest.raises(RuntimeError, match="shut down"):
+        engine.start_weight_update()
+    with pytest.raises(RuntimeError, match="shut down"):
+        engine.init_transfer_engine(engine.init_info_cls())
 
     client.close.assert_not_called()
 

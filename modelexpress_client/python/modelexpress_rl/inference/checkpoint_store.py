@@ -157,7 +157,8 @@ class LocalCheckpointStore:
         #     state.json                current preparation transaction
         #     active.json               version committed after engine install
         #     .lock                     cross-process cache coordination
-        #     .install.lock             blocks preparation during engine install
+        #     .prepare.lock             serializes preparation requests
+        #     .install.lock             excludes mutation during engine install
         #
         # Full checkpoints, deltas, and chain manifests are the canonical
         # lineage. Materialized checkpoints are rebuildable outputs for engines
@@ -172,6 +173,7 @@ class LocalCheckpointStore:
         self.state_path = self.cache / "state.json"
         self.active_path = self.cache / "active.json"
         self.lock_path = self.cache / ".lock"
+        self.prepare_lock_path = self.cache / ".prepare.lock"
         self.install_lock_path = self.cache / ".install.lock"
         self.max_size_bytes = max_size_bytes
 
@@ -210,6 +212,9 @@ class LocalCheckpointStore:
 
     def installation_locked(self, *, shared: bool = False):
         return self._locked(self.install_lock_path, shared=shared)
+
+    def preparation_locked(self):
+        return self._locked(self.prepare_lock_path, shared=False)
 
     @contextmanager
     def replace_directory(
@@ -468,6 +473,9 @@ class LocalCheckpointStore:
                 "files": _artifact_files_state(artifact),
             },
         )
+
+    def has_artifact_record(self, artifact: Path) -> bool:
+        return self._source_path(artifact).exists()
 
     def _verified_artifact_metadata(self, artifact: Path) -> dict:
         metadata = self._read_json(self._source_path(artifact))

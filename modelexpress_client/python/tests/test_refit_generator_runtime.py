@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from pathlib import Path
-
-import pytest
-import torch
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import modelexpress_rl.inference.engines as engines_module
 import modelexpress_rl.inference.runtime as runtime_module
+import pytest
+import torch
 from modelexpress import p2p_pb2
 from modelexpress_rl import ObjectStorageType, WeightPayloadFormat, WeightSource
 from modelexpress_rl.inference.adapter import GeneratorEngineContext
@@ -24,6 +25,7 @@ from modelexpress_rl.inference.runtime import (
     FullTensorEngineCapability,
     initialize_generator_runtime,
 )
+from modelexpress_rl.inference.version_chain import resolve_replay_chain
 
 
 class _Installer(EngineInstaller):
@@ -39,6 +41,7 @@ class _Method(UpdateMethod):
     def __init__(self, sources):
         self._sources = frozenset(sources)
         self.closed = False
+        self.requires_full_root = False
 
     @property
     def capabilities(self):
@@ -137,6 +140,8 @@ def test_object_storage_runtime_preserves_source_order(
     )
     full_tensor = _Method({WeightSource.GENERATOR, WeightSource.TRAINER})
     canonical = _Method({WeightSource.OBJECT_STORAGE})
+    canonical.requires_full_root = True
+    resolve_chain = Mock(return_value=())
     monkeypatch.setattr(
         runtime_module,
         "RuntimeTensorNixlUpdateMethod",
@@ -164,14 +169,21 @@ def test_object_storage_runtime_preserves_source_order(
         rpc_timeout_seconds=30,
         service=lambda: object(),
         start_lease=lambda _version_id: object(),
+        resolve_replay_chain=resolve_chain,
     )
+
+    for needs_bootstrap in (True, False):
+        canonical.requires_full_root = needs_bootstrap
+        resolve_chain.reset_mock()
+        runtime.session._resolve_replay_chain(SimpleNamespace(version_id="target"))
+        resolve_chain.assert_called_once_with("target", True)
 
     assert runtime.methods == (canonical, full_tensor)
     assert runtime.session._planner.source_order == expected_source_order
     assert runtime.initial_version_id == "base-a"
-    assert [
-        resolver.kind for resolver in runtime.session._planner._resolvers
-    ] == list(expected_source_order)
+    assert [resolver.kind for resolver in runtime.session._planner._resolvers] == list(
+        expected_source_order
+    )
     generator_resolvers = [
         resolver
         for resolver in runtime.session._planner._resolvers
@@ -186,6 +198,7 @@ def test_object_storage_runtime_preserves_source_order(
     assert p2p.closed
 
 
+@pytest.mark.parametrize("requires_full_root", [False, True])
 @pytest.mark.parametrize(
     "source_order",
     [None, (WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE)],
@@ -203,6 +216,7 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
     source_order,
     runtime_tensors,
     nixl_manager,
+    requires_full_root,
 ):
     context = GeneratorEngineContext()
     monkeypatch.setattr(
@@ -219,6 +233,8 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
         lambda **_kwargs: pytest.fail("P2P client must not be created"),
     )
     canonical = _Method({WeightSource.OBJECT_STORAGE})
+    canonical.requires_full_root = requires_full_root
+    resolve_chain = Mock(return_value=())
     monkeypatch.setattr(
         runtime_module,
         "CanonicalDeltaUpdateMethod",
@@ -241,10 +257,38 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
         rpc_timeout_seconds=30,
         service=lambda: object(),
         start_lease=lambda _version_id: object(),
+        resolve_replay_chain=resolve_chain,
     )
 
     assert runtime.session._planner.source_order == (WeightSource.OBJECT_STORAGE,)
     assert runtime.methods == (canonical,)
+    runtime.session._resolve_replay_chain(SimpleNamespace(version_id="target"))
+    resolve_chain.assert_called_once_with("target", requires_full_root)
+
+    canonical.requires_full_root = False
+    versions = {
+        f"v{index}": SimpleNamespace(
+            version_id=f"v{index}",
+            base_version_id=f"v{index - 1}" if index else None,
+            payload_format=(
+                WeightPayloadFormat.XOR_DELTA
+                if index else WeightPayloadFormat.FULL_HF_CHECKPOINT
+            ),
+            object_storage=object(),
+            layout_signature="",
+        )
+        for index in range(65)
+    }
+    fetched = Mock(side_effect=versions.__getitem__)
+    resolve_chain.side_effect = lambda target, from_full_root: resolve_replay_chain(
+        target_version_id=target,
+        fetch_ready_version=fetched,
+        max_chain_length=64,
+        stop_before_version_id=None if from_full_root else "v63",
+    )
+    chain = runtime.session._resolve_replay_chain(versions["v64"])
+    assert chain == (versions["v64"],)
+    fetched.assert_called_once_with("v64")
     runtime.close()
 
 
@@ -335,9 +379,9 @@ def test_object_storage_runtime_survives_p2p_initialization_failure(
 
     assert runtime.methods == (canonical,)
     assert runtime.session._planner.source_order == (WeightSource.OBJECT_STORAGE,)
-    assert [
-        resolver.kind for resolver in runtime.session._planner._resolvers
-    ] == [WeightSource.OBJECT_STORAGE]
+    assert [resolver.kind for resolver in runtime.session._planner._resolvers] == [
+        WeightSource.OBJECT_STORAGE
+    ]
     assert p2p.closed
     runtime.close()
     assert canonical.closed
@@ -382,3 +426,47 @@ def test_generator_runtime_closes_resources_when_resolver_creation_fails(
 
     assert full_tensor.closed
     assert p2p.closed
+
+
+@pytest.mark.parametrize("blocked_first", [False, True])
+@pytest.mark.parametrize(
+    "failure", ["drain_failed", "close_failed", "source_failed", "in_progress"]
+)
+def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
+    blocked_first, failure
+):
+    from types import SimpleNamespace
+
+    from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
+    from modelexpress_rl.inference.plan import PreparedStreamingTensors
+    from modelexpress_rl.inference.runtime import GeneratorRuntime
+
+    arena = torch.ones(2)
+    closed = []
+    transfer = SimpleNamespace(arena=arena, close=lambda: closed.append("transfer"))
+    method = LoadTimeTensorNixlUpdateMethod(transfer=transfer, capture_layout=None)
+    prepared = PreparedStreamingTensors(lambda: iter(()), frozenset({"weight"}), {})
+    prepared.ownership.iterator = iter(({"weight": arena},))
+    if failure != "in_progress":
+        setattr(prepared.ownership, failure, True)
+    method._active_streamed = prepared
+    other = _Method({WeightSource.GENERATOR})
+    p2p = _P2P(server_url="mx:8000")
+    runtime = GeneratorRuntime(
+        engine=_full_tensor_engine(),
+        methods=(method, other) if blocked_first else (other, method),
+        session=object(),
+        p2p_client=p2p,
+        initial_version_id=None,
+    )
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="reset the process"):
+            runtime.close()
+        assert not runtime._closed
+        assert not p2p.closed
+        assert not other.closed
+        assert closed == []
+        assert method._active_streamed is prepared
+        assert prepared.ownership.iterator is not None
+        assert transfer.arena is arena

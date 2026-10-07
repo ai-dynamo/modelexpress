@@ -106,11 +106,9 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
     ) -> None:
         """Initialize ModelExpress from the rank-local vLLM model context."""
         if self._closed:
-            logger.warning("weight transfer engine is shut down")
-            return
+            raise RuntimeError("weight transfer engine is shut down")
         if self._client is not None:
-            logger.warning("weight transfer engine is already initialized")
-            return
+            raise RuntimeError("weight transfer engine is already initialized")
 
         object_storage_values = (
             init_info.object_storage_type,
@@ -173,15 +171,12 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
         logger.info("ModelExpress weight transfer initialized model=%s", model_name)
 
     def start_weight_update(self) -> None:
-        if self._closed:
-            logger.warning("weight transfer engine is shut down")
-            return
-        if self._client is None:
-            logger.warning("weight transfer engine is not initialized")
-            return
+        if self._closed or self._client is None:
+            raise RuntimeError(
+                "weight transfer engine is not initialized or is shut down"
+            )
         if self._update_active:
-            logger.warning("weight update is already active")
-            return
+            raise RuntimeError("weight update is already active")
         self._update_active = True
         self._active_version_id = None
         self._staged = None
@@ -190,18 +185,12 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
     def receive_weights(
         self, update_info: ModelExpressWeightTransferUpdateInfo
     ) -> None:
-        if not self._update_active:
-            logger.warning("weight update has not been started")
-            return
+        if not self._update_active or self._client is None:
+            raise RuntimeError("weight update has not been started")
         if self._staged is not None:
-            logger.warning("weight update already received a version")
-            return
+            raise RuntimeError("weight update already received a version")
 
         client = self._client
-        if client is None:
-            logger.warning("weight transfer engine is not initialized")
-            self._update_active = False
-            return
 
         staged: StagedWeightHandle | None = None
         try:
@@ -246,24 +235,30 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
 
     def finish_weight_update(self) -> None:
         if not self._update_active:
-            logger.warning("weight update has not been started")
-            return
+            raise RuntimeError("weight update has not been started")
         if self._staged is None:
-            logger.warning("weight update has not received a version")
-            self._update_active = False
-            return
+            raise RuntimeError("weight update has not received a version")
         staged = self._staged
         version_id = self._active_version_id
+        staged.release()
+        self._staged = None
+        self._active_version_id = None
+        self._update_active = False
+        logger.info(
+            "ModelExpress weight update finished version=%s",
+            version_id,
+        )
+
+    def reset_weight_update_target(self) -> None:
+        """Release session state when vLLM aborts, including payload parse errors."""
         try:
-            staged.release()
-            logger.info(
-                "ModelExpress weight update finished version=%s",
-                version_id,
-            )
+            if self._staged is not None:
+                self._staged.release()
         finally:
             self._staged = None
             self._active_version_id = None
             self._update_active = False
+            super().reset_weight_update_target()
 
     def shutdown(self) -> None:
         if self._closed:

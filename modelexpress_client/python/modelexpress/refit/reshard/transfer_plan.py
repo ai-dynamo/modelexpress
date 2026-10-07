@@ -18,10 +18,10 @@ and hands them to a ``Transport``.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from modelexpress import envs
 from modelexpress.refit.reshard.slice_plan import (
     PullSegment,
     _row_major_strides,
@@ -203,9 +203,7 @@ def plan_transfer(
     exact_by_source: dict[str, list[tuple[RecordedCopy, list]]] = {}
     full_pull_names: set[str] = set()
     if max_segments_per_copy is None:
-        max_segments_per_copy = int(
-            os.environ.get("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "64")
-        )
+        max_segments_per_copy = envs.MX_RESHARD_MAX_SEGMENTS_PER_COPY
     if max_segments_per_copy < 1:
         raise ValueError("max_segments_per_copy must be at least 1")
 
