@@ -86,6 +86,15 @@ def test_ca_file_env_turns_tls_on_for_bare_addresses(monkeypatch, tmp_path):
     assert _tls_requested("mx:8001") is True
 
 
+def test_explicit_http_scheme_wins_over_ca_file_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("MODEL_EXPRESS_TLS_CA_FILE", str(tmp_path / "ca.crt"))
+    monkeypatch.delenv("MODEL_EXPRESS_URL", raising=False)
+    assert _tls_requested("http://mx:8001") is False
+    assert _tls_requested("https://mx:8001") is True
+    monkeypatch.setenv("MX_SERVER_ADDRESS", "http://mx:8001")
+    assert _tls_requested(None) is False
+
+
 def test_clients_record_tls_and_strip_the_scheme(monkeypatch):
     monkeypatch.delenv("MODEL_EXPRESS_TLS_CA_FILE", raising=False)
     mx = MxClient(server_url="https://mx:8001")
