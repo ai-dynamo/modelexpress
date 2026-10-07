@@ -38,6 +38,11 @@ impl Acceptor {
     }
 }
 
+#[cfg(test)]
+pub fn tcp(stream: &Stream) -> &TcpStream {
+    stream.get_ref()
+}
+
 /// Build the OpenSSL acceptor from the resolved config, or `None` when TLS is off.
 pub fn build(config: &TlsConfig) -> Result<Option<Acceptor>, TlsError> {
     let Some((cert, key)) = config.key_pair()? else {
