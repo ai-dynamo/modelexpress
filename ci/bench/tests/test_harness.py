@@ -213,7 +213,10 @@ def saved_run(tmp_path):
         result(
             role, "post-refit-inference", [{"token_ids": [3, 4], "logprob_count": 2}]
         )
-        log = "Model loading took 1 GiB memory and 2.0 seconds\n"
+        log = (
+            "(Worker_TP1 pid=9) Model loading took 1 GiB memory and 3.0 seconds\n"
+            "(Worker_TP0 pid=8) Model loading took 1 GiB memory and 2.0 seconds\n"
+        )
         log += (
             "Streaming weights from s3://bucket/model\n"
             if role == "s3"
@@ -476,7 +479,7 @@ def test_report_preserves_measured_refit_latency_and_failed_rank(tmp_path):
     path.write_text("\n".join(lines) + "\n")
     report = build_report(tmp_path)
     assert report["status"] == "PASS"
-    assert report["workers"]["s3"]["model_load_seconds"] == [2.0]
+    assert report["workers"]["s3"]["model_load_seconds"] == [3.0, 2.0]
     assert report["workers"]["s3"]["refit"]["seconds"] == 4.5
     path.write_text(
         path.read_text().replace(
@@ -646,3 +649,79 @@ def test_checkpoint_digest_mismatch_on_any_rank_fails(tmp_path, rank):
     report = build_report(tmp_path)
     assert report["validation_status"] == "FAILED"
     assert report["latency_summary"] == {}
+
+
+def test_runtime_inventory_override_remains_strict(tmp_path):
+    config = render(
+        "nemotron",
+        tmp_path / "override",
+        "nemotron-inventory",
+        environment={**PORTABLE_ENV, "expected_tensors_per_rank": 2},
+    )
+    row = {"rank": 0, "phase": "hashes", "tensors": {"a": {}, "b": {}}}
+    assert validation.hashes([row], config)[0] == row["tensors"]
+    row["tensors"].pop("b")
+    with pytest.raises(AssertionError):
+        validation.hashes([row], config)
+    saved = json.loads((tmp_path / "override" / "config.json").read_text())
+    assert saved["expected_tensors_per_rank"] == 2
+    assert saved["expected_host_scales_per_rank"] == 18
+    default = render("nemotron", tmp_path / "default", "nemotron-default")
+    assert default["expected_tensors_per_rank"] == 761
+
+
+@pytest.mark.parametrize(
+    "key", ["expected_tensors_per_rank", "expected_host_scales_per_rank"]
+)
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "2"])
+def test_invalid_inventory_override_is_rejected(tmp_path, key, value):
+    with pytest.raises(ValueError, match=key):
+        render(
+            "nemotron",
+            tmp_path / "invalid",
+            "nemotron-invalid",
+            environment={**PORTABLE_ENV, key: value},
+        )
+
+
+def test_report_aggregates_load_times_by_rank(tmp_path):
+    saved_run(tmp_path)
+    report = build_report(tmp_path)
+    assert report["status"] == "PASS"
+    summary = report["latency_summary"]["s3"]
+    assert summary["model_load_seconds"] == 3.0
+    assert summary["model_load_seconds_by_rank"] == {0: 2.0, 1: 3.0}
+
+
+@pytest.mark.parametrize("case", ["missing", "duplicate", "unidentified"])
+def test_report_rejects_incomplete_or_repeated_load_timers(tmp_path, case):
+    saved_run(tmp_path)
+    path = tmp_path / "s3-worker.log"
+    text = path.read_text()
+    line = text.splitlines()[0]
+    if case == "missing":
+        text = text.replace(line + "\n", "")
+    elif case == "duplicate":
+        text += line + "\n"
+    else:
+        text = text.replace("Worker_TP1", "Worker")
+    path.write_text(text)
+    report = build_report(tmp_path)
+    assert report["validation_status"] == "PASS"
+    assert report["measurement_status"] == "INVALID"
+    assert report["status"] == "FAILED"
+    assert report["latency_summary"] == {}
+
+
+@pytest.mark.parametrize("line", ['RESULT s3 refit {"response":', "RESULT invalid"])
+def test_report_retains_malformed_result_evidence(tmp_path, line):
+    saved_run(tmp_path)
+    with (tmp_path / "bench-driver.log").open("a") as stream:
+        stream.write(line + "\n")
+    report = build_report(tmp_path)
+    assert report["status"] == "FAILED"
+    assert report["measurement_status"] == "INVALID"
+    assert report["latency_summary"] == {}
+    assert len(report["record_errors"]) == 1
+    assert report["record_errors"][0]["line"] > 0
+    assert "Malformed RESULT" in report["failure_reason"]

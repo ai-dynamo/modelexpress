@@ -81,6 +81,14 @@ def prepare(model, output, run, paths=None, *, environment, **overrides):
             config[key] = env[key]
     if not isinstance(config["tp"], int) or config["tp"] < 1:
         raise ValueError("tp must be a positive integer")
+    for key in ["expected_tensors_per_rank", "expected_host_scales_per_rank"]:
+        if key in env:
+            value = env[key]
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 1
+            ):
+                raise ValueError(f"{key} must be a positive integer or null")
+            config[key] = value
     config.update(
         run=run,
         resource_prefix="mx-" + run,

@@ -1682,6 +1682,12 @@ Use `--environment /path/to/environment.json` for placement/storage changes.
 Fields include worker/control node selectors, tolerations, control resources,
 service account, image-pull secrets, security context, `addressing_style`,
 `pod_env` (including Secret references), `pod_env_from`, and image references.
+Runtime tensor inventories can differ between vLLM versions and kernel layouts.
+An environment may override `expected_tensors_per_rank` and
+`expected_host_scales_per_rank` with a positive integer (or `null` for an
+unqualified count). Keep qualified counts explicit and tied to the recorded image
+digest; do not disable a failed count check merely to pass a run.
+
 CLI options include context, namespace, region, bucket, endpoint URL, service
 account, seed/delta prefixes, TP, CPU, memory, and GPU memory utilization. Literal
 credentials must not enter the environment file: resolved settings are retained
@@ -1726,13 +1732,23 @@ installation timing covers apply plus CUDA synchronization. Total refit time is
 stage plus installation; logging, pointer verification, hashing, and inference
 are outside these intervals. The separate RPC duration includes those additional
 operations and must not be compared as the same interval.
+The first refit after client initialization may use a full checkpoint install
+even with `MX_REFIT_DELTA_SURGICAL=1`, because the installer has not established
+its live version. Confirm surgical metrics or logs before interpreting an install
+measurement as surgical. GPU/CPU/host scale agreement does not establish that
+untouched scales retained their exact pre-refit values.
 
 The report separates `validation_status` (`PASS`/`FAILED`) from
 `measurement_status` (`VALID`/`INVALID`). Overall `status` passes only when both
 pass. Successful `latency_summary` entries include the model-load time, RPC time,
-each rank's stage/install/total, and the maximum per-rank total. Every required
+each rank's stage/install/total, and the maximum per-rank total. Model-load time
+is the maximum of one timer per TP rank, with individual rank times retained.
+Missing, duplicate, or unidentified rank timers invalidate measurements; untagged
+model-load timers are accepted only for TP1. Every required
 duration must be finite and nonnegative; missing timings invalidate a benchmark.
 Failed runs keep raw measurements as evidence but have an empty summary.
+Malformed `RESULT` log records are retained as parse-error metadata and make
+the report fail, rather than preventing the failure report from being written.
 
 This is one trial per run,
 with no percentiles, baseline comparison, or performance threshold.

@@ -19,10 +19,14 @@ def build_report(root):
         else ""
     )
     records = {}
-    for line in log.splitlines():
+    record_errors = []
+    for number, line in enumerate(log.splitlines(), 1):
         if line.startswith("RESULT "):
-            _, role, step, body = line.split(" ", 3)
-            records[role, step] = json.loads(body)
+            try:
+                _, role, step, body = line.split(" ", 3)
+                records[role, step] = json.loads(body)
+            except ValueError as error:
+                record_errors.append({"line": number, "error": str(error)})
     report = {
         "status": "FAILED",
         "validation_status": "FAILED",
@@ -31,6 +35,7 @@ def build_report(root):
         "config": config,
         "images": json.loads((root / "images.json").read_text()),
         "workers": {},
+        "record_errors": record_errors,
     }
 
     def result(role, step):
@@ -44,12 +49,20 @@ def build_report(root):
             if (root / f"{role}-worker.log").exists()
             else ""
         )
-        times = [
-            float(x)
-            for x in re.findall(
-                r"Model loading took .*? memory and ([\d.]+) seconds", text
+        times = []
+        times_by_rank = {}
+        for line in text.splitlines():
+            match = re.search(
+                r"Model loading took .*? memory and ([\d.]+) seconds", line
             )
-        ]
+            if match:
+                seconds = float(match[1])
+                times.append(seconds)
+                rank_match = re.search(r"\bWorker_TP(\d+)\b", line)
+                rank = int(rank_match[1]) if rank_match else (
+                    0 if config["tp"] == 1 else -1
+                )
+                times_by_rank.setdefault(rank, []).append(seconds)
         wire = [
             line
             for line in text.splitlines()
@@ -57,6 +70,7 @@ def build_report(root):
         ]
         worker = {
             "model_load_seconds": times,
+            "model_load_seconds_by_rank": times_by_rank,
             "rdma_transfer_records": wire,
             "refit": records.get((role, "refit")),
             "failures": [],
@@ -75,6 +89,7 @@ def build_report(root):
             worker["pod"] = json.loads(pod_file.read_text())
         report["workers"][role] = worker
     try:
+        assert not record_errors, "Malformed RESULT records; inspect record_errors"
         assert "BENCH_PASS" in log.splitlines(), (
             "Driver failed or did not finish; inspect per-rank failures and bench-driver.log"
         )
@@ -132,7 +147,7 @@ def build_report(root):
             role: validation.latency(
                 result(role, "refit"),
                 config,
-                report["workers"][role]["model_load_seconds"],
+                report["workers"][role]["model_load_seconds_by_rank"],
                 records[role, "refit"]["seconds"],
             )
             for role in config["roles"]

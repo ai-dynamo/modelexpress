@@ -83,7 +83,13 @@ def duration(value):
 
 
 def latency(rows, config, load_seconds, rpc_seconds):
-    assert len(load_seconds) == 1, "Expected one fresh model-load measurement"
+    assert set(load_seconds) == set(range(config["tp"])), (
+        "Missing or unidentifiable model-load ranks"
+    )
+    assert all(len(values) == 1 for values in load_seconds.values()), (
+        "Expected one fresh model-load measurement per rank"
+    )
+    model_load = {rank: duration(values[0]) for rank, values in load_seconds.items()}
     per_rank = {}
     for rank, row in ranks(rows, config).items():
         per_rank[rank] = {
@@ -97,7 +103,8 @@ def latency(rows, config, load_seconds, rpc_seconds):
             abs_tol=1e-6,
         ), "Total must equal measured stage plus install time"
     return {
-        "model_load_seconds": duration(load_seconds[0]),
+        "model_load_seconds": max(model_load.values()),
+        "model_load_seconds_by_rank": model_load,
         "refit_rpc_seconds": duration(rpc_seconds),
         "per_rank": per_rank,
         "slowest_rank_total_seconds": max(
