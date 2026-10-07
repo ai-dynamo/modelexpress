@@ -1205,20 +1205,26 @@ def test_canonical_s3_reseeds_a_modified_ready_checkpoint(monkeypatch, tmp_path)
     second.close()
 
 
+@pytest.mark.parametrize(
+    ("storage_type", "scheme"),
+    [(ObjectStorageType.GCS, "gs"), (ObjectStorageType.AZURE, "az")],
+)
 def test_canonical_s3_rejects_non_s3_source_before_storage_access(
     monkeypatch,
     tmp_path,
+    storage_type,
+    scheme,
 ):
     adapter, storage = _build(monkeypatch, tmp_path, {})
     inputs = replace(
         _inputs(None),
         object_storage=ObjectStorageSource(
-            storage_type=ObjectStorageType.GCS,
-            uri="gs://weights/test/v1/model.safetensors.index.json",
+            storage_type=storage_type,
+            uri=f"{scheme}://weights/test/v1/model.safetensors.index.json",
         ),
     )
 
-    with pytest.raises(ValueError, match="requires S3 or Azure object storage"):
+    with pytest.raises(ValueError, match="storage type must match configured reader"):
         adapter.stage_weight(inputs)
 
     assert storage.calls == []

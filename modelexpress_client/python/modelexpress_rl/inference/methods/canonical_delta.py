@@ -133,15 +133,16 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         self._active = PreparedCheckpointArtifact(checkpoint=checkpoint)
         return self._active
 
-    @staticmethod
     def _version(
-        version: WeightVersion, source: ResolvedSource
+        self, version: WeightVersion, source: ResolvedSource
     ) -> _ObjectStorageVersion:
         if not isinstance(source, ObjectStorageUpdateSource):
             raise TypeError("canonical checkpoint requires an object-storage source")
         storage = source.storage
-        if storage.storage_type not in {ObjectStorageType.S3, ObjectStorageType.AZURE}:
-            raise ValueError("canonical checkpoint requires S3 or Azure object storage")
+        if storage.storage_type is not self._config.storage_type:
+            raise ValueError(
+                "canonical checkpoint source storage type must match configured reader"
+            )
         if version.payload_format is WeightPayloadFormat.XOR_DELTA:
             if version.base_version_id is None:
                 raise ValueError("canonical delta is missing base_version_id")
