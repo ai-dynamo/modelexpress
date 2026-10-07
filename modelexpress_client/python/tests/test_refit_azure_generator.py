@@ -310,6 +310,30 @@ def test_generator_bootstraps_azure_replay_without_a_recorded_seed(
         session.release(update)
 
 
+@pytest.mark.parametrize("azure_runtime", ["missing"], indirect=True)
+def test_generator_rejects_mixed_provider_chain_before_downloading_root(
+    azure_runtime, azure_control, azure_delta_chain, checkpoint_store, sdk
+):
+    azure_control.versions["delta-1"] = replace(
+        azure_control.versions["delta-1"],
+        object_storage=ObjectStorageSource(
+            ObjectStorageType.S3,
+            "s3://models/delta-1/model.safetensors.index.json",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="storage type must match configured reader"):
+        azure_runtime.session.stage(azure_delta_chain.target)
+
+    assert sdk.client.calls == []
+    assert azure_runtime.methods[0].requires_full_root
+    assert checkpoint_store.state() is None
+    assert not checkpoint_store.active_path.exists()
+    azure_runtime.engine.installer.install.assert_not_called()
+    for lease in azure_control.leases:
+        lease.close.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("failure", "message"),
     [
