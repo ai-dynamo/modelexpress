@@ -1550,6 +1550,25 @@ registered, pinned model profiles. `profiles.json` lists supported profile keys
 and the default (`nemotron`). Add a profile to the catalog to extend the harness;
 the trigger and lifecycle scripts do not contain model-specific allowlists.
 
+The shared RL harness separates scenario behavior from execution. Rendered config
+records `scenario`, `initial_version`, `target_version`, and the source for each
+worker role. `common/scenario.py` selects the implementation; only `delta` is
+available. The existing CLI, model profiles, and S3/peer paths retain their behavior.
+
+`common/delta_scenario.py` owns source startup and publication readiness,
+publication evidence collection, generator storage settings, checkpoint evidence,
+inventory/transport validation, and object cleanup. The shared driver owns
+pause/refit/verify/resume ordering; reporting owns per-rank version and timing
+checks; lifecycle owns process teardown and Kubernetes cleanup. Scenario validation
+must succeed before workers resume or measurements become valid.
+
+To add a scenario, implement these module functions and add its explicit selection
+to `scenario.load()`. Its `configure()` supplies roles, sources, and version IDs;
+`prepare_run()` owns source readiness and lifetime rather than assuming a publisher
+must exit. Keep preparation, verification, evidence, and source cleanup in that
+scenario, using the public ModelExpress RL APIs for transfer and installation.
+This separation does not add a reshard benchmark or enable GPU CI runs.
+
 | Profile | Pinned model | Resources per worker |
 | --- | --- | --- |
 | `nemotron` | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4`, revision `bee7596271d1495f6992ae224aefde4410e816b8` | TP1, 16 CPU, 128 GiB RAM |

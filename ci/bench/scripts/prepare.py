@@ -7,9 +7,13 @@ import argparse
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "common"))
+import scenario
+
 REDIS_IMAGE = "redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08"
 
 
@@ -65,18 +69,7 @@ def prepare(model, output, run, paths=None, *, environment, **overrides):
             f"RUN_ID must be {model}- followed by 1–32 lowercase letters/digits/hyphens"
         )
     paths = paths or env.get("default_paths", "s3")
-    if paths not in ["s3", "both"]:
-        raise ValueError("paths must be s3 or both")
-    if paths == "both" and not (
-        env.get("extra_worker_resources")
-        and env.get("worker_env", {}).get("MX_NIXL_BACKEND")
-        and env.get("peer_transfer_marker")
-    ):
-        raise ValueError(
-            "Peer coverage requires explicit extra_worker_resources, "
-            "worker_env.MX_NIXL_BACKEND, and peer_transfer_marker"
-        )
-    for key in ["tp", "cpu", "memory", "seed_prefix", "delta_prefix"]:
+    for key in ["tp", "cpu", "memory"]:
         if key in env:
             config[key] = env[key]
     if not isinstance(config["tp"], int) or config["tp"] < 1:
@@ -84,12 +77,13 @@ def prepare(model, output, run, paths=None, *, environment, **overrides):
     config.update(
         run=run,
         resource_prefix="mx-" + run,
-        roles=["s3", "peer"] if paths == "both" else ["s3"],
         bucket=env["bucket"],
         storage={k: env[k] for k in ["endpoint_url", "region", "addressing_style"]},
         gpu_memory_utilization=env.get("gpu_memory_utilization", 0.70),
         peer_transfer_marker=env.get("peer_transfer_marker", "RDMA transfer complete:"),
     )
+    case = scenario.load(config)
+    case.configure(config, paths, env)
     if not 0 < config["gpu_memory_utilization"] <= 1:
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
     prefix = config["resource_prefix"]
@@ -122,7 +116,8 @@ def prepare(model, output, run, paths=None, *, environment, **overrides):
         storage_env["AWS_ENDPOINT_URL"] = env["endpoint_url"]
     pod_env = env.get("pod_env", [])
     control_env = [
-        {"name": k, "value": v} for k, v in {**storage_env, "DELTA_RUN": run}.items()
+        {"name": k, "value": v}
+        for k, v in {**storage_env, **case.control_env(config)}.items()
     ] + pod_env
     resources = {
         "cpu": str(config["cpu"]),
@@ -181,17 +176,14 @@ def prepare(model, output, run, paths=None, *, environment, **overrides):
             "MX_TRANSFER_TIMEOUT": "1800",
             "MODEL_EXPRESS_LOG_LEVEL": "INFO",
             "NIXL_LOG_LEVEL": "INFO",
-            "MX_GENERATOR_SOURCE_ORDER": "OBJECT_STORAGE",
             "DYN_RL_INIT_WEIGHTS_TIMEOUT_S": "3600",
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-            **env.get("worker_env", {}),
+            **case.worker_env(config, env),
             **storage_env,
             "MODEL_EXPRESS_URL": prefix + "-control:8000",
             "MX_SERVER_ADDRESS": prefix + "-control:8000",
-            "MX_MODEL_URI": f"s3://{config['bucket']}/{config['seed_prefix'].rstrip('/')}",
             "BENCH_MODEL": config["model"],
             "BENCH_REVISION": config["revision"],
-            "BENCH_PREFIX": config["seed_prefix"],
             "BENCH_KEY": model,
             "BENCH_ROLE": role,
             "BENCH_RUN": run,

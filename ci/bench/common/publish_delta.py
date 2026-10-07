@@ -126,8 +126,8 @@ dist.init_process_group(
     "gloo", init_method="tcp://127.0.0.1:29642", rank=0, world_size=1
 )
 control = ModelExpressControlClient.connect(server_url="127.0.0.1:8000")
-base = run + "-base"
-version = run + "-d1"
+base = CONFIG["initial_version"]
+version = CONFIG["target_version"]
 target = CONFIG["delta_bytes"]
 control.create_weight_version(
     uid=base,

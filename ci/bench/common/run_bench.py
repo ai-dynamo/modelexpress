@@ -9,16 +9,16 @@ import traceback
 from pathlib import Path
 
 import requests
+import scenario
 import validation
 from config import CONFIG as config
 
 root = Path("/tmp/mx-bench")
 root.mkdir(exist_ok=True)
-run = config["run"]
+case = scenario.load(config)
 urls = {
     role: f"http://{config['resource_prefix']}-{role}:8080/" for role in config["roles"]
 }
-records = {}
 
 
 def call(role, name, route, body):
@@ -37,7 +37,6 @@ def call(role, name, route, body):
     response.raise_for_status()
     assert record["response"]["ok"], record
     result = record["response"]["result"]
-    records[role, name] = result
     return result
 
 
@@ -63,7 +62,7 @@ def tensor_hashes(role, name):
 
 
 try:
-    publication = json.loads(Path("/tmp/mx-delta/report.json").read_text())
+    publication = json.loads(Path(case.publication_path).read_text())
     base, updated = {}, {}
     for role, url in urls.items():
         deadline = time.monotonic() + 7200
@@ -82,35 +81,26 @@ try:
         call(role, "pause", "pause", {})
         audit(role, "baseline-host-scales")
         base[role] = tensor_hashes(role, "base-hashes")
-    if "peer" in urls:
-        assert base["s3"] == base["peer"], "Cold peer tensors differ per TP rank"
+    case.compare_workers(base, config)
     for role in urls:
         rows = rpc(
             role,
             "init",
             "hotload_init",
             {
-                "run_id": run,
-                "source": "OBJECT_STORAGE" if role == "s3" else "GENERATOR",
+                "initial_version_id": config["initial_version"],
+                "source": config["sources"][role],
             },
         )
         assert all(x["phase"] == "init" for x in rows)
     for role in urls:
-        rows = rpc(role, "refit", "hotload", {"weight_path": run + "-d1"})
+        rows = rpc(role, "refit", "hotload", {"weight_path": config["target_version"]})
         validation.refit(rows, config, role)
-        if role == "s3":
-            verified = rpc(
-                role,
-                "verify-checkpoint",
-                "hotload_verify_checkpoint",
-                {"version_id": run + "-d1"},
-            )
-            validation.checkpoint(verified, config, publication)
+        case.verify_refit(rpc, role, config, publication)
         audit(role, "immediate-post-refit-host-scales")
         updated[role] = tensor_hashes(role, "updated-hashes")
-        assert updated[role] != base[role], "No updated tensors"
-    if "peer" in urls:
-        assert updated["s3"] == updated["peer"], "Refit peer tensors differ per TP rank"
+        case.validate_inventory(base[role], updated[role])
+    case.compare_workers(updated, config)
     for role in urls:
         audit(role, "host-scales")
     for role in urls:

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 
 def test_refit_timers_exclude_recording_and_pointer_checks(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "common"))
     clock = [0.0]
     records = []
     released = []

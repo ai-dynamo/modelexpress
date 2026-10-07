@@ -4,7 +4,6 @@
 """Validation contracts shared by the online driver and offline report."""
 
 import math
-import re
 
 
 def ranks(rows, config):
@@ -47,9 +46,9 @@ def refit(rows, config, role):
             row["phase"]
             == row["version"]
             == row["serving_version"]
-            == config["run"] + "-d1"
+            == config["target_version"]
         ), row
-        assert row["source"] == ("OBJECT_STORAGE" if role == "s3" else "GENERATOR")
+        assert row["source"] == config["sources"][role]
         assert row["weight_addresses_preserved"]
 
 
@@ -57,23 +56,6 @@ def inference(rows):
     assert rows
     for row in rows:
         assert row["token_ids"] and row["logprob_count"] == len(row["token_ids"]), row
-
-
-def checkpoint(rows, config, publication):
-    assert publication["run"] == config["run"]
-    assert publication["model_revision"] == config["revision"]
-    assert publication["tensor"] == config["embedding"]
-    assert re.fullmatch(r"[0-9a-f]{64}", publication["expected_sha256"]), (
-        "Invalid published digest"
-    )
-    by_rank = ranks(rows, config)
-    for row in by_rank.values():
-        assert row["version"] == config["run"] + "-d1"
-        assert row["checkpoint_tensor"] == publication["tensor"]
-        assert row["verified"]
-        assert row["checkpoint_sha256"] == publication["expected_sha256"], (
-            "Reconstructed checkpoint differs from published embedding"
-        )
 
 
 def duration(value):

@@ -7,26 +7,10 @@ import argparse
 import json
 import subprocess
 import sys
-import time
 from pathlib import Path
 
-
-def pending_publications(processes):
-    pending = []
-    for process in processes:
-        code = process.poll()
-        if code is None:
-            pending.append(process)
-        elif code:
-            raise RuntimeError("Seed download or publication failed; inspect logs")
-    return pending
-
-
-def wait_for_publications(processes, deadline):
-    while pending_publications(processes):
-        if time.monotonic() >= deadline:
-            raise TimeoutError("Seed download or publication timed out")
-        time.sleep(5)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
+import scenario
 
 
 class Kubernetes:
@@ -71,6 +55,7 @@ class Benchmark:
         self.prefix = self.config["resource_prefix"]
         self.control = self.prefix + "-control"
         self.roles = self.config["roles"]
+        self.scenario = scenario.load(self.config)
         self.processes = []
 
     def capture(self, name, *args):
@@ -104,16 +89,7 @@ class Benchmark:
                 "-",
                 "benchmark",
             )
-        self.capture(
-            "publication.json",
-            "exec",
-            self.control,
-            "-c",
-            "main",
-            "--",
-            "cat",
-            "/tmp/mx-delta/report.json",
-        )
+        self.scenario.collect_publication(self)
         self.capture(
             "bench-evidence.tar.gz",
             "exec",
@@ -166,52 +142,7 @@ class Benchmark:
         self.k.call("cluster-info")
         (self.root / "started").touch(exist_ok=False)
         try:
-            for name in ["harness.json", "control.yaml", "worker-s3.yaml"]:
-                self.apply(name)
-            source = self.prefix + "-s3"
-            self.k.call(
-                "wait",
-                "--for=condition=Ready",
-                "pod/" + self.control,
-                "pod/" + source,
-                "--timeout=10m",
-            )
-            worker = self.start(source, "native_server.py", "s3-worker.log")
-            seed = self.start(source, "download_seed.py", "seed.log")
-            publisher = self.start(self.control, "publish_delta.py", "publication.log")
-            deadline = time.monotonic() + 7200
-            while (
-                "BENCH_READY"
-                not in (self.root / "s3-worker.log")
-                .read_text(errors="replace")
-                .splitlines()
-            ):
-                pending_publications([seed, publisher])
-                if worker.poll() is not None:
-                    raise RuntimeError(
-                        "S3 worker exited before readiness; inspect s3-worker.log"
-                    )
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("S3 worker readiness timed out")
-                time.sleep(5)
-            if "peer" in self.roles:
-                self.apply("worker-peer.yaml")
-                peer = self.prefix + "-peer"
-                self.k.call(
-                    "wait", "--for=condition=Ready", "pod/" + peer, "--timeout=10m"
-                )
-                self.start(peer, "native_server.py", "peer-worker.log")
-            wait_for_publications([seed, publisher], deadline)
-            self.k.call(
-                "exec",
-                self.control,
-                "-c",
-                "main",
-                "--",
-                "cat",
-                "/tmp/mx-delta/report.json",
-                output=self.root / "publication.json",
-            )
+            self.scenario.prepare_run(self)
             self.k.call(
                 "exec",
                 self.control,
@@ -251,21 +182,7 @@ class Benchmark:
             self.collect()
         except (subprocess.SubprocessError, OSError) as error:
             print(f"Collection failed: {error}", file=sys.stderr)
-        self.k.call(
-            "exec",
-            self.control,
-            "-c",
-            "main",
-            "--",
-            "python3",
-            "-u",
-            "/opt/benchmark/cleanup_objects.py",
-            output=self.root / "cleanup-objects.json",
-        )
-        if not json.loads((self.root / "cleanup-objects.json").read_text())[
-            "verified_absent"
-        ]:
-            raise RuntimeError("Object cleanup was not verified")
+        self.scenario.cleanup(self)
         pods = ["pod/" + self.control]
         for role in self.roles:
             self.k.call(

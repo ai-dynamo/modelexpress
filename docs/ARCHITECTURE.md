@@ -1302,6 +1302,14 @@ If initialization fails, recovery aborts without attempting another loader.
 
 See [ModelExpress Benchmarks](BENCHMARKS.md) for measured loading-path, NIXL registration, and artifact-transfer results with explicit timing boundaries.
 
+The RL benchmark harness in `ci/bench/` shares execution, timing, reporting, and
+Kubernetes lifecycle across scenarios. `common/scenario.py` selects the scenario
+module; the current `delta_scenario.py` owns publication, source preparation,
+payload validation, and source cleanup. It uses the public ModelExpress RL APIs
+without duplicating reshard planning or transport. See the
+[deployment guide](DEPLOYMENT.md#modelexpress-benchmark-ci-harness) for the scenario
+contract and current CPU-only CI coverage.
+
 ### Server-Backed Model Cache
 
 Workers without shared storage need repository files at two different moments, and only one of them is late enough for the strategy chain.

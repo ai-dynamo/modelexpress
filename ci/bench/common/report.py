@@ -8,11 +8,13 @@ import re
 import sys
 from pathlib import Path
 
+import scenario
 import validation
 
 
 def build_report(root):
     config = json.loads((root / "config.json").read_text())
+    case = scenario.load(config)
     log = (
         (root / "bench-driver.log").read_text()
         if (root / "bench-driver.log").exists()
@@ -50,17 +52,12 @@ def build_report(root):
                 r"Model loading took .*? memory and ([\d.]+) seconds", text
             )
         ]
-        wire = [
-            line
-            for line in text.splitlines()
-            if config.get("peer_transfer_marker", "RDMA transfer complete:") in line
-        ]
         worker = {
             "model_load_seconds": times,
-            "rdma_transfer_records": wire,
             "refit": records.get((role, "refit")),
             "failures": [],
         }
+        worker.update(case.worker_evidence(text, config))
         # Preserve streamed records even when an OOM prevented an RPC response.
         for line in text.splitlines():
             if "HOTLOAD_BENCHMARK " in line:
@@ -88,7 +85,7 @@ def build_report(root):
         for role in config["roles"]:
             baseline[role] = validation.hashes(result(role, "base-hashes"), config)
             updated[role] = validation.hashes(result(role, "updated-hashes"), config)
-            assert baseline[role] != updated[role], "No updated tensors"
+            case.validate_inventory(baseline[role], updated[role])
             validation.refit(result(role, "refit"), config, role)
             validation.inference(result(role, "post-refit-inference"))
             if config["expected_host_scales_per_rank"] is not None:
@@ -99,34 +96,15 @@ def build_report(root):
                 ]:
                     validation.scales(result(role, step), config)
             worker = report["workers"][role]
-            text = (root / f"{role}-worker.log").read_text()
-            if role == "s3":
-                assert "Streaming weights from s3://" in text
-            else:
-                assert worker["rdma_transfer_records"], "No RDMA completion evidence"
-                assert not any(
-                    x in text
-                    for x in [
-                        "Trying strategy: model_streamer",
-                        "Streaming weights from s3://",
-                        "Trying strategy: instant_tensor",
-                    ]
-                ), "Peer cold load fell back"
             pod = worker["pod"]
             assert pod["status"].get("containerStatuses")
             assert all(
                 x["restartCount"] == 0 and "terminated" not in x["state"]
                 for x in pod["status"]["containerStatuses"]
             )
-        validation.checkpoint(result("s3", "verify-checkpoint"), config, publication)
-        if "peer" in config["roles"]:
-            assert (
-                baseline["s3"] == baseline["peer"] and updated["s3"] == updated["peer"]
-            )
-            assert (
-                report["workers"]["s3"]["pod"]["spec"]["nodeName"]
-                != report["workers"]["peer"]["pod"]["spec"]["nodeName"]
-            )
+        case.compare_workers(baseline, config)
+        case.compare_workers(updated, config)
+        case.validate_report(result, report, root)
         report["validation_status"] = "PASS"
         summary = {
             role: validation.latency(

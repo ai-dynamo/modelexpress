@@ -11,6 +11,7 @@ import time
 import traceback
 from pathlib import Path
 
+import scenario
 import torch
 from config import CONFIG
 
@@ -27,7 +28,7 @@ class BenchWorkerExtension:
         tmp.replace(dest)
         print("HOTLOAD_BENCHMARK " + json.dumps(body), flush=True)
 
-    def _hotload_init_impl(self, run_id, source="OBJECT_STORAGE"):
+    def _hotload_init_impl(self, initial_version_id, source):
         try:
             from modelexpress.engines.vllm.loader import get_model_loader
             from modelexpress_rl.inference.client import (
@@ -38,13 +39,10 @@ class BenchWorkerExtension:
                 VllmGeneratorContext,
             )
             from modelexpress_rl.inference.plan import WeightSource
-            from modelexpress_rl.inference.receiver import ObjectStorageGeneratorConfig
-            from modelexpress_rl.object_storage import ObjectStorageType
 
             cfg = copy.copy(self.vllm_config)
             cfg.load_config = copy.copy(cfg.load_config)
             cfg.load_config.model_loader_extra_config = {}
-            self._hotload_run = run_id
             live = get_model_loader(self.local_rank).tensors
             BenchWorkerExtension._record(
                 self,
@@ -62,19 +60,6 @@ class BenchWorkerExtension:
                     ),
                 },
             )
-            storage = (
-                ObjectStorageGeneratorConfig(
-                    storage_type=ObjectStorageType.S3,
-                    initial_base_version_id=run_id + "-base",
-                    seed_checkpoint_path="/models",
-                    refit_checkpoint_dir="/refit",
-                    refit_checkpoint_max_size_gb=CONFIG["refit_checkpoint_max_size_gb"],
-                    endpoint_url=CONFIG["storage"]["endpoint_url"],
-                    region_name=CONFIG["storage"]["region"],
-                )
-                if source == "OBJECT_STORAGE"
-                else None
-            )
             self._hotload_client = ModelExpressGeneratorClient.initialize(
                 ModelExpressGeneratorConfig(
                     engine_context=VllmGeneratorContext(
@@ -82,8 +67,8 @@ class BenchWorkerExtension:
                     ),
                     model_name=os.environ["BENCH_MODEL"],
                     server_url=CONFIG["resource_prefix"] + "-control:8000",
-                    initial_serving_version_id=run_id + "-base",
-                    object_storage=storage,
+                    initial_serving_version_id=initial_version_id,
+                    **scenario.load(CONFIG).generator_kwargs(CONFIG, source),
                     source_order=(WeightSource[source],),
                 )
             )
@@ -95,7 +80,7 @@ class BenchWorkerExtension:
                 self,
                 "init",
                 {
-                    "version": run_id + "-base",
+                    "version": initial_version_id,
                     "source": source,
                     "quant_config": str(cfg.quant_config),
                     "registered_runtime_tensors_available": bool(live),
@@ -280,37 +265,12 @@ class BenchWorkerExtension:
             assert not changed and not extra, {"changed": changed, "extra": extra}
             if version_id.startswith("addresses:"):
                 return
-            from modelexpress_rl.inference.checkpoint_store import LocalCheckpointStore
-            from safetensors import safe_open
-
-            if CONFIG["embedding"]:
-                checkpoint = LocalCheckpointStore(
-                    root="/refit", model_name=os.environ["BENCH_MODEL"]
-                ).checkpoint_path(version_id)
-                index = json.loads(
-                    (checkpoint / "model.safetensors.index.json").read_text()
-                )
-                name = CONFIG["embedding"]
-                with safe_open(
-                    str(checkpoint / index["weight_map"][name]), framework="pt"
-                ) as sf:
-                    raw = sf.get_tensor(name)
-                    checkpoint_sha256 = hashlib.sha256(
-                        raw.contiguous().view(torch.uint8).numpy().tobytes()
-                    ).hexdigest()
-                BenchWorkerExtension._record(
-                    self,
-                    "checkpoint-verified",
-                    {
-                        "version": version_id,
-                        "checkpoint_tensor": name,
-                        "checkpoint_sha256": checkpoint_sha256,
-                        "shape": list(raw.shape),
-                        "dtype": str(raw.dtype),
-                        "verified": True,
-                    },
-                )
-                return self._last_record
+            BenchWorkerExtension._record(
+                self,
+                "checkpoint-verified",
+                scenario.load(CONFIG).refit_evidence(CONFIG, version_id),
+            )
+            return self._last_record
         except Exception as e:  # noqa: BLE001 -- Preserve runtime failure evidence.
             BenchWorkerExtension._record(
                 self,
@@ -324,13 +284,13 @@ class BenchWorkerExtension:
 
         return self._last_record
 
-    def hotload_init(self, run_id, source="OBJECT_STORAGE"):
+    def hotload_init(self, initial_version_id, source):
         import importlib
 
         import bench_worker
 
         importlib.reload(bench_worker).BenchWorkerExtension._hotload_init_impl(
-            self, run_id, source
+            self, initial_version_id, source
         )
         return self._last_record
 

@@ -75,6 +75,10 @@ def test_rendered_workloads_share_profile_and_mount_all_runtime_code(
     config = render(model, out, model + "-test", paths)
     cm = json.loads((out / "harness.json").read_text())
     assert json.loads(cm["data"]["config.json"]) == config
+    assert config["scenario"] == "delta"
+    assert config["target_version"] == model + "-test-d1"
+    assert config["sources"]["s3"] == "OBJECT_STORAGE"
+    assert {"scenario.py", "delta_scenario.py"} <= cm["data"].keys()
     assert "apply_patch.py" not in cm["data"]
     for name, text in cm["data"].items():
         if name.endswith(".py"):
@@ -138,6 +142,9 @@ def saved_run(tmp_path):
         "tp": 2,
         "roles": ["s3", "peer"],
         "run": "nemotron-test",
+        "initial_version": "nemotron-test-base",
+        "target_version": "nemotron-test-d1",
+        "sources": {"s3": "OBJECT_STORAGE", "peer": "GENERATOR"},
         "revision": "revision",
         "expected_tensors_per_rank": None,
         "expected_host_scales_per_rank": None,
@@ -681,3 +688,24 @@ def test_checkpoint_digest_mismatch_on_any_rank_fails(tmp_path, rank):
     report = build_report(tmp_path)
     assert report["validation_status"] == "FAILED"
     assert report["latency_summary"] == {}
+
+
+def test_refit_uses_explicit_version_and_source():
+    config = {
+        "tp": 1,
+        "target_version": "update-42",
+        "sources": {"receiver": "GENERATOR"},
+    }
+    row = {
+        "rank": 0,
+        "phase": "update-42",
+        "version": "update-42",
+        "serving_version": "update-42",
+        "source": "GENERATOR",
+        "weight_addresses_preserved": True,
+    }
+    validation.refit([row], config, "receiver")
+    with pytest.raises(AssertionError):
+        validation.refit([{**row, "source": "OBJECT_STORAGE"}], config, "receiver")
+    with pytest.raises(AssertionError):
+        validation.refit([{**row, "serving_version": "old"}], config, "receiver")

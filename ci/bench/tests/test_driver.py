@@ -14,9 +14,13 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_publisher_mismatch_stops_before_resume(tmp_path, monkeypatch):
+@pytest.mark.parametrize("target_version", ["nemotron-test-d1", "custom-update"])
+def test_publisher_mismatch_stops_before_resume(tmp_path, monkeypatch, target_version):
     config = {
         "run": "nemotron-test",
+        "initial_version": "nemotron-test-base",
+        "target_version": target_version,
+        "sources": {"s3": "OBJECT_STORAGE", "peer": "GENERATOR"},
         "resource_prefix": "mx-test",
         "roles": ["s3"],
         "tp": 1,
@@ -49,9 +53,9 @@ def test_publisher_mismatch_stops_before_resume(tmp_path, monkeypatch):
             row = {"rank": 0, "phase": "init"}
             if method == "hotload":
                 row.update(
-                    phase=config["run"] + "-d1",
-                    version=config["run"] + "-d1",
-                    serving_version=config["run"] + "-d1",
+                    phase=config["target_version"],
+                    version=config["target_version"],
+                    serving_version=config["target_version"],
                     source="OBJECT_STORAGE",
                     weight_addresses_preserved=True,
                 )
@@ -60,7 +64,7 @@ def test_publisher_mismatch_stops_before_resume(tmp_path, monkeypatch):
                     row["tensors"] = {"embedding": {"sha256": "before"}}
                 else:
                     row.update(
-                        version=config["run"] + "-d1",
+                        version=config["target_version"],
                         verified=True,
                         sha256="same",
                         expected_sha256="same",
