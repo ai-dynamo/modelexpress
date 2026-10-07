@@ -6,7 +6,7 @@ use object_store::client::{
 };
 use openssl::error::ErrorStack;
 use openssl::hash::MessageDigest;
-use openssl::pkey::{PKey, Private};
+use openssl::pkey::{Id, PKey, Private};
 use openssl::sign::Signer as OpensslSigner;
 use thiserror::Error;
 
@@ -17,14 +17,14 @@ enum OpensslCryptoError {
     #[error("Invalid RSA key: {source}")]
     InvalidKey { source: ErrorStack },
 
+    #[error("RS256 needs an RSA key, got {0:?}")]
+    NotRsa(Id),
+
     #[error("Error computing digest: {source}")]
     Digest { source: ErrorStack },
 
     #[error("Error signing: {source}")]
     Sign { source: ErrorStack },
-
-    #[error("Digest input was not fully consumed")]
-    Incomplete,
 }
 
 impl From<OpensslCryptoError> for object_store::Error {
@@ -47,7 +47,7 @@ impl CryptoProvider for OpensslCryptoProvider {
         Ok(Box::new(OpensslDigestContext {
             hasher,
             out: None,
-            failed: false,
+            update_error: None,
         }))
     }
 
@@ -76,6 +76,9 @@ impl CryptoProvider for OpensslCryptoProvider {
         };
         let key = PKey::private_key_from_pem(pem)
             .map_err(|source| OpensslCryptoError::InvalidKey { source })?;
+        if key.id() != Id::RSA {
+            return Err(OpensslCryptoError::NotRsa(key.id()).into());
+        }
         Ok(Box::new(OpensslRsaKey { key, digest }))
     }
 }
@@ -96,19 +99,22 @@ fn unsupported(algorithm: &dyn std::fmt::Debug) -> object_store::Error {
 struct OpensslDigestContext {
     hasher: openssl::hash::Hasher,
     out: Option<Vec<u8>>,
-    failed: bool,
+    update_error: Option<ErrorStack>,
 }
 
 impl DigestContext for OpensslDigestContext {
     fn update(&mut self, data: &[u8]) {
-        if self.hasher.update(data).is_err() {
-            self.failed = true;
+        if self.update_error.is_some() {
+            return;
+        }
+        if let Err(source) = self.hasher.update(data) {
+            self.update_error = Some(source);
         }
     }
 
     fn finish(&mut self) -> object_store::Result<&[u8]> {
-        if self.failed {
-            return Err(OpensslCryptoError::Incomplete.into());
+        if let Some(source) = self.update_error.take() {
+            return Err(OpensslCryptoError::Digest { source }.into());
         }
         let digest = self
             .hasher
@@ -165,10 +171,18 @@ impl Signer for OpensslRsaKey {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::*;
+    use object_store::client::{CryptoProvider, DigestAlgorithm, DigestContext, SigningAlgorithm};
+    use openssl::ec::{EcGroup, EcKey};
+    use openssl::error::ErrorStack;
     use openssl::hash::MessageDigest;
+    use openssl::nid::Nid;
+    use openssl::pkey::PKey;
     use openssl::rsa::Rsa;
     use openssl::sign::Verifier;
+
+    use crate::providers::s3_crypto::{
+        OpensslCryptoProvider, OpensslDigestContext, STORE, unsupported,
+    };
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -234,12 +248,13 @@ mod tests {
     }
 
     #[test]
-    fn digest_reports_a_failed_update_on_finish() {
+    fn digest_reports_the_failed_update_on_finish() {
         let mut ctx = OpensslDigestContext {
             hasher: openssl::hash::Hasher::new(MessageDigest::sha256()).expect("hasher"),
             out: None,
-            failed: true,
+            update_error: Some(ErrorStack::get()),
         };
+        ctx.update(b"ignored after a failure");
         let err = ctx
             .finish()
             .expect_err("a failed update must not produce a digest");
@@ -247,11 +262,22 @@ mod tests {
             matches!(err, object_store::Error::Generic { store: STORE, .. }),
             "unexpected error: {err:?}"
         );
-        assert!(err.to_string().contains("not fully consumed"), "{err}");
+        assert!(err.to_string().contains("Error computing digest"), "{err}");
     }
 
     #[test]
-    fn unsupported_algorithm_is_not_supported_error() {
+    fn sign_rejects_a_non_rsa_key() {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).expect("curve");
+        let key = PKey::from_ec_key(EcKey::generate(&group).expect("ec key")).expect("pkey");
+        let pem = key.private_key_to_pem_pkcs8().expect("pem");
+        let Err(err) = OpensslCryptoProvider.sign(SigningAlgorithm::RS256, &pem) else {
+            panic!("an EC key must not sign RS256");
+        };
+        assert!(err.to_string().contains("RS256 needs an RSA key"), "{err}");
+    }
+
+    #[test]
+    fn unsupported_helper_formats_a_not_supported_error() {
         let err = unsupported(&SigningAlgorithm::RS256);
         assert!(
             matches!(err, object_store::Error::NotSupported { .. }),
@@ -329,9 +355,7 @@ mod tests {
     async fn signs_a_request_a_real_s3_server_accepts() {
         use object_store::{ObjectStoreExt, aws::AmazonS3Builder, path::Path};
 
-        let Ok(endpoint) = std::env::var("MX_TEST_S3_ENDPOINT") else {
-            return;
-        };
+        let endpoint = std::env::var("MX_TEST_S3_ENDPOINT").expect("MX_TEST_S3_ENDPOINT");
         let bucket = std::env::var("MX_TEST_S3_BUCKET").unwrap_or_else(|_| "test-bucket".into());
         let key = std::env::var("MX_TEST_S3_KEY").unwrap_or_else(|_| "model.bin".into());
         let mut builder = AmazonS3Builder::new()
