@@ -48,6 +48,10 @@ security:
 tls:
   enabled: false
   secretName: ""
+  # Key in secretName holding the CA that issued the certificate (ca.crt for
+  # cert-manager). When set, `helm test` verifies the server certificate against
+  # it for the name <fullname>.<namespace>.svc; otherwise it skips verification.
+  caKey: ""
   # minVersion: TLS1.2
   # cipherSuites: []
   # groups: []

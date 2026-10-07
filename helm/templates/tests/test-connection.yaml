@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+{{- $tls := .Values.tls | default dict }}
 apiVersion: v1
 kind: Pod
 metadata:
@@ -16,8 +17,28 @@ spec:
     command: ['/ko-app/grpc-health-probe']
     args:
     - '-addr={{ include "modelexpress.fullname" . }}:{{ .Values.service.port | default 8001 }}'
-    {{- if .Values.tls.enabled }}
+    {{- if $tls.enabled }}
     - '-tls'
+    {{- if $tls.caKey }}
+    - '-tls-ca-cert=/etc/modelexpress/tls/ca.crt'
+    - '-tls-server-name={{ include "modelexpress.fullname" . }}.{{ .Release.Namespace }}.svc'
+    {{- else }}
     - '-tls-no-verify'
     {{- end }}
+    {{- end }}
+    {{- if and $tls.enabled $tls.caKey }}
+    volumeMounts:
+    - name: tls-ca
+      mountPath: /etc/modelexpress/tls
+      readOnly: true
+    {{- end }}
+  {{- if and $tls.enabled $tls.caKey }}
+  volumes:
+  - name: tls-ca
+    secret:
+      secretName: {{ $tls.secretName }}
+      items:
+      - key: {{ $tls.caKey }}
+        path: ca.crt
+  {{- end }}
   restartPolicy: Never
