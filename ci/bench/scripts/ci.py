@@ -177,6 +177,10 @@ def ci(mode):
             for item in yaml.safe_load_all(stack.read_text())
             if item["metadata"]["name"] == "vime-delta-refit-seaweedfs"
         ]
+        storage = next(item for item in items if item["kind"] == "Deployment")
+        resources = storage["spec"]["template"]["spec"]["containers"][0]["resources"]
+        for budget in ["requests", "limits"]:
+            resources[budget]["cpu"] = "4"
         k.manifest("create", {"apiVersion": "v1", "kind": "List", "items": items})
         k.call(
             "rollout", "status", "deployment/vime-delta-refit-seaweedfs", "--timeout=5m"

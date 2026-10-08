@@ -1625,7 +1625,8 @@ by [GitHub](https://docs.github.com/en/actions/reference/workflows-and-actions/e
 
 Both automatic and comment-triggered CI reuse the SeaweedFS Deployment and
 Service from `examples/rl/vime_dynamo_delta_refit/stack.yaml` in the benchmark's
-isolated namespace. Setup creates per-run credentials, downloads the pinned model
+isolated namespace. The benchmark reserves four CPUs for SeaweedFS to serve
+concurrent model-weight reads. Setup creates per-run credentials, downloads the pinned model
 snapshot on the CPU control pod, verifies uploads, and publishes its snapshot manifest
 before the timed workload starts. Redis runs as an init sidecar with a startup
 probe so it accepts connections before the ModelExpress server starts. The
