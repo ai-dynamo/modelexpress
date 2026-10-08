@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from harness.config import load_config
 from huggingface_hub import snapshot_download
@@ -39,6 +40,7 @@ def main():
         config=Config(s3={"addressing_style": "path"}),
     )
     s3.create_bucket(Bucket=config["bucket"])
+    transfer = TransferConfig(preferred_transfer_client="classic")
     files = []
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
@@ -46,7 +48,7 @@ def main():
             continue
         name, size = relative.as_posix(), path.stat().st_size
         key = config["seed_prefix"] + name
-        s3.upload_file(str(path), config["bucket"], key)
+        s3.upload_file(str(path), config["bucket"], key, Config=transfer)
         if s3.head_object(Bucket=config["bucket"], Key=key)["ContentLength"] != size:
             raise RuntimeError("Seed upload size mismatch: " + name)
         files.append({"name": name, "bytes": size})

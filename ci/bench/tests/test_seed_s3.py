@@ -33,7 +33,8 @@ def test_seed_upload_verifies_objects_before_publishing_manifest(
         assert model == config["model"] and kwargs["revision"] == config["revision"]
         return str(tmp_path)
 
-    def upload(path, bucket, key):
+    def upload(path, bucket, key, **kwargs):
+        assert kwargs.get("Config", {}).get("preferred_transfer_client") == "classic"
         assert bucket == config["bucket"]
         objects[key] = Path(path).read_bytes()
 
@@ -47,6 +48,7 @@ def test_seed_upload_verifies_objects_before_publishing_manifest(
     )
     for name, module in {
         "boto3": SimpleNamespace(client=lambda *args, **kwargs: client),
+        "boto3.s3.transfer": SimpleNamespace(TransferConfig=lambda **kwargs: kwargs),
         "botocore.config": SimpleNamespace(Config=lambda **kwargs: kwargs),
         "huggingface_hub": SimpleNamespace(snapshot_download=download),
         "harness.config": SimpleNamespace(load_config=lambda: config),

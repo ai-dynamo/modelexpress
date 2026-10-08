@@ -1627,7 +1627,8 @@ Both automatic and comment-triggered CI reuse the SeaweedFS Deployment and
 Service from `examples/rl/vime_dynamo_delta_refit/stack.yaml` in the benchmark's
 isolated namespace. Setup creates per-run credentials, downloads the pinned model
 snapshot on the CPU control pod, verifies uploads, and publishes its snapshot manifest
-before the timed workload starts. The existing `HF_TOKEN` secret is forwarded for
+before the timed workload starts. Seed uploads use boto3's standard transfer client
+for the custom HTTP endpoint, matching seed downloads. The existing `HF_TOKEN` secret is forwarded for
 model access. Delta objects are verified absent before namespace deletion; SeaweedFS
 and its seed data remain available if cleanup fails. This path needs no AWS IAM role
 or pre-populated bucket. It defaults to the digest-pinned vLLM 0.17.1 image already
