@@ -136,6 +136,18 @@ class DeltaScenario:
             text = (root / f"{role}-worker.log").read_text()
             if config["sources"][role] == "OBJECT_STORAGE":
                 assert "Streaming weights from s3://" in text
+                completed = {
+                    int(rank)
+                    for rank in re.findall(
+                        r"\[Worker (\d+)\] Model streamer weight loading complete", text
+                    )
+                }
+                assert completed == set(range(config["tp"])), (
+                    "S3 cold load did not complete on every rank"
+                )
+                assert "Model streamer loading failed, falling through:" not in text, (
+                    "S3 cold load fell back"
+                )
             else:
                 assert worker["rdma_transfer_records"], "No RDMA completion evidence"
                 assert not any(

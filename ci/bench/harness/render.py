@@ -194,7 +194,6 @@ def prepare(
     for role in ["control", *config["roles"]]:
         worker_env = {
             "VLLM_PLUGINS": "modelexpress",
-            "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MX_INSTANT_TENSOR": "0",
             "MX_MS_DISTRIBUTED": "0",
             "MX_P2P_METADATA": "1",

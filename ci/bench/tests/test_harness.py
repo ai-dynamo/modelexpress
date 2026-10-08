@@ -224,6 +224,8 @@ def saved_run(tmp_path):
         )
         log += (
             "Streaming weights from s3://bucket/model\n"
+            "[Worker 0] Model streamer weight loading complete\n"
+            "[Worker 1] Model streamer weight loading complete\n"
             if role == "s3"
             else "RDMA transfer complete: test\n"
         )
@@ -283,6 +285,21 @@ def test_report_checks_corresponding_tp_ranks_and_rejects_peer_fallback(tmp_path
     report = build_report(tmp_path)
     assert report["status"] == "FAILED"
     assert "fell back" in report["failure_reason"]
+
+
+@pytest.mark.parametrize("failure", ["missing_rank", "fallback"])
+def test_report_rejects_incomplete_s3_cold_load(tmp_path, failure):
+    saved_run(tmp_path)
+    path = tmp_path / "s3-worker.log"
+    text = path.read_text()
+    if failure == "missing_rank":
+        text = text.replace("[Worker 1] Model streamer weight loading complete\n", "")
+    else:
+        text += "[Worker 1] Model streamer loading failed, falling through: error\n"
+    path.write_text(text)
+    report = build_report(tmp_path)
+    assert report["status"] == "FAILED"
+    assert "S3 cold load" in report["failure_reason"]
 
 
 def test_report_rejects_wrong_nonzero_rank_even_with_pass_marker(tmp_path):
