@@ -691,21 +691,21 @@ class TestBoundedSynchronizeFallback:
         """Must hold with OR without a device.
 
         FakeStream carries a ``cuda_stream`` attribute, so on a CPU box this
-        returns False at the availability gate and on a GPU box it returns
-        False because recording against a test double fails. Asserting it
+        returns None at the availability gate and on a GPU box it returns
+        None because recording against a test double fails. Asserting it
         without pinning the reason is deliberate: the earlier version of this
         test passed only because the box had no CUDA, which is the same test
         passing for a reason that does not generalize.
         """
         live = lane(recorder, "lane0")
-        assert live._synchronize_bounded(5.0) is False
+        assert live.record_event() is None
 
     def test_the_fallback_accepts_a_stream_that_only_carries_a_raw_handle(
         self, recorder, monkeypatch
     ):
         """The unbounded path must take the same shapes the bounded one does.
 
-        _synchronize_bounded and backend._stream_handle both read
+        record_event and backend._stream_handle both read
         ``cuda_stream`` off the object. int() on the object itself raises
         TypeError, and this path is reachable whenever timeout_s is None.
         """

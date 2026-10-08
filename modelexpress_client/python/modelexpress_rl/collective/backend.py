@@ -205,6 +205,11 @@ class _CollectiveHalf:
         self._groups_run: set[int] = set()
         self._active_lanes: OrderedDict[int, LaneCommunicator] = OrderedDict()
         self._pending_contexts: list[RefitCtx] = []
+        # Layer groups whose receives are enqueued but not yet waited on, each
+        # with the per-lane events marking its end and the contexts it holds.
+        self._in_flight: OrderedDict[
+            int, tuple[list[tuple[LaneCommunicator, Any]], list[RefitCtx]]
+        ] = OrderedDict()
         self._deadline: float | None = None
         self._timeout_s: float | None = None
         self._version: str | None = None
@@ -298,6 +303,7 @@ class _CollectiveHalf:
         """
         self._pending_misc = True
         self._groups_run = set()
+        self._in_flight.clear()
         self._version = version
         self._timeout_s = transfer_timeout()
         self._deadline = time.monotonic() + self._timeout_s
@@ -332,6 +338,7 @@ class _CollectiveHalf:
         self._cache.abort_group(self._group_id)
         self._active_lanes.clear()
         self._pending_contexts.clear()
+        self._in_flight.clear()
         self._deadline = None
 
     def _stream_context(self, lane: LaneCommunicator, spec: LocalParamSpec):
@@ -443,12 +450,62 @@ class NcclM2nReceiver(_CollectiveHalf):
         logger.debug("collective receiver starting version %s", version)
 
     def update_weights(self, layer_group_id: int) -> None:
+        """Receive one layer group and return once it has fully landed."""
+        self.issue_weights(layer_group_id)
+        self.wait_weights(layer_group_id)
+
+    def issue_weights(self, layer_group_id: int) -> None:
+        """Enqueue one layer group's receives without waiting for them.
+
+        Each lane the group used gets an event recorded right after its last
+        receive, so wait_weights can wait for this group alone while later
+        groups are already queued on the same streams.
+        """
+        first = len(self._pending_contexts)
+        lanes: OrderedDict[int, LaneCommunicator] = OrderedDict()
         for entry in self._claim_group(layer_group_id):
+            lane = self._lane(entry.partition_id)
+            lanes[id(lane)] = lane
             self._issue_reshard(entry, src=lambda ctx: None, dst=lambda ctx: ctx.buf)
-        # Loader.install runs immediately after this method. It may read or
-        # release receive buffers, so the group's transfers and post hooks must
-        # be complete before returning.
-        self._drain_active_lanes()
+        marks = [(lane, lane.record_event()) for lane in lanes.values()]
+        self._in_flight[layer_group_id] = (marks, self._pending_contexts[first:])
+
+    def wait_weights(self, layer_group_id: int) -> None:
+        """Block until one issued layer group's receives and post hooks are done.
+
+        Loader.install runs after this. It may read or release the receive
+        buffers, so it must never see a group whose transfers are in flight.
+        A lane whose stream cannot carry an event falls back to draining the
+        whole stream, which is correct and only loses the overlap.
+        """
+        if layer_group_id not in self._in_flight:
+            raise RuntimeError(
+                f"layer group {layer_group_id} was not issued, or was already waited on"
+            )
+        marks, contexts = self._in_flight.pop(layer_group_id)
+        for lane, event in marks:
+            remaining = self._remaining()
+            try:
+                if event is None:
+                    lane.synchronize(
+                        timeout_s=None if remaining == math.inf else remaining
+                    )
+                else:
+                    lane.wait_event(event, remaining)
+            except TimeoutError:
+                self._fail_deadline()
+        # A lane no later in-flight group uses is now fully drained, so the
+        # finish-time drain has nothing left to wait for on it.
+        still_used = {
+            id(lane) for pending, _ in self._in_flight.values() for lane, _ in pending
+        }
+        for lane, _ in marks:
+            if id(lane) not in still_used:
+                self._active_lanes.pop(id(lane), None)
+        done = {id(ctx) for ctx in contexts}
+        self._pending_contexts = [
+            ctx for ctx in self._pending_contexts if id(ctx) not in done
+        ]
 
     def finish_weight_update(self, broadcast_lane_id: int) -> None:
         self._require_every_group()

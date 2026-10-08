@@ -383,7 +383,7 @@ rules are the contract; the right-hand column is what this backend does with the
 | `setup_layer_groups` | Once per worker; groups must be disjoint and cover the model | Map each `layer_group_id` to its bulk `ParamPlan` subset. The grouping is folded into the plan digest, so it is fixed before `compute_plan` and every participant must supply the same one |
 | `compute_plan` | After all workers finish `initialize`+`setup_layer_groups`; re-run on membership change | **Join the group with the plan digest, wait for READY, create the communicators.** Membership change = new epoch = new communicators |
 | `start_weight_update(version, worker_ids)` | Once per refit; all `compute_plan` done; no overlapping refits | `Publisher.start_new_round(version)`; the backend binds the operation and the admitted destination subset |
-| `publish_weights` / `update_weights(version, layer_group_id)` | Multiple per refit; concurrency across affected workers is desirable | The co-called `nccl.m2n.reshard` sequence for that group's bulk params. Every group runs exactly once per refit, in the same order on every participant; that order is the caller's to keep, and the backend refuses a repeated group and a finish that skipped one. A failure aborts the lanes and closes the round |
+| `publish_weights` / `update_weights(version, layer_group_id)` | Multiple per refit; concurrency across affected workers is desirable | The co-called `nccl.m2n.reshard` sequence for that group's bulk params. Every group runs exactly once per refit, in the same order on every participant; that order is the caller's to keep, and the backend refuses a repeated group and a finish that skipped one. On the generator, a group is installed once `MX_NCCL_REFIT_PIPELINE_DEPTH` groups are in flight, so `Loader.install` for group N overlaps the transfer of group N+1; `finish_weight_update` installs whatever is left. A failure aborts the lanes and closes the round |
 | `finish_weight_update(version)` | After all `*_weight_update` calls for this refit | The misc broadcast; `Loader.finish()`; stream sync; `ReportCollectiveTransfer` |
 | `cleanup` | Terminal | Release buffers, destroy communicators, deregister |
 
@@ -435,6 +435,7 @@ is exactly what the fused-parameter path already does.
 |---|---|---|
 | `MX_REFIT_TRANSPORT` | `nixl` | `nccl_m2n` selects this path. One deployment, one backend |
 | `MX_NCCL_REFIT_NUM_STREAMS` | `2` | Size of the stream pool an integration builds when it does not pass its own `streams`. `RefitClientTrainer`/`RefitClientGenerator` do not read it |
+| `MX_NCCL_REFIT_PIPELINE_DEPTH` | `2` | Layer groups the generator keeps in flight before installing the oldest; `1` installs each group before `update_weights` returns. All groups are installed before `finish_weight_update` returns |
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for one lane's non-blocking `Communicator.init` |

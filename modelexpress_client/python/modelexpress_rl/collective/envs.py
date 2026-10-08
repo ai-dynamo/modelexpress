@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S: float
     MX_NCCL_REFIT_TRANSFER_TIMEOUT_S: float
     MX_NCCL_REFIT_REGISTRATION_TTL_S: int
+    MX_NCCL_REFIT_PIPELINE_DEPTH: int
 
 
 def _int(name: str, default: int) -> int:
@@ -56,6 +57,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_NCCL_REFIT_TRANSFER_TIMEOUT_S": lambda: _float(
         "MX_NCCL_REFIT_TRANSFER_TIMEOUT_S", 600.0
     ),
+    "MX_NCCL_REFIT_PIPELINE_DEPTH": lambda: _int("MX_NCCL_REFIT_PIPELINE_DEPTH", 2),
     "MX_NCCL_REFIT_REGISTRATION_TTL_S": lambda: _int(
         "MX_NCCL_REFIT_REGISTRATION_TTL_S",
         _int("MX_HEARTBEAT_INTERVAL_SECS", 30) * 3,

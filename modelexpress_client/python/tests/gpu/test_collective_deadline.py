@@ -12,7 +12,7 @@ one of those can be green while the poll itself is broken.
 
 The allow arm is the one that matters here. A deny arm needs nothing external
 and red-tests cleanly; admitting requires the event to record and query on a
-real stream, and if _synchronize_bounded returned False on a GPU box then every
+real stream, and if record_event returned None on a GPU box then every
 deadline in production would silently degrade to the blocking wait it was
 written to replace, with no test anywhere going red.
 """
@@ -56,9 +56,9 @@ def lane() -> LaneCommunicator:
 def test_the_bound_actually_applies_on_a_real_stream(lane) -> None:
     """The allow arm: the poll runs rather than falling back.
 
-    False here means every transfer deadline silently becomes a blocking wait.
+    None here means every transfer deadline silently becomes a blocking wait.
     """
-    assert lane._synchronize_bounded(30.0) is True
+    assert lane.record_event() is not None
 
 
 @pytest.mark.skipif(_requirements() is not None, reason=_requirements() or "")
@@ -96,3 +96,45 @@ def test_an_unbounded_wait_still_waits(lane) -> None:
         torch.cuda._sleep(100_000_000)
     lane.synchronize()
     assert lane.stream.query() is True
+
+
+@pytest.mark.skipif(_requirements() is not None, reason=_requirements() or "")
+def test_an_event_covers_only_the_work_before_it(lane) -> None:
+    """What lets a receiver install one layer group while the next is in flight.
+
+    The event is recorded after a short kernel and BEFORE a long one is queued
+    on the same stream. Waiting on it must return once the short kernel ends;
+    an event recorded at wait time instead would cover the long kernel too and
+    run into the deadline.
+    """
+    with torch.cuda.stream(lane.stream):
+        torch.cuda._sleep(1_000_000)
+    event = lane.record_event()
+    assert event is not None
+    with torch.cuda.stream(lane.stream):
+        torch.cuda._sleep(SPIN_CYCLES)
+
+    started = time.monotonic()
+    lane.wait_event(event, timeout_s=5.0)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert lane.stream.query() is False, "the later kernel must still be running"
+
+
+@pytest.mark.skipif(_requirements() is not None, reason=_requirements() or "")
+def test_a_finished_event_is_noticed_well_inside_a_millisecond_poll(lane) -> None:
+    """The poll must not sleep a fixed multi-millisecond step per wait.
+
+    A refit waits once per layer group, so a 5 ms step is paid dozens of times
+    a round. Fifty waits on ~20 us of work stay well under what a fixed 5 ms
+    step costs, which is at least 50 x 5 ms whenever the first query misses.
+    """
+    waits = 50
+    started = time.monotonic()
+    for _ in range(waits):
+        with torch.cuda.stream(lane.stream):
+            torch.cuda._sleep(20_000)
+        lane.wait_event(lane.record_event(), timeout_s=5.0)
+    elapsed = time.monotonic() - started
+    assert elapsed < waits * 0.002, f"{waits} short waits took {elapsed * 1e3:.1f} ms"

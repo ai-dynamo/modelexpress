@@ -31,6 +31,9 @@ from . import envs
 
 logger = logging.getLogger("modelexpress_rl.collective.comm")
 
+_POLL_MIN_S = 20e-6
+_POLL_MAX_S = 1e-3
+
 
 class NcclUnavailableError(RuntimeError):
     """nccl4py is not installed.
@@ -153,8 +156,11 @@ class LaneCommunicator:
         CUDA event can be recorded on - a test double, or a build without
         torch. Those cannot hang on device work, so there is nothing to bound.
         """
-        if timeout_s is not None and self._synchronize_bounded(timeout_s):
-            return
+        if timeout_s is not None:
+            event = self.record_event()
+            if event is not None:
+                self.wait_event(event, timeout_s)
+                return
         stream = self.stream
         if stream is not None and callable(getattr(stream, "synchronize", None)):
             stream.synchronize()
@@ -172,18 +178,21 @@ class LaneCommunicator:
                 handle = getattr(stream, "cuda_stream", stream)
                 torch.cuda.ExternalStream(int(handle)).synchronize()
 
-    def _synchronize_bounded(self, timeout_s: float) -> bool:
-        """Poll a CUDA event until this lane's work lands or the deadline passes.
+    def record_event(self) -> Any | None:
+        """Mark everything enqueued on this lane's stream so far.
 
-        Returns False when the stream cannot carry an event, so the caller can
-        fall back rather than silently reporting a bound it did not apply.
+        Returns a CUDA event that completes once that work has, or None when the
+        stream cannot carry one, in which case the caller falls back to a plain
+        synchronize rather than reporting a bound it did not apply. Work enqueued
+        after the mark is not covered, which is what lets a caller wait for one
+        layer group while the next one is already queued behind it.
         """
         try:
             import torch
         except ImportError:
-            return False
+            return None
         if not torch.cuda.is_available():
-            return False
+            return None
 
         stream = self.stream
         device_context = (
@@ -205,7 +214,7 @@ class LaneCommunicator:
                 elif hasattr(stream, "cuda_stream"):
                     target = torch.cuda.ExternalStream(int(stream.cuda_stream))
                 else:
-                    return False
+                    return None
                 event = torch.cuda.Event()
                 event.record(target)
         except Exception as error:  # noqa: BLE001 - any resolve failure means fall back
@@ -214,9 +223,18 @@ class LaneCommunicator:
                 "blocking wait: %r",
                 error,
             )
-            return False
+            return None
+        return event
 
+    def wait_event(self, event: Any, timeout_s: float) -> None:
+        """Poll ``event`` until it completes, raising once ``timeout_s`` passes.
+
+        The poll backs off from tens of microseconds to a millisecond. A refit
+        waits once per layer group, so a fixed multi-millisecond sleep would be
+        paid on every group and can exceed the transfer it is waiting for.
+        """
         deadline = time.monotonic() + timeout_s
+        delay = _POLL_MIN_S
         while not event.query():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -224,8 +242,8 @@ class LaneCommunicator:
                     f"lane {self.rank}/{self.world_size} did not finish its enqueued "
                     f"work within {timeout_s:.1f}s"
                 )
-            time.sleep(min(0.005, remaining))
-        return True
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, _POLL_MAX_S)
 
 
 def _wait_until_initialized(comm: Any, bindings: Any, timeout_s: float) -> None:

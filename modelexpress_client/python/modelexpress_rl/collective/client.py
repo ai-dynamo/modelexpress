@@ -19,6 +19,7 @@ The sequencing is the contract, and two of its rules are load-bearing here:
 from __future__ import annotations
 
 import logging
+from collections import deque
 from contextlib import nullcontext
 from typing import Any
 
@@ -560,7 +561,21 @@ class RefitClientTrainer(_RefitClientBase):
 
 
 class RefitClientGenerator(_RefitClientBase):
-    """Generator-side lifecycle."""
+    """Generator-side lifecycle.
+
+    Layer groups are pipelined: ``update_weights`` enqueues a group's receives
+    and installs the OLDEST group still waiting once
+    ``MX_NCCL_REFIT_PIPELINE_DEPTH`` groups are outstanding, so one group is
+    installed while the next is on the wire. Every group is installed before
+    ``finish_weight_update`` returns. Depth 1 installs each group before
+    ``update_weights`` returns, at the cost of serializing install and
+    transfer. A depth of N keeps up to N groups' receive buffers live.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._unfinished: deque[int] = deque()
+        self._pipeline_depth = 1
 
     def initialize(
         self,
@@ -605,8 +620,19 @@ class RefitClientGenerator(_RefitClientBase):
         self._check_still_current()
         self._loader.start_new_round(version)
         self._half.start_weight_update(version)
+        self._unfinished = deque()
+        self._pipeline_depth = envs.MX_NCCL_REFIT_PIPELINE_DEPTH
         self._round_started = True
         self._version = version
+
+    def _abort_round(self) -> None:
+        self._unfinished = deque()
+        super()._abort_round()
+
+    def _install_oldest(self, half: NcclM2nReceiver) -> None:
+        layer_group_id = self._unfinished.popleft()
+        half.wait_weights(layer_group_id)
+        self._loader.install(layer_group_id)
 
     def update_weights(
         self, version: str, layer_group_id: int = DEFAULT_LAYER_GROUP
@@ -615,8 +641,10 @@ class RefitClientGenerator(_RefitClientBase):
         if self._loader is None:
             raise RuntimeError("initialize must run before update_weights")
         try:
-            half.update_weights(layer_group_id)
-            self._loader.install(layer_group_id)
+            half.issue_weights(layer_group_id)
+            self._unfinished.append(layer_group_id)
+            while len(self._unfinished) >= self._pipeline_depth:
+                self._install_oldest(half)
         except Exception:
             self._abort_round()
             raise
@@ -628,9 +656,12 @@ class RefitClientGenerator(_RefitClientBase):
         if self._loader is None:
             raise RuntimeError("initialize must run before finish_weight_update")
         try:
+            while self._unfinished:
+                self._install_oldest(half)
             half.finish_weight_update(self.membership.broadcast_lane.lane_id)
             self._loader.finish()
         except Exception as error:
+            self._unfinished = deque()
             half.abort()
             try:
                 self._report(operation_id, succeeded=False, message=repr(error))

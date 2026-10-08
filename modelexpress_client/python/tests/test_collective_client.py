@@ -789,6 +789,8 @@ class TestPerGroupFailure:
     def test_a_failed_install_aborts_the_lanes_and_closes_the_round(
         self, fake_nccl, monkeypatch
     ):
+        # Depth 1 installs inside update_weights, which is the path under test.
+        monkeypatch.setenv("MX_NCCL_REFIT_PIPELINE_DEPTH", "1")
         engine = FakeEngine()
         client = RefitClientGenerator(
             rendezvous=FakeRendezvous(),
@@ -809,6 +811,81 @@ class TestPerGroupFailure:
         assert len(client._cache) == 0
         with pytest.raises(RuntimeError, match="start_weight_update must run"):
             client.update_weights("v1")
+
+
+THREE_GROUPS = ReshardPlan(bulk=[entry("a"), entry("b"), entry("c")])
+
+
+def pipelined_generator(engine):
+    client = RefitClientGenerator(
+        rendezvous=FakeRendezvous(),
+        model_name="m",
+        trainer_slots=["t0", "t1"],
+        generator_slots=["g0", "g1"],
+        source_partition_count=1,
+        slot_id="g0",
+        worker_id="w9",
+        index_in_role=0,
+    )
+    client.setup_layer_groups([["a"], ["b"], ["c"]])
+    client.initialize(engine)
+    client.compute_plan()
+    return client
+
+
+def installs(engine):
+    return [call[1] for call in engine.calls if call[0] == "install"]
+
+
+class TestLayerGroupPipeline:
+    def test_depth_two_installs_each_group_while_the_next_is_issued(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_PIPELINE_DEPTH", "2")
+        engine = FakeEngine(plan=THREE_GROUPS)
+        client = pipelined_generator(engine)
+        client.start_weight_update("v1")
+        client.update_weights("v1", 0)
+        assert installs(engine) == []
+        client.update_weights("v1", 1)
+        assert installs(engine) == [0]
+        client.update_weights("v1", 2)
+        assert installs(engine) == [0, 1]
+        client.finish_weight_update("v1")
+        assert installs(engine) == [0, 1, 2]
+        # finish() refreshes derived state, so it must follow the last install.
+        assert [call[0] for call in engine.calls][-2:] == ["install", "finish"]
+
+    def test_depth_one_installs_before_update_weights_returns(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_PIPELINE_DEPTH", "1")
+        engine = FakeEngine(plan=THREE_GROUPS)
+        client = pipelined_generator(engine)
+        client.start_weight_update("v1")
+        for group in range(3):
+            client.update_weights("v1", group)
+            assert installs(engine) == list(range(group + 1))
+        client.finish_weight_update("v1")
+
+    def test_a_deferred_install_that_fails_aborts_at_finish_and_reports(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_PIPELINE_DEPTH", "2")
+        engine = FakeEngine(plan=THREE_GROUPS)
+        client = pipelined_generator(engine)
+        rz = client._rendezvous
+        client.start_weight_update("v1")
+        for group in range(3):
+            client.update_weights("v1", group)
+        monkeypatch.setattr(engine, "install", _raises(RuntimeError("install failed")))
+        with pytest.raises(RuntimeError, match="install failed"):
+            client.finish_weight_update("v1", operation_id="op1")
+        assert rz.reports[0]["succeeded"] is False
+        assert len(client._cache) == 0
+        assert not client._unfinished
+        with pytest.raises(RuntimeError, match="start_weight_update must run"):
+            client.update_weights("v1", 0)
 
 
 class TestLayerGroupContract:
