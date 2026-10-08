@@ -109,3 +109,51 @@ def test_completed_publications_do_not_wait(lifecycle, monkeypatch):
         lifecycle.time, "sleep", lambda _: pytest.fail("Unexpected wait")
     )
     lifecycle.wait_for_publications([SimpleNamespace(poll=lambda: 0)], 0)
+
+
+@pytest.mark.parametrize("preparation_code", [0, 1])
+def test_engine_start_waits_for_preparation(
+    tmp_path, lifecycle, monkeypatch, preparation_code
+):
+    from types import SimpleNamespace
+
+    bench = object.__new__(lifecycle.Benchmark)
+    bench.root = tmp_path
+    bench.prefix = "test"
+    bench.control = "test-control"
+    bench.roles = ["s3"]
+    bench.config = {
+        "publication_path": "/publication.json",
+        "preparation": [
+            {"role": "s3", "module": "download", "log": "seed.log"},
+            {"role": "control", "module": "publish", "log": "publication.log"},
+        ],
+    }
+    bench.k = SimpleNamespace(call=lambda *args, **kwargs: None)
+    bench.apply = lambda name: None
+    completed = set()
+    sleeps = []
+    monkeypatch.setattr(lifecycle.time, "sleep", sleeps.append)
+
+    def start(pod, module, log):
+        if module == "engines.vllm.server":
+            assert completed == {"download", "publish"}
+            (tmp_path / log).write_text("BENCH_READY\n")
+            return SimpleNamespace(poll=lambda: None)
+
+        def poll():
+            if not sleeps:
+                return None
+            completed.add(module)
+            return preparation_code
+
+        return SimpleNamespace(poll=poll)
+
+    bench.start = start
+    if preparation_code:
+        with pytest.raises(RuntimeError, match="publication failed"):
+            bench.prepare_run()
+        assert not (tmp_path / "s3-worker.log").exists()
+    else:
+        bench.prepare_run()
+        assert sleeps == [5]

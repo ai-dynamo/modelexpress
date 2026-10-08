@@ -176,26 +176,25 @@ class Benchmark:
             self.apply(f"worker-{role}.yaml")
             pod = self.prefix + "-" + role
             self.k.call("wait", "--for=condition=Ready", "pod/" + pod, "--timeout=10m")
-            worker = self.start(pod, "engines.vllm.server", role + "-worker.log")
             for task in self.config["preparation"]:
                 if task["role"] == role or (
                     task["role"] == "control" and role == self.roles[0]
                 ):
                     target = self.control if task["role"] == "control" else pod
                     preparations.append(self.start(target, task["module"], task["log"]))
+            wait_for_publications(preparations, deadline)
+            worker = self.start(pod, "engines.vllm.server", role + "-worker.log")
             while (
                 "BENCH_READY"
                 not in (self.root / (role + "-worker.log"))
                 .read_text(errors="replace")
                 .splitlines()
             ):
-                pending_publications(preparations)
                 if worker.poll() is not None:
                     raise RuntimeError(f"{role} worker exited before readiness")
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"{role} worker readiness timed out")
                 time.sleep(5)
-        wait_for_publications(preparations, deadline)
         self.k.call(
             "exec",
             self.control,
