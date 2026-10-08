@@ -71,7 +71,8 @@ impl std::str::FromStr for TlsVersion {
 /// Split a mixed cipher list into what OpenSSL configures through
 /// `set_cipher_list` (TLS 1.2 and below) and `set_ciphersuites` (TLS 1.3).
 /// IANA-spelled TLS 1.2 names (`TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`) start
-/// with `TLS_` too, but contain `_WITH_`, which no TLS 1.3 suite name does.
+/// with `TLS_` too, but contain `_WITH_`, which no TLS 1.3 suite name does;
+/// each backend resolves them with its own IANA name table.
 #[must_use]
 pub fn split_cipher_suites(names: &[String]) -> (Vec<String>, Vec<String>) {
     names

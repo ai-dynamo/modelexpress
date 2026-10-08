@@ -55,6 +55,7 @@ pub fn build(config: &TlsConfig) -> Result<Option<Acceptor>, TlsError> {
     builder.check_private_key()?;
     builder.set_min_proto_version(Some(ssl_version(min_version(config.min_version))))?;
     let (tls12, tls13) = split_cipher_suites(&config.cipher_suites);
+    let tls12: Vec<String> = tls12.iter().map(|name| openssl_cipher_name(name)).collect();
     let tls12 = supported_names(&tls12, "TLS1.2 cipher", SslContextBuilder::set_cipher_list)?;
     if !tls12.is_empty() {
         builder.set_cipher_list(&tls12.join(":"))?;
@@ -85,6 +86,19 @@ fn min_version(configured: Option<TlsVersion>) -> TlsVersion {
             TlsVersion::Tls12
         }
         None => TlsVersion::Tls12,
+    }
+}
+
+/// The OpenSSL name for an IANA-spelled suite, from OpenSSL's own table, or
+/// `name` unchanged when it is not an IANA name OpenSSL knows. Only OpenSSL
+/// 3.2 and later accept IANA names in a cipher list themselves.
+fn openssl_cipher_name(name: &str) -> String {
+    if !name.contains("_WITH_") || name.contains('\0') {
+        return name.to_string();
+    }
+    match openssl::ssl::cipher_name(name) {
+        "(NONE)" => name.to_string(),
+        openssl => openssl.to_string(),
     }
 }
 
@@ -154,7 +168,7 @@ mod tests {
 
     use crate::config::{TlsConfig, TlsConfigError};
     use crate::tls::TlsError;
-    use crate::tls::backend_openssl::{ALPN_H2, build, min_version};
+    use crate::tls::backend_openssl::{ALPN_H2, build, min_version, openssl_cipher_name};
 
     /// A throwaway CA-signed leaf for `localhost` written into `dir`.
     pub(crate) fn self_signed(dir: &TempDir) -> (PathBuf, PathBuf) {
@@ -536,6 +550,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn iana_names_resolve_through_openssls_table() {
+        assert_eq!(
+            openssl_cipher_name("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"),
+            "ECDHE-RSA-AES256-GCM-SHA384"
+        );
+        assert_eq!(
+            openssl_cipher_name("TLS_RSA_WITH_AES_128_CBC_SHA"),
+            "AES128-SHA"
+        );
+        for unchanged in [
+            "ECDHE-RSA-AES256-GCM-SHA384",
+            "TLS_NOT_WITH_A_SUITE",
+            "TLS_AES_128_GCM_SHA256",
+            "TLS_X_WITH_\0",
+        ] {
+            assert_eq!(openssl_cipher_name(unchanged), unchanged);
+        }
     }
 
     #[test]
