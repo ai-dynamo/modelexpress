@@ -29,11 +29,20 @@ import modelexpress_rl
     assert result.returncode == 0, result.stderr
 
 
-def test_package_import_does_not_load_optional_engine_implementations():
+def test_package_import_does_not_load_optional_engine_or_framework_implementations():
     code = """
 import sys
 import modelexpress_rl
+import modelexpress_rl.train.frameworks
+import modelexpress_rl.train.frameworks.vime
 
+assert modelexpress_rl.train.frameworks.vime.__all__ == ["UpdateWeightFromModelExpress"]
+assert not hasattr(modelexpress_rl.train.frameworks.vime, "unknown_export")
+assert "vime" not in sys.modules
+assert "miles" not in sys.modules
+assert "ray" not in sys.modules
+assert "megatron" not in sys.modules
+assert "modelexpress_rl.train.frameworks.vime.modelexpress" not in sys.modules
 assert "modelexpress.engines.vllm.adapter" not in sys.modules
 assert "modelexpress_rl.inference.engines.vllm.installer" not in sys.modules
 assert "modelexpress_rl.inference.engines.sglang.installer" not in sys.modules

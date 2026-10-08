@@ -1164,6 +1164,30 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `inference/engines/vllm/installer.py` | Private vLLM load-layout capture plus graph-safe tensor or prepared-checkpoint installation |
 | `inference/engines/vllm/weight_transfer_engine.py` | Native vLLM weight-transfer bridge for NIXL full-tensor and canonical S3 checkpoint refit |
 
+### Vime trainer integration
+
+`train/frameworks/vime/modelexpress.py` owns Vime's ModelExpress weight updater,
+including version publication, checkpoint cadence, rollout refits, and metrics.
+The framework package exposes it lazily:
+
+```python
+from modelexpress_rl.train.frameworks.vime import UpdateWeightFromModelExpress
+```
+
+Only requesting the updater loads Vime, Ray, and Megatron; ordinary SDK and
+framework-package imports do not. The `.vime.modelexpress` submodule import
+also works. Vime selects the adapter with
+`--update-weight-transport modelexpress`, and the adapter reuses Vime's HF weight
+iterator and Gloo-group helper.
+
+Replacement rollout engines keep the original seed's version ID. Once training
+has advanced, they install the latest published version before generation
+resumes, using canonical replay or a full checkpoint. Disconnect is a no-op for
+this S3 transport: trainer sleep preserves rollout handles, so reconnecting the
+same cohort does not reinitialize its weight-transfer backend or replay weights.
+A failed restore does not resume the replacement engines. Successful installs
+publish the exact MX version ID through vLLM's weight-version metadata.
+
 ### MxClient
 
 gRPC client wrapping the P2P service stubs:
