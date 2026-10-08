@@ -1623,29 +1623,32 @@ comment runs use the default-branch harness until the edits merge.
 `issue_comment` requires the workflow on the default branch, as documented
 by [GitHub](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#issue_comment).
 
-Configure these repository Actions variables:
+Both automatic and comment-triggered CI reuse the MinIO Deployment and
+Service from `examples/rl/vime_dynamo_delta_refit/stack.yaml` in the benchmark's
+isolated namespace. Setup creates per-run credentials, downloads the pinned model
+snapshot on the CPU control pod, verifies uploads, and publishes its snapshot manifest
+before the timed workload starts. The existing `HF_TOKEN` secret is forwarded for
+model access. Delta objects are verified absent before namespace deletion; MinIO
+and its seed data remain available if cleanup fails. This path needs no AWS IAM role
+or pre-populated bucket. It defaults to the digest-pinned vLLM 0.17.1 image already
+used by CI, recorded in the Nemotron profile, with `MX_BENCH_RUNTIME_BASES.nemotron` available as an override.
 
-| Variable | Required value |
+Optional repository Actions variables configure placement and runtime overrides:
+
+| Variable | Value |
 | --- | --- |
-| `MX_BENCH_KUBE_CONTEXT` | AWS Kubernetes context available in `/teleport/kubeconfig.yaml`; defaults to `nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02` |
-| `MX_BENCH_S3_ROLE_ARN` | IAM role trusted for the cluster's IRSA identity and `mx-bench` service account in run namespaces |
-| `MX_BENCH_S3_BUCKET` | Bucket holding each selected profile's complete pinned snapshot; defaults to `ai-dynamo-modelexpress-ci` |
-| `MX_BENCH_S3_REGION` | Bucket region; defaults to `us-west-2` |
+| `MX_BENCH_KUBE_CONTEXT` | Kubernetes context available in `/teleport/kubeconfig.yaml`; defaults to `nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02` |
 | `MX_BENCH_RUNTIME_BASES` | JSON mapping profile keys to compatible digest-pinned vLLM base images, e.g. `{"nemotron":"registry/runtime@sha256:...","kimi":"registry/kimi-runtime@sha256:..."}` with full digests |
 
-A runtime mapping is required only for profiles being run. Each image must include
+Runtime overrides take precedence over the profile default. Kimi requires an
+override because its profile has no qualified default runtime. Each image must include
 compatible Torch, vLLM, NIXL, NumPy, requests, and safetensors; the build installs
 ModelExpress and verifies imports. Compatibility with each model's quantization
 and refit path still requires hardware qualification. The existing `NGC_API_KEY`
-secret supplies registry access.
-
-The cluster must support IRSA injection. IAM trust must cover
-`mx-ci-bench-<run-id>-<attempt>` namespaces and service account `mx-bench`; access must
-allow snapshot reads/listing and delta-prefix writes/deletes. The CI runner's
-identity is not inherited by workload pods. Populate all checkpoint shards and
-`snapshot-manifest.json` under the profile's `seed_prefix` beforehand. The worker seed-download step reads
-the snapshot manifest and checks downloaded file sizes against S3 object sizes. CI does not
-provision IAM, mirror snapshots, deploy MinIO, or use the Vime job's FSx cache.
+secret supplies registry access. CI seeds its own MinIO store and does not use the
+Vime job's FSx cache. The seed-download step reads the snapshot manifest and checks
+downloaded file sizes against S3 object sizes. Manual runs can use external S3
+through their environment configuration.
 
 The `RL weight refit CI` comment workflow delegates execution to the shared
 `RL refit CI` workflow for the selected profile and scenario. The GPU job is named
@@ -1654,8 +1657,8 @@ PR automatically calls the same workflow for Nemotron, under
 `Small model S3 refit / S3 delta-weight refit (nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4)`.
 Workflow callers can pass a profile key or its registered full model name; validation
 resolves it to the profile key for resource names and configuration. The required `CI status check`
-depends on this workflow, including cleanup; missing runtime, IAM, or seed configuration
-fails the gate. Kimi remains opt-in. Automatic runs check out the approved mirrored
+depends on this workflow, including cleanup; seed download, storage or refit failures
+fail the gate. Kimi remains opt-in and requires a runtime override. Automatic runs check out the approved mirrored
 SHA for the harness; comment runs use the default-branch harness. Offline
 contracts run on every PR in the `RL refit harness tests` job. The namespace GPU quota follows the rendered profile's
 TP size (one for Nemotron, eight for Kimi). Image builds have a 60-minute timeout;

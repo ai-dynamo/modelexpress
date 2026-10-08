@@ -16,12 +16,6 @@ concurrency:
   cancel-in-progress: false
   queue: max
 
-env:
-  KUBE_CONTEXT: ${{ vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02' }}
-  MX_BENCH_S3_ROLE_ARN: ${{ vars.MX_BENCH_S3_ROLE_ARN }}
-  MX_CI_S3_BUCKET: ${{ vars.MX_BENCH_S3_BUCKET || 'ai-dynamo-modelexpress-ci' }}
-  MX_CI_S3_REGION: ${{ vars.MX_BENCH_S3_REGION || 'us-west-2' }}
-
 jobs:
   authorize:
     if: >-
@@ -37,7 +31,6 @@ jobs:
       sha: ${{ steps.gate.outputs.sha }}
       model: ${{ steps.gate.outputs.model }}
       scenario: ${{ steps.gate.outputs.scenario }}
-      runtime: ${{ steps.config.outputs.runtime }}
     steps:
       # issue_comment uses default-branch code. Never check out PR code here.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -48,23 +41,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 ci/bench/scripts/comment_gate.py
-      - name: Require configured AWS identity and runtime
-        id: config
-        env:
-          MODEL_PROFILE: ${{ steps.gate.outputs.model }}
-          RUNTIME_BASES: ${{ vars.MX_BENCH_RUNTIME_BASES }}
-        run: |
-          python3 - <<'PY'
-          import json, os, re
-          for key in ['KUBE_CONTEXT', 'MX_BENCH_S3_ROLE_ARN', 'MX_CI_S3_BUCKET', 'MX_CI_S3_REGION']:
-              if not os.environ.get(key):
-                  raise SystemExit('Missing repository configuration: ' + key)
-          runtime = json.loads(os.environ['RUNTIME_BASES']).get(os.environ['MODEL_PROFILE'], '')
-          if not re.fullmatch(r'[a-zA-Z0-9./:_-]+@sha256:[0-9a-f]{64}', runtime):
-              raise SystemExit('MX_BENCH_RUNTIME_BASES must contain a digest-pinned runtime for the selected model')
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write('runtime=' + runtime + '\n')
-          PY
 
   benchmark:
     name: RL refit
@@ -78,5 +54,5 @@ jobs:
       model: ${{ needs.authorize.outputs.model }}
       scenario: ${{ needs.authorize.outputs.scenario }}
       sha: ${{ needs.authorize.outputs.sha }}
-      runtime: ${{ needs.authorize.outputs.runtime }}
+      runtime: ${{ fromJSON(vars.MX_BENCH_RUNTIME_BASES || '{}')[needs.authorize.outputs.model] || '' }}
     secrets: inherit

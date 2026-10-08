@@ -4,6 +4,7 @@
 """The comment boundary must never authorize an unapproved PR revision."""
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -125,9 +126,6 @@ def test_unsupported_options_fail_closed(command):
 def workflow_environment():
     return {
         "KUBE_CONTEXT": "ci",
-        "MX_BENCH_S3_ROLE_ARN": "arn:aws:iam::123:role/test",
-        "MX_CI_S3_BUCKET": "ci",
-        "MX_CI_S3_REGION": "us-west-2",
         "TEST_SHA": SHA,
         "RUNTIME_BASE": "registry/runtime@sha256:" + "b" * 64,
         "PR_NUMBER": "42",
@@ -144,6 +142,7 @@ def test_reusable_workflow_resolves_the_same_authorized_revision():
         "sha": SHA,
         "model": "nemotron",
         "scenario": "delta",
+        "runtime": workflow_environment()["RUNTIME_BASE"],
     }
 
 
@@ -193,6 +192,7 @@ def test_trusted_mirror_push_does_not_require_bot_writer_permission():
         "sha": SHA,
         "model": "nemotron",
         "scenario": "delta",
+        "runtime": workflow_environment()["RUNTIME_BASE"],
     }
 
 
@@ -206,7 +206,31 @@ def test_workflow_accepts_full_model_name_and_returns_safe_profile_key(environme
         },
         get,
     )
-    assert result == {"sha": SHA, "model": "nemotron", "scenario": "delta"}
+    assert result == {
+        "sha": SHA,
+        "model": "nemotron",
+        "scenario": "delta",
+        "runtime": workflow_environment()["RUNTIME_BASE"],
+    }
+
+
+def test_workflow_uses_profile_runtime_when_override_is_absent():
+    _, get = request()
+    result = gate.authorize_workflow({**mirror_environment(), "RUNTIME_BASE": ""}, get)
+    profile = json.loads(
+        (
+            Path(__file__).resolve().parents[1] / "profiles/nemotron/profile.json"
+        ).read_text()
+    )
+    assert result["runtime"] == profile["runtime"]
+
+
+def test_profile_without_runtime_requires_an_override():
+    _, get = request()
+    with pytest.raises(ValueError, match="digest-pinned"):
+        gate.authorize_workflow(
+            {**mirror_environment(), "MODEL_PROFILE": "kimi", "RUNTIME_BASE": ""}, get
+        )
 
 
 @pytest.mark.parametrize(

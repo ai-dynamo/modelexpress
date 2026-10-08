@@ -142,7 +142,7 @@ env:
   MX_IMAGE_REPO: nvcr.io/0980761089281446
 
 jobs:
-  nemotron-s3-refit:
+  small-model-s3-refit:
     name: Small model S3 refit
     permissions:
       contents: read
@@ -1348,7 +1348,7 @@ jobs:
       - test-rolling-update
       - test-stale-metadata
       - model-streamer
-      - nemotron-s3-refit
+      - small-model-s3-refit
     if: always()
     steps:
       - name: All dependent jobs succeeded

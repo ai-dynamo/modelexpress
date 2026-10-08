@@ -66,20 +66,11 @@ def authorize(event, repository, get):
 
 
 def authorize_workflow(environment, get):
-    for key in [
-        "KUBE_CONTEXT",
-        "MX_BENCH_S3_ROLE_ARN",
-        "MX_CI_S3_BUCKET",
-        "MX_CI_S3_REGION",
-    ]:
-        if not environment.get(key):
-            raise ValueError("Missing repository configuration: " + key)
+    if not environment.get("KUBE_CONTEXT"):
+        raise ValueError("Missing repository configuration: KUBE_CONTEXT")
     sha = environment.get("TEST_SHA", "")
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise ValueError("sha must be a full lowercase commit SHA")
-    runtime = environment.get("RUNTIME_BASE", "")
-    if not re.fullmatch(r"[a-zA-Z0-9./:_-]+@sha256:[0-9a-f]{64}", runtime):
-        raise ValueError("runtime must be digest-pinned")
     profiles = Path(__file__).resolve().parents[1]
     catalog = json.loads((profiles / "profiles.json").read_text())
     model, scenario = environment["MODEL_PROFILE"], environment["SCENARIO"]
@@ -93,6 +84,10 @@ def authorize_workflow(environment, get):
                 break
     if model not in catalog["models"] or scenario not in catalog["scenarios"]:
         raise ValueError("Unknown model or scenario")
+    profile = json.loads((profiles / "profiles" / model / "profile.json").read_text())
+    runtime = environment.get("RUNTIME_BASE") or profile.get("runtime", "")
+    if not re.fullmatch(r"[a-zA-Z0-9./:_-]+@sha256:[0-9a-f]{64}", runtime):
+        raise ValueError("runtime must be digest-pinned")
     if environment.get("GITHUB_EVENT_NAME") == "push":
         match = re.fullmatch(
             r"refs/heads/pull-request/([1-9][0-9]*)", environment.get("GITHUB_REF", "")
@@ -108,7 +103,7 @@ def authorize_workflow(environment, get):
         if requested_number not in (0, number):
             raise ValueError("pull_request does not match the mirrored branch")
         authorize_revision(environment["GITHUB_REPOSITORY"], number, sha, get)
-        return {"sha": sha, "model": model, "scenario": scenario}
+        return {"sha": sha, "model": model, "scenario": scenario, "runtime": runtime}
     number = int(environment["PR_NUMBER"])
     if number < 1:
         raise ValueError("pull_request must be a positive PR number")
@@ -130,7 +125,10 @@ def authorize_workflow(environment, get):
             "user": {"login": environment["GITHUB_ACTOR"]},
         },
     }
-    return authorize(event, environment["GITHUB_REPOSITORY"], get)
+    return {
+        **authorize(event, environment["GITHUB_REPOSITORY"], get),
+        "runtime": runtime,
+    }
 
 
 def main():

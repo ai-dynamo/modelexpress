@@ -65,10 +65,14 @@ contracts run on every PR in `RL refit harness tests`. `bench-ci.yml` accepts `/
 [--scenario delta] [--sha FULL_SHA]` from repository writers after copy-pr-bot mirrors the current
 head. Every trusted PR also runs the one-GPU Nemotron S3 delta-weight refit through
 `rl-refit-ci.yml`; `CI status check` requires its build, GPU test, and cleanup to succeed.
+Automatic and comment-triggered CI use the Vime example's MinIO setup in an isolated
+namespace and upload the pinned seed snapshot before measurement; they need no AWS IAM role.
 Kimi remains opt-in. The reusable workflow independently validates the current
 approved mirror before building the requested SHA. Only delta is registered; no reshard CI case
-is introduced. S3-only GPU runs use profile-derived quotas and configured per-model runtime
-images. No live AWS validation has been performed; Kimi refit compatibility is
+is introduced. GPU runs use profile-derived quotas; Nemotron defaults to a pinned
+copy of the existing CI vLLM runtime, with a repository override available. Kimi
+requires a per-model runtime override. No live qualification of
+the new Nemotron benchmark has been performed; Kimi refit compatibility is
 not established. Peer coverage stays manual. See
 [usage and limitations](../docs/DEPLOYMENT.md#modelexpress-benchmark-ci-harness).
 

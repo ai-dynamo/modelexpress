@@ -3,12 +3,14 @@
 
 """Exercise namespace ownership and failure cleanup without a cluster."""
 
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -44,7 +46,6 @@ if 'apply' in args:
         "RESULTS_DIR": str(tmp_path / "results"),
         "SERVER_IMAGE": "registry/server@sha256:" + "a" * 64,
         "WORKER_IMAGE": "registry/worker@sha256:" + "b" * 64,
-        "MX_BENCH_S3_ROLE_ARN": "arn:aws:iam::123:role/test",
         "GITHUB_RUN_ID": "123",
         "GITHUB_RUN_ATTEMPT": "1",
     }
@@ -69,10 +70,17 @@ def test_setup_sizes_quota_from_selected_profile(tmp_path, profile, gpus):
     executable = tmp_path / "kubectl"
     log = tmp_path / "calls"
     executable.write_text("""#!/usr/bin/env python3
-import os, sys
+import json, os, sys
 from pathlib import Path
 with Path(os.environ['CALLS']).open('a') as out:
     out.write(' '.join(sys.argv[1:]) + '\\n')
+    if sys.argv[-2:] == ['-f', '-']:
+        resource = json.load(sys.stdin)
+        if resource['kind'] == 'List':
+            for item in resource['items']:
+                out.write('RESOURCE ' + item['kind'] + ' ' + item['metadata']['name'] + '\\n')
+                if item['kind'] == 'Deployment':
+                    out.write('IMAGE ' + item['spec']['template']['spec']['containers'][0]['image'] + '\\n')
 sys.exit(0)
 """)
     executable.chmod(0o755)
@@ -87,7 +95,6 @@ sys.exit(0)
         "RESULTS_DIR": str(tmp_path / "results"),
         "SERVER_IMAGE": "registry/server@sha256:" + "a" * 64,
         "WORKER_IMAGE": "registry/worker@sha256:" + "b" * 64,
-        "MX_BENCH_S3_ROLE_ARN": "arn:aws:iam::123:role/test",
         "NGC_API_KEY": "fake",
         "GITHUB_RUN_ID": "123",
         "GITHUB_RUN_ATTEMPT": "1",
@@ -100,7 +107,23 @@ sys.exit(0)
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert "apply" not in log.read_text()
+    calls = log.read_text()
+    assert "annotate serviceaccount" not in calls
+    assert "rollout status deployment/vime-delta-refit-minio" in calls
+    assert "scenarios.delta.seed_minio" in calls
+    stack = ROOT.parents[1] / "examples/rl/vime_dynamo_delta_refit/stack.yaml"
+    minio = next(
+        item
+        for item in yaml.safe_load_all(stack.read_text())
+        if item["kind"] == "Deployment"
+    )
+    assert (
+        "IMAGE " + minio["spec"]["template"]["spec"]["containers"][0]["image"] in calls
+    )
+    assert "RESOURCE Deployment vime-delta-refit-mx" not in calls
+    config = json.loads((tmp_path / "results/config.json").read_text())
+    assert config["storage"]["endpoint_url"] == "http://vime-delta-refit-minio:9000"
+    assert config["storage"]["addressing_style"] == "path"
     assert (
         f"create quota bench-gpu-budget --hard=requests.nvidia.com/gpu={gpus},limits.nvidia.com/gpu={gpus}"
         in log.read_text()
@@ -143,7 +166,6 @@ if 'logs' in args:
         "RESULTS_DIR": str(results),
         "SERVER_IMAGE": "registry/server@sha256:" + "a" * 64,
         "WORKER_IMAGE": "registry/worker@sha256:" + "b" * 64,
-        "MX_BENCH_S3_ROLE_ARN": "arn:aws:iam::123:role/test",
         "GITHUB_RUN_ID": "123",
         "GITHUB_RUN_ATTEMPT": "1",
     }

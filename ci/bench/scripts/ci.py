@@ -6,6 +6,7 @@
 import argparse
 import json
 import os
+import secrets
 import shutil
 import sys
 import tempfile
@@ -30,7 +31,6 @@ def ci(mode):
         "RESULTS_DIR",
         "SERVER_IMAGE",
         "WORKER_IMAGE",
-        "MX_BENCH_S3_ROLE_ARN",
         "GITHUB_RUN_ID",
         "GITHUB_RUN_ATTEMPT",
     ]:
@@ -46,6 +46,25 @@ def ci(mode):
     )
 
     def render():
+        overrides = {
+            "endpoint_url": "http://vime-delta-refit-minio:9000",
+            "bucket": "mx-refit",
+            "region": "us-east-1",
+            "addressing_style": "path",
+            "pod_env": [
+                {
+                    "name": key,
+                    "valueFrom": {
+                        "secretKeyRef": {"name": "mx-minio-creds", "key": key}
+                    },
+                }
+                for key in [
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "HF_TOKEN",
+                ]
+            ],
+        }
         with tempfile.TemporaryDirectory(prefix="mx-bench-render-") as temporary:
             rendered = Path(temporary) / "run"
             config = prepare(
@@ -56,6 +75,7 @@ def ci(mode):
                 environment="aws-ci",
                 scenario_name=env.get("SCENARIO", "delta"),
                 service_account="mx-bench",
+                **overrides,
             )
             root.mkdir(parents=True, exist_ok=True)
             shutil.copytree(rendered, root, dirs_exist_ok=True)
@@ -91,12 +111,6 @@ def ci(mode):
             f"--hard=requests.nvidia.com/gpu={count},limits.nvidia.com/gpu={count}",
         )
         k.call("create", "serviceaccount", "mx-bench")
-        k.call(
-            "annotate",
-            "serviceaccount",
-            "mx-bench",
-            "eks.amazonaws.com/role-arn=" + env["MX_BENCH_S3_ROLE_ARN"],
-        )
         # Send credentials through stdin, so subprocess errors cannot print them.
         import base64
 
@@ -121,6 +135,50 @@ def ci(mode):
                 if item["kind"] == "Pod":
                     item["spec"]["activeDeadlineSeconds"] = 3300
             path.write_text(yaml.safe_dump(manifest))
+        password = secrets.token_urlsafe(32)
+        k.manifest(
+            "create",
+            {
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {"name": "mx-minio-creds"},
+                "stringData": {
+                    "MINIO_ROOT_USER": "minio",
+                    "MINIO_ROOT_PASSWORD": password,
+                    "AWS_ACCESS_KEY_ID": "minio",
+                    "AWS_SECRET_ACCESS_KEY": password,
+                    "HF_TOKEN": env.get("HF_TOKEN", ""),
+                },
+            },
+        )
+        stack = (
+            Path(__file__).resolve().parents[3]
+            / "examples/rl/vime_dynamo_delta_refit/stack.yaml"
+        )
+        items = [
+            item
+            for item in yaml.safe_load_all(stack.read_text())
+            if item["metadata"]["name"] == "vime-delta-refit-minio"
+        ]
+        k.manifest("create", {"apiVersion": "v1", "kind": "List", "items": items})
+        k.call("rollout", "status", "deployment/vime-delta-refit-minio", "--timeout=5m")
+        for name in ["harness.json", "control.yaml"]:
+            k.call("apply", "-f", str(root / name))
+        control = config["resource_prefix"] + "-control"
+        k.call("wait", "--for=condition=Ready", "pod/" + control, "--timeout=10m")
+        k.call(
+            "exec",
+            control,
+            "-c",
+            "main",
+            "--",
+            "python3",
+            "-u",
+            "-m",
+            "scenarios.delta.seed_minio",
+            output=root / "seed-upload.log",
+            timeout=2700,
+        )
     elif mode == "run":
         owned()
         Benchmark(root).run()
