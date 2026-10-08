@@ -24,7 +24,6 @@ use tokio::io::AsyncWriteExt;
 use tonic::transport::Channel;
 use tracing::debug;
 use tracing::info;
-#[cfg(test)]
 use tracing::warn;
 use uuid::Uuid;
 
@@ -873,7 +872,46 @@ impl Client {
         let model_name = model_name.into();
         let provider = ModelProvider::resolve_provider_for_model_name(&model_name, provider);
 
-        match Client::new(config.clone()).await {
+        let endpoint = config.connection.endpoint.clone();
+        let connect_wait = Duration::from_secs(
+            config
+                .connection
+                .connect_wait_secs
+                .unwrap_or(constants::DEFAULT_CONNECT_WAIT_SECS),
+        );
+        // An endpoint that does not even parse will never connect, so spend no budget on it.
+        let endpoint_parses = tonic::transport::Endpoint::new(endpoint.clone()).is_ok();
+        let started = tokio::time::Instant::now();
+        let mut backoff = Duration::from_millis(250);
+        let mut attempts: u32 = 0;
+
+        // Retry only the initial connection: a server that is a moment from ready (cold
+        // cluster, rolling restart) should not push every client onto a full provider
+        // download. `Client::new` only builds and connects the channel, so its errors are
+        // all transport errors.
+        let connect_result = loop {
+            attempts = attempts.saturating_add(1);
+            match Client::new(config.clone()).await {
+                Ok(client) => break Ok(client),
+                Err(e) => {
+                    let remaining = connect_wait.saturating_sub(started.elapsed());
+                    let retryable =
+                        endpoint_parses && matches!(*e, modelexpress_common::Error::Transport(_));
+                    if !retryable || remaining.is_zero() {
+                        break Err(e);
+                    }
+                    let sleep_for = backoff.min(remaining);
+                    debug!(
+                        "Connection attempt {} to {} failed ({}); retrying in {:?}",
+                        attempts, endpoint, e, sleep_for
+                    );
+                    tokio::time::sleep(sleep_for).await;
+                    backoff = backoff.saturating_mul(2).min(Duration::from_secs(2));
+                }
+            }
+        };
+
+        match connect_result {
             Ok(mut client) => {
                 info!("Server connection established, downloading via server...");
                 client
@@ -881,7 +919,14 @@ impl Client {
                     .await
             }
             Err(e) => {
-                info!("Cannot connect to server ({}), downloading directly...", e);
+                warn!(
+                    "Cannot connect to ModelExpress server at {} after waiting {:.2}s ({} attempt(s)); last error: {}. Downloading model {} directly from the provider, bypassing the server cache.",
+                    endpoint,
+                    started.elapsed().as_secs_f64(),
+                    attempts,
+                    e,
+                    model_name
+                );
                 download::download_model_revision(
                     &model_name,
                     provider,
@@ -1266,6 +1311,13 @@ mod tests {
         let addr = listener
             .local_addr()
             .expect("Failed to read test listener address");
+        (addr, tokio::spawn(serve_model_service(listener, service)))
+    }
+
+    async fn serve_model_service(
+        listener: tokio::net::TcpListener,
+        service: impl ModelService + 'static,
+    ) -> Result<(), tonic::transport::Error> {
         let incoming = futures::stream::unfold(listener, |listener| async {
             match listener.accept().await {
                 Ok((stream, _)) => Some((Ok::<_, std::io::Error>(stream), listener)),
@@ -1273,14 +1325,10 @@ mod tests {
             }
         });
 
-        let handle = tokio::spawn(async move {
-            Server::builder()
-                .add_service(ModelServiceServer::new(service))
-                .serve_with_incoming(incoming)
-                .await
-        });
-
-        (addr, handle)
+        Server::builder()
+            .add_service(ModelServiceServer::new(service))
+            .serve_with_incoming(incoming)
+            .await
     }
 
     fn create_test_client_config() -> ClientConfig {
@@ -1803,7 +1851,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_model_with_smart_fallback_no_server() {
-        let config = Config::for_testing("http://127.0.0.1:99999"); // Invalid port
+        let mut config = Config::for_testing("http://127.0.0.1:99999"); // Invalid port
+        config.connection.connect_wait_secs = Some(0);
 
         let result = Client::request_model_with_smart_fallback(
             "definitely-not-a-real-model-name-12345",
@@ -1821,6 +1870,95 @@ mod tests {
                 || error_msg.contains("gRPC error")
                 || error_msg.contains("h2 protocol error")
                 || error_msg.contains("connection")
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_request_model_with_smart_fallback_waits_for_late_server() {
+        // Pre-pick a free port, release it, and only start listening on it ~600ms after the
+        // client has begun connecting, the way a server comes up during a rolling restart.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("Failed to bind port probe")
+            .local_addr()
+            .expect("Failed to read probe address");
+        let seen_model_name = Arc::new(Mutex::new(None));
+        let service = RecordingModelService {
+            seen_model_name: Arc::clone(&seen_model_name),
+            seen_provider: Arc::new(Mutex::new(None)),
+        };
+        let server_handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .expect("Failed to bind late test listener");
+            serve_model_service(listener, service).await
+        });
+
+        let cache_dir = TempDir::new().expect("Failed to create temp dir");
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.local_path = cache_dir.path().to_path_buf();
+        config.cache.shared_storage = true;
+        config.connection.connect_wait_secs = Some(5);
+
+        // Observable: the recording server's ensure_model_downloaded handler stores the model
+        // name it was asked for, so `seen_model_name` is Some only if the request went
+        // through the server path. The model name is bogus, so the direct-download path
+        // cannot succeed: the call returning Ok also rules it out.
+        let result = Client::request_model_with_smart_fallback(
+            "definitely-not-a-real-org/definitely-not-a-real-model-12345",
+            ModelProvider::HuggingFace,
+            config,
+            false,
+        )
+        .await;
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        result.expect("Expected smart fallback to wait for the server and succeed via it");
+        assert_eq!(
+            seen_model_name
+                .lock()
+                .expect("Failed to lock seen_model_name")
+                .clone(),
+            Some("definitely-not-a-real-org/definitely-not-a-real-model-12345".to_string()),
+            "Request should have reached the late-starting server"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_model_with_smart_fallback_gives_up_after_connect_wait() {
+        // Nothing listens on this pre-picked port for the whole wait budget.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("Failed to bind port probe")
+            .local_addr()
+            .expect("Failed to read probe address");
+        let cache_dir = TempDir::new().expect("Failed to create temp dir");
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.local_path = cache_dir.path().to_path_buf();
+        config.connection.connect_wait_secs = Some(1);
+
+        let started = std::time::Instant::now();
+        let result = Client::request_model_with_smart_fallback(
+            "definitely-not-a-real-org/definitely-not-a-real-model-12345",
+            ModelProvider::HuggingFace,
+            config,
+            false,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(950),
+            "Expected the client to keep retrying for ~1s, returned after {elapsed:?}"
+        );
+        let error_msg = result
+            .expect_err("Bogus model should fail on the direct-download path")
+            .to_string();
+        assert!(
+            error_msg.contains("Direct download failed"),
+            "Expected fall-through to direct download, got: {error_msg}"
         );
     }
 

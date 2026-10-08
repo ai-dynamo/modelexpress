@@ -39,6 +39,8 @@ pub const MODEL_EXPRESS_PREFIX: &str = "MODEL_EXPRESS";
 pub const MODEL_EXPRESS_ENDPOINT: &str = "MODEL_EXPRESS_ENDPOINT";
 /// Client request timeout in seconds (`ClientArgs::timeout`).
 pub const MODEL_EXPRESS_TIMEOUT: &str = "MODEL_EXPRESS_TIMEOUT";
+/// Client initial-connection wait budget in seconds (`ClientArgs::connect_wait_secs`).
+pub const MODEL_EXPRESS_CONNECT_WAIT_SECS: &str = "MODEL_EXPRESS_CONNECT_WAIT_SECS";
 /// Local model cache directory (client, server, and both providers).
 pub const MODEL_EXPRESS_CACHE_DIRECTORY: &str = "MODEL_EXPRESS_CACHE_DIRECTORY";
 /// Log level (client and server).
@@ -347,6 +349,10 @@ mod tests {
         assert_eq!(MODEL_EXPRESS_PREFIX, "MODEL_EXPRESS");
         assert_eq!(MODEL_EXPRESS_ENDPOINT, "MODEL_EXPRESS_ENDPOINT");
         assert_eq!(MODEL_EXPRESS_TIMEOUT, "MODEL_EXPRESS_TIMEOUT");
+        assert_eq!(
+            MODEL_EXPRESS_CONNECT_WAIT_SECS,
+            "MODEL_EXPRESS_CONNECT_WAIT_SECS"
+        );
         assert_eq!(
             MODEL_EXPRESS_CACHE_DIRECTORY,
             "MODEL_EXPRESS_CACHE_DIRECTORY"
