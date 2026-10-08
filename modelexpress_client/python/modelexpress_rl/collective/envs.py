@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     MX_NCCL_REFIT_TRANSFER_TIMEOUT_S: float
     MX_NCCL_REFIT_REGISTRATION_TTL_S: int
     MX_NCCL_REFIT_PIPELINE_DEPTH: int
+    MX_NCCL_REFIT_BLOCKING_DATA_PLANE: bool
 
 
 def _int(name: str, default: int) -> int:
@@ -35,6 +36,15 @@ def _int(name: str, default: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be positive, got {value}")
     return value
+
+
+def _flag(name: str) -> bool:
+    value = os.environ.get(name, "0").strip().lower()
+    if value in ("", "0", "false", "no", "off"):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"invalid {name}: {os.environ.get(name)!r}")
 
 
 def _float(name: str, default: float) -> float:
@@ -56,6 +66,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_NCCL_REFIT_TRANSFER_TIMEOUT_S": lambda: _float(
         "MX_NCCL_REFIT_TRANSFER_TIMEOUT_S", 600.0
+    ),
+    "MX_NCCL_REFIT_BLOCKING_DATA_PLANE": lambda: _flag(
+        "MX_NCCL_REFIT_BLOCKING_DATA_PLANE"
     ),
     "MX_NCCL_REFIT_PIPELINE_DEPTH": lambda: _int("MX_NCCL_REFIT_PIPELINE_DEPTH", 2),
     "MX_NCCL_REFIT_REGISTRATION_TTL_S": lambda: _int(

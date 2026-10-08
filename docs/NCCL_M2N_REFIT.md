@@ -435,6 +435,7 @@ is exactly what the fused-parameter path already does.
 |---|---|---|
 | `MX_REFIT_TRANSPORT` | `nixl` | `nccl_m2n` selects this path. One deployment, one backend |
 | `MX_NCCL_REFIT_NUM_STREAMS` | `2` | Size of the stream pool an integration builds when it does not pass its own `streams`. `RefitClientTrainer`/`RefitClientGenerator` do not read it |
+| `MX_NCCL_REFIT_BLOCKING_DATA_PLANE` | `0` | Opt-in. When `1`, each lane is still initialized as a non-blocking communicator, bounded by `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S`, and the reshard and broadcast traffic then runs on a blocking communicator split off it, also under that deadline. On the M2N NVLink path a non-blocking communicator costs roughly 0.4 ms of host time per reshard call, so this cuts a single-node refit of a few hundred parameters several-fold; over the network the per-call cost is already small and this changes little. Abort tears down both communicators. |
 | `MX_NCCL_REFIT_PIPELINE_DEPTH` | `2` | Layer groups the generator keeps in flight before installing the oldest; `1` installs each group before `update_weights` returns. All groups are installed before `finish_weight_update` returns |
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |

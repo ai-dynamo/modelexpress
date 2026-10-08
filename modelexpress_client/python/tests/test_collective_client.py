@@ -407,6 +407,115 @@ class TestCommunicatorBootstrap:
         assert seen["config"].blocking is False
         assert seen["device"] == 3
 
+    def test_blocking_data_plane_is_split_off_the_bounded_comm(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_BLOCKING_DATA_PLANE", "1")
+        communicator = sys.modules["nccl.core.communicator"]
+        made = {}
+
+        class Child:
+            is_valid = True
+
+            def abort(self):
+                made["child_aborted"] = True
+
+        class Parent:
+            def get_async_error(self):
+                return 0
+
+            def split(self, *, color, key, config):
+                made["split"] = (color, key, config.blocking)
+                return Child()
+
+            def abort(self):
+                made["parent_aborted"] = True
+
+        def init(**kwargs):
+            made["init_blocking"] = kwargs["config"].blocking
+            return Parent()
+
+        communicator.Communicator.init = init
+        cache = CommunicatorCache()
+        lane = cache.create(
+            LaneKey("g", 1, 0),
+            rank=1,
+            world_size=2,
+            unique_id=b"x" * 128,
+            device=None,
+            stream=None,
+            timeout_s=0.1,
+        )
+        assert made["init_blocking"] is False
+        assert made["split"] == (0, 1, True)
+        assert isinstance(lane.handle, Child)
+        lane.abort()
+        assert made == {**made, "child_aborted": True, "parent_aborted": True}
+
+    def test_without_the_flag_the_data_plane_is_the_nonblocking_comm(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.delenv("MX_NCCL_REFIT_BLOCKING_DATA_PLANE", raising=False)
+        communicator = sys.modules["nccl.core.communicator"]
+
+        class Parent:
+            def get_async_error(self):
+                return 0
+
+            def split(self, **kwargs):
+                raise AssertionError("no split without the flag")
+
+            def abort(self):
+                pass
+
+        parent = Parent()
+        communicator.Communicator.init = lambda **kwargs: parent
+        lane = CommunicatorCache().create(
+            LaneKey("g", 1, 0),
+            rank=0,
+            world_size=2,
+            unique_id=b"x" * 128,
+            device=None,
+            stream=None,
+            timeout_s=0.1,
+        )
+        assert lane.handle is parent
+
+    def test_a_split_whose_peer_never_joins_aborts_the_parent_at_the_deadline(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_BLOCKING_DATA_PLANE", "1")
+        bindings = sys.modules["nccl.bindings.nccl"]
+        communicator = sys.modules["nccl.core.communicator"]
+
+        class Parent:
+            split_called = False
+            aborted = False
+
+            def get_async_error(self):
+                return bindings.Result.InProgress if self.split_called else 0
+
+            def split(self, **kwargs):
+                self.split_called = True
+                return SimpleNamespace(is_valid=False, abort=lambda: None)
+
+            def abort(self):
+                self.aborted = True
+
+        parent = Parent()
+        communicator.Communicator.init = lambda **kwargs: parent
+        with pytest.raises(TimeoutError, match="did not complete"):
+            CommunicatorCache().create(
+                LaneKey("g", 1, 0),
+                rank=0,
+                world_size=2,
+                unique_id=b"x" * 128,
+                device=None,
+                stream=None,
+                timeout_s=0.01,
+            )
+        assert parent.aborted
+
     def test_a_stalled_nonblocking_init_is_aborted_at_the_deadline(
         self, fake_nccl, monkeypatch
     ):

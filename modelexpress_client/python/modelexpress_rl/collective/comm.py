@@ -100,6 +100,7 @@ class LaneCommunicator:
         stream: Any,
         device: Any = None,
         unique_id: bytes | None = None,
+        control: Any = None,
     ) -> None:
         self._comm = comm
         self.rank = rank
@@ -107,6 +108,7 @@ class LaneCommunicator:
         self.stream = stream
         self.device = device
         self.unique_id = unique_id
+        self._control = control
         self._aborted = False
 
     @property
@@ -132,15 +134,16 @@ class LaneCommunicator:
         if self._aborted:
             return
         self._aborted = True
-        abort = getattr(self._comm, "abort", None)
-        if abort is None:
-            return
-        try:
-            abort()
-        except Exception as error:  # noqa: BLE001 - teardown must not mask the original failure
-            logger.warning(
-                "aborting the NCCL communicator did not complete cleanly: %r", error
-            )
+        for comm in (self._comm, self._control):
+            abort = getattr(comm, "abort", None)
+            if abort is None:
+                continue
+            try:
+                abort()
+            except Exception as error:  # noqa: BLE001 - teardown must not mask the original failure
+                logger.warning(
+                    "aborting the NCCL communicator did not complete cleanly: %r", error
+                )
 
     def synchronize(self, timeout_s: float | None = None) -> None:
         """Wait for work enqueued on this lane's stream.
@@ -280,6 +283,25 @@ def _wait_until_initialized(comm: Any, bindings: Any, timeout_s: float) -> None:
         time.sleep(min(0.01, remaining))
 
 
+def _split_blocking(
+    parent: Any, config_type: Any, bindings: Any, rank: int, timeout_s: float
+) -> Any:
+    """Split a blocking data-plane communicator off a bounded non-blocking one.
+
+    A non-blocking communicator costs a host-side thread per NCCL group on the
+    M2N NVLink path, which dominates a refit made of hundreds of reshards. The
+    blocking child avoids that, and the bounded part is kept: the split is a
+    collective on the non-blocking parent, so it is polled against the same
+    deadline as init, and a peer that never joins leaves the parent in progress
+    where aborting it returns.
+    """
+    child = parent.split(color=0, key=rank, config=config_type(blocking=True))
+    _wait_until_initialized(parent, bindings, timeout_s)
+    if not getattr(child, "is_valid", True):
+        raise RuntimeError("the blocking data-plane split returned no communicator")
+    return child
+
+
 class CommunicatorCache:
     """Communicators for one worker, keyed by ``(group_id, epoch, lane_id)``.
 
@@ -369,6 +391,7 @@ class CommunicatorCache:
             device_context = torch.cuda.device(device)
 
         comm = None
+        data = None
         try:
             with device_context:
                 comm = communicator.Communicator.init(
@@ -378,6 +401,8 @@ class CommunicatorCache:
                     config=config_type(blocking=False),
                 )
                 _wait_until_initialized(comm, bindings, timeout_s)
+                if envs.MX_NCCL_REFIT_BLOCKING_DATA_PLANE:
+                    data = _split_blocking(comm, config_type, bindings, rank, timeout_s)
         except BaseException:
             if comm is not None:
                 try:
@@ -390,12 +415,13 @@ class CommunicatorCache:
             raise
 
         lane = LaneCommunicator(
-            comm,
+            data if data is not None else comm,
             rank=rank,
             world_size=world_size,
             stream=stream,
             device=device,
             unique_id=bytes(unique_id),
+            control=comm if data is not None else None,
         )
         self._lanes[key] = lane
         # Bringing a new communicator up puts every other live one back into
