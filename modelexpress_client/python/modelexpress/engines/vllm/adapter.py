@@ -170,7 +170,8 @@ def _mtp_layer_prefixes(config: dict | None) -> tuple[str, ...]:
 
     GLM (Glm4MoeForCausalLM) stores the MTP head as extra decoder layers
     model.layers.{num_hidden_layers + i}, i < num_nextn_predict_layers, with
-    both counts at the top level. Reads the on-disk config, not the runtime
+    both counts at the top level. Multimodal GLM (Glm5NextForConditionalGeneration)
+    nests both counts under text_config. Reads the on-disk config, not the runtime
     draft config: vLLM rewrites num_hidden_layers to 0 for some families (MiMo,
     GLM-Lite), which would then match the ordinary layer 0. Any other shape
     returns () so the selector safely streams all shards. Name forms mirror
@@ -178,6 +179,9 @@ def _mtp_layer_prefixes(config: dict | None) -> tuple[str, ...]:
     """
     if not config:
         return ()
+    text_config = config.get("text_config")
+    if "num_hidden_layers" not in config and isinstance(text_config, dict):
+        config = text_config
     base = config.get("num_hidden_layers")
     n = config.get("num_nextn_predict_layers")
     if isinstance(base, bool) or isinstance(n, bool):
