@@ -988,9 +988,9 @@ jobs:
             --docker-server=nvcr.io \
             --docker-username="\$oauthtoken" \
             --docker-password="$NGC_API_KEY"
-          "${k[@]}" create secret generic mx-minio-creds \
-            --from-literal=MINIO_ROOT_USER=minio \
-            --from-literal=MINIO_ROOT_PASSWORD=delta-refit-smoke
+          "${k[@]}" create secret generic mx-s3-creds \
+            --from-literal=AWS_ACCESS_KEY_ID=delta-refit \
+            --from-literal=AWS_SECRET_ACCESS_KEY=delta-refit-smoke
           "${k[@]}" create secret generic hf-token-secret \
             --from-literal=HF_TOKEN="$HF_TOKEN"
           "${k[@]}" wait --for=create persistentvolumeclaim/shared-model-cache --timeout=2m

@@ -399,6 +399,44 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 `RefitService` is a new RL-specific control plane. It does not reuse or modify the
 legacy `WeightSyncService`. The initial slice stores worker registrations,
 immutable weight versions, and compact physical shard publications in Redis.
+The control plane stores long-lived `TrainerMesh` membership as
+`workers: worker_id -> TrainerTensorsMetadata(logical_shard_id, metadata_endpoint)`.
+`bind_tensors()` computes address-independent coverage locally and returns
+this compact reference. Adapters derive wire coverage without copying weights,
+registering source buffers, or publishing a version. The adapter binding and
+trainer `source_slot_id` identify the same logical shard. Logical IDs hash canonical
+coverage, so equivalent replicas share an ID. The orchestrator supplies the complete
+trainer worker set and is responsible for logical-shard completeness. Mesh creation
+and update validate compact membership metadata without fetching coverage manifests;
+large manifests never live in Redis.
+`CreateTrainerMesh` is idempotent; `UpdateTrainerMesh` replaces the complete
+worker map with generation compare-and-swap while preserving logical coverage.
+Every member requires an active model-matching trainer registration whose
+`refit_endpoint` matches the binding endpoint. A worker-sharded `WeightVersion`
+requires a trainer mesh; MX checks its existence and model atomically with version
+creation. Object-storage versions omit the mesh. For worker-sharded versions,
+`logical_shard_id` identifies a logical shard. MX accepts publications only from
+workers in that shard's current membership, validates the publication manifest
+against its bound coverage, and marks the version READY
+when every logical shard has a current, live publication. Mesh-backed readiness
+is computed from physical publications and their binding endpoints, not historical
+coverage. Generator discovery reads the mesh
+for complete expected shard coverage and filters out publications from replaced
+workers and expired registrations. Generation changes invalidate cached transfer
+plans; discovery rechecks the mesh generation after fetching worker manifests
+to reject a snapshot that changed during resolution. Version leases protect
+sources during installation. Publication release retries only the active-reader
+lease rejection until its RPC deadline, retaining source buffers until deletion
+succeeds. Mesh-backed trainers
+can release published buffers before version retirement after all reader leases
+drain. Removing a worker or rebinding its endpoint atomically retires its
+publications and rejects the update while those versions have reader leases.
+`ListWeightVersions` filters by model and optionally mesh, newest first. Mesh-filtered
+listing uses the mesh's version index; metadata reads are pipelined.
+`version_number` is optional caller correlation metadata, not version identity.
+Object-storage callers manage version state; mesh callers do not manage readiness.
+DIRECT installation and pipelined worker streaming are
+not implemented by this control-plane slice.
 NIXL manifest endpoints belong to their physical worker shards; a typed object
 storage source belongs directly to its durable `WeightVersion`. The protocol
 can identify S3, Azure Blob Storage, or GCS, while this initial implementation
@@ -515,8 +553,8 @@ preparation, without changing live weights. Trainer-source preparation receives
 a full copy; generator-peer preparation reserves a read that runs during apply.
 The handle owns the version lease through installation at the caller's safe
 point. Applying the weights or releasing an unapplied handle ends the lease.
-Bounded DIRECT combines preparation and installation in
-`apply_weight_streaming()` without exposing a staged handle to the caller.
+With bounded staging configured, the same handle holds deferred batch reads;
+`apply_weight()` performs pipelined transfer and installation.
 
 The initial worker manifest channel uses plaintext gRPC and does not authenticate
 the publishing worker. Manifest digests detect corruption but do not establish
@@ -567,21 +605,26 @@ full-tensor NIXL and canonical-checkpoint object-storage publication remain sepa
 method implementations. This keeps transport, payload preparation, engine
 geometry, and framework orchestration independently replaceable.
 
-The explicit `apply_weight_streaming(version=..., max_staging_bytes=...)`
-generator API holds a version lease across metadata preparation and incremental
-installation. The NIXL receiver plans complete owning-module batches and uses
+`ModelExpressGeneratorConfig.staging_buffer_bytes` sets bounded-streaming
+capacity per arena, and `staging_buffers_count` defaults to one. The streaming
+client uses their product as its total staging limit. `staging_device` selects
+CUDA or pinned host receive memory.
+
+The `stage_weight()` / `apply_weight()` generator APIs hold a version lease
+across metadata preparation and incremental installation. The NIXL receiver
+plans complete owning-module batches and uses
 one or two registered byte arenas (`staging_buffers`) on CUDA or pinned host
 memory (`staging_device`). Receive tensors, wire-dtype conversion buffers,
-full-source reconstruction buffers, and alignment all count toward the limit,
-which is split evenly across the arenas. With two arenas the READ for batch
+full-source reconstruction buffers, and alignment all count toward each
+buffer's capacity. With two arenas the READ for batch
 `i + 1` is posted before batch `i` is yielded for commit, allowing asynchronous
 READs to overlap installation; an arena is refilled only after its commit has
 synchronized. Host arenas are registered as NIXL DRAM and read with a DRAM local
 memory type. The vLLM installer copies each batch into engine-owned load-time
 tensors, then uses native post-load processing to restore existing kernel
 storage. Receive-arena views are never passed to engine callbacks. For trainer
-sources, `stage_weight()` continues to transfer a full independent copy before
-installation.
+sources without bounded staging configured, `stage_weight()` transfers a full
+independent copy before installation.
 
 `MX_REFIT_PACK_MODULES` coalesces consecutive owning-module batches up to the
 same staging limit, trading a larger arena residency for fewer of them. It never
@@ -614,8 +657,13 @@ still fence the engine rather than retrying a partially committed update.
 Streaming is opt-in, trainer-only, and currently limited to unquantized vLLM
 models. It does not publish generator peers or roll back partially installed
 versions. An installation failure marks the client engine state uncertain and
-blocks further streaming updates. The hosting framework must keep all replicas
-paused and restart them after any failed update. Only completion of all replicas
+makes the failed handle unusable for another installation. A subsequent
+`stage_weight()` releases the failed transaction after proven cleanup, acquires
+a new version lease, rediscovers sources, and prepares a complete full-tensor
+replay. The engine stays uncertain until that fresh transaction installs
+successfully. Unproven transport or GPU cleanup retains resources and leases
+and requires a process restart. The hosting framework must keep all replicas
+paused throughout recovery. Only completion of all replicas
 permits resuming generation. The staging limit excludes live model weights,
 engine-owned post-load workspace, CUDA allocator overhead, and transport metadata.
 
@@ -714,7 +762,15 @@ is consulted only when a later refit cannot use P2P.
 The canonical receiver retains each full checkpoint and delta payload under its
 version, then writes a resolved chain manifest. A full target is directly
 installable. The first delta after a full checkpoint copies that immutable full
-checkpoint into a version-scoped derived checkpoint. Later sequential deltas
+checkpoint into a version-scoped derived checkpoint. On Linux the checkpoint
+store attempts `FICLONE` per regular file, sharing blocks copy-on-write where
+the filesystem supports reflinks. Unsupported filesystems, cross-mount copies,
+and other platforms use an ordinary copy. This includes `EBADF` from `FICLONE`
+on already-opened files when the source filesystem cannot reflink.
+File metadata and symlink dereferencing
+retain `copytree`/`copy2` behavior; mutable files never use hard links. Clone I/O,
+permission, and capacity failures abort preparation and clean its temporary
+directory before promotion. Later sequential deltas
 rename the active materialization and apply only the incoming XOR delta in
 place, avoiding another full-model copy. Canonical artifacts are never modified
 during reconstruction, and derived checkpoints can be rebuilt from the lineage.
@@ -726,6 +782,12 @@ The local checkpoint store caps its configured quota at the existing model cache
 size plus free disk space. It logs any cap applied at initialization and rechecks
 free space before known writes and copies. Capacity checks evict stale
 checkpoints or reject the update while preserving protected lineage.
+Reflinks retain logical-size accounting and the full first-materialization
+free-space check: delta writes can allocate private blocks. This is an admission
+check, not a filesystem reservation against concurrent users. Reflink support
+must be tested on the actual checkpoint cache mount; a Kubernetes `emptyDir`
+does not establish support. First-refit latency savings require a fresh benchmark
+on that mount; existing sequential-reuse timings do not measure this optimization.
 
 Under the local checkpoint lock, preparation state advances from `READY` to
 `UPDATING` before artifact construction and back to `READY(target)` only after
@@ -1624,6 +1686,13 @@ incoming alias paths. Only distinct changed slots need reassignment. Custom
 attribute access, setters and parameter-registration hooks retain the original
 path lookup and assignment behavior; no validation verdict is cached across
 callbacks or updates.
+
+Before reload initialization, alias restoration uses vLLM's recorded parameter
+metadata to separate load-time ties from runtime-only aliases such as WNA16's
+`w13_weight` and `w2_weight`. Capture and checkpoint loading reconnect only the
+load-time slots; native post-processing recreates runtime aliases. Missing
+load-time slots still fail restoration, and final runtime identity and storage
+validation remains required.
 
 Warm load-layout capture keeps a private snapshot when records contain only
 ordinary immutable metadata. Each caller receives fresh mutable capture records

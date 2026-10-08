@@ -9,6 +9,14 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class TrainerTensorsMetadata:
+    """Compact reference to immutable worker-local logical tensor coverage."""
+
+    logical_shard_id: str
+    metadata_endpoint: str
+
+
+@dataclass(frozen=True)
 class WeightVersionRef:
     """Opaque reference to one global WeightVersion created by the orchestrator."""
 
@@ -19,4 +27,4 @@ class WeightVersionRef:
             raise ValueError("version.version_id is required")
 
 
-__all__ = ["WeightVersionRef"]
+__all__ = ["TrainerTensorsMetadata", "WeightVersionRef"]

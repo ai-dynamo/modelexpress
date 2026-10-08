@@ -23,6 +23,7 @@ the client passes each stage, so a trainer that re-materializes its state_dict
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import math
 from collections.abc import Mapping
 from typing import Any
@@ -46,6 +47,7 @@ from modelexpress_rl.train.adapter import (
     WeightPayloadFormat,
     WeightVersionShardManifest,
 )
+from modelexpress_rl.train.manifest import bound_tensor_manifest
 
 from .publisher import (
     WIRE_DTYPE,
@@ -80,7 +82,7 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
             if dtype not in (torch.float16, torch.bfloat16, torch.float32):
                 raise ValueError(f"unsupported wire dtype {dtype!r} for {name!r}")
         self._nixl_metadata_endpoint = nixl_metadata_endpoint
-        self._source_slot_id = f"publisher:global-rank:{dist.get_rank()}"
+        self._source_slot_id: str | None = None
         self._initialized = False
         self._staging_mode: TrainerStagingMode | None = None
         # name -> (global_shape, shard_offset, local_shape) fixed at initialize().
@@ -96,11 +98,27 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
 
     @property
     def source_slot_id(self) -> str:
+        if self._source_slot_id is None:
+            raise RuntimeError("bind_tensors() must be called before source_slot_id")
         return self._source_slot_id
 
     def bind_tensors(self, tensors: Any) -> str:
-        """Validate the local state dict and bind it to this global-rank slot."""
-        self._capture(tensors)
+        """Bind address-independent wire coverage without staging source bytes."""
+        shards = self._capture(tensors)
+        coverage = [
+            {
+                "name": shard.name,
+                "dtype": str(self._wire_dtype(shard)),
+                "elsize": self._wire_dtype(shard).itemsize,
+                "full_shape": shard.global_shape,
+                "shards": [{"shard_offset": shard.shard_offset, "shape": shard.local_shape}],
+            }
+            for shard in shards
+        ]
+        source_slot_id = hashlib.sha256(bound_tensor_manifest(coverage)).hexdigest()
+        if self._source_slot_id is not None and self._source_slot_id != source_slot_id:
+            raise RuntimeError("FSDP tensor coverage changed after binding")
+        self._source_slot_id = source_slot_id
         return self.source_slot_id
 
     @property

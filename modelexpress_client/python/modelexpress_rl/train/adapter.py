@@ -131,7 +131,7 @@ class TrainerEngineAdapter(ABC):
 
     @abstractmethod
     def bind_tensors(self, tensors: Any) -> str:
-        """Bind stable engine tensors and return their logical source slot."""
+        """Hash canonical wire coverage without staging or publishing weights."""
 
     @property
     @abstractmethod
@@ -156,6 +156,9 @@ class TrainerEngineAdapter(ABC):
 
 class WeightVersionShardManifestPublisher(Protocol):
     """Worker endpoint that makes a manifest retrievable before advertisement."""
+
+    @property
+    def endpoint(self) -> str: ...
 
     def publish_manifest(
         self,

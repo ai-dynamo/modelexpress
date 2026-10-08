@@ -125,14 +125,20 @@ def main() -> None:
         )
     )
     control = ModelExpressControlClient.connect(server_url=MX_SERVER_ADDRESS)
+    mesh = None
     version = None
     try:
-        source_slot = trainer.bind_tensors(model.state_dict())
+        binding = trainer.bind_tensors(model.state_dict())
+        mesh = control.create_trainer_mesh(
+            model_name=MODEL_NAME,
+            idempotency_key=f"dynamo-vllm-mesh-{uuid.uuid4().hex}",
+            workers={trainer.worker_id: binding},
+        )
         version = control.create_weight_version(
             model_name=MODEL_NAME,
             idempotency_key=f"dynamo-vllm-e2e-{uuid.uuid4().hex}",
             payload_format=WeightPayloadFormat.FULL_TENSOR,
-            expected_source_slots=[source_slot],
+            trainer_mesh_id=mesh.mesh_id,
         )
         trainer.publish_version(version=version.ref)
         ready = control.get_weight_version(version.version_id)
@@ -203,6 +209,8 @@ def main() -> None:
         if version is not None:
             control.delete_weight_version(version.version_id)
             trainer.release_version(version=WeightVersionRef(version.version_id))
+        if mesh is not None:
+            control.delete_trainer_mesh(mesh.mesh_id)
         control.close()
         trainer.close()
         dist.destroy_process_group()

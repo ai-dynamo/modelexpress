@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
+import json
 from contextlib import nullcontext
 from unittest.mock import Mock
 
@@ -11,6 +13,7 @@ from modelexpress_rl.train.adapter import TrainerStagingMode, WeightPayloadForma
 from modelexpress_rl.train.context import FSDPTrainerContext
 from modelexpress_rl.train.engines import _create_trainer_adapter
 from modelexpress_rl.train.engines.fsdp.adapter import FSDPTrainerAdapter
+from modelexpress_rl.train.manifest import bound_tensor_manifest
 
 ADAPTER = "modelexpress_rl.train.engines.fsdp.adapter"
 
@@ -197,16 +200,31 @@ def test_requires_initialized_distributed_engine(monkeypatch):
         _adapter()
 
 
-def test_source_slot_id_is_rank_stamped(dist_ready):
-    assert _adapter().source_slot_id == "publisher:global-rank:0"
+def test_source_slot_id_requires_binding(dist_ready):
+    with pytest.raises(RuntimeError, match="bind_tensors"):
+        _ = _adapter().source_slot_id
 
 
-def test_bind_tensors_validates_state_dict_and_returns_rank_slot(dist_ready):
+def test_bind_tensors_validates_state_dict_and_returns_wire_coverage(dist_ready):
     adapter = _adapter()
 
-    assert adapter.bind_tensors({"w": torch.ones(2, 4)}) == ("publisher:global-rank:0")
+    binding = adapter.bind_tensors({"w": torch.ones(2, 4)})
+    assert len(binding) == 64
+    assert adapter.source_slot_id == binding
+    assert not adapter._manager.registered
+    assert adapter._arenas == {}
+    assert _adapter().bind_tensors({"w": torch.zeros(2, 4)}) == binding
+    assert _adapter().bind_tensors({"w": torch.zeros(4, 4)}) != binding
+    assert _adapter().bind_tensors({"w": torch.ones(2, 4, dtype=torch.bfloat16)}) == binding
+    with pytest.raises(RuntimeError, match="coverage changed"):
+        adapter.bind_tensors({"w": torch.ones(4, 4)})
     with pytest.raises(TypeError, match="state_dict"):
         adapter.bind_tensors([torch.ones(2, 4)])
+
+    staged = _stage(adapter, {"w": torch.ones(2, 4, dtype=torch.bfloat16)})
+    assert binding == hashlib.sha256(
+        bound_tensor_manifest(json.loads(staged.manifest.data)["tensors"])
+    ).hexdigest()
 
 
 def test_in_place_stage_registers_once(dist_ready):
