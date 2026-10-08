@@ -207,6 +207,7 @@ def prepare(
             "MX_METRICS_PORT": "9402",
             "MX_TRANSFER_TIMEOUT": "1800",
             "MODEL_EXPRESS_LOG_LEVEL": "INFO",
+            "RUNAI_STREAMER_LOG_TO_STDERR": "1",
             "NIXL_LOG_LEVEL": "INFO",
             "DYN_RL_INIT_WEIGHTS_TIMEOUT_S": "3600",
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",

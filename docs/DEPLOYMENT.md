@@ -1639,7 +1639,8 @@ Worker checkpoint preparation and delta publication finish before the timed
 engine startup, so reference downloads do not compete with S3 cold loading.
 The configured S3 addressing style is applied to both boto3 and Run:ai
 Model Streamer (`RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING=0` for CI's path-style
-endpoint). Seed uploads use boto3's standard transfer client
+endpoint). Worker logs include native Model Streamer warnings and errors.
+Seed uploads use boto3's standard transfer client
 for the custom HTTP endpoint, matching seed downloads. The existing `HF_TOKEN` secret is forwarded for
 model access. Delta objects are verified absent before namespace deletion; SeaweedFS
 and its seed data remain available if cleanup fails. If setup fails before bucket
