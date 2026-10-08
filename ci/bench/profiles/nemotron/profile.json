@@ -1,6 +1,6 @@
 {
   "model": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
-  "runtime": "vllm/vllm-openai@sha256:0dc46f74eb0e630675d83101dc66c6441c4475cceedcf9235ee42b87c3affd23",
+  "runtime": "vllm/vllm-openai@sha256:0a51ea5b4ae2dc5d81890e5173f54203d2a3ae0cfffe51b8fd2afd4391bfd967",
   "revision": "bee7596271d1495f6992ae224aefde4410e816b8",
   "tp": 1,
   "cpu": "16",

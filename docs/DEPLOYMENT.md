@@ -1631,8 +1631,9 @@ before the timed workload starts. Seed uploads use boto3's standard transfer cli
 for the custom HTTP endpoint, matching seed downloads. The existing `HF_TOKEN` secret is forwarded for
 model access. Delta objects are verified absent before namespace deletion; SeaweedFS
 and its seed data remain available if cleanup fails. This path needs no AWS IAM role
-or pre-populated bucket. It defaults to the digest-pinned vLLM 0.17.1 image already
-used by CI, recorded in the Nemotron profile, with `MX_BENCH_RUNTIME_BASES.nemotron` available as an override.
+or pre-populated bucket. The Nemotron profile defaults to digest-pinned vLLM 0.27.1,
+the version documented in the model's deployment recipe, with
+`MX_BENCH_RUNTIME_BASES.nemotron` available as an override.
 
 Optional repository Actions variables configure placement and runtime overrides:
 
