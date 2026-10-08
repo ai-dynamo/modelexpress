@@ -1103,6 +1103,9 @@ this Secret before deploying the stack. The `/healthz` readiness probe checks
 that the S3 listener is serving; it does not validate the backing storage.
 Data stays in an `emptyDir` volume. Volume counts are bounded for the 64 GiB
 Vime and 16 GiB lifecycle fixtures, with 1 GiB SeaweedFS volumes.
+Each storage pod requests 1 GiB of memory and has a 4 GiB limit for concurrent
+trainer multipart uploads. `GOMEMLIMIT=3GiB` leaves headroom below that limit;
+the previous 1 GiB container limit is insufficient for two trainer ranks.
 The Vime CI smoke test consumes the example manifest directly; update both
 manifests together when changing the fixture image.
 
