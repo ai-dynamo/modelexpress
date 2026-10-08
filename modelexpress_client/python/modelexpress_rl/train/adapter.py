@@ -167,7 +167,6 @@ class WeightVersionShardManifestPublisher(Protocol):
 
     def publish_binding(self, manifest: bytes) -> None:
         """Serve immutable tensor coverage before joining a trainer mesh."""
-        ...
 
     def publish_manifest(
         self,

@@ -83,6 +83,7 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
                 raise ValueError(f"unsupported wire dtype {dtype!r} for {name!r}")
         self._nixl_metadata_endpoint = nixl_metadata_endpoint
         self._logical_shard_id: str | None = None
+        self._bound_manifest: bytes | None = None
         self._initialized = False
         self._staging_mode: TrainerStagingMode | None = None
         # name -> (global_shape, shard_offset, local_shape) fixed at initialize().
@@ -125,7 +126,7 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
 
     @property
     def bound_manifest(self) -> bytes:
-        if self._logical_shard_id is None:
+        if self._bound_manifest is None:
             raise RuntimeError("bind_tensors() must be called before bound_manifest")
         return self._bound_manifest
 

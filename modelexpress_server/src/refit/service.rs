@@ -7,7 +7,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
+use futures::{StreamExt, TryStreamExt, stream};
 use modelexpress_common::grpc::refit::{
     CreateTrainerMeshRequest, CreateTrainerMeshResponse, CreateWeightVersionRequest,
     CreateWeightVersionResponse, CreateWeightVersionShardRequest, CreateWeightVersionShardResponse,
@@ -55,6 +57,36 @@ fn validate_mesh_members(workers: &HashMap<String, TrainerTensorsMetadata>) -> R
         required(&metadata.metadata_endpoint, "metadata_endpoint")?;
     }
     Ok(())
+}
+
+async fn validate_mesh_bindings(
+    workers: Vec<(String, TrainerTensorsMetadata)>,
+) -> Result<(), Status> {
+    stream::iter(workers)
+        .map(|(worker_id, metadata)| async move {
+            let started = Instant::now();
+            let result = super::coverage::validate_binding(&metadata).await;
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            match &result {
+                Ok(()) => debug!(
+                    worker_id,
+                    endpoint = %metadata.metadata_endpoint,
+                    elapsed_ms,
+                    "Validated trainer binding"
+                ),
+                Err(error) => warn!(
+                    worker_id,
+                    endpoint = %metadata.metadata_endpoint,
+                    elapsed_ms,
+                    error = %error,
+                    "Trainer binding validation failed"
+                ),
+            }
+            result
+        })
+        .buffer_unordered(32)
+        .try_for_each(|()| async { Ok(()) })
+        .await
 }
 
 fn validate_s3_uri(uri: &str) -> Result<(), Status> {
@@ -231,9 +263,18 @@ impl RefitService for RefitServiceImpl {
                 mesh: Some(mesh),
             }));
         }
-        for metadata in request.workers.values() {
-            super::coverage::validate_binding(metadata).await?;
-        }
+        self.backend
+            .validate_trainer_mesh_workers(&request.model_name, &request.workers)
+            .await
+            .map_err(backend_status)?;
+        validate_mesh_bindings(
+            request
+                .workers
+                .iter()
+                .map(|(worker_id, metadata)| (worker_id.clone(), metadata.clone()))
+                .collect(),
+        )
+        .await?;
         let mesh = self
             .backend
             .create_trainer_mesh(&request)
@@ -275,11 +316,19 @@ impl RefitService for RefitServiceImpl {
                 "trainer mesh generation changed",
             ));
         }
-        for (worker_id, metadata) in &request.workers {
-            if current.workers.get(worker_id) != Some(metadata) {
-                super::coverage::validate_binding(metadata).await?;
-            }
-        }
+        self.backend
+            .validate_trainer_mesh_workers(&current.model_name, &request.workers)
+            .await
+            .map_err(backend_status)?;
+        validate_mesh_bindings(
+            request
+                .workers
+                .iter()
+                .filter(|(worker_id, metadata)| current.workers.get(*worker_id) != Some(*metadata))
+                .map(|(worker_id, metadata)| (worker_id.clone(), metadata.clone()))
+                .collect(),
+        )
+        .await?;
         let mesh = self
             .backend
             .update_trainer_mesh(

@@ -411,6 +411,10 @@ resolves idempotent retries before contacting trainers and validates every bindi
 only for a new mesh. Mesh updates validate new workers and changed endpoints or
 logical shards; unchanged members are not refetched. Large manifests never live
 in Redis.
+Admission first preflights worker registrations, then validates bindings with at
+most 32 concurrent callbacks per request. Redis rechecks registrations atomically
+when committing membership. Callback logs include the worker, endpoint, elapsed
+time, and failures.
 `CreateTrainerMesh` is idempotent; `UpdateTrainerMesh` replaces the complete
 worker map with generation compare-and-swap while preserving logical coverage.
 Every member requires an active model-matching trainer registration whose

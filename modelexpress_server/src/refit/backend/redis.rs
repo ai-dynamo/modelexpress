@@ -335,6 +335,35 @@ impl RedisRefitBackend {
 
 #[async_trait]
 impl RefitBackend for RedisRefitBackend {
+    async fn validate_trainer_mesh_workers(
+        &self,
+        model_name: &str,
+        workers: &HashMap<String, TrainerTensorsMetadata>,
+    ) -> RefitResult<()> {
+        let members: Vec<_> = workers.iter().collect();
+        let mut pipeline = redis::pipe();
+        for (worker_id, _) in &members {
+            pipeline.hgetall(worker_key(worker_id));
+        }
+        let registrations: Vec<HashMap<String, String>> = pipeline
+            .query_async(&mut self.redis.clone())
+            .await
+            .map_err(redis_error)?;
+        let trainer_role = i32::from(WorkerRole::Trainer).to_string();
+        for ((worker_id, metadata), registration) in members.into_iter().zip(registrations) {
+            if registration.get("worker_id") != Some(worker_id)
+                || registration.get("model_name").map(String::as_str) != Some(model_name)
+                || registration.get("role") != Some(&trainer_role)
+                || registration.get("refit_endpoint") != Some(&metadata.metadata_endpoint)
+            {
+                return Err(RefitBackendError::FailedPrecondition(format!(
+                    "mesh worker {worker_id:?} requires an active trainer registration for the model and binding endpoint"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn find_trainer_mesh_for_request(
         &self,
         request: &CreateTrainerMeshRequest,

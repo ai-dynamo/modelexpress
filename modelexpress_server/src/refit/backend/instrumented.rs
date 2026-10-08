@@ -43,6 +43,21 @@ impl InstrumentedRefitBackend {
 
 #[async_trait]
 impl RefitBackend for InstrumentedRefitBackend {
+    async fn validate_trainer_mesh_workers(
+        &self,
+        model_name: &str,
+        workers: &HashMap<String, TrainerTensorsMetadata>,
+    ) -> RefitResult<()> {
+        self.metrics
+            .time(
+                Store::Refit,
+                "validate_trainer_mesh_workers",
+                self.inner
+                    .validate_trainer_mesh_workers(model_name, workers),
+            )
+            .await
+    }
+
     async fn create_trainer_mesh(
         &self,
         request: &CreateTrainerMeshRequest,
@@ -278,6 +293,14 @@ mod tests {
 
     #[async_trait]
     impl RefitBackend for StubRefitBackend {
+        async fn validate_trainer_mesh_workers(
+            &self,
+            _model_name: &str,
+            _workers: &HashMap<String, TrainerTensorsMetadata>,
+        ) -> RefitResult<()> {
+            self.outcome()
+        }
+
         async fn create_trainer_mesh(
             &self,
             _request: &CreateTrainerMeshRequest,
@@ -449,6 +472,9 @@ mod tests {
             .create_trainer_mesh(&CreateTrainerMeshRequest::default())
             .await;
         let _ = backend
+            .validate_trainer_mesh_workers("model", &HashMap::new())
+            .await;
+        let _ = backend
             .find_trainer_mesh_for_request(&CreateTrainerMeshRequest::default())
             .await;
         let _ = backend.get_trainer_mesh("mesh").await;
@@ -479,6 +505,7 @@ mod tests {
             "get_weight_version",
             "list_weight_versions",
             "create_trainer_mesh",
+            "validate_trainer_mesh_workers",
             "find_trainer_mesh_for_request",
             "get_trainer_mesh",
             "update_trainer_mesh",
@@ -495,6 +522,6 @@ mod tests {
                 format!(r#"mx_backend_ops_total{{store="refit",op="{op}",result="ok"}} 1"#);
             assert!(encoded.contains(&expected), "missing {op}: {encoded}");
         }
-        assert_eq!(stub.calls.load(Ordering::Relaxed), 16);
+        assert_eq!(stub.calls.load(Ordering::Relaxed), 17);
     }
 }
