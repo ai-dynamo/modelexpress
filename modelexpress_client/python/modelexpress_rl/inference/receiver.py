@@ -14,7 +14,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -35,6 +35,9 @@ from modelexpress_rl.utils import (
     read_safetensors_header,
     threadpool_map,
 )
+
+if TYPE_CHECKING:
+    from .streaming_checkpoint import StreamedCheckpoint
 
 _BYTES_PER_GB = 1_000_000_000
 DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB = 2000
@@ -82,6 +85,7 @@ class PreparedCheckpoint:
     target_version: str
     path: Path
     metrics: dict[str, float]
+    streaming: StreamedCheckpoint | None = None
 
 
 @dataclass(frozen=True)
