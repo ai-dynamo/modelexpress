@@ -123,6 +123,10 @@ def prepare(
     }
     if env["endpoint_url"] is not None:
         storage_env["AWS_ENDPOINT_URL"] = env["endpoint_url"]
+    if env["addressing_style"] != "auto":
+        storage_env["RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING"] = (
+            "1" if env["addressing_style"] == "virtual" else "0"
+        )
     pod_env = env.get("pod_env", [])
     control_env = [
         {"name": k, "value": v}

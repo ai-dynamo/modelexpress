@@ -1635,7 +1635,9 @@ retained `shared-model-cache` FSx claim only on the control pod and sets
 files for the pinned revision across runs; a cold cache downloads them once.
 Each run still uploads and verifies its isolated S3 seed. GPU workers do not
 mount this cache, and cleanup leaves the shared source files intact.
-Seed uploads use boto3's standard transfer client
+The configured S3 addressing style is applied to both boto3 and Run:ai
+Model Streamer (`RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING=0` for CI's path-style
+endpoint). Seed uploads use boto3's standard transfer client
 for the custom HTTP endpoint, matching seed downloads. The existing `HF_TOKEN` secret is forwarded for
 model access. Delta objects are verified absent before namespace deletion; SeaweedFS
 and its seed data remain available if cleanup fails. If setup fails before bucket

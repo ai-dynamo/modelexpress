@@ -366,6 +366,7 @@ def test_aws_ci_aliases_native_s3_and_namespace_reach_every_resource(
         main = pod["spec"]["containers"][0]
         env = {x["name"]: x.get("value") for x in main["env"]}
         assert "AWS_ENDPOINT_URL" not in env
+        assert "RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING" not in env
         assert env["AWS_REGION"] == "eu-west-1"
         assert "rdma/ib" not in main["resources"]["limits"]
         assert pod["spec"]["imagePullSecrets"] == [{"name": "nvcr-imagepullsecret"}]
@@ -382,11 +383,16 @@ def test_aws_ci_aliases_native_s3_and_namespace_reach_every_resource(
     assert "/runner/kubeconfig" in (out / "environment.json").read_text()
 
 
-def test_custom_endpoint_secret_references_and_efa_are_not_assumed(tmp_path):
+@pytest.mark.parametrize(
+    "addressing_style,virtual_addressing", [("path", "0"), ("virtual", "1")]
+)
+def test_custom_endpoint_secret_references_and_efa_are_not_assumed(
+    tmp_path, addressing_style, virtual_addressing
+):
     env = {
         **PORTABLE_ENV,
         "endpoint_url": "http://minio.example:9000",
-        "addressing_style": "path",
+        "addressing_style": addressing_style,
         "extra_worker_resources": {"vpc.amazonaws.com/efa": "4"},
         "worker_env": {"MX_NIXL_BACKEND": "LIBFABRIC"},
         "pod_env": [
@@ -409,7 +415,9 @@ def test_custom_endpoint_secret_references_and_efa_are_not_assumed(tmp_path):
         cpu="8",
         memory="96Gi",
     )
-    assert config["tp"] == 2 and config["storage"]["addressing_style"] == "path"
+    assert (
+        config["tp"] == 2 and config["storage"]["addressing_style"] == addressing_style
+    )
     for name in ["control.yaml", "worker-s3.yaml", "worker-peer.yaml"]:
         pod = next(
             x
@@ -419,6 +427,10 @@ def test_custom_endpoint_secret_references_and_efa_are_not_assumed(tmp_path):
         main = pod["spec"]["containers"][0]
         variables = {x["name"]: x for x in main["env"]}
         assert variables["AWS_ENDPOINT_URL"]["value"] == "http://minio.example:9000"
+        assert (
+            variables["RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING"]["value"]
+            == virtual_addressing
+        )
         assert "valueFrom" in variables["AWS_ACCESS_KEY_ID"]
         assert main["envFrom"] == env["pod_env_from"]
         if name != "control.yaml":
