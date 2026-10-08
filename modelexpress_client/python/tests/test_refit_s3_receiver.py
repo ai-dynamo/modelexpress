@@ -619,11 +619,19 @@ def test_implicit_cached_seed_restores_without_copying(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("explicit_cached_seed", [False, True])
+@pytest.mark.parametrize("stream_full_checkpoints", [False, True])
+@pytest.mark.parametrize("checksums", [False, True])
 def test_p2p_startup_s3_bootstrap_retries_without_activating(
-    monkeypatch, tmp_path, explicit_cached_seed
+    monkeypatch, tmp_path, explicit_cached_seed, stream_full_checkpoints, checksums
 ):
     weights = torch.tensor([7.0, 8.0])
-    storage = _MemoryS3(_full_artifact(weights))
+    objects = _full_artifact(weights)
+    if not checksums:
+        uri = "s3://weights/test/v2/model.safetensors.index.json"
+        index = json.loads(objects[uri])
+        del index["metadata"]["checksum_format"]
+        objects[uri] = json.dumps(index).encode()
+    storage = _MemoryS3(objects)
     monkeypatch.setattr(canonical_delta_module, "S3Client", lambda **_kwargs: storage)
     store = checkpoint_store_module.LocalCheckpointStore(
         root=tmp_path / "cache", model_name="test/model"
@@ -638,6 +646,7 @@ def test_p2p_startup_s3_bootstrap_retries_without_activating(
             ),
             refit_checkpoint_dir=tmp_path / "cache",
         ),
+        stream_full_checkpoints=stream_full_checkpoints,
     )
     try:
         with pytest.raises(RuntimeError, match="requires a full replay root"):
@@ -651,6 +660,7 @@ def test_p2p_startup_s3_bootstrap_retries_without_activating(
         assert adapter._method.requires_full_root
         assert not store.active_path.exists()
         staged = adapter.stage_weight(_full_inputs())
+        assert staged.streaming is None
         assert torch.equal(
             load_file(staged.path / "model-00001-of-00001.safetensors")["weight"],
             weights,
