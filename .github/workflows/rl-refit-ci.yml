@@ -29,10 +29,10 @@ permissions:
 
 env:
   KUBECONFIG: /teleport/kubeconfig.yaml
-  KUBE_CONTEXT: ${{ vars.MX_BENCH_KUBE_CONTEXT }}
+  KUBE_CONTEXT: ${{ vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02' }}
   MX_BENCH_S3_ROLE_ARN: ${{ vars.MX_BENCH_S3_ROLE_ARN }}
-  MX_CI_S3_BUCKET: ${{ vars.MX_BENCH_S3_BUCKET }}
-  MX_CI_S3_REGION: ${{ vars.MX_BENCH_S3_REGION }}
+  MX_CI_S3_BUCKET: ${{ vars.MX_BENCH_S3_BUCKET || 'ai-dynamo-modelexpress-ci' }}
+  MX_CI_S3_REGION: ${{ vars.MX_BENCH_S3_REGION || 'us-west-2' }}
   NAMESPACE: mx-ci-bench-${{ github.run_id }}-${{ github.run_attempt }}
   RESULTS_DIR: ${{ github.workspace }}/bench-results
   MODEL_PROFILE: ${{ inputs.model }}

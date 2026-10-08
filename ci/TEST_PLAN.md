@@ -55,6 +55,9 @@ Coverage matrix for the ModelExpress CI infrastructure. Reflects what's currentl
 
 When a row moves status, update this table in the same PR so the doc stays the source of truth on what CI does and doesn't catch.
 
+The existing Vime smoke uses a digest-pinned public Chainguard MinIO image;
+its pod grants group 65532 access to the data volume for non-root startup.
+
 ## Comment-triggered model benchmark CI
 
 `ci/bench/` contains registered Nemotron and Kimi-K2.7-Code profiles. Offline

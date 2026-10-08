@@ -1627,10 +1627,10 @@ Configure these repository Actions variables:
 
 | Variable | Required value |
 | --- | --- |
-| `MX_BENCH_KUBE_CONTEXT` | AWS Kubernetes context available in `/teleport/kubeconfig.yaml` |
+| `MX_BENCH_KUBE_CONTEXT` | AWS Kubernetes context available in `/teleport/kubeconfig.yaml`; defaults to `nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02` |
 | `MX_BENCH_S3_ROLE_ARN` | IAM role trusted for the cluster's IRSA identity and `mx-bench` service account in run namespaces |
-| `MX_BENCH_S3_BUCKET` | Bucket holding each selected profile's complete pinned snapshot |
-| `MX_BENCH_S3_REGION` | Bucket region |
+| `MX_BENCH_S3_BUCKET` | Bucket holding each selected profile's complete pinned snapshot; defaults to `ai-dynamo-modelexpress-ci` |
+| `MX_BENCH_S3_REGION` | Bucket region; defaults to `us-west-2` |
 | `MX_BENCH_RUNTIME_BASES` | JSON mapping profile keys to compatible digest-pinned vLLM base images, e.g. `{"nemotron":"registry/runtime@sha256:...","kimi":"registry/kimi-runtime@sha256:..."}` with full digests |
 
 A runtime mapping is required only for profiles being run. Each image must include
