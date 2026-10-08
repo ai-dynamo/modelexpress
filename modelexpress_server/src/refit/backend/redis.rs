@@ -9,10 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use modelexpress_common::grpc::refit::{
-    CreateWeightVersionRequest, DeleteVersionLeaseRequest, DeleteWeightVersionShardRequest,
-    ObjectStorageSource, ObjectStorageType, RegisterVersionLeaseRequest,
+    CreateTrainerMeshRequest, CreateWeightVersionRequest, DeleteVersionLeaseRequest,
+    DeleteWeightVersionShardRequest, ObjectStorageSource, ObjectStorageType,
+    RegisterVersionLeaseRequest, TrainerMesh, TrainerTensorsMetadata,
     UpdateWeightVersionStateRequest, VersionLease, WeightVersion, WeightVersionShard,
-    WeightVersionState, WorkerRegistration,
+    WeightVersionState, WorkerRegistration, WorkerRole,
 };
 use prost::Message;
 use redis::aio::ConnectionManager;
@@ -30,6 +31,21 @@ const UPDATE_VERSION_STATE_LUA: &str =
 const DELETE_SHARD_LUA: &str = include_str!("redis/scripts/delete_weight_version_shard.lua");
 const REGISTER_LEASE_LUA: &str = include_str!("redis/scripts/register_version_lease.lua");
 const DELETE_LEASE_LUA: &str = include_str!("redis/scripts/delete_version_lease.lua");
+const CREATE_MESH_LUA: &str = include_str!("redis/scripts/create_trainer_mesh.lua");
+const UPDATE_MESH_LUA: &str = include_str!("redis/scripts/update_trainer_mesh.lua");
+const DELETE_MESH_LUA: &str = include_str!("redis/scripts/delete_trainer_mesh.lua");
+
+fn mesh_key(mesh_id: &str) -> String {
+    format!("mx:refit:trainer-mesh:metadata:{mesh_id}")
+}
+
+fn mesh_versions_key(mesh_id: &str) -> String {
+    format!("mx:refit:trainer-mesh:versions:{mesh_id}")
+}
+
+fn mesh_idempotency_key(model_name: &str, request_key: &str) -> String {
+    format!("mx:refit:trainer-mesh-request:{model_name}:{request_key}")
+}
 
 fn version_key(version_id: &str) -> String {
     format!("mx:refit:version:metadata:{version_id}")
@@ -39,16 +55,12 @@ fn shards_key(version_id: &str) -> String {
     format!("mx:refit:version:shards:{version_id}")
 }
 
-fn publication_key(worker_id: &str, source_slot_id: &str) -> String {
-    format!("{}:{worker_id}{source_slot_id}", worker_id.len())
+fn publication_key(worker_id: &str, logical_shard_id: &str) -> String {
+    format!("{}:{worker_id}{logical_shard_id}", worker_id.len())
 }
 
-fn coverage_key(version_id: &str) -> String {
-    format!("mx:refit:version:coverage:{version_id}")
-}
-
-fn expected_source_slots_key(version_id: &str) -> String {
-    format!("mx:refit:version:expected-source-slots:{version_id}")
+fn publication_endpoints_key(version_id: &str) -> String {
+    format!("mx:refit:version:publication-endpoints:{version_id}")
 }
 
 fn worker_key(worker_id: &str) -> String {
@@ -127,10 +139,6 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
             "" => None,
             value => Some(value.to_string()),
         },
-        expected_source_slots: serde_json::from_str(hash_field(&fields, "expected_source_slots")?)
-            .map_err(|error| {
-                RefitBackendError::Internal(format!("invalid expected_source_slots: {error}"))
-            })?,
         layout_signature: hash_field(&fields, "layout_signature")?.to_string(),
         state: parse_hash_field(&fields, "state")?,
         created_at_unix_ms: parse_hash_field(&fields, "created_at_unix_ms")?,
@@ -141,7 +149,64 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
                 uri: uri.clone(),
                 storage_type: ObjectStorageType::S3.into(),
             }),
+        trainer_mesh_id: fields
+            .get("trainer_mesh_id")
+            .filter(|mesh_id| !mesh_id.is_empty())
+            .cloned(),
+        version_number: fields
+            .get("version_number")
+            .filter(|number| !number.is_empty())
+            .map(|number| {
+                number.parse().map_err(|error| {
+                    RefitBackendError::Internal(format!("invalid version_number: {error}"))
+                })
+            })
+            .transpose()?,
     })
+}
+
+fn mesh_from_hash(fields: HashMap<String, String>) -> RefitResult<TrainerMesh> {
+    let workers = decode_mesh_workers(hash_field(&fields, "workers")?)?;
+    Ok(TrainerMesh {
+        mesh_id: hash_field(&fields, "mesh_id")?.to_string(),
+        model_name: hash_field(&fields, "model_name")?.to_string(),
+        generation: parse_hash_field(&fields, "generation")?,
+        workers,
+    })
+}
+
+fn mesh_workers_json(workers: &HashMap<String, TrainerTensorsMetadata>) -> RefitResult<String> {
+    let workers: HashMap<&str, serde_json::Value> = workers
+        .iter()
+        .map(|(worker_id, metadata)| {
+            (
+                worker_id.as_str(),
+                serde_json::json!({
+                    "logical_shard_id": metadata.logical_shard_id,
+                    "metadata_endpoint": metadata.metadata_endpoint,
+                }),
+            )
+        })
+        .collect();
+    serde_json::to_string(&workers)
+        .map_err(|error| RefitBackendError::Internal(format!("encode mesh workers: {error}")))
+}
+
+fn decode_mesh_workers(encoded: &str) -> RefitResult<HashMap<String, TrainerTensorsMetadata>> {
+    let workers: HashMap<String, HashMap<String, String>> = serde_json::from_str(encoded)
+        .map_err(|error| RefitBackendError::Internal(format!("invalid mesh workers: {error}")))?;
+    workers
+        .into_iter()
+        .map(|(worker_id, metadata)| {
+            Ok((
+                worker_id,
+                TrainerTensorsMetadata {
+                    logical_shard_id: hash_field(&metadata, "logical_shard_id")?.to_string(),
+                    metadata_endpoint: hash_field(&metadata, "metadata_endpoint")?.to_string(),
+                },
+            ))
+        })
+        .collect()
 }
 
 fn lease_from_hash(fields: HashMap<String, String>) -> RefitResult<VersionLease> {
@@ -225,10 +290,6 @@ impl RedisRefitBackend {
         request: &CreateWeightVersionRequest,
         uid: &str,
     ) -> RefitResult<String> {
-        let expected_source_slots =
-            serde_json::to_string(&request.expected_source_slots).map_err(|error| {
-                RefitBackendError::Internal(format!("encode expected_source_slots: {error}"))
-            })?;
         let script = Script::new(CREATE_VERSION_LUA);
         let mut invocation = script.prepare_invoke();
         invocation
@@ -237,14 +298,17 @@ impl RedisRefitBackend {
                 &request.model_name,
                 &request.idempotency_key,
             ))
-            .key(expected_source_slots_key(uid))
+            .key(mesh_key(
+                request.trainer_mesh_id.as_deref().unwrap_or_default(),
+            ))
+            .key(mesh_versions_key(
+                request.trainer_mesh_id.as_deref().unwrap_or_default(),
+            ))
             .arg(uid)
             .arg(&request.model_name)
             .arg(&request.idempotency_key)
             .arg(request.payload_format)
             .arg(request.base_version_id.as_deref().unwrap_or_default())
-            .arg(expected_source_slots)
-            .arg(request.expected_source_slots.len())
             .arg(
                 request
                     .object_storage
@@ -253,10 +317,14 @@ impl RedisRefitBackend {
             )
             .arg(request.state)
             .arg(request.state)
-            .arg(now_unix_ms()?);
-        for source_slot_id in &request.expected_source_slots {
-            invocation.arg(source_slot_id);
-        }
+            .arg(now_unix_ms()?)
+            .arg(request.trainer_mesh_id.as_deref().unwrap_or_default());
+        invocation.arg(
+            request
+                .version_number
+                .map(|number| number.to_string())
+                .unwrap_or_default(),
+        );
         let mut redis = self.redis.clone();
         invocation
             .invoke_async(&mut redis)
@@ -267,6 +335,198 @@ impl RedisRefitBackend {
 
 #[async_trait]
 impl RefitBackend for RedisRefitBackend {
+    async fn find_trainer_mesh_for_request(
+        &self,
+        request: &CreateTrainerMeshRequest,
+    ) -> RefitResult<Option<TrainerMesh>> {
+        let mut redis = self.redis.clone();
+        let existing_id: Option<String> = redis
+            .get(mesh_idempotency_key(
+                &request.model_name,
+                &request.idempotency_key,
+            ))
+            .await
+            .map_err(redis_error)?;
+        let Some(existing_id) = existing_id else {
+            return Ok(None);
+        };
+        let fields: HashMap<String, String> = redis
+            .hgetall(mesh_key(&existing_id))
+            .await
+            .map_err(redis_error)?;
+        if fields.is_empty() {
+            return Err(RefitBackendError::AlreadyExists(
+                "idempotency_key belongs to a deleted TrainerMesh".to_string(),
+            ));
+        }
+        let initial_workers = decode_mesh_workers(hash_field(&fields, "initial_workers")?)?;
+        let existing = mesh_from_hash(fields)?;
+        if existing.model_name != request.model_name || initial_workers != request.workers {
+            return Err(RefitBackendError::AlreadyExists(
+                "idempotency_key was already used for a different TrainerMesh".to_string(),
+            ));
+        }
+        Ok(Some(existing))
+    }
+    async fn create_trainer_mesh(
+        &self,
+        request: &CreateTrainerMeshRequest,
+    ) -> RefitResult<TrainerMesh> {
+        let logical_shards: std::collections::BTreeSet<_> = request
+            .workers
+            .values()
+            .map(|metadata| &metadata.logical_shard_id)
+            .collect();
+        let logical_shards = serde_json::to_string(&logical_shards).map_err(|error| {
+            RefitBackendError::Internal(format!("encode mesh logical_shards: {error}"))
+        })?;
+        let workers = mesh_workers_json(&request.workers)?;
+        for _ in 0..5 {
+            let mesh_id: String = Uuid::new_v4()
+                .simple()
+                .to_string()
+                .chars()
+                .take(8)
+                .collect();
+            let mut redis = self.redis.clone();
+            let script = Script::new(CREATE_MESH_LUA);
+            let mut invocation = script.prepare_invoke();
+            invocation
+                .key(mesh_key(&mesh_id))
+                .key(mesh_idempotency_key(
+                    &request.model_name,
+                    &request.idempotency_key,
+                ))
+                .arg(&mesh_id)
+                .arg(&request.model_name)
+                .arg(&logical_shards)
+                .arg(&workers)
+                .arg(i32::from(WorkerRole::Trainer));
+            for worker_id in request.workers.keys() {
+                invocation.key(worker_key(worker_id));
+            }
+            let result: String = invocation
+                .invoke_async(&mut redis)
+                .await
+                .map_err(redis_error)?;
+            if result == "CREATED" {
+                return self.get_trainer_mesh(&mesh_id).await;
+            }
+            if result.starts_with("EXISTING:") {
+                return self
+                    .find_trainer_mesh_for_request(request)
+                    .await?
+                    .ok_or_else(|| {
+                        RefitBackendError::Internal("mesh idempotency key disappeared".to_string())
+                    });
+            }
+            if result == "WORKER_NOT_FOUND" || result == "WORKER_MISMATCH" {
+                return Err(RefitBackendError::FailedPrecondition(
+                    "mesh workers require active trainer registrations for the model".to_string(),
+                ));
+            }
+            if result != "COLLISION" {
+                return Err(RefitBackendError::Internal(format!(
+                    "unexpected Redis response: {result}"
+                )));
+            }
+        }
+        Err(RefitBackendError::ResourceExhausted(
+            "could not allocate a unique trainer mesh ID".to_string(),
+        ))
+    }
+
+    async fn get_trainer_mesh(&self, mesh_id: &str) -> RefitResult<TrainerMesh> {
+        let mut redis = self.redis.clone();
+        let fields: HashMap<String, String> = redis
+            .hgetall(mesh_key(mesh_id))
+            .await
+            .map_err(redis_error)?;
+        if fields.is_empty() {
+            return Err(RefitBackendError::NotFound(format!(
+                "trainer mesh {mesh_id:?} was not found"
+            )));
+        }
+        mesh_from_hash(fields)
+    }
+
+    async fn update_trainer_mesh(
+        &self,
+        mesh_id: &str,
+        expected_generation: u64,
+        workers: HashMap<String, TrainerTensorsMetadata>,
+    ) -> RefitResult<TrainerMesh> {
+        let current = self.get_trainer_mesh(mesh_id).await?;
+        if current.generation != expected_generation {
+            return Err(RefitBackendError::FailedPrecondition(
+                "trainer mesh generation changed".to_string(),
+            ));
+        }
+        let script = Script::new(UPDATE_MESH_LUA);
+        let mut invocation = script.prepare_invoke();
+        invocation
+            .key(mesh_key(mesh_id))
+            .key(mesh_versions_key(mesh_id))
+            .arg(expected_generation)
+            .arg(mesh_workers_json(&workers)?)
+            .arg(&current.model_name)
+            .arg(i32::from(WorkerRole::Trainer));
+        for worker_id in workers.keys() {
+            invocation.key(worker_key(worker_id));
+        }
+        let mut redis = self.redis.clone();
+        let result: String = invocation
+            .invoke_async(&mut redis)
+            .await
+            .map_err(redis_error)?;
+        match result.as_str() {
+            "UPDATED" | "UNCHANGED" => self.get_trainer_mesh(mesh_id).await,
+            "COVERAGE_MISMATCH" => Err(RefitBackendError::InvalidArgument(
+                "mesh update must preserve logical shard coverage".to_string(),
+            )),
+            "NOT_FOUND" => Err(RefitBackendError::NotFound(
+                "trainer mesh was not found".to_string(),
+            )),
+            "GENERATION_MISMATCH" => Err(RefitBackendError::FailedPrecondition(
+                "trainer mesh generation changed".to_string(),
+            )),
+            "WORKER_NOT_FOUND" | "WORKER_MISMATCH" => Err(RefitBackendError::FailedPrecondition(
+                "new mesh worker must have an active trainer registration for the model"
+                    .to_string(),
+            )),
+            "VERSION_LEASED" => Err(RefitBackendError::FailedPrecondition(
+                "cannot rebind a worker endpoint while a linked version has an active lease"
+                    .to_string(),
+            )),
+            _ => Err(RefitBackendError::Internal(format!(
+                "unexpected Redis response: {result}"
+            ))),
+        }
+    }
+
+    async fn delete_trainer_mesh(&self, mesh_id: &str) -> RefitResult<()> {
+        let mut redis = self.redis.clone();
+        let result: String = Script::new(DELETE_MESH_LUA)
+            .key(mesh_key(mesh_id))
+            .key(mesh_versions_key(mesh_id))
+            .arg(i32::from(WeightVersionState::Releasing))
+            .invoke_async(&mut redis)
+            .await
+            .map_err(redis_error)?;
+        match result.as_str() {
+            "DELETED" => Ok(()),
+            "NOT_FOUND" => Err(RefitBackendError::NotFound(
+                "trainer mesh was not found".to_string(),
+            )),
+            "IN_USE" => Err(RefitBackendError::FailedPrecondition(
+                "trainer mesh still has active weight versions or resources".to_string(),
+            )),
+            _ => Err(RefitBackendError::Internal(format!(
+                "unexpected Redis response: {result}"
+            ))),
+        }
+    }
+
     async fn register_worker(
         &self,
         mut worker: WorkerRegistration,
@@ -279,6 +539,7 @@ impl RefitBackend for RedisRefitBackend {
             .arg(worker.role)
             .arg(&worker.model_name)
             .arg(u64::from(ttl_seconds).saturating_mul(1000))
+            .arg(&worker.refit_endpoint)
             .invoke_async(&mut redis)
             .await
             .map_err(redis_error)?;
@@ -341,8 +602,9 @@ impl RefitBackend for RedisRefitBackend {
                 if existing.model_name == request.model_name
                     && existing.payload_format == request.payload_format
                     && existing.base_version_id == request.base_version_id
-                    && existing.expected_source_slots == request.expected_source_slots
                     && existing.object_storage == request.object_storage
+                    && existing.trainer_mesh_id == request.trainer_mesh_id
+                    && existing.version_number == request.version_number
                     && initial_state == request.state
                 {
                     return Ok(existing);
@@ -355,6 +617,16 @@ impl RefitBackend for RedisRefitBackend {
                 return Err(RefitBackendError::AlreadyExists(format!(
                     "weight version UID {uid:?} already exists"
                 )));
+            }
+            if result == "MESH_NOT_FOUND" {
+                return Err(RefitBackendError::NotFound(
+                    "trainer mesh was not found".to_string(),
+                ));
+            }
+            if result == "MESH_MODEL_MISMATCH" {
+                return Err(RefitBackendError::FailedPrecondition(
+                    "trainer mesh and weight version model_name differ".to_string(),
+                ));
             }
             if result != "COLLISION" {
                 return Err(RefitBackendError::Internal(format!(
@@ -371,6 +643,69 @@ impl RefitBackend for RedisRefitBackend {
         version_from_hash(self.get_version_fields(uid).await?)
     }
 
+    async fn list_weight_versions(
+        &self,
+        model_name: &str,
+        trainer_mesh_id: Option<&str>,
+    ) -> RefitResult<Vec<WeightVersion>> {
+        let mut redis = self.redis.clone();
+        let keys = if let Some(mesh_id) = trainer_mesh_id {
+            let ids: Vec<String> = redis
+                .smembers(mesh_versions_key(mesh_id))
+                .await
+                .map_err(redis_error)?;
+            ids.iter().map(|id| version_key(id)).collect::<Vec<_>>()
+        } else {
+            let mut cursor = 0_u64;
+            let mut keys = Vec::new();
+            loop {
+                let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg("mx:refit:version:metadata:*")
+                    .arg("COUNT")
+                    .arg(100)
+                    .query_async(&mut redis)
+                    .await
+                    .map_err(redis_error)?;
+                keys.extend(batch);
+                cursor = next;
+                if cursor == 0 {
+                    break;
+                }
+            }
+            keys
+        };
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipeline = redis::pipe();
+        for key in keys {
+            pipeline.hgetall(key);
+        }
+        let records: Vec<HashMap<String, String>> = pipeline
+            .query_async(&mut redis)
+            .await
+            .map_err(redis_error)?;
+        let mut versions = HashMap::new();
+        for fields in records {
+            if fields.is_empty() {
+                continue;
+            }
+            let version = version_from_hash(fields)?;
+            if version.model_name == model_name
+                && trainer_mesh_id
+                    .is_none_or(|mesh_id| version.trainer_mesh_id.as_deref() == Some(mesh_id))
+            {
+                versions.insert(version.uid.clone(), version);
+            }
+        }
+        let mut versions: Vec<_> = versions.into_values().collect();
+        versions
+            .sort_by(|a, b| (&b.created_at_unix_ms, &b.uid).cmp(&(&a.created_at_unix_ms, &a.uid)));
+        Ok(versions)
+    }
+
     async fn delete_weight_version(&self, uid: &str) -> RefitResult<WeightVersion> {
         self.transition_weight_version_state(uid, WeightVersionState::Releasing.into())
             .await
@@ -380,6 +715,16 @@ impl RefitBackend for RedisRefitBackend {
         &self,
         request: &UpdateWeightVersionStateRequest,
     ) -> RefitResult<WeightVersion> {
+        if self
+            .get_weight_version(&request.uid)
+            .await?
+            .trainer_mesh_id
+            .is_some()
+        {
+            return Err(RefitBackendError::FailedPrecondition(
+                "mesh-backed weight version state is managed by MX".to_string(),
+            ));
+        }
         self.transition_weight_version_state(&request.uid, request.state)
             .await
     }
@@ -389,21 +734,26 @@ impl RefitBackend for RedisRefitBackend {
         shard: WeightVersionShard,
     ) -> RefitResult<(WeightVersionShard, WeightVersion)> {
         let mut version = self.get_weight_version(&shard.version_id).await?;
-        let publication_key = publication_key(&shard.worker_id, &shard.source_slot_id);
+        let publication_key = publication_key(&shard.worker_id, &shard.logical_shard_id);
         let encoded = shard.encode_to_vec();
         let mut redis = self.redis.clone();
         let result: String = Script::new(CREATE_SHARD_LUA)
             .key(version_key(&shard.version_id))
             .key(worker_key(&shard.worker_id))
             .key(shards_key(&shard.version_id))
-            .key(coverage_key(&shard.version_id))
-            .key(expected_source_slots_key(&shard.version_id))
+            .key(mesh_key(
+                version.trainer_mesh_id.as_deref().unwrap_or_default(),
+            ))
+            .key(publication_endpoints_key(&shard.version_id))
             .arg(publication_key)
             .arg(encoded)
             .arg(&version.model_name)
-            .arg(&shard.source_slot_id)
+            .arg(&shard.logical_shard_id)
             .arg(i32::from(WeightVersionState::Staging))
             .arg(i32::from(WeightVersionState::Ready))
+            .arg(&shard.worker_id)
+            .arg(i32::from(WorkerRole::Trainer))
+            .arg(&shard.manifest_endpoint)
             .invoke_async(&mut redis)
             .await
             .map_err(redis_error)?;
@@ -423,9 +773,14 @@ impl RefitBackend for RedisRefitBackend {
                     "worker and weight version model_name differ".to_string(),
                 ));
             }
-            "SOURCE_SLOT_NOT_REQUIRED" => {
-                return Err(RefitBackendError::InvalidArgument(
-                    "source_slot_id is not required by the weight version".to_string(),
+            "MESH_NOT_FOUND" => {
+                return Err(RefitBackendError::FailedPrecondition(
+                    "trainer mesh is missing".to_string(),
+                ));
+            }
+            "WORKER_NOT_TRAINER" | "WORKER_NOT_IN_MESH" | "WORKER_ENDPOINT_MISMATCH" => {
+                return Err(RefitBackendError::FailedPrecondition(
+                    "worker is not an active trainer member of this logical shard".to_string(),
                 ));
             }
             "VERSION_NOT_WRITABLE" => {
@@ -435,7 +790,7 @@ impl RefitBackend for RedisRefitBackend {
             }
             "SHARD_CONFLICT" => {
                 return Err(RefitBackendError::AlreadyExists(
-                    "worker and source_slot_id already published different metadata".to_string(),
+                    "worker and logical_shard_id already published different metadata".to_string(),
                 ));
             }
             value => {
@@ -460,7 +815,7 @@ impl RefitBackend for RedisRefitBackend {
         &self,
         version_id: &str,
     ) -> RefitResult<Vec<WeightVersionShard>> {
-        self.get_weight_version(version_id).await?;
+        let version = self.get_weight_version(version_id).await?;
         let mut redis = self.redis.clone();
         let encoded: Vec<Vec<u8>> = redis
             .hvals(shards_key(version_id))
@@ -476,8 +831,37 @@ impl RefitBackend for RedisRefitBackend {
                 })
             })
             .collect::<RefitResult<Vec<_>>>()?;
+        if let Some(mesh_id) = version.trainer_mesh_id.as_deref() {
+            let mesh = self.get_trainer_mesh(mesh_id).await?;
+            shards.retain(|shard| {
+                mesh.workers.get(&shard.worker_id).is_some_and(|metadata| {
+                    metadata.logical_shard_id == shard.logical_shard_id
+                        && metadata.metadata_endpoint == shard.manifest_endpoint
+                })
+            });
+            if !shards.is_empty() {
+                let mut registrations = redis::pipe();
+                for shard in &shards {
+                    registrations.hget(worker_key(&shard.worker_id), "refit_endpoint");
+                }
+                let endpoints: Vec<Option<String>> = registrations
+                    .query_async(&mut redis)
+                    .await
+                    .map_err(redis_error)?;
+                shards = shards
+                    .into_iter()
+                    .zip(endpoints)
+                    .filter_map(|(shard, endpoint)| {
+                        let metadata = mesh.workers.get(&shard.worker_id)?;
+                        (endpoint.as_deref() == Some(metadata.metadata_endpoint.as_str()))
+                            .then_some(shard)
+                    })
+                    .collect();
+            }
+        }
         shards.sort_by(|left, right| {
-            (&left.source_slot_id, &left.worker_id).cmp(&(&right.source_slot_id, &right.worker_id))
+            (&left.logical_shard_id, &left.worker_id)
+                .cmp(&(&right.logical_shard_id, &right.worker_id))
         });
         Ok(shards)
     }
@@ -486,7 +870,7 @@ impl RefitBackend for RedisRefitBackend {
         &self,
         request: &DeleteWeightVersionShardRequest,
     ) -> RefitResult<bool> {
-        let publication_key = publication_key(&request.worker_id, &request.source_slot_id);
+        let publication_key = publication_key(&request.worker_id, &request.logical_shard_id);
         let mut redis = self.redis.clone();
         let encoded: Option<Vec<u8>> = redis
             .hget(shards_key(&request.version_id), &publication_key)
@@ -509,9 +893,9 @@ impl RefitBackend for RedisRefitBackend {
             .key(worker_key(&request.worker_id))
             .key(shards_key(&request.version_id))
             .key(leases_key(&request.version_id))
+            .key(publication_endpoints_key(&request.version_id))
             .arg(publication_key)
             .arg(encoded)
-            .arg(i32::from(WeightVersionState::Releasing))
             .invoke_async(&mut redis)
             .await
             .map_err(redis_error)?;
@@ -519,9 +903,6 @@ impl RefitBackend for RedisRefitBackend {
             "DELETED" => Ok(true),
             "VERSION_NOT_FOUND" => Err(RefitBackendError::NotFound(
                 "weight version was not found".to_string(),
-            )),
-            "VERSION_NOT_RELEASING" => Err(RefitBackendError::FailedPrecondition(
-                "weight version must be RELEASING before its shards can be deleted".to_string(),
             )),
             "WORKER_NOT_FOUND" => Err(RefitBackendError::FailedPrecondition(
                 "worker registration is missing or expired".to_string(),
@@ -545,6 +926,7 @@ impl RefitBackend for RedisRefitBackend {
         &self,
         request: &RegisterVersionLeaseRequest,
     ) -> RefitResult<VersionLease> {
+        self.get_weight_version(&request.version_id).await?;
         let lease_id = lease_id(&request.version_id, &request.worker_id);
         let mut redis = self.redis.clone();
         let result: String = Script::new(REGISTER_LEASE_LUA)
@@ -622,12 +1004,8 @@ mod tests {
 
     #[test]
     fn version_ids_cannot_collide_with_derived_keys() {
+        assert_ne!(mesh_key("versions:foo"), mesh_versions_key("foo"));
         assert_ne!(version_key("foo:shards"), shards_key("foo"));
-        assert_ne!(version_key("foo:coverage"), coverage_key("foo"));
-        assert_ne!(
-            version_key("foo:expected-source-slots"),
-            expected_source_slots_key("foo")
-        );
         assert_ne!(version_key("foo:leases"), leases_key("foo"));
         assert_ne!(version_key("foo:lease:bar"), lease_key("foo", "bar"));
     }

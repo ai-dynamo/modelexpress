@@ -10,8 +10,13 @@ package model_express.refit;
 // per-worker manifests.
 service RefitService {
   // External APIs: called by the RL framework orchestrator.
+  rpc CreateTrainerMesh(CreateTrainerMeshRequest) returns (CreateTrainerMeshResponse);
+  rpc GetTrainerMesh(GetTrainerMeshRequest) returns (GetTrainerMeshResponse);
+  rpc UpdateTrainerMesh(UpdateTrainerMeshRequest) returns (UpdateTrainerMeshResponse);
+  rpc DeleteTrainerMesh(DeleteTrainerMeshRequest) returns (DeleteTrainerMeshResponse);
   rpc CreateWeightVersion(CreateWeightVersionRequest) returns (CreateWeightVersionResponse);
   rpc GetWeightVersion(GetWeightVersionRequest) returns (GetWeightVersionResponse);
+  rpc ListWeightVersions(ListWeightVersionsRequest) returns (ListWeightVersionsResponse);
   // Cancel a STAGING version or retire a READY version.
   rpc DeleteWeightVersion(DeleteWeightVersionRequest) returns (DeleteWeightVersionResponse);
   rpc UpdateWeightVersionState(UpdateWeightVersionStateRequest) returns (UpdateWeightVersionStateResponse);
@@ -68,6 +73,7 @@ message WorkerRegistration {
   WorkerRole role = 2;
   string model_name = 3;
   uint64 expires_at_unix_ms = 4;
+  string refit_endpoint = 5;
 }
 
 message RegisterWorkerRequest {
@@ -79,6 +85,52 @@ message RegisterWorkerResponse {
   WorkerRegistration worker = 1;
 }
 
+message TrainerTensorsMetadata {
+  string logical_shard_id = 1;
+  string metadata_endpoint = 2;
+}
+
+message TrainerMesh {
+  string mesh_id = 1;
+  string model_name = 2;
+  uint64 generation = 3;
+  map<string, TrainerTensorsMetadata> workers = 4;
+}
+
+message CreateTrainerMeshRequest {
+  string model_name = 1;
+  string idempotency_key = 2;
+  map<string, TrainerTensorsMetadata> workers = 3;
+}
+
+message CreateTrainerMeshResponse {
+  TrainerMesh mesh = 1;
+}
+
+message GetTrainerMeshRequest {
+  string mesh_id = 1;
+}
+
+message GetTrainerMeshResponse {
+  TrainerMesh mesh = 1;
+}
+
+message UpdateTrainerMeshRequest {
+  string mesh_id = 1;
+  uint64 expected_generation = 2;
+  map<string, TrainerTensorsMetadata> workers = 3;
+}
+
+message UpdateTrainerMeshResponse {
+  TrainerMesh mesh = 1;
+}
+
+message DeleteTrainerMeshRequest {
+  string mesh_id = 1;
+}
+
+message DeleteTrainerMeshResponse {}
+
 message WeightVersion {
   // Opaque identity for this WeightVersion. MX generates it when the caller
   // omits CreateWeightVersionRequest.uid.
@@ -89,11 +141,8 @@ message WeightVersion {
   // Present only for XOR_DELTA; identifies the base WeightVersion to which the
   // delta is applied. Full payloads omit it.
   optional string base_version_id = 5;
-  // Required only for worker-sharded publication. Physical source workers are
-  // not baked in; the trainer coordinator supplies opaque IDs such as a
-  // selected publisher global rank. Object-storage-backed versions leave this
-  // empty.
-  repeated string expected_source_slots = 6;
+  reserved 6;
+  reserved "expected_source_slots";
   // Reserved placeholder for a future server-assigned layout fingerprint.
   // Content identity currently travels in the payload.
   string layout_signature = 7;
@@ -101,6 +150,9 @@ message WeightVersion {
   uint64 created_at_unix_ms = 9;
   // Present only when the version payload is published through object storage.
   ObjectStorageSource object_storage = 10;
+  // Required for worker publication; absent for object-storage versions.
+  optional string trainer_mesh_id = 11;
+  optional int64 version_number = 12;
 }
 
 message CreateWeightVersionRequest {
@@ -109,14 +161,26 @@ message CreateWeightVersionRequest {
   WeightPayloadFormat payload_format = 3;
   // Required only for XOR_DELTA; omitted for full payloads.
   optional string base_version_id = 4;
-  // Required for worker-sharded publication; empty for object storage.
-  repeated string expected_source_slots = 5;
+  reserved 5;
+  reserved "expected_source_slots";
   // Set for an object-storage-backed version; omitted for worker-sharded
   // publication.
   ObjectStorageSource object_storage = 6;
   WeightVersionState state = 7;
   // Optional caller-selected identity; MX generates one when omitted.
   optional string uid = 8;
+  // Required for worker publication; absent for object-storage versions.
+  optional string trainer_mesh_id = 9;
+  optional int64 version_number = 10;
+}
+
+message ListWeightVersionsRequest {
+  string model_name = 1;
+  optional string trainer_mesh_id = 2;
+}
+
+message ListWeightVersionsResponse {
+  repeated WeightVersion versions = 1;
 }
 
 message CreateWeightVersionResponse {
@@ -151,8 +215,8 @@ message UpdateWeightVersionStateResponse {
 message WeightVersionShard {
   string version_id = 1;
   // Required version-scoped source contribution covered by this publication.
-  string source_slot_id = 2;
-  // Together with version_id and source_slot_id, identifies this publication.
+  string logical_shard_id = 2;
+  // Together with version_id and logical_shard_id, identifies this publication.
   string worker_id = 3;
   uint64 tensor_count = 4;
   uint64 total_bytes = 5;
@@ -184,7 +248,7 @@ message ListWeightVersionShardsResponse {
 
 message GetWeightVersionShardManifestRequest {
   string version_id = 1;
-  string source_slot_id = 2;
+  string logical_shard_id = 2;
 }
 
 message GetWeightVersionShardManifestResponse {
@@ -194,7 +258,7 @@ message GetWeightVersionShardManifestResponse {
 
 message DeleteWeightVersionShardRequest {
   string version_id = 1;
-  string source_slot_id = 2;
+  string logical_shard_id = 2;
   string worker_id = 3;
 }
 

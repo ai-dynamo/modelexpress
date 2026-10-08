@@ -73,7 +73,6 @@ def _version(
             storage_type=ObjectStorageType.S3,
             uri=f"s3://weights/{uid}/model.safetensors.index.json",
         ),
-        expected_source_slots=(),
         layout_signature="layout",
         state=state,
         created_at_unix_ms=1,

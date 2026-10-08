@@ -1410,29 +1410,38 @@ policy described below.
 | Integration choice | Public setting or operation |
 | --- | --- |
 | Trainer storage | Set `ModelExpressTrainerConfig.staging_mode` explicitly. Prefer `IN_PLACE` when its lifetime and dtype requirements hold; otherwise start with `COPY_TO_HOST`. |
-| Generator installation | For trainer sources, use `stage_weight()` followed by `apply_weight()` for a complete staged copy, or `apply_weight_streaming()` for bounded installation into live weights. |
-| Receiver memory | Set `max_staging_bytes` for bounded installation. `staging_device` selects host or device receive memory; `staging_buffers` divides that budget across receive arenas. |
+| Generator installation | Use `stage_weight()` followed by `apply_weight()`, then release the handle. Bounded staging defers batch reads until apply. |
+| Receiver memory | Set `ModelExpressGeneratorConfig.staging_buffer_bytes` per buffer and `staging_buffers_count` for bounded installation. `staging_device` selects host or device receive memory. |
 
 For unquantized vLLM models whose weights leave insufficient memory for a second
 complete weight copy, initialize the generator with
-`source_order=(WeightSource.TRAINER,)` and call:
+`source_order=(WeightSource.TRAINER,)` and bounded staging:
 
 ```python
-# Pause generation on every replica before entering this operation.
-metrics = generator.apply_weight_streaming(
-    version=WeightVersionRef(version_uid),
-    max_staging_bytes=4 * 1024**3,
-    staging_device="cuda",  # or "cpu" for pinned host staging
-    staging_buffers=1,      # 2 allows asynchronous transfer/install overlap
+generator = ModelExpressGeneratorClient.initialize(
+    ModelExpressGeneratorConfig(
+        engine_context=engine_context,
+        model_name=model_name,
+        source_order=(WeightSource.TRAINER,),
+        staging_buffer_bytes=4 * 1024**3,
+        staging_buffers_count=2,
+        staging_device="cuda",  # or "cpu" for pinned host staging
+    )
 )
+# Pause generation on every replica before installing live weights.
+staged = generator.stage_weight(version=WeightVersionRef(version_uid))
+try:
+    metrics = generator.apply_weight(staged)
+finally:
+    staged.release()
 # Resume only after every replica completes successfully.
 ```
 
 This API interleaves NIXL reads and per-module installation. It supports mixed
 floating-point wire/engine dtypes through the existing conversion planner. The
-limit covers receive, conversion, full-pull scratch, and alignment across all
-staging arenas together; with `staging_buffers=2` each arena receives half of
-it. A module larger than one arena's share fails during preparation. Engine
+per-buffer limit covers receive, conversion, full-pull scratch, and alignment.
+Total arena capacity is `staging_buffer_bytes * staging_buffers_count` per
+generator worker. A module larger than one buffer fails during preparation. Engine
 post-load workspaces and live weights require additional headroom; the limit is
 not a total process-memory cap.
 
@@ -1440,7 +1449,7 @@ not a total process-memory cap.
 in VRAM and commits with a device copy. `"cpu"` allocates pinned host memory,
 registers it as NIXL DRAM, and commits with a host-to-device copy, so the arena
 costs no VRAM. Host staging adds a host-to-device copy and depends on the
-available host-memory and CPU-to-GPU bandwidth. `staging_buffers=2` posts the
+available host-memory and CPU-to-GPU bandwidth. `staging_buffers_count=2` posts the
 next batch's READ into the other arena before the current batch is committed,
 allowing transfer and installation to overlap. The benefit depends on the
 hardware and the relative transfer and installation times; it does not guarantee
