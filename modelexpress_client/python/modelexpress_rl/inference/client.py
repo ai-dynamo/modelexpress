@@ -531,14 +531,18 @@ class ModelExpressGeneratorClient:
     def _renew_worker_registration(self) -> None:
         interval_seconds = max(self._registration_ttl_seconds / 3, 0.1)
         while not self._registration_stop.wait(interval_seconds):
-            try:
-                self._register_worker()
-            except grpc.RpcError as error:
-                logger.warning("worker registration renewal failed: %s", error)
-                continue
-            except Exception:
-                logger.exception("unexpected worker registration renewal failure")
-                continue
+            self._try_register_worker()
+
+    def _try_register_worker(self) -> bool:
+        try:
+            self._register_worker()
+        except grpc.RpcError as error:
+            logger.warning("worker registration renewal failed: %s", error)
+        except Exception:
+            logger.exception("unexpected worker registration renewal failure")
+        else:
+            return True
+        return False
 
     def _get_ready_version(self, version_id: str) -> WeightVersion:
         return self._fetch_ready_version(
@@ -633,26 +637,35 @@ class ModelExpressGeneratorClient:
             raise RuntimeError("MX RegisterVersionLease response is missing lease")
         return response.lease
 
+    def _try_renew_lease(self, version_id: str) -> grpc.StatusCode | None:
+        """Renew one lease and return the RPC failure code, never raising."""
+        try:
+            self._register_lease(version_id)
+        except grpc.RpcError as error:
+            logger.warning("version %s lease renewal failed: %s", version_id, error)
+            return error.code()
+        except Exception:
+            logger.exception("unexpected version %s lease renewal failure", version_id)
+        return None
+
     def _start_version_lease(self, version_id: str) -> _VersionLease:
+        # A restarted MX server loses registrations until the next renewal tick.
+        self._register_worker()
         lease = self._register_lease(version_id)
         stop = threading.Event()
 
         def renew() -> None:
             interval_seconds = max(self._lease_ttl_seconds / 3, 0.1)
             while not stop.wait(interval_seconds):
-                try:
-                    self._register_lease(version_id)
-                except grpc.RpcError as error:
-                    logger.warning(
-                        "version %s lease renewal failed: %s",
-                        version_id,
-                        error,
-                    )
-                except Exception:
-                    logger.exception(
-                        "unexpected version %s lease renewal failure",
-                        version_id,
-                    )
+                code = self._try_renew_lease(version_id)
+                # FAILED_PRECONDITION includes a missing worker registration (e.g. after an
+                # MX restart). RegisterWorker is an idempotent upsert, so it is harmless for
+                # the other causes.
+                if (
+                    code is grpc.StatusCode.FAILED_PRECONDITION
+                    and self._try_register_worker()
+                ):
+                    self._try_renew_lease(version_id)
 
         renewal = threading.Thread(
             target=renew,
