@@ -1633,7 +1633,9 @@ separate S3 cleanup pod runs without Redis or the server.
 Seed uploads use boto3's standard transfer client
 for the custom HTTP endpoint, matching seed downloads. The existing `HF_TOKEN` secret is forwarded for
 model access. Delta objects are verified absent before namespace deletion; SeaweedFS
-and its seed data remain available if cleanup fails. This path needs no AWS IAM role
+and its seed data remain available if cleanup fails. If setup fails before bucket
+creation, an explicit S3 `NoSuchBucket` response also verifies that run objects
+are absent; other storage errors still fail cleanup. This path needs no AWS IAM role
 or pre-populated bucket. The Nemotron profile defaults to digest-pinned vLLM 0.27.1,
 the version documented in the model's deployment recipe, with
 `MX_BENCH_RUNTIME_BASES.nemotron` available as an override.

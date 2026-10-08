@@ -21,19 +21,22 @@ def cleanup(s3, config):
         raise ValueError("Cleanup prefix overlaps the model snapshot")
     bucket = config["bucket"]
     deleted = 0
-    for page in s3.get_paginator("list_objects_v2").paginate(
-        Bucket=bucket, Prefix=prefix
-    ):
-        objects = [{"Key": row["Key"]} for row in page.get("Contents", [])]
-        if any(not row["Key"].startswith(prefix) for row in objects):
-            raise ValueError("Object outside exact run prefix")
-        if objects:
-            response = s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
-            if response.get("Errors"):
-                raise RuntimeError(response["Errors"])
-            deleted += len(objects)
-    if s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1).get("Contents"):
-        raise RuntimeError("Run objects remain after cleanup")
+    try:
+        for page in s3.get_paginator("list_objects_v2").paginate(
+            Bucket=bucket, Prefix=prefix
+        ):
+            objects = [{"Key": row["Key"]} for row in page.get("Contents", [])]
+            if any(not row["Key"].startswith(prefix) for row in objects):
+                raise ValueError("Object outside exact run prefix")
+            if objects:
+                response = s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+                if response.get("Errors"):
+                    raise RuntimeError(response["Errors"])
+                deleted += len(objects)
+        if s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1).get("Contents"):
+            raise RuntimeError("Run objects remain after cleanup")
+    except s3.exceptions.NoSuchBucket:
+        pass
     return {"prefix": prefix, "deleted": deleted, "verified_absent": True}
 
 

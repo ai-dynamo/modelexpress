@@ -8,6 +8,10 @@ from harness import cleanup as module
 
 
 class Storage:
+    class exceptions:
+        class NoSuchBucket(Exception):
+            pass
+
     def __init__(self):
         self.objects = {
             "deltas/nemotron-test/partial": 1,
@@ -55,6 +59,23 @@ def test_partial_publication_cleanup_preserves_snapshot_and_neighbor_run():
     assert report["verified_absent"] and report["deleted"] == 1
     assert set(storage.objects) == {"deltas/nemotron-test2/keep", "models/keep"}
     assert module.cleanup(storage, config())["deleted"] == 0
+
+
+@pytest.mark.parametrize("missing_bucket", [True, False])
+def test_cleanup_before_bucket_creation_requires_explicit_absence(missing_bucket):
+    class UnavailableStorage(Storage):
+        def paginate(self, **kwargs):
+            if missing_bucket:
+                raise self.exceptions.NoSuchBucket("NoSuchBucket")
+            raise RuntimeError("AccessDenied")
+
+    storage = UnavailableStorage()
+    if missing_bucket:
+        report = module.cleanup(storage, config())
+        assert report["verified_absent"] and report["deleted"] == 0
+    else:
+        with pytest.raises(RuntimeError, match="AccessDenied"):
+            module.cleanup(storage, config())
 
 
 @pytest.mark.parametrize(
