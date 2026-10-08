@@ -177,7 +177,7 @@ class MxModelLoader:
             main_loader = _loader_registry.get(ctx.device_id)
             main_ctx = main_loader._ctx if main_loader is not None else None
             draft_adapter = draft_weight_adapter_for(
-                type(model).__name__, role="draft"
+                type(model).__name__, role="draft", model=model
             )
             same_checkpoint = main_ctx is not None and main_ctx.identity == ctx.identity
             compatible_adapter = (
@@ -212,7 +212,7 @@ class MxModelLoader:
             draft_gate = _draft_publication_gates.pop(ctx.device_id, None)
         elif _expects_draft_pass():
             self._draft_weight_adapter = draft_weight_adapter_for(
-                type(model).__name__, role="main"
+                type(model).__name__, role="main", model=model
             )
             self._strict_draft_publication = self._draft_weight_adapter is not None
             if self._strict_draft_publication or not envs.MX_ARTIFACT_READY_URL.strip():
@@ -228,7 +228,7 @@ class MxModelLoader:
                     ctx.source_ready_fn = main_gate.is_open
         elif not is_draft:
             self._draft_weight_adapter = draft_weight_adapter_for(
-                type(model).__name__, role="main"
+                type(model).__name__, role="main", model=model
             )
         if not is_draft and ctx.source_ready_fn is None and envs.MX_ARTIFACT_READY_URL.strip():
             ctx.source_ready_fn = lambda: _sglang_health_ready(ctx)

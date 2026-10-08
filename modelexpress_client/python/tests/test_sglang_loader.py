@@ -1348,6 +1348,50 @@ def test_sglang_draft_adopts_main_agent_and_extends_registry(
     assert draft_loader._ctx is None
 
 
+@pytest.mark.parametrize(
+    ("main_class", "draft_class", "layer"),
+    [
+        ("DeepseekV32ForCausalLM", "DeepseekV3ForCausalLMNextN", 61),
+        ("Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN", 92),
+        ("GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN", 78),
+    ],
+)
+def test_sglang_nextn_draft_reuses_main_nixl_agent(
+    _clean_sglang_registries, main_class, draft_class, layer
+):
+    def model_for(name):
+        model_type = type(name, (nn.Module,), {})
+        model = model_type()
+        model.config = SimpleNamespace(
+            num_hidden_layers=layer, num_nextn_predict_layers=1
+        )
+        return model
+
+    manager = MagicMock()
+    with patch(
+        "modelexpress.engines.sglang.loader._sglang_version", return_value="0.5.16"
+    ):
+        _run_nixl_pass(
+            _model_config(), _target_chain(manager, {"main.weight": torch.zeros(1)}),
+            model=model_for(main_class),
+        )
+
+        def draft_chain(model, ctx):
+            assert ctx.shared_nixl_manager is manager
+            assert ctx.draft_tensor_namespace.startswith("mx_draft::")
+            ctx.nixl_manager = manager
+            ctx.draft_published = True
+            return model
+
+        _, draft_ctx, _, _ = _run_nixl_pass(
+            _model_config(is_draft_model=True),
+            draft_chain,
+            model=model_for(draft_class),
+        )
+    assert draft_ctx.p2p_enabled is True
+    assert draft_ctx.p2p_role == "draft"
+
+
 def test_sglang_unknown_draft_uses_storage_fallback_not_unsafe_peer(
     _clean_sglang_registries,
 ):

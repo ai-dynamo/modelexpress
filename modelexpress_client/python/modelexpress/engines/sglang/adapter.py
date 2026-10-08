@@ -111,7 +111,7 @@ class SglangAdapter(EngineAdapter):
         tensors = collect_module_tensors(result.model, self.accelerator_backend)
         if is_sglang_draft_model(self.model_config):
             selector = draft_weight_adapter_for(
-                type(result.model).__name__, role="draft"
+                type(result.model).__name__, role="draft", model=result.model
             )
             if selector is not None:
                 tensors = selector.transferable_tensors(result.model, tensors)
@@ -151,7 +151,7 @@ class SglangAdapter(EngineAdapter):
 
         is_draft = is_sglang_draft_model(self.model_config)
         selector = draft_weight_adapter_for(
-            type(model).__name__, role="draft" if is_draft else "main"
+            type(model).__name__, role="draft" if is_draft else "main", model=model
         )
         from sglang.srt.configs.load_config import LoadFormat
         from sglang.srt.model_loader.loader import RunaiModelStreamerLoader

@@ -1288,14 +1288,20 @@ unless `speculative_draft_load_format` names another format, it loads through th
 same `remote_instance` backend. The generic MX draft path recognizes that
 second pass, reuses the main load's NIXL agent instead of binding the same
 metadata port again, and gives draft tensors a separate manifest namespace.
-Model-specific weight selection lives behind `DraftWeightAdapter`; the only
-implemented selector is Qwen3.5 MTP, whose raw-tensor predicate matches
-SGLang v0.5.16's `Qwen3_5ForCausalLMMTP.load_weights`. Actual tensor mapping,
+Model-specific weight selection lives behind `DraftWeightAdapter`. Qwen3.5 MTP
+uses the raw-tensor predicate in SGLang v0.5.16's
+`Qwen3_5ForCausalLMMTP.load_weights`. DeepSeek V3/V3.2 NextN and GLM4 MoE,
+GLM4 MoE Lite, and GLM MoE DSA NextN use an extra decoder layer at
+`model.layers.<num_hidden_layers>`; the adapter reads the layer count and the
+single-draft-layer flag from the model config instead of hard-coding a model
+version's layer number. The separate family tags prevent pairing an unrelated
+main and draft manifest. DeepSeek V4's MTP/DSpark layouts are not covered by
+the extra-layer adapter. Actual tensor mapping,
 quantization, and loading still run through SGLang's model loader. The
 checkpoint's `model.safetensors.index.json` maps tensor names to shard files;
 it does not by itself define which tensors belong to every architecture's draft.
 
-- A Qwen3.5 draft may use P2P only when it shares the main `SourceIdentity`,
+- A recognized draft may use P2P only when it shares the main `SourceIdentity`,
   both passes select the same model adapter, pipeline parallelism is one, and
   the source identity includes an explicit revision and SGLang package version.
   A hash of these inputs and the model URI scopes its draft tensor names. The
@@ -1305,9 +1311,9 @@ it does not by itself define which tensors belong to every architecture's draft.
   main NIXL registration and metadata publication; target-shared embedding and
   head storage is excluded using SGLang's `get_embed_and_head`, independent of
   parameter names. The source's publication gate does not open for a recognized
-  Qwen3.5 draft until that extension succeeds. If a health URL is configured,
+  draft until that extension succeeds. If a health URL is configured,
   both draft publication and engine health must be ready.
-- On a cold source using ModelStreamer, the recognized Qwen3.5 adapter selects
+- On a cold source using ModelStreamer, a recognized adapter selects
   **files** separately for the main and draft passes. MX first lets SGLang's
   `RunaiModelStreamerLoader._prepare_weights` resolve the checkpoint and its
   normal file list. An override then reads `model.safetensors.index.json` from
@@ -1323,6 +1329,9 @@ it does not by itself define which tensors belong to every architecture's draft.
   unmodified SGLang loader. A mixed shard containing both main and draft
   tensors is selected by both passes, so file-level selection does **not**
   guarantee disjoint object-store bytes or eliminate every duplicate read.
+  Extra-layer adapters are disabled when the required layer metadata is absent,
+  describes more than one draft layer, or uses the ambiguous one-layer legacy
+  layout; those checkpoints retain the full-file storage fallback.
 - Cold loading uses shard selection without a persistent local draft staging
   directory. For object storage, the index reader uses a temporary directory for
   `model.safetensors.index.json` only and removes it after parsing; the
@@ -1335,7 +1344,7 @@ it does not by itself define which tensors belong to every architecture's draft.
 
 ```mermaid
 flowchart LR
-    I[Checkpoint index<br/>tensor to shard] --> S[Qwen3.5 role selector]
+    I[Checkpoint index<br/>tensor to shard] --> S[Model-family role selector]
     R[SGLang resolves URI<br/>and available shards] --> S
     S -->|main shard subset| M[SGLang ModelStreamer<br/>main load_weights]
     S -->|draft shard subset| D[SGLang ModelStreamer<br/>draft load_weights]

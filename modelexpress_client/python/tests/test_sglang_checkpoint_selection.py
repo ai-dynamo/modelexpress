@@ -9,7 +9,10 @@ import sys
 from types import SimpleNamespace
 from pathlib import Path
 
-from modelexpress.engines.sglang.draft_weights import Qwen35MtpWeights
+from modelexpress.engines.sglang.draft_weights import (
+    Qwen35MtpWeights,
+    draft_weight_adapter_for,
+)
 
 
 def select_role_shards(*args):
@@ -43,6 +46,36 @@ def test_qwen35_selects_main_and_draft_shards_without_discarding_mixed_shards(
 
     assert select_role_shards(str(tmp_path), files, selector, "main") == files[:2]
     assert select_role_shards(str(tmp_path), files, selector, "draft") == files[1:]
+
+
+def test_glm_nextn_selects_extra_layer_and_preserves_mixed_shard(tmp_path):
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {
+                "model.layers.77.mlp.weight": "main.safetensors",
+                "model.layers.78.shared_head.norm.weight": "mixed.safetensors",
+                "model.layers.77.self_attn.weight": "mixed.safetensors",
+                "model.layers.78.self_attn.weight": "draft.safetensors",
+            }}
+        ),
+        encoding="utf-8",
+    )
+    files = [
+        str(tmp_path / name)
+        for name in ("main.safetensors", "mixed.safetensors", "draft.safetensors")
+    ]
+    model = SimpleNamespace(
+        config=SimpleNamespace(num_hidden_layers=78, num_nextn_predict_layers=1)
+    )
+    main = draft_weight_adapter_for(
+        "GlmMoeDsaForCausalLM", role="main", model=model
+    )
+    draft = draft_weight_adapter_for(
+        "GlmMoeDsaForCausalLMNextN", role="draft", model=model
+    )
+
+    assert select_role_shards(str(tmp_path), files, main, "main") == files[:2]
+    assert select_role_shards(str(tmp_path), files, draft, "draft") == files[1:]
 
 
 def test_qwen35_missing_or_incomplete_index_falls_back_to_all_shards(tmp_path):
