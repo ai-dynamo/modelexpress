@@ -87,6 +87,10 @@ def test_rendered_workloads_share_profile_and_mount_all_runtime_code(
         x["mountPath"] == "/opt/benchmark"
         for x in pod["spec"]["containers"][0]["volumeMounts"]
     )
+    redis = next(x for x in pod["spec"]["initContainers"] if x["name"] == "redis")
+    assert redis["restartPolicy"] == "Always"
+    assert redis["startupProbe"]["tcpSocket"]["port"] == 6379
+    assert all(x["name"] != "redis" for x in pod["spec"]["containers"])
     for role in config["roles"]:
         manifest = yaml.safe_load((out / f"worker-{role}.yaml").read_text())
         pod, service = manifest["items"]

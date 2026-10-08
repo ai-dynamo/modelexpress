@@ -278,6 +278,7 @@ class Benchmark:
             "limits": {"cpu": "1", "memory": "1Gi"},
         }
         pod["spec"]["containers"] = [main]
+        pod["spec"].pop("initContainers", None)
         try:
             self.k.manifest(
                 "apply", {"apiVersion": "v1", "kind": "List", "items": [configmap, pod]}

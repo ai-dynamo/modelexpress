@@ -28,6 +28,19 @@ items:
           configMap: {name: ${AWS_CONFIG_NAME}}
         - name: benchmark
           configMap: {name: ${HARNESS_NAME}, items: ${HARNESS_ITEMS}}
+      initContainers:
+        - name: redis
+          image: ${REDIS_IMAGE}
+          args: [--save, "", --appendonly, "no"]
+          restartPolicy: Always
+          startupProbe:
+            tcpSocket: {port: 6379}
+            periodSeconds: 1
+            failureThreshold: 30
+          ports: [{name: redis, containerPort: 6379}]
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
       containers:
         - name: main
           image: ${MX_MAIN_RUNTIME_IMAGE}
@@ -51,13 +64,6 @@ items:
           resources:
             requests: {cpu: "1", memory: 1Gi}
             limits: {cpu: "2", memory: 2Gi}
-        - name: redis
-          image: ${REDIS_IMAGE}
-          args: [--save, "", --appendonly, "no"]
-          ports: [{name: redis, containerPort: 6379}]
-          resources:
-            requests: {cpu: 100m, memory: 128Mi}
-            limits: {cpu: "1", memory: 512Mi}
   - apiVersion: v1
     kind: Service
     metadata:

@@ -136,9 +136,14 @@ def test_cleanup_failure_can_retry_with_existing_results(tmp_path):
     log = tmp_path / "calls"
     attempts = tmp_path / "attempts"
     executable.write_text("""#!/usr/bin/env python3
-import os, sys
+import json, os, sys
 from pathlib import Path
 args = sys.argv[1:]
+if 'apply' in args and '-' in args:
+    manifest = json.load(sys.stdin)
+    pod = next(item for item in manifest['items'] if item['kind'] == 'Pod')
+    assert 'initContainers' not in pod['spec']
+    assert [item['name'] for item in pod['spec']['containers']] == ['main']
 with Path(os.environ['CALLS']).open('a') as out:
     out.write(' '.join(args) + '\\n')
 if 'get' in args:

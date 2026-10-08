@@ -1627,7 +1627,10 @@ Both automatic and comment-triggered CI reuse the SeaweedFS Deployment and
 Service from `examples/rl/vime_dynamo_delta_refit/stack.yaml` in the benchmark's
 isolated namespace. Setup creates per-run credentials, downloads the pinned model
 snapshot on the CPU control pod, verifies uploads, and publishes its snapshot manifest
-before the timed workload starts. Seed uploads use boto3's standard transfer client
+before the timed workload starts. Redis runs as an init sidecar with a startup
+probe so it accepts connections before the ModelExpress server starts. The
+separate S3 cleanup pod runs without Redis or the server.
+Seed uploads use boto3's standard transfer client
 for the custom HTTP endpoint, matching seed downloads. The existing `HF_TOKEN` secret is forwarded for
 model access. Delta objects are verified absent before namespace deletion; SeaweedFS
 and its seed data remain available if cleanup fails. This path needs no AWS IAM role
