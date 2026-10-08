@@ -14,15 +14,15 @@ k=(kubectl --namespace "$namespace")
 
 # Check the namespace prerequisites before creating resources.
 echo "Using context $(kubectl config current-context), namespace $namespace"
-"${k[@]}" get secret mx-minio-creds nvcr-imagepullsecret >/dev/null
+"${k[@]}" get secret mx-s3-creds nvcr-imagepullsecret >/dev/null
 "${k[@]}" get persistentvolumeclaim shared-model-cache >/dev/null
 
-# Deploy MinIO, ModelExpress, Dynamo, and the rollout worker.
+# Deploy SeaweedFS, ModelExpress, Dynamo, and the rollout worker.
 sed -e "s|WORKER_IMAGE|$worker_image|g" -e "s|MODEL_SUBPATH|$model_subpath|g" \
   "$here/stack.yaml" | "${k[@]}" create -f -
 
 # Wait for the services and rollout worker to become ready.
-"${k[@]}" rollout status deployment/vime-delta-refit-minio --timeout=5m
+"${k[@]}" rollout status deployment/vime-delta-refit-seaweedfs --timeout=5m
 "${k[@]}" rollout status deployment/vime-delta-refit-mx --timeout=5m
 "${k[@]}" wait --for=condition=Ready dynamographdeployment/vime-delta-refit --timeout=15m
 

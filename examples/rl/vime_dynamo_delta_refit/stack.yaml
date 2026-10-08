@@ -4,34 +4,41 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: vime-delta-refit-minio
-  labels: {app: vime-delta-refit-minio}
+  name: vime-delta-refit-seaweedfs
+  labels: {app: vime-delta-refit-seaweedfs}
 spec:
   replicas: 1
   selector:
-    matchLabels: {app: vime-delta-refit-minio}
+    matchLabels: {app: vime-delta-refit-seaweedfs}
   template:
     metadata:
-      labels: {app: vime-delta-refit-minio}
+      labels: {app: vime-delta-refit-seaweedfs}
     spec:
-      nodeSelector: {kubernetes.io/arch: amd64}
-      imagePullSecrets:
-      - {name: nvcr-imagepullsecret}
       containers:
-      - name: minio
-        image: nvcr.io/0980761089281446/minio@sha256:52dfd5c0bbd38d3219f2058c7af216d9f9a27a994b7b5baad09bbd38866015ff
-        args: [server, /data, --console-address, ":9001"]
+      - name: seaweedfs
+        image: docker.io/chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+        args:
+        - mini
+        - -dir=/data
+        - -s3.port=9000
+        - -master.volumeSizeLimitMB=1024
+        - -volume.max=64
+        - -master.telemetry=false
+        - -admin.ui=false
+        - -webdav=false
+        - -s3.port.iceberg=0
+        - -s3.port.lance=0
         env:
-        - name: MINIO_ROOT_USER
+        - name: AWS_ACCESS_KEY_ID
           valueFrom:
-            secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_USER}
-        - name: MINIO_ROOT_PASSWORD
+            secretKeyRef: {name: mx-s3-creds, key: AWS_ACCESS_KEY_ID}
+        - name: AWS_SECRET_ACCESS_KEY
           valueFrom:
-            secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_PASSWORD}
+            secretKeyRef: {name: mx-s3-creds, key: AWS_SECRET_ACCESS_KEY}
         ports:
         - {name: s3, containerPort: 9000}
         readinessProbe:
-          httpGet: {path: /minio/health/ready, port: s3}
+          httpGet: {path: /healthz, port: s3}
           periodSeconds: 2
         resources:
           requests: {cpu: 250m, memory: 256Mi}
@@ -45,9 +52,9 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: vime-delta-refit-minio
+  name: vime-delta-refit-seaweedfs
 spec:
-  selector: {app: vime-delta-refit-minio}
+  selector: {app: vime-delta-refit-seaweedfs}
   ports:
   - {name: s3, port: 9000, targetPort: s3}
 ---
@@ -166,15 +173,15 @@ spec:
           env:
           - {name: MX_SERVER_ADDRESS, value: "vime-delta-refit-mx:8101"}
           - {name: VLLM_PLUGINS, value: modelexpress}
-          - {name: AWS_ENDPOINT_URL, value: "http://vime-delta-refit-minio:9000"}
+          - {name: AWS_ENDPOINT_URL, value: "http://vime-delta-refit-seaweedfs:9000"}
           - {name: AWS_DEFAULT_REGION, value: us-east-1}
           - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
           - name: AWS_ACCESS_KEY_ID
             valueFrom:
-              secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_USER}
+              secretKeyRef: {name: mx-s3-creds, key: AWS_ACCESS_KEY_ID}
           - name: AWS_SECRET_ACCESS_KEY
             valueFrom:
-              secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_PASSWORD}
+              secretKeyRef: {name: mx-s3-creds, key: AWS_SECRET_ACCESS_KEY}
           ports:
           - {name: engine-http, containerPort: 8000}
           - {name: engine-grpc, containerPort: 50051}

@@ -27,7 +27,7 @@ from P2P to S3.
 ## What is real
 
 - `ModelExpressTrainerClient` creates the full HF checkpoint and XOR deltas.
-- MinIO stores the immutable checkpoint objects.
+- SeaweedFS stores the immutable checkpoint objects.
 - ModelExpress stores the `WeightVersion` catalog in Redis.
 - Dynamo discovers the worker and forwards its native RL control routes.
 - vLLM applies updates through the ModelExpress weight-transfer backend.
@@ -42,8 +42,8 @@ point parameter. It is not a training or numerical-quality test.
 
 - A Kubernetes cluster with the Dynamo v1beta1 operator and two GPUs with RDMA.
 - The `shared-model-cache` PVC populated with `Qwen/Qwen3-0.6B`.
-- `hf-token-secret`, `mx-minio-creds`, and an `nvcr-imagepullsecret` with pull
-  access to the private `nvcr.io/0980761089281446/minio` mirror.
+- `hf-token-secret`, an `mx-s3-creds` Secret containing `AWS_ACCESS_KEY_ID`
+  and `AWS_SECRET_ACCESS_KEY`, and `nvcr-imagepullsecret` for the worker images.
 - `envsubst`, `kubectl`, and images visible to the cluster.
 
 The model PVC can be prepared with `ci/rl/model-download.yaml`. Use a unique

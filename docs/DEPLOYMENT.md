@@ -1095,14 +1095,16 @@ for the next delta. The cadence is disabled by default. Slime exposes
 counts published ModelExpress weight versions.
 
 The `vime_dynamo_delta_refit` and `dynamo_vllm_s3_delta_refit` Kubernetes examples
-use a disposable MinIO fixture pinned by digest in the private
-`nvcr.io/0980761089281446/minio` repository. The mirror preserves the upstream
-`RELEASE.2025-09-07T16-13-09Z` AMD64 image's configuration and filesystem layers;
-the original Quay and Docker Hub images are no longer publicly pullable.
-Both MinIO pods select AMD64 nodes and use `nvcr-imagepullsecret`, which must
-have pull access to this repository. Vime CI creates that Secret from
-`NGC_API_KEY` and consumes the example manifest directly. Update both manifests
-together when changing the fixture image.
+use a disposable SeaweedFS 4.48 S3 fixture. Both manifests pin the upstream
+public `docker.io/chrislusf/seaweedfs` image by digest and run `weed mini` with
+S3 on port 9000. The `mx-s3-creds` Secret supplies `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` to both SeaweedFS and the S3 clients; Vime CI creates
+this Secret before deploying the stack. The `/healthz` readiness probe checks
+that the S3 listener is serving; it does not validate the backing storage.
+Data stays in an `emptyDir` volume. Volume counts are bounded for the 64 GiB
+Vime and 16 GiB lifecycle fixtures, with 1 GiB SeaweedFS volumes.
+The Vime CI smoke test consumes the example manifest directly; update both
+manifests together when changing the fixture image.
 
 ### Server-Backed Model Cache (No Shared Storage)
 
