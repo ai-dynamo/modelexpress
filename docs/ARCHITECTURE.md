@@ -407,8 +407,10 @@ registering source buffers, or publishing a version. The adapter binding and
 trainer `logical_shard_id` identify the same logical shard. Logical IDs hash canonical
 coverage, so equivalent replicas share an ID. The orchestrator supplies the complete
 trainer worker set and is responsible for logical-shard completeness. Mesh creation
-and update validate compact membership metadata without fetching coverage manifests;
-large manifests never live in Redis.
+resolves idempotent retries before contacting trainers and validates every binding
+only for a new mesh. Mesh updates validate new workers and changed endpoints or
+logical shards; unchanged members are not refetched. Large manifests never live
+in Redis.
 `CreateTrainerMesh` is idempotent; `UpdateTrainerMesh` replaces the complete
 worker map with generation compare-and-swap while preserving logical coverage.
 Every member requires an active model-matching trainer registration whose
@@ -416,8 +418,7 @@ Every member requires an active model-matching trainer registration whose
 requires a trainer mesh; MX checks its existence and model atomically with version
 creation. Object-storage versions omit the mesh. For worker-sharded versions,
 `logical_shard_id` identifies a logical shard. MX accepts publications only from
-workers in that shard's current membership, validates the publication manifest
-against its bound coverage, and marks the version READY
+workers in that shard's current membership and marks the version READY
 when every logical shard has a current, live publication. Mesh-backed readiness
 is computed from physical publications and their binding endpoints, not historical
 coverage. Generator discovery reads the mesh
@@ -683,7 +684,7 @@ engine-owned post-load workspace, CUDA allocator overhead, and transport metadat
 | `GetWeightVersion` | `GetWeightVersionRequest` | `GetWeightVersionResponse` | Read the version and its lifecycle state |
 | `DeleteWeightVersion` | `DeleteWeightVersionRequest` | `DeleteWeightVersionResponse` | Cancel a `STAGING` version or move a `READY` version to `RELEASING` for retirement |
 | `UpdateWeightVersionState` | `UpdateWeightVersionStateRequest` | `UpdateWeightVersionStateResponse` | Explicitly update lifecycle state, including S3 `STAGING` to `READY` |
-| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker manifest for a required source slot |
+| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker manifest for a required logical shard |
 | `ListWeightVersionShards` | `ListWeightVersionShardsRequest` | `ListWeightVersionShardsResponse` | List the version's physical source publications |
 | `DeleteWeightVersionShard` | `DeleteWeightVersionShardRequest` | `DeleteWeightVersionShardResponse` | Evict one source shard after release when no lease protects the version |
 | `RegisterVersionLease` | `RegisterVersionLeaseRequest` | `RegisterVersionLeaseResponse` | Acquire or renew protection while installing a version |
@@ -854,14 +855,14 @@ fields and may differ from the MX IDs. Cache paths and chain records use MX IDs;
 MX lineage checks and payload validation remain enabled. The registering caller
 is responsible for selecting the correct S3 artifacts and base mapping.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
-Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
-identifies the required, version-scoped source contribution it covers, and
+Its identity is `(version_id, worker_id, logical_shard_id)`: `logical_shard_id`
+identifies the logical shard covered by the publication, and
 `worker_id` identifies the publishing process. The trainer engine adapter
-derives the slot from its native topology; the Megatron adapter uses
+derives the logical shard ID from its native topology; the Megatron adapter uses
 the logical tensor names and shard geometry, excluding physical process and DP
-replica identity. The orchestrator deduplicates those adapter-defined slots when
+replica identity. The orchestrator deduplicates those adapter-defined logical shards when
 declaring the version's expected contributions. Multiple DP workers may therefore
-advertise the same source slot; generators rotate through those publications on
+advertise the same logical shard; generators rotate through those publications on
 transfer retry. Each shard carries its trainer-local `manifest_endpoint`.
 Deployments configured with
 Kubernetes or the test-only memory backend do not expose `RefitService` yet.
