@@ -1780,7 +1780,7 @@ scenario and runtime before building images.
 The trusted-PR GPU workflow also calls it automatically for Nemotron S3 delta refit,
 using the approved mirrored harness revision. Its result, including cleanup, gates
 the required `CI status check`; Kimi remains comment-triggered. Required Nemotron
-Both automatic and comment-triggered CI reuse the Vime example's MinIO Deployment
+Both automatic and comment-triggered CI reuse the Vime example's SeaweedFS Deployment
 and Service in an isolated namespace, then seed the pinned snapshot before timing.
 `scripts/ci.py` owns namespace ownership, GPU quotas, storage and image credentials. `harness/lifecycle.py` owns
 workload execution, evidence collection and cleanup for both entry points.

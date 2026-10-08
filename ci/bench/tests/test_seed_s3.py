@@ -21,7 +21,7 @@ def test_seed_upload_verifies_objects_before_publishing_manifest(
         "revision": "a" * 40,
         "bucket": "mx-refit",
         "seed_prefix": "seed/",
-        "storage": {"endpoint_url": "http://minio:9000", "region": "us-east-1"},
+        "storage": {"endpoint_url": "http://seaweedfs:9000", "region": "us-east-1"},
     }
     (tmp_path / "config.json").write_text("{}")
     (tmp_path / "model.safetensors").write_bytes(b"weights")
@@ -52,8 +52,8 @@ def test_seed_upload_verifies_objects_before_publishing_manifest(
         "harness.config": SimpleNamespace(load_config=lambda: config),
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
-    path = Path(__file__).resolve().parents[1] / "scenarios/delta/seed_minio.py"
-    spec = importlib.util.spec_from_file_location("seed_minio_test", path)
+    path = Path(__file__).resolve().parents[1] / "scenarios/delta/seed_s3.py"
+    spec = importlib.util.spec_from_file_location("seed_s3_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     if wrong_size:

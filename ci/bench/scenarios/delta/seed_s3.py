@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Seed an isolated CI MinIO instance from the pinned Hugging Face snapshot."""
+"""Seed an isolated CI S3 fixture from the pinned Hugging Face snapshot."""
 
 import json
 from pathlib import Path
@@ -15,7 +15,7 @@ from huggingface_hub import snapshot_download
 def main():
     config = load_config()
     if not config["storage"]["endpoint_url"]:
-        raise ValueError("MinIO seed upload requires an explicit endpoint")
+        raise ValueError("CI seed upload requires an explicit endpoint")
     root = Path(
         snapshot_download(
             config["model"],

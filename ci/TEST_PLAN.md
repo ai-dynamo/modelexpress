@@ -55,8 +55,8 @@ Coverage matrix for the ModelExpress CI infrastructure. Reflects what's currentl
 
 When a row moves status, update this table in the same PR so the doc stays the source of truth on what CI does and doesn't catch.
 
-The existing Vime smoke uses a digest-pinned public Chainguard MinIO image;
-its pod grants group 65532 access to the data volume for non-root startup.
+The existing Vime smoke uses a digest-pinned SeaweedFS S3 fixture, shared with
+the benchmark CI workflow.
 
 ## Comment-triggered model benchmark CI
 
@@ -65,7 +65,7 @@ contracts run on every PR in `RL refit harness tests`. `bench-ci.yml` accepts `/
 [--scenario delta] [--sha FULL_SHA]` from repository writers after copy-pr-bot mirrors the current
 head. Every trusted PR also runs the one-GPU Nemotron S3 delta-weight refit through
 `rl-refit-ci.yml`; `CI status check` requires its build, GPU test, and cleanup to succeed.
-Automatic and comment-triggered CI use the Vime example's MinIO setup in an isolated
+Automatic and comment-triggered CI use the Vime example's SeaweedFS setup in an isolated
 namespace and upload the pinned seed snapshot before measurement; they need no AWS IAM role.
 Kimi remains opt-in. The reusable workflow independently validates the current
 approved mirror before building the requested SHA. Only delta is registered; no reshard CI case

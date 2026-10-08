@@ -1623,12 +1623,12 @@ comment runs use the default-branch harness until the edits merge.
 `issue_comment` requires the workflow on the default branch, as documented
 by [GitHub](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#issue_comment).
 
-Both automatic and comment-triggered CI reuse the MinIO Deployment and
+Both automatic and comment-triggered CI reuse the SeaweedFS Deployment and
 Service from `examples/rl/vime_dynamo_delta_refit/stack.yaml` in the benchmark's
 isolated namespace. Setup creates per-run credentials, downloads the pinned model
 snapshot on the CPU control pod, verifies uploads, and publishes its snapshot manifest
 before the timed workload starts. The existing `HF_TOKEN` secret is forwarded for
-model access. Delta objects are verified absent before namespace deletion; MinIO
+model access. Delta objects are verified absent before namespace deletion; SeaweedFS
 and its seed data remain available if cleanup fails. This path needs no AWS IAM role
 or pre-populated bucket. It defaults to the digest-pinned vLLM 0.17.1 image already
 used by CI, recorded in the Nemotron profile, with `MX_BENCH_RUNTIME_BASES.nemotron` available as an override.
@@ -1645,7 +1645,7 @@ override because its profile has no qualified default runtime. Each image must i
 compatible Torch, vLLM, NIXL, NumPy, requests, and safetensors; the build installs
 ModelExpress and verifies imports. Compatibility with each model's quantization
 and refit path still requires hardware qualification. The existing `NGC_API_KEY`
-secret supplies registry access. CI seeds its own MinIO store and does not use the
+secret supplies registry access. CI seeds its own S3 store and does not use the
 Vime job's FSx cache. The seed-download step reads the snapshot manifest and checks
 downloaded file sizes against S3 object sizes. Manual runs can use external S3
 through their environment configuration.

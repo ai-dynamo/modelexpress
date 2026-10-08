@@ -109,20 +109,21 @@ sys.exit(0)
     assert result.returncode == 0, result.stderr
     calls = log.read_text()
     assert "annotate serviceaccount" not in calls
-    assert "rollout status deployment/vime-delta-refit-minio" in calls
-    assert "scenarios.delta.seed_minio" in calls
+    assert "rollout status deployment/vime-delta-refit-seaweedfs" in calls
+    assert "scenarios.delta.seed_s3" in calls
     stack = ROOT.parents[1] / "examples/rl/vime_dynamo_delta_refit/stack.yaml"
-    minio = next(
+    storage = next(
         item
         for item in yaml.safe_load_all(stack.read_text())
         if item["kind"] == "Deployment"
     )
     assert (
-        "IMAGE " + minio["spec"]["template"]["spec"]["containers"][0]["image"] in calls
+        "IMAGE " + storage["spec"]["template"]["spec"]["containers"][0]["image"]
+        in calls
     )
     assert "RESOURCE Deployment vime-delta-refit-mx" not in calls
     config = json.loads((tmp_path / "results/config.json").read_text())
-    assert config["storage"]["endpoint_url"] == "http://vime-delta-refit-minio:9000"
+    assert config["storage"]["endpoint_url"] == "http://vime-delta-refit-seaweedfs:9000"
     assert config["storage"]["addressing_style"] == "path"
     assert (
         f"create quota bench-gpu-budget --hard=requests.nvidia.com/gpu={gpus},limits.nvidia.com/gpu={gpus}"

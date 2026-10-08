@@ -47,16 +47,14 @@ def ci(mode):
 
     def render():
         overrides = {
-            "endpoint_url": "http://vime-delta-refit-minio:9000",
+            "endpoint_url": "http://vime-delta-refit-seaweedfs:9000",
             "bucket": "mx-refit",
             "region": "us-east-1",
             "addressing_style": "path",
             "pod_env": [
                 {
                     "name": key,
-                    "valueFrom": {
-                        "secretKeyRef": {"name": "mx-minio-creds", "key": key}
-                    },
+                    "valueFrom": {"secretKeyRef": {"name": "mx-s3-creds", "key": key}},
                 }
                 for key in [
                     "AWS_ACCESS_KEY_ID",
@@ -141,11 +139,9 @@ def ci(mode):
             {
                 "apiVersion": "v1",
                 "kind": "Secret",
-                "metadata": {"name": "mx-minio-creds"},
+                "metadata": {"name": "mx-s3-creds"},
                 "stringData": {
-                    "MINIO_ROOT_USER": "minio",
-                    "MINIO_ROOT_PASSWORD": password,
-                    "AWS_ACCESS_KEY_ID": "minio",
+                    "AWS_ACCESS_KEY_ID": "mx-bench",
                     "AWS_SECRET_ACCESS_KEY": password,
                     "HF_TOKEN": env.get("HF_TOKEN", ""),
                 },
@@ -158,10 +154,12 @@ def ci(mode):
         items = [
             item
             for item in yaml.safe_load_all(stack.read_text())
-            if item["metadata"]["name"] == "vime-delta-refit-minio"
+            if item["metadata"]["name"] == "vime-delta-refit-seaweedfs"
         ]
         k.manifest("create", {"apiVersion": "v1", "kind": "List", "items": items})
-        k.call("rollout", "status", "deployment/vime-delta-refit-minio", "--timeout=5m")
+        k.call(
+            "rollout", "status", "deployment/vime-delta-refit-seaweedfs", "--timeout=5m"
+        )
         for name in ["harness.json", "control.yaml"]:
             k.call("apply", "-f", str(root / name))
         control = config["resource_prefix"] + "-control"
@@ -175,7 +173,7 @@ def ci(mode):
             "python3",
             "-u",
             "-m",
-            "scenarios.delta.seed_minio",
+            "scenarios.delta.seed_s3",
             output=root / "seed-upload.log",
             timeout=2700,
         )
