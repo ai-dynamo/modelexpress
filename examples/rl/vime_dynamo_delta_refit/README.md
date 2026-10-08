@@ -21,7 +21,8 @@ flowchart LR
   `nvidia.com/v1beta1` Dynamo operator, three SM90+ NVIDIA GPUs, and about 70 GiB
   of node-local storage headroom for the 100 deltas.
 - A `shared-model-cache` PVC containing `Qwen/Qwen3-0.6B`.
-- An `nvcr-imagepullsecret` image-pull Secret and an `mx-minio-creds` Secret
+- An `nvcr-imagepullsecret` image-pull Secret with access to the private
+  `nvcr.io/0980761089281446/minio` mirror, and an `mx-minio-creds` Secret
   containing `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD`.
 - A sibling `dynamo` worktree checked out at commit
   `c3e05f0244ae6264d7953f68e2499c6dc2f54723`, matching the pinned Dynamo

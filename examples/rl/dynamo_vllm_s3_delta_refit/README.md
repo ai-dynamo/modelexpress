@@ -42,7 +42,8 @@ point parameter. It is not a training or numerical-quality test.
 
 - A Kubernetes cluster with the Dynamo v1beta1 operator and two GPUs with RDMA.
 - The `shared-model-cache` PVC populated with `Qwen/Qwen3-0.6B`.
-- `hf-token-secret`, `mx-minio-creds`, and `nvcr-imagepullsecret`.
+- `hf-token-secret`, `mx-minio-creds`, and an `nvcr-imagepullsecret` with pull
+  access to the private `nvcr.io/0980761089281446/minio` mirror.
 - `envsubst`, `kubectl`, and images visible to the cluster.
 
 The model PVC can be prepared with `ci/rl/model-download.yaml`. Use a unique

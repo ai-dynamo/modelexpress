@@ -14,9 +14,12 @@ spec:
     metadata:
       labels: {app: vime-delta-refit-minio}
     spec:
+      nodeSelector: {kubernetes.io/arch: amd64}
+      imagePullSecrets:
+      - {name: nvcr-imagepullsecret}
       containers:
       - name: minio
-        image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+        image: nvcr.io/0980761089281446/minio@sha256:52dfd5c0bbd38d3219f2058c7af216d9f9a27a994b7b5baad09bbd38866015ff
         args: [server, /data, --console-address, ":9001"]
         env:
         - name: MINIO_ROOT_USER

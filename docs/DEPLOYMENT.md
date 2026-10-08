@@ -1094,6 +1094,16 @@ for the next delta. The cadence is disabled by default. Slime exposes
 `full_hf_checkpoint_interval` in `--modelexpress-config`. In both cases, `N`
 counts published ModelExpress weight versions.
 
+The `vime_dynamo_delta_refit` and `dynamo_vllm_s3_delta_refit` Kubernetes examples
+use a disposable MinIO fixture pinned by digest in the private
+`nvcr.io/0980761089281446/minio` repository. The mirror preserves the upstream
+`RELEASE.2025-09-07T16-13-09Z` AMD64 image's configuration and filesystem layers;
+the original Quay and Docker Hub images are no longer publicly pullable.
+Both MinIO pods select AMD64 nodes and use `nvcr-imagepullsecret`, which must
+have pull access to this repository. Vime CI creates that Secret from
+`NGC_API_KEY` and consumes the example manifest directly. Update both manifests
+together when changing the fixture image.
+
 ### Server-Backed Model Cache (No Shared Storage)
 
 For workers that cannot reach the Hugging Face Hub themselves, ModelExpress Server can act as the only route to the model. The worker asks the server for repository files; the server downloads the model once on a cold miss and serves every later worker from its own cache.
