@@ -606,17 +606,10 @@ full-tensor NIXL and canonical-checkpoint object-storage publication remain sepa
 method implementations. This keeps transport, payload preparation, engine
 geometry, and framework orchestration independently replaceable.
 
-`train/frameworks/miles/modelexpress.py` implements Miles' `WeightTransferProtocol`.
-The Miles integration package exposes the adapter as:
-
-```python
-from modelexpress_rl.train.frameworks.miles import UpdateWeightFromModelExpress
-```
-
-Miles re-exports this class and loads it when the `modelexpress` transfer mode is
-selected. Importing this integration requires Miles; shared SDK package
-initializers do not import it, so other frameworks can use the SDK without Miles
-installed.
+Miles owns `UpdateWeightFromModelExpressDelta` in
+`miles.backends.training_utils.weight_update.protocols.modelexpress`. Its
+`modelexpress` transfer mode uses the shared SDK's staging and publication APIs
+below. The SDK does not depend on Miles.
 
 Canonical S3 publication accepts either `stage_shard(hf_tensor_iter=...)` for a
 complete weight stream or repeated `stage_shard(tensors=bucket)` calls for one
@@ -636,8 +629,8 @@ staged.publish()  # Collective across the configured publication process group.
 
 The Miles adapter creates this process group from sender ranks only. Non-senders
 still join the framework's weight gathers and barriers, but do not create an MX
-trainer or call publication. The iterator and full-tensor NIXL workflows keep
-their existing staging contracts.
+trainer or call publication. Full-tensor NIXL publication uses `bind_tensors()`
+and `publish_version(version=...)`.
 
 Bucket staging retains the bucket and its tensors, so their contents must remain
 stable until publication finishes. Callers submit all buckets for one version
@@ -1191,7 +1184,6 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `train/runtime.py` | Trainer publication composition, bound tensor state, and transport-resource ownership |
 | `train/context.py` | Public explicit Megatron and FSDP engine selection |
 | `train/methods/` | Independent full-tensor NIXL and canonical-checkpoint publication methods |
-| `train/frameworks/miles/modelexpress.py` | Miles weight-transfer protocol, sender coordination, and rollout refit lifecycle; re-exported by Miles |
 | `train/engines/megatron/selection.py` | Megatron-Bridge mapping and tensor-selection translation into MX publication specs |
 | `train/engines/megatron/adapter.py` | Stable in-place Megatron tensor registration and manifest construction |
 | `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place, pinned host-copy, or device-copy staging |
