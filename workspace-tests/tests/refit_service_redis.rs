@@ -64,7 +64,10 @@ impl RefitWorkerService for BoundWorker {
         use sha2::{Digest, Sha256};
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(activity) = &self.activity {
-            let active = activity.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let active = activity
+                .active
+                .fetch_add(1, Ordering::SeqCst)
+                .saturating_add(1);
             activity.peak.fetch_max(active, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(50)).await;
             activity.active.fetch_sub(1, Ordering::SeqCst);
