@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import json
 from concurrent import futures
 from dataclasses import replace
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from modelexpress_rl import (
     refit_pb2_grpc,
 )
 from modelexpress_rl.train.adapter import TrainerEngineAdapter
+from modelexpress_rl.train.manifest import bound_tensor_manifest
 from modelexpress_rl.train.engines.megatron import (
     MegatronTensorSpec,
     MegatronTrainerAdapter,
@@ -67,6 +69,11 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.events.append("register-worker")
         self.registration_ttl = request.ttl_seconds
         return refit_pb2.RegisterWorkerResponse(worker=request.worker)
+
+    def GetWeightVersion(self, request, _context):
+        return refit_pb2.GetWeightVersionResponse(
+            version=refit_pb2.WeightVersion(uid=request.uid, trainer_mesh_id="mesh-a")
+        )
 
     def CreateWeightVersionShard(self, request, _context):
         self.events.append("publish-version-shard")
@@ -212,7 +219,8 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
                 registration_ttl_seconds=60,
             )
         )
-        source_slot_id = refit_client.bind_tensors(tensors)
+        metadata = refit_client.bind_tensors(tensors)
+        source_slot_id = refit_client.source_slot_id
         selected_adapter = refit_client._runtime.method._adapter
         refit_client.publish_version(version=WeightVersionRef("version-a"))
         worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
@@ -221,7 +229,7 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
         fetched = worker_stub.GetWeightVersionShardManifest(
             refit_pb2.GetWeightVersionShardManifestRequest(
                 version_id="version-a",
-                source_slot_id=source_slot_id,
+                logical_shard_id=metadata.logical_shard_id,
             )
         )
     finally:
@@ -238,8 +246,9 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     assert refit_service.registration_ttl == 60
     assert len(resources.manager.registered) == 1
     assert refit_service.shard.version_id == "version-a"
-    assert source_slot_id.startswith("megatron:partition:")
-    assert refit_service.shard.source_slot_id == source_slot_id
+    assert source_slot_id == metadata.logical_shard_id
+    assert len(metadata.logical_shard_id) == 64
+    assert refit_service.shard.logical_shard_id == metadata.logical_shard_id
     assert refit_service.shard.worker_id == "worker-3"
     assert refit_service.shard.tensor_count == 1
     assert refit_service.shard.total_bytes == 128
@@ -249,6 +258,9 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     )
     assert refit_service.shard.manifest_endpoint == f"127.0.0.1:{port}"
     assert fetched.manifest_digest == refit_service.shard.manifest_digest
+    assert metadata.logical_shard_id == hashlib.sha256(
+        bound_tensor_manifest(json.loads(fetched.manifest)["tensors"])
+    ).hexdigest()
     payload = unwrap_rendezvous_blob(fetched.manifest)
     assert payload.metadata_endpoint == "10.0.0.3:19003"
     assert payload.tensors[0].shards[0].addr == 0x1234

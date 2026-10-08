@@ -110,7 +110,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
     def DeleteWeightVersionShard(self, request, context):
         if any(
             deleted.version_id == request.version_id
-            and deleted.source_slot_id == request.source_slot_id
+            and deleted.logical_shard_id == request.logical_shard_id
             and deleted.worker_id == request.worker_id
             for deleted in self.deleted_shards
         ):

@@ -58,15 +58,15 @@ spec:
         - {name: RUN_ID, value: "${RUN_ID}"}
         - {name: EXPECTED_WORKERS, value: "2"}
         - {name: MX_SERVER_ADDRESS, value: "mx-s3-refit-server:8000"}
-        - {name: AWS_ENDPOINT_URL, value: "http://mx-s3-refit-minio:9000"}
+        - {name: AWS_ENDPOINT_URL, value: "http://mx-s3-refit-seaweedfs:9000"}
         - {name: AWS_DEFAULT_REGION, value: us-east-1}
         - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
-            secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_USER}
+            secretKeyRef: {name: mx-s3-creds, key: AWS_ACCESS_KEY_ID}
         - name: AWS_SECRET_ACCESS_KEY
           valueFrom:
-            secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_PASSWORD}
+            secretKeyRef: {name: mx-s3-creds, key: AWS_SECRET_ACCESS_KEY}
         resources:
           requests: {cpu: "4", memory: 8Gi}
           limits: {memory: 16Gi}
