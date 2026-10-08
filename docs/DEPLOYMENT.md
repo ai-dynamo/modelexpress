@@ -1629,7 +1629,12 @@ isolated namespace. Setup creates per-run credentials, downloads the pinned mode
 snapshot on the CPU control pod, verifies uploads, and publishes its snapshot manifest
 before the timed workload starts. Redis runs as an init sidecar with a startup
 probe so it accepts connections before the ModelExpress server starts. The
-separate S3 cleanup pod runs without Redis or the server.
+separate S3 cleanup pod runs without Redis or the server. CI mounts the cluster's
+retained `shared-model-cache` FSx claim only on the control pod and sets
+`HF_HUB_CACHE` to `/model-cache/.cache/mx-rl-refit/hub`. Hugging Face reuses cached
+files for the pinned revision across runs; a cold cache downloads them once.
+Each run still uploads and verifies its isolated S3 seed. GPU workers do not
+mount this cache, and cleanup leaves the shared source files intact.
 Seed uploads use boto3's standard transfer client
 for the custom HTTP endpoint, matching seed downloads. The existing `HF_TOKEN` secret is forwarded for
 model access. Delta objects are verified absent before namespace deletion; SeaweedFS
@@ -1653,7 +1658,8 @@ compatible Torch, vLLM, NIXL, NumPy, requests, and safetensors; the build instal
 ModelExpress and verifies imports. Compatibility with each model's quantization
 and refit path still requires hardware qualification. The existing `NGC_API_KEY`
 secret supplies registry access. CI seeds its own S3 store and does not use the
-Vime job's FSx cache. Test and cleanup jobs provision Python 3.12 before installing
+Vime model directory; its Hugging Face cache has a separate directory on the same
+FSx volume. Test and cleanup jobs provision Python 3.12 before installing
 PyYAML. S3 cold-load qualification requires a streamer completion marker from
 every TP rank and rejects streamer fallback. The harness retains the runtime's
 FlashInfer compatibility checks. The seed-download step reads the snapshot

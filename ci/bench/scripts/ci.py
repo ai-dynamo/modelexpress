@@ -77,6 +77,27 @@ def ci(mode):
             )
             root.mkdir(parents=True, exist_ok=True)
             shutil.copytree(rendered, root, dirs_exist_ok=True)
+            if mode == "setup":
+                path = root / "control.yaml"
+                manifest = yaml.safe_load(path.read_text())
+                pod = next(item for item in manifest["items"] if item["kind"] == "Pod")
+                pod["spec"]["volumes"].append(
+                    {
+                        "name": "seed-cache",
+                        "persistentVolumeClaim": {"claimName": "shared-model-cache"},
+                    }
+                )
+                main = pod["spec"]["containers"][0]
+                main["volumeMounts"].append(
+                    {"name": "seed-cache", "mountPath": "/model-cache"}
+                )
+                main["env"].append(
+                    {
+                        "name": "HF_HUB_CACHE",
+                        "value": "/model-cache/.cache/mx-rl-refit/hub",
+                    }
+                )
+                path.write_text(yaml.safe_dump(manifest))
             return config
 
     def owned():
@@ -160,10 +181,29 @@ def ci(mode):
         k.call(
             "rollout", "status", "deployment/vime-delta-refit-seaweedfs", "--timeout=5m"
         )
+        print("Waiting for the shared model cache claim", flush=True)
+        k.call(
+            "wait",
+            "--for=create",
+            "persistentvolumeclaim/shared-model-cache",
+            "--timeout=2m",
+        )
+        k.call(
+            "wait",
+            "--for=jsonpath={.status.phase}=Bound",
+            "persistentvolumeclaim/shared-model-cache",
+            "--timeout=5m",
+        )
         for name in ["harness.json", "control.yaml"]:
             k.call("apply", "-f", str(root / name))
         control = config["resource_prefix"] + "-control"
+        print(
+            "Waiting for the control pod (image pull and service startup)", flush=True
+        )
         k.call("wait", "--for=condition=Ready", "pod/" + control, "--timeout=10m")
+        print(
+            "Seeding isolated S3 storage from the pinned Hugging Face cache", flush=True
+        )
         k.call(
             "exec",
             control,
@@ -177,6 +217,7 @@ def ci(mode):
             output=root / "seed-upload.log",
             timeout=2700,
         )
+        print("Pinned S3 seed uploaded and verified", flush=True)
     elif mode == "run":
         owned()
         Benchmark(root).run()

@@ -21,7 +21,6 @@ def main():
         snapshot_download(
             config["model"],
             revision=config["revision"],
-            local_dir="/tmp/mx-seed",
             allow_patterns=[
                 "*.json",
                 "*.safetensors",

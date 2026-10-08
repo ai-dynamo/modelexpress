@@ -31,6 +31,7 @@ def test_seed_upload_verifies_objects_before_publishing_manifest(
 
     def download(model, **kwargs):
         assert model == config["model"] and kwargs["revision"] == config["revision"]
+        assert "local_dir" not in kwargs
         return str(tmp_path)
 
     def upload(path, bucket, key, **kwargs):

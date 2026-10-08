@@ -123,6 +123,25 @@ sys.exit(0)
     )
     assert "RESOURCE Deployment vime-delta-refit-mx" not in calls
     config = json.loads((tmp_path / "results/config.json").read_text())
+    control = yaml.safe_load((tmp_path / "results/control.yaml").read_text())
+    pod = next(item for item in control["items"] if item["kind"] == "Pod")
+    main = pod["spec"]["containers"][0]
+    assert {
+        "name": "HF_HUB_CACHE",
+        "value": "/model-cache/.cache/mx-rl-refit/hub",
+    } in main["env"]
+    assert {"name": "seed-cache", "mountPath": "/model-cache"} in main["volumeMounts"]
+    assert {
+        "name": "seed-cache",
+        "persistentVolumeClaim": {"claimName": "shared-model-cache"},
+    } in pod["spec"]["volumes"]
+    assert "persistentvolumeclaim/shared-model-cache --timeout=2m" in calls
+    worker = yaml.safe_load((tmp_path / "results/worker-s3.yaml").read_text())["items"][
+        0
+    ]
+    assert all(
+        "persistentVolumeClaim" not in volume for volume in worker["spec"]["volumes"]
+    )
     assert config["storage"]["endpoint_url"] == "http://vime-delta-refit-seaweedfs:9000"
     assert config["storage"]["addressing_style"] == "path"
     assert (
@@ -143,6 +162,7 @@ if 'apply' in args and '-' in args:
     manifest = json.load(sys.stdin)
     pod = next(item for item in manifest['items'] if item['kind'] == 'Pod')
     assert 'initContainers' not in pod['spec']
+    assert all('persistentVolumeClaim' not in volume for volume in pod['spec']['volumes'])
     assert [item['name'] for item in pod['spec']['containers']] == ['main']
 with Path(os.environ['CALLS']).open('a') as out:
     out.write(' '.join(args) + '\\n')
