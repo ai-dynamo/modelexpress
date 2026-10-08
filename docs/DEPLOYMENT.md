@@ -1094,6 +1094,21 @@ for the next delta. The cadence is disabled by default. Slime exposes
 `full_hf_checkpoint_interval` in `--modelexpress-config`. In both cases, `N`
 counts published ModelExpress weight versions.
 
+The `vime_dynamo_delta_refit` and `dynamo_vllm_s3_delta_refit` Kubernetes examples
+use a disposable SeaweedFS 4.48 S3 fixture. Both manifests pin the upstream
+public `docker.io/chrislusf/seaweedfs` image by digest and run `weed mini` with
+S3 on port 9000. The `mx-s3-creds` Secret supplies `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` to both SeaweedFS and the S3 clients; Vime CI creates
+this Secret before deploying the stack. The `/healthz` readiness probe checks
+that the S3 listener is serving; it does not validate the backing storage.
+Data stays in an `emptyDir` volume. Volume counts are bounded for the 64 GiB
+Vime and 16 GiB lifecycle fixtures, with 1 GiB SeaweedFS volumes.
+Each storage pod requests 1 GiB of memory and has a 4 GiB limit for concurrent
+trainer multipart uploads. `GOMEMLIMIT=3GiB` leaves headroom below that limit;
+the previous 1 GiB container limit is insufficient for two trainer ranks.
+The Vime CI smoke test consumes the example manifest directly; update both
+manifests together when changing the fixture image.
+
 ### Server-Backed Model Cache (No Shared Storage)
 
 For workers that cannot reach the Hugging Face Hub themselves, ModelExpress Server can act as the only route to the model. The worker asks the server for repository files; the server downloads the model once on a cold miss and serves every later worker from its own cache.
