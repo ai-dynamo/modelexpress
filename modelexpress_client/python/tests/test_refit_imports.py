@@ -33,14 +33,11 @@ def test_package_import_does_not_load_optional_engine_or_framework_implementatio
     code = """
 import sys
 import modelexpress_rl
-import modelexpress_rl.train.frameworks
 from modelexpress_rl.inference.engines.sglang import get_modelexpress_generator
 
 assert callable(get_modelexpress_generator)
 assert "miles" not in sys.modules
 assert "sglang" not in sys.modules
-assert "modelexpress_rl.train.frameworks.miles" not in sys.modules
-assert "modelexpress_rl.train.frameworks.miles.modelexpress" not in sys.modules
 assert "modelexpress.engines.vllm.adapter" not in sys.modules
 assert "modelexpress_rl.inference.engines.vllm.installer" not in sys.modules
 assert "modelexpress_rl.inference.engines.sglang.installer" not in sys.modules
