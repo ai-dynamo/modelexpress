@@ -1646,8 +1646,9 @@ compatible Torch, vLLM, NIXL, NumPy, requests, and safetensors; the build instal
 ModelExpress and verifies imports. Compatibility with each model's quantization
 and refit path still requires hardware qualification. The existing `NGC_API_KEY`
 secret supplies registry access. CI seeds its own S3 store and does not use the
-Vime job's FSx cache. The seed-download step reads the snapshot manifest and checks
-downloaded file sizes against S3 object sizes. Manual runs can use external S3
+Vime job's FSx cache. Test and cleanup jobs provision Python 3.12 before installing
+PyYAML. The seed-download step reads the snapshot manifest and checks downloaded
+file sizes against S3 object sizes. Manual runs can use external S3
 through their environment configuration.
 
 The `RL weight refit CI` comment workflow delegates execution to the shared
