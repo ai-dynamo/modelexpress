@@ -82,7 +82,7 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
             if dtype not in (torch.float16, torch.bfloat16, torch.float32):
                 raise ValueError(f"unsupported wire dtype {dtype!r} for {name!r}")
         self._nixl_metadata_endpoint = nixl_metadata_endpoint
-        self._source_slot_id: str | None = None
+        self._logical_shard_id: str | None = None
         self._initialized = False
         self._staging_mode: TrainerStagingMode | None = None
         # name -> (global_shape, shard_offset, local_shape) fixed at initialize().
@@ -97,10 +97,10 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         self._manifest: WeightVersionShardManifest | None = None
 
     @property
-    def source_slot_id(self) -> str:
-        if self._source_slot_id is None:
-            raise RuntimeError("bind_tensors() must be called before source_slot_id")
-        return self._source_slot_id
+    def logical_shard_id(self) -> str:
+        if self._logical_shard_id is None:
+            raise RuntimeError("bind_tensors() must be called before logical_shard_id")
+        return self._logical_shard_id
 
     def bind_tensors(self, tensors: Any) -> str:
         """Bind address-independent wire coverage without staging source bytes."""
@@ -115,11 +115,19 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
             }
             for shard in shards
         ]
-        source_slot_id = hashlib.sha256(bound_tensor_manifest(coverage)).hexdigest()
-        if self._source_slot_id is not None and self._source_slot_id != source_slot_id:
+        manifest = bound_tensor_manifest(coverage)
+        logical_shard_id = hashlib.sha256(manifest).hexdigest()
+        if self._logical_shard_id is not None and self._logical_shard_id != logical_shard_id:
             raise RuntimeError("FSDP tensor coverage changed after binding")
-        self._source_slot_id = source_slot_id
-        return self.source_slot_id
+        self._logical_shard_id = logical_shard_id
+        self._bound_manifest = manifest
+        return logical_shard_id
+
+    @property
+    def bound_manifest(self) -> bytes:
+        if self._logical_shard_id is None:
+            raise RuntimeError("bind_tensors() must be called before bound_manifest")
+        return self._bound_manifest
 
     @property
     def supported_staging_modes(self) -> frozenset[TrainerStagingMode]:

@@ -221,6 +221,19 @@ impl RefitService for RefitServiceImpl {
         required(&request.model_name, "model_name")?;
         required(&request.idempotency_key, "idempotency_key")?;
         validate_mesh_members(&request.workers)?;
+        if let Some(mesh) = self
+            .backend
+            .find_trainer_mesh_for_request(&request)
+            .await
+            .map_err(backend_status)?
+        {
+            return Ok(Response::new(CreateTrainerMeshResponse {
+                mesh: Some(mesh),
+            }));
+        }
+        for metadata in request.workers.values() {
+            super::coverage::validate_binding(metadata).await?;
+        }
         let mesh = self
             .backend
             .create_trainer_mesh(&request)
@@ -252,6 +265,21 @@ impl RefitService for RefitServiceImpl {
         let request = request.into_inner();
         required(&request.mesh_id, "mesh_id")?;
         validate_mesh_members(&request.workers)?;
+        let current = self
+            .backend
+            .get_trainer_mesh(&request.mesh_id)
+            .await
+            .map_err(backend_status)?;
+        if current.generation != request.expected_generation {
+            return Err(Status::failed_precondition(
+                "trainer mesh generation changed",
+            ));
+        }
+        for (worker_id, metadata) in &request.workers {
+            if current.workers.get(worker_id) != Some(metadata) {
+                super::coverage::validate_binding(metadata).await?;
+            }
+        }
         let mesh = self
             .backend
             .update_trainer_mesh(
@@ -441,23 +469,6 @@ impl RefitService for RefitServiceImpl {
             "Registering shard for version '{}' from worker '{}' (logical shard '{}')",
             shard.version_id, shard.worker_id, shard.logical_shard_id
         );
-        let version = self
-            .backend
-            .get_weight_version(&shard.version_id)
-            .await
-            .map_err(backend_status)?;
-        if let Some(mesh_id) = &version.trainer_mesh_id {
-            let mesh = self
-                .backend
-                .get_trainer_mesh(mesh_id)
-                .await
-                .map_err(backend_status)?;
-            let metadata = mesh.workers.get(&shard.worker_id).ok_or_else(|| {
-                Status::failed_precondition("publishing worker is not in the mesh")
-            })?;
-            super::coverage::validate_publication(&shard, metadata).await?;
-        }
-
         let (shard, version) = self
             .backend
             .create_weight_version_shard(shard)

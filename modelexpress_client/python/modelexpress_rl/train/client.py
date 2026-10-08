@@ -219,8 +219,8 @@ class ModelExpressTrainerClient:
         return self._runtime
 
     @property
-    def source_slot_id(self) -> str:
-        return self._active_runtime().source_slot_id
+    def logical_shard_id(self) -> str:
+        return self._active_runtime().logical_shard_id
 
     def prepare_delta_base(
         self, *, hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]]

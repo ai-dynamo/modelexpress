@@ -404,7 +404,7 @@ The control plane stores long-lived `TrainerMesh` membership as
 `bind_tensors()` computes address-independent coverage locally and returns
 this compact reference. Adapters derive wire coverage without copying weights,
 registering source buffers, or publishing a version. The adapter binding and
-trainer `source_slot_id` identify the same logical shard. Logical IDs hash canonical
+trainer `logical_shard_id` identify the same logical shard. Logical IDs hash canonical
 coverage, so equivalent replicas share an ID. The orchestrator supplies the complete
 trainer worker set and is responsible for logical-shard completeness. Mesh creation
 and update validate compact membership metadata without fetching coverage manifests;
@@ -532,6 +532,15 @@ and leases, but it does not discover engine tensor layouts or transfer weights.
 For NIXL, `RefitWorkerService` is the trainer-local manifest endpoint.
 The manifest is an opaque description of the exact published source buffers;
 the generator uses it to compile and validate its receiver-local transfer plan.
+Trainers serve canonical, address-independent coverage after `bind_tensors()`.
+`GetWeightVersionShardManifest` with an empty version ID retrieves this binding
+by logical shard ID. Mesh creation resolves idempotent retries before contacting trainers and validates
+every binding only for a new mesh; mesh updates validate
+new workers and changed endpoints or logical shards. Unchanged members are not
+refetched. Shard publication retains atomic registration, membership, endpoint,
+and conflict checks in Redis without fetching or parsing a trainer manifest.
+Per-version tensor counts and coverage are trusted at publication; generators
+still verify versioned manifest digests and validate transfer coverage.
 Full-tensor trainers reuse manifest bytes while registrations, addresses, and
 tensor geometry remain stable and content digests are disabled. Generators
 cache each selected worker manifest by endpoint and digest. A changed endpoint,
