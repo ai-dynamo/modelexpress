@@ -14,10 +14,9 @@ from typing import TYPE_CHECKING, Iterator
 
 import torch
 
-from ... import envs
-from ... import p2p_pb2
-from ...adapter import EngineAdapter
+from ... import envs, p2p_pb2
 from ...accelerators import accelerator_backend_for
+from ...adapter import EngineAdapter
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...tensor_utils import (
@@ -25,6 +24,8 @@ from ...tensor_utils import (
     capture_tensor_attrs,
     collect_module_tensors,
 )
+from .checkpoint_selection import select_role_shards
+from .draft_weights import draft_weight_adapter_for
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
 
@@ -69,9 +70,9 @@ class SglangAdapter(EngineAdapter):
         ):
             return 0
 
-        from sglang.srt import distributed
+        from sglang.srt.distributed.parallel_state import get_world_group
 
-        return int(distributed.get_world_group().local_rank)
+        return int(get_world_group().local_rank)
 
     def get_device_id(self) -> int:
         gpu_id = getattr(self.device_config, "gpu_id", None)
@@ -106,7 +107,22 @@ class SglangAdapter(EngineAdapter):
         # the same ModelExpress version; mixing old and new manifests fails
         # tensor matching.
         adopt_hidden_tensors(result.model, self.accelerator_backend)
-        return collect_module_tensors(result.model, self.accelerator_backend)
+        tensors = collect_module_tensors(result.model, self.accelerator_backend)
+        if is_sglang_draft_model(self.model_config):
+            selector = draft_weight_adapter_for(
+                type(result.model).__name__, role="draft", model=result.model
+            )
+            if selector is not None:
+                tensors = selector.publishable(result.model, tensors)
+            else:
+                prefixes = _target_shared_draft_prefixes(result.model)
+                if prefixes:
+                    tensors = {
+                        name: tensor
+                        for name, tensor in tensors.items()
+                        if not name.startswith(prefixes)
+                    }
+        return tensors
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
         with capture_tensor_attrs(self.accelerator_backend):
@@ -132,6 +148,10 @@ class SglangAdapter(EngineAdapter):
         if model is None:
             raise RuntimeError("SGLang ModelStreamer loading requires result.model")
 
+        is_draft = is_sglang_draft_model(self.model_config)
+        selector = draft_weight_adapter_for(
+            type(model).__name__, role="draft" if is_draft else "main", model=model
+        )
         from sglang.srt.configs.load_config import LoadFormat
         from sglang.srt.model_loader.loader import RunaiModelStreamerLoader
 
@@ -147,9 +167,29 @@ class SglangAdapter(EngineAdapter):
         stream_model_config = copy.copy(self.model_config)
         _set_load_config_attr(stream_model_config, "model_weights", model_uri)
 
-        loader = RunaiModelStreamerLoader(stream_config)
+        if selector is not None:
+            role = "draft" if is_draft else "main"
+
+            class RoleAwareModelStreamerLoader(RunaiModelStreamerLoader):
+                def _prepare_weights(self, source_uri, revision):
+                    folder, files = super()._prepare_weights(source_uri, revision)
+                    if source_uri != model_uri:
+                        return folder, files
+                    selected = select_role_shards(folder, files, selector, role)
+                    if selected is not None:
+                        logger.info(
+                            "[Worker %s] Selected %d/%d %s checkpoint shards",
+                            self_rank, len(selected), len(files), role,
+                        )
+                        files = selected
+                    return folder, files
+
+            self_rank = self.get_global_rank()
+            loader = RoleAwareModelStreamerLoader(stream_config)
+        else:
+            loader = RunaiModelStreamerLoader(stream_config)
         loader.target_device_str = str(self.target_device)
-        return loader._get_all_weights(stream_model_config, model)
+        yield from loader._get_all_weights(stream_model_config, model)
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
         with capture_tensor_attrs(self.accelerator_backend):
@@ -296,6 +336,35 @@ def _call_sglang_post_load_weights(model: torch.nn.Module) -> None:
         post_load_weights = getattr(child, "post_load_weights", None)
         if callable(post_load_weights):
             post_load_weights()
+
+
+def is_sglang_draft_model(model_config: ModelConfig) -> bool:
+    """True for SGLang's speculative draft ModelRunner load.
+
+    The draft worker builds its ModelConfig with ``is_draft_model=True`` and,
+    unless ``speculative_draft_load_format`` says otherwise, loads through the
+    same ``remote_instance`` path as the target, on the same GPU.
+    """
+    return bool(getattr(model_config, "is_draft_model", False))
+
+
+def _target_shared_draft_prefixes(model) -> tuple[str, ...]:
+    """Tensor-name prefixes SGLang swaps for the target's after an MTP draft loads.
+
+    Same-checkpoint drafts (MTP / NextN) go through the EAGLE worker's
+    non-EAGLE3 branch, which calls ``set_embed_and_head(embed, head)``: the
+    draft's own ``model.embed_tokens.weight`` and ``lm_head.weight`` are
+    deleted and replaced with the target's (the embedding only on a single
+    pipeline stage, where the target provides it). Those draft copies are
+    discarded, so they are neither served nor received over P2P; holding them
+    for NIXL would pin memory SGLang frees right after the load.
+    """
+    if not hasattr(model, "set_embed_and_head"):
+        return ()
+    prefixes = ["lm_head."]
+    if _get_parallel_size("get_pipeline_model_parallel_world_size") == 1:
+        prefixes.insert(0, "model.embed_tokens.")
+    return tuple(prefixes)
 
 
 def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIdentity:
