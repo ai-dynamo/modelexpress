@@ -52,6 +52,7 @@ class WeightVersion:
     version_number: int | None = None
 
     def __post_init__(self) -> None:
+        """Require a uint64 generation consistent with whether the version has a mesh."""
         generation = self.trainer_mesh_generation
         if type(generation) is not int or not 0 <= generation < 2**64:
             raise ValueError("trainer_mesh_generation must be a uint64 integer")
@@ -114,6 +115,7 @@ def _mesh_workers(
 
 
 def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
+    """Decode the wire version, including its recorded trainer mesh generation."""
     payload_formats = {
         refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR: WeightPayloadFormat.FULL_TENSOR,
         refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA: WeightPayloadFormat.XOR_DELTA,

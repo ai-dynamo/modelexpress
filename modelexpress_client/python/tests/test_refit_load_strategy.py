@@ -64,6 +64,7 @@ def _version(
     model_name="test-model",
     state=WeightVersionState.READY,
 ) -> WeightVersion:
+    """Build a ready version for trainer or object-storage load tests."""
     return WeightVersion(
         trainer_mesh_generation=0,
         version_id=uid,

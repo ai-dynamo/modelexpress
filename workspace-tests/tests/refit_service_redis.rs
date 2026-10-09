@@ -242,6 +242,7 @@ fn mesh_shard(
     publication
 }
 
+/// Create a version stamped with the current generation of the supplied mesh.
 async fn fresh_mesh_version(
     client: &mut RefitServiceClient<tonic::transport::Channel>,
     mesh_id: &str,
@@ -262,6 +263,7 @@ async fn fresh_mesh_version(
         .expect("version")
 }
 
+/// Verify stale publication fails without changing the version or its shards.
 async fn reject_stale_publication(
     client: &mut RefitServiceClient<tonic::transport::Channel>,
     publication: WeightVersionShard,
@@ -501,6 +503,7 @@ async fn trainer_mesh_membership_is_shared_and_generation_checked() {
 
 #[tokio::test]
 #[ignore = "requires a live Redis at REDIS_URL"]
+/// Keep membership fixed during an active lease, including additive replica updates.
 async fn linked_reader_lease_fences_replica_addition_until_release_or_expiry() {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
@@ -649,6 +652,7 @@ async fn linked_reader_lease_fences_replica_addition_until_release_or_expiry() {
 
 #[tokio::test]
 #[ignore = "requires a live Redis at REDIS_URL"]
+/// Discover current mesh publications and reject publication through stale versions.
 async fn mesh_linked_versions_publish_and_discover_declared_trainers() {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
@@ -933,6 +937,7 @@ async fn mesh_linked_versions_publish_and_discover_declared_trainers() {
 
 #[tokio::test]
 #[ignore = "requires a live Redis at REDIS_URL"]
+/// Require current-generation shard coverage before a staged version becomes ready.
 async fn staged_mesh_readiness_requires_current_publications() {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
@@ -1123,6 +1128,7 @@ async fn removed_mesh_worker_publications_retire_after_readers_drain() {
     mesh_worker_rebinding_retires_publication(true).await;
 }
 
+/// Retire old publications after endpoint or worker replacement and reader drain.
 async fn mesh_worker_rebinding_retires_publication(replace_worker_id: bool) {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());

@@ -129,6 +129,7 @@ where
     })
 }
 
+/// Decode a stored version, requiring its generation field to parse as a uint64.
 fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersion> {
     let trainer_mesh_id = fields
         .get("trainer_mesh_id")
@@ -481,6 +482,7 @@ impl RefitBackend for RedisRefitBackend {
         mesh_from_hash(fields)
     }
 
+    /// Apply a generation-checked membership update subject to linked reader leases.
     async fn update_trainer_mesh(
         &self,
         mesh_id: &str,
@@ -591,6 +593,7 @@ impl RefitBackend for RedisRefitBackend {
         Ok(worker)
     }
 
+    /// Create a generation-stamped version or return its original idempotent result.
     async fn create_weight_version(
         &self,
         request: &CreateWeightVersionRequest,
@@ -765,6 +768,7 @@ impl RefitBackend for RedisRefitBackend {
             .await
     }
 
+    /// Publish a shard only while its recorded trainer generation remains current.
     async fn create_weight_version_shard(
         &self,
         shard: WeightVersionShard,
@@ -1043,6 +1047,7 @@ impl RefitBackend for RedisRefitBackend {
 mod tests {
     use super::*;
 
+    /// Build stored version fields for generation-decoding tests.
     fn stored_version(mesh_id: &str, generation: Option<&str>) -> HashMap<String, String> {
         let mut fields = HashMap::from([
             ("uid".to_string(), "version".to_string()),
@@ -1066,6 +1071,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::expect_used)]
+    /// Reject missing or malformed generations and preserve the full uint64 range.
     fn stored_versions_require_uint64_generation() {
         for generation in [None, Some("invalid"), Some("18446744073709551616")] {
             assert!(matches!(
@@ -1080,6 +1086,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::expect_used)]
+    /// Decode the zero generation written for versions without a trainer mesh.
     fn stored_nonmesh_versions_have_generation_zero() {
         let version = version_from_hash(stored_version("", Some("0")))
             .expect("generation is not applicable without a mesh");

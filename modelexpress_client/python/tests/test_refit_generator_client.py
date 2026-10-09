@@ -58,6 +58,7 @@ from modelexpress_rl.inference.source import (
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
     def __init__(self, *, endpoint: str, state=None, manifest_digest=None) -> None:
+        """Initialize the fake service with a generation-stamped trainer version."""
         self.registrations = {}
         self.active_leases = set()
         self.lease_registrations = 0

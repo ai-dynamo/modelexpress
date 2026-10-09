@@ -39,6 +39,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.mesh_id = None
 
     def GetWeightVersion(self, request, _context) -> refit_pb2.GetWeightVersionResponse:
+        """Return a generation-stamped trainer version for the requested identifier."""
         version = refit_pb2.WeightVersion(uid=request.uid)
         if self.mesh_id is not None:
             version.trainer_mesh_id = self.mesh_id

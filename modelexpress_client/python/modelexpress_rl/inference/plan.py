@@ -325,6 +325,7 @@ class WeightUpdatePlanner:
         *,
         source_kind: WeightSource | None = None,
     ) -> Iterator[WeightUpdatePlan]:
+        """Yield compatible update plans while propagating source-discovery failures."""
         for resolver in self._resolvers:
             if source_kind is not None and resolver.kind is not source_kind:
                 continue

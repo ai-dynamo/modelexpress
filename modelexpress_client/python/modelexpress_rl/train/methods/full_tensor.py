@@ -91,6 +91,7 @@ class FullTensorNixlPublicationMethod:
         version: WeightVersionRef,
         staged: object,
     ) -> None:
+        """Publish the bound trainer shard after its staged payload is ready."""
         if not isinstance(staged, StagedWeightVersionShardData):
             raise TypeError("full-tensor publication received an invalid shard")
         version_response = self._service().GetWeightVersion(

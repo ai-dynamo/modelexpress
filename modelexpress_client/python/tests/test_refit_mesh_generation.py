@@ -14,6 +14,7 @@ from modelexpress_rl import control, refit_pb2
 
 @pytest.fixture
 def redis_command(tmp_path: Path) -> Iterator[Callable[..., str]]:
+    """Provide an isolated Redis process accessed through a temporary Unix socket."""
     server = shutil.which("redis-server")
     client = shutil.which("redis-cli")
     if server is None or client is None:
@@ -36,6 +37,7 @@ def redis_command(tmp_path: Path) -> Iterator[Callable[..., str]]:
     )
 
     def command(*args: str) -> str:
+        """Execute a Redis command and return its raw textual result."""
         return subprocess.check_output(
             [client, "-s", socket, "--raw", *args], text=True
         ).strip()
@@ -58,6 +60,7 @@ def redis_command(tmp_path: Path) -> Iterator[Callable[..., str]]:
 def _script(
     command: Callable[..., str], name: str, keys: list[str], args: list[str]
 ) -> str:
+    """Run a production Redis script against the isolated test database."""
     scripts = (
         Path(__file__).resolve().parents[3]
         / "modelexpress_server/src/refit/backend/redis/scripts"
@@ -66,6 +69,7 @@ def _script(
 
 
 def _create(command: Callable[..., str], uid: str, *, mesh_id: str = "mesh") -> str:
+    """Create a version without supplying a caller-selected mesh generation."""
     return _script(
         command,
         "create_weight_version.lua",
@@ -89,6 +93,7 @@ def _create(command: Callable[..., str], uid: str, *, mesh_id: str = "mesh") -> 
 def test_creation_captures_generation_without_a_caller_generation(
     redis_command: Callable[..., str],
 ) -> None:
+    """Stamp the current generation once and retain it across idempotent retries."""
     redis_command("HSET", "mesh", "model_name", "model", "generation", "1")
     assert _create(redis_command, "first") == "CREATED"
     assert redis_command("HGET", "version:first", "trainer_mesh_generation") == "1"
@@ -105,6 +110,7 @@ def test_creation_captures_generation_without_a_caller_generation(
 def test_creation_rejects_mesh_without_generation(
     redis_command: Callable[..., str], generation: str | None
 ) -> None:
+    """Reject an unversioned mesh without reserving a version or idempotency key."""
     redis_command("HSET", "mesh", "model_name", "model")
     if generation is not None:
         redis_command("HSET", "mesh", "generation", generation)
@@ -116,6 +122,7 @@ def test_creation_rejects_mesh_without_generation(
 def test_publication_rejects_stale_generation_before_any_write(
     redis_command: Callable[..., str], initial_state: str
 ) -> None:
+    """Reject stale initial and repeated publications without changing stored state."""
     worker = {"worker": {"logical_shard_id": "shard", "metadata_endpoint": "endpoint"}}
     redis_command(
         "HSET",
@@ -174,6 +181,7 @@ def test_publication_rejects_stale_generation_before_any_write(
 
 @pytest.mark.parametrize("generation", [0, 1, 2**64 - 1])
 def test_mesh_generation_is_decoded_from_response(generation: int) -> None:
+    """Preserve valid wire generations and reject zero for mesh-backed versions."""
     version = refit_pb2.WeightVersion(
         uid="version",
         trainer_mesh_id="mesh",
@@ -199,6 +207,7 @@ def test_mesh_generation_is_decoded_from_response(generation: int) -> None:
 
 @pytest.mark.parametrize("generation", [True, -1, 2**64])
 def test_weight_version_rejects_invalid_generation(generation: int) -> None:
+    """Reject boolean and out-of-range values in the generation contract."""
     with pytest.raises(ValueError, match="generation"):
         control.WeightVersion(
             version_id="version",

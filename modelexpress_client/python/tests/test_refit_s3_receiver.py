@@ -194,6 +194,7 @@ class _Adapter:
         return self._method._checkpoint
 
     def stage_weight(self, inputs) -> receiver_module.PreparedCheckpoint:
+        """Prepare one object-storage revision through the canonical update method."""
         version = WeightVersion(
             trainer_mesh_generation=0,
             version_id=inputs.version_id,
@@ -215,6 +216,7 @@ class _Adapter:
         return self._active.checkpoint
 
     def stage_chain(self, inputs) -> receiver_module.PreparedCheckpoint:
+        """Prepare an ordered object-storage revision chain for installation."""
         chain = []
         for item in inputs:
             version = WeightVersion(
@@ -1978,6 +1980,7 @@ def test_full_lineage_replay_resumes_from_verified_local_checkpoint(
 def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
     monkeypatch, tmp_path, use_peer_for_second_delta, aliased_manifest_ids, startup_seed
 ) -> None:
+    """Replay S3 deltas from the disk checkpoint after peer updates advance serving state."""
     tensors = [torch.tensor([float(i), float(i + 1)]) for i in (1, 3, 5, 7)]
     objects = _full_artifact(tensors[0], version_label=0)
     inputs = [_full_inputs(version="base-a", version_label=0)]
