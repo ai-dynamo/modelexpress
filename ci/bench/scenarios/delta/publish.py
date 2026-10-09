@@ -38,10 +38,10 @@ def main():
     config = load_config()
     root = Path("/tmp/mx-delta")
     root.mkdir(exist_ok=True)
-    run = os.environ["DELTA_RUN"]
+    run = config["run"]
     bucket = config["bucket"]
     model = config["model"]
-    prefix = config["delta_prefix"] + run + "/"
+    prefix = config["artifact_prefix"]
     uri = f"s3://{bucket}/{prefix}"
     name = config["embedding"]
     seed_prefix = config["seed_prefix"]
@@ -244,7 +244,6 @@ def main():
         "publication_seconds": publication_seconds,
         "publisher_metrics": publisher_metrics,
         "objects": objects,
-        "trials": [],
     }
     (root / "report.json").write_text(json.dumps(report, indent=2))
     print(

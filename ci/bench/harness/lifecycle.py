@@ -249,10 +249,6 @@ class Benchmark:
                 )
 
     def cleanup(self):
-        try:
-            self.collect()
-        except (subprocess.SubprocessError, OSError) as error:
-            print(f"Collection failed: {error}", file=sys.stderr)
         cleanup_pod = self.control + "-cleanup"
         self.k.call(
             "delete",
@@ -334,10 +330,6 @@ def main():
     parser.add_argument("directory", type=Path)
     args = parser.parse_args()
     getattr(Benchmark(args.directory), args.command)()
-
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":

@@ -47,12 +47,11 @@ class DeltaScenario:
                     "log": "publication.log",
                 },
             ],
-            control_env={"DELTA_RUN": config["run"]},
+            control_env={},
             worker_env={
                 "MX_GENERATOR_SOURCE_ORDER": "OBJECT_STORAGE",
                 **environment.get("worker_env", {}),
                 "MX_MODEL_URI": f"s3://{config['bucket']}/{config['seed_prefix'].rstrip('/')}",
-                "BENCH_PREFIX": config["seed_prefix"],
             },
             sources={
                 "s3": "OBJECT_STORAGE",

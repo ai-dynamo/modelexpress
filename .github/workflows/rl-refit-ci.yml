@@ -133,8 +133,8 @@ jobs:
       - name: Verify refitted GPU weights and measure cold-load and refit latency
         timeout-minutes: 45
         run: python3 ci/bench/scripts/ci.py run
-      - name: Collect evidence
-        if: always()
+      - name: Collect missing run evidence
+        if: ${{ always() && hashFiles('bench-results/report.json') == '' }}
         run: python3 ci/bench/scripts/ci.py collect
       - name: Save evidence
         if: always()

@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -26,7 +25,7 @@ def main():
         ),
     )
     b = config["bucket"]
-    prefix = os.environ["BENCH_PREFIX"]
+    prefix = config["seed_prefix"]
     m = json.loads(
         s.get_object(Bucket=b, Key=prefix + "snapshot-manifest.json")["Body"].read()
     )

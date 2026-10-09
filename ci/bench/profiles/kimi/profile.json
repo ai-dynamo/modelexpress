@@ -8,7 +8,6 @@
   "delta_bytes": 1073741824,
   "expected_tensors_per_rank": null,
   "expected_host_scales_per_rank": null,
-  "default_paths": "s3",
   "limit_mm_per_prompt": {
     "image": 0,
     "video": 0

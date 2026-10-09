@@ -157,3 +157,66 @@ def test_engine_start_waits_for_preparation(
     else:
         bench.prepare_run()
         assert sleeps == [5]
+
+
+def test_module_collect_runs_once(tmp_path, monkeypatch):
+    import json
+    import runpy
+    import sys
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"resource_prefix": "test", "roles": [], "publication_path": "/report.json"}
+        )
+    )
+    (tmp_path / "environment.json").write_text(
+        json.dumps({"context": "ci", "namespace": "test"})
+    )
+    reports = []
+
+    def run(command, **kwargs):
+        if command[1:3] == ["-m", "harness.report"]:
+            reports.append(command)
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(sys, "argv", ["harness.lifecycle", "collect", str(tmp_path)])
+    runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "harness/lifecycle.py"),
+        run_name="__main__",
+    )
+    assert len(reports) == 1
+
+
+def test_cleanup_releases_workloads_before_other_work(tmp_path, lifecycle):
+    from types import SimpleNamespace
+
+    calls = []
+    bench = object.__new__(lifecycle.Benchmark)
+    bench.root = tmp_path
+    bench.prefix = "test"
+    bench.control = "test-control"
+    bench.roles = ["s3"]
+    bench.collect = lambda: pytest.fail("Cleanup must not recollect run evidence")
+
+    def call(*args):
+        calls.append(args)
+        raise RuntimeError("stop after first operation")
+
+    bench.k = SimpleNamespace(call=call)
+    with pytest.raises(RuntimeError, match="stop after first operation"):
+        bench.cleanup()
+    assert calls == [
+        (
+            "delete",
+            "pod",
+            "test-control",
+            "test-s3",
+            "test-control-cleanup",
+            "--ignore-not-found",
+            "--wait=true",
+            "--timeout=2m",
+        )
+    ]

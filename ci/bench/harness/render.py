@@ -217,9 +217,7 @@ def prepare(
             "MX_SERVER_ADDRESS": prefix + "-control:8000",
             "BENCH_MODEL": config["model"],
             "BENCH_REVISION": config["revision"],
-            "BENCH_KEY": model,
             "BENCH_ROLE": role,
-            "BENCH_RUN": run,
         }
         fields = {
             **values,
