@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +26,15 @@ from .plan import (
 )
 
 logger = logging.getLogger("modelexpress_rl.inference.session")
+
+
+@dataclass(frozen=True)
+class StreamingSettings:
+    """Receive capacity and placement for one bounded update."""
+
+    max_staging_bytes: int
+    staging_device: str = "cuda"
+    staging_buffers: int = 1
 
 
 @dataclass
@@ -95,8 +104,12 @@ class WeightUpdateSession:
     def stage(
         self,
         version: WeightVersion,
+        *,
+        streaming: StreamingSettings | None = None,
     ) -> SessionUpdate:
-        """Prepare one target version using the configured source order."""
+        """Prepare one target and retain its leases until apply or release."""
+        if streaming is not None:
+            return self._stage_one(version, streaming=streaming)
         source_order = self._planner.source_order
         if not source_order:
             raise RuntimeError("no refit source is configured")
@@ -151,78 +164,99 @@ class WeightUpdateSession:
         version: WeightVersion,
         *,
         source_kind: WeightSource | None = None,
+        streaming: StreamingSettings | None = None,
     ) -> SessionUpdate:
         with refit_span("setup_registration"):
             lease = self._start_lease(version.version_id)
         try:
-            last_error: BaseException | None = None
-            found_plan = False
-            try:
-                for plan in self._planner.plans(
-                    version,
-                    source_kind=source_kind,
-                ):
-                    found_plan = True
-                    source = plan.source.kind.value
-                    method = type(plan.method).__name__
-                    installer = type(plan.installer).__name__
-                    logger.info(
-                        "ModelExpress weight update version=%s trying "
-                        "source=%s method=%s installer=%s",
-                        version.version_id,
-                        source,
-                        method,
-                        installer,
-                    )
-                    try:
-                        prepared = plan.method.prepare(
-                            version=version,
-                            source=plan.source,
-                        )
-                    except StrategyRecoveryError:
-                        raise
-                    except (
-                        grpc.RpcError,
-                        RuntimeError,
-                        ManifestMismatchError,
-                    ) as error:
-                        self._recover_preparation(plan.method, error)
-                        last_error = error
-                        logger.warning(
-                            "ModelExpress weight update version=%s preparation "
-                            "failed source=%s method=%s error=%s",
-                            version.version_id,
-                            source,
-                            method,
-                            error,
-                        )
-                        continue
-                    logger.info(
-                        "ModelExpress weight update version=%s prepared "
-                        "source=%s method=%s",
-                        version.version_id,
-                        source,
-                        method,
-                    )
-                    return SessionUpdate(
-                        plan=plan,
-                        prepared=prepared,
-                        lease=lease,
-                    )
-            except (grpc.RpcError, RuntimeError) as error:
-                last_error = error
-            if not found_plan and last_error is None:
-                last_error = RuntimeError(
-                    f"no usable refit source for weight version {version.version_id!r}"
-                )
-            if last_error is None:
-                raise RuntimeError(
-                    f"no usable refit source for weight version {version.version_id!r}"
-                )
-            raise last_error
+            plan, prepared = self._prepare_candidates(
+                version, source_kind=source_kind, streaming=streaming
+            )
+            return SessionUpdate(plan=plan, prepared=prepared, lease=lease)
         except BaseException as primary_error:
             self._close_lease(lease, version.version_id, primary_error)
             raise
+
+    def _candidate_plans(
+        self,
+        version: WeightVersion,
+        source_kind: WeightSource | None,
+        streaming: StreamingSettings | None,
+    ) -> Iterator[WeightUpdatePlan]:
+        from .methods import LoadTimeTensorNixlUpdateMethod
+
+        for plan in self._planner.plans(version, source_kind=source_kind):
+            if streaming is not None:
+                if plan.source.kind is not WeightSource.TRAINER:
+                    continue
+                if not isinstance(plan.method, LoadTimeTensorNixlUpdateMethod):
+                    continue
+                if (
+                    PreparedStreamingTensors
+                    not in plan.installer.capabilities.artifact_types
+                ):
+                    raise ValueError(
+                        "engine does not support bounded streaming installation"
+                    )
+            yield plan
+
+    def _prepare_candidates(
+        self,
+        version: WeightVersion,
+        *,
+        source_kind: WeightSource | None,
+        streaming: StreamingSettings | None,
+    ) -> tuple[WeightUpdatePlan, PreparedArtifact]:
+        last_error: BaseException | None = None
+        for plan in self._candidate_plans(version, source_kind, streaming):
+            logger.info(
+                "ModelExpress weight update version=%s trying source=%s method=%s installer=%s",
+                version.version_id,
+                plan.source.kind.value,
+                type(plan.method).__name__,
+                type(plan.installer).__name__,
+            )
+            try:
+                if streaming is None:
+                    prepared = plan.method.prepare(
+                        version=version, source=plan.source
+                    )
+                else:
+                    prepared = plan.method.prepare_streaming(
+                        version=version,
+                        source=plan.source,
+                        max_staging_bytes=streaming.max_staging_bytes,
+                        staging_device=streaming.staging_device,
+                        staging_buffers=streaming.staging_buffers,
+                    )
+            except (grpc.RpcError, RuntimeError, ManifestMismatchError) as error:
+                if streaming is None:
+                    if isinstance(error, StrategyRecoveryError):
+                        raise
+                    self._recover_preparation(plan.method, error)
+                last_error = error
+                logger.warning(
+                    "ModelExpress weight update version=%s preparation failed source=%s method=%s error=%s",
+                    version.version_id,
+                    plan.source.kind.value,
+                    type(plan.method).__name__,
+                    error,
+                )
+                continue
+            logger.info(
+                "ModelExpress weight update version=%s prepared source=%s method=%s",
+                version.version_id,
+                plan.source.kind.value,
+                type(plan.method).__name__,
+            )
+            return plan, prepared
+        if last_error is not None:
+            raise last_error
+        if streaming is not None:
+            raise ValueError("no NIXL trainer plan supports bounded streaming")
+        raise RuntimeError(
+            f"no usable refit source for weight version {version.version_id!r}"
+        )
 
     def _stage_replay_chain(
         self,
@@ -284,57 +318,6 @@ class WeightUpdateSession:
             )
         except BaseException as primary_error:
             self._close_lease(lease_group, versions[-1].version_id, primary_error)
-            raise
-
-    def prepare_streaming(
-        self,
-        version: WeightVersion,
-        *,
-        max_staging_bytes: int,
-        staging_device: str = "cuda",
-        staging_buffers: int = 1,
-    ) -> SessionUpdate:
-        """Hold the version lease across deferred transfer and installation."""
-        from .methods import LoadTimeTensorNixlUpdateMethod
-
-        lease = self._start_lease(version.version_id)
-        try:
-            last_error: BaseException | None = None
-            for plan in self._planner.plans(version):
-                if plan.source.kind is not WeightSource.TRAINER:
-                    continue
-                if not isinstance(plan.method, LoadTimeTensorNixlUpdateMethod):
-                    continue
-                if (
-                    PreparedStreamingTensors
-                    not in plan.installer.capabilities.artifact_types
-                ):
-                    raise ValueError(
-                        "engine does not support bounded streaming installation"
-                    )
-                try:
-                    prepared = plan.method.prepare_streaming(
-                        version=version,
-                        source=plan.source,
-                        max_staging_bytes=max_staging_bytes,
-                        staging_device=staging_device,
-                        staging_buffers=staging_buffers,
-                    )
-                except (grpc.RpcError, RuntimeError, ManifestMismatchError) as error:
-                    last_error = error
-                    logger.warning(
-                        "Streaming preparation failed version=%s source=%s: %s",
-                        version.version_id,
-                        plan.source.kind.value,
-                        error,
-                    )
-                    continue
-                return SessionUpdate(plan=plan, prepared=prepared, lease=lease)
-            if last_error is not None:
-                raise last_error
-            raise ValueError("no NIXL trainer plan supports bounded streaming")
-        except BaseException as error:
-            self._close_lease(lease, version.version_id, error)
             raise
 
     @staticmethod

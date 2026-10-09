@@ -1780,13 +1780,14 @@ def _stage_and_apply(generator, *, version):
         (1, RuntimeError, False),
         (1, grpc.RpcError, False),
         (1, ManifestMismatchError, False),
+        (1, StrategyRecoveryError, False),
         (3, RuntimeError, False),
         (1, RuntimeError, True),
     ],
 )
 def test_streaming_client_holds_lease_and_fences_partial_install(
     monkeypatch, fail_second, prepare_failures, prepare_error, reset_failure
-):
+) -> None:
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
     generator = _initialize(

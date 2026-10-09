@@ -1802,6 +1802,11 @@ unsupported. The same generic path is used for small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
 
 
+Full-copy and bounded updates enter one session staging flow. Frozen streaming
+settings select the bounded method while the version lease remains held through
+installation or release. Preparation retry and recovery behavior stays scoped
+to the selected update strategy; failures after a possible write fence the engine.
+
 ## RL refit CI harness
 
 `ci/bench/` shares one Kubernetes lifecycle and pause/refit/verify/resume protocol
