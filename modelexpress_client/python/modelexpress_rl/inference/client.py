@@ -26,10 +26,10 @@ from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
 from ..train import WeightPayloadFormat
 from .adapter import GeneratorEngineContext
-from .plan import WeightSource, parse_weight_source_order
+from .plan import StreamingSettings, WeightSource, parse_weight_source_order
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime, initialize_generator_runtime
-from .session import SessionUpdate, StreamingSettings
+from .session import SessionUpdate
 from .version_chain import resolve_replay_chain
 
 logger = logging.getLogger("modelexpress_rl.inference.client")
@@ -317,6 +317,7 @@ class ModelExpressGeneratorClient:
                 service=lambda: client._service,
                 start_lease=client._start_version_lease,
                 resolve_replay_chain=client._resolve_replay_chain,
+                streaming=client._streaming,
             )
             client._runtime = runtime
             client._has_initial_serving_version = (
@@ -398,7 +399,7 @@ class ModelExpressGeneratorClient:
                         raise RuntimeError(
                             "uncertain streaming engine requires a full tensor update"
                         )
-                    update = runtime.session.stage(ready, streaming=self._streaming)
+                    update = runtime.session.stage(ready)
             except BaseException:
                 # Failed preparation has no handle to report the timing later.
                 timing.emit(recorder, logger)

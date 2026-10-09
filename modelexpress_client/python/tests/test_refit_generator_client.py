@@ -393,8 +393,9 @@ def _runtime(
     max_transfer_attempts,
     rpc_timeout_seconds,
     resolve_replay_chain,
+    streaming=None,
     **_kwargs,
-):
+) -> GeneratorRuntime:
     if source_order is None:
         source_order = (
             (WeightSource.OBJECT_STORAGE,)
@@ -459,6 +460,7 @@ def _runtime(
                 max_transfer_attempts=max_transfer_attempts,
             ),
             start_lease=start_lease,
+            streaming=streaming,
             resolve_replay_chain=lambda version: resolve_replay_chain(
                 version.version_id,
                 {
@@ -1808,9 +1810,6 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
                 raise RuntimeError("cleanup failure")
 
         def prepare(self, **kwargs):
-            assert kwargs["max_staging_bytes"] == 512
-            assert kwargs["staging_device"] == "cuda"
-            assert kwargs["staging_buffers"] == 1
             assert service.active_leases
             prepare_calls.append(kwargs)
             if len(prepare_calls) <= prepare_failures:
@@ -2365,65 +2364,6 @@ def test_streaming_rejects_invalid_staging_options_before_leasing(kwargs, match)
             engine_context=VllmGeneratorContext(model=object(), vllm_config=object()),
             **kwargs,
         )
-
-
-@pytest.mark.parametrize("buffer_bytes,count", [(512, 1), (1024, 2)])
-def test_streaming_forwards_staging_options_to_the_method(
-    monkeypatch, buffer_bytes, count
-):
-    server, endpoint, service = _start_server()
-    adapter = _Adapter(service)
-    generator = _initialize(
-        monkeypatch,
-        endpoint,
-        adapter,
-        source_order=(WeightSource.TRAINER,),
-        staging_buffer_bytes=buffer_bytes,
-        staging_buffers_count=count,
-        staging_device="cpu",
-    )
-    prepare_calls = []
-
-    class Transfer:
-        def prepare(self, **kwargs):
-            prepare_calls.append(kwargs)
-            return SimpleNamespace(
-                metrics={},
-                batches=[SimpleNamespace(layouts=({"a.weight": None},))],
-            )
-
-        def iter_bounded(self, prepared, metrics):
-            yield {"a.weight": 1}
-
-    class Installer:
-        @property
-        def capabilities(self):
-            return EngineCapabilities(
-                frozenset({PreparedEngineTensors, PreparedStreamingTensors})
-            )
-
-        def install(self, prepared):
-            for _tensors in prepared.batches():
-                pass
-            return {}
-
-    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer(), capture_layout=None)
-    planner = generator._runtime.session._planner
-    planner._methods = (method,)
-    planner._installer = Installer()
-    try:
-        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
-        assert not staged.applied
-        assert service.active_leases
-        assert adapter.apply_calls == []
-        generator.apply_weight(staged)
-        staged.release()
-        assert prepare_calls[-1]["staging_device"] == "cpu"
-        assert prepare_calls[-1]["staging_buffers"] == count
-        assert prepare_calls[-1]["max_staging_bytes"] == buffer_bytes * count
-    finally:
-        generator.close()
-        server.stop(grace=None).wait()
 
 
 @pytest.mark.parametrize(

@@ -111,9 +111,6 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         *,
         version,
         source: ResolvedSource,
-        max_staging_bytes: int,
-        staging_device: str = "cuda",
-        staging_buffers: int = 1,
     ) -> PreparedArtifact:
         """Prepare trainer metadata without transferring a full weight copy."""
         del version
@@ -124,8 +121,6 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             for item in source.inputs.sources
         ):
             raise ValueError("bounded staging requires NIXL trainer sources")
-        # Streaming replaces the full-copy destinations, including any cached
-        # descriptors into them. Invalidate before a possibly failing switch.
         self._active_plan = None
         self._active_fingerprint = None
         self._active_manifest_digests = ()
@@ -133,9 +128,6 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             prepared = self._transfer.prepare(
                 manifests=[item.transport.manifest for item in source.inputs.sources],
                 capture_layout=self._capture_layout,
-                max_staging_bytes=max_staging_bytes,
-                staging_device=staging_device,
-                staging_buffers=staging_buffers,
             )
             metrics = dict(prepared.metrics)
             streamed = PreparedStreamingTensors(

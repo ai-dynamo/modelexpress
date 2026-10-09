@@ -23,6 +23,15 @@ if TYPE_CHECKING:
     from .receiver import PreparedCheckpoint
 
 
+@dataclass(frozen=True)
+class StreamingSettings:
+    """Fixed receive capacity and placement for one bounded runtime."""
+
+    max_staging_bytes: int
+    staging_device: str = "cuda"
+    staging_buffers: int = 1
+
+
 class WeightSource(str, Enum):
     """Location from which a generator obtains weight bytes."""
 

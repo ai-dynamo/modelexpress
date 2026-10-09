@@ -25,6 +25,7 @@ from .nixl_staged_transfer import _NixlStagedTransfer
 from .plan import (
     EngineInstaller,
     SourceResolver,
+    StreamingSettings,
     UpdateMethod,
     WeightSource,
     WeightUpdatePlanner,
@@ -179,9 +180,11 @@ def _create_load_time_tensor_method(
     *,
     capability: FullTensorEngineCapability,
     worker_id: str,
+    streaming: StreamingSettings | None = None,
 ) -> LoadTimeTensorNixlUpdateMethod:
     transfer = _NixlStagedTransfer(
         agent_name=f"mx-refit-load-time-{worker_id}",
+        streaming=streaming,
         device_id=capability.device_id,
         device=capability.device,
         listen_port=None,
@@ -283,6 +286,7 @@ def initialize_generator_runtime(
     rpc_timeout_seconds: float,
     service: Callable,
     start_lease: Callable[[str], Any],
+    streaming: StreamingSettings | None = None,
     resolve_replay_chain: Callable[[str, bool], tuple[WeightVersion, ...]]
     | None = None,
 ) -> GeneratorRuntime:
@@ -326,6 +330,7 @@ def initialize_generator_runtime(
                         _create_load_time_tensor_method(
                             capability=engine.full_tensor,
                             worker_id=worker_id,
+                            streaming=streaming,
                         )
                     )
                 if WeightSource.GENERATOR in resolved_source_order:
@@ -383,6 +388,7 @@ def initialize_generator_runtime(
                     max_transfer_attempts=max_transfer_attempts,
                 ),
                 start_lease=start_lease,
+                streaming=streaming,
                 resolve_replay_chain=(
                     None
                     if resolve_replay_chain is None

@@ -6,6 +6,8 @@ from contextlib import nullcontext
 from dataclasses import replace
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
+from modelexpress_rl.inference.plan import StreamingSettings
+
 import pytest
 import torch
 from modelexpress import p2p_pb2
@@ -251,12 +253,12 @@ def _manifest(
     )
 
 
-@pytest.mark.parametrize("switch_failure", [None, "initialize", "register"])
+@pytest.mark.parametrize("bounded", [False, True])
 @pytest.mark.parametrize("warm_cache", [False, True])
-def test_released_updates_switch_workspaces_without_reusing_stale_plans(
-    monkeypatch, switch_failure, warm_cache
-):
-    """Switch modes with real plans and byte copies, mocking only CUDA/NIXL."""
+def test_fixed_mode_updates_receive_changed_values(
+    monkeypatch, bounded, warm_cache
+) -> None:
+    """Receive changing weights in each fixed mode with real plans and CPU copies."""
     events = []
     source_tensor = torch.arange(4, dtype=torch.float32)
     real_empty = torch.empty
@@ -396,6 +398,7 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
         device_id=0,
         device=torch.device("cuda:0"),
         listen_port=None,
+        streaming=StreamingSettings(256) if bounded else None,
     )
     method = LoadTimeTensorNixlUpdateMethod(
         transfer=transfer,
@@ -404,60 +407,26 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
             {"layer.weight": ((4,), torch.float32)},
         ),
     )
-    first_plan = None
     try:
-        for index, bounded in enumerate(
-            (False, True, True, True, False, True, True, True)
-        ):
+        for _ in range(4):
             source_tensor.add_(1)
             if bounded:
-                if index == 1 and switch_failure is not None:
-                    setattr(transfer._manager, f"fail_{switch_failure}", 1)
-                    with pytest.raises(RuntimeError, match="failed"):
-                        method.prepare_streaming(
-                            version=None, source=source, max_staging_bytes=256
-                        )
-                    assert method._active_plan is None
-                    assert not transfer._manager.registered
-                prepared = method.prepare_streaming(
-                    version=None, source=source, max_staging_bytes=256
-                )
-                hit = warm_cache and (
-                    index in (3, 7) or (index == 2 and switch_failure is not None)
-                )
-                assert prepared.metrics["plan_cache_hits"] == int(hit)
-                assert prepared.metrics["owner_plan_builds"] == int(not hit)
-                with pytest.raises(RuntimeError, match="release"):
-                    method.prepare(version=None, source=source)
+                prepared = method.prepare_streaming(version=None, source=source)
                 for tensors in prepared.batches():
                     assert torch.equal(tensors["layer.weight"], source_tensor)
-                with pytest.raises(RuntimeError, match="no longer active"):
-                    transfer.stage(first_plan)
             else:
                 prepared = method.prepare(version=None, source=source)
                 assert torch.equal(
                     prepared.staged.tensors["layer.weight"], source_tensor
                 )
-                with pytest.raises(RuntimeError, match="release"):
-                    method.prepare_streaming(
-                        version=None, source=source, max_staging_bytes=256
-                    )
-                if first_plan is None:
-                    first_plan = method._active_plan
-                else:
-                    assert method._active_plan is not first_plan
+            with pytest.raises(RuntimeError, match="release"):
+                method.prepare(version=None, source=source)
             method.release(prepared)
-        # Every switch disconnects/deregisters before registering replacement storage.
-        expected_registrations = 5 if switch_failure == "register" else 4
-        assert events.count("metadata") == expected_registrations
-        assert events.count("register") == expected_registrations
-        for i, event in enumerate(events):
-            if event == "shutdown" and i and events[i - 1] == "sync":
-                assert events[i + 1] == "initialize"
+        assert events.count("register") == 1
+        assert events.count("shutdown") == 0
     finally:
         method.close()
-        assert transfer._source_cache._entry is None
-        assert transfer._plan_cache._entry is None
+        assert not transfer._manager.registered
 
 
 def test_source_structure_uses_planner_shard_fields_and_ignores_digest():
@@ -799,7 +768,6 @@ def test_borrowed_manager_survives_peer_receive_and_refuses_a_reset(monkeypatch)
         device=torch.device("cpu"),
         manager=_Manager(),
     )
-    assert transfer._workspace_mode is None
 
     source = p2p_pb2.WorkerMetadata(worker_grpc_endpoint="127.0.0.1:18000")
     live = {"weight": torch.empty(4, dtype=torch.float32)}
@@ -816,8 +784,6 @@ def test_borrowed_manager_survives_peer_receive_and_refuses_a_reset(monkeypatch)
             on_transfer_start=lambda: None,
         )
         assert metrics["bytes_received"] == 16
-    # Direct peer receive never selects a workspace on the borrowed agent.
-    assert transfer._workspace_mode is None
 
     with pytest.raises(RuntimeError, match="transfer-owned NIXL agent"):
         transfer.reset_workspace()
@@ -882,7 +848,6 @@ def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch):
     transfer._timeout = 30.0
     transfer._manager = _Manager()
     transfer._closed = False
-    transfer._workspace_mode = "full"
     source = p2p_pb2.WorkerMetadata(
         worker_grpc_endpoint="127.0.0.1:18000",
     )
@@ -1088,11 +1053,12 @@ def test_abandoned_double_buffered_iteration_drains_the_prefetched_read(monkeypa
     assert transfer._active is prepared
 
 
+@pytest.mark.parametrize("budget_fits", [False, True])
 @pytest.mark.parametrize("staging_buffers", [1, 2])
 @pytest.mark.parametrize("source_memory_type", ["VRAM", "DRAM"])
 def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
-    monkeypatch, staging_buffers, source_memory_type
-):
+    monkeypatch, staging_buffers, source_memory_type, budget_fits
+) -> None:
     """staging_device='cpu' registers DRAM arenas and reads with a DRAM local type."""
     events = []
     source_tensor = torch.arange(4, dtype=torch.float32)
@@ -1197,77 +1163,50 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
         device_id=0,
         device=torch.device("cuda:0"),
         listen_port=None,
+        streaming=StreamingSettings(
+            256 * staging_buffers - int(not budget_fits), "cpu", staging_buffers
+        ),
     )
     layout = {"layer.weight": ((4,), torch.float32)}
     try:
-        # 16 bytes of payload rounds to one 256-byte residency per arena; the
-        # budget is split per buffer, so 256 * buffers admits it and less does not.
-        expected = (
-            "split across staging_buffers=2 gives 255 bytes per arena"
-            if staging_buffers == 2
-            else "exceeds max_staging_bytes=255; raise max_staging_bytes"
-        )
-        with pytest.raises(IncompleteRefit, match=expected):
-            transfer.prepare(
-                manifests=[manifest],
-                capture_layout=lambda m: (capture, layout),
-                max_staging_bytes=256 * staging_buffers - 1,
-                staging_device="cpu",
-                staging_buffers=staging_buffers,
-            )
+        if not budget_fits:
+            with pytest.raises(IncompleteRefit, match="255"):
+                transfer.prepare(
+                    manifests=[manifest], capture_layout=lambda m: (capture, layout)
+                )
+            assert "register_dram" not in events
+            return
         prepared = transfer.prepare(
             manifests=[manifest],
             capture_layout=lambda m: (capture, layout),
-            max_staging_bytes=256 * staging_buffers,
-            staging_device="cpu",
-            staging_buffers=staging_buffers,
         )
         assert events.count("register_dram") == staging_buffers
         assert len(transfer._staging_arenas) == staging_buffers
         assert all(a.device.type == "cpu" for a in transfer._staging_arenas)
-        assert transfer._workspace_mode == f"bounded:cpu:{staging_buffers}"
         metrics = {}
         for tensors in transfer.iter_bounded(prepared, metrics):
             assert tensors["layer.weight"].device.type == "cpu"
             assert torch.equal(tensors["layer.weight"], source_tensor)
         assert metrics["staging_buffers"] == staging_buffers
         assert metrics["staging_peak_bytes"] == 256 * staging_buffers
-        if staging_buffers == 2:
-            # Changing the buffer count is a workspace switch: the host arenas
-            # are deregistered before the agent is torn down and rebuilt.
-            transfer._active = None
-            transfer.prepare(
-                manifests=[manifest],
-                capture_layout=lambda m: (capture, layout),
-                max_staging_bytes=256,
-                staging_device="cpu",
-                staging_buffers=1,
-            )
-            assert events.count("deregister") == 2
-            assert events.index("deregister") < events.index("shutdown")
-            assert len(transfer._staging_arenas) == 1
     finally:
         transfer.close()
     assert not transfer._manager.registered
 
 
-def test_prepare_rejects_invalid_staging_options():
-    transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
-    transfer._workspace_generation = 0
-    transfer._closed = False
-    transfer._device = torch.device("cuda:0")
-    with pytest.raises(ValueError, match="staging_device"):
-        transfer.prepare(
-            manifests=[],
-            capture_layout=None,
-            max_staging_bytes=1,
-            staging_device="disk",
+def test_bounded_device_validation_precedes_manager_creation(monkeypatch) -> None:
+    events = []
+    monkeypatch.setattr(
+        transfer_module, "NixlTransferManager", lambda **kwargs: events.append(kwargs)
+    )
+    with pytest.raises(ValueError, match="CUDA device"):
+        _NixlStagedTransfer(
+            agent_name="receiver",
+            device_id=0,
+            device=torch.device("cpu"),
+            streaming=StreamingSettings(256),
         )
-    with pytest.raises(ValueError, match="staging_buffers"):
-        transfer.prepare(
-            manifests=[], capture_layout=None, max_staging_bytes=1, staging_buffers=0
-        )
+    assert events == []
 
 
 def test_failed_prefetch_drain_is_reported_not_swallowed(monkeypatch):

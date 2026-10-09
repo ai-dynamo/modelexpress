@@ -1802,8 +1802,13 @@ unsupported. The same generic path is used for small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
 
 
-Full-copy and bounded updates enter one session staging flow. Frozen streaming
-settings select the bounded method while the version lease remains held through
+Full-copy and bounded updates enter one session staging flow. Immutable streaming
+settings bind the mode, placement, buffer count and total budget at runtime
+construction; each transfer retains that configuration for its lifetime. Public
+`staging_buffer_bytes` remains the capacity of each buffer, multiplied by the
+buffer count for the internal total budget. Bounded device compatibility is
+checked before creating its NIXL manager. Generator peer reads retain a separate
+full-copy transfer borrowing the engine manager. The version lease remains held through
 installation or release. Preparation retry and recovery behavior stays scoped
 to the selected update strategy; failures after a possible write fence the engine.
 

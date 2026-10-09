@@ -11,19 +11,24 @@ from modelexpress_rl.inference.adapter import (
     GeneratorTransferInputs,
     NixlGeneratorSource,
 )
-from modelexpress_rl.inference.plan import PreparedStreamingTensors, TrainerUpdateSource
+from modelexpress_rl.inference.plan import (
+    PreparedStreamingTensors,
+    TrainerUpdateSource,
+    StreamingSettings,
+)
 from modelexpress_rl.train import WeightPayloadFormat
 
 
-def setup_method(monkeypatch):
+def setup_method(monkeypatch, *, staging_device="cuda", staging_buffers=1) -> tuple:
     events = []
     arena = torch.ones(2, 2)
 
     class Transfer:
         fail_prepare = False
 
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
             self.arena = arena
+            self.settings = kwargs["streaming"]
 
         def prepare(self, **kwargs):
             events.append(("prepare", kwargs))
@@ -52,6 +57,7 @@ def setup_method(monkeypatch):
     method = runtime._create_load_time_tensor_method(
         capability=SimpleNamespace(device_id=0, device="cpu", capture_layout=None),
         worker_id="receiver",
+        streaming=StreamingSettings(512, staging_device, staging_buffers),
     )
     source = TrainerUpdateSource(
         GeneratorTransferInputs(
@@ -72,12 +78,10 @@ def setup_method(monkeypatch):
     return method, source, events, arena
 
 
-def prepare(method, source, **kwargs):
+def prepare(method, source) -> PreparedStreamingTensors:
     return method.prepare_streaming(
         version=SimpleNamespace(version_id="v:1"),
         source=source,
-        max_staging_bytes=512,
-        **kwargs,
     )
 
 
@@ -86,25 +90,20 @@ def prepare(method, source, **kwargs):
 )
 def test_streaming_prepare_is_lazy_and_keeps_receive_options(
     monkeypatch, staging_device, staging_buffers
-):
-    method, source, events, arena = setup_method(monkeypatch)
+) -> None:
+    method, source, events, arena = setup_method(
+        monkeypatch, staging_device=staging_device, staging_buffers=staging_buffers
+    )
     previous_owner = None
     for value in (5, 7, 11):
         arena.fill_(value)
         events.clear()
-        prepared = prepare(
-            method,
-            source,
-            staging_device=staging_device,
-            staging_buffers=staging_buffers,
-        )
+        prepared = prepare(method, source)
         assert type(prepared) is PreparedStreamingTensors
         assert prepared is method._active_streamed
         assert prepared.ownership is not previous_owner
         assert not prepared.ownership.release_blocked
         assert [name for name, _ in events] == ["prepare"]
-        assert events[0][1]["staging_device"] == staging_device
-        assert events[0][1]["staging_buffers"] == staging_buffers
         assert prepared.parameter_names == frozenset({"weight"})
         with method.installation_context(prepared):
             batches = list(prepared.batches())

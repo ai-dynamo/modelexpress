@@ -66,6 +66,8 @@ from modelexpress_rl.inference._source_snapshot import (
     _SourceSnapshot,
 )
 
+from .plan import StreamingSettings
+
 # Named under modelexpress.* (not modelexpress_rl) so the per-update summary surfaces
 # in the vLLM engine process, which only configures the modelexpress logger.
 logger = logging.getLogger("modelexpress.reshard.staged_transfer")
@@ -764,7 +766,16 @@ class _NixlStagedTransfer:
         listen_port: int | None = None,
         timeout_seconds: float | None = None,
         manager: NixlTransferManager | None = None,
+        streaming: StreamingSettings | None = None,
     ) -> None:
+        if streaming is not None and device.type != "cuda":
+            raise ValueError("bounded NIXL staging requires a CUDA device")
+        self._streaming = streaming
+        self._buffer_budget = (
+            None
+            if streaming is None
+            else streaming.max_staging_bytes // streaming.staging_buffers
+        )
         self._device_id = device_id
         self._device = device
         self._timeout = float(
@@ -810,7 +821,7 @@ class _NixlStagedTransfer:
         self._staging_arenas: list[torch.Tensor] = []
         self._staging_registrations: list[Any] = []
         self._staging_device: torch.device | None = None
-        self._workspace_mode: str | None = None
+        self._manager_ready = True
         self._source_cache = _SourceResolutionCache()
         self._plan_cache = _BoundedPlanCache()
         self._workspace_generation = 0
@@ -870,27 +881,18 @@ class _NixlStagedTransfer:
         self._convert_registered = False
         self._full_registered = False
         self._loaded_agent_metadata.clear()
-        self._workspace_mode = None
+        self._manager_ready = False
         self._source_cache.clear()
         self._plan_cache.clear()
 
-    def _select_workspace_mode(self, mode: str) -> None:
-        """Replace released staging storage only after tearing down its agent."""
-        if self._workspace_mode == mode:
-            return
-        if self._workspace_mode is not None:
-            self.reset_workspace()
-        if self._owns_manager:
-            # The constructor initialized an owned agent and reset_workspace()
-            # shuts it down, so a mode change has to bring it back. A borrowed
-            # agent is initialized and torn down by its owner, and
-            # reset_workspace() refuses to cycle one, so it needs neither.
+    def _ensure_manager_initialized(self) -> None:
+        if not self._manager_ready and self._owns_manager:
             try:
                 self._manager.initialize()
             except Exception:
                 self._manager.shutdown()
                 raise
-        self._workspace_mode = mode
+            self._manager_ready = True
 
     def prepare(
         self,
@@ -903,33 +905,15 @@ class _NixlStagedTransfer:
                 dict[str, tuple[tuple[int, ...], torch.dtype]],
             ],
         ],
-        max_staging_bytes: int | None = None,
-        staging_device: str = "cuda",
-        staging_buffers: int = 1,
     ) -> _PreparedNixlTransfer | _PreparedBoundedTransfer:
-        """Compile one exact source version into a physical NIXL plan.
-
-        ``max_staging_bytes`` bounds the bounded-mode arenas in total.
-        ``staging_device`` places them on ``"cuda"`` (RDMA lands in VRAM and the
-        commit is a device copy) or ``"cpu"`` (pinned host memory registered as
-        NIXL DRAM; the commit is a host-to-device copy). ``staging_buffers`` of
-        2 splits the budget across two arenas, allowing the next batch's READ to
-        overlap the current commit when asynchronous READs are enabled.
-        """
-        # A failed preparation must not leave the previous addresses reusable.
+        """Compile one source version using the fixed runtime staging settings."""
         previous_descriptors, self._descriptor_cache = self._descriptor_cache, None
         if self._closed:
             raise RuntimeError("NIXL staged transfer is closed")
-        if max_staging_bytes is not None and self._device.type != "cuda":
-            raise ValueError("bounded NIXL staging requires a CUDA device")
-        if staging_device not in ("cuda", "cpu"):
-            raise ValueError("staging_device must be 'cuda' or 'cpu'")
-        if (
-            isinstance(staging_buffers, bool)
-            or not isinstance(staging_buffers, int)
-            or staging_buffers < 1
-        ):
-            raise ValueError("staging_buffers must be a positive integer")
+        streaming = self._streaming
+        max_staging_bytes = None if streaming is None else streaming.max_staging_bytes
+        staging_device = "cuda" if streaming is None else streaming.staging_device
+        staging_buffers = 1 if streaming is None else streaming.staging_buffers
         phase_started = time.perf_counter()
         metrics = {}
         resolved = self._source_cache.resolve(
@@ -945,20 +929,9 @@ class _NixlStagedTransfer:
         metrics["layout_capture_s"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
         batches = None
-        buffer_budget = None
+        buffer_budget = self._buffer_budget
         if max_staging_bytes is not None:
-            if (
-                isinstance(max_staging_bytes, bool)
-                or not isinstance(max_staging_bytes, int)
-                or max_staging_bytes <= 0
-            ):
-                raise ValueError("max_staging_bytes must be a positive integer")
-            # The caller's limit bounds total staging, so each arena gets a share.
-            buffer_budget = max_staging_bytes // staging_buffers
-            if buffer_budget <= 0:
-                raise ValueError(
-                    "max_staging_bytes must cover at least one byte per staging buffer"
-                )
+            assert buffer_budget is not None
             compiled = self._plan_cache.compile(
                 manifests=manifests,
                 resolved=resolved,
@@ -984,11 +957,7 @@ class _NixlStagedTransfer:
             )
         metrics["transfer_planning_s"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
-        self._select_workspace_mode(
-            f"bounded:{staging_device}:{staging_buffers}"
-            if batches is not None
-            else "full"
-        )
+        self._ensure_manager_initialized()
         required_metadata = _required_agent_metadata(plan, resolved)
         if batches is not None:
             for batch in batches:
