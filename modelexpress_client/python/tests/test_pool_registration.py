@@ -229,6 +229,56 @@ class TestRawDescriptorMemType:
         mgr._find_cuda_allocations.assert_not_called()
         mgr._agent.register_memory.assert_called_once_with([tensor], backends=["UCX"])
 
+    def test_null_address_tensor_stays_in_manifest_but_is_not_registered(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("MX_POOL_REG", raising=False)
+        tensor = torch.zeros(4, dtype=torch.float32)
+        unallocated = MagicMock()
+        unallocated.numel.return_value = 1
+        unallocated.element_size.return_value = 4
+        unallocated.data_ptr.return_value = 0
+        unallocated.dtype = torch.float32
+        unallocated.is_contiguous.side_effect = AssertionError(
+            "contiguity should not be checked without allocated storage"
+        )
+
+        mgr = self._make_manager()
+        assert (
+            mgr.register_tensors({"w": tensor, "unallocated": unallocated})
+            == b"metadata"
+        )
+
+        mgr._agent.register_memory.assert_called_once_with(
+            [tensor], backends=["UCX"]
+        )
+        assert list(mgr._tensors) == ["w", "unallocated"]
+        assert mgr._tensors["unallocated"] is unallocated
+
+        descriptors = {
+            descriptor.name: descriptor for descriptor in mgr.tensor_descriptors
+        }
+        assert descriptors["unallocated"].addr == 0
+        assert descriptors["unallocated"].size == 4
+
+    def test_all_empty_tensors_skip_pool_registration(self, monkeypatch):
+        monkeypatch.setenv("MX_POOL_REG", "1")
+        empty = torch.empty(0, dtype=torch.float32)
+        mgr = self._make_manager()
+        mgr._find_cuda_allocations = MagicMock(
+            side_effect=AssertionError(
+                "pool discovery should not run without registrable tensors"
+            )
+        )
+
+        assert mgr.register_tensors({"empty": empty}) == b"metadata"
+
+        mgr._find_cuda_allocations.assert_not_called()
+        mgr._agent.register_memory.assert_not_called()
+        assert [descriptor.name for descriptor in mgr.tensor_descriptors] == [
+            "empty"
+        ]
+
     def test_arena_registration_uses_vram_segment(self):
         # The arena range must actually cover the tensor, as a real arena does.
         tensor = torch.zeros(1)
