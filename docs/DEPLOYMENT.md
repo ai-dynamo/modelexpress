@@ -964,6 +964,15 @@ their non-tensor derived state cannot currently be refreshed by a direct copy.
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
+Worker metadata endpoints may use DNS hostnames or numeric IPv4/IPv6 addresses.
+Before fetching NIXL metadata, the client resolves hostnames using the system
+resolver and selects the first IPv4 or IPv6 address in resolver order; it does
+not retry other addresses if the connection fails. Numeric addresses bypass
+DNS, bracketed IPv6 literals are normalized, and IPv6 scope IDs are preserved.
+DNS failures are reported before calling NIXL. IPv6 socket metadata exchange
+requires a NIXL build containing
+[IPv6 support from PR #2236](https://github.com/ai-dynamo/nixl/pull/2236).
+
 For cache artifact transfer, set `MX_ARTIFACT_TRANSFER=1` on source and target workers. The default P2P metadata path is also required; if it was disabled, set `MX_P2P_METADATA=1`. The vLLM and SGLang NIXL loaders install compatible artifacts before model initialization, then schedule publisher threads after successful load. Each publisher waits for readiness before publishing local cache directories and waits for their file count, total size, and max mtime to settle before sealing the artifact.
 
 vLLM publishes torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), DeepGEMM (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes vLLM's persistent autotune directory from `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR`, or `VLLM_CACHE_ROOT/flashinfer_autotune_cache` when unset; ModelExpress does not change either path.
