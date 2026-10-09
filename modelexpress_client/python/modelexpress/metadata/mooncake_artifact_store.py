@@ -66,6 +66,10 @@ class MooncakeArtifactCacheUnavailable(RuntimeError):
     """Raised when Mooncake native store is not installed or configured."""
 
 
+class _RepairDeadlineExpired(RuntimeError):
+    """Stop repair operations after the owner's marker expires."""
+
+
 _ARTIFACT_ENVELOPE_HEADER = struct.Struct("!8sHQ")
 _ARTIFACT_ENVELOPE_MAGIC = b"MXMCART1"
 # This is part of the MXMCART1 wire layout, not a deployment tuning knob.
@@ -921,7 +925,9 @@ def _repair_artifact_object(
 ) -> None:
     repair_key = _repair_key(cache_key)
     token = uuid4().hex
-    lock_data = _encode_repair_lock(token)
+    created_at = time.time()
+    lock_data = _encode_repair_lock(token, created_at=created_at)
+    deadline = created_at + _REPAIR_LOCK_STALE_SECONDS
     if not _acquire_repair_lock(
         store,
         repair_key,
@@ -940,6 +946,7 @@ def _repair_artifact_object(
         return
 
     try:
+        _check_repair_deadline(deadline)
         try:
             current = _fetch_artifact_object(store, cache_key)
         except MooncakeArtifactCacheStale as exc:
@@ -954,7 +961,7 @@ def _repair_artifact_object(
                     exc.fingerprint,
                 )
                 return
-            _remove_object_with_retry(store, cache_key)
+            _remove_object_with_retry(store, cache_key, repair_deadline=deadline)
         except MooncakeArtifactCacheMiss:
             current = None
         else:
@@ -966,18 +973,34 @@ def _repair_artifact_object(
                 current.artifact_id,
             )
             return
+        _check_repair_deadline(deadline)
         _put_artifact_object(store, cache_key, buffers, transfer_name)
+    except _RepairDeadlineExpired:
+        logger.warning(
+            "[Mooncake] artifact repair expired; skipping further repair "
+            "operations: name=%s key=%s timeout=%ss",
+            transfer_name,
+            cache_key,
+            _REPAIR_LOCK_STALE_SECONDS,
+        )
     finally:
         _release_repair_lock(store, repair_key, token)
 
 
-def _encode_repair_lock(token: str) -> bytes:
+def _check_repair_deadline(deadline: float) -> None:
+    # This is a best-effort guard, not fencing: an owner can still pause
+    # between this check and the store operation.
+    if time.time() >= deadline:
+        raise _RepairDeadlineExpired
+
+
+def _encode_repair_lock(token: str, *, created_at: float | None = None) -> bytes:
     payload = json.dumps(
         {
             "token": token,
             "pid": os.getpid(),
             "hostname": socket.gethostname(),
-            "created_at": time.time(),
+            "created_at": time.time() if created_at is None else created_at,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1172,11 +1195,18 @@ def _raise_stale_artifact(
     )
 
 
-def _remove_object_with_retry(store: _MooncakeNativeStore, key: str) -> None:
+def _remove_object_with_retry(
+    store: _MooncakeNativeStore,
+    key: str,
+    *,
+    repair_deadline: float | None = None,
+) -> None:
     retries = max(0, int(envs.MX_ARTIFACT_MOONCAKE_DELETE_RETRIES))
     delay = max(0.0, float(envs.MX_ARTIFACT_MOONCAKE_DELETE_RETRY_DELAY_SECS))
     # OBJECT_NOT_FOUND is -704; OBJECT_HAS_LEASE is -706.
     for attempt in range(retries + 1):
+        if repair_deadline is not None:
+            _check_repair_deadline(repair_deadline)
         ret = store.remove(key)
         if ret in (0, -704):
             return

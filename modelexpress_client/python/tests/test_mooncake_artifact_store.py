@@ -478,6 +478,55 @@ def test_repair_reclaims_marker_older_than_ten_minutes(
     assert (tmp_path / "target" / "one.bin").read_bytes() == b"abcdefgh"
 
 
+@pytest.mark.parametrize("phase", ["acquisition", "fetch", "missing"])
+@pytest.mark.parametrize("elapsed", [600, 601])
+def test_expired_repair_owner_skips_object_changes(
+    tmp_path, memory_store, monkeypatch, caplog, phase, elapsed
+):
+    transfer = _transfer(tmp_path)
+    identity = _identity()
+    cache_key = _publish(transfer, identity)
+    _corrupt_checksum(memory_store, cache_key)
+    with pytest.raises(mc.MooncakeArtifactCacheStale) as raised:
+        _fetch(transfer, identity)
+    stale = memory_store.values[cache_key]
+    clock = [1000.0]
+    monkeypatch.setattr(mc.time, "time", lambda: clock[0])
+    original_acquire = mc._acquire_repair_lock
+    original_fetch = mc._fetch_artifact_object
+
+    def acquire(*args, **kwargs):
+        acquired = original_acquire(*args, **kwargs)
+        if phase == "acquisition":
+            clock[0] += elapsed
+        return acquired
+
+    def fetch(store, key):
+        if phase == "missing":
+            store.values.pop(key)
+        try:
+            return original_fetch(store, key)
+        finally:
+            clock[0] += elapsed
+
+    monkeypatch.setattr(mc, "_acquire_repair_lock", acquire)
+    monkeypatch.setattr(mc, "_fetch_artifact_object", fetch)
+    publish = MagicMock()
+    remove = MagicMock(wraps=memory_store.remove)
+    monkeypatch.setattr(mc, "_put_artifact_object", publish)
+    monkeypatch.setattr(memory_store, "remove", remove)
+
+    _publish(transfer, identity, stale_fingerprint=raised.value.fingerprint)
+
+    publish.assert_not_called()
+    assert all(call.args[0] != cache_key for call in remove.call_args_list)
+    assert memory_store.values.get(cache_key) == (
+        None if phase == "missing" else stale
+    )
+    assert mc._repair_key(cache_key) not in memory_store.values
+    assert "artifact repair expired" in caplog.text
+
+
 def test_repair_does_not_reclaim_marker_that_changes_during_confirmation(
     tmp_path, memory_store, monkeypatch
 ):
@@ -576,6 +625,23 @@ def test_remove_object_retries_while_object_has_lease(memory_store, monkeypatch)
     mc._remove_object_with_retry(memory_store, "key")
 
     assert "key" not in memory_store.values
+
+
+def test_remove_object_stops_retrying_when_repair_expires(memory_store, monkeypatch):
+    monkeypatch.setenv("MX_ARTIFACT_MOONCAKE_DELETE_RETRIES", "1")
+    clock = [1000.0]
+    monkeypatch.setattr(mc.time, "time", lambda: clock[0])
+    monkeypatch.setattr(mc.time, "sleep", lambda _delay: clock.__setitem__(0, 1001.0))
+    memory_store.values["key"] = b"value"
+    memory_store.remove_results[:] = [-706, 0]
+    remove = MagicMock(wraps=memory_store.remove)
+    monkeypatch.setattr(memory_store, "remove", remove)
+
+    with pytest.raises(mc._RepairDeadlineExpired):
+        mc._remove_object_with_retry(memory_store, "key", repair_deadline=1001.0)
+
+    remove.assert_called_once_with("key")
+    assert memory_store.values["key"] == b"value"
 
 
 class _NativeBufferStore:
