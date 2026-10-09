@@ -53,6 +53,22 @@ def _vllm_config(parallel):
     return SimpleNamespace(parallel_config=parallel)
 
 
+@pytest.mark.parametrize("model_name", [None, "", "mx_model_abc"])
+def test_build_source_identity_uses_supplied_model_name(monkeypatch, model_name):
+    """Identity construction uses its supplied config, regardless of MX_MODEL_NAME_OVERRIDE."""
+    if model_name is None:
+        monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
+    else:
+        monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", model_name)
+    model_path = "/root/.cache/vllm/assets/model_streamer/0088a9aa"
+    model_config = _model_config(model=model_path)
+
+    identity = build_source_identity(_vllm_config(_parallel_config()), model_config)
+
+    assert identity.model_name == model_path
+    assert model_config.model == model_path
+
+
 def test_expert_parallel_disabled_is_one_not_zero():
     assert _derive_expert_parallel_size(_parallel_config()) == 1
     assert (

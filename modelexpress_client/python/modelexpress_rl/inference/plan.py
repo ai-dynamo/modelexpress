@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -29,6 +29,23 @@ class WeightSource(str, Enum):
     TRAINER = "TRAINER"
     GENERATOR = "GENERATOR"
     OBJECT_STORAGE = "OBJECT_STORAGE"
+
+
+def parse_weight_source_order(value: str) -> tuple[WeightSource, ...]:
+    """Parse a comma-separated weight-source fallback order."""
+    names = tuple(item.strip().upper() for item in value.split(","))
+    if not names or any(not name for name in names):
+        raise ValueError("MX_GENERATOR_SOURCE_ORDER must be a comma-separated list")
+    try:
+        sources = tuple(WeightSource(name) for name in names)
+    except ValueError as exc:
+        choices = ", ".join(source.value for source in WeightSource)
+        raise ValueError(
+            f"MX_GENERATOR_SOURCE_ORDER entries must be one of: {choices}"
+        ) from exc
+    if len(set(sources)) != len(sources):
+        raise ValueError("MX_GENERATOR_SOURCE_ORDER must not contain duplicates")
+    return sources
 
 
 @dataclass(frozen=True)
@@ -53,6 +70,8 @@ class GeneratorPeerUpdateSource:
     """A generator peer that already serves the requested version."""
 
     worker: p2p_pb2.WorkerMetadata
+    mx_source_id: str
+    worker_id: str
     kind = WeightSource.GENERATOR
     payload_format = WeightPayloadFormat.FULL_TENSOR
 
@@ -96,11 +115,55 @@ class PreparedArtifact(ABC):
     @property
     @abstractmethod
     def metrics(self) -> dict[str, float]:
-        """Return metrics recorded while preparing this artifact."""
+        """Return metrics recorded while preparing or applying this artifact."""
 
 
 @dataclass(frozen=True)
 class PreparedEngineTensors(PreparedArtifact):
+    staged: StagedEngineTensors
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        return dict(getattr(self.staged, "metrics", {}))
+
+
+@dataclass
+class _StreamingOwnership:
+    """Retain receive resources until both GPU work and transport are drained."""
+
+    iterator: Iterator[dict[str, Any]] | None = None
+    drain_failed: bool = False
+    close_failed: bool = False
+    source_failed: bool = False
+
+    @property
+    def release_blocked(self) -> bool:
+        return (
+            self.iterator is not None
+            or self.drain_failed
+            or self.close_failed
+            or self.source_failed
+        )
+
+
+@dataclass(frozen=True)
+class PreparedStreamingTensors(PreparedArtifact):
+    """Deferred bounded transfer; payload is read only during installation."""
+
+    batches: Callable[[], Iterator[dict[str, Any]]]
+    parameter_names: frozenset[str]
+    transfer_metrics: dict[str, float]
+    ownership: _StreamingOwnership = field(default_factory=_StreamingOwnership)
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        return dict(self.transfer_metrics)
+
+
+@dataclass(frozen=True)
+class PreparedRuntimeTensors(PreparedArtifact):
+    """A peer read prepared to write directly into live runtime tensors."""
+
     staged: StagedEngineTensors
 
     @property
@@ -139,7 +202,7 @@ class SourceResolver(ABC):
 
 
 class UpdateMethod(ABC):
-    """Prepare weights from a resolved source without mutating the live engine."""
+    """Prepare an update and protect method state while the engine applies it."""
 
     @property
     @abstractmethod
@@ -164,16 +227,28 @@ class UpdateMethod(ABC):
         version: WeightVersion,
         source: ResolvedSource,
     ) -> PreparedArtifact:
-        """Transfer and verify one update without changing live weights."""
+        """Prepare and verify one update without changing live weights."""
 
     @abstractmethod
     def release(self, prepared: PreparedArtifact) -> None:
         """Release method-owned staging for one prepared update."""
 
     def installation_context(self, prepared: PreparedArtifact):
-        """Protect method-owned state while the installer reads it."""
+        """Run method-specific work at the caller's safe point.
+
+        Implementations may transfer into live storage. The framework must
+        already have paused engine execution.
+        """
         del prepared
         return nullcontext()
+
+    def mutated_during_installation_context(
+        self,
+        prepared: PreparedArtifact,
+    ) -> bool:
+        """Return whether a failed context entry may have changed live storage."""
+        del prepared
+        return False
 
     def prepare_chain(
         self,
@@ -187,11 +262,14 @@ class UpdateMethod(ABC):
         version, source = chain[0]
         return self.prepare(version=version, source=source)
 
+    def preparation_failed(self) -> None:
+        """Restore method-owned state after preparation fails."""
+
     def installation_failed(self, prepared: PreparedArtifact) -> None:
         """Fence method-owned state after an engine installation failure."""
 
-    def publish_applied(self, *, version_id: str, prepared: PreparedArtifact) -> None:
-        """Optionally advertise an installed update as a generator source."""
+    def validate_close(self) -> None:
+        """Reject teardown while transport or installation may still use resources."""
 
     def close(self) -> None:
         """Release method-owned process resources."""
@@ -236,8 +314,20 @@ class WeightUpdatePlanner:
         self._installer = installer
         self._max_transfer_attempts = max_transfer_attempts
 
-    def plans(self, version: WeightVersion):
+    @property
+    def source_order(self) -> tuple[WeightSource, ...]:
+        """Return source kinds in the order configured for fallback."""
+        return tuple(resolver.kind for resolver in self._resolvers)
+
+    def plans(
+        self,
+        version: WeightVersion,
+        *,
+        source_kind: WeightSource | None = None,
+    ):
         for resolver in self._resolvers:
+            if source_kind is not None and resolver.kind is not source_kind:
+                continue
             if not resolver.supports(version):
                 continue
             resolved_plans = []
@@ -274,10 +364,17 @@ class WeightUpdatePlanner:
                 for _ in range(1, self._max_transfer_attempts):
                     yield resolved_plans[0]
 
-    def validate(self, version: WeightVersion) -> None:
+    def validate(
+        self,
+        version: WeightVersion,
+        *,
+        source_kind: WeightSource | None = None,
+    ) -> None:
         """Reject unsupported static combinations before source I/O or leases."""
         candidates = []
         for resolver in self._resolvers:
+            if source_kind is not None and resolver.kind is not source_kind:
+                continue
             if not resolver.supports(version):
                 continue
             candidates.append((resolver.kind, resolver.payload_format(version)))
@@ -310,6 +407,7 @@ __all__ = [
     "PreparedArtifact",
     "PreparedCheckpointArtifact",
     "PreparedEngineTensors",
+    "PreparedRuntimeTensors",
     "ResolvedSource",
     "StagedEngineTensors",
     "TrainerUpdateSource",

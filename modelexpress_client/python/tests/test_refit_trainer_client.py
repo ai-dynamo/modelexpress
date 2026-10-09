@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import time
+import json
+import hashlib
 from concurrent import futures
 from unittest.mock import MagicMock
 
@@ -25,7 +27,7 @@ from modelexpress_rl.train.adapter import (
     TrainerEngineAdapter,
     WeightVersionShardManifest,
 )
-from modelexpress_rl.train.manifest import WeightVersionShardManifestService
+from modelexpress_rl.train.manifest import WeightVersionShardManifestService, bound_tensor_manifest
 
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
@@ -34,6 +36,13 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.registration_count = 0
         self.shards = []
         self.deleted_shards = []
+        self.mesh_id = None
+
+    def GetWeightVersion(self, request, _context):
+        version = refit_pb2.WeightVersion(uid=request.uid)
+        if self.mesh_id is not None:
+            version.trainer_mesh_id = self.mesh_id
+        return refit_pb2.GetWeightVersionResponse(version=version)
 
     def RegisterWorker(self, request, _context):
         self.registration_count += 1
@@ -65,7 +74,17 @@ class _Manager:
 
 
 class _Adapter(TrainerEngineAdapter):
-    source_slot_id = "rank:0"
+    source_slot_id = hashlib.sha256(
+        bound_tensor_manifest([
+            {
+                "name": "weight",
+                "dtype": "torch.bfloat16",
+                "elsize": 2,
+                "full_shape": [4],
+                "shards": [{"shard_offset": [0], "shape": [4]}],
+            }
+        ])
+    ).hexdigest()
     supported_staging_modes = frozenset({TrainerStagingMode.COPY_TO_DEVICE})
     supported_payload_formats = frozenset({WeightPayloadFormat.FULL_TENSOR})
 
@@ -82,7 +101,10 @@ class _Adapter(TrainerEngineAdapter):
 
         return StagedWeightVersionShardData(
             manifest=WeightVersionShardManifest(
-                data=b"manifest",
+                data=json.dumps({"tensors": [{
+                    "name": "weight", "dtype": "torch.bfloat16", "elsize": 2,
+                    "full_shape": [4], "shards": [{"shard_offset": [0], "shape": [4]}],
+                }]}).encode(),
                 tensor_count=2,
                 total_bytes=128,
                 transport="NIXL",
@@ -154,14 +176,39 @@ def test_refit_shard_keeps_only_its_nixl_manifest_endpoint():
 def test_refit_service_uses_named_response_messages():
     service = refit_pb2.DESCRIPTOR.services_by_name["RefitService"]
 
-    assert len(service.methods) == 10
+    assert len(service.methods) == 15
     assert all(
         method.output_type.name.endswith("Response") for method in service.methods
     )
 
 
+def test_released_manifests_do_not_accumulate():
+    service = WeightVersionShardManifestService(endpoint="trainer:9000")
+    manifest = WeightVersionShardManifest(
+        data=b"manifest",
+        tensor_count=1,
+        total_bytes=2,
+        transport="NIXL",
+    )
+
+    for index in range(1000):
+        version_id = f"version-{index}"
+        service.publish_manifest(
+            version_id=version_id,
+            source_slot_id="rank:0",
+            manifest=manifest,
+        )
+        service.release_manifest(
+            version_id=version_id,
+            source_slot_id="rank:0",
+        )
+
+    assert service._manifests == {}
+
+
 def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     service = _RefitService()
+    service.mesh_id = "mesh-a"
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
     port = server.add_insecure_port("127.0.0.1:0")
@@ -172,7 +219,7 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     monkeypatch.setattr(
         runtime_module, "_create_trainer_adapter", lambda *_args, **_kwargs: adapter
     )
-    monkeypatch.setenv("MODEL_NAME", "test/model")
+    monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", "test/model")
     monkeypatch.setenv("MX_TRAINER_STAGING_MODE", "COPY_TO_DEVICE")
     monkeypatch.setenv("MX_WEIGHT_PAYLOAD_FORMAT", "FULL_TENSOR")
     monkeypatch.setenv("MX_WORKER_HOST", "127.0.0.1")
@@ -200,11 +247,18 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         assert service.registration_count >= 2
         with pytest.raises(ValueError, match="must not be None"):
             trainer.bind_tensors(None)
-        assert trainer.bind_tensors("model") == "rank:0"
+        metadata = trainer.bind_tensors("model")
+        assert metadata.metadata_endpoint == f"127.0.0.1:{port}"
+        assert len(metadata.logical_shard_id) == 64
+        assert trainer.source_slot_id == metadata.logical_shard_id
+        assert adapter.calls == []
         with pytest.raises(RuntimeError, match="already bound"):
             trainer.bind_tensors("replacement")
         assert service.shards == []
         trainer.publish_version(version=WeightVersionRef("version-a"))
+        metrics = trainer.pop_metrics()
+        assert metrics["trainer_refit_e2e_s"] >= 0
+        assert metrics["publication_rpc_s"] >= 0
 
         worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
             grpc.insecure_channel(service.shards[0].manifest_endpoint)
@@ -212,15 +266,21 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         fetched = worker_stub.GetWeightVersionShardManifest(
             refit_pb2.GetWeightVersionShardManifestRequest(
                 version_id="version-a",
-                source_slot_id="rank:0",
+                logical_shard_id=metadata.logical_shard_id,
             )
         )
-        second = trainer.stage_shard(
-            version=WeightVersionRef("version-a"),
-            tensors="model-2",
-        )
-        second.publish()
-        second.publish()
+        with pytest.raises(TypeError, match="tensors"):
+            trainer.stage_shard(
+                version=WeightVersionRef("version-a"),
+                tensors="model-2",
+                hf_tensor_iter=iter([]),
+            )
+        with pytest.raises(RuntimeError, match="canonical-delta"):
+            trainer.stage_shard(
+                version=WeightVersionRef("version-a"),
+                hf_tensor_iter=iter([]),
+            )
+        trainer.publish_version(version=WeightVersionRef("version-a"))
         method = trainer._runtime.method
         retained_owners = [
             staged.buffer_owner for staged in method.published["version-a"]
@@ -228,6 +288,14 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         trainer.release_version(version=WeightVersionRef("version-a"))
         trainer.release_version(version=WeightVersionRef("version-a"))
         assert "version-a" not in method.published
+        with pytest.raises(grpc.RpcError) as released:
+            worker_stub.GetWeightVersionShardManifest(
+                refit_pb2.GetWeightVersionShardManifestRequest(
+                    version_id="version-a",
+                    logical_shard_id=metadata.logical_shard_id,
+                )
+            )
+        assert released.value.code() is grpc.StatusCode.NOT_FOUND
     finally:
         if "trainer" in locals():
             trainer.close()
@@ -240,24 +308,41 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
             WeightPayloadFormat.FULL_TENSOR,
         ),
         (
-            "model-2",
+            "model",
             TrainerStagingMode.COPY_TO_DEVICE,
             WeightPayloadFormat.FULL_TENSOR,
         ),
     ]
-    assert retained_owners == ["model", "model-2"]
+    assert retained_owners == ["model", "model"]
     assert len(service.shards) == 2
     assert len(service.deleted_shards) == 1
-    assert service.deleted_shards[0].source_slot_id == "rank:0"
+    assert service.deleted_shards[0].logical_shard_id == metadata.logical_shard_id
     assert service.registrations["trainer-0"].role == refit_pb2.WORKER_ROLE_TRAINER
     assert "endpoint" not in refit_pb2.WorkerRegistration.DESCRIPTOR.fields_by_name
     assert service.shards[0].version_id == "version-a"
-    assert service.shards[0].source_slot_id == "rank:0"
+    assert service.shards[0].logical_shard_id == metadata.logical_shard_id
     assert service.shards[0].worker_id == "trainer-0"
     assert service.shards[0].tensor_count == 2
     assert service.shards[0].total_bytes == 128
     assert service.shards[0].manifest_endpoint == f"127.0.0.1:{port}"
-    assert fetched.manifest == b"manifest"
+    assert json.loads(fetched.manifest)["tensors"][0]["name"] == "weight"
+    assert metadata.logical_shard_id == hashlib.sha256(
+        bound_tensor_manifest(json.loads(fetched.manifest)["tensors"])
+    ).hexdigest()
+
+
+def test_bound_manifest_excludes_process_addresses_and_weight_content():
+    first = {"agent_name": "worker-a", "tensors": [{
+        "name": "w", "dtype": "torch.bfloat16", "elsize": 2,
+        "full_shape": [4], "shards": [{"shape": [2], "shard_offset": [0],
+            "addr": 1234, "device_id": 0, "agent_name": "worker-a", "digest": "old"}],
+    }]}
+    second = json.loads(json.dumps(first))
+    second["agent_name"] = "worker-b"
+    second["tensors"][0]["shards"][0].update(addr=5678, device_id=1, agent_name="worker-b", digest="new")
+    assert bound_tensor_manifest(first["tensors"]) == bound_tensor_manifest(second["tensors"])
+    second["tensors"][0]["shards"][0]["shard_offset"] = [2]
+    assert bound_tensor_manifest(first["tensors"]) != bound_tensor_manifest(second["tensors"])
 
 
 def test_trainer_initialization_rejects_unspecified_fixed_settings(monkeypatch):
@@ -373,7 +458,10 @@ def test_trainer_client_owns_default_transport_resources(monkeypatch):
         )
     )
     adapter_factory.assert_not_called()
-    assert trainer.source_slot_id == "rank:0"
+    with pytest.raises(RuntimeError, match="bind_tensors"):
+        _ = trainer.source_slot_id
+    metadata = trainer.bind_tensors("model")
+    assert trainer.source_slot_id == metadata.logical_shard_id
     assert len(adapter_factory.call_args.args) == 1
     assert isinstance(adapter_factory.call_args.args[0], FSDPTrainerContext)
     assert adapter_factory.call_args.kwargs == {

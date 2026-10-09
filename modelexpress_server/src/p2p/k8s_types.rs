@@ -171,17 +171,17 @@ pub struct ArtifactSourceStatus {
 
     /// Number of files in the sealed artifact manifest.
     #[serde(rename = "fileCount")]
-    #[schemars(with = "i64", range(min = 0))]
+    #[schemars(with = "i64", range(min = 0, max = 4294967295u32))]
     pub file_count: u32,
 
     /// Number of transfer chunks in the sealed artifact manifest.
     #[serde(rename = "chunkCount")]
-    #[schemars(with = "i64", range(min = 0))]
+    #[schemars(with = "i64", range(min = 0, max = 4294967295u32))]
     pub chunk_count: u32,
 
     /// Distributed node rank that owns this node-scoped artifact.
     #[serde(rename = "nodeRank", default)]
-    #[schemars(with = "i64", range(min = 0))]
+    #[schemars(with = "i64", range(min = 0, max = 4294967295u32))]
     pub node_rank: u32,
 }
 

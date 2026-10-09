@@ -261,6 +261,8 @@ var P2PService_ServiceDesc = grpc.ServiceDesc{
 
 const (
 	WorkerService_GetTensorManifest_FullMethodName         = "/model_express.p2p.WorkerService/GetTensorManifest"
+	WorkerService_PrepareTensorRead_FullMethodName         = "/model_express.p2p.WorkerService/PrepareTensorRead"
+	WorkerService_ReleaseTensorRead_FullMethodName         = "/model_express.p2p.WorkerService/ReleaseTensorRead"
 	WorkerService_GetArtifactManifestHeader_FullMethodName = "/model_express.p2p.WorkerService/GetArtifactManifestHeader"
 	WorkerService_GetArtifactManifestChunks_FullMethodName = "/model_express.p2p.WorkerService/GetArtifactManifestChunks"
 	WorkerService_PrepareArtifactChunk_FullMethodName      = "/model_express.p2p.WorkerService/PrepareArtifactChunk"
@@ -278,6 +280,10 @@ const (
 // source-side registered DRAM range and returns its transfer descriptor.
 type WorkerServiceClient interface {
 	GetTensorManifest(ctx context.Context, in *GetTensorManifestRequest, opts ...grpc.CallOption) (*GetTensorManifestResponse, error)
+	// Prepare/Release protect a mutable RL generator's live tensor storage while
+	// another generator reads it during active-refit P2P transfer.
+	PrepareTensorRead(ctx context.Context, in *PrepareTensorReadRequest, opts ...grpc.CallOption) (*PrepareTensorReadResponse, error)
+	ReleaseTensorRead(ctx context.Context, in *ReleaseTensorReadRequest, opts ...grpc.CallOption) (*ReleaseTensorReadResponse, error)
 	GetArtifactManifestHeader(ctx context.Context, in *GetArtifactManifestHeaderRequest, opts ...grpc.CallOption) (*GetArtifactManifestHeaderResponse, error)
 	GetArtifactManifestChunks(ctx context.Context, in *GetArtifactManifestChunksRequest, opts ...grpc.CallOption) (*GetArtifactManifestChunksResponse, error)
 	PrepareArtifactChunk(ctx context.Context, in *PrepareArtifactChunkRequest, opts ...grpc.CallOption) (*PrepareArtifactChunkResponse, error)
@@ -296,6 +302,26 @@ func (c *workerServiceClient) GetTensorManifest(ctx context.Context, in *GetTens
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetTensorManifestResponse)
 	err := c.cc.Invoke(ctx, WorkerService_GetTensorManifest_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerServiceClient) PrepareTensorRead(ctx context.Context, in *PrepareTensorReadRequest, opts ...grpc.CallOption) (*PrepareTensorReadResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrepareTensorReadResponse)
+	err := c.cc.Invoke(ctx, WorkerService_PrepareTensorRead_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerServiceClient) ReleaseTensorRead(ctx context.Context, in *ReleaseTensorReadRequest, opts ...grpc.CallOption) (*ReleaseTensorReadResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseTensorReadResponse)
+	err := c.cc.Invoke(ctx, WorkerService_ReleaseTensorRead_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -353,6 +379,10 @@ func (c *workerServiceClient) ReleaseArtifactChunk(ctx context.Context, in *Rele
 // source-side registered DRAM range and returns its transfer descriptor.
 type WorkerServiceServer interface {
 	GetTensorManifest(context.Context, *GetTensorManifestRequest) (*GetTensorManifestResponse, error)
+	// Prepare/Release protect a mutable RL generator's live tensor storage while
+	// another generator reads it during active-refit P2P transfer.
+	PrepareTensorRead(context.Context, *PrepareTensorReadRequest) (*PrepareTensorReadResponse, error)
+	ReleaseTensorRead(context.Context, *ReleaseTensorReadRequest) (*ReleaseTensorReadResponse, error)
 	GetArtifactManifestHeader(context.Context, *GetArtifactManifestHeaderRequest) (*GetArtifactManifestHeaderResponse, error)
 	GetArtifactManifestChunks(context.Context, *GetArtifactManifestChunksRequest) (*GetArtifactManifestChunksResponse, error)
 	PrepareArtifactChunk(context.Context, *PrepareArtifactChunkRequest) (*PrepareArtifactChunkResponse, error)
@@ -369,6 +399,12 @@ type UnimplementedWorkerServiceServer struct{}
 
 func (UnimplementedWorkerServiceServer) GetTensorManifest(context.Context, *GetTensorManifestRequest) (*GetTensorManifestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetTensorManifest not implemented")
+}
+func (UnimplementedWorkerServiceServer) PrepareTensorRead(context.Context, *PrepareTensorReadRequest) (*PrepareTensorReadResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareTensorRead not implemented")
+}
+func (UnimplementedWorkerServiceServer) ReleaseTensorRead(context.Context, *ReleaseTensorReadRequest) (*ReleaseTensorReadResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseTensorRead not implemented")
 }
 func (UnimplementedWorkerServiceServer) GetArtifactManifestHeader(context.Context, *GetArtifactManifestHeaderRequest) (*GetArtifactManifestHeaderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetArtifactManifestHeader not implemented")
@@ -417,6 +453,42 @@ func _WorkerService_GetTensorManifest_Handler(srv interface{}, ctx context.Conte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(WorkerServiceServer).GetTensorManifest(ctx, req.(*GetTensorManifestRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerService_PrepareTensorRead_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareTensorReadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).PrepareTensorRead(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_PrepareTensorRead_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).PrepareTensorRead(ctx, req.(*PrepareTensorReadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerService_ReleaseTensorRead_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseTensorReadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).ReleaseTensorRead(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_ReleaseTensorRead_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).ReleaseTensorRead(ctx, req.(*ReleaseTensorReadRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -503,6 +575,14 @@ var WorkerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetTensorManifest",
 			Handler:    _WorkerService_GetTensorManifest_Handler,
+		},
+		{
+			MethodName: "PrepareTensorRead",
+			Handler:    _WorkerService_PrepareTensorRead_Handler,
+		},
+		{
+			MethodName: "ReleaseTensorRead",
+			Handler:    _WorkerService_ReleaseTensorRead_Handler,
 		},
 		{
 			MethodName: "GetArtifactManifestHeader",

@@ -315,6 +315,10 @@ message WorkerMetadata {
 // source-side registered DRAM range and returns its transfer descriptor.
 service WorkerService {
   rpc GetTensorManifest(GetTensorManifestRequest) returns (GetTensorManifestResponse);
+  // Prepare/Release protect a mutable RL generator's live tensor storage while
+  // another generator reads it during active-refit P2P transfer.
+  rpc PrepareTensorRead(PrepareTensorReadRequest) returns (PrepareTensorReadResponse);
+  rpc ReleaseTensorRead(ReleaseTensorReadRequest) returns (ReleaseTensorReadResponse);
   rpc GetArtifactManifestHeader(GetArtifactManifestHeaderRequest) returns (GetArtifactManifestHeaderResponse);
   rpc GetArtifactManifestChunks(GetArtifactManifestChunksRequest) returns (GetArtifactManifestChunksResponse);
   rpc PrepareArtifactChunk(PrepareArtifactChunkRequest) returns (PrepareArtifactChunkResponse);
@@ -357,6 +361,38 @@ message GetTensorManifestResponse {
   // always set it; absence identifies a legacy source during rolling upgrade.
   optional string worker_id = 7;
 }
+
+message PrepareTensorReadRequest {
+  // Exact source version selected through discovery.
+  string mx_source_id = 1;
+
+  // Exact worker process selected through discovery. Unlike immutable artifact
+  // chunks, live tensor addresses become stale when the worker process changes.
+  optional string worker_id = 2;
+}
+
+message PrepareTensorReadResponse {
+  // Lease protecting the returned tensor addresses from donor mutation. The
+  // target releases it after the read; if the target process exits first, the
+  // donor expires it after its bounded server-owned lifetime.
+  string lease_id = 1;
+
+  // Tensor addresses and NIXL endpoint captured under this lease. Artifact
+  // prepare returns the analogous single-chunk transfer descriptor instead.
+  GetTensorManifestResponse manifest = 2;
+}
+
+message ReleaseTensorReadRequest {
+  // Revalidate that the lease belongs to this source version and worker.
+  string mx_source_id = 1;
+  optional string worker_id = 2;
+
+  // Lease returned by PrepareTensorRead. Release is best-effort on target
+  // shutdown; donor-side expiry handles SIGKILL, OOM, and node loss.
+  string lease_id = 3;
+}
+
+message ReleaseTensorReadResponse {}
 
 message GetArtifactManifestHeaderRequest {
   // mx_source_id for validation (catches stale discovery)

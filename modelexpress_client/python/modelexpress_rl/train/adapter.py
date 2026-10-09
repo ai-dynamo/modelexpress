@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -46,7 +47,13 @@ class NixlMetadataProvider(Protocol):
 
 
 class TrainerStagingMode(str, Enum):
-    """How a trainer adapter preserves a version's immutable source bytes."""
+    """How a trainer adapter preserves a version's immutable source bytes.
+
+    Prefer IN_PLACE for synchronous updates with stable, matching-dtype sources
+    and no trainer-side conversion. Keep source bytes immutable until retirement.
+    Prefer COPY_TO_HOST otherwise. COPY_TO_DEVICE trades substantial extra VRAM
+    for lower latency and should be an explicit, measured exception.
+    """
 
     UNSPECIFIED = "UNSPECIFIED"
     COPY_TO_DEVICE = "COPY_TO_DEVICE"
@@ -94,7 +101,7 @@ class WeightVersionShardManifest:
         if not self.transport:
             raise ValueError("transport must not be empty")
 
-    @property
+    @cached_property
     def digest(self) -> str:
         """Return the SHA-256 digest advertised through RefitService."""
         return hashlib.sha256(self.data).hexdigest()
@@ -124,7 +131,7 @@ class TrainerEngineAdapter(ABC):
 
     @abstractmethod
     def bind_tensors(self, tensors: Any) -> str:
-        """Bind stable engine tensors and return their logical source slot."""
+        """Hash canonical wire coverage without staging or publishing weights."""
 
     @property
     @abstractmethod
@@ -150,6 +157,9 @@ class TrainerEngineAdapter(ABC):
 class WeightVersionShardManifestPublisher(Protocol):
     """Worker endpoint that makes a manifest retrievable before advertisement."""
 
+    @property
+    def endpoint(self) -> str: ...
+
     def publish_manifest(
         self,
         *,
@@ -158,6 +168,9 @@ class WeightVersionShardManifestPublisher(Protocol):
         manifest: WeightVersionShardManifest,
     ) -> str:
         """Publish ``manifest`` and return its ready, worker-local endpoint."""
+
+    def release_manifest(self, *, version_id: str, source_slot_id: str) -> None:
+        """Stop serving a released version's manifest."""
 
 
 __all__ = [

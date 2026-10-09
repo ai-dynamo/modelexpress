@@ -37,7 +37,7 @@ from modelexpress_rl.utils import (
 )
 
 _BYTES_PER_GB = 1_000_000_000
-DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB = 500
+DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB = 2000
 
 
 @dataclass(frozen=True)
@@ -46,7 +46,7 @@ class ObjectStorageGeneratorConfig:
 
     storage_type: ObjectStorageType
     initial_base_version_id: str
-    seed_checkpoint_path: str | Path
+    seed_checkpoint_path: str | Path | None
     refit_checkpoint_dir: str | Path
     refit_checkpoint_max_size_gb: int | None = DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB
     endpoint_url: str | None = None
@@ -57,8 +57,11 @@ class ObjectStorageGeneratorConfig:
             raise TypeError("storage_type must be an ObjectStorageType")
         if not self.initial_base_version_id.strip():
             raise ValueError("initial_base_version_id is required")
-        if not str(self.seed_checkpoint_path).strip():
-            raise ValueError("seed_checkpoint_path is required")
+        if (
+            self.seed_checkpoint_path is not None
+            and not str(self.seed_checkpoint_path).strip()
+        ):
+            raise ValueError("seed_checkpoint_path must be non-empty when provided")
         if not str(self.refit_checkpoint_dir).strip():
             raise ValueError("refit_checkpoint_dir is required")
         if (
@@ -153,8 +156,6 @@ def _parse_index_manifest(
     if is_delta:
         assert version is not None
         expected_metadata = {
-            "version": version.version_id,
-            "base_version": version.base_version_id,
             "delta_encoding": "xor",
             "checksum_format": "adler32",
         }
@@ -415,7 +416,6 @@ class _LocalCheckpoint:
         s3: S3Client,
     ) -> None:
         self.initial_version = config.initial_base_version_id
-        self.seed_checkpoint_path = Path(config.seed_checkpoint_path)
         self.s3 = s3
         self.store = LocalCheckpointStore(
             root=config.refit_checkpoint_dir,
@@ -427,19 +427,36 @@ class _LocalCheckpoint:
             ),
         )
         self.local_checkpoint = self.store.full_path(self.initial_version)
+        self.seed_checkpoint_path = (
+            Path(config.seed_checkpoint_path)
+            if config.seed_checkpoint_path is not None
+            else self.local_checkpoint
+        )
         self.checkpoint_paths: list[Path] = []
         self.locations: dict[str, tuple[Path, int, int]] = {}
         self.tensor_metadata: dict[str, dict] = {}
 
-    def initialize(self) -> None:
+    def initialize(self, *, allow_unrecorded_seed: bool = False) -> bool:
+        """Initialize the disk seed, or return False if bootstrap is deferred."""
         self.store.initialize()
         with self.store.installation_locked(), self.store.locked():
             initial_checkpoint = self.store.full_path(self.initial_version)
-            # Cold-start bootstrap passes the cached immutable root as its seed.
-            # That lets the receiver detect this path without a caller-owned flag.
+            # An omitted seed or an explicit cached-root path reuses the cache.
             cached_seed = (
                 self.seed_checkpoint_path.resolve() == initial_checkpoint.resolve()
             )
+            if (
+                allow_unrecorded_seed
+                and cached_seed
+                and not self.store.has_artifact_record(initial_checkpoint)
+                and self.store.state() is None
+            ):
+                return False
+            if cached_seed and not initial_checkpoint.is_dir():
+                raise FileNotFoundError(
+                    f"cached seed checkpoint for {self.initial_version!r} "
+                    f"not found: {initial_checkpoint}"
+                )
             version = self._initialize_checkpoint_state(
                 state=self.store.state(),
                 initial_checkpoint=initial_checkpoint,
@@ -450,6 +467,8 @@ class _LocalCheckpoint:
             self.store.enforce_capacity(
                 protected_versions=_protected_versions(self.store, version),
             )
+
+        return True
 
     def _initialize_checkpoint_state(
         self,
@@ -527,6 +546,21 @@ class _LocalCheckpoint:
             checkpoint_paths=self.checkpoint_paths,
         )
 
+    def recover_incomplete_preparation(self) -> None:
+        """Restore a usable cache head after an in-process replay failure."""
+        with self.store.installation_locked(), self.store.locked():
+            state = self.store.state()
+            if state is None or state.status is CheckpointState.READY:
+                return
+            self.local_checkpoint = self.store.full_path(self.initial_version)
+            self._restore_cached_initial_checkpoint()
+            self.store.enforce_capacity(
+                protected_versions=_protected_versions(
+                    self.store,
+                    self.initial_version,
+                ),
+            )
+
     def _set_local_checkpoint(self, path: Path) -> None:
         self.local_checkpoint = path
         (
@@ -594,27 +628,45 @@ class _LocalCheckpoint:
         """Prepare an ordered chain into one immutable target checkpoint."""
         if not versions:
             raise ValueError("canonical replay chain is empty")
-        with self.store.installation_locked(), self.store.locked():
-            target = versions[-1]
-            state, active_version = self._load_ready_state()
-            prepared = self._reuse_prepared_target(
-                state=state,
-                target=target,
-                active_version=active_version,
-            )
-            if prepared is not None:
-                return prepared
-            manifests, index_download_time = self._download_replay_manifests(
-                versions=versions,
-                target=target,
-                active_version=active_version,
-            )
-            return self._reconstruct_target(
-                manifests=manifests,
-                target=target,
-                active_version=active_version,
-                index_download_time=index_download_time,
-            )
+        target = versions[-1]
+        # Queue preparers separately so followers can reuse the target while
+        # the leader installs it, without first waiting for an exclusive fence.
+        with self.store.preparation_locked():
+            with self.store.installation_locked(shared=True), self.store.locked(
+                shared=True
+            ):
+                state, _active_version = self._load_ready_state()
+                prepared = self._reuse_prepared_target(state=state, target=target)
+                if prepared is not None:
+                    return prepared
+            with self.store.installation_locked(), self.store.locked():
+                state, active_version = self._load_ready_state()
+                prepared = self._reuse_prepared_target(state=state, target=target)
+                if prepared is not None:
+                    return prepared
+                # P2P can advance the engine without advancing this disk checkpoint.
+                # Choose the replay suffix from the verified cache head under lock.
+                for position, version in enumerate(versions[:-1]):
+                    if version.version_id != state.version:
+                        continue
+                    source = self.store.artifact_source(self._artifact_path(version))
+                    if source is None:
+                        break
+                    if source != _source_identity(version):
+                        raise ValueError("prepared checkpoint has different source identity")
+                    versions = versions[position + 1 :]
+                    break
+                manifests, index_download_time = self._download_replay_manifests(
+                    versions=versions,
+                    target=target,
+                    base_version=state.version,
+                )
+                return self._reconstruct_target(
+                    manifests=manifests,
+                    target=target,
+                    active_version=active_version,
+                    index_download_time=index_download_time,
+                )
 
     def _load_ready_state(self) -> tuple[CheckpointRecord, str]:
         state = self.store.state()
@@ -635,15 +687,11 @@ class _LocalCheckpoint:
         *,
         state: CheckpointRecord,
         target: _S3Version,
-        active_version: str,
     ) -> PreparedCheckpoint | None:
         if state.version != target.version_id:
             return None
         # Followers reach this after the lock holder has reconstructed the
         # target. Source identity prevents attaching to a reused UID artifact.
-        self.store.enforce_capacity(
-            protected_versions={active_version, target.version_id},
-        )
         self.store.verify_artifact_source(
             self._artifact_path(target),
             _source_identity(target),
@@ -663,10 +711,10 @@ class _LocalCheckpoint:
         *,
         versions: tuple[_S3Version, ...],
         target: _S3Version,
-        active_version: str,
+        base_version: str,
     ) -> tuple[list[_S3Manifest], float]:
         """Validate the entire chain before mutating preparation state."""
-        expected_base = active_version
+        expected_base = base_version
         manifests = []
         index_download_time = 0.0
         for position, version in enumerate(versions):
@@ -683,7 +731,7 @@ class _LocalCheckpoint:
                 and expected_base != version.base_version_id
             ):
                 raise RuntimeError(
-                    f"active checkpoint version {expected_base!r} does not match "
+                    f"local checkpoint version {expected_base!r} does not match "
                     f"exact base {version.base_version_id!r} for revision "
                     f"{version.version_id!r}"
                 )
@@ -814,34 +862,44 @@ class _LocalCheckpoint:
     ) -> tuple[float, float]:
         target = self.store.full_path(version.version_id)
         if target.exists():
-            self.store.enforce_capacity(
-                protected_versions=_protected_versions(
-                    self.store,
+            source = self.store.artifact_source(target)
+            if source is not None:
+                self.store.enforce_capacity(
+                    protected_versions=_protected_versions(
+                        self.store,
+                        version.version_id,
+                    ),
+                )
+                self.store.verify_artifact_source(
+                    target,
+                    _source_identity(version),
+                )
+                self._set_local_checkpoint(target)
+                self.store.write_chain(
                     version.version_id,
-                ),
-            )
-            self.store.verify_artifact_source(
-                target,
-                _source_identity(version),
-            )
-            self._set_local_checkpoint(target)
-            self.store.write_chain(
-                version.version_id,
-                {
-                    "version": version.version_id,
-                    "full_version": version.version_id,
-                    "deltas": [],
-                },
-            )
-            return 0.0, 0.0
+                    {
+                        "version": version.version_id,
+                        "full_version": version.version_id,
+                        "deltas": [],
+                    },
+                )
+                return 0.0, 0.0
 
+        non_weight_source = self.seed_checkpoint_path
+        if (
+            non_weight_source.resolve()
+            == self.store.full_path(self.initial_version).resolve()
+        ):
+            # Updates carry seed metadata forward; the initial root may be evicted.
+            non_weight_source = self.local_checkpoint
         protected_versions = _protected_versions(self.store, version.version_id)
         self.store.ensure_capacity(
-            self._non_weight_files_size(self.seed_checkpoint_path) + len(index_data),
+            self._non_weight_files_size(non_weight_source) + len(index_data),
             protected_versions=protected_versions,
+            protected_paths={non_weight_source},
         )
         with self.store.replace_directory(target) as temporary:
-            self._copy_non_weight_files(self.seed_checkpoint_path, temporary)
+            self._copy_non_weight_files(non_weight_source, temporary)
             index_name = Path(version.uri).name
             (temporary / index_name).write_bytes(index_data)
             download_time, validation_time = self._download_full_checkpoint(

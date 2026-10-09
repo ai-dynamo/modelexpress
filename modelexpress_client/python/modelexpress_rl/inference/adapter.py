@@ -22,6 +22,13 @@ class NixlGeneratorSource:
 
     manifest_endpoint: str
     manifest: bytes
+    structural_digest: str
+    """Digest of the manifest's transfer structure, excluding content digests.
+
+    Required rather than defaulted: this is what decides plan reuse, and a
+    resolver that forgot it would fall back to the per-version manifest digest
+    and quietly replan on every refit.
+    """
 
 
 @dataclass(frozen=True)
@@ -39,7 +46,7 @@ class GeneratorSource:
         return (
             "NIXL",
             self.transport.manifest_endpoint,
-            self.manifest_digest,
+            self.transport.structural_digest,
         )
 
 
@@ -53,6 +60,8 @@ class GeneratorTransferInputs:
     payload_format: WeightPayloadFormat
     sources: tuple[GeneratorSource, ...]
     object_storage: ObjectStorageSource | None = None
+    trainer_mesh_id: str | None = None
+    trainer_mesh_generation: int | None = None
 
     @property
     def physical_fingerprint(self) -> tuple:
@@ -62,6 +71,8 @@ class GeneratorTransferInputs:
             self.layout_signature,
             self.payload_format,
             self.object_storage,
+            self.trainer_mesh_id,
+            self.trainer_mesh_generation,
             tuple(
                 (
                     source.source_slot_id,

@@ -5,12 +5,39 @@
 
 from __future__ import annotations
 
+import json
 import threading
 
 import grpc
 
 from .. import refit_pb2, refit_pb2_grpc
 from .adapter import WeightVersionShardManifest
+
+
+def bound_tensor_manifest(tensor_coverage: list[dict]) -> bytes:
+    """Canonical address- and content-independent coverage of one binding."""
+    tensors = []
+    for tensor in tensor_coverage:
+        shards = sorted(
+            (
+                {"shard_offset": shard["shard_offset"], "shape": shard["shape"]}
+                for shard in tensor["shards"]
+            ),
+            key=lambda shard: (shard["shard_offset"], shard["shape"]),
+        )
+        tensors.append(
+            {
+                "name": tensor["name"],
+                "dtype": tensor["dtype"],
+                "elsize": tensor["elsize"],
+                "full_shape": tensor["full_shape"],
+                "shards": shards,
+            }
+        )
+    tensors.sort(key=lambda tensor: tensor["name"])
+    return json.dumps(
+        {"tensors": tensors}, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
 
 
 class WeightVersionShardManifestService(refit_pb2_grpc.RefitWorkerServiceServicer):
@@ -51,8 +78,18 @@ class WeightVersionShardManifestService(refit_pb2_grpc.RefitWorkerServiceService
             self._manifests[key] = manifest
         return self.endpoint
 
+    def release_manifest(self, *, version_id: str, source_slot_id: str) -> None:
+        """Drop a served manifest once its version is released.
+
+        Without this the worker holds every manifest it ever published for the
+        life of the process, which on a large MoE is megabytes per step.
+        """
+        key = (version_id, source_slot_id)
+        with self._lock:
+            self._manifests.pop(key, None)
+
     def GetWeightVersionShardManifest(self, request, context):
-        key = (request.version_id, request.source_slot_id)
+        key = (request.version_id, request.logical_shard_id)
         with self._lock:
             manifest = self._manifests.get(key)
         if manifest is None:

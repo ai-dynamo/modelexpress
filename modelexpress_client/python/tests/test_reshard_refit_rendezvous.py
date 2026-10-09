@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
+import json
+import logging
 from importlib import metadata
 from threading import Event
 from types import SimpleNamespace
@@ -12,7 +15,12 @@ from modelexpress.refit.reshard.rendezvous import (
     MxReshardRendezvous,
     PublishedShard,
     PublishedTensor,
+    build_sources,
+    encode_shard_table,
+    decode_shard_table,
+    unwrap_rendezvous_blob,
     _mx_version,
+    structural_manifest_digest,
     wrap_rendezvous_blob,
 )
 
@@ -36,6 +44,110 @@ def _one_tensor(agent_name="trainer-agent"):
             ],
         )
     ]
+
+
+def test_structural_digest_ignores_version_and_content_digest():
+    first = _one_tensor()
+    first[0].shards[0].digest = "version-a"
+    second = _one_tensor()
+    second[0].shards[0].digest = "version-b"
+
+    first_blob = wrap_rendezvous_blob(
+        b"nixl",
+        "trainer-agent",
+        "trainer:1234",
+        first,
+        publisher_step=1,
+    )
+    second_blob = wrap_rendezvous_blob(
+        b"nixl",
+        "trainer-agent",
+        "trainer:1234",
+        second,
+        publisher_step=2,
+    )
+
+    assert structural_manifest_digest(first_blob) == structural_manifest_digest(
+        second_blob
+    )
+    moved = _one_tensor()
+    moved[0].shards[0].addr = 8192
+    moved_blob = wrap_rendezvous_blob(
+        b"nixl",
+        "trainer-agent",
+        "trainer:1234",
+        moved,
+    )
+    restarted_blob = wrap_rendezvous_blob(
+        b"new-registration",
+        "trainer-agent",
+        "trainer:1234",
+        second,
+    )
+    assert structural_manifest_digest(first_blob) != structural_manifest_digest(
+        moved_blob
+    )
+    assert structural_manifest_digest(first_blob) != structural_manifest_digest(
+        restarted_blob
+    )
+
+
+def test_host_memory_kind_roundtrips_and_requires_host_aware_reader():
+    device = _one_tensor()
+    host = _one_tensor()
+    host[0].shards[0].memory_type = "DRAM"
+    device_blob = wrap_rendezvous_blob(b"nixl", "trainer-agent", "host:1234", device)
+    host_blob = wrap_rendezvous_blob(b"nixl", "trainer-agent", "host:1234", host)
+    assert json.loads(device_blob)["schema"] == "mx.reshard.shard_table.v1"
+    assert "memory_type" not in json.loads(device_blob)["tensors"][0]["shards"][0]
+    assert json.loads(host_blob)["schema"] == "mx.reshard.shard_table.v2"
+    assert structural_manifest_digest(device_blob) != structural_manifest_digest(
+        host_blob
+    )
+    decoded = unwrap_rendezvous_blob(host_blob).tensors
+    assert (
+        decode_shard_table(encode_shard_table(host))[0].shards[0].memory_type == "DRAM"
+    )
+    assert decoded[0].shards[0].memory_type == "DRAM"
+    with pytest.raises(ValueError, match="memory-type-aware receiver"):
+        build_sources(decoded)
+    memory = {}
+    sources, agents, devices = build_sources(decoded, session_to_memory=memory)
+    assert memory == {"trainer-agent": "DRAM"}
+    assert agents == {"trainer-agent": "trainer-agent"}
+    assert devices == {"trainer-agent": 0}
+    assert sources["weight"].shards[0].addr == 4096
+
+
+def test_rejects_unknown_source_memory_type():
+    blob = json.loads(wrap_rendezvous_blob(b"nixl", "a", "a:1", _one_tensor()))
+    blob["tensors"][0]["shards"][0]["memory_type"] = "typo"
+    with pytest.raises(ValueError, match="unsupported source memory type"):
+        unwrap_rendezvous_blob(json.dumps(blob).encode())
+
+
+@pytest.mark.parametrize("field,value", [("memory_type", "DRAM"), ("device_id", 1)])
+def test_one_source_session_cannot_advertise_conflicting_memory(field, value):
+    tensors = _one_tensor() + _one_tensor()
+    tensors[1].name = "other"
+    setattr(tensors[1].shards[0], field, value)
+    with pytest.raises(ValueError, match="conflicting device or memory"):
+        build_sources(tensors, session_to_memory={})
+
+
+@pytest.mark.parametrize(
+    "blob", [b"\xff\xfe not json", b"{ definitely not json", b'["a", "list"]']
+)
+def test_an_unreadable_manifest_says_it_disabled_plan_reuse(caplog, blob):
+    """The raw-byte fallback moves with the per-shard content digests, so every
+    version looks structurally different and plan reuse stops. Correct, but the
+    symptom is a warm refit priced like a cold one, which needs a reason."""
+    with caplog.at_level(logging.WARNING):
+        assert structural_manifest_digest(blob) == hashlib.sha256(blob).hexdigest()
+
+    assert [m for m in caplog.messages if "disables transfer-plan reuse" in m], (
+        f"an unreadable manifest must say so, got {caplog.messages}"
+    )
 
 
 def test_mx_version_falls_back_only_when_package_is_missing(monkeypatch):
@@ -145,8 +257,9 @@ def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
     last = client.status_updates[-1]
     # Compare the identity/status fields under test; the heartbeat also carries
     # advisory telemetry (source_load) that is not what this test asserts.
-    assert {k: last.get(k) for k in
-            ("mx_source_id", "worker_id", "worker_rank", "status")} == {
+    assert {
+        k: last.get(k) for k in ("mx_source_id", "worker_id", "worker_rank", "status")
+    } == {
         "mx_source_id": "source-id",
         "worker_id": "trainer-2",
         "worker_rank": 2,

@@ -10,7 +10,6 @@ from collections.abc import Callable, Iterator
 import grpc
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClient
-from modelexpress.metadata.worker_server import fetch_tensor_manifest
 from modelexpress.types import ManifestMismatchError
 
 from ...control import WeightVersion
@@ -35,13 +34,11 @@ class GeneratorSourceResolver(SourceResolver):
         worker_id: str,
         worker_rank: int,
         build_identity: Callable[[str], p2p_pb2.SourceIdentity],
-        rpc_timeout_seconds: float,
     ) -> None:
         self._p2p_client = p2p_client
         self._worker_id = worker_id
         self._worker_rank = worker_rank
         self._build_identity = build_identity
-        self._rpc_timeout_seconds = rpc_timeout_seconds
 
     @property
     def kind(self) -> WeightSource:
@@ -68,7 +65,11 @@ class GeneratorSourceResolver(SourceResolver):
                     error,
                 )
                 continue
-            yield GeneratorPeerUpdateSource(worker=worker)
+            yield GeneratorPeerUpdateSource(
+                worker=worker,
+                mx_source_id=source.mx_source_id,
+                worker_id=source.worker_id,
+            )
 
     def _list_ready_sources(
         self, version_id: str
@@ -106,15 +107,10 @@ class GeneratorSourceResolver(SourceResolver):
             raise RuntimeError(
                 f"P2P worker rank changed for worker {source.worker_id!r}"
             )
-        if worker.worker_grpc_endpoint:
-            tensors, _manifest_bytes = fetch_tensor_manifest(
-                endpoint=worker.worker_grpc_endpoint,
-                mx_source_id=source.mx_source_id,
-                worker_id=source.worker_id,
-                timeout=self._rpc_timeout_seconds,
+        if not worker.worker_grpc_endpoint:
+            raise RuntimeError(
+                f"P2P worker {source.worker_id!r} has no tensor lease endpoint"
             )
-            worker.tensor_source.ClearField("tensors")
-            worker.tensor_source.tensors.extend(tensors)
         return worker
 
 

@@ -1,10 +1,11 @@
-# Dynamo + vLLM ModelExpress refit
+# Dynamo + vLLM reshard refit
 
 This example validates the complete inference-side lifecycle designed for
 ModelExpress `WeightVersion` updates:
 
-1. A GPU trainer job loads `Qwen/Qwen3-0.6B`, publishes one immutable full-weight
-   version through `modelexpress_rl`, and waits as the NIXL source.
+1. A GPU trainer job loads `Qwen/Qwen3-0.6B`, binds its tensors, creates a
+   `TrainerMesh` from its worker ID and binding metadata, and publishes a linked
+   immutable full-weight version through `modelexpress_rl` as the NIXL source.
 2. On cold start, all vLLM ranks agree on the desired UID and load it through
    desired-version P2P or canonical S3 replay. The vLLM init container's startup
    probe then writes and verifies that UID through vLLM's native Control gRPC
@@ -14,6 +15,9 @@ ModelExpress `WeightVersion` updates:
    `start_weight_update`, `update_weights`, and `finish_weight_update`.
 5. The RL coordinator verifies the exact UID on every worker, resumes generation,
    and compares deterministic inference before and after the refit.
+
+Cleanup retires the weight version and releases trainer buffers before deleting
+the trainer mesh.
 
 The DGD uses the current `nvidia.com/v1beta1` schema and Dynamo's native Rust
 vLLM sidecar. Dynamo main is pinned because the weight-transfer route forwarding
@@ -42,7 +46,7 @@ docker build -f ci/k8s/server/Dockerfile.server \
   -t "$REGISTRY/modelexpress-server:$MX_COMMIT-dynamo-refit" .
 docker push "$REGISTRY/modelexpress-server:$MX_COMMIT-dynamo-refit"
 
-docker build -f examples/rl/dynamo_vllm_refit/Dockerfile.vllm \
+docker build -f examples/rl/dynamo_vllm_reshard_refit/Dockerfile.vllm \
   -t "$REGISTRY/modelexpress-vllm:a9a17e7-$MX_COMMIT-dynamo-refit" .
 docker push "$REGISTRY/modelexpress-vllm:a9a17e7-$MX_COMMIT-dynamo-refit"
 ```
@@ -72,17 +76,18 @@ export MX_SERVER_IMAGE="$REGISTRY/modelexpress-server:$MX_COMMIT-dynamo-refit"
 export VLLM_ENGINE_IMAGE="$REGISTRY/modelexpress-vllm:a9a17e7-$MX_COMMIT-dynamo-refit"
 export DYNAMO_SIDECAR_IMAGE="$REGISTRY/dynamo-vllm-sidecar:ff95985"
 
-envsubst < examples/rl/dynamo_vllm_refit/server.yaml |
+envsubst < examples/rl/dynamo_vllm_reshard_refit/server.yaml |
   kubectl apply -n "$NAMESPACE" -f -
-envsubst < examples/rl/dynamo_vllm_refit/dgd.yaml |
+envsubst < examples/rl/dynamo_vllm_reshard_refit/dgd.yaml |
   kubectl apply -n "$NAMESPACE" -f -
 
 kubectl wait -n "$NAMESPACE" --for=condition=Ready \
   dgd/mx-vllm-refit --timeout=15m
 
-export RL_COORDINATOR="$(sed 's/^/    /' \
-  examples/rl/dynamo_vllm_refit/rl_coordinator.py)"
-envsubst < examples/rl/dynamo_vllm_refit/rl-job.yaml |
+kubectl create configmap mx-vllm-rl-coordinator -n "$NAMESPACE" \
+  --from-file=rl_coordinator.py=examples/rl/dynamo_vllm_reshard_refit/rl_coordinator.py \
+  --dry-run=client -o yaml | kubectl apply -n "$NAMESPACE" -f -
+envsubst < examples/rl/dynamo_vllm_reshard_refit/rl-job.yaml |
   kubectl apply -n "$NAMESPACE" -f -
 kubectl wait -n "$NAMESPACE" --for=condition=complete \
   job/mx-vllm-rl-job --timeout=15m
@@ -94,3 +99,6 @@ UID, worker count, and post-refit generation. Keep worker, server, and coordinat
 logs as separate evidence; the pass line does not by itself qualify throughput
 or delta/S3 behavior. The checked-in coordinator exercises the full-weight NIXL
 active-refit lifecycle; it does not qualify canonical S3 delta cold start.
+
+For XOR artifact-backed S3 deltas with a Vime trainer,
+see [`vime_dynamo_delta_refit`](../vime_dynamo_delta_refit/README.md).

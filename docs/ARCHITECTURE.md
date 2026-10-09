@@ -383,12 +383,14 @@ Key message types: `SourceIdentity` (all fields affecting tensor layout compatib
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
 | `GetTensorManifest` | `GetTensorManifestRequest` | `GetTensorManifestResponse` | Fetch tensor descriptors directly from a source worker |
+| `PrepareTensorRead` | `PrepareTensorReadRequest` | `PrepareTensorReadResponse` | Prepare a bounded read lease and exact manifest for generator-to-generator RL active refit |
+| `ReleaseTensorRead` | `ReleaseTensorReadRequest` | `ReleaseTensorReadResponse` | Confirm transfer completion and release the donor read lease |
 | `GetArtifactManifestHeader` | `GetArtifactManifestHeaderRequest` | `GetArtifactManifestHeaderResponse` | Fetch artifact identity, counts, file table, and worker endpoints |
 | `GetArtifactManifestChunks` | `GetArtifactManifestChunksRequest` | `GetArtifactManifestChunksResponse` | Fetch artifact chunk metadata pages by `chunk_index` |
 | `PrepareArtifactChunk` | `PrepareArtifactChunkRequest` | `PrepareArtifactChunkResponse` | Read one artifact range into source registered DRAM and return a NIXL descriptor lease |
 | `ReleaseArtifactChunk` | `ReleaseArtifactChunkRequest` | `ReleaseArtifactChunkResponse` | Release a prepared artifact chunk lease |
 
-Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally when using a decentralized metadata backend (the backend's client sets `REQUIRES_P2P_METADATA = True` and the env var is ignored). Targets call this instead of fetching tensor descriptors or artifact manifest metadata from the central server. `GetTensorManifestResponse` carries the source worker's runtime `accelerator` value so decentralized targets can apply the same compatibility filter as central metadata mode. Artifact byte transfer still uses NIXL; `PrepareArtifactChunk` only exposes a source-side registered DRAM range for one sealed artifact chunk. `GetTensorManifest` validates both `mx_source_id` and the selected runtime `worker_id` to catch stale discovery records whose endpoint has been reused by a new process. The `worker_id` handshake fields are optional for rolling-upgrade compatibility; generation validation takes effect when the source supports them.
+Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally when using a decentralized metadata backend (the backend's client sets `REQUIRES_P2P_METADATA = True` and the env var is ignored). Targets call this instead of fetching tensor descriptors or artifact manifest metadata from the central server. `GetTensorManifestResponse` carries the source worker's runtime `accelerator` value so decentralized targets can apply the same compatibility filter as central metadata mode. An RL generator-to-generator active refit target calls `PrepareTensorRead` while preparing the update and holds the returned lease through transfer completion or staged-handle release. The donor owns the bounded lease lifetime, rejects new leases, and drains existing ones before mutating its published storage. Normal completion and transfer failures release immediately. A retry after a pre-transfer failure reacquires and revalidates the exact source version and worker; a consumed lease is never reused. If a target process disappears before release, the donor expires the abandoned lease automatically; no target shutdown hook is required. If the bounded drain fails before that expiry, refit fails before mutation. An expired lease makes `ReleaseTensorRead` fail, so the target discards the transfer instead of accepting potentially mixed bytes. Ordinary inference loading continues to use `GetTensorManifest` without the RL mutation fence. Artifact byte transfer still uses NIXL; `PrepareArtifactChunk` only exposes a source-side registered DRAM range for one sealed artifact chunk. Tensor RPCs require `mx_source_id` and validate the selected runtime `worker_id` when present to catch stale discovery records whose endpoint has been reused by a new process.
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
@@ -397,6 +399,44 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 `RefitService` is a new RL-specific control plane. It does not reuse or modify the
 legacy `WeightSyncService`. The initial slice stores worker registrations,
 immutable weight versions, and compact physical shard publications in Redis.
+The control plane stores long-lived `TrainerMesh` membership as
+`workers: worker_id -> TrainerTensorsMetadata(logical_shard_id, metadata_endpoint)`.
+`bind_tensors()` computes address-independent coverage locally and returns
+this compact reference. Adapters derive wire coverage without copying weights,
+registering source buffers, or publishing a version. The adapter binding and
+trainer `source_slot_id` identify the same logical shard. Logical IDs hash canonical
+coverage, so equivalent replicas share an ID. The orchestrator supplies the complete
+trainer worker set and is responsible for logical-shard completeness. Mesh creation
+and update validate compact membership metadata without fetching coverage manifests;
+large manifests never live in Redis.
+`CreateTrainerMesh` is idempotent; `UpdateTrainerMesh` replaces the complete
+worker map with generation compare-and-swap while preserving logical coverage.
+Every member requires an active model-matching trainer registration whose
+`refit_endpoint` matches the binding endpoint. A worker-sharded `WeightVersion`
+requires a trainer mesh; MX checks its existence and model atomically with version
+creation. Object-storage versions omit the mesh. For worker-sharded versions,
+`logical_shard_id` identifies a logical shard. MX accepts publications only from
+workers in that shard's current membership, validates the publication manifest
+against its bound coverage, and marks the version READY
+when every logical shard has a current, live publication. Mesh-backed readiness
+is computed from physical publications and their binding endpoints, not historical
+coverage. Generator discovery reads the mesh
+for complete expected shard coverage and filters out publications from replaced
+workers and expired registrations. Generation changes invalidate cached transfer
+plans; discovery rechecks the mesh generation after fetching worker manifests
+to reject a snapshot that changed during resolution. Version leases protect
+sources during installation. Publication release retries only the active-reader
+lease rejection until its RPC deadline, retaining source buffers until deletion
+succeeds. Mesh-backed trainers
+can release published buffers before version retirement after all reader leases
+drain. Removing a worker or rebinding its endpoint atomically retires its
+publications and rejects the update while those versions have reader leases.
+`ListWeightVersions` filters by model and optionally mesh, newest first. Mesh-filtered
+listing uses the mesh's version index; metadata reads are pipelined.
+`version_number` is optional caller correlation metadata, not version identity.
+Object-storage callers manage version state; mesh callers do not manage readiness.
+DIRECT installation and pipelined worker streaming are
+not implemented by this control-plane slice.
 NIXL manifest endpoints belong to their physical worker shards; a typed object
 storage source belongs directly to its durable `WeightVersion`. The protocol
 can identify S3, Azure Blob Storage, or GCS, while this initial implementation
@@ -492,6 +532,15 @@ and leases, but it does not discover engine tensor layouts or transfer weights.
 For NIXL, `RefitWorkerService` is the trainer-local manifest endpoint.
 The manifest is an opaque description of the exact published source buffers;
 the generator uses it to compile and validate its receiver-local transfer plan.
+Full-tensor trainers reuse manifest bytes while registrations, addresses, and
+tensor geometry remain stable and content digests are disabled. Generators
+cache each selected worker manifest by endpoint and digest. A changed endpoint,
+registration metadata,
+address, dtype, shape, or sharding changes the structural fingerprint and
+rebuilds the transfer plan. Content-only digest changes refresh verification
+metadata without rebuilding that plan. Releasing a trainer shard evicts its
+worker-local version entry only after the central service accepts the deletion;
+the service rejects deletion while a version lease is active.
 For S3, `WeightVersion.object_storage` identifies the storage type and global
 `model.safetensors.index.json` URI directly; the server validates only this
 typed location and does not contact S3.
@@ -499,11 +548,13 @@ Trainer integrations provide the matching `ObjectStorageConfig` through
 `ModelExpressTrainerConfig.object_storage`; the initial implementation rejects
 providers other than S3 before creating the storage client.
 
-The synchronous generator client returns a staged handle only after transfer
-and verification finish. That handle owns the version lease through graph-safe
-installation; applying the weights or releasing an unapplied handle ends the
-lease. There is no separate asynchronous wait or unimplemented direct-install
-API.
+The synchronous generator client returns a staged handle after source-specific
+preparation, without changing live weights. Trainer-source preparation receives
+a full copy; generator-peer preparation reserves a read that runs during apply.
+The handle owns the version lease through installation at the caller's safe
+point. Applying the weights or releasing an unapplied handle ends the lease.
+With bounded staging configured, the same handle holds deferred batch reads;
+`apply_weight()` performs pipelined transfer and installation.
 
 The initial worker manifest channel uses plaintext gRPC and does not authenticate
 the publishing worker. Manifest digests detect corruption but do not establish
@@ -513,10 +564,13 @@ Transport authentication and TLS require a separate protocol and deployment
 design; they are not provided by this implementation.
 
 `GeneratorRuntime` composes three independent seams. Source resolvers discover
-candidate locations without moving bytes; update methods transfer and verify a
-typed artifact without mutating the live engine; the engine installer commits
-that artifact at the caller's safe point. Source fallback and retry limits live
-in the planner/session rather than in engine integrations.
+candidate locations without moving bytes; update methods prepare a typed update;
+the engine installer commits it at the caller's safe point. Trainer and S3
+methods transfer or reconstruct private artifacts during preparation. The
+generator-peer method instead validates the peer and exact runtime tensor catalog
+during preparation, then transfers directly into live storage at the safe point.
+Source fallback and retry limits live in the planner/session rather than in
+engine integrations.
 
 - `nixl_staged_transfer.py` owns exact-manifest decoding, transfer planning,
   reusable registered buffers, NIXL reads, transforms, and digest verification.
@@ -530,11 +584,88 @@ in the planner/session rather than in engine integrations.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
   through SGLang's native safetensors loader.
 
+Canonical preparation requests queue on a separate `.prepare.lock`. Once the
+leader has reconstructed a target, followers verify and attach to that READY
+checkpoint with shared installation and cache locks. They can therefore prepare
+while another rank loads the same checkpoint. A cache miss releases the shared
+locks, acquires the exclusive installation/cache fences, and rechecks the state
+before reconstructing. Cache-hit attachment performs no eviction; capacity is
+enforced by initialization, reconstruction, and activation.
+
+| Canonical checkpoint operation | `.prepare.lock` | `.install.lock` | `.lock` |
+|---|---|---|---|
+| Attach to an already prepared target | Exclusive | Shared | Shared |
+| Reconstruct a target | Exclusive | Exclusive | Exclusive |
+| Load engine weights | None | Shared | Shared |
+| Commit activation when the installation context exits | None | Shared | Exclusive |
+
 The corresponding trainer composition is owned by `TrainerRuntime`. Public
 `FSDPTrainerContext` and `MegatronTrainerContext` select only engine capture;
 full-tensor NIXL and canonical-checkpoint object-storage publication remain separate
 method implementations. This keeps transport, payload preparation, engine
 geometry, and framework orchestration independently replaceable.
+
+`ModelExpressGeneratorConfig.staging_buffer_bytes` sets bounded-streaming
+capacity per arena, and `staging_buffers_count` defaults to one. The streaming
+client uses their product as its total staging limit. `staging_device` selects
+CUDA or pinned host receive memory.
+
+The `stage_weight()` / `apply_weight()` generator APIs hold a version lease
+across metadata preparation and incremental installation. The NIXL receiver
+plans complete owning-module batches and uses
+one or two registered byte arenas (`staging_buffers`) on CUDA or pinned host
+memory (`staging_device`). Receive tensors, wire-dtype conversion buffers,
+full-source reconstruction buffers, and alignment all count toward each
+buffer's capacity. With two arenas the READ for batch
+`i + 1` is posted before batch `i` is yielded for commit, allowing asynchronous
+READs to overlap installation; an arena is refilled only after its commit has
+synchronized. Host arenas are registered as NIXL DRAM and read with a DRAM local
+memory type. The vLLM installer copies each batch into engine-owned load-time
+tensors, then uses native post-load processing to restore existing kernel
+storage. Receive-arena views are never passed to engine callbacks. For trainer
+sources without bounded staging configured, `stage_weight()` transfers a full
+independent copy before installation.
+
+`MX_REFIT_PACK_MODULES` coalesces consecutive owning-module batches up to the
+same staging limit, trading a larger arena residency for fewer of them. It never
+changes which source bytes are read: the packed batch preserves source ranges,
+byte counts and descriptor counts, while destination offsets follow the packed
+arena layout. Modules that pull the same complete source stay in separate
+batches. It is off by default because one module per batch is the smallest arena
+a model can refit through.
+
+Before vLLM rebuilds per-module load-time parameter skeletons, the adapter records
+shared parameter objects and reconnects those aliases afterward. Alias owners
+must remain at the same module paths during restoration and final processing;
+replacement or removal fails the refit, including owners with no separately
+published parameter and multiple paths to the same module. Capture then
+counts tied weights once, and installation preserves their shared kernel storage.
+Alias groups with inconsistent load-time shapes or dtypes are rejected.
+Streaming owner checks resolve aliases against the live parameter objects on
+each batch. An owner may reuse a shared parameter installed by an earlier batch
+only while it still points to that exact committed object; a missing or rebound
+parameter is rejected. Installation reconnects shared bindings after each
+managed owner's kernel-storage restoration, before dependent hooks execute.
+
+Released full-copy and bounded updates may alternate on one client. The transfer
+owner tears down its agent before clearing the mode-specific buffers and reloads
+source metadata into the new registrations. The update method invalidates cached
+full-copy descriptors before entering bounded preparation. Preparation retries
+retain one version lease and discard failed setup state; installation failures
+still fence the engine rather than retrying a partially committed update.
+
+Streaming is opt-in, trainer-only, and currently limited to unquantized vLLM
+models. It does not publish generator peers or roll back partially installed
+versions. An installation failure marks the client engine state uncertain and
+makes the failed handle unusable for another installation. A subsequent
+`stage_weight()` releases the failed transaction after proven cleanup, acquires
+a new version lease, rediscovers sources, and prepares a complete full-tensor
+replay. The engine stays uncertain until that fresh transaction installs
+successfully. Unproven transport or GPU cleanup retains resources and leases
+and requires a process restart. The hosting framework must keep all replicas
+paused throughout recovery. Only completion of all replicas
+permits resuming generation. The staging limit excludes live model weights,
+engine-owned post-load workspace, CUDA allocator overhead, and transport metadata.
 
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
@@ -561,25 +692,102 @@ creating a second Refit peer registry. A generator serving an exact version
 publishes its normal `SourceIdentity` with `revision=WeightVersion.uid`; another
 generator queries `P2pService.ListSources` with the same engine-compatible
 identity and selects a READY source for its worker rank before falling back to
-trainer shard publications. Applied generators publish their verified canonical
-staging buffers—not engine-specific packed kernel tensors—under that identity.
-An identical-rank peer pulls those buffers directly with NIXL, then uses the
-same graph-safe engine installer as a trainer update.
+trainer shard publications. Applied generators publish their complete post-load
+runtime tensors, including registered runtime buffers. An identical-rank peer
+validates that exact runtime representation before mutation, then pulls it
+directly into the existing live tensor storage at the engine safe point. This
+avoids a second model-sized GPU allocation and copy.
+The peer holds a donor read lease through NIXL completion. Before the donor's
+next active refit, it rejects new reads and waits for all leases to drain; a
+drain timeout aborts before any live tensor is overwritten.
+Trainer NIXL inputs remain a separate load-time representation that runs through
+vLLM's normal post-weight-load processing.
 
-An object-storage generator defaults to a same-rank generator peer first and the
-version-level object-storage source second. A memory-backed generator defaults
-to a peer first and trainer manifests second. `source_order` can select or
-reorder supported sources without changing an engine integration.
+The vLLM inference loader discovers this post-load tensor set once and retains
+the device-local mapping. The RL runtime reuses that mapping for peer layout
+validation, publication, and in-place installation instead of walking the model
+again after warmup or compilation. It also borrows the loader-owned NIXL agent:
+the already-registered live tensors are the peer receive destination, and the
+loader retains responsibility for shutting down the rank-local transport. A
+failure after the direct transfer starts leaves the engine state uncertain, so
+MX fences it rather than attempting in-process source fallback. This path
+requires a nonempty loader-owned runtime tensor mapping and an initialized
+NIXL manager. Model quantization, FP8 KV-cache dtype, and execution mode do not
+gate peer selection. With `model_config.enforce_eager=True`, after validating
+the live destinations, the RL installer uses the same host-scale refresh as
+cold RDMA loading: q/k/v Python scalars and CPU mirrors are updated from the
+received accelerator tensors (using the maximum for per-head scales), with
+tensor storage preserved. It also invalidates the
+FlashInfer BMM and output-scale caches together so the next eager forward
+recomputes them. It does not rerun post-weight-load processing on tensors that
+are already in runtime format. Invalid scale contracts fail installation and
+leave the mutated engine fenced.
+
+Without `enforce_eager`, peer refits retain the existing direct-copy behavior
+and do not run this host-scale refresh. Updating host mirrors alone cannot
+update scalar values already captured in CUDA graphs; graph-scale refresh and
+recapture remain outside this eager-mode fix.
+Cold RDMA loading requires lazily populated attention caches to be uninitialized.
+Q/K/V-only attention paths, including MiniMax-M3 sparse attention, do not need an
+`_o_scale_float` field; that field is specific to output quantization. DeepSeek
+V4/V4.1 FlashInfer instead recomputes its constructor-initialized BMM scalars from
+the received custom Q/KV scale buffers. Its GPU scale buffers stay unchanged.
+Recognized DeepSeek packed KV attention (`fp8_ds_mla` / `nvfp4_ds_mla`) carries
+per-block scales in the cache format and needs no standard host mirrors. Each
+`AttentionLayerBase` owner declaring FP8 KV cache must have a recognized scale
+contract, even when another layer was refreshed or uses a supported packed format.
+Container modules and `MambaBase` state-space layers are not attention scale owners.
+
+An object-storage generator with full-tensor engine support defaults to a
+same-rank generator peer first and the version-level object-storage source
+second. Engines without that support use object storage directly. An explicit
+`source_order` may select object storage only or combine `GENERATOR` and
+`OBJECT_STORAGE` in either order. A memory-backed generator defaults to a peer
+first and trainer manifests second. If the rank-local NIXL transport cannot be
+initialized, an object-storage generator drops the peer attempt and remains
+available with object storage as its only source.
+
+For an active refit, the peer lookup is for the exact target UID. If no peer can
+prepare that version, the generator resolves the full canonical lineage from
+its `FULL_HF_CHECKPOINT` root through the target deltas. Under the local cache
+lock, the receiver reuses its verified checkpoint when that version is on the
+target lineage, downloading and applying only the missing revisions before
+installing the target. Full-root reconstruction is retained when no matching,
+source-verified local checkpoint exists, including an unverified launch seed.
+A successful peer refit does not rebuild the canonical checkpoint in the
+background, so the local checkpoint may lag the engine's serving version.
+Fallback therefore resumes from the local checkpoint version. Object storage
+is consulted only when a later refit cannot use P2P.
 
 The canonical receiver retains each full checkpoint and delta payload under its
 version, then writes a resolved chain manifest. A full target is directly
 installable. The first delta after a full checkpoint copies that immutable full
-checkpoint into a version-scoped derived checkpoint. Later sequential deltas
+checkpoint into a version-scoped derived checkpoint. On Linux the checkpoint
+store attempts `FICLONE` per regular file, sharing blocks copy-on-write where
+the filesystem supports reflinks. Unsupported filesystems, cross-mount copies,
+and other platforms use an ordinary copy. This includes `EBADF` from `FICLONE`
+on already-opened files when the source filesystem cannot reflink.
+File metadata and symlink dereferencing
+retain `copytree`/`copy2` behavior; mutable files never use hard links. Clone I/O,
+permission, and capacity failures abort preparation and clean its temporary
+directory before promotion. Later sequential deltas
 rename the active materialization and apply only the incoming XOR delta in
 place, avoiding another full-model copy. Canonical artifacts are never modified
 during reconstruction, and derived checkpoints can be rebuilt from the lineage.
-If an in-place delta fails, the cache remains `UPDATING` until initialization
-rebuilds it; the running engine retains its previously installed weights.
+If an in-place delta fails, the cache remains `UPDATING` until the active refit
+session or the next initialization restores the immutable full root. The running
+engine retains its previously installed weights.
+
+The local checkpoint store caps its configured quota at the existing model cache
+size plus free disk space. It logs any cap applied at initialization and rechecks
+free space before known writes and copies. Capacity checks evict stale
+checkpoints or reject the update while preserving protected lineage.
+Reflinks retain logical-size accounting and the full first-materialization
+free-space check: delta writes can allocate private blocks. This is an admission
+check, not a filesystem reservation against concurrent users. Reflink support
+must be tested on the actual checkpoint cache mount; a Kubernetes `emptyDir`
+does not establish support. First-refit latency savings require a fresh benchmark
+on that mount; existing sequential-reuse timings do not measure this optimization.
 
 Under the local checkpoint lock, preparation state advances from `READY` to
 `UPDATING` before artifact construction and back to `READY(target)` only after
@@ -601,6 +809,18 @@ cache activation commit runs only after every engine rank reports a successful
 load; configuration drift, phase disagreement, or a partial load fails the
 cold start without advancing `active.json`.
 
+Startup P2P does not populate the canonical disk checkpoint. If hotload starts
+with a missing or unrecorded cached seed and no preparation state, the S3 method
+defers initialization until object-storage fallback is needed. It resolves the
+full replay lineage and downloads a source-verified full root before applying
+deltas. This does not activate the disk checkpoint or change the serving UID;
+activation still follows successful engine installation. Recorded artifacts
+continue to undergo integrity verification. The bootstrap requirement is checked
+on every replay request. Once initialized, an object-storage-only runtime can
+resolve from its serving version instead of revisiting the full lineage. Mixed
+P2P/object-storage runtimes still resolve from the full root because their disk
+checkpoint may lag the serving version.
+
 The engine's serving version remains separate from checkpoint-cache state.
 vLLM constructs its Control server only after EngineCore and its workers finish
 loading. Because an explicit desired UID makes the MX loader fail closed, the
@@ -619,6 +839,11 @@ already-used caller-supplied UID returns `ALREADY_EXISTS`. For an `XOR_DELTA`,
 these UID strings as `metadata.version` and `metadata.base_version`. MX assigns
 no numeric ordering and requires no version-directory naming convention; the
 exact `object_storage.uri` identifies the version's global index.
+Generators use the registered MX IDs and base relationships for replay. A delta
+index's `metadata.version` and `metadata.base_version` are optional descriptive
+fields and may differ from the MX IDs. Cache paths and chain records use MX IDs;
+MX lineage checks and payload validation remain enabled. The registering caller
+is responsible for selecting the correct S3 artifacts and base mapping.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
 Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and
@@ -922,18 +1147,18 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `train/methods/` | Independent full-tensor NIXL and canonical-checkpoint publication methods |
 | `train/engines/megatron/selection.py` | Megatron-Bridge mapping and tensor-selection translation into MX publication specs |
 | `train/engines/megatron/adapter.py` | Stable in-place Megatron tensor registration and manifest construction |
-| `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place or device-copy staging |
+| `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place, pinned host-copy, or device-copy staging |
 | `inference/client.py` | Rank-local generator lifecycle, leases, exact-version source discovery, staging, and apply |
 | `inference/runtime.py` | Generator source policy, method/resource composition, and update-session ownership |
 | `inference/engines/vllm/control.py` | Direct vLLM Control gRPC client |
 | `inference/engines/vllm/startup_probe.py` | Serving-version reconciliation and startup gate |
 | `inference/source/` | Independent generator-peer, trainer-memory, and object-storage discovery |
-| `inference/methods/` | Independent full-tensor NIXL and canonical-checkpoint preparation |
+| `inference/methods/` | Trainer load-time tensor, generator runtime tensor, and canonical-checkpoint preparation |
 | `inference/checkpoint_store.py` | Host-local immutable lineage, locking, temporary-directory promotion, atomic JSON persistence, artifact fingerprints, and activation state |
 | `inference/receiver.py` | Canonical S3 index/shard decoding, full-checkpoint validation, and XOR reconstruction into derived checkpoints |
 | `inference/load_strategy.py` | RL cold-start policy: exact desired-version P2P, canonical S3 replay, and version-agnostic fallback when no desired version is configured |
 | `inference/version_chain.py` | Shared validation and resolution of immutable full-checkpoint and delta lineage |
-| `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable buffers, and verification |
+| `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable destination buffers, and verification |
 | `inference/engines/sglang/` | SGLang context and native checkpoint installer |
 | `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |
 | `inference/engines/vllm/installer.py` | Private vLLM load-layout capture plus graph-safe tensor or prepared-checkpoint installation |
@@ -976,14 +1201,19 @@ Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `
 
 ### vLLM Refit Installation
 
-The vLLM integration exposes engine installation and full-tensor target geometry
-to `GeneratorRuntime`; it does not select a transport or source. Runtime
-composition adds the NIXL full-tensor method when generator or trainer memory is
-requested and adds the canonical-checkpoint method when object storage is
+The vLLM integration exposes engine installation and tensor geometry to
+`GeneratorRuntime`; it does not select a transport or source. Runtime composition
+uses separate NIXL methods for trainer load-time tensors and generator runtime
+tensors, and adds the canonical-checkpoint method when object storage is
 configured. XOR deltas mutate an exact base; full HF checkpoints stream tensors
 into the existing mmap-backed checkpoint and become the base for later deltas.
-Both methods feed the shared private installer, which commits staged tensors or
+All methods feed the shared private installer, which commits staged tensors or
 reloads a prepared checkpoint through vLLM's graph-safe layerwise reload path.
+Before a reload, the installer restores registered slots for live kernel buffers
+that were created after vLLM recorded its load-time metadata. PWAL can then
+replace those buffers without turning them into conflicting plain attributes,
+and vLLM's normal finalizer copies them back into their original graph-bound
+storage.
 
 The ModelExpress vLLM plugin registers one `modelexpress` native weight-transfer
 backend for both paths. An empty initialization payload preserves the existing
@@ -996,7 +1226,12 @@ through `object_storage_endpoint_url` and `object_storage_region_name`. Each
 update carries the opaque MX `version_id`.
 `start_weight_update()` opens the update window, `receive_weights()` stages and
 applies the version through `ModelExpressGeneratorClient`, and
-`finish_weight_update()` releases its staged handle. Draft-model updates remain
+`finish_weight_update()` releases its staged handle. Each session accepts one
+version; calls before initialization, out-of-order calls, and a second update
+raise instead of reporting success. vLLM's reset hook releases staged resources
+and clears the session after an update error, including invalid payloads rejected
+before receiving weights. A failed finish retains the session so cleanup can be
+retried; already applied model weights are not rolled back. Draft-model updates remain
 unsupported, and trainer-pushed bytes are ignored because trainers publish
 WeightVersions through `ModelExpressTrainerClient`. After a successful apply,
 the bridge merges staging
@@ -1039,6 +1274,18 @@ shards, and compiles one-sided read descriptors without materializing a full
 trainer tensor. Geometry, slice planning, transfer planning, and the transport
 protocol are engine-agnostic.
 
+Geometry capture passes all lazy source weights through the engine loader in
+one call, amortizing model-wide parameter and expert-map construction. Each
+lazy tensor retains its original source identity, including native-to-HF view
+conversions. If an unsupported operation interrupts the bulk attempt, the
+recorder rolls every accumulator it advanced back to the attempt's starting
+state before retrying each source individually for precise diagnostics, so bulk
+capture still never produces an incorrect partial plan. The bulk cause is logged
+even when the per-source retry then succeeds for every source, because bulk order
+can trip a loader that per-source order does not. Unexpected engine errors
+propagate, and parameter loader hooks are restored on every exit. This optimizes
+the first capture without caching layouts across model or source changes.
+
 The minimal rendezvous publisher is called only after its NIXL agent and source
 buffers are registered, so `publish()` stores the worker as READY and repeated
 publication replaces that worker record. The shared `PublisherThread` sends a
@@ -1050,12 +1297,25 @@ their lifecycle; SIGKILL and mid-transfer failure recovery remain follow-up
 work.
 
 `modelexpress_rl/inference/nixl_staged_transfer.py` owns exact-manifest planning,
-registered staging buffers, transfer, and verification. The vLLM-specific
-`installer.py` captures geometry on an unquantized meta twin and installs verified
-tensors through vLLM's layerwise reload and `process_weights_after_loading` path.
-The adapter composes those modules and rebuilds the plan when validated source
-manifests change; an incompatible destination staging layout requires an engine
-restart.
+trainer staging buffers, direct generator-peer transfer, and verification. The
+vLLM-specific
+`installer.py` captures trainer load-time geometry through layerwise reload and
+installs it through `process_weights_after_loading`. For tensor and checkpoint
+reloads, vLLM owns quantization-aware refresh of MLA's `W_UV` and `W_UK_T`;
+ModelExpress preserves their graph-bound storage when post-load processing
+replaces these bare tensor attributes. The RL installer does not recompute MLA
+weights from `kv_b_proj.weight` or reject quantized MLA models. After reload,
+the installer checks that vLLM replaced each existing `W_UV` and `W_UK_T`
+before copying it back into its original graph-bound storage. An unchanged tensor
+identity raises `IncompleteRefit` rather than accepting a potentially stale update.
+Compatibility is checked through this post-load behavior, not a version-string
+gate, so nightly and source builds can be used. The check runs after weight
+loading; a failed refit requires engine recovery before serving resumes.
+Generator peers instead
+transfer the complete post-load runtime tensor set directly into existing live
+storage without re-running PWAL. The adapter rebuilds a trainer plan when
+validated source manifests change; an incompatible destination staging layout
+requires an engine restart.
 
 See the [RL weight refit overview](../modelexpress_client/python/modelexpress/refit/README.md)
 for the end-to-end design, integration contract, implementation status, and
@@ -1087,10 +1347,20 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 |---|---|---|---|
 | p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank` and runtime `accelerator`, order the survivors via the configured `SourceSelector` (`MX_P2P_SOURCE_SELECTOR`: `random` default, `rendezvous_hash`, `load_aware`, or `topology_aware`), then try candidates (max 3). Filtering before the retry slice prevents incompatible sources from exhausting the retry budget; a post-`GetMetadata` accelerator check remains as defense-in-depth. Before preparing target tensors, P2P sources must serve a manifest for the selected runtime `worker_id`; generation mismatches and transfer failures retry the next candidate, reinitializing the target first when it may have been mutated. |
 | p1 | `ServerCacheStrategy` | `MODEL_EXPRESS_NO_SHARED_STORAGE` enabled + server address configured + adapter implements `load_via_native` | Stream the model's weight files from ModelExpress Server into the snapshot the engine already resolved, then hand off to the engine's native loader. The cold-miss path for workers with no route to Hugging Face: the server downloads and caches the model once, and every later worker is served from that cache. Non-weight files arrive earlier, before the engine starts — see [Server-Backed Model Cache](#server-backed-model-cache). Falls through on failure. |
-| p2 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so it needs no `MX_MODEL_URI`; the engine resolves and (if needed) downloads the weight files. Falls through on failure. |
+| p2 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + no object-store `MX_MODEL_URI` + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves and (if needed) downloads the weight files. An `s3://`, `gs://`, or `az://` `MX_MODEL_URI` skips this strategy and proceeds to ModelStreamer. Falls through on other failures. |
 | p3 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
 | p4 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
 | p5 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
+
+When a vLLM loading attempt fails after mutating the model, retry cleanup
+unregisters its layers and clears the old model's tensor graph before allocating
+the replacement. Caller frames can still retain the old root object, so clearing
+only `LoadResult` cannot release its GPU storage. Cleanup also clears the state
+of child modules that own parameters: native tensor aliases can retain replaced
+parameters and their bound weight-loader callbacks outside Python's GC traversal.
+Shared parameterless caches, such as rotary embeddings, remain intact. Remaining
+cycles are collected before the allocator cache is emptied and initialization starts.
+If initialization fails, recovery aborts without attempting another loader.
 
 See [ModelExpress Benchmarks](BENCHMARKS.md) for measured loading-path, NIXL registration, and artifact-transfer results with explicit timing boundaries.
 
@@ -1269,10 +1539,15 @@ graph TD
 2. **Source publishes**: Registers tensors with NIXL, or prepares a sealed cache artifact bundle, then a `PublisherThread` calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). `WorkerMetadata.accelerator` records runtime accelerator family for compatibility filtering; it is not part of `SourceIdentity` or the source-id hash. In P2P mode (`MX_P2P_METADATA=1`, or auto-forced on by decentralized backends like `k8s-service`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor manifests or artifact manifest/chunk serving.
 3. **Publisher heartbeats**: `PublisherThread` sends `UpdateStatus(READY)` every 30s after publication succeeds, refreshing `updated_at`
 4. **Target discovers**: Calls `ListSources(identity, status=READY)`, which returns only READY workers whose `updated_at` is still within `MX_HEARTBEAT_TIMEOUT_SECS`, then filters by `worker_rank` and compatible runtime `accelerator`
-5. **Target fetches on demand**: Calls `GetMetadata(mx_source_id, worker_id)` for the chosen candidate. Accelerator-incompatible sources were already dropped using `SourceInstanceRef.accelerator`; this step re-checks the authoritative `WorkerMetadata.accelerator` as defense-in-depth. Empty accelerator metadata is accepted for backward compatibility. If `worker_grpc_endpoint` is populated, the target fetches the tensor manifest before target preparation and requires the endpoint to confirm the selected runtime `worker_id`. The prefetched manifest is reused during transfer; NIXL metadata is fetched via the source listen thread.
-6. **Target transfers**: Executes RDMA reads from source; for cache artifacts, it prepares one source chunk lease at a time, receives into target registered DRAM, verifies CRC32C, writes to target-local staging, releases the lease, then installs the staged tar into the runtime cache directory. Generation mismatches and transfer failures try the next candidate (max 3); a possibly mutated target is reinitialized before retry.
+5. **Target fetches on demand**: Calls `GetMetadata(mx_source_id, worker_id)` for the chosen candidate. Accelerator-incompatible sources were already dropped using `SourceInstanceRef.accelerator`; this step re-checks the authoritative `WorkerMetadata.accelerator` as defense-in-depth. Empty accelerator metadata is accepted for backward compatibility. If `worker_grpc_endpoint` is populated, the target fetches and retains a version-validated tensor manifest before target preparation.
+6. **Target transfers**: Executes the NIXL reads using the prefetched manifest. An RL generator-to-generator active refit validates the manifest and reserves the donor while the engine is unchanged. It holds that bounded lease until staged-handle release or, at the apply safe point, writes directly into the already-registered live runtime tensors and synchronizes the target. This prevents donor mutation without allocating another model-sized GPU buffer. Preparation failures may select the next configured source. A failure after direct mutation starts fences the target as uncertain and requires engine reset or restart; a failure before the first transfer remains retryable. For cache artifacts, the target prepares one source chunk lease at a time, receives into target registered DRAM, verifies CRC32C, writes to target-local staging, releases the lease, then installs the staged tar into the runtime cache directory. Generation mismatches and transfer failures try the next candidate (max 3); a possibly mutated target is reinitialized before retry.
 7. **Target becomes source**: After receiving weights or installing a cache artifact, publishes own metadata and starts its own heartbeat
 8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; `ListSources(READY)` also applies this heartbeat freshness check at query time so expired READY records are not returned while waiting for the next reaper pass. GC deletes STALE workers after 1 hour
+
+Zero-byte tensors remain in manifests and participate in exact name, size, and
+dtype validation. They count as matched tensors but are omitted from NIXL
+descriptor lists because they have no registered memory range. A manifest made
+entirely of empty tensors completes as a successful no-op transfer.
 
 Tarred cache artifacts carry regular files and directories only. The source
 side enumerates members explicitly and hands tar that list, so nothing else can
@@ -1308,7 +1583,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses it for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. The default `nixl` artifact backend requires P2P metadata and is skipped when `MX_P2P_METADATA=0`; the `mooncake` backend is independent of P2P metadata. |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim |
+| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Feeds the torch compile cache `SourceIdentity`, adding compile configuration as a partitioning dimension for artifact discovery. Unset leaves the field empty, which drops it from the `mx_source_id` input, so workers whose other identity fields match — model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch — share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](DEPLOYMENT.md#pairing-workers-by-compile-configuration) |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
@@ -1364,3 +1639,132 @@ Optimization opportunities: contiguous regions (blocked), warm source pool, Deep
 ## Deployment and Configuration
 
 See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering server/client configuration, Docker, Kubernetes, Helm, P2P transfer setup, and debugging commands.
+
+
+### Bounded vLLM streaming installation
+
+The generator streams complete owning-module groups through reusable receive
+arenas. The transport planner derives those groups from captured loader geometry;
+applications do not select individual layers or depend on model-specific names.
+One installer uses vLLM's reload lifecycle for all supported unquantized models.
+
+```mermaid
+flowchart LR
+    T[Trainer shards in HBM or DRAM] -->|NIXL READ| A[Bounded receive arenas]
+    A -->|Copy complete module inputs| E[Engine-owned load-time tensors]
+    E --> P[vLLM post-load processing]
+    P --> L[Original live parameter storage]
+    L --> F[vLLM deferred attention finalization]
+    G[Framework update guard] -. held through transfer and installation .-> A
+    G -.-> F
+```
+
+The installer opens one reload window per update. For each completed group, it
+validates live owners, input coverage and shared parameters, materializes the
+engine's load-time destinations, and copies received values into them. vLLM then
+performs post-load processing, reconciles parameter state and restores the
+original kernel tensor bindings. Its finalization handles attention dependencies
+after all required inputs have arrived. Engine reload runs in its native device
+context: layer materialization selects its recorded device, while host bookkeeping
+can be recreated on CPU. Bare tensors on the installer device keep the storage
+referenced by graph consumers. MX does not implement model-family
+admission tables or attention-specific weight transformations.
+
+Receive-arena tensors are never attached to the model or passed to post-load
+callbacks. The copy boundary requires ordinary Tensor storage views and rejects
+custom dispatch modes instead of bypassing their semantics. A callback may retain an engine-owned tensor without preventing arena
+reuse. CUDA completion is still required before the next READ overwrites an
+arena. This ownership boundary removes receive-retention scans; it does not
+remove checks that a callback changed another module or a shared parameter.
+
+Alias validation distinguishes multiple paths to one parameter slot from ties
+between distinct slots. It records shared parent-to-child edges in reusable reload metadata,
+then checks every edge afresh after each callback, including ancestors and all
+incoming alias paths. Only distinct changed slots need reassignment. Custom
+attribute access, setters and parameter-registration hooks retain the original
+path lookup and assignment behavior; no validation verdict is cached across
+callbacks or updates.
+
+Before reload initialization, alias restoration uses vLLM's recorded parameter
+metadata to separate load-time ties from runtime-only aliases such as WNA16's
+`w13_weight` and `w2_weight`. Capture and checkpoint loading reconnect only the
+load-time slots; native post-processing recreates runtime aliases. Missing
+load-time slots still fail restoration, and final runtime identity and storage
+validation remains required.
+
+Warm load-layout capture keeps a private snapshot when records contain only
+ordinary immutable metadata. Each caller receives fresh mutable capture records
+and containers, with duplicate record references preserved. Slice-containing
+operation tuples are copied with a shared memo. Mutable or custom payloads and
+changed copy protocols use whole-result deep copying. The existing model,
+loader, routing and manifest keys still decide whether a capture can be reused.
+
+Alias validation uses Python module lookup and parameter registration semantics.
+Each streaming batch checks the current ownership structure and reuses the
+initial reload's alias metadata when paths, owners, ordering and classes still
+match. Native reload can reorder parameter groups without changing their members.
+Those batches retain fresh callback order while sharing per-owner views of the
+initial owners. Changed group membership, paths, classes or ancestors prevents
+that sharing. No validation verdict survives an engine callback. The initial
+metadata and its per-owner views live only for that reload window; plans referring
+to later owners are released with the batch.
+Within one signature calculation, entries with the same current inheritance
+chain share its identity tuple. For owners with ordinary object hashing and
+equality, complete group signatures are also shared when building per-owner
+cache keys. Custom hashing or equality retains per-owner signature calculation.
+
+For ordinary layer-local materialization, a per-owner view restores each complete
+shared-parameter group touched by that layer. Ordinary tensor buffers and vLLM's
+stock parameter forwarding method are supported; the latter's function, code and
+inheritance are recorded when the installer is created and checked before use.
+Ordinary instance dictionaries inherited from mixins are also supported; custom
+dictionary descriptors use the full restoration path.
+Custom ancestor lookup, setters, registration hooks, tensor dispatch or restore
+contexts use the full restoration path. Post-load
+callbacks always retain whole-model alias validation and restoration, including
+changes to unrelated owners that a later callback could otherwise hide.
+This path adds no native extension or CPython-internal dependency.
+
+The staging limit bounds receive, conversion and transfer scratch allocations.
+Engine-owned materialized destinations and post-load workspaces consume
+additional memory, as do the live model and runtime state. The staging limit is
+therefore not a total GPU-memory bound. Two arenas can overlap the next READ with
+installation of the current group; the benefit must be measured on the target
+hardware. Trainer staging mode and receiver arena location are separate choices.
+
+Bounded transfer can reuse immutable READ addresses and sizes for the currently
+validated compiled plan. The one-entry cache checks the workspace generation and
+the identity, order and geometry of all receive arenas before every batch. It
+holds only weak arena references; source leases, tensor views and transport
+handles remain owned by the update. Preparation still validates current source
+metadata and coverage, and every batch still creates views, zeroes padding,
+posts fresh READs and completes the existing fences. Failed preparation,
+incomplete iteration and workspace teardown discard the descriptors. Private
+transfer counters report hits, misses and builds; descriptor work stays outside
+the wire timer on both cold and warm updates.
+
+The manifest-byte cache owns an immutable snapshot of ordinary parsed source
+and shard rows. A warm bounded-plan lookup reuses its structural key only while
+the resolved source table is the snapshot's table. All other resolved fields
+and maps keep their original schema and ownership. The snapshot contains only
+host metadata; it owns no tensors, transport handles or source leases. Custom
+or mutable source rows retain the original field-by-field checks. Ordered
+manifest bytes, agent and device maps,
+captured layouts and the staging configuration still participate in invalidation,
+and current source coverage is checked before transfer. Snapshot construction is
+charged to source preparation on a cache miss.
+
+The prepared streaming artifact owns its iterator and remains protected by the
+version lease. An installation failure fences the engine and never falls back
+after a possible write. CUDA work must drain before iterator cleanup and source
+release. A failed drain, iterator close or source iteration retains the active
+handle, receive workspace and source lease and requires a process restart: CUDA
+synchronization alone cannot prove failed RDMA reads have completed. Simultaneous
+installation and cleanup errors preserve the original exception with the cleanup
+failure chained as its cause. Partial installation has no rollback.
+
+The adapter depends on vLLM's layerwise reload helpers. Runtime compatibility must
+be qualified with changing weights, shared parameters, graph-bound addresses,
+post-load state and failure cleanup. Quantized bounded installation remains
+unsupported. The same generic path is used for small-model validation and GLM;
+passing the former does not establish full-model correctness or performance.

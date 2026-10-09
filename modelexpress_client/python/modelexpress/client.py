@@ -41,6 +41,10 @@ class MxClientBase(ABC):
 
     REQUIRES_P2P_METADATA: bool = False
 
+    def worker_rpc_retry_policy(self) -> tuple[int, float]:
+        """Return fresh-channel retries and backoff for worker RPCs."""
+        return 0, 0.0
+
     @abstractmethod
     def publish_metadata(
         self,

@@ -426,9 +426,9 @@ def artifact_ready_fn(
     return ready
 
 
-def artifact_health_ready(url: str) -> bool:
+def artifact_health_ready(url: str, *, timeout_secs: float = 1.0) -> bool:
     try:
-        with urllib.request.urlopen(url, timeout=1.0) as response:
+        with urllib.request.urlopen(url, timeout=timeout_secs) as response:
             return 200 <= response.status < 400
     except (OSError, urllib.error.URLError, TimeoutError):
         return False

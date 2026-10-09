@@ -20,7 +20,7 @@ def _make_adapter(extra_config):
     vllm_config.load_config = load_config
     vllm_config.device_config.device = "cuda"
     vllm_config.parallel_config.tensor_parallel_size = 8
-    model_config = SimpleNamespace(revision="main")
+    model_config = SimpleNamespace(model="test/model", revision="main")
     return VllmAdapter(vllm_config, model_config), load_config
 
 

@@ -15,19 +15,21 @@ Extraction rules (per state_dict tensor, floating point only):
 - replicated DTensor: same as unsharded
 - sharded DTensor: this rank serves its per-dim local box (general: FSDP dim 0,
   tensor-parallel dim 1, or 2-D meshes) via compute_local_shape_and_global_offset
-- served as the wire dtype (WIRE_DTYPE), cast into the staging arena for
-  COPY_TO_DEVICE only when the source differs
+- served in the selected per-tensor wire dtype, cast into the staging arena for
+  COPY_TO_HOST or COPY_TO_DEVICE only when the source differs
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 import torch
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
+from modelexpress.nixl_transfer import NIXL_DRAM_MEM_TYPE, NIXL_VRAM_MEM_TYPE
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
@@ -38,10 +40,7 @@ from modelexpress_rl.train.adapter import NixlMetadataProvider
 
 logger = logging.getLogger("modelexpress_rl.train.engines.fsdp.publisher")
 
-# The dtype weights are served on the wire as. The cast only actually happens
-# when the source dtype differs (e.g. an fp32 master): a matching source copies
-# as-is, and IN_PLACE can serve a matching source with no copy at all.
-# TODO: make this configurable at client initialization; hardcoded to bf16 for now.
+# Default transfer dtype; FSDPTrainerContext can override it per tensor.
 WIRE_DTYPE = torch.bfloat16
 
 
@@ -51,9 +50,9 @@ class LocalTensorShard:
 
     ``source_tensor`` is the live (or detached) rank-local view. ``shard_offset``
     is the per-dim offset of this shard's box inside the global tensor (all-zero
-    for unsharded/replicated). ``staging_tensor`` is set only for COPY_TO_DEVICE
-    and is the WIRE_DTYPE registered arena the source is copied into (copy_
-    converts only if the source dtype differs).
+    for unsharded/replicated). ``staging_tensor`` is set for either COPY mode
+    and uses the selected transfer dtype. Copying converts only when the source
+    dtype differs.
     """
 
     name: str
@@ -66,7 +65,11 @@ class LocalTensorShard:
     @property
     def served_tensor(self) -> torch.Tensor:
         """The tensor NIXL actually registers/serves (staging if copied, else source)."""
-        return self.staging_tensor if self.staging_tensor is not None else self.source_tensor
+        return (
+            self.staging_tensor
+            if self.staging_tensor is not None
+            else self.source_tensor
+        )
 
 
 def capture_local_shards(
@@ -89,7 +92,7 @@ def capture_local_shards(
         zero_offset = tuple(0 for _ in full_shape)
 
         # TODO(dedup-staging): for the full-copy tensors below (unsharded +
-        # replicated), under COPY_TO_DEVICE every rank stages a redundant copy;
+        # replicated), under either COPY mode every rank stages a redundant copy;
         # consider staging + publishing from rank 0 only in that mode.
 
         # Unsharded (not a DTensor): this rank holds the full tensor; publish it.
@@ -153,6 +156,7 @@ def build_fsdp_reshard_manifest(
     manager: NixlMetadataProvider,
     shards: list[LocalTensorShard],
     metadata_endpoint: str,
+    metrics: dict[str, int | float] | None = None,
 ) -> bytes:
     """Describe already-registered FSDP source shards as an MX manifest blob.
 
@@ -167,6 +171,7 @@ def build_fsdp_reshard_manifest(
     if not shards:
         raise ValueError("no local shards to publish")
 
+    generation_started = time.perf_counter()
     by_name: dict[str, PublishedTensor] = {}
     for shard in shards:
         served = shard.served_tensor
@@ -182,6 +187,11 @@ def build_fsdp_reshard_manifest(
             shard_offset=tuple(shard.shard_offset),
             shape=tuple(shard.local_shape),
             digest=published_digest(served),
+            memory_type=(
+                NIXL_DRAM_MEM_TYPE
+                if served.device.type == "cpu"
+                else NIXL_VRAM_MEM_TYPE
+            ),
         )
         tensor = by_name.get(shard.name)
         if tensor is None:
@@ -196,12 +206,30 @@ def build_fsdp_reshard_manifest(
             tensor.shards.append(published_shard)
 
     published = list(by_name.values())
-    return wrap_rendezvous_blob(
+    generation_s = time.perf_counter() - generation_started
+    serialization_started = time.perf_counter()
+    blob = wrap_rendezvous_blob(
         manager.nixl_metadata,
         agent_name,
         metadata_endpoint,
         published,
     )
+    serialization_s = time.perf_counter() - serialization_started
+    if metrics is not None:
+        metrics.update(
+            {
+                "manifest_generation_s": generation_s,
+                "manifest_serialization_s": serialization_s,
+                "manifest_bytes": len(blob),
+                "manifest_tensor_count": len(published),
+            }
+        )
+    return blob
 
 
-__all__ = ["WIRE_DTYPE", "LocalTensorShard", "capture_local_shards", "build_fsdp_reshard_manifest"]
+__all__ = [
+    "WIRE_DTYPE",
+    "LocalTensorShard",
+    "build_fsdp_reshard_manifest",
+    "capture_local_shards",
+]

@@ -13,9 +13,10 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from .. import envs as rl_envs
+from .. import timing
 from ..s3 import S3Client
 from ..utils import make_tensor_reader
-from ..version import WeightVersionRef
+from ..version import TrainerTensorsMetadata, WeightVersionRef
 from .adapter import (
     StagedWeightVersionShardData,
     TrainerStagingMode,
@@ -42,6 +43,27 @@ PublicationArtifact = (
 logger = logging.getLogger("modelexpress_rl.train.runtime")
 
 
+def _flatten_timing(payload: dict[str, Any]) -> dict[str, int | float]:
+    """Flatten one refit record into scalar metrics a framework can chart.
+
+    Stages with no measurements are dropped rather than reported as zero, since
+    a stage that did not run and a stage that took no time are different facts
+    and only one of them is worth a point on a graph.
+    """
+    metrics: dict[str, int | float] = {
+        "trainer_refit_e2e_s": float(payload["e2e_ms"]) / 1000.0,
+    }
+    for stage, values in payload["stages"].items():
+        if values["count"]:
+            metrics[f"{stage}_s"] = float(values["duration_ms"]) / 1000.0
+        for name, value in values.get("metadata", {}).items():
+            if isinstance(value, bool):
+                metrics[name] = int(value)
+            elif isinstance(value, (int, float)):
+                metrics[name] = value
+    return metrics
+
+
 class TrainerRuntime:
     """Own one publication method and all transport resources it requires."""
 
@@ -62,6 +84,7 @@ class TrainerRuntime:
             resources.worker_endpoint if resources is not None else ""
         )
         self._bound_tensors: Any | None = None
+        self._last_full_tensor_metrics: dict[str, int | float] = {}
         self._closed = False
 
     @classmethod
@@ -124,6 +147,7 @@ class TrainerRuntime:
             host = envs.MX_WORKER_HOST
             if not host.strip():
                 raise ValueError("MX_WORKER_HOST is required")
+
             def create_full_tensor() -> FullTensorNixlPublicationMethod:
                 adapter = _create_trainer_adapter(
                     engine_context,
@@ -167,14 +191,16 @@ class TrainerRuntime:
 
     def _canonical_delta(self) -> CanonicalDeltaPublicationMethod:
         if not isinstance(self.method, CanonicalDeltaPublicationMethod):
-            raise RuntimeError("operation requires canonical-delta publication")
+            raise RuntimeError(  # noqa: TRY004
+                "operation requires canonical-delta publication"
+            )
         return self.method
 
     @property
     def source_slot_id(self) -> str:
         return self._full_tensor().source_slot_id
 
-    def bind_tensors(self, tensors: Any) -> str:
+    def bind_tensors(self, tensors: Any) -> TrainerTensorsMetadata:
         if tensors is None:
             raise ValueError("tensors must not be None")
         if self._bound_tensors is not None:
@@ -192,24 +218,13 @@ class TrainerRuntime:
         self,
         *,
         version: WeightVersionRef,
-        tensors: Any,
-        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None,
+        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
     ) -> PublicationArtifact:
-        if self.method is None:
-            self._full_tensor()
-        if isinstance(self.method, FullTensorNixlPublicationMethod):
-            if hf_tensor_iter is not None:
-                raise ValueError("hf_tensor_iter is only supported for object storage")
-            return self.method.stage(version=version, tensors=tensors)
-        if tensors is not None:
-            raise ValueError(
-                "object storage publication accepts hf_tensor_iter, not tensors"
-            )
         if hf_tensor_iter is None:
             raise ValueError(
                 "hf_tensor_iter is required for object storage publication"
             )
-        return self.method.stage(version=version, hf_tensor_iter=hf_tensor_iter)
+        return self._canonical_delta().stage(version=version, hf_tensor_iter=hf_tensor_iter)
 
     def publish(
         self, *, version: WeightVersionRef, staged: PublicationArtifact
@@ -222,11 +237,22 @@ class TrainerRuntime:
         if self._bound_tensors is None:
             raise RuntimeError("bind_tensors() must be called before publish_version()")
         method = self._full_tensor()
-        staged = method.stage(
-            version=version,
-            tensors=self._bound_tensors,
+        recorder = timing.start_cycle(
+            version_id=version.version_id,
+            rank=rl_envs.LOCAL_RANK,
+            backend="rl_trainer",
         )
-        method.publish(version=version, staged=staged)
+        try:
+            with timing.active(recorder):
+                staged = method.stage(
+                    version=version,
+                    tensors=self._bound_tensors,
+                )
+                method.publish(version=version, staged=staged)
+        finally:
+            payload = timing.emit(recorder, logger)
+            if payload is not None:
+                self._last_full_tensor_metrics = _flatten_timing(payload)
 
     def release(self, *, version: WeightVersionRef) -> None:
         if isinstance(self.method, FullTensorNixlPublicationMethod):
@@ -235,7 +261,9 @@ class TrainerRuntime:
     def pop_metrics(self) -> dict[str, int | float]:
         if isinstance(self.method, CanonicalDeltaPublicationMethod):
             return self.method.pop_metrics()
-        return {}
+        metrics = self._last_full_tensor_metrics
+        self._last_full_tensor_metrics = {}
+        return metrics
 
     def close(self) -> None:
         if self._closed:

@@ -126,7 +126,7 @@ trainer.bind_tensors(megatron_tensor_specs)
 trainer.publish_version(version=WeightVersionRef(version.uid))
 ```
 
-The deployment supplies `MODEL_NAME`,
+The deployment supplies `MX_MODEL_NAME_OVERRIDE`,
 `MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the
 normal ModelExpress server configuration. The Megatron adapter derives its
 source slot from logical tensor names and shard geometry. DP replicas of the same
@@ -180,12 +180,25 @@ objects are stored beside it. A delta index records the target
 `STAGING` to `READY`. S3 versions remain READY for rollout recovery; their
 immutable objects are governed by the bucket's external lifecycle policy.
 
+Generators use registered MX IDs and base relationships to replay S3 deltas.
+The manifest's `metadata.version` and `metadata.base_version` may differ from
+those IDs or be absent, allowing existing artifacts to be registered without
+rewriting their indexes. The caller must register the correct S3 URI and base
+version; MX's exact-base checks and payload validation remain enabled.
+
 The client owns the NIXL manager and trainer-side manifest service. `server_url`
 selects the central ModelExpress control-plane service and defaults to the
 normal ModelExpress server configuration. A Megatron worker may initialize the
 client before its distributed process group is ready; the explicitly selected
 `engine_context` is constructed lazily on the first tensor operation. Deployment
 environment variables do not select Python implementations.
+
+For synchronous trainers, prefer `IN_PLACE` when storage remains stable and no
+trainer-side conversion is needed. FSDP also supports `COPY_TO_HOST`, the first
+choice when in-place publication is unavailable. Reserve `COPY_TO_DEVICE` for
+cases where measured latency justifies a persistent extra copy in VRAM. See
+[staging mode selection](../../docs/DEPLOYMENT.md#choosing-trainer-staging-for-synchronous-refits)
+for conversion, lifetime, host-memory, and compatibility requirements.
 
 Initialization fixes the staging mode. NIXL also fixes its payload format;
 canonical S3 publication follows each target `WeightVersion`. On NIXL,
@@ -256,6 +269,7 @@ register_modelexpress_loaders()
 | `MX_P2P_METADATA` | `1` | Serve tensor and artifact manifests directly from source workers; set to `0` to route full tensor metadata through the central server |
 | `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Select the engine-neutral initial-load policy. With `RL`, a configured desired UID permits only desired-version P2P and S3 replay; without one, loading falls back through `MX_MODEL_URI` and then the engine default. vLLM speculative draft models are rejected in `RL` mode. |
 | `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact version required when `MX_LOAD_STRATEGY_CHAIN=RL`; startup fails rather than using a version-agnostic fallback when neither P2P nor S3 can load it |
+| `MX_GENERATOR_SOURCE_ORDER` | Auto-detected | Ordered RL weight sources. Desired-version cold start defaults to `GENERATOR,OBJECT_STORAGE`; `OBJECT_STORAGE` disables P2P for both cold start and active refit. `TRAINER` applies only to active refit and is rejected for desired-version cold start. |
 | `MX_REFIT_CHECKPOINT_DIR` | (unset) | Host-local cache for RL S3 full checkpoints, deltas, and materialized checkpoints; the S3 strategy skips when it is unset |
 | `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL metadata-listener port for RL generator refit; each rank adds its local device ID. Kept separate from `MX_METADATA_PORT`, which may remain owned by the boot-time loader |
 | `MX_ARTIFACT_TRANSFER` | `0` | Transfer compatible vLLM TorchInductor, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM |
@@ -274,6 +288,7 @@ register_modelexpress_loaders()
 | `MX_RESHARD_HANDSHAKE_ATTEMPT_S` | `20` | Ceiling on a single peer dial. A reachable peer answers in well under a second, so a short attempt frees the budget to try a different peer rather than block on one |
 | `MX_RESHARD_HANDSHAKE_BACKOFF_S` | `2` | Pause after a full pass over the pending peers makes no progress, so a transient stall is waited out rather than hammered |
 | `MX_REFIT_STAGE_RECORD` | `1` | Emit one `refit-stage-v2` JSON record per refit, giving a benchmark harness the per-stage timings without parsing logs. Set to `0` to silence it |
+| `MX_REFIT_PACK_MODULES` | `0` | Coalesce consecutive owning-module batches in a bounded refit up to the same `max_staging_bytes`, trading a larger arena residency for fewer of them. The packed batch reads exactly the bytes its modules read — same copies, planned bytes and READ descriptors — and modules pulling the same complete source are never packed together. Off by default because one module per batch is the smallest arena a model can refit through |
 | `MX_RESHARD_MAX_GBPS` | `0` | Per-rank fabric ceiling in Gbps. A measured wire rate above it means the timing is wrong rather than the transfer being fast, so the refit is rejected. `0` disables the check, since only the operator knows the real per-rank limit |
 | `MX_RESHARD_MIN_GBPS` | `0` | Per-rank floor in Gbps. Below it, the refit emits a `refit-slow-throughput-v1` JSON warning naming the rate, the bound and the shortfall. Applies to both receivers — the Megatron slice-reshard receiver and the staged receiver the FSDP trainers pull over, including its peer-to-peer pull — so one setting covers a job whichever path it refits on. Warns rather than aborting, unlike the ceiling: an impossible rate means the payload never moved, but a slow one is still correct, so enforcement belongs in a CI gate reading the record rather than in a running job. `0` disables it. Worth setting for any throughput run — a 20x collapse has been observed with byte counts exact, descriptor counts exact, coverage 100%, fallback 0 and no error anywhere, and without a lower bound there is nothing in the telemetry that dissents. When choosing a value, note that it is compared per rank against the rate one receiver sees *while its siblings are also receiving*, which is well below the rate a single receiver reaches alone; sizing it against the solo number puts the floor above the healthy concurrent rate and it will fire on good runs. Aim between the two — roughly the geometric mean of the collapsed rate and the healthy concurrent rate leaves both verdicts off a tight margin |
 | `MX_RESHARD_PUBLISH_DIGEST` | `0` | Have each trainer publish a position-sensitive digest of every shard it advertises, so a receiver can later confirm it installed the bytes the publisher held. Off by default: the reduction costs a pass over every published tensor, which is large next to a ~1.5 s wire, so turn it on when qualifying a build rather than when measuring throughput |

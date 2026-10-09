@@ -12,6 +12,7 @@ import pytest
 import torch.nn as nn
 
 from modelexpress.adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
+from modelexpress.engines.vllm.adapter import VllmAdapter
 from modelexpress.load_strategy import LoadResult
 from modelexpress_rl import (
     ObjectStorageSource,
@@ -27,8 +28,6 @@ from modelexpress_rl.inference.load_strategy import (
     RLLoadStrategyChain,
     _resolve_s3_replay_chain,
 )
-
-
 def _context():
     """Build a default load context for cold-start strategy tests."""
     ctx = MagicMock()
@@ -74,7 +73,6 @@ def _version(
             storage_type=ObjectStorageType.S3,
             uri=f"s3://weights/{uid}/model.safetensors.index.json",
         ),
-        expected_source_slots=(),
         layout_signature="layout",
         state=state,
         created_at_unix_ms=1,
@@ -109,6 +107,66 @@ def test_desired_version_does_not_use_version_agnostic_fallbacks(monkeypatch):
         RLLoadStrategyChain.run(model, ctx)
 
     fallback.load.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (None, [DesiredVersionP2PStrategy, DesiredVersionS3Strategy]),
+        ("OBJECT_STORAGE", [DesiredVersionS3Strategy]),
+        (
+            "OBJECT_STORAGE,GENERATOR",
+            [DesiredVersionS3Strategy, DesiredVersionP2PStrategy],
+        ),
+        ("GENERATOR", [DesiredVersionP2PStrategy]),
+    ],
+)
+def test_desired_version_uses_configured_source_order(
+    monkeypatch,
+    configured,
+    expected,
+):
+    monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
+    if configured is None:
+        monkeypatch.delenv("MX_GENERATOR_SOURCE_ORDER", raising=False)
+    else:
+        monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", configured)
+    model = nn.Linear(1, 1)
+
+    with patch(
+        "modelexpress_rl.inference.load_strategy.execute_load_strategies",
+        return_value=model,
+    ) as execute:
+        assert RLLoadStrategyChain.run(model, _context()) is model
+
+    strategies = execute.call_args.args[2]
+    assert [type(strategy) for strategy in strategies] == expected
+
+
+def test_desired_version_rejects_trainer_source(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "TRAINER,GENERATOR")
+
+    with pytest.raises(ValueError, match="cannot include TRAINER"):
+        RLLoadStrategyChain.run(nn.Linear(1, 1), _context())
+
+
+def test_distributed_cold_start_rejects_source_order_disagreement(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "GENERATOR,OBJECT_STORAGE")
+
+    def gather(state):
+        phase, desired, configured, result = state
+        peer_result = ("OBJECT_STORAGE",) if phase == "source_order" else result
+        return state, (phase, desired, configured, peer_result)
+
+    ctx = _context()
+    ctx.adapter = _DistributedAdapter(gather)
+    with pytest.raises(
+        StrategyRecoveryError,
+        match="result disagreement during cold-start source order",
+    ):
+        RLLoadStrategyChain.run(nn.Linear(1, 1), ctx)
 
 
 def test_distributed_cold_start_rejects_desired_version_disagreement(monkeypatch):
@@ -212,14 +270,34 @@ def test_desired_p2p_is_skipped_without_desired_version(monkeypatch):
     assert DesiredVersionP2PStrategy().is_available(_context()) is False
 
 
-def test_desired_p2p_uses_exact_revision(monkeypatch):
+def test_desired_p2p_requires_a_tensor_read_lease():
+    assert DesiredVersionP2PStrategy.requires_tensor_read_lease is True
+
+
+@pytest.mark.parametrize("model_name", [None, "mx_model_abc"])
+def test_desired_p2p_uses_exact_revision(monkeypatch, model_name):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
+    if model_name is None:
+        monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
+    else:
+        monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", model_name)
+    model_path = "/root/.cache/vllm/assets/model_streamer/0088a9aa"
     ctx = _context()
+    adapter = VllmAdapter(
+        SimpleNamespace(
+            parallel_config=SimpleNamespace(),
+            load_config=SimpleNamespace(device="cuda:0"),
+        ),
+        SimpleNamespace(model=model_path, dtype="bfloat16", quantization=None),
+    )
+    ctx.identity = adapter.build_identity()
     result = LoadResult(value=nn.Linear(1, 1))
     client = MagicMock()
     client.__enter__.return_value = client
     client.get_weight_version.return_value = _version(
-        "version-7", WeightPayloadFormat.FULL_HF_CHECKPOINT
+        "version-7",
+        WeightPayloadFormat.FULL_HF_CHECKPOINT,
+        model_name=model_name or model_path,
     )
 
     with patch(
@@ -309,6 +387,7 @@ def test_missing_optional_sources_reaches_engine_default(monkeypatch, caplog):
     monkeypatch.delenv("MX_REFIT_DESIRED_VERSION_UID", raising=False)
     monkeypatch.delenv("MX_REFIT_CHECKPOINT_DIR", raising=False)
     monkeypatch.delenv("MX_MODEL_URI", raising=False)
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "invalid")
     model = nn.Linear(1, 1)
     ctx = _context()
     unavailable = MagicMock()

@@ -5,15 +5,51 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
+import logging
 import shutil
+import stat
+import sys
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from urllib.parse import quote
+
+logger = logging.getLogger(__name__)
+
+
+def _copy_checkpoint_file(source: str, destination: str) -> str:
+    """Copy a file with copy2 metadata, using Linux copy-on-write if supported."""
+    if sys.platform != "linux" or not stat.S_ISREG(Path(source).stat().st_mode):
+        return shutil.copy2(source, destination)
+
+    # FICLONE from linux/fs.h; Python exposes the constant starting in 3.12.
+    with open(source, "rb") as src, open(destination, "xb") as dst:
+        try:
+            fcntl.ioctl(
+                dst.fileno(), getattr(fcntl, "FICLONE", 0x40049409), src.fileno()
+            )
+        except OSError as error:
+            # Whole-file cloning can be unsupported for a filesystem, mount
+            # pair, or file layout. Permission, capacity and I/O errors are fatal.
+            if error.errno not in {
+                errno.EBADF,  # Also means the source filesystem cannot reflink.
+                errno.EOPNOTSUPP,
+                errno.ENOTTY,
+                errno.EXDEV,
+                errno.EINVAL,
+                errno.ENOSYS,
+            }:
+                raise
+        else:
+            shutil.copystat(source, destination)
+            return destination
+
+    return shutil.copy2(source, destination)
 
 
 def _encode_cache_component(value: str) -> str:
@@ -121,7 +157,8 @@ class LocalCheckpointStore:
         #     state.json                current preparation transaction
         #     active.json               version committed after engine install
         #     .lock                     cross-process cache coordination
-        #     .install.lock             blocks preparation during engine install
+        #     .prepare.lock             serializes preparation requests
+        #     .install.lock             excludes mutation during engine install
         #
         # Full checkpoints, deltas, and chain manifests are the canonical
         # lineage. Materialized checkpoints are rebuildable outputs for engines
@@ -136,6 +173,7 @@ class LocalCheckpointStore:
         self.state_path = self.cache / "state.json"
         self.active_path = self.cache / "active.json"
         self.lock_path = self.cache / ".lock"
+        self.prepare_lock_path = self.cache / ".prepare.lock"
         self.install_lock_path = self.cache / ".install.lock"
         self.max_size_bytes = max_size_bytes
 
@@ -149,6 +187,19 @@ class LocalCheckpointStore:
         ):
             path.mkdir(exist_ok=True)
 
+        with self.locked(shared=True):
+            free_bytes = shutil.disk_usage(self.cache).free
+            disk_limit = self.cache_size_bytes() + free_bytes
+            if self.max_size_bytes is None or self.max_size_bytes > disk_limit:
+                self.max_size_bytes = disk_limit
+                logger.info(
+                    "Refit checkpoint cache %s capped at %.2f GB "
+                    "(free=%.2f GB)",
+                    self.cache,
+                    disk_limit / 1_000_000_000,
+                    free_bytes / 1_000_000_000,
+                )
+
     @contextmanager
     def _locked(self, path: Path, shared: bool) -> Iterator[None]:
         with path.open("a+") as handle:
@@ -161,6 +212,9 @@ class LocalCheckpointStore:
 
     def installation_locked(self, *, shared: bool = False):
         return self._locked(self.install_lock_path, shared=shared)
+
+    def preparation_locked(self):
+        return self._locked(self.prepare_lock_path, shared=False)
 
     @contextmanager
     def replace_directory(
@@ -176,7 +230,9 @@ class LocalCheckpointStore:
             if copy_from is None:
                 temporary.mkdir(parents=True)
             else:
-                shutil.copytree(copy_from, temporary)
+                shutil.copytree(
+                    copy_from, temporary, copy_function=_copy_checkpoint_file
+                )
             yield temporary
             shutil.rmtree(target, ignore_errors=True)
             temporary.replace(target)
@@ -418,6 +474,9 @@ class LocalCheckpointStore:
             },
         )
 
+    def has_artifact_record(self, artifact: Path) -> bool:
+        return self._source_path(artifact).exists()
+
     def _verified_artifact_metadata(self, artifact: Path) -> dict:
         metadata = self._read_json(self._source_path(artifact))
         if metadata is None or metadata.get("files") != _artifact_files_state(
@@ -429,13 +488,16 @@ class LocalCheckpointStore:
     def verify_artifact(self, artifact: Path) -> None:
         self._verified_artifact_metadata(artifact)
 
+    def artifact_source(self, artifact: Path) -> dict[str, str] | None:
+        """Return the recorded immutable source after verifying local files."""
+        return self._verified_artifact_metadata(artifact).get("source")
+
     def verify_artifact_source(
         self,
         artifact: Path,
         expected_source: dict[str, str],
     ) -> None:
-        metadata = self._verified_artifact_metadata(artifact)
-        if metadata.get("source") != expected_source:
+        if self.artifact_source(artifact) != expected_source:
             raise ValueError("prepared checkpoint has different source identity")
 
 

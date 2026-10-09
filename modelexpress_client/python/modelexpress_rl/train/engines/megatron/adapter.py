@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
+from dataclasses import asdict
 from typing import Any
 
 import torch.distributed as dist
+from modelexpress import envs as mx_envs
+from modelexpress.refit.timing import add_refit_metadata, refit_span
 
 from modelexpress_rl.train.adapter import (
     CompletionFence,
@@ -21,6 +23,7 @@ from modelexpress_rl.train.adapter import (
     WeightPayloadFormat,
     WeightVersionShardManifest,
 )
+from modelexpress_rl.train.manifest import bound_tensor_manifest
 
 from .aliases import MegatronTensorSpec, build_hf_aliases
 from .publisher import build_megatron_reshard_manifest
@@ -41,6 +44,7 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
         self._nixl_metadata_endpoint = nixl_metadata_endpoint
         self._source_slot_id: str | None = None
         self._registered_addrs: dict[str, int] | None = None
+        self._manifest: WeightVersionShardManifest | None = None
 
     @property
     def source_slot_id(self) -> str:
@@ -55,25 +59,17 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
             isinstance(item, MegatronTensorSpec) for item in tensors
         ):
             raise TypeError("tensors must be a list of MegatronTensorSpec")
-        layout = [
-            {
-                "name": item.name,
-                "role": item.role,
-                "hf_names": item.hf_names,
-                "global_shape": item.global_shape,
-                "placement_kind": item.placement_kind,
-                "shard_axis": item.shard_axis,
-                "local_shard_range": item.local_shard_range,
-                "extras": item.extras,
-            }
-            for item in sorted(tensors, key=lambda item: item.name)
+        coverage = [
+            asdict(tensor)
+            for tensor in build_hf_aliases(
+                tensors, agent_name=str(self._manager.agent_name)
+            )
         ]
-        digest = hashlib.sha256(
-            json.dumps(layout, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-        source_slot_id = f"megatron:partition:{digest}"
+        source_slot_id = hashlib.sha256(bound_tensor_manifest(coverage)).hexdigest()
         if self._source_slot_id is not None and self._source_slot_id != source_slot_id:
-            raise RuntimeError("Megatron logical tensor partition changed after binding")
+            raise RuntimeError(
+                "Megatron logical tensor partition changed after binding"
+            )
         self._source_slot_id = source_slot_id
         return source_slot_id
 
@@ -110,35 +106,59 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
             raise ValueError("Megatron tensor names must be unique within this rank")
         addresses = {name: tensor.data_ptr() for name, tensor in sources.items()}
         if self._registered_addrs is None:
-            self._manager.register_tensors(sources)
+            with refit_span(
+                "setup_registration",
+                metadata={"trainer_registrations": 1},
+                accumulate_metadata=True,
+                duration_key="trainer_registration_s",
+            ):
+                self._manager.register_tensors(sources)
             self._registered_addrs = addresses
         elif addresses != self._registered_addrs:
             raise RuntimeError(
                 "Megatron source storage changed after NIXL registration; "
                 "IN_PLACE requires stable tensor addresses"
             )
-        published = build_hf_aliases(
-            tensors,
-            agent_name=str(self._manager.agent_name),
-        )
-        manifest = build_megatron_reshard_manifest(
-            manager=self._manager,
-            published=published,
-            metadata_endpoint=self._nixl_metadata_endpoint,
-        )
-        total_bytes = sum(
-            math.prod(shard.shape) * tensor.elsize
-            for tensor in manifest.tensors
-            for shard in tensor.shards
-        )
-
-        return StagedWeightVersionShardData(
-            manifest=WeightVersionShardManifest(
+        cache_hit = self._manifest is not None and not mx_envs.MX_RESHARD_PUBLISH_DIGEST
+        if not cache_hit:
+            with refit_span(
+                "source_preparation",
+                metadata={"manifest_generations": 1},
+                accumulate_metadata=True,
+                duration_key="manifest_generation_s",
+            ):
+                published = build_hf_aliases(
+                    tensors,
+                    agent_name=str(self._manager.agent_name),
+                )
+                manifest = build_megatron_reshard_manifest(
+                    manager=self._manager,
+                    published=published,
+                    metadata_endpoint=self._nixl_metadata_endpoint,
+                )
+            total_bytes = sum(
+                math.prod(shard.shape) * tensor.elsize
+                for tensor in manifest.tensors
+                for shard in tensor.shards
+            )
+            self._manifest = WeightVersionShardManifest(
                 data=manifest.blob,
                 tensor_count=len(manifest.tensors),
                 total_bytes=total_bytes,
                 transport="NIXL",
-            ),
+            )
+        assert self._manifest is not None
+        add_refit_metadata(
+            "source_preparation",
+            {
+                "manifest_bytes": len(self._manifest.data),
+                "manifest_cache_hit": cache_hit,
+                "manifest_tensor_count": self._manifest.tensor_count,
+            },
+        )
+
+        return StagedWeightVersionShardData(
+            manifest=self._manifest,
             # IN_PLACE performs no asynchronous copy, so the shard is ready to
             # publish as soon as its manifest has been built.
             publish_ready=CompletionFence(lambda: None),
