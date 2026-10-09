@@ -501,6 +501,154 @@ async fn trainer_mesh_membership_is_shared_and_generation_checked() {
 
 #[tokio::test]
 #[ignore = "requires a live Redis at REDIS_URL"]
+async fn linked_reader_lease_fences_replica_addition_until_release_or_expiry() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (shutdown, server) = start_server(port, &redis_url);
+    let mut client = connect(port).await;
+    let (metadata, stop_worker, worker_server) = bound_worker().await;
+    for expire in [false, true] {
+        let trainer_id = unique_id("leased-mesh-trainer");
+        let replica_id = unique_id("leased-mesh-replica");
+        let generator_id = unique_id("leased-mesh-reader");
+        for worker_id in [&trainer_id, &replica_id] {
+            client
+                .register_worker(mesh_trainer(worker_id, &metadata))
+                .await
+                .expect("register live trainer");
+        }
+        client
+            .register_worker(worker(&generator_id, WorkerRole::Generator, 60))
+            .await
+            .expect("register reader");
+        let mesh = client
+            .create_trainer_mesh(CreateTrainerMeshRequest {
+                model_name: "test/model".to_string(),
+                idempotency_key: unique_id("leased-replica-mesh"),
+                workers: HashMap::from([(trainer_id.clone(), metadata.clone())]),
+            })
+            .await
+            .expect("create mesh")
+            .into_inner()
+            .mesh
+            .expect("mesh");
+        let version = fresh_mesh_version(&mut client, &mesh.mesh_id).await;
+        let publication = mesh_shard(&version.uid, &trainer_id, &metadata);
+        let ready = client
+            .create_weight_version_shard(CreateWeightVersionShardRequest {
+                shard: Some(publication.clone()),
+            })
+            .await
+            .expect("publish initial version")
+            .into_inner()
+            .version
+            .expect("version");
+        assert_eq!(ready.state, WeightVersionState::Ready as i32);
+        let lease = client
+            .register_version_lease(RegisterVersionLeaseRequest {
+                version_id: version.uid.clone(),
+                worker_id: generator_id,
+                ttl_seconds: if expire { 2 } else { 60 },
+            })
+            .await
+            .expect("acquire linked reader lease")
+            .into_inner()
+            .lease
+            .expect("lease");
+        let unchanged = client
+            .update_trainer_mesh(UpdateTrainerMeshRequest {
+                mesh_id: mesh.mesh_id.clone(),
+                expected_generation: mesh.generation,
+                workers: mesh.workers.clone(),
+            })
+            .await
+            .expect("identical mesh update is safe while leased")
+            .into_inner()
+            .mesh
+            .expect("mesh");
+        assert_eq!(unchanged, mesh);
+        let update = UpdateTrainerMeshRequest {
+            mesh_id: mesh.mesh_id.clone(),
+            expected_generation: mesh.generation,
+            workers: HashMap::from([
+                (trainer_id.clone(), metadata.clone()),
+                (replica_id.clone(), metadata.clone()),
+            ]),
+        };
+        assert_eq!(
+            client
+                .update_trainer_mesh(update.clone())
+                .await
+                .expect_err("adding a replica must not advance a leased mesh")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            client
+                .get_trainer_mesh(GetTrainerMeshRequest {
+                    mesh_id: mesh.mesh_id.clone(),
+                })
+                .await
+                .expect("read protected mesh")
+                .into_inner()
+                .mesh,
+            Some(mesh.clone())
+        );
+        assert_eq!(
+            client
+                .get_weight_version(GetWeightVersionRequest {
+                    uid: version.uid.clone(),
+                })
+                .await
+                .expect("read protected version")
+                .into_inner()
+                .version,
+            Some(ready)
+        );
+        if expire {
+            tokio::time::sleep(Duration::from_millis(2_250)).await;
+        } else {
+            client
+                .delete_version_lease(DeleteVersionLeaseRequest {
+                    version_id: version.uid.clone(),
+                    lease_id: lease.lease_id,
+                    worker_id: lease.worker_id,
+                })
+                .await
+                .expect("release linked reader lease");
+        }
+        let updated = client
+            .update_trainer_mesh(update)
+            .await
+            .expect("reader release or expiry permits replica addition")
+            .into_inner()
+            .mesh
+            .expect("updated mesh");
+        assert_eq!(updated.generation, mesh.generation + 1);
+        assert_eq!(updated.workers.len(), 2);
+        reject_stale_publication(&mut client, publication).await;
+        let fresh = fresh_mesh_version(&mut client, &mesh.mesh_id).await;
+        assert_eq!(fresh.trainer_mesh_generation, updated.generation);
+        for worker_id in [&trainer_id, &replica_id] {
+            let published = client
+                .create_weight_version_shard(CreateWeightVersionShardRequest {
+                    shard: Some(mesh_shard(&fresh.uid, worker_id, &metadata)),
+                })
+                .await
+                .expect("publish current generation")
+                .into_inner()
+                .version
+                .expect("fresh version");
+            assert_eq!(published.state, WeightVersionState::Ready as i32);
+        }
+    }
+    stop(shutdown, server).await;
+    stop(stop_worker, worker_server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
 async fn mesh_linked_versions_publish_and_discover_declared_trainers() {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());

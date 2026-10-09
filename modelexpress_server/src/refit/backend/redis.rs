@@ -547,7 +547,7 @@ impl RefitBackend for RedisRefitBackend {
                     .to_string(),
             )),
             "VERSION_LEASED" => Err(RefitBackendError::FailedPrecondition(
-                "cannot rebind a worker endpoint while a linked version has an active lease"
+                "cannot change trainer mesh generation while a linked version has an active lease"
                     .to_string(),
             )),
             _ => Err(RefitBackendError::Internal(format!(

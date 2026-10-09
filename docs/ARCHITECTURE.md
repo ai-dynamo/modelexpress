@@ -452,6 +452,12 @@ fail explicitly. Versions without a trainer mesh, including object-storage
 versions, carry generation zero. A requested version whose recorded mesh
 generation differs from the current trainer mesh fails source resolution.
 
+Any trainer mesh update that changes its generation is rejected while a linked
+weight version has an active consumer lease, including additive replicas that
+leave existing publications intact. An update with unchanged membership remains a no-op.
+After readers release their leases, membership may advance and new weight
+versions capture the new generation; old version stamps are never changed.
+
 DIRECT installation and pipelined worker streaming are
 not implemented by this control-plane slice.
 NIXL manifest endpoints belong to their physical worker shards; a typed object
