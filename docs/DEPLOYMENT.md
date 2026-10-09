@@ -472,7 +472,11 @@ lacks.
 
 The image is scanned without running it: `.github/scripts/compliance/Dockerfile.extract`
 bind-mounts each arch's filesystem into an extractor on the runner's own
-platform. release-automation's `nvbug:attach-compliance` and
+platform. A syft scan of each arch's image and base image then cross-checks the
+CSV (`.github/scripts/compliance/audit_image.py`): the job fails if the image
+adds a package the CSV lacks, or a file no package owns that is not one of the
+binaries or `NOTICES` copied into `/app`. A new first-party file copied into
+`/app` goes in that script's `FIRST_PARTY_FILES`. release-automation's `nvbug:attach-compliance` and
 `nvbug:attach-license` jobs attach these files on every security nightly;
 when the trigger sends `DRY_RUN=true` they fetch and match the artifacts but
 write nothing to the OSRB bugs. The artifact names and layout are the contract of

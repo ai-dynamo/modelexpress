@@ -491,6 +491,35 @@ jobs:
           retention-days: 30
           overwrite: true
 
+      - name: Audit the server image with syft
+        env:
+          IMAGE: ${{ secrets.MX_IMAGE_REPO }}/modelexpress-server
+          TAG: ${{ needs.preflight.outputs.build_tag }}
+          SHA: ${{ github.sha }}
+          SYFT_VERSION: 1.52.0
+          SYFT_SHA256: caeedb81fb0491615f1ebd1761e4145d41ee86dd2cc7bf80669f9f5ad9d6133d
+          SYFT_FILE_METADATA_SELECTION: all
+          SYFT_FILE_METADATA_DIGESTS: sha256
+        run: |
+          set -euo pipefail
+          TARBALL="${RUNNER_TEMP}/syft.tar.gz"
+          curl -fsSL -o "${TARBALL}" \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          echo "${SYFT_SHA256}  ${TARBALL}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/syft"
+          tar -xzf "${TARBALL}" -C "${RUNNER_TEMP}/syft" syft
+          BASE=$(sed -n 's/^FROM \([^ ]*\) AS runtime$/\1/p' docker/Dockerfile)
+          for ARCH in amd64 arm64; do
+            "${RUNNER_TEMP}/syft/syft" "registry:${IMAGE}:${TAG}-${ARCH}" --platform "linux/${ARCH}" \
+              -o syft-json -q > "${RUNNER_TEMP}/syft-image-${ARCH}.json"
+            "${RUNNER_TEMP}/syft/syft" "registry:${BASE}" --platform "linux/${ARCH}" \
+              -o syft-json -q > "${RUNNER_TEMP}/syft-base-${ARCH}.json"
+            python3 .github/scripts/compliance/audit_image.py \
+              --image-sbom "${RUNNER_TEMP}/syft-image-${ARCH}.json" \
+              --base-sbom "${RUNNER_TEMP}/syft-base-${ARCH}.json" \
+              --csv "osrb-out/compliance/linux_${ARCH}/osrb-modelexpress-server-${ARCH}-${SHA:0:8}.csv"
+          done
+
       - name: Remove registry credentials
         if: always()
         run: rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
