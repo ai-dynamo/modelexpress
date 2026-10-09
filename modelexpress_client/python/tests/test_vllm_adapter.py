@@ -283,6 +283,61 @@ def test_after_rdma_receive_runs_derived_weight_finalizers(monkeypatch):
     ]
 
 
+def test_after_rdma_receive_releases_idle_cache_after_finalization(monkeypatch):
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = nn.Linear(4, 4)
+    model.register_buffer("scale", torch.ones(4))
+    result = LoadResult(value=model, model=model)
+    original = {
+        name: (tensor, tensor.data_ptr(), tensor.detach().clone())
+        for name, tensor in list(model.named_parameters()) + list(model.named_buffers())
+    }
+    events = []
+
+    def finalize(value, names):
+        events.append("finalize")
+        return value
+
+    def refresh(value):
+        events.append("refresh")
+        return value
+
+    monkeypatch.setattr(adapter, "_finalize_model_specific_weights", finalize)
+    monkeypatch.setattr(adapter, "_refresh_host_quantization_state", refresh)
+    monkeypatch.setattr(adapter.accelerator_backend, "synchronize", lambda: events.append("synchronize"))
+    monkeypatch.setattr(adapter.accelerator_backend, "empty_cache", lambda: events.append("empty_cache"))
+    assert adapter.after_rdma_receive(result) is result
+    assert events == ["finalize", "refresh", "synchronize", "empty_cache"]
+    for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+        previous, pointer, value = original[name]
+        assert tensor is previous
+        assert tensor.data_ptr() == pointer
+        torch.testing.assert_close(tensor, value)
+
+
+def test_before_rdma_receive_leaves_allocator_cache_untouched(monkeypatch):
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    monkeypatch.setattr(adapter, "_finalize_model_specific_weights", lambda value, names: value)
+    monkeypatch.setattr(adapter, "_process_weights_after_loading", lambda value: value)
+    empty_cache = MagicMock()
+    monkeypatch.setattr(adapter.accelerator_backend, "empty_cache", empty_cache)
+    model = nn.Linear(1, 1)
+    adapter.before_rdma_receive(LoadResult(value=model, model=model))
+    empty_cache.assert_not_called()
+
+
+def test_after_rdma_receive_does_not_release_cache_after_failed_finalization(monkeypatch):
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    monkeypatch.setattr(adapter, "_finalize_model_specific_weights", lambda value, names: value)
+    monkeypatch.setattr(adapter, "_refresh_host_quantization_state", MagicMock(side_effect=RuntimeError("refresh failed")))
+    empty_cache = MagicMock()
+    monkeypatch.setattr(adapter.accelerator_backend, "empty_cache", empty_cache)
+    with pytest.raises(RuntimeError, match="refresh failed"):
+        model = nn.Linear(1, 1)
+        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+    empty_cache.assert_not_called()
+
+
 def test_after_rdma_receive_refreshes_host_attention_scale_mirrors(
     mock_accelerator_backend_cls,
 ):
