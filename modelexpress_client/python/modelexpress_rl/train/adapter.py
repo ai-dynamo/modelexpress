@@ -47,7 +47,13 @@ class NixlMetadataProvider(Protocol):
 
 
 class TrainerStagingMode(str, Enum):
-    """How a trainer adapter preserves a version's immutable source bytes."""
+    """How a trainer adapter preserves a version's immutable source bytes.
+
+    Prefer IN_PLACE for synchronous updates with stable, matching-dtype sources
+    and no trainer-side conversion. Keep source bytes immutable until retirement.
+    Prefer COPY_TO_HOST otherwise. COPY_TO_DEVICE trades substantial extra VRAM
+    for lower latency and should be an explicit, measured exception.
+    """
 
     UNSPECIFIED = "UNSPECIFIED"
     COPY_TO_DEVICE = "COPY_TO_DEVICE"
@@ -125,7 +131,7 @@ class TrainerEngineAdapter(ABC):
 
     @abstractmethod
     def bind_tensors(self, tensors: Any) -> str:
-        """Bind stable engine tensors and return their logical source slot."""
+        """Hash canonical wire coverage without staging or publishing weights."""
 
     @property
     @abstractmethod
@@ -150,6 +156,9 @@ class TrainerEngineAdapter(ABC):
 
 class WeightVersionShardManifestPublisher(Protocol):
     """Worker endpoint that makes a manifest retrievable before advertisement."""
+
+    @property
+    def endpoint(self) -> str: ...
 
     def publish_manifest(
         self,

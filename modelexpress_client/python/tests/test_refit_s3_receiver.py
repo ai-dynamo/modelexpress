@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -198,7 +200,6 @@ class _Adapter:
             payload_format=inputs.payload_format,
             base_version_id=inputs.base_version_id,
             object_storage=inputs.object_storage,
-            expected_source_slots=(),
             layout_signature=inputs.layout_signature,
             state=WeightVersionState.READY,
             created_at_unix_ms=0,
@@ -221,7 +222,6 @@ class _Adapter:
                 payload_format=item.payload_format,
                 base_version_id=item.base_version_id,
                 object_storage=item.object_storage,
-                expected_source_slots=(),
                 layout_signature=item.layout_signature,
                 state=WeightVersionState.READY,
                 created_at_unix_ms=0,
@@ -1090,7 +1090,13 @@ def test_canonical_s3_preserves_active_checkpoint_when_disk_is_full(
 def test_canonical_s3_reseeds_a_modified_ready_checkpoint(monkeypatch, tmp_path):
     first, _storage = _build(monkeypatch, tmp_path, {})
     checkpoint_path = first._checkpoint.local_checkpoint / "model.safetensors"
+    previous = checkpoint_path.stat()
     save_file({"weight": torch.tensor([9.0, 10.0])}, checkpoint_path)
+    # Make the same-size overwrite visible on filesystems with coarse timestamps.
+    os.utime(
+        checkpoint_path,
+        ns=(previous.st_atime_ns, previous.st_mtime_ns + 1_000_000_000),
+    )
     first.close()
 
     second = _Adapter(
@@ -1789,6 +1795,29 @@ def test_canonical_s3_can_defer_activation_until_distributed_load_completes(
     adapter.close()
 
 
+def test_first_delta_retains_full_materialization_capacity_check(monkeypatch, tmp_path):
+    objects = _artifact(
+        torch.tensor([1.0, 2.0]).view(torch.uint8).numpy(),
+        torch.tensor([3.0, 4.0]).view(torch.uint8).numpy(),
+    )
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    store = adapter._checkpoint.store
+    base = store.full_path("base-a")
+    base_size = store.path_size_bytes(base)
+    ensure_capacity = store.ensure_capacity
+    reservations = []
+
+    def track_capacity(additional_bytes, **kwargs):
+        reservations.append(additional_bytes)
+        ensure_capacity(additional_bytes, **kwargs)
+
+    monkeypatch.setattr(store, "ensure_capacity", track_capacity)
+    staged = adapter.stage_weight(_inputs(None))
+    assert base_size in reservations
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
 def test_canonical_s3_applies_one_delta_to_the_active_checkpoint(
     monkeypatch, tmp_path
 ):
@@ -1979,7 +2008,6 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
             payload_format=item.payload_format,
             base_version_id=item.base_version_id,
             object_storage=item.object_storage,
-            expected_source_slots=(),
             layout_signature="",
             state=WeightVersionState.READY,
             created_at_unix_ms=0,
@@ -2014,6 +2042,9 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
     generator = ModelExpressGeneratorClient()
     generator._serving_version_id = "base-a"
     generator._max_replay_chain_length = 64
+    generator._staging_buffer_bytes = None
+    generator._staging_buffers_count = 1
+    generator._staging_device = "cuda"
     monkeypatch.setattr(
         generator,
         "_fetch_ready_version",
@@ -2196,6 +2227,42 @@ def test_canonical_s3_in_place_delta_failure_requires_recovery(
     adapter.close()
 
 
+@pytest.mark.parametrize("payload", ["full", "delta"])
+def test_prepared_target_can_be_reused_during_installation(
+    monkeypatch, tmp_path, payload
+):
+    if payload == "full":
+        objects = _full_artifact(torch.tensor([7.0, 8.0]))
+        inputs = _full_inputs()
+    else:
+        objects = _artifact(
+            torch.tensor([1.0, 2.0]).view(torch.uint8).numpy(),
+            torch.tensor([7.0, 8.0]).view(torch.uint8).numpy(),
+        )
+        inputs = _inputs(None)
+    first, storage = _build(monkeypatch, tmp_path, objects)
+    second = _Adapter(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path=tmp_path / "launch",
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+    )
+    first_staged = first.stage_weight(inputs)
+    downloads = list(storage.calls)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with first._method.installation_context(first._active):
+            second_staged = pool.submit(second.stage_weight, inputs).result(timeout=2)
+            assert second_staged.path == first_staged.path
+            assert storage.calls == downloads
+    first.release_staged_weight(first_staged)
+    second.release_staged_weight(second_staged)
+    first.close()
+    second.close()
+
+
 def test_installation_fence_blocks_prepare_until_activation(monkeypatch, tmp_path):
     objects = _full_artifact(torch.tensor([7.0, 8.0]))
     objects.update(
@@ -2374,11 +2441,17 @@ def test_canonical_s3_rejects_a_corrupt_cached_delta_during_replay(
         base.view(torch.uint8).numpy(),
         torch.tensor([9.0, 10.0]).view(torch.uint8).numpy(),
     )["s3://weights/test/v1/model-00000-of-00001.safetensors"]
-    (
+    delta_path = (
         adapter._checkpoint.store.delta_cache
         / "target-a"
         / "model-00000-of-00001.safetensors"
-    ).write_bytes(corrupt)
+    )
+    previous = delta_path.stat()
+    delta_path.write_bytes(corrupt)
+    os.utime(
+        delta_path,
+        ns=(previous.st_atime_ns, previous.st_mtime_ns + 1_000_000_000),
+    )
     objects.update(
         _artifact(
             middle.view(torch.uint8).numpy(),

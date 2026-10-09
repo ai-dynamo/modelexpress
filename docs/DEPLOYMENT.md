@@ -125,6 +125,13 @@ The chart creates a `ClusterRole` and `ClusterRoleBinding`, allowing the server
 to run in a dedicated namespace while accessing metadata resources in another
 namespace.
 
+The Kubernetes backend also needs the projected service account token to
+authenticate against the API server. The chart's `values.yaml` currently
+sets `serviceAccount.automount: false`; if the `serviceAccount.automount`
+key is absent from `values.yaml`, it defaults to `true`. Set
+`serviceAccount.automount: true` explicitly when using the Kubernetes
+backend.
+
 For automatic cleanup of P2P metadata, expose the client Pod identity through
 the Kubernetes Downward API. The checked-in vLLM, SGLang, and Dynamo manifests
 already include these fields:
@@ -659,8 +666,8 @@ default. An unknown name or non-floating tensor is rejected rather than silently
 ignoring a precision exception. Names must match the state dict supplied by that
 trainer, including any wrapper prefixes.
 
-`COPY_TO_DEVICE` registers persistent buffers in each selected dtype and copies
-subsequent versions into those buffers. `IN_PLACE` requires the source dtype to
+`COPY_TO_HOST` and `COPY_TO_DEVICE` register persistent buffers in each selected
+dtype and copy subsequent versions into those buffers. `IN_PLACE` requires the source dtype to
 match the selected dtype. The adapter copies the override mapping at creation;
 changing the caller's mapping does not change an active adapter. A source dtype
 change after initialization is rejected before writing a new version. Recreate
@@ -670,6 +677,41 @@ Manifests describe each served tensor's dtype and element size, and byte totals
 sum their actual sizes. Existing receiver dtype conversion remains available,
 but casting a rounded BF16 value back to FP32 cannot recover source precision.
 Verify installed parameters and generation separately from transfer completion.
+
+### Choosing trainer staging for synchronous refits
+
+Choose an existing `TrainerStagingMode` explicitly for the integration:
+
+| Mode | Recommendation | Lifetime and memory cost |
+|---|---|---|
+| `IN_PLACE` | First choice and lowest staging latency for synchronous integrations. Trainers wait for receivers to finish and retire/delete the version before updating its source bytes. | Registers existing contiguous storage without a second weight copy. Addresses must remain stable across updates; bytes must remain immutable while the version can be read. |
+| `COPY_TO_HOST` | First choice when `IN_PLACE` is unavailable, including trainer-side dtype conversion or moving source storage. | Keeps a persistent wire-format copy in pinned host RAM on CUDA hosts. GPU-to-host staging and host-to-receiver transfer add latency, but avoid a persistent second weight copy in VRAM. |
+| `COPY_TO_DEVICE` | Explicit exception when measured latency justifies the VRAM cost, typically for small models where `IN_PLACE` is unavailable. | Keeps an additional wire-format copy on the trainer device. It is generally faster than host staging but can consume substantial VRAM; budget all rank-local shards, including replicated tensors. |
+
+`IN_PLACE` cannot perform trainer-side conversion: each source must already have
+the selected transfer dtype and representation. A conversion plugin also rules
+out this mode. CPU offload or state-dict rematerialization can invalidate its
+stable-address requirement even when the dtypes match. Do not silently fall back
+to a device copy when these checks fail.
+
+The FSDP adapter supports all three modes for full-tensor payloads. Host staging
+preserves the per-tensor dtype overrides above and registers its persistent CPU
+buffers once. CUDA copy completion is fenced before publication; the served
+snapshot and its registration remain live until version retirement. Conversion
+can still require temporary device workspace; host staging eliminates the
+persistent wire-format device copy, not every transient allocation. Support for
+arbitrary conversion plugins remains adapter-specific.
+
+FP32 trainer shards transferred as BF16 with selected FP32 exceptions require
+conversion, so they cannot use `IN_PLACE`. Use `COPY_TO_HOST` for this precision
+policy unless a measured latency requirement justifies the additional VRAM
+needed by `COPY_TO_DEVICE`.
+
+Trainer `COPY_TO_HOST` is independent of the generator's `staging_device="cpu"`
+setting: the former changes where source snapshots live, while the latter
+changes where receivers land incoming bytes. Host-source manifests use the
+internal `mx.reshard.shard_table.v2` format, so both ends must run a host-aware
+client. Older readers reject this format. Device-only manifests retain v1.
 
 ### Dynamo Model Cache Deployment
 
@@ -1142,6 +1184,21 @@ for the next delta. The cadence is disabled by default. Slime exposes
 `full_hf_checkpoint_interval` in `--modelexpress-config`. In both cases, `N`
 counts published ModelExpress weight versions.
 
+The `vime_dynamo_delta_refit` and `dynamo_vllm_s3_delta_refit` Kubernetes examples
+use a disposable SeaweedFS 4.48 S3 fixture. Both manifests pin the upstream
+public `docker.io/chrislusf/seaweedfs` image by digest and run `weed mini` with
+S3 on port 9000. The `mx-s3-creds` Secret supplies `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` to both SeaweedFS and the S3 clients; Vime CI creates
+this Secret before deploying the stack. The `/healthz` readiness probe checks
+that the S3 listener is serving; it does not validate the backing storage.
+Data stays in an `emptyDir` volume. Volume counts are bounded for the 64 GiB
+Vime and 16 GiB lifecycle fixtures, with 1 GiB SeaweedFS volumes.
+Each storage pod requests 1 GiB of memory and has a 4 GiB limit for concurrent
+trainer multipart uploads. `GOMEMLIMIT=3GiB` leaves headroom below that limit;
+the previous 1 GiB container limit is insufficient for two trainer ranks.
+The Vime CI smoke test consumes the example manifest directly; update both
+manifests together when changing the fixture image.
+
 ### Server-Backed Model Cache (No Shared Storage)
 
 For workers that cannot reach the Hugging Face Hub themselves, ModelExpress Server can act as the only route to the model. The worker asks the server for repository files; the server downloads the model once on a cold miss and serves every later worker from its own cache.
@@ -1449,7 +1506,153 @@ kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/co
 
 ## Performance Reference
 
+### Bounded GPU refit
+
+Framework integrations choose the public staging, installation and memory
+settings. The framework also owns the safe update point and the pause/restart
+policy described below.
+
+| Integration choice | Public setting or operation |
+| --- | --- |
+| Trainer storage | Set `ModelExpressTrainerConfig.staging_mode` explicitly. Prefer `IN_PLACE` when its lifetime and dtype requirements hold; otherwise start with `COPY_TO_HOST`. |
+| Generator installation | Use `stage_weight()` followed by `apply_weight()`, then release the handle. Bounded staging defers batch reads until apply. |
+| Receiver memory | Set `ModelExpressGeneratorConfig.staging_buffer_bytes` per buffer and `staging_buffers_count` for bounded installation. `staging_device` selects host or device receive memory. |
+
+For unquantized vLLM models whose weights leave insufficient memory for a second
+complete weight copy, initialize the generator with
+`source_order=(WeightSource.TRAINER,)` and bounded staging:
+
+```python
+generator = ModelExpressGeneratorClient.initialize(
+    ModelExpressGeneratorConfig(
+        engine_context=engine_context,
+        model_name=model_name,
+        source_order=(WeightSource.TRAINER,),
+        staging_buffer_bytes=4 * 1024**3,
+        staging_buffers_count=2,
+        staging_device="cuda",  # or "cpu" for pinned host staging
+    )
+)
+# Pause generation on every replica before installing live weights.
+staged = generator.stage_weight(version=WeightVersionRef(version_uid))
+try:
+    metrics = generator.apply_weight(staged)
+finally:
+    staged.release()
+# Resume only after every replica completes successfully.
+```
+
+This API interleaves NIXL reads and per-module installation. It supports mixed
+floating-point wire/engine dtypes through the existing conversion planner. The
+per-buffer limit covers receive, conversion, full-pull scratch, and alignment.
+Total arena capacity is `staging_buffer_bytes * staging_buffers_count` per
+generator worker. A module larger than one buffer fails during preparation. Engine
+post-load workspaces and live weights require additional headroom; the limit is
+not a total process-memory cap.
+
+`staging_device` selects where the arenas live. `"cuda"` (default) lands RDMA
+in VRAM and commits with a device copy. `"cpu"` allocates pinned host memory,
+registers it as NIXL DRAM, and commits with a host-to-device copy, so the arena
+costs no VRAM. Host staging adds a host-to-device copy and depends on the
+available host-memory and CPU-to-GPU bandwidth. `staging_buffers_count=2` posts the
+next batch's READ into the other arena before the current batch is committed,
+allowing transfer and installation to overlap. The benefit depends on the
+hardware and the relative transfer and installation times; it does not guarantee
+that the copy is hidden. Host arenas are an option for VRAM-constrained
+deployments. Changing either option between updates is a workspace switch (see
+below).
+
+Any failure requires keeping the deployment paused and restarting its engines.
+Some modules may already contain the new version, so a failed operation cannot
+be treated as a usable old version. The framework owns this pause/restart policy.
+Quantized engines, generator-peer publication, and object-storage delta replay
+are not supported by this API. Trainer-source `stage_weight()` keeps its
+full-copy behavior.
+After releasing an update, callers can switch between full-copy and bounded
+staging on the same trainer-only client. A mode switch disconnects the NIXL
+agent and deregisters its workspace before freeing the old buffers, then
+reinitializes registrations and plans for the new mode. Same-mode updates retain
+their reusable workspace. Never switch while an update handle remains active.
+
+Streaming preparation retries transient RPC, runtime, and manifest-validation
+failures up to `max_transfer_attempts`, keeping the version lease across attempts.
+Failed preparation storage is reset before retrying; a reset failure requires an
+engine restart. Once installation starts, failures are not automatically retried.
+Release errors remain visible to callers, but a locally released update no longer
+holds the client's active slot even when lease deletion fails.
+Metrics include `staging_peak_bytes`, `batches`, `bytes_received`, `wire_s`, and
+`reconstruct_s`. `wire_s` measures READ posting through completion observation;
+`wire_wait_s` measures the blocking completion wait. With two arenas, a READ can
+overlap the previous batch's installation, so wire and installation times must
+not be added as disjoint intervals. GPU validation is required for each target
+model and topology before performance qualification.
+
+Streaming reports independent `streaming_total_s`, `streaming_prepare_s`,
+`streaming_apply_s`, and `streaming_release_s` intervals. Preparation contains
+`source_metadata_s`, `layout_capture_s`, `transfer_planning_s`, and
+`connection_registration_s`; the remaining preparation time includes version
+discovery and lease/control operations. Application contains NIXL `wire_s`,
+`reconstruct_s`, `install_commit_s` (including CUDA completion), `reload_s`, and
+`post_install_sync_s`. In the generic installer, vLLM's post-load processing
+refreshes attention-derived weights within `reload_s`. The ordinary
+`perf/mx_receive_install_time` is not emitted for streaming installation because
+its application interval includes network reads. With refit timing enabled,
+DIRECT updates emit the same stage record as staged updates. The installation
+stage's `materialization_s`, `receive_copy_s`, and `post_load_processing_s`
+metadata report host-call durations inside the native engine lifecycle. They
+exclude subsequent CUDA completion waits and are not standalone GPU latencies.
+Do not sum nested parent and child intervals or maxima from different ranks.
+Preserve raw samples and expose residual/unattributed time against the independent
+total rather than describing the entire streaming operation as wire or install.
+
+### Reference transfer results
+
 | Model | Total Data | Transfer Time | Per-Worker Speed |
 |-------|-----------|---------------|------------------|
 | DeepSeek-V3 (671B, FP8) | 681 GB (8 GPUs) | ~15 seconds | ~45 Gbps |
 | Llama 3.3 70B | 140 GB (8 GPUs) | ~5 seconds | ~28 Gbps |
+
+### Internal streaming cache controls
+
+Benchmarks record the following implementation switches in their experiment
+manifest. They are internal qualification controls, separate from the public
+integration choices above. Integrations should not expose cache algorithms as
+application configuration. This table records the existing controls and defaults;
+it does not establish a stable configuration API.
+
+| Internal environment variable | Default | Qualification purpose |
+| --- | --- | --- |
+| `MX_REFIT_CACHE_RESOLVED_SOURCES` | `0` | Reuse decoded, merged source tables only when every ordered manifest byte matches. |
+| `MX_REFIT_CACHE_BOUNDED_PLANS` | `0` | Reuse physical plans when manifests, source geometry/addresses, load capture, destination layout, staging configuration, and planning controls match. |
+| `MX_REFIT_REUSE_COMPLETE_PLAN` | `0` | Use the already-built whole-model plan for bounded coverage validation. |
+| `MX_REFIT_COPY_PLAN_KEY_ON_MISS` | `0` | Snapshot callback inputs only on a plan-cache miss; reject overlapping compilation. |
+| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Existing descriptor budget before full-source reconstruction; changing it invalidates cached plans. |
+
+Bounded streaming requires the framework to hold its update guard through
+transfer, installation and verification. Each group is copied from a receive
+arena into engine-owned load-time storage; vLLM performs post-load processing and
+restores live parameter bindings. Partial installation can change the live
+version. Engine-owned temporary tensors and post-load workspaces require VRAM
+beyond the arena cap. Trainer staging is a separate choice. See
+[bounded vLLM streaming installation](ARCHITECTURE.md#bounded-vllm-streaming-installation)
+for the ownership and failure contract.
+
+The unquantized vLLM installer also reuses a successful load-layout capture while
+parameter identities, addresses, shapes, strides, dtypes, devices, original
+loaders, module identities/loaders, routing-buffer versions or contents, and
+the source converter match. Cache results are copied before returning them.
+Quantized and incomplete captures are never retained. Callers must keep model
+configuration and loader behavior fixed while using an installer.
+
+These caches hold layouts and plans, not weight values or readiness. Every
+update still obtains its version and lease, reads fresh tensor values, and runs
+coverage validation. The installer checks live owners, shared parameters and
+complete module inputs. Engine callbacks receive independent storage, so they
+cannot retain a view into the receive arena.
+Workspace reset and close discard source and plan caches. Cache counters and
+lookup/build/validation times accompany streaming preparation metrics; a miss
+rebuilds the entry rather than using a stale layout.
+Wire-to-engine dtype conversion respects the captured destination slice, strides
+and arena storage offset, including padding surrounding the destination view.
+Bounded staging views are zeroed before each READ so untouched loader padding
+cannot retain bytes from a previous batch or version.

@@ -45,12 +45,18 @@ from typing import NamedTuple
 from modelexpress import envs, p2p_pb2
 from modelexpress.client import MxClient
 from modelexpress.metadata.publisher import PublisherThread
+from modelexpress.nixl_transfer import (
+    NIXL_DRAM_MEM_TYPE,
+    NIXL_MEM_TYPES,
+    NIXL_VRAM_MEM_TYPE,
+)
 from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import SourceInfo
 
 logger = logging.getLogger("modelexpress.refit.reshard.rendezvous")
 
 _SCHEMA = "mx.reshard.shard_table.v1"
+_HOST_SCHEMA = "mx.reshard.shard_table.v2"
 
 
 def _mx_version() -> str:
@@ -83,6 +89,11 @@ class PublishedShard:
     shard_offset: tuple
     shape: tuple
     digest: str | None = None
+    memory_type: str = NIXL_VRAM_MEM_TYPE
+
+    def __post_init__(self) -> None:
+        if self.memory_type not in NIXL_MEM_TYPES:
+            raise ValueError(f"unsupported source memory type {self.memory_type!r}")
 
 
 @dataclass
@@ -113,7 +124,18 @@ def _encode_shard(shard) -> dict:
     }
     if shard.digest is not None:
         encoded["digest"] = shard.digest
+    if shard.memory_type != NIXL_VRAM_MEM_TYPE:
+        encoded["memory_type"] = shard.memory_type
     return encoded
+
+
+def _schema_for(tensors: list) -> str:
+    # Old readers must reject host addresses rather than issue VRAM reads.
+    return (
+        _HOST_SCHEMA
+        if any(s.memory_type != NIXL_VRAM_MEM_TYPE for t in tensors for s in t.shards)
+        else _SCHEMA
+    )
 
 
 def _encode_tensor_entries(tensors: list) -> list[dict]:
@@ -137,7 +159,10 @@ def _encode_tensor_entries(tensors: list) -> list[dict]:
 
 def encode_shard_table(tensors: list) -> bytes:
     """Serialize published tensors + shards to a JSON blob."""
-    payload = {"schema": _SCHEMA, "tensors": _encode_tensor_entries(tensors)}
+    payload = {
+        "schema": _schema_for(tensors),
+        "tensors": _encode_tensor_entries(tensors),
+    }
     return json.dumps(payload).encode("utf-8")
 
 
@@ -145,8 +170,11 @@ def decode_shard_table(blob: bytes) -> list:
     """Inverse of ``encode_shard_table``; returns ``list[PublishedTensor]``."""
     payload = json.loads(blob.decode("utf-8"))
     schema = payload.get("schema")
-    if schema != _SCHEMA:
-        raise ValueError(f"unexpected shard-table schema {schema!r} (want {_SCHEMA!r})")
+    if schema not in (_SCHEMA, _HOST_SCHEMA):
+        raise ValueError(
+            f"unexpected shard-table schema {schema!r} "
+            f"(want one of {_SCHEMA!r}, {_HOST_SCHEMA!r})"
+        )
     return decode_shard_entries(payload["tensors"])
 
 
@@ -168,6 +196,7 @@ def decode_shard_entries(entries: list) -> list:
                 shard_offset=tuple(s["shard_offset"]),
                 shape=tuple(s["shape"]),
                 digest=s.get("digest"),
+                memory_type=s.get("memory_type", NIXL_VRAM_MEM_TYPE),
             )
             for s in t["shards"]
         ]
@@ -189,21 +218,32 @@ def _torch_dtype(label: str):
     return getattr(torch, label.split(".")[-1])
 
 
-def build_sources(tensors: list) -> tuple:
+def build_sources(tensors: list, *, session_to_memory: dict | None = None) -> tuple:
     """Turn decoded ``PublishedTensor``s into the planning inputs.
 
     Returns ``(sources, session_to_agent, session_to_device)`` where ``sources``
     is ``{src_name: SourceInfo}`` for ``plan_transfer`` and the two maps drive
     ``NixlReshardTransport``. Each shard's ``session`` is its owning agent name.
+    Host-aware callers must supply ``session_to_memory``, populated here with
+    the memory type for each session, and forward it to the transport.
     """
     sources = {}
     session_to_agent = {}
     session_to_device = {}
+    memory_types = {}
     for t in tensors:
         dtype = _torch_dtype(t.dtype)
         shards = []
         for s in t.shards:
             session = s.agent_name
+            if s.memory_type == NIXL_DRAM_MEM_TYPE and session_to_memory is None:
+                raise ValueError("host sources require a memory-type-aware receiver")
+            if session in session_to_device and (
+                session_to_device[session] != s.device_id
+                or memory_types[session] != s.memory_type
+            ):
+                raise ValueError(f"conflicting device or memory type for {session!r}")
+            memory_types[session] = s.memory_type
             shards.append(
                 Shard(
                     shard_offset=s.shard_offset,
@@ -222,6 +262,8 @@ def build_sources(tensors: list) -> tuple:
             elsize=t.elsize,
             shards=shards,
         )
+    if session_to_memory is not None:
+        session_to_memory.update(memory_types)
     return sources, session_to_agent, session_to_device
 
 
@@ -307,7 +349,7 @@ def wrap_rendezvous_blob(
     unstamped publisher is byte-identical to one an older client would have produced.
     """
     payload = {
-        "schema": _SCHEMA,
+        "schema": _schema_for(tensors),
         "agent_name": agent_name,
         "metadata_endpoint": metadata_endpoint,
         "agent_meta_b64": base64.b64encode(agent_metadata).decode("ascii"),
@@ -397,7 +439,7 @@ def unwrap_rendezvous_blob(
     ``tensor_count`` is still populated, so an empty publisher stays detectable.
     """
     payload = json.loads(blob.decode("utf-8"))
-    if payload.get("schema") != _SCHEMA:
+    if payload.get("schema") not in (_SCHEMA, _HOST_SCHEMA):
         raise ValueError(f"unexpected rendezvous blob schema {payload.get('schema')!r}")
     agent_metadata = base64.b64decode(payload["agent_meta_b64"])
     agent_name = payload["agent_name"]
