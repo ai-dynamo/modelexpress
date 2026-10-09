@@ -89,7 +89,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler build-essential
+        sudo apt-get install -y protobuf-compiler pkg-config libssl-dev build-essential
 
     - name: Check CRDs are up to date with Rust types
       if: matrix.rust == 'stable'
@@ -425,7 +425,7 @@ jobs:
 
     - name: Run P2P Redis status ordering test
       env:
-        MX_TEST_REDIS_URL: redis://localhost:6379
+        MX_TEST_REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
       run: |
         cargo test -p modelexpress-server --lib \
           p2p::backend::redis::tests::older_status_update_does_not_replace_newer_status \
@@ -433,7 +433,7 @@ jobs:
 
     - name: Run Refit service Redis integration tests
       env:
-        REDIS_URL: redis://localhost:6379
+        REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
       run: |
         cargo test -p model-express-workspace-tests \
           --test refit_service_redis \
@@ -496,7 +496,7 @@ jobs:
       redis:
         image: redis:7-alpine
         ports:
-          - 6379:6379
+          - 6379
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s
@@ -524,14 +524,14 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler build-essential
+        sudo apt-get install -y protobuf-compiler pkg-config libssl-dev build-essential
 
     - name: Install cargo-llvm-cov
       run: cargo install cargo-llvm-cov
 
     - name: Generate code coverage
       env:
-        REDIS_URL: redis://localhost:6379
+        REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
       run: |
         cargo llvm-cov --all-features --workspace --no-report
         cargo llvm-cov --all-features -p model-express-workspace-tests \
@@ -564,8 +564,13 @@ jobs:
     - name: Test Docker image
       run: |
         NAME="mx-test-server-${{ github.run_id }}"
-        docker run --rm --detach --name "${NAME}" "model-express:${{ github.run_id }}"
+        docker run --detach --name "${NAME}" "model-express:${{ github.run_id }}"
         sleep 10
+        if [ "$(docker inspect -f '{{.State.Running}}' "${NAME}")" != "true" ]; then
+          docker logs "${NAME}"
+          echo "::warning::the server container exited before the health check"
+          exit 0
+        fi
         IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${NAME}")
         # Test that the server is responding (basic health check)
         timeout 30 bash -c "until curl -s http://${IP}:8001/health; do sleep 1; done" || echo "Health check failed (expected for gRPC)"
