@@ -311,14 +311,34 @@ class NixlTransferManager:
         param.data in vLLM. Do NOT call .contiguous() here - that would
         create copies and RDMA writes would land in the wrong memory.
 
+        We keep a descriptor and a ``self._tensors`` entry for every tensor,
+        including zero-byte or unallocated ones, so the published manifest and
+        the receiver's name match see the same name set. Those tensors are
+        excluded only from NIXL memory registration because they carry no RDMA
+        payload.
+
         We take a shallow copy of the caller's dict (``dict(tensors)``)
-        so ``shutdown()``'s cleanup cannot mutate the caller's
-        container. The tensor VALUES are the same objects as
-        ``param.data``; only the dict container is owned by the manager.
+        so ``shutdown()``'s cleanup cannot mutate the caller's container.
+        The tensor VALUES are the same objects as ``param.data``; only the
+        dict container is owned by the manager.
         """
         self._tensors = dict(tensors)
         tensor_descriptors = []
         for name, tensor in tensors.items():
+            size = tensor.numel() * tensor.element_size()
+            addr = tensor.data_ptr()
+            if size == 0 or addr == 0:
+                tensor_descriptors.append(
+                    TensorDescriptor(
+                        name=name,
+                        addr=addr,
+                        size=size,
+                        device_id=self._device_id,
+                        dtype=str(tensor.dtype),
+                    )
+                )
+                continue
+
             if not tensor.is_contiguous():
                 raise RuntimeError(
                     f"Tensor '{name}' is not contiguous. "
@@ -327,8 +347,8 @@ class NixlTransferManager:
             tensor_descriptors.append(
                 TensorDescriptor(
                     name=name,
-                    addr=tensor.data_ptr(),
-                    size=tensor.numel() * tensor.element_size(),
+                    addr=addr,
+                    size=size,
                     device_id=self._device_id,
                     dtype=str(tensor.dtype),
                 )
@@ -376,10 +396,15 @@ class NixlTransferManager:
 
         tensor_descriptors = self._build_tensor_descriptors(tensors)
         registrable_descriptors = [
-            descriptor for descriptor in tensor_descriptors if descriptor.size > 0
+            descriptor
+            for descriptor in tensor_descriptors
+            if descriptor.size > 0 and descriptor.addr != 0
         ]
+        registrable_names = {descriptor.name for descriptor in registrable_descriptors}
         registrable_tensors = [
-            tensor for tensor in tensors.values() if tensor.numel() > 0
+            tensor
+            for name, tensor in self._tensors.items()
+            if name in registrable_names
         ]
 
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
@@ -387,6 +412,7 @@ class NixlTransferManager:
         if (
             _pool_reg_enabled()
             and not force_per_tensor
+            and registrable_tensors
             and all(t.is_cuda for t in registrable_tensors)
         ):
             if self._accelerator_backend.supports_pool_reg():
