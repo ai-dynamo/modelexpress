@@ -259,6 +259,7 @@ def build_trtllm_load_context(
     )
     worker_rank = adapter.get_worker_rank()
     return LoadContext(
+        engine="trtllm",
         model_config=model_config,
         load_config=load_config,
         target_device=adapter.get_target_device(),

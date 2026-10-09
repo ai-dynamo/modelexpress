@@ -813,6 +813,227 @@
       }
     },
     {
+      "id": 118,
+      "type": "table",
+      "title": "Strategy attempt duration",
+      "description": "Mean duration of one strategy attempt, per engine, model, strategy and outcome. This is the breakdown of the chain phase in the row above: that phase says the chain took four seconds, these rows say which strategy spent them.\n\nThe rows sum to LESS than the chain phase, always. That phase also covers the eligibility filter, the span setup and the loop bookkeeping, none of which belongs to any one strategy. A residual here is that overhead, not lost time.\n\nAn rdma row is an envelope rather than a transfer: one attempt can try several source candidates, and mx_p2p_transfer_seconds splits it from the inside. Outcome is on the table because a fallback and a success are not comparable durations -- a strategy that misses cleanly in milliseconds and one that loads weights for thirty seconds are both normal.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 10,
+        "x": 0,
+        "y": 30
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine, model, strategy, outcome) (mx_load_strategy_seconds_sum) / sum by (engine, model, strategy, outcome) (mx_load_strategy_seconds_count)",
+          "format": "table",
+          "instant": true,
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "0"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "engine"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 70
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "model"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 200
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "strategy"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 125
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "outcome"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 115
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "engine": 0,
+              "model": 1,
+              "strategy": 2,
+              "outcome": 3,
+              "Value": 4
+            },
+            "renameByName": {
+              "Value": "mean"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "engine",
+                "desc": false
+              },
+              {
+                "field": "model",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": 119,
+      "type": "bargauge",
+      "title": "Attempts by strategy and outcome",
+      "description": "How many times each strategy was tried, and how each attempt ended. Read with the panel to the right: a strategy absent from both was neither tried nor skipped, which on a healthy load just means an earlier strategy succeeded and the chain returned before reaching it.\n\nA cumulative count rather than a rate. A load happens a handful of times in a process's life, so rate() over a scrape window is zero almost always and the panel would read empty on a fleet that is working.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 7,
+        "x": 10,
+        "y": 30
+      },
+      "targets": [
+        {
+          "expr": "sum by (strategy, outcome) (mx_load_strategy_seconds_count)",
+          "legendFormat": "{{strategy}}  {{outcome}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0"
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 120,
+      "type": "bargauge",
+      "title": "Strategies skipped by the eligibility filter",
+      "description": "Strategies the eligibility filter dropped before the chain could try them. This is what makes the panel to its left readable: without it, a strategy that recorded no attempt was either filtered out here or was eligible and never reached, and those are opposite conclusions drawn from the same empty row.\n\nExpect a steady nonzero background on any real cluster -- gds, model_streamer and instant_tensor are all normally absent from an image that ships none of them. The counter says a strategy was unavailable, not why; the worker log names the reason at the point it was decided.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 7,
+        "x": 17,
+        "y": 30
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine, strategy) (mx_load_strategy_skipped_total)",
+          "legendFormat": "{{engine}}  {{strategy}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0"
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      }
+    },
+    {
       "id": 6,
       "type": "row",
       "title": "Downloads",
@@ -821,7 +1042,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 30
+        "y": 38
       },
       "panels": []
     },
@@ -837,7 +1058,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 31
+        "y": 39
       },
       "targets": [
         {
@@ -887,7 +1108,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 31
+        "y": 39
       },
       "targets": [
         {
@@ -919,7 +1140,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 31
+        "y": 39
       },
       "targets": [
         {
@@ -951,7 +1172,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 31
+        "y": 39
       },
       "targets": [
         {
@@ -983,7 +1204,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 39
+        "y": 47
       },
       "targets": [
         {
@@ -1015,7 +1236,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 39
+        "y": 47
       },
       "targets": [
         {
@@ -1044,7 +1265,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 47
+        "y": 55
       },
       "panels": []
     },
@@ -1060,7 +1281,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 48
+        "y": 56
       },
       "targets": [
         {
@@ -1092,7 +1313,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 48
+        "y": 56
       },
       "targets": [
         {
@@ -1125,7 +1346,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 48
+        "y": 56
       },
       "targets": [
         {
@@ -1157,7 +1378,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 48
+        "y": 56
       },
       "targets": [
         {
@@ -1185,7 +1406,7 @@
         "h": 5,
         "w": 24,
         "x": 0,
-        "y": 56
+        "y": 64
       },
       "options": {
         "mode": "markdown",
@@ -1204,7 +1425,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 61
+        "y": 69
       },
       "targets": [
         {
@@ -1236,7 +1457,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 61
+        "y": 69
       },
       "targets": [
         {
@@ -1278,7 +1499,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 61
+        "y": 69
       },
       "targets": [
         {
@@ -1310,7 +1531,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 61
+        "y": 69
       },
       "targets": [
         {
@@ -1339,7 +1560,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 69
+        "y": 77
       },
       "panels": []
     },
@@ -1355,7 +1576,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 70
+        "y": 78
       },
       "targets": [
         {
@@ -1387,7 +1608,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 70
+        "y": 78
       },
       "targets": [
         {
@@ -1449,7 +1670,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 70
+        "y": 78
       },
       "targets": [
         {
@@ -1462,7 +1683,7 @@
           }
         }
       ],
-      "description": "Does not partition every candidate: one rejected by the accelerator check is skipped without recording an attempt, so this understates how many peers were passed over.",
+      "description": "Source attempts by result. These now partition the candidates the selector handed back: success, metadata_miss (GetMetadata failed or returned nothing), accelerator_reject (metadata arrived and the accelerator was incompatible), and the transfer retry and fallback results. A rise in accelerator_reject against flat success is a heterogeneous fleet advertising sources this target cannot read.",
       "fieldConfig": {
         "defaults": {
           "unit": "ops"
@@ -1481,7 +1702,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 70
+        "y": 78
       },
       "targets": [
         {
@@ -1513,7 +1734,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 78
+        "y": 86
       },
       "targets": [
         {
@@ -1563,7 +1784,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 78
+        "y": 86
       },
       "targets": [
         {
@@ -1595,7 +1816,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 78
+        "y": 86
       },
       "targets": [
         {
@@ -1627,7 +1848,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 78
+        "y": 86
       },
       "targets": [
         {
@@ -1660,7 +1881,7 @@
         "h": 10,
         "w": 14,
         "x": 0,
-        "y": 86
+        "y": 94
       },
       "targets": [
         {
@@ -1761,7 +1982,7 @@
         "h": 10,
         "w": 10,
         "x": 14,
-        "y": 86
+        "y": 94
       },
       "targets": [
         {
@@ -1805,7 +2026,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 96
+        "y": 104
       },
       "targets": [
         {
@@ -1844,7 +2065,7 @@
         "h": 6,
         "w": 18,
         "x": 6,
-        "y": 96
+        "y": 104
       },
       "options": {
         "mode": "markdown",
@@ -1860,7 +2081,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 102
+        "y": 110
       },
       "panels": []
     },
@@ -1876,7 +2097,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 103
+        "y": 111
       },
       "targets": [
         {
@@ -1908,7 +2129,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 103
+        "y": 111
       },
       "targets": [
         {
@@ -1941,7 +2162,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 103
+        "y": 111
       },
       "targets": [
         {
