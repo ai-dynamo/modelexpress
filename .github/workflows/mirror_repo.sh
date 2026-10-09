@@ -23,10 +23,12 @@ RETRY_INTERVAL=30
 # Convert timestamps to epoch for comparison, timezone agnostic
 SYNC_TIME_SECONDS=$(date -d "$SYNC_TIME" +%s)
 for i in $(seq 1 $((MAX_RETRIES + 1))); do
-    if MIRROR_INFO=$(curl --fail --silent --show-error \
+    if MIRROR_RESPONSE=$(curl --fail --silent --show-error \
         --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 \
         --retry-connrefused --retry-max-time 120 \
+        --write-out '\n%{http_code}' \
         --header "PRIVATE-TOKEN: ${GITLAB_ACCESS_TOKEN}" "${GITLAB_MIRROR_URL}"); then
+        MIRROR_INFO=${MIRROR_RESPONSE%$'\n'*}
         MIRROR_STATUS=$(echo "$MIRROR_INFO" | jq -er '.update_status | select(type == "string")')
         LAST_UPDATE=$(echo "$MIRROR_INFO" | jq -r '.last_update_at // empty')
         LAST_ERROR=$(echo "$MIRROR_INFO" | jq -r '.last_error // empty')
@@ -49,9 +51,10 @@ for i in $(seq 1 $((MAX_RETRIES + 1))); do
         fi
     else
         status=$?
-        case "$status" in
-            5|6|7|18|28|35|52|55|56)
-                echo "Mirror status request failed with curl exit ${status}; retrying"
+        HTTP_STATUS=${MIRROR_RESPONSE##*$'\n'}
+        case "${status}:${HTTP_STATUS}" in
+            5:*|6:*|7:*|18:*|28:*|35:*|52:*|55:*|56:*|22:408|22:429|22:500|22:502|22:503|22:504)
+                echo "Mirror status request failed with curl exit ${status}, HTTP ${HTTP_STATUS}; retrying"
                 ;;
             *) exit "$status" ;;
         esac
