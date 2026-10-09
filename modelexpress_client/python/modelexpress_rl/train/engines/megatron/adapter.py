@@ -6,8 +6,8 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
+from dataclasses import asdict
 from typing import Any
 
 import torch.distributed as dist
@@ -23,6 +23,7 @@ from modelexpress_rl.train.adapter import (
     WeightPayloadFormat,
     WeightVersionShardManifest,
 )
+from modelexpress_rl.train.manifest import bound_tensor_manifest
 
 from .aliases import MegatronTensorSpec, build_hf_aliases
 from .publisher import build_megatron_reshard_manifest
@@ -58,23 +59,13 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
             isinstance(item, MegatronTensorSpec) for item in tensors
         ):
             raise TypeError("tensors must be a list of MegatronTensorSpec")
-        layout = [
-            {
-                "name": item.name,
-                "role": item.role,
-                "hf_names": item.hf_names,
-                "global_shape": item.global_shape,
-                "placement_kind": item.placement_kind,
-                "shard_axis": item.shard_axis,
-                "local_shard_range": item.local_shard_range,
-                "extras": item.extras,
-            }
-            for item in sorted(tensors, key=lambda item: item.name)
+        coverage = [
+            asdict(tensor)
+            for tensor in build_hf_aliases(
+                tensors, agent_name=str(self._manager.agent_name)
+            )
         ]
-        digest = hashlib.sha256(
-            json.dumps(layout, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-        source_slot_id = f"megatron:partition:{digest}"
+        source_slot_id = hashlib.sha256(bound_tensor_manifest(coverage)).hexdigest()
         if self._source_slot_id is not None and self._source_slot_id != source_slot_id:
             raise RuntimeError(
                 "Megatron logical tensor partition changed after binding"

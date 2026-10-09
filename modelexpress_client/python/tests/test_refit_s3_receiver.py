@@ -200,7 +200,6 @@ class _Adapter:
             payload_format=inputs.payload_format,
             base_version_id=inputs.base_version_id,
             object_storage=inputs.object_storage,
-            expected_source_slots=(),
             layout_signature=inputs.layout_signature,
             state=WeightVersionState.READY,
             created_at_unix_ms=0,
@@ -223,7 +222,6 @@ class _Adapter:
                 payload_format=item.payload_format,
                 base_version_id=item.base_version_id,
                 object_storage=item.object_storage,
-                expected_source_slots=(),
                 layout_signature=item.layout_signature,
                 state=WeightVersionState.READY,
                 created_at_unix_ms=0,
@@ -1797,6 +1795,29 @@ def test_canonical_s3_can_defer_activation_until_distributed_load_completes(
     adapter.close()
 
 
+def test_first_delta_retains_full_materialization_capacity_check(monkeypatch, tmp_path):
+    objects = _artifact(
+        torch.tensor([1.0, 2.0]).view(torch.uint8).numpy(),
+        torch.tensor([3.0, 4.0]).view(torch.uint8).numpy(),
+    )
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    store = adapter._checkpoint.store
+    base = store.full_path("base-a")
+    base_size = store.path_size_bytes(base)
+    ensure_capacity = store.ensure_capacity
+    reservations = []
+
+    def track_capacity(additional_bytes, **kwargs):
+        reservations.append(additional_bytes)
+        ensure_capacity(additional_bytes, **kwargs)
+
+    monkeypatch.setattr(store, "ensure_capacity", track_capacity)
+    staged = adapter.stage_weight(_inputs(None))
+    assert base_size in reservations
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
 def test_canonical_s3_applies_one_delta_to_the_active_checkpoint(
     monkeypatch, tmp_path
 ):
@@ -1987,7 +2008,6 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
             payload_format=item.payload_format,
             base_version_id=item.base_version_id,
             object_storage=item.object_storage,
-            expected_source_slots=(),
             layout_signature="",
             state=WeightVersionState.READY,
             created_at_unix_ms=0,
@@ -2022,6 +2042,9 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
     generator = ModelExpressGeneratorClient()
     generator._serving_version_id = "base-a"
     generator._max_replay_chain_length = 64
+    generator._staging_buffer_bytes = None
+    generator._staging_buffers_count = 1
+    generator._staging_device = "cuda"
     monkeypatch.setattr(
         generator,
         "_fetch_ready_version",

@@ -2508,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "model-express-workspace-tests"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -2520,6 +2520,7 @@ dependencies = [
  "modelexpress-server",
  "redis",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tonic 0.13.1",
@@ -2531,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-client"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2551,7 +2552,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-common"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2586,7 +2587,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-server"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
