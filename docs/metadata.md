@@ -162,7 +162,7 @@ The header currently returns the full file table sorted by manifest path, while 
 The Python `ArtifactTransfer` interface defines backend-independent cache artifact packaging and installation:
 
 1. A source calls `prepare_source()` to seal a publishable bundle.
-2. The selected `ArtifactTransport` publishes or fetches that bundle through P2P or Mooncake.
+2. The selected `ArtifactTransport` publishes or fetches that bundle through NIXL or Mooncake.
 3. A target calls `install()` to unpack the staged artifact before using the cache.
 
 `TarredArtifactTransfer` packages each configured cache root as an uncompressed tar file and builds the shared manifest used by both transports.

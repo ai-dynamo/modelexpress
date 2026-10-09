@@ -163,7 +163,7 @@ python -m pip install ./modelexpress_client/python
 export MX_SERVER_ADDRESS=modelexpress-server:8001
 export MX_P2P_METADATA=1
 export MX_ARTIFACT_TRANSFER=1
-export MX_ARTIFACT_BACKEND=p2p
+export MX_ARTIFACT_BACKEND=nixl
 
 vllm serve deepseek-ai/DeepSeek-V4-Pro \
   --load-format modelexpress \
@@ -175,7 +175,7 @@ Start the first replica with weights available through local storage or `MX_MODE
 
 `MX_ARTIFACT_TRANSFER=1` enables compatible JIT-cache installation and
 publication. `MX_ARTIFACT_BACKEND` selects exactly one artifact transport and
-defaults to `p2p`. The P2P backend requires `MX_P2P_METADATA=1` and a central
+defaults to `nixl`. The NIXL backend requires `MX_P2P_METADATA=1` and a central
 coordinator (`redis` or `kubernetes`). The `mooncake` backend instead uses a
 configured Mooncake distributed store and does not require an MX server or P2P
 metadata. Both backends require writable staging/runtime cache directories and
@@ -205,7 +205,7 @@ vllm serve deepseek-ai/DeepSeek-V4-Pro \
   --trust-remote-code
 ```
 
-vLLM 0.23.0 recognizes the load format natively; the ModelExpress Python package must still be installed in the runtime image. The first instance loads from disk, while subsequent instances receive weights via RDMA. Set `MX_ARTIFACT_TRANSFER=1` to transfer compatible JIT caches as well, and select `MX_ARTIFACT_BACKEND=p2p` (the default) or `mooncake`. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Server setup](examples/p2p_transfer_k8s/server/README.md).
+vLLM 0.23.0 recognizes the load format natively; the ModelExpress Python package must still be installed in the runtime image. The first instance loads from disk, while subsequent instances receive weights via RDMA. Set `MX_ARTIFACT_TRANSFER=1` to transfer compatible JIT caches as well, and select `MX_ARTIFACT_BACKEND=nixl` (the default) or `mooncake`. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Server setup](examples/p2p_transfer_k8s/server/README.md).
 
 ### ModelStreamer on Kubernetes
 

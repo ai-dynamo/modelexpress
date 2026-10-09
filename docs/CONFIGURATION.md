@@ -181,7 +181,7 @@ ModelStreamer credentials are third-party settings. See [Load from object storag
 | Environment variable | Default | Effect |
 |---|---|---|
 | MX_ARTIFACT_TRANSFER | false | Enable compatible file-backed JIT artifact installation and publication |
-| MX_ARTIFACT_BACKEND | p2p | Artifact transport: `p2p` or `mooncake`; exactly one is selected and there is no fallback |
+| MX_ARTIFACT_BACKEND | nixl | Artifact transport: `nixl` or `mooncake`; exactly one is selected and there is no fallback |
 | MX_ARTIFACT_BUNDLE_ROOT | $TMPDIR/modelexpress-artifacts | Local staging root for artifact bundles |
 | MX_ARTIFACT_COMPILE_CONFIG_DIGEST | empty | Partitions torch compile artifact sources by compile configuration |
 | MX_ARTIFACT_MOONCAKE_NAMESPACE | modelexpress/artifacts | Key prefix used by the Mooncake artifact backend |

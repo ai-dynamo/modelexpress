@@ -404,7 +404,7 @@ def test_validate_fetched_manifest_rejects_manifest_id_mismatch(tmp_path):
         )
 
 
-def test_tarred_p2p_artifact_transfer_prepares_single_file_bundle(tmp_path):
+def test_tarred_artifact_transfer_prepares_single_file_bundle(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     nested = source / "nested"
@@ -541,7 +541,7 @@ def test_flashinfer_cache_transfer_allows_missing_optional_root(tmp_path):
     assert (tmp_path / "autotune-target").is_dir()
 
 
-def test_tarred_p2p_artifact_transfer_rejects_unsafe_staging(tmp_path):
+def test_tarred_artifact_transfer_rejects_unsafe_staging(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     transfer = torch_compile_cache_artifact_transfer(
@@ -554,7 +554,7 @@ def test_tarred_p2p_artifact_transfer_rejects_unsafe_staging(tmp_path):
         transfer.prepare_source()
 
 
-def test_tarred_p2p_artifact_transfer_rejects_stale_bundle_files(tmp_path):
+def test_tarred_artifact_transfer_rejects_stale_bundle_files(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     bundle = tmp_path / "bundle"
@@ -570,7 +570,7 @@ def test_tarred_p2p_artifact_transfer_rejects_stale_bundle_files(tmp_path):
         transfer.prepare_source()
 
 
-def test_tarred_p2p_artifact_transfer_rejects_target_bundle_symlink(tmp_path):
+def test_tarred_artifact_transfer_rejects_target_bundle_symlink(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     bundle = tmp_path / "target-bundle"
@@ -604,7 +604,7 @@ def _prepare_and_install(source, target, bundle):
     return transfer
 
 
-def test_tarred_p2p_artifact_transfer_skips_internal_symlink(tmp_path):
+def test_tarred_artifact_transfer_skips_internal_symlink(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     (source / "target.txt").write_text("target")
@@ -617,7 +617,7 @@ def test_tarred_p2p_artifact_transfer_skips_internal_symlink(tmp_path):
     assert not (target / "link.txt").exists()
 
 
-def test_tarred_p2p_artifact_transfer_skips_external_symlink(tmp_path, caplog):
+def test_tarred_artifact_transfer_skips_external_symlink(tmp_path, caplog):
     caplog.set_level(logging.WARNING, logger="modelexpress.metadata.artifact_transfer")
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -636,7 +636,7 @@ def test_tarred_p2p_artifact_transfer_skips_external_symlink(tmp_path, caplog):
     assert "external symlink" in caplog.text
 
 
-def test_tarred_p2p_artifact_transfer_survives_broken_symlink(tmp_path, caplog):
+def test_tarred_artifact_transfer_survives_broken_symlink(tmp_path, caplog):
     caplog.set_level(logging.WARNING, logger="modelexpress.metadata.artifact_transfer")
     source = tmp_path / "source"
     source.mkdir()
@@ -651,7 +651,7 @@ def test_tarred_p2p_artifact_transfer_survives_broken_symlink(tmp_path, caplog):
     assert "broken symlink" in caplog.text
 
 
-def test_tarred_p2p_artifact_transfer_archives_awkward_member_names(tmp_path):
+def test_tarred_artifact_transfer_archives_awkward_member_names(tmp_path):
     source = tmp_path / "source"
     (source / "gen").mkdir(parents=True)
     (source / "gen" / "config[sm100].inc").write_text("kept")
@@ -668,7 +668,7 @@ def test_tarred_p2p_artifact_transfer_archives_awkward_member_names(tmp_path):
     assert not (target / "gen" / "new\nline_link").is_symlink()
 
 
-def test_tarred_p2p_artifact_transfer_keeps_empty_directories(tmp_path):
+def test_tarred_artifact_transfer_keeps_empty_directories(tmp_path):
     source = tmp_path / "source"
     (source / "cached_ops" / "tmp").mkdir(parents=True)
     (source / "cached_ops" / "kernel.so").write_bytes(b"compiled")
@@ -792,7 +792,7 @@ def test_extract_tarred_artifact_rejects_duplicate_archive_names(tmp_path):
         transfer.install(header)
 
 
-def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path, caplog):
+def test_tarred_artifact_transfer_splits_transfer_and_install(tmp_path, caplog):
     source = tmp_path / "source"
     source.mkdir()
     (source / "bucket-000").mkdir()
@@ -930,7 +930,7 @@ def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path, capl
         ),
     ],
 )
-def test_cache_artifact_transfers_share_p2p_interface(
+def test_cache_artifact_transfers_share_artifact_interface(
     tmp_path,
     factory,
     name,

@@ -77,4 +77,4 @@ For `k8s-service`, also check the source Service selectors, endpoints, and rank-
 
 ## Artifact transfer
 
-Artifact transfer requires `MX_ARTIFACT_TRANSFER=1`, compatible artifact identity, and writable staging/cache directories. The default `p2p` backend additionally requires `MX_P2P_METADATA=1` and a central coordinator; `mooncake` requires an importable, configured `mooncake.store`.
+Artifact transfer requires `MX_ARTIFACT_TRANSFER=1`, compatible artifact identity, and writable staging/cache directories. The default `nixl` backend additionally requires `MX_P2P_METADATA=1` and a central coordinator; `mooncake` requires an importable, configured `mooncake.store`.

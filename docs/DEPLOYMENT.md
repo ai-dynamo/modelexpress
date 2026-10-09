@@ -659,7 +659,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses the same artifact lifecycle for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. |
-| `MX_ARTIFACT_BACKEND` | `p2p` | Select exactly one artifact backend: `p2p` or `mooncake`. There is no fallback. |
+| `MX_ARTIFACT_BACKEND` | `nixl` | Select exactly one artifact backend: `nixl` or `mooncake`. There is no fallback. |
 | `MX_ARTIFACT_TRANSFER_CHUNK_SIZE` | `67108864` | Artifact transfer chunk size in bytes. Default is 64 MiB; maximum is 4 GiB. Larger values reduce manifest/RPC overhead but increase registered DRAM buffer memory, approximately `chunk_size * max_inflight_chunks` per source and target worker. |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
 | `MX_ARTIFACT_MOONCAKE_NAMESPACE` | `modelexpress/artifacts` | Key prefix used by the Mooncake artifact backend. |
@@ -873,9 +873,11 @@ schedule publisher threads after successful load. Each publisher waits for
 readiness and for the cache file count, total size, and max mtime to settle
 before sealing the artifact.
 
-`MX_ARTIFACT_BACKEND=p2p` is the default. It preserves the existing worker
-discovery, manifest/chunk RPC, and NIXL data path, and therefore requires
+`MX_ARTIFACT_BACKEND=nixl` is the default. It uses worker discovery,
+manifest/chunk RPC, and NIXL data transfer, and therefore requires
 `MX_P2P_METADATA=1` plus a central metadata backend (`redis` or `kubernetes`).
+
+Unsupported backend values produce a warning and skip artifact transfer.
 
 `MX_ARTIFACT_BACKEND=mooncake` uses a shared Mooncake store instead. Install a
 package that exposes `mooncake.store`, configure at least
@@ -960,7 +962,7 @@ each worker logs.
 
 In multi-node deployments, the artifact key includes the framework `node_rank`,
 so each target node selects the corresponding source-node artifact without
-making it worker-specific. For P2P, that rank is carried in artifact metadata;
+making it worker-specific. For NIXL, that rank is carried in artifact metadata;
 artifact discovery requires a central coordinator (`redis` or `kubernetes`),
 and Kubernetes deployments must use the matching `ModelMetadata` CRD containing
 `status.worker.artifactSource.nodeRank`. Mooncake includes the same rank in its

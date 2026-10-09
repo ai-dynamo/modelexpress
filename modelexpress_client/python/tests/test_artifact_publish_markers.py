@@ -46,7 +46,7 @@ def _clear_publish_leases():
 def _schedule_publish(tmp_dir, rank, results):
     al.tempfile.gettempdir = lambda: tmp_dir
     al._artifact_transfer_enabled = lambda: True
-    al._artifact_backend = lambda: "p2p"
+    al._artifact_backend = lambda: "nixl"
     al._p2p_metadata_enabled_for_artifacts = lambda ctx, engine, log: True
     al._metadata_publication_configured = lambda ctx: True
     al.is_nixl_available = lambda: True

@@ -50,7 +50,7 @@ def _identity(digest: str = "") -> p2p_pb2.SourceIdentity:
     )
 
 
-def _run_p2p_install_owner(tmp_dir, started, release):
+def _run_nixl_install_owner(tmp_dir, started, release):
     """Run one real install in a child process for lease coordination tests."""
     artifact_lifecycle.tempfile.gettempdir = lambda: str(tmp_dir)
     target_root = tmp_dir / "cache"
@@ -89,7 +89,7 @@ def _run_p2p_install_owner(tmp_dir, started, release):
     )
 
 
-def _crash_during_p2p_install(tmp_dir, started):
+def _crash_during_nixl_install(tmp_dir, started):
     """Terminate while holding the real install lease."""
     artifact_lifecycle.tempfile.gettempdir = lambda: str(tmp_dir)
     target_root = tmp_dir / "cache"
@@ -159,7 +159,7 @@ def _run_install(identity, *, install_result):
     if "return_value" in install_result:
         install_result = {
             **install_result,
-            "return_value": (install_result["return_value"], "p2p"),
+            "return_value": (install_result["return_value"], "nixl"),
         }
 
     transport = MagicMock()
@@ -197,7 +197,7 @@ def test_artifact_miss_is_logged_at_info_with_the_identity_it_looked_for(
     assert len(records) == 1
     message = records[0].getMessage()
     assert "No remote vLLM artifact available" in message
-    assert "backend=p2p" in message
+    assert "backend=nixl" in message
     assert compute_mx_source_id(identity) in message
     assert "vllmcfg1-deadbeef" in message
 
@@ -454,7 +454,7 @@ def test_install_artifact_lease_waits_and_rechecks_success(
     started = context.Event()
     release = context.Event()
     owner = context.Process(
-        target=_run_p2p_install_owner,
+        target=_run_nixl_install_owner,
         args=(tmp_path, started, release),
     )
     owner.start()
@@ -523,7 +523,7 @@ def test_install_artifact_attempt_marker_survives_owner_crash(
     context = multiprocessing.get_context("fork")
     started = context.Event()
     owner = context.Process(
-        target=_crash_during_p2p_install,
+        target=_crash_during_nixl_install,
         args=(tmp_path, started),
     )
     owner.start()
@@ -574,8 +574,12 @@ def test_unified_install_marker_is_backend_neutral():
     ).name.startswith("install-attempted-")
 
 
-def test_p2p_backend_does_not_check_mooncake_availability(monkeypatch):
-    monkeypatch.setenv("MX_ARTIFACT_BACKEND", "p2p")
+@pytest.mark.parametrize("backend", [None, "nixl", " NIXL "])
+def test_nixl_backend_does_not_check_mooncake_availability(monkeypatch, backend):
+    if backend is None:
+        monkeypatch.delenv("MX_ARTIFACT_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("MX_ARTIFACT_BACKEND", backend)
     mooncake_check = MagicMock(side_effect=AssertionError("Mooncake was checked"))
     monkeypatch.setattr(
         artifact_lifecycle.MooncakeArtifactTransport,
@@ -583,7 +587,7 @@ def test_p2p_backend_does_not_check_mooncake_availability(monkeypatch):
         mooncake_check,
     )
     monkeypatch.setattr(
-        artifact_lifecycle, "_p2p_artifact_install_available", lambda *args: True
+        artifact_lifecycle, "_nixl_artifact_install_available", lambda *args: True
     )
     ctx = SimpleNamespace(
         global_rank=0,
@@ -595,11 +599,48 @@ def test_p2p_backend_does_not_check_mooncake_availability(monkeypatch):
     )
 
     transport = artifact_lifecycle._create_artifact_transport(
-        ctx, "p2p", "vLLM", MagicMock()
+        ctx, artifact_lifecycle._artifact_backend(), "vLLM", MagicMock()
     )
 
-    assert isinstance(transport, artifact_lifecycle.P2PArtifactTransport)
+    assert isinstance(transport, artifact_lifecycle.NixlArtifactTransport)
     mooncake_check.assert_not_called()
+
+
+def test_unsupported_backend_skips_install_and_publish(monkeypatch, caplog):
+    monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
+    monkeypatch.setenv("MX_ARTIFACT_BACKEND", "invalid")
+    nixl_check = MagicMock()
+    mooncake_check = MagicMock()
+    monkeypatch.setattr(
+        artifact_lifecycle, "_nixl_artifact_install_available", nixl_check
+    )
+    monkeypatch.setattr(
+        artifact_lifecycle.MooncakeArtifactTransport, "is_available", mooncake_check
+    )
+    ctx = SimpleNamespace(global_rank=0)
+    transfers_factory = MagicMock()
+    ready_fn_factory = MagicMock()
+    artifact_publish_fn = MagicMock()
+    scheduled_publishers = {}
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        artifact_lifecycle.install_artifacts(
+            ctx, transfers_factory, engine_label="vLLM"
+        )
+        artifact_lifecycle.schedule_artifact_publish(
+            ctx,
+            transfers_factory,
+            engine_label="vLLM",
+            ready_fn_factory=ready_fn_factory,
+            artifact_publish_fn=artifact_publish_fn,
+            scheduled_publishers=scheduled_publishers,
+        )
+    transfers_factory.assert_not_called()
+    ready_fn_factory.assert_not_called()
+    artifact_publish_fn.assert_not_called()
+    nixl_check.assert_not_called()
+    mooncake_check.assert_not_called()
+    assert scheduled_publishers == {}
+    assert caplog.text.count("supported values are nixl and mooncake") == 2
 
 
 def test_unavailable_mooncake_backend_skips_install_and_publish(
@@ -869,8 +910,8 @@ def test_mooncake_miss_is_visible_but_not_publishable_by_another_process(
     assert result.get(timeout=1) == ("miss", "cached_miss", False)
 
 
-def test_p2p_miss_preserves_original_attempted_marker(monkeypatch, tmp_path):
-    monkeypatch.setenv("MX_ARTIFACT_BACKEND", "p2p")
+def test_nixl_miss_preserves_original_attempted_marker(monkeypatch, tmp_path):
+    monkeypatch.setenv("MX_ARTIFACT_BACKEND", "nixl")
     monkeypatch.setattr(
         artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path)
     )
@@ -880,7 +921,7 @@ def test_p2p_miss_preserves_original_attempted_marker(monkeypatch, tmp_path):
         roots=(ArtifactCacheRoot("primary", tmp_path / "source", tmp_path / "target"),),
         install=MagicMock(),
     )
-    transport = artifact_lifecycle.P2PArtifactTransport()
+    transport = artifact_lifecycle.NixlArtifactTransport()
     transport.fetch = MagicMock(side_effect=ArtifactCacheMiss("missing"))
     monkeypatch.setattr(
         artifact_lifecycle,
@@ -1025,15 +1066,15 @@ def test_shared_mooncake_miss_can_be_published_by_the_querying_process(
     assert next(iter(scheduled.values())).kwargs["retry_publish_on_failure"] is False
 
 
-def test_p2p_schedule_preserves_publish_retries(monkeypatch, tmp_path):
+def test_nixl_schedule_preserves_publish_retries(monkeypatch, tmp_path):
     monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
-    monkeypatch.setenv("MX_ARTIFACT_BACKEND", "p2p")
+    monkeypatch.setenv("MX_ARTIFACT_BACKEND", "nixl")
     transfer = SimpleNamespace(
         name="triton_cache",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
         roots=(),
     )
-    transport = artifact_lifecycle.P2PArtifactTransport()
+    transport = artifact_lifecycle.NixlArtifactTransport()
     monkeypatch.setattr(
         artifact_lifecycle,
         "_create_artifact_transport",
@@ -1126,7 +1167,9 @@ def _publish_context():
     )
 
 
-def test_publish_artifact_uses_selected_transport(monkeypatch, tmp_path):
+@pytest.mark.parametrize("backend", ["nixl", "mooncake"])
+def test_publish_artifact_uses_selected_transport(monkeypatch, tmp_path, backend):
+    monkeypatch.setenv("MX_ARTIFACT_BACKEND", backend)
     bundle = SimpleNamespace(
         artifact_id="artifact",
         manifest=SimpleNamespace(files=[]),
@@ -1137,17 +1180,24 @@ def test_publish_artifact_uses_selected_transport(monkeypatch, tmp_path):
         roots=(SimpleNamespace(source_root=tmp_path, optional=False),),
         prepare_source=MagicMock(return_value=bundle),
     )
-    handle = SimpleNamespace(identifier="published", transport="test", stop=MagicMock())
+    handle = SimpleNamespace(
+        identifier="published", transport=backend, stop=MagicMock()
+    )
     transport = SimpleNamespace(publish=MagicMock(return_value=handle))
+    factory = MagicMock(return_value=transport)
+    worker_server = object()
+    get_worker_server = MagicMock(return_value=worker_server)
+    monkeypatch.setattr(artifact_lifecycle, "_get_worker_server", get_worker_server)
     monkeypatch.setattr(artifact_lifecycle, "has_files", lambda _path: True)
     monkeypatch.setattr(
         artifact_lifecycle,
         "_create_artifact_transport",
-        lambda *args, **kwargs: transport,
+        factory,
     )
 
+    ctx = _publish_context()
     result = artifact_lifecycle.publish_artifact(
-        _publish_context(),
+        ctx,
         transfer,
         _identity(),
         engine_label="vLLM",
@@ -1158,3 +1208,14 @@ def test_publish_artifact_uses_selected_transport(monkeypatch, tmp_path):
     assert result is handle
     transport.publish.assert_called_once()
     assert transfer.prepare_source.call_count == 1
+    factory.assert_called_once_with(
+        ctx,
+        backend,
+        "vLLM",
+        artifact_lifecycle.logger,
+        worker_grpc_server=worker_server if backend == "nixl" else None,
+    )
+    if backend == "nixl":
+        get_worker_server.assert_called_once_with(ctx.device_id)
+    else:
+        get_worker_server.assert_not_called()

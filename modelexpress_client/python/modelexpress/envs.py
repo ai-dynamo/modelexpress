@@ -384,7 +384,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_ARTIFACT_COMPILE_CONFIG_DIGEST": lambda: os.environ.get(
         "MX_ARTIFACT_COMPILE_CONFIG_DIGEST", ""
     ),
-    "MX_ARTIFACT_BACKEND": lambda: os.environ.get("MX_ARTIFACT_BACKEND", "p2p")
+    "MX_ARTIFACT_BACKEND": lambda: os.environ.get("MX_ARTIFACT_BACKEND", "nixl")
     .strip()
     .lower(),
     "MX_ARTIFACT_MOONCAKE_NAMESPACE": lambda: os.environ.get(

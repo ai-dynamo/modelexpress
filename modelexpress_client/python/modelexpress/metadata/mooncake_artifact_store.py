@@ -230,7 +230,7 @@ def compute_artifact_cache_key(
     """Generate the deterministic Mooncake key for one artifact.
 
     The digest reuses the canonical compatibility identity shared with the
-    P2P/server path, plus the artifact type, artifact name, node rank, and
+    NIXL/server path, plus the artifact type, artifact name, node rank, and
     accelerator backend. The returned key directly addresses the complete
     Mooncake object; no manifest or chunk suffix is appended.
     """

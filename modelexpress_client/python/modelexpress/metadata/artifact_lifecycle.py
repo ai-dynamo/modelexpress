@@ -44,7 +44,7 @@ from .artifact_transport import (
     PublicationHandle,
 )
 from .mooncake_artifact_transport import MooncakeArtifactTransport
-from .p2p_artifact_transport import P2PArtifactTransport
+from .nixl_artifact_transport import NixlArtifactTransport
 from .publisher import PublisherThread
 from .publish import _get_worker_server, _is_p2p_metadata_enabled
 from .source_id import compute_mx_source_id
@@ -335,7 +335,7 @@ def publish_artifact(
     """Prepare and publish one artifact through the selected transport."""
     backend = _artifact_backend()
     worker_grpc_server = (
-        _get_worker_server(ctx.device_id) if backend == "p2p" else None
+        _get_worker_server(ctx.device_id) if backend == "nixl" else None
     )
     transport = _create_artifact_transport(
         ctx,
@@ -727,10 +727,10 @@ def _create_artifact_transport(
             )
             return None
         return MooncakeArtifactTransport()
-    if backend == "p2p":
-        if not _p2p_artifact_install_available(ctx, engine_label, log):
+    if backend == "nixl":
+        if not _nixl_artifact_install_available(ctx, engine_label, log):
             return None
-        return P2PArtifactTransport(
+        return NixlArtifactTransport(
             mx_client=ctx.mx_client,
             nixl_manager=ctx.nixl_manager,
             worker_id=ctx.worker_id,
@@ -739,14 +739,15 @@ def _create_artifact_transport(
             worker_grpc_server=worker_grpc_server,
         )
     log.warning(
-        "Unsupported MX_ARTIFACT_BACKEND=%r; skipping %s artifacts",
+        "Unsupported MX_ARTIFACT_BACKEND=%r; supported values are nixl and "
+        "mooncake; skipping %s artifacts",
         backend,
         engine_label,
     )
     return None
 
 
-def _p2p_artifact_install_available(
+def _nixl_artifact_install_available(
     ctx: LoadContext,
     engine_label: str,
     log: logging.Logger,

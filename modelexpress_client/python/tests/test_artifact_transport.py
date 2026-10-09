@@ -25,10 +25,10 @@ from modelexpress.metadata.artifact_transport import (
 from modelexpress.metadata.mooncake_artifact_transport import (
     MooncakeArtifactTransport,
 )
-from modelexpress.metadata.p2p_artifact_transport import P2PArtifactTransport
+from modelexpress.metadata.nixl_artifact_transport import NixlArtifactTransport
 
 
-class _FakeP2PArtifact:
+class _FakeArtifact:
     name = "fake"
     mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE
     roots = ()
@@ -58,12 +58,12 @@ def clear_mooncake_pending_publications():
     module._pending_publications.clear()
 
 
-def test_p2p_transport_fetch_keeps_discovery_inside_adapter(monkeypatch):
-    import modelexpress.metadata.p2p_artifact_transport as module
+def test_nixl_transport_fetch_keeps_discovery_inside_adapter(monkeypatch):
+    import modelexpress.metadata.nixl_artifact_transport as module
 
-    artifact = _FakeP2PArtifact()
+    artifact = _FakeArtifact()
     artifact.discovery_header = p2p_pb2.GetArtifactManifestHeaderResponse(
-        artifact_id="p2p-artifact"
+        artifact_id="nixl-artifact"
     )
     artifact.discovery_error = None
     identity = p2p_pb2.SourceIdentity()
@@ -78,36 +78,36 @@ def test_p2p_transport_fetch_keeps_discovery_inside_adapter(monkeypatch):
         return_value=SimpleNamespace(
             worker_grpc_endpoint="worker:1234",
             mx_source_id="source",
-            artifact_id="p2p-artifact",
+            artifact_id="nixl-artifact",
         )
     )
     transfer = MagicMock(return_value=artifact.discovery_header)
     monkeypatch.setattr(module, "discover_artifact_source", discover)
     monkeypatch.setattr(module, "transfer_artifact_from_worker", transfer)
 
-    result = P2PArtifactTransport(
+    result = NixlArtifactTransport(
         mx_client=mx_client,
         nixl_manager=nixl_manager,
     ).fetch(artifact, identity, context)
 
-    assert result.transport == "p2p"
-    assert result.header.artifact_id == "p2p-artifact"
+    assert result.transport == "nixl"
+    assert result.header.artifact_id == "nixl-artifact"
     discover.assert_called_once_with(
         mx_client, identity, worker_rank=None, node_rank=2, accelerator="cuda"
     )
     transfer.assert_called_once_with(
         "worker:1234",
         "source",
-        "p2p-artifact",
+        "nixl-artifact",
         nixl_manager,
         target_file_paths=[],
     )
 
 
-def test_p2p_transport_maps_discovery_miss(monkeypatch):
-    import modelexpress.metadata.p2p_artifact_transport as module
+def test_nixl_transport_maps_discovery_miss(monkeypatch):
+    import modelexpress.metadata.nixl_artifact_transport as module
 
-    artifact = _FakeP2PArtifact()
+    artifact = _FakeArtifact()
     monkeypatch.setattr(
         module,
         "discover_artifact_source",
@@ -115,7 +115,7 @@ def test_p2p_transport_maps_discovery_miss(monkeypatch):
     )
 
     with pytest.raises(ArtifactCacheMiss, match="no source"):
-        P2PArtifactTransport(
+        NixlArtifactTransport(
             mx_client=object(),
             nixl_manager=object(),
         ).fetch(
@@ -138,7 +138,7 @@ def test_mooncake_transport_maps_cache_miss(monkeypatch):
 
     with pytest.raises(ArtifactCacheMiss, match="missing"):
         MooncakeArtifactTransport().fetch(
-            _FakeP2PArtifact(),
+            _FakeArtifact(),
             p2p_pb2.SourceIdentity(),
             ArtifactTransportContext(),
         )
@@ -161,7 +161,7 @@ def test_mooncake_transport_maps_stale_cache_separately(monkeypatch):
 
     with pytest.raises(ArtifactCacheStale, match="checksum mismatch"):
         MooncakeArtifactTransport().fetch(
-            _FakeP2PArtifact(),
+            _FakeArtifact(),
             p2p_pb2.SourceIdentity(),
             ArtifactTransportContext(),
         )
@@ -172,7 +172,7 @@ def test_mooncake_transport_passes_stale_fingerprint_to_repair_publish(
 ):
     import modelexpress.metadata.mooncake_artifact_transport as module
 
-    artifact = _FakeP2PArtifact()
+    artifact = _FakeArtifact()
     identity = p2p_pb2.SourceIdentity()
     context = ArtifactTransportContext()
     stale = module.MooncakeArtifactCacheStale(
@@ -204,7 +204,7 @@ def test_mooncake_transport_passes_stale_fingerprint_to_repair_publish(
 def test_mooncake_transport_plain_miss_uses_normal_publish(monkeypatch):
     import modelexpress.metadata.mooncake_artifact_transport as module
 
-    artifact = _FakeP2PArtifact()
+    artifact = _FakeArtifact()
     identity = p2p_pb2.SourceIdentity()
     context = ArtifactTransportContext()
     monkeypatch.setattr(module, "compute_artifact_cache_key", lambda *a, **k: "key")
@@ -243,16 +243,16 @@ def test_mooncake_transport_maps_operational_failure_to_unavailable(monkeypatch)
         match="connecting to the Mooncake store failed",
     ):
         MooncakeArtifactTransport().fetch(
-            _FakeP2PArtifact(),
+            _FakeArtifact(),
             p2p_pb2.SourceIdentity(),
             ArtifactTransportContext(),
         )
 
 
 def test_publish_retry_policy_is_transport_specific():
-    assert P2PArtifactTransport.publish_requires_install_state is False
+    assert NixlArtifactTransport.publish_requires_install_state is False
     assert MooncakeArtifactTransport.publish_requires_install_state is True
-    assert P2PArtifactTransport.retry_publish_on_failure is True
+    assert NixlArtifactTransport.retry_publish_on_failure is True
     assert MooncakeArtifactTransport.retry_publish_on_failure is False
 
 
@@ -285,8 +285,8 @@ def test_mooncake_availability_check_does_not_import_native_module(monkeypatch):
     assert "mooncake.store" not in sys.modules
 
 
-def test_p2p_lifecycle_policy_preserves_original_publish_behavior():
-    transport = P2PArtifactTransport()
+def test_nixl_lifecycle_policy_preserves_original_publish_behavior():
+    transport = NixlArtifactTransport()
     attempted = transport.state_after_cache_miss()
 
     assert attempted == ArtifactInstallState(ArtifactInstallStatus.ATTEMPTED)
