@@ -184,12 +184,13 @@ impl ProviderCache for HuggingFaceProviderCache {
                 continue;
             }
 
-            models.push(ModelInfo {
-                provider: ModelProvider::HuggingFace,
-                name: Self::folder_name_to_model_id(folder_name),
-                size: directory_size(&path)?,
+            let size = directory_size(&path);
+            models.push(ModelInfo::measured(
+                ModelProvider::HuggingFace,
+                Self::folder_name_to_model_id(folder_name),
                 path,
-            });
+                size,
+            ));
         }
 
         Ok(models)
