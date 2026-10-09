@@ -27,7 +27,7 @@ use modelexpress_common::grpc::refit::{
     GetWeightVersionShardManifestRequest, GetWeightVersionShardManifestResponse,
     ListWeightVersionShardsRequest, ListWeightVersionsRequest, ObjectStorageSource,
     ObjectStorageType, RegisterVersionLeaseRequest, RegisterWorkerRequest, TrainerTensorsMetadata,
-    UpdateTrainerMeshRequest, UpdateWeightVersionStateRequest, WeightPayloadFormat,
+    UpdateTrainerMeshRequest, UpdateWeightVersionStateRequest, WeightPayloadFormat, WeightVersion,
     WeightVersionShard, WeightVersionState, WorkerRegistration, WorkerRole,
     refit_service_client::RefitServiceClient,
     refit_worker_service_server::{RefitWorkerService, RefitWorkerServiceServer},
@@ -240,6 +240,73 @@ fn mesh_shard(
     publication.tensor_count = 1;
     publication.total_bytes = 8;
     publication
+}
+
+async fn fresh_mesh_version(
+    client: &mut RefitServiceClient<tonic::transport::Channel>,
+    mesh_id: &str,
+) -> WeightVersion {
+    client
+        .create_weight_version(CreateWeightVersionRequest {
+            model_name: "test/model".to_string(),
+            idempotency_key: unique_id("new-mesh-generation"),
+            trainer_mesh_id: Some(mesh_id.to_string()),
+            payload_format: WeightPayloadFormat::FullTensor.into(),
+            state: WeightVersionState::Staging.into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create version for current mesh generation")
+        .into_inner()
+        .version
+        .expect("version")
+}
+
+async fn reject_stale_publication(
+    client: &mut RefitServiceClient<tonic::transport::Channel>,
+    publication: WeightVersionShard,
+) {
+    let uid = publication.version_id.clone();
+    let before = client
+        .get_weight_version(GetWeightVersionRequest { uid: uid.clone() })
+        .await
+        .expect("version before stale publication")
+        .into_inner()
+        .version;
+    let shards = client
+        .list_weight_version_shards(ListWeightVersionShardsRequest {
+            version_id: uid.clone(),
+        })
+        .await
+        .expect("publications before stale attempt")
+        .into_inner()
+        .shards;
+    let failure = client
+        .create_weight_version_shard(CreateWeightVersionShardRequest {
+            shard: Some(publication),
+        })
+        .await
+        .expect_err("new mesh cannot publish an old version");
+    assert_eq!(failure.code(), tonic::Code::FailedPrecondition);
+    assert!(failure.message().contains("generation"));
+    assert_eq!(
+        client
+            .get_weight_version(GetWeightVersionRequest { uid: uid.clone() })
+            .await
+            .expect("read immutable version")
+            .into_inner()
+            .version,
+        before
+    );
+    assert_eq!(
+        client
+            .list_weight_version_shards(ListWeightVersionShardsRequest { version_id: uid })
+            .await
+            .expect("publications unchanged")
+            .into_inner()
+            .shards,
+        shards
+    );
 }
 
 fn worker(worker_id: &str, role: WorkerRole, ttl_seconds: u32) -> RegisterWorkerRequest {
@@ -637,7 +704,19 @@ async fn mesh_linked_versions_publish_and_discover_declared_trainers() {
             .code(),
         tonic::Code::FailedPrecondition
     );
-    let replacement = mesh_shard(&version.uid, &replacement_id, &metadata);
+    reject_stale_publication(
+        &mut client,
+        mesh_shard(&version.uid, &replacement_id, &metadata),
+    )
+    .await;
+    let fresh = fresh_mesh_version(&mut client, &mesh.mesh_id).await;
+    assert_eq!(
+        fresh.trainer_mesh_generation,
+        mesh.generation
+            .checked_add(1)
+            .expect("generation increment")
+    );
+    let replacement = mesh_shard(&fresh.uid, &replacement_id, &metadata);
     client
         .create_weight_version_shard(CreateWeightVersionShardRequest {
             shard: Some(replacement.clone()),
@@ -647,7 +726,7 @@ async fn mesh_linked_versions_publish_and_discover_declared_trainers() {
     assert_eq!(
         client
             .list_weight_version_shards(ListWeightVersionShardsRequest {
-                version_id: version.uid.clone(),
+                version_id: fresh.uid.clone(),
             })
             .await
             .expect("discover replacement")
@@ -656,7 +735,7 @@ async fn mesh_linked_versions_publish_and_discover_declared_trainers() {
         vec![replacement]
     );
     assert_eq!(
-        update_state(&mut client, &version.uid, WeightVersionState::Ready)
+        update_state(&mut client, &fresh.uid, WeightVersionState::Ready)
             .await
             .expect_err("manual readiness must fail")
             .code(),
@@ -664,12 +743,18 @@ async fn mesh_linked_versions_publish_and_discover_declared_trainers() {
     );
     client
         .delete_weight_version_shard(DeleteWeightVersionShardRequest {
-            version_id: version.uid.clone(),
+            version_id: fresh.uid.clone(),
             logical_shard_id: logical_shard_id.clone(),
             worker_id: replacement_id,
         })
         .await
         .expect("release replacement before retirement");
+    client
+        .delete_weight_version(DeleteWeightVersionRequest {
+            uid: fresh.uid.clone(),
+        })
+        .await
+        .expect("retire new generation version");
     client
         .delete_weight_version(DeleteWeightVersionRequest {
             uid: version.uid.clone(),
@@ -746,7 +831,7 @@ async fn staged_mesh_readiness_requires_current_publications() {
             .into_inner()
             .mesh
             .expect("mesh");
-        let version = client
+        let mut version = client
             .create_weight_version(CreateWeightVersionRequest {
                 model_name: "test/model".to_string(),
                 idempotency_key: unique_id("staged-mesh-version"),
@@ -811,6 +896,18 @@ async fn staged_mesh_readiness_requires_current_publications() {
                     })
                     .await
                     .expect("replace first trainer");
+                let mut stale = mesh_shard(&version.uid, &second_id, &second);
+                stale.total_bytes = 4;
+                reject_stale_publication(&mut client, stale).await;
+                assert_eq!(version.trainer_mesh_generation, mesh.generation);
+                version = fresh_mesh_version(&mut client, &mesh.mesh_id).await;
+                assert_eq!(
+                    version.trainer_mesh_generation,
+                    mesh.generation
+                        .checked_add(1)
+                        .expect("generation increment")
+                );
+                first_publication.version_id = version.uid.clone();
             }
             "expired" => tokio::time::sleep(Duration::from_millis(1200)).await,
             _ => unreachable!("fixed test scenarios"),
@@ -1007,7 +1104,15 @@ async fn mesh_worker_rebinding_retires_publication(replace_worker_id: bool) {
             .code(),
         tonic::Code::FailedPrecondition
     );
-    let publication = mesh_shard(&version.uid, &replacement_id, &new);
+    reject_stale_publication(&mut client, mesh_shard(&version.uid, &replacement_id, &new)).await;
+    let fresh = fresh_mesh_version(&mut client, &mesh.mesh_id).await;
+    assert_eq!(
+        fresh.trainer_mesh_generation,
+        mesh.generation
+            .checked_add(1)
+            .expect("generation increment")
+    );
+    let publication = mesh_shard(&fresh.uid, &replacement_id, &new);
     client
         .create_weight_version_shard(CreateWeightVersionShardRequest {
             shard: Some(publication.clone()),
@@ -1017,7 +1122,7 @@ async fn mesh_worker_rebinding_retires_publication(replace_worker_id: bool) {
     assert_eq!(
         client
             .list_weight_version_shards(ListWeightVersionShardsRequest {
-                version_id: version.uid.clone()
+                version_id: fresh.uid.clone()
             })
             .await
             .expect("new endpoint discovered")
@@ -1033,12 +1138,16 @@ async fn mesh_worker_rebinding_retires_publication(replace_worker_id: bool) {
         .expect("release version");
     client
         .delete_weight_version_shard(DeleteWeightVersionShardRequest {
-            version_id: version.uid,
+            version_id: fresh.uid.clone(),
             logical_shard_id: new.logical_shard_id,
             worker_id: replacement_id,
         })
         .await
         .expect("retire replacement publication");
+    client
+        .delete_weight_version(DeleteWeightVersionRequest { uid: fresh.uid })
+        .await
+        .expect("retire fresh generation version");
     client
         .delete_trainer_mesh(DeleteTrainerMeshRequest {
             mesh_id: mesh.mesh_id,

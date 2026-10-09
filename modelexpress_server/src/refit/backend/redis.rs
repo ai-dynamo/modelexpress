@@ -130,6 +130,31 @@ where
 }
 
 fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersion> {
+    let trainer_mesh_id = fields
+        .get("trainer_mesh_id")
+        .filter(|mesh_id| !mesh_id.is_empty())
+        .cloned();
+    let trainer_mesh_generation = if trainer_mesh_id.is_some() {
+        fields
+            .get("trainer_mesh_generation")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|generation| *generation > 0)
+            .ok_or_else(|| {
+                RefitBackendError::FailedPrecondition(
+                    "mesh-backed weight version is missing a positive trainer_mesh_generation; recreate the version".to_string(),
+                )
+            })?
+    } else {
+        if fields
+            .get("trainer_mesh_generation")
+            .is_some_and(|value| value != "0")
+        {
+            return Err(RefitBackendError::FailedPrecondition(
+                "weight version without a trainer mesh must have generation zero".to_string(),
+            ));
+        }
+        0
+    };
     Ok(WeightVersion {
         uid: hash_field(&fields, "uid")?.to_string(),
         model_name: hash_field(&fields, "model_name")?.to_string(),
@@ -149,10 +174,8 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
                 uri: uri.clone(),
                 storage_type: ObjectStorageType::S3.into(),
             }),
-        trainer_mesh_id: fields
-            .get("trainer_mesh_id")
-            .filter(|mesh_id| !mesh_id.is_empty())
-            .cloned(),
+        trainer_mesh_id,
+        trainer_mesh_generation,
         version_number: fields
             .get("version_number")
             .filter(|number| !number.is_empty())
@@ -657,6 +680,11 @@ impl RefitBackend for RedisRefitBackend {
                     "trainer mesh and weight version model_name differ".to_string(),
                 ));
             }
+            if result == "MESH_GENERATION_MISSING" {
+                return Err(RefitBackendError::FailedPrecondition(
+                    "trainer mesh is missing a positive generation".to_string(),
+                ));
+            }
             if result != "COLLISION" {
                 return Err(RefitBackendError::Internal(format!(
                     "unexpected Redis response: {result}"
@@ -805,6 +833,11 @@ impl RefitBackend for RedisRefitBackend {
             "MESH_NOT_FOUND" => {
                 return Err(RefitBackendError::FailedPrecondition(
                     "trainer mesh is missing".to_string(),
+                ));
+            }
+            "MESH_GENERATION_MISSING" | "MESH_GENERATION_MISMATCH" => {
+                return Err(RefitBackendError::FailedPrecondition(
+                    "weight version trainer_mesh_generation does not match the current mesh; create a new version".to_string(),
                 ));
             }
             "WORKER_NOT_TRAINER" | "WORKER_NOT_IN_MESH" | "WORKER_ENDPOINT_MISMATCH" => {
@@ -1030,6 +1063,53 @@ impl RefitBackend for RedisRefitBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stored_version(mesh_id: &str, generation: Option<&str>) -> HashMap<String, String> {
+        let mut fields = HashMap::from([
+            ("uid".to_string(), "version".to_string()),
+            ("model_name".to_string(), "model".to_string()),
+            ("idempotency_key".to_string(), "request".to_string()),
+            ("payload_format".to_string(), "1".to_string()),
+            ("base_version_id".to_string(), String::new()),
+            ("layout_signature".to_string(), String::new()),
+            ("state".to_string(), "1".to_string()),
+            ("created_at_unix_ms".to_string(), "123".to_string()),
+            ("trainer_mesh_id".to_string(), mesh_id.to_string()),
+        ]);
+        if let Some(generation) = generation {
+            fields.insert(
+                "trainer_mesh_generation".to_string(),
+                generation.to_string(),
+            );
+        }
+        fields
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn stored_mesh_versions_require_positive_generation() {
+        for generation in [None, Some("0"), Some("invalid")] {
+            assert!(matches!(
+                version_from_hash(stored_version("mesh", generation)),
+                Err(RefitBackendError::FailedPrecondition(_))
+            ));
+        }
+        let version = version_from_hash(stored_version("mesh", Some("18446744073709551615")))
+            .expect("positive generation decodes");
+        assert_eq!(version.trainer_mesh_generation, u64::MAX);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn stored_nonmesh_versions_have_generation_zero() {
+        let version = version_from_hash(stored_version("", Some("0")))
+            .expect("generation is not applicable without a mesh");
+        assert_eq!(version.trainer_mesh_generation, 0);
+        assert!(matches!(
+            version_from_hash(stored_version("", Some("1"))),
+            Err(RefitBackendError::FailedPrecondition(_))
+        ));
+    }
 
     #[test]
     fn version_ids_cannot_collide_with_derived_keys() {
