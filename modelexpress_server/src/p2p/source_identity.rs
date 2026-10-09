@@ -28,6 +28,60 @@ pub fn validate_identity(identity: &SourceIdentity) -> Result<(), String> {
     Ok(())
 }
 
+/// Maximum accepted length of a `worker_id`, in bytes.
+///
+/// A `worker_id` reaches Kubernetes on two paths with different limits: it is
+/// interpolated into the `mx-source-{source_id}-{worker_id}` object name, which
+/// is a DNS-1123 subdomain capped at 253, and it is written verbatim as the
+/// `modelexpress.nvidia.com/mx-worker-id` label value, which is capped at 63.
+/// The label value is the binding constraint.
+const WORKER_ID_MAX_LEN: usize = 63;
+
+/// Validate a client-supplied `worker_id` before it reaches a backend.
+///
+/// The value is interpolated into a Kubernetes object name and written as a
+/// label value, so it is constrained to the intersection of what both accept:
+/// lowercase alphanumerics, `-` and `.`, with alphanumeric boundaries. Object
+/// names are DNS-1123 and reject uppercase, which is why the lowercase rule is
+/// not merely stylistic. The documented producer is a UUID, which satisfies it.
+///
+/// This rejects rather than sanitizes, unlike the model-name path. Rewriting
+/// the value would change which object name a previously-published worker maps
+/// to, and the CR name is reconstructed from `worker_id` on later operations,
+/// so a lossy transform here would strand records rather than protect them.
+///
+/// The length check is on bytes rather than characters on purpose: Kubernetes
+/// counts bytes, and non-ASCII input is rejected by the charset check anyway.
+pub fn validate_worker_id(worker_id: &str) -> Result<(), String> {
+    if worker_id.is_empty() {
+        return Err("worker_id is required".to_string());
+    }
+    if worker_id.len() > WORKER_ID_MAX_LEN {
+        return Err(format!(
+            "worker_id must be at most {} bytes, got {}",
+            WORKER_ID_MAX_LEN,
+            worker_id.len()
+        ));
+    }
+    if let Some(bad) = worker_id
+        .chars()
+        .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '.'))
+    {
+        return Err(format!(
+            "worker_id may only contain lowercase alphanumerics, '-' and '.', found {bad:?}"
+        ));
+    }
+    let bytes = worker_id.as_bytes();
+    let boundary_ok =
+        |b: Option<&u8>| matches!(b, Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit());
+    if !boundary_ok(bytes.first()) || !boundary_ok(bytes.last()) {
+        return Err(
+            "worker_id must start and end with a lowercase alphanumeric character".to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn canonical_json(identity: &SourceIdentity) -> String {
     // Normalize extra_parameters deterministically:
     // 1. sort by original key (String::cmp = byte order, matches Python's
@@ -296,5 +350,69 @@ mod tests {
     #[test]
     fn test_validate_passes() {
         assert!(validate_identity(&base_identity()).is_ok());
+    }
+
+    #[test]
+    fn worker_id_accepts_a_uuid() {
+        // The shape the proto documents as the producer.
+        assert!(validate_worker_id("3f2504e0-4f89-41d3-9a0c-0305e82c3301").is_ok());
+    }
+
+    #[test]
+    fn worker_id_accepts_dotted_and_numeric_forms() {
+        assert!(validate_worker_id("worker-0").is_ok());
+        assert!(validate_worker_id("rank0.replica1").is_ok());
+        assert!(validate_worker_id("0").is_ok());
+    }
+
+    #[test]
+    fn worker_id_rejects_empty() {
+        assert!(validate_worker_id("").is_err());
+    }
+
+    #[test]
+    fn worker_id_rejects_over_label_value_budget() {
+        // 63 bytes is the Kubernetes label-value cap and is accepted; 64 is not.
+        let at_cap = "a".repeat(WORKER_ID_MAX_LEN);
+        assert!(validate_worker_id(&at_cap).is_ok());
+        let over_cap = "a".repeat(WORKER_ID_MAX_LEN + 1);
+        assert!(validate_worker_id(&over_cap).is_err());
+    }
+
+    #[test]
+    fn worker_id_rejects_k8s_name_injection() {
+        // Each of these is currently interpolated raw into an object name and a
+        // label value. A '/' escapes the name component entirely.
+        for bad in [
+            "a/../b", "a/b", "a b", "a\nb", "a:b", "a=b", "a,b", "a%2Fb", "a\"b", "a$b",
+        ] {
+            assert!(
+                validate_worker_id(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_id_rejects_uppercase() {
+        // Valid as a label value, invalid as a DNS-1123 object name, so the CR
+        // create would fail at the API server rather than here.
+        assert!(validate_worker_id("Worker-0").is_err());
+        assert!(validate_worker_id("ABC").is_err());
+    }
+
+    #[test]
+    fn worker_id_rejects_non_alphanumeric_boundaries() {
+        assert!(validate_worker_id("-abc").is_err());
+        assert!(validate_worker_id("abc-").is_err());
+        assert!(validate_worker_id(".abc").is_err());
+        assert!(validate_worker_id("abc.").is_err());
+        assert!(validate_worker_id("-").is_err());
+    }
+
+    #[test]
+    fn worker_id_rejects_non_ascii() {
+        assert!(validate_worker_id("wörker").is_err());
+        assert!(validate_worker_id("worker\u{200b}0").is_err());
     }
 }
