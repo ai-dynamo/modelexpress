@@ -123,6 +123,32 @@ def test_sglang_context_separates_worker_rank_from_global_rank(monkeypatch):
     assert ctx.mx_client.server_url == "mx.example:9000"
 
 
+def test_sglang_context_uses_lws_node_rank_and_leader(monkeypatch):
+    monkeypatch.setenv("LWS_WORKER_INDEX", "1")
+    monkeypatch.setenv("LWS_LEADER_ADDRESS", "sglang-group-0.sglang-group")
+
+    ctx = build_sglang_load_context(
+        _load_config(tp_rank=1),
+        _model_config(),
+        _device_config(),
+    )
+
+    assert ctx.node_rank == 1
+    assert ctx.head_addr == "sglang-group-0.sglang-group"
+
+
+def test_sglang_context_prefers_explicit_node_rank(monkeypatch):
+    monkeypatch.setenv("LWS_WORKER_INDEX", "4")
+
+    ctx = build_sglang_load_context(
+        _load_config(node_rank=2),
+        _model_config(),
+        _device_config(),
+    )
+
+    assert ctx.node_rank == 2
+
+
 def test_sglang_is_cuda_alike_uses_sglang_platform_helper(monkeypatch):
     adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
     sglang_mod = ModuleType("sglang")

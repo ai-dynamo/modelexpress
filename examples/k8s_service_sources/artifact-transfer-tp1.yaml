@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Small TP=1 example for k8s-service weight and JIT-cache artifact transfer.
+# Start with one replica, wait for its artifact publisher, then scale to two.
+# The new unready Pod discovers through the Service, which contains only the
+# healthy source Pod, and pins artifact chunk RPCs to the returned Pod IP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-sources
+spec:
+  selector:
+    app: mx-sources
+  ports:
+    - name: worker-grpc
+      port: 6555
+      targetPort: 6555
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-sources
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-sources
+  template:
+    metadata:
+      labels:
+        app: mx-sources
+    spec:
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - Qwen/Qwen2.5-0.5B-Instruct
+            - --load-format
+            - modelexpress
+            - --tensor-parallel-size
+            - "1"
+            - --max-model-len
+            - "1024"
+            - --gpu-memory-utilization
+            - "0.35"
+          env:
+            - { name: VLLM_PLUGINS, value: modelexpress }
+            - { name: MX_METADATA_BACKEND, value: k8s-service }
+            - { name: MX_K8S_SERVICE_PATTERN, value: "mx-sources:6555" }
+            - { name: MX_K8S_ARTIFACT_SERVICE_PATTERN, value: "mx-sources:6555" }
+            - { name: MX_ARTIFACT_TRANSFER, value: "1" }
+            - { name: MX_ARTIFACT_OWNER_DEVICE_ID, value: "0" }
+            - { name: MX_MODEL_REVISION, value: "REPLACE_WITH_COMMIT_SHA" }
+            - { name: MX_METADATA_PORT, value: "5555" }
+            - { name: MX_WORKER_GRPC_PORT, value: "6555" }
+            - name: MX_WORKER_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - { name: MX_ARTIFACT_BUNDLE_ROOT, value: /cache/bundles }
+            - { name: TRITON_CACHE_DIR, value: /cache/triton }
+            - { name: VLLM_CACHE_ROOT, value: /cache/vllm }
+          ports:
+            - { name: http, containerPort: 8000 }
+            - { name: nixl, containerPort: 5555 }
+            - { name: worker-grpc, containerPort: 6555 }
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 120
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+              rdma/shared_ib: "1"
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/shared_ib: "1"
+          volumeMounts:
+            - { name: cache, mountPath: /cache }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: cache
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi

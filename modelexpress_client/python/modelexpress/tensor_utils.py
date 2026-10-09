@@ -201,18 +201,34 @@ def adopt_hidden_tensors(
 
     adopted = 0
     for _module_name, module in model.named_modules():
-        for attr_name in list(vars(module)):
-            attr_val = getattr(module, attr_name, None)
+        # Read the snapshotted values directly.  Calling getattr() here can
+        # invoke engine-defined lazy attribute resolution (for example
+        # Transformers' lazy modules) and import unrelated optional models.
+        for attr_name, attr_val in list(vars(module).items()):
             if attr_val is None:
                 continue
             if isinstance(attr_val, (torch.Tensor, nn.Parameter, nn.Module)):
                 continue
 
-            tensors = _find_hidden_accel_tensors(
-                attr_val,
-                visited=set(),
-                accelerator_backend=backend,
-            )
+            try:
+                tensors = _find_hidden_accel_tensors(
+                    attr_val,
+                    visited=set(),
+                    accelerator_backend=backend,
+                )
+            except Exception as exc:
+                # Hidden-tensor adoption is supplementary to normal parameter
+                # and buffer discovery.  Lazy/proxy runtime objects may reject
+                # introspection; skip only that root instead of disabling the
+                # worker's entire P2P source publication path.
+                logger.debug(
+                    "Skipping hidden tensor scan for %s.%s (%s): %s",
+                    _module_name,
+                    attr_name,
+                    type(attr_val).__name__,
+                    exc,
+                )
+                continue
             for tensor_path, tensor in tensors:
                 if tensor.data_ptr() in existing_ptrs:
                     continue

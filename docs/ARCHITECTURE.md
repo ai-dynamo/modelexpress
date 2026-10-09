@@ -985,7 +985,7 @@ See [`metadata.md`](metadata.md) for the full storage layout and schemas.
 
 ### k8s-service Metadata Backend
 
-The decentralized `k8s-service` backend lives in the Python client as `MxK8sServiceClient` (duck-typed to `MxClientBase`). Clients open a direct gRPC channel to a Kubernetes Service DNS name and call `GetTensorManifest`; kube-proxy load-balances across ready backends; `mx_source_id` is computed client-side (Python `compute_mx_source_id` matches the Rust implementation via pinned cross-check tests) and validated on every response. This backend currently serves tensor manifests only; file-backed artifact discovery requires a central-coordinator backend (`redis` or `kubernetes`) until `k8s-service` grows an artifact-source discovery path.
+The decentralized `k8s-service` backend lives in the Python client as `MxK8sServiceClient` (duck-typed to `MxClientBase`). Clients open a gRPC channel to a Kubernetes Service DNS name; kube-proxy load-balances across ready backends; `mx_source_id` is computed client-side (Python `compute_mx_source_id` matches the Rust implementation via pinned cross-check tests) and validated on every response. Tensor clients call `GetTensorManifest` through the rank Service. Artifact clients call `GetArtifactManifestHeader` through a node-scoped Service only for discovery, validate the returned identity, node rank, and accelerator, and then pin every manifest-page and chunk-lease RPC to the returned pod-direct endpoint. This split is required because artifact leases and NIXL agents are worker-local state.
 
 **Pattern encoding:** `MX_K8S_SERVICE_PATTERN` supports two shapes:
 
@@ -1588,6 +1588,8 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Feeds the torch compile cache `SourceIdentity`, adding compile configuration as a partitioning dimension for artifact discovery. Unset leaves the field empty, which drops it from the `mx_source_id` input, so workers whose other identity fields match — model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch — share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](DEPLOYMENT.md#pairing-workers-by-compile-configuration) |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
+| `MX_K8S_ARTIFACT_SERVICE_PATTERN` | inherits `MX_K8S_SERVICE_PATTERN` | Optional node-scoped artifact discovery Service template. Supports `{node_rank}` and `{rank}`; `{rank}` is the artifact owner device ID. Use an explicit port for one-port artifact Services. |
+| `MX_ARTIFACT_OWNER_DEVICE_ID` | `0` | Device whose worker publishes pod-scoped artifacts for `k8s-service`. Other devices skip duplicate publication. The artifact Service must route to this device's worker gRPC port. |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` sleep between retry attempts |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |

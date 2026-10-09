@@ -669,6 +669,34 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
     artifacts._scheduled_publishers.clear()
 
 
+def test_k8s_service_artifact_publish_only_runs_on_owner_device(monkeypatch):
+    monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
+    monkeypatch.setenv("MX_P2P_METADATA", "1")
+    monkeypatch.setenv("MX_ARTIFACT_OWNER_DEVICE_ID", "0")
+    ctx = SimpleNamespace(
+        global_rank=1,
+        device_id=1,
+        mx_client=SimpleNamespace(
+            REQUIRES_P2P_METADATA=True,
+            SERVICE_ROUTED_ARTIFACTS=True,
+        ),
+        nixl_manager=object(),
+    )
+
+    with patch(
+        "modelexpress.metadata.artifact_lifecycle._metadata_publication_configured",
+        return_value=True,
+    ), patch(
+        "modelexpress.engines.vllm.artifacts._vllm_artifact_transfers",
+    ) as transfers, patch(
+        "modelexpress.metadata.artifact_lifecycle.PublisherThread",
+    ) as publisher_cls:
+        artifacts.schedule_vllm_cache_artifact_publish(ctx)
+
+    transfers.assert_not_called()
+    publisher_cls.assert_not_called()
+
+
 def test_vllm_artifact_ready_fn_waits_for_health_and_stable_cache(
     monkeypatch,
     tmp_path,
