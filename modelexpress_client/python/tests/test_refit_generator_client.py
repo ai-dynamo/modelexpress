@@ -742,8 +742,8 @@ def test_generator_stages_applies_and_releases_across_versions(monkeypatch) -> N
         server.stop(grace=None).wait()
 
     assert service.registrations["generator-0"].role == refit_pb2.WORKER_ROLE_GENERATOR
-    assert service.lease_registrations == 2
-    assert service.lease_deletions == 2
+    assert service.lease_registrations == 4
+    assert service.lease_deletions == 4
     assert len(adapter.stage_calls) == 2
     assert len(adapter.apply_calls) == 1
     assert len(adapter.publish_calls) == 1
@@ -799,21 +799,25 @@ def test_trainer_source_allows_fallback_when_initial_mesh_lookup_fails(
 
 @pytest.mark.parametrize("bounded", [False, True])
 @pytest.mark.parametrize("mismatch", ["initial", "post_manifest"])
-def test_generator_rejects_mesh_change_during_source_resolution(
-    monkeypatch, mismatch, bounded
+@pytest.mark.parametrize("peer_fallback", [False, True])
+def test_generator_handles_mesh_change_with_configured_peer_fallback(
+    monkeypatch, mismatch, bounded, peer_fallback
 ) -> None:
     server, endpoint, service = _start_server()
     service.version.trainer_mesh_id = "mesh-a"
     if mismatch == "initial":
         service.version.trainer_mesh_generation = 2
     service.mesh_generation_on_recheck = 2
-    _add_generator_peer(service)
+    if peer_fallback:
+        _add_generator_peer(service)
     adapter = _Adapter(service)
     generator = _initialize(
         monkeypatch,
         endpoint,
         adapter,
-        source_order=(WeightSource.TRAINER, WeightSource.GENERATOR),
+        source_order=(WeightSource.TRAINER, WeightSource.GENERATOR)
+        if peer_fallback
+        else (WeightSource.TRAINER,),
         staging_buffer_bytes=512 if bounded else None,
     )
     if bounded:
@@ -842,19 +846,31 @@ def test_generator_rejects_mesh_change_during_source_resolution(
                 )
 
             def install(self, prepared) -> str:
+                if isinstance(prepared, PreparedEngineTensors):
+                    return adapter.apply_weight(prepared.staged)
                 assert [batch["weight"] for batch in prepared.batches()] == [2]
                 adapter.apply_calls.append(prepared)
                 return "installed"
 
         planner = generator._runtime.session._planner
-        planner._methods = (Method(transfer=Transfer(), capture_layout=None),)
+        planner._methods = (
+            Method(transfer=Transfer(), capture_layout=None),
+            _TestMethod(adapter),
+        )
         planner._installer = Installer()
     try:
-        with pytest.raises(RuntimeError, match="mesh generation"):
-            generator.stage_weight(version=WeightVersionRef("version-a"))
+        if peer_fallback:
+            staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+            assert generator.apply_weight(staged) == "installed"
+            staged.release()
+        else:
+            with pytest.raises(RuntimeError, match="mesh generation"):
+                generator.stage_weight(version=WeightVersionRef("version-a"))
         assert adapter.stage_calls == []
-        assert adapter.peer_stage_calls == []
-        assert service.lease_registrations == service.lease_deletions == 1
+        assert len(adapter.peer_stage_calls) == int(peer_fallback)
+        assert service.lease_registrations == service.lease_deletions == 1 + int(
+            peer_fallback
+        )
         assert not service.active_leases
         service.version.uid = "version-b"
         service.version.trainer_mesh_generation = 2
@@ -863,10 +879,13 @@ def test_generator_rejects_mesh_change_during_source_resolution(
         staged = generator.stage_weight(version=WeightVersionRef("version-b"))
         assert generator.apply_weight(staged) == "installed"
         staged.release()
-        assert len(adapter.stage_calls) == len(adapter.apply_calls) == 1
+        assert len(adapter.stage_calls) == 1
+        assert len(adapter.apply_calls) == 1 + int(peer_fallback)
         assert adapter.stage_calls[0].version_id == "version-b"
-        assert adapter.peer_stage_calls == []
-        assert service.lease_registrations == service.lease_deletions == 2
+        assert len(adapter.peer_stage_calls) == int(peer_fallback)
+        assert service.lease_registrations == service.lease_deletions == 2 + int(
+            peer_fallback
+        )
         assert not service.active_leases
     finally:
         generator.close()
@@ -1034,7 +1053,7 @@ def test_generator_does_not_retry_peer_publication(monkeypatch):
     assert adapter.publish_calls == []
 
 
-def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
+def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch) -> None:
     server, endpoint, service = _start_server(manifest_digest="bad-digest")
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter)
@@ -1047,8 +1066,8 @@ def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
         server.stop(grace=None).wait()
 
     assert not service.active_leases
-    assert service.lease_registrations == 1
-    assert service.lease_deletions == 1
+    assert service.lease_registrations == 2
+    assert service.lease_deletions == 2
     assert adapter.stage_calls == []
 
 
@@ -1564,11 +1583,13 @@ def test_generator_rejects_missing_initial_s3_base_before_registration(monkeypat
     assert adapter.close_calls == 1
 
 
-def test_generator_retries_complete_staged_transfer_under_one_lease(monkeypatch):
+def test_generator_retries_complete_staged_transfer_under_one_lease(monkeypatch) -> None:
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
     adapter.stage_failures = 1
-    generator = _initialize(monkeypatch, endpoint, adapter)
+    generator = _initialize(
+        monkeypatch, endpoint, adapter, source_order=(WeightSource.TRAINER,)
+    )
 
     try:
         staged = generator.stage_weight(version=WeightVersionRef("version-a"))
@@ -1897,7 +1918,7 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
 
             endpoint = service.shards[0].manifest_endpoint
             service.shards[0].manifest_endpoint = ""
-            with pytest.raises(ValueError, match="no NIXL trainer plan"):
+            with pytest.raises(RuntimeError, match="no NIXL trainer plan"):
                 generator.stage_weight(version=WeightVersionRef("version-a"))
             assert failed._update.released
             assert generator._active_handle is None
@@ -1998,7 +2019,7 @@ def test_generator_rejects_non_ready_version_before_leasing(monkeypatch):
     assert service.lease_registrations == 0
 
 
-def test_generator_rejects_unsupported_payload_after_peer_miss(monkeypatch):
+def test_generator_rejects_unsupported_payload_after_peer_miss(monkeypatch) -> None:
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
     service.version.base_version_id = "version-base"
@@ -2012,8 +2033,8 @@ def test_generator_rejects_unsupported_payload_after_peer_miss(monkeypatch):
         generator.close()
         server.stop(grace=None).wait()
 
-    assert service.lease_registrations == 1
-    assert service.lease_deletions == 1
+    assert service.lease_registrations == 2
+    assert service.lease_deletions == 2
 
 
 def test_generator_falls_back_when_peer_identity_is_unavailable(monkeypatch):

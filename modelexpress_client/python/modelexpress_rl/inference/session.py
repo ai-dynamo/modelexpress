@@ -100,13 +100,9 @@ class WeightUpdateSession:
         version: WeightVersion,
     ) -> SessionUpdate:
         """Prepare one target and retain its leases until apply or release."""
-        if self._streaming is not None:
-            return self._stage_one(version)
         source_order = self._planner.source_order
         if not source_order:
             raise RuntimeError("no refit source is configured")
-        if WeightSource.OBJECT_STORAGE not in source_order:
-            return self._stage_one(version)
         for source_kind in source_order[:-1]:
             try:
                 return self._stage_source(version, source_kind=source_kind)
@@ -137,7 +133,6 @@ class WeightUpdateSession:
             source_kind.value,
         )
         if source_kind is not WeightSource.OBJECT_STORAGE:
-            self._planner.validate(version, source_kind=source_kind)
             return self._stage_one(version, source_kind=source_kind)
         if self._resolve_replay_chain is None:
             raise RuntimeError("object-storage replay-chain resolver is unavailable")
@@ -174,9 +169,7 @@ class WeightUpdateSession:
         from .methods import LoadTimeTensorNixlUpdateMethod
 
         for plan in self._planner.plans(version, source_kind=source_kind):
-            if self._streaming is not None:
-                if plan.source.kind is not WeightSource.TRAINER:
-                    continue
+            if self._streaming is not None and source_kind is WeightSource.TRAINER:
                 if not isinstance(plan.method, LoadTimeTensorNixlUpdateMethod):
                     continue
                 if (
@@ -195,6 +188,7 @@ class WeightUpdateSession:
         source_kind: WeightSource | None,
     ) -> tuple[WeightUpdatePlan, PreparedArtifact]:
         last_error: BaseException | None = None
+        streaming = self._streaming is not None and source_kind is WeightSource.TRAINER
         for plan in self._candidate_plans(version, source_kind):
             logger.info(
                 "ModelExpress weight update version=%s trying source=%s method=%s installer=%s",
@@ -204,7 +198,7 @@ class WeightUpdateSession:
                 type(plan.installer).__name__,
             )
             try:
-                if self._streaming is None:
+                if not streaming:
                     prepared = plan.method.prepare(
                         version=version, source=plan.source
                     )
@@ -214,7 +208,7 @@ class WeightUpdateSession:
                         source=plan.source,
                     )
             except (grpc.RpcError, RuntimeError, ManifestMismatchError) as error:
-                if self._streaming is None:
+                if not streaming:
                     if isinstance(error, StrategyRecoveryError):
                         raise
                     self._recover_preparation(plan.method, error)
@@ -236,8 +230,8 @@ class WeightUpdateSession:
             return plan, prepared
         if last_error is not None:
             raise last_error
-        if self._streaming is not None:
-            raise ValueError("no NIXL trainer plan supports bounded streaming")
+        if streaming:
+            raise RuntimeError("no NIXL trainer plan supports bounded streaming")
         raise RuntimeError(
             f"no usable refit source for weight version {version.version_id!r}"
         )

@@ -450,7 +450,13 @@ resolution compares the recorded generation with the current mesh. Stored versio
 require the generation field; decoding parses it as a uint64 without repeating
 creation-time consistency checks. Versions without a trainer mesh, including object-storage
 versions, carry generation zero. A requested version whose recorded mesh
-generation differs from the current trainer mesh fails source resolution.
+generation differs from the current trainer mesh fails trainer source resolution.
+The session tries configured source kinds in order, so this failure can fall back
+to a generator peer serving the requested version. Bounded staging applies to
+trainer transfers; peers retain their normal runtime-tensor preparation path.
+Trainer and peer paths check compatibility during plan selection without a
+separate preflight pass. Object-storage replay retains preflight validation of
+every revision before acquiring the chain's leases.
 
 Any trainer mesh update that changes its generation is rejected while a linked
 weight version has an active consumer lease, including additive replicas that
