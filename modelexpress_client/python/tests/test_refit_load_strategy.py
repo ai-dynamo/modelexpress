@@ -436,6 +436,40 @@ def test_resolve_s3_chain_returns_full_root_then_deltas():
         assert _resolve_s3_replay_chain(_context(), "delta") == (root, delta)
 
 
+@pytest.mark.parametrize(
+    "configured_limit, delta_count, should_succeed",
+    [(None, 63, True), (None, 64, False), ("65", 64, True), ("2", 2, False)],
+)
+def test_resolve_s3_chain_honors_replay_limit(
+    monkeypatch, configured_limit, delta_count, should_succeed
+):
+    if configured_limit is None:
+        monkeypatch.delenv("MX_MAX_REPLAY_CHAIN_LENGTH", raising=False)
+    else:
+        monkeypatch.setenv("MX_MAX_REPLAY_CHAIN_LENGTH", configured_limit)
+    versions = {"v0": _version("v0", WeightPayloadFormat.FULL_HF_CHECKPOINT)}
+    for index in range(1, delta_count + 1):
+        uid = f"v{index}"
+        versions[uid] = _version(
+            uid, WeightPayloadFormat.XOR_DELTA, base=f"v{index - 1}"
+        )
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.get_weight_version.side_effect = versions.__getitem__
+
+    with patch(
+        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
+        return_value=client,
+    ):
+        if should_succeed:
+            assert _resolve_s3_replay_chain(_context(), f"v{delta_count}") == tuple(
+                versions.values()
+            )
+        else:
+            with pytest.raises(RuntimeError, match="maximum chain length"):
+                _resolve_s3_replay_chain(_context(), f"v{delta_count}")
+
+
 def test_resolve_s3_chain_rejects_mismatched_returned_uid():
     client = MagicMock()
     client.__enter__.return_value = client

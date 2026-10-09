@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
+    MX_MAX_REPLAY_CHAIN_LENGTH: int
     MX_REFIT_TIMING: bool
     MX_S3_DOWNLOAD_RANGE_BYTES: int
     MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
@@ -82,6 +83,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "LOCAL_RANK": lambda: (
         int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else None
+    ),
+    "MX_MAX_REPLAY_CHAIN_LENGTH": lambda: positive_int_env(
+        "MX_MAX_REPLAY_CHAIN_LENGTH", 64
     ),
     "MX_REFIT_METADATA_PORT": lambda: require_positive_int(
         int(os.environ.get("MX_REFIT_METADATA_PORT", "7555")),
