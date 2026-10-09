@@ -27,9 +27,9 @@ from modelexpress.metadata.artifact_manifest import (
     build_artifact_manifest,
 )
 from modelexpress.metadata.artifact_transfer import (
+    ArtifactTransfer,
     ArtifactBundle,
     ArtifactCacheRoot,
-    P2PArtifactTransfer,
     cute_dsl_cache_artifact_transfer,
     deep_gemm_cache_artifact_transfer,
     discover_artifact_source,
@@ -631,7 +631,7 @@ def test_validate_fetched_manifest_rejects_manifest_id_mismatch(tmp_path):
         )
 
 
-def test_tarred_p2p_artifact_transfer_prepares_single_file_bundle(tmp_path):
+def test_tarred_artifact_transfer_prepares_single_file_bundle(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     nested = source / "nested"
@@ -716,11 +716,12 @@ def test_flashinfer_cache_transfer_includes_engine_autotune_files(tmp_path, capl
     server, port = _start_server(servicer)
 
     try:
-        header = target_transfer.transfer_from_worker(
+        header = transfer_artifact_from_worker(
             f"127.0.0.1:{port}",
             mx_source_id="source-123",
             artifact_id=bundle.artifact_id,
             nixl_manager=target_nixl,
+            target_file_paths=target_transfer.target_file_paths(),
             timeout=1.0,
         )
         target_transfer.install(header)
@@ -767,7 +768,7 @@ def test_flashinfer_cache_transfer_allows_missing_optional_root(tmp_path):
     assert (tmp_path / "autotune-target").is_dir()
 
 
-def test_tarred_p2p_artifact_transfer_rejects_unsafe_staging(tmp_path):
+def test_tarred_artifact_transfer_rejects_unsafe_staging(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     transfer = torch_compile_cache_artifact_transfer(
@@ -780,7 +781,7 @@ def test_tarred_p2p_artifact_transfer_rejects_unsafe_staging(tmp_path):
         transfer.prepare_source()
 
 
-def test_tarred_p2p_artifact_transfer_rejects_stale_bundle_files(tmp_path):
+def test_tarred_artifact_transfer_rejects_stale_bundle_files(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     bundle = tmp_path / "bundle"
@@ -796,7 +797,7 @@ def test_tarred_p2p_artifact_transfer_rejects_stale_bundle_files(tmp_path):
         transfer.prepare_source()
 
 
-def test_tarred_p2p_artifact_transfer_rejects_target_bundle_symlink(tmp_path):
+def test_tarred_artifact_transfer_rejects_target_bundle_symlink(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     bundle = tmp_path / "target-bundle"
@@ -811,11 +812,12 @@ def test_tarred_p2p_artifact_transfer_rejects_target_bundle_symlink(tmp_path):
     )
 
     with pytest.raises(ValueError, match="symlink"):
-        transfer.transfer_from_worker(
+        transfer_artifact_from_worker(
             "127.0.0.1:1",
             mx_source_id="source-123",
             artifact_id="artifact",
             nixl_manager=object(),
+            target_file_paths=transfer.target_file_paths(),
         )
     assert outside.read_bytes() == b"keep-me"
 
@@ -829,7 +831,7 @@ def _prepare_and_install(source, target, bundle):
     return transfer
 
 
-def test_tarred_p2p_artifact_transfer_skips_internal_symlink(tmp_path):
+def test_tarred_artifact_transfer_skips_internal_symlink(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     (source / "target.txt").write_text("target")
@@ -842,7 +844,7 @@ def test_tarred_p2p_artifact_transfer_skips_internal_symlink(tmp_path):
     assert not (target / "link.txt").exists()
 
 
-def test_tarred_p2p_artifact_transfer_skips_external_symlink(tmp_path, caplog):
+def test_tarred_artifact_transfer_skips_external_symlink(tmp_path, caplog):
     caplog.set_level(logging.WARNING, logger="modelexpress.metadata.artifact_transfer")
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -861,7 +863,7 @@ def test_tarred_p2p_artifact_transfer_skips_external_symlink(tmp_path, caplog):
     assert "external symlink" in caplog.text
 
 
-def test_tarred_p2p_artifact_transfer_survives_broken_symlink(tmp_path, caplog):
+def test_tarred_artifact_transfer_survives_broken_symlink(tmp_path, caplog):
     caplog.set_level(logging.WARNING, logger="modelexpress.metadata.artifact_transfer")
     source = tmp_path / "source"
     source.mkdir()
@@ -876,7 +878,7 @@ def test_tarred_p2p_artifact_transfer_survives_broken_symlink(tmp_path, caplog):
     assert "broken symlink" in caplog.text
 
 
-def test_tarred_p2p_artifact_transfer_archives_awkward_member_names(tmp_path):
+def test_tarred_artifact_transfer_archives_awkward_member_names(tmp_path):
     source = tmp_path / "source"
     (source / "gen").mkdir(parents=True)
     (source / "gen" / "config[sm100].inc").write_text("kept")
@@ -893,7 +895,7 @@ def test_tarred_p2p_artifact_transfer_archives_awkward_member_names(tmp_path):
     assert not (target / "gen" / "new\nline_link").is_symlink()
 
 
-def test_tarred_p2p_artifact_transfer_keeps_empty_directories(tmp_path):
+def test_tarred_artifact_transfer_keeps_empty_directories(tmp_path):
     source = tmp_path / "source"
     (source / "cached_ops" / "tmp").mkdir(parents=True)
     (source / "cached_ops" / "kernel.so").write_bytes(b"compiled")
@@ -1017,7 +1019,7 @@ def test_extract_tarred_artifact_rejects_duplicate_archive_names(tmp_path):
         transfer.install(header)
 
 
-def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path, caplog):
+def test_tarred_artifact_transfer_splits_transfer_and_install(tmp_path, caplog):
     source = tmp_path / "source"
     source.mkdir()
     (source / "bucket-000").mkdir()
@@ -1063,11 +1065,12 @@ def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path, capl
             logging.INFO,
             logger="modelexpress.metadata.artifact_transfer",
         ):
-            header = target_transfer.transfer_from_worker(
+            header = transfer_artifact_from_worker(
                 f"127.0.0.1:{port}",
                 mx_source_id="source-123",
                 artifact_id=bundle.artifact_id,
                 nixl_manager=target_nixl,
+                target_file_paths=target_transfer.target_file_paths(),
                 timeout=1.0,
             )
         assert header.files[0].path == (
@@ -1154,7 +1157,7 @@ def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path, capl
         ),
     ],
 )
-def test_cache_artifact_transfers_share_p2p_interface(
+def test_cache_artifact_transfers_share_artifact_interface(
     tmp_path,
     factory,
     name,
@@ -1170,7 +1173,7 @@ def test_cache_artifact_transfers_share_p2p_interface(
         chunk_size=6,
     )
 
-    assert isinstance(transfer, P2PArtifactTransfer)
+    assert isinstance(transfer, ArtifactTransfer)
     assert transfer.name == name
     assert transfer.mx_source_type == mx_source_type
     bundle = transfer.prepare_source()
@@ -1192,11 +1195,12 @@ def test_cache_artifact_transfers_share_p2p_interface(
     server, port = _start_server(servicer)
 
     try:
-        header = transfer.transfer_from_worker(
+        header = transfer_artifact_from_worker(
             f"127.0.0.1:{port}",
             mx_source_id="source-123",
             artifact_id=bundle.artifact_id,
             nixl_manager=target_nixl,
+            target_file_paths=transfer.target_file_paths(),
             timeout=1.0,
         )
         assert not (transfer.roots[0].target_root / "kernel.so").exists()
@@ -1583,10 +1587,12 @@ def test_torch_compile_cache_transfer_discovers_source_through_mx_server(tmp_pat
 
     try:
         discovered = discover_artifact_source(mx_client, identity)
-        header = transfer.discover_and_transfer(
-            mx_client,
-            identity,
+        header = transfer_artifact_from_worker(
+            discovered.worker_grpc_endpoint,
+            discovered.mx_source_id,
+            discovered.artifact_id,
             target_nixl,
+            target_file_paths=transfer.target_file_paths(),
             timeout=1.0,
             max_inflight_chunks=2,
         )

@@ -19,8 +19,7 @@ from ...load_strategy.context import LoadContext
 from ...metadata import artifact_lifecycle as _common_artifacts
 from ...metadata.artifact_transfer import (
     ArtifactCacheRoot,
-    P2PArtifactTransfer,
-    PublishedArtifactSource,
+    ArtifactTransfer,
     cute_dsl_cache_artifact_transfer,
     deep_gemm_cache_artifact_transfer,
     flashinfer_cache_artifact_transfer,
@@ -29,12 +28,13 @@ from ...metadata.artifact_transfer import (
     tvm_ffi_cache_artifact_transfer,
     torch_compile_cache_artifact_transfer,
 )
+from ...metadata.artifact_transport import PublicationHandle
 from ...metadata.publisher import PublisherThread
 
 logger = logging.getLogger("modelexpress.engines.sglang.artifacts")
 
 _DEFAULT_READY_URL = "http://127.0.0.1:30000/health"
-_published_sources: dict[tuple[int, int], PublishedArtifactSource] = {}
+_published_sources: dict[tuple[int, int], PublicationHandle] = {}
 _scheduled_publishers: dict[tuple[int, int], PublisherThread] = {}
 
 
@@ -69,10 +69,10 @@ def _artifact_transfer_enabled() -> bool:
 
 def _publish_sglang_cache_artifact(
     ctx: LoadContext,
-    transfer: P2PArtifactTransfer,
+    transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
-) -> PublishedArtifactSource:
-    """Compatibility wrapper for the shared source publication operation."""
+) -> PublicationHandle:
+    """Publish one SGLang cache artifact through the selected transport."""
     return _common_artifacts.publish_artifact(
         ctx,
         transfer,
@@ -86,7 +86,7 @@ def _publish_sglang_cache_artifact(
 
 def _sglang_artifact_transfers(
     ctx: LoadContext,
-) -> list[tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]]:
+) -> list[tuple[ArtifactTransfer, p2p_pb2.SourceIdentity]]:
     bundle_root = _bundle_root(ctx)
     torch_compile_cache_root = _torch_compile_cache_root()
     triton_cache_root = _common_artifacts.triton_cache_root()
