@@ -104,6 +104,13 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `securityContext`                            | Container security context                     | `{runAsNonRoot: true}` |
 | `service.type`                               | Service type                                   | `ClusterIP` |
 | `service.port`                               | Service port. Single source of truth for the `MODEL_EXPRESS_SERVER_PORT` env var, containerPort and probes | `8001`   |
+| `service.annotations`                        | Service annotations, e.g. to have an in-cluster issuer populate `tls.secretName` | `{}` |
+| `tls.enabled`                                | Terminate TLS on the gRPC listener             | `false`  |
+| `tls.secretName`                             | Secret holding `tls.crt` and `tls.key`. Required when `tls.enabled` | `""` |
+| `tls.caKey`                                  | Key in `tls.secretName` holding the issuing CA. Makes `helm test` verify the certificate for `<fullname>.<namespace>.svc` instead of skipping verification | `""` |
+| `tls.minVersion`                             | Lowest TLS version accepted (`TLS1.2`, `TLS1.3`, or `VersionTLS12`) | unset (TLS1.2) |
+| `tls.cipherSuites`                           | Cipher names, OpenSSL or IANA spelling, TLS 1.2 and 1.3 mixed | `[]` (backend defaults) |
+| `tls.groups`                                 | Key exchange groups in preference order        | `[]` (backend defaults) |
 | `metrics.enabled`                            | Serve Prometheus metrics on their own port     | `true`   |
 | `metrics.port`                               | Metrics port. Single source of truth for the env var, containerPort, annotation and Service port | `9401` |
 | `metrics.podAnnotations`                     | Emit `prometheus.io/{scrape,port,path}`. Inert on Prometheus Operator clusters -- use `metrics.podMonitor` there | `true` |

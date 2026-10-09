@@ -235,7 +235,8 @@ fn discover_default_config() -> Option<PathBuf> {
 }
 
 /// Load configuration with strict file parsing but with environment variable overrides.
-/// This is used internally by both strict validation and normal loading with fallbacks.
+/// Errors when there is no file to load, so [`load_layered_config`] checks for
+/// one first.
 fn load_config_with_env_strict<T>(
     config_file: Option<PathBuf>,
     env_prefix: &str,
@@ -285,24 +286,25 @@ where
     load_config_file_strict(config_file)
 }
 
-/// Default implementation of layered configuration loading with fallback to defaults
+/// Layered configuration loading: `config_file`, or else a default config file
+/// if one is found, with environment overrides on top.
+///
+/// `defaults` is returned only when there is no file at all. A file that is
+/// missing, does not parse, or holds a value a field rejects is an error.
+/// Falling back to `defaults` there would discard every setting in the file
+/// without a word, and for a server that includes its TLS section.
 pub fn load_layered_config<T>(
     config_file: Option<PathBuf>,
     env_prefix: &str,
     defaults: T,
 ) -> Result<T, ConfigError>
 where
-    T: serde::de::DeserializeOwned + Default,
+    T: serde::de::DeserializeOwned,
 {
-    // Try to load configuration strictly first
-    match load_config_with_env_strict(config_file, env_prefix) {
-        Ok(config) => Ok(config),
-        Err(_) => {
-            // If strict loading fails, fall back to defaults
-            // This provides a safe fallback for partial configurations or errors
-            Ok(defaults)
-        }
+    if config_file.is_none() && discover_default_config().is_none() {
+        return Ok(defaults);
     }
+    load_config_with_env_strict(config_file, env_prefix)
 }
 
 /// Common configuration for client connections
@@ -313,6 +315,10 @@ pub struct ConnectionConfig {
 
     /// Timeout in seconds for requests
     pub timeout_secs: Option<u64>,
+
+    /// PEM CA bundle to trust for an `https://` endpoint. System roots when unset.
+    #[serde(default)]
+    pub tls_ca_file: Option<std::path::PathBuf>,
 }
 
 pub fn normalize_grpc_endpoint(endpoint: impl Into<String>) -> String {
@@ -330,6 +336,7 @@ impl Default for ConnectionConfig {
         Self {
             endpoint: format!("http://localhost:{}", crate::constants::DEFAULT_GRPC_PORT),
             timeout_secs: Some(crate::constants::DEFAULT_TIMEOUT_SECS),
+            tls_ca_file: None,
         }
     }
 }
@@ -339,6 +346,7 @@ impl ConnectionConfig {
         Self {
             endpoint: normalize_grpc_endpoint(endpoint),
             timeout_secs: Some(crate::constants::DEFAULT_TIMEOUT_SECS),
+            tls_ca_file: None,
         }
     }
 
@@ -519,5 +527,103 @@ mod tests {
 
         assert_eq!(strict_config.endpoint, validate_config.endpoint);
         assert_eq!(strict_config.timeout_secs, validate_config.timeout_secs);
+    }
+
+    const LAYERED_DEFAULT_ENDPOINT: &str = "http://layered-defaults:1";
+
+    fn layered_defaults() -> ConnectionConfig {
+        ConnectionConfig {
+            endpoint: LAYERED_DEFAULT_ENDPOINT.to_string(),
+            ..ConnectionConfig::default()
+        }
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_load_layered_config_without_any_file_returns_defaults() {
+        assert!(
+            discover_default_config().is_none(),
+            "this test needs a machine with no default model-express config file"
+        );
+        let config: ConnectionConfig =
+            load_layered_config(None, crate::envs::MODEL_EXPRESS_PREFIX, layered_defaults())
+                .expect("defaults");
+        assert_eq!(config.endpoint, LAYERED_DEFAULT_ENDPOINT);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_load_layered_config_loads_a_valid_file() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let config_file = temp_dir.path().join("layered.yaml");
+        fs::write(
+            &config_file,
+            "endpoint: \"http://from-file:9999\"\ntimeout_secs: 60\n",
+        )
+        .expect("Failed to write config file");
+
+        let config: ConnectionConfig = load_layered_config(
+            Some(config_file),
+            crate::envs::MODEL_EXPRESS_PREFIX,
+            layered_defaults(),
+        )
+        .expect("valid file");
+        assert_eq!(config.endpoint, "http://from-file:9999");
+        assert_eq!(config.timeout_secs, Some(60));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_load_layered_config_missing_file_is_an_error() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let result: Result<ConnectionConfig, ConfigError> = load_layered_config(
+            Some(temp_dir.path().join("not-there.yaml")),
+            crate::envs::MODEL_EXPRESS_PREFIX,
+            layered_defaults(),
+        );
+        let error = result.expect_err("a named file that does not exist must not load");
+        assert!(error.to_string().contains("not found"), "{error}");
+    }
+
+    /// The case that used to come back as `defaults`: every setting in the
+    /// file was dropped, with no error and no log line.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_load_layered_config_invalid_value_is_an_error() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let config_file = temp_dir.path().join("bad_value.yaml");
+        fs::write(
+            &config_file,
+            "endpoint: \"http://from-file:9999\"\ntimeout_secs: \"not a number\"\n",
+        )
+        .expect("Failed to write config file");
+
+        let result: Result<ConnectionConfig, ConfigError> = load_layered_config(
+            Some(config_file),
+            crate::envs::MODEL_EXPRESS_PREFIX,
+            layered_defaults(),
+        );
+        assert!(
+            result.is_err(),
+            "loaded {result:?} from a file with a bad value"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_load_layered_config_unparsable_file_is_an_error() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let config_file = temp_dir.path().join("broken.yaml");
+        fs::write(&config_file, "endpoint: [unclosed\n").expect("Failed to write config file");
+
+        let result: Result<ConnectionConfig, ConfigError> = load_layered_config(
+            Some(config_file),
+            crate::envs::MODEL_EXPRESS_PREFIX,
+            layered_defaults(),
+        );
+        assert!(
+            result.is_err(),
+            "loaded {result:?} from a file that does not parse"
+        );
     }
 }

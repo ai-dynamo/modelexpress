@@ -147,6 +147,22 @@ pub const MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS: &str =
 /// TTL for the verified-token and rejection caches, in seconds.
 pub const MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS: &str = "MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS";
 
+// ── TLS (server) ────────────────────────────────────────────────────────────
+/// PEM certificate chain the gRPC listener serves (`TlsArgs::cert_file`).
+pub const MODEL_EXPRESS_TLS_CERT_FILE: &str = "MODEL_EXPRESS_TLS_CERT_FILE";
+/// PEM private key for [`MODEL_EXPRESS_TLS_CERT_FILE`] (`TlsArgs::key_file`).
+pub const MODEL_EXPRESS_TLS_KEY_FILE: &str = "MODEL_EXPRESS_TLS_KEY_FILE";
+/// Minimum TLS protocol version the listener accepts (`TlsArgs::min_version`).
+pub const MODEL_EXPRESS_TLS_MIN_VERSION: &str = "MODEL_EXPRESS_TLS_MIN_VERSION";
+/// Comma-separated OpenSSL cipher names the listener offers (`TlsArgs::cipher_suites`).
+pub const MODEL_EXPRESS_TLS_CIPHER_SUITES: &str = "MODEL_EXPRESS_TLS_CIPHER_SUITES";
+/// Comma-separated key exchange groups the listener offers (`TlsArgs::groups`).
+pub const MODEL_EXPRESS_TLS_GROUPS: &str = "MODEL_EXPRESS_TLS_GROUPS";
+
+// ── TLS (client) ────────────────────────────────────────────────────────────
+/// PEM CA bundle the client trusts for an `https://` endpoint (`ClientArgs::tls_ca_file`).
+pub const MODEL_EXPRESS_TLS_CA_FILE: &str = "MODEL_EXPRESS_TLS_CA_FILE";
+
 // ── Auth (client) ───────────────────────────────────────────────────────────
 /// Path to the Kubernetes projected ServiceAccount token file.
 pub const MX_AUTH_TOKEN_PATH: &str = "MX_AUTH_TOKEN_PATH";
@@ -404,6 +420,18 @@ mod tests {
             MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS,
             "MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS"
         );
+        assert_eq!(MODEL_EXPRESS_TLS_CERT_FILE, "MODEL_EXPRESS_TLS_CERT_FILE");
+        assert_eq!(MODEL_EXPRESS_TLS_KEY_FILE, "MODEL_EXPRESS_TLS_KEY_FILE");
+        assert_eq!(
+            MODEL_EXPRESS_TLS_MIN_VERSION,
+            "MODEL_EXPRESS_TLS_MIN_VERSION"
+        );
+        assert_eq!(
+            MODEL_EXPRESS_TLS_CIPHER_SUITES,
+            "MODEL_EXPRESS_TLS_CIPHER_SUITES"
+        );
+        assert_eq!(MODEL_EXPRESS_TLS_GROUPS, "MODEL_EXPRESS_TLS_GROUPS");
+        assert_eq!(MODEL_EXPRESS_TLS_CA_FILE, "MODEL_EXPRESS_TLS_CA_FILE");
         assert_eq!(MX_AUTH_TOKEN_PATH, "MX_AUTH_TOKEN_PATH");
         assert_eq!(MX_AUTH_TOKEN_TTL_SECONDS, "MX_AUTH_TOKEN_TTL_SECONDS");
         assert_eq!(HOME, "HOME");
