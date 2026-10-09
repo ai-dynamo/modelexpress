@@ -3,10 +3,9 @@
 
 """Tests for the Python compute_mx_source_id helper.
 
-The pinned hash values here are cross-checked by matching assertions in
-modelexpress_server/src/source_identity.rs - if the canonical JSON
-encoding or hashing scheme ever diverges between Python and Rust, both
-sides' tests will fail together and catch it.
+The pinned ASCII hashes have matching assertions in
+modelexpress_server/src/p2p/source_identity.rs. The Unicode vector was
+cross-checked against that production Rust source in a standalone harness.
 """
 
 from __future__ import annotations
@@ -177,3 +176,12 @@ def test_case_colliding_extra_parameters_are_deterministic():
     b.extra_parameters["Foo"] = "a"
     assert compute_mx_source_id(a) == compute_mx_source_id(b)
     assert compute_mx_source_id(a) == "f4eeab03e859b088"
+
+
+def test_pinned_hash_with_unicode_identity():
+    identity = _base_identity()
+    identity.model_name = "模型/Café"
+    identity.extra_parameters["标签"] = "Crème 𐐀"
+    identity.compile_config_digest = "编译-Ä"
+    # Cross-checked with Rust compute_mx_source_id, which emits UTF-8 JSON.
+    assert compute_mx_source_id(identity) == "5c25d40f31327f9e"
