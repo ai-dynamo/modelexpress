@@ -45,10 +45,22 @@ class WeightVersion:
     layout_signature: str
     state: WeightVersionState
     created_at_unix_ms: int
+    trainer_mesh_generation: int
     base_version_id: str | None = None
     object_storage: ObjectStorageSource | None = None
     trainer_mesh_id: str | None = None
     version_number: int | None = None
+
+    def __post_init__(self) -> None:
+        generation = self.trainer_mesh_generation
+        if type(generation) is not int or not 0 <= generation < 2**64:
+            raise ValueError("trainer_mesh_generation must be a uint64 integer")
+        if self.trainer_mesh_id is not None and generation == 0:
+            raise ValueError(
+                "mesh-backed WeightVersion requires a positive trainer_mesh_generation; recreate the version"
+            )
+        if self.trainer_mesh_id is None and generation != 0:
+            raise ValueError("trainer_mesh_generation requires trainer_mesh_id")
 
     @property
     def ref(self) -> WeightVersionRef:
@@ -137,6 +149,7 @@ def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
             uri=version.object_storage.uri,
         )
     return WeightVersion(
+        trainer_mesh_generation=version.trainer_mesh_generation,
         version_id=version.uid,
         model_name=version.model_name,
         payload_format=payload_format,

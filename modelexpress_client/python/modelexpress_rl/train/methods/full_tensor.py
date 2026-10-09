@@ -99,6 +99,10 @@ class FullTensorNixlPublicationMethod:
         )
         if not version_response.version.HasField("trainer_mesh_id"):
             raise RuntimeError("trainer publication requires trainer_mesh_id")
+        if version_response.version.trainer_mesh_generation == 0:
+            raise RuntimeError(
+                "trainer publication requires a positive trainer_mesh_generation; recreate the version"
+            )
         if self._binding is None:
             raise RuntimeError("mesh publication requires bind_tensors()")
         logical_shard_id = self._binding.logical_shard_id

@@ -57,7 +57,7 @@ from modelexpress_rl.inference.source import (
 
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
-    def __init__(self, *, endpoint: str, state=None, manifest_digest=None):
+    def __init__(self, *, endpoint: str, state=None, manifest_digest=None) -> None:
         self.registrations = {}
         self.active_leases = set()
         self.lease_registrations = 0
@@ -72,6 +72,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.omit_base_version = False
         self.additional_versions = {}
         self.version = refit_pb2.WeightVersion(
+            trainer_mesh_generation=1,
             uid="version-a",
             model_name="test/model",
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR,

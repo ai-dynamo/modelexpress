@@ -448,6 +448,12 @@ rejects a changed generation before writing. Stored mesh versions without a
 positive generation must be recreated. Versions without a trainer mesh carry
 generation zero.
 
+The Python weight-version contract requires the recorded generation. Mesh-backed
+versions require a positive uint64 value, while versions without a trainer mesh
+require zero. The unchanged creation API returns the server-assigned generation;
+clients and trainer producers retain it instead of inferring a mutable current
+mesh generation.
+
 DIRECT installation and pipelined worker streaming are
 not implemented by this control-plane slice.
 NIXL manifest endpoints belong to their physical worker shards; a typed object
