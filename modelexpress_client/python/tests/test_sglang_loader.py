@@ -18,9 +18,14 @@ import torch.nn as nn
 from modelexpress import p2p_pb2
 from modelexpress.engines.sglang.adapter import (
     SglangAdapter,
+    _is_speculative_draft,
     build_sglang_load_context,
 )
-from modelexpress.engines.sglang.loader import MxModelLoader
+from modelexpress.engines.sglang.loader import (
+    MxModelLoader,
+    _nixl_managers,
+    _tensor_registry,
+)
 from modelexpress.load_strategy.context import LoadResult
 
 
@@ -594,6 +599,8 @@ def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain(
     ctx = run.call_args.args[1]
     assert ctx.adapter.__class__ is SglangAdapter
     assert ctx.identity.backend_framework == p2p_pb2.BACKEND_FRAMEWORK_SGLANG
+    assert ctx.p2p_enabled is True
+    assert loader.nixl_manager is ctx.nixl_manager
     if health_gated:
         # Bound to ctx so the URL resolves against this worker's node_rank
         # and head address, so identity is not asserted.
@@ -1112,3 +1119,308 @@ def test_te_find_source_records_the_funnel_on_success(monkeypatch):
         call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list
     }
     assert observed["listed"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Speculative (MTP / NextN) draft pass
+# ---------------------------------------------------------------------------
+
+
+def test_is_speculative_draft_reads_sglang_is_draft_model():
+    assert _is_speculative_draft(_model_config(is_draft_model=True)) is True
+    assert _is_speculative_draft(_model_config(is_draft_model=False)) is False
+    # Older SGLang ModelConfigs without the flag are ordinary target loads.
+    assert _is_speculative_draft(_model_config()) is False
+
+
+def test_mx_model_loader_nixl_path_keeps_draft_out_of_p2p(monkeypatch):
+    """The draft's second load must not touch NIXL, artifacts, or the
+    target's device registries."""
+    from modelexpress.engines.sglang import loader as loader_mod
+
+    target_tensors = {"target.weight": torch.randn(2, 2)}
+    target_manager = MagicMock(name="target-nixl-manager")
+    monkeypatch.setitem(_tensor_registry, 0, target_tensors)
+    monkeypatch.setitem(_nixl_managers, 0, target_manager)
+
+    model = nn.Linear(2, 2)
+    loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
+
+    with patch.dict(
+        os.environ, {"MX_ARTIFACT_READY_URL": "http://127.0.0.1:30000/health"}
+    ), patch(
+        "modelexpress.engines.sglang.loader.run_load_strategy_chain",
+        return_value=model,
+    ) as run, patch(
+        "modelexpress.engines.sglang.loader.install_sglang_cache_artifacts",
+    ) as install_artifacts, patch(
+        "modelexpress.engines.sglang.loader.schedule_sglang_cache_artifact_publish",
+    ) as schedule_artifacts:
+        loaded = loader._load_model_via_nixl(
+            model=model,
+            model_config=_model_config(is_draft_model=True),
+            device_config=_device_config(gpu_id=0),
+        )
+
+    assert loaded is model
+    ctx = run.call_args.args[1]
+    assert ctx.p2p_enabled is False
+    install_artifacts.assert_not_called()
+    schedule_artifacts.assert_not_called()
+    assert loader_mod._tensor_registry[0] is target_tensors
+    assert loader_mod._nixl_managers[0] is target_manager
+    assert loader.nixl_manager is None
+    assert loader.tensors == {}
+
+
+def test_rdma_strategy_is_not_eligible_for_draft_context():
+    from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+    ctx = build_sglang_load_context(
+        _load_config(), _model_config(is_draft_model=True), _device_config()
+    )
+    ctx.p2p_enabled = not _is_speculative_draft(ctx.model_config)
+
+    with patch(
+        "modelexpress.load_strategy.rdma_strategy.is_nixl_available",
+        return_value=True,
+    ):
+        assert RdmaStrategy().is_available(ctx) is False
+
+
+def test_transfer_engine_draft_loads_natively_without_discovery_or_publish():
+    transfer_engine = MagicMock()
+    load_config = _load_config(
+        modelexpress_transport="transfer_engine",
+        remote_instance_weight_loader_transfer_engine=transfer_engine,
+        remote_instance_weight_loader_transfer_engine_session_id="target-session",
+    )
+    loader = MxModelLoader(load_config)
+    initial_model = nn.Linear(2, 2)
+    native_model = nn.Linear(2, 2)
+    native_result = SimpleNamespace(value=native_model, model=native_model)
+    adapter = MagicMock()
+    adapter.load_via_native.return_value = native_result
+    ctx = SimpleNamespace(
+        global_rank=0,
+        identity=SimpleNamespace(model_name="model"),
+        adapter=adapter,
+        tensors={},
+    )
+
+    with patch(
+        "modelexpress.engines.sglang.loader.build_sglang_load_context",
+        return_value=ctx,
+    ), patch.object(
+        loader,
+        "_find_transfer_engine_source",
+    ) as find_source, patch.object(
+        loader,
+        "_publish_transfer_engine_source",
+    ) as publish:
+        loaded = loader._load_model_via_transfer_engine(
+            model=initial_model,
+            model_config=_model_config(is_draft_model=True),
+            device_config=_device_config(),
+        )
+
+    assert loaded is native_model
+    assert ctx.p2p_enabled is False
+    find_source.assert_not_called()
+    publish.assert_not_called()
+    adapter.load_via_native.assert_called_once()
+    assert adapter.load_via_native.call_args.args[0].model is initial_model
+    adapter.discover_tensors.assert_not_called()
+    adapter.before_rdma_receive.assert_not_called()
+    transfer_engine.register_memory.assert_not_called()
+    assert loader.remote_instance_transfer_engine_weight_info == {}
+    assert loader.nixl_manager is None
+
+
+def test_transfer_engine_draft_does_not_require_a_transfer_engine():
+    # SGLang only initializes a TransferEngine for the draft runner when its
+    # draft load format asks for one, so the draft pass must not insist on it.
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    native_model = nn.Linear(2, 2)
+    adapter = MagicMock()
+    adapter.load_via_native.return_value = SimpleNamespace(
+        value=native_model, model=native_model
+    )
+    ctx = SimpleNamespace(
+        global_rank=0,
+        identity=SimpleNamespace(model_name="model"),
+        adapter=adapter,
+        tensors={},
+    )
+
+    with patch(
+        "modelexpress.engines.sglang.loader.build_sglang_load_context",
+        return_value=ctx,
+    ):
+        loaded = loader._load_model_via_transfer_engine(
+            model=nn.Linear(2, 2),
+            model_config=_model_config(is_draft_model=True),
+            device_config=_device_config(),
+        )
+
+    assert loaded is native_model
+
+
+class _RecordingModel(nn.Module):
+    """Model whose load_weights records every tensor name it is handed."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen: list[str] = []
+
+    def load_weights(self, weights):
+        for name, _tensor in weights:
+            self.seen.append(name)
+
+
+def _install_sglang_default_loader_modules(monkeypatch, tmp_path, shard_tensors):
+    """Fake sglang.srt.model_loader.loader.DefaultModelLoader over shards on
+    disk under tmp_path. shard_tensors maps shard basename -> tensor names."""
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    configs_mod = ModuleType("sglang.srt.configs")
+    load_config_mod = ModuleType("sglang.srt.configs.load_config")
+    model_loader_mod = ModuleType("sglang.srt.model_loader")
+    loader_mod = ModuleType("sglang.srt.model_loader.loader")
+    load_config_mod.LoadFormat = SimpleNamespace(AUTO="auto")
+    calls: dict = {}
+
+    class DefaultModelLoader:
+        def __init__(self, load_config):
+            self.load_config = load_config
+
+        def _prepare_weights(self, model_name_or_path, revision, fall_back_to_pt):
+            calls["prepare"] = (model_name_or_path, revision, fall_back_to_pt)
+            files = sorted(
+                os.path.join(str(tmp_path), name) for name in shard_tensors
+            )
+            return str(tmp_path), files, True
+
+        def _get_weights_iterator(self, source):
+            _folder, files, _use_safetensors = self._prepare_weights(
+                source.model_or_path, source.revision, source.fall_back_to_pt
+            )
+            calls["files"] = files
+            for path in files:
+                for name in shard_tensors[os.path.basename(path)]:
+                    yield name, torch.zeros(1)
+
+        def _get_all_weights(self, model_config, model):
+            source = SimpleNamespace(
+                model_or_path=model_config.model_path,
+                revision=model_config.revision,
+                fall_back_to_pt=True,
+            )
+            yield from self._get_weights_iterator(source)
+
+        @staticmethod
+        def load_weights_and_postprocess(model, weights, target_device):
+            model.load_weights(weights)
+
+    loader_mod.DefaultModelLoader = DefaultModelLoader
+    loader_mod.device_loading_context = MagicMock()
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.configs", configs_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.configs.load_config", load_config_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader", model_loader_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader.loader", loader_mod)
+    return calls
+
+
+_NEXTN_SHARDS = {
+    "model-00001-of-00003.safetensors": [
+        "model.embed_tokens.weight",
+        "model.layers.0.mlp.weight",
+    ],
+    "model-00002-of-00003.safetensors": ["model.layers.1.mlp.weight", "lm_head.weight"],
+    "model-00003-of-00003.safetensors": [
+        "model.layers.2.eh_proj.weight",
+        "model.layers.2.enorm.weight",
+        "model.layers.2.embed_tokens.weight",
+    ],
+}
+
+
+def _write_nextn_checkpoint(tmp_path, shard_tensors, num_hidden_layers=2):
+    import json
+
+    weight_map = {
+        name: shard for shard, names in shard_tensors.items() for name in names
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8"
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Glm4MoeForCausalLM"],
+                "num_hidden_layers": num_hidden_layers,
+                "num_nextn_predict_layers": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    for shard in shard_tensors:
+        (tmp_path / shard).write_bytes(b"")
+
+
+def test_sglang_native_load_reads_only_draft_shards_for_draft(monkeypatch, tmp_path):
+    _write_nextn_checkpoint(tmp_path, _NEXTN_SHARDS)
+    calls = _install_sglang_default_loader_modules(monkeypatch, tmp_path, _NEXTN_SHARDS)
+    adapter = SglangAdapter(
+        _load_config(),
+        _model_config(model_path=str(tmp_path), is_draft_model=True),
+        _device_config(),
+    )
+    model = _RecordingModel()
+
+    adapter.load_via_native(SimpleNamespace(value=model, model=model))
+
+    assert calls["files"] == [
+        os.path.join(str(tmp_path), "model-00003-of-00003.safetensors")
+    ]
+    assert model.seen == _NEXTN_SHARDS["model-00003-of-00003.safetensors"]
+    # Loader identity is preserved for the wrapped class.
+    assert calls["prepare"] == (str(tmp_path), "abc123", True)
+
+
+def test_sglang_native_load_reads_every_shard_for_target(monkeypatch, tmp_path):
+    _write_nextn_checkpoint(tmp_path, _NEXTN_SHARDS)
+    calls = _install_sglang_default_loader_modules(monkeypatch, tmp_path, _NEXTN_SHARDS)
+    adapter = SglangAdapter(
+        _load_config(),
+        _model_config(model_path=str(tmp_path), is_draft_model=False),
+        _device_config(),
+    )
+    model = _RecordingModel()
+
+    adapter.load_via_native(SimpleNamespace(value=model, model=model))
+
+    assert len(calls["files"]) == 3
+    assert len(model.seen) == sum(len(v) for v in _NEXTN_SHARDS.values())
+
+
+def test_sglang_native_draft_load_falls_back_to_all_shards_without_index(
+    monkeypatch, tmp_path
+):
+    # No index and no config.json: the draft head cannot be located, so the
+    # loader must read every shard rather than nothing.
+    for shard in _NEXTN_SHARDS:
+        (tmp_path / shard).write_bytes(b"")
+    calls = _install_sglang_default_loader_modules(monkeypatch, tmp_path, _NEXTN_SHARDS)
+    adapter = SglangAdapter(
+        _load_config(),
+        _model_config(model_path=str(tmp_path), is_draft_model=True),
+        _device_config(),
+    )
+    model = _RecordingModel()
+
+    adapter.load_via_native(SimpleNamespace(value=model, model=model))
+
+    assert len(calls["files"]) == 3

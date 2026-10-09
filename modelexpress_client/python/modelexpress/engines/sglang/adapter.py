@@ -18,6 +18,7 @@ from ... import envs
 from ... import p2p_pb2
 from ...adapter import EngineAdapter
 from ...accelerators import accelerator_backend_for
+from ...draft_shards import narrow_to_draft_shards
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...tensor_utils import (
@@ -32,6 +33,42 @@ if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
+
+
+def _is_speculative_draft(model_config) -> bool:
+    """True for the draft pass of an SGLang speculative load.
+
+    SGLang builds the MTP / NextN draft from the target's checkpoint with a
+    second ModelConfig flagged is_draft_model=True, so the same loader runs
+    twice in one process. Missing attribute means an ordinary target load.
+    """
+    return bool(getattr(model_config, "is_draft_model", False))
+
+
+def _draft_shard_loader(base_cls, log_prefix: str):
+    """Subclass an SGLang disk loader so it resolves only the draft's shards.
+
+    SGLang's DefaultModelLoader globs every safetensors shard and lets the
+    NextN model discard the ~99% it does not own after reading them. The shard
+    list is decided in _prepare_weights, and the prefetch and iterator both
+    consume what it returns, so narrowing there keeps every downstream code
+    path (multithread, mmap, page-cache prefetch) intact.
+    """
+
+    class DraftShardModelLoader(base_cls):
+        def _prepare_weights(self, *args, **kwargs):
+            prepared = super()._prepare_weights(*args, **kwargs)
+            if not (isinstance(prepared, tuple) and len(prepared) == 3):
+                return prepared
+            hf_folder, weight_files, use_safetensors = prepared
+            if not use_safetensors:
+                return prepared
+            narrowed = narrow_to_draft_shards(
+                hf_folder, list(weight_files), log_prefix=log_prefix
+            )
+            return hf_folder, narrowed, use_safetensors
+
+    return DraftShardModelLoader
 
 
 class SglangAdapter(EngineAdapter):
@@ -164,7 +201,12 @@ class SglangAdapter(EngineAdapter):
 
         disk_config = copy.copy(self.load_config)
         disk_config.load_format = LoadFormat.AUTO
-        disk_loader = DefaultModelLoader(disk_config)
+        loader_cls = DefaultModelLoader
+        if _is_speculative_draft(self.model_config):
+            loader_cls = _draft_shard_loader(
+                DefaultModelLoader, f"[Worker {self.get_global_rank()}] "
+            )
+        disk_loader = loader_cls(disk_config)
         weights_iter = disk_loader._get_all_weights(self.model_config, result.model)
         # Same capture as the target path so the source publishes the derived
         # MLA tensors under matching buffer names (symmetric manifest).
