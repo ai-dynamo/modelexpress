@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.runtime_context import ParallelContext
 
 
 class SglangAdapter(EngineAdapter):
@@ -69,9 +70,13 @@ class SglangAdapter(EngineAdapter):
         ):
             return 0
 
-        from sglang.srt import distributed
+        parallel = _get_sglang_parallel_context()
+        if parallel is not None:
+            return int(parallel.world_group.local_rank)
 
-        return int(distributed.get_world_group().local_rank)
+        from sglang.srt.distributed import parallel_state
+
+        return int(parallel_state.get_world_group().local_rank)
 
     def get_device_id(self) -> int:
         gpu_id = getattr(self.device_config, "gpu_id", None)
@@ -351,26 +356,50 @@ def _get_revision(model_config: ModelConfig) -> str:
     return str(getattr(model_config, "revision", "") or "")
 
 
-def _get_parallel_size(name: str) -> int:
+def _get_sglang_parallel_context() -> ParallelContext | None:
+    """Use the scoped parallel API when provided by SGLang."""
     try:
-        from sglang.srt import distributed
+        from sglang.srt.runtime_context import get_parallel
+    except ModuleNotFoundError as exc:
+        if exc.name != "sglang.srt.runtime_context":
+            raise
+        return None
+    return get_parallel()
 
-        return int(getattr(distributed, name)())
-    except Exception:
+
+def _get_parallel_size(name: str) -> int:
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return 1
+
+    parallel = _get_sglang_parallel_context()
+    if parallel is not None:
+        field = {
+            "get_tensor_model_parallel_world_size": "tp_size",
+            "get_pipeline_model_parallel_world_size": "pp_size",
+            "get_moe_expert_parallel_world_size": "moe_ep_size",
+        }[name]
+        return int(getattr(parallel, field))
+
+    from sglang.srt.distributed import parallel_state
+
+    return int(getattr(parallel_state, name)())
 
 
 def _get_sglang_worker_rank(load_config: LoadConfig) -> int:
     """Return the SGLang model-parallel shard key, excluding DP replicas."""
-    try:
-        from sglang.srt import distributed
-
-        tp_rank = int(distributed.get_tensor_model_parallel_rank())
-        pp_rank = int(distributed.get_pipeline_model_parallel_rank())
-        tp_size = int(distributed.get_tensor_model_parallel_world_size())
-        return pp_rank * tp_size + tp_rank
-    except Exception:
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return int(getattr(load_config, "tp_rank", 0) or 0)
+
+    parallel = _get_sglang_parallel_context()
+    if parallel is not None:
+        return int(parallel.pp_rank) * int(parallel.tp_size) + int(parallel.tp_rank)
+
+    from sglang.srt.distributed import parallel_state
+
+    tp_rank = int(parallel_state.get_tensor_model_parallel_rank())
+    pp_rank = int(parallel_state.get_pipeline_model_parallel_rank())
+    tp_size = int(parallel_state.get_tensor_model_parallel_world_size())
+    return pp_rank * tp_size + tp_rank
 
 
 def build_sglang_load_context(
