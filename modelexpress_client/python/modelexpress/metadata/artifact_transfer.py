@@ -609,12 +609,22 @@ def publish_artifact_source(
         artifact_chunk_manager.close()
         raise
 
+    def republish_fn() -> str:
+        return _publish_metadata_to_server(
+            mx_client=mx_client,
+            identity=identity,
+            worker=worker,
+            worker_id=worker_id,
+            worker_rank=worker_rank,
+        )
+
     heartbeat = PublisherThread(
         mx_client=mx_client,
         mx_source_id=mx_source_id,
         worker_id=worker_id,
         worker_rank=worker_rank,
         nixl_manager=nixl_manager,
+        publish_fn=republish_fn,
     )
     try:
         nixl_manager.refresh_agent_metadata()
