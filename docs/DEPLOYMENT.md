@@ -1693,11 +1693,13 @@ contracts run on every PR in the `RL refit harness tests` job. The namespace GPU
 TP size (one for Nemotron, eight for Kimi). Image builds have a 60-minute timeout;
 the test job has a 60-minute timeout, its experiment step 45 minutes, and pods a
 55-minute lifetime. Large models may exceed this initial qualification budget;
-a timeout is a failure. Requests serialize per PR without canceling active runs, with up to 100 pending
-runs retained in the concurrency queue.
+a timeout is a failure. Automatic trusted-PR and comment-triggered runs use per-PR,
+per-job concurrency: when a replacement job becomes eligible, it cancels the older
+queued or running job. Matrix entries use separate groups. Cleanup jobs remain
+outside these groups, so newer runs can start while earlier cleanup is running or
+waiting for a runner. Existing `always()` cleanup steps still run after job cancellation.
 Actions runs expose the tested SHA and artifacts; the workflow does not post PR
-comments. Automatic trusted-PR runs serialize per PR so a newer push cannot cancel
-S3 cleanup.
+comments.
 
 ### Manual CLI and environments
 
