@@ -454,6 +454,10 @@ generation differs from the current trainer mesh fails trainer source resolution
 The session tries configured source kinds in order, so this failure can fall back
 to a generator peer serving the requested version. Bounded staging applies to
 trainer transfers; peers retain their normal runtime-tensor preparation path.
+An engine left uncertain by a failed installation can recover through a complete
+peer tensor transfer even when the requested version was published as a delta.
+The publication format does not determine the peer's transfer representation;
+failed-handle and undrained-transfer protections still apply.
 Trainer and peer paths check compatibility during plan selection without a
 separate preflight pass. Object-storage replay retains preflight validation of
 every revision before acquiring the chain's leases.

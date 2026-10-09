@@ -24,7 +24,6 @@ from modelexpress_rl.version import WeightVersionRef
 from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
-from ..train import WeightPayloadFormat
 from .adapter import GeneratorEngineContext
 from .plan import StreamingSettings, WeightSource, parse_weight_source_order
 from .receiver import ObjectStorageGeneratorConfig
@@ -391,14 +390,6 @@ class ModelExpressGeneratorClient:
                 with timing.active(recorder):
                     with refit_span("control_discovery"):
                         ready = self._get_ready_version(version.version_id)
-                    if (
-                        self._streaming is not None
-                        and self._engine_state is _EngineState.UNCERTAIN
-                        and ready.payload_format is not WeightPayloadFormat.FULL_TENSOR
-                    ):
-                        raise RuntimeError(
-                            "uncertain streaming engine requires a full tensor update"
-                        )
                     update = runtime.session.stage(ready)
             except BaseException:
                 # Failed preparation has no handle to report the timing later.

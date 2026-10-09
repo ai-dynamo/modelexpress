@@ -39,6 +39,7 @@ from modelexpress_rl.inference.plan import (
     PreparedEngineTensors,
     PreparedStreamingTensors,
     ResolvedSource,
+    StreamingSettings,
     TrainerSourceSnapshot,
     UpdateMethod,
     WeightUpdatePlanner,
@@ -1952,6 +1953,96 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
     finally:
         generator.close()
         server.stop(grace=None).wait()
+
+
+@pytest.mark.parametrize(
+    "payload_format",
+    [WeightPayloadFormat.XOR_DELTA, WeightPayloadFormat.FULL_HF_CHECKPOINT],
+)
+def test_uncertain_streaming_client_recovers_from_complete_peer_tensors(
+    monkeypatch, payload_format
+) -> None:
+    service = _RefitService(endpoint="unused")
+    service.p2p = _P2pService()
+    _add_generator_peer(service)
+    adapter = _Adapter(service)
+    adapter.apply_failure = True
+    peer_client = SimpleNamespace(
+        list_sources=lambda **kwargs: service.p2p.ListSources(
+            p2p_pb2.ListSourcesRequest(**kwargs), None
+        ),
+        get_metadata=lambda **kwargs: service.p2p.GetMetadata(
+            p2p_pb2.GetMetadataRequest(**kwargs), None
+        ),
+    )
+
+    def start_lease(version_id: str) -> SimpleNamespace:
+        service.active_leases.add(version_id)
+        return SimpleNamespace(close=lambda: service.active_leases.discard(version_id))
+
+    method = _TestMethod(adapter)
+    installer = _TestInstaller(adapter)
+    settings = StreamingSettings(512)
+    generator = ModelExpressGeneratorClient()
+    generator._streaming = settings
+    generator._runtime = GeneratorRuntime(
+        engine=EngineRuntime(model_name="test/model", installer=installer),
+        methods=(method,),
+        session=WeightUpdateSession(
+            planner=WeightUpdatePlanner(
+                resolvers=(
+                    GeneratorSourceResolver(
+                        p2p_client=peer_client,
+                        worker_id="generator-0",
+                        worker_rank=0,
+                        build_identity=adapter.build_p2p_identity,
+                    ),
+                ),
+                methods=(method,),
+                installer=installer,
+                max_transfer_attempts=1,
+            ),
+            start_lease=start_lease,
+            streaming=settings,
+        ),
+        p2p_client=None,
+        initial_version_id=None,
+    )
+    ready = SimpleNamespace(
+        version_id="version-a",
+        payload_format=WeightPayloadFormat.FULL_TENSOR,
+        base_version_id=None,
+    )
+    monkeypatch.setattr(generator, "_get_ready_version", lambda _version_id: ready)
+    try:
+        failed = generator.stage_weight(version=WeightVersionRef("version-a"))
+        with pytest.raises(RuntimeError, match="apply failed"):
+            generator.apply_weight(failed)
+        assert generator._engine_state.value == "UNCERTAIN"
+        assert not service.active_leases
+        with pytest.raises(RuntimeError, match="fresh transaction"):
+            generator.apply_weight(failed)
+
+        ready = SimpleNamespace(
+            version_id="version-b",
+            payload_format=payload_format,
+            base_version_id=(
+                "base-a" if payload_format is WeightPayloadFormat.XOR_DELTA else None
+            ),
+        )
+        adapter.apply_failure = False
+        recovered = generator.stage_weight(version=WeightVersionRef("version-b"))
+        assert service.active_leases
+        assert generator.apply_weight(recovered) == "installed"
+        assert generator._engine_state.value == "READY"
+        assert recovered.applied
+        recovered.release()
+        assert len(adapter.peer_stage_calls) == 2
+        assert service.p2p.requests[-1].identity.revision == "version-b"
+        assert not adapter.stage_calls
+        assert not service.active_leases
+    finally:
+        generator.close()
 
 
 def test_generator_republishes_after_pretransfer_failure(monkeypatch):
