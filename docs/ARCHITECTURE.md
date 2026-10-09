@@ -1812,6 +1812,14 @@ full-copy transfer borrowing the engine manager. The version lease remains held 
 installation or release. Preparation retry and recovery behavior stays scoped
 to the selected update strategy; failures after a possible write fence the engine.
 
+Trainer source rows and captured layouts are owned snapshots inside one pull plan.
+Full-copy and bounded preparation share metadata/layout resolution, connection
+and registration, descriptor binding, and publication phases while retaining
+their separate compilation and transfer algorithms. Prepared plans publish only
+after all setup succeeds. Internal batching consumes the fixed validated budget;
+coverage and capacity checks remain at the compilation boundary. Existing cache
+switches and lazy descriptor bindings retain their behavior at this layer.
+
 ## RL refit CI harness
 
 `ci/bench/` shares one Kubernetes lifecycle and pause/refit/verify/resume protocol

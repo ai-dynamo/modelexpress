@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
 from modelexpress.refit.timing import (
@@ -16,10 +16,8 @@ from modelexpress.refit.timing import (
 )
 
 from ...train import WeightPayloadFormat
-from ..adapter import NixlGeneratorSource
 from ..nixl_staged_transfer import (
     _NixlStagedTransfer,
-    _PreparedNixlTransfer,
     _StagedNixlWeights,
 )
 from ..plan import (
@@ -28,7 +26,7 @@ from ..plan import (
     PreparedEngineTensors,
     PreparedStreamingTensors,
     ResolvedSource,
-    TrainerUpdateSource,
+    TrainerSourceSnapshot,
     UpdateMethod,
     WeightSource,
 )
@@ -45,9 +43,6 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
     ) -> None:
         self._transfer = transfer
         self._capture_layout = capture_layout
-        self._active_plan: _PreparedNixlTransfer | None = None
-        self._active_fingerprint: tuple | None = None
-        self._active_manifest_digests: tuple[str, ...] = ()
         self._active_staged: _StagedNixlWeights | None = None
         self._active_streamed: PreparedStreamingTensors | None = None
 
@@ -60,49 +55,20 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         )
 
     def prepare(self, *, version, source: ResolvedSource) -> PreparedArtifact:
-        del version
         if self._active_staged is not None or self._active_streamed is not None:
             raise RuntimeError("release staged weight before staging another version")
-        if not isinstance(source, TrainerUpdateSource):
+        if not isinstance(source, TrainerSourceSnapshot):
             raise TypeError("load-time tensor method requires a trainer source")
-        inputs = source.inputs
-        if any(
-            not isinstance(item.transport, NixlGeneratorSource)
-            for item in inputs.sources
-        ):
-            raise ValueError("load-time tensor method requires NIXL sources")
-        reusable = (
-            self._active_plan is not None
-            and self._active_fingerprint == inputs.physical_fingerprint
-        )
-        set_refit_cold(not reusable)
-        manifests = [item.transport.manifest for item in inputs.sources]
-        manifest_digests = tuple(item.manifest_digest for item in inputs.sources)
-        with refit_span(
-            "transfer_planning",
-            metadata={
-                "plan_cache_hits": int(reusable),
-                "plan_cache_misses": int(not reusable),
-            },
-            accumulate_metadata=True,
-        ):
-            if not reusable:
-                self._active_plan = self._transfer.prepare(
-                    manifests=manifests,
-                    capture_layout=self._capture_layout,
-                )
-                self._active_fingerprint = inputs.physical_fingerprint
-        if reusable and manifest_digests != self._active_manifest_digests:
-            assert self._active_plan is not None
-            with refit_span(
-                "source_preparation",
-                metadata={"manifest_refreshes": 1},
-                accumulate_metadata=True,
-                duration_key="manifest_refresh_s",
-            ):
-                self._transfer.refresh_sources(self._active_plan, manifests)
-        self._active_manifest_digests = manifest_digests
-        self._active_staged = self._transfer.stage(self._active_plan)
+        manifests = [item.manifest for item in source.shards]
+        with refit_span("transfer_planning", accumulate_metadata=True) as counters:
+            prepared = self._transfer.prepare_full_copy(
+                manifests=manifests,
+                trainer_snapshot=source,
+                capture_layout=self._capture_layout,
+            )
+            counters.update(prepared.metrics)
+        set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))
+        self._active_staged = self._transfer.stage(prepared)
         _attribute_transfer(self._active_staged.metrics)
         return PreparedEngineTensors(staged=self._active_staged)
 
@@ -113,20 +79,14 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         source: ResolvedSource,
     ) -> PreparedArtifact:
         """Prepare trainer metadata without transferring a full weight copy."""
-        del version
         if self._active_staged is not None or self._active_streamed is not None:
             raise RuntimeError("release the active update before preparing another")
-        if not isinstance(source, TrainerUpdateSource) or any(
-            not isinstance(item.transport, NixlGeneratorSource)
-            for item in source.inputs.sources
-        ):
+        if not isinstance(source, TrainerSourceSnapshot):
             raise ValueError("bounded staging requires NIXL trainer sources")
-        self._active_plan = None
-        self._active_fingerprint = None
-        self._active_manifest_digests = ()
         try:
-            prepared = self._transfer.prepare(
-                manifests=[item.transport.manifest for item in source.inputs.sources],
+            prepared = self._transfer.prepare_streaming(
+                manifests=[item.manifest for item in source.shards],
+                trainer_snapshot=source,
                 capture_layout=self._capture_layout,
             )
             metrics = dict(prepared.metrics)
@@ -149,7 +109,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         return streamed
 
     @contextmanager
-    def installation_context(self, prepared: PreparedArtifact):
+    def installation_context(self, prepared: PreparedArtifact) -> Iterator[None]:
         if isinstance(prepared, PreparedStreamingTensors):
             if prepared is not self._active_streamed:
                 raise RuntimeError("streaming update does not own the active source")
@@ -186,9 +146,6 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self.validate_close()
         self._active_streamed = None
         self._active_staged = None
-        self._active_plan = None
-        self._active_fingerprint = None
-        self._active_manifest_digests = ()
         self._transfer.close()
 
 

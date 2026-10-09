@@ -452,20 +452,6 @@ def test_bounded_plan_cache_invalidates_each_planning_input(
     assert metrics["plan_cache_misses"] == 1
 
 
-@pytest.mark.parametrize("invalid", [0, -1, True, 512.0])
-def test_bounded_plan_cache_rejects_bad_budget_even_when_numerically_equal(
-    monkeypatch, invalid
-):
-    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
-    cache = _BoundedPlanCache()
-    args = _bounded_cache_inputs()
-    first = cache.compile(**args, metrics={})
-    with pytest.raises(ValueError, match="positive integer"):
-        cache.compile(**{**args, "max_staging_bytes": invalid}, metrics={})
-    assert cache._entry is None
-    assert cache.compile(**args, metrics={}) is not first
-    cache.compile(**{**args, "enabled": False}, metrics={})
-    assert cache._entry is None
 
 
 @pytest.mark.parametrize(

@@ -21,16 +21,11 @@ from modelexpress.refit import (
     use_refit_timing,
 )
 from modelexpress_rl import timing
-from modelexpress_rl.inference.adapter import (
-    GeneratorSource,
-    GeneratorTransferInputs,
-    NixlGeneratorSource,
-)
 from modelexpress_rl.inference.methods.load_time_tensor import (
     LoadTimeTensorNixlUpdateMethod,
     _attribute_transfer,
 )
-from modelexpress_rl.inference.plan import TrainerUpdateSource
+from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 from modelexpress_rl.train import WeightPayloadFormat
 
 STAGED_METRICS = {
@@ -122,60 +117,32 @@ def test_reusing_a_transfer_plan_is_marked_warm(monkeypatch):
     assert recorder.as_dict()["cold_warm"] == "warm"
 
 
-def test_version_digest_refreshes_verification_without_replanning():
+def test_full_copy_timing_reports_transfer_owned_cache_reuse() -> None:
     class Transfer:
-        def __init__(self):
-            self.prepare_calls = 0
-            self.refresh_calls = 0
+        def __init__(self) -> None:
+            self.hits = iter((0, 1))
 
-        def unpublish_peer(self):
-            pass
+        def prepare_full_copy(self, **_kwargs) -> SimpleNamespace:
+            return SimpleNamespace(metrics={"plan_cache_hits": next(self.hits)})
 
-        def prepare(self, **_kwargs):
-            self.prepare_calls += 1
-            return object()
-
-        def refresh_sources(self, _prepared, _manifests):
-            self.refresh_calls += 1
-
-        def stage(self, _prepared):
+        def stage(self, _prepared) -> SimpleNamespace:
             return SimpleNamespace(metrics={"bytes_received": 0})
 
-    transfer = Transfer()
     method = LoadTimeTensorNixlUpdateMethod(
-        transfer=transfer,
-        capture_layout=lambda _manifest: None,
+        transfer=Transfer(), capture_layout=lambda _manifest: None
     )
-
-    def source(version, digest):
-        return TrainerUpdateSource(
-            inputs=GeneratorTransferInputs(
-                version_id=version,
-                base_version_id=None,
-                layout_signature="layout",
-                payload_format=WeightPayloadFormat.FULL_TENSOR,
-                sources=(
-                    GeneratorSource(
-                        source_slot_id="rank:0",
-                        worker_id="trainer-0",
-                        manifest_digest=digest,
-                        transport=NixlGeneratorSource(
-                            manifest_endpoint="trainer:9000",
-                            manifest=version.encode(),
-                            structural_digest="stable-structure",
-                        ),
-                    ),
-                ),
-            )
-        )
-
-    first = method.prepare(version=None, source=source("v1", "digest-1"))
-    method.release(first)
-    second = method.prepare(version=None, source=source("v2", "digest-2"))
-    method.release(second)
-
-    assert transfer.prepare_calls == 1
-    assert transfer.refresh_calls == 1
+    source = TrainerSourceSnapshot("mesh", 1, ())
+    version = SimpleNamespace(
+        base_version_id=None,
+        layout_signature="layout",
+        payload_format=WeightPayloadFormat.FULL_TENSOR,
+    )
+    for label, expected in (("v1", "cold"), ("v2", "warm")):
+        recorder = RefitTimingRecorder(backend="rl_generator", version=label, rank=0)
+        with use_refit_timing(recorder):
+            prepared = method.prepare(version=version, source=source)
+            method.release(prepared)
+        assert recorder.as_dict()["cold_warm"] == expected
 
 
 def test_the_record_is_emitted_once(monkeypatch, caplog):
