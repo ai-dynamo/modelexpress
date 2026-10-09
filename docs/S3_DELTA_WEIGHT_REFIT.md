@@ -145,7 +145,7 @@ trainer = ModelExpressTrainerClient.initialize(
 )
 
 # Call once before the first optimizer update.
-trainer.prepare_delta_base(hf_tensor_iter=hf_tensor_buckets())
+trainer.prepare_delta_base(tensor_iter=hf_tensor_buckets())
 ```
 
 The bucket names must match tensors in the seed checkpoint. Keep the trainer
@@ -490,7 +490,7 @@ dist.barrier(group=refit_process_group)
 # The global index is written after all rank-local delta shards are durable.
 staged = trainer.stage_shard(
     version=WeightVersionRef("v1"),
-    hf_tensor_iter=hf_tensor_buckets(),
+    tensor_iter=hf_tensor_buckets(),
 )
 staged.publish()
 dist.barrier(group=refit_process_group)

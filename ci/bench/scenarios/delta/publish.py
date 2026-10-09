@@ -160,7 +160,7 @@ def main():
             ),
         )
     )
-    trainer.prepare_delta_base(hf_tensor_iter=[[(name, tensor)]])
+    trainer.prepare_delta_base(tensor_iter=[[(name, tensor)]])
     sample = np.zeros(32 * 1024**2, dtype=np.uint8)
     sample[::element_bytes] = np.random.default_rng(15).integers(
         0, 2, len(sample[::element_bytes]), dtype=np.uint8
@@ -206,7 +206,7 @@ def main():
         ),
     )
     t = time.perf_counter()
-    staged = trainer.stage_shard(version=v.ref, hf_tensor_iter=[[(name, tensor)]])
+    staged = trainer.stage_shard(version=v.ref, tensor_iter=[[(name, tensor)]])
     encode_seconds = time.perf_counter() - t
     t = time.perf_counter()
     staged.publish()
