@@ -6,7 +6,7 @@
 #![allow(clippy::result_large_err)] // Match tonic service validation helpers.
 
 use modelexpress_common::grpc::refit::{
-    GetWeightVersionShardManifestRequest, TrainerTensorsMetadata, WeightVersionShard,
+    GetWeightVersionShardManifestRequest, TrainerTensorsMetadata,
     refit_worker_service_client::RefitWorkerServiceClient,
 };
 use serde::{Deserialize, Serialize};
@@ -48,41 +48,31 @@ fn volume(shape: &[u64]) -> Result<u64, Status> {
     })
 }
 
-pub(super) async fn validate_publication(
-    shard: &WeightVersionShard,
-    metadata: &TrainerTensorsMetadata,
-) -> Result<(), Status> {
-    if shard.logical_shard_id != metadata.logical_shard_id
-        || shard.manifest_endpoint != metadata.metadata_endpoint
-    {
-        return Err(Status::failed_precondition(
-            "publication does not match worker binding",
-        ));
-    }
+pub(super) async fn validate_binding(metadata: &TrainerTensorsMetadata) -> Result<(), Status> {
     let endpoint =
-        tonic::transport::Endpoint::from_shared(format!("http://{}", shard.manifest_endpoint))
+        tonic::transport::Endpoint::from_shared(format!("http://{}", metadata.metadata_endpoint))
             .map_err(|_| invalid("invalid manifest endpoint"))?
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30));
     let channel = endpoint
         .connect()
         .await
-        .map_err(|_| Status::unavailable("could not connect to publication manifest endpoint"))?;
+        .map_err(|_| Status::unavailable("could not connect to binding manifest endpoint"))?;
     let response = RefitWorkerServiceClient::new(channel)
         .max_decoding_message_size(100 * 1024 * 1024)
         .get_weight_version_shard_manifest(GetWeightVersionShardManifestRequest {
-            version_id: shard.version_id.clone(),
-            logical_shard_id: shard.logical_shard_id.clone(),
+            version_id: String::new(),
+            logical_shard_id: metadata.logical_shard_id.clone(),
         })
         .await?
         .into_inner();
-    if response.manifest_digest != shard.manifest_digest
-        || format!("{:x}", Sha256::digest(&response.manifest)) != shard.manifest_digest
+    if response.manifest_digest != metadata.logical_shard_id
+        || format!("{:x}", Sha256::digest(&response.manifest)) != metadata.logical_shard_id
     {
-        return Err(invalid("publication manifest digest does not match"));
+        return Err(invalid("binding manifest digest does not match"));
     }
     let mut manifest: BoundManifest = serde_json::from_slice(&response.manifest)
-        .map_err(|_| invalid("invalid publication tensor manifest"))?;
+        .map_err(|_| invalid("invalid binding tensor manifest"))?;
     manifest.tensors.sort_by(|a, b| a.name.cmp(&b.name));
     let mut total_bytes = 0_u64;
     for tensor in &mut manifest.tensors {
@@ -96,18 +86,11 @@ pub(super) async fn validate_publication(
                 .ok_or_else(|| invalid("publication byte count overflows uint64"))?;
         }
     }
-    if shard.tensor_count != manifest.tensors.len() as u64 || shard.total_bytes != total_bytes {
-        return Err(invalid(
-            "publication tensor or byte count does not match manifest",
-        ));
-    }
     // Value serialization uses canonical sorted object keys, matching bind-time encoding.
     let value = serde_json::to_value(&manifest).map_err(|_| invalid("invalid bound coverage"))?;
     let bytes = serde_json::to_vec(&value).map_err(|_| invalid("invalid bound coverage"))?;
     if format!("{:x}", Sha256::digest(bytes)) != metadata.logical_shard_id {
-        return Err(invalid(
-            "publication coverage differs from bound logical shard",
-        ));
+        return Err(invalid("binding coverage differs from logical shard"));
     }
     Ok(())
 }

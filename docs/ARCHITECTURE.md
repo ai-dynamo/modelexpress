@@ -404,11 +404,17 @@ The control plane stores long-lived `TrainerMesh` membership as
 `bind_tensors()` computes address-independent coverage locally and returns
 this compact reference. Adapters derive wire coverage without copying weights,
 registering source buffers, or publishing a version. The adapter binding and
-trainer `source_slot_id` identify the same logical shard. Logical IDs hash canonical
+trainer `logical_shard_id` identify the same logical shard. Logical IDs hash canonical
 coverage, so equivalent replicas share an ID. The orchestrator supplies the complete
 trainer worker set and is responsible for logical-shard completeness. Mesh creation
-and update validate compact membership metadata without fetching coverage manifests;
-large manifests never live in Redis.
+resolves idempotent retries before contacting trainers and validates every binding
+only for a new mesh. Mesh updates validate new workers and changed endpoints or
+logical shards; unchanged members are not refetched. Large manifests never live
+in Redis.
+Admission first preflights worker registrations, then validates bindings with at
+most 32 concurrent callbacks per request. Redis rechecks registrations atomically
+when committing membership. Callback logs include the worker, endpoint, elapsed
+time, and failures.
 `CreateTrainerMesh` is idempotent; `UpdateTrainerMesh` replaces the complete
 worker map with generation compare-and-swap while preserving logical coverage.
 Every member requires an active model-matching trainer registration whose
@@ -416,8 +422,7 @@ Every member requires an active model-matching trainer registration whose
 requires a trainer mesh; MX checks its existence and model atomically with version
 creation. Object-storage versions omit the mesh. For worker-sharded versions,
 `logical_shard_id` identifies a logical shard. MX accepts publications only from
-workers in that shard's current membership, validates the publication manifest
-against its bound coverage, and marks the version READY
+workers in that shard's current membership and marks the version READY
 when every logical shard has a current, live publication. Mesh-backed readiness
 is computed from physical publications and their binding endpoints, not historical
 coverage. Generator discovery reads the mesh
@@ -532,6 +537,15 @@ and leases, but it does not discover engine tensor layouts or transfer weights.
 For NIXL, `RefitWorkerService` is the trainer-local manifest endpoint.
 The manifest is an opaque description of the exact published source buffers;
 the generator uses it to compile and validate its receiver-local transfer plan.
+Trainers serve canonical, address-independent coverage after `bind_tensors()`.
+`GetWeightVersionShardManifest` with an empty version ID retrieves this binding
+by logical shard ID. Mesh creation resolves idempotent retries before contacting trainers and validates
+every binding only for a new mesh; mesh updates validate
+new workers and changed endpoints or logical shards. Unchanged members are not
+refetched. Shard publication retains atomic registration, membership, endpoint,
+and conflict checks in Redis without fetching or parsing a trainer manifest.
+Per-version tensor counts and coverage are trusted at publication; generators
+still verify versioned manifest digests and validate transfer coverage.
 Full-tensor trainers reuse manifest bytes while registrations, addresses, and
 tensor geometry remain stable and content digests are disabled. Generators
 cache each selected worker manifest by endpoint and digest. A changed endpoint,
@@ -674,7 +688,7 @@ engine-owned post-load workspace, CUDA allocator overhead, and transport metadat
 | `GetWeightVersion` | `GetWeightVersionRequest` | `GetWeightVersionResponse` | Read the version and its lifecycle state |
 | `DeleteWeightVersion` | `DeleteWeightVersionRequest` | `DeleteWeightVersionResponse` | Cancel a `STAGING` version or move a `READY` version to `RELEASING` for retirement |
 | `UpdateWeightVersionState` | `UpdateWeightVersionStateRequest` | `UpdateWeightVersionStateResponse` | Explicitly update lifecycle state, including S3 `STAGING` to `READY` |
-| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker manifest for a required source slot |
+| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker manifest for a required logical shard |
 | `ListWeightVersionShards` | `ListWeightVersionShardsRequest` | `ListWeightVersionShardsResponse` | List the version's physical source publications |
 | `DeleteWeightVersionShard` | `DeleteWeightVersionShardRequest` | `DeleteWeightVersionShardResponse` | Evict one source shard after release when no lease protects the version |
 | `RegisterVersionLease` | `RegisterVersionLeaseRequest` | `RegisterVersionLeaseResponse` | Acquire or renew protection while installing a version |
@@ -845,14 +859,14 @@ fields and may differ from the MX IDs. Cache paths and chain records use MX IDs;
 MX lineage checks and payload validation remain enabled. The registering caller
 is responsible for selecting the correct S3 artifacts and base mapping.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
-Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
-identifies the required, version-scoped source contribution it covers, and
+Its identity is `(version_id, worker_id, logical_shard_id)`: `logical_shard_id`
+identifies the logical shard covered by the publication, and
 `worker_id` identifies the publishing process. The trainer engine adapter
-derives the slot from its native topology; the Megatron adapter uses
+derives the logical shard ID from its native topology; the Megatron adapter uses
 the logical tensor names and shard geometry, excluding physical process and DP
-replica identity. The orchestrator deduplicates those adapter-defined slots when
+replica identity. The orchestrator deduplicates those adapter-defined logical shards when
 declaring the version's expected contributions. Multiple DP workers may therefore
-advertise the same source slot; generators rotate through those publications on
+advertise the same logical shard; generators rotate through those publications on
 transfer retry. Each shard carries its trainer-local `manifest_endpoint`.
 Deployments configured with
 Kubernetes or the test-only memory backend do not expose `RefitService` yet.

@@ -14,6 +14,10 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU16;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use modelexpress_common::grpc::refit::{
@@ -41,6 +45,14 @@ type ServerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 struct BoundWorker {
     manifest: Vec<u8>,
+    calls: Arc<AtomicUsize>,
+    activity: Option<Arc<BindingActivity>>,
+}
+
+#[derive(Default)]
+struct BindingActivity {
+    active: AtomicUsize,
+    peak: AtomicUsize,
 }
 
 #[tonic::async_trait]
@@ -50,6 +62,16 @@ impl RefitWorkerService for BoundWorker {
         _request: tonic::Request<GetWeightVersionShardManifestRequest>,
     ) -> Result<tonic::Response<GetWeightVersionShardManifestResponse>, tonic::Status> {
         use sha2::{Digest, Sha256};
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(activity) = &self.activity {
+            let active = activity
+                .active
+                .fetch_add(1, Ordering::SeqCst)
+                .saturating_add(1);
+            activity.peak.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            activity.active.fetch_sub(1, Ordering::SeqCst);
+        }
         Ok(tonic::Response::new(
             GetWeightVersionShardManifestResponse {
                 manifest: self.manifest.clone(),
@@ -75,6 +97,31 @@ async fn bound_worker_shard(
     oneshot::Sender<()>,
     JoinHandle<ServerResult>,
 ) {
+    bound_worker_counted(offset, length, Arc::new(AtomicUsize::new(0))).await
+}
+
+async fn bound_worker_counted(
+    offset: u64,
+    length: u64,
+    calls: Arc<AtomicUsize>,
+) -> (
+    TrainerTensorsMetadata,
+    oneshot::Sender<()>,
+    JoinHandle<ServerResult>,
+) {
+    bound_worker_observed(offset, length, calls, None).await
+}
+
+async fn bound_worker_observed(
+    offset: u64,
+    length: u64,
+    calls: Arc<AtomicUsize>,
+    activity: Option<Arc<BindingActivity>>,
+) -> (
+    TrainerTensorsMetadata,
+    oneshot::Sender<()>,
+    JoinHandle<ServerResult>,
+) {
     use sha2::{Digest, Sha256};
     let manifest = serde_json::to_vec(&serde_json::json!({"tensors": [{
         "name": "weight", "dtype": "torch.bfloat16", "elsize": 2,
@@ -84,7 +131,11 @@ async fn bound_worker_shard(
     let logical_shard_id = format!("{:x}", Sha256::digest(&manifest));
     let port = free_port();
     let (tx, rx) = oneshot::channel();
-    let worker = BoundWorker { manifest };
+    let worker = BoundWorker {
+        manifest,
+        calls,
+        activity,
+    };
     let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(RefitWorkerServiceServer::new(worker))
@@ -270,10 +321,7 @@ async fn trainer_mesh_membership_is_shared_and_generation_checked() {
     let mut client_b = connect(port_b).await;
     let old_worker = unique_id("mesh-worker-old");
     let new_worker = unique_id("mesh-worker-new");
-    let metadata = TrainerTensorsMetadata {
-        logical_shard_id: "logical-shard".to_string(),
-        metadata_endpoint: format!("127.0.0.1:{}", free_port()),
-    };
+    let (metadata, stop_worker, worker_server) = bound_worker().await;
     client_a
         .register_worker(mesh_trainer(&old_worker, &metadata))
         .await
@@ -379,6 +427,7 @@ async fn trainer_mesh_membership_is_shared_and_generation_checked() {
         })
         .await
         .expect("delete unused mesh");
+    stop(stop_worker, worker_server).await;
     stop(stop_a, server_a).await;
     stop(stop_b, server_b).await;
 }
@@ -1142,7 +1191,7 @@ async fn version_becomes_ready_across_server_replicas() {
         })
         .await
         .expect_err("the same worker and logical shard cannot publish different metadata");
-    assert_eq!(conflict.code(), tonic::Code::InvalidArgument);
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
 
     let ready = client_b
         .get_weight_version(GetWeightVersionRequest {
@@ -1861,6 +1910,283 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
         .expect_err("expired worker registration cannot publish a manifest");
     assert_eq!(expired.code(), tonic::Code::FailedPrecondition);
 
+    stop(shutdown, server).await;
+    stop(stop_worker, worker_server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn validates_bindings_on_mesh_join_without_publication_callbacks() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (shutdown, server) = start_server(port, &redis_url);
+    let mut client = connect(port).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (metadata, stop_worker, worker_server) = bound_worker_counted(0, 4, calls.clone()).await;
+    let trainer_id = unique_id("binding-trainer");
+    client
+        .register_worker(mesh_trainer(&trainer_id, &metadata))
+        .await
+        .expect("register trainer");
+    let mut wrong = metadata.clone();
+    wrong.logical_shard_id = "wrong-coverage".to_string();
+    let invalid = CreateTrainerMeshRequest {
+        model_name: "test/model".to_string(),
+        idempotency_key: unique_id("invalid-binding"),
+        workers: HashMap::from([(trainer_id.clone(), wrong)]),
+    };
+    assert_eq!(
+        client
+            .create_trainer_mesh(invalid)
+            .await
+            .expect_err("mesh rejects invalid binding")
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    let creation = CreateTrainerMeshRequest {
+        model_name: "test/model".to_string(),
+        idempotency_key: unique_id("valid-binding"),
+        workers: HashMap::from([(trainer_id.clone(), metadata.clone())]),
+    };
+    let mesh = client
+        .create_trainer_mesh(creation.clone())
+        .await
+        .expect("mesh validates binding")
+        .into_inner()
+        .mesh
+        .expect("mesh");
+    let validated = calls.load(Ordering::SeqCst);
+    assert_eq!(validated, 2);
+    client
+        .update_trainer_mesh(UpdateTrainerMeshRequest {
+            mesh_id: mesh.mesh_id.clone(),
+            expected_generation: mesh.generation,
+            workers: mesh.workers.clone(),
+        })
+        .await
+        .expect("unchanged binding needs no callback");
+    assert_eq!(calls.load(Ordering::SeqCst), validated);
+    stop(stop_worker, worker_server).await;
+    for _ in 0..2 {
+        let version = client
+            .create_weight_version(CreateWeightVersionRequest {
+                model_name: "test/model".to_string(),
+                idempotency_key: unique_id("binding-version"),
+                payload_format: WeightPayloadFormat::FullTensor.into(),
+                state: WeightVersionState::Staging.into(),
+                trainer_mesh_id: Some(mesh.mesh_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("create version")
+            .into_inner()
+            .version
+            .expect("version");
+        client
+            .create_weight_version_shard(CreateWeightVersionShardRequest {
+                shard: Some(mesh_shard(&version.uid, &trainer_id, &metadata)),
+            })
+            .await
+            .expect("publication does not contact trainer manifest endpoint");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), validated);
+    let replacement_calls = Arc::new(AtomicUsize::new(0));
+    let (replacement, stop_replacement, replacement_server) =
+        bound_worker_counted(0, 4, replacement_calls.clone()).await;
+    let replacement_id = unique_id("replacement-binding");
+    client
+        .register_worker(mesh_trainer(&replacement_id, &replacement))
+        .await
+        .expect("register replacement");
+    let mut invalid_replacement = replacement.clone();
+    invalid_replacement.logical_shard_id = "wrong-coverage".to_string();
+    assert_eq!(
+        client
+            .update_trainer_mesh(UpdateTrainerMeshRequest {
+                mesh_id: mesh.mesh_id.clone(),
+                expected_generation: mesh.generation,
+                workers: HashMap::from([(replacement_id.clone(), invalid_replacement)]),
+            })
+            .await
+            .expect_err("replacement binding must be valid")
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    let updated = client
+        .update_trainer_mesh(UpdateTrainerMeshRequest {
+            mesh_id: mesh.mesh_id,
+            expected_generation: mesh.generation,
+            workers: HashMap::from([(replacement_id, replacement)]),
+        })
+        .await
+        .expect("validate replacement binding")
+        .into_inner()
+        .mesh
+        .expect("updated mesh");
+    let retried = client
+        .create_trainer_mesh(creation.clone())
+        .await
+        .expect("creation retry does not contact retired trainer")
+        .into_inner()
+        .mesh
+        .expect("retried mesh");
+    assert_eq!(retried, updated);
+    assert_eq!(calls.load(Ordering::SeqCst), validated);
+    let mut conflict = creation;
+    conflict
+        .workers
+        .values_mut()
+        .next()
+        .expect("original worker")
+        .logical_shard_id = "different-binding".to_string();
+    assert_eq!(
+        client
+            .create_trainer_mesh(conflict)
+            .await
+            .expect_err("idempotency conflicts do not contact retired trainers")
+            .code(),
+        tonic::Code::AlreadyExists
+    );
+
+    assert_eq!(replacement_calls.load(Ordering::SeqCst), 2);
+    stop(stop_replacement, replacement_server).await;
+    stop(shutdown, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn rejects_invalid_mesh_registrations_before_binding_callbacks() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (shutdown, server) = start_server(port, &redis_url);
+    let mut client = connect(port).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (metadata, stop_worker, worker_server) = bound_worker_counted(0, 4, calls.clone()).await;
+    let trainer_id = unique_id("preflight-trainer");
+    client
+        .register_worker(mesh_trainer(&trainer_id, &metadata))
+        .await
+        .expect("register trainer");
+    let mesh = client
+        .create_trainer_mesh(CreateTrainerMeshRequest {
+            model_name: "test/model".to_string(),
+            idempotency_key: unique_id("preflight-mesh"),
+            workers: HashMap::from([(trainer_id.clone(), metadata.clone())]),
+        })
+        .await
+        .expect("create mesh")
+        .into_inner()
+        .mesh
+        .expect("mesh");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    for scenario in ["missing", "model", "role", "endpoint"] {
+        let invalid_id = unique_id(scenario);
+        if scenario != "missing" {
+            let mut registration = mesh_trainer(&invalid_id, &metadata);
+            let worker = registration.worker.as_mut().expect("worker");
+            match scenario {
+                "model" => worker.model_name = "other/model".to_string(),
+                "role" => worker.role = WorkerRole::Generator.into(),
+                "endpoint" => worker.refit_endpoint = "127.0.0.1:1".to_string(),
+                _ => unreachable!(),
+            }
+            client
+                .register_worker(registration)
+                .await
+                .expect("register invalid member");
+        }
+        let workers = HashMap::from([
+            (trainer_id.clone(), metadata.clone()),
+            (invalid_id, metadata.clone()),
+        ]);
+        let creation = client
+            .create_trainer_mesh(CreateTrainerMeshRequest {
+                model_name: "test/model".to_string(),
+                idempotency_key: unique_id("preflight-rejected"),
+                workers: workers.clone(),
+            })
+            .await
+            .expect_err("reject invalid registration before fetching bindings");
+        assert_eq!(
+            creation.code(),
+            tonic::Code::FailedPrecondition,
+            "{scenario}"
+        );
+        let update = client
+            .update_trainer_mesh(UpdateTrainerMeshRequest {
+                mesh_id: mesh.mesh_id.clone(),
+                expected_generation: mesh.generation,
+                workers,
+            })
+            .await
+            .expect_err("reject invalid replacement before fetching bindings");
+        assert_eq!(update.code(), tonic::Code::FailedPrecondition, "{scenario}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{scenario}");
+    }
+    stop(shutdown, server).await;
+    stop(stop_worker, worker_server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn validates_every_mesh_worker_with_bounded_concurrency() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (shutdown, server) = start_server(port, &redis_url);
+    let mut client = connect(port).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let activity = Arc::new(BindingActivity::default());
+    let (metadata, stop_worker, worker_server) =
+        bound_worker_observed(0, 4, calls.clone(), Some(activity.clone())).await;
+    let mut mesh = None;
+    for attempt in 0..2 {
+        let mut workers = HashMap::new();
+        for _ in 0..64 {
+            let worker_id = unique_id("concurrent-binding");
+            client
+                .register_worker(mesh_trainer(&worker_id, &metadata))
+                .await
+                .expect("register trainer");
+            workers.insert(worker_id, metadata.clone());
+        }
+        activity.peak.store(0, Ordering::SeqCst);
+        mesh = Some(if let Some(current) = mesh {
+            let current: modelexpress_common::grpc::refit::TrainerMesh = current;
+            client
+                .update_trainer_mesh(UpdateTrainerMeshRequest {
+                    mesh_id: current.mesh_id,
+                    expected_generation: current.generation,
+                    workers,
+                })
+                .await
+                .expect("validate replacement workers concurrently")
+                .into_inner()
+                .mesh
+                .expect("mesh")
+        } else {
+            client
+                .create_trainer_mesh(CreateTrainerMeshRequest {
+                    model_name: "test/model".to_string(),
+                    idempotency_key: unique_id("concurrent-mesh"),
+                    workers,
+                })
+                .await
+                .expect("validate new workers concurrently")
+                .into_inner()
+                .mesh
+                .expect("mesh")
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 64 * (attempt + 1));
+        let peak = activity.peak.load(Ordering::SeqCst);
+        assert!(peak > 1, "callbacks were serialized");
+        assert!(
+            peak <= 32,
+            "callback concurrency exceeded the bound: {peak}"
+        );
+    }
     stop(shutdown, server).await;
     stop(stop_worker, worker_server).await;
 }

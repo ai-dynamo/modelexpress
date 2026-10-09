@@ -74,17 +74,16 @@ class _Manager:
 
 
 class _Adapter(TrainerEngineAdapter):
-    source_slot_id = hashlib.sha256(
-        bound_tensor_manifest([
-            {
-                "name": "weight",
-                "dtype": "torch.bfloat16",
-                "elsize": 2,
-                "full_shape": [4],
-                "shards": [{"shard_offset": [0], "shape": [4]}],
-            }
-        ])
-    ).hexdigest()
+    bound_manifest = bound_tensor_manifest([
+        {
+            "name": "weight",
+            "dtype": "torch.bfloat16",
+            "elsize": 2,
+            "full_shape": [4],
+            "shards": [{"shard_offset": [0], "shape": [4]}],
+        }
+    ])
+    logical_shard_id = hashlib.sha256(bound_manifest).hexdigest()
     supported_staging_modes = frozenset({TrainerStagingMode.COPY_TO_DEVICE})
     supported_payload_formats = frozenset({WeightPayloadFormat.FULL_TENSOR})
 
@@ -94,7 +93,7 @@ class _Adapter(TrainerEngineAdapter):
     def bind_tensors(self, tensors):
         if tensors is None:
             raise ValueError("tensors must not be None")
-        return self.source_slot_id
+        return self.logical_shard_id
 
     def stage_shard(self, *, tensors, staging_mode, payload_format):
         self.calls.append((tensors, staging_mode, payload_format))
@@ -195,12 +194,12 @@ def test_released_manifests_do_not_accumulate():
         version_id = f"version-{index}"
         service.publish_manifest(
             version_id=version_id,
-            source_slot_id="rank:0",
+            logical_shard_id="rank:0",
             manifest=manifest,
         )
         service.release_manifest(
             version_id=version_id,
-            source_slot_id="rank:0",
+            logical_shard_id="rank:0",
         )
 
     assert service._manifests == {}
@@ -250,11 +249,21 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         metadata = trainer.bind_tensors("model")
         assert metadata.metadata_endpoint == f"127.0.0.1:{port}"
         assert len(metadata.logical_shard_id) == 64
-        assert trainer.source_slot_id == metadata.logical_shard_id
+        assert trainer.logical_shard_id == metadata.logical_shard_id
         assert adapter.calls == []
         with pytest.raises(RuntimeError, match="already bound"):
             trainer.bind_tensors("replacement")
         assert service.shards == []
+        with grpc.insecure_channel(metadata.metadata_endpoint) as channel:
+            binding = refit_pb2_grpc.RefitWorkerServiceStub(
+                channel
+            ).GetWeightVersionShardManifest(
+                refit_pb2.GetWeightVersionShardManifestRequest(
+                    logical_shard_id=metadata.logical_shard_id
+                )
+            )
+        assert binding.manifest == adapter.bound_manifest
+        assert binding.manifest_digest == metadata.logical_shard_id
         trainer.publish_version(version=WeightVersionRef("version-a"))
         metrics = trainer.pop_metrics()
         assert metrics["trainer_refit_e2e_s"] >= 0
@@ -395,7 +404,7 @@ def test_trainer_initialization_rejects_adapter_unsupported_mode(monkeypatch):
         )
     )
     with pytest.raises(ValueError, match="does not support staging mode IN_PLACE"):
-        _ = trainer.source_slot_id
+        _ = trainer.logical_shard_id
     resources.close.assert_called_once_with()
 
 
@@ -459,9 +468,9 @@ def test_trainer_client_owns_default_transport_resources(monkeypatch):
     )
     adapter_factory.assert_not_called()
     with pytest.raises(RuntimeError, match="bind_tensors"):
-        _ = trainer.source_slot_id
+        _ = trainer.logical_shard_id
     metadata = trainer.bind_tensors("model")
-    assert trainer.source_slot_id == metadata.logical_shard_id
+    assert trainer.logical_shard_id == metadata.logical_shard_id
     assert len(adapter_factory.call_args.args) == 1
     assert isinstance(adapter_factory.call_args.args[0], FSDPTrainerContext)
     assert adapter_factory.call_args.kwargs == {
@@ -517,3 +526,23 @@ def test_trainer_initialization_cleans_up_when_renewal_thread_cannot_start(
         )
 
     resources.close.assert_called_once_with()
+
+
+def test_binding_manifest_is_available_before_version_publication():
+    service = WeightVersionShardManifestService(endpoint="127.0.0.1:9000")
+    manifest = _Adapter.bound_manifest
+    service.publish_binding(manifest)
+    binding_id = hashlib.sha256(manifest).hexdigest()
+    response = service.GetWeightVersionShardManifest(
+        refit_pb2.GetWeightVersionShardManifestRequest(
+            version_id="", logical_shard_id=binding_id
+        ),
+        None,
+    )
+    assert response.manifest == manifest
+    assert response.manifest_digest == binding_id
+    service.release_manifest(version_id="version-a", logical_shard_id=binding_id)
+    assert service.GetWeightVersionShardManifest(
+        refit_pb2.GetWeightVersionShardManifestRequest(logical_shard_id=binding_id),
+        None,
+    ).manifest == manifest

@@ -126,12 +126,17 @@ class TrainerEngineAdapter(ABC):
 
     @property
     @abstractmethod
-    def source_slot_id(self) -> str:
+    def logical_shard_id(self) -> str:
         """Return this rank's required logical contribution identifier."""
 
     @abstractmethod
     def bind_tensors(self, tensors: Any) -> str:
         """Hash canonical wire coverage without staging or publishing weights."""
+
+    @property
+    @abstractmethod
+    def bound_manifest(self) -> bytes:
+        """Return canonical coverage computed by bind_tensors()."""
 
     @property
     @abstractmethod
@@ -160,16 +165,19 @@ class WeightVersionShardManifestPublisher(Protocol):
     @property
     def endpoint(self) -> str: ...
 
+    def publish_binding(self, manifest: bytes) -> None:
+        """Serve immutable tensor coverage before joining a trainer mesh."""
+
     def publish_manifest(
         self,
         *,
         version_id: str,
-        source_slot_id: str,
+        logical_shard_id: str,
         manifest: WeightVersionShardManifest,
     ) -> str:
         """Publish ``manifest`` and return its ready, worker-local endpoint."""
 
-    def release_manifest(self, *, version_id: str, source_slot_id: str) -> None:
+    def release_manifest(self, *, version_id: str, logical_shard_id: str) -> None:
         """Stop serving a released version's manifest."""
 
 
