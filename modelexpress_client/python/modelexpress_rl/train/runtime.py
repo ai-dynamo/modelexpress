@@ -208,22 +208,22 @@ class TrainerRuntime:
         return slot
 
     def prepare_delta_base(
-        self, *, hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]]
+        self, *, tensor_iter: Iterable[list[tuple[str, torch.Tensor]]]
     ) -> None:
-        self._canonical_delta().prepare_base(hf_tensor_iter=hf_tensor_iter)
+        self._canonical_delta().prepare_base(tensor_iter=tensor_iter)
 
     def stage(
         self,
         *,
         version: WeightVersionRef,
         tensors: Any = None,
-        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None = None,
+        tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None = None,
     ) -> PublicationArtifact:
         method = self._canonical_delta()
-        if (hf_tensor_iter is None) == (tensors is None):
-            raise ValueError("provide either hf_tensor_iter or a tensor bucket")
-        if hf_tensor_iter is not None:
-            return method.stage(version=version, hf_tensor_iter=hf_tensor_iter)
+        if (tensor_iter is None) == (tensors is None):
+            raise ValueError("provide either tensor_iter or a tensor bucket")
+        if tensor_iter is not None:
+            return method.stage(version=version, tensor_iter=tensor_iter)
         return method.stage_bucket(version=version, bucket=tensors)
 
     def publish(

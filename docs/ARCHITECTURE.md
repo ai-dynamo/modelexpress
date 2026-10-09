@@ -611,7 +611,7 @@ Miles owns `UpdateWeightFromModelExpressDelta` in
 `modelexpress` transfer mode uses the shared SDK's staging and publication APIs
 below. The SDK does not depend on Miles.
 
-Canonical S3 publication accepts either `stage_shard(hf_tensor_iter=...)` for a
+Canonical S3 publication accepts either `stage_shard(tensor_iter=...)` for a
 complete weight stream or repeated `stage_shard(tensors=bucket)` calls for one
 version. The runtime dispatches these to the canonical method's `stage()` and
 `stage_bucket()` respectively. Both use the same bounded encoding pool for XOR

@@ -277,7 +277,7 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         with pytest.raises(RuntimeError, match="canonical-delta"):
             trainer.stage_shard(
                 version=WeightVersionRef("version-a"),
-                hf_tensor_iter=iter([]),
+                tensor_iter=iter([]),
             )
         trainer.publish_version(version=WeightVersionRef("version-a"))
         method = trainer._runtime.method

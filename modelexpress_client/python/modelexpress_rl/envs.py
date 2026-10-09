@@ -102,7 +102,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_CHECKPOINT_DIR": lambda: (
         os.environ.get("MX_REFIT_CHECKPOINT_DIR", "").strip() or None
     ),
-    # Framework integrations read this while constructing ``hf_tensor_iter``;
+    # Framework integrations read this while constructing ``tensor_iter``;
     # ModelExpress preserves the supplied framework bucket boundaries.
     "MX_REFIT_DELTA_BUCKET_BYTES": lambda: require_positive_int(
         int(os.environ.get("MX_REFIT_DELTA_BUCKET_BYTES", 512 * 1024**2)),

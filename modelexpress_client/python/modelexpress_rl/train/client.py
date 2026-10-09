@@ -225,9 +225,9 @@ class ModelExpressTrainerClient:
         return self._active_runtime().source_slot_id
 
     def prepare_delta_base(
-        self, *, hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]]
+        self, *, tensor_iter: Iterable[list[tuple[str, torch.Tensor]]]
     ) -> None:
-        self._active_runtime().prepare_delta_base(hf_tensor_iter=hf_tensor_iter)
+        self._active_runtime().prepare_delta_base(tensor_iter=tensor_iter)
 
     def bind_tensors(self, tensors: Any) -> TrainerTensorsMetadata:
         return self._active_runtime().bind_tensors(tensors)
@@ -267,7 +267,7 @@ class ModelExpressTrainerClient:
         *,
         version: WeightVersionRef,
         tensors: Any = None,
-        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None = None,
+        tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None = None,
     ) -> StagedWeightVersionShard:
         """Stage a canonical HF iterator or one S3 tensor bucket.
 
@@ -285,7 +285,7 @@ class ModelExpressTrainerClient:
         staged = self._active_runtime().stage(
             version=version,
             tensors=tensors,
-            hf_tensor_iter=hf_tensor_iter,
+            tensor_iter=tensor_iter,
         )
         return StagedWeightVersionShard(client=self, version=version, staged=staged)
 

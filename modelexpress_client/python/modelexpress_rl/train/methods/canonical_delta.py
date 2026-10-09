@@ -117,7 +117,7 @@ class CanonicalDeltaPublicationMethod:
     def prepare_base(
         self,
         *,
-        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
+        tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
     ) -> None:
         if self._staged is not None:
             raise RuntimeError(
@@ -135,7 +135,7 @@ class CanonicalDeltaPublicationMethod:
 
         snapshot = {}
         for tensors in threadpool_map(
-            (bucket for bucket in hf_tensor_iter if bucket),
+            (bucket for bucket in tensor_iter if bucket),
             read_bucket,
             max_workers=rl_envs.MX_REFIT_DELTA_WORKERS,
             thread_name_prefix="modelexpress-delta-base",
@@ -186,7 +186,7 @@ class CanonicalDeltaPublicationMethod:
         self,
         *,
         version: WeightVersionRef,
-        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
+        tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
     ) -> StagedCanonicalDelta | StagedFullCheckpoint:
         """Consume one iterator and complete staging before returning."""
         if self._staged is not None:
@@ -198,7 +198,7 @@ class CanonicalDeltaPublicationMethod:
             )
         self._begin_stage(version)
         try:
-            for bucket in hf_tensor_iter:
+            for bucket in tensor_iter:
                 self.stage_bucket(version=version, bucket=bucket)
             self._finish_staging()
         except BaseException:
