@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   authorize:
+    name: RL refit authorization
     if: >-
       github.repository == 'ai-dynamo/modelexpress' &&
       github.event.issue.pull_request &&

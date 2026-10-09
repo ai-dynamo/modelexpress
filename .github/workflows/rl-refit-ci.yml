@@ -39,6 +39,7 @@ env:
 
 jobs:
   validate:
+    name: RL refit validation
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -66,6 +67,7 @@ jobs:
           echo "harness_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
+    name: RL refit build
     needs: validate
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 60
@@ -111,7 +113,7 @@ jobs:
           echo "worker=$repo/mx-bench-worker@$(jq -r '."containerimage.digest"' worker-build.json)" >> "$GITHUB_OUTPUT"
 
   test:
-    name: "Refit (${{ inputs.model }})"
+    name: "RL refit (${{ inputs.model }})"
     needs: [validate, build]
     runs-on: prod-deploy-tester-v1
     timeout-minutes: 60
@@ -157,6 +159,7 @@ jobs:
         run: echo "RL weight refit CI of $TEST_SHA; evidence is attached to this run." >> "$GITHUB_STEP_SUMMARY"
 
   cleanup:
+    name: RL refit cleanup
     needs: [validate, build, test]
     if: ${{ always() && needs.build.result == 'success' && needs.test.result != 'skipped' }}
     runs-on: prod-deploy-tester-v1
