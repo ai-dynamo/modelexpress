@@ -441,18 +441,16 @@ listing uses the mesh's version index; metadata reads are pipelined.
 `version_number` is optional caller correlation metadata, not version identity.
 Object-storage callers manage version state; mesh callers do not manage readiness.
 
-Mesh-backed weight versions include the trainer mesh generation captured atomically
-by the server at creation. Idempotent retries return the original generation.
-Shard publication, including the final READY transition and repeated publications,
-rejects a changed generation before writing. Stored mesh versions without a
-positive generation must be recreated. Versions without a trainer mesh carry
-generation zero.
-
-The Python weight-version contract requires the recorded generation. Mesh-backed
-versions require a positive uint64 value, while versions without a trainer mesh
-require zero. The unchanged creation API returns the server-assigned generation;
-clients and trainer producers retain it instead of inferring a mutable current
-mesh generation.
+Mesh-backed `WeightVersion` records require a positive `trainer_mesh_generation`.
+The unchanged creation API supplies a mesh ID; the server reads and stamps its
+generation atomically while creating the version. Idempotent retries return the
+original stamp. Shard publication, including the final READY transition and
+repeated publications, rejects a changed mesh generation before writing. Trainer
+resolution compares the recorded generation with the current mesh. Versions
+created before this field must be recreated; missing or zero mesh generations
+fail explicitly. Versions without a trainer mesh, including object-storage
+versions, carry generation zero. A requested version whose recorded mesh
+generation differs from the current trainer mesh fails source resolution.
 
 DIRECT installation and pipelined worker streaming are
 not implemented by this control-plane slice.

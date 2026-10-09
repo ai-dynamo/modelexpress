@@ -116,11 +116,18 @@ class TrainerSourceResolver(SourceResolver):
             return
         if not mesh_response.HasField("mesh"):
             raise RuntimeError("MX GetTrainerMesh response is missing mesh")
+        mesh = mesh_response.mesh
+        if mesh.mesh_id != version.trainer_mesh_id:
+            raise RuntimeError("MX GetTrainerMesh returned a different mesh ID")
+        if mesh.generation != version.trainer_mesh_generation:
+            raise RuntimeError(
+                "weight version trainer mesh generation differs from the current mesh"
+            )
         expected_slots = tuple(sorted({
             metadata.logical_shard_id for metadata in mesh_response.mesh.workers.values()
         }))
         mesh_workers = mesh_response.mesh.workers
-        mesh_generation = mesh_response.mesh.generation
+        mesh_generation = version.trainer_mesh_generation
         try:
             with refit_span(
                 "source_preparation",
@@ -189,7 +196,11 @@ class TrainerSourceResolver(SourceResolver):
                     refit_pb2.GetTrainerMeshRequest(mesh_id=version.trainer_mesh_id),
                     timeout=self._rpc_timeout_seconds,
                 )
-                if not current.HasField("mesh") or current.mesh.generation != mesh_generation:
+                if (
+                    not current.HasField("mesh")
+                    or current.mesh.mesh_id != version.trainer_mesh_id
+                    or current.mesh.generation != mesh_generation
+                ):
                     raise RuntimeError("trainer mesh generation changed during source resolution")
                 seen.add(selection)
                 yield TrainerUpdateSource(
