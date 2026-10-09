@@ -267,6 +267,9 @@ class Benchmark:
         pod["metadata"]["name"] = cleanup_pod
         pod["spec"]["activeDeadlineSeconds"] = 300
         main = pod["spec"]["containers"][0]
+        main["image"] = json.loads((self.root / "images.json").read_text())[
+            "MX_MAIN_CLEANUP_IMAGE"
+        ]
         main["command"] = ["python3", "-u", "-m", "harness.cleanup"]
         main["resources"] = {
             "requests": {"cpu": "100m", "memory": "256Mi"},

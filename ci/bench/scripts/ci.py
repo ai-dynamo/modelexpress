@@ -31,6 +31,7 @@ def ci(mode):
         "RESULTS_DIR",
         "SERVER_IMAGE",
         "WORKER_IMAGE",
+        "CLEANUP_IMAGE",
         "GITHUB_RUN_ID",
         "GITHUB_RUN_ATTEMPT",
     ]:

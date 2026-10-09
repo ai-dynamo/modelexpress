@@ -100,6 +100,7 @@ def prepare(
     for kind, aliases in {
         "server": ["SERVER_IMAGE", "MX_MAIN_SERVER_IMAGE"],
         "runtime": ["WORKER_IMAGE", "MX_MAIN_RUNTIME_IMAGE"],
+        "cleanup": ["CLEANUP_IMAGE", "MX_MAIN_CLEANUP_IMAGE"],
     }.items():
         value = next(
             (os.environ[a] for a in aliases if os.environ.get(a)),
@@ -112,9 +113,7 @@ def prepare(
             raise ValueError(
                 f"{kind} image must be digest-qualified or tagged with a full commit SHA"
             )
-        images[
-            "MX_MAIN_" + ("SERVER" if kind == "server" else "RUNTIME") + "_IMAGE"
-        ] = value
+        images["MX_MAIN_" + kind.upper() + "_IMAGE"] = value
     storage_env = {
         "AWS_DEFAULT_REGION": env["region"],
         "AWS_REGION": env["region"],

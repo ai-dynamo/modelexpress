@@ -1630,7 +1630,9 @@ concurrent model-weight reads. Setup creates per-run credentials, downloads the 
 snapshot on the CPU control pod, verifies uploads, and publishes its snapshot manifest
 before the timed workload starts. Redis runs as an init sidecar with a startup
 probe so it accepts connections before the ModelExpress server starts. The
-separate S3 cleanup pod runs without Redis or the server. The benchmark collects
+separate S3 cleanup pod uses a digest-pinned CPU Python image containing only
+boto3 and its dependencies, with boto3 taken from the client lockfile. It runs
+without vLLM, Torch, Redis, or the server. The benchmark collects
 run evidence once on success or failure; CI collects separately only if the run
 report is missing. Cleanup releases the GPU pods before removing S3 objects
 and records object and Kubernetes cleanup receipts. CI mounts the cluster's
@@ -1679,9 +1681,9 @@ through their environment configuration.
 
 The `RL weight refit CI` comment workflow delegates execution to the shared
 `RL refit CI` workflow for the selected profile and scenario. The GPU job is named
-`RL refit / S3 delta-weight refit (PROFILE)` for the delta scenario. Every trusted
+`RL refit / Refit (PROFILE)` for the delta scenario. Every trusted
 PR automatically calls the same workflow for Nemotron, under
-`RL small model delta refit (vllm, s3) / S3 delta-weight refit (nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4)`.
+`RL generator-only delta refit (vllm, s3) / Refit (nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4)`.
 Workflow callers can pass a profile key or its registered full model name; validation
 resolves it to the profile key for resource names and configuration. The required `CI status check`
 depends on this workflow, including cleanup; seed download, storage or refit failures
@@ -1703,6 +1705,7 @@ S3 cleanup.
 export KUBE_CONTEXT='<aws-context>' NAMESPACE='<existing-run-namespace>'
 export SERVER_IMAGE='<registry/server:full-commit-sha>'
 export WORKER_IMAGE='<registry/runtime:full-commit-sha>'
+export CLEANUP_IMAGE='<registry/cleanup:full-commit-sha>'
 export MX_CI_S3_BUCKET='<snapshot-bucket>' MX_CI_S3_REGION='<aws-region>'
 export RESULTS_DIR=/tmp/mx-bench-unique-run
 python3 ci/bench/scripts/prepare.py kimi "$RESULTS_DIR" \

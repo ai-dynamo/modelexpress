@@ -72,6 +72,7 @@ jobs:
     outputs:
       server: ${{ steps.images.outputs.server }}
       worker: ${{ steps.images.outputs.worker }}
+      cleanup: ${{ steps.images.outputs.cleanup }}
     steps:
       - name: Checkout trusted harness
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -97,16 +98,20 @@ jobs:
           repo=nvcr.io/0980761089281446
           server="$repo/mx-bench-server:$TEST_SHA"
           worker="$repo/mx-bench-worker:$TEST_SHA"
+          cleanup="$repo/mx-bench-cleanup:$TEST_SHA"
           docker buildx build --platform linux/amd64 -f ci/k8s/server/Dockerfile.server \
             -t "$server" --metadata-file server-build.json --push candidate
           docker buildx build --platform linux/amd64 -f ci/bench/Dockerfile \
             --build-arg "RUNTIME_BASE=$RUNTIME_BASE" -t "$worker" \
             --metadata-file worker-build.json --push candidate
+          docker buildx build --platform linux/amd64 -f ci/bench/Dockerfile.cleanup \
+            -t "$cleanup" --metadata-file cleanup-build.json --push candidate
+          echo "cleanup=$repo/mx-bench-cleanup@$(jq -r '."containerimage.digest"' cleanup-build.json)" >> "$GITHUB_OUTPUT"
           echo "server=$repo/mx-bench-server@$(jq -r '."containerimage.digest"' server-build.json)" >> "$GITHUB_OUTPUT"
           echo "worker=$repo/mx-bench-worker@$(jq -r '."containerimage.digest"' worker-build.json)" >> "$GITHUB_OUTPUT"
 
   test:
-    name: "${{ inputs.scenario == 'delta' && 'S3 delta-weight refit' || format('RL refit ({0})', inputs.scenario) }} (${{ inputs.model }})"
+    name: "Refit (${{ inputs.model }})"
     needs: [validate, build]
     runs-on: prod-deploy-tester-v1
     timeout-minutes: 60
@@ -115,6 +120,7 @@ jobs:
       RUN_ID: ${{ needs.validate.outputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
       SERVER_IMAGE: ${{ needs.build.outputs.server }}
       WORKER_IMAGE: ${{ needs.build.outputs.worker }}
+      CLEANUP_IMAGE: ${{ needs.build.outputs.cleanup }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -160,6 +166,7 @@ jobs:
       RUN_ID: ${{ needs.validate.outputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
       SERVER_IMAGE: ${{ needs.build.outputs.server }}
       WORKER_IMAGE: ${{ needs.build.outputs.worker }}
+      CLEANUP_IMAGE: ${{ needs.build.outputs.cleanup }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:

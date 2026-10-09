@@ -46,6 +46,7 @@ if 'apply' in args:
         "RESULTS_DIR": str(tmp_path / "results"),
         "SERVER_IMAGE": "registry/server@sha256:" + "a" * 64,
         "WORKER_IMAGE": "registry/worker@sha256:" + "b" * 64,
+        "CLEANUP_IMAGE": "registry/cleanup@sha256:" + "c" * 64,
         "GITHUB_RUN_ID": "123",
         "GITHUB_RUN_ATTEMPT": "1",
     }
@@ -95,6 +96,7 @@ sys.exit(0)
         "RESULTS_DIR": str(tmp_path / "results"),
         "SERVER_IMAGE": "registry/server@sha256:" + "a" * 64,
         "WORKER_IMAGE": "registry/worker@sha256:" + "b" * 64,
+        "CLEANUP_IMAGE": "registry/cleanup@sha256:" + "c" * 64,
         "NGC_API_KEY": "fake",
         "GITHUB_RUN_ID": "123",
         "GITHUB_RUN_ATTEMPT": "1",
@@ -164,6 +166,7 @@ if 'apply' in args and '-' in args:
     assert 'initContainers' not in pod['spec']
     assert all('persistentVolumeClaim' not in volume for volume in pod['spec']['volumes'])
     assert [item['name'] for item in pod['spec']['containers']] == ['main']
+    assert pod['spec']['containers'][0]['image'] == os.environ['CLEANUP_IMAGE']
 with Path(os.environ['CALLS']).open('a') as out:
     out.write(' '.join(args) + '\\n')
 if 'get' in args:
@@ -192,6 +195,7 @@ if 'logs' in args:
         "RESULTS_DIR": str(results),
         "SERVER_IMAGE": "registry/server@sha256:" + "a" * 64,
         "WORKER_IMAGE": "registry/worker@sha256:" + "b" * 64,
+        "CLEANUP_IMAGE": "registry/cleanup@sha256:" + "c" * 64,
         "GITHUB_RUN_ID": "123",
         "GITHUB_RUN_ATTEMPT": "1",
     }

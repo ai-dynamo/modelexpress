@@ -143,7 +143,7 @@ env:
 
 jobs:
   small-model-s3-refit:
-    name: RL small model delta refit (vllm, s3)
+    name: RL generator-only delta refit (vllm, s3)
     permissions:
       contents: read
       pull-requests: read

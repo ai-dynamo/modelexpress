@@ -29,6 +29,7 @@ PORTABLE_ENV = {
     "images": {
         "server": "registry.example/server@sha256:" + "a" * 64,
         "runtime": "registry.example/runtime@sha256:" + "b" * 64,
+        "cleanup": "registry.example/cleanup@sha256:" + "c" * 64,
     },
 }
 
@@ -47,8 +48,10 @@ def isolated_runner_environment(monkeypatch):
         "AWS_ENDPOINT_URL",
         "SERVER_IMAGE",
         "WORKER_IMAGE",
+        "CLEANUP_IMAGE",
         "MX_MAIN_SERVER_IMAGE",
         "MX_MAIN_RUNTIME_IMAGE",
+        "MX_MAIN_CLEANUP_IMAGE",
     ]:
         monkeypatch.delenv(key, raising=False)
 
@@ -347,6 +350,7 @@ def test_aws_ci_aliases_native_s3_and_namespace_reach_every_resource(
         "MX_CI_S3_BUCKET": "ci-snapshots",
         "SERVER_IMAGE": "registry.example/server:" + "a" * 40,
         "WORKER_IMAGE": "registry.example/worker:" + "b" * 40,
+        "CLEANUP_IMAGE": "registry.example/cleanup:" + "c" * 40,
     }.items():
         monkeypatch.setenv(key, value)
     out = tmp_path / "aws"
