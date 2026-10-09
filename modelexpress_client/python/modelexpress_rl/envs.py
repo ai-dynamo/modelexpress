@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
+    MX_REFIT_FULL_STREAMING: bool
+    MX_REFIT_STREAM_WINDOW_LAYERS: int
     MX_REFIT_TIMING: bool
     MX_S3_DOWNLOAD_RANGE_BYTES: int
     MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
@@ -175,6 +177,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("MX_S3_TCP_KEEPALIVE", "true"),
         "MX_S3_TCP_KEEPALIVE",
     ),
+    "MX_REFIT_FULL_STREAMING": lambda: parse_bool(
+        os.environ.get("MX_REFIT_FULL_STREAMING", "false"),
+        "MX_REFIT_FULL_STREAMING",
+    ),
+    # Decoder layers per streamed full-refit request; 0 streams all at once.
+    "MX_REFIT_STREAM_WINDOW_LAYERS": lambda: require_non_negative_int(
+        int(os.environ.get("MX_REFIT_STREAM_WINDOW_LAYERS", 2)),
+        "MX_REFIT_STREAM_WINDOW_LAYERS",
+    ),
     # One normalized timing record per generator refit. On by default: the
     # durations are already being measured on the staging path, so recording
     # them costs a few perf_counter calls and one log line, against a refit
@@ -206,6 +217,13 @@ def require_positive_int(value: int, name: str) -> int:
 def positive_int_env(name: str, default: int) -> int:
     """Read a positive integer while retaining its setting name in errors."""
     return require_positive_int(parse_int(os.environ.get(name, str(default)), name), name)
+
+
+def require_non_negative_int(value: int, name: str) -> int:
+    """Return ``value`` or raise when it is negative."""
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return value
 
 
 def require_positive_float(value: float, name: str) -> float:
