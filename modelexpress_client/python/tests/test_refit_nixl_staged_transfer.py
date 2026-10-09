@@ -15,6 +15,7 @@ from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     structural_manifest_digest,
+    unwrap_rendezvous_blob,
     wrap_rendezvous_blob,
 )
 from modelexpress.refit.reshard.slice_plan import PullSegment, Shard
@@ -243,13 +244,17 @@ def _manifest(
     )
 
 
+@pytest.mark.parametrize(
+    "failure", [None, "registration", "cleanup", "metadata", "capture"]
+)
 @pytest.mark.parametrize("bounded", [False, True])
 @pytest.mark.parametrize("warm_cache", [False, True])
 def test_fixed_mode_updates_receive_changed_values(
-    monkeypatch, bounded, warm_cache
+    monkeypatch, bounded, warm_cache, failure
 ) -> None:
     """Receive changing weights in each fixed mode with real plans and CPU copies."""
     events = []
+    cleanup_error = RuntimeError("shutdown failed")
     source_tensor = torch.arange(4, dtype=torch.float32)
     real_empty = torch.empty
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
@@ -271,11 +276,12 @@ def test_fixed_mode_updates_receive_changed_values(
     monkeypatch.setattr(torch, "empty", empty)
 
     class Manager:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
             self.ready = False
             self.registered = {}
             self.fail_initialize = 0
             self.fail_register = 0
+            self.fail_shutdown = 0
 
         def initialize(self):
             if self.ready:
@@ -286,7 +292,10 @@ def test_fixed_mode_updates_receive_changed_values(
                 raise RuntimeError("initialization failed")
             self.ready = True
 
-        def shutdown(self):
+        def shutdown(self) -> None:
+            if self.fail_shutdown:
+                self.fail_shutdown -= 1
+                raise cleanup_error
             if self.registered:
                 assert transfer._recv_buffers or transfer._bounded_arena is not None
             events.append("shutdown")
@@ -310,7 +319,8 @@ def test_fixed_mode_updates_receive_changed_values(
         def __init__(self, manager, *args, **kwargs):
             self.manager = manager
 
-        def read(self, descriptors):
+        def read(self, descriptors) -> None:
+            events.append("read")
             assert self.manager.ready
             for d in descriptors:
                 assert any(
@@ -393,8 +403,25 @@ def test_fixed_mode_updates_receive_changed_values(
             {"layer.weight": ((4,), torch.float32)},
         ),
     )
+    prepare = method.prepare_streaming if bounded else method.prepare
     try:
-        for _ in range(4):
+        if failure in ("registration", "cleanup"):
+            transfer._manager.fail_register = 1
+            transfer._manager.fail_shutdown = int(failure == "cleanup")
+            if failure == "cleanup":
+                mode = "streaming" if bounded else "full-copy"
+                with pytest.raises(
+                    ValueError, match=f"failed to reset {mode} preparation"
+                ) as raised:
+                    prepare(version=None, source=source)
+                assert raised.value.__cause__ is cleanup_error
+                assert transfer._manager.registered
+                return
+            with pytest.raises(RuntimeError, match="registration failed"):
+                prepare(version=None, source=source)
+            assert not transfer._manager.ready
+            assert not transfer._manager.registered
+        for index in range(4):
             source_tensor.add_(1)
             if bounded:
                 prepared = method.prepare_streaming(version=None, source=source)
@@ -408,8 +435,48 @@ def test_fixed_mode_updates_receive_changed_values(
             with pytest.raises(RuntimeError, match="release"):
                 method.prepare(version=None, source=source)
             method.release(prepared)
-        assert events.count("register") == 1
-        assert events.count("shutdown") == 0
+            if index == 0 and failure in ("metadata", "capture"):
+                addresses = {
+                    name: tensor.data_ptr()
+                    for name, tensor in transfer._manager.registered.items()
+                }
+                reads = events.count("read")
+                if failure == "metadata":
+                    payload = unwrap_rendezvous_blob(manifest)
+                    changed = wrap_rendezvous_blob(
+                        b"changed",
+                        payload.agent_name,
+                        payload.metadata_endpoint,
+                        payload.tensors,
+                    )
+                    bad_source = replace(
+                        source, shards=(replace(source.shards[0], manifest=changed),)
+                    )
+                    expected = "already connected source"
+                else:
+                    bad_source = replace(source, mesh_generation=2)
+                    capture_layout = method._capture_layout
+
+                    def fail_capture(_manifest) -> tuple:
+                        raise RuntimeError("layout capture failed")
+
+                    method._capture_layout = fail_capture
+                    expected = "layout capture failed"
+                try:
+                    with pytest.raises(RuntimeError, match=expected):
+                        prepare(version=None, source=bad_source)
+                finally:
+                    if failure == "capture":
+                        method._capture_layout = capture_layout
+                assert transfer._manager.ready
+                assert {
+                    name: tensor.data_ptr()
+                    for name, tensor in transfer._manager.registered.items()
+                } == addresses
+                assert events.count("read") == reads
+                assert "shutdown" not in events
+        assert events.count("register") == (2 if failure == "registration" else 1)
+        assert events.count("shutdown") == int(failure == "registration")
     finally:
         method.close()
         assert not transfer._manager.registered

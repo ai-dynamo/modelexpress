@@ -1820,6 +1820,14 @@ after all setup succeeds. Internal batching consumes the fixed validated budget;
 coverage and capacity checks remain at the compilation boundary. Existing cache
 switches and lazy descriptor bindings retain their behavior at this layer.
 
+The transfer owns cleanup of partial native preparation. Metadata, layout and
+compilation failures leave registered storage and existing connections intact.
+A failed preparation that attempted manager initialization, source connection or
+registration resets an owned manager before releasing its storage; cleanup failure
+remains fatal with its cause retained. Borrowed managers cannot be reset by the
+transfer. Streaming READ drain, retained leases and uncertain-resource quarantine
+keep their existing installation behavior.
+
 ## RL refit CI harness
 
 `ci/bench/` shares one Kubernetes lifecycle and pause/refit/verify/resume protocol

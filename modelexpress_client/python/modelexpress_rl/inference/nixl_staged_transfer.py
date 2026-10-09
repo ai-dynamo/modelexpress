@@ -902,6 +902,7 @@ class _NixlStagedTransfer:
 
     def _ensure_manager_initialized(self) -> None:
         if not self._manager_ready and self._owns_manager:
+            self._native_setup_started = True
             try:
                 self._manager.initialize()
             except Exception:
@@ -985,6 +986,8 @@ class _NixlStagedTransfer:
                 "NIXL metadata changed for an already connected source agent: "
                 f"{conflicting[:10]}"
             )
+        if changed:
+            self._native_setup_started = True
         _load_agent_metadata(self._manager, changed)
         self._loaded_agent_metadata.update(changed)
         return NixlReshardTransport(
@@ -1000,12 +1003,23 @@ class _NixlStagedTransfer:
     def _preparing(self) -> Iterator[None]:
         if self._closed:
             raise RuntimeError("NIXL staged transfer is closed")
+        self._native_setup_started = False
         try:
             yield
         except Exception:
             self._cached_pull_plan = None
             self._full_copy_descriptors = None
+            if self._native_setup_started:
+                try:
+                    self.reset_workspace()
+                except Exception as cleanup_error:
+                    mode = "streaming" if self._streaming is not None else "full-copy"
+                    raise ValueError(
+                        f"failed to reset {mode} preparation; restart the generator engine"
+                    ) from cleanup_error
             raise
+        finally:
+            self._native_setup_started = False
 
     def _publish_prepared(
         self,
@@ -1197,6 +1211,7 @@ class _NixlStagedTransfer:
                 arena = self._allocate_arena(arena_bytes)
                 # Retain storage before registration so failed setup can be cleaned up.
                 self._staging_arenas.append(arena)
+                self._native_setup_started = True
                 if staging_device == "cpu":
                     self._staging_registrations.append(
                         self._manager.register_dram_buffer(arena)
@@ -1483,6 +1498,7 @@ class _NixlStagedTransfer:
                 "receive parameter set changed; restart the generator engine"
             )
         if convert_expected and not self._convert_registered:
+            self._native_setup_started = True
             self._manager.register_tensors(
                 {
                     f"__convert__{name}": tensor
@@ -1491,6 +1507,7 @@ class _NixlStagedTransfer:
             )
             self._convert_registered = True
         if full_expected and not self._full_registered:
+            self._native_setup_started = True
             self._manager.register_tensors(
                 {
                     f"__full__{name}": tensor
@@ -1499,6 +1516,7 @@ class _NixlStagedTransfer:
             )
             self._full_registered = True
         if not self._registered_recv_params and recv_params:
+            self._native_setup_started = True
             self._manager.register_tensors(self._recv_buffers)
             self._registered_recv_params = recv_params
 

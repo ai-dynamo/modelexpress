@@ -797,16 +797,76 @@ def test_trainer_source_allows_fallback_when_initial_mesh_lookup_fails(
         server.stop(grace=None).wait()
 
 
-def test_generator_rejects_mesh_change_during_source_resolution(monkeypatch) -> None:
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("mismatch", ["initial", "post_manifest"])
+def test_generator_rejects_mesh_change_during_source_resolution(
+    monkeypatch, mismatch, bounded
+) -> None:
     server, endpoint, service = _start_server()
     service.version.trainer_mesh_id = "mesh-a"
+    if mismatch == "initial":
+        service.version.trainer_mesh_generation = 2
     service.mesh_generation_on_recheck = 2
+    _add_generator_peer(service)
     adapter = _Adapter(service)
-    generator = _initialize(monkeypatch, endpoint, adapter)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        source_order=(WeightSource.TRAINER, WeightSource.GENERATOR),
+        staging_buffer_bytes=512 if bounded else None,
+    )
+    if bounded:
+
+        class Transfer:
+            def prepare_streaming(self, **_kwargs) -> SimpleNamespace:
+                return SimpleNamespace(
+                    metrics={}, batches=[SimpleNamespace(layouts=({"weight": None},))]
+                )
+
+            def iter_bounded(self, _prepared, _metrics) -> object:
+                yield {"weight": 2}
+
+        class Method(LoadTimeTensorNixlUpdateMethod):
+            def prepare_streaming(self, *, version, source) -> PreparedArtifact:
+                adapter.stage_calls.append(
+                    SimpleNamespace(version_id=version.version_id)
+                )
+                return super().prepare_streaming(version=version, source=source)
+
+        class Installer:
+            @property
+            def capabilities(self) -> EngineCapabilities:
+                return EngineCapabilities(
+                    frozenset({PreparedEngineTensors, PreparedStreamingTensors})
+                )
+
+            def install(self, prepared) -> str:
+                assert [batch["weight"] for batch in prepared.batches()] == [2]
+                adapter.apply_calls.append(prepared)
+                return "installed"
+
+        planner = generator._runtime.session._planner
+        planner._methods = (Method(transfer=Transfer(), capture_layout=None),)
+        planner._installer = Installer()
     try:
-        with pytest.raises(RuntimeError, match="trainer mesh generation changed"):
+        with pytest.raises(RuntimeError, match="mesh generation"):
             generator.stage_weight(version=WeightVersionRef("version-a"))
         assert adapter.stage_calls == []
+        assert adapter.peer_stage_calls == []
+        assert service.lease_registrations == service.lease_deletions == 1
+        assert not service.active_leases
+        service.version.uid = "version-b"
+        service.version.trainer_mesh_generation = 2
+        for shard in service.shards:
+            shard.version_id = "version-b"
+        staged = generator.stage_weight(version=WeightVersionRef("version-b"))
+        assert generator.apply_weight(staged) == "installed"
+        staged.release()
+        assert len(adapter.stage_calls) == len(adapter.apply_calls) == 1
+        assert adapter.stage_calls[0].version_id == "version-b"
+        assert adapter.peer_stage_calls == []
+        assert service.lease_registrations == service.lease_deletions == 2
         assert not service.active_leases
     finally:
         generator.close()
@@ -1749,19 +1809,18 @@ def _stage_and_apply(generator, *, version):
 
 @pytest.mark.parametrize("fail_second", [False, True])
 @pytest.mark.parametrize(
-    "prepare_failures,prepare_error,reset_failure",
+    "prepare_failures,prepare_error",
     [
-        (0, RuntimeError, False),
-        (1, RuntimeError, False),
-        (1, grpc.RpcError, False),
-        (1, ManifestMismatchError, False),
-        (1, StrategyRecoveryError, False),
-        (3, RuntimeError, False),
-        (1, RuntimeError, True),
+        (0, RuntimeError),
+        (1, RuntimeError),
+        (1, grpc.RpcError),
+        (1, ManifestMismatchError),
+        (1, StrategyRecoveryError),
+        (3, RuntimeError),
     ],
 )
 def test_streaming_client_holds_lease_and_fences_partial_install(
-    monkeypatch, fail_second, prepare_failures, prepare_error, reset_failure
+    monkeypatch, fail_second, prepare_failures, prepare_error
 ) -> None:
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
@@ -1777,11 +1836,6 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
     recovered = False
 
     class Transfer:
-        def reset_workspace(self):
-            assert service.active_leases
-            if reset_failure:
-                raise RuntimeError("cleanup failure")
-
         def prepare_streaming(self, **kwargs) -> SimpleNamespace:
             assert service.active_leases
             prepare_calls.append(kwargs)
@@ -1826,11 +1880,7 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
     planner._methods = (method,)
     planner._installer = Installer()
     try:
-        if reset_failure:
-            with pytest.raises(ValueError, match="restart the generator engine"):
-                _stage_and_apply(generator, version=WeightVersionRef("version-a"))
-            assert installed == []
-        elif prepare_failures == 3:
+        if prepare_failures == 3:
             with pytest.raises(prepare_error, match="preparation failure"):
                 _stage_and_apply(generator, version=WeightVersionRef("version-a"))
             assert installed == []
@@ -1876,9 +1926,7 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
         assert not service.active_leases
         assert generator._active_handle is None
         assert method._active_streamed is None
-        assert len(prepare_calls) == (
-            (1 if reset_failure else min(prepare_failures + 1, 3)) + int(recovered)
-        )
+        assert len(prepare_calls) == (min(prepare_failures + 1, 3) + int(recovered))
         assert service.lease_registrations == (3 if recovered else 1)
     finally:
         generator.close()
