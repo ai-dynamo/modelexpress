@@ -83,10 +83,15 @@ def publish_metadata_and_ready(
     tensor_protos = build_tensor_protos(tensors, device_id, worker_rank)
 
     # This node's RDMA-fabric location, published once so the topology_aware
-    # selector can rank sources by locality. Empty when unconfigured.
-    from ..topology import local_topology
+    # selector can rank sources by locality. Empty when unconfigured. With a
+    # transfer domain configured, wait for it: a source published without it
+    # is permanently ineligible under required enforcement.
+    from ..topology import local_topology, wait_for_domain
 
-    node_topology = local_topology()
+    transfer_domain = (envs.MX_P2P_TOPOLOGY_DOMAIN or "").strip()
+    node_topology = (
+        wait_for_domain(transfer_domain) if transfer_domain else local_topology()
+    )
 
     if _is_p2p_metadata_enabled(mx_client):
         from .worker_server import WorkerGrpcServer
