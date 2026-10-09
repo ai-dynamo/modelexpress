@@ -1813,7 +1813,10 @@ settings bind the mode, placement, buffer count and total budget at runtime
 construction; each transfer retains that configuration for its lifetime. Public
 `staging_buffer_bytes` remains the capacity of each buffer, multiplied by the
 buffer count for the internal total budget. Bounded device compatibility is
-checked before creating its NIXL manager. Generator peer reads retain a separate
+checked before creating its NIXL manager. Streaming installer support is checked
+once during runtime initialization, before allocating transfers. Runtime
+construction selects the trainer method; per-update candidate selection does not
+repeat method-type or streaming-installer checks. Generator peer reads retain a separate
 full-copy transfer borrowing the engine manager. The version lease remains held through
 installation or release. Preparation retry and recovery behavior stays scoped
 to the selected update strategy; failures after a possible write fence the engine.

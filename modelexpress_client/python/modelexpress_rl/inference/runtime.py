@@ -24,6 +24,7 @@ from .methods import (
 from .nixl_staged_transfer import _NixlStagedTransfer
 from .plan import (
     EngineInstaller,
+    PreparedStreamingTensors,
     SourceResolver,
     StreamingSettings,
     UpdateMethod,
@@ -305,6 +306,12 @@ def initialize_generator_runtime(
         object_storage=object_storage,
         source_order=resolved_source_order,
     )
+    if (
+        streaming is not None
+        and WeightSource.TRAINER in resolved_source_order
+        and PreparedStreamingTensors not in engine.installer.capabilities.artifact_types
+    ):
+        raise ValueError("engine does not support bounded streaming installation")
     methods: list[UpdateMethod] = []
     p2p_client = None
     canonical_method = None

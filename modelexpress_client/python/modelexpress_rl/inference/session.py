@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -161,26 +161,6 @@ class WeightUpdateSession:
             self._close_lease(lease, version.version_id, primary_error)
             raise
 
-    def _candidate_plans(
-        self,
-        version: WeightVersion,
-        source_kind: WeightSource | None,
-    ) -> Iterator[WeightUpdatePlan]:
-        from .methods import LoadTimeTensorNixlUpdateMethod
-
-        for plan in self._planner.plans(version, source_kind=source_kind):
-            if self._streaming is not None and source_kind is WeightSource.TRAINER:
-                if not isinstance(plan.method, LoadTimeTensorNixlUpdateMethod):
-                    continue
-                if (
-                    PreparedStreamingTensors
-                    not in plan.installer.capabilities.artifact_types
-                ):
-                    raise ValueError(
-                        "engine does not support bounded streaming installation"
-                    )
-            yield plan
-
     def _prepare_candidates(
         self,
         version: WeightVersion,
@@ -189,7 +169,7 @@ class WeightUpdateSession:
     ) -> tuple[WeightUpdatePlan, PreparedArtifact]:
         last_error: BaseException | None = None
         streaming = self._streaming is not None and source_kind is WeightSource.TRAINER
-        for plan in self._candidate_plans(version, source_kind):
+        for plan in self._planner.plans(version, source_kind=source_kind):
             logger.info(
                 "ModelExpress weight update version=%s trying source=%s method=%s installer=%s",
                 version.version_id,
