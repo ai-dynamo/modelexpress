@@ -22,6 +22,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_REFIT_CHECKPOINT_DIR is None
     assert envs.MX_REFIT_DELTA_BUCKET_BYTES == 512 * 1024**2
     assert envs.MX_REFIT_DELTA_WORKERS == min(32, os.cpu_count() or 8)
+    assert envs.MX_REFIT_DOWNLOAD_WORKERS == 16
     assert envs.MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES == 4 * 1024**3
     assert envs.MX_S3_MULTIPART_THRESHOLD_BYTES == 100 * 1024**2
     assert envs.MX_S3_UPLOAD_PART_BYTES == 16 * 1024**2
@@ -45,6 +46,7 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     monkeypatch.setenv("MX_REFIT_CHECKPOINT_DIR", " /checkpoints ")
     monkeypatch.setenv("MX_REFIT_DELTA_BUCKET_BYTES", "1024")
     monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", "3")
+    monkeypatch.setenv("MX_REFIT_DOWNLOAD_WORKERS", "9")
     monkeypatch.setenv("MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES", "8192")
     monkeypatch.setenv("MX_S3_MULTIPART_THRESHOLD_BYTES", "2048")
     monkeypatch.setenv("MX_S3_UPLOAD_PART_BYTES", str(5 * 1024**2))
@@ -66,6 +68,7 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     assert envs.MX_REFIT_CHECKPOINT_DIR == "/checkpoints"
     assert envs.MX_REFIT_DELTA_BUCKET_BYTES == 1024
     assert envs.MX_REFIT_DELTA_WORKERS == 3
+    assert envs.MX_REFIT_DOWNLOAD_WORKERS == 9
     assert envs.MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES == 8192
     assert envs.MX_S3_MULTIPART_THRESHOLD_BYTES == 2048
     assert envs.MX_S3_UPLOAD_PART_BYTES == 5 * 1024**2
@@ -102,6 +105,54 @@ def test_positive_integer_settings_reject_zero(monkeypatch, name):
     monkeypatch.setenv(name, "0")
     with pytest.raises(ValueError, match=f"{name} must be positive"):
         getattr(envs, name)
+
+
+@pytest.mark.parametrize(
+    ("neutral", "legacy", "expected"),
+    [(None, "3", 3), ("5", "3", 5), ("4", "invalid", 4)],
+)
+def test_refit_download_workers_precedence(monkeypatch, neutral, legacy, expected):
+    monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", legacy)
+    monkeypatch.delenv("MX_REFIT_DOWNLOAD_WORKERS", raising=False)
+    if neutral is not None:
+        monkeypatch.setenv("MX_REFIT_DOWNLOAD_WORKERS", neutral)
+    assert envs.MX_REFIT_DOWNLOAD_WORKERS == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("", "must be an integer"),
+        (" ", "must be an integer"),
+        ("invalid", "must be an integer"),
+        ("0", "must be positive"),
+        ("-1", "must be positive"),
+    ],
+)
+def test_invalid_refit_download_workers_names_setting_without_fallback(
+    monkeypatch, value, message
+):
+    monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", "3")
+    monkeypatch.setenv("MX_REFIT_DOWNLOAD_WORKERS", value)
+    with pytest.raises(ValueError, match=f"MX_REFIT_DOWNLOAD_WORKERS {message}"):
+        _ = envs.MX_REFIT_DOWNLOAD_WORKERS
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("0", "MX_S3_DOWNLOAD_WORKERS must be positive"),
+        ("-1", "MX_S3_DOWNLOAD_WORKERS must be positive"),
+        ("invalid", "invalid literal"),
+    ],
+)
+def test_refit_download_workers_propagates_invalid_legacy_setting(
+    monkeypatch, value, message
+):
+    monkeypatch.delenv("MX_REFIT_DOWNLOAD_WORKERS", raising=False)
+    monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", value)
+    with pytest.raises(ValueError, match=message):
+        _ = envs.MX_REFIT_DOWNLOAD_WORKERS
 
 
 def test_unknown_attribute_raises():

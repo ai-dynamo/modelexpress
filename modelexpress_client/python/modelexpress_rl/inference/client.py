@@ -163,7 +163,7 @@ class ModelExpressGeneratorConfig:
 class StagedWeightHandle:
     """An exact version prepared for, but not yet installed into, the engine.
 
-    Preparation may validate and reserve a P2P peer or reconstruct an S3
+    Preparation may validate and reserve a P2P peer or reconstruct a stored
     checkpoint. The live engine remains unchanged until ``apply_weight`` runs at
     its safe point.
     The handle keeps session internals private and binds idempotent release to
@@ -287,9 +287,10 @@ class ModelExpressGeneratorClient:
         )
         if (
             config.object_storage is not None
-            and config.object_storage.storage_type is not ObjectStorageType.S3
+            and config.object_storage.storage_type
+            not in {ObjectStorageType.S3, ObjectStorageType.AZURE}
         ):
-            raise ValueError("only S3 object storage is currently supported")
+            raise ValueError("only S3 and Azure object storage are currently supported")
 
         client = cls()
         client.model_name = model_name

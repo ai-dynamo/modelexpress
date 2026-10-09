@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Canonical S3 checkpoint preparation for generator refit."""
+"""Canonical object-storage checkpoint preparation for generator refit."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from modelexpress_rl.inference.checkpoint_store import (
     checkpoint_files_state,
 )
 from modelexpress_rl.object_storage import ObjectStorageType
-from modelexpress_rl.s3 import S3Client
+from modelexpress_rl.object_storage_reader import ObjectStorageReader
 from modelexpress_rl.train import WeightPayloadFormat
 from modelexpress_rl.utils import (
     checksum_factory,
@@ -55,6 +55,10 @@ class ObjectStorageGeneratorConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.storage_type, ObjectStorageType):
             raise TypeError("storage_type must be an ObjectStorageType")
+        if self.storage_type is ObjectStorageType.AZURE:
+            for field in ("endpoint_url", "region_name"):
+                if getattr(self, field) is not None:
+                    raise ValueError(f"{field} is not supported for Azure object storage")
         if not self.initial_base_version_id.strip():
             raise ValueError("initial_base_version_id is required")
         if (
@@ -85,17 +89,19 @@ class PreparedCheckpoint:
 
 
 @dataclass(frozen=True)
-class _S3Version:
+class _ObjectStorageVersion:
     version_id: str
     base_version_id: str | None
     payload_format: WeightPayloadFormat
     uri: str
 
 
-_S3Manifest = tuple[_S3Version, bytes, dict[str, Any], dict[str, str]]
+_ObjectStorageManifest = tuple[
+    _ObjectStorageVersion, bytes, dict[str, Any], dict[str, str]
+]
 
 
-def _source_identity(version: _S3Version) -> dict[str, str]:
+def _source_identity(version: _ObjectStorageVersion) -> dict[str, str]:
     return {"uri": version.uri}
 
 
@@ -127,7 +133,7 @@ def _parse_index_manifest(
     data: bytes,
     *,
     is_delta: bool,
-    version: _S3Version | None = None,
+    version: _ObjectStorageVersion | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Parse and validate an index manifest."""
     try:
@@ -186,7 +192,7 @@ def _group_tensors_by_shard(
 
 def _download_full_checkpoint(
     *,
-    s3: S3Client,
+    reader: ObjectStorageReader,
     store: LocalCheckpointStore,
     target: Path,
     index_metadata: dict[str, Any],
@@ -202,12 +208,12 @@ def _download_full_checkpoint(
 
     shard_to_tensors = _group_tensors_by_shard(weight_map)
     parent_uri = root_uri.rsplit("/", 1)[0]
-    workers = min(rl_envs.MX_S3_DOWNLOAD_WORKERS, len(shard_to_tensors))
+    workers = min(rl_envs.MX_REFIT_DOWNLOAD_WORKERS, len(shard_to_tensors))
     shard_sizes = threadpool_map(
         shard_to_tensors,
-        lambda filename: s3.size(f"{parent_uri}/{filename}"),
+        lambda filename: reader.size(f"{parent_uri}/{filename}"),
         max_workers=workers,
-        thread_name_prefix="modelexpress-s3-head-full",
+        thread_name_prefix="modelexpress-refit-head-full",
     )
     store.ensure_capacity(
         sum(shard_sizes),
@@ -218,7 +224,7 @@ def _download_full_checkpoint(
     def download_and_validate(filename: str) -> tuple[float, float]:
         download_started = time.perf_counter()
         try:
-            data = s3.get(f"{parent_uri}/{filename}")
+            data = reader.get(f"{parent_uri}/{filename}")
         except Exception as error:
             raise RuntimeError(
                 f"full HF checkpoint download failed for {filename!r}"
@@ -280,7 +286,7 @@ def _download_full_checkpoint(
             shard_to_tensors,
             download_and_validate,
             max_workers=workers,
-            thread_name_prefix="modelexpress-s3-download-full",
+            thread_name_prefix="modelexpress-refit-download-full",
         )
     )
     return (
@@ -317,8 +323,8 @@ def _ensure_full_checkpoint(
     *,
     store: LocalCheckpointStore,
     target: Path,
-    version: _S3Version,
-    s3: S3Client,
+    version: _ObjectStorageVersion,
+    reader: ObjectStorageReader,
     protected_versions: set[str],
 ) -> None:
     """Ensure one immutable, source-verified full checkpoint is cached."""
@@ -331,7 +337,7 @@ def _ensure_full_checkpoint(
         except (OSError, RuntimeError, ValueError):
             pass
 
-    index_data = s3.get(version.uri)
+    index_data = reader.get(version.uri)
     metadata, weight_map = _parse_index_manifest(index_data, is_delta=False)
     store.ensure_capacity(
         len(index_data),
@@ -340,7 +346,7 @@ def _ensure_full_checkpoint(
     with store.replace_directory(target) as temporary:
         (temporary / Path(version.uri).name).write_bytes(index_data)
         _download_full_checkpoint(
-            s3=s3,
+            reader=reader,
             store=store,
             target=temporary,
             index_metadata=metadata,
@@ -352,12 +358,12 @@ def _ensure_full_checkpoint(
     index_checkpoint_tensors(target)
 
 
-def bootstrap_s3_checkpoint(
+def bootstrap_object_storage_checkpoint(
     *,
     model_name: str,
-    version: _S3Version,
+    version: _ObjectStorageVersion,
     refit_checkpoint_dir: str | Path,
-    s3: S3Client,
+    reader: ObjectStorageReader,
     refit_checkpoint_max_size_gb: int | None = DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB,
 ) -> Path:
     """Download the immutable full root needed by a cold-start replay."""
@@ -386,7 +392,7 @@ def bootstrap_s3_checkpoint(
             store=store,
             target=target,
             version=version,
-            s3=s3,
+            reader=reader,
             protected_versions=protected_versions,
         )
 
@@ -413,10 +419,10 @@ class _LocalCheckpoint:
         *,
         model_name: str,
         config: ObjectStorageGeneratorConfig,
-        s3: S3Client,
+        reader: ObjectStorageReader,
     ) -> None:
         self.initial_version = config.initial_base_version_id
-        self.s3 = s3
+        self.reader = reader
         self.store = LocalCheckpointStore(
             root=config.refit_checkpoint_dir,
             model_name=model_name,
@@ -529,7 +535,7 @@ class _LocalCheckpoint:
         return True
 
     def _restore_cached_initial_checkpoint(self) -> None:
-        """Recover incomplete preparation without copying over the S3 root."""
+        """Recover incomplete preparation without copying over the storage root."""
         self.store.verify_artifact(self.local_checkpoint)
         self._set_local_checkpoint(self.local_checkpoint)
         self.store.write_chain(
@@ -618,12 +624,12 @@ class _LocalCheckpoint:
             checkpoint_paths=self.checkpoint_paths,
         )
 
-    def prepare(self, version: _S3Version) -> PreparedCheckpoint:
+    def prepare(self, version: _ObjectStorageVersion) -> PreparedCheckpoint:
         return self.prepare_chain((version,))
 
     def prepare_chain(
         self,
-        versions: tuple[_S3Version, ...],
+        versions: tuple[_ObjectStorageVersion, ...],
     ) -> PreparedCheckpoint:
         """Prepare an ordered chain into one immutable target checkpoint."""
         if not versions:
@@ -686,7 +692,7 @@ class _LocalCheckpoint:
         self,
         *,
         state: CheckpointRecord,
-        target: _S3Version,
+        target: _ObjectStorageVersion,
     ) -> PreparedCheckpoint | None:
         if state.version != target.version_id:
             return None
@@ -709,10 +715,10 @@ class _LocalCheckpoint:
     def _download_replay_manifests(
         self,
         *,
-        versions: tuple[_S3Version, ...],
-        target: _S3Version,
+        versions: tuple[_ObjectStorageVersion, ...],
+        target: _ObjectStorageVersion,
         base_version: str,
-    ) -> tuple[list[_S3Manifest], float]:
+    ) -> tuple[list[_ObjectStorageManifest], float]:
         """Validate the entire chain before mutating preparation state."""
         expected_base = base_version
         manifests = []
@@ -738,7 +744,7 @@ class _LocalCheckpoint:
             expected_base = version.version_id
             started = time.perf_counter()
             try:
-                index_data = self.s3.get(version.uri)
+                index_data = self.reader.get(version.uri)
                 is_delta = version.payload_format is WeightPayloadFormat.XOR_DELTA
                 metadata, weight_map = _parse_index_manifest(
                     index_data,
@@ -757,8 +763,8 @@ class _LocalCheckpoint:
     def _reconstruct_target(
         self,
         *,
-        manifests: list[_S3Manifest],
-        target: _S3Version,
+        manifests: list[_ObjectStorageManifest],
+        target: _ObjectStorageVersion,
         active_version: str,
         index_download_time: float,
     ) -> PreparedCheckpoint:
@@ -822,7 +828,7 @@ class _LocalCheckpoint:
             },
         )
 
-    def _artifact_path(self, version: _S3Version) -> Path:
+    def _artifact_path(self, version: _ObjectStorageVersion) -> Path:
         if version.payload_format is WeightPayloadFormat.XOR_DELTA:
             return self.store.delta_path(version.version_id)
         return self.store.full_path(version.version_id)
@@ -855,7 +861,7 @@ class _LocalCheckpoint:
 
     def _prepare_full(
         self,
-        version: _S3Version,
+        version: _ObjectStorageVersion,
         index_data: bytes,
         metadata: dict[str, Any],
         weight_map: dict[str, str],
@@ -927,7 +933,7 @@ class _LocalCheckpoint:
 
     def _prepare_delta(
         self,
-        version: _S3Version,
+        version: _ObjectStorageVersion,
         index_data: bytes,
         metadata: dict[str, Any],
         weight_map: dict[str, str],
@@ -1038,17 +1044,17 @@ class _LocalCheckpoint:
 
         def download(item: tuple[str, list[str]]):
             filename, names = item
-            data = self.s3.get(f"{parent_uri}/{filename}")
+            data = self.reader.get(f"{parent_uri}/{filename}")
             return filename, data, names
 
         for filename, data, names in threadpool_map(
             shard_to_tensors.items(),
             download,
             max_workers=min(
-                rl_envs.MX_S3_DOWNLOAD_WORKERS,
+                rl_envs.MX_REFIT_DOWNLOAD_WORKERS,
                 len(shard_to_tensors),
             ),
-            thread_name_prefix="modelexpress-s3-download-file",
+            thread_name_prefix="modelexpress-refit-download-file",
         ):
             shards[filename] = (data, names)
         return shards
@@ -1063,7 +1069,7 @@ class _LocalCheckpoint:
         protected_versions: set[str],
     ) -> tuple[float, float]:
         return _download_full_checkpoint(
-            s3=self.s3,
+            reader=self.reader,
             store=self.store,
             target=target,
             index_metadata=index_metadata,
@@ -1235,5 +1241,5 @@ __all__ = [
     "PreparedCheckpoint",
     "ReceiverInstallError",
     "ObjectStorageGeneratorConfig",
-    "bootstrap_s3_checkpoint",
+    "bootstrap_object_storage_checkpoint",
 ]

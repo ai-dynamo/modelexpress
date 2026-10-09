@@ -316,6 +316,7 @@ def test_s3_client_uses_transfer_connection_and_retry_settings(monkeypatch):
 
     monkeypatch.setenv("MX_S3_UPLOAD_WORKERS", "2")
     monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", "3")
+    monkeypatch.setenv("MX_REFIT_DOWNLOAD_WORKERS", "11")
     monkeypatch.setenv("MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES", "4096")
     monkeypatch.setenv("MX_S3_DOWNLOAD_RANGE_BYTES", "1024")
     monkeypatch.setenv("MX_S3_DOWNLOAD_IO_CHUNK_BYTES", "512")
@@ -342,6 +343,61 @@ def test_s3_client_uses_transfer_connection_and_retry_settings(monkeypatch):
         assert transfer.num_download_attempts == 6
     finally:
         s3.close()
+
+
+@pytest.mark.parametrize("full_checkpoint", [True, False], ids=["full", "delta"])
+@pytest.mark.parametrize(
+    ("workers", "expected_workers"), [(1, 1), (8, 3)],
+    ids=["configured", "capped-by-shard-count"],
+)
+def test_receiver_uses_configured_download_workers_capped_by_shard_count(
+    monkeypatch, tmp_path, full_checkpoint, workers, expected_workers
+):
+    monkeypatch.setenv("MX_REFIT_DOWNLOAD_WORKERS", str(workers))
+    monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", "2")
+    weight_map = {f"weight_{i}": f"shard-{i}.safetensors" for i in range(3)}
+    storage = _MemoryS3(
+        {
+            f"s3://weights/{shard}": safetensors.torch.save({name: torch.ones(1)})
+            for name, shard in weight_map.items()
+        }
+    )
+    pools = []
+    threadpool_map = receiver_module.threadpool_map
+
+    def track_pool(*args, **kwargs):
+        pools.append(kwargs["max_workers"])
+        return threadpool_map(*args, **kwargs)
+
+    monkeypatch.setattr(receiver_module, "threadpool_map", track_pool)
+    checkpoint = receiver_module._LocalCheckpoint(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path=tmp_path / "seed",
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        reader=storage,
+    )
+    checkpoint.store.initialize()
+
+    if full_checkpoint:
+        receiver_module._download_full_checkpoint(
+            reader=storage,
+            store=checkpoint.store,
+            target=tmp_path,
+            index_metadata={},
+            weight_map=weight_map,
+            root_uri="s3://weights/model.safetensors.index.json",
+            protected_versions=set(),
+        )
+    else:
+        checkpoint._download_deltas(
+            weight_map, "s3://weights/model.safetensors.index.json"
+        )
+    assert pools == [expected_workers] * (2 if full_checkpoint else 1)
+    assert sorted(storage.calls) == sorted(storage.objects)
 
 
 def test_s3_multipart_uploads_parts_concurrently_and_completes_immutably(
@@ -541,18 +597,18 @@ def test_bootstrap_s3_checkpoint_downloads_and_reuses_full_root(
             "disk_usage",
             lambda _path: SimpleNamespace(free=3_000_000_000_000),
         )
-    version = receiver_module._S3Version(
+    version = receiver_module._ObjectStorageVersion(
         version_id="full-a",
         base_version_id=None,
         payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
         uri="s3://weights/test/v2/model.safetensors.index.json",
     )
 
-    path = receiver_module.bootstrap_s3_checkpoint(
+    path = receiver_module.bootstrap_object_storage_checkpoint(
         model_name="test/model",
         version=version,
         refit_checkpoint_dir=tmp_path / "cache",
-        s3=storage,
+        reader=storage,
     )
 
     assert torch.equal(
@@ -565,11 +621,11 @@ def test_bootstrap_s3_checkpoint_downloads_and_reuses_full_root(
         "s3://weights/test/v2/model-00001-of-00001.safetensors",
     ]
 
-    assert receiver_module.bootstrap_s3_checkpoint(
+    assert receiver_module.bootstrap_object_storage_checkpoint(
         model_name="test/model",
         version=version,
         refit_checkpoint_dir=tmp_path / "cache",
-        s3=storage,
+        reader=storage,
     ) == path
     assert storage.calls == first_calls
 
@@ -577,16 +633,16 @@ def test_bootstrap_s3_checkpoint_downloads_and_reuses_full_root(
 def test_implicit_cached_seed_restores_without_copying(monkeypatch, tmp_path):
     weights = torch.tensor([1.0, 2.0])
     storage = _MemoryS3(_full_artifact(weights, version_label=20))
-    seed = receiver_module.bootstrap_s3_checkpoint(
+    seed = receiver_module.bootstrap_object_storage_checkpoint(
         model_name="test/model",
-        version=receiver_module._S3Version(
+        version=receiver_module._ObjectStorageVersion(
             version_id="seed/v0",
             base_version_id=None,
             payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
             uri="s3://weights/test/v20/model.safetensors.index.json",
         ),
         refit_checkpoint_dir=tmp_path / "cache",
-        s3=storage,
+        reader=storage,
     )
     storage.calls.clear()
     copy_file = Mock(side_effect=AssertionError("cached seed must not be copied"))
@@ -601,7 +657,7 @@ def test_implicit_cached_seed_restores_without_copying(monkeypatch, tmp_path):
             seed_checkpoint_path=None,
             refit_checkpoint_dir=tmp_path / "cache",
         ),
-        s3=storage,
+        reader=storage,
     )
 
     checkpoint.initialize()
@@ -706,7 +762,7 @@ def test_implicit_cached_seed_requires_valid_root(
             seed_checkpoint_path=None,
             refit_checkpoint_dir=tmp_path / "cache",
         ),
-        s3=storage,
+        reader=storage,
     )
     seed = checkpoint.local_checkpoint
     if cached_root != "missing":
@@ -744,18 +800,18 @@ def test_cold_start_ranks_do_not_rewind_prepared_target(
     )
     storage = _MemoryS3(objects)
     monkeypatch.setattr(canonical_delta_module, "S3Client", lambda **_kwargs: storage)
-    root = receiver_module._S3Version(
+    root = receiver_module._ObjectStorageVersion(
         version_id="v20",
         base_version_id=None,
         payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
         uri="s3://weights/test/v20/model.safetensors.index.json",
     )
     cache = tmp_path / "cache"
-    seed = receiver_module.bootstrap_s3_checkpoint(
+    seed = receiver_module.bootstrap_object_storage_checkpoint(
         model_name="test/model",
         version=root,
         refit_checkpoint_dir=cache,
-        s3=storage,
+        reader=storage,
     )
     adapter = _Adapter(
         model_name="test/model",
@@ -780,11 +836,11 @@ def test_cold_start_ranks_do_not_rewind_prepared_target(
     state_before = adapter._checkpoint.store.state_path.read_bytes()
     assert not adapter._checkpoint.store.active_path.exists()
 
-    assert receiver_module.bootstrap_s3_checkpoint(
+    assert receiver_module.bootstrap_object_storage_checkpoint(
         model_name="test/model",
         version=root,
         refit_checkpoint_dir=cache,
-        s3=storage,
+        reader=storage,
     ) == seed
     assert adapter._checkpoint.store.state_path.read_bytes() == state_before
     assert not adapter._checkpoint.store.active_path.exists()
@@ -964,6 +1020,37 @@ def test_object_storage_generator_config_rejects_nonpositive_cache_quota(
         )
 
 
+def test_canonical_s3_forwards_endpoint_and_region(monkeypatch, tmp_path):
+    storage = _MemoryS3({})
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return storage
+
+    monkeypatch.setattr(canonical_delta_module, "S3Client", create)
+    monkeypatch.setattr(
+        receiver_module._LocalCheckpoint, "initialize", Mock(return_value=True)
+    )
+    method = CanonicalDeltaUpdateMethod(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path=tmp_path / "seed",
+            refit_checkpoint_dir=tmp_path / "cache",
+            endpoint_url="https://s3.example.test",
+            region_name="test-region",
+        ),
+    )
+    try:
+        assert calls == [{
+            "endpoint_url": "https://s3.example.test", "region_name": "test-region",
+        }]
+    finally:
+        method.close()
+
+
 def test_object_storage_generator_config_converts_cache_quota_to_bytes(
     monkeypatch, tmp_path
 ):
@@ -1116,20 +1203,26 @@ def test_canonical_s3_reseeds_a_modified_ready_checkpoint(monkeypatch, tmp_path)
     second.close()
 
 
+@pytest.mark.parametrize(
+    ("storage_type", "scheme"),
+    [(ObjectStorageType.GCS, "gs"), (ObjectStorageType.AZURE, "az")],
+)
 def test_canonical_s3_rejects_non_s3_source_before_storage_access(
     monkeypatch,
     tmp_path,
+    storage_type,
+    scheme,
 ):
     adapter, storage = _build(monkeypatch, tmp_path, {})
     inputs = replace(
         _inputs(None),
         object_storage=ObjectStorageSource(
-            storage_type=ObjectStorageType.GCS,
-            uri="gs://weights/test/v1/model.safetensors.index.json",
+            storage_type=storage_type,
+            uri=f"{scheme}://weights/test/v1/model.safetensors.index.json",
         ),
     )
 
-    with pytest.raises(ValueError, match="requires S3 object storage"):
+    with pytest.raises(ValueError, match="storage type must match configured reader"):
         adapter.stage_weight(inputs)
 
     assert storage.calls == []
@@ -1601,7 +1694,7 @@ def test_cached_metadata_source_is_protected_before_first_activation(tmp_path):
             seed_checkpoint_path=None,
             refit_checkpoint_dir=tmp_path / "cache",
         ),
-        s3=storage,
+        reader=storage,
     )
     seed = checkpoint.local_checkpoint
     seed.mkdir(parents=True)
@@ -1616,7 +1709,7 @@ def test_cached_metadata_source_is_protected_before_first_activation(tmp_path):
 
     with pytest.raises(checkpoint_store_module.CheckpointCacheCapacityError):
         checkpoint.prepare(
-            receiver_module._S3Version(
+            receiver_module._ObjectStorageVersion(
                 version_id="full-a",
                 base_version_id=None,
                 payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
@@ -3084,7 +3177,7 @@ def test_canonical_s3_applies_delta_tensors_concurrently(monkeypatch, tmp_path):
             seed_checkpoint_path=launch,
             refit_checkpoint_dir=tmp_path / "cache",
         ),
-        s3=_MemoryS3({}),
+        reader=_MemoryS3({}),
     )
     checkpoint.initialize()
 
