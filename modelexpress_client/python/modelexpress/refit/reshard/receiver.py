@@ -32,10 +32,11 @@ from collections import deque
 import torch
 
 from modelexpress import envs
+from modelexpress.accelerators import accelerator_backend_for
 from modelexpress.client import MxClient
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.refit.reshard import throughput
-from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress.refit.reshard.alloc_scope import registered_buffer_alloc_scope
 from modelexpress.refit.reshard.rendezvous import gather_sources
 from modelexpress.refit.reshard.transfer_plan import (
     exact_descriptors,
@@ -413,13 +414,24 @@ class ReshardReceiver:
         self._num_trainer_sources = num_trainer_sources
         self._timeout = timeout
         self._global_rank = global_rank
+        self._backend = accelerator_backend_for(device)
+
+        # TODO(publisher-accelerator): nothing here checks the publisher's
+        # accelerator family, because the rendezvous identity and the shard table
+        # do not carry one. Both same-family and cross-family pairings are
+        # unchecked by accelerator family. Publish the source family in the shard
+        # table and run it through
+        # metadata/payload.py::accelerators_compatible.
 
         # TODO(transport-agnostic): the receiver is engine-agnostic but still
         # transport-bound to NIXL (this manager, NixlReshardTransport, and the
         # fetch_remote_and_wait P2P handshake in _prepare). Abstract these behind
         # a transport interface so non-NIXL backends can plug in.
         self._manager = NixlTransferManager(
-            agent_name=agent_name, device_id=local_rank, listen_port=listen_port
+            agent_name=agent_name,
+            device_id=local_rank,
+            listen_port=listen_port,
+            accelerator_backend=self._backend,
         )
         self._manager.initialize()
         self._mx_client = MxClient(server_url=mx_server)
@@ -589,13 +601,13 @@ class ReshardReceiver:
 
         # dtype-mismatched sources (e.g. a bf16-served router for an fp32 dest):
         # one persistent bf16 STAGING buffer per convert param, registered as an
-        # RDMA target (classic cudaMalloc so the HCA can RDMA into it); each refit
-        # we RDMA into staging then cast staging -> the (load-time) receive buffer.
+        # RDMA target using the backend-selected allocation scope; each refit we
+        # RDMA into staging then cast staging -> the (load-time) receive buffer.
         # Allocation and registration happen in three places below (convert
         # staging, full-pull staging, receive buffers). They are accumulated into
         # one figure each rather than reported per buffer class, because the
-        # actionable question is how much of a cold start is cudaMalloc versus HCA
-        # registration.
+        # actionable question is how much of a cold start is allocation versus
+        # HCA registration.
         alloc_s = 0.0
         register_s = 0.0
 
@@ -603,7 +615,7 @@ class ReshardReceiver:
         self._staging_ptr = {}
         if plan.converts:
             _t = time.perf_counter()
-            with classic_cuda_alloc():
+            with registered_buffer_alloc_scope(self._backend):
                 self._staging = {
                     c.param_name: torch.empty(
                         c.dest_shape, dtype=c.src_dtype, device=self._device
@@ -625,7 +637,7 @@ class ReshardReceiver:
         self._full_staging_ptr = {}
         if plan.full_pulls:
             _t = time.perf_counter()
-            with classic_cuda_alloc():
+            with registered_buffer_alloc_scope(self._backend):
                 self._full_staging = {
                     full_pull.src_name: torch.empty(
                         full_pull.global_shape,
@@ -648,15 +660,16 @@ class ReshardReceiver:
             }
 
         # Receive buffers: one per captured param at its CAPTURED (load-time)
-        # shape/dtype, classic cudaMalloc, registered once. The live params are
-        # NOT RDMA targets; _install() writes the buffers into the live params.
+        # shape/dtype, allocated through the backend-selected scope and registered
+        # once. The live params are NOT RDMA targets; _install() writes the buffers
+        # into the live params.
         # Segment params (captured == served) are the RDMA targets - register them
         # + point _param_ptr at them. Convert params (router) are captured fp32 ->
         # their bf16 staging is the RDMA target and the refit casts into the buffer.
         seg_params = {seg.param_name for seg in plan.segments}
         self._recv_buffers = {}
         _t = time.perf_counter()
-        with classic_cuda_alloc():
+        with registered_buffer_alloc_scope(self._backend):
             for name in all_params:
                 shape, dtype = param_layout[name]
                 self._recv_buffers[name] = torch.empty(
@@ -985,7 +998,7 @@ class ReshardReceiver:
                         destinations, source_views, strict=True
                     ):
                         destination.copy_(source_view)
-            torch.cuda.synchronize(self._device)
+            self._backend.synchronize(self._device.index)
             stages["reslice_s"] = time.perf_counter() - _t
             # Views, not sources: the per-view launch count is what batching
             # removes, and the source count is already reported separately.
@@ -999,12 +1012,12 @@ class ReshardReceiver:
                 self._recv_buffers[convert.param_name].copy_(
                     self._staging[convert.param_name]
                 )
-            torch.cuda.synchronize(self._device)
+            self._backend.synchronize(self._device.index)
             stages["convert_s"] = time.perf_counter() - _t
 
         _t = time.perf_counter()
         self._install(self._recv_buffers)
-        torch.cuda.synchronize(self._device)
+        self._backend.synchronize(self._device.index)
         stages["install_s"] = time.perf_counter() - _t
 
         metrics = {
