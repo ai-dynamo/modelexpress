@@ -23,7 +23,13 @@ from ..source_selection import (
     configured_policy_label,
     get_configured_selector,
 )
-from ..topology import apply_policy, blocks_selection, count_in_domain, resolve_policy
+from ..topology import (
+    apply_policy,
+    blocks_selection,
+    count_in_domain,
+    resolve_policy,
+    warn_if_no_domain_match,
+)
 from ..transfer_safety import check_transfer_allowed
 from ..types import TensorDescriptor
 from .base import (
@@ -309,12 +315,10 @@ class RdmaStrategy(LoadStrategy):
                 # every one filtered out" was unreachable, so the two looked
                 # identical on a dashboard.
                 selection_metrics.record_list_sources(policy, "empty")
-                for stage in (
-                    "listed",
-                    "rank_matched",
-                    "accelerator_matched",
-                    "topology_matched",
-                ):
+                stages = ["listed", "rank_matched", "accelerator_matched"]
+                if topology_policy is not None:
+                    stages.append("topology_matched")
+                for stage in stages:
                     selection_metrics.observe_candidates(policy, stage, 0)
                 return []
 
@@ -345,7 +349,6 @@ class RdmaStrategy(LoadStrategy):
             selector = get_configured_selector()
             select_start = time.perf_counter()
             ordered = apply_policy(selector.order(candidates, ctx), topology_policy)
-            topology_matched = count_in_domain(ordered, topology_policy)
             select_seconds = time.perf_counter() - select_start
 
             selection_metrics.record_list_sources(selector.name, "ok")
@@ -358,9 +361,14 @@ class RdmaStrategy(LoadStrategy):
             selection_metrics.observe_candidates(
                 selector.name, "accelerator_matched", len(candidates)
             )
-            selection_metrics.observe_candidates(
-                selector.name, "topology_matched", topology_matched
-            )
+            topology_field = ""
+            if topology_policy is not None:
+                topology_matched = count_in_domain(ordered, topology_policy)
+                selection_metrics.observe_candidates(
+                    selector.name, "topology_matched", topology_matched
+                )
+                topology_field = f" source_candidates_topology_matched={topology_matched}"
+                warn_if_no_domain_match(candidates, topology_policy, ctx.global_rank)
             selection_metrics.observe_selection_seconds(selector.name, select_seconds)
 
             # Surface the source-published load the client saw, so a dashboard can
@@ -373,8 +381,8 @@ class RdmaStrategy(LoadStrategy):
                 f"source_selector={selector.name} "
                 f"source_candidates_total={len(list_resp.instances)} "
                 f"source_candidates_rank_matched={len(rank_matched)} "
-                f"source_candidates_accelerator_matched={len(candidates)} "
-                f"source_candidates_topology_matched={topology_matched}"
+                f"source_candidates_accelerator_matched={len(candidates)}"
+                f"{topology_field}"
             )
             if ordered:
                 logger.debug(

@@ -1061,6 +1061,24 @@ def test_te_find_source_required_zone_unknown_locally_falls_back(monkeypatch, tm
     ctx.mx_client.list_sources.assert_not_called()
 
 
+def test_te_find_source_empty_emits_topology_stage_only_with_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("DYN_TOPOLOGY_MOUNT_PATH", str(tmp_path / "absent"))
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.engines.sglang.loader.selection_metrics", m)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_DOMAIN", raising=False)
+    assert loader._find_transfer_engine_source(_te_ctx([])) is None
+    assert {c.args[1] for c in m.observe_candidates.call_args_list} == {"listed", "rank_matched"}
+
+    m.reset_mock()
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "zone")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", '{"zone": "az1"}')
+    assert loader._find_transfer_engine_source(_te_ctx([])) is None
+    observed = {c.args[1]: c.args[2] for c in m.observe_candidates.call_args_list}
+    assert observed == {"listed": 0, "rank_matched": 0, "topology_matched": 0}
+
+
 def test_te_find_source_skips_not_found(monkeypatch):
     # Force identity order so w0 (not-found) is queried first and the
     # `if not metadata.found: continue` branch is actually exercised.

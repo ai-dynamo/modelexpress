@@ -23,7 +23,13 @@ from ...metrics import enable_metrics
 from ...nixl_transfer import NixlTransferManager
 from ...metrics import metrics as selection_metrics
 from ...source_selection import configured_policy_label, get_configured_selector
-from ...topology import apply_policy, blocks_selection, count_in_domain, resolve_policy
+from ...topology import (
+    apply_policy,
+    blocks_selection,
+    count_in_domain,
+    resolve_policy,
+    warn_if_no_domain_match,
+)
 from .adapter import _get_model_name, build_sglang_load_context
 from .artifacts import (
     _sglang_health_ready,
@@ -309,7 +315,10 @@ class MxModelLoader:
 
         if not response.instances:
             selection_metrics.record_list_sources(policy, "empty")
-            for stage in ("listed", "rank_matched"):
+            stages = ["listed", "rank_matched"]
+            if topology_policy is not None:
+                stages.append("topology_matched")
+            for stage in stages:
                 selection_metrics.observe_candidates(policy, stage, 0)
             return None
 
@@ -323,19 +332,22 @@ class MxModelLoader:
         # RdmaStrategy; this is SGLang's separate transfer_engine path, which
         # discovers sources itself, so it applies the same selector here.
         selector = get_configured_selector()
-        rank_matched = len(candidates)
+        rank_matched = candidates
         candidates = apply_policy(selector.order(candidates, ctx), topology_policy)
-        topology_matched = count_in_domain(candidates, topology_policy)
-        selection_metrics.observe_candidates(policy, "topology_matched", topology_matched)
+        topology_field = ""
+        if topology_policy is not None:
+            topology_matched = count_in_domain(candidates, topology_policy)
+            selection_metrics.observe_candidates(policy, "topology_matched", topology_matched)
+            topology_field = f" source_candidates_topology_matched={topology_matched}"
+            warn_if_no_domain_match(rank_matched, topology_policy, ctx.global_rank)
         logger.info(
             "[Worker %s] TransferEngine source selection: source_selector=%s "
-            "source_candidates_total=%d source_candidates_rank_matched=%d "
-            "source_candidates_topology_matched=%d",
+            "source_candidates_total=%d source_candidates_rank_matched=%d%s",
             ctx.global_rank,
             selector.name,
             len(response.instances),
-            rank_matched,
-            topology_matched,
+            len(rank_matched),
+            topology_field,
         )
         for source_ref in candidates:
             metadata = ctx.mx_client.get_metadata(

@@ -22,6 +22,7 @@ from modelexpress.topology import (
     apply_policy,
     blocks_selection,
     count_in_domain,
+    warn_if_no_domain_match,
     local_topology,
     resolve_levels,
     resolve_policy,
@@ -435,6 +436,37 @@ def test_resolve_policy_unknown_local_value(monkeypatch):
     assert resolve_policy(timeout=0).local_value is None
 
 
+def test_resolve_policy_preferred_does_not_wait(monkeypatch):
+    # preferred with an unknown value only keeps the selector's order.
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "zone")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_ENFORCEMENT", "preferred")
+    monkeypatch.delenv("MX_P2P_TOPOLOGY", raising=False)
+    sleeps = []
+    monkeypatch.setattr("modelexpress.topology.time.sleep", sleeps.append)
+    assert resolve_policy(timeout=30.0).local_value is None
+    assert sleeps == []
+
+
+def test_resolve_policy_logs_actual_wait(monkeypatch, caplog):
+    # After the first expiry later calls wait 0s; the log must not claim 30s.
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "zone")
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_ENFORCEMENT", raising=False)
+    monkeypatch.delenv("MX_P2P_TOPOLOGY", raising=False)
+    clock = [0.0]
+    monkeypatch.setattr("modelexpress.topology.time.monotonic", lambda: clock[0])
+
+    def fake_sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr("modelexpress.topology.time.sleep", fake_sleep)
+    with caplog.at_level("WARNING", logger="modelexpress.topology"):
+        resolve_policy(timeout=30.0)
+        resolve_policy(timeout=30.0)
+    waits = [r.getMessage() for r in caplog.records if "reports no value" in r.getMessage()]
+    assert "waited 30.0s" in waits[0]
+    assert "waited 0.0s" in waits[1]
+
+
 def test_wait_for_domain_polls_until_file_appears(monkeypatch, tmp_path):
     # The operator patches the pod label after scheduling, so the Downward API
     # file shows up only after startup has begun.
@@ -505,9 +537,20 @@ def test_blocks_selection_only_for_required_with_unknown_local():
 
 def test_count_in_domain():
     refs = [_zone_ref("a", "az2"), _zone_ref("b", "az1"), _zone_ref("c"), _zone_ref("d", "az1")]
-    assert count_in_domain(refs, None) == 4
     assert count_in_domain(refs, _policy("preferred")) == 2
     assert count_in_domain(refs, _policy(local_value=None)) == 0
+
+
+def test_warn_if_no_domain_match(caplog):
+    refs = [_zone_ref("a", "az2"), _zone_ref("b")]
+    with caplog.at_level("WARNING", logger="modelexpress.topology"):
+        warn_if_no_domain_match(refs, _policy("preferred"), 0)
+        warn_if_no_domain_match([], _policy(), 0)
+        warn_if_no_domain_match(refs + [_zone_ref("c", "az1")], _policy(), 0)
+        assert caplog.records == []
+        warn_if_no_domain_match(refs, _policy(), 0)
+    assert "1 without published 'zone'" in caplog.text
+    assert "1 in another zone" in caplog.text
 
 
 def test_apply_policy_preferred_is_a_stable_partition():

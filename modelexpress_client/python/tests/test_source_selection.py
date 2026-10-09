@@ -280,18 +280,25 @@ def test_no_peers_published_records_a_zero_funnel(monkeypatch):
     m = MagicMock()
     monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
     monkeypatch.delenv(ENV_SELECTOR, raising=False)
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_DOMAIN", raising=False)
 
     ctx = _rdma_ctx([])
     assert RdmaStrategy()._find_source_instances(ctx) == []
 
     m.record_list_sources.assert_called_once_with("random", "empty")
     observed = {call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list}
-    assert observed == {
-        "listed": 0,
-        "rank_matched": 0,
-        "accelerator_matched": 0,
-        "topology_matched": 0,
-    }
+    assert observed == {"listed": 0, "rank_matched": 0, "accelerator_matched": 0}
+
+
+def test_no_peers_with_topology_policy_records_topology_stage(monkeypatch):
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    _require_zone(monkeypatch, "az1")
+
+    assert RdmaStrategy()._find_source_instances(_rdma_ctx([])) == []
+
+    observed = {call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list}
+    assert observed["topology_matched"] == 0
 
 
 def test_list_sources_rpc_failure_is_recorded_not_silent(monkeypatch):
@@ -419,6 +426,30 @@ def test_find_source_instances_preferred_zone_funnel_counts_same_zone(monkeypatc
     observed = {call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list}
     assert len(out) == 3
     assert observed["topology_matched"] == 1
+
+
+def test_find_source_instances_without_policy_omits_topology_stage(monkeypatch):
+    # With the feature off the stage would only duplicate accelerator_matched.
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_DOMAIN", raising=False)
+    RdmaStrategy()._find_source_instances(_rdma_ctx([_zone_ref("s0aaaaaaaaaaaaaa", "w0", "az2")]))
+    stages = {call.args[1] for call in m.observe_candidates.call_args_list}
+    assert "topology_matched" not in stages
+
+
+def test_find_source_instances_required_zone_warns_when_none_match(monkeypatch, caplog):
+    # Targets upgraded before sources: compatible sources exist but none
+    # published the zone, so the warning must say why nothing was selected.
+    _require_zone(monkeypatch, "az1")
+    instances = [
+        _zone_ref("s0aaaaaaaaaaaaaa", "old-0", None),
+        _zone_ref("s1aaaaaaaaaaaaaa", "far-0", "az2"),
+    ]
+    with caplog.at_level(logging.WARNING, logger="modelexpress.topology"):
+        assert RdmaStrategy()._find_source_instances(_rdma_ctx(instances)) == []
+    assert "No P2P source shares zone='az1'" in caplog.text
+    assert "2 compatible source(s), 1 without published 'zone'" in caplog.text
 
 
 def test_find_source_instances_empty_accelerator_is_compatible():
@@ -1417,3 +1448,44 @@ def test_an_unknown_phase_is_dropped_and_an_unknown_outcome_clamps(monkeypatch):
     collector.observe_source_attempt_phase_seconds("random", "receive", "not_an_outcome", 1.0)
     phases, _ = _phase_series(collector)
     assert set(phases) == {("receive", "error")}, phases
+
+
+def test_required_zone_all_sources_cross_domain_falls_through_chain(monkeypatch):
+    """End to end through the chain: every source is in another zone.
+
+    RDMA must not fetch metadata from (or attempt) any source, and the chain
+    must hand the unmutated model to the next strategy.
+    """
+    from modelexpress.load_strategy import execute_load_strategies
+
+    _require_zone(monkeypatch, "az1")
+    monkeypatch.setattr(RdmaStrategy, "is_available", lambda self, ctx: True)
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.publish_source_if_supported", lambda result, ctx: None
+    )
+
+    class NextStrategy:
+        name = "next"
+        calls = []
+
+        def is_available(self, ctx):
+            return True
+
+        def load(self, result, ctx):
+            self.calls.append(result.model)
+            return result
+
+        def rollback(self, ctx):
+            pass
+
+    instances = [_zone_ref(f"s{i}aaaaaaaaaaaaaa", f"far-{i}", "az2") for i in range(4)]
+    ctx = _rdma_ctx(instances)
+    ctx.nixl_manager = None
+    model = MagicMock()
+    rdma = RdmaStrategy()
+    rdma._load_as_target = MagicMock()
+
+    assert execute_load_strategies(model, ctx, [rdma, NextStrategy()]) is model
+    assert NextStrategy.calls == [model]
+    ctx.mx_client.get_metadata.assert_not_called()
+    rdma._load_as_target.assert_not_called()

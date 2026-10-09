@@ -227,13 +227,18 @@ def resolve_policy(timeout: Optional[float] = None) -> Optional[TopologyPolicy]:
             _DEFAULT_ENFORCEMENT,
         )
         enforcement = _DEFAULT_ENFORCEMENT
+    # Under preferred an unknown value only keeps the selector's order, which is
+    # not worth delaying the load for.
+    if enforcement != "required":
+        timeout = 0.0
+    start = time.monotonic()
     local_value = wait_for_domain(domain, timeout=timeout).get(domain)
     if local_value is None:
         logger.warning(
             "MX_P2P_TOPOLOGY_DOMAIN=%r but this node reports no value for it "
-            "after %.0fs (check MX_P2P_TOPOLOGY or %s)",
+            "(waited %.1fs; check MX_P2P_TOPOLOGY or %s)",
             domain,
-            timeout,
+            time.monotonic() - start,
             os.environ.get(_DYNAMO_TOPOLOGY_DIR_ENV, _DYNAMO_TOPOLOGY_DIR_DEFAULT),
         )
     return TopologyPolicy(domain=domain, enforcement=enforcement, local_value=local_value)
@@ -258,15 +263,44 @@ def in_domain(candidate, policy: TopologyPolicy) -> bool:
     )
 
 
-def count_in_domain(candidates: list, policy: Optional[TopologyPolicy]) -> int:
+def count_in_domain(candidates: list, policy: TopologyPolicy) -> int:
     """Same-domain candidates, for the ``topology_matched`` funnel stage.
 
     Counted separately from ``apply_policy``'s output because ``preferred``
-    keeps every candidate. With no policy every candidate is eligible.
+    keeps every candidate.
     """
-    if policy is None:
-        return len(candidates)
     return sum(1 for c in candidates if in_domain(c, policy))
+
+
+def warn_if_no_domain_match(
+    candidates: list, policy: Optional[TopologyPolicy], worker: object
+) -> None:
+    """Explain an empty selection when ``required`` dropped every compatible source.
+
+    Otherwise the only signal is ``topology_matched=0``. The usual cause during
+    a rollout is sources whose client predates published topology metadata.
+    """
+    if policy is None or not policy.required or not candidates:
+        return
+    if any(in_domain(c, policy) for c in candidates):
+        return
+    missing = sum(
+        1 for c in candidates if not (getattr(c, "topology", None) or {}).get(policy.domain)
+    )
+    logger.warning(
+        "[Worker %s] No P2P source shares %s=%r: %d compatible source(s), %d "
+        "without published %r (client predates topology metadata, or no topology "
+        "source), %d in another %s. Upgrade sources before targets require the "
+        "domain, or use MX_P2P_TOPOLOGY_ENFORCEMENT=preferred during the rollout.",
+        worker,
+        policy.domain,
+        policy.local_value,
+        len(candidates),
+        missing,
+        policy.domain,
+        len(candidates) - missing,
+        policy.domain,
+    )
 
 
 def apply_policy(candidates: list, policy: Optional[TopologyPolicy]) -> list:
