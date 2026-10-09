@@ -20,7 +20,6 @@ from modelexpress_rl import (
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
     def __init__(self) -> None:
-        """Initialize an empty version store and a trainer mesh at generation one."""
         self.version = None
         self.mesh = refit_pb2.TrainerMesh(
             mesh_id="mesh-a", model_name="test/model", generation=1
@@ -60,7 +59,6 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
     def CreateWeightVersion(
         self, request, _context
     ) -> refit_pb2.CreateWeightVersionResponse:
-        """Stamp new versions from the mesh and preserve stamps on idempotent retries."""
         if (
             self.version is not None
             and self.version.idempotency_key == request.idempotency_key
@@ -111,7 +109,6 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
 
 
 def test_weight_version_requires_generation_at_construction() -> None:
-    """Require callers constructing version objects to supply their recorded generation."""
     with pytest.raises(TypeError, match="trainer_mesh_generation"):
         control_module.WeightVersion(
             version_id="version-a",
@@ -204,7 +201,6 @@ def test_control_client_links_version_to_trainer_mesh():
 
 
 def test_control_client_owns_global_weight_version_lifecycle() -> None:
-    """Preserve version identity and generation across creation retries and state changes."""
     service = _RefitService()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)

@@ -129,7 +129,6 @@ where
     })
 }
 
-/// Decode a stored version, requiring its generation field to parse as a uint64.
 fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersion> {
     let trainer_mesh_id = fields
         .get("trainer_mesh_id")
@@ -482,7 +481,6 @@ impl RefitBackend for RedisRefitBackend {
         mesh_from_hash(fields)
     }
 
-    /// Apply a generation-checked membership update subject to linked reader leases.
     async fn update_trainer_mesh(
         &self,
         mesh_id: &str,
@@ -593,7 +591,6 @@ impl RefitBackend for RedisRefitBackend {
         Ok(worker)
     }
 
-    /// Create a generation-stamped version or return its original idempotent result.
     async fn create_weight_version(
         &self,
         request: &CreateWeightVersionRequest,
@@ -768,7 +765,6 @@ impl RefitBackend for RedisRefitBackend {
             .await
     }
 
-    /// Publish a shard only while its recorded trainer generation remains current.
     async fn create_weight_version_shard(
         &self,
         shard: WeightVersionShard,

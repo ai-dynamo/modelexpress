@@ -115,7 +115,6 @@ def _mesh_workers(
 
 
 def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
-    """Decode the wire version, including its recorded trainer mesh generation."""
     payload_formats = {
         refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR: WeightPayloadFormat.FULL_TENSOR,
         refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA: WeightPayloadFormat.XOR_DELTA,

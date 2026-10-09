@@ -652,7 +652,6 @@ async fn linked_reader_lease_fences_replica_addition_until_release_or_expiry() {
 
 #[tokio::test]
 #[ignore = "requires a live Redis at REDIS_URL"]
-/// Discover current mesh publications and reject publication through stale versions.
 async fn mesh_linked_versions_publish_and_discover_declared_trainers() {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
@@ -937,7 +936,6 @@ async fn mesh_linked_versions_publish_and_discover_declared_trainers() {
 
 #[tokio::test]
 #[ignore = "requires a live Redis at REDIS_URL"]
-/// Require current-generation shard coverage before a staged version becomes ready.
 async fn staged_mesh_readiness_requires_current_publications() {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
@@ -1128,7 +1126,6 @@ async fn removed_mesh_worker_publications_retire_after_readers_drain() {
     mesh_worker_rebinding_retires_publication(true).await;
 }
 
-/// Retire old publications after endpoint or worker replacement and reader drain.
 async fn mesh_worker_rebinding_retires_publication(replace_worker_id: bool) {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());

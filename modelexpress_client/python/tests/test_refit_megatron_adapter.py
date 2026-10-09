@@ -71,7 +71,6 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         return refit_pb2.RegisterWorkerResponse(worker=request.worker)
 
     def GetWeightVersion(self, request, _context) -> refit_pb2.GetWeightVersionResponse:
-        """Return a generation-stamped trainer version for the requested identifier."""
         return refit_pb2.GetWeightVersionResponse(
             version=refit_pb2.WeightVersion(uid=request.uid, trainer_mesh_id="mesh-a", trainer_mesh_generation=1)
         )

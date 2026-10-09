@@ -100,7 +100,6 @@ class TrainerSourceResolver(SourceResolver):
         return version.payload_format
 
     def candidates(self, version: WeightVersion) -> Iterator[ResolvedSource]:
-        """Resolve trainer replicas only while the requested mesh identity remains current."""
         if version.trainer_mesh_id is None:
             raise RuntimeError("trainer publication requires trainer_mesh_id")
         try:
