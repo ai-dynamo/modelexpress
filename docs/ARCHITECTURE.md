@@ -378,6 +378,8 @@ Cache eviction parses the key back to delete the right snapshot. It keeps the fi
 
 Key message types: `SourceIdentity` (all fields affecting tensor layout compatibility and `mx_source_id`), `WorkerMetadata` (rank, runtime `accelerator`, oneof backend_metadata, tensors, status, P2P endpoint fields), `TensorDescriptor` (name, addr, size, device_id, dtype), `SourceInstanceRef` (lightweight worker reference for listing, including runtime `accelerator` for pre-fetch compatibility filtering).
 
+Rust and Python compute `mx_source_id` from the same normalized, sorted-key JSON encoded as UTF-8, preserving non-ASCII identity strings.
+
 ### p2p.proto - WorkerService (P2P, opt-in)
 
 | RPC | Request | Response | Purpose |

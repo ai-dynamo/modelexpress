@@ -4,7 +4,7 @@
 """Content-addressed source ID computation.
 
 Mirrors the Rust ``compute_mx_source_id`` in
-``modelexpress_server/src/source_identity.rs``. When the central server
+``modelexpress_server/src/p2p/source_identity.rs``. When the central server
 is in the loop, it computes the ID and returns it to clients; in
 decentralized / K8s-Service-routed deployments where there is no central
 server, clients compute the ID locally. The two implementations MUST
@@ -80,4 +80,6 @@ def _canonical_json(identity: p2p_pb2.SourceIdentity) -> str:
     # them alphabetically on serialization. Match that ordering with
     # sort_keys=True so both sides produce the exact same bytes for
     # SHA256 to hash.
-    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    return json.dumps(
+        payload, separators=(",", ":"), sort_keys=True, ensure_ascii=False
+    )
