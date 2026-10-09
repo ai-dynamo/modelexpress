@@ -188,7 +188,7 @@ jobs:
 
       - name: Build and push
         run: |
-          docker buildx build \
+          bash .github/scripts/build-with-registry-retry.sh \
             --platform linux/amd64 \
             -f ci/k8s/server/Dockerfile.server \
             -t "${SERVER_IMAGE}" \
@@ -251,7 +251,7 @@ jobs:
       - name: Build and push
         # Build context is repo root — Dockerfiles COPY from modelexpress_client/python/.
         run: |
-          docker buildx build \
+          bash .github/scripts/build-with-registry-retry.sh \
             --platform linux/amd64 \
             -f "${{ matrix.dockerfile }}" \
             -t "${WORKER_IMAGE}" \
@@ -270,7 +270,7 @@ jobs:
 
   # Build the trainer and rollout images used by the Vime delta-refit smoke.
   build-vime-delta-refit:
-    name: Build Vime delta-refit images
+    name: RL Vime delta-refit build
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
       contents: read
@@ -302,11 +302,11 @@ jobs:
 
       - name: Build and push trainer and rollout
         run: |
-          docker buildx build --platform linux/amd64 \
+          bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 \
             -f examples/rl/vime_dynamo_delta_refit/Dockerfile \
             --target trainer --push \
             -t "${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:${{ github.sha }}" .
-          docker buildx build --platform linux/amd64 \
+          bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 \
             -f examples/rl/vime_dynamo_delta_refit/Dockerfile \
             --build-context dynamo="${RUNNER_TEMP}/dynamo" \
             --target worker --push \
@@ -962,7 +962,7 @@ jobs:
 
   # Ten-step TP2 trainer + TP1 Dynamo rollout smoke on three H100s.
   test-vime-delta-refit:
-    name: Vime delta-refit smoke
+    name: RL Vime delta-refit smoke
     runs-on: prod-deploy-tester-v1
     timeout-minutes: 120
     needs: [build-vime-delta-refit]
@@ -1041,7 +1041,7 @@ jobs:
           fi
 
   test-vime-delta-refit-cleanup:
-    name: Vime delta-refit cleanup
+    name: RL Vime delta-refit cleanup
     runs-on: prod-deploy-tester-v1
     needs: [test-vime-delta-refit]
     if: always()
@@ -1173,7 +1173,7 @@ jobs:
           fleet_size: "5"
           wave_sizes: "5"
           rolling_update: "true"
-          rollout_timeout_seconds: "600"
+          rollout_timeout_seconds: "900"
 
       - name: Dump vCluster diagnostics on failure
         if: failure()

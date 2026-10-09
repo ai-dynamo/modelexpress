@@ -305,7 +305,7 @@ runs:
             fi
             local failed
             failed=$(kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers 2>/dev/null \
-              | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
+              | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)
             if [ -n "${failed}" ]; then
               echo "ERROR: source pod failed before publishing artifact metadata: ${failed}"
               return 1
@@ -348,7 +348,7 @@ runs:
             break
           fi
           FAILED=$(kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers 2>/dev/null \
-            | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
+            | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)
           if [ -n "${FAILED}" ]; then
             echo "ERROR: source pod failed before publishing metadata: ${FAILED}"
             exit 1
