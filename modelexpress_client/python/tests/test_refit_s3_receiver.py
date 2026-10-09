@@ -1218,6 +1218,94 @@ def test_canonical_s3_replays_multiple_deltas_before_one_install(monkeypatch, tm
     adapter.close()
 
 
+def _two_delta_objects():
+    base = torch.tensor([1.0, 2.0])
+    first = torch.tensor([3.0, 4.0])
+    target = torch.tensor([5.0, 6.0])
+    objects = _artifact(base.view(torch.uint8).numpy(), first.view(torch.uint8).numpy())
+    objects.update(
+        _artifact(
+            first.view(torch.uint8).numpy(),
+            target.view(torch.uint8).numpy(),
+            version="target-b",
+            version_label=2,
+            base_version="target-a",
+        )
+    )
+    return objects
+
+
+def _colocated(tmp_path):
+    return _Adapter(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path=tmp_path / "launch",
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+    )
+
+
+def _two_delta_chain():
+    return (
+        _inputs(None),
+        _inputs(None, version="target-b", version_label=2, base_version="target-a"),
+    )
+
+
+def test_canonical_s3_prepared_delta_records_changed_tensor_lineage(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
+    adapter, _ = _build(monkeypatch, tmp_path, _two_delta_objects())
+
+    staged = adapter.stage_chain(_two_delta_chain())
+
+    assert staged.delta_changes == (
+        receiver_module.DeltaChange("base-a", "target-a", frozenset({"weight"})),
+        receiver_module.DeltaChange("target-a", "target-b", frozenset({"weight"})),
+    )
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_colocated_rank_reusing_prepared_target_gets_the_same_lineage(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
+    adapter, _ = _build(monkeypatch, tmp_path, _two_delta_objects())
+    follower = _colocated(tmp_path)
+    staged = adapter.stage_chain(_two_delta_chain())
+
+    reused = follower.stage_chain(_two_delta_chain())
+
+    assert reused.metrics["perf/mx_receive_delta_download"] == 0.0
+    assert reused.delta_changes == staged.delta_changes
+    follower.release_staged_weight(reused)
+    adapter.release_staged_weight(staged)
+    follower.close()
+    adapter.close()
+
+
+def test_missing_delta_index_drops_lineage_instead_of_guessing(monkeypatch, tmp_path):
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
+    adapter, _ = _build(monkeypatch, tmp_path, _two_delta_objects())
+    follower = _colocated(tmp_path)
+    staged = adapter.stage_chain(_two_delta_chain())
+    store = adapter._checkpoint.store
+    (store.delta_path("target-a") / "model.safetensors.index.json").unlink()
+
+    reused = follower.stage_chain(_two_delta_chain())
+
+    assert staged.delta_changes
+    assert reused.delta_changes == ()
+    follower.release_staged_weight(reused)
+    adapter.release_staged_weight(staged)
+    follower.close()
+    adapter.close()
+
+
 def test_canonical_s3_validates_all_replay_manifests_before_mutation(
     monkeypatch, tmp_path
 ):
@@ -3337,3 +3425,43 @@ def test_installed_target_becomes_the_next_exact_base(monkeypatch, tmp_path):
         load_file(staged.path / "model.safetensors")["weight"],
         second_tensor,
     )
+
+
+@pytest.mark.parametrize("flag", [None, "false"])
+def test_disabled_surgical_does_not_read_lineage(monkeypatch, tmp_path, flag):
+    if flag is None:
+        monkeypatch.delenv("MX_REFIT_DELTA_SURGICAL", raising=False)
+    else:
+        monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", flag)
+    adapter, _ = _build(monkeypatch, tmp_path, _two_delta_objects())
+    staged = adapter.stage_chain(_two_delta_chain())
+
+    def unexpected_read(_version):
+        raise AssertionError("disabled surgical feature must not read lineage")
+
+    monkeypatch.setattr(adapter._checkpoint.store, "chain", unexpected_read)
+    assert staged.delta_changes == ()
+    assert adapter._checkpoint._delta_changes("target-b") == ()
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        [],
+        {"metadata": [], "weight_map": {}},
+        {"metadata": {"base_version": "wrong"}, "weight_map": {}},
+    ],
+)
+def test_malformed_delta_lineage_falls_back(monkeypatch, tmp_path, index):
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
+    adapter, _ = _build(monkeypatch, tmp_path, _two_delta_objects())
+    staged = adapter.stage_chain(_two_delta_chain())
+    store = adapter._checkpoint.store
+    (store.delta_path("target-a") / "model.safetensors.index.json").write_text(
+        json.dumps(index)
+    )
+    assert adapter._checkpoint._delta_changes("target-b") == ()
+    adapter.release_staged_weight(staged)
+    adapter.close()

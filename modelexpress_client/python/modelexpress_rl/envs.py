@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     MX_REFIT_DESIRED_VERSION_UID: str | None
     MX_REFIT_CHECKPOINT_DIR: str | None
     MX_REFIT_DELTA_BUCKET_BYTES: int
+    MX_REFIT_DELTA_SURGICAL: bool
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
@@ -174,6 +175,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_S3_TCP_KEEPALIVE": lambda: parse_bool(
         os.environ.get("MX_S3_TCP_KEEPALIVE", "true"),
         "MX_S3_TCP_KEEPALIVE",
+    ),
+    # Install a delta by reloading only the modules it changes.
+    "MX_REFIT_DELTA_SURGICAL": lambda: parse_bool(
+        os.environ.get("MX_REFIT_DELTA_SURGICAL", "false"),
+        "MX_REFIT_DELTA_SURGICAL",
     ),
     # One normalized timing record per generator refit. On by default: the
     # durations are already being measured on the staging path, so recording

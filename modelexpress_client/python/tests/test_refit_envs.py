@@ -34,6 +34,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_S3_MAX_POOL_CONNECTIONS == 32
     assert envs.MX_S3_MAX_ATTEMPTS == 5
     assert envs.MX_S3_TCP_KEEPALIVE is True
+    assert envs.MX_REFIT_DELTA_SURGICAL is False
 
 
 def test_values_are_normalized_and_read_live(monkeypatch):
@@ -141,3 +142,11 @@ def test_s3_tcp_keepalive_rejects_invalid_boolean(monkeypatch):
     monkeypatch.setenv("MX_S3_TCP_KEEPALIVE", "sometimes")
     with pytest.raises(ValueError, match="MX_S3_TCP_KEEPALIVE must be a boolean"):
         _ = envs.MX_S3_TCP_KEEPALIVE
+
+
+def test_delta_surgical_parses_boolean(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
+    assert envs.MX_REFIT_DELTA_SURGICAL is True
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "maybe")
+    with pytest.raises(ValueError, match="MX_REFIT_DELTA_SURGICAL"):
+        envs.MX_REFIT_DELTA_SURGICAL
