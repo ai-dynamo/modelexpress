@@ -757,6 +757,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for decentralized backends where no central coordinator tracks versions. |
+| `MX_SOURCE_DOMAIN` | `""` (unset) | Locality label folded into `SourceIdentity.extra_parameters["source_domain"]` of every weights and cache-artifact identity a worker publishes or discovers with. Workers only see peers with the same value, so set it to the scope within which peers can actually reach each other (a Kubernetes namespace via the downward API, a zone, a cluster). Opaque to ModelExpress. Unset leaves identities and `mx_source_id`s unchanged. See [Partitioning discovery by locality](#partitioning-discovery-by-locality). |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` backend: sleep between retry attempts. |
@@ -965,6 +966,42 @@ their non-tensor derived state cannot currently be refreshed by a direct copy.
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
 For cache artifact transfer, set `MX_ARTIFACT_TRANSFER=1` on source and target workers. The default P2P metadata path is also required; if it was disabled, set `MX_P2P_METADATA=1`. The vLLM and SGLang NIXL loaders install compatible artifacts before model initialization, then schedule publisher threads after successful load. Each publisher waits for readiness before publishing local cache directories and waits for their file count, total size, and max mtime to settle before sealing the artifact.
+
+### Partitioning discovery by locality
+
+`ListSources` returns every READY source whose `mx_source_id` matches the
+target's identity, and the broker has no notion of which of them the target can
+reach. On the P2P metadata path the target then dials each candidate's own
+worker endpoint for its tensor manifest, and an unreachable peer (for example a
+pod in a namespace that a network policy blocks) costs the full manifest-fetch
+timeout plus a model re-initialization before the next candidate is tried.
+
+`MX_SOURCE_DOMAIN` partitions discovery on the client side. When set, the value
+is written to `SourceIdentity.extra_parameters["source_domain"]` on every
+weights identity (vLLM, SGLang, TRT-LLM) and every cache-artifact identity a
+worker publishes or discovers with, so workers that do not share the value
+compute different `mx_source_id`s and never see each other. Nothing changes on
+the server, in the wire format, or in the selectors. Set it to the scope within
+which peers can reach one another:
+
+```yaml
+env:
+  - name: MX_SOURCE_DOMAIN
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.namespace
+```
+
+The value is opaque: a zone or cluster name works the same way. Leave it unset
+where peers are reachable everywhere the broker can see, since partitioning
+there only removes sources; [Sharing One Server Across Namespaces](#sharing-one-server-across-namespaces)
+describes that unpartitioned pool. Rolling the variable onto a running fleet splits it
+transiently: workers with and without the value stop pairing with each other
+until the roll completes, then pair again within each domain.
+
+The refit rendezvous identity (trainer to generator) is not partitioned by this
+variable; it carries its own `role` extra parameter and pairs across
+deployments by design.
 
 vLLM publishes torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), DeepGEMM (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes vLLM's persistent autotune directory from `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR`, or `VLLM_CACHE_ROOT/flashinfer_autotune_cache` when unset; ModelExpress does not change either path.
 

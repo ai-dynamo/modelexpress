@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     MX_MODEL_REVISION: str
     MX_MODEL_URI: Optional[str]
     MX_LOAD_STRATEGY_CHAIN: str
+    MX_SOURCE_DOMAIN: str
     MX_P2P_METADATA: str
     MX_RESHARD_FUSED_WIRE: bool
     MX_RESHARD_BATCH_INSTALL: bool
@@ -280,6 +281,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_LOAD_STRATEGY_CHAIN": lambda: (
         os.environ.get("MX_LOAD_STRATEGY_CHAIN", "INFERENCE").strip().upper()
     ),
+    # Locality label folded into every weights and artifact SourceIdentity so
+    # discovery only returns peers this worker can reach. Opaque to MX.
+    "MX_SOURCE_DOMAIN": lambda: os.environ.get("MX_SOURCE_DOMAIN", "").strip(),
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
     "MX_RESHARD_FUSED_WIRE": lambda: _env_bool("MX_RESHARD_FUSED_WIRE", True),
     # Issue the per-view re-slice copies of full-pulled sources as one batched

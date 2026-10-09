@@ -17,6 +17,7 @@ from ... import envs
 from ... import p2p_pb2
 from ...load_strategy.context import LoadContext
 from ...metadata import artifact_lifecycle as _common_artifacts
+from ...metadata.source_domain import apply_source_domain
 from ...metadata.artifact_transfer import (
     ArtifactCacheRoot,
     P2PArtifactTransfer,
@@ -224,7 +225,10 @@ def _artifact_identity(
         raise ValueError(
             f"unknown SGLang artifact source type: {mx_source_type}"
         )
-    return builder(ctx)
+    # Artifact identities are built from scratch rather than copied from
+    # ctx.identity, so the locality partition is applied here as well; weights
+    # and artifacts must agree on which peers exist.
+    return apply_source_domain(builder(ctx))
 
 
 def _torch_compile_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:

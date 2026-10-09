@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from ... import envs
 from ... import p2p_pb2
+from ...metadata.source_domain import apply_source_domain
 
 
 def _derive_expert_parallel_size(parallel) -> int:
@@ -61,7 +62,7 @@ def build_source_identity(
     dtype = str(model_config.dtype).replace("torch.", "")
     quantization = model_config.quantization or ""
 
-    return p2p_pb2.SourceIdentity(
+    identity = p2p_pb2.SourceIdentity(
         mx_version=mx_version,
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
         model_name=model_config.model,
@@ -73,6 +74,7 @@ def build_source_identity(
         quantization=quantization,
         revision=_resolve_model_revision(model_config),
     )
+    return apply_source_domain(identity)
 
 
 def _resolve_model_revision(model_config) -> str:
