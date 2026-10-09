@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-FROM rust:1.90 AS builder
+FROM public.ecr.aws/docker/library/rust:1.90 AS builder
 
 WORKDIR /app
 

@@ -197,7 +197,7 @@ runs:
             break
           fi
           FAILED=$(kubectl get pods -n "${NAMESPACE}" -l app=mx-fleet-worker --no-headers 2>/dev/null \
-            | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
+            | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)
           if [ -n "${FAILED}" ]; then
             echo "ERROR: worker pod failed before becoming Ready: ${FAILED}"
             exit 1
@@ -243,7 +243,7 @@ runs:
               break
             fi
             FAILED=$(kubectl get pods -n "${NAMESPACE}" -l app=mx-fleet-worker --no-headers 2>/dev/null \
-              | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
+              | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)
             if [ -n "${FAILED}" ]; then
               echo "ERROR: a worker pod failed during wave ${WAVE}: ${FAILED}"
               exit 1

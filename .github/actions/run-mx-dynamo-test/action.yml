@@ -169,7 +169,7 @@ runs:
         DGD_NAME: ${{ inputs.dgd_name }}
       run: |
         echo "::group::Apply DGD ${MANIFEST} (name=${DGD_NAME})"
-        envsubst < "${MANIFEST}" | kubectl apply -n "${NAMESPACE}" -f -
+        bash "${{ github.action_path }}/apply-dgd.sh" "${MANIFEST}" "${NAMESPACE}"
         echo "::endgroup::"
 
     - name: Resolve mode-specific parameters

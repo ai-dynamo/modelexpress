@@ -39,6 +39,10 @@ env:
 
 jobs:
   validate:
+    concurrency:
+      group: ${{ github.workflow }}-${{ inputs.pull_request || github.ref_name }}-rl-refit-validate
+      cancel-in-progress: true
+    name: RL refit validation
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -66,6 +70,10 @@ jobs:
           echo "harness_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
+    concurrency:
+      group: ${{ github.workflow }}-${{ inputs.pull_request || github.ref_name }}-rl-refit-build
+      cancel-in-progress: true
+    name: RL refit build
     needs: validate
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 60
@@ -111,7 +119,10 @@ jobs:
           echo "worker=$repo/mx-bench-worker@$(jq -r '."containerimage.digest"' worker-build.json)" >> "$GITHUB_OUTPUT"
 
   test:
-    name: "Refit (${{ inputs.model }})"
+    concurrency:
+      group: ${{ github.workflow }}-${{ inputs.pull_request || github.ref_name }}-rl-refit-test
+      cancel-in-progress: true
+    name: "RL refit (${{ inputs.model }})"
     needs: [validate, build]
     runs-on: prod-deploy-tester-v1
     timeout-minutes: 60
@@ -156,7 +167,9 @@ jobs:
           TEST_SHA: ${{ inputs.sha }}
         run: echo "RL weight refit CI of $TEST_SHA; evidence is attached to this run." >> "$GITHUB_STEP_SUMMARY"
 
+  # Keep queued and running cleanup outside the cancellation groups.
   cleanup:
+    name: RL refit cleanup
     needs: [validate, build, test]
     if: ${{ always() && needs.build.result == 'success' && needs.test.result != 'skipped' }}
     runs-on: prod-deploy-tester-v1

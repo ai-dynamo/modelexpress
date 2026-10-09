@@ -125,12 +125,7 @@ on:
     branches:
       - "pull-request/[0-9]+"
 
-concurrency:
-  # github.ref_name is the bot-created branch (e.g. `pull-request/123`), so
-  # Serialize each PR so a later push cannot cancel S3 cleanup.
-  group: ${{ github.workflow }}-${{ github.ref_name }}
-  cancel-in-progress: false
-  queue: max
+# Cancel superseded work per job; cleanup remains independent of newer runs.
 
 env:
   MX_CI_MODEL: Qwen/Qwen2.5-0.5B
@@ -161,6 +156,9 @@ jobs:
   # Uses a public ubuntu:24.04 runtime base — no NGC org access required.
   # ---------------------------------------------------------------------------
   build-server:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-build-server
+      cancel-in-progress: true
     name: Build server image
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -188,7 +186,7 @@ jobs:
 
       - name: Build and push
         run: |
-          docker buildx build \
+          bash .github/scripts/build-with-registry-retry.sh \
             --platform linux/amd64 \
             -f ci/k8s/server/Dockerfile.server \
             -t "${SERVER_IMAGE}" \
@@ -211,6 +209,9 @@ jobs:
   # The test job reconstructs this tag from the same inputs — no job output needed.
   # ---------------------------------------------------------------------------
   build-client:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-build-client-${{ strategy.job-index }}
+      cancel-in-progress: true
     name: Build worker image (${{ matrix.framework }})
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -251,7 +252,7 @@ jobs:
       - name: Build and push
         # Build context is repo root — Dockerfiles COPY from modelexpress_client/python/.
         run: |
-          docker buildx build \
+          bash .github/scripts/build-with-registry-retry.sh \
             --platform linux/amd64 \
             -f "${{ matrix.dockerfile }}" \
             -t "${WORKER_IMAGE}" \
@@ -270,7 +271,10 @@ jobs:
 
   # Build the trainer and rollout images used by the Vime delta-refit smoke.
   build-vime-delta-refit:
-    name: Build Vime delta-refit images
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-build-vime-delta-refit
+      cancel-in-progress: true
+    name: RL Vime delta-refit build
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
       contents: read
@@ -302,11 +306,11 @@ jobs:
 
       - name: Build and push trainer and rollout
         run: |
-          docker buildx build --platform linux/amd64 \
+          bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 \
             -f examples/rl/vime_dynamo_delta_refit/Dockerfile \
             --target trainer --push \
             -t "${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:${{ github.sha }}" .
-          docker buildx build --platform linux/amd64 \
+          bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 \
             -f examples/rl/vime_dynamo_delta_refit/Dockerfile \
             --build-context dynamo="${RUNNER_TEMP}/dynamo" \
             --target worker --push \
@@ -318,6 +322,9 @@ jobs:
   # jobs — the vCluster does not depend on any built image.
   # ---------------------------------------------------------------------------
   ensure-vcluster:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-ensure-vcluster
+      cancel-in-progress: true
     name: Ensure vCluster
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -429,6 +436,9 @@ jobs:
   # parallel execution in the future (remove max-parallel: 1 to enable).
   # ---------------------------------------------------------------------------
   test-p2p:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-test-p2p-${{ strategy.job-index }}
+      cancel-in-progress: true
     name: P2P test (${{ matrix.label || matrix.framework }})
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
@@ -627,6 +637,9 @@ jobs:
   # their results independent: one framework failing does not skip the other.
   # ---------------------------------------------------------------------------
   test-p2p-mla-model:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-test-p2p-mla-model-${{ strategy.job-index }}
+      cancel-in-progress: true
     name: P2P MLA model test (${{ matrix.framework }} TP=2)
     runs-on: prod-modelexpress-builder-amd-v1
     # Full-GPU pool is required because VRAM sampling is blocked on MIG slices.
@@ -712,6 +725,9 @@ jobs:
   # dropped in favor of the MLA one. See TEST_PLAN row 5.1.
   # ---------------------------------------------------------------------------
   test-tp:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-test-tp-${{ strategy.job-index }}
+      cancel-in-progress: true
     name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }} ${{ matrix.topology }})
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
@@ -807,6 +823,9 @@ jobs:
   # not skip the other).
   # ---------------------------------------------------------------------------
   test-parallel:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-test-parallel-${{ strategy.job-index }}
+      cancel-in-progress: true
     name: P2P ${{ matrix.label }} test (vllm)
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
@@ -896,6 +915,9 @@ jobs:
   # matrix entry of test-p2p.
   # ---------------------------------------------------------------------------
   test-with-dynamo:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-test-with-dynamo-${{ strategy.job-index }}
+      cancel-in-progress: true
     name: P2P test with Dynamo (${{ matrix.mode }})
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
@@ -962,7 +984,10 @@ jobs:
 
   # Ten-step TP2 trainer + TP1 Dynamo rollout smoke on three H100s.
   test-vime-delta-refit:
-    name: Vime delta-refit smoke
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-test-vime-delta-refit
+      cancel-in-progress: true
+    name: RL Vime delta-refit smoke
     runs-on: prod-deploy-tester-v1
     timeout-minutes: 120
     needs: [build-vime-delta-refit]
@@ -1041,7 +1066,7 @@ jobs:
           fi
 
   test-vime-delta-refit-cleanup:
-    name: Vime delta-refit cleanup
+    name: RL Vime delta-refit cleanup
     runs-on: prod-deploy-tester-v1
     needs: [test-vime-delta-refit]
     if: always()
@@ -1074,6 +1099,9 @@ jobs:
   # Scales in waves (1→5→10→15) so CI failures localise to a wave.
   # ---------------------------------------------------------------------------
   test-fleet-scale:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-test-fleet-scale
+      cancel-in-progress: true
     name: Fleet scale test (vLLM, 15 workers)
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
@@ -1128,6 +1156,9 @@ jobs:
   # terminates while four stay alive.
   # ---------------------------------------------------------------------------
   test-rolling-update:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-test-rolling-update-${{ strategy.job-index }}
+      cancel-in-progress: true
     name: Rolling-update test (${{ matrix.framework }}, 5 workers)
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
@@ -1173,7 +1204,7 @@ jobs:
           fleet_size: "5"
           wave_sizes: "5"
           rolling_update: "true"
-          rollout_timeout_seconds: "600"
+          rollout_timeout_seconds: "900"
 
       - name: Dump vCluster diagnostics on failure
         if: failure()
@@ -1197,6 +1228,9 @@ jobs:
   # framework-specific publish-path regressions in the reaper flow.
   # ---------------------------------------------------------------------------
   test-stale-metadata:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-test-stale-metadata-${{ strategy.job-index }}
+      cancel-in-progress: true
     name: Stale metadata test (${{ matrix.framework }})
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
@@ -1267,6 +1301,9 @@ jobs:
   # readiness, inference, and cleanup checks shared.
   # ---------------------------------------------------------------------------
   model-streamer:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-model-streamer-${{ strategy.job-index }}
+      cancel-in-progress: true
     name: Model Streamer ${{ matrix.mode }} test (${{ matrix.framework }}, S3)
     runs-on: prod-modelexpress-tester-amd-gpu-v1
     needs: [build-client]

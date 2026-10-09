@@ -4,7 +4,7 @@
 # CI image for the ModelExpress gRPC coordination server.
 # Builds from source so no NGC org access is required at build time.
 
-FROM rust:1.90 AS builder
+FROM public.ecr.aws/docker/library/rust:1.90 AS builder
 
 WORKDIR /app
 
@@ -16,7 +16,7 @@ COPY . .
 
 RUN cargo build --release --bin modelexpress-server
 
-FROM ubuntu:24.04 AS runtime
+FROM public.ecr.aws/docker/library/ubuntu:24.04 AS runtime
 
 WORKDIR /app
 

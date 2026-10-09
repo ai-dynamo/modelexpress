@@ -10,14 +10,12 @@ on:
 permissions:
   contents: read
 
-# Serialize requests for a PR so a later comment cannot cancel cleanup.
-concurrency:
-  group: bench-pr-${{ github.event.issue.number }}
-  cancel-in-progress: false
-  queue: max
-
 jobs:
   authorize:
+    concurrency:
+      group: bench-pr-${{ github.event.issue.number }}-authorize
+      cancel-in-progress: true
+    name: RL refit authorization
     if: >-
       github.repository == 'ai-dynamo/modelexpress' &&
       github.event.issue.pull_request &&
