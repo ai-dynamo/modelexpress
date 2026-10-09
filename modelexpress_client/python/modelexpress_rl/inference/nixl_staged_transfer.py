@@ -108,7 +108,7 @@ class _ResolvedSources:
 
 
 @dataclass(frozen=True)
-class _CachedPullPlan:
+class _WeightUpdatePlan:
     trainer_source_snapshot: TrainerSourceSnapshot
     generator_capture_snapshot: CaptureResult
     parameter_layout: MappingProxyType
@@ -836,7 +836,7 @@ class _NixlStagedTransfer:
         self._staging_registrations: list[Any] = []
         self._staging_device: torch.device | None = None
         self._manager_ready = True
-        self._cached_pull_plan: _CachedPullPlan | None = None
+        self._cached_pull_plan: _WeightUpdatePlan | None = None
         self._full_copy_descriptors: tuple[ReadDescriptor, ...] | None = None
         self._plan_compile_lock = threading.Lock()
         self._workspace_generation = 0
@@ -1023,7 +1023,7 @@ class _NixlStagedTransfer:
 
     def _publish_prepared(
         self,
-        cached: _CachedPullPlan,
+        cached: _WeightUpdatePlan,
         prepared: _PreparedNixlTransfer | _PreparedBoundedTransfer,
     ) -> None:
         self._cached_pull_plan = cached
@@ -1109,7 +1109,7 @@ class _NixlStagedTransfer:
                 transport=transport,
                 metrics=metrics,
             )
-            cached = _CachedPullPlan(
+            cached = _WeightUpdatePlan(
                 trainer,
                 capture,
                 MappingProxyType(parameter_layout),
@@ -1184,7 +1184,7 @@ class _NixlStagedTransfer:
                 compiled.batches, resolved.sources, transport, metrics
             )
             key = compiler._entry[0] if compiler._entry is not None else None
-            cached = _CachedPullPlan(
+            cached = _WeightUpdatePlan(
                 trainer,
                 capture,
                 MappingProxyType(parameter_layout),
