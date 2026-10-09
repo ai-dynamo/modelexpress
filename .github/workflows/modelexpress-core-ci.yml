@@ -241,7 +241,8 @@ jobs:
 
   python-proto-bindings:
     name: Python Generated Bindings
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 20
     permissions:
       contents: read
 
@@ -563,22 +564,33 @@ jobs:
 
     - name: Test Docker image
       run: |
-        NAME="mx-test-server-${{ github.run_id }}"
-        docker run --detach --name "${NAME}" "model-express:${{ github.run_id }}"
-        sleep 10
-        if [ "$(docker inspect -f '{{.State.Running}}' "${NAME}")" != "true" ]; then
-          docker logs "${NAME}"
-          echo "::warning::the server container exited before the health check"
-          exit 0
-        fi
-        IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${NAME}")
-        # Test that the server is responding (basic health check)
-        timeout 30 bash -c "until curl -s http://${IP}:8001/health; do sleep 1; done" || echo "Health check failed (expected for gRPC)"
+        ID="${{ github.run_id }}-${{ github.run_attempt }}"
+        docker network create "mx-test-${ID}"
+        docker run --detach --name "mx-test-redis-${ID}" --network "mx-test-${ID}" redis:7-alpine
+        docker run --detach --name "mx-test-server-${ID}" --network "mx-test-${ID}" \
+          -e MX_METADATA_BACKEND=redis -e REDIS_URL="redis://mx-test-redis-${ID}:6379" \
+          "model-express:${{ github.run_id }}"
+        for _ in $(seq 1 30); do
+          if [ "$(docker inspect -f '{{.State.Running}}' "mx-test-server-${ID}")" != "true" ]; then
+            docker logs "mx-test-server-${ID}"
+            echo "::error::the server container exited during startup"
+            exit 1
+          fi
+          if docker exec "mx-test-server-${ID}" ./modelexpress-cli health; then
+            exit 0
+          fi
+          sleep 1
+        done
+        docker logs "mx-test-server-${ID}"
+        echo "::error::the server did not report healthy within 30 seconds"
+        exit 1
 
     - name: Cleanup Docker image
       if: always()
       run: |
-        docker rm -f "mx-test-server-${{ github.run_id }}" 2>/dev/null || true
+        ID="${{ github.run_id }}-${{ github.run_attempt }}"
+        docker rm -f "mx-test-server-${ID}" "mx-test-redis-${ID}" 2>/dev/null || true
+        docker network rm "mx-test-${ID}" 2>/dev/null || true
         docker image rm -f "model-express:${{ github.run_id }}" 2>/dev/null || true
 
   k8s-grpc-test:
