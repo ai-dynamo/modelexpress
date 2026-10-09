@@ -339,8 +339,20 @@ class RefitWorkerExtension:
                 VocabParallelEmbedding,
             )
 
-            module_name, parameter_name = tensor_name.rsplit(".", 1)
-            module = self.model_runner.get_model().get_submodule(module_name)
+            model = self.model_runner.get_model()
+            mapper = getattr(model, "hf_to_vllm_mapper", None)
+            names = (
+                mapper.apply_list([tensor_name])
+                if mapper is not None
+                else [tensor_name]
+            )
+            if not names:
+                raise ValueError(
+                    f"checkpoint tensor excluded by the model mapper: {tensor_name}"
+                )
+            runtime_name = names[0]
+            module_name, parameter_name = runtime_name.rsplit(".", 1)
+            module = model.get_submodule(module_name)
             if (
                 not isinstance(module, VocabParallelEmbedding)
                 or parameter_name != "weight"
@@ -374,6 +386,7 @@ class RefitWorkerExtension:
                 {
                     "version": version_id,
                     "checkpoint_tensor": tensor_name,
+                    "runtime_tensor": runtime_name,
                     "shape": list(actual.shape),
                     "dtype": str(actual.dtype),
                     "expected_sha256": hashlib.sha256(

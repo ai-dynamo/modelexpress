@@ -34,13 +34,17 @@ class Tensor:
 
 
 @pytest.mark.parametrize("installed,verified", [([3, 4, 0], True), ([3, 9, 0], False)])
+@pytest.mark.parametrize(
+    "checkpoint_name",
+    ["model.embed_tokens.weight", "backbone.embeddings.weight", "excluded.weight"],
+)
 def test_runtime_tensor_uses_engine_sharding_without_mutating_weight(
-    monkeypatch, tmp_path, installed, verified
+    monkeypatch, tmp_path, installed, verified, checkpoint_name
 ):
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     (checkpoint / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"model.embed_tokens.weight": "weights.safetensors"}})
+        json.dumps({"weight_map": {checkpoint_name: "weights.safetensors"}})
     )
     live = Tensor(installed)
     loader_calls = []
@@ -70,7 +74,7 @@ def test_runtime_tensor_uses_engine_sharding_without_mutating_weight(
             pass
 
         def get_tensor(self, name):
-            assert name == "model.embed_tokens.weight"
+            assert name == checkpoint_name
             return Tensor([1, 2, 3, 4])
 
     monkeypatch.setitem(
@@ -102,29 +106,46 @@ def test_runtime_tensor_uses_engine_sharding_without_mutating_weight(
     monkeypatch.delitem(sys.modules, "engines.vllm.worker", raising=False)
     module = importlib.import_module("engines.vllm.worker")
     worker = module.RefitWorkerExtension()
-    worker.model_runner = SimpleNamespace(
-        get_model=lambda: SimpleNamespace(
-            get_submodule=lambda name: VocabParallelEmbedding()
-        )
-    )
+
+    def get_submodule(name):
+        assert name == "model.embed_tokens"
+        return VocabParallelEmbedding()
+
+    model = SimpleNamespace(get_submodule=get_submodule)
+    if checkpoint_name != "model.embed_tokens.weight":
+
+        def apply_list(names):
+            assert names == [checkpoint_name]
+            return (
+                []
+                if checkpoint_name == "excluded.weight"
+                else ["model.embed_tokens.weight"]
+            )
+
+        model.hf_to_vllm_mapper = SimpleNamespace(apply_list=apply_list)
+    worker.model_runner = SimpleNamespace(get_model=lambda: model)
 
     def record(self, phase, body):
         self._last_record = dict(body, phase=phase)
 
     monkeypatch.setattr(module.RefitWorkerExtension, "_record", record)
-    result = worker.verify_runtime_tensor(
-        "arbitrary-target", "model.embed_tokens.weight"
-    )
+    result = worker.verify_runtime_tensor("arbitrary-target", checkpoint_name)
+    if checkpoint_name == "excluded.weight":
+        assert result["phase"] == "runtime-tensor-verified-failed"
+        assert "excluded by the model mapper" in result["error"]
+        assert not loader_calls
+        assert live.values == installed
+        return
     assert result["phase"] == "runtime-tensor-verified"
+    assert result["checkpoint_tensor"] == checkpoint_name
+    assert result["runtime_tensor"] == "model.embed_tokens.weight"
     assert result["verified"] is verified
     assert (result["actual_sha256"] == result["expected_sha256"]) is verified
     assert loader_calls == [[1, 2, 3, 4]]
     assert live.values == installed
 
     live.packed_dim = 0
-    failed = worker.verify_runtime_tensor(
-        "arbitrary-target", "model.embed_tokens.weight"
-    )
+    failed = worker.verify_runtime_tensor("arbitrary-target", checkpoint_name)
     assert failed["phase"] == "runtime-tensor-verified-failed"
     assert failed["verified"] is False
     assert "packed embedding" in failed["error"]
