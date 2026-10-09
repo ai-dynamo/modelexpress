@@ -116,6 +116,29 @@ def _receive(manager, p2p=True, ctx=None, leased=True):
     return prepare_read
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, 120.0), ("5", 5.0), ("0.5", 0.5), ("bad", 120.0), ("0", 120.0), ("nan", 120.0)],
+)
+def test_p2p_metadata_timeout(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("MX_NIXL_METADATA_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("MX_NIXL_METADATA_TIMEOUT", value)
+    monkeypatch.setenv("MX_TRANSFER_TIMEOUT", "37")
+    mgr = _manager()
+
+    _receive(mgr)
+
+    mgr.fetch_remote_and_wait.assert_called_once_with(
+        remote_agent_name=P2P_AGENT,
+        ip="10.0.18.37",
+        port=5555,
+        timeout_seconds=expected,
+    )
+    assert mgr.receive_from_source.call_args.kwargs["timeout_seconds"] == 37.0
+
+
 class TestReleaseOnTheLoadPath:
     def test_standard_p2p_does_not_prepare_a_tensor_read_lease(self):
         mgr = _manager()

@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     MX_K8S_SOURCE_BACKOFF_SECONDS: str
     # NIXL / transport
     MX_NIXL_BACKEND: str
+    MX_NIXL_METADATA_TIMEOUT: float
     MX_POOL_REG: bool
     NIXL_UCX_TLS: Optional[str]
     UCX_TLS: Optional[str]
@@ -379,6 +380,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # ── NIXL / transport ───────────────────────────────────────────────────
     "MX_NIXL_BACKEND": lambda: os.environ.get("MX_NIXL_BACKEND", "UCX").strip().upper(),
+    "MX_NIXL_METADATA_TIMEOUT": lambda: _env_positive_float(
+        "MX_NIXL_METADATA_TIMEOUT", 120.0
+    ),
     "MX_POOL_REG": lambda: os.environ.get("MX_POOL_REG", "0") == "1",
     "NIXL_UCX_TLS": lambda: os.environ.get("NIXL_UCX_TLS"),
     "UCX_TLS": lambda: os.environ.get("UCX_TLS"),
