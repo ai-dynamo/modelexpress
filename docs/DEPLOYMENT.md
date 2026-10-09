@@ -401,18 +401,112 @@ docker run --rm -v "$PWD/dist:/out" mx-wheel-builder bash -lc 'cp -r /dist/. /ou
 every push to `main` / `release/**`, building both archs in parallel on
 velonix self-hosted runners and uploading the artifacts to NV Artifactory.
 
-Destination layout under `${ARTIFACTORY_PYPI_REPO_NAME}`:
+Destination layout:
 
-| Event | Subpath |
-|---|---|
-| `push` to `pull-request/<pr_id>` (copy-pr-bot mirror) | `pr/<pr_id>/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
-| `push` to `main`, `release/**` | `post-merge/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
+| Event | Repository | Subpath |
+|---|---|---|
+| `push` to `pull-request/<pr_id>` (copy-pr-bot mirror) | `${ARTIFACTORY_PYPI_REPO_NAME}` | `pr/<pr_id>/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
+| `push` to `main`, `release/**` | `${ARTIFACTORY_PYPI_REPO_NAME}` | `post-merge/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
+| Nightly wheels (`nightly-ci.yml`) | `${ARTIFACTORY_PYPI_REPO_NAME}` | `nightly/<run_id>/` |
+| Nightly crates (`nightly-ci.yml`) | `${ARTIFACTORY_CARGO_REPO_NAME}` | `nightly/<run_id>/` |
 
-Each path contains the 6 artifacts from one arch: 4 manylinux wheels
-(cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist. The upload step is
-gated on the `automated-release` GitHub environment, which holds three
-secrets: `ARTIFACTORY_URL`, `ARTIFACTORY_TOKEN` (JFrog identity token),
-and `ARTIFACTORY_PYPI_REPO_NAME`.
+The PR and post-merge paths each contain the 6 artifacts from one arch:
+4 manylinux wheels (cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist.
+The nightly path is shared by both archs and additionally receives the
+packaged Rust crates (`.crate`) — see
+[Nightly pipeline](#nightly-pipeline). The upload step is gated on the
+`automated-release` GitHub environment, which holds `ARTIFACTORY_URL`,
+`ARTIFACTORY_TOKEN` (JFrog identity token), and
+`ARTIFACTORY_PYPI_REPO_NAME`. Registry and repository
+names are secrets so they stay out of this public repo and are masked in
+run logs: `MX_IMAGE_REPO`, `NGC_PUBLISH_ORG` (repo scope) and `ARTIFACTORY_CARGO_REPO_NAME`
+(`automated-release`).
+
+### Nightly pipeline
+
+`.github/workflows/nightly-ci.yml` runs daily at 09:00 UTC (01:00 PST)
+against `main`, builds every release artifact from that commit, runs the
+full hosted and K8s/GPU test suites, and stages the artifacts internally.
+It can also be dispatched manually; a manual run only stages after
+approval through the `manual-release-approval` GitHub environment.
+
+Every job runs on the velonix self-hosted runners.
+
+| Artifact | Version | Destination |
+|---|---|---|
+| Server image (amd64 + arm64) | tag `<date>-<sha7>` | `nvcr.io/${NGC_PUBLISH_ORG}/ai-dynamo/modelexpress-server-nightly` (+ floating `:latest`, and `modelexpress-server:nightly`) |
+| Python wheels + sdist | `<base>.dev<date>` | `${ARTIFACTORY_PYPI_REPO_NAME}/nightly/<run_id>/` |
+| Rust crates (`.crate`) | `<base>-nightly.<date>.g<sha7>` | `${ARTIFACTORY_CARGO_REPO_NAME}/nightly/<run_id>/` |
+| Helm chart `modelexpress-nightly` | `<base>-nightly.<date>.g<sha7>` | `helm.ngc.nvidia.com/${NGC_PUBLISH_ORG}/ai-dynamo` |
+
+The packaged nightly chart is stamped to reference the nightly server
+image, so `helm install` of a nightly chart deploys nightly code — it does
+not fall back to the released image in `helm/values.yaml`.
+
+No ModelExpress artifact is uploaded to GitHub artifact storage; the table
+above is the complete list of places a nightly artifact exists. Compliance
+scan results are the only permitted GitHub artifact. `package-helm-chart`
+and `stage-helm-ngc` each build the chart through
+`.github/scripts/package_helm_chart.sh`; keep both on that script so they
+cannot package different charts.
+
+The `compliance` job uploads the two GitHub artifacts the nightly is allowed
+to produce, both dependency lists for OSRB review. Neither contains a build
+artifact. Both use Dynamo's OSRB CSV columns
+(`ecosystem,name,version,spdx,source_url,notes`).
+
+| Artifact | Contents | OSRB bug |
+|---|---|---|
+| `compliance-<sha>-modelexpress-server` | `linux_<arch>/osrb-modelexpress-server-<arch>-<sha8>.csv`: the dpkg and Python packages the image adds on top of its base image, plus the Rust crates compiled into its binaries. `.diff.csv`: what changed since the previous scheduled nightly, with a `change` column. `baseline/`: the baseline's provenance and CSV. | container |
+| `license-<sha>-modelexpress` | `osrb-modelexpress-deps-<sha8>.csv`: the crate closure of the published crates with all features, and the Python closure of the wheel with its user-facing extras on Python 3.10 to 3.13. `.diff.csv` and `baseline/BASELINE.md` as above. | source and crates |
+
+The diff baseline is the newest earlier scheduled `nightly-ci.yml` run on
+`main` whose GitLab trigger succeeded and that still has the same artifact
+(`.github/scripts/compliance/baseline.py`). Without one, the diff holds a
+single `baseline_unavailable` row; a failed lookup fails the job, and GitLab
+is only triggered when the compliance scan succeeds. Every row needs a valid
+SPDX expression. Add an entry with a source link to
+`.github/scripts/compliance/license_overrides.toml` to set a dpkg or image
+Python license, or to fill one that a crate or wheel dependency's metadata
+lacks.
+
+The image is scanned without running it: `.github/scripts/compliance/Dockerfile.extract`
+bind-mounts each arch's filesystem into an extractor on the runner's own
+platform. A syft scan of each arch's image and base image then cross-checks the
+CSV (`.github/scripts/compliance/audit_image.py`): the job fails if the image
+adds a package the CSV lacks, or a file no package owns that is not one of the
+binaries or `NOTICES` copied into `/app`. A new first-party file copied into
+`/app` goes in that script's `FIRST_PARTY_FILES`. release-automation's `nvbug:attach-compliance` and
+`nvbug:attach-license` jobs attach these files on every security nightly;
+when the trigger sends `DRY_RUN=true` they fetch and match the artifacts but
+write nothing to the OSRB bugs. The artifact names and layout are the contract of
+its `nvbug-attach-compliance.py` and `nvbug-attach-license.py`.
+
+After staging, the workflow triggers the internal GitLab
+release-automation pipeline (security scans) and reports to Slack. A
+thread is opened at the start of every run, and its `thread_ts` is
+forwarded to GitLab as `SLACK_THREAD_TS`, so the GitLab pipeline
+continues posting its scan updates onto the same thread instead of
+starting a new one. Staging results and the GitLab handoff are replied on
+that thread; a channel-level message goes out through
+`SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL` once per run, green or red. The single
+job to watch is `nightly-status`.
+
+Every Slack message mentions `SLACK_MENTION_OPS_SUPPORT` and
+`SLACK_MENTION_DYNAMO_BOT`; a failing run additionally mentions
+`SLACK_MENTION_MX_DEV_TEAM`. All three are repository variables holding
+full Slack mention syntax (`<!subteam^ID>` for a user group, `<@ID>` for
+a user or bot), so the IDs stay out of this public repository.
+
+Test failures do **not** block staging (matching the Dynamo nightly): a
+red test lane alerts Slack while the scan-gated staging proceeds.
+
+Additional secrets beyond the `ARTIFACTORY_*` set above, all in the
+`automated-release` environment unless noted: `NGC_PUBLISH_USERNAME`,
+`NGC_PUBLISH_TOKEN`, `GITLAB_PIPELINE_URL`, `GITLAB_TRIGGER_TOKEN`, and
+(repository scope) `SLACK_RELEASE_BOT_TOKEN`, `SLACK_RELEASE_CHANNEL_ID`,
+`SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL`. The optional repository variable
+`GITLAB_RELEASE_AUTOMATION_REF` overrides the GitLab ref (default `main`).
 
 ### Custom Client Image (P2P Transfers)
 

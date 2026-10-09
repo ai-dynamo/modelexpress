@@ -124,13 +124,28 @@ on:
   push:
     branches:
       - "pull-request/[0-9]+"
+  workflow_call:
+    inputs:
+      concurrency_key:
+        description: >-
+          Disambiguates this workflow's concurrency group for reusable-workflow
+          callers. Under `workflow_call` the top-level concurrency block is
+          still honored but evaluates in the CALLER's context, so github.workflow
+          becomes the caller's name and cancel-in-progress would apply to the
+          caller's run — a second nightly would cancel the first nightly's
+          in-flight GPU matrix. Callers pass a unique key (e.g. the run id) to
+          opt into "never cancel"; the empty default preserves the
+          cancel-previous behavior that copy-pr-bot PR runs rely on.
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   # github.ref_name is the bot-created branch (e.g. `pull-request/123`), so
   # consecutive pushes to the same PR cancel earlier runs but pushes to
   # different PRs don't fight for the same group.
-  group: ${{ github.workflow }}-${{ github.ref_name }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ inputs.concurrency_key }}
+  cancel-in-progress: ${{ inputs.concurrency_key == '' }}
 
 env:
   MX_CI_MODEL: Qwen/Qwen2.5-0.5B
@@ -163,6 +178,7 @@ jobs:
         # Persist the tag in $GITHUB_ENV so both the build step and the
         # cleanup step reference the same value without re-templating.
         run: |
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-buildsrv" >> "$GITHUB_ENV"
           echo "SERVER_IMAGE=${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}" >> "$GITHUB_ENV"
 
       - name: Log in to image registry
@@ -191,6 +207,7 @@ jobs:
         if: always()
         run: |
           docker image rm -f "${SERVER_IMAGE}" 2>/dev/null || true
+          rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
   # ---------------------------------------------------------------------------
   # Build one worker image per inference engine framework.
@@ -225,6 +242,7 @@ jobs:
         # Persist the tag in $GITHUB_ENV so both the build step and the
         # cleanup step reference the same value without re-templating.
         run: |
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-buildcli-${{ strategy.job-index }}" >> "$GITHUB_ENV"
           echo "WORKER_IMAGE=${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}" >> "$GITHUB_ENV"
 
       - name: Log in to image registry
@@ -254,6 +272,7 @@ jobs:
         if: always()
         run: |
           docker image rm -f "${WORKER_IMAGE}" 2>/dev/null || true
+          rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
   # Build the trainer and rollout images used by the Vime delta-refit smoke.
   build-vime-delta-refit:
@@ -409,6 +428,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
   # Run P2P weight-transfer test for each framework.
@@ -599,6 +619,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
   # Dedicated P2P MLA/MoE model test (vLLM + SGLang).
@@ -683,6 +704,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
   # P2P weight transfer with tensor parallelism > 1.
@@ -767,6 +789,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
   # P2P weight transfer with parallelism > 1 beyond plain TP — vLLM data
@@ -874,6 +897,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
   # Dynamo aggregated-serving P2P test — DGD lifecycle (apply / scale / wait)
@@ -946,6 +970,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # Ten-step TP2 trainer + TP1 Dynamo rollout smoke on three H100s.
   test-vime-delta-refit:
@@ -1107,6 +1132,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
   # Rolling-update test — five workers, CRD backend, NIXL-over-TCP.
@@ -1175,6 +1201,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
   # Stale-metadata test (row 18) — single source pod, no target, mx-server
@@ -1243,6 +1270,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
   # Model Streamer S3 tests — single worker pod, no vCluster, no P2P.
@@ -1277,6 +1305,10 @@ jobs:
             test_model_streamer_fallback: 'true'
 
     steps:
+      - name: Scope docker credentials to this job
+        run: |
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-streamer-${{ strategy.job-index }}" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -1297,6 +1329,11 @@ jobs:
           s3_region: ${{ env.MX_CI_S3_REGION }}
           hf_token: ${{ secrets.HF_TOKEN }}
           test_model_streamer_fallback: ${{ matrix.test_model_streamer_fallback }}
+
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
   # ---------------------------------------------------------------------------
   # Umbrella status check for branch protection.

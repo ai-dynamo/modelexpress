@@ -4,3 +4,7 @@
 # Supply-chain and ownership policy require DevOps review.
 /.github/CODEOWNERS @ai-dynamo/devops
 /deny.toml            @ai-dynamo/devops
+
+/.github/workflows/ @ai-dynamo/devops
+/.github/actions/   @ai-dynamo/devops
+/.github/scripts/   @ai-dynamo/devops

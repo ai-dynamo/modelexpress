@@ -16,11 +16,13 @@ set -e
 RELEASE_NAME="modelexpress-test"
 NAMESPACE="modelexpress-test"
 IMAGE_NAME="modelexpress"
-IMAGE_TAG="test"
+IMAGE_TAG="${MX_TEST_IMAGE_TAG:-test}"
 TEST_MODEL="hf-internal-testing/tiny-random-gpt2"
 TIMEOUT_SECONDS=600
 CLEANUP=true
 TEST_MODE="all"  # "cli", "env", or "all"
+KIND_CLUSTER_NAME="${MX_KIND_CLUSTER_NAME:-kind}"
+CREATED_CLUSTER=false
 
 # Colors for output
 RED='\033[0;31m'
@@ -89,6 +91,10 @@ cleanup() {
         kubectl delete job grpc-transfer-test-env -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
         helm uninstall "$RELEASE_NAME" -n "$NAMESPACE" 2>/dev/null || true
         kubectl delete namespace "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+        if [ "$CREATED_CLUSTER" = true ]; then
+            log_info "Deleting kind cluster ${KIND_CLUSTER_NAME}..."
+            kind delete cluster --name "${KIND_CLUSTER_NAME}" 2>/dev/null || true
+        fi
         log_info "Cleanup complete"
     else
         log_warning "Skipping cleanup (--no-cleanup specified)"
@@ -96,6 +102,9 @@ cleanup() {
         echo "  kubectl delete job grpc-transfer-test-cli grpc-transfer-test-env -n $NAMESPACE"
         echo "  helm uninstall $RELEASE_NAME -n $NAMESPACE"
         echo "  kubectl delete namespace $NAMESPACE"
+        if [ "$CREATED_CLUSTER" = true ]; then
+            echo "  kind delete cluster --name ${KIND_CLUSTER_NAME}"
+        fi
     fi
 }
 
@@ -129,17 +138,19 @@ check_prerequisites() {
         log_success "kind installed"
     fi
 
-    # Check for kind cluster, create if needed
-    if ! kind get clusters 2>/dev/null | grep -q .; then
-        log_info "Creating kind cluster..."
-        kind create cluster --wait 5m
-        # Fix kubeconfig for Docker-in-Docker environments
-        CONTAINER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' kind-control-plane)
-        kubectl config set-cluster kind-kind --server="https://${CONTAINER_IP}:6443" --insecure-skip-tls-verify=true >/dev/null
+    if ! kind get clusters 2>/dev/null | grep -qx "${KIND_CLUSTER_NAME}"; then
+        log_info "Creating kind cluster ${KIND_CLUSTER_NAME}..."
+        kind create cluster --name "${KIND_CLUSTER_NAME}" --wait 5m
+        CREATED_CLUSTER=true
         log_success "kind cluster created"
     else
-        log_info "Using existing kind cluster"
+        log_info "Using existing kind cluster ${KIND_CLUSTER_NAME}"
     fi
+    CONTAINER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${KIND_CLUSTER_NAME}-control-plane" 2>/dev/null || true)
+    if [ -n "${CONTAINER_IP}" ]; then
+        kubectl config set-cluster "kind-${KIND_CLUSTER_NAME}" --server="https://${CONTAINER_IP}:6443" --insecure-skip-tls-verify=true >/dev/null
+    fi
+    kubectl config use-context "kind-${KIND_CLUSTER_NAME}" >/dev/null 2>&1 || true
 
     log_success "Prerequisites met"
 }
@@ -153,7 +164,7 @@ build_and_load_image() {
 
     # Load into kind cluster
     log_info "Loading image into kind cluster..."
-    kind load docker-image "${IMAGE_NAME}:${IMAGE_TAG}" 2>&1 | tail -3
+    kind load docker-image --name "${KIND_CLUSTER_NAME}" "${IMAGE_NAME}:${IMAGE_TAG}" 2>&1 | tail -3
 
     log_success "Docker image built and loaded: ${IMAGE_NAME}:${IMAGE_TAG}"
 }
