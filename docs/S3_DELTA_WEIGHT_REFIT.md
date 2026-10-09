@@ -1,15 +1,28 @@
 # S3 Delta Weight Refit
 
 This guide shows how to publish XOR-delta weight updates to S3 and install them
-in a running vLLM model with ModelExpress. The trainer and generator start from
-the same local checkpoint; integrations may use a framework-selected cadence of
-full HF checkpoints to reset that base. ModelExpress coordinates each version's
+in a running vLLM or SGLang model with ModelExpress. The trainer and generator
+start from the same local checkpoint; integrations may periodically publish full
+HF checkpoints to reset that base. ModelExpress coordinates each version's
 lineage and readiness.
+
+Complete the [shared setup](#shared-setup), choose a backend, and use the
+[shared publication workflow](#shared-weight-publication) for each update.
 
 For a runnable Vime TP2 trainer, Dynamo TP1 rollout worker, and SeaweedFS setup, see
 [`examples/rl/vime_dynamo_delta_refit`](../examples/rl/vime_dynamo_delta_refit/README.md).
 
-## Components
+| Backend | Receiver configuration | Apply a READY version |
+|---|---|---|
+| [vLLM](#vllm-backend) | `POST /init_weight_transfer_engine` | `start_weight_update` → `update_weights` → `finish_weight_update` |
+| [SGLang](#sglang-backend) | `--modelexpress-config` | `POST /update_weights_from_modelexpress` |
+
+The [checkpoint cache](#shared-checkpoint-cache) and
+[S3 artifact contract](#s3-artifact-contract) are shared by both backends.
+
+## Shared setup
+
+### Components
 
 | Component | Responsibility |
 |---|---|
@@ -17,16 +30,16 @@ For a runnable Vime TP2 trainer, Dynamo TP1 rollout worker, and SeaweedFS setup,
 | `ModelExpressTrainerClient` | Capture the seed-checkpoint base and publish either XOR deltas or full HF checkpoint batches to S3. |
 | `ModelExpressGeneratorClient` | Validate READY versions, apply the requested S3 payload to its refit checkpoint, and reload the live model. |
 
-## Requirements
+### Requirements
 
 - A Redis-backed ModelExpress Refit service.
-- A ModelExpress build containing the canonical S3 delta and vLLM integrations.
-- The `modelexpress` Python package installed in both the trainer environment
-  and the environment used to launch vLLM.
-- vLLM 0.27.1.
-- Trainer ranks with S3 read/write access and vLLM hosts with read access.
+- A ModelExpress build containing the canonical S3 delta integration and the
+  selected inference backend.
+- The `modelexpress` Python package installed in both the trainer and inference
+  environments.
+- Trainer ranks with S3 read/write access and inference hosts with read access.
 - The corresponding base checkpoint in safetensors format on every trainer and
-  vLLM host.
+  inference host.
 
 Minimal ModelExpress server configuration:
 
@@ -35,17 +48,17 @@ export MX_METADATA_BACKEND=redis
 export REDIS_URL=redis://redis:6379
 ```
 
-Environment variables used by the clients and vLLM engine:
+### Common environment variables
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `MX_SERVER_ADDRESS` | `localhost:8001` | ModelExpress server address. |
-| `MX_MODEL_NAME_OVERRIDE` | unset | Logical MX model name used by vLLM at startup and during refit. Use the same name for trainer clients and published WeightVersions. Without it, vLLM's configured model path or ID is used. |
 | `MX_AUTH_TOKEN_PATH` | unset | Optional ModelExpress bearer-token file. |
 | `MX_AUTH_TOKEN_TTL_SECONDS` | `60` | Token-file reread interval in seconds. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | unset | S3 credentials when an IAM role or workload identity is unavailable. |
 | `AWS_SESSION_TOKEN` | unset | Session token when using temporary AWS credentials. |
 | `AWS_DEFAULT_REGION` | unset | S3 region when `region_name` is not supplied in client configuration. |
+| `MX_GENERATOR_SOURCE_ORDER` | Backend default | Set to `OBJECT_STORAGE` for S3-only refit. See the vLLM section for generator-peer fallback. |
 | `MX_REFIT_DELTA_BUCKET_BYTES` | `536870912` (512 MiB) | Optional tensor-bucket size override for framework integrations. |
 | `MX_REFIT_DELTA_WORKERS` | `min(32, CPU count)` | CPU workers used to compute and apply XOR deltas. |
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum algorithm written by canonical S3 trainers. |
@@ -54,15 +67,11 @@ Environment variables used by the clients and vLLM engine:
 | `MX_S3_DOWNLOAD_WORKERS` | `16` | Generator download concurrency. |
 | `MX_S3_MAX_POOL_CONNECTIONS` | `32` | Botocore HTTP connection-pool size. |
 | `MX_S3_MAX_ATTEMPTS` | `5` | Total S3 request attempts. |
-| `VLLM_SERVER_DEV_MODE` | unset | Set to `1` to enable vLLM's weight-update HTTP routes. Network-isolate these routes. |
-| `VLLM_PLUGINS` | unset | Set to `modelexpress` to load the ModelExpress vLLM plugin. |
 
 Optional S3 tuning variables and defaults are documented in
 [`modelexpress_client/python/README.md`](../modelexpress_client/python/README.md#canonical-s3-transfer-tuning).
 
-## Initialization
-
-### 1. Create the base version
+### Create the base version
 
 Create a READY initial WeightVersion before initializing trainer or generator
 clients. The current API requires a syntactically valid object-storage URI, but
@@ -106,14 +115,17 @@ is not downloaded.
 See [`refit.proto`](../modelexpress_common/proto/refit.proto) for the complete
 control-plane request and response schemas.
 
-### 2. Initialize the trainer client
+### Initialize the trainer client
 
-Initialize one trainer client on every distributed trainer rank and keep it for
-the full training run. `hf_tensor_buckets()` below represents a framework-owned
-function that returns a fresh iterable of Hugging Face tensor buckets.
+Initialize one trainer client on each rank participating in MX publication and
+keep it for the full training run. `hf_tensor_buckets()` below represents a
+framework-owned function that returns a fresh iterable of Hugging Face tensor
+buckets.
 
 ```python
 import torch.distributed as dist
+
+refit_process_group = ...  # Existing Gloo group of publishing ranks.
 
 trainer = ModelExpressTrainerClient.initialize(
     ModelExpressTrainerConfig(
@@ -121,7 +133,7 @@ trainer = ModelExpressTrainerClient.initialize(
         staging_mode=TrainerStagingMode.WRITE_TO_STORAGE,
         payload_format=WeightPayloadFormat.XOR_DELTA,
         server_url="modelexpress:8001",
-        process_group=...,  # Gloo process group for control plane
+        process_group=refit_process_group,
         object_storage=ObjectStorageConfig(
             storage_type=ObjectStorageType.S3,
             uri_prefix=S3_URI_PREFIX,
@@ -133,18 +145,33 @@ trainer = ModelExpressTrainerClient.initialize(
 )
 
 # Call once before the first optimizer update.
-trainer.prepare_delta_base(hf_tensor_iter=hf_tensor_buckets())
+trainer.prepare_delta_base(tensor_iter=hf_tensor_buckets())
 ```
 
 The bucket names must match tensors in the seed checkpoint. Keep the trainer
 client alive because each successful publication advances its retained base
 from `v0` to `v1`, then `v2`, and so on.
 
-Use a dedicated Gloo process group containing every participating trainer rank.
-ModelExpress uses it for CPU object collectives that coordinate shard and index
-publication; do not reuse the model-training NCCL group for this example.
+Use a dedicated Gloo process group containing the ranks that call MX staging
+and publication. ModelExpress uses it for CPU object collectives that coordinate
+shard and index publication. Other ranks may still participate in the framework's
+weight gathers; Miles, for example, creates MX clients only on sender ranks.
 
-### 3. Initialize the generator
+## vLLM backend
+
+This example uses vLLM 0.27.1 and the ModelExpress weight-transfer plugin.
+For a runnable Vime TP2 trainer, Dynamo TP1 rollout worker, and MinIO setup, see
+[`examples/rl/vime_dynamo_delta_refit`](../examples/rl/vime_dynamo_delta_refit/README.md).
+
+Backend-specific environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MX_MODEL_NAME_OVERRIDE` | unset | Logical MX model name used by vLLM at startup and during refit. Use the same name for trainer clients and published WeightVersions. Without it, vLLM's configured model path or ID is used. |
+| `VLLM_SERVER_DEV_MODE` | unset | Set to `1` to enable vLLM's weight-update HTTP routes. Network-isolate these routes. |
+| `VLLM_PLUGINS` | unset | Set to `modelexpress` to load the ModelExpress vLLM plugin. |
+
+### Start vLLM
 
 Install the `modelexpress` Python package in the same environment used to run
 `vllm serve`. The package provides the vLLM plugin entry point:
@@ -184,6 +211,8 @@ An explicit `init_info.model_name` still overrides the transfer client's default
 after startup. Keep it consistent with `MX_MODEL_NAME_OVERRIDE`; it cannot change
 an identity already used during cold start.
 
+### Initialize the weight-transfer engine
+
 After vLLM is ready, initialize each server once:
 
 ```python
@@ -213,19 +242,20 @@ response = requests.post(
 response.raise_for_status()
 ```
 
-#### `seed_checkpoint_path`
+`POST /init_weight_transfer_engine` fans out to every vLLM worker. Each worker:
 
-When supplied, this must be a complete local safetensors checkpoint for
-`initial_base_version_id`, readable by every inference engine worker. It may be
-either:
+1. initializes the seed lineage and host-local checkpoint cache;
+2. fetches `initial_base_version_id` from the ModelExpress server;
+3. verifies that the base is READY and has the configured model name; and
+4. registers itself as a ModelExpress generator worker.
 
-- one unsharded `.safetensors` file containing the full model; or
-- a directory containing all `.safetensors` shards. If
-  `model.safetensors.index.json` is present, every shard referenced by its
-  `weight_map` must also be present.
+Initialization fails before serving updates if any worker cannot read the
+seed checkpoint, write the cache, or validate the base version.
 
-For typical sharded models such as Qwen3-30B-A3B, use the full Hugging Face
-snapshot directory.
+See [seed checkpoint requirements](#seed_checkpoint_path) and
+[cache configuration](#refit_checkpoint_dir) for the shared storage settings.
+
+### Reuse a cached seed
 
 If desired-version cold start already cached the full checkpoint for
 `initial_base_version_id`, omit `seed_checkpoint_path` from `init_info` or set it
@@ -244,7 +274,292 @@ current prepared checkpoint. Its directory is protected from eviction until the
 copy finishes, so eviction of the original seed does not drop these files.
 Explicit external seed paths remain the source of their non-weight files.
 
-#### `refit_checkpoint_dir`
+### Apply a published version
+
+After [publishing `v1`](#publish-v1) and marking it READY, run the update while
+generation is paused. `mode=abort` clears active requests and vLLM caches before
+the weight update.
+
+```python
+import requests
+
+VLLM_URL = "http://vllm-generator:8000"
+
+
+def post(path, *, body=None, params=None):
+    response = requests.post(
+        f"{VLLM_URL}/{path}",
+        json=body or {},
+        params=params,
+        timeout=900,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+post("pause", body={}, params={"mode": "abort"})
+post("start_weight_update", body={})
+post("update_weights", body={"update_info": {"version_id": "v1"}})
+post("finish_weight_update", body={"weight_version": "v1"})
+post("resume", body={})
+```
+
+If an update request fails, keep generation paused while recovering the engine.
+The sequence resumes generation only after the update succeeds.
+
+### Source selection and peer fallback
+
+By default, with full-tensor engine support, active refit uses this order:
+
+1. load the exact requested version from a same-rank generator peer;
+2. if no peer can prepare it, reconstruct the complete S3 lineage from its full
+   checkpoint root through the target deltas and install that checkpoint.
+
+Set `MX_GENERATOR_SOURCE_ORDER=OBJECT_STORAGE` to use S3 directly.
+
+Post-load generator P2P requires registered runtime tensors and an initialized
+loader-owned NIXL manager. Quantized models and FP8 KV caches can select this
+path in either eager or graph mode. The peer transfer copies the registered
+runtime representation without rerunning post-load processing. Eager
+installation then refreshes q/k/v host
+scale mirrors and invalidates FlashInfer launch-scale caches for recomputation
+on the next forward. Graph-mode refits retain direct-copy behavior without
+this refresh; captured scalar updates are not handled here. This does not clear
+stored KV entries; retaining quantized KV entries across a change to their
+K/V scales remains unsupported.
+
+A successful peer install does not trigger checkpoint reconstruction. If a
+later active refit cannot use a same-rank generator peer, that foreground refit
+resolves the immutable full root and delta lineage before installation. The
+receiver validates its local checkpoint under the cache lock and, when it is a
+source-verified ancestor of the target, downloads and applies only the missing
+revisions. The local checkpoint can lag GPU weights after P2P updates, so its
+version determines the replay suffix. When no matching, source-verified local
+checkpoint exists, the receiver reconstructs from the full root.
+
+## SGLang backend
+
+Use an SGLang build with the `/update_weights_from_modelexpress` endpoint and an
+MX build exposing `get_modelexpress_generator()` in
+`modelexpress_rl.inference.engines.sglang`. The ModelExpress package must be
+installed in each SGLang worker's environment.
+
+### Start SGLang
+
+Pass the receiver settings through `--modelexpress-config`. The model name and
+initial base ID must match the trainer and catalog records from the shared setup.
+
+```bash
+export MX_GENERATOR_SOURCE_ORDER=OBJECT_STORAGE
+
+python -m sglang.launch_server \
+  --model-path /models/Qwen3-30B-A3B \
+  --host 0.0.0.0 --port 30000 --tp-size 4 \
+  --modelexpress-config '{
+    "model_name": "Qwen/Qwen3-30B-A3B",
+    "server_url": "modelexpress:8001",
+    "initial_base_version_id": "v0",
+    "seed_checkpoint_path": "/models/Qwen3-30B-A3B",
+    "refit_checkpoint_dir": "/var/cache/modelexpress",
+    "refit_checkpoint_max_size_gb": 500,
+    "object_storage_region_name": "us-west-2",
+    "max_transfer_attempts": 3,
+    "max_replay_chain_length": 64,
+    "rpc_timeout_seconds": 30
+  }'
+```
+
+The AWS example uses the default endpoint. For MinIO or another S3-compatible
+endpoint, add `object_storage_endpoint_url` to the JSON configuration:
+
+```json
+{
+  "object_storage_endpoint_url": "http://minio:9000",
+  "object_storage_region_name": "us-east-1"
+}
+```
+
+Both backends use these field names. MX maps them to `endpoint_url` and
+`region_name` in `ObjectStorageGeneratorConfig`.
+
+### Receiver initialization and ownership
+
+Each TP worker creates its MX client on the first refit request and reuses it
+for later versions. There is no separate initialization HTTP request. The
+SGLang handler obtains the client through this public MX API:
+
+```python
+from modelexpress_rl.inference.engines.sglang import get_modelexpress_generator
+
+generator = get_modelexpress_generator(model_runner)
+```
+
+MX parses the configuration, resolves the seed, validates the READY base version,
+and caches the client on `model_runner.modelexpress_generator`. SGLang closes
+that client during scheduler shutdown. If `seed_checkpoint_path` is omitted or
+`null`, the factory resolves the launch checkpoint through the model runner's
+loader. Use an explicit local seed path to select a different checkpoint.
+
+The shared [seed requirements](#seed_checkpoint_path) and
+[cache settings](#refit_checkpoint_dir) apply. Speculative draft-model refits and
+incompatible shared or derived weight-cache modes are rejected by SGLang.
+
+### Apply a published version
+
+After [publishing `v1`](#publish-v1) and marking it READY, pause generation,
+flush serving caches, refit, and resume:
+
+```python
+import requests
+
+SGLANG_URL = "http://sglang-generator:30000"
+
+for path, body in (
+    ("pause_generation", {"mode": "abort"}),
+    ("flush_cache", {}),
+    ("update_weights_from_modelexpress", {"weight_version": "v1", "flush_cache": False}),
+    ("continue_generation", {}),
+):
+    response = requests.post(f"{SGLANG_URL}/{path}", json=body, timeout=900)
+    response.raise_for_status()
+```
+
+The explicit flush runs while generation is paused; `flush_cache=False` avoids
+a second flush after installation. The handler stages and applies the version,
+releases the staged handle, and combines TP results before reporting success.
+A failed refit returns an error, so the sequence above leaves generation paused.
+
+### Miles integration
+
+With Miles-managed SGLang, select `--update-weight-transfer-mode modelexpress`
+and pass `--modelexpress-config` to Miles. Include the receiver settings above,
+the trainer's `object_storage_uri_prefix`, and an optional `full_hf_checkpoint_interval`.
+Miles launches SGLang and owns the shared base initialization and publication
+steps described in this guide.
+
+Miles sends each real tensor bucket through `stage_shard(tensors=bucket)` and
+publishes once all buckets have been submitted. Only sender ranks join the MX
+publication group; other ranks still participate in framework weight gathering.
+Miles pauses and flushes the engines before refit, then restores its numeric
+weight-version label through `/update_weight_version` before resuming generation.
+MX retains its opaque version ID for checkpoint lineage.
+
+## Shared weight publication
+
+Both backends consume the same immutable WeightVersions and S3 artifacts. The
+trainer chooses whether each version is a delta or a full checkpoint; the
+backend's apply request carries the target version ID.
+
+### Publish `v1`
+
+Create `v1` as STAGING, upload the delta shards and index, and then mark it
+READY. The S3 URI is the exact index URI, not a directory prefix.
+
+```python
+import torch.distributed as dist
+
+from modelexpress_rl import (
+    ModelExpressControlClient,
+    ObjectStorageSource,
+    ObjectStorageType,
+    WeightPayloadFormat,
+    WeightVersionRef,
+    WeightVersionState,
+)
+
+# The coordinator creates the target version.
+if dist.get_rank(group=refit_process_group) == 0:
+    with ModelExpressControlClient.connect(
+        server_url="modelexpress:8001",
+    ) as control:
+        control.create_weight_version(
+            uid="v1",
+            model_name="Qwen/Qwen3-30B-A3B",
+            idempotency_key="publish-v1",
+            payload_format=WeightPayloadFormat.XOR_DELTA,
+            base_version_id="v0",
+            object_storage=ObjectStorageSource(
+                storage_type=ObjectStorageType.S3,
+                uri=f"{S3_URI_PREFIX}/v1/model.safetensors.index.json",
+            ),
+            state=WeightVersionState.STAGING,
+        )
+dist.barrier(group=refit_process_group)
+
+# Every rank in refit_process_group computes and publishes its contribution.
+# The global index is written after all rank-local delta shards are durable.
+staged = trainer.stage_shard(
+    version=WeightVersionRef("v1"),
+    tensor_iter=hf_tensor_buckets(),
+)
+staged.publish()
+dist.barrier(group=refit_process_group)
+
+# The coordinator exposes the completed version to generators.
+if dist.get_rank(group=refit_process_group) == 0:
+    with ModelExpressControlClient.connect(
+        server_url="modelexpress:8001",
+    ) as control:
+        control.update_weight_version_state(
+            "v1",
+            WeightVersionState.READY,
+        )
+```
+
+### Submit one bucket at a time
+
+Frameworks with a bucket callback, such as Miles, can replace the iterator-based
+stage/publish pair above with:
+
+```python
+for bucket in hf_tensor_buckets():
+    staged = trainer.stage_shard(
+        version=WeightVersionRef("v1"),
+        tensors=bucket,
+    )
+staged.publish()
+```
+
+Each rank in the configured publication process group must stage and publish a
+contribution. A rank with no tensors submits `stage_shard(version=version,
+tensors=[])` once and publishes the returned handle. Miles uses a sender-only
+publication group, so its non-sender ranks do not stage or publish.
+
+All calls for the same version share one staged payload; `publish()` waits for
+pending bucket processing before uploading. Submitted tensors must remain stable until
+publication finishes. Publish the current version before staging another.
+The iterator form completes staging before returning.
+
+The next delta must be `v2` with `base_version_id="v1"`. An integration may
+instead create a `FULL_HF_CHECKPOINT` version without `base_version_id`; that
+version becomes the exact base for the following delta. Full checkpoint batches
+may declare `checksum_format="adler32"` in the index and carry per-tensor
+checksums under tensor-name keys in shard metadata. They are retained as an
+immutable full artifact. XOR deltas require the complete index metadata contract
+above and are replayed in order in the canonical lineage; each preparation
+applies only the incoming delta to its exact active base.
+
+## Shared checkpoint cache
+
+### `seed_checkpoint_path`
+
+When supplied, this must be a complete local safetensors checkpoint for
+`initial_base_version_id`, readable by every inference engine worker. It may be
+either:
+
+- one unsharded `.safetensors` file containing the full model; or
+- a directory containing all `.safetensors` shards. If
+  `model.safetensors.index.json` is present, every shard referenced by its
+  `weight_map` must also be present.
+
+For typical sharded models such as Qwen3-30B-A3B, use the full Hugging Face
+snapshot directory.
+
+The backend sections describe how an omitted seed is resolved: vLLM can
+[reuse a cached full root](#reuse-a-cached-seed), while SGLang's factory resolves
+the launch checkpoint through its model runner.
+
+### `refit_checkpoint_dir`
 
 This is the root of ModelExpress's host-local immutable checkpoint cache. During
 initialization, ModelExpress creates a model-specific subdirectory containing
@@ -270,36 +585,18 @@ installation lock is held shared by concurrent co-located installers and
 exclusively by preparation, preventing another preparation from entering before
 activation.
 
-```text
-<refit_checkpoint_dir>/<URL-quoted-MX-model-name>/
-  .lock
-  .install.lock
-  active.json
-  state.json
-  full/
-    v0/
-      *.safetensors
-      config.json
-      ...
-    v4/
-      model.safetensors.index.json
-      *.safetensors
-      config.json
-      ...
-  deltas/
-    v1/
-      model.safetensors.index.json
-      *.safetensors
-  chains/
-    v0.json
-    v1.json
-    v4.json
-  materialized/
-    v1/
-      *.safetensors
-      config.json
-      ...
-```
+Paths under `<refit_checkpoint_dir>/<URL-quoted-MX-model-name>/`:
+
+| Path | Contents or role |
+|---|---|
+| `.lock` | Coordinates cache metadata and artifact mutations. |
+| `.prepare.lock` | Serializes checkpoint preparation requests. |
+| `.install.lock` | Shared during installation and exclusive during reconstruction. |
+| `active.json`, `state.json` | Active version and preparation state. |
+| `full/<version>/` | Immutable full checkpoint: safetensors, optional HF index, and files such as `config.json`. |
+| `deltas/<version>/` | Delta index and compressed safetensors shards. |
+| `chains/<version>.json` | Full root and ordered deltas for the version. |
+| `materialized/<version>/` | Derived checkpoint consumed by the engine's native loader. |
 
 The generator may request a target several revisions ahead of its active
 version. ModelExpress first resolves the complete READY chain, rejecting cycles,
@@ -315,13 +612,13 @@ clears the uncertain state.
 All ranks sharing one host filesystem can share the same cache. Each host without
 a shared filesystem needs its own cache.
 
-A Kubernetes example:
+A Kubernetes volume layout for either backend:
 
 ```yaml
 spec:
   containers:
-    - name: vllm
-      image: your-vllm-image
+    - name: generator
+      image: your-generator-image
       env:
         - name: HF_HOME
           value: /root/.cache/huggingface
@@ -360,8 +657,9 @@ The corresponding generator configuration would use:
 
 `refit_checkpoint_max_size_gb` is a positive per-model quota in decimal
 gigabytes (`1 GB = 1,000,000,000 bytes`) for payload files under `full/`,
-`deltas/`, and `materialized/`. It defaults to 2000 GB; set it to `null` to
-disable the configured quota.
+`deltas/`, and `materialized/`. The SDK, vLLM, and SGLang default to 2000 GB.
+Set it explicitly to override the quota, or set it to `null` to disable the
+configured quota.
 At initialization, ModelExpress caps the quota at the existing model cache size
 plus available filesystem space. A short INFO log reports the cap and free space
 when this reduces the configured quota or replaces `null` with a disk-based
@@ -375,52 +673,12 @@ active checkpoint as READY so a later update can retry. On initialization, the
 configured seed is restored as the initial full artifact and becomes the active
 version.
 
-#### Initialization behavior
-
-`POST /init_weight_transfer_engine` fans out to every vLLM worker. Each worker:
-
-1. initializes the seed lineage and host-local checkpoint cache;
-2. fetches `initial_base_version_id` from the ModelExpress server;
-3. verifies that the base is READY and has the configured model name; and
-4. registers itself as a ModelExpress generator worker.
-
-Initialization fails before serving updates if any worker cannot read the
-seed checkpoint, write the cache, or validate the base version.
-
-## Weight Update
-
-With full-tensor engine support, active refit uses this order:
-
-1. load the exact requested version from a same-rank generator peer;
-2. if no peer can prepare it, reconstruct the complete S3 lineage from its full
-   checkpoint root through the target deltas and install that checkpoint.
-
-Post-load generator P2P requires registered runtime tensors and an initialized
-loader-owned NIXL manager. Quantized models and FP8 KV caches can select this
-path in either eager or graph mode. The peer transfer copies the registered
-runtime representation without rerunning post-load processing. Eager
-installation then refreshes q/k/v host
-scale mirrors and invalidates FlashInfer launch-scale caches for recomputation
-on the next forward. Graph-mode refits retain direct-copy behavior without
-this refresh; captured scalar updates are not handled here. This does not clear
-stored KV entries; retaining quantized KV entries across a change to their
-K/V scales remains unsupported.
-
-A successful peer install does not trigger checkpoint reconstruction. If a
-later active refit cannot use a same-rank generator peer, that foreground refit
-resolves the immutable full root and delta lineage before installation. The
-receiver validates its local checkpoint under the cache lock and, when it is a
-source-verified ancestor of the target, downloads and applies only the missing
-revisions. The local checkpoint can lag GPU weights after P2P updates, so its
-version determines the replay suffix. When no matching, source-verified local
-checkpoint exists, the receiver reconstructs from the full root.
-
-### Generator-side S3 artifact contract
+## S3 artifact contract
 
 The weight version's `object_storage.uri` points to a global JSON index. Shard
 filenames in `weight_map` are resolved relative to that index.
 
-#### `XOR_DELTA`
+### `XOR_DELTA`
 
 ```json
 {
@@ -466,7 +724,7 @@ tensor:
 }
 ```
 
-#### `FULL_HF_CHECKPOINT`
+### `FULL_HF_CHECKPOINT`
 
 Full checkpoints use a standard Hugging Face safetensors index:
 
@@ -509,99 +767,3 @@ When the index omits `checksum_format`, checksum verification is skipped and
 shard metadata is not interpreted as checksums. Tensor names, dtypes, shapes,
 and byte sizes are always checked before the immutable full artifact is
 promoted.
-
-### 1. Publish `v1`
-
-Create `v1` as STAGING, upload the delta shards and index, and then mark it
-READY. The S3 URI is the exact index URI, not a directory prefix.
-
-```python
-import torch.distributed as dist
-
-from modelexpress_rl import (
-    ModelExpressControlClient,
-    ObjectStorageSource,
-    ObjectStorageType,
-    WeightPayloadFormat,
-    WeightVersionRef,
-    WeightVersionState,
-)
-
-# The coordinator creates the target version.
-if dist.get_rank(group=refit_process_group) == 0:
-    with ModelExpressControlClient.connect(
-        server_url="modelexpress:8001",
-    ) as control:
-        control.create_weight_version(
-            uid="v1",
-            model_name="Qwen/Qwen3-30B-A3B",
-            idempotency_key="publish-v1",
-            payload_format=WeightPayloadFormat.XOR_DELTA,
-            base_version_id="v0",
-            object_storage=ObjectStorageSource(
-                storage_type=ObjectStorageType.S3,
-                uri=f"{S3_URI_PREFIX}/v1/model.safetensors.index.json",
-            ),
-            state=WeightVersionState.STAGING,
-        )
-dist.barrier(group=refit_process_group)
-
-# Every trainer rank computes and publishes its contribution. This writes the
-# global index after all rank-local delta shards are durable.
-staged = trainer.stage_shard(
-    version=WeightVersionRef("v1"),
-    hf_tensor_iter=hf_tensor_buckets(),
-)
-staged.publish()
-dist.barrier(group=refit_process_group)
-
-# The coordinator exposes the completed version to generators.
-if dist.get_rank(group=refit_process_group) == 0:
-    with ModelExpressControlClient.connect(
-        server_url="modelexpress:8001",
-    ) as control:
-        control.update_weight_version_state(
-            "v1",
-            WeightVersionState.READY,
-        )
-```
-
-### 2. Apply `v1` in vLLM
-
-Run the update while generation is paused. `mode=abort` clears active requests
-and vLLM caches before the weight update.
-
-```python
-import requests
-
-VLLM_URL = "http://vllm-generator:8000"
-
-
-def post(path, *, body=None, params=None):
-    response = requests.post(
-        f"{VLLM_URL}/{path}",
-        json=body or {},
-        params=params,
-        timeout=900,
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-post("pause", body={}, params={"mode": "abort"})
-try:
-    post("start_weight_update", body={})
-    post("update_weights", body={"update_info": {"version_id": "v1"}})
-    post("finish_weight_update", body={"weight_version": "v1"})
-finally:
-    post("resume", body={})
-```
-
-The next delta must be `v2` with `base_version_id="v1"`. An integration may
-instead create a `FULL_HF_CHECKPOINT` version without `base_version_id`; that
-version becomes the exact base for the following delta. Full checkpoint batches
-may declare `checksum_format="adler32"` in the index and carry per-tensor
-checksums under tensor-name keys in shard metadata. They are retained as an
-immutable full artifact. XOR deltas require the complete index metadata contract
-above and are replayed in order in the canonical lineage; each preparation
-applies only the incoming delta to its exact active base.

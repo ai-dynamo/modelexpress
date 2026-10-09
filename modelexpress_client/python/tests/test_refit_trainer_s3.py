@@ -30,6 +30,7 @@ from modelexpress_rl import (
 from modelexpress_rl.s3 import S3Client
 from modelexpress_rl.train import client as trainer_client_module
 from modelexpress_rl.train import runtime as trainer_runtime_module
+from modelexpress_rl.train.methods import canonical_delta as canonical_delta_module
 
 
 class _MemoryS3:
@@ -198,7 +199,7 @@ def _trainer(
     )
     if prepare_base:
         trainer.prepare_delta_base(
-            hf_tensor_iter=iter([list(seed_tensors.items())]),
+            tensor_iter=iter([list(seed_tensors.items())]),
         )
     return trainer, storage
 
@@ -262,7 +263,7 @@ def test_s3_prepare_delta_base_uses_owned_seed_tensors(
     try:
         with caplog.at_level(logging.INFO, logger=trainer_client_module.__name__):
             trainer.prepare_delta_base(
-                hf_tensor_iter=iter([[("a", torch.tensor([9.0]))]]),
+                tensor_iter=iter([[("a", torch.tensor([9.0]))]]),
             )
 
         assert set(trainer._runtime.method.snapshot) == {"a"}
@@ -305,7 +306,7 @@ def test_s3_prepare_delta_base_reads_framework_buckets_concurrently(
     trainer._runtime.method._read_seed_tensor = read
     try:
         trainer.prepare_delta_base(
-            hf_tensor_iter=iter(
+            tensor_iter=iter(
                 [
                     [("a", torch.tensor([9.0]))],
                     [("b", torch.tensor([9.0]))],
@@ -361,7 +362,7 @@ def test_s3_stage_is_local_then_publish_uploads_version_root(
             _ = trainer.logical_shard_id
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([[("weight", current)]]),
+            tensor_iter=iter([[("weight", current)]]),
         )
         assert storage.objects == {}
 
@@ -384,9 +385,7 @@ def test_s3_stage_is_local_then_publish_uploads_version_root(
     assert index["weight_map"] == {"weight": "model-00000-of-00001.safetensors"}
     removed_digests = {"base_digest", "target_digest", "format_digest"}
     assert removed_digests.isdisjoint(index)
-    shard_key = next(
-        uri for uri in storage.objects if uri.endswith(".safetensors")
-    )
+    shard_key = next(uri for uri in storage.objects if uri.endswith(".safetensors"))
     assert shard_key == "s3://weights/tests/v1/model-00000-of-00001.safetensors"
     blob = storage.objects[shard_key]
     (header_size,) = struct.unpack("<Q", blob[:8])
@@ -424,7 +423,7 @@ def test_s3_full_hf_checkpoint_publishes_native_tensors_and_rebases(
     try:
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([[("weight", current)]]),
+            tensor_iter=iter([[("weight", current)]]),
         )
         assert storage.objects == {}
         staged_tensor = method.snapshot["weight"]
@@ -455,9 +454,7 @@ def test_s3_full_hf_checkpoint_publishes_native_tensors_and_rebases(
         (header_size,) = struct.unpack("<Q", shard[:8])
         header = json.loads(shard[8 : 8 + header_size])
         assert header["__metadata__"] == {
-            "weight": (
-                f"{zlib.adler32(expected.view(torch.uint8).numpy()):08x}"
-            )
+            "weight": (f"{zlib.adler32(expected.view(torch.uint8).numpy()):08x}")
         }
         assert method.current_base_version_id == "target-a"
         assert np.array_equal(
@@ -480,7 +477,7 @@ def test_s3_full_hf_checkpoint_publishes_native_tensors_and_rebases(
         )
         trainer.stage_shard(
             version=WeightVersionRef("target-b"),
-            hf_tensor_iter=iter(
+            tensor_iter=iter(
                 [[("weight", torch.tensor([[5.0, 6.0]], dtype=torch.bfloat16))]]
             ),
         ).publish()
@@ -501,7 +498,7 @@ def test_s3_full_hf_checkpoint_upload_failure_is_retryable(
     try:
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([[("weight", torch.tensor([3.0, 4.0]))]]),
+            tensor_iter=iter([[("weight", torch.tensor([3.0, 4.0]))]]),
         )
         storage.fail_next = True
         with pytest.raises(RuntimeError, match="injected upload failure"):
@@ -511,7 +508,7 @@ def test_s3_full_hf_checkpoint_upload_failure_is_retryable(
 
         retry = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([[("weight", torch.tensor([9.0, 10.0]))]]),
+            tensor_iter=iter([[("weight", torch.tensor([9.0, 10.0]))]]),
         )
         assert retry._staged is staged._staged
         retry.publish()
@@ -539,12 +536,12 @@ def test_s3_full_hf_checkpoint_blocks_a_second_staged_update(
     try:
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([[("weight", torch.tensor([3.0, 4.0]))]]),
+            tensor_iter=iter([[("weight", torch.tensor([3.0, 4.0]))]]),
         )
         with pytest.raises(RuntimeError, match="before staging another"):
             trainer.stage_shard(
                 version=WeightVersionRef("target-b"),
-                hf_tensor_iter=iter([[("weight", torch.tensor([5.0, 6.0]))]]),
+                tensor_iter=iter([[("weight", torch.tensor([5.0, 6.0]))]]),
             )
         staged.publish()
     finally:
@@ -576,18 +573,18 @@ def test_s3_full_hf_checkpoint_captures_buckets_concurrently(
     method = trainer._runtime.method
     capture_barrier = threading.Barrier(2)
     capture_threads = set()
-    capture_bucket = method._capture_full_checkpoint_bucket
+    capture_bucket = method._process_full_checkpoint_bucket
 
     def track_capture(bucket):
         capture_threads.add(threading.get_ident())
         capture_barrier.wait(timeout=5)
         return capture_bucket(bucket)
 
-    method._capture_full_checkpoint_bucket = track_capture
+    method._process_full_checkpoint_bucket = track_capture
     try:
         trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter(
+            tensor_iter=iter(
                 [
                     [("a", torch.tensor([3.0]))],
                     [("b", torch.tensor([4.0]))],
@@ -625,7 +622,7 @@ def test_s3_full_hf_checkpoint_batches_tensors_by_size(
     try:
         trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([list(tensors.items())]),
+            tensor_iter=iter([list(tensors.items())]),
         ).publish()
     finally:
         trainer.close()
@@ -669,7 +666,7 @@ def test_s3_full_hf_checkpoint_uploads_batches_concurrently(
     try:
         trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([list(tensors.items())]),
+            tensor_iter=iter([list(tensors.items())]),
         ).publish()
     finally:
         trainer.close()
@@ -695,7 +692,7 @@ def test_s3_stage_requires_version_uri_under_configured_prefix(
         with pytest.raises(RuntimeError, match="does not match the configured prefix"):
             trainer.stage_shard(
                 version=WeightVersionRef("target-a"),
-                hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 3.0]))]]),
+                tensor_iter=iter([[("weight", torch.tensor([1.0, 3.0]))]]),
             )
     finally:
         trainer.close()
@@ -714,7 +711,7 @@ def test_s3_stage_accepts_caller_uri_under_configured_prefix(
     try:
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 3.0]))]]),
+            tensor_iter=iter([[("weight", torch.tensor([1.0, 3.0]))]]),
         )
     finally:
         trainer.close()
@@ -729,7 +726,7 @@ def test_s3_publish_failure_keeps_handle_retryable(monkeypatch, tmp_path, refit_
     try:
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([[("weight", torch.tensor([4.0, 5.0]))]]),
+            tensor_iter=iter([[("weight", torch.tensor([4.0, 5.0]))]]),
         )
         encoded = {
             name: value.tobytes()
@@ -764,7 +761,7 @@ def test_s3_index_publish_failure_keeps_handle_retryable(
     try:
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 2.0]))]]),
+            tensor_iter=iter([[("weight", torch.tensor([1.0, 2.0]))]]),
         )
         storage.fail_next = True
         with pytest.raises(RuntimeError, match="injected upload failure"):
@@ -802,7 +799,7 @@ def test_s3_remote_index_failure_prevents_non_root_state_transition(
     try:
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 2.0]))]]),
+            tensor_iter=iter([[("weight", torch.tensor([1.0, 2.0]))]]),
         )
         with pytest.raises(RuntimeError, match="failed on rank 0"):
             staged.publish()
@@ -868,7 +865,7 @@ def test_s3_processes_buckets_concurrently_and_uploads_one_shard(
     )
     process_barrier = threading.Barrier(2)
     process_threads = set()
-    process_bucket = trainer._runtime.method._process_bucket
+    process_bucket = trainer._runtime.method._process_delta_bucket
     save = safetensors.numpy.save
     save_calls = 0
 
@@ -882,12 +879,12 @@ def test_s3_processes_buckets_concurrently_and_uploads_one_shard(
         save_calls += 1
         return save(*args, **kwargs)
 
-    trainer._runtime.method._process_bucket = track_process
+    trainer._runtime.method._process_delta_bucket = track_process
     monkeypatch.setattr(safetensors.numpy, "save", track_save)
     try:
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter(
+            tensor_iter=iter(
                 [
                     [("a", torch.tensor([2.0, 3.0]))],
                     [("b", torch.tensor([4.0, 5.0]))],
@@ -935,17 +932,17 @@ def test_s3_preserves_framework_bucket_boundaries(monkeypatch, tmp_path, refit_s
         [("c", torch.tensor([4.0]))],
     ]
     processed = []
-    process_bucket = trainer._runtime.method._process_bucket
+    process_bucket = trainer._runtime.method._process_delta_bucket
 
     def track_process(bucket):
         processed.append(bucket)
         return process_bucket(bucket)
 
-    trainer._runtime.method._process_bucket = track_process
+    trainer._runtime.method._process_delta_bucket = track_process
     try:
         trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter(buckets),
+            tensor_iter=iter(buckets),
         )
     finally:
         trainer.close()
@@ -971,14 +968,14 @@ def test_s3_exposes_local_metrics_after_publication(
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", track_gather)
     monkeypatch.setattr(
-        trainer_runtime_module,
+        canonical_delta_module,
         "perf_counter",
         lambda: next(clock),
     )
     try:
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([[("weight", current)]]),
+            tensor_iter=iter([[("weight", current)]]),
         )
         expected_delta = torch.bitwise_xor(
             torch.tensor([1.0, 2.0]).view(torch.uint8),
@@ -1019,7 +1016,7 @@ def test_s3_clean_update_still_publishes_root_index(
     try:
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 2.0]))]]),
+            tensor_iter=iter([[("weight", torch.tensor([1.0, 2.0]))]]),
         )
         assert staged._staged.encoded_deltas == {}
         assert staged._staged.checksums == {}
@@ -1042,16 +1039,22 @@ def test_s3_clean_update_still_publishes_root_index(
     assert metrics["publish_object_storage_time"] >= 0
 
 
+@pytest.mark.parametrize("incremental", [False, True])
 def test_s3_chains_from_published_base_and_keeps_previous_advertisement(
-    monkeypatch, tmp_path, refit_server
+    monkeypatch, tmp_path, refit_server, incremental
 ):
     service, server_url = refit_server
     trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
 
     try:
+        first_bucket = [("weight", torch.tensor([1.0, 3.0]))]
+        first_inputs = (
+            {"tensors": first_bucket}
+            if incremental
+            else {"tensor_iter": iter([first_bucket])}
+        )
         first = trainer.stage_shard(
-            version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 3.0]))]]),
+            version=WeightVersionRef("target-a"), **first_inputs
         )
         first.publish()
         assert first._staged.encoded_deltas == {}
@@ -1069,9 +1072,14 @@ def test_s3_chains_from_published_base_and_keeps_previous_advertisement(
             ),
             state=refit_pb2.WEIGHT_VERSION_STATE_STAGING,
         )
+        second_bucket = [("weight", torch.tensor([2.0, 4.0]))]
+        second_inputs = (
+            {"tensors": second_bucket}
+            if incremental
+            else {"tensor_iter": iter([second_bucket])}
+        )
         second = trainer.stage_shard(
-            version=WeightVersionRef("target-b"),
-            hf_tensor_iter=iter([[("weight", torch.tensor([2.0, 4.0]))]]),
+            version=WeightVersionRef("target-b"), **second_inputs
         )
         second.publish()
         assert second._staged.encoded_deltas == {}
@@ -1104,7 +1112,7 @@ def test_s3_release_keeps_canonical_advertisement(monkeypatch, tmp_path, refit_s
     try:
         trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 3.0]))]]),
+            tensor_iter=iter([[("weight", torch.tensor([1.0, 3.0]))]]),
         ).publish()
         service.target = refit_pb2.WeightVersion(
             uid="target-b",
@@ -1119,7 +1127,7 @@ def test_s3_release_keeps_canonical_advertisement(monkeypatch, tmp_path, refit_s
         )
         trainer.stage_shard(
             version=WeightVersionRef("target-b"),
-            hf_tensor_iter=iter([[("weight", torch.tensor([2.0, 4.0]))]]),
+            tensor_iter=iter([[("weight", torch.tensor([2.0, 4.0]))]]),
         ).publish()
 
         trainer.release_version(version=WeightVersionRef("target-a"))
@@ -1139,7 +1147,7 @@ def test_s3_propagates_tensor_processing_error(monkeypatch, tmp_path, refit_serv
         with pytest.raises(KeyError, match="missing"):
             trainer.stage_shard(
                 version=WeightVersionRef("target-a"),
-                hf_tensor_iter=iter([[("missing", torch.tensor([1.0]))]]),
+                tensor_iter=iter([[("missing", torch.tensor([1.0]))]]),
             )
     finally:
         trainer.close()
@@ -1185,3 +1193,327 @@ def test_object_storage_config_rejects_unsupported_provider(tmp_path):
                 ),
             )
         )
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_s3_incremental_buckets_process_concurrently_and_publish_once(
+    monkeypatch, tmp_path, refit_server, full
+):
+    service, server_url = refit_server
+    if full:
+        service.target.payload_format = (
+            refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+        )
+        service.target.ClearField("base_version_id")
+    monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", "2")
+    seeds = {"a": torch.tensor([1.0]), "b": torch.tensor([2.0])}
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url, seeds)
+    method = trainer._runtime.method
+    entered = {name: threading.Event() for name in seeds}
+    release = threading.Event()
+    process_name = "_process_full_checkpoint_bucket" if full else "_process_delta_bucket"
+    original = getattr(method, process_name)
+
+    def process(bucket):
+        entered[bucket[0][0]].set()
+        assert release.wait(5), "bucket workers did not run concurrently"
+        return original(bucket)
+
+    monkeypatch.setattr(method, process_name, process)
+    version = WeightVersionRef("target-a")
+    try:
+        staged = trainer.stage_shard(version=version, tensors=[])
+        for name, tensor in seeds.items():
+            bucket = [(name, tensor + 1)]
+            handle = trainer.stage_shard(version=version, tensors=bucket)
+            assert handle._staged is staged._staged
+        assert all(event.wait(5) for event in entered.values())
+        assert storage.objects == {}
+        assert method.current_base_version_id == "base-a"
+        release.set()
+        staged.publish()
+        staged.publish()
+        assert method._stage_threadpool is None
+        assert method.current_base_version_id == "target-a"
+        assert len(storage.objects) == 2
+        index = json.loads(
+            storage.objects["s3://weights/tests/v1/model.safetensors.index.json"]
+        )
+        assert set(index["weight_map"]) == set(seeds)
+        for name, filename in index["weight_map"].items():
+            blob = storage.objects[f"s3://weights/tests/v1/{filename}"]
+            if full:
+                assert torch.equal(safetensors.torch.load(blob)[name], seeds[name] + 1)
+            else:
+                encoded = safetensors.numpy.load(blob)[name]
+                delta = np.frombuffer(
+                    zstandard.ZstdDecompressor().decompress(encoded), dtype=np.uint8
+                )
+                actual = np.bitwise_xor(seeds[name].view(torch.uint8).numpy(), delta)
+                assert np.array_equal(
+                    actual, (seeds[name] + 1).view(torch.uint8).numpy()
+                )
+    finally:
+        release.set()
+        trainer.close()
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_s3_incremental_rejects_another_version_without_changing_payload(
+    monkeypatch, tmp_path, refit_server, full
+):
+    service, server_url = refit_server
+    if full:
+        service.target.payload_format = (
+            refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+        )
+        service.target.ClearField("base_version_id")
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+    expected = torch.tensor([3.0, 4.0])
+    try:
+        staged = trainer.stage_shard(
+            version=WeightVersionRef("target-a"), tensors=[("weight", expected)]
+        )
+        with pytest.raises(RuntimeError, match="publish the staged canonical checkpoint"):
+            trainer.stage_shard(
+                version=WeightVersionRef("target-b"),
+                tensors=[("weight", torch.tensor([5.0, 6.0]))],
+            )
+        staged.publish()
+        index = json.loads(
+            storage.objects["s3://weights/tests/v1/model.safetensors.index.json"]
+        )
+        shard = storage.objects[
+            f"s3://weights/tests/v1/{index['weight_map']['weight']}"
+        ]
+        if full:
+            actual = safetensors.torch.load(shard)["weight"].view(torch.uint8).numpy()
+        else:
+            encoded = safetensors.numpy.load(shard)["weight"]
+            delta = np.frombuffer(
+                zstandard.ZstdDecompressor().decompress(encoded), dtype=np.uint8
+            )
+            actual = np.bitwise_xor(
+                torch.tensor([1.0, 2.0]).view(torch.uint8).numpy(), delta
+            )
+        assert np.array_equal(actual, expected.view(torch.uint8).numpy())
+        assert trainer._runtime.method.current_base_version_id == "target-a"
+    finally:
+        trainer.close()
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_s3_incremental_publish_failure_keeps_complete_payload_retryable(
+    monkeypatch, tmp_path, refit_server, full
+):
+    service, server_url = refit_server
+    if full:
+        service.target.payload_format = (
+            refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+        )
+        service.target.ClearField("base_version_id")
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+    version = WeightVersionRef("target-a")
+    try:
+        staged = trainer.stage_shard(
+            version=version, tensors=[("weight", torch.tensor([3.0, 4.0]))]
+        )
+        storage.fail_next = True
+        with pytest.raises(RuntimeError, match="injected upload failure"):
+            staged.publish()
+        assert trainer._runtime.method.current_base_version_id == "base-a"
+        staged.publish()
+        assert trainer._runtime.method.current_base_version_id == "target-a"
+        assert len(storage.objects) == 2
+    finally:
+        trainer.close()
+
+
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize("during_submission", [False, True])
+def test_s3_incremental_processing_failure_cannot_publish_partial_weights(
+    monkeypatch, tmp_path, refit_server, full, during_submission
+):
+    service, server_url = refit_server
+    if full:
+        service.target.payload_format = (
+            refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+        )
+        service.target.ClearField("base_version_id")
+    monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", "1")
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+    method = trainer._runtime.method
+
+    def fail(_bucket):
+        raise RuntimeError("bucket encoding failed")
+
+    monkeypatch.setattr(
+        method, "_process_full_checkpoint_bucket" if full else "_process_delta_bucket", fail
+    )
+    try:
+        staged = trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            tensors=[("weight", torch.tensor([3.0, 4.0]))],
+        )
+        if during_submission:
+            with pytest.raises(RuntimeError, match="bucket encoding failed"):
+                trainer.stage_shard(
+                    version=WeightVersionRef("target-a"),
+                    tensors=[("weight", torch.tensor([5.0, 6.0]))],
+                )
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="bucket encoding failed"):
+                staged.publish()
+        assert storage.objects == {}
+        assert method.current_base_version_id == "base-a"
+        assert method._stage_threadpool is None
+    finally:
+        trainer.close()
+
+
+def test_s3_incremental_buckets_backpressure_the_producer(
+    monkeypatch, tmp_path, refit_server
+):
+    _service, server_url = refit_server
+    monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", "1")
+    seeds = {"a": torch.tensor([1.0]), "b": torch.tensor([2.0])}
+    trainer, _storage = _trainer(monkeypatch, tmp_path, server_url, seeds)
+    method = trainer._runtime.method
+    release = threading.Event()
+    second_submitted = threading.Event()
+    process_bucket = method._process_delta_bucket
+
+    def process(bucket):
+        assert release.wait(5), "test failed to release bucket processing"
+        return process_bucket(bucket)
+
+    monkeypatch.setattr(method, "_process_delta_bucket", process)
+    version = WeightVersionRef("target-a")
+    try:
+        staged = trainer.stage_shard(version=version, tensors=[])
+        trainer.stage_shard(version=version, tensors=[("a", torch.tensor([3.0]))])
+        submit = method._stage_threadpool.submit
+
+        def observe_submit(*args, **kwargs):
+            future = submit(*args, **kwargs)
+            second_submitted.set()
+            return future
+
+        monkeypatch.setattr(method._stage_threadpool, "submit", observe_submit)
+        with futures.ThreadPoolExecutor(max_workers=1) as producer:
+            pending = producer.submit(
+                trainer.stage_shard,
+                version=version,
+                tensors=[("b", torch.tensor([4.0]))],
+            )
+            try:
+                assert second_submitted.wait(5)
+                assert not pending.done()
+            finally:
+                release.set()
+            pending.result(timeout=5)
+        staged.publish()
+    finally:
+        release.set()
+        trainer.close()
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_s3_failed_iterator_can_retry_the_complete_stream(
+    monkeypatch, tmp_path, refit_server, full
+):
+    service, server_url = refit_server
+    if full:
+        service.target.payload_format = (
+            refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+        )
+        service.target.ClearField("base_version_id")
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+
+    def broken():
+        yield [("weight", torch.tensor([3.0, 4.0]))]
+        raise RuntimeError("gather failed")
+
+    try:
+        with pytest.raises(RuntimeError, match="gather failed"):
+            trainer.stage_shard(
+                version=WeightVersionRef("target-a"), tensor_iter=broken()
+            )
+        assert storage.objects == {}
+        assert trainer._runtime.method._stage_threadpool is None
+        trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            tensor_iter=iter([[("weight", torch.tensor([5.0, 6.0]))]]),
+        ).publish()
+        assert trainer._runtime.method.current_base_version_id == "target-a"
+        assert len(storage.objects) == 2
+        shard = next(
+            data
+            for uri, data in storage.objects.items()
+            if uri.endswith(".safetensors")
+        )
+        expected = torch.tensor([5.0, 6.0])
+        if full:
+            assert torch.equal(safetensors.torch.load(shard)["weight"], expected)
+        else:
+            encoded = safetensors.numpy.load(shard)["weight"]
+            delta = np.frombuffer(
+                zstandard.ZstdDecompressor().decompress(encoded), dtype=np.uint8
+            )
+            actual = np.bitwise_xor(
+                torch.tensor([1.0, 2.0]).view(torch.uint8).numpy(), delta
+            )
+            assert np.array_equal(actual, expected.view(torch.uint8).numpy())
+    finally:
+        trainer.close()
+
+
+@pytest.mark.parametrize("incremental", [False, True])
+def test_s3_rank_without_tensors_still_publishes(
+    monkeypatch, tmp_path, refit_server, incremental
+):
+    _service, server_url = refit_server
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url, prepare_base=False)
+    inputs = {"tensors": []} if incremental else {"tensor_iter": iter([])}
+    try:
+        staged = trainer.stage_shard(version=WeightVersionRef("target-a"), **inputs)
+        staged.publish()
+        index = json.loads(
+            storage.objects["s3://weights/tests/v1/model.safetensors.index.json"]
+        )
+        assert index["weight_map"] == {}
+        assert len(storage.objects) == 1
+        assert trainer._runtime.method.current_base_version_id == "target-a"
+    finally:
+        trainer.close()
+
+
+@pytest.mark.parametrize("both", [False, True])
+def test_s3_staging_requires_exactly_one_input_form(
+    monkeypatch, tmp_path, refit_server, both
+):
+    _service, server_url = refit_server
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+    try:
+        inputs = {"tensors": [], "tensor_iter": iter([])} if both else {}
+        with pytest.raises(
+            ValueError, match="either tensor_iter or a tensor bucket"
+        ):
+            trainer.stage_shard(version=WeightVersionRef("target-a"), **inputs)
+        assert storage.objects == {}
+    finally:
+        trainer.close()
+
+
+def test_s3_close_discards_unpublished_bucket_work(monkeypatch, tmp_path, refit_server):
+    _service, server_url = refit_server
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+    method = trainer._runtime.method
+    trainer.stage_shard(
+        version=WeightVersionRef("target-a"),
+        tensors=[("weight", torch.tensor([3.0, 4.0]))],
+    )
+    trainer.close()
+    assert storage.closed and storage.objects == {}
+    assert method._stage_threadpool is None and not method._stage_futures
+    assert method._staged is None and method.snapshot == {}

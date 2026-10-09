@@ -230,12 +230,21 @@ GCS uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DI
 
 See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
+### Generator refit connection settings
+
+vLLM's `init_info` and SGLang's `--modelexpress-config` use
+`object_storage_endpoint_url` and `object_storage_region_name`. These map to the
+SDK's `ObjectStorageGeneratorConfig.endpoint_url` and `.region_name`. Omit the
+endpoint to use the provider default. Miles uses `object_storage_uri_prefix`
+for trainer publication. See the [backend setup examples](S3_DELTA_WEIGHT_REFIT.md).
+
 ### Generator refit checkpoint cache
 
-`refit_checkpoint_max_size_gb` defaults to 2000 GB per model. At initialization,
-the generator caps this quota at existing cache bytes plus free disk space and
-logs any reduction. Free space is checked again before known writes and copies,
-including when `null` disables the configured quota. See the
+`refit_checkpoint_max_size_gb` defaults to 2000 GB per model in the SDK, vLLM,
+and SGLang. At initialization, the generator caps this quota at existing
+cache bytes plus free disk space and logs any reduction. Free space is checked
+again before known writes and copies, including when `null` disables the
+configured quota. See the
 [S3 refit cache configuration](S3_DELTA_WEIGHT_REFIT.md#refit_checkpoint_dir)
 for setup and eviction behavior.
 
