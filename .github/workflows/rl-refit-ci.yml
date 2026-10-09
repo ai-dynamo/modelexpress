@@ -1,0 +1,189 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+name: RL refit CI
+
+on:
+  workflow_call:
+    inputs:
+      pull_request:
+        type: number
+        default: 0
+      model:
+        type: string
+        required: true
+      scenario:
+        type: string
+        default: delta
+      sha:
+        type: string
+        required: true
+      runtime:
+        type: string
+        default: ""
+    secrets:
+      NGC_API_KEY:
+        required: true
+      HF_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  KUBECONFIG: /teleport/kubeconfig.yaml
+  KUBE_CONTEXT: ${{ vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02' }}
+  NAMESPACE: mx-ci-bench-${{ github.run_id }}-${{ github.run_attempt }}
+  RESULTS_DIR: ${{ github.workspace }}/bench-results
+  MODEL_PROFILE: ${{ inputs.model }}
+  SCENARIO: ${{ inputs.scenario }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      harness_sha: ${{ steps.inputs.outputs.harness_sha }}
+      model: ${{ steps.inputs.outputs.model }}
+      runtime: ${{ steps.inputs.outputs.runtime }}
+    steps:
+      - name: Checkout trusted harness
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event_name == 'push' && inputs.sha || github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Validate immutable source and registered experiment
+        id: inputs
+        env:
+          TEST_SHA: ${{ inputs.sha }}
+          PR_NUMBER: ${{ inputs.pull_request }}
+          GH_TOKEN: ${{ github.token }}
+          RUNTIME_BASE: ${{ inputs.runtime }}
+        run: |
+          python3 ci/bench/scripts/comment_gate.py --workflow-call
+          echo "harness_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 60
+    outputs:
+      server: ${{ steps.images.outputs.server }}
+      worker: ${{ steps.images.outputs.worker }}
+      cleanup: ${{ steps.images.outputs.cleanup }}
+    steps:
+      - name: Checkout trusted harness
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate.outputs.harness_sha }}
+          persist-credentials: false
+      - name: Checkout approved source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ inputs.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+      - name: Build images from the approved revision
+        id: images
+        env:
+          TEST_SHA: ${{ inputs.sha }}
+          RUNTIME_BASE: ${{ needs.validate.outputs.runtime }}
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+          repo=nvcr.io/0980761089281446
+          server="$repo/mx-bench-server:$TEST_SHA"
+          worker="$repo/mx-bench-worker:$TEST_SHA"
+          cleanup="$repo/mx-bench-cleanup:$TEST_SHA"
+          docker buildx build --platform linux/amd64 -f ci/k8s/server/Dockerfile.server \
+            -t "$server" --metadata-file server-build.json --push candidate
+          docker buildx build --platform linux/amd64 -f ci/bench/Dockerfile \
+            --build-arg "RUNTIME_BASE=$RUNTIME_BASE" -t "$worker" \
+            --metadata-file worker-build.json --push candidate
+          docker buildx build --platform linux/amd64 -f ci/bench/Dockerfile.cleanup \
+            -t "$cleanup" --metadata-file cleanup-build.json --push candidate
+          echo "cleanup=$repo/mx-bench-cleanup@$(jq -r '."containerimage.digest"' cleanup-build.json)" >> "$GITHUB_OUTPUT"
+          echo "server=$repo/mx-bench-server@$(jq -r '."containerimage.digest"' server-build.json)" >> "$GITHUB_OUTPUT"
+          echo "worker=$repo/mx-bench-worker@$(jq -r '."containerimage.digest"' worker-build.json)" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: "Refit (${{ inputs.model }})"
+    needs: [validate, build]
+    runs-on: prod-deploy-tester-v1
+    timeout-minutes: 60
+    env:
+      MODEL_PROFILE: ${{ needs.validate.outputs.model }}
+      RUN_ID: ${{ needs.validate.outputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
+      SERVER_IMAGE: ${{ needs.build.outputs.server }}
+      WORKER_IMAGE: ${{ needs.build.outputs.worker }}
+      CLEANUP_IMAGE: ${{ needs.build.outputs.cleanup }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate.outputs.harness_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install manifest parser
+        run: python3 -m pip install pyyaml
+      - name: Provision storage and profile-sized namespace
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python3 ci/bench/scripts/ci.py setup
+      - name: Verify refitted GPU weights and measure cold-load and refit latency
+        timeout-minutes: 45
+        run: python3 ci/bench/scripts/ci.py run
+      - name: Collect missing run evidence
+        if: ${{ always() && hashFiles('bench-results/report.json') == '' }}
+        run: python3 ci/bench/scripts/ci.py collect
+      - name: Save evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Record tested revision
+        if: always()
+        env:
+          TEST_SHA: ${{ inputs.sha }}
+        run: echo "RL weight refit CI of $TEST_SHA; evidence is attached to this run." >> "$GITHUB_STEP_SUMMARY"
+
+  cleanup:
+    needs: [validate, build, test]
+    if: ${{ always() && needs.build.result == 'success' && needs.test.result != 'skipped' }}
+    runs-on: prod-deploy-tester-v1
+    timeout-minutes: 15
+    env:
+      MODEL_PROFILE: ${{ needs.validate.outputs.model }}
+      RUN_ID: ${{ needs.validate.outputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
+      SERVER_IMAGE: ${{ needs.build.outputs.server }}
+      WORKER_IMAGE: ${{ needs.build.outputs.worker }}
+      CLEANUP_IMAGE: ${{ needs.build.outputs.cleanup }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate.outputs.harness_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install manifest parser
+        run: python3 -m pip install pyyaml
+      - name: Remove exact-run objects and owned namespace
+        run: python3 ci/bench/scripts/ci.py cleanup
+      - name: Save cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: warn
+          retention-days: 14

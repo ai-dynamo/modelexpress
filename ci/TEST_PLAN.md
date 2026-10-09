@@ -54,3 +54,28 @@ Coverage matrix for the ModelExpress CI infrastructure. Reflects what's currentl
 - **Not started** — no scaffold, no matrix entry, no dependency planning yet.
 
 When a row moves status, update this table in the same PR so the doc stays the source of truth on what CI does and doesn't catch.
+
+The existing Vime smoke uses a digest-pinned SeaweedFS S3 fixture, shared with
+the benchmark CI workflow.
+
+## Comment-triggered model benchmark CI
+
+`ci/bench/` contains registered Nemotron and Kimi-K2.7-Code profiles. Offline
+contracts run on every PR in `RL refit harness tests`. `bench-ci.yml` accepts `/bench [--model PROFILE]
+[--scenario delta] [--sha FULL_SHA]` from repository writers after copy-pr-bot mirrors the current
+head. Every trusted PR also runs the one-GPU Nemotron S3 delta-weight refit through
+`rl-refit-ci.yml`; `CI status check` requires its build, GPU test, and cleanup to succeed.
+Automatic and comment-triggered CI use the Vime example's SeaweedFS setup in an isolated
+namespace and upload the pinned seed snapshot before measurement; they need no AWS IAM role.
+Kimi remains opt-in. The reusable workflow independently validates the current
+approved mirror before building the requested SHA. Only delta is registered; no reshard CI case
+is introduced. GPU runs use profile-derived quotas; Nemotron defaults to a pinned
+copy of the existing CI vLLM runtime, with a repository override available. Kimi
+requires a per-model runtime override. No live qualification of
+the new Nemotron benchmark has been performed; Kimi refit compatibility is
+not established. Peer coverage stays manual. See
+[usage and limitations](../docs/DEPLOYMENT.md#modelexpress-benchmark-ci-harness).
+
+Benchmark success requires both weight/checkpoint validation and complete latency
+measurements. Reports retain per-rank times and the slowest rank; failed trials are excluded from successful summaries. This is independent
+of the existing Vime/Dynamo E2E smoke and does not enforce performance thresholds.
