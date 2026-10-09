@@ -134,27 +134,6 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
         .get("trainer_mesh_id")
         .filter(|mesh_id| !mesh_id.is_empty())
         .cloned();
-    let trainer_mesh_generation = if trainer_mesh_id.is_some() {
-        fields
-            .get("trainer_mesh_generation")
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|generation| *generation > 0)
-            .ok_or_else(|| {
-                RefitBackendError::FailedPrecondition(
-                    "mesh-backed weight version is missing a positive trainer_mesh_generation; recreate the version".to_string(),
-                )
-            })?
-    } else {
-        if fields
-            .get("trainer_mesh_generation")
-            .is_some_and(|value| value != "0")
-        {
-            return Err(RefitBackendError::FailedPrecondition(
-                "weight version without a trainer mesh must have generation zero".to_string(),
-            ));
-        }
-        0
-    };
     Ok(WeightVersion {
         uid: hash_field(&fields, "uid")?.to_string(),
         model_name: hash_field(&fields, "model_name")?.to_string(),
@@ -175,7 +154,7 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
                 storage_type: ObjectStorageType::S3.into(),
             }),
         trainer_mesh_id,
-        trainer_mesh_generation,
+        trainer_mesh_generation: parse_hash_field(&fields, "trainer_mesh_generation")?,
         version_number: fields
             .get("version_number")
             .filter(|number| !number.is_empty())
@@ -1087,11 +1066,11 @@ mod tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn stored_mesh_versions_require_positive_generation() {
-        for generation in [None, Some("0"), Some("invalid")] {
+    fn stored_versions_require_uint64_generation() {
+        for generation in [None, Some("invalid"), Some("18446744073709551616")] {
             assert!(matches!(
                 version_from_hash(stored_version("mesh", generation)),
-                Err(RefitBackendError::FailedPrecondition(_))
+                Err(RefitBackendError::Internal(_))
             ));
         }
         let version = version_from_hash(stored_version("mesh", Some("18446744073709551615")))
@@ -1105,10 +1084,6 @@ mod tests {
         let version = version_from_hash(stored_version("", Some("0")))
             .expect("generation is not applicable without a mesh");
         assert_eq!(version.trainer_mesh_generation, 0);
-        assert!(matches!(
-            version_from_hash(stored_version("", Some("1"))),
-            Err(RefitBackendError::FailedPrecondition(_))
-        ));
     }
 
     #[test]

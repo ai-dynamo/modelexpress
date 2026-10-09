@@ -446,9 +446,9 @@ The unchanged creation API supplies a mesh ID; the server reads and stamps its
 generation atomically while creating the version. Idempotent retries return the
 original stamp. Shard publication, including the final READY transition and
 repeated publications, rejects a changed mesh generation before writing. Trainer
-resolution compares the recorded generation with the current mesh. Versions
-created before this field must be recreated; missing or zero mesh generations
-fail explicitly. Versions without a trainer mesh, including object-storage
+resolution compares the recorded generation with the current mesh. Stored versions
+require the generation field; decoding parses it as a uint64 without repeating
+creation-time consistency checks. Versions without a trainer mesh, including object-storage
 versions, carry generation zero. A requested version whose recorded mesh
 generation differs from the current trainer mesh fails source resolution.
 
