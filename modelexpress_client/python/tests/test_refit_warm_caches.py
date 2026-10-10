@@ -141,6 +141,26 @@ def _transfer_with_resolved_plan(monkeypatch, manifests: list[bytes]) -> tuple:
     return transfer, resolved
 
 
+def test_layout_capture_result_is_owned_without_redundant_copy(monkeypatch) -> None:
+    monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", "0")
+    manifest = _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100)
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._weight_update_plan = None
+    capture = CaptureResult(copies=[])
+    parameter_layout = {"layer.weight": ((4,), torch.float32)}
+
+    trainer, actual_capture, actual_layout, _ = transfer._resolve_layout(
+        [manifest],
+        lambda _manifest: (capture, parameter_layout),
+        {},
+        TrainerSourceSnapshot("mesh", 1, ()),
+    )
+
+    assert trainer.mesh_id == "mesh"
+    assert actual_capture is capture
+    assert actual_layout is parameter_layout
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_metadata_reuse_requires_enabled_cache_and_matching_manifests(
     monkeypatch, enabled

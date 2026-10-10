@@ -51,6 +51,8 @@ class FullTensorEngineCapability:
     device: Any
     # Rank in the engine's weight-transfer group; peer selection matches it.
     worker_rank: int
+    # capture_layout transfers ownership of its returned capture and layout
+    # to the update plan; it must not mutate them after returning.
     capture_layout: Callable
     runtime_tensors: dict[str, Any] | None
     source_worker_id: str | None

@@ -1826,7 +1826,9 @@ installation or release. Preparation retry and recovery behavior stays scoped
 to the selected update strategy; failures after a possible write fence the engine.
 
 Trainer source rows and captured layouts are owned snapshots inside one weight
-update plan. `TensorTransferPlan` describes physical reads and conversions, and a
+update plan. The engine capture callback transfers ownership of its returned
+capture and layout to that plan and does not mutate them after returning.
+`TensorTransferPlan` describes physical reads and conversions, and a
 bounded `_StreamingSchedule` groups those reads into `_StreamingBatch` entries.
 With source caching enabled, byte-identical ordered manifests reuse the resolved
 metadata directly from that plan; a miss resolves and freezes new metadata.

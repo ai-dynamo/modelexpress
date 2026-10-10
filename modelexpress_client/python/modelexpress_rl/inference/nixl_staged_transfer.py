@@ -934,7 +934,6 @@ class _NixlStagedTransfer:
         metrics["source_metadata_s"] = time.perf_counter() - started
         started = time.perf_counter()
         capture, parameter_layout = capture_layout(manifest)
-        capture, parameter_layout = deepcopy((capture, parameter_layout))
         metrics["layout_capture_s"] = time.perf_counter() - started
         return trainer, capture, parameter_layout, frozen
 
