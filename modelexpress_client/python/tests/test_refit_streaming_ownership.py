@@ -7,33 +7,34 @@ import pytest
 import torch
 from modelexpress_rl.inference import runtime
 from modelexpress_rl.inference.adapter import (
-    GeneratorSource,
-    GeneratorTransferInputs,
-    NixlGeneratorSource,
+    TrainerSourceShard,
 )
-from modelexpress_rl.inference.plan import PreparedStreamingTensors, TrainerUpdateSource
+from modelexpress_rl.inference.plan import (
+    PreparedStreamingTensors,
+    TrainerSourceSnapshot,
+    StreamingSettings,
+)
 from modelexpress_rl.train import WeightPayloadFormat
 
 
-def setup_method(monkeypatch):
+def setup_method(monkeypatch, *, staging_device="cuda", staging_buffers=1) -> tuple:
     events = []
     arena = torch.ones(2, 2)
 
     class Transfer:
         fail_prepare = False
 
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
             self.arena = arena
+            self.settings = kwargs["streaming"]
 
-        def prepare(self, **kwargs):
+        def prepare_streaming(self, **kwargs) -> SimpleNamespace:
             events.append(("prepare", kwargs))
             if self.fail_prepare:
                 raise RuntimeError("preparation failed")
             return SimpleNamespace(
                 metrics={},
-                batches=[
-                    SimpleNamespace(layouts=({"weight": ((2, 2), torch.float32)},))
-                ],
+                batches=[SimpleNamespace(layouts=({"weight": None},))],
             )
 
         def iter_bounded(self, prepared, metrics):
@@ -52,32 +53,29 @@ def setup_method(monkeypatch):
     method = runtime._create_load_time_tensor_method(
         capability=SimpleNamespace(device_id=0, device="cpu", capture_layout=None),
         worker_id="receiver",
+        streaming=StreamingSettings(512, staging_device, staging_buffers),
     )
-    source = TrainerUpdateSource(
-        GeneratorTransferInputs(
-            version_id="v:1",
-            base_version_id=None,
-            layout_signature="",
-            payload_format=WeightPayloadFormat.FULL_TENSOR,
-            sources=(
-                GeneratorSource(
-                    "slot",
-                    "trainer",
-                    "digest",
-                    NixlGeneratorSource("trainer:19000", b"manifest", "structure"),
-                ),
+    source = TrainerSourceSnapshot(
+        mesh_id="mesh",
+        mesh_generation=1,
+        shards=(
+            TrainerSourceShard(
+                source_slot_id="slot",
+                worker_id="trainer",
+                manifest_digest="digest",
+                manifest_endpoint="trainer:19000",
+                manifest=b"manifest",
+                structural_digest="structure",
             ),
-        )
+        ),
     )
     return method, source, events, arena
 
 
-def prepare(method, source, **kwargs):
+def prepare(method, source) -> PreparedStreamingTensors:
     return method.prepare_streaming(
         version=SimpleNamespace(version_id="v:1"),
         source=source,
-        max_staging_bytes=512,
-        **kwargs,
     )
 
 
@@ -86,25 +84,20 @@ def prepare(method, source, **kwargs):
 )
 def test_streaming_prepare_is_lazy_and_keeps_receive_options(
     monkeypatch, staging_device, staging_buffers
-):
-    method, source, events, arena = setup_method(monkeypatch)
+) -> None:
+    method, source, events, arena = setup_method(
+        monkeypatch, staging_device=staging_device, staging_buffers=staging_buffers
+    )
     previous_owner = None
     for value in (5, 7, 11):
         arena.fill_(value)
         events.clear()
-        prepared = prepare(
-            method,
-            source,
-            staging_device=staging_device,
-            staging_buffers=staging_buffers,
-        )
+        prepared = prepare(method, source)
         assert type(prepared) is PreparedStreamingTensors
         assert prepared is method._active_streamed
         assert prepared.ownership is not previous_owner
         assert not prepared.ownership.release_blocked
         assert [name for name, _ in events] == ["prepare"]
-        assert events[0][1]["staging_device"] == staging_device
-        assert events[0][1]["staging_buffers"] == staging_buffers
         assert prepared.parameter_names == frozenset({"weight"})
         with method.installation_context(prepared):
             batches = list(prepared.batches())
@@ -166,21 +159,17 @@ def test_foreign_or_released_stream_cannot_enter_or_release_active_source(monkey
     assert method._transfer.arena is None
 
 
-def test_failed_unread_preparation_resets_workspace_and_allows_retry(monkeypatch):
+def test_failed_unread_preparation_preserves_workspace_and_allows_retry(
+    monkeypatch,
+) -> None:
     method, source, events, _ = setup_method(monkeypatch)
-    method._active_plan = object()
-    method._active_fingerprint = ("old",)
-    method._active_manifest_digests = ("old",)
     method._transfer.fail_prepare = True
     with pytest.raises(RuntimeError, match="preparation failed"):
         prepare(method, source)
     assert method._active_streamed is None
-    assert method._active_plan is None
-    assert method._active_fingerprint is None
-    assert method._active_manifest_digests == ()
-    assert [name for name, _ in events] == ["prepare", "reset"]
+    assert [name for name, _ in events] == ["prepare"]
     method._transfer.fail_prepare = False
     prepared = prepare(method, source)
     assert method._active_streamed is prepared
     method.release(prepared)
-    assert [name for name, _ in events] == ["prepare", "reset", "prepare"]
+    assert [name for name, _ in events] == ["prepare", "prepare"]

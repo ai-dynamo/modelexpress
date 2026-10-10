@@ -13,7 +13,7 @@ from modelexpress_rl.inference.methods import (
 from modelexpress_rl.inference.plan import (
     GeneratorPeerUpdateSource,
     PreparedRuntimeTensors,
-    TrainerUpdateSource,
+    TrainerSourceSnapshot,
     WeightSource,
 )
 
@@ -210,12 +210,12 @@ def test_runtime_method_releases_reserved_peer_without_apply():
     assert transfer.lease.closed is True
 
 
-def test_runtime_method_rejects_a_trainer_source():
+def test_runtime_method_rejects_a_trainer_source() -> None:
     method = RuntimeTensorNixlUpdateMethod(
         transfer=_Transfer(),
         runtime_tensors={},
     )
-    source = TrainerUpdateSource(inputs=object())
+    source = TrainerSourceSnapshot(mesh_id="mesh", mesh_generation=1, shards=())
 
     try:
         method.prepare(version=object(), source=source)

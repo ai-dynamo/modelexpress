@@ -17,6 +17,8 @@ from modelexpress_rl.inference.plan import (
     EngineInstaller,
     MethodCapabilities,
     PreparedEngineTensors,
+    PreparedStreamingTensors,
+    StreamingSettings,
     UpdateMethod,
 )
 from modelexpress_rl.inference.receiver import ObjectStorageGeneratorConfig
@@ -290,6 +292,62 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
     assert chain == (versions["v64"],)
     fetched.assert_called_once_with("v64")
     runtime.close()
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("supports_streaming", [False, True])
+@pytest.mark.parametrize("source_kind", [WeightSource.TRAINER, WeightSource.GENERATOR])
+def test_runtime_validates_streaming_support_before_allocating_transfers(
+    monkeypatch, bounded, supports_streaming, source_kind
+) -> None:
+    class Installer(_Installer):
+        @property
+        def capabilities(self) -> EngineCapabilities:
+            artifacts = {PreparedEngineTensors}
+            if supports_streaming:
+                artifacts.add(PreparedStreamingTensors)
+            return EngineCapabilities(artifact_types=frozenset(artifacts))
+
+    engine = _full_tensor_engine()
+    monkeypatch.setattr(
+        engines_module,
+        "_create_engine_runtime",
+        lambda _context: EngineRuntime(
+            model_name=engine.model_name,
+            installer=Installer(),
+            full_tensor=engine.full_tensor,
+        ),
+    )
+    transfers = []
+
+    def create_transfer(**_kwargs) -> Mock:
+        transfer = Mock()
+        transfers.append(transfer)
+        return transfer
+
+    monkeypatch.setattr(runtime_module, "_NixlStagedTransfer", create_transfer)
+    monkeypatch.setattr(runtime_module, "MxClient", _P2P)
+    kwargs = dict(
+        engine_context=GeneratorEngineContext(),
+        worker_id="generator-3",
+        server_url="mx:8000",
+        object_storage=None,
+        source_order=(source_kind,),
+        max_transfer_attempts=3,
+        rpc_timeout_seconds=30,
+        service=lambda: pytest.fail("initialization must not perform source discovery"),
+        start_lease=lambda _version_id: pytest.fail("initialization must not acquire leases"),
+        streaming=StreamingSettings(512) if bounded else None,
+    )
+    if bounded and source_kind is WeightSource.TRAINER and not supports_streaming:
+        with pytest.raises(ValueError, match="does not support bounded streaming"):
+            initialize_generator_runtime(**kwargs)
+        assert not transfers
+    else:
+        runtime = initialize_generator_runtime(**kwargs)
+        runtime.close()
+        for transfer in transfers:
+            transfer.close.assert_called_once_with()
 
 
 def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):

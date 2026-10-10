@@ -25,7 +25,7 @@ import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress import p2p_pb2
 from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, TransferPlan
+from modelexpress.refit.reshard.transfer_plan import SourceInfo, TensorTransferPlan
 from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
 from modelexpress.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.nixl_staged_transfer import (
@@ -110,7 +110,7 @@ def _prepared(tensor: torch.Tensor, nbytes: int) -> _PreparedNixlTransfer:
         ],
     )
     return _PreparedNixlTransfer(
-        plan=TransferPlan(),
+        transfer_plan=TensorTransferPlan(),
         capture=CaptureResult(copies=[copy]),
         sources={"weight": source},
         descriptors=(_Descriptor(nbytes),),

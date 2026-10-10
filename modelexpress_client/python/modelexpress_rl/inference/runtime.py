@@ -24,7 +24,9 @@ from .methods import (
 from .nixl_staged_transfer import _NixlStagedTransfer
 from .plan import (
     EngineInstaller,
+    PreparedStreamingTensors,
     SourceResolver,
+    StreamingSettings,
     UpdateMethod,
     WeightSource,
     WeightUpdatePlanner,
@@ -49,6 +51,8 @@ class FullTensorEngineCapability:
     device: Any
     # Rank in the engine's weight-transfer group; peer selection matches it.
     worker_rank: int
+    # capture_layout transfers ownership of its returned capture and layout
+    # to the update plan; it must not mutate them after returning.
     capture_layout: Callable
     runtime_tensors: dict[str, Any] | None
     source_worker_id: str | None
@@ -179,9 +183,11 @@ def _create_load_time_tensor_method(
     *,
     capability: FullTensorEngineCapability,
     worker_id: str,
+    streaming: StreamingSettings | None = None,
 ) -> LoadTimeTensorNixlUpdateMethod:
     transfer = _NixlStagedTransfer(
         agent_name=f"mx-refit-load-time-{worker_id}",
+        streaming=streaming,
         device_id=capability.device_id,
         device=capability.device,
         listen_port=None,
@@ -283,6 +289,7 @@ def initialize_generator_runtime(
     rpc_timeout_seconds: float,
     service: Callable,
     start_lease: Callable[[str], Any],
+    streaming: StreamingSettings | None = None,
     resolve_replay_chain: Callable[[str, bool], tuple[WeightVersion, ...]]
     | None = None,
 ) -> GeneratorRuntime:
@@ -301,6 +308,12 @@ def initialize_generator_runtime(
         object_storage=object_storage,
         source_order=resolved_source_order,
     )
+    if (
+        streaming is not None
+        and WeightSource.TRAINER in resolved_source_order
+        and PreparedStreamingTensors not in engine.installer.capabilities.artifact_types
+    ):
+        raise ValueError("engine does not support bounded streaming installation")
     methods: list[UpdateMethod] = []
     p2p_client = None
     canonical_method = None
@@ -326,6 +339,7 @@ def initialize_generator_runtime(
                         _create_load_time_tensor_method(
                             capability=engine.full_tensor,
                             worker_id=worker_id,
+                            streaming=streaming,
                         )
                     )
                 if WeightSource.GENERATOR in resolved_source_order:
@@ -383,6 +397,7 @@ def initialize_generator_runtime(
                     max_transfer_attempts=max_transfer_attempts,
                 ),
                 start_lease=start_lease,
+                streaming=streaming,
                 resolve_replay_chain=(
                     None
                     if resolve_replay_chain is None

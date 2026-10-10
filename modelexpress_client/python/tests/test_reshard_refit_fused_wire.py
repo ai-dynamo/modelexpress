@@ -29,7 +29,7 @@ from modelexpress.refit.reshard.slice_plan import PullSegment
 from modelexpress.refit.reshard.transfer_plan import (
     ConvertSource,
     FullPullSource,
-    TransferPlan,
+    TensorTransferPlan,
 )
 from modelexpress.refit.reshard.transport import InMemoryReferenceTransport
 
@@ -69,7 +69,7 @@ class _Harness(ReshardReceiver):
         self._transport.installed_after.append(len(self._transport.batch_sizes))
 
 
-def _build(transport):
+def _build(transport) -> tuple:
     """One plan covering all three read groups.
 
     ``exact`` is read straight into its receive buffer. ``strided`` is a whole
@@ -101,7 +101,7 @@ def _build(transport):
     harness._staging = {"router": convert_staging}
     harness._staging_ptr = {"router": convert_staging.data_ptr()}
 
-    plan = TransferPlan(
+    plan = TensorTransferPlan(
         segments=[
             PullSegment(
                 session="s0",

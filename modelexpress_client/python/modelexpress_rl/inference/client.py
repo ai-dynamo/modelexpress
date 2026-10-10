@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
@@ -25,9 +24,8 @@ from modelexpress_rl.version import WeightVersionRef
 from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
-from ..train import WeightPayloadFormat
 from .adapter import GeneratorEngineContext
-from .plan import WeightSource, parse_weight_source_order
+from .plan import StreamingSettings, WeightSource, parse_weight_source_order
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime, initialize_generator_runtime
 from .session import SessionUpdate
@@ -257,6 +255,7 @@ class ModelExpressGeneratorClient:
         self._has_initial_serving_version = False
         self._engine_state = _EngineState.READY
         self._runtime: GeneratorRuntime | None = None
+        self._streaming: StreamingSettings | None = None
         self._closed = False
 
     @classmethod
@@ -299,9 +298,12 @@ class ModelExpressGeneratorClient:
         client._lease_ttl_seconds = lease_ttl_seconds
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         client._max_replay_chain_length = config.max_replay_chain_length
-        client._staging_buffer_bytes = config.staging_buffer_bytes
-        client._staging_buffers_count = config.staging_buffers_count
-        client._staging_device = config.staging_device
+        if config.staging_buffer_bytes is not None:
+            client._streaming = StreamingSettings(
+                max_staging_bytes=config.staging_buffer_bytes * config.staging_buffers_count,
+                staging_device=config.staging_device,
+                staging_buffers=config.staging_buffers_count,
+            )
         try:
             runtime = initialize_generator_runtime(
                 engine_context=config.engine_context,
@@ -314,6 +316,7 @@ class ModelExpressGeneratorClient:
                 service=lambda: client._service,
                 start_lease=client._start_version_lease,
                 resolve_replay_chain=client._resolve_replay_chain,
+                streaming=client._streaming,
             )
             client._runtime = runtime
             client._has_initial_serving_version = (
@@ -352,13 +355,14 @@ class ModelExpressGeneratorClient:
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
         with self._operation_lock:
-            if self._active_handle is not None:
-                if self._active_handle._installation_failed:
-                    self._release_staged(self._active_handle)
-                else:
-                    if self._active_handle.version_id == version.version_id:
-                        return self._active_handle
-                    raise RuntimeError("another generator update is still active")
+            active = self._active_handle
+            if active is not None and active._installation_failed:
+                self._release_staged(active)
+                active = None
+            if active is not None:
+                if active.version_id == version.version_id:
+                    return active
+                raise RuntimeError("another generator update is still active")
             runtime = self._require_runtime()
             if (
                 (
@@ -386,30 +390,9 @@ class ModelExpressGeneratorClient:
                 with timing.active(recorder):
                     with refit_span("control_discovery"):
                         ready = self._get_ready_version(version.version_id)
-                    if self._staging_buffer_bytes is None:
-                        update = runtime.session.stage(ready)
-                    else:
-                        if (
-                            self._engine_state is _EngineState.UNCERTAIN
-                            and ready.payload_format
-                            is not WeightPayloadFormat.FULL_TENSOR
-                        ):
-                            raise RuntimeError(
-                                "uncertain streaming engine requires a full tensor update"
-                            )
-                        update = runtime.session.prepare_streaming(
-                            ready,
-                            max_staging_bytes=(
-                                self._staging_buffer_bytes * self._staging_buffers_count
-                            ),
-                            staging_device=self._staging_device,
-                            staging_buffers=self._staging_buffers_count,
-                        )
+                    update = runtime.session.stage(ready)
             except BaseException:
-                # Nothing else will report this cycle: the recorder is handed on
-                # through the staged handle, and staging failed before there was
-                # one. A refit that died on the wire is exactly the case the
-                # stage split exists to explain.
+                # Failed preparation has no handle to report the timing later.
                 timing.emit(recorder, logger)
                 raise
             self._active_handle = StagedWeightHandle(

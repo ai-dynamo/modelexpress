@@ -450,7 +450,17 @@ resolution compares the recorded generation with the current mesh. Stored versio
 require the generation field; decoding parses it as a uint64 without repeating
 creation-time consistency checks. Versions without a trainer mesh, including object-storage
 versions, carry generation zero. A requested version whose recorded mesh
-generation differs from the current trainer mesh fails source resolution.
+generation differs from the current trainer mesh fails trainer source resolution.
+The session tries configured source kinds in order, so this failure can fall back
+to a generator peer serving the requested version. Bounded staging applies to
+trainer transfers; peers retain their normal runtime-tensor preparation path.
+An engine left uncertain by a failed installation can recover through a complete
+peer tensor transfer even when the requested version was published as a delta.
+The publication format does not determine the peer's transfer representation;
+failed-handle and undrained-transfer protections still apply.
+Trainer and peer paths check compatibility during plan selection without a
+separate preflight pass. Object-storage replay retains preflight validation of
+every revision before acquiring the chain's leases.
 
 Any trainer mesh update that changes its generation is rejected while a linked
 weight version has an active consumer lease, including additive replicas that
@@ -1801,6 +1811,41 @@ post-load state and failure cleanup. Quantized bounded installation remains
 unsupported. The same generic path is used for small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
 
+
+Full-copy and bounded updates enter one session staging flow. Immutable streaming
+settings bind the mode, placement, buffer count and total budget at runtime
+construction; each transfer retains that configuration for its lifetime. Public
+`staging_buffer_bytes` remains the capacity of each buffer, multiplied by the
+buffer count for the internal total budget. Bounded device compatibility is
+checked before creating its NIXL manager. Streaming installer support is checked
+once during runtime initialization, before allocating transfers. Runtime
+construction selects the trainer method; per-update candidate selection does not
+repeat method-type or streaming-installer checks. Generator peer reads retain a separate
+full-copy transfer borrowing the engine manager. The version lease remains held through
+installation or release. Preparation retry and recovery behavior stays scoped
+to the selected update strategy; failures after a possible write fence the engine.
+
+Trainer source rows and captured layouts are owned snapshots inside one weight
+update plan. The engine capture callback transfers ownership of its returned
+capture and layout to that plan and does not mutate them after returning.
+`TensorTransferPlan` describes physical reads and conversions, and a
+bounded `_StreamingSchedule` groups those reads into `_StreamingBatch` entries.
+With source caching enabled, byte-identical ordered manifests reuse the resolved
+metadata directly from that plan; a miss resolves and freezes new metadata.
+Full-copy and bounded preparation share metadata/layout resolution, connection
+and registration, descriptor binding, and publication phases while retaining
+their separate compilation and transfer algorithms. Prepared plans publish only
+after all setup succeeds. Internal batching consumes the fixed validated budget;
+coverage and capacity checks remain at the compilation boundary. Existing cache
+switches and lazy descriptor bindings retain their behavior at this layer.
+
+The transfer owns cleanup of partial native preparation. Metadata, layout and
+compilation failures leave registered storage and existing connections intact.
+A failed preparation that attempted manager initialization, source connection or
+registration resets an owned manager before releasing its storage; cleanup failure
+remains fatal with its cause retained. Borrowed managers cannot be reset by the
+transfer. Streaming READ drain, retained leases and uncertain-resource quarantine
+keep their existing installation behavior.
 
 ## RL refit CI harness
 

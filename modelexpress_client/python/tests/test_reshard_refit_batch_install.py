@@ -26,7 +26,7 @@ import torch
 
 from modelexpress.refit.reshard.receiver import ReshardReceiver
 from modelexpress.refit.reshard.slice_plan import PullSegment
-from modelexpress.refit.reshard.transfer_plan import FullPullSource, TransferPlan
+from modelexpress.refit.reshard.transfer_plan import FullPullSource, TensorTransferPlan
 from modelexpress.refit.reshard.transport import InMemoryReferenceTransport
 
 EL = 4  # float32 element size
@@ -61,7 +61,7 @@ class _Harness(ReshardReceiver):
         pass
 
 
-def _build(transport):
+def _build(transport) -> tuple:
     """Two full-pulled sources, four views in total.
 
     ``qkv`` is a 4x6 source re-sliced into three column blocks, the shape a
@@ -99,7 +99,7 @@ def _build(transport):
     harness._staging = {}
     harness._staging_ptr = {}
 
-    plan = TransferPlan(
+    plan = TensorTransferPlan(
         segments=[],
         full_pulls=[
             FullPullSource(

@@ -5,7 +5,7 @@
 
 Ties the pieces together: take a ``CaptureResult`` and the published source
 shards, run ``plan_pull`` per captured copy, and collect the byte segments into a
-``TransferPlan``. Any source whose slice can't be expressed as a box
+``TensorTransferPlan``. Any source whose slice can't be expressed as a box
 (``UnsupportedReshard``), or that has no published shards, or that capture
 already flagged, is recorded in ``fallback`` as unsupported. The current
 receiver rejects such plans before transfer. Descriptor-heavy but otherwise
@@ -78,7 +78,7 @@ class FullPullSource:
 
 
 @dataclass
-class TransferPlan:
+class TensorTransferPlan:
     """Planned pull: ``segments`` are byte runs READ straight into live params;
     ``converts`` are dtype-mismatched sources to pull into staging then cast;
     ``full_pulls`` bound descriptor-heavy copies through contiguous source
@@ -194,11 +194,11 @@ def plan_transfer(
     sources: dict,
     *,
     max_segments_per_copy: int | None = None,
-) -> TransferPlan:
-    """Build a ``TransferPlan`` from captured copies + published ``sources``
+) -> TensorTransferPlan:
+    """Build a ``TensorTransferPlan`` from captured copies + published ``sources``
     (``{src_name: SourceInfo}``). Sources flagged unsupported at capture, missing
     from ``sources``, or non-box at ``plan_pull`` are marked unsupported."""
-    plan = TransferPlan()
+    plan = TensorTransferPlan()
     fallback_seen: set = set()
     exact_by_source: dict[str, list[tuple[RecordedCopy, list]]] = {}
     full_pull_names: set[str] = set()
@@ -298,7 +298,7 @@ def plan_transfer(
 
 
 def exact_descriptors(
-    plan: TransferPlan,
+    plan: TensorTransferPlan,
     resolve_param_ptr: Callable[[str], int],
 ) -> list[ReadDescriptor]:
     """Absolute-address ``ReadDescriptor``s for the exact-segment phase.
@@ -319,7 +319,7 @@ def exact_descriptors(
 
 
 def execute_transfer(
-    plan: TransferPlan,
+    plan: TensorTransferPlan,
     resolve_param_ptr: Callable[[str], int],
     transport: Transport,
 ) -> dict:

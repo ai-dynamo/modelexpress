@@ -12,7 +12,10 @@ from modelexpress.refit.reshard.transfer_plan import SourceInfo
 from modelexpress_rl.inference import _source_snapshot as snapshot
 from modelexpress_rl.inference import nixl_staged_transfer as transfer
 
-from tests.test_refit_warm_caches import _bounded_cache_inputs
+from tests.test_refit_warm_caches import (
+    _bounded_cache_inputs,
+    _transfer_with_resolved_plan,
+)
 
 
 def _freeze(resolved):
@@ -142,11 +145,11 @@ def test_changed_snapshot_accessor_rebuilds_current_source_fields(
 @pytest.mark.parametrize(
     "field_name", ["addr", "digest", "device_id", "agent_meta_b64"]
 )
-def test_changed_manifest_keeps_current_version_metadata(field_name):
+def test_changed_manifest_keeps_current_version_metadata(
+    monkeypatch, field_name
+) -> None:
     args = _bounded_cache_inputs()
-    cache = transfer._SourceResolutionCache()
-    first = cache.resolve(args["manifests"], enabled=True, metrics={})
-    assert snapshot._snapshot_structure(first, cache._snapshot) is not None
+    cache, first = _transfer_with_resolved_plan(monkeypatch, args["manifests"])
     payload = json.loads(args["manifests"][0])
     values = {
         "addr": 900,
@@ -161,7 +164,7 @@ def test_changed_manifest_keeps_current_version_metadata(field_name):
     )
     target[field_name] = values[field_name]
     manifests = [json.dumps(payload).encode(), args["manifests"][1]]
-    second = cache.resolve(manifests, enabled=True, metrics={})
+    second, token = cache._resolve_metadata(manifests, {})
     assert second is not first
     expected = transfer._resolve_sources(manifests)
     for item in fields(expected):
@@ -170,7 +173,7 @@ def test_changed_manifest_keeps_current_version_metadata(field_name):
     assert [shard.digest for shard in second.sources["weight"].shards] == [
         shard.digest for shard in expected.sources["weight"].shards
     ]
-    assert snapshot._snapshot_structure(second, cache._snapshot) == tuple(
+    assert snapshot._snapshot_structure(second, token) == tuple(
         (name, snapshot._source_structure(source))
         for name, source in expected.sources.items()
     )
@@ -197,7 +200,7 @@ def test_outer_metadata_remains_fresh_and_mutable(which):
     assert metrics["plan_cache_misses"] == 1
 
 
-def test_cache_preserves_extended_outer_schema_without_copying_maps(monkeypatch):
+def test_metadata_preserves_extended_outer_schema(monkeypatch) -> None:
     args = _bounded_cache_inputs()
     original = transfer._resolve_sources
     extra_maps = {
@@ -223,14 +226,13 @@ def test_cache_preserves_extended_outer_schema_without_copying_maps(monkeypatch)
         return value
 
     monkeypatch.setattr(transfer, "_resolve_sources", resolve)
-    cache = transfer._SourceResolutionCache()
-    result = cache.resolve(args["manifests"], enabled=True, metrics={})
+    cache, result = _transfer_with_resolved_plan(monkeypatch, args["manifests"])
     assert type(result) is extended
-    assert snapshot._snapshot_structure(result, cache._snapshot) is not None
     for item in fields(result):
         if item.name != "sources":
-            assert getattr(result, item.name) is getattr(parsed[0], item.name)
-    assert cache.resolve(args["manifests"], enabled=True, metrics={}) is result
+            assert getattr(result, item.name) == getattr(parsed[0], item.name)
+    reused, _ = cache._resolve_metadata(args["manifests"], {})
+    assert reused is result
 
 
 def test_snapshot_token_requires_current_table_identity():
@@ -253,22 +255,26 @@ def test_snapshot_does_not_change_mutable_plan_input_invalidation():
     assert metrics["plan_cache_misses"] == 1
 
 
-def test_snapshot_failure_and_disabled_cache_clear_token(monkeypatch):
+def test_metadata_freeze_failure_propagates_and_later_resolution_succeeds(
+    monkeypatch,
+) -> None:
     args = _bounded_cache_inputs()
-    cache = transfer._SourceResolutionCache()
-    first = cache.resolve(args["manifests"], enabled=True, metrics={})
+    cache, first = _transfer_with_resolved_plan(monkeypatch, args["manifests"])
     changed = [args["manifests"][0] + b" ", args["manifests"][1]]
     original = transfer._freeze_sources
     monkeypatch.setattr(
         transfer, "_freeze_sources", lambda _: (_ for _ in ()).throw(MemoryError())
     )
     with pytest.raises(MemoryError):
-        cache.resolve(changed, enabled=True, metrics={})
-    assert cache._entry is None and cache._snapshot is None
+        cache._resolve_metadata(changed, {})
     monkeypatch.setattr(transfer, "_freeze_sources", original)
-    assert cache.resolve(args["manifests"], enabled=True, metrics={}) is not first
-    cache.resolve(args["manifests"], enabled=False, metrics={})
-    assert cache._entry is None and cache._snapshot is None
+    resolved, token = cache._resolve_metadata(changed, {})
+    assert resolved is not first
+    assert token is not None
+    monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", "0")
+    resolved, token = cache._resolve_metadata(args["manifests"], {})
+    assert resolved is not first
+    assert token is not None
 
 
 @pytest.mark.parametrize(
