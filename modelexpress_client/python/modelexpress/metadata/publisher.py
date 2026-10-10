@@ -285,6 +285,20 @@ class PublisherThread:
         self._publish_started_at = None
         self._publish_given_up = False
 
+    def republish(self) -> None:
+        """Publish again on the next tick, e.g. after the manifest grew.
+
+        Resets publish state the same way repeated heartbeat rejections do,
+        so ``publish_fn`` runs again (still gated by ``ready_fn``) with a
+        fresh publish timeout. A no-op without a ``publish_fn``.
+        """
+        if self._publish_fn is None:
+            return
+        with self._status_lock:
+            self._mx_source_id = None
+            self._publish_started_at = None
+            self._publish_given_up = False
+
     def _cleanup(self) -> None:
         if self._cleanup_fn is None or self._cleaned_up:
             return

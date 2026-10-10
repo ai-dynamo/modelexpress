@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     MX_MODEL_URI: Optional[str]
     MX_LOAD_STRATEGY_CHAIN: str
     MX_P2P_METADATA: str
+    MX_DISABLE_DRAFT_P2P: bool
     MX_RESHARD_FUSED_WIRE: bool
     MX_RESHARD_BATCH_INSTALL: bool
     MX_RESHARD_CACHE_DESCRIPTORS: bool
@@ -285,6 +286,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("MX_LOAD_STRATEGY_CHAIN", "INFERENCE").strip().upper()
     ),
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
+    "MX_DISABLE_DRAFT_P2P": lambda: _env_bool("MX_DISABLE_DRAFT_P2P", False),
     "MX_RESHARD_FUSED_WIRE": lambda: _env_bool("MX_RESHARD_FUSED_WIRE", True),
     # Issue the per-view re-slice copies of full-pulled sources as one batched
     # _foreach_copy_ instead of a copy_() per view. On by default: it is the same
