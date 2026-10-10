@@ -5,7 +5,12 @@
 
 from __future__ import annotations
 
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import pytest
+from prometheus_client import CollectorRegistry, generate_latest
+from prometheus_client.core import GaugeMetricFamily
 
 from modelexpress.runtime_load import RuntimeLoadProvider, _scrape_gauge
 
@@ -56,6 +61,62 @@ def test_scrape_gauge_missing_returns_none():
 
 def test_scrape_gauge_skips_comments():
     assert _scrape_gauge("# TYPE x gauge\n# HELP x foo", "x") is None
+
+
+@pytest.mark.parametrize("labels", ["", '{gpu="0"}'])
+@pytest.mark.parametrize("timestamp", ["0", "1726400000000", "-1", "+1"])
+def test_scrape_gauge_accepts_explicit_timestamps(labels, timestamp):
+    text = f"sglang:token_usage{labels} 8.5e-1 {timestamp}\n"
+    assert _scrape_gauge(text, "sglang:token_usage") == pytest.approx(0.85)
+
+
+def test_scrape_gauge_takes_max_across_timestamped_and_untimestamped_series():
+    text = (
+        'vllm:kv_cache_usage_perc{gpu="0"} 0.8 1726400000000\n'
+        'vllm:kv_cache_usage_perc{gpu="1"} 0.3\n'
+        'vllm:kv_cache_usage_perc{gpu="2"} 0.7 1726400000001\n'
+    )
+    assert _scrape_gauge(text, "vllm:kv_cache_usage_perc") == 0.8
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["junk", "1.5", "NaN", "1 2", str(2**63), str(-(2**63) - 1)],
+)
+def test_scrape_gauge_skips_invalid_timestamps(suffix):
+    assert _scrape_gauge(f"sglang:token_usage 0.9 {suffix}\n", "sglang:token_usage") is None
+
+
+def test_provider_reads_timestamped_prometheus_http_endpoint():
+    class Collector:
+        def collect(self):
+            gauge = GaugeMetricFamily("sglang:token_usage", "KV usage", labels=["model"])
+            gauge.add_metric(["Qwen"], 0.85, timestamp=1726400000)
+            yield gauge
+
+    registry = CollectorRegistry()
+    registry.register(Collector())
+    payload = generate_latest(registry)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            provider = RuntimeLoadProvider(f"http://127.0.0.1:{server.server_port}/metrics")
+            assert provider.sample() == 0.85
+        finally:
+            server.shutdown()
+            thread.join()
 
 
 def test_provider_reads_vllm_kv_usage():
