@@ -927,6 +927,20 @@ class _NixlStagedTransfer:
             resolved_metadata=resolved,
             resolved_structure=frozen.structure if frozen is not None else None,
         )
+        previous = self._weight_update_plan
+        if (
+            previous is not None
+            and trainer.mesh_id == previous.trainer_source_snapshot.mesh_id
+            and trainer.mesh_generation == previous.trainer_source_snapshot.mesh_generation
+            and resolved is previous.trainer_source_snapshot.resolved_metadata
+        ):
+            metrics["source_metadata_s"] = time.perf_counter() - started
+            return (
+                trainer,
+                previous.generator_capture_snapshot,
+                previous.parameter_layout,
+                frozen,
+            )
         manifest = [
             (name, source.dtype, tuple(source.global_shape))
             for name, source in resolved.sources.items()

@@ -253,6 +253,7 @@ def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change) -
     if change == "address":
         harness.sources["exact"] = harness.sources["exact"].clone() + 5
     elif change == "capture":
+        harness.sources["exact"] = harness.sources["exact"].clone()
         harness.capture.copies[0] = replace(harness.capture.copies[0], dest_offset=1)
     else:
         monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", "0")
@@ -310,10 +311,11 @@ def test_arena_change_between_batches_is_not_hidden_by_first_hit(harness):
 @pytest.mark.parametrize(
     "failure", ["coverage", "transport", "prepared", "registration"]
 )
-def test_failed_prepare_discards_descriptors(harness, monkeypatch, failure):
+def test_failed_prepare_discards_descriptors(harness, monkeypatch, failure) -> None:
     harness.collect(harness.prepare())
     assert harness.transfer._descriptor_cache is not None
     if failure == "coverage":
+        harness.sources["exact"] = harness.sources["exact"].clone()
         harness.layout["missing.weight"] = ((4,), torch.float32)
         expected = IncompleteRefit
     else:
