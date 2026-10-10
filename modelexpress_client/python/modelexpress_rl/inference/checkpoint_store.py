@@ -12,6 +12,7 @@ import logging
 import shutil
 import stat
 import sys
+import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -224,14 +225,15 @@ class LocalCheckpointStore:
         copy_from: Path | None = None,
     ) -> Iterator[Path]:
         """Populate a temporary directory and promote it to ``target``."""
-        temporary = target.with_name(f"{target.name}.tmp")
-        shutil.rmtree(temporary, ignore_errors=True)
+        temporary = target.with_name(f".checkpoint-{uuid.uuid4().hex}")
+        temporary.mkdir(parents=True)
         try:
-            if copy_from is None:
-                temporary.mkdir(parents=True)
-            else:
+            if copy_from is not None:
                 shutil.copytree(
-                    copy_from, temporary, copy_function=_copy_checkpoint_file
+                    copy_from,
+                    temporary,
+                    copy_function=_copy_checkpoint_file,
+                    dirs_exist_ok=True,
                 )
             yield temporary
             shutil.rmtree(target, ignore_errors=True)
