@@ -13,7 +13,6 @@ by compiled CUDA graphs.
 from __future__ import annotations
 
 import copy
-import hashlib
 import logging
 import time
 from collections import OrderedDict
@@ -31,13 +30,13 @@ from modelexpress.engines.vllm.host_quantization import (
     refresh_host_quantization_state,
 )
 from modelexpress.refit.reshard.geometry import (
+    build_lazy_weights,
     capture_weights,
     convert_source_weights,
 )
-from modelexpress.refit.reshard.types import IncompleteRefit
+from modelexpress.refit.reshard.types import CaptureResult, IncompleteRefit
 from modelexpress.refit.timing import refit_span
 
-from modelexpress_rl.inference.engines.vllm._capture_snapshot import _CaptureSnapshot
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -50,7 +49,6 @@ from modelexpress_rl.inference.plan import (
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
 
 if TYPE_CHECKING:
-    from modelexpress.refit.reshard.types import CaptureResult
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
 
@@ -62,6 +60,36 @@ _MODULE_SETATTR = torch.nn.Module.__setattr__
 _MODULE_REGISTER_PARAMETER = torch.nn.Module.register_parameter
 _MODULE_GETATTR_CODE = _MODULE_GETATTR.__code__
 _MODULE_GET_SUBMODULE_CODE = _MODULE_GET_SUBMODULE.__code__
+
+
+@dataclass(frozen=True)
+class _EngineLoadLayout:
+    inputs: dict[str, tuple[torch.dtype, tuple[int, ...]]]
+    capture: CaptureResult
+    parameters: dict[str, tuple[tuple[int, ...], torch.dtype]]
+
+    def bind(
+        self, weights: dict
+    ) -> tuple[CaptureResult, dict[str, tuple[tuple[int, ...], torch.dtype]]]:
+        inputs = {
+            name: (weight.dtype, tuple(weight.shape))
+            for name, weight in weights.items()
+        }
+        if inputs != self.inputs:
+            raise IncompleteRefit(
+                "source conversion does not match the fixed engine input layout"
+            )
+        capture = CaptureResult(
+            copies=[
+                replace(
+                    record,
+                    src_name=weights[record.src_name]._name,
+                    op_chain=weights[record.src_name]._ops + record.op_chain,
+                )
+                for record in self.capture.copies
+            ]
+        )
+        return copy.deepcopy((capture, self.parameters))
 
 
 @dataclass(frozen=True)
@@ -576,6 +604,7 @@ class _VllmInstaller(EngineInstaller):
         self._device = device
         self._convert_native_to_hf = convert_native_to_hf
         self._runtime_tensors = runtime_tensors
+        self._engine_load_layout: _EngineLoadLayout | None = None
         self._capture_cache = None
         self._native_parameter_dispatch = _native_parameter_dispatch()
 
@@ -590,55 +619,6 @@ class _VllmInstaller(EngineInstaller):
                 "ModelExpress refit requires vLLM's layerwise reload APIs"
             ) from error
         return _get_original_loader
-
-    def _capture_key(self, manifest):
-        original_loader = self._original_loader
-
-        def function_identity(function):
-            return (
-                id(getattr(function, "__func__", function)),
-                id(function.__self__) if hasattr(function, "__self__") else None,
-            )
-
-        parameters = tuple(
-            (
-                name,
-                id(parameter),
-                parameter.data_ptr(),
-                tuple(parameter.shape),
-                tuple(parameter.stride()),
-                parameter.dtype,
-                parameter.device,
-                function_identity(original_loader(parameter)),
-            )
-            for name, parameter in self._model.named_parameters(remove_duplicate=False)
-        )
-        modules = tuple(
-            (name, id(module), function_identity(getattr(module, "load_weights", None)))
-            for name, module in self._model.named_modules()
-        )
-        routing_buffers = tuple(
-            (
-                name,
-                id(buffer),
-                buffer.data_ptr(),
-                tuple(buffer.shape),
-                hashlib.sha256(
-                    buffer.detach().cpu().contiguous().numpy().tobytes()
-                ).digest()
-                if buffer.is_inference()
-                else buffer._version,
-            )
-            for name, buffer in self._model.named_buffers()
-            if not buffer.is_floating_point() and not buffer.is_complex()
-        )
-        return (
-            tuple(manifest),
-            parameters,
-            modules,
-            routing_buffers,
-            id(self._convert_native_to_hf),
-        )
 
     @property
     def capabilities(self) -> EngineCapabilities:
@@ -785,22 +765,21 @@ class _VllmInstaller(EngineInstaller):
         Captures on the LIVE model with its params reverted to engine load-time
         skeletons via layerwise reload; graph-bound kernel tensors are restored
         afterward without finalizing (finalizing would commit the empty skeletons
-        and corrupt the live params).
+        and corrupt the live params). Returned bindings are borrowed immutable
+        results; engine architecture, routing and conversion are fixed per client.
         """
-        if not self._is_quantized and self._capture_cache is not None:
-            key, result = self._capture_cache
-            current_key = self._capture_key(manifest)
-            if key == current_key:
-                copies = (
-                    result.indices
-                    if type(result) is _CaptureSnapshot
-                    else result[0].copies
-                )
-                logger.info("reusing cached vLLM load layout (%d copies)", len(copies))
-                if type(result) is _CaptureSnapshot:
-                    return result.clone()
-                return copy.deepcopy(result)
-        self._capture_cache = None
+        key = tuple((name, dtype, tuple(shape)) for name, dtype, shape in manifest)
+        if self._capture_cache is not None and self._capture_cache[0] == key:
+            return self._capture_cache[1]
+        weights = convert_source_weights(self._convert_native_to_hf, manifest)
+        if self._engine_load_layout is not None:
+            result = self._engine_load_layout.bind(weights)
+            self._capture_cache = (key, result)
+            return result
+        canonical_manifest = [
+            (name, weight.dtype, tuple(weight.shape))
+            for name, weight in weights.items()
+        ]
         try:
             from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.reload.layerwise import (
@@ -832,7 +811,7 @@ class _VllmInstaller(EngineInstaller):
                 # weight_loader (norms) so their copies are attributed, not dropped.
                 capture = capture_weights(
                     model,
-                    convert_source_weights(self._convert_native_to_hf, manifest),
+                    build_lazy_weights(canonical_manifest),
                     default_weight_loader=default_weight_loader,
                 )
                 param_layout = {
@@ -852,16 +831,22 @@ class _VllmInstaller(EngineInstaller):
             len(capture.unsupported),
             self._is_quantized,
         )
-        if (
-            not self._is_quantized
-            and not capture.unsupported
-            and not capture.unattributed
-        ):
-            self._capture_cache = (
-                self._capture_key(manifest),
-                _CaptureSnapshot.create(copy.deepcopy((capture, param_layout))),
+        missing = set(param_layout) - {record.param_name for record in capture.copies}
+        if missing or capture.unsupported or capture.unattributed:
+            raise IncompleteRefit(
+                "engine capture must cover every parameter; "
+                f"missing={sorted(missing)}, unsupported={capture.unsupported}, "
+                f"unattributed={capture.unattributed}"
             )
-        return capture, param_layout
+        layout = _EngineLoadLayout(
+            {name: (dtype, shape) for name, dtype, shape in canonical_manifest},
+            capture,
+            param_layout,
+        )
+        result = layout.bind(weights)
+        self._engine_load_layout = layout
+        self._capture_cache = (key, result)
+        return result
 
     def install_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Install verified load-layout tensors without changing graph addresses."""

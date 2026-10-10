@@ -1726,12 +1726,25 @@ load-time slots; native post-processing recreates runtime aliases. Missing
 load-time slots still fail restoration, and final runtime identity and storage
 validation remains required.
 
-Warm load-layout capture keeps a private snapshot when records contain only
-ordinary immutable metadata. Each caller receives fresh mutable capture records
-and containers, with duplicate record references preserved. Slice-containing
-operation tuples are copied with a shared memo. Mutable or custom payloads and
-changed copy protocols use whole-result deep copying. The existing model,
-loader, routing and manifest keys still decide whether a capture can be reused.
+The vLLM installer captures a canonical engine load layout once per client,
+independent of trainer names and views. Successful capture, restoration and
+coverage validation establish the fixed canonical inputs and destination geometry.
+Engine architecture, routing, loader behavior and source conversion must remain
+fixed for the client lifetime; changing them requires a new client. Supported
+quantized full-copy refits use the same contract; quantized streaming remains
+unsupported.
+
+The installer retains one source-bound mapping keyed by ordered source names,
+dtypes and global shapes. Compatible rounds return that mapping without source
+conversion, binding, deep copying or tracing. Payload values, weight versions,
+source addresses and mesh generations do not belong to this logical key. On a
+schema change, conversion must still produce compatible canonical inputs before
+new source views are composed with the captured recipes. A new binding is copied
+away from the canonical layout once, then borrowed by full-copy and bounded
+consumers as immutable data. Callers must not mutate returned records or layouts.
+Physical metadata and transport invalidation remain independently validated.
+Failed binding does not replace the retained successful mapping; failed initial
+capture or restoration does not initialize the canonical layout.
 
 Alias validation uses Python module lookup and parameter registration semantics.
 Each streaming batch checks the current ownership structure and reuses the
