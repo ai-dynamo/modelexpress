@@ -571,56 +571,6 @@ def _resolve_sources(manifests: list[bytes], *, metrics=None) -> _ResolvedSource
     )
 
 
-class _SourceResolutionCache:
-    """Retain one resolved table only while every ordered manifest byte matches."""
-
-    def __init__(self) -> None:
-        self._entry: tuple[tuple[bytes, ...], _ResolvedSources] | None = None
-        self._snapshot: _SourceSnapshot | None = None
-
-    def clear(self) -> None:
-        self._entry = None
-        self._snapshot = None
-
-    def resolve(self, manifests: list[bytes], *, enabled: bool, metrics: dict):
-        if enabled and any(not isinstance(blob, bytes) for blob in manifests):
-            self.clear()
-            raise TypeError("cached source manifests must be immutable bytes")
-        metrics.update(
-            source_cache_enabled=int(enabled),
-            source_cache_hits=0,
-            source_cache_misses=0,
-            source_cache_lookup_s=0.0,
-            source_decode_s=0.0,
-            source_merge_s=0.0,
-            source_build_s=0.0,
-            source_manifest_bytes=sum(len(blob) for blob in manifests),
-        )
-        if not enabled:
-            self.clear()
-            return _resolve_sources(manifests, metrics=metrics)
-        started = time.perf_counter()
-        key = tuple(manifests)
-        entry = self._entry
-        hit = entry is not None and entry[0] == key
-        metrics["source_cache_lookup_s"] = time.perf_counter() - started
-        metrics["source_cache_hits"] = int(hit)
-        metrics["source_cache_misses"] = int(not hit)
-        if hit:
-            assert entry is not None
-            return entry[1]
-        self.clear()
-        resolved = _resolve_sources(manifests, metrics=metrics)
-        started = time.perf_counter()
-        snapshot = _freeze_sources(resolved.sources)
-        if snapshot is not None:
-            resolved = replace(resolved, sources=snapshot.sources)
-        metrics["source_build_s"] += time.perf_counter() - started
-        self._entry = (key, resolved)
-        self._snapshot = snapshot
-        return resolved
-
-
 def _required_agent_metadata(
     plan: TransferPlan, resolved: _ResolvedSources
 ) -> dict[str, bytes]:
@@ -913,22 +863,43 @@ class _NixlStagedTransfer:
     def _resolve_metadata(
         self, manifests: list[bytes], metrics: dict
     ) -> tuple[_ResolvedSources, _SourceSnapshot | None]:
-        cache = _SourceResolutionCache()
-        previous = self._cached_pull_plan
-        if previous is not None:
-            trainer = previous.trainer_source_snapshot
-            cache._entry = (previous.manifests, trainer.resolved_metadata)
-            if trainer.resolved_structure is not None:
-                cache._snapshot = _SourceSnapshot(
-                    trainer.resolved_metadata.sources, trainer.resolved_structure
-                )
-        resolved = cache.resolve(
-            manifests, enabled=envs.MX_REFIT_CACHE_RESOLVED_SOURCES, metrics=metrics
+        enabled = envs.MX_REFIT_CACHE_RESOLVED_SOURCES
+        if enabled and any(not isinstance(blob, bytes) for blob in manifests):
+            raise TypeError("cached source manifests must be immutable bytes")
+        metrics.update(
+            source_cache_enabled=int(enabled),
+            source_cache_hits=0,
+            source_cache_misses=0,
+            source_cache_lookup_s=0.0,
+            source_decode_s=0.0,
+            source_merge_s=0.0,
+            source_build_s=0.0,
+            source_manifest_bytes=sum(len(blob) for blob in manifests),
         )
-        # Freeze source rows even when the manifest-byte cache is disabled.
-        frozen = cache._snapshot or _freeze_sources(resolved.sources)
+        if enabled:
+            started = time.perf_counter()
+            previous = self._cached_pull_plan
+            hit = previous is not None and previous.manifests == tuple(manifests)
+            metrics["source_cache_lookup_s"] = time.perf_counter() - started
+            metrics["source_cache_hits"] = int(hit)
+            metrics["source_cache_misses"] = int(not hit)
+            if hit:
+                trainer = previous.trainer_source_snapshot
+                frozen = (
+                    _SourceSnapshot(
+                        trainer.resolved_metadata.sources, trainer.resolved_structure
+                    )
+                    if trainer.resolved_structure is not None
+                    else None
+                )
+                return trainer.resolved_metadata, frozen
+        resolved = _resolve_sources(manifests, metrics=metrics)
+        started = time.perf_counter()
+        frozen = _freeze_sources(resolved.sources)
         if frozen is not None:
             resolved = replace(resolved, sources=frozen.sources)
+        if enabled:
+            metrics["source_build_s"] += time.perf_counter() - started
         resolved = replace(
             resolved,
             session_to_agent=MappingProxyType(dict(resolved.session_to_agent)),

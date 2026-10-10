@@ -1826,6 +1826,8 @@ installation or release. Preparation retry and recovery behavior stays scoped
 to the selected update strategy; failures after a possible write fence the engine.
 
 Trainer source rows and captured layouts are owned snapshots inside one pull plan.
+With source caching enabled, byte-identical ordered manifests reuse the resolved
+metadata directly from that plan; a miss resolves and freezes new metadata.
 Full-copy and bounded preparation share metadata/layout resolution, connection
 and registration, descriptor binding, and publication phases while retaining
 their separate compilation and transfer algorithms. Prepared plans publish only

@@ -7,7 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
@@ -35,8 +35,10 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _plan_staged_transfer,
     _PreparedNixlTransfer,
     _resolve_sources,
-    _SourceResolutionCache,
+    _WeightUpdatePlan,
 )
+
+from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
 
 def _manifest(*, agent_name: str, endpoint: str, offset: int, address: int) -> bytes:
@@ -121,72 +123,71 @@ def _bounded_cache_inputs():
     }
 
 
-def test_resolved_source_cache_requires_complete_ordered_manifest_bytes():
-    cache = _SourceResolutionCache()
+def _transfer_with_resolved_plan(monkeypatch, manifests: list[bytes]) -> tuple:
+    monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", "1")
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._cached_pull_plan = None
+    resolved, frozen = transfer._resolve_metadata(manifests, {})
+    transfer._cached_pull_plan = _WeightUpdatePlan(
+        trainer_source_snapshot=TrainerSourceSnapshot(
+            "mesh", 1, (), resolved, frozen.structure if frozen else None
+        ),
+        generator_capture_snapshot=CaptureResult(copies=[]),
+        parameter_layout=MappingProxyType({}),
+        compiled=TransferPlan(),
+        key=None,
+        manifests=tuple(manifests),
+    )
+    return transfer, resolved
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_metadata_reuse_requires_enabled_cache_and_matching_manifests(
+    monkeypatch, enabled
+) -> None:
     manifests = [
         _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100),
         _manifest(agent_name="b", endpoint="b:19000", offset=2, address=200),
     ]
+    transfer, first = _transfer_with_resolved_plan(monkeypatch, manifests)
+    monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", str(int(enabled)))
     metrics = {}
-    first = cache.resolve(manifests, enabled=True, metrics=metrics)
-    assert metrics["source_cache_misses"] == 1
-    assert metrics["source_manifest_bytes"] == sum(map(len, manifests))
     copied = [bytes(bytearray(blob)) for blob in manifests]
-    assert copied[0] is not manifests[0]
-    assert cache.resolve(copied, enabled=True, metrics=metrics) is first
-    assert metrics["source_cache_hits"] == 1
-    assert all(
-        metrics[f"source_{phase}_s"] == 0 for phase in ("decode", "merge", "build")
-    )
-
-    changed = json.loads(manifests[0])
-    changed["tensors"][0]["shards"][0]["addr"] = 300
-    changed["tensors"][0]["shards"][0]["digest"] = "new-version-digest"
-    second = cache.resolve(
-        [json.dumps(changed).encode(), manifests[1]], enabled=True, metrics=metrics
-    )
-    assert second.sources["weight"].shards[0].addr == 300
-    assert second.sources["weight"].shards[0].digest == "new-version-digest"
-    assert first.sources["weight"].shards[0].addr == 100
-    assert metrics["source_cache_misses"] == 1
-    assert cache.resolve(manifests, enabled=True, metrics=metrics) is not first
-    assert metrics["source_cache_misses"] == 1  # The previous version was evicted.
-    cache.resolve(list(reversed(manifests)), enabled=True, metrics=metrics)
-    assert metrics["source_cache_misses"] == 1
-    cache.resolve(manifests[:1], enabled=True, metrics=metrics)
-    assert metrics["source_cache_misses"] == 1
-    cache.clear()
-    cache.resolve(manifests[:1], enabled=True, metrics=metrics)
-    assert metrics["source_cache_misses"] == 1
-    cache.resolve(manifests[:1], enabled=False, metrics=metrics)
-    assert metrics["source_cache_enabled"] == metrics["source_cache_hits"] == 0
-    cache.resolve(manifests[:1], enabled=True, metrics=metrics)
-    assert metrics["source_cache_misses"] == 1
+    resolved, _ = transfer._resolve_metadata(copied, metrics)
+    assert (resolved is first) == enabled
+    assert metrics["source_cache_hits"] == int(enabled)
+    assert metrics["source_manifest_bytes"] == sum(map(len, manifests))
+    for changed in (list(reversed(manifests)), manifests[:1]):
+        resolved, _ = transfer._resolve_metadata(changed, metrics)
+        assert resolved is not first
+        assert metrics["source_cache_hits"] == 0
 
 
 @pytest.mark.parametrize(
-    "field", ["digest", "device_id", "agent_meta_b64", "publisher_step"]
+    "field", ["digest", "device_id", "agent_meta_b64", "publisher_step", "addr"]
 )
-def test_resolved_source_cache_refreshes_changed_version_and_transport_fields(field):
-    cache = _SourceResolutionCache()
+def test_metadata_refreshes_changed_version_and_transport_fields(
+    monkeypatch, field
+) -> None:
     manifest = _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100)
-    metrics = {}
-    first = cache.resolve([manifest], enabled=True, metrics=metrics)
+    transfer, first = _transfer_with_resolved_plan(monkeypatch, [manifest])
     payload = json.loads(manifest)
-    if field in ("digest", "device_id"):
-        payload["tensors"][0]["shards"][0][field] = (
-            "new-digest" if field == "digest" else 1
-        )
+    if field in ("digest", "device_id", "addr"):
+        payload["tensors"][0]["shards"][0][field] = {
+            "digest": "new-digest",
+            "device_id": 1,
+            "addr": 300,
+        }[field]
     else:
         payload[field] = "bmV3LW1ldGFkYXRh" if field == "agent_meta_b64" else 2
     changed = json.dumps(payload).encode()
-    resolved = cache.resolve([changed], enabled=True, metrics=metrics)
+    metrics = {}
+    resolved, _ = transfer._resolve_metadata([changed], metrics)
     assert resolved is not first
     expected = _resolve_sources([changed])
     assert resolved.session_to_agent == expected.session_to_agent
     assert resolved.session_to_device == expected.session_to_device
     assert resolved.agent_metadata == expected.agent_metadata
-    assert tuple(resolved.sources) == tuple(expected.sources)
     for name, source in resolved.sources.items():
         original = expected.sources[name]
         assert (source.global_shape, source.dtype, source.elsize) == (
@@ -197,17 +198,18 @@ def test_resolved_source_cache_refreshes_changed_version_and_transport_fields(fi
         assert [tuple(shard) for shard in source.shards] == [
             tuple(vars(shard).values()) for shard in original.shards
         ]
+    assert first.sources["weight"].shards[0].addr == 100
     assert metrics["source_cache_misses"] == 1
 
 
 @pytest.mark.parametrize(
     "defect", ["empty", "malformed", "duplicate", "mutable", "geometry"]
 )
-def test_resolved_source_cache_does_not_reuse_previous_entry_after_bad_inputs(defect):
-    cache = _SourceResolutionCache()
+def test_metadata_rejects_bad_manifests_even_with_a_cached_plan(
+    monkeypatch, defect
+) -> None:
     manifest = _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100)
-    metrics = {}
-    first = cache.resolve([manifest], enabled=True, metrics=metrics)
+    transfer, _ = _transfer_with_resolved_plan(monkeypatch, [manifest])
     if defect == "geometry":
         payload = json.loads(
             _manifest(agent_name="b", endpoint="b:19000", offset=2, address=200)
@@ -222,9 +224,7 @@ def test_resolved_source_cache_does_not_reuse_previous_entry_after_bad_inputs(de
             "mutable": [bytearray(manifest)],
         }[defect]
     with pytest.raises((ValueError, TypeError)):
-        cache.resolve(bad, enabled=True, metrics=metrics)
-    assert cache.resolve([manifest], enabled=True, metrics=metrics) is not first
-    assert metrics["source_cache_misses"] == 1
+        transfer._resolve_metadata(bad, {})
 
 
 @pytest.mark.parametrize("copy_key_on_miss", [False, True])

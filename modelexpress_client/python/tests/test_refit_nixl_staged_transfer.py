@@ -747,7 +747,6 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
     transfer._full_buffers = {}
     transfer._staging_arenas = []
     transfer._staging_registrations = []
-    transfer._source_cache = transfer_module._SourceResolutionCache()
     transfer._plan_cache = transfer_module._BoundedPlanCache()
     transfer.close()
     transfer.close()
