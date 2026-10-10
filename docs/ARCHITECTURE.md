@@ -1840,9 +1840,10 @@ capture and layout to that plan and does not mutate them after returning.
 `TensorTransferPlan` describes physical reads and conversions, and a
 bounded `_StreamingSchedule` groups those reads into `_StreamingBatch` entries.
 Each preparation resolves current metadata according to the source-cache setting.
-The captured layout is reused only when mesh ID, mesh generation and the exact
-ordered manifest bytes match the previous plan; changed manifests or generations
-capture a new layout.
+The captured layout is reused when the ordered resolved source names, dtypes and
+global shapes match the previous plan. Current resolved metadata remains the basis
+for physical reads, so changed addresses or mesh generations do not reuse stale
+transport data.
 Full-copy and bounded preparation share metadata/layout resolution, connection
 and registration, descriptor binding, and publication phases while retaining
 their separate compilation and transfer algorithms. Prepared plans publish only

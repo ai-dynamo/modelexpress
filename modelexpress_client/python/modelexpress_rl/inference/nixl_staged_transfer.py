@@ -928,11 +928,23 @@ class _NixlStagedTransfer:
             resolved_structure=frozen.structure if frozen is not None else None,
         )
         previous = self._weight_update_plan
+        source_schema = tuple(
+            (name, source.dtype, tuple(source.global_shape))
+            for name, source in resolved.sources.items()
+        )
+        previous_metadata = (
+            previous.trainer_source_snapshot.resolved_metadata
+            if previous is not None
+            else None
+        )
         if (
             previous is not None
-            and trainer.mesh_id == previous.trainer_source_snapshot.mesh_id
-            and trainer.mesh_generation == previous.trainer_source_snapshot.mesh_generation
-            and tuple(manifests) == previous.manifests
+            and previous_metadata is not None
+            and source_schema
+            == tuple(
+                (name, source.dtype, tuple(source.global_shape))
+                for name, source in previous_metadata.sources.items()
+            )
         ):
             metrics["source_metadata_s"] = time.perf_counter() - started
             return (
@@ -941,13 +953,9 @@ class _NixlStagedTransfer:
                 previous.parameter_layout,
                 frozen,
             )
-        manifest = [
-            (name, source.dtype, tuple(source.global_shape))
-            for name, source in resolved.sources.items()
-        ]
         metrics["source_metadata_s"] = time.perf_counter() - started
         started = time.perf_counter()
-        capture, parameter_layout = capture_layout(manifest)
+        capture, parameter_layout = capture_layout(list(source_schema))
         metrics["layout_capture_s"] = time.perf_counter() - started
         return trainer, capture, parameter_layout, frozen
 
@@ -1064,9 +1072,11 @@ class _NixlStagedTransfer:
                     )
                     metrics["manifest_refreshes"] = 1
             else:
+                self._weight_update_plan = previous
                 trainer, capture, parameter_layout, _ = self._resolve_layout(
                     manifests, capture_layout, metrics, trainer_snapshot
                 )
+                self._weight_update_plan = None
                 started = time.perf_counter()
                 plan = _plan_staged_transfer(capture, trainer.resolved_metadata.sources)
                 metrics["initial_whole_plan_s"] = time.perf_counter() - started

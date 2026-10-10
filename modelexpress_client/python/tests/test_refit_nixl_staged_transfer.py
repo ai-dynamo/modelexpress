@@ -472,11 +472,25 @@ def test_fixed_mode_updates_receive_changed_values(
                         payload.tensors,
                     )
                     bad_source = replace(
-                        source, shards=(replace(source.shards[0], manifest=changed),)
+                        source,
+                        mesh_generation=2,
+                        shards=(replace(source.shards[0], manifest=changed),),
                     )
                     expected = "already connected source"
                 elif failure == "capture":
-                    bad_source = replace(source, mesh_generation=2)
+                    payload = unwrap_rendezvous_blob(manifest)
+                    renamed = replace(payload.tensors[0], name="renamed")
+                    changed = wrap_rendezvous_blob(
+                        payload.agent_metadata,
+                        payload.agent_name,
+                        payload.metadata_endpoint,
+                        [renamed],
+                    )
+                    bad_source = replace(
+                        source,
+                        mesh_generation=2,
+                        shards=(replace(source.shards[0], manifest=changed),),
+                    )
                     capture_layout = method._capture_layout
 
                     def fail_capture(_manifest) -> tuple:
@@ -500,8 +514,8 @@ def test_fixed_mode_updates_receive_changed_values(
                     if failure == "capture":
                         method._capture_layout = capture_layout
                 assert transfer._weight_update_plan is None
-                if failure == "metadata" and bounded:
-                    assert len(capture_calls) == capture_count + 1
+                if failure == "metadata":
+                    assert len(capture_calls) == capture_count
                 if failure == "malformed":
                     assert len(capture_calls) == capture_count
                 assert transfer._manager.ready
@@ -518,7 +532,7 @@ def test_fixed_mode_updates_receive_changed_values(
         elif failure == "registration":
             assert len(capture_calls) == 2
         elif failure == "metadata":
-            assert len(capture_calls) == (3 if bounded else 2)
+            assert len(capture_calls) == 2
         elif failure == "capture":
             assert len(capture_calls) == 2
         elif failure == "malformed":
