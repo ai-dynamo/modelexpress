@@ -126,9 +126,9 @@ def _bounded_cache_inputs():
 def _transfer_with_resolved_plan(monkeypatch, manifests: list[bytes]) -> tuple:
     monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", "1")
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._cached_pull_plan = None
+    transfer._weight_update_plan = None
     resolved, frozen = transfer._resolve_metadata(manifests, {})
-    transfer._cached_pull_plan = _WeightUpdatePlan(
+    transfer._weight_update_plan = _WeightUpdatePlan(
         trainer_source_snapshot=TrainerSourceSnapshot(
             "mesh", 1, (), resolved, frozen.structure if frozen else None
         ),

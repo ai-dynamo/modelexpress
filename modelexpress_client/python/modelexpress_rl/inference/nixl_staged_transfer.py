@@ -786,7 +786,7 @@ class _NixlStagedTransfer:
         self._staging_registrations: list[Any] = []
         self._staging_device: torch.device | None = None
         self._manager_ready = True
-        self._cached_pull_plan: _WeightUpdatePlan | None = None
+        self._weight_update_plan: _WeightUpdatePlan | None = None
         self._full_copy_descriptors: tuple[ReadDescriptor, ...] | None = None
         self._plan_compile_lock = threading.Lock()
         self._workspace_generation = 0
@@ -847,7 +847,7 @@ class _NixlStagedTransfer:
         self._full_registered = False
         self._loaded_agent_metadata.clear()
         self._manager_ready = False
-        self._cached_pull_plan = None
+        self._weight_update_plan = None
         self._full_copy_descriptors = None
 
     def _ensure_manager_initialized(self) -> None:
@@ -878,7 +878,7 @@ class _NixlStagedTransfer:
         )
         if enabled:
             started = time.perf_counter()
-            previous = self._cached_pull_plan
+            previous = self._weight_update_plan
             hit = previous is not None and previous.manifests == tuple(manifests)
             metrics["source_cache_lookup_s"] = time.perf_counter() - started
             metrics["source_cache_hits"] = int(hit)
@@ -978,7 +978,7 @@ class _NixlStagedTransfer:
         try:
             yield
         except Exception:
-            self._cached_pull_plan = None
+            self._weight_update_plan = None
             self._full_copy_descriptors = None
             if self._native_setup_started:
                 try:
@@ -997,7 +997,7 @@ class _NixlStagedTransfer:
         cached: _WeightUpdatePlan,
         prepared: _PreparedNixlTransfer | _PreparedBoundedTransfer,
     ) -> None:
-        self._cached_pull_plan = cached
+        self._weight_update_plan = cached
         self._active = prepared
 
     def prepare_full_copy(
@@ -1012,7 +1012,7 @@ class _NixlStagedTransfer:
             raise RuntimeError("this transfer owns bounded staging storage")
         with self._preparing():
             self._descriptor_cache = None
-            previous, self._cached_pull_plan = self._cached_pull_plan, None
+            previous, self._weight_update_plan = self._weight_update_plan, None
             reusable = (
                 previous is not None
                 and isinstance(previous.compiled, TransferPlan)
@@ -1028,9 +1028,9 @@ class _NixlStagedTransfer:
                 parameter_layout = previous.parameter_layout
                 plan = previous.compiled
                 if tuple(manifests) != previous.manifests:
-                    self._cached_pull_plan = previous
+                    self._weight_update_plan = previous
                     resolved, frozen = self._resolve_metadata(manifests, metrics)
-                    self._cached_pull_plan = None
+                    self._weight_update_plan = None
                     old = trainer.resolved_metadata
                     if set(resolved.sources) != set(old.sources) or any(
                         _source_structure(source)
@@ -1109,7 +1109,7 @@ class _NixlStagedTransfer:
         assert buffer_budget is not None
         with self._preparing():
             previous_descriptors, self._descriptor_cache = self._descriptor_cache, None
-            previous = self._cached_pull_plan
+            previous = self._weight_update_plan
             metrics = {}
             trainer, capture, parameter_layout, frozen = self._resolve_layout(
                 manifests, capture_layout, metrics, trainer_snapshot
@@ -1120,7 +1120,7 @@ class _NixlStagedTransfer:
                 previous.compiled, _CompiledBoundedPlan
             ):
                 compiler._entry = (previous.key, previous.compiled)
-            self._cached_pull_plan = None
+            self._weight_update_plan = None
             started = time.perf_counter()
             compiled = compiler.compile(
                 manifests=manifests,
@@ -1801,7 +1801,7 @@ class _NixlStagedTransfer:
         if self._closed:
             return
         self._invalidate_descriptors()
-        self._cached_pull_plan = None
+        self._weight_update_plan = None
         self._full_copy_descriptors = None
         self._closed = True
         if self._owns_manager:
