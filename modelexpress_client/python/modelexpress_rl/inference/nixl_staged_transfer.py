@@ -1035,7 +1035,7 @@ class _NixlStagedTransfer:
             raise RuntimeError("this transfer owns bounded staging storage")
         with self._preparing():
             self._descriptor_cache = None
-            previous, self._weight_update_plan = self._weight_update_plan, None
+            previous = self._weight_update_plan
             reusable = (
                 previous is not None
                 and isinstance(previous.transfer_plan, TensorTransferPlan)
@@ -1051,9 +1051,7 @@ class _NixlStagedTransfer:
                 parameter_layout = previous.parameter_layout
                 plan = previous.transfer_plan
                 if tuple(manifests) != previous.manifests:
-                    self._weight_update_plan = previous
                     resolved, frozen = self._resolve_metadata(manifests, metrics)
-                    self._weight_update_plan = None
                     old = trainer.resolved_metadata
                     if set(resolved.sources) != set(old.sources) or any(
                         _source_structure(source)
@@ -1072,11 +1070,9 @@ class _NixlStagedTransfer:
                     )
                     metrics["manifest_refreshes"] = 1
             else:
-                self._weight_update_plan = previous
                 trainer, capture, parameter_layout, _ = self._resolve_layout(
                     manifests, capture_layout, metrics, trainer_snapshot
                 )
-                self._weight_update_plan = None
                 started = time.perf_counter()
                 plan = _plan_staged_transfer(capture, trainer.resolved_metadata.sources)
                 metrics["initial_whole_plan_s"] = time.perf_counter() - started
@@ -1145,7 +1141,6 @@ class _NixlStagedTransfer:
                 previous.transfer_plan, _StreamingSchedule
             ):
                 compiler._entry = (previous.key, previous.transfer_plan)
-            self._weight_update_plan = None
             started = time.perf_counter()
             compiled = compiler.compile(
                 manifests=manifests,
