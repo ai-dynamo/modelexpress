@@ -251,7 +251,7 @@ def _manifest(
 
 
 @pytest.mark.parametrize(
-    "failure", [None, "registration", "cleanup", "metadata", "capture"]
+    "failure", [None, "registration", "cleanup", "metadata", "capture", "malformed"]
 )
 @pytest.mark.parametrize("bounded", [False, True])
 @pytest.mark.parametrize("warm_cache", [False, True])
@@ -395,6 +395,12 @@ def test_fixed_mode_updates_receive_changed_values(
             )
         ]
     )
+    capture_calls = []
+
+    def capture_layout(manifest):
+        capture_calls.append(tuple(manifest))
+        return capture, {"layer.weight": ((4,), torch.float32)}
+
     transfer = _NixlStagedTransfer(
         agent_name="receiver",
         device_id=0,
@@ -404,10 +410,7 @@ def test_fixed_mode_updates_receive_changed_values(
     )
     method = LoadTimeTensorNixlUpdateMethod(
         transfer=transfer,
-        capture_layout=lambda manifest: (
-            capture,
-            {"layer.weight": ((4,), torch.float32)},
-        ),
+        capture_layout=capture_layout,
     )
     prepare = method.prepare_streaming if bounded else method.prepare
     try:
@@ -422,6 +425,7 @@ def test_fixed_mode_updates_receive_changed_values(
                     prepare(version=None, source=source)
                 assert raised.value.__cause__ is cleanup_error
                 assert transfer._manager.registered
+                assert transfer._weight_update_plan is None
                 return
             with pytest.raises(RuntimeError, match="registration failed"):
                 prepare(version=None, source=source)
@@ -438,15 +442,27 @@ def test_fixed_mode_updates_receive_changed_values(
                 assert torch.equal(
                     prepared.staged.tensors["layer.weight"], source_tensor
                 )
+            if failure is None:
+                if index == 0:
+                    retained_capture = (
+                        transfer._weight_update_plan.generator_capture_snapshot
+                    )
+                    assert retained_capture is capture
+                else:
+                    assert (
+                        transfer._weight_update_plan.generator_capture_snapshot
+                        is retained_capture
+                    )
             with pytest.raises(RuntimeError, match="release"):
                 method.prepare(version=None, source=source)
             method.release(prepared)
-            if index == 0 and failure in ("metadata", "capture"):
+            if index == 0 and failure in ("metadata", "capture", "malformed"):
                 addresses = {
                     name: tensor.data_ptr()
                     for name, tensor in transfer._manager.registered.items()
                 }
                 reads = events.count("read")
+                capture_count = len(capture_calls)
                 if failure == "metadata":
                     payload = unwrap_rendezvous_blob(manifest)
                     changed = wrap_rendezvous_blob(
@@ -459,7 +475,7 @@ def test_fixed_mode_updates_receive_changed_values(
                         source, shards=(replace(source.shards[0], manifest=changed),)
                     )
                     expected = "already connected source"
-                else:
+                elif failure == "capture":
                     bad_source = replace(source, mesh_generation=2)
                     capture_layout = method._capture_layout
 
@@ -468,12 +484,26 @@ def test_fixed_mode_updates_receive_changed_values(
 
                     method._capture_layout = fail_capture
                     expected = "layout capture failed"
+                else:
+                    bad_source = replace(
+                        source,
+                        shards=(replace(source.shards[0], manifest=b"malformed"),),
+                    )
                 try:
-                    with pytest.raises(RuntimeError, match=expected):
-                        prepare(version=None, source=bad_source)
+                    if failure == "malformed":
+                        with pytest.raises(ValueError):
+                            prepare(version=None, source=bad_source)
+                    else:
+                        with pytest.raises(RuntimeError, match=expected):
+                            prepare(version=None, source=bad_source)
                 finally:
                     if failure == "capture":
                         method._capture_layout = capture_layout
+                assert transfer._weight_update_plan is None
+                if failure == "metadata" and bounded:
+                    assert len(capture_calls) == capture_count + 1
+                if failure == "malformed":
+                    assert len(capture_calls) == capture_count
                 assert transfer._manager.ready
                 assert {
                     name: tensor.data_ptr()
@@ -483,8 +513,19 @@ def test_fixed_mode_updates_receive_changed_values(
                 assert "shutdown" not in events
         assert events.count("register") == (2 if failure == "registration" else 1)
         assert events.count("shutdown") == int(failure == "registration")
+        if failure is None:
+            assert len(capture_calls) == 1
+        elif failure == "registration":
+            assert len(capture_calls) == 2
+        elif failure == "metadata":
+            assert len(capture_calls) == (3 if bounded else 2)
+        elif failure == "capture":
+            assert len(capture_calls) == 2
+        elif failure == "malformed":
+            assert len(capture_calls) == 2
     finally:
         method.close()
+        assert transfer._weight_update_plan is None
         assert not transfer._manager.registered
 
 

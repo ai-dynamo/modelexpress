@@ -1839,8 +1839,10 @@ update plan. The engine capture callback transfers ownership of its returned
 capture and layout to that plan and does not mutate them after returning.
 `TensorTransferPlan` describes physical reads and conversions, and a
 bounded `_StreamingSchedule` groups those reads into `_StreamingBatch` entries.
-With source caching enabled, byte-identical ordered manifests reuse the resolved
-metadata directly from that plan; a miss resolves and freezes new metadata.
+Each preparation resolves current metadata according to the source-cache setting.
+The captured layout is reused only when mesh ID, mesh generation and the exact
+ordered manifest bytes match the previous plan; changed manifests or generations
+capture a new layout.
 Full-copy and bounded preparation share metadata/layout resolution, connection
 and registration, descriptor binding, and publication phases while retaining
 their separate compilation and transfer algorithms. Prepared plans publish only

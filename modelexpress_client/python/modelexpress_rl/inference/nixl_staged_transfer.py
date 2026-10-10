@@ -932,7 +932,7 @@ class _NixlStagedTransfer:
             previous is not None
             and trainer.mesh_id == previous.trainer_source_snapshot.mesh_id
             and trainer.mesh_generation == previous.trainer_source_snapshot.mesh_generation
-            and resolved is previous.trainer_source_snapshot.resolved_metadata
+            and tuple(manifests) == previous.manifests
         ):
             metrics["source_metadata_s"] = time.perf_counter() - started
             return (
