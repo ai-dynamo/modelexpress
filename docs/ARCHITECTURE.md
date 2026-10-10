@@ -1734,12 +1734,21 @@ load-time slots; native post-processing recreates runtime aliases. Missing
 load-time slots still fail restoration, and final runtime identity and storage
 validation remains required.
 
-Warm load-layout capture keeps a private snapshot when records contain only
-ordinary immutable metadata. Each caller receives fresh mutable capture records
-and containers, with duplicate record references preserved. Slice-containing
-operation tuples are copied with a shared memo. Mutable or custom payloads and
-changed copy protocols use whole-result deep copying. The existing model,
-loader, routing and manifest keys still decide whether a capture can be reused.
+The vLLM installer captures its engine load layout once per client lifetime,
+using canonical loader inputs independent of trainer names and source views.
+After successful capture, live-state restoration and coverage validation, it
+retains the canonical copy recipes and destination geometry. Replacement trainer
+sources run the configured native-to-canonical conversion and must produce the
+same canonical names, shapes and dtypes. Their source views are composed with the
+retained recipes without invoking the engine loader again. Changing the engine
+architecture, routing or loader behavior requires a new client. This also applies
+to supported quantized full-copy refits; quantized streaming remains unsupported.
+
+Warm streaming preparations reuse the plan's source-bound records when resolved
+metadata is reused. Full-copy plan hits retain their existing fast path. Failed
+transfer preparation does not discard the installer's independent layout; failed
+initial capture or restoration does not initialize it. Native cleanup and
+physical-plan invalidation retain their existing behavior.
 
 Alias validation uses Python module lookup and parameter registration semantics.
 Each streaming batch checks the current ownership structure and reuses the
@@ -1830,8 +1839,11 @@ update plan. The engine capture callback transfers ownership of its returned
 capture and layout to that plan and does not mutate them after returning.
 `TensorTransferPlan` describes physical reads and conversions, and a
 bounded `_StreamingSchedule` groups those reads into `_StreamingBatch` entries.
-With source caching enabled, byte-identical ordered manifests reuse the resolved
-metadata directly from that plan; a miss resolves and freezes new metadata.
+Each preparation resolves current metadata according to the source-cache setting.
+The captured layout is reused when the ordered resolved source names, dtypes and
+global shapes match the previous plan. Current resolved metadata remains the basis
+for physical reads, so changed addresses or mesh generations do not reuse stale
+transport data.
 Full-copy and bounded preparation share metadata/layout resolution, connection
 and registration, descriptor binding, and publication phases while retaining
 their separate compilation and transfer algorithms. Prepared plans publish only

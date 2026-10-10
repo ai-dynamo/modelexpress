@@ -41,24 +41,35 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
 
-def _manifest(*, agent_name: str, endpoint: str, offset: int, address: int) -> bytes:
+def _manifest(
+    *,
+    agent_name: str,
+    endpoint: str,
+    offset: int,
+    address: int,
+    name: str = "weight",
+    dtype: str = "torch.float32",
+    elsize: int = 4,
+    full_shape: tuple[int, ...] = (4,),
+    shard_shape: tuple[int, ...] = (2,),
+) -> bytes:
     return wrap_rendezvous_blob(
         b"nixl-metadata",
         agent_name,
         endpoint,
         [
             PublishedTensor(
-                name="weight",
-                dtype="torch.float32",
-                elsize=4,
-                full_shape=(4,),
+                name=name,
+                dtype=dtype,
+                elsize=elsize,
+                full_shape=full_shape,
                 shards=[
                     PublishedShard(
                         agent_name=agent_name,
                         device_id=0,
                         addr=address,
                         shard_offset=(offset,),
-                        shape=(2,),
+                        shape=shard_shape,
                     )
                 ],
             )
@@ -141,17 +152,36 @@ def _transfer_with_resolved_plan(monkeypatch, manifests: list[bytes]) -> tuple:
     return transfer, resolved
 
 
-def test_layout_capture_result_is_owned_without_redundant_copy(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("name", "dtype", "elsize", "shape"),
+    [
+        ("renamed", "torch.float32", 4, (4,)),
+        ("weight", "torch.bfloat16", 2, (4,)),
+        ("weight", "torch.float32", 4, (8,)),
+    ],
+)
+def test_layout_capture_reuse_tracks_resolved_source_schema(
+    monkeypatch, name, dtype, elsize, shape
+) -> None:
     monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", "0")
-    manifest = _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100)
+    manifest = _manifest(
+        agent_name="a", endpoint="a:19000", offset=0, address=100, shard_shape=(4,)
+    )
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._weight_update_plan = None
-    capture = CaptureResult(copies=[])
+    capture = CaptureResult(
+        copies=[RecordedCopy("weight", (), "layer.weight", 0, (4,), (1,), torch.float32)]
+    )
     parameter_layout = {"layer.weight": ((4,), torch.float32)}
+    calls = []
+
+    def capture_layout(current_manifest):
+        calls.append(current_manifest)
+        return capture, parameter_layout
 
     trainer, actual_capture, actual_layout, _ = transfer._resolve_layout(
         [manifest],
-        lambda _manifest: (capture, parameter_layout),
+        capture_layout,
         {},
         TrainerSourceSnapshot("mesh", 1, ()),
     )
@@ -159,6 +189,61 @@ def test_layout_capture_result_is_owned_without_redundant_copy(monkeypatch) -> N
     assert trainer.mesh_id == "mesh"
     assert actual_capture is capture
     assert actual_layout is parameter_layout
+    cached_layout = MappingProxyType(parameter_layout)
+    transfer._weight_update_plan = _WeightUpdatePlan(
+        trainer_source_snapshot=trainer,
+        generator_capture_snapshot=actual_capture,
+        parameter_layout=cached_layout,
+        transfer_plan=TensorTransferPlan(),
+        key=None,
+        manifests=(manifest,),
+    )
+
+    same_schema = _manifest(
+        agent_name="a", endpoint="a:19000", offset=0, address=300, shard_shape=(4,)
+    )
+    refreshed, reused_capture, reused_layout, _ = transfer._resolve_layout(
+        [same_schema],
+        capture_layout,
+        {},
+        TrainerSourceSnapshot("new-mesh", 2, ()),
+    )
+    assert reused_capture is capture
+    assert reused_layout is cached_layout
+    assert len(calls) == 1
+    assert (
+        refreshed.resolved_metadata.sources["weight"].shards[0].addr == 300
+    )
+    plan = transfer_module._plan_staged_transfer(
+        capture, refreshed.resolved_metadata.sources
+    )
+    assert plan.segments[0].src_addr == 300
+
+    changed_schema = _manifest(
+        agent_name="a",
+        endpoint="a:19000",
+        offset=0,
+        address=300,
+        name=name,
+        dtype=dtype,
+        elsize=elsize,
+        full_shape=shape,
+    )
+    changed, recaptured, _, _ = transfer._resolve_layout(
+        [changed_schema],
+        capture_layout,
+        {},
+        TrainerSourceSnapshot("new-mesh", 2, ()),
+    )
+    assert recaptured is capture
+    assert len(calls) == 2
+    assert calls[1] == [(name, getattr(torch, dtype.split(".")[-1]), shape)]
+    if name != "weight" or shape != (4,):
+        plan = transfer_module._plan_staged_transfer(
+            capture, changed.resolved_metadata.sources
+        )
+        with pytest.raises(IncompleteRefit):
+            _NixlStagedTransfer._validate_complete(capture, parameter_layout, plan)
 
 
 @pytest.mark.parametrize("enabled", [False, True])

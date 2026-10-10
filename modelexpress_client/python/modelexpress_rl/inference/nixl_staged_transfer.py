@@ -927,13 +927,35 @@ class _NixlStagedTransfer:
             resolved_metadata=resolved,
             resolved_structure=frozen.structure if frozen is not None else None,
         )
-        manifest = [
+        previous = self._weight_update_plan
+        source_schema = tuple(
             (name, source.dtype, tuple(source.global_shape))
             for name, source in resolved.sources.items()
-        ]
+        )
+        previous_metadata = (
+            previous.trainer_source_snapshot.resolved_metadata
+            if previous is not None
+            else None
+        )
+        if (
+            previous is not None
+            and previous_metadata is not None
+            and source_schema
+            == tuple(
+                (name, source.dtype, tuple(source.global_shape))
+                for name, source in previous_metadata.sources.items()
+            )
+        ):
+            metrics["source_metadata_s"] = time.perf_counter() - started
+            return (
+                trainer,
+                previous.generator_capture_snapshot,
+                previous.parameter_layout,
+                frozen,
+            )
         metrics["source_metadata_s"] = time.perf_counter() - started
         started = time.perf_counter()
-        capture, parameter_layout = capture_layout(manifest)
+        capture, parameter_layout = capture_layout(list(source_schema))
         metrics["layout_capture_s"] = time.perf_counter() - started
         return trainer, capture, parameter_layout, frozen
 
@@ -1013,7 +1035,7 @@ class _NixlStagedTransfer:
             raise RuntimeError("this transfer owns bounded staging storage")
         with self._preparing():
             self._descriptor_cache = None
-            previous, self._weight_update_plan = self._weight_update_plan, None
+            previous = self._weight_update_plan
             reusable = (
                 previous is not None
                 and isinstance(previous.transfer_plan, TensorTransferPlan)
@@ -1029,9 +1051,7 @@ class _NixlStagedTransfer:
                 parameter_layout = previous.parameter_layout
                 plan = previous.transfer_plan
                 if tuple(manifests) != previous.manifests:
-                    self._weight_update_plan = previous
                     resolved, frozen = self._resolve_metadata(manifests, metrics)
-                    self._weight_update_plan = None
                     old = trainer.resolved_metadata
                     if set(resolved.sources) != set(old.sources) or any(
                         _source_structure(source)
@@ -1121,7 +1141,6 @@ class _NixlStagedTransfer:
                 previous.transfer_plan, _StreamingSchedule
             ):
                 compiler._entry = (previous.key, previous.transfer_plan)
-            self._weight_update_plan = None
             started = time.perf_counter()
             compiled = compiler.compile(
                 manifests=manifests,
