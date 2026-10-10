@@ -27,7 +27,7 @@ from modelexpress.refit.reshard.receiver import (
     handshake_with_peers,
 )
 from modelexpress.refit.reshard.slice_plan import PullSegment
-from modelexpress.refit.reshard.transfer_plan import TransferPlan
+from modelexpress.refit.reshard.transfer_plan import TensorTransferPlan
 
 
 class _Manager:
@@ -221,29 +221,29 @@ def _session_to_agent(n):
     return {f"s{i}": f"trainer-r{i}" for i in range(n)}
 
 
-def test_only_the_trainers_the_plan_reads_from_are_dialed():
+def test_only_the_trainers_the_plan_reads_from_are_dialed() -> None:
     """Four trainers were discovered, the plan reads from two, so two are dialed."""
-    plan = TransferPlan(segments=[_segment("s1"), _segment("s3")])
+    plan = TensorTransferPlan(segments=[_segment("s1"), _segment("s3")])
 
     narrowed = handshake_endpoints_for_plan(plan, _session_to_agent(4), _endpoints(4))
 
     assert set(narrowed) == {"trainer-r1", "trainer-r3"}
 
 
-def test_the_narrowed_endpoints_keep_their_addresses():
-    plan = TransferPlan(segments=[_segment("s2")])
+def test_the_narrowed_endpoints_keep_their_addresses() -> None:
+    plan = TensorTransferPlan(segments=[_segment("s2")])
 
     narrowed = handshake_endpoints_for_plan(plan, _session_to_agent(4), _endpoints(4))
 
     assert narrowed == {"trainer-r2": "10.0.0.2:9999"}
 
 
-def test_reads_are_counted_from_every_phase_of_the_plan():
+def test_reads_are_counted_from_every_phase_of_the_plan() -> None:
     """Segments land in three places - straight into live params, into
     dtype-conversion staging, and into full-pull staging. Missing any one of them
     would drop a peer the plan genuinely reads from, and the failure would surface
     later as an unresolvable address in prep_xfer_dlist."""
-    plan = TransferPlan(
+    plan = TensorTransferPlan(
         segments=[_segment("s0")],
         converts=[types.SimpleNamespace(segments=[_segment("s1")])],
         full_pulls=[types.SimpleNamespace(segments=[_segment("s2")])],
@@ -256,10 +256,10 @@ def test_reads_are_counted_from_every_phase_of_the_plan():
     assert set(narrowed) == {"trainer-r0", "trainer-r1", "trainer-r2"}
 
 
-def test_a_planned_trainer_with_no_endpoint_fails_closed():
+def test_a_planned_trainer_with_no_endpoint_fails_closed() -> None:
     """Silently skipping it would defer the failure to prep_xfer_dlist, which
     cannot say which peer it was missing metadata for."""
-    plan = TransferPlan(segments=[_segment("s0"), _segment("s3")])
+    plan = TensorTransferPlan(segments=[_segment("s0"), _segment("s3")])
     endpoints = {"trainer-r0": "10.0.0.0:9999"}
 
     with pytest.raises(RuntimeError) as excinfo:
@@ -268,9 +268,9 @@ def test_a_planned_trainer_with_no_endpoint_fails_closed():
     assert "trainer-r3" in str(excinfo.value)
 
 
-def test_an_empty_plan_dials_nobody():
+def test_an_empty_plan_dials_nobody() -> None:
     narrowed = handshake_endpoints_for_plan(
-        TransferPlan(), _session_to_agent(4), _endpoints(4)
+        TensorTransferPlan(), _session_to_agent(4), _endpoints(4)
     )
 
     assert narrowed == {}

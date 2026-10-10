@@ -21,7 +21,7 @@ from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import (
     ConvertSource,
     SourceInfo,
-    TransferPlan,
+    TensorTransferPlan,
 )
 from modelexpress.refit.reshard.types import (
     CaptureResult,
@@ -69,7 +69,7 @@ def _manifest(*, agent_name: str, endpoint: str, offset: int, address: int) -> b
 @pytest.mark.parametrize("padded", [False, True])
 def test_converted_copy_uses_captured_slice_with_arena_storage_offset(
     monkeypatch, padded
-):
+) -> None:
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     width = 6 if padded else 4
@@ -84,7 +84,7 @@ def test_converted_copy_uses_captured_slice_with_arena_storage_offset(
             )
         ]
     )
-    plan = TransferPlan(
+    plan = TensorTransferPlan(
         converts=[ConvertSource("layer.weight", (8, 4), torch.float32, [])]
     )
     transfer = object.__new__(_NixlStagedTransfer)
@@ -104,7 +104,7 @@ def test_converted_copy_uses_captured_slice_with_arena_storage_offset(
             assert torch.all(target[:, 0] == -17) and torch.all(target[:, -1] == -17)
 
 
-def _bounded_cache_inputs():
+def _bounded_cache_inputs() -> dict:
     manifests = [
         _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100),
         _manifest(agent_name="b", endpoint="b:19000", offset=2, address=200),
@@ -134,7 +134,7 @@ def _transfer_with_resolved_plan(monkeypatch, manifests: list[bytes]) -> tuple:
         ),
         generator_capture_snapshot=CaptureResult(copies=[]),
         parameter_layout=MappingProxyType({}),
-        compiled=TransferPlan(),
+        transfer_plan=TensorTransferPlan(),
         key=None,
         manifests=tuple(manifests),
     )
@@ -230,7 +230,7 @@ def test_metadata_rejects_bad_manifests_even_with_a_cached_plan(
 @pytest.mark.parametrize("copy_key_on_miss", [False, True])
 def test_bounded_plan_cache_snapshots_callback_inputs_and_revalidates(
     monkeypatch, copy_key_on_miss
-):
+) -> None:
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setenv("MX_REFIT_COPY_PLAN_KEY_ON_MISS", str(int(copy_key_on_miss)))
     cache = _BoundedPlanCache()
@@ -257,12 +257,12 @@ def test_bounded_plan_cache_snapshots_callback_inputs_and_revalidates(
 
     # A hit must still execute the global coverage gate.
     fresh = cache.compile(**pristine, metrics=metrics)
-    fresh.plan.fallback.append("injected-unsupported")
+    fresh.transfer_plan.fallback.append("injected-unsupported")
     with pytest.raises(IncompleteRefit, match="cover every"):
         cache.compile(**pristine, metrics=metrics)
     assert cache._entry is None
     fresh = cache.compile(**pristine, metrics=metrics)
-    fresh.module_batches[0].plan.fallback.append("injected-owner-unsupported")
+    fresh.module_batches[0].transfer_plan.fallback.append("injected-owner-unsupported")
     with pytest.raises(IncompleteRefit, match="cover every"):
         cache.compile(**pristine, metrics=metrics)
     assert cache._entry is None
@@ -457,7 +457,7 @@ def test_bounded_plan_cache_invalidates_each_planning_input(
 @pytest.mark.parametrize(
     "defect", ["unattributed", "unsupported", "missing", "unknown", "fallback"]
 )
-def test_supplied_complete_plan_keeps_global_coverage_gate(monkeypatch, defect):
+def test_supplied_complete_plan_keeps_global_coverage_gate(monkeypatch, defect) -> None:
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     source = SourceInfo((4,), torch.float32, 4, [Shard((0,), (4,), "s", 100, 4)])
     capture = CaptureResult(

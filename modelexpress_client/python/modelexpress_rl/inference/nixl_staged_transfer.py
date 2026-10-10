@@ -45,7 +45,7 @@ from modelexpress.refit.reshard.rendezvous import (
 from modelexpress.refit.reshard.slice_plan import plan_pull
 from modelexpress.refit.reshard.transfer_plan import (
     FullPullSource,
-    TransferPlan,
+    TensorTransferPlan,
     exact_descriptors,
     plan_transfer,
 )
@@ -112,7 +112,7 @@ class _WeightUpdatePlan:
     trainer_source_snapshot: TrainerSourceSnapshot
     generator_capture_snapshot: CaptureResult
     parameter_layout: MappingProxyType
-    compiled: TransferPlan | _CompiledBoundedPlan
+    transfer_plan: TensorTransferPlan | _StreamingSchedule
     key: tuple | None
     manifests: tuple[bytes, ...]
 
@@ -121,7 +121,7 @@ class _WeightUpdatePlan:
 class _PreparedNixlTransfer:
     """One immutable physical plan over reusable registered destinations."""
 
-    plan: TransferPlan
+    transfer_plan: TensorTransferPlan
     capture: CaptureResult
     sources: dict
     descriptors: tuple[ReadDescriptor | _BoundedReadDescriptor, ...]
@@ -153,9 +153,9 @@ class _StagingLayouts(NamedTuple):
 
 
 @dataclass(frozen=True)
-class _BoundedBatch:
+class _StreamingBatch:
     capture: CaptureResult
-    plan: TransferPlan
+    transfer_plan: TensorTransferPlan
     layouts: _StagingLayouts
     nbytes: int
 
@@ -169,17 +169,17 @@ class _BoundedBatch:
 
 @dataclass(frozen=True)
 class _PreparedBoundedTransfer:
-    batches: tuple[_BoundedBatch, ...]
+    batches: tuple[_StreamingBatch, ...]
     sources: dict
     transport: NixlReshardTransport
     metrics: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
-class _CompiledBoundedPlan:
-    plan: TransferPlan
-    module_batches: tuple[_BoundedBatch, ...]
-    batches: tuple[_BoundedBatch, ...]
+class _StreamingSchedule:
+    transfer_plan: TensorTransferPlan
+    module_batches: tuple[_StreamingBatch, ...]
+    batches: tuple[_StreamingBatch, ...]
     fingerprint: str | None = None
 
 
@@ -208,19 +208,19 @@ def _arena_geometry(arena: torch.Tensor) -> tuple:
 class _BoundedDescriptors:
     """One validated plan, weak arena identities, and no transfer resources."""
 
-    plan: _CompiledBoundedPlan
+    schedule: _StreamingSchedule
     generation: int
     arenas: tuple[tuple[weakref.ReferenceType, tuple], ...]
     batches: tuple[tuple[_BoundedReadDescriptor, ...] | None, ...]
 
     def matches(
         self,
-        batches: tuple[_BoundedBatch, ...],
+        batches: tuple[_StreamingBatch, ...],
         generation: int,
         arenas: list[torch.Tensor],
     ) -> bool:
         return (
-            self.plan.batches is batches
+            self.schedule.batches is batches
             and self.generation == generation
             and len(self.arenas) == len(arenas)
             and all(
@@ -236,7 +236,7 @@ class _BoundedPlanCache:
     """Keep one validated plan without transport handles or destination views."""
 
     def __init__(self) -> None:
-        self._entry: tuple[tuple, _CompiledBoundedPlan] | None = None
+        self._entry: tuple[tuple, _StreamingSchedule] | None = None
         self._compile_lock = threading.Lock()
 
     def clear(self) -> None:
@@ -256,7 +256,7 @@ class _BoundedPlanCache:
         staging_buffers=1,
         total_staging_bytes=None,
         source_snapshot=None,
-    ) -> _CompiledBoundedPlan:
+    ) -> _StreamingSchedule:
         """Compile a bounded plan, copying inputs when caching is enabled.
 
         Keep capture/layout stable during compilation. Uncached plans retain
@@ -300,7 +300,7 @@ class _BoundedPlanCache:
         staging_buffers,
         total_staging_bytes,
         source_snapshot,
-    ) -> _CompiledBoundedPlan:
+    ) -> _StreamingSchedule:
         entry = self._entry
         self.clear()
         metrics.update(
@@ -366,13 +366,13 @@ class _BoundedPlanCache:
                 compiled = entry[1]
                 started = time.perf_counter()
                 _NixlStagedTransfer._validate_complete(
-                    capture, parameter_layout, compiled.plan
+                    capture, parameter_layout, compiled.transfer_plan
                 )
                 metrics["bounded_whole_validation_s"] = time.perf_counter() - started
                 owner_started = time.perf_counter()
                 for batch in compiled.module_batches:
                     _NixlStagedTransfer._validate_complete(
-                        batch.capture, batch.layouts[0], batch.plan
+                        batch.capture, batch.layouts[0], batch.transfer_plan
                     )
                 metrics["owner_validation_s"] = time.perf_counter() - owner_started
                 metrics["plan_cache_validate_s"] = time.perf_counter() - started
@@ -410,7 +410,7 @@ class _BoundedPlanCache:
             digest.update(repr(key[1:]).encode())
             fingerprint = digest.hexdigest()
             metrics["plan_cache_fingerprint_s"] = time.perf_counter() - started
-        compiled = _CompiledBoundedPlan(plan, modules, batches, fingerprint)
+        compiled = _StreamingSchedule(plan, modules, batches, fingerprint)
         if key is not None:
             self._entry = (key, compiled)
             logger.info("compiled bounded physical plan %s", fingerprint)
@@ -427,7 +427,7 @@ def _bounded_batches(
     metrics=None,
     total_staging_bytes=None,
     staging_buffers=1,
-) -> tuple[_BoundedBatch, ...]:
+) -> tuple[_StreamingBatch, ...]:
     """Validate all owning-module batches before allocating or installing."""
     if metrics is None:
         metrics = {}
@@ -486,15 +486,15 @@ def _bounded_batches(
                 f"module {module!r} requires {nbytes} staging bytes, exceeds "
                 f"{budget}; {remedy} (there is no CPU fallback)"
             )
-        batches.append(_BoundedBatch(subset, plan, layouts, nbytes))
+        batches.append(_StreamingBatch(subset, plan, layouts, nbytes))
     if not batches:
         raise IncompleteRefit("bounded refit has no engine parameters")
     return tuple(batches)
 
 
 def _pack_bounded_batches(
-    batches: tuple[_BoundedBatch, ...], max_staging_bytes: int
-) -> tuple[_BoundedBatch, ...]:
+    batches: tuple[_StreamingBatch, ...], max_staging_bytes: int
+) -> tuple[_StreamingBatch, ...]:
     """Pack complete modules without changing source READ ranges.
 
     Owning-module batches are the unit of correctness; this only coalesces
@@ -502,17 +502,17 @@ def _pack_bounded_batches(
     installs whole modules and reads exactly the bytes the unpacked plan read.
     """
 
-    def merge(group: list[_BoundedBatch]) -> _BoundedBatch:
+    def merge(group: list[_StreamingBatch]) -> _StreamingBatch:
         capture = CaptureResult(
             copies=[copy for batch in group for copy in batch.capture.copies]
         )
-        plan = TransferPlan()
+        plan = TensorTransferPlan()
         layouts = _StagingLayouts({}, {}, {})
         for batch in group:
-            _merge_plan(plan, batch.plan)
+            _merge_plan(plan, batch.transfer_plan)
             for layout, incoming in zip(layouts, batch.layouts, strict=True):
                 layout.update(incoming)
-        return _BoundedBatch(
+        return _StreamingBatch(
             capture, plan, layouts, sum(batch.nbytes for batch in group)
         )
 
@@ -572,7 +572,7 @@ def _resolve_sources(manifests: list[bytes], *, metrics=None) -> _ResolvedSource
 
 
 def _required_agent_metadata(
-    plan: TransferPlan, resolved: _ResolvedSources
+    plan: TensorTransferPlan, resolved: _ResolvedSources
 ) -> dict[str, bytes]:
     sessions = plan.sessions()
     missing_sessions = sorted(sessions - set(resolved.session_to_agent))
@@ -629,7 +629,7 @@ def _row_major_strides(shape: tuple) -> tuple:
     return tuple(reversed(strides))
 
 
-def _merge_plan(target: TransferPlan, source: TransferPlan) -> None:
+def _merge_plan(target: TensorTransferPlan, source: TensorTransferPlan) -> None:
     target.segments.extend(source.segments)
     target.converts.extend(source.converts)
     target.full_pulls.extend(source.full_pulls)
@@ -641,7 +641,9 @@ def _merge_plan(target: TransferPlan, source: TransferPlan) -> None:
     target.exact_bytes += source.exact_bytes
 
 
-def _plan_staged_transfer(capture: CaptureResult, sources: dict) -> TransferPlan:
+def _plan_staged_transfer(
+    capture: CaptureResult, sources: dict
+) -> TensorTransferPlan:
     """Plan reads for each source.
 
     Default: minimal slice reads via plan_transfer (a partial read of a shard cannot
@@ -653,7 +655,7 @@ def _plan_staged_transfer(capture: CaptureResult, sources: dict) -> TransferPlan
     if not envs.MX_RESHARD_PUBLISH_DIGEST:
         return plan_transfer(capture, sources)
 
-    result = TransferPlan()
+    result = TensorTransferPlan()
     copies_by_source: dict[str, list[RecordedCopy]] = {}
     for copy in capture.copies:
         copies_by_source.setdefault(copy.src_name, []).append(copy)
@@ -1015,7 +1017,7 @@ class _NixlStagedTransfer:
             previous, self._weight_update_plan = self._weight_update_plan, None
             reusable = (
                 previous is not None
-                and isinstance(previous.compiled, TransferPlan)
+                and isinstance(previous.transfer_plan, TensorTransferPlan)
                 and previous.key == trainer_snapshot.physical_fingerprint
             )
             metrics = {
@@ -1026,7 +1028,7 @@ class _NixlStagedTransfer:
                 trainer = previous.trainer_source_snapshot
                 capture = previous.generator_capture_snapshot
                 parameter_layout = previous.parameter_layout
-                plan = previous.compiled
+                plan = previous.transfer_plan
                 if tuple(manifests) != previous.manifests:
                     self._weight_update_plan = previous
                     resolved, frozen = self._resolve_metadata(manifests, metrics)
@@ -1069,7 +1071,7 @@ class _NixlStagedTransfer:
             if not reusable or self._full_copy_descriptors is None:
                 self._full_copy_descriptors = tuple(self._descriptors(plan))
             prepared = _PreparedNixlTransfer(
-                plan=plan,
+                transfer_plan=plan,
                 capture=capture,
                 sources={
                     copy.src_name: resolved.sources[copy.src_name]
@@ -1117,9 +1119,9 @@ class _NixlStagedTransfer:
             compiler = _BoundedPlanCache()
             compiler._compile_lock = self._plan_compile_lock
             if previous is not None and isinstance(
-                previous.compiled, _CompiledBoundedPlan
+                previous.transfer_plan, _StreamingSchedule
             ):
-                compiler._entry = (previous.key, previous.compiled)
+                compiler._entry = (previous.key, previous.transfer_plan)
             self._weight_update_plan = None
             started = time.perf_counter()
             compiled = compiler.compile(
@@ -1138,9 +1140,13 @@ class _NixlStagedTransfer:
             metrics["transfer_planning_s"] = time.perf_counter() - started
             started = time.perf_counter()
             resolved = trainer.resolved_metadata
-            required_metadata = _required_agent_metadata(compiled.plan, resolved)
+            required_metadata = _required_agent_metadata(
+                compiled.transfer_plan, resolved
+            )
             for batch in compiled.batches:
-                required_metadata.update(_required_agent_metadata(batch.plan, resolved))
+                required_metadata.update(
+                    _required_agent_metadata(batch.transfer_plan, resolved)
+                )
             transport = self._connect_sources(
                 resolved, required_metadata, host_staging=staging_device == "cpu"
             )
@@ -1169,7 +1175,7 @@ class _NixlStagedTransfer:
 
     def _prepare_arenas(
         self,
-        batches: tuple[_BoundedBatch, ...],
+        batches: tuple[_StreamingBatch, ...],
     ) -> None:
         streaming = cast(StreamingSettings, self._streaming)
         buffer_budget = cast(int, self._buffer_budget)
@@ -1200,7 +1206,7 @@ class _NixlStagedTransfer:
 
     def _prepare_bounded_descriptors(
         self,
-        compiled: _CompiledBoundedPlan,
+        compiled: _StreamingSchedule,
         previous: _BoundedDescriptors | None,
         *,
         enabled: bool,
@@ -1211,7 +1217,7 @@ class _NixlStagedTransfer:
             return None
         if (
             previous is not None
-            and previous.plan is compiled
+            and previous.schedule is compiled
             and previous.matches(
                 compiled.batches, self._workspace_generation, self._staging_arenas
             )
@@ -1267,7 +1273,9 @@ class _NixlStagedTransfer:
                 return entry.batches[index]
             metrics["descriptor_cache_misses"] += 1
             metrics["descriptor_builds"] += 1
-            fresh = tuple(self._descriptors(batches[index].plan, recv, full, convert))
+            fresh = tuple(
+                self._descriptors(batches[index].transfer_plan, recv, full, convert)
+            )
             if entry is None:
                 return fresh
             if not all(
@@ -1294,7 +1302,7 @@ class _NixlStagedTransfer:
             return immutable
 
         def carve(
-            batch: _BoundedBatch, arena: torch.Tensor
+            batch: _StreamingBatch, arena: torch.Tensor
         ) -> tuple[dict[str, torch.Tensor], ...]:
             offset = 0
             buffers = []
@@ -1323,7 +1331,7 @@ class _NixlStagedTransfer:
                 c.src_name: prepared.sources[c.src_name] for c in batch.capture.copies
             }
             chunk = _PreparedNixlTransfer(
-                batch.plan,
+                batch.transfer_plan,
                 batch.capture,
                 sources,
                 descriptors(index, recv, full, convert),
@@ -1395,7 +1403,7 @@ class _NixlStagedTransfer:
     def _validate_complete(
         capture: CaptureResult,
         parameter_layout: dict[str, tuple[tuple[int, ...], torch.dtype]],
-        plan: TransferPlan,
+        plan: TensorTransferPlan,
     ) -> None:
         written = {copy.param_name for copy in capture.copies}
         missing = sorted(set(parameter_layout) - written)
@@ -1439,7 +1447,7 @@ class _NixlStagedTransfer:
 
     def _ensure_workspace(
         self,
-        plan: TransferPlan,
+        plan: TensorTransferPlan,
         parameter_layout: dict[str, tuple[tuple[int, ...], torch.dtype]],
     ) -> None:
         recv_expected = {
@@ -1493,7 +1501,7 @@ class _NixlStagedTransfer:
 
     def _descriptors(
         self,
-        plan: TransferPlan,
+        plan: TensorTransferPlan,
         recv: dict[str, torch.Tensor] | None = None,
         full: dict[str, torch.Tensor] | None = None,
         convert: dict[str, torch.Tensor] | None = None,
@@ -1547,7 +1555,7 @@ class _NixlStagedTransfer:
         wire_seconds = time.perf_counter() - started
 
         reconstruct_started = time.perf_counter()
-        for full in prepared.plan.full_pulls:
+        for full in prepared.transfer_plan.full_pulls:
             source = self._full_buffers[full.src_name]
             for copy in full.copies:
                 destination = self._recv_buffers[copy.param_name].as_strided(
@@ -1557,13 +1565,13 @@ class _NixlStagedTransfer:
                     + copy.dest_offset,
                 )
                 destination.copy_(_replay_ops(source, copy.op_chain))
-        converted = {convert.param_name for convert in prepared.plan.converts}
+        converted = {convert.param_name for convert in prepared.transfer_plan.converts}
         conversion_copies = {
             copy.param_name: copy
             for copy in prepared.capture.copies
             if copy.param_name in converted
         }
-        for convert in prepared.plan.converts:
+        for convert in prepared.transfer_plan.converts:
             copy = conversion_copies[convert.param_name]
             target = self._recv_buffers[convert.param_name]
             destination = target.as_strided(
@@ -1593,9 +1601,9 @@ class _NixlStagedTransfer:
             "wire=%.3fs reconstruct=%.3fs",
             bytes_received / 1e9,
             len(prepared.descriptors),
-            len(prepared.plan.segments),
-            len(prepared.plan.full_pulls),
-            len(prepared.plan.converts),
+            len(prepared.transfer_plan.segments),
+            len(prepared.transfer_plan.full_pulls),
+            len(prepared.transfer_plan.converts),
             len(self._recv_buffers),
             wire_seconds,
             reconstruct_seconds,
@@ -1608,8 +1616,8 @@ class _NixlStagedTransfer:
                 "wire_s": wire_seconds,
                 "wire_wait_s": wire_wait_seconds,
                 "reconstruct_s": reconstruct_seconds,
-                "full_pull_sources": len(prepared.plan.full_pulls),
-                "converts": len(prepared.plan.converts),
+                "full_pull_sources": len(prepared.transfer_plan.full_pulls),
+                "converts": len(prepared.transfer_plan.converts),
             },
         )
 

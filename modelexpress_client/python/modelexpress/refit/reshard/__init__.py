@@ -30,7 +30,7 @@ from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.reshard.transfer_plan import (
     FullPullSource,
     SourceInfo,
-    TransferPlan,
+    TensorTransferPlan,
     execute_transfer,
     plan_transfer,
 )
@@ -78,7 +78,7 @@ __all__ = [
     "Shard",
     "SourceInfo",
     "Transport",
-    "TransferPlan",
+    "TensorTransferPlan",
     "UnsupportedReshard",
     "build_lazy_weights",
     "capture_geometry",

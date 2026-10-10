@@ -32,7 +32,7 @@ import pytest
 import torch
 
 from modelexpress.refit.reshard import receiver as receiver_mod
-from modelexpress.refit.reshard.transfer_plan import TransferPlan
+from modelexpress.refit.reshard.transfer_plan import TensorTransferPlan
 from modelexpress.refit.reshard.types import CaptureResult
 from tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
 
@@ -90,13 +90,13 @@ def test_second_refit_through_the_cache_repeats_the_first(monkeypatch):
     assert keepalive
 
 
-def test_rebuilding_the_plan_drops_the_cache(monkeypatch):
+def test_rebuilding_the_plan_drops_the_cache(monkeypatch) -> None:
     monkeypatch.setenv("MX_RESHARD_CACHE_DESCRIPTORS", "1")
     harness, keepalive = _build(_RecordingTransport())
     _refit(harness, 1)
     assert harness._cached_descriptors is not None
 
-    new_plan = TransferPlan()
+    new_plan = TensorTransferPlan()
     monkeypatch.setattr(
         receiver_mod,
         "gather_sources",

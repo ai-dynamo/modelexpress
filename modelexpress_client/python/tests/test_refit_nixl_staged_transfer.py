@@ -19,7 +19,7 @@ from modelexpress.refit.reshard.rendezvous import (
     wrap_rendezvous_blob,
 )
 from modelexpress.refit.reshard.slice_plan import PullSegment, Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, TransferPlan
+from modelexpress.refit.reshard.transfer_plan import SourceInfo, TensorTransferPlan
 from modelexpress.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
@@ -70,7 +70,9 @@ def test_bounded_batches_preserve_module_groups_and_count_dtype_scratch(
         ]
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
-    batches = _bounded_batches(CaptureResult(copies=copies), layout, sources, 512)
+    batches = _bounded_batches(
+        CaptureResult(copies=copies), layout, sources, 512
+    )
     assert [b.nbytes for b in batches] == [256, 512]
     assert [set(b.layouts[0]) for b in batches] == [
         {"layer0.weight"},
@@ -108,18 +110,20 @@ def test_packing_coalesces_modules_without_changing_planned_reads(monkeypatch) -
         ]
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
-    batches = _bounded_batches(CaptureResult(copies=copies), layout, sources, 512)
+    batches = _bounded_batches(
+        CaptureResult(copies=copies), layout, sources, 512
+    )
     assert [b.nbytes for b in batches] == [256, 512]
 
     packed = _pack_bounded_batches(batches, 768)
     assert len(packed) == 1 and packed[0].nbytes == 768
     assert list(packed[0].layouts.recv) == ["layer0.weight", "layer1.weight"]
     assert packed[0].capture.copies == copies
-    assert packed[0].plan.bytes_planned() == sum(
-        b.plan.bytes_planned() for b in batches
+    assert packed[0].transfer_plan.bytes_planned() == sum(
+        b.transfer_plan.bytes_planned() for b in batches
     )
-    assert packed[0].plan.descriptor_count() == sum(
-        b.plan.descriptor_count() for b in batches
+    assert packed[0].transfer_plan.descriptor_count() == sum(
+        b.transfer_plan.descriptor_count() for b in batches
     )
 
     # A budget that only fits one module leaves the owning-module batching intact.
@@ -140,7 +144,9 @@ def test_packing_coalesces_modules_without_changing_planned_reads(monkeypatch) -
 
 @pytest.mark.parametrize("pack", [False, True])
 @pytest.mark.parametrize("padded", [False, True])
-def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, pack, padded):
+def test_bounded_transfer_reuses_arena_and_preserves_fp32(
+    monkeypatch, pack, padded
+) -> None:
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     source_tensor = torch.tensor([1.001, 2.002, 3.003, 4.004])
@@ -553,8 +559,8 @@ def test_exact_manifests_resolve_without_legacy_source_discovery(memory_type):
     }
 
 
-def test_required_agent_metadata_rejects_incomplete_source_metadata():
-    plan = TransferPlan(segments=[PullSegment("session-a", 1, "weight", 0, 4)])
+def test_required_agent_metadata_rejects_incomplete_source_metadata() -> None:
+    plan = TensorTransferPlan(segments=[PullSegment("session-a", 1, "weight", 0, 4)])
     resolved = _ResolvedSources(
         sources={},
         session_to_agent={"session-a": "agent-a"},
@@ -590,7 +596,9 @@ def test_load_agent_metadata_validates_embedded_agent_identity():
         _load_agent_metadata(_Manager(), {"agent-b": b"metadata"})
 
 
-def test_transformed_source_is_fully_reconstructed_for_verification(monkeypatch):
+def test_transformed_source_is_fully_reconstructed_for_verification(
+    monkeypatch,
+) -> None:
     # Full reconstruction + verification is the digest mode; default is minimal reads.
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
     source = SourceInfo(
@@ -612,7 +620,9 @@ def test_transformed_source_is_fully_reconstructed_for_verification(monkeypatch)
         dest_dtype=torch.float32,
     )
 
-    plan = _plan_staged_transfer(CaptureResult(copies=[copy]), {"weight": source})
+    plan = _plan_staged_transfer(
+        CaptureResult(copies=[copy]), {"weight": source}
+    )
 
     assert plan.segments == []
     assert len(plan.full_pulls) == 1
@@ -624,7 +634,7 @@ def test_transformed_source_is_fully_reconstructed_for_verification(monkeypatch)
     }
 
 
-def test_transformed_source_reads_only_required_slice_by_default(monkeypatch):
+def test_transformed_source_reads_only_required_slice_by_default(monkeypatch) -> None:
     monkeypatch.delenv("MX_RESHARD_PUBLISH_DIGEST", raising=False)
     source = SourceInfo(
         global_shape=(4, 4),
@@ -645,7 +655,9 @@ def test_transformed_source_reads_only_required_slice_by_default(monkeypatch):
         dest_dtype=torch.float32,
     )
 
-    plan = _plan_staged_transfer(CaptureResult(copies=[copy]), {"weight": source})
+    plan = _plan_staged_transfer(
+        CaptureResult(copies=[copy]), {"weight": source}
+    )
 
     assert plan.full_pulls == []
     assert sum(segment.nbytes for segment in plan.segments) == 32
@@ -678,7 +690,7 @@ def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer
         ],
     )
     return _PreparedNixlTransfer(
-        plan=TransferPlan(),
+        transfer_plan=TensorTransferPlan(),
         capture=CaptureResult(copies=[copy]),
         sources={"weight": source},
         descriptors=(),
@@ -702,13 +714,13 @@ def test_staged_verification_rejects_missing_or_mismatched_digest():
         transfer._verify(_prepared(tensor, None))
 
 
-def test_full_tensor_plan_fails_before_transfer_when_capture_has_holes():
+def test_full_tensor_plan_fails_before_transfer_when_capture_has_holes() -> None:
     capture = CaptureResult(copies=[])
     with pytest.raises(IncompleteRefit, match="must cover every engine parameter"):
         _NixlStagedTransfer._validate_complete(
             capture,
             {"weight": ((4,), torch.float32)},
-            TransferPlan(),
+            TensorTransferPlan(),
         )
 
 
@@ -965,7 +977,9 @@ def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch):
         )
 
 
-def test_double_buffered_iteration_alternates_arenas_and_prefetches(monkeypatch):
+def test_double_buffered_iteration_alternates_arenas_and_prefetches(
+    monkeypatch,
+) -> None:
     """Batch i+1 is posted before batch i is handed to the caller."""
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
@@ -990,7 +1004,9 @@ def test_double_buffered_iteration_alternates_arenas_and_prefetches(monkeypatch)
         for name in names
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
-    batches = _bounded_batches(CaptureResult(copies=copies), layout, {"w": source}, 256)
+    batches = _bounded_batches(
+        CaptureResult(copies=copies), layout, {"w": source}, 256
+    )
     assert len(batches) == 3
     events = []
 
@@ -1048,7 +1064,9 @@ def test_double_buffered_iteration_alternates_arenas_and_prefetches(monkeypatch)
     assert transfer._active is prepared
 
 
-def test_abandoned_double_buffered_iteration_drains_the_prefetched_read(monkeypatch):
+def test_abandoned_double_buffered_iteration_drains_the_prefetched_read(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     source_tensor = torch.tensor([1.0, 2.0, 3.0, 4.0])
@@ -1071,7 +1089,9 @@ def test_abandoned_double_buffered_iteration_drains_the_prefetched_read(monkeypa
         for name in ["a.weight", "b.weight"]
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
-    batches = _bounded_batches(CaptureResult(copies=copies), layout, {"w": source}, 256)
+    batches = _bounded_batches(
+        CaptureResult(copies=copies), layout, {"w": source}, 256
+    )
     posted, awaited = [], []
 
     class Transport:
@@ -1264,7 +1284,7 @@ def test_bounded_device_validation_precedes_manager_creation(monkeypatch) -> Non
     assert events == []
 
 
-def test_failed_prefetch_drain_is_reported_not_swallowed(monkeypatch):
+def test_failed_prefetch_drain_is_reported_not_swallowed(monkeypatch) -> None:
     """An undrained prefetch leaves the arena writable, so it cannot pass quietly.
 
     With two arenas a READ for the next batch is already in flight when the
@@ -1295,7 +1315,9 @@ def test_failed_prefetch_drain_is_reported_not_swallowed(monkeypatch):
         for name in ("a.weight", "b.weight")
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
-    batches = _bounded_batches(CaptureResult(copies=copies), layout, {"w": source}, 512)
+    batches = _bounded_batches(
+        CaptureResult(copies=copies), layout, {"w": source}, 512
+    )
     assert len(batches) == 2
 
     class Transport:
@@ -1329,7 +1351,7 @@ def test_failed_prefetch_drain_is_reported_not_swallowed(monkeypatch):
         iterator.close()
 
 
-def test_failed_prefetch_drain_does_not_mask_a_caller_error(monkeypatch):
+def test_failed_prefetch_drain_does_not_mask_a_caller_error(monkeypatch) -> None:
     """A drain failure must not replace the error that caused the abandonment."""
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
@@ -1353,7 +1375,9 @@ def test_failed_prefetch_drain_does_not_mask_a_caller_error(monkeypatch):
         for name in ("a.weight", "b.weight")
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
-    batches = _bounded_batches(CaptureResult(copies=copies), layout, {"w": source}, 512)
+    batches = _bounded_batches(
+        CaptureResult(copies=copies), layout, {"w": source}, 512
+    )
     drained = []
 
     class Transport:
@@ -1385,7 +1409,7 @@ def test_failed_prefetch_drain_does_not_mask_a_caller_error(monkeypatch):
         iterator.throw(RuntimeError("the install failed"))
 
 
-def test_bounded_batch_layouts_are_named_however_they_are_built():
+def test_bounded_batch_layouts_are_named_however_they_are_built() -> None:
     """Readers use both `.full` and `[0]`, so construction style must not matter.
 
     The annotation alone does not enforce this: a plain 3-tuple or a
@@ -1396,8 +1420,11 @@ def test_bounded_batch_layouts_are_named_however_they_are_built():
     convert: dict = {}
     full = {"w": ((4,), torch.float32)}
 
-    built = transfer_module._BoundedBatch(
-        CaptureResult(copies=[]), TransferPlan(), (recv, convert, full), 256
+    built = transfer_module._StreamingBatch(
+        CaptureResult(copies=[]),
+        TensorTransferPlan(),
+        (recv, convert, full),
+        256,
     )
     assert isinstance(built.layouts, transfer_module._StagingLayouts)
     assert built.layouts.recv is built.layouts[0] is recv
