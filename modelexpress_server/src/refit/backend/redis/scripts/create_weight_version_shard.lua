@@ -36,6 +36,13 @@ end
 if redis.call('EXISTS', KEYS[4]) == 0 then
   return 'MESH_NOT_FOUND'
 end
+local generation = redis.call('HGET', KEYS[1], 'trainer_mesh_generation')
+if not generation or generation == '0' then
+  return 'MESH_GENERATION_MISSING'
+end
+if generation ~= redis.call('HGET', KEYS[4], 'generation') then
+  return 'MESH_GENERATION_MISMATCH'
+end
 if tonumber(redis.call('HGET', KEYS[2], 'role')) ~= tonumber(ARGV[8]) then
   return 'WORKER_NOT_TRAINER'
 end

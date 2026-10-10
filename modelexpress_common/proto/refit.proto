@@ -153,6 +153,9 @@ message WeightVersion {
   // Required for worker publication; absent for object-storage versions.
   optional string trainer_mesh_id = 11;
   optional int64 version_number = 12;
+  // Server-stamped trainer mesh generation at creation. Required and positive
+  // for mesh-backed versions; zero only when no trainer mesh applies.
+  uint64 trainer_mesh_generation = 14;
 }
 
 message CreateWeightVersionRequest {
