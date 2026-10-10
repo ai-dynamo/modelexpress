@@ -18,6 +18,7 @@ def test_defaults_when_unset(monkeypatch):
         "MX_VMM_ARENA",
         "MX_MS_DISTRIBUTED",
         "MX_LOAD_STRATEGY_CHAIN",
+        "MX_DISABLE_DRAFT_P2P",
         "MX_INSTANT_TENSOR",
         "VLLM_ATTENTION_BACKEND",
         "SGLANG_CACHE_DIR",
@@ -43,6 +44,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_VMM_ARENA is False
     assert envs.MX_MS_DISTRIBUTED is True
     assert envs.MX_LOAD_STRATEGY_CHAIN == "INFERENCE"
+    assert envs.MX_DISABLE_DRAFT_P2P is False
     assert envs.MX_INSTANT_TENSOR is True
     assert envs.VLLM_ATTENTION_BACKEND == "auto"
     assert envs.SGLANG_CACHE_DIR is None
@@ -79,6 +81,10 @@ def test_invalid_int_falls_back_to_default(monkeypatch):
 
 
 def test_bool_parsing(monkeypatch, caplog):
+    monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", "1")
+    assert envs.MX_DISABLE_DRAFT_P2P is True
+    monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", "0")
+    assert envs.MX_DISABLE_DRAFT_P2P is False
     monkeypatch.setenv("MX_POOL_REG", "1")
     assert envs.MX_POOL_REG is True
     monkeypatch.setenv("MX_POOL_REG", "0")
