@@ -449,3 +449,39 @@ def test_descriptor_build_time_stays_outside_wire_time(harness, monkeypatch):
     assert now[0] == 400
     assert cold["wire_s"] == warm["wire_s"] == 0
     assert warm["descriptor_builds"] == 0
+
+
+@pytest.mark.parametrize("index", [
+    [0, 2], [[0, 1], [2, 3]], torch.tensor([0, 2]),
+    torch.tensor([[0, 1], [2, 3]]),
+    torch.tensor([True, False, True, False]),
+    torch.tensor([1, 0, 1, 0], dtype=torch.uint8),
+])
+def test_full_source_index_replay_snapshots_indices(harness, monkeypatch, index):
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    expected = harness.sources["full"][index].clone()
+    harness.capture.copies[1] = replace(
+        harness.capture.copies[1], op_chain=(("__getitem__", (index,), ()),),
+        dest_shape=tuple(expected.shape), dest_stride=tuple(expected.stride()),
+    )
+    if isinstance(index, torch.Tensor):
+        index.zero_()
+    else:
+        index[:] = [0]
+    for increment in (0, 5):
+        harness.sources["full"].add_(increment)
+        _, installed = harness.collect(harness.prepare())
+        target = torch.zeros(20, dtype=torch.float32)
+        target[2:2 + expected.numel()].copy_((expected + increment).reshape(-1))
+        assert torch.equal(installed["b.weight"], target)
+
+
+def test_full_source_index_replay_rejects_float_tensor(harness, monkeypatch):
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    harness.capture.copies[1] = replace(
+        harness.capture.copies[1],
+        op_chain=(("__getitem__", (torch.tensor([0., 2.]),), ()),),
+        dest_shape=(2, 4), dest_stride=(4, 1),
+    )
+    with pytest.raises(IndexError, match="indices"):
+        harness.collect(harness.prepare())

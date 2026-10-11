@@ -220,15 +220,6 @@ def test_recorded_operation_arguments_are_snapshotted_before_binding():
     assert torch.equal(destination, source.permute(1, 0))
 
 
-def test_recorded_copy_rejects_advanced_index_lists():
-    with pytest.raises(UnsupportedReshard, match="advanced list indexing"):
-        RecordedCopy(
-            src_name="weight", op_chain=(("__getitem__", ([0, 2],), []),),
-            param_name="param", dest_offset=0, dest_shape=(2,),
-            dest_stride=(1,), dest_dtype=torch.float32,
-        )
-
-
 @pytest.mark.parametrize("grouped", [False, True])
 def test_full_pull_replay_preserves_source_order_after_capture_reordering(grouped):
     a = torch.tensor([[1, 2], [3, 4]], dtype=torch.float32)
