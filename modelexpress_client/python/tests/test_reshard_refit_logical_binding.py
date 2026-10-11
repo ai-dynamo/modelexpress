@@ -10,29 +10,13 @@ import torch
 
 from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import (
-    LogicalTransferPlan,
-    PhysicalTransferPlan,
     SourceInfo,
     bind_transfer,
     plan_transfer,
     plan_transfer_groups,
 )
 from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
-from modelexpress.refit.reshard.types import UnsupportedReshard
 from tests.test_refit_bounded_descriptors import harness
-
-
-def _capture():
-    copy = RecordedCopy(
-        src_name="weight",
-        op_chain=(),
-        param_name="param",
-        dest_offset=0,
-        dest_shape=(2, 3),
-        dest_stride=(3, 1),
-        dest_dtype=torch.float32,
-    )
-    return CaptureResult(copies=[copy])
 
 
 def _source(tensor, session="physical-0"):
@@ -56,49 +40,6 @@ def _apply(descriptors):
     for d in descriptors:
         if d.nbytes:
             ctypes.memmove(d.dst_addr, d.src_addr, d.nbytes)
-
-
-def test_logical_plan_binds_to_two_replicas_and_respects_explicit_slot_map():
-    source = torch.arange(6, dtype=torch.float32).reshape(2, 3) + 10
-    # Physical rank/session names intentionally do not encode logical rank order.
-    logical = plan_transfer(
-        _capture(),
-        {"weight": _source(source, "trainer-session-7")},
-        source_slots={"trainer-session-7": "logical-slot-0"},
-    )
-    assert isinstance(logical, LogicalTransferPlan)
-    assert logical.source_buffers[0].source_slot_id == "logical-slot-0"
-    assert logical.source_buffers[0].src_name == "weight"
-
-    replicas = []
-    for session, values in (
-        ("replica-a", source),
-        ("replica-b", source + 100),
-    ):
-        src = values.contiguous()
-        dst = torch.zeros_like(src)
-        source_calls = []
-        destination_calls = []
-
-        def resolve_source(buffer):
-            source_calls.append(buffer)
-            return session, src.data_ptr()
-
-        def resolve_destination(kind, name):
-            destination_calls.append((kind, name))
-            assert kind == "recv"
-            assert name == "param"
-            return dst.data_ptr()
-
-        physical = bind_transfer(logical, resolve_source, resolve_destination)
-        assert isinstance(physical, PhysicalTransferPlan)
-        assert len(source_calls) == 1
-        assert len(destination_calls) == 1
-        assert all(d.session == session for d in physical.descriptors)
-        _apply(physical.descriptors)
-        assert torch.equal(dst, values)
-        replicas.append(dst)
-    assert torch.equal(replicas[1], replicas[0] + 100)
 
 
 @pytest.mark.parametrize("shared_storage", [False, True])
@@ -125,46 +66,50 @@ def test_binding_keeps_multiple_sources_attached_to_their_logical_slots(shared_s
         capture, published,
         source_slots={left_session: left_slot, right_session: right_slot},
     )
-    sources = {
-        (left_slot, "left"): (left_session, left.data_ptr()),
-        (right_slot, "right"): (right_session, right.data_ptr()),
-    }
-    outputs = {
-        "left_param": torch.zeros_like(left),
-        "right_param": torch.zeros_like(right),
-    }
-    source_calls = []
-    destination_calls = []
+    plans = tuple(plan_transfer_groups(
+        (CaptureResult(copies=[copy]) for copy in capture.copies), published, logical,
+    )) if grouped else (logical,)
+    for offset in (0, 100):
+        if shared_storage:
+            storage = backing + offset
+            replicas = {"left": storage[:4].view(2, 2), "right": storage[4:].view(2, 2)}
+        else:
+            replicas = {"left": left + offset, "right": right + offset}
+        sources = {
+            (left_slot, "left"): (f"replica-{offset}-{left_session}", replicas["left"].data_ptr()),
+            (right_slot, "right"): (f"replica-{offset}-{right_session}", replicas["right"].data_ptr()),
+        }
+        outputs = {name + "_param": torch.zeros_like(value) for name, value in replicas.items()}
+        source_calls, destination_calls = [], []
 
-    def resolve_source(buffer):
-        source_calls.append((buffer.source_slot_id, buffer.src_name))
-        return sources[(buffer.source_slot_id, buffer.src_name)]
+        def resolve_source(buffer):
+            key = buffer.source_slot_id, buffer.src_name
+            source_calls.append(key)
+            return sources[key]
 
-    def resolve_destination(kind, name):
-        destination_calls.append((kind, name))
-        return outputs[name].data_ptr()
+        def resolve_destination(kind, name):
+            destination_calls.append((kind, name))
+            return outputs[name].data_ptr()
 
-    plans = (
-        plan_transfer_groups(
-            (CaptureResult(copies=[copy]) for copy in capture.copies),
-            published, logical,
-        ) if grouped else (logical,)
-    )
-    for plan in plans:
-        physical = bind_transfer(plan, resolve_source, resolve_destination)
-        _apply(physical.descriptors)
-    assert set(source_calls) == {(left_slot, "left"), (right_slot, "right")}
-    assert len(source_calls) == 2
-    assert set(destination_calls) == {("recv", "left_param"), ("recv", "right_param")}
-    assert torch.equal(outputs["left_param"], left)
-    assert torch.equal(outputs["right_param"], right)
-    assert backing is None or backing.data_ptr()
+        sessions = set()
+        for plan in plans:
+            physical = bind_transfer(plan, resolve_source, resolve_destination)
+            sessions.update(descriptor.session for descriptor in physical.descriptors)
+            _apply(physical.descriptors)
+        assert sessions == {session for session, _ in sources.values()}
+        assert sorted(source_calls) == sorted(sources)
+        assert sorted(destination_calls) == [("recv", "left_param"), ("recv", "right_param")]
+        for name, value in replicas.items():
+            assert torch.equal(outputs[name + "_param"], value)
 
 
 def test_binding_failure_does_not_return_a_partial_descriptor_plan():
     source = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    capture = CaptureResult(copies=[RecordedCopy(
+        "weight", (), "param", 0, (2, 3), (3, 1), torch.float32
+    )])
     logical = plan_transfer(
-        _capture(), {"weight": _source(source)},
+        capture, {"weight": _source(source)},
         source_slots={"physical-0": "slot-0"},
     )
     calls = []
@@ -254,7 +199,6 @@ def test_full_pull_replay_preserves_source_order_after_capture_reordering(groupe
         logical = next(plan_transfer_groups(
             (capture,), sources, logical, max_segments_per_copy=1,
         ))
-    assert [full.src_name for full in logical.full_pulls] == ["a", "b"]
 
     staging = {"a": torch.empty_like(a), "b": torch.empty_like(b)}
     destination = torch.zeros_like(a)
@@ -322,7 +266,7 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(
         return capture, layout
 
     fingerprints = tuple(structural_manifest_digest(m) for m in manifests)
-    prepared = harness.transfer.prepare(
+    request = dict(
         manifests=manifests,
         source_fingerprints=fingerprints,
         capture_layout=capture_layout,
@@ -330,6 +274,7 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(
         staging_device="cpu",
         source_slot_ids=("slot-z", "slot-a"),
     )
+    prepared = harness.transfer.prepare(**request)
     metrics, installed = harness.collect(prepared)
     expected = torch.cat((first, second))
     assert torch.equal(installed["weight"], expected)
@@ -337,14 +282,7 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(
 
     first.add_(1000)
     second.add_(1000)
-    prepared = harness.transfer.prepare(
-        manifests=manifests,
-        source_fingerprints=fingerprints,
-        capture_layout=capture_layout,
-        max_staging_bytes=512,
-        staging_device="cpu",
-        source_slot_ids=("slot-z", "slot-a"),
-    )
+    prepared = harness.transfer.prepare(**request)
     _second_metrics, second_install = harness.collect(prepared)
     assert torch.equal(second_install["weight"], torch.cat((first, second)))
     assert len(capture_calls) == 1

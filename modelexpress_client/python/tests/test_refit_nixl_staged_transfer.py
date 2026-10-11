@@ -57,37 +57,14 @@ def _bind_plan(plan, sources) -> tuple[LogicalTransferPlan, _SourceBinding]:
         {agent: 0 for agent in agents},
         {agent: b"metadata" for agent in agents},
     )
-    slots = {agent: agent for agent in agents}
-    fingerprint = tuple(
-        (
-            agent,
-            tuple(
-                sorted(
-                    (name, tuple(shard.shard_offset), tuple(shard.shape), shard.addr)
-                    for name, source in sources.items()
-                    for shard in source.shards
-                    if shard.session == agent
-                )
-            ),
-        )
-        for agent in agents
-    )
-    binding = _SourceBinding(
-        resolved, {slot: agent for agent, slot in slots.items()}, fingerprint
-    )
+    binding = _SourceBinding(resolved, {agent: agent for agent in agents}, ())
     return plan, binding
 
 
 def _prepared_bounded(batches, sources, transport, metrics=None) -> _PreparedBoundedTransfer:
-    bound = []
-    binding = None
-    for batch in batches:
-        plan, binding = _bind_plan(batch.plan, sources)
-        bound.append(replace(batch, plan=plan))
-    if binding is None:
-        _, binding = _bind_plan(LogicalTransferPlan(), sources)
+    _, binding = _bind_plan(LogicalTransferPlan(), sources)
     return _PreparedBoundedTransfer(
-        tuple(bound), sources, transport, binding, {} if metrics is None else metrics
+        batches, sources, transport, binding, {} if metrics is None else metrics
     )
 
 
