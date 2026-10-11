@@ -177,6 +177,12 @@ def _full_pull_segments(src_name: str, source: SourceInfo) -> list:
                 param_name=src_name,
                 dst_byte=start * trailing * source.elsize,
                 nbytes=elements * source.elsize,
+                _source_read=(
+                    src_name,
+                    tuple(shard.shard_offset),
+                    tuple(shard.shape),
+                    0,
+                ),
             )
         )
         next_row += rows

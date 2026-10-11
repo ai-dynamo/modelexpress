@@ -150,7 +150,6 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
         "vllm_config": config,
         "model_config": config.model_config,
         "device": torch.device("cuda:2"),
-        "convert_native_to_hf": convert_native_to_hf,
     }
     expected_runtime_tensors = (
         {"weight": model.weight} if runtime_p2p_available else None
@@ -160,6 +159,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     assert runtime.full_tensor.device_id == 2
     assert runtime.full_tensor.worker_rank == 3
     assert runtime.full_tensor.capture_layout(["manifest"]) == ["manifest"]
+    assert runtime.full_tensor.convert_native_to_hf is convert_native_to_hf
     assert (runtime.full_tensor.runtime_tensors is loader.tensors) is (
         runtime_p2p_available
     )

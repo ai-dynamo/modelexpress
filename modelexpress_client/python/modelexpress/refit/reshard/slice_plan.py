@@ -41,7 +41,7 @@ or a dim-merging reshape - plus src/dst dtype mismatch - raises
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from modelexpress.refit.reshard.types import (
@@ -81,6 +81,9 @@ class PullSegment:
     param_name: str
     dst_byte: int
     nbytes: int
+    _source_read: tuple[str, tuple, tuple, int] | None = field(
+        default=None, compare=False, repr=False
+    )
 
 
 def _row_major_strides(shape) -> list:
@@ -343,6 +346,12 @@ def plan_pull(
                     param_name=copy.param_name,
                     dst_byte=(copy.dest_offset + d_off) * elsize,
                     nbytes=n * elsize,
+                    _source_read=(
+                        copy.src_name,
+                        tuple(sh.shard_offset),
+                        tuple(sh.shape),
+                        s_off * sh.elsize,
+                    ),
                 )
             )
     return segments

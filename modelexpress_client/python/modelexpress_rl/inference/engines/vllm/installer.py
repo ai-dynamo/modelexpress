@@ -17,7 +17,7 @@ import logging
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from functools import cached_property
 from inspect import getattr_static
 from pathlib import Path
@@ -32,7 +32,6 @@ from modelexpress.engines.vllm.host_quantization import (
 from modelexpress.refit.reshard.geometry import (
     build_lazy_weights,
     capture_weights,
-    convert_source_weights,
 )
 from modelexpress.refit.reshard.types import CaptureResult, IncompleteRefit
 from modelexpress.refit.timing import refit_span
@@ -64,32 +63,13 @@ _MODULE_GET_SUBMODULE_CODE = _MODULE_GET_SUBMODULE.__code__
 
 @dataclass(frozen=True)
 class _EngineLoadLayout:
-    inputs: dict[str, tuple[torch.dtype, tuple[int, ...]]]
     capture: CaptureResult
     parameters: dict[str, tuple[tuple[int, ...], torch.dtype]]
-
-    def bind(
-        self, weights: dict
-    ) -> tuple[CaptureResult, dict[str, tuple[tuple[int, ...], torch.dtype]]]:
-        inputs = {
-            name: (weight.dtype, tuple(weight.shape))
-            for name, weight in weights.items()
-        }
-        if inputs != self.inputs:
-            raise IncompleteRefit(
-                "source conversion does not match the fixed engine input layout"
-            )
-        capture = CaptureResult(
-            copies=[
-                replace(
-                    record,
-                    src_name=weights[record.src_name]._name,
-                    op_chain=weights[record.src_name]._ops + record.op_chain,
-                )
-                for record in self.capture.copies
-            ]
-        )
-        return copy.deepcopy((capture, self.parameters))
+    groups: tuple[tuple[Module, tuple[tuple[str, str], ...]], ...]
+    aliases: _ParameterAliases
+    load_aliases: _ParameterAliases
+    graph_tensors: tuple[tuple[Module, dict[str, torch.Tensor]], ...]
+    runtime_storages: frozenset[int]
 
 
 @dataclass(frozen=True)
@@ -109,14 +89,22 @@ class _ParameterAliases:
     ties: tuple[tuple[tuple[Module, str], ...], ...]
     writers: tuple[tuple[Module, type], ...]
     attributes: tuple[tuple[type, str], ...]
-    structure: tuple | None = None
-    root_type: type | None = None
-    _owner_plans: dict = field(default_factory=dict, compare=False, repr=False)
 
     @cached_property
     def by_owner(self):
         """Share each complete tie group with every layer that can change it."""
-        if self.edges is None or self.structure is None:
+        if (
+            self.edges is None
+            or any(
+                type(path) is not str or type(type(module)) is not type
+                for path, module in self.owners
+            )
+            or any(
+                type(leaf) is not str
+                for group in self.groups
+                for _module, leaf in group
+            )
+        ):
             return None
         modules = {"": self.root}
         for edge in self.edges:
@@ -129,68 +117,12 @@ class _ParameterAliases:
             named_groups.append(named)
             for module in dict.fromkeys(module for module, _ in group):
                 groups_by_owner.setdefault(module, []).append(index)
-        structures = (
-            # Custom owner hashing can change classes between dictionary writes.
-            _alias_structure(named_groups)
-            if _ordinary_owner_hashes(self.writers)
-            else None
-        )
-        result = {}
-        for module, indices in groups_by_owner.items():
-            groups = [named_groups[index] for index in indices]
-            structure = (
-                tuple(structures[index] for index in indices)
-                if structures is not None
-                else _alias_structure(groups)
+        return {
+            module: _compile_parameter_aliases(
+                self.root, [named_groups[index] for index in indices], modules
             )
-            plan = self._owner_plans.get(structure) if structure is not None else None
-            if plan is None:
-                plan = _compile_parameter_aliases(self.root, groups, modules)
-                if structure is not None:
-                    self._owner_plans[structure] = plan
-            result[module] = plan
-        return result
-
-
-def _ordinary_owner_hashes(writers):
-    checked = set()
-    for module, _captured_class in writers:
-        cls = type(module)
-        if type(cls) is not type:
-            return False
-        if cls not in checked:
-            if (
-                getattr_static(cls, "__hash__") is not object.__hash__
-                or getattr_static(cls, "__eq__") is not object.__eq__
-            ):
-                return False
-            checked.add(cls)
-    return True
-
-
-def _alias_structure(groups):
-    result = []
-    inheritance = {}
-    for group in groups:
-        if len(group) < 2:
-            continue
-        entries = []
-        for path, module, leaf in group:
-            if (
-                type(path) is not str
-                or type(leaf) is not str
-                or type(type(module)) is not type
-            ):
-                return None
-            cls = type(module)
-            bases = cls.__mro__
-            cached = inheritance.get(cls)
-            if cached is None or cached[0] is not bases:
-                cached = (bases, tuple(map(id, bases)))
-                inheritance[cls] = cached
-            entries.append((path, id(module), leaf, cached[1]))
-        result.append(tuple(entries))
-    return tuple(result)
+            for module, indices in groups_by_owner.items()
+        }
 
 
 def _compile_parameter_aliases(model, groups, modules) -> _ParameterAliases:
@@ -251,42 +183,7 @@ def _compile_parameter_aliases(model, groups, modules) -> _ParameterAliases:
         tuple(ties),
         tuple(writers.values()),
         tuple(attributes),
-        _alias_structure(groups),
-        type(model),
     )
-
-
-def _select_parameter_aliases(model, groups, modules, initial_aliases):
-    groups = tuple(groups)
-    structure = _alias_structure(groups)
-    same_owners = (
-        initial_aliases is not None
-        and initial_aliases.root is model
-        and initial_aliases.root_type is type(model)
-        and initial_aliases.structure is not None
-        and initial_aliases.edges is not None
-        and modules.get("") is model
-        and all(
-            modules.get(edge.path) is edge.child
-            and modules.get(edge.path.rpartition(".")[0]) is edge.parent
-            for edge in initial_aliases.edges
-        )
-    )
-    if same_owners and structure == initial_aliases.structure:
-        return initial_aliases
-    # Only reuse the initial reload's owners. A later plan must die with its
-    # batch so it cannot extend the lifetime of a module replaced by a hook.
-    aliases = _compile_parameter_aliases(model, groups, modules)
-    if (
-        same_owners
-        and structure is not None
-        and sorted(structure) == sorted(initial_aliases.structure)
-    ):
-        # Reload can reorder parameter groups as it replaces meta tensors.
-        # Keep fresh callback order, but share views of the initial owners.
-        # These views cannot retain a module introduced by a later callback.
-        aliases = replace(aliases, _owner_plans=initial_aliases._owner_plans)
-    return aliases
 
 
 def _has_descriptor(cls, name):
@@ -595,17 +492,14 @@ class _VllmInstaller(EngineInstaller):
         vllm_config: VllmConfig,
         model_config: ModelConfig,
         device: torch.device,
-        convert_native_to_hf: Callable[[dict], dict] | None = None,
         runtime_tensors: dict[str, torch.Tensor] | None = None,
     ) -> None:
         self._model = model
         self._vllm_config = vllm_config
         self._model_config = model_config
         self._device = device
-        self._convert_native_to_hf = convert_native_to_hf
         self._runtime_tensors = runtime_tensors
         self._engine_load_layout: _EngineLoadLayout | None = None
-        self._capture_cache = None
         self._native_parameter_dispatch = _native_parameter_dispatch()
 
     @cached_property
@@ -673,51 +567,10 @@ class _VllmInstaller(EngineInstaller):
                     groups.setdefault(id(parameter), []).append((path, module, name))
         return _compile_parameter_aliases(model, groups.values(), modules)
 
-    def _validate_alias_owners(self, aliases: _ParameterAliases) -> None:
-        if self._model is not aliases.root:
-            raise IncompleteRefit("parameter alias root was replaced during refit")
-        standard = (
-            aliases.edges is not None
-            and type(self._model).get_submodule is _MODULE_GET_SUBMODULE
-            and "get_submodule" not in object.__getattribute__(self._model, "__dict__")
-        )
-        checked_classes, checked_attributes = set(), set()
-        if standard:
-            for edge in aliases.edges:
-                if not _standard_module_access(
-                    edge.parent, edge.name, checked_classes, checked_attributes
-                ):
-                    standard = False
-                    break
-                try:
-                    current = getattr(edge.parent, edge.name)
-                except AttributeError as error:
-                    raise IncompleteRefit(
-                        f"parameter alias owner {edge.path!r} disappeared during refit"
-                    ) from error
-                if current is not edge.child:
-                    raise IncompleteRefit(
-                        f"parameter alias owner {edge.path!r} was replaced during refit"
-                    )
-        if standard:
-            return
-        for path, module in aliases.owners:
-            try:
-                current = self._model.get_submodule(path)
-            except AttributeError as error:
-                raise IncompleteRefit(
-                    f"parameter alias owner {path!r} disappeared during refit"
-                ) from error
-            if current is not module:
-                raise IncompleteRefit(
-                    f"parameter alias owner {path!r} was replaced during refit"
-                )
-
     def _load_time_parameter_aliases(
         self, aliases: _ParameterAliases, layerwise_info: Mapping
     ) -> _ParameterAliases:
         """Exclude runtime-only slots using vLLM's recorded load-time metadata."""
-        self._validate_alias_owners(aliases)
         owners = iter(aliases.owners)
         groups = []
         changed = False
@@ -740,17 +593,12 @@ class _VllmInstaller(EngineInstaller):
     def _restore_parameter_aliases(self, aliases: _ParameterAliases) -> None:
         # vLLM restores metadata separately for each module. Reconnect shared
         # parameters so a tied loader still covers one canonical destination.
-        self._validate_alias_owners(aliases)
         standard = _standard_parameter_writes(aliases)
         for group in aliases.ties if standard else aliases.groups:
             first_module, first_name = group[0]
             parameter = getattr(first_module, first_name)
             for module, name in group[1:]:
                 other = getattr(module, name)
-                if other.shape != parameter.shape or other.dtype != parameter.dtype:
-                    raise IncompleteRefit(
-                        "tied parameters have incompatible load-time layouts"
-                    )
                 if not standard or other is not parameter:
                     setattr(module, name, parameter)
 
@@ -760,26 +608,17 @@ class _VllmInstaller(EngineInstaller):
         CaptureResult,
         dict[str, tuple[tuple[int, ...], torch.dtype]],
     ]:
-        """Record how published tensors map into vLLM's load-time parameters.
+        """Capture canonical loader operations once for this generator client.
 
         Captures on the LIVE model with its params reverted to engine load-time
         skeletons via layerwise reload; graph-bound kernel tensors are restored
         afterward without finalizing (finalizing would commit the empty skeletons
-        and corrupt the live params). Returned bindings are borrowed immutable
-        results; engine architecture, routing and conversion are fixed per client.
+        and corrupt the live params). Architecture and loader routing are fixed
+        for the client lifetime; trainer conversion belongs to transfer planning.
         """
-        key = tuple((name, dtype, tuple(shape)) for name, dtype, shape in manifest)
-        if self._capture_cache is not None and self._capture_cache[0] == key:
-            return self._capture_cache[1]
-        weights = convert_source_weights(self._convert_native_to_hf, manifest)
         if self._engine_load_layout is not None:
-            result = self._engine_load_layout.bind(weights)
-            self._capture_cache = (key, result)
-            return result
-        canonical_manifest = [
-            (name, weight.dtype, tuple(weight.shape))
-            for name, weight in weights.items()
-        ]
+            layout = self._engine_load_layout
+            return layout.capture, layout.parameters
         try:
             from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.reload.layerwise import (
@@ -797,8 +636,13 @@ class _VllmInstaller(EngineInstaller):
 
         original_loader = self._original_loader
         model = self._model
-        aliases = self._load_time_parameter_aliases(
-            self._parameter_aliases(model), LAYERWISE_INFO
+        runtime_aliases = self._parameter_aliases(model)
+        aliases = self._load_time_parameter_aliases(runtime_aliases, LAYERWISE_INFO)
+        graph_tensors = self._graph_tensors()
+        runtime_storages = frozenset(
+            tensor.untyped_storage().data_ptr()
+            for tensor in (*model.parameters(), *model.buffers())
+            if tensor.device.type != "meta"
         )
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(model)
@@ -811,13 +655,18 @@ class _VllmInstaller(EngineInstaller):
                 # weight_loader (norms) so their copies are attributed, not dropped.
                 capture = capture_weights(
                     model,
-                    build_lazy_weights(canonical_manifest),
+                    build_lazy_weights(manifest),
                     default_weight_loader=default_weight_loader,
                 )
                 param_layout = {
                     name: (tuple(p.shape), p.dtype)
                     for name, p in model.named_parameters()
                 }
+                groups = {}
+                for name in param_layout:
+                    path, _, leaf = name.rpartition(".")
+                    owner = model.get_submodule(path)
+                    groups.setdefault(owner, []).append((name, leaf))
             finally:
                 for layer in model.modules():
                     info = LAYERWISE_INFO.get(layer)
@@ -838,15 +687,16 @@ class _VllmInstaller(EngineInstaller):
                 f"missing={sorted(missing)}, unsupported={capture.unsupported}, "
                 f"unattributed={capture.unattributed}"
             )
-        layout = _EngineLoadLayout(
-            {name: (dtype, shape) for name, dtype, shape in canonical_manifest},
+        self._engine_load_layout = _EngineLoadLayout(
             capture,
             param_layout,
+            tuple((owner, tuple(parameters)) for owner, parameters in groups.items()),
+            runtime_aliases,
+            aliases,
+            graph_tensors,
+            runtime_storages,
         )
-        result = layout.bind(weights)
-        self._engine_load_layout = layout
-        self._capture_cache = (key, result)
-        return result
+        return capture, param_layout
 
     def install_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Install verified load-layout tensors without changing graph addresses."""
@@ -873,11 +723,10 @@ class _VllmInstaller(EngineInstaller):
 
         metrics = prepared.transfer_metrics
         load_s = commit_s = 0.0
-        live_storages = {
-            tensor.untyped_storage().data_ptr()
-            for tensor in (*self._model.parameters(), *self._model.buffers())
-            if tensor.device.type != "meta"
-        }
+        layout = self._engine_load_layout
+        if layout is None:
+            raise RuntimeError("capture the install plan before installing tensors")
+        live_storages = layout.runtime_storages
         primary_error = None
 
         def drain() -> None:
@@ -887,16 +736,13 @@ class _VllmInstaller(EngineInstaller):
                 ownership.drain_failed = True
                 raise
 
-        def load(initial_aliases: _ParameterAliases) -> None:
+        def load(_aliases: _ParameterAliases) -> None:
             nonlocal load_s, commit_s
             load_started = time.perf_counter()
-            expected = set(dict(self._model.named_parameters()))
+            expected = set(layout.parameters)
             if expected != prepared.parameter_names:
-                raise IncompleteRefit(
-                    "streaming parameter coverage differs from the live load layout"
-                )
+                raise IncompleteRefit("streaming parameter coverage differs from the install plan")
             installed = set()
-            installed_parameters: dict[str, torch.Tensor] = {}
             try:
                 ownership.iterator = iter(prepared.batches())
             except BaseException:
@@ -928,17 +774,7 @@ class _VllmInstaller(EngineInstaller):
                 self._process_and_commit(
                     tensors,
                     reload=False,
-                    installed_parameters=installed_parameters,
-                    initial_aliases=initial_aliases,
                 )
-                try:
-                    installed_parameters.update(
-                        (name, self._model.get_parameter(name)) for name in names
-                    )
-                except AttributeError as error:
-                    raise IncompleteRefit(
-                        "installed canonical parameter disappeared"
-                    ) from error
                 installed.update(names)
                 drain()
                 commit_s += time.perf_counter() - commit_started
@@ -1040,8 +876,6 @@ class _VllmInstaller(EngineInstaller):
         tensors: dict[str, torch.Tensor],
         *,
         reload: bool = True,
-        installed_parameters: dict[str, torch.Tensor] | None = None,
-        initial_aliases: _ParameterAliases | None = None,
     ) -> None:
         """Run vLLM's per-layer post-load processing into graph-bound storage.
 
@@ -1049,6 +883,9 @@ class _VllmInstaller(EngineInstaller):
         arena tensors are copied into those destinations and never attached to
         a module or passed to a post-load callback.
         """
+        layout = self._engine_load_layout
+        if layout is None:
+            raise RuntimeError("capture the install plan before installing tensors")
         try:
             from vllm.model_executor.layers.attention import is_deferred_attention_layer
             from vllm.model_executor.layers.quantization.base_config import (
@@ -1066,68 +903,26 @@ class _VllmInstaller(EngineInstaller):
             ) from error
 
         def load(_reload_aliases: _ParameterAliases | None = None) -> None:
-            # Quantized models expose kernel-packed parameters before layerwise
-            # reload and load-time parameters after it. Resolve the captured
-            # names only after vLLM has restored that load-time hierarchy, and
-            # resolve them on every call: a streaming install runs this once per
-            # batch, and a hook may have replaced a module since the last one.
-            groups: dict[Module, list[tuple[str, str]]] = {}
-            group_paths: dict[Module, str] = {}
-            matched: set[str] = set()
-            canonical: dict[int, str] = {}
-            alias_groups: dict[int, list[tuple[str, Module, str]]] = {}
-            module_paths = {}
-            for module_name, module in self._model.named_modules(
-                remove_duplicate=False
-            ):
-                module_paths[module_name] = module
-                duplicate_module = module in group_paths
-                group_paths.setdefault(module, module_name)
-                owned = set()
-                missing = set()
-                for leaf, parameter in module._parameters.items():
-                    if parameter is None:
-                        continue
-                    full_name = f"{module_name}.{leaf}" if module_name else leaf
-                    alias_groups.setdefault(id(parameter), []).append(
-                        (module_name, module, leaf)
-                    )
-                    # Keep every alias path, but process each owning module once.
-                    if duplicate_module:
-                        continue
-                    canonical_name = canonical.setdefault(id(parameter), full_name)
-                    owned.add(full_name)
-                    if canonical_name not in tensors:
-                        previously_installed_alias = (
-                            canonical_name != full_name
-                            and installed_parameters is not None
-                            and installed_parameters.get(canonical_name) is parameter
-                        )
-                        if not previously_installed_alias:
-                            missing.add(canonical_name)
-                    if full_name in tensors:
-                        groups.setdefault(module, []).append((full_name, leaf))
-                        matched.add(full_name)
-                # Each included owner needs complete canonical coverage. Check
-                # the live tree before hooks run: earlier batches may have added
-                # parameters since the layout was captured.
-                if owned & tensors.keys() and missing:
-                    kind = "staged" if reload else "streaming"
+            for name, tensor in tensors.items():
+                if layout.parameters.get(name) != (tuple(tensor.shape), tensor.dtype):
                     raise IncompleteRefit(
-                        f"{kind} batch splits an owning module {module_name!r}; "
-                        f"missing canonical parameters={sorted(missing)}"
+                        f"received tensor {name!r} differs from the install plan"
                     )
-            unmatched = sorted(set(tensors) - matched)
-            if unmatched:
-                raise IncompleteRefit(
-                    "vLLM layerwise reload did not expose every staged parameter; "
-                    f"unmatched={unmatched[:10]}"
-                )
-            aliases = _select_parameter_aliases(
-                self._model, alias_groups.values(), module_paths, initial_aliases
-            )
+            if reload and tensors.keys() != layout.parameters.keys():
+                raise IncompleteRefit("received tensors do not cover the install plan")
+            for _owner, parameters in layout.groups:
+                names = {name for name, _leaf in parameters}
+                if names & tensors.keys() and not names <= tensors.keys():
+                    raise IncompleteRefit(
+                        "received batch splits an owning module in the install plan"
+                    )
+            groups = {
+                owner: [(name, leaf) for name, leaf in parameters if name in tensors]
+                for owner, parameters in layout.groups
+                if any(name in tensors for name, _leaf in parameters)
+            }
+            aliases = layout.load_aliases
 
-            self._validate_alias_owners(aliases)
             owner_aliases = (
                 aliases.by_owner
                 if _ordinary_alias_lookups(aliases)
@@ -1140,18 +935,6 @@ class _VllmInstaller(EngineInstaller):
                     aliases if owner_aliases is None else owner_aliases.get(layer)
                 )
 
-                # A packed batch resolves several owning modules before any of
-                # their hooks run, and an earlier hook may replace a later
-                # owner. Committing into the detached module would leave the
-                # live one without the published bytes.
-                if (
-                    not reload
-                    and self._model.get_submodule(group_paths[layer]) is not layer
-                ):
-                    raise IncompleteRefit(
-                        f"a post-load hook replaced module {group_paths[layer]!r} "
-                        "before its parameters were committed"
-                    )
                 info = LAYERWISE_INFO.get(layer)
                 managed = info is not None and info.kernel_tensors is not None
                 if info is not None:
@@ -1179,14 +962,6 @@ class _VllmInstaller(EngineInstaller):
                     for full_name, leaf in parameters:
                         target = getattr(layer, leaf)
                         source = tensors[full_name]
-                        if (
-                            target.device.type == "meta"
-                            or target.shape != source.shape
-                            or target.dtype != source.dtype
-                        ):
-                            raise IncompleteRefit(
-                                "streaming parameter has no compatible live storage"
-                            )
                         _copy_received(target, source)
                 if not reload and not managed:
                     continue
@@ -1228,6 +1003,22 @@ class _VllmInstaller(EngineInstaller):
         else:
             load()
 
+    def _graph_tensors(self) -> tuple[tuple[Module, dict[str, torch.Tensor]], ...]:
+        return tuple(
+            (module, tensors)
+            for module in self._model.modules()
+            if (tensors := {
+                name: value
+                for name, value in module.__dict__.items()
+                if isinstance(value, torch.Tensor)
+                and value.device.type == self._device.type
+                and (
+                    self._device.index is None
+                    or value.device.index == self._device.index
+                )
+            })
+        )
+
     @torch.no_grad()
     def _reload(self, load: Callable[[_ParameterAliases], None]) -> None:
         """Run one weight loader inside vLLM's graph-safe reload window."""
@@ -1243,37 +1034,18 @@ class _VllmInstaller(EngineInstaller):
                 "ModelExpress refit requires vLLM's layerwise reload APIs"
             ) from error
 
-        # Layerwise reload does not save bare device tensors referenced by
-        # captured graphs. Host bookkeeping follows the native reload lifecycle.
-        def geometry(tensor):
-            return (
-                tuple(tensor.shape),
-                tuple(tensor.stride()),
-                tensor.dtype,
-                tensor.device,
-                tensor.data_ptr(),
-            )
-
-        bare_tensors = [
-            (
-                path,
-                module,
-                {
-                    name: (value, geometry(value))
-                    for name, value in module.__dict__.items()
-                    if isinstance(value, torch.Tensor)
-                    and value.device.type == self._device.type
-                    and (
-                        self._device.index is None
-                        or value.device.index == self._device.index
-                    )
-                },
-            )
-            for path, module in self._model.named_modules()
-        ]
-        bare_tensors = [entry for entry in bare_tensors if entry[2]]
-        aliases = self._parameter_aliases(self._model)
-        load_aliases = self._load_time_parameter_aliases(aliases, LAYERWISE_INFO)
+        layout = self._engine_load_layout
+        bare_tensors = (
+            layout.graph_tensors if layout is not None else self._graph_tensors()
+        )
+        aliases = (
+            layout.aliases if layout is not None else self._parameter_aliases(self._model)
+        )
+        load_aliases = (
+            layout.load_aliases
+            if layout is not None
+            else self._load_time_parameter_aliases(aliases, LAYERWISE_INFO)
+        )
 
         # Native materialization enters each layer's recorded restore device.
         # PWAL also creates host tensors, so it must keep the ambient device.
@@ -1283,26 +1055,11 @@ class _VllmInstaller(EngineInstaller):
             _reserve_runtime_buffer_slots(self._model, LAYERWISE_INFO)
             load(load_aliases)
             finalize_layerwise_reload(self._model, self._model_config)
-            self._validate_alias_owners(aliases)
 
-            # Preserve storage referenced by existing graph consumers.
-            for path, module, attributes in bare_tensors:
-                if self._model.get_submodule(path) is not module:
-                    raise IncompleteRefit(
-                        f"graph-bound tensor owner {path!r} was replaced"
-                    )
-                for name, (graph_tensor, original_geometry) in attributes.items():
-                    current = module.__dict__.get(name)
-                    if (
-                        not isinstance(current, torch.Tensor)
-                        or geometry(graph_tensor) != original_geometry
-                        or current.shape != graph_tensor.shape
-                        or current.dtype != graph_tensor.dtype
-                        or current.device != graph_tensor.device
-                    ):
-                        raise IncompleteRefit(
-                            f"graph-bound tensor {path}.{name} disappeared or changed geometry"
-                        )
+            # Preserve the destinations retained by graph consumers.
+            for module, attributes in bare_tensors:
+                for name, graph_tensor in attributes.items():
+                    current = getattr(module, name)
                     if current is not graph_tensor:
                         graph_tensor.copy_(current)
                     setattr(module, name, graph_tensor)
@@ -1310,10 +1067,17 @@ class _VllmInstaller(EngineInstaller):
         # A parameter left on meta has no backing storage. CUDA-graph replay would
         # read an invalid address, so reject the update and let the framework
         # restart the engine.
+        parameters = (
+            (
+                (name, getattr(owner, leaf))
+                for owner, group in layout.groups
+                for name, leaf in group
+            )
+            if layout is not None
+            else self._model.named_parameters()
+        )
         meta_parameters = [
-            name
-            for name, parameter in self._model.named_parameters()
-            if parameter.device.type == "meta"
+            name for name, parameter in parameters if parameter.device.type == "meta"
         ]
         if meta_parameters:
             raise IncompleteRefit(

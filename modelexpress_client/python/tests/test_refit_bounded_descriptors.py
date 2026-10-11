@@ -14,6 +14,7 @@ from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
+    structural_manifest_digest,
     wrap_rendezvous_blob,
 )
 from modelexpress.refit.reshard.types import (
@@ -21,6 +22,7 @@ from modelexpress.refit.reshard.types import (
     IncompleteRefit,
     RecordedCopy,
 )
+from modelexpress.refit.reshard.verify import tensor_digest
 
 
 @pytest.fixture
@@ -39,6 +41,7 @@ def harness(monkeypatch):
         for index, name in enumerate(("exact", "full", "convert"))
     }
     captures = []
+    publisher_step = [0]
     copies = [
         RecordedCopy(src, ops, name, 2, (4, 4), (4, 1), dtype)
         for src, ops, name, dtype in (
@@ -142,11 +145,13 @@ def harness(monkeypatch):
                                 addr=tensor.data_ptr(),
                                 shard_offset=(0, 0),
                                 shape=(4, 4),
+                                digest=tensor_digest(tensor),
                             )
                         ],
                     )
                     for name, tensor in sources.items()
                 ],
+                publisher_step=publisher_step[0],
             )
         ]
 
@@ -155,8 +160,12 @@ def harness(monkeypatch):
         return capture, layout
 
     def prepare(**kwargs):
+        blobs = manifests()
         return transfer.prepare(
-            manifests=manifests(),
+            manifests=blobs,
+            source_fingerprints=tuple(
+                structural_manifest_digest(blob) for blob in blobs
+            ),
             capture_layout=capture_layout,
             **{"max_staging_bytes": 1024, "staging_device": "cpu", **kwargs},
         )
@@ -175,6 +184,8 @@ def harness(monkeypatch):
         prepare=prepare,
         collect=collect,
         captures=captures,
+        manifests=manifests,
+        publisher_step=publisher_step,
         transports=transports,
         events=events,
     )
@@ -219,7 +230,7 @@ def test_warm_descriptors_still_transfer_new_values(
     second = prepare()
     warm, installed = harness.collect(second)
     _check_values(harness, installed)
-    assert len(harness.captures) == 2
+    assert len(harness.captures) == 1
     assert first.batches is second.batches
     assert harness.transfer._descriptor_cache is cached
     assert warm["descriptor_cache_hits"] == len(second.batches)
@@ -233,6 +244,82 @@ def test_warm_descriptors_still_transfer_new_values(
         descriptor.dst_addr = 0
 
 
+@pytest.mark.parametrize("resolved_cache", [0, 1])
+def test_descriptor_cache_is_scoped_to_resolved_source_binding(
+    harness, monkeypatch, resolved_cache
+) -> None:
+    monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", str(resolved_cache))
+    first = harness.prepare()
+    cold, _ = harness.collect(first)
+    assert cold["descriptor_builds"] == len(first.batches)
+
+    same_binding = harness.prepare()
+    assert same_binding.batches is first.batches
+    same_metrics, _ = harness.collect(same_binding)
+    assert same_metrics["descriptor_cache_hits"] == len(same_binding.batches)
+    assert same_metrics["descriptor_builds"] == 0
+    if not resolved_cache:
+        assert "shard_bindings" not in vars(same_binding.source_binding.resolved)
+
+    changed_binding_update = harness.prepare()
+    assert changed_binding_update.batches is first.batches
+    original_binding = changed_binding_update.source_binding
+    replacement = harness.sources["exact"].clone() + 101
+    sources = dict(original_binding.resolved.sources)
+    source = sources["exact"]
+    shards = tuple(
+        shard._replace(addr=replacement.data_ptr())
+        if hasattr(shard, "_replace")
+        else replace(shard, addr=replacement.data_ptr())
+        for shard in source.shards
+    )
+    sources["exact"] = (
+        source._replace(shards=shards)
+        if hasattr(source, "_replace")
+        else replace(source, shards=list(shards))
+    )
+    resolved = replace(original_binding.resolved, sources=sources)
+    changed_binding = module._SourceBinding(
+        resolved,
+        dict(original_binding.agents_by_slot),
+        (("0", ("replacement", replacement.data_ptr())),),
+    )
+    changed_binding_update = replace(
+        changed_binding_update, source_binding=changed_binding
+    )
+    harness.transfer._active = changed_binding_update
+    harness.sources["exact"] = replacement
+
+    warm, installed = harness.collect(changed_binding_update)
+    assert warm["descriptor_cache_hits"] == 0
+    assert warm["descriptor_builds"] == len(changed_binding_update.batches)
+    _check_values(harness, installed)
+
+
+def test_warm_plan_reuses_captured_layout_and_values(harness, monkeypatch) -> None:
+    before_manifest = harness.manifests()[0]
+    before_fingerprint = structural_manifest_digest(before_manifest)
+    first = harness.prepare()
+    harness.collect(first)
+    for values in harness.sources.values():
+        values.add_(3)
+    harness.publisher_step[0] += 1
+    after_manifest = harness.manifests()[0]
+    assert after_manifest != before_manifest
+    assert structural_manifest_digest(after_manifest) == before_fingerprint
+
+    def unexpected_capture(*_args, **_kwargs) -> None:
+        raise AssertionError("warm bounded plan should retain capture and layout")
+
+    monkeypatch.setattr(module, "_capture_canonical_layout", unexpected_capture)
+    second = harness.prepare()
+    metrics, installed = harness.collect(second)
+    _check_values(harness, installed)
+    assert second.batches is first.batches
+    assert metrics["descriptor_cache_hits"] == len(second.batches)
+    assert metrics["descriptor_builds"] == 0
+
+
 @pytest.mark.parametrize("change", ["address", "capture", "budget", "disabled"])
 def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change):
     first = harness.prepare()
@@ -242,6 +329,7 @@ def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change):
         harness.sources["exact"] = harness.sources["exact"].clone() + 5
     elif change == "capture":
         harness.capture.copies[0] = replace(harness.capture.copies[0], dest_offset=1)
+        harness.transfer._plan_cache.clear()
     elif change == "budget":
         kwargs["max_staging_bytes"] = 2048
     else:
@@ -305,6 +393,7 @@ def test_failed_prepare_discards_descriptors(harness, monkeypatch, failure):
     assert harness.transfer._descriptor_cache is not None
     if failure == "coverage":
         harness.layout["missing.weight"] = ((4,), torch.float32)
+        harness.transfer._plan_cache.clear()
         expected = IncompleteRefit
     else:
 

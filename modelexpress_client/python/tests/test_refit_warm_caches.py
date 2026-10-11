@@ -15,6 +15,7 @@ import torch
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
+    structural_manifest_digest,
     wrap_rendezvous_blob,
 )
 from modelexpress.refit.reshard.slice_plan import Shard
@@ -34,7 +35,9 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _NixlStagedTransfer,
     _plan_staged_transfer,
     _PreparedNixlTransfer,
+    _ResolvedSources,
     _resolve_sources,
+    _SourceBinding,
     _SourceResolutionCache,
 )
 
@@ -90,8 +93,9 @@ def test_converted_copy_uses_captured_slice_with_arena_storage_offset(
     transfer._convert_buffers = {"layer.weight": source}
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
+    source_binding = _SourceBinding(_ResolvedSources({}, {}, {}, {}), {}, ())
     prepared = _PreparedNixlTransfer(
-        plan, capture, {}, (), SimpleNamespace(await_reads=lambda _: None)
+        plan, capture, {}, (), SimpleNamespace(await_reads=lambda _: None), source_binding
     )
     for version in range(3):
         source.add_(1)
@@ -109,6 +113,9 @@ def _bounded_cache_inputs():
     ]
     return {
         "manifests": manifests,
+        "source_fingerprints": tuple(
+            structural_manifest_digest(blob) for blob in manifests
+        ),
         "resolved": _resolve_sources(manifests),
         "capture": CaptureResult(
             copies=[
@@ -337,6 +344,7 @@ def test_copy_plan_key_on_miss_rejects_overlapping_compile_and_recovers(
     [
         "manifest",
         "manifest_order",
+        "source_fingerprints",
         "address",
         "session",
         "offset",
@@ -383,9 +391,19 @@ def test_bounded_plan_cache_invalidates_each_planning_input(
     source = args["resolved"].sources["weight"]
     shard = source.shards[0]
     if component == "manifest":
-        args["manifests"][0] += b" "
+        changed_manifest = json.loads(args["manifests"][0])
+        changed_manifest["metadata_endpoint"] = "replacement:19000"
+        args["manifests"][0] = json.dumps(changed_manifest).encode()
+        args["source_fingerprints"] = tuple(
+            structural_manifest_digest(blob) for blob in args["manifests"]
+        )
     elif component == "manifest_order":
         args["manifests"].reverse()
+        args["source_fingerprints"] = tuple(
+            structural_manifest_digest(blob) for blob in args["manifests"]
+        )
+    elif component == "source_fingerprints":
+        args["source_fingerprints"] = ("replacement-physical-source",)
     elif component == "address":
         shard.addr += 16
     elif component == "session":
@@ -446,7 +464,7 @@ def test_bounded_plan_cache_invalidates_each_planning_input(
         monkeypatch.setenv(variable, value)
     try:
         assert cache.compile(**args, metrics=metrics) is not first
-    except IncompleteRefit:
+    except (IncompleteRefit, KeyError):
         assert cache._entry is None
     assert metrics["plan_cache_hits"] == 0
     assert metrics["plan_cache_misses"] == 1

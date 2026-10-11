@@ -83,48 +83,6 @@ def test_layout_survives_runtime_parameter_replacement(
     assert model.capture_calls == 1
 
 
-def test_replacement_native_source_composes_views(capture_installer) -> None:
-    installer, model = capture_installer
-    installer._convert_native_to_hf = lambda weights: {
-        "weight": next(iter(weights.values())).transpose(0, 1)
-    }
-    installer.capture([("first", torch.float32, (3, 3))])
-
-    def unavailable(weights) -> None:
-        raise AssertionError("engine capture is no longer available")
-
-    model.load_weights = unavailable
-    capture, layout = installer.capture([("replacement", torch.float32, (3, 3))])
-    record = capture.copies[0]
-    assert record.src_name == "replacement"
-    # Execute the recipe against real replacement bytes.
-    source = torch.arange(9, dtype=torch.float32).reshape(3, 3)
-    value = source
-    for operation, args, kwargs in record.op_chain:
-        value = getattr(value, operation)(*args, **dict(kwargs))
-    assert torch.equal(value, source.T[:2, :2])
-    assert layout == {"weight": ((2, 2), torch.float32)}
-
-
-def test_incompatible_inputs_do_not_replace_layout(capture_installer) -> None:
-    installer, model = capture_installer
-    manifest = [("weight", torch.float32, (3, 3))]
-    expected = installer.capture(manifest)
-
-    def unavailable(weights) -> None:
-        raise AssertionError("engine capture is no longer available")
-
-    model.load_weights = unavailable
-    for invalid in (
-        [("weight", torch.float32, (4, 4))],
-        [("other", torch.float32, (3, 3))],
-        [("weight", torch.float16, (3, 3))],
-    ):
-        with pytest.raises(IncompleteRefit, match="fixed engine input layout"):
-            installer.capture(invalid)
-    assert installer.capture(manifest) == expected
-
-
 def test_failed_initial_capture_allows_later_initialization(
     capture_installer, monkeypatch
 ) -> None:
@@ -182,8 +140,8 @@ def test_unchanged_source_schema_reuses_binding(
     def unexpected(*args, **kwargs) -> None:
         raise AssertionError("warm mapping must not convert, bind, copy or trace")
 
-    monkeypatch.setattr(module, "convert_source_weights", unexpected)
-    monkeypatch.setattr(module.copy, "deepcopy", unexpected)
+    monkeypatch.setattr(module, "capture_weights", unexpected)
+    monkeypatch.setattr(installer, "_parameter_aliases", unexpected)
     model.load_weights = unexpected
     for value in (2.0, 7.0, -3.0):
         model.weight.data.fill_(value)
@@ -195,22 +153,42 @@ def test_unchanged_source_schema_reuses_binding(
     assert model.capture_calls == 1
 
 
-def test_ordered_schema_rebinds_once_and_isolates_canonical_layout(capture_installer) -> None:
+def test_client_install_plan_is_not_revalidated(capture_installer, monkeypatch) -> None:
     installer, model = capture_installer
-    calls = []
+    first = installer.capture([("weight", torch.float32, (3, 3))])
+    plan = installer._engine_load_layout
 
-    def convert(weights) -> dict:
-        calls.append(tuple(weights))
-        return {"weight": next(iter(weights.values()))}
+    def unexpected(*args, **kwargs) -> None:
+        raise AssertionError("retained install plan must not inspect the live model")
 
-    installer._convert_native_to_hf = convert
-    first = [("a", torch.float32, (3, 3)), ("b", torch.float32, (3, 3))]
-    capture, parameters = installer.capture(first)
-    assert capture.copies[0].src_name == "a"
-    assert parameters == {"weight": ((2, 2), torch.float32)}
-    replacement = installer.capture(list(reversed(first)))
-    assert replacement[0].copies[0].src_name == "b"
-    assert capture.copies[0].src_name == "a"
-    assert installer.capture(list(reversed(first)))[0].copies == replacement[0].copies
-    assert model.capture_calls == 1
-    assert calls == [("a", "b"), ("b", "a")]
+    monkeypatch.setattr(model, "named_modules", unexpected)
+    monkeypatch.setattr(model, "named_parameters", unexpected)
+    monkeypatch.setattr(model, "load_weights", unexpected)
+    second = installer.capture([("different_source", torch.float16, (9, 9))])
+    assert second[0] is first[0]
+    assert second[1] is first[1]
+    assert installer._engine_load_layout is plan
+    assert not hasattr(installer, "_capture_cache")
+
+
+def test_install_plan_owns_module_execution_metadata(capture_installer) -> None:
+    installer, model = capture_installer
+    installer.capture([("weight", torch.float32, (3, 3))])
+    plan = installer._engine_load_layout
+    assert len(plan.groups) == 1
+    owner, parameters = plan.groups[0]
+    assert owner is model
+    assert parameters == (("weight", "weight"),)
+    assert plan.parameters == {"weight": ((2, 2), torch.float32)}
+
+
+def test_new_client_has_its_own_install_plan(capture_installer) -> None:
+    first, model = capture_installer
+    schema = [("weight", torch.float32, (3, 3))]
+    first.capture(schema)
+    second = module._VllmInstaller(
+        model=model, vllm_config=object(), model_config=object(), device=torch.device("cpu")
+    )
+    second.capture(schema)
+    assert first._engine_load_layout is not second._engine_load_layout
+    assert model.capture_calls == 2

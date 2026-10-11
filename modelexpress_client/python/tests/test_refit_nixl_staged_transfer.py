@@ -4,6 +4,7 @@
 import ctypes
 from contextlib import nullcontext
 from dataclasses import replace
+from types import SimpleNamespace
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
@@ -22,6 +23,7 @@ from modelexpress.refit.reshard.types import (
     IncompleteRefit,
     RecordedCopy,
 )
+from modelexpress.refit.reshard.geometry import convert_source_weights
 from modelexpress.refit.reshard.verify import tensor_digest
 from modelexpress_rl import WeightPayloadFormat
 from modelexpress_rl.inference.adapter import (
@@ -34,15 +36,136 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _bounded_batches,
     _load_agent_metadata,
     _NixlStagedTransfer,
+    _LogicalRead,
     _pack_bounded_batches,
     _plan_staged_transfer,
+    _PreparedBoundedTransfer,
     _PreparedNixlTransfer,
+    _SourceBinding,
     _required_agent_metadata,
+    _logical_transfer_plan,
     _resolve_sources,
     _ResolvedSources,
     _source_structure,
 )
 from modelexpress_rl.inference.plan import TrainerUpdateSource
+
+
+def _bind_plan(plan, sources) -> tuple[TransferPlan, _SourceBinding]:
+    agents = sorted(
+        {shard.session for source in sources.values() for shard in source.shards}
+    )
+    resolved = _ResolvedSources(
+        sources,
+        {agent: agent for agent in agents},
+        {agent: 0 for agent in agents},
+        {agent: b"metadata" for agent in agents},
+    )
+    slots = {agent: f"slot-{agent}" for agent in agents}
+    fingerprint = tuple(
+        (
+            agent,
+            tuple(
+                sorted(
+                    (name, tuple(shard.shard_offset), tuple(shard.shape), shard.addr)
+                    for name, source in sources.items()
+                    for shard in source.shards
+                    if shard.session == agent
+                )
+            ),
+        )
+        for agent in agents
+    )
+    binding = _SourceBinding(
+        resolved, {slot: agent for agent, slot in slots.items()}, fingerprint
+    )
+    return _logical_transfer_plan(plan, resolved, slots), binding
+
+
+def _prepared_bounded(batches, sources, transport, metrics=None) -> _PreparedBoundedTransfer:
+    bound = []
+    binding = None
+    for batch in batches:
+        plan, binding = _bind_plan(batch.plan, sources)
+        bound.append(replace(batch, plan=plan))
+    if binding is None:
+        _, binding = _bind_plan(TransferPlan(), sources)
+    return _PreparedBoundedTransfer(
+        tuple(bound), sources, transport, binding, {} if metrics is None else metrics
+    )
+
+
+def test_prepare_plans_composed_canonical_capture(monkeypatch) -> None:
+    manifest = [("packed.experts", torch.float32, (2, 2, 3))]
+    convert = lambda weights: {
+        f"layers.{index}.weight": weights["packed.experts"].select(0, index)
+        for index in range(2)
+    }
+    resolved = _ResolvedSources(
+        sources={
+            "packed.experts": SimpleNamespace(
+                dtype=torch.float32, global_shape=(2, 2, 3)
+            )
+        },
+        session_to_agent={},
+        session_to_device={},
+        agent_metadata={},
+    )
+    transfer = _NixlStagedTransfer(
+        device_id=0,
+        device=torch.device("cpu"),
+        manager=object(),
+        convert_native_to_hf=convert,
+    )
+    transfer._source_cache.resolve = lambda _manifests, **_kwargs: resolved
+    transfer._validate_complete = lambda *_args: None
+    transfer._select_workspace_mode = lambda _mode: None
+    transfer._ensure_workspace = lambda *_args: None
+    transfer._descriptors = lambda _plan, **_kwargs: ()
+    monkeypatch.setattr(transfer_module, "_required_agent_metadata", lambda *_args: {})
+    monkeypatch.setattr(transfer_module, "_load_agent_metadata", lambda *_args: None)
+    monkeypatch.setattr(transfer_module, "NixlReshardTransport", lambda *_args, **_kwargs: object())
+    planned = []
+    monkeypatch.setattr(
+        transfer_module,
+        "_plan_staged_transfer",
+        lambda capture, _sources: planned.append(capture) or TransferPlan(),
+    )
+    captured_schema = []
+
+    def capture_layout(schema) -> tuple:
+        captured_schema.extend(schema)
+        return CaptureResult(
+            copies=[
+                RecordedCopy(
+                    src_name="layers.0.weight",
+                    op_chain=(("transpose", (0, 1), ()),),
+                    param_name="layers.0.weight",
+                    dest_offset=0,
+                    dest_shape=(2, 3),
+                    dest_stride=(3, 1),
+                    dest_dtype=torch.float32,
+                )
+            ],
+            unsupported=["layers.1.weight"],
+            unsupported_reasons={"layers.1.weight": "unsupported on lazy layers.1.weight"},
+        ), {"layers.0.weight": ((2, 3), torch.float32)}
+
+    transfer.prepare(
+        manifests=[b"source"],
+        source_fingerprints=(),
+        capture_layout=capture_layout,
+    )
+    assert captured_schema == [
+        ("layers.0.weight", torch.float32, (2, 3)),
+        ("layers.1.weight", torch.float32, (2, 3)),
+    ]
+    assert planned[0].copies[0].src_name == "packed.experts"
+    assert planned[0].copies[0].op_chain == convert_source_weights(
+        convert, manifest
+    )["layers.0.weight"]._ops + (("transpose", (0, 1), ()),)
+    assert planned[0].unsupported == ["packed.experts"]
+    assert set(planned[0].unsupported_reasons) == {"packed.experts"}
 
 
 def test_bounded_batches_preserve_module_groups_and_count_dtype_scratch(monkeypatch):
@@ -193,9 +316,7 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, pack, pad
         def await_reads(self, posted):
             assert posted == []
 
-    prepared = transfer_module._PreparedBoundedTransfer(
-        batches, {"w": source}, Transport()
-    )
+    prepared = _prepared_bounded(batches, {"w": source}, Transport())
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._descriptor_cache = None
     transfer._workspace_generation = 0
@@ -532,24 +653,43 @@ def test_exact_manifests_resolve_without_legacy_source_discovery(memory_type):
 
 
 def test_required_agent_metadata_rejects_incomplete_source_metadata():
-    plan = TransferPlan(segments=[PullSegment("session-a", 1, "weight", 0, 4)])
     resolved = _ResolvedSources(
         sources={},
-        session_to_agent={"session-a": "agent-a"},
+        session_to_agent={"agent-a": "agent-a"},
         session_to_device={},
         agent_metadata={"agent-a": b"metadata"},
     )
-    assert _required_agent_metadata(plan, resolved) == {"agent-a": b"metadata"}
+    binding = _SourceBinding(
+        resolved, {"slot-a": "agent-a"}, (("slot-a", "agent-a", "manifest-a"),)
+    )
+    plan = TransferPlan(
+        segments=[_LogicalRead("slot-a", "weight", (0,), (1,), 0, "weight", 0, 4)]
+    )
+    assert _required_agent_metadata(plan, resolved, binding) == {
+        "agent-a": b"metadata"
+    }
 
-    with pytest.raises(RuntimeError, match="unknown source sessions"):
+    with pytest.raises(RuntimeError, match="unknown source slots"):
         _required_agent_metadata(
-            plan,
-            _ResolvedSources({}, {}, {}, {}),
+            TransferPlan(
+                segments=[
+                    _LogicalRead("missing-slot", "weight", (0,), (1,), 0, "weight", 0, 4)
+                ]
+            ),
+            resolved,
+            binding,
         )
+
+    missing_metadata = _ResolvedSources({}, {}, {}, {})
     with pytest.raises(RuntimeError, match="without NIXL metadata"):
         _required_agent_metadata(
             plan,
-            _ResolvedSources({}, {"session-a": "agent-a"}, {}, {}),
+            missing_metadata,
+            _SourceBinding(
+                missing_metadata,
+                {"slot-a": "agent-a"},
+                (("slot-a", "agent-a", "missing-metadata"),),
+            ),
         )
 
 
@@ -630,6 +770,170 @@ def test_transformed_source_reads_only_required_slice_by_default(monkeypatch):
     assert {segment.session for segment in plan.segments} == {"left"}
 
 
+def test_logical_plan_preserves_conversion_and_full_pull_reads(monkeypatch) -> None:
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    source_tensor = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    source = SourceInfo(
+        global_shape=(4, 4),
+        dtype=torch.float32,
+        elsize=4,
+        shards=[Shard((0, 0), (4, 4), "agent-a", source_tensor.data_ptr(), 4)],
+    )
+    resolved = _ResolvedSources(
+        {"weight": source},
+        {"agent-a": "agent-a"},
+        {"agent-a": 0},
+        {"agent-a": b"metadata"},
+    )
+    binding = _SourceBinding(
+        resolved,
+        {"slot-a": "agent-a"},
+        (("slot-a", "agent-a", source_tensor.data_ptr()),),
+    )
+    copy = RecordedCopy(
+        src_name="weight",
+        op_chain=(("narrow", (1, 0, 2), ()),),
+        param_name="converted", dest_offset=0,
+        dest_shape=(4, 2), dest_stride=(2, 1), dest_dtype=torch.float16,
+    )
+    converted = _plan_staged_transfer(CaptureResult(copies=[copy]), resolved.sources)
+    logical_converted = _logical_transfer_plan(converted, resolved, {"agent-a": "slot-a"})
+    conversion_reads = logical_converted.converts[0].segments
+    assert conversion_reads[0] == _LogicalRead(
+        "slot-a", "weight", (0, 0), (4, 4), 0, "converted", 0, 8
+    )
+    assert sum(segment.nbytes for segment in conversion_reads) == 32
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._recv_buffers = {}
+    transfer._full_buffers = {}
+    transfer._convert_buffers = {}
+    conversion_buffer = torch.empty((4, 2), dtype=torch.float32)
+    conversion_descriptors = transfer._descriptors(
+        logical_converted,
+        convert={"converted": conversion_buffer},
+        source_binding=binding,
+    )
+    for descriptor in conversion_descriptors:
+        ctypes.memmove(descriptor.dst_addr, descriptor.src_addr, descriptor.nbytes)
+    assert torch.equal(conversion_buffer, source_tensor[:, :2])
+
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    full_pull = _plan_staged_transfer(CaptureResult(copies=[replace(copy, dest_dtype=torch.float32)]), resolved.sources)
+    logical_full = _logical_transfer_plan(full_pull, resolved, {"agent-a": "slot-a"})
+    assert logical_full.full_pulls[0].segments[0] == _LogicalRead(
+        "slot-a", "weight", (0, 0), (4, 4), 0, "weight", 0, 64
+    )
+    assert binding.read(logical_full.full_pulls[0].segments[0]) == (
+        "agent-a", source_tensor.data_ptr()
+    )
+    reconstructed = torch.empty_like(source_tensor)
+    full_descriptors = transfer._descriptors(
+        logical_full,
+        full={"weight": reconstructed},
+        source_binding=binding,
+    )
+    for descriptor in full_descriptors:
+        ctypes.memmove(descriptor.dst_addr, descriptor.src_addr, descriptor.nbytes)
+    assert torch.equal(reconstructed, source_tensor)
+
+
+def test_packed_mixed_reads_keep_logical_binding_provenance(monkeypatch) -> None:
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    values = torch.arange(4, dtype=torch.float32)
+    source = SourceInfo(
+        global_shape=(4,),
+        dtype=torch.float32,
+        elsize=4,
+        shards=[Shard((0,), (4,), "agent-a", values.data_ptr(), 4)],
+    )
+    resolved = _ResolvedSources(
+        {"weight": source},
+        {"agent-a": "agent-a"},
+        {"agent-a": 0},
+        {"agent-a": b"metadata"},
+    )
+    copies = [
+        RecordedCopy("weight", (), "layer0.weight", 0, (4,), (1,), torch.float32),
+        RecordedCopy("weight", (), "layer1.weight", 0, (4,), (1,), torch.bfloat16),
+    ]
+    capture = CaptureResult(copies=copies)
+    layout = {copy.param_name: (copy.dest_shape, copy.dest_dtype) for copy in copies}
+    batches = _bounded_batches(capture, layout, resolved.sources, 512)
+    packed = _pack_bounded_batches(batches, 1024)
+
+    assert len(packed) == 1
+    logical = _logical_transfer_plan(
+        packed[0].plan, resolved, {"agent-a": "slot-a"}
+    )
+    reads = logical.segments + [
+        segment for conversion in logical.converts for segment in conversion.segments
+    ]
+    assert len(logical.segments) == 1
+    assert len(logical.converts) == 1
+    assert all(isinstance(segment, _LogicalRead) for segment in reads)
+    assert {segment.param_name for segment in reads} == {
+        "layer0.weight", "layer1.weight"
+    }
+    assert sum(segment.nbytes for segment in reads) == 32
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_prepare_retains_logical_plan_and_source_binding(monkeypatch, bounded) -> None:
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    values = torch.arange(4, dtype=torch.float32)
+    source = SourceInfo(
+        global_shape=(4,),
+        dtype=torch.float32,
+        elsize=4,
+        shards=[Shard((0,), (4,), "agent-a", values.data_ptr(), 4)],
+    )
+    resolved = _ResolvedSources(
+        {"weight": source},
+        {"agent-a": "agent-a"},
+        {"agent-a": 0},
+        {"agent-a": b"metadata"},
+    )
+    copy = RecordedCopy("weight", (), "weight", 0, (4,), (1,), torch.float32)
+    capture = CaptureResult(copies=[copy])
+    layout = {"weight": ((4,), torch.float32)}
+    monkeypatch.setattr(
+        transfer_module, "NixlReshardTransport", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(transfer_module, "_load_agent_metadata", lambda *_args: None)
+    manager = SimpleNamespace(register_tensors=lambda *_args: None)
+    transfer = _NixlStagedTransfer(
+        device_id=0,
+        device=torch.device("cuda:0") if bounded else torch.device("cpu"),
+        manager=manager,
+    )
+    transfer._source_cache.resolve = lambda *_args, **_kwargs: resolved
+    transfer._select_workspace_mode = lambda _mode: None
+    transfer._validate_complete = lambda *_args: None
+    transfer._ensure_workspace = lambda *_args: None
+    transfer._allocate_arena = lambda size: torch.empty(size, dtype=torch.uint8)
+    transfer._recv_buffers = {"weight": torch.empty_like(values)}
+
+    prepared = transfer.prepare(
+        manifests=[b"manifest"],
+        source_fingerprints=(
+            ("replica-slot", "agent-a", values.data_ptr()),
+        ),
+        capture_layout=lambda _manifest: (capture, layout),
+        max_staging_bytes=512 if bounded else None,
+        source_slot_ids=("replica-slot",),
+    )
+
+    plans = [batch.plan for batch in prepared.batches] if bounded else [prepared.plan]
+    reads = [segment for plan in plans for segment in plan._all_segments()]
+    assert reads and all(isinstance(segment, _LogicalRead) for segment in reads)
+    assert {segment.source_slot_id for segment in reads} == {"replica-slot"}
+    assert prepared.source_binding.read(reads[0]) == ("agent-a", values.data_ptr())
+    if not bounded:
+        assert len(prepared.descriptors) == 1
+        assert prepared.descriptors[0].session == "agent-a"
+        assert prepared.descriptors[0].src_addr == values.data_ptr()
+
+
 def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer:
     copy = RecordedCopy(
         src_name="weight",
@@ -655,12 +959,14 @@ def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer
             )
         ],
     )
+    plan, source_binding = _bind_plan(TransferPlan(), {"weight": source})
     return _PreparedNixlTransfer(
-        plan=TransferPlan(),
+        plan=plan,
         capture=CaptureResult(copies=[copy]),
         sources={"weight": source},
         descriptors=(),
         transport=object(),
+        source_binding=source_binding,
     )
 
 
@@ -988,9 +1294,7 @@ def test_double_buffered_iteration_alternates_arenas_and_prefetches(monkeypatch)
             assert posted == ["posted"]
             events.append("await")
 
-    prepared = transfer_module._PreparedBoundedTransfer(
-        batches, {"w": source}, Transport()
-    )
+    prepared = _prepared_bounded(batches, {"w": source}, Transport())
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._descriptor_cache = None
     transfer._workspace_generation = 0
@@ -1068,9 +1372,7 @@ def test_abandoned_double_buffered_iteration_drains_the_prefetched_read(monkeypa
         def await_reads(self, handles):
             awaited.extend(handles)
 
-    prepared = transfer_module._PreparedBoundedTransfer(
-        batches, {"w": source}, Transport()
-    )
+    prepared = _prepared_bounded(batches, {"w": source}, Transport())
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._descriptor_cache = None
     transfer._workspace_generation = 0
@@ -1210,6 +1512,9 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
         with pytest.raises(IncompleteRefit, match=expected):
             transfer.prepare(
                 manifests=[manifest],
+                source_fingerprints=(
+                    ("source", "source", source_tensor.data_ptr()),
+                ),
                 capture_layout=lambda m: (capture, layout),
                 max_staging_bytes=256 * staging_buffers - 1,
                 staging_device="cpu",
@@ -1217,6 +1522,9 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
             )
         prepared = transfer.prepare(
             manifests=[manifest],
+            source_fingerprints=(
+                ("source", "source", source_tensor.data_ptr()),
+            ),
             capture_layout=lambda m: (capture, layout),
             max_staging_bytes=256 * staging_buffers,
             staging_device="cpu",
@@ -1238,6 +1546,9 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
             transfer._active = None
             transfer.prepare(
                 manifests=[manifest],
+                source_fingerprints=(
+                    ("source", "source", source_tensor.data_ptr()),
+                ),
                 capture_layout=lambda m: (capture, layout),
                 max_staging_bytes=256,
                 staging_device="cpu",
@@ -1260,13 +1571,18 @@ def test_prepare_rejects_invalid_staging_options():
     with pytest.raises(ValueError, match="staging_device"):
         transfer.prepare(
             manifests=[],
+            source_fingerprints=(),
             capture_layout=None,
             max_staging_bytes=1,
             staging_device="disk",
         )
     with pytest.raises(ValueError, match="staging_buffers"):
         transfer.prepare(
-            manifests=[], capture_layout=None, max_staging_bytes=1, staging_buffers=0
+            manifests=[],
+            source_fingerprints=(),
+            capture_layout=None,
+            max_staging_bytes=1,
+            staging_buffers=0,
         )
 
 
@@ -1316,9 +1632,7 @@ def test_failed_prefetch_drain_is_reported_not_swallowed(monkeypatch):
                 ctypes.memmove(d.dst_addr, d.src_addr, d.nbytes)
 
     drained = []
-    prepared = transfer_module._PreparedBoundedTransfer(
-        batches, {"w": source}, Transport()
-    )
+    prepared = _prepared_bounded(batches, {"w": source}, Transport())
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._descriptor_cache = None
     transfer._workspace_generation = 0
@@ -1373,9 +1687,7 @@ def test_failed_prefetch_drain_does_not_mask_a_caller_error(monkeypatch):
             for d in posted:
                 ctypes.memmove(d.dst_addr, d.src_addr, d.nbytes)
 
-    prepared = transfer_module._PreparedBoundedTransfer(
-        batches, {"w": source}, Transport()
-    )
+    prepared = _prepared_bounded(batches, {"w": source}, Transport())
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._descriptor_cache = None
     transfer._workspace_generation = 0
@@ -1412,3 +1724,54 @@ def test_bounded_batch_layouts_are_named_however_they_are_built():
     swapped = replace(built, layouts=(recv, convert, {}))
     assert isinstance(swapped.layouts, transfer_module._StagingLayouts)
     assert swapped.layouts.full == {}
+
+
+def test_logical_plan_binds_replica_addresses_without_recompiling() -> None:
+    from modelexpress.refit.reshard.slice_plan import Shard
+    from modelexpress.refit.reshard.transfer_plan import SourceInfo
+
+    values = torch.arange(8, dtype=torch.float32)
+    replica = values.clone()
+    capture = CaptureResult(copies=[RecordedCopy(
+        src_name="weight", op_chain=(), param_name="weight", dest_offset=0,
+        dest_shape=(8,), dest_stride=(1,), dest_dtype=torch.float32,
+    )])
+
+    def resolve(tensor, agent) -> _ResolvedSources:
+        return _ResolvedSources(
+            {"weight": SourceInfo((8,), torch.float32, 4, [Shard((0,), (8,), agent, tensor.data_ptr(), 4)])},
+            {agent: agent}, {agent: 0}, {agent: b"metadata"},
+        )
+
+    first = resolve(values, "replica-a")
+    second = resolve(replica, "replica-b")
+    physical = transfer_module._plan_staged_transfer(capture, first.sources)
+    logical = transfer_module._logical_transfer_plan(physical, first, {"replica-a": "group"})
+    read = logical.segments[0]
+    assert read.source_slot_id == "group"
+    assert read.src_byte == 0
+    assert not hasattr(read, "src_addr")
+    assert not hasattr(read, "session")
+    receiver = object.__new__(_NixlStagedTransfer)
+    receiver._recv_buffers = {"weight": torch.empty_like(values)}
+    receiver._full_buffers = {}
+    receiver._convert_buffers = {}
+    for resolved, agent in ((first, "replica-a"), (second, "replica-b")):
+        binding = transfer_module._SourceBinding(
+            resolved,
+            {"group": agent},
+            (
+                (
+                    "group",
+                    agent,
+                    (values if agent == "replica-a" else replica).data_ptr(),
+                ),
+            ),
+        )
+        descriptors = receiver._descriptors(logical, source_binding=binding)
+        assert descriptors[0].session == agent
+        assert descriptors[0].src_addr == (values if agent == "replica-a" else replica).data_ptr()
+        for descriptor in descriptors:
+            ctypes.memmove(descriptor.dst_addr, descriptor.src_addr, descriptor.nbytes)
+        assert torch.equal(receiver._recv_buffers["weight"], values)
+        assert logical.segments[0] is read
