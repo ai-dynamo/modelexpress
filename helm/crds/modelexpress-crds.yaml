@@ -120,17 +120,20 @@ spec:
                       chunkCount:
                         description: Number of transfer chunks in the sealed artifact manifest.
                         format: int64
+                        maximum: 4294967295.0
                         minimum: 0.0
                         type: integer
                       fileCount:
                         description: Number of files in the sealed artifact manifest.
                         format: int64
+                        maximum: 4294967295.0
                         minimum: 0.0
                         type: integer
                       nodeRank:
                         default: 0
                         description: Distributed node rank that owns this node-scoped artifact.
                         format: int64
+                        maximum: 4294967295.0
                         minimum: 0.0
                         type: integer
                       totalSize:

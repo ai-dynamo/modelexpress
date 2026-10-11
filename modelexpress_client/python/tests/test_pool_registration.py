@@ -205,7 +205,8 @@ class TestRawDescriptorMemType:
 
     def test_pool_registration_uses_vram_segment(self, monkeypatch, fake_driver):
         monkeypatch.setenv("MX_POOL_REG", "1")
-        tensor = torch.zeros(4, dtype=torch.float32)
+        tensor = MagicMock(wraps=torch.zeros(4, dtype=torch.float32))
+        tensor.is_cuda = True
         fake_driver([(tensor.data_ptr(), tensor.numel() * tensor.element_size())])
 
         mgr = self._make_manager()
@@ -216,6 +217,17 @@ class TestRawDescriptorMemType:
             mem_type=NIXL_ACCELERATOR_MEM_TYPE,
             backends=["UCX"],
         )
+
+    def test_host_sources_bypass_cuda_pool_discovery(self, monkeypatch):
+        monkeypatch.setenv("MX_POOL_REG", "1")
+        tensor = torch.zeros(4, dtype=torch.float32)
+        mgr = self._make_manager()
+        mgr._find_cuda_allocations = MagicMock(
+            side_effect=AssertionError("CPU address")
+        )
+        assert mgr.register_tensors({"w": tensor}) == b"metadata"
+        mgr._find_cuda_allocations.assert_not_called()
+        mgr._agent.register_memory.assert_called_once_with([tensor], backends=["UCX"])
 
     def test_arena_registration_uses_vram_segment(self):
         # The arena range must actually cover the tensor, as a real arena does.
@@ -318,6 +330,34 @@ class TestRawDescriptorMemType:
             ),
         ]
 
+    def test_transfer_start_callback_runs_after_descriptor_preparation(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(torch.cuda, "set_device", lambda *args, **kwargs: None)
+        local = torch.zeros(4, dtype=torch.float32)
+        mgr = self._make_manager()
+        mgr._tensors = {"w": local}
+        mgr._agent.prep_xfer_dlist.side_effect = RuntimeError("descriptor failure")
+        on_transfer_start = MagicMock()
+
+        with pytest.raises(RuntimeError, match="descriptor failure"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[
+                    TensorDescriptor(
+                        name="w",
+                        addr=0x1000,
+                        size=local.numel() * local.element_size(),
+                        device_id=0,
+                        dtype=str(local.dtype),
+                    )
+                ],
+                remote_agent_name="source",
+                on_transfer_start=on_transfer_start,
+            )
+
+        on_transfer_start.assert_not_called()
+
 
 class TestReceiveFromSourceManifestValidation:
     """receive_from_source must reject size/dtype mismatches before building
@@ -369,6 +409,71 @@ class TestReceiveFromSourceManifestValidation:
                 remote_agent_name="dummy",
             )
 
+    def test_empty_tensor_is_validated_but_not_transferred(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+        weight = torch.ones(4, dtype=torch.float32)
+        indices = torch.empty(0, dtype=torch.int32)
+        mgr = self._make_manager(
+            monkeypatch,
+            {"weight": weight, "indices": indices},
+        )
+        mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
+        mgr._agent.make_prepped_xfer.return_value = "handle"
+        mgr._agent.check_xfer_state.return_value = "DONE"
+
+        result = mgr.receive_from_source(
+            source_metadata=b"",
+            source_tensors=[
+                TensorDescriptor(
+                    "weight",
+                    0x1000,
+                    weight.numel() * weight.element_size(),
+                    0,
+                    str(weight.dtype),
+                ),
+                TensorDescriptor("indices", 0, 0, 0, str(indices.dtype)),
+            ],
+            remote_agent_name="source",
+            require_exact_match=True,
+        )
+
+        assert result[:2] == (weight.numel() * weight.element_size(), 2)
+        assert [
+            entry.kwargs["xfer_list"]
+            for entry in mgr._agent.prep_xfer_dlist.call_args_list
+        ] == [
+            [(0x1000, weight.numel() * weight.element_size(), 0)],
+            [(weight.data_ptr(), weight.numel() * weight.element_size(), 0)],
+        ]
+
+    def test_all_empty_manifest_needs_no_nixl_transfer(self, monkeypatch):
+        indices = torch.empty(0, dtype=torch.int32)
+        mgr = self._make_manager(monkeypatch, {"indices": indices})
+
+        result = mgr.receive_from_source(
+            source_metadata=b"",
+            source_tensors=[TensorDescriptor("indices", 0, 0, 0, str(indices.dtype))],
+            remote_agent_name="source",
+            require_exact_match=True,
+        )
+
+        assert result == (0, 1, 0.0)
+        mgr._agent.prep_xfer_dlist.assert_not_called()
+
+    def test_empty_tensor_still_rejects_source_size_mismatch(self, monkeypatch):
+        indices = torch.empty(0, dtype=torch.int32)
+        mgr = self._make_manager(monkeypatch, {"indices": indices})
+
+        with pytest.raises(ManifestMismatchError, match="size mismatch"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[
+                    TensorDescriptor("indices", 0x1000, 4, 0, str(indices.dtype))
+                ],
+                remote_agent_name="source",
+                require_exact_match=True,
+            )
+
     def test_size_mismatch_raises_for_heterogeneous_source_device(self, monkeypatch):
         # Heterogeneous transfer signature: the source tensor lives on a
         # different device ordinal (e.g. source xpu:2 -> target cuda:0). The
@@ -377,7 +482,11 @@ class TestReceiveFromSourceManifestValidation:
         local = torch.zeros(10, dtype=torch.float32)
         mgr = self._make_manager(monkeypatch, {"w": local})
         hetero_bogus = TensorDescriptor(
-            name="w", addr=0x1000, size=80, device_id=2, dtype=str(local.dtype),
+            name="w",
+            addr=0x1000,
+            size=80,
+            device_id=2,
+            dtype=str(local.dtype),
         )
         with pytest.raises(ManifestMismatchError, match="size mismatch"):
             mgr.receive_from_source(
@@ -443,7 +552,11 @@ class TestReceiveFromSourceManifestValidation:
             },
         )
         src = TensorDescriptor(
-            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+            name="w",
+            addr=0x1000,
+            size=4,
+            device_id=0,
+            dtype="torch.float32",
         )
         with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
             mgr.receive_from_source(
@@ -460,10 +573,18 @@ class TestReceiveFromSourceManifestValidation:
         )
         src = [
             TensorDescriptor(
-                name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+                name="w",
+                addr=0x1000,
+                size=4,
+                device_id=0,
+                dtype="torch.float32",
             ),
             TensorDescriptor(
-                name="extra", addr=0x2000, size=4, device_id=0, dtype="torch.float32",
+                name="extra",
+                addr=0x2000,
+                size=4,
+                device_id=0,
+                dtype="torch.float32",
             ),
         ]
         with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
@@ -481,7 +602,11 @@ class TestReceiveFromSourceManifestValidation:
             monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)}
         )
         src = TensorDescriptor(
-            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+            name="w",
+            addr=0x1000,
+            size=4,
+            device_id=0,
+            dtype="torch.float32",
         )
         with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
             mgr.receive_from_source(
@@ -500,7 +625,11 @@ class TestReceiveFromSourceManifestValidation:
         local = torch.zeros(10, dtype=torch.float32)
         mgr = self._make_manager(monkeypatch, {"w": local})
         src = TensorDescriptor(
-            name="w", addr=0x1000, size=80, device_id=0, dtype=str(local.dtype),
+            name="w",
+            addr=0x1000,
+            size=80,
+            device_id=0,
+            dtype=str(local.dtype),
         )
         with pytest.raises(ManifestMismatchError, match="size mismatch"):
             mgr.receive_from_source(
@@ -517,7 +646,11 @@ class TestReceiveFromSourceManifestValidation:
         auxiliary = torch.zeros(1, dtype=torch.float32)
         mgr = self._make_manager(monkeypatch, {"__convert__w": auxiliary})
         src = TensorDescriptor(
-            name="w", addr=0x1000, size=80, device_id=0, dtype=str(canonical.dtype),
+            name="w",
+            addr=0x1000,
+            size=80,
+            device_id=0,
+            dtype=str(canonical.dtype),
         )
         with pytest.raises(ManifestMismatchError, match="size mismatch"):
             mgr.receive_from_source(

@@ -7,6 +7,7 @@ use modelexpress_server::{
     config::{ServerArgs, ServerConfig},
     run_server,
 };
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
@@ -42,13 +43,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    // Translate a CTRL+C into a graceful shutdown of the embedded server.
-    let shutdown = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            error!("Failed to install CTRL+C signal handler: {e}");
-            return;
+    // Shut down gracefully on CTRL+C (SIGINT) or SIGTERM. SIGTERM is what
+    // Kubernetes and container runtimes send to stop a container; as PID 1 the
+    // server would otherwise ignore it and be SIGKILLed after the grace period.
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let shutdown = async move {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => match result {
+                Ok(()) => info!("Received CTRL+C, shutting down gracefully..."),
+                Err(e) => error!("Failed to install CTRL+C signal handler: {e}"),
+            },
+            _ = sigterm.recv() => info!("Received SIGTERM, shutting down gracefully..."),
         }
-        info!("Received CTRL+C, shutting down gracefully...");
     };
 
     let backend = BackendConfig::from_env()?;

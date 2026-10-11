@@ -62,7 +62,7 @@ class PublisherThread:
         cleanup_fn: Optional best-effort callback invoked on stop/exit after
             stale marking.
         publish_timeout_secs: Seconds to keep waiting/publishing before giving
-            up and stopping the thread.
+            up and stopping the thread. Zero retries indefinitely.
         interval_secs: Optional tick interval override. Defaults to
             ``MX_HEARTBEAT_INTERVAL_SECS``.
         heartbeat_after_publish: If False, the thread exits after publish_fn
@@ -303,6 +303,8 @@ class PublisherThread:
         return time.monotonic() - self._publish_started_at
 
     def _publish_timed_out(self, elapsed: float) -> bool:
+        if self._publish_timeout == 0:
+            return False
         if elapsed <= self._publish_timeout:
             return False
         if not self._publish_given_up:

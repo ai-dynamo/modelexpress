@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -70,6 +70,8 @@ class GeneratorPeerUpdateSource:
     """A generator peer that already serves the requested version."""
 
     worker: p2p_pb2.WorkerMetadata
+    mx_source_id: str
+    worker_id: str
     kind = WeightSource.GENERATOR
     payload_format = WeightPayloadFormat.FULL_TENSOR
 
@@ -113,7 +115,7 @@ class PreparedArtifact(ABC):
     @property
     @abstractmethod
     def metrics(self) -> dict[str, float]:
-        """Return metrics recorded while preparing this artifact."""
+        """Return metrics recorded while preparing or applying this artifact."""
 
 
 @dataclass(frozen=True)
@@ -125,9 +127,42 @@ class PreparedEngineTensors(PreparedArtifact):
         return dict(getattr(self.staged, "metrics", {}))
 
 
+@dataclass
+class _StreamingOwnership:
+    """Retain receive resources until both GPU work and transport are drained."""
+
+    iterator: Iterator[dict[str, Any]] | None = None
+    drain_failed: bool = False
+    close_failed: bool = False
+    source_failed: bool = False
+
+    @property
+    def release_blocked(self) -> bool:
+        return (
+            self.iterator is not None
+            or self.drain_failed
+            or self.close_failed
+            or self.source_failed
+        )
+
+
+@dataclass(frozen=True)
+class PreparedStreamingTensors(PreparedArtifact):
+    """Deferred bounded transfer; payload is read only during installation."""
+
+    batches: Callable[[], Iterator[dict[str, Any]]]
+    parameter_names: frozenset[str]
+    transfer_metrics: dict[str, float]
+    ownership: _StreamingOwnership = field(default_factory=_StreamingOwnership)
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        return dict(self.transfer_metrics)
+
+
 @dataclass(frozen=True)
 class PreparedRuntimeTensors(PreparedArtifact):
-    """Post-load engine tensors ready for an in-place runtime copy."""
+    """A peer read prepared to write directly into live runtime tensors."""
 
     staged: StagedEngineTensors
 
@@ -167,7 +202,7 @@ class SourceResolver(ABC):
 
 
 class UpdateMethod(ABC):
-    """Prepare weights from a resolved source without mutating the live engine."""
+    """Prepare an update and protect method state while the engine applies it."""
 
     @property
     @abstractmethod
@@ -192,16 +227,28 @@ class UpdateMethod(ABC):
         version: WeightVersion,
         source: ResolvedSource,
     ) -> PreparedArtifact:
-        """Transfer and verify one update without changing live weights."""
+        """Prepare and verify one update without changing live weights."""
 
     @abstractmethod
     def release(self, prepared: PreparedArtifact) -> None:
         """Release method-owned staging for one prepared update."""
 
     def installation_context(self, prepared: PreparedArtifact):
-        """Protect method-owned state while the installer reads it."""
+        """Run method-specific work at the caller's safe point.
+
+        Implementations may transfer into live storage. The framework must
+        already have paused engine execution.
+        """
         del prepared
         return nullcontext()
+
+    def mutated_during_installation_context(
+        self,
+        prepared: PreparedArtifact,
+    ) -> bool:
+        """Return whether a failed context entry may have changed live storage."""
+        del prepared
+        return False
 
     def prepare_chain(
         self,
@@ -220,6 +267,9 @@ class UpdateMethod(ABC):
 
     def installation_failed(self, prepared: PreparedArtifact) -> None:
         """Fence method-owned state after an engine installation failure."""
+
+    def validate_close(self) -> None:
+        """Reject teardown while transport or installation may still use resources."""
 
     def close(self) -> None:
         """Release method-owned process resources."""

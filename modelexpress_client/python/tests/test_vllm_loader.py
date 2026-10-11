@@ -65,6 +65,13 @@ def test_model_loader_owns_runtime_tensor_publication(monkeypatch):
     events = []
     monkeypatch.setattr(
         loader_mod,
+        "drain_tensor_readers",
+        lambda received, *, timeout: events.append(
+            ("drain", received, timeout)
+        ),
+    )
+    monkeypatch.setattr(
+        loader_mod,
         "unpublish_metadata",
         lambda received: events.append(("unpublish", received)),
     )
@@ -77,8 +84,33 @@ def test_model_loader_owns_runtime_tensor_publication(monkeypatch):
     loader.unpublish_runtime_tensors()
     loader.publish_runtime_tensors("version-a")
 
-    assert events == [("unpublish", ctx), ("publish", ctx)]
+    assert events == [
+        ("drain", ctx, 900),
+        ("unpublish", ctx),
+        ("publish", ctx),
+    ]
     assert ctx.identity.revision == "version-a"
+
+
+def test_model_loader_keeps_source_published_when_reader_drain_times_out(
+    monkeypatch,
+):
+    from modelexpress.engines.vllm import loader as loader_mod
+
+    loader = _make_loader()
+    loader._ctx = _make_load_context(device_id=3)
+    unpublish = MagicMock()
+    monkeypatch.setattr(loader_mod, "unpublish_metadata", unpublish)
+    monkeypatch.setattr(
+        loader_mod,
+        "drain_tensor_readers",
+        MagicMock(side_effect=TimeoutError("active readers")),
+    )
+
+    with pytest.raises(TimeoutError, match="active readers"):
+        loader.unpublish_runtime_tensors()
+
+    unpublish.assert_not_called()
 
 
 def _make_identity(model_name="test-model"):
@@ -2105,3 +2137,73 @@ def test_unregister_releases_the_discarded_model():
     gc.collect()
 
     assert layer_ref() is None
+
+
+@pytest.mark.parametrize("native_scale_alias", [False, True])
+@pytest.mark.parametrize("rebuild_fails", [False, True])
+def test_retry_releases_tensors_while_caller_retains_model(
+    monkeypatch, mock_accelerator_backend_cls, rebuild_fails, native_scale_alias,
+):
+    """Retry must free old tensors before allocating a replacement model."""
+    import sys
+    import weakref
+
+    cc = _make_compilation_config()
+    target, _ = _initialize_model(cc, "target")
+    retained_model, adapter = _initialize_model(cc, "retry")
+    retained_model.weight = nn.Parameter(torch.ones(1))
+    retained_model.register_buffer("scale", torch.ones(1))
+    retained_model.scratch = torch.ones(1)
+    retained_model.self_attn.weight = nn.Parameter(torch.ones(1))
+    retained_model.self_attn.cycle = [retained_model.self_attn]
+    if native_scale_alias:
+        # A native alias can retain a replaced scale parameter and its loader
+        # callback outside Python's GC traversal, pinning the expert weights.
+        original_scale = nn.Parameter(torch.ones(1), requires_grad=False)
+        original_scale.weight_loader = retained_model.self_attn.forward
+        retained_model.self_attn.weight_scale = nn.Parameter(
+            torch.from_dlpack(original_scale), requires_grad=False,
+        )
+        del original_scale
+    cached_rotary = nn.Module()
+    cached_rotary.register_buffer("cos_sin_cache", torch.ones(1))
+    retained_model.rotary = cached_rotary
+    rotary_cache = cached_rotary.cos_sin_cache
+    tensor_refs = [
+        weakref.ref(tensor) for tensor in (
+            retained_model.weight,
+            retained_model.scale,
+            retained_model.scratch,
+            retained_model.self_attn.weight,
+        )
+    ]
+    adapter.target_device = torch.device("cpu")
+    adapter.model_config = object()
+    adapter.accelerator_backend = mock_accelerator_backend_cls()
+    result = LoadResult(value=retained_model, model=retained_model, publishable=False)
+
+    def initialize_model(**kwargs):
+        assert all(ref() is None for ref in tensor_refs)
+        assert cached_rotary.cos_sin_cache is rotary_cache
+        assert cc.static_forward_context == {
+            "target.layers.0.self_attn": target.self_attn,
+        }
+        if rebuild_fails:
+            raise RuntimeError("rebuild failed")
+        return _initialize_model(cc, "retry")[0]
+
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.model_loader.utils"],
+        "initialize_model",
+        initialize_model,
+    )
+    if rebuild_fails:
+        with pytest.raises(RuntimeError, match="rebuild failed"):
+            adapter.reinit_for_retry(result)
+        assert result.model is None and result.value is None
+    else:
+        rebuilt = adapter.reinit_for_retry(result)
+        assert rebuilt.model is not retained_model
+        assert rebuilt.value is rebuilt.model
+        assert rebuilt.publishable is False
+    assert adapter.accelerator_backend.empty_cache_calls == 1

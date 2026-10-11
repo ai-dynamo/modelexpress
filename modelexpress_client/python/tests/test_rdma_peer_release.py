@@ -54,6 +54,9 @@ def _ctx(manager):
         accelerator_backend=SimpleNamespace(name="cuda", synchronize=MagicMock()),
         adapter=adapter,
         identity=SimpleNamespace(model_name="m"),
+        mx_client=SimpleNamespace(
+            worker_rpc_retry_policy=lambda: (0, 0.0),
+        ),
     )
 
 
@@ -69,21 +72,71 @@ def _source_worker(p2p: bool):
     )
 
 
-def _receive(manager, p2p=True, ctx=None):
+def _receive(manager, p2p=True, ctx=None, leased=True):
     strategy = RdmaStrategy()
+    strategy.requires_tensor_read_lease = leased
+
+    class _Lease:
+        manifest = SimpleNamespace(
+            tensors=[_descriptor()],
+            metadata_endpoint="10.0.18.37:5555",
+            agent_name=P2P_AGENT,
+        )
+
+        def __enter__(self):
+            return self
+
+        def close(self):
+            callback = getattr(manager, "_tensor_lease_release", None)
+            if callback is not None:
+                callback()
+
+        def __exit__(self, *_args):
+            self.close()
+            return None
+
     with (
         patch("modelexpress.load_strategy.rdma_strategy.register_tensors"),
+        patch(
+            "modelexpress.metadata.worker_server.prepare_tensor_read",
+            return_value=(_Lease(), 0),
+        ) as prepare_read,
         patch(
             "modelexpress.load_strategy.rdma_strategy.worker_tensor_descriptors",
             return_value=[_descriptor()],
         ),
     ):
         strategy._receive_from_peer(
-            MagicMock(), ctx or _ctx(manager), _source_worker(p2p), "src-1"
+            MagicMock(),
+            ctx or _ctx(manager),
+            _source_worker(p2p),
+            "src-1",
+            "source-worker-1",
         )
+    return prepare_read
 
 
 class TestReleaseOnTheLoadPath:
+    def test_standard_p2p_does_not_prepare_a_tensor_read_lease(self):
+        mgr = _manager()
+
+        assert RdmaStrategy.requires_tensor_read_lease is False
+        prepare_read = _receive(mgr, p2p=True, leased=False)
+
+        prepare_read.assert_not_called()
+
+    def test_p2p_uses_metadata_backend_retry_policy(self):
+        mgr = _manager()
+        ctx = _ctx(mgr)
+        ctx.mx_client = SimpleNamespace(
+            worker_rpc_retry_policy=lambda: (4, 0.25),
+        )
+
+        prepare_read = _receive(mgr, p2p=True, ctx=ctx)
+
+        assert prepare_read.call_args.kwargs["max_retries"] == 4
+        assert prepare_read.call_args.kwargs["retry_backoff_seconds"] == 0.25
+
     def test_p2p_source_is_released_after_a_successful_load(self):
         """The case rc.3 disproved: cleanup must not wait for interpreter exit."""
         mgr = _manager()
@@ -110,10 +163,11 @@ class TestReleaseOnTheLoadPath:
         mgr.remove_remote_agent.side_effect = lambda *_: order.append("release") or True
         ctx = _ctx(mgr)
         ctx.accelerator_backend.synchronize.side_effect = lambda: order.append("sync")
+        mgr._tensor_lease_release = lambda: order.append("lease_release")
 
         _receive(mgr, p2p=True, ctx=ctx)
 
-        assert order == ["transfer", "sync", "release"]
+        assert order == ["transfer", "sync", "release", "lease_release"]
 
 
 class TestReleaseOnFailure:

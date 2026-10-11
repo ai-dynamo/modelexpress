@@ -374,7 +374,10 @@ def _sglang_artifact_ready_fn(
 
 
 def _sglang_health_ready(ctx: LoadContext | None = None) -> bool:
-    return _common_artifacts.artifact_health_ready(_sglang_health_url(ctx))
+    # SGLang waits one second before checking its health-generation result.
+    return _common_artifacts.artifact_health_ready(
+        _sglang_health_url(ctx), timeout_secs=5.0,
+    )
 
 
 def _sglang_health_url(ctx: LoadContext | None = None) -> str:

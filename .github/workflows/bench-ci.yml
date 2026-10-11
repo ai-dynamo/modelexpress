@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+name: RL weight refit CI
+run-name: "RL weight refit PR #${{ github.event.issue.number }} requested by @${{ github.actor }}"
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+# Serialize requests for a PR so a later comment cannot cancel cleanup.
+concurrency:
+  group: bench-pr-${{ github.event.issue.number }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  authorize:
+    if: >-
+      github.repository == 'ai-dynamo/modelexpress' &&
+      github.event.issue.pull_request &&
+      (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench '))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.gate.outputs.sha }}
+      model: ${{ steps.gate.outputs.model }}
+      scenario: ${{ steps.gate.outputs.scenario }}
+    steps:
+      # issue_comment uses default-branch code. Never check out PR code here.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Validate caller and copy-pr-bot mirror
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/bench/scripts/comment_gate.py
+
+  benchmark:
+    name: RL refit
+    needs: authorize
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/rl-refit-ci.yml
+    with:
+      pull_request: ${{ github.event.issue.number }}
+      model: ${{ needs.authorize.outputs.model }}
+      scenario: ${{ needs.authorize.outputs.scenario }}
+      sha: ${{ needs.authorize.outputs.sha }}
+      runtime: ${{ fromJSON(vars.MX_BENCH_RUNTIME_BASES || '{}')[needs.authorize.outputs.model] || '' }}
+    secrets: inherit

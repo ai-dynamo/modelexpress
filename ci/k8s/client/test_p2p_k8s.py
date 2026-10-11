@@ -14,6 +14,9 @@ have reached Running state.  Asserts:
      are loaded and the model is serving correctly on each.
   4. When enabled by the workflow, target peak and final VRAM do not materially
      exceed source VRAM.
+  5. When --expect-mtp is set, the target transfers the main model through P2P
+     before loading the MTP draft model locally, and source/target greedy
+     completions for a small prompt match exactly.
 
 Invoked by the workflow as:
   pytest ci/k8s/client/test_p2p_k8s.py -v \
@@ -23,7 +26,8 @@ Invoked by the workflow as:
       --worker-port $WORKER_PORT \
       --tp-size $TP_SIZE \
       [--dp-size $DP_SIZE] \
-      [--p2p-marker "framework-specific transfer complete string"]
+      [--p2p-marker "framework-specific transfer complete string"] \
+      [--expect-mtp]
 
 --p2p-marker defaults:
   vLLM: "RDMA transfer complete" (emitted by vLLM's RdmaStrategy)
@@ -152,7 +156,15 @@ def _ready_artifact_source_types(namespace: str) -> set[str]:
     return source_types
 
 
-def _assert_inference(namespace: str, job_name: str, model: str, remote_port: int, local_port: int) -> None:
+def _assert_inference(
+    namespace: str,
+    job_name: str,
+    model: str,
+    remote_port: int,
+    local_port: int,
+    *,
+    deterministic: bool = False,
+) -> str:
     # Pin to pod-0 explicitly. For multi-node StatefulSets, only the head
     # pod (apps.kubernetes.io/pod-index=0) runs the vLLM HTTP API server;
     # the worker pod has no HTTP listener. For single-pod Jobs, _pod_name
@@ -162,11 +174,14 @@ def _assert_inference(namespace: str, job_name: str, model: str, remote_port: in
     print(f"\n[{job_name}] pod={pod} remote_port={remote_port} local_port={local_port}")
     # TODO: replace with a more complex prompt that exercises multi-token reasoning
     # to better validate model correctness beyond a single-word completion.
-    payload = json.dumps({
+    request_payload = {
         "model": model,
         "prompt": "The capital of France is",
         "max_tokens": 8,
-    }).encode()
+    }
+    if deterministic:
+        request_payload.update({"temperature": 0, "seed": 0})
+    payload = json.dumps(request_payload).encode()
     with port_forward(namespace, pod, local_port=local_port, remote_port=remote_port) as port:
         req = urllib.request.Request(
             f"http://localhost:{port}/v1/completions",
@@ -186,6 +201,7 @@ def _assert_inference(namespace: str, job_name: str, model: str, remote_port: in
     text = choices[0].get("text", "")
     print(f"[{job_name}] completion text: {text!r}")
     assert text, f"Empty completion text from {job_name}: {body}"
+    return text
 
 
 def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
@@ -204,6 +220,36 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
     assert p2p_marker in logs, (
         f"P2P marker {p2p_marker!r} not found in target logs.\n"
         f"Last 50 log lines:\n" + "\n".join(logs.splitlines()[-50:])
+    )
+
+
+def test_mtp_load_phases(namespace: str, expect_mtp: bool) -> None:
+    """MTP must use P2P only for the main model, never for its draft head."""
+    if not expect_mtp:
+        pytest.skip("MTP phase assertion not enabled")
+
+    logs = _all_pod_logs(namespace, "mx-target", "mx-target")
+    main_marker = "p2p_enabled=True"
+    transfer_marker = "RDMA transfer complete"
+    draft_marker = "p2p_enabled=False"
+    main_index = logs.find(main_marker)
+    transfer_index = logs.find(transfer_marker, main_index + 1)
+    draft_index = logs.find(draft_marker, transfer_index + 1)
+    phase_lines = [
+        line
+        for line in logs.splitlines()
+        if any(marker in line for marker in (main_marker, transfer_marker, draft_marker))
+    ]
+    print("[mx-target] MTP load phases:\n" + "\n".join(phase_lines))
+    assert main_index >= 0, "Target did not start a P2P-enabled main-model load"
+    assert transfer_index > main_index, (
+        "Target did not complete RDMA transfer after starting the main-model load"
+    )
+    assert draft_index > transfer_index, (
+        "Target did not load the MTP draft locally after the main-model transfer"
+    )
+    assert logs.find(transfer_marker, draft_index + 1) < 0, (
+        "Target performed another RDMA transfer while loading the MTP draft"
     )
 
 
@@ -421,6 +467,39 @@ def test_source_inference_produces_output(namespace: str, model: str, source_por
 def test_target_inference_produces_output(namespace: str, model: str, worker_port: int) -> None:
     """Target server must return a valid completion response after P2P transfer."""
     _assert_inference(namespace, "mx-target", model, remote_port=worker_port, local_port=18000)
+
+
+def test_mtp_source_target_outputs_match(
+    namespace: str,
+    model: str,
+    source_port: int,
+    worker_port: int,
+    expect_mtp: bool,
+) -> None:
+    """Disk-loaded source and P2P-loaded target must produce identical output."""
+    if not expect_mtp:
+        pytest.skip("MTP output consistency assertion not enabled")
+
+    source_text = _assert_inference(
+        namespace,
+        "mx-source",
+        model,
+        remote_port=source_port,
+        local_port=18003,
+        deterministic=True,
+    )
+    target_text = _assert_inference(
+        namespace,
+        "mx-target",
+        model,
+        remote_port=worker_port,
+        local_port=18004,
+        deterministic=True,
+    )
+    assert target_text == source_text, (
+        "MTP source/target completions differ for the deterministic prompt: "
+        f"source={source_text!r}, target={target_text!r}"
+    )
 
 
 def _assert_target_vram_matches_source(

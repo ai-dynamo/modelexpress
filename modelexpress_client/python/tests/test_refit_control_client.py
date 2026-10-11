@@ -12,6 +12,7 @@ from modelexpress_rl import (
     ObjectStorageType,
     WeightPayloadFormat,
     WeightVersionState,
+    TrainerTensorsMetadata,
     refit_pb2,
     refit_pb2_grpc,
 )
@@ -20,6 +21,38 @@ from modelexpress_rl import (
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
     def __init__(self) -> None:
         self.version = None
+        self.mesh = None
+
+    def CreateTrainerMesh(self, request, _context):
+        self.mesh = refit_pb2.TrainerMesh(
+            mesh_id="mesh-a",
+            model_name=request.model_name,
+            generation=1,
+            workers=request.workers,
+        )
+        return refit_pb2.CreateTrainerMeshResponse(mesh=self.mesh)
+
+    def GetTrainerMesh(self, request, context):
+        if self.mesh is None or request.mesh_id != self.mesh.mesh_id:
+            context.abort(grpc.StatusCode.NOT_FOUND, "mesh not found")
+        return refit_pb2.GetTrainerMeshResponse(mesh=self.mesh)
+
+    def UpdateTrainerMesh(self, request, context):
+        if self.mesh is None or request.mesh_id != self.mesh.mesh_id:
+            context.abort(grpc.StatusCode.NOT_FOUND, "mesh not found")
+        if request.expected_generation != self.mesh.generation:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "stale generation")
+        self.mesh.generation += 1
+        self.mesh.workers.clear()
+        for worker_id, metadata in request.workers.items():
+            self.mesh.workers[worker_id].CopyFrom(metadata)
+        return refit_pb2.UpdateTrainerMeshResponse(mesh=self.mesh)
+
+    def DeleteTrainerMesh(self, request, context):
+        if self.mesh is None or request.mesh_id != self.mesh.mesh_id:
+            context.abort(grpc.StatusCode.NOT_FOUND, "mesh not found")
+        self.mesh = None
+        return refit_pb2.DeleteTrainerMeshResponse()
 
     def CreateWeightVersion(self, request, _context):
         self.version = refit_pb2.WeightVersion(
@@ -27,7 +60,6 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             model_name=request.model_name,
             idempotency_key=request.idempotency_key,
             payload_format=request.payload_format,
-            expected_source_slots=request.expected_source_slots,
             state=request.state,
             created_at_unix_ms=1234,
         )
@@ -35,7 +67,18 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             self.version.base_version_id = request.base_version_id
         if request.HasField("object_storage"):
             self.version.object_storage.CopyFrom(request.object_storage)
+        if request.HasField("trainer_mesh_id"):
+            self.version.trainer_mesh_id = request.trainer_mesh_id
+        if request.HasField("version_number"):
+            self.version.version_number = request.version_number
         return refit_pb2.CreateWeightVersionResponse(version=self.version)
+
+    def ListWeightVersions(self, request, _context):
+        versions = []
+        if self.version is not None and self.version.model_name == request.model_name:
+            if not request.HasField("trainer_mesh_id") or self.version.trainer_mesh_id == request.trainer_mesh_id:
+                versions.append(self.version)
+        return refit_pb2.ListWeightVersionsResponse(versions=versions)
 
     def GetWeightVersion(self, request, context):
         if self.version is None or request.uid != self.version.uid:
@@ -55,12 +98,106 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         return refit_pb2.UpdateWeightVersionStateResponse(version=self.version)
 
 
+def test_weight_version_required_fields_precede_optional_fields():
+    from dataclasses import MISSING, fields
+
+    optional_seen = False
+    for field in fields(control_module.WeightVersion):
+        if field.default is MISSING:
+            assert not optional_seen
+        else:
+            optional_seen = True
+    version = control_module.WeightVersion(
+        version_id="version-a",
+        model_name="test/model",
+        payload_format=WeightPayloadFormat.FULL_TENSOR,
+        layout_signature="",
+        state=WeightVersionState.STAGING,
+        created_at_unix_ms=1234,
+    )
+    assert version.base_version_id is None
+    assert version.object_storage is None
+    assert version.trainer_mesh_id is None
+    assert version.version_number is None
+
+
 def test_control_client_rejects_missing_version_response():
     with pytest.raises(RuntimeError, match="GetWeightVersion.*missing version"):
         control_module._response_version(
             refit_pb2.GetWeightVersionResponse(),
             "GetWeightVersion",
         )
+
+
+def test_control_client_manages_trainer_mesh():
+    service = _RefitService()
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    control = ModelExpressControlClient.connect(server_url=f"127.0.0.1:{port}")
+    try:
+        created = control.create_trainer_mesh(
+            model_name="test/model",
+            idempotency_key="run-a",
+            workers={"worker-a": TrainerTensorsMetadata("shard-a", "worker-a:5000")},
+        )
+        fetched = control.get_trainer_mesh(created.mesh_id)
+        updated = control.update_trainer_mesh(
+            mesh_id=created.mesh_id,
+            expected_generation=created.generation,
+            workers={"worker-b": TrainerTensorsMetadata("shard-a", "worker-b:5000")},
+        )
+        with pytest.raises(grpc.RpcError) as stale:
+            control.update_trainer_mesh(
+                mesh_id=created.mesh_id,
+                expected_generation=created.generation,
+                workers={"worker-c": TrainerTensorsMetadata("shard-a", "worker-c:5000")},
+            )
+        control.delete_trainer_mesh(created.mesh_id)
+    finally:
+        control.close()
+        server.stop(grace=None).wait()
+
+    assert fetched == created
+    assert created.workers == {"worker-a": TrainerTensorsMetadata("shard-a", "worker-a:5000")}
+    assert updated.generation == created.generation + 1
+    assert updated.workers == {"worker-b": TrainerTensorsMetadata("shard-a", "worker-b:5000")}
+    assert stale.value.code() is grpc.StatusCode.FAILED_PRECONDITION
+
+
+def test_control_client_links_version_to_trainer_mesh():
+    service = _RefitService()
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    control = ModelExpressControlClient.connect(server_url=f"127.0.0.1:{port}")
+    try:
+        version = control.create_weight_version(
+            model_name="test/model",
+            idempotency_key="step-a",
+            payload_format=WeightPayloadFormat.FULL_TENSOR,
+            trainer_mesh_id="mesh-a",
+            version_number=7,
+        )
+        fetched = control.get_weight_version(version.version_id)
+        assert control.list_weight_versions(model_name="test/model", trainer_mesh_id="mesh-a") == [version]
+        assert control.list_weight_versions(model_name="other/model") == []
+        assert control.list_weight_versions(model_name="test/model", trainer_mesh_id="other-mesh") == []
+        with pytest.raises(ValueError, match="trainer_mesh_id is required"):
+            control.create_weight_version(
+                model_name="test/model",
+                idempotency_key="step-b",
+                payload_format=WeightPayloadFormat.FULL_TENSOR,
+            )
+    finally:
+        control.close()
+        server.stop(grace=None).wait()
+
+    assert version.trainer_mesh_id == "mesh-a"
+    assert version.version_number == 7
+    assert fetched == version
 
 
 def test_control_client_owns_global_weight_version_lifecycle():
@@ -76,10 +213,7 @@ def test_control_client_owns_global_weight_version_lifecycle():
             model_name="test/model",
             idempotency_key="training-step-7",
             payload_format=WeightPayloadFormat.FULL_TENSOR,
-            expected_source_slots=[
-                "publisher:global-rank:0",
-                "publisher:global-rank:1",
-            ],
+            trainer_mesh_id="mesh-a",
         )
         fetched = control.get_weight_version(created.version_id)
         ready = control.update_weight_version_state(
@@ -94,10 +228,7 @@ def test_control_client_owns_global_weight_version_lifecycle():
 
     assert created.ref.version_id == "version-a"
     assert created.payload_format is WeightPayloadFormat.FULL_TENSOR
-    assert created.expected_source_slots == (
-        "publisher:global-rank:0",
-        "publisher:global-rank:1",
-    )
+    assert created.trainer_mesh_id == "mesh-a"
     assert created.state is WeightVersionState.STAGING
     assert fetched == created
     assert ready.state is WeightVersionState.READY
@@ -143,7 +274,6 @@ def test_control_client_round_trips_object_storage_source(storage_type, uri):
         uri=uri,
     )
     assert created.version_id == "caller-version"
-    assert created.expected_source_slots == ()
     assert created.state is WeightVersionState.READY
 
 
@@ -175,6 +305,16 @@ def test_control_client_round_trips_full_hf_checkpoint():
     assert created.base_version_id is None
 
 
+def test_expected_source_slots_is_removed_from_public_contract():
+    import inspect
+
+    assert "expected_source_slots" not in refit_pb2.WeightVersion.DESCRIPTOR.fields_by_name
+    assert "expected_source_slots" not in refit_pb2.CreateWeightVersionRequest.DESCRIPTOR.fields_by_name
+    assert "expected_source_slots" not in inspect.signature(
+        ModelExpressControlClient.create_weight_version
+    ).parameters
+
+
 def test_control_client_validates_framework_inputs_before_rpc():
     control = ModelExpressControlClient.connect(server_url="127.0.0.1:1")
     try:
@@ -190,13 +330,13 @@ def test_control_client_validates_framework_inputs_before_rpc():
                 model_name="test/model",
                 idempotency_key="attempt-a",
                 payload_format=WeightPayloadFormat.UNSPECIFIED,
-                expected_source_slots=["rank:0"],
             )
         with pytest.raises(ValueError, match="uid"):
             control.create_weight_version(
                 model_name="test/model",
                 idempotency_key="attempt-a",
                 payload_format=WeightPayloadFormat.FULL_TENSOR,
+                trainer_mesh_id="mesh-a",
                 uid=" ",
             )
     finally:

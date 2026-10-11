@@ -125,6 +125,13 @@ The chart creates a `ClusterRole` and `ClusterRoleBinding`, allowing the server
 to run in a dedicated namespace while accessing metadata resources in another
 namespace.
 
+The Kubernetes backend also needs the projected service account token to
+authenticate against the API server. The chart's `values.yaml` currently
+sets `serviceAccount.automount: false`; if the `serviceAccount.automount`
+key is absent from `values.yaml`, it defaults to `true`. Set
+`serviceAccount.automount: true` explicitly when using the Kubernetes
+backend.
+
 For automatic cleanup of P2P metadata, expose the client Pod identity through
 the Kubernetes Downward API. The checked-in vLLM, SGLang, and Dynamo manifests
 already include these fields:
@@ -224,6 +231,15 @@ Cache directory resolution for NGC: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `~/.cache
 GCS uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DIRECTORY` overrides it. Cached GCS models are stored under `<cache>/gcs/<bucket>/<object-prefix>`. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for provider internals.
 
 See [`CLI.md`](CLI.md) for full CLI usage documentation.
+
+### Generator refit checkpoint cache
+
+`refit_checkpoint_max_size_gb` defaults to 2000 GB per model. At initialization,
+the generator caps this quota at existing cache bytes plus free disk space and
+logs any reduction. Free space is checked again before known writes and copies,
+including when `null` disables the configured quota. See the
+[S3 refit cache configuration](S3_DELTA_WEIGHT_REFIT.md#refit_checkpoint_dir)
+for setup and eviction behavior.
 
 ## ServiceAccount Authentication
 
@@ -535,6 +551,80 @@ deploy, and need `metrics.clientPodMonitor` with a selector you supply.
 See [METRICS.md](METRICS.md) for the discovery models, the alert runbook and the
 dashboard.
 
+### FSDP refit tensor precision
+
+The FSDP publisher transfers floating tensors in BF16 by default. Frameworks
+whose models require higher precision for selected tensors can provide exact
+state-dict names through the trainer context:
+
+```python
+import torch
+from modelexpress_rl import FSDPTrainerContext, ModelExpressTrainerConfig
+
+config = ModelExpressTrainerConfig(
+    engine_context=FSDPTrainerContext(
+        wire_dtype_overrides={"model.layers.0.mlp.router.selection_bias": torch.float32},
+    ),
+    model_name="my-model",
+    device_id=0,
+    server_url="localhost:8001",
+)
+```
+
+Model-specific name selection belongs to the framework. Overrides accept
+`torch.float16`, `torch.bfloat16`, and `torch.float32`; these are unquantized
+tensor dtypes, not packed FP8/FP4 format support. Other tensors retain the BF16
+default. An unknown name or non-floating tensor is rejected rather than silently
+ignoring a precision exception. Names must match the state dict supplied by that
+trainer, including any wrapper prefixes.
+
+`COPY_TO_HOST` and `COPY_TO_DEVICE` register persistent buffers in each selected
+dtype and copy subsequent versions into those buffers. `IN_PLACE` requires the source dtype to
+match the selected dtype. The adapter copies the override mapping at creation;
+changing the caller's mapping does not change an active adapter. A source dtype
+change after initialization is rejected before writing a new version. Recreate
+the adapter and rebind when the model's precision policy changes.
+
+Manifests describe each served tensor's dtype and element size, and byte totals
+sum their actual sizes. Existing receiver dtype conversion remains available,
+but casting a rounded BF16 value back to FP32 cannot recover source precision.
+Verify installed parameters and generation separately from transfer completion.
+
+### Choosing trainer staging for synchronous refits
+
+Choose an existing `TrainerStagingMode` explicitly for the integration:
+
+| Mode | Recommendation | Lifetime and memory cost |
+|---|---|---|
+| `IN_PLACE` | First choice and lowest staging latency for synchronous integrations. Trainers wait for receivers to finish and retire/delete the version before updating its source bytes. | Registers existing contiguous storage without a second weight copy. Addresses must remain stable across updates; bytes must remain immutable while the version can be read. |
+| `COPY_TO_HOST` | First choice when `IN_PLACE` is unavailable, including trainer-side dtype conversion or moving source storage. | Keeps a persistent wire-format copy in pinned host RAM on CUDA hosts. GPU-to-host staging and host-to-receiver transfer add latency, but avoid a persistent second weight copy in VRAM. |
+| `COPY_TO_DEVICE` | Explicit exception when measured latency justifies the VRAM cost, typically for small models where `IN_PLACE` is unavailable. | Keeps an additional wire-format copy on the trainer device. It is generally faster than host staging but can consume substantial VRAM; budget all rank-local shards, including replicated tensors. |
+
+`IN_PLACE` cannot perform trainer-side conversion: each source must already have
+the selected transfer dtype and representation. A conversion plugin also rules
+out this mode. CPU offload or state-dict rematerialization can invalidate its
+stable-address requirement even when the dtypes match. Do not silently fall back
+to a device copy when these checks fail.
+
+The FSDP adapter supports all three modes for full-tensor payloads. Host staging
+preserves the per-tensor dtype overrides above and registers its persistent CPU
+buffers once. CUDA copy completion is fenced before publication; the served
+snapshot and its registration remain live until version retirement. Conversion
+can still require temporary device workspace; host staging eliminates the
+persistent wire-format device copy, not every transient allocation. Support for
+arbitrary conversion plugins remains adapter-specific.
+
+FP32 trainer shards transferred as BF16 with selected FP32 exceptions require
+conversion, so they cannot use `IN_PLACE`. Use `COPY_TO_HOST` for this precision
+policy unless a measured latency requirement justifies the additional VRAM
+needed by `COPY_TO_DEVICE`.
+
+Trainer `COPY_TO_HOST` is independent of the generator's `staging_device="cpu"`
+setting: the former changes where source snapshots live, while the latter
+changes where receivers land incoming bytes. Host-source manifests use the
+internal `mx.reshard.shard_table.v2` format, so both ends must run a host-aware
+client. Older readers reject this format. Device-only manifests retain v1.
+
 ### Dynamo Model Cache Deployment
 
 For deploying ModelExpress alongside Dynamo with a vLLM worker:
@@ -628,6 +718,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 |----------|---------|-------------|
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client's gRPC server address (recommended; ignored when client uses `k8s-service` backend) |
+| `MX_MODEL_NAME_OVERRIDE` | (unset) | Override vLLM's MX model identity without changing its model-loading path. Set before worker startup and use the same name for RL trainers and WeightVersions. Unset or empty preserves vLLM's configured model path/ID, including rewritten S3 cache paths. See [S3 Delta Weight Refit](S3_DELTA_WEIGHT_REFIT.md). |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Initial-load policy. `RL` uses exact desired-version P2P and canonical S3 replay when `MX_REFIT_DESIRED_VERSION_UID` is set; otherwise it tries `MX_MODEL_URI` and then the engine-native loader. vLLM speculative draft models are rejected because the desired UID identifies only the main model. |
 | `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact immutable version required by the RL initial-load policy. When set, startup fails if neither desired-version P2P nor S3 replay succeeds; version-agnostic fallbacks are not allowed. |
@@ -640,6 +731,8 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_P2P_TOPOLOGY_LEVELS` | (unset) | For `topology_aware`. Comma-separated **Grove `ClusterTopology` domains**, broad → narrow, matching the cluster's `clustertopologies.grove.io` `spec.levels` order. Domains are the fixed set `region,zone,datacenter,block,rack,host,numa` (a level outside this set still works but is logged, since it would misalign this node's map with the fleet). Typical inter-node RDMA set: `region,zone,datacenter,block,rack`. Unset or empty → defaults to the full Grove order `region,zone,datacenter,block,rack,host,numa`, so `topology_aware` still ranks. It is this node's `MX_P2P_TOPOLOGY` being unset that collapses the policy to `rendezvous_hash`. |
 | `MX_P2P_TOPOLOGY` | (unset) | For `topology_aware`. This node's `{domain: value}` map as JSON, e.g. `{"block":"b1","rack":"r3","host":"node7"}`, populated by the operator from the node's labels using the `ClusterTopology` domain→key mapping. Published once at registration and surfaced on `SourceInstanceRef.topology`. Unset/unparseable → this node shares no domain (rendezvous ordering). |
 | `MX_P2P_TOPOLOGY_LOAD_WEIGHT` | `0.0` (falls back to `MX_P2P_LOAD_WEIGHT`) | For `topology_aware`. When `> 0`, the within-tier tiebreak becomes `unit_hash − w·source_load` (source_load read defensively), so within a locality tier selection also steers away from busy sources — composing topology- and load-aware selection. If left unset, it falls back to `MX_P2P_LOAD_WEIGHT` (the load_aware weight) when that feature is deployed, so a single knob turns on both. `0` keeps the pure rendezvous jitter. Clamped to finite `≥ 0`. |
+| `MX_P2P_TOPOLOGY_DOMAIN` | (unset) | Transfer-domain policy, independent of `MX_P2P_SOURCE_SELECTOR`. Names the topology domain (e.g. `zone`) a source must share with this node. This node's value comes from `MX_P2P_TOPOLOGY` or the Dynamo topology mount (`DYN_TOPOLOGY_MOUNT_PATH`, default `/etc/dynamo/topology`), polled for up to 30s under `required` (once per process, shared by load and publish; `preferred` reads it once without waiting) because the Dynamo operator populates the mount after scheduling. Use `zone` on AWS: EFA traffic cannot cross Availability Zones. Unset disables the policy. |
+| `MX_P2P_TOPOLOGY_ENFORCEMENT` | `required` | For `MX_P2P_TOPOLOGY_DOMAIN`. `required` drops every source outside this node's domain value (and sources that published none) before the retry slice; if this node's own value is unknown, RDMA is skipped and the load falls through to the next strategy. `preferred` keeps all sources but moves same-domain ones first, preserving the selector's order within each group. Any other value logs a warning and is treated as `required`. |
 | `MX_METRICS_ENABLED` | `0` | Opt-in Prometheus metrics collector for the client. `1` enables the collectors (requires the `metrics` extra, `prometheus-client`, which the vLLM, SGLang and TensorRT-LLM engine images already provide). Off by default; selection signals are always emitted as structured logs regardless. See [METRICS.md](METRICS.md). |
 | `PROMETHEUS_MULTIPROC_DIR` | (unset) | Pod-local directory shared by every rank, so one endpoint serves the merged union of all of them. **Required on any pod with more than one worker process**, and it must be set in the pod manifest: `prometheus_client` latches its value class at import, so assigning it from Python produces zero data with no error. Wipe it at the container entrypoint with `python -m modelexpress.metrics --reset`, never from worker code. |
 | `MX_METRICS_PORT` | (unset) | With metrics enabled, serve a pull `/metrics` endpoint on this port. One rank per pod wins the bind and serves every rank's data; the rest re-attempt periodically so the endpoint migrates if the winner exits. |
@@ -664,7 +757,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses the same artifact path for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer. |
 | `MX_ARTIFACT_TRANSFER_CHUNK_SIZE` | `67108864` | Artifact transfer chunk size in bytes. Default is 64 MiB; maximum is 4 GiB. Larger values reduce manifest/RPC overhead but increase registered DRAM buffer memory, approximately `chunk_size * max_inflight_chunks` per source and target worker. |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
+| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for decentralized backends where no central coordinator tracks versions. |
@@ -675,6 +768,14 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_METADATA_NAMESPACE` | `default` | K8s namespace for CRD backend |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms (2 hours for large models) |
 | `VLLM_PLUGINS` | - | For vLLM versions older than 0.23.0, set to `modelexpress` to register the `modelexpress` and `mx` loaders. vLLM 0.23.0 and newer recognize the load format natively. |
+
+**Restricting P2P to one Availability Zone.** Set `MX_P2P_TOPOLOGY_DOMAIN=zone` (enforcement defaults to `required`). On a Dynamo-managed cluster the zone needs no MX wiring: setting `spec.experimental.kvTransferPolicy` on the DynamoGraphDeployment to `{labelKey: topology.kubernetes.io/zone, domain: zone}` makes the operator copy the node's zone label onto each worker pod and project it to `/etc/dynamo/topology/zone`, which MX reads. Use `enforcement: preferred, preferredWeight: 0` there to get the mount without changing Dynamo's prefill/decode routing. Roll out in this order, because under `required` a source with no published zone is ineligible and the target silently loads from disk:
+
+1. The server (and, for the Kubernetes backend, the CRDs). A server that predates `SourceInstanceRef.topology` drops it, so every source looks zone-less.
+2. Every source, onto a client that publishes topology and with the zone mount in place. A source on a client from before topology metadata never publishes a zone.
+3. Targets with `MX_P2P_TOPOLOGY_DOMAIN`. Alternatively, run `MX_P2P_TOPOLOGY_ENFORCEMENT=preferred` until every source has republished, then switch to `required`.
+
+When `required` leaves no source although some passed the accelerator check, the client logs `No P2P source shares <domain>=...` with how many sources published no zone and how many are in another one.
 
 **Combining topology- and load-aware selection.** To rank primarily by RDMA locality *and* steer away from busy sources within each locality tier, set `MX_P2P_SOURCE_SELECTOR=topology_aware` and a non-zero blend weight (`MX_P2P_TOPOLOGY_LOAD_WEIGHT`, or just `MX_P2P_LOAD_WEIGHT` since topology falls back to it). Locality is always the primary key — a closer source outranks a farther one regardless of load; the load term only orders equidistant peers.
 
@@ -858,7 +959,17 @@ handles.
 
 ### P2P Metadata Exchange
 
-P2P metadata exchange is enabled by default. Source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch tensor manifests or artifact manifests directly from the source worker rather than pulling them through the central store. For file-backed cache artifacts, targets also call `PrepareArtifactChunk` and `ReleaseArtifactChunk` on this worker service while bytes move through NIXL into target-local staging, then install the staged artifact into the runtime cache directory. The division of responsibility depends on which metadata backend is in use:
+P2P metadata exchange is enabled by default. Source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch tensor manifests or artifact manifests directly from the source worker rather than pulling them through the central store. RL generator-to-generator active refit calls `PrepareTensorRead` while preparing the update, then holds the bounded lease until the staged update is released or the NIXL transfer completes. These donor-timed leases protect the donor's live tensor storage while another generator reads it; the donor drains existing readers before overwriting that storage, and if the drain times out, refit fails before mutation. Completion and ordinary failures release immediately. A pre-transfer retry obtains a fresh lease and revalidates the exact source version and worker instead of reusing the consumed manifest. If the target pod exits without cleanup because of `SIGKILL`, OOM, or node loss, the donor expires the abandoned lease after its bounded lifetime. Ordinary inference loading continues to use `GetTensorManifest` without this RL-specific mutation fence. For file-backed cache artifacts, targets call `PrepareArtifactChunk` and `ReleaseArtifactChunk` while bytes move through NIXL into target-local staging, then install the staged artifact into the runtime cache directory. The division of responsibility depends on which metadata backend is in use:
+
+Active refit of a generator that publishes runtime tensors requires this default P2P metadata path. With `MX_P2P_METADATA=0`, ModelExpress cannot account for readers of tensor addresses stored in the central coordinator, so it fails the refit before mutation instead of risking a mixed-version transfer.
+
+Generator-to-generator active refit validates the peer first, then receives
+directly into the target's registered live runtime tensors at the engine safe
+point. It does not allocate a second model-sized GPU buffer. If that direct
+transfer fails after mutation starts, ModelExpress marks the engine state
+uncertain; reset or restart the worker before serving or retrying. Quantized
+models and FP8 KV-cache configurations use canonical object-storage refit because
+their non-tensor derived state cannot currently be refreshed by a direct copy.
 
 - **Central-coordinator backends (`redis`, `kubernetes`):** the source publishes only a lightweight pointer (its `worker_grpc_endpoint` and NIXL listen address) to the central server, and targets use that pointer to connect directly to the source for the MB-scale data. Set `MX_P2P_METADATA=0` to publish full tensor metadata (NIXL blobs + tensor descriptors) to the central server instead. Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the server's metadata; no configuration is needed on the target side.
 - **`k8s-service` backend:** auto-enabled for tensor metadata. The backend declares itself decentralized (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P tensor path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly. File-backed artifact transfer currently requires a central-coordinator backend (`redis` or `kubernetes`) because `k8s-service` does not yet publish `artifact_source` discovery metadata.
@@ -995,6 +1106,21 @@ for the next delta. The cadence is disabled by default. Slime exposes
 `full_hf_checkpoint_interval` in `--modelexpress-config`. In both cases, `N`
 counts published ModelExpress weight versions.
 
+The `vime_dynamo_delta_refit` and `dynamo_vllm_s3_delta_refit` Kubernetes examples
+use a disposable SeaweedFS 4.48 S3 fixture. Both manifests pin the upstream
+public `docker.io/chrislusf/seaweedfs` image by digest and run `weed mini` with
+S3 on port 9000. The `mx-s3-creds` Secret supplies `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` to both SeaweedFS and the S3 clients; Vime CI creates
+this Secret before deploying the stack. The `/healthz` readiness probe checks
+that the S3 listener is serving; it does not validate the backing storage.
+Data stays in an `emptyDir` volume. Volume counts are bounded for the 64 GiB
+Vime and 16 GiB lifecycle fixtures, with 1 GiB SeaweedFS volumes.
+Each storage pod requests 1 GiB of memory and has a 4 GiB limit for concurrent
+trainer multipart uploads. `GOMEMLIMIT=3GiB` leaves headroom below that limit;
+the previous 1 GiB container limit is insufficient for two trainer ranks.
+The Vime CI smoke test consumes the example manifest directly; update both
+manifests together when changing the fixture image.
+
 ### Server-Backed Model Cache (No Shared Storage)
 
 For workers that cannot reach the Hugging Face Hub themselves, ModelExpress Server can act as the only route to the model. The worker asks the server for repository files; the server downloads the model once on a cold miss and serves every later worker from its own cache.
@@ -1035,7 +1161,7 @@ Requirements and limits:
 
 ### InstantTensor (Fast Local Safetensors)
 
-InstantTensor loads the model's own safetensors directly onto CUDA using distributed loading, pipelined prefetching, and direct I/O, with GPUDirect Storage when the hardware supports it. It follows server-backed loading in the fixed chain: when no peer source is already serving, ModelExpress tries server cache first when no-shared-storage mode is enabled, then uses InstantTensor when eligible before falling back to ModelStreamer, GDS, or the native loader. Unlike ModelStreamer it needs no `MX_MODEL_URI`; it reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves the model's weight files (downloading from the Hugging Face Hub into the local cache first if they are not already local).
+InstantTensor loads the model's own safetensors directly onto CUDA using distributed loading, pipelined prefetching, and direct I/O, with GPUDirect Storage when the hardware supports it. It follows server-backed loading in the fixed chain: when no peer source is already serving, ModelExpress tries server cache first when no-shared-storage mode is enabled, then uses InstantTensor when eligible before falling back to ModelStreamer, GDS, or the native loader. Unlike ModelStreamer it needs no `MX_MODEL_URI`; it reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves the model's weight files (downloading from the Hugging Face Hub into the local cache first if they are not already local). When `MX_MODEL_URI` uses `s3://`, `gs://`, or `az://`, ModelExpress skips InstantTensor so ModelStreamer can handle that remote source directly.
 
 The strategy is enabled by default. The `instanttensor` package is a core dependency on Linux (installed automatically alongside `runai-model-streamer`), so no extra install step is needed. The strategy activates on a CUDA device **when the engine adapter implements the InstantTensor capability**. Currently only the vLLM adapter implements it; on engines that do not (for example SGLang today), the strategy falls through even when `instanttensor` and a CUDA device are available. If the package is unavailable (for example on a non-Linux platform) the chain simply skips to the next strategy.
 
@@ -1133,6 +1259,35 @@ kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/client/vllm/vllm-multi-
 ```
 
 See [`../examples/p2p_transfer_k8s/README.md`](../examples/p2p_transfer_k8s/README.md) for the full P2P transfer guide including architecture, prerequisites, and performance expectations.
+
+#### Sharing One Server Across Namespaces
+
+Workers do not have to run in the server's namespace. One server can back workers in several workload namespaces, and every worker that talks to it joins the same P2P source pool — a namespace added later boots over RDMA from the workers already registered with that server instead of reading the weights from storage. Running a separate server per namespace splits the pool instead: each namespace then loads from storage on its first start and shares sources only within itself.
+
+Only the worker's server address changes. A worker outside the server's namespace has to qualify the Service name with the server's namespace, because the Pod's DNS search path resolves a bare name only within its own namespace:
+
+```yaml
+# Worker pods, in any namespace.
+# <server-service>   the server's Service name — "modelexpress-server" in the
+#                    example manifests, the Helm release's fullname when installed
+#                    from the chart.
+# <server-namespace> the namespace that Service lives in, not the worker's.
+env:
+  - name: MX_SERVER_ADDRESS
+    value: "<server-service>.<server-namespace>.svc.cluster.local:8001"
+  - name: MODEL_EXPRESS_URL   # deprecated alias; keep identical during the transition
+    value: "<server-service>.<server-namespace>.svc.cluster.local:8001"
+```
+
+For a server deployed as `modelexpress-server` in a namespace named `modelexpress`, that is `modelexpress-server.modelexpress.svc.cluster.local:8001`. Workers that do run in the server's namespace can keep the short `modelexpress-server:8001` used by the example manifests.
+
+`MX_METADATA_NAMESPACE` is a server setting, not a worker one: it selects the namespace the server writes `ModelMetadata` and `ModelCacheEntry` CRs into, and the client does not read it. The metadata RBAC in [Distributed backend selection](#distributed-backend-selection) is likewise needed only by the server — workers publish and list sources over gRPC and never call the Kubernetes API, and the weight transfer is Pod-to-Pod RDMA. The source pool is scoped by the server a worker connects to and by `SourceIdentity`, not by the worker's own namespace.
+
+Three consequences:
+
+- **Ownership falls back to the reaper.** Kubernetes does not let a Pod own a namespaced object in another namespace, so `ModelMetadata` CRs published by workers outside the server's `MX_METADATA_NAMESPACE` carry no `ownerReference` — the cross-namespace identity behavior described under [Distributed backend selection](#distributed-backend-selection). Rather than disappearing with the Pod, those records go STALE after `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s) and are garbage-collected after `MX_GC_TIMEOUT_SECS` (default 3600s); see [Source Lifecycle](metadata.md#source-lifecycle). Setting `POD_NAME` / `POD_UID` / `POD_NAMESPACE` on such workers is harmless — ignored for ownership, and used if the worker later moves into the server's namespace.
+- **The auth allowlist is per ServiceAccount.** `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` is an exact-match list of `<namespace>:<serviceaccount>`, so under `enforce` a shared server needs one entry per allowed ServiceAccount in each workload namespace — two entries for `vllm:worker` and `vllm:router`, not one for `vllm`. Every workload namespace adds its own entries. See [ServiceAccount Authentication](#serviceaccount-authentication).
+- **Model files stay per namespace.** PersistentVolumeClaims are namespaced, and the engine reads the model's config and tokenizer from the `--model` path even when every weight arrives over RDMA. That path must still resolve inside the worker's own namespace.
 
 #### K8s-Service-Routed Backend
 
@@ -1273,7 +1428,433 @@ kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/co
 
 ## Performance Reference
 
+### Bounded GPU refit
+
+Framework integrations choose the public staging, installation and memory
+settings. The framework also owns the safe update point and the pause/restart
+policy described below.
+
+| Integration choice | Public setting or operation |
+| --- | --- |
+| Trainer storage | Set `ModelExpressTrainerConfig.staging_mode` explicitly. Prefer `IN_PLACE` when its lifetime and dtype requirements hold; otherwise start with `COPY_TO_HOST`. |
+| Generator installation | Use `stage_weight()` followed by `apply_weight()`, then release the handle. Bounded staging defers batch reads until apply. |
+| Receiver memory | Set `ModelExpressGeneratorConfig.staging_buffer_bytes` per buffer and `staging_buffers_count` for bounded installation. `staging_device` selects host or device receive memory. |
+
+For unquantized vLLM models whose weights leave insufficient memory for a second
+complete weight copy, initialize the generator with
+`source_order=(WeightSource.TRAINER,)` and bounded staging:
+
+```python
+generator = ModelExpressGeneratorClient.initialize(
+    ModelExpressGeneratorConfig(
+        engine_context=engine_context,
+        model_name=model_name,
+        source_order=(WeightSource.TRAINER,),
+        staging_buffer_bytes=4 * 1024**3,
+        staging_buffers_count=2,
+        staging_device="cuda",  # or "cpu" for pinned host staging
+    )
+)
+# Pause generation on every replica before installing live weights.
+staged = generator.stage_weight(version=WeightVersionRef(version_uid))
+try:
+    metrics = generator.apply_weight(staged)
+finally:
+    staged.release()
+# Resume only after every replica completes successfully.
+```
+
+This API interleaves NIXL reads and per-module installation. It supports mixed
+floating-point wire/engine dtypes through the existing conversion planner. The
+per-buffer limit covers receive, conversion, full-pull scratch, and alignment.
+Total arena capacity is `staging_buffer_bytes * staging_buffers_count` per
+generator worker. A module larger than one buffer fails during preparation. Engine
+post-load workspaces and live weights require additional headroom; the limit is
+not a total process-memory cap.
+
+`staging_device` selects where the arenas live. `"cuda"` (default) lands RDMA
+in VRAM and commits with a device copy. `"cpu"` allocates pinned host memory,
+registers it as NIXL DRAM, and commits with a host-to-device copy, so the arena
+costs no VRAM. Host staging adds a host-to-device copy and depends on the
+available host-memory and CPU-to-GPU bandwidth. `staging_buffers_count=2` posts the
+next batch's READ into the other arena before the current batch is committed,
+allowing transfer and installation to overlap. The benefit depends on the
+hardware and the relative transfer and installation times; it does not guarantee
+that the copy is hidden. Host arenas are an option for VRAM-constrained
+deployments. Changing either option between updates is a workspace switch (see
+below).
+
+Any failure requires keeping the deployment paused and restarting its engines.
+Some modules may already contain the new version, so a failed operation cannot
+be treated as a usable old version. The framework owns this pause/restart policy.
+Quantized engines, generator-peer publication, and object-storage delta replay
+are not supported by this API. Trainer-source `stage_weight()` keeps its
+full-copy behavior.
+After releasing an update, callers can switch between full-copy and bounded
+staging on the same trainer-only client. A mode switch disconnects the NIXL
+agent and deregisters its workspace before freeing the old buffers, then
+reinitializes registrations and plans for the new mode. Same-mode updates retain
+their reusable workspace. Never switch while an update handle remains active.
+
+Streaming preparation retries transient RPC, runtime, and manifest-validation
+failures up to `max_transfer_attempts`, keeping the version lease across attempts.
+Failed preparation storage is reset before retrying; a reset failure requires an
+engine restart. Once installation starts, failures are not automatically retried.
+Release errors remain visible to callers, but a locally released update no longer
+holds the client's active slot even when lease deletion fails.
+Metrics include `staging_peak_bytes`, `batches`, `bytes_received`, `wire_s`, and
+`reconstruct_s`. `wire_s` measures READ posting through completion observation;
+`wire_wait_s` measures the blocking completion wait. With two arenas, a READ can
+overlap the previous batch's installation, so wire and installation times must
+not be added as disjoint intervals. GPU validation is required for each target
+model and topology before performance qualification.
+
+Streaming reports independent `streaming_total_s`, `streaming_prepare_s`,
+`streaming_apply_s`, and `streaming_release_s` intervals. Preparation contains
+`source_metadata_s`, `layout_capture_s`, `transfer_planning_s`, and
+`connection_registration_s`; the remaining preparation time includes version
+discovery and lease/control operations. Application contains NIXL `wire_s`,
+`reconstruct_s`, `install_commit_s` (including CUDA completion), `reload_s`, and
+`post_install_sync_s`. In the generic installer, vLLM's post-load processing
+refreshes attention-derived weights within `reload_s`. The ordinary
+`perf/mx_receive_install_time` is not emitted for streaming installation because
+its application interval includes network reads. With refit timing enabled,
+DIRECT updates emit the same stage record as staged updates. The installation
+stage's `materialization_s`, `receive_copy_s`, and `post_load_processing_s`
+metadata report host-call durations inside the native engine lifecycle. They
+exclude subsequent CUDA completion waits and are not standalone GPU latencies.
+Do not sum nested parent and child intervals or maxima from different ranks.
+Preserve raw samples and expose residual/unattributed time against the independent
+total rather than describing the entire streaming operation as wire or install.
+
+### Reference transfer results
+
 | Model | Total Data | Transfer Time | Per-Worker Speed |
 |-------|-----------|---------------|------------------|
 | DeepSeek-V3 (671B, FP8) | 681 GB (8 GPUs) | ~15 seconds | ~45 Gbps |
 | Llama 3.3 70B | 140 GB (8 GPUs) | ~5 seconds | ~28 Gbps |
+
+### Internal streaming cache controls
+
+Benchmarks record the following implementation switches in their experiment
+manifest. They are internal qualification controls, separate from the public
+integration choices above. Integrations should not expose cache algorithms as
+application configuration. This table records the existing controls and defaults;
+it does not establish a stable configuration API.
+
+| Internal environment variable | Default | Qualification purpose |
+| --- | --- | --- |
+| `MX_REFIT_CACHE_RESOLVED_SOURCES` | `0` | Reuse decoded, merged source tables only when every ordered manifest byte matches. |
+| `MX_REFIT_CACHE_BOUNDED_PLANS` | `0` | Reuse physical plans when manifests, source geometry/addresses, load capture, destination layout, staging configuration, and planning controls match. |
+| `MX_REFIT_REUSE_COMPLETE_PLAN` | `0` | Use the already-built whole-model plan for bounded coverage validation. |
+| `MX_REFIT_COPY_PLAN_KEY_ON_MISS` | `0` | Snapshot callback inputs only on a plan-cache miss; reject overlapping compilation. |
+| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Existing descriptor budget before full-source reconstruction; changing it invalidates cached plans. |
+
+Bounded streaming requires the framework to hold its update guard through
+transfer, installation and verification. Each group is copied from a receive
+arena into engine-owned load-time storage; vLLM performs post-load processing and
+restores live parameter bindings. Partial installation can change the live
+version. Engine-owned temporary tensors and post-load workspaces require VRAM
+beyond the arena cap. Trainer staging is a separate choice. See
+[bounded vLLM streaming installation](ARCHITECTURE.md#bounded-vllm-streaming-installation)
+for the ownership and failure contract.
+
+The unquantized vLLM installer also reuses a successful load-layout capture while
+parameter identities, addresses, shapes, strides, dtypes, devices, original
+loaders, module identities/loaders, routing-buffer versions or contents, and
+the source converter match. Cache results are copied before returning them.
+Quantized and incomplete captures are never retained. Callers must keep model
+configuration and loader behavior fixed while using an installer.
+
+These caches hold layouts and plans, not weight values or readiness. Every
+update still obtains its version and lease, reads fresh tensor values, and runs
+coverage validation. The installer checks live owners, shared parameters and
+complete module inputs. Engine callbacks receive independent storage, so they
+cannot retain a view into the receive arena.
+Workspace reset and close discard source and plan caches. Cache counters and
+lookup/build/validation times accompany streaming preparation metrics; a miss
+rebuilds the entry rather than using a stale layout.
+Wire-to-engine dtype conversion respects the captured destination slice, strides
+and arena storage offset, including padding surrounding the destination view.
+Bounded staging views are zeroed before each READ so untouched loader padding
+cannot retain bytes from a previous batch or version.
+
+## ModelExpress benchmark CI harness
+
+[`ci/bench/`](../ci/bench/) runs native vLLM cold-load and refit checks using
+registered, pinned model profiles. `profiles.json` lists supported profile keys
+and the defaults (`nemotron`, scenario `delta`). Only delta refit is implemented.
+Add a profile to the catalog to extend the harness;
+the trigger and lifecycle scripts do not contain model-specific allowlists.
+
+| Profile | Pinned model | Resources per worker |
+| --- | --- | --- |
+| `nemotron` | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4`, revision `bee7596271d1495f6992ae224aefde4410e816b8` | TP1, 16 CPU, 128 GiB RAM |
+| `kimi` | `moonshotai/Kimi-K2.7-Code`, revision `74797c9c62378b951a1f6fcf5c4631024e9b8bef` | TP8, 64 CPU, 1 TiB RAM |
+
+There has been **no live AWS validation**. Profile support means the model can be
+selected, rendered, and tested; it does not establish GPU/kernel or refit
+compatibility. Kimi requires eight GPUs on one node with sufficient host RAM.
+Its quantized MLA refit path needs qualification; the experimental WNA16 workaround
+is not included or applied. Failures remain failures and stop before resume.
+
+### Trigger benchmark CI with a PR comment
+
+After the workflow lands on the default branch, a repository writer can post:
+
+```text
+/bench
+/bench --model kimi --scenario delta
+/bench --model nemotron --sha <full-40-character-PR-head-SHA>
+```
+
+Bare `/bench` uses the catalog's default profile. `--model` selects a registered
+profile, `--scenario` selects a registered experiment, and `--sha` optionally binds the request to an explicit PR head. Otherwise
+the authorization job resolves the current head once. In both cases that exact
+revision must match copy-pr-bot's `pull-request/<PR-number>` mirror. First use the
+existing `/ok to test <SHA>` approval process if needed, wait for mirroring, then
+post the benchmark comment. The new command does not grant copy-pr-bot approval. Closed
+PRs, edited comments, stale explicit SHAs, unmirrored heads, unknown models/scenarios/options,
+and commenters without write permission are rejected. New revisions need new
+requests. Labels do not trigger this workflow.
+
+The hosted gate checks permission and resolves immutable source/model/scenario outputs.
+`bench-ci.yml` handles comment authorization and configured runtime selection, then
+calls `rl-refit-ci.yml`. The reusable workflow accepts PR number, exact source SHA,
+model, scenario and digest-pinned runtime inputs. Comment runs repeat the caller
+permission, current-head and mirror checks before privileged builds. Automatic
+runs derive the PR number from the upstream `pull-request/<N>` push and require
+the event SHA to match the current open PR and approved mirror. One trusted harness
+revision is resolved on the hosted runner and reused by build, test and cleanup:
+the approved mirrored SHA for automatic runs, or the default branch for comments.
+Privileged jobs build that approved ModelExpress revision using the selected
+trusted Dockerfiles and harness scripts. Per-model runtime bases are
+configured by digest; built images are also consumed by digest. Harness edits in
+a PR run on GPUs after copy-pr-bot approval in automatic Nemotron CI. Opt-in
+comment runs use the default-branch harness until the edits merge.
+`issue_comment` requires the workflow on the default branch, as documented
+by [GitHub](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#issue_comment).
+
+Both automatic and comment-triggered CI reuse the SeaweedFS Deployment and
+Service from `examples/rl/vime_dynamo_delta_refit/stack.yaml` in the benchmark's
+isolated namespace. The benchmark reserves four CPUs for SeaweedFS to serve
+concurrent model-weight reads. Setup creates per-run credentials, downloads the pinned model
+snapshot on the CPU control pod, verifies uploads, and publishes its snapshot manifest
+before the timed workload starts. Redis runs as an init sidecar with a startup
+probe so it accepts connections before the ModelExpress server starts. The
+separate S3 cleanup pod uses a digest-pinned CPU Python image containing only
+boto3 and its dependencies, with boto3 taken from the client lockfile. It runs
+without vLLM, Torch, Redis, or the server. The benchmark collects
+run evidence once on success or failure; CI collects separately only if the run
+report is missing. Cleanup releases the GPU pods before removing S3 objects
+and records object and Kubernetes cleanup receipts. CI mounts the cluster's
+retained `shared-model-cache` FSx claim only on the control pod and sets
+`HF_HUB_CACHE` to `/model-cache/.cache/mx-rl-refit/hub`. Hugging Face reuses cached
+files for the pinned revision across runs; a cold cache downloads them once.
+Each run still uploads and verifies its isolated S3 seed. GPU workers do not
+mount this cache, and cleanup leaves the shared source files intact.
+Worker checkpoint preparation and delta publication finish before the timed
+engine startup, so reference downloads do not compete with S3 cold loading.
+Installed embedding verification resolves checkpoint names through the model's
+native weight mapper before applying its shard loader and comparing tensor bytes.
+The configured S3 addressing style is applied to both boto3 and Run:ai
+Model Streamer (`RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING=0` for CI's path-style
+endpoint). Worker logs include native Model Streamer warnings and errors.
+Seed uploads use boto3's standard transfer client
+for the custom HTTP endpoint, matching seed downloads. The existing `HF_TOKEN` secret is forwarded for
+model access. Delta objects are verified absent before namespace deletion; SeaweedFS
+and its seed data remain available if cleanup fails. If setup fails before bucket
+creation, an explicit S3 `NoSuchBucket` response also verifies that run objects
+are absent; other storage errors still fail cleanup. This path needs no AWS IAM role
+or pre-populated bucket. The Nemotron profile defaults to digest-pinned vLLM 0.27.1,
+the version documented in the model's deployment recipe, with
+`MX_BENCH_RUNTIME_BASES.nemotron` available as an override.
+
+Optional repository Actions variables configure placement and runtime overrides:
+
+| Variable | Value |
+| --- | --- |
+| `MX_BENCH_KUBE_CONTEXT` | Kubernetes context available in `/teleport/kubeconfig.yaml`; defaults to `nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02` |
+| `MX_BENCH_RUNTIME_BASES` | JSON mapping profile keys to compatible digest-pinned vLLM base images, e.g. `{"nemotron":"registry/runtime@sha256:...","kimi":"registry/kimi-runtime@sha256:..."}` with full digests |
+
+Runtime overrides take precedence over the profile default. Kimi requires an
+override because its profile has no qualified default runtime. Each image must include
+compatible Torch, vLLM, NIXL, NumPy, requests, and safetensors; the build installs
+ModelExpress and verifies imports. Compatibility with each model's quantization
+and refit path still requires hardware qualification. The existing `NGC_API_KEY`
+secret supplies registry access. CI seeds its own S3 store and does not use the
+Vime model directory; its Hugging Face cache has a separate directory on the same
+FSx volume. Test and cleanup jobs provision Python 3.12 before installing
+PyYAML. S3 cold-load qualification requires a streamer completion marker from
+every TP rank and rejects streamer fallback. The harness retains the runtime's
+FlashInfer compatibility checks. The seed-download step reads the snapshot
+manifest and checks downloaded file sizes against S3 object sizes. Manual runs can use external S3
+through their environment configuration.
+
+The `RL weight refit CI` comment workflow delegates execution to the shared
+`RL refit CI` workflow for the selected profile and scenario. The GPU job is named
+`RL refit / Refit (PROFILE)` for the delta scenario. Every trusted
+PR automatically calls the same workflow for Nemotron, under
+`RL generator-only delta refit (vllm, s3) / Refit (nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4)`.
+Workflow callers can pass a profile key or its registered full model name; validation
+resolves it to the profile key for resource names and configuration. The required `CI status check`
+depends on this workflow, including cleanup; seed download, storage or refit failures
+fail the gate. Kimi remains opt-in and requires a runtime override. Automatic runs check out the approved mirrored
+SHA for the harness; comment runs use the default-branch harness. Offline
+contracts run on every PR in the `RL refit harness tests` job. The namespace GPU quota follows the rendered profile's
+TP size (one for Nemotron, eight for Kimi). Image builds have a 60-minute timeout;
+the test job has a 60-minute timeout, its experiment step 45 minutes, and pods a
+55-minute lifetime. Large models may exceed this initial qualification budget;
+a timeout is a failure. Requests serialize per PR without canceling active runs, with up to 100 pending
+runs retained in the concurrency queue.
+Actions runs expose the tested SHA and artifacts; the workflow does not post PR
+comments. Automatic trusted-PR runs serialize per PR so a newer push cannot cancel
+S3 cleanup.
+
+### Manual CLI and environments
+
+```bash
+export KUBE_CONTEXT='<aws-context>' NAMESPACE='<existing-run-namespace>'
+export SERVER_IMAGE='<registry/server:full-commit-sha>'
+export WORKER_IMAGE='<registry/runtime:full-commit-sha>'
+export CLEANUP_IMAGE='<registry/cleanup:full-commit-sha>'
+export MX_CI_S3_BUCKET='<snapshot-bucket>' MX_CI_S3_REGION='<aws-region>'
+export RESULTS_DIR=/tmp/mx-bench-unique-run
+python3 ci/bench/scripts/prepare.py kimi "$RESULTS_DIR" \
+  --environment aws-ci --run-id kimi-unique-run
+# Inspect rendered manifests before deploying.
+python3 ci/bench/scripts/lifecycle.py run "$RESULTS_DIR"
+python3 ci/bench/scripts/lifecycle.py collect "$RESULTS_DIR"
+python3 ci/bench/scripts/lifecycle.py cleanup "$RESULTS_DIR"
+```
+
+Manual callers provision their namespace, service account, secrets, and mirror.
+The Python `lifecycle.py` CLI reads the rendered JSON configuration directly.
+Seed download and publication share a two-hour deadline from process startup;
+either process failing stops the run, including during worker readiness.
+The Python `ci.py` entry point manages CI setup, execution, and namespace cleanup.
+
+Use a fresh run ID/output directory; run IDs begin with the selected profile key.
+`KUBECONFIG` overrides `/teleport/kubeconfig.yaml`. CLI overrides take precedence
+over environment variables and environment-file values. Images require full
+commit SHA tags or digests. The AWS preset selects H100 80 GB nodes,
+0.70 GPU memory utilization, `ci-nightly-high-priority`, and `nvcr-imagepullsecret`.
+S3 is the default with no custom endpoint or RDMA device. Profile defaults supply
+TP/CPU/memory and object prefixes.
+
+Use `--environment /path/to/environment.json` for placement/storage changes.
+Fields include worker/control node selectors, tolerations, control resources,
+service account, image-pull secrets, security context, `addressing_style`,
+`pod_env` (including Secret references), `pod_env_from`, and image references.
+Runtime tensor inventories can differ between vLLM versions and kernel layouts.
+An environment may override `expected_tensors_per_rank` and
+`expected_host_scales_per_rank` with a positive integer (or `null` for an
+unqualified count). Keep qualified counts explicit and tied to the recorded image
+digest; do not disable a failed count check merely to pass a run.
+
+CLI options include context, namespace, region, bucket, endpoint URL, service
+account, seed/delta prefixes, TP, CPU, memory, and GPU memory utilization. Literal
+credentials must not enter the environment file: resolved settings are retained
+as evidence. `--endpoint-url ''` clears an inherited endpoint.
+
+Peer coverage remains manual: `--paths both` requires two suitable nodes plus
+explicit `extra_worker_resources`, `worker_env.MX_NIXL_BACKEND`, and
+`peer_transfer_marker`. See the [EFA example](../examples/p2p_transfer_k8s/client/vllm/aws_efa/).
+Setting these fields does not qualify transport. Each worker's TP ranks stay on
+one node. The report rejects peer fallback to S3, ModelStreamer, or InstantTensor
+and requires different donor/peer nodes.
+
+### Shared RL refit experiment contract
+
+The shared `harness/lifecycle.py` owns Kubernetes deployment, process deadlines, evidence collection
+and cleanup. `harness/runner.py` exposes `RefitRunner`, which owns the shared pause/refit/verify/resume sequence.
+Rendered configuration supplies explicit initial and target versions, sources by
+worker role, publication evidence path and preparation commands. These values
+keep the sequence independent of delta version naming and S3/peer role names.
+
+Runtime code uses the `harness`, `scenarios.delta` and `engines.vllm` Python
+packages. ConfigMap item mappings preserve these paths inside `/opt/benchmark`;
+pods invoke tasks with `python3 -m`. The renderer mounts shared runtime code,
+the selected scenario and the engine adapter, excluding host-only rendering and
+Kubernetes lifecycle code. CLI paths under `scripts/` remain the same.
+
+The `DeltaScenario` class stores its configuration and has four methods: `configure`, `verify_refit`,
+`validate_inventory` and `validate_report`. It prepares the changed checkpoint
+and validates delta-specific evidence while shared validation checks rank
+completeness, source/version, addresses and timing. Reshard can add an experiment
+through this contract later; there is no reshard implementation or CI case in
+this PR. Comment-triggered GPU runs currently exercise delta over S3 only.
+
+### Validation, timing, and cleanup
+
+The benchmark uses vLLM’s default execution mode without forcing eager execution.
+
+The CI-only `RefitWorkerExtension` in `ci/bench/engines/vllm/worker.py` extends
+each vLLM worker with refit timing and weight/checkpoint validation RPC methods.
+
+The driver checks every rank's tensor hashes, reconstructed checkpoint embedding
+and its corresponding installed vocabulary embedding,
+refit source/version, preserved tensor addresses, and resumed inference. Shared
+validation checks GPU/CPU/host scale agreement for profiles with configured scale
+counts. Model-specific scale-change counts and FlashInfer cache invalidation are
+not asserted. A failed rank stops before resume. Native HTTP
+pause/resume is not Dynamo administration. The publisher preserves the selected
+checkpoint tensor's stored dtype and changes low-order bits to produce a delta.
+The configured payload size (64 MiB for Nemotron, 1 GiB for Kimi) is a best-effort
+target; reports include actual bytes, and size differences do not fail validation.
+Peer refit transfers full runtime tensors.
+Each rank verifies the reconstructed checkpoint tensor hash against the publisher's
+expected hash. Runtime tensor inventories must change after refit and match between
+S3 and peer workers when both paths run. Installed embedding validation resolves the engine vocabulary embedding and
+checks each TP rank against the corresponding checkpoint slice, including
+vocabulary padding. Profiles still select a checkpoint tensor;
+its dtype must be supported by the installed safetensors/PyTorch and refit stack.
+
+`report.json` retains model-load seconds, RPC and per-rank stage/install/total
+seconds, failures, image IDs, and restarts. Loading excludes
+scheduling, image pulls, engine warmup, and the separately downloaded reconstruction
+seed. Stage timing covers the stage operation and completion synchronization;
+installation timing covers apply plus CUDA synchronization. Total refit time is
+stage plus installation; logging, pointer verification, hashing, and inference
+are outside these intervals. The separate RPC duration includes those additional
+operations and must not be compared as the same interval.
+The first refit after client initialization may use a full checkpoint install
+even with `MX_REFIT_DELTA_SURGICAL=1`, because the installer has not established
+its live version. Confirm surgical metrics or logs before interpreting an install
+measurement as surgical. GPU/CPU/host scale agreement does not establish that
+untouched scales retained their exact pre-refit values.
+
+The report separates `validation_status` (`PASS`/`FAILED`) from
+`measurement_status` (`VALID`/`INVALID`). Overall `status` passes only when both
+pass. Successful `latency_summary` entries include the model-load time, RPC time,
+each rank's stage/install/total, and the maximum per-rank total. Model-load time
+is the maximum of one timer per TP rank, with individual rank times retained.
+Missing, duplicate, or unidentified rank timers invalidate measurements; untagged
+model-load timers are accepted only for TP1. Every required
+duration must be finite and nonnegative; missing timings invalidate a benchmark.
+Failed runs keep raw measurements as evidence but have an empty summary.
+Malformed `RESULT` log records are retained as parse-error metadata and make
+the report fail, rather than preventing the failure report from being written.
+
+This is one trial per run,
+with no percentiles, baseline comparison, or performance threshold.
+No AWS performance baseline has been established. Do not run assertion-based
+validators with Python `-O`.
+
+CI uploads evidence on success/failure and runs a separate cleanup job. It stops
+publisher/workers, removes objects under the rendered `artifact_prefix`
+(delta-prefix/run-ID for the delta scenario, including partial publications), and deletes the namespace after checking its
+ownership label and verifying S3 deletion. Cleanup logs are retained separately; artifacts expire after
+14 days. Cluster outages or forced workflow stops can still require manual
+exact-run cleanup. S3 version history follows bucket lifecycle policy.
+
+Run resources use the `mx-benchmark` label for selection and cleanup.
+Manual and CI cleanup share exact-run prefix deletion, including incomplete
+publication and retries after partial deletion. Manual cleanup preserves the
+namespace, snapshot and local evidence. CI deletes its owned namespace only after
+object deletion is verified; failures release benchmark GPU pods and retain the
+namespace and service account for a retry. Retry `ci.py cleanup` with the original
+run ID, namespace, GitHub run ID/attempt and image/environment settings. Rerunning
+the whole GitHub workflow uses a new attempt and does not recover an older retained
+namespace. Never delete the shared model prefix or bucket. Every fresh run
+has isolated server/Redis state and empty worker volumes.
