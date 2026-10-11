@@ -45,7 +45,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from modelexpress.refit.reshard.types import (
-    _RecordedIndex,
     OpChain,
     RecordedCopy,
     UnsupportedReshard,
@@ -114,8 +113,6 @@ def op_chain_to_box(op_chain: OpChain, global_shape) -> list:
             pass  # layout-only, no index change
         elif op_name == "__getitem__":
             key = args[0] if args else slice(None)
-            if isinstance(key, _RecordedIndex):
-                key = key.restore()
             keys = key if isinstance(key, tuple) else (key,)
             dim = 0
             for k in keys:
@@ -159,8 +156,6 @@ def _replay_view(op_chain: OpChain, global_shape) -> tuple:
     src = torch.empty(tuple(int(g) for g in global_shape), device="meta")
     t: Any = src
     for op_name, args, kw in op_chain:
-        if op_name == "__getitem__":
-            args = tuple(arg.restore() if isinstance(arg, _RecordedIndex) else arg for arg in args)
         t = getattr(t, op_name)(*args, **dict(kw))
     if not isinstance(t, torch.Tensor):
         raise UnsupportedReshard(f"op-chain resolved to non-tensor {type(t).__name__}")

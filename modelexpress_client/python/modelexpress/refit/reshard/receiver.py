@@ -44,7 +44,6 @@ from modelexpress.refit.reshard.transfer_plan import (
 )
 from modelexpress.refit.reshard.transport import NixlReshardTransport
 from modelexpress.refit.reshard.types import (
-    _RecordedIndex,
     CaptureResult,
     IncompleteRefit,
     UnsupportedReshard,
@@ -358,9 +357,7 @@ def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
     for op_name, args, frozen_kwargs in op_chain:
         kwargs = dict(frozen_kwargs)
         if op_name == "__getitem__":
-            value = value.__getitem__(*(
-                arg.restore() if isinstance(arg, _RecordedIndex) else arg for arg in args
-            ))
+            value = value.__getitem__(*args)
         else:
             value = getattr(value, op_name)(*args, **kwargs)
     return value

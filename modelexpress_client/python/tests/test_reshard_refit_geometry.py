@@ -652,3 +652,15 @@ if __name__ == "__main__":
     test_capture_feeds_slice_plan()
     test_default_loader_param_needs_default_weight_loader()
     print("OK: geometry capture + unsupported attribution + slice-plan compose")
+
+
+@pytest.mark.parametrize("index", [
+    [0, 2], torch.tensor([0, 2]), (slice(None), [0, 2]), ((0, 2),),
+])
+def test_capture_rejects_advanced_indices(index):
+    with torch.device("meta"):
+        model = ToyModel()
+    model.col.weight_loader = lambda param, loaded: param.data.copy_(loaded[index])
+    result = capture_geometry(model, [("col", torch.float32, (8, 4))])
+    assert result.unsupported == ["col"]
+    assert not result.copies

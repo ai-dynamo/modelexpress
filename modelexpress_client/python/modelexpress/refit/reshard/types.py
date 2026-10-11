@@ -55,43 +55,6 @@ def summarize_unsupported(
 
 
 @dataclass(frozen=True)
-class _RecordedIndex:
-    """Immutable indexing payload; replay retains PyTorch's original semantics."""
-
-    kind: type
-    values: Any
-    dtype: Any = None
-    device: Any = None
-    shape: tuple = ()
-
-    @classmethod
-    def capture(cls, index):
-        if isinstance(index, (int, slice, type(Ellipsis), type(None), cls)):
-            return index
-        if isinstance(index, (list, tuple)):
-            values = tuple(cls.capture(item) for item in index)
-            if isinstance(index, tuple) and all(a is b for a, b in zip(index, values)):
-                return index
-            return cls(type(index), values)
-        import torch
-
-        if isinstance(index, torch.Tensor):
-            return cls(torch.Tensor, cls.capture(index.tolist()),
-                       index.dtype, index.device, tuple(index.shape))
-        return index
-
-    def restore(self):
-        if self.dtype is not None:
-            import torch
-
-            values = (self.values.restore()
-                      if isinstance(self.values, _RecordedIndex) else self.values)
-            return torch.tensor(values, dtype=self.dtype, device=self.device).reshape(self.shape)
-        return self.kind(item.restore() if isinstance(item, _RecordedIndex) else item
-                         for item in self.values)
-
-
-@dataclass(frozen=True)
 class RecordedCopy:
     """One recorded scatter: read ``src_name`` sliced by ``op_chain`` and write it
     into ``param_name`` at ``as_strided(dest_shape, dest_stride, dest_offset)``.
@@ -111,10 +74,12 @@ class RecordedCopy:
         operations = []
         for op, args, kwargs in self.op_chain:
             if op == "__getitem__":
-                frozen_args = tuple(
-                    _RecordedIndex.capture(arg)
-                    for arg in args
-                )
+                index = args[0]
+                indices = index if isinstance(index, tuple) else (index,)
+                if any(not isinstance(item, (int, slice, type(Ellipsis), type(None)))
+                       for item in indices):
+                    raise UnsupportedReshard("advanced indexing is unsupported")
+                frozen_args = tuple(args)
             else:
                 frozen_args = tuple(
                     tuple(arg) if isinstance(arg, list) else arg for arg in args

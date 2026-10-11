@@ -1732,8 +1732,9 @@ must not mutate the retained canonical capture or destination metadata.
 and full-source pulls index a shared source-buffer table and carry shard-relative
 byte offsets. The table identifies logical source slots and tensor shards; it
 contains no addresses or transport handles. Retained copies snapshot nested view
-arguments once. Advanced indices retain list nesting and tensor dtype, shape,
-and device when replayed from their immutable snapshots. Grouped plans inherit the complete plan’s full-source verification policy.
+arguments once. Capture rejects advanced list/tensor indexing; basic integer,
+slice, ellipsis and new-axis indexing remain supported. Grouped plans inherit
+the complete plan’s full-source verification policy.
 `plan_transfer_groups` derives module plans from a complete
 plan, keeping the shared source table and its index map inside the planner.
 Module batching and packing preserve the same read order.
