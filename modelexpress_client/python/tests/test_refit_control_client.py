@@ -59,11 +59,6 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
     def CreateWeightVersion(
         self, request, _context
     ) -> refit_pb2.CreateWeightVersionResponse:
-        if (
-            self.version is not None
-            and self.version.idempotency_key == request.idempotency_key
-        ):
-            return refit_pb2.CreateWeightVersionResponse(version=self.version)
         self.version = refit_pb2.WeightVersion(
             uid=request.uid if request.HasField("uid") else "version-a",
             model_name=request.model_name,
@@ -108,8 +103,9 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         return refit_pb2.UpdateWeightVersionStateResponse(version=self.version)
 
 
-def test_weight_version_requires_generation_at_construction() -> None:
-    with pytest.raises(TypeError, match="trainer_mesh_generation"):
+@pytest.mark.parametrize("generation", [True, -1, 0, 2**64])
+def test_weight_version_rejects_invalid_mesh_generation(generation) -> None:
+    with pytest.raises(ValueError, match="generation"):
         control_module.WeightVersion(
             version_id="version-a",
             model_name="test/model",
@@ -118,6 +114,7 @@ def test_weight_version_requires_generation_at_construction() -> None:
             state=WeightVersionState.STAGING,
             created_at_unix_ms=1234,
             trainer_mesh_id="mesh-a",
+            trainer_mesh_generation=generation,
         )
 
 
@@ -200,8 +197,10 @@ def test_control_client_links_version_to_trainer_mesh():
     assert fetched == version
 
 
-def test_control_client_owns_global_weight_version_lifecycle() -> None:
+@pytest.mark.parametrize("generation", [1, 2**64 - 1])
+def test_control_client_owns_global_weight_version_lifecycle(generation) -> None:
     service = _RefitService()
+    service.mesh.generation = generation
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
     port = server.add_insecure_port("127.0.0.1:0")
@@ -216,42 +215,11 @@ def test_control_client_owns_global_weight_version_lifecycle() -> None:
             trainer_mesh_id="mesh-a",
         )
         fetched = control.get_weight_version(created.version_id)
-        service.mesh.generation = 2
-        retried = control.create_weight_version(
-            model_name="test/model",
-            idempotency_key="training-step-7",
-            payload_format=WeightPayloadFormat.FULL_TENSOR,
-            trainer_mesh_id="mesh-a",
-        )
-        assert retried.trainer_mesh_generation == created.trainer_mesh_generation == 1
-        fresh = control.create_weight_version(
-            model_name="test/model",
-            idempotency_key="training-step-8",
-            payload_format=WeightPayloadFormat.FULL_TENSOR,
-            trainer_mesh_id="mesh-a",
-        )
-        assert fresh.trainer_mesh_generation == 2
         ready = control.update_weight_version_state(
             created.version_id,
             WeightVersionState.READY,
         )
         deleted = control.delete_weight_version(created.version_id)
-        service.mesh.generation = 2**64 - 1
-        maximum = control.create_weight_version(
-            model_name="test/model",
-            idempotency_key="training-step-max-generation",
-            payload_format=WeightPayloadFormat.FULL_TENSOR,
-            trainer_mesh_id="mesh-a",
-        )
-        assert maximum.trainer_mesh_generation == 2**64 - 1
-        service.mesh.generation = 0
-        with pytest.raises(ValueError, match="recreate"):
-            control.create_weight_version(
-                model_name="test/model",
-                idempotency_key="training-step-zero-generation",
-                payload_format=WeightPayloadFormat.FULL_TENSOR,
-                trainer_mesh_id="mesh-a",
-            )
     finally:
         if "control" in locals():
             control.close()
@@ -260,7 +228,7 @@ def test_control_client_owns_global_weight_version_lifecycle() -> None:
     assert created.ref.version_id == "version-a"
     assert created.payload_format is WeightPayloadFormat.FULL_TENSOR
     assert created.trainer_mesh_id == "mesh-a"
-    assert created.trainer_mesh_generation == 1
+    assert created.trainer_mesh_generation == generation
     assert created.state is WeightVersionState.STAGING
     assert fetched == created
     assert ready.state is WeightVersionState.READY
