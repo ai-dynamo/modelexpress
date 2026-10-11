@@ -1735,7 +1735,9 @@ and address through the binding. The same logical reads can therefore execute
 against equivalent replicas without rewriting the plan. Direct reshard transport
 consumers retain their physical `PullSegment` interface.
 The retained compiled plan owns its composed capture and destination layout;
-unchanged trainer structure reuses both without repeating source conversion.
+unchanged trainer structure reuses both without repeating source conversion,
+including when the optional whole-plan cache is disabled. Module reads become
+logical before packing so packed batches reuse those immutable reads.
 
 Alias restoration distinguishes repeated paths to one slot from ties between
 slots. vLLM's recorded parameter metadata separates load-time ties from runtime

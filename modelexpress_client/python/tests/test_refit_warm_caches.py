@@ -482,8 +482,6 @@ def test_bounded_plan_cache_rejects_bad_budget_even_when_numerically_equal(
         cache.compile(**{**args, "max_staging_bytes": invalid}, metrics={})
     assert cache._entry is None
     assert cache.compile(**args, metrics={}) is not first
-    cache.compile(**{**args, "enabled": False}, metrics={})
-    assert cache._entry is None
 
 
 @pytest.mark.parametrize(

@@ -498,33 +498,25 @@ class _BoundedPlanCache:
             total_staging_bytes=total_staging_bytes,
             staging_buffers=staging_buffers,
         )
-        batches = _pack_bounded_batches(modules, max_staging_bytes) if pack else modules
         fingerprint = None
         if key is not None:
             started = time.perf_counter()
             fingerprint = hashlib.sha256(repr(key).encode()).hexdigest()
             metrics["plan_cache_fingerprint_s"] = time.perf_counter() - started
         plan = _logical_transfer_plan(plan, resolved, slots_by_agent)
-        logical_modules = tuple(
+        modules = tuple(
             replace(
                 batch,
                 plan=_logical_transfer_plan(batch.plan, resolved, slots_by_agent),
             )
             for batch in modules
         )
-        batches = logical_modules if batches is modules else tuple(
-            replace(
-                batch,
-                plan=_logical_transfer_plan(batch.plan, resolved, slots_by_agent),
-            )
-            for batch in batches
-        )
-        modules = logical_modules
+        batches = _pack_bounded_batches(modules, max_staging_bytes) if pack else modules
         compiled = _CompiledBoundedPlan(
             plan, modules, batches, capture, parameter_layout, fingerprint
         )
+        self._entry = (key if key is not None else (source_fingerprints,), compiled)
         if key is not None:
-            self._entry = (key, compiled)
             logger.info("compiled bounded logical plan %s", fingerprint)
         return compiled
 
@@ -1098,7 +1090,7 @@ class _NixlStagedTransfer:
         phase_started = time.perf_counter()
         layout = (
             self._plan_cache.layout(source_fingerprints)
-            if max_staging_bytes is not None and envs.MX_REFIT_CACHE_BOUNDED_PLANS
+            if max_staging_bytes is not None
             else None
         )
         if layout is None:

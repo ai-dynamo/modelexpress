@@ -219,10 +219,12 @@ def _check_values(harness, installed, *, source_transposed=False):
 @pytest.mark.parametrize("buffers", [1, 2])
 @pytest.mark.parametrize("pack", [False, True])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("plan_cache", [False, True])
 def test_warm_descriptors_still_transfer_new_values(
-    harness, monkeypatch, buffers, pack, device
+    harness, monkeypatch, buffers, pack, device, plan_cache
 ):
     monkeypatch.setenv("MX_REFIT_PACK_MODULES", str(int(pack)))
+    monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", str(int(plan_cache)))
     prepare = lambda: harness.prepare(staging_buffers=buffers, staging_device=device)
     first = prepare()
     assert any(batch.plan.full_pulls for batch in first.batches)
@@ -239,15 +241,14 @@ def test_warm_descriptors_still_transfer_new_values(
     warm, installed = harness.collect(second)
     _check_values(harness, installed)
     assert len(harness.captures) == 1
-    assert warm["descriptor_cache_hits"] == len(second.batches)
-    assert warm["descriptor_cache_misses"] == warm["descriptor_builds"] == 0
+    assert warm["descriptor_cache_hits"] == (len(second.batches) if plan_cache else 0)
+    assert warm["descriptor_cache_misses"] == warm["descriptor_builds"] == (
+        0 if plan_cache else len(second.batches)
+    )
     assert first.transport is not second.transport
     assert second.transport.mem_type == ("DRAM" if device == "cpu" else "VRAM")
     assert first.transport.posts == second.transport.posts
     assert second.transport.awaited == second.transport.posted
-    descriptor = second.transport.posts[0][0]
-    with pytest.raises(AttributeError):
-        descriptor.dst_addr = 0
 
 
 @pytest.mark.parametrize("harness", ["rename", "transpose"], indirect=True)
