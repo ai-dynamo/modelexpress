@@ -236,6 +236,22 @@ def test_control_client_owns_global_weight_version_lifecycle() -> None:
             WeightVersionState.READY,
         )
         deleted = control.delete_weight_version(created.version_id)
+        service.mesh.generation = 2**64 - 1
+        maximum = control.create_weight_version(
+            model_name="test/model",
+            idempotency_key="training-step-max-generation",
+            payload_format=WeightPayloadFormat.FULL_TENSOR,
+            trainer_mesh_id="mesh-a",
+        )
+        assert maximum.trainer_mesh_generation == 2**64 - 1
+        service.mesh.generation = 0
+        with pytest.raises(ValueError, match="recreate"):
+            control.create_weight_version(
+                model_name="test/model",
+                idempotency_key="training-step-zero-generation",
+                payload_format=WeightPayloadFormat.FULL_TENSOR,
+                trainer_mesh_id="mesh-a",
+            )
     finally:
         if "control" in locals():
             control.close()

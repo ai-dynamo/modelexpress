@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
-from modelexpress_rl import control, refit_pb2
+from modelexpress_rl import control
 
 
 @pytest.fixture
@@ -177,32 +177,6 @@ def test_publication_rejects_stale_generation_before_any_write(
         == "MESH_GENERATION_MISMATCH"
     )
     assert redis_command("HGET", "shards", "6:workershard") == "manifest"
-
-
-@pytest.mark.parametrize("generation", [0, 1, 2**64 - 1])
-def test_mesh_generation_is_decoded_from_response(generation: int) -> None:
-    """Preserve valid wire generations and reject zero for mesh-backed versions."""
-    version = refit_pb2.WeightVersion(
-        uid="version",
-        trainer_mesh_id="mesh",
-        trainer_mesh_generation=generation,
-        payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR,
-        state=refit_pb2.WEIGHT_VERSION_STATE_STAGING,
-    )
-    if generation == 0:
-        with pytest.raises(ValueError, match="recreate"):
-            control._response_version(
-                refit_pb2.CreateWeightVersionResponse(version=version),
-                "CreateWeightVersion",
-            )
-    else:
-        assert (
-            control._response_version(
-                refit_pb2.CreateWeightVersionResponse(version=version),
-                "CreateWeightVersion",
-            ).trainer_mesh_generation
-            == generation
-        )
 
 
 @pytest.mark.parametrize("generation", [True, -1, 2**64])
