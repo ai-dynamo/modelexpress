@@ -1597,8 +1597,6 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
     has to be applied by the consumer, which is the only side that knows.
     """
     import ctypes
-    from dataclasses import replace
-
     import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
     from modelexpress.refit.reshard.slice_plan import Shard
     from modelexpress.refit.reshard.transfer_plan import SourceInfo
@@ -1629,7 +1627,8 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
     planned = transfer_module._bounded_batches(
-        CaptureResult(copies=copies), layout, {"w": source}, 512
+        CaptureResult(copies=copies), layout, {"w": source}, 512,
+        source_slots={"source": "slot-source"},
     )
     resolved = transfer_module._ResolvedSources(
         {"w": source},
@@ -1641,15 +1640,6 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
         resolved,
         {"slot-source": "source"},
         (("slot-source", "source", source.shards[0].addr),),
-    )
-    planned = tuple(
-        replace(
-            batch,
-            plan=transfer_module._logical_transfer_plan(
-                batch.plan, resolved, {"source": "slot-source"}
-            ),
-        )
-        for batch in planned
     )
     drained = []
 

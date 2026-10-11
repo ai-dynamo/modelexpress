@@ -8,6 +8,7 @@ from dataclasses import replace
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
 import torch
+from modelexpress import envs
 from modelexpress import p2p_pb2
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
@@ -15,8 +16,8 @@ from modelexpress.refit.reshard.rendezvous import (
     structural_manifest_digest,
     wrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.slice_plan import PullSegment, Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, TransferPlan
+from modelexpress.refit.reshard.slice_plan import LogicalRead, SourceBuffer, Shard
+from modelexpress.refit.reshard.transfer_plan import SourceInfo, LogicalTransferPlan, plan_transfer
 from modelexpress.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
@@ -34,14 +35,11 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _bounded_batches,
     _load_agent_metadata,
     _NixlStagedTransfer,
-    _LogicalRead,
     _pack_bounded_batches,
-    _plan_staged_transfer,
     _PreparedBoundedTransfer,
     _PreparedNixlTransfer,
     _SourceBinding,
     _required_agent_metadata,
-    _logical_transfer_plan,
     _resolve_sources,
     _ResolvedSources,
     _source_structure,
@@ -49,7 +47,7 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
 from modelexpress_rl.inference.plan import TrainerUpdateSource
 
 
-def _bind_plan(plan, sources) -> tuple[TransferPlan, _SourceBinding]:
+def _bind_plan(plan, sources) -> tuple[LogicalTransferPlan, _SourceBinding]:
     agents = sorted(
         {shard.session for source in sources.values() for shard in source.shards}
     )
@@ -59,7 +57,7 @@ def _bind_plan(plan, sources) -> tuple[TransferPlan, _SourceBinding]:
         {agent: 0 for agent in agents},
         {agent: b"metadata" for agent in agents},
     )
-    slots = {agent: f"slot-{agent}" for agent in agents}
+    slots = {agent: agent for agent in agents}
     fingerprint = tuple(
         (
             agent,
@@ -77,7 +75,7 @@ def _bind_plan(plan, sources) -> tuple[TransferPlan, _SourceBinding]:
     binding = _SourceBinding(
         resolved, {slot: agent for agent, slot in slots.items()}, fingerprint
     )
-    return _logical_transfer_plan(plan, resolved, slots), binding
+    return plan, binding
 
 
 def _prepared_bounded(batches, sources, transport, metrics=None) -> _PreparedBoundedTransfer:
@@ -87,7 +85,7 @@ def _prepared_bounded(batches, sources, transport, metrics=None) -> _PreparedBou
         plan, binding = _bind_plan(batch.plan, sources)
         bound.append(replace(batch, plan=plan))
     if binding is None:
-        _, binding = _bind_plan(TransferPlan(), sources)
+        _, binding = _bind_plan(LogicalTransferPlan(), sources)
     return _PreparedBoundedTransfer(
         tuple(bound), sources, transport, binding, {} if metrics is None else metrics
     )
@@ -587,8 +585,9 @@ def test_required_agent_metadata_rejects_incomplete_source_metadata():
     binding = _SourceBinding(
         resolved, {"slot-a": "agent-a"}, (("slot-a", "agent-a", "manifest-a"),)
     )
-    plan = TransferPlan(
-        segments=[_LogicalRead("slot-a", "weight", (0,), (1,), 0, "weight", 0, 4)]
+    plan = LogicalTransferPlan(
+        source_buffers=(SourceBuffer("slot-a", "weight", (0,), (1,)),),
+        segments=(LogicalRead(0, 0, "weight", 0, 4),)
     )
     assert _required_agent_metadata(plan, resolved, binding) == {
         "agent-a": b"metadata"
@@ -596,10 +595,9 @@ def test_required_agent_metadata_rejects_incomplete_source_metadata():
 
     with pytest.raises(RuntimeError, match="unknown source slots"):
         _required_agent_metadata(
-            TransferPlan(
-                segments=[
-                    _LogicalRead("missing-slot", "weight", (0,), (1,), 0, "weight", 0, 4)
-                ]
+            LogicalTransferPlan(
+                source_buffers=(SourceBuffer("missing-slot", "weight", (0,), (1,)),),
+                segments=(LogicalRead(0, 0, "weight", 0, 4),)
             ),
             resolved,
             binding,
@@ -655,13 +653,12 @@ def test_transformed_source_is_fully_reconstructed_for_verification(monkeypatch)
         dest_dtype=torch.float32,
     )
 
-    plan = _plan_staged_transfer(CaptureResult(copies=[copy]), {"weight": source})
+    plan = plan_transfer(CaptureResult(copies=[copy]), {"weight": source}, verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST)
 
-    assert plan.segments == []
+    assert not plan.segments
     assert len(plan.full_pulls) == 1
-    assert plan.full_pulls[0].copies == [copy]
     assert sum(segment.nbytes for segment in plan.full_pulls[0].segments) == 64
-    assert {segment.session for segment in plan.full_pulls[0].segments} == {
+    assert {plan.source_buffers[segment.source_buffer].source_slot_id for segment in plan.full_pulls[0].segments} == {
         "left",
         "right",
     }
@@ -688,11 +685,11 @@ def test_transformed_source_reads_only_required_slice_by_default(monkeypatch):
         dest_dtype=torch.float32,
     )
 
-    plan = _plan_staged_transfer(CaptureResult(copies=[copy]), {"weight": source})
+    plan = plan_transfer(CaptureResult(copies=[copy]), {"weight": source}, verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST)
 
-    assert plan.full_pulls == []
+    assert not plan.full_pulls
     assert sum(segment.nbytes for segment in plan.segments) == 32
-    assert {segment.session for segment in plan.segments} == {"left"}
+    assert {plan.source_buffers[segment.source_buffer].source_slot_id for segment in plan.segments} == {"left"}
 
 
 def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer:
@@ -720,7 +717,7 @@ def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer
             )
         ],
     )
-    plan, source_binding = _bind_plan(TransferPlan(), {"weight": source})
+    plan, source_binding = _bind_plan(LogicalTransferPlan(), {"weight": source})
     return _PreparedNixlTransfer(
         plan=plan,
         capture=CaptureResult(copies=[copy]),
@@ -753,7 +750,7 @@ def test_full_tensor_plan_fails_before_transfer_when_capture_has_holes():
         _NixlStagedTransfer._validate_complete(
             capture,
             {"weight": ((4,), torch.float32)},
-            TransferPlan(),
+            LogicalTransferPlan(),
         )
 
 
@@ -1476,7 +1473,7 @@ def test_bounded_batch_layouts_are_named_however_they_are_built():
     full = {"w": ((4,), torch.float32)}
 
     built = transfer_module._BoundedBatch(
-        CaptureResult(copies=[]), TransferPlan(), (recv, convert, full), 256
+        CaptureResult(copies=[]), LogicalTransferPlan(), (recv, convert, full), 256
     )
     assert isinstance(built.layouts, transfer_module._StagingLayouts)
     assert built.layouts.recv is built.layouts[0] is recv

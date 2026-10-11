@@ -1727,17 +1727,28 @@ canonical loader-input schema needed for lazy capture; the installer retains no
 trainer identity, source conversion or source-bound mapping. Transfer consumers
 must not mutate the retained canonical capture or destination metadata.
 
-Staged transfer plans retain logical source slots and shard-relative byte offsets
-for exact reads, conversions and full-source pulls. Packing and module batching
-preserve that provenance. A prepared update separately binds those slots to its
-selected replica metadata; descriptor construction resolves the current session
-and address through the binding. The same logical reads can therefore execute
-against equivalent replicas without rewriting the plan. Direct reshard transport
-consumers retain their physical `PullSegment` interface.
+`modelexpress.refit.reshard.plan_transfer` builds an immutable
+`LogicalTransferPlan` directly from captured geometry. Exact reads, conversions
+and full-source pulls index a shared source-buffer table and carry shard-relative
+byte offsets. The table identifies logical source slots and tensor shards; it
+contains no addresses or transport handles. Retained copies snapshot nested view
+arguments once. Module batching and packing preserve the same read order.
+
+`bind_transfer(plan, resolve_source, resolve_destination)` returns a separate
+`PhysicalTransferPlan`. It resolves each used source buffer and each named
+receive, conversion or full-source destination once. The staged and legacy
+receivers both use this binder. The staged receiver explicitly associates each
+selected source slot with the agent parsed from its corresponding manifest;
+metadata, leases, transport connections and staging allocation remain outside
+the shared planner. Equivalent replicas can bind the same logical reads to
+current sessions and addresses without rebuilding geometry.
+
 The retained compiled plan owns its composed capture and destination layout;
 unchanged trainer structure reuses both without repeating source conversion,
-including when the optional whole-plan cache is disabled. Module reads become
-logical before packing so packed batches reuse those immutable reads.
+including when the optional whole-plan cache is disabled. The installer retains
+its separate client-lifetime canonical capture. Immutable logical records need
+no defensive copies on cache reuse. Existing E cache invalidation inputs remain
+in effect; this does not introduce mesh-generation-scoped plan ownership.
 
 Alias restoration distinguishes repeated paths to one slot from ties between
 slots. vLLM's recorded parameter metadata separates load-time ties from runtime

@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import copy
 import json
 import threading
 import time
@@ -19,10 +18,13 @@ from modelexpress.refit.reshard.rendezvous import (
     wrap_rendezvous_blob,
 )
 from modelexpress.refit.reshard.slice_plan import Shard
+from modelexpress.refit.reshard.geometry import convert_source_weights
 from modelexpress.refit.reshard.transfer_plan import (
     ConvertSource,
     SourceInfo,
-    TransferPlan,
+    LogicalTransferPlan,
+    plan_transfer,
+    compose_transfer_capture,
 )
 from modelexpress.refit.reshard.types import (
     CaptureResult,
@@ -33,7 +35,6 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _bounded_batches,
     _BoundedPlanCache,
     _NixlStagedTransfer,
-    _plan_staged_transfer,
     _PreparedNixlTransfer,
     _ResolvedSources,
     _resolve_sources,
@@ -85,7 +86,7 @@ def test_converted_copy_uses_captured_slice_with_arena_storage_offset(
             )
         ]
     )
-    plan = TransferPlan(
+    plan = LogicalTransferPlan(
         converts=[ConvertSource("layer.weight", (8, 4), torch.float32, [])]
     )
     transfer = object.__new__(_NixlStagedTransfer)
@@ -117,10 +118,11 @@ def _bounded_cache_inputs():
             structural_manifest_digest(blob) for blob in manifests
         ),
         "resolved": _resolve_sources(manifests),
-        "capture": CaptureResult(
-            copies=[
+        "capture": compose_transfer_capture(
+            CaptureResult(copies=[
                 RecordedCopy("weight", (), "layer.weight", 0, (4,), (1,), torch.float32)
-            ]
+            ]),
+            convert_source_weights(None, [("weight", torch.float32, (4,))]),
         ),
         "parameter_layout": {"layer.weight": ((4,), torch.float32)},
         "max_staging_bytes": 512,
@@ -242,61 +244,21 @@ def test_bounded_plan_cache_snapshots_callback_inputs_and_revalidates(
     monkeypatch.setenv("MX_REFIT_COPY_PLAN_KEY_ON_MISS", str(int(copy_key_on_miss)))
     cache = _BoundedPlanCache()
     args = _bounded_cache_inputs()
-    pristine = copy.deepcopy(args)
+    pristine = _bounded_cache_inputs()
     metrics = {}
     first = cache.compile(**args, metrics=metrics)
-    key_capture = cache._entry[0][5][0]
-    assert key_capture is not args["capture"]
-    assert key_capture.copies[0] is not args["capture"].copies[0]
-    assert first.module_batches[0].capture.copies[0] is not key_capture.copies[0]
     assert len(first.fingerprint) == 64
     assert metrics["plan_cache_misses"] == metrics["owner_plan_builds"] == 1
     assert cache.compile(**pristine, metrics=metrics) is first
     assert metrics["plan_cache_hits"] == 1
-    assert metrics["plan_cache_key_copies"] == int(not copy_key_on_miss)
+    assert metrics["plan_cache_key_copies"] == 0
     assert metrics["owner_plan_builds"] == metrics["bounded_whole_plan_builds"] == 0
-    args["capture"].copies[0].dest_offset = 1
-    args["parameter_layout"]["layer.weight"] = ((5,), torch.float32)
+    args["capture"] = replace(args["capture"], copies=(replace(args["capture"].copies[0], dest_offset=1),))
+    args["parameter_layout"] = {"layer.weight": ((5,), torch.float32)}
     assert first.module_batches[0].capture.copies[0].dest_offset == 0
     assert first.module_batches[0].layouts[0]["layer.weight"][0] == (4,)
     assert cache.compile(**args, metrics=metrics) is not first
     assert metrics["plan_cache_misses"] == 1
-
-    # A hit must still execute the global coverage gate.
-    fresh = cache.compile(**pristine, metrics=metrics)
-    fresh.plan.fallback.append("injected-unsupported")
-    with pytest.raises(IncompleteRefit, match="cover every"):
-        cache.compile(**pristine, metrics=metrics)
-    assert cache._entry is None
-    fresh = cache.compile(**pristine, metrics=metrics)
-    fresh.module_batches[0].plan.fallback.append("injected-owner-unsupported")
-    with pytest.raises(IncompleteRefit, match="cover every"):
-        cache.compile(**pristine, metrics=metrics)
-    assert cache._entry is None
-
-
-def test_copy_plan_key_on_miss_keeps_exact_fingerprint_and_avoids_hit_deepcopy(
-    monkeypatch,
-):
-    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
-    args = _bounded_cache_inputs()
-    monkeypatch.setenv("MX_REFIT_COPY_PLAN_KEY_ON_MISS", "0")
-    original = _BoundedPlanCache().compile(**args, metrics={})
-    monkeypatch.setenv("MX_REFIT_COPY_PLAN_KEY_ON_MISS", "1")
-    cache = _BoundedPlanCache()
-    metrics = {}
-    first = cache.compile(**args, metrics=metrics)
-    assert first.fingerprint == original.fingerprint
-    assert metrics["plan_cache_copy_key_on_miss_enabled"] == 1
-    assert metrics["plan_cache_key_copies"] == 1
-
-    def unexpected_copy(value):
-        pytest.fail("a warm key lookup must not deepcopy callback inputs")
-
-    monkeypatch.setattr(transfer_module, "deepcopy", unexpected_copy)
-    assert cache.compile(**args, metrics=metrics) is first
-    assert metrics["plan_cache_hits"] == 1
-    assert metrics["plan_cache_key_copies"] == 0
 
 
 @pytest.mark.parametrize("concurrent", [False, True])
@@ -307,19 +269,19 @@ def test_copy_plan_key_on_miss_rejects_overlapping_compile_and_recovers(
     monkeypatch.setenv("MX_REFIT_COPY_PLAN_KEY_ON_MISS", "1")
     cache = _BoundedPlanCache()
     args = _bounded_cache_inputs()
-    original = transfer_module._plan_staged_transfer
+    original = transfer_module.plan_transfer
     entered = threading.Event()
     release = threading.Event()
 
-    def planning(capture, sources):
+    def planning(capture, sources, **kwargs):
         if concurrent:
             entered.set()
             assert release.wait(timeout=5)
         else:
             cache.compile(**args, metrics={})
-        return original(capture, sources)
+        return original(capture, sources, **kwargs)
 
-    monkeypatch.setattr(transfer_module, "_plan_staged_transfer", planning)
+    monkeypatch.setattr(transfer_module, "plan_transfer", planning)
     if concurrent:
         with ThreadPoolExecutor(max_workers=1) as executor:
             pending = executor.submit(cache.compile, **args, metrics={})
@@ -334,7 +296,7 @@ def test_copy_plan_key_on_miss_rejects_overlapping_compile_and_recovers(
         with pytest.raises(RuntimeError, match="already in progress"):
             cache.compile(**args, metrics={})
         assert cache._entry is None
-    monkeypatch.setattr(transfer_module, "_plan_staged_transfer", original)
+    monkeypatch.setattr(transfer_module, "plan_transfer", original)
     assert cache.compile(**args, metrics={}).fingerprint
 
 
@@ -430,9 +392,9 @@ def test_bounded_plan_cache_invalidates_each_planning_input(
     elif component == "agent_metadata":
         args["resolved"].agent_metadata["a"] = b"replacement"
     elif component == "capture":
-        args["capture"].unattributed = 1
+        args["capture"] = replace(args["capture"], unattributed=1)
     elif component == "unsupported":
-        args["capture"].unsupported.append("weight")
+        args["capture"] = replace(args["capture"], unsupported=("weight",))
     elif component.startswith("copy_"):
         attribute, value = {
             "copy_source": ("src_name", "missing-source"),
@@ -443,9 +405,9 @@ def test_bounded_plan_cache_invalidates_each_planning_input(
             "copy_dtype": ("dest_dtype", torch.bfloat16),
             "copy_operations": ("op_chain", (("view", ([4],), ()),)),
         }[component]
-        setattr(args["capture"].copies[0], attribute, value)
+        args["capture"] = replace(args["capture"], copies=(replace(args["capture"].copies[0], **{attribute: value}),))
     elif component == "layout":
-        args["parameter_layout"]["layer.extra"] = ((4,), torch.float32)
+        args["parameter_layout"] = {**args["parameter_layout"], "layer.extra": ((4,), torch.float32)}
     elif component == "cap":
         args["max_staging_bytes"] = 768
     elif component.startswith("staging_") or component == "total_staging_bytes":
@@ -502,8 +464,8 @@ def test_supplied_complete_plan_keeps_global_coverage_gate(monkeypatch, defect):
         layout["other.w"] = ((4,), torch.float32)
     elif defect == "unknown":
         capture.copies.append(replace(capture.copies[0], param_name="unknown.w"))
-    complete = _plan_staged_transfer(capture, {"w": source})
+    complete = plan_transfer(capture, {"w": source})
     if defect == "fallback":
-        complete.fallback.append("w")
+        complete = replace(complete, fallback=("w",))
     with pytest.raises(IncompleteRefit):
         _bounded_batches(capture, layout, {"w": source}, 512, complete_plan=complete)

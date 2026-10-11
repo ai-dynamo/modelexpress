@@ -416,7 +416,7 @@ def test_descriptor_order_duplicates_and_empty_reads_survive_reuse(
 
     def descriptors(*args, **kwargs):
         result = original(*args, **kwargs)
-        result += [result[0], replace(result[0], nbytes=0)]
+        result += (result[0], replace(result[0], nbytes=0))
         builds.append(
             tuple((d.session, d.src_addr, d.dst_addr, d.nbytes) for d in result)
         )

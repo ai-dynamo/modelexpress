@@ -54,7 +54,7 @@ def summarize_unsupported(
     return ranked[:limit] if limit is not None else ranked
 
 
-@dataclass
+@dataclass(frozen=True)
 class RecordedCopy:
     """One recorded scatter: read ``src_name`` sliced by ``op_chain`` and write it
     into ``param_name`` at ``as_strided(dest_shape, dest_stride, dest_offset)``.
@@ -69,6 +69,29 @@ class RecordedCopy:
     dest_shape: tuple
     dest_stride: tuple
     dest_dtype: Any
+
+    def __post_init__(self):
+        operations = []
+        for op, args, kwargs in self.op_chain:
+            if op == "__getitem__":
+                index = args[0]
+                indices = index if isinstance(index, tuple) else (index,)
+                if any(isinstance(item, list) for item in indices):
+                    raise UnsupportedReshard("advanced list indexing is unsupported")
+                frozen_args = tuple(args)
+            else:
+                frozen_args = tuple(
+                    tuple(arg) if isinstance(arg, list) else arg for arg in args
+                )
+            operations.append((
+                op, frozen_args,
+                tuple((name, tuple(value) if isinstance(value, list) else value)
+                      for name, value in kwargs),
+            ))
+        operations = tuple(operations)
+        object.__setattr__(self, "op_chain", operations)
+        object.__setattr__(self, "dest_shape", tuple(self.dest_shape))
+        object.__setattr__(self, "dest_stride", tuple(self.dest_stride))
 
 
 @dataclass
