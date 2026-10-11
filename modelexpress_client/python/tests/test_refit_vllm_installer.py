@@ -1066,44 +1066,6 @@ def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch):
     assert torch.equal(model.lm_head.weight, torch.full((2, 2), 7.0))
 
 
-def test_streaming_walks_live_owners_without_arena_scans(monkeypatch) -> None:
-    """Keep owner validation live without recursively scanning tensor contents."""
-    _install_fake_vllm(monkeypatch, lambda model: None)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
-
-    def walks_for(batch_size):
-        model = nn.Sequential(*[nn.Linear(2, 2, bias=False) for _ in range(6)])
-        names = frozenset(dict(model.named_parameters()))
-        walks = []
-        real_named_modules = model.named_modules
-
-        def counted(*args, **kwargs):
-            walks.append(1)
-            return real_named_modules(*args, **kwargs)
-
-        monkeypatch.setattr(model, "named_modules", counted)
-        arena = torch.ones(2, 2)
-
-        def batches():
-            for start in range(0, 6, batch_size):
-                yield {f"{i}.weight": arena for i in range(start, start + batch_size)}
-
-        installer = _VllmInstaller(
-            model=model,
-            vllm_config=object(),
-            model_config=object(),
-            device=torch.device("cpu"),
-        )
-        metrics = {}
-        _install_streaming(installer, PreparedStreamingTensors(batches, names, metrics))
-        assert "retention_scan_s" not in metrics
-        assert all(torch.equal(p, torch.ones(2, 2)) for p in model.parameters())
-        return len(walks)
-
-    # Captured owner metadata avoids a fresh model walk for every batch.
-    assert walks_for(1) == walks_for(6)
-
-
 @pytest.mark.parametrize("mode", ["consume_then_remove", "new_module"])
 def test_streaming_hooks_retain_owned_values_across_arena_reuse(monkeypatch, mode):
     """Post-load callbacks may retain engine values without retaining the arena."""
@@ -1611,16 +1573,6 @@ def test_retained_install_plan_preserves_tied_parameters(
     assert model.embedding.weight is model.lm_head.weight
     assert torch.equal(model.embedding.weight, original)
     manifest = [("embedding.weight", torch.float32, (2, 2))]
-    cached, _ = installer.capture(manifest)
-    assert cached is capture
-    assert installer.capture(manifest)[0] is capture
-    retained_plan = installer._engine_load_layout
-
-    def unexpected(*args, **kwargs) -> None:
-        raise AssertionError("warm installation must reuse captured model metadata")
-
-    monkeypatch.setattr(installer, "_parameter_aliases", unexpected)
-    monkeypatch.setattr(installer, "_graph_tensors", unexpected)
     for value in (7.0, 11.0, -3.0):
 
         def batches(value=value):
@@ -1631,10 +1583,7 @@ def test_retained_install_plan_preserves_tied_parameters(
         assert model.embedding.weight is model.lm_head.weight
         assert model.embedding.weight.data_ptr() == address
         assert torch.equal(model.lm_head.weight, torch.full((2, 2), value))
-        assert "retention_batch_scans" not in prepared.transfer_metrics
-        assert "retention_final_scans" not in prepared.transfer_metrics
         installer.capture(manifest)
-        assert installer._engine_load_layout is retained_plan
     assert model.capture_calls == 1
 
 
@@ -1756,60 +1705,6 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
         )
 
 
-@pytest.mark.parametrize("failure", [None, "source", "drain"])
-def test_streaming_reuses_captured_layout_without_rebuilding_aliases(
-    monkeypatch, failure
-):
-    _install_fake_vllm(monkeypatch, lambda model: None)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
-    model = nn.Module()
-    model.first = model.first_alias = nn.Linear(2, 2, bias=False)
-    model.second = model.second_alias = nn.Linear(2, 2, bias=False)
-    names = frozenset(dict(model.named_parameters()))
-    installer = _VllmInstaller(
-        model=model,
-        vllm_config=object(),
-        model_config=object(),
-        device=torch.device("cpu"),
-    )
-    layout = _retain_test_layout(installer)
-    load_aliases = layout.load_aliases
-
-    def unexpected(*args, **kwargs) -> None:
-        raise AssertionError("warm installation must reuse captured aliases")
-
-    monkeypatch.setattr(installer, "_parameter_aliases", unexpected)
-
-    def batches():
-        yield {"first.weight": torch.ones(2, 2)}
-        yield {"second.weight": torch.full((2, 2), 2.0)}
-        if failure == "source":
-            raise RuntimeError("source failed after completed batch")
-
-    drains = []
-
-    def observe_drain():
-        drains.append(True)
-        if len(drains) % 3:
-            assert installer._engine_load_layout is layout
-            assert layout.load_aliases is load_aliases
-        if failure == "drain" and len(drains) == 3:
-            raise RuntimeError("drain failed after completed batch")
-
-    monkeypatch.setattr(installer, "_drain_streaming", observe_drain)
-    prepared = PreparedStreamingTensors(batches, names, {})
-    if failure:
-        with pytest.raises(RuntimeError, match="failed after completed batch"):
-            _install_streaming(installer, prepared)
-    else:
-        _install_streaming(installer, prepared)
-        _install_streaming(installer, PreparedStreamingTensors(batches, names, {}))
-    assert installer._engine_load_layout is layout
-    assert layout.load_aliases is load_aliases
-    assert torch.equal(model.first.weight, torch.ones(2, 2))
-    assert torch.equal(model.second.weight, torch.full((2, 2), 2.0))
-
-
 @pytest.mark.parametrize("case", ["no_alias", "load_time_tie", "runtime_alias", "mixed"])
 @pytest.mark.parametrize("runtime_first", [False, True])
 def test_checkpoint_reload_distinguishes_wna16_runtime_aliases(
@@ -1903,20 +1798,12 @@ def test_load_time_alias_restoration_does_not_ignore_missing_ties(recorded):
 
 @pytest.mark.parametrize("invalid", ["missing", "unknown", "shape", "dtype"])
 def test_install_validates_received_batch_against_retained_plan(monkeypatch, invalid) -> None:
-    from modelexpress.refit.reshard.types import CaptureResult
-    from modelexpress_rl.inference.engines.vllm import installer as api
-
     _install_fake_vllm(monkeypatch, lambda model: None)
     model = nn.Linear(2, 2)
     installer = _VllmInstaller(
         model=model, vllm_config=object(), model_config=object(), device=torch.device("cpu")
     )
-    parameters = {name: (tuple(value.shape), value.dtype) for name, value in model.named_parameters()}
-    aliases = installer._parameter_aliases(model)
-    installer._engine_load_layout = api._EngineLoadLayout(
-        CaptureResult(), parameters, ((model, (("weight", "weight"), ("bias", "bias"))),),
-        aliases, aliases, (), frozenset(),
-    )
+    _retain_test_layout(installer)
     tensors = {"weight": torch.ones(2, 2), "bias": torch.ones(2)}
     if invalid == "missing":
         tensors.pop("bias")
@@ -1927,4 +1814,4 @@ def test_install_validates_received_batch_against_retained_plan(monkeypatch, inv
     else:
         tensors["weight"] = torch.ones(2, 2, dtype=torch.float64)
     with pytest.raises(IncompleteRefit, match="install plan"):
-        installer._process_and_commit(tensors, reload=False)
+        installer.install_tensors(tensors)

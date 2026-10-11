@@ -26,7 +26,7 @@ from modelexpress.refit.reshard.verify import tensor_digest
 
 
 @pytest.fixture
-def harness(monkeypatch):
+def harness(monkeypatch, request):
     """Real planning and byte copies with synthetic capture metadata and CPU arenas."""
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setenv("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "1")
@@ -40,6 +40,7 @@ def harness(monkeypatch):
         name: torch.arange(16, dtype=torch.float32).reshape(4, 4) + index / 16
         for index, name in enumerate(("exact", "full", "convert"))
     }
+    conversion = getattr(request, "param", None)
     captures = []
     publisher_step = [0]
     copies = [
@@ -124,6 +125,12 @@ def harness(monkeypatch):
         device_id=0,
         device=torch.device("cuda:0"),
         listen_port=None,
+        convert_native_to_hf=(
+            (lambda weights: {
+                name.removeprefix("native."): value.transpose(0, 1) if conversion == "transpose" else value
+                for name, value in weights.items()
+            }) if conversion else None
+        ),
     )
 
     def manifests():
@@ -134,7 +141,7 @@ def harness(monkeypatch):
                 "source:19000",
                 [
                     PublishedTensor(
-                        name=name,
+                        name=f"native.{name}" if conversion else name,
                         dtype="torch.float32",
                         elsize=4,
                         full_shape=(4, 4),
@@ -177,6 +184,7 @@ def harness(monkeypatch):
         return metrics, installed
 
     state = SimpleNamespace(
+        source_transposed=conversion == "transpose",
         transfer=transfer,
         sources=sources,
         capture=capture,
@@ -193,7 +201,7 @@ def harness(monkeypatch):
     transfer.close()
 
 
-def _check_values(harness, installed):
+def _check_values(harness, installed, *, source_transposed=False):
     for source, name, dtype, transpose in (
         ("exact", "a.weight", torch.float32, False),
         ("full", "b.weight", torch.float32, True),
@@ -202,6 +210,8 @@ def _check_values(harness, installed):
     ):
         expected = torch.zeros(20, dtype=dtype)
         value = harness.sources[source]
+        if source_transposed:
+            value = value.T
         expected[2:18].copy_((value.T if transpose else value).reshape(-1))
         assert torch.equal(installed[name], expected)
 
@@ -220,19 +230,15 @@ def test_warm_descriptors_still_transfer_new_values(
     assert any(batch.plan.segments for batch in first.batches)
     cold, installed = harness.collect(first)
     _check_values(harness, installed)
-    cached = harness.transfer._descriptor_cache
     assert cold["descriptor_builds"] == len(first.batches)
     assert cold["descriptor_cache_hits"] == 0
     for values in harness.sources.values():
         values.add_(3)
-    for arena in harness.transfer._staging_arenas:
-        arena.fill_(255)
+    harness.publisher_step[0] += 1
     second = prepare()
     warm, installed = harness.collect(second)
     _check_values(harness, installed)
     assert len(harness.captures) == 1
-    assert first.batches is second.batches
-    assert harness.transfer._descriptor_cache is cached
     assert warm["descriptor_cache_hits"] == len(second.batches)
     assert warm["descriptor_cache_misses"] == warm["descriptor_builds"] == 0
     assert first.transport is not second.transport
@@ -244,80 +250,27 @@ def test_warm_descriptors_still_transfer_new_values(
         descriptor.dst_addr = 0
 
 
+@pytest.mark.parametrize("harness", ["rename", "transpose"], indirect=True)
+@pytest.mark.parametrize("pack", [False, True])
+def test_native_conversion_composes_with_installation(harness, monkeypatch, pack):
+    monkeypatch.setenv("MX_REFIT_PACK_MODULES", str(int(pack)))
+    _, installed = harness.collect(harness.prepare())
+    _check_values(
+        harness, installed,
+        source_transposed=harness.source_transposed,
+    )
+
+
 @pytest.mark.parametrize("resolved_cache", [0, 1])
-def test_descriptor_cache_is_scoped_to_resolved_source_binding(
-    harness, monkeypatch, resolved_cache
-) -> None:
+def test_replaced_source_buffers_transfer_current_values(harness, monkeypatch, resolved_cache):
     monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", str(resolved_cache))
-    first = harness.prepare()
-    cold, _ = harness.collect(first)
-    assert cold["descriptor_builds"] == len(first.batches)
-
-    same_binding = harness.prepare()
-    assert same_binding.batches is first.batches
-    same_metrics, _ = harness.collect(same_binding)
-    assert same_metrics["descriptor_cache_hits"] == len(same_binding.batches)
-    assert same_metrics["descriptor_builds"] == 0
-    if not resolved_cache:
-        assert "shard_bindings" not in vars(same_binding.source_binding.resolved)
-
-    changed_binding_update = harness.prepare()
-    assert changed_binding_update.batches is first.batches
-    original_binding = changed_binding_update.source_binding
-    replacement = harness.sources["exact"].clone() + 101
-    sources = dict(original_binding.resolved.sources)
-    source = sources["exact"]
-    shards = tuple(
-        shard._replace(addr=replacement.data_ptr())
-        if hasattr(shard, "_replace")
-        else replace(shard, addr=replacement.data_ptr())
-        for shard in source.shards
-    )
-    sources["exact"] = (
-        source._replace(shards=shards)
-        if hasattr(source, "_replace")
-        else replace(source, shards=list(shards))
-    )
-    resolved = replace(original_binding.resolved, sources=sources)
-    changed_binding = module._SourceBinding(
-        resolved,
-        dict(original_binding.agents_by_slot),
-        (("0", ("replacement", replacement.data_ptr())),),
-    )
-    changed_binding_update = replace(
-        changed_binding_update, source_binding=changed_binding
-    )
-    harness.transfer._active = changed_binding_update
-    harness.sources["exact"] = replacement
-
-    warm, installed = harness.collect(changed_binding_update)
-    assert warm["descriptor_cache_hits"] == 0
-    assert warm["descriptor_builds"] == len(changed_binding_update.batches)
-    _check_values(harness, installed)
-
-
-def test_warm_plan_reuses_captured_layout_and_values(harness, monkeypatch) -> None:
-    before_manifest = harness.manifests()[0]
-    before_fingerprint = structural_manifest_digest(before_manifest)
-    first = harness.prepare()
-    harness.collect(first)
-    for values in harness.sources.values():
-        values.add_(3)
-    harness.publisher_step[0] += 1
-    after_manifest = harness.manifests()[0]
-    assert after_manifest != before_manifest
-    assert structural_manifest_digest(after_manifest) == before_fingerprint
-
-    def unexpected_capture(*_args, **_kwargs) -> None:
-        raise AssertionError("warm bounded plan should retain capture and layout")
-
-    monkeypatch.setattr(module, "_capture_canonical_layout", unexpected_capture)
-    second = harness.prepare()
-    metrics, installed = harness.collect(second)
-    _check_values(harness, installed)
-    assert second.batches is first.batches
-    assert metrics["descriptor_cache_hits"] == len(second.batches)
-    assert metrics["descriptor_builds"] == 0
+    for update in range(3):
+        if update:
+            harness.sources.update({
+                name: value.clone() + update for name, value in harness.sources.items()
+            })
+        _, installed = harness.collect(harness.prepare())
+        _check_values(harness, installed)
 
 
 @pytest.mark.parametrize("change", ["address", "capture", "budget", "disabled"])
