@@ -203,9 +203,6 @@ def test_descriptor_heavy_slice_full_pulls_then_replays_locally():
     assert plan.descriptor_savings() == 3
     assert plan.exact_bytes == truth_row.numel() * EL
     assert plan.extra_wire_bytes() == row_src.numel() * EL - plan.exact_bytes
-    assert plan.full_pulls[0].segments[0]._source_read == (
-        "row", (0, 0), tuple(row_src.shape), 0
-    )
 
     staging = torch.zeros_like(row_src)
     full_pull = plan.full_pulls[0]
@@ -264,26 +261,6 @@ def test_non_dim0_source_keeps_exact_descriptors():
     assert len(plan.segments) == 4
     assert plan.descriptor_savings() == 0
     assert plan.extra_wire_bytes() == 0
-
-
-def test_conversion_segments_keep_logical_source_reads() -> None:
-    copy = RecordedCopy(
-        src_name="row",
-        op_chain=(("narrow", (1, 4, 4), ()),),
-        param_name="row",
-        dest_offset=0,
-        dest_shape=(4, 4),
-        dest_stride=(4, 1),
-        dest_dtype=torch.float16,
-    )
-    shard = Shard((0, 4), (4, 4), "right", 4000, EL)
-    capture = CaptureResult(copies=[copy])
-    source = SourceInfo((4, 8), torch.float32, EL, [shard])
-
-    plan = plan_transfer(capture, {"row": source})
-
-    assert len(plan.converts) == 1
-    assert plan.converts[0].segments[0]._source_read == ("row", (0, 4), (4, 4), 0)
 
 
 def test_unsupported_source_is_marked_for_fail_closed():

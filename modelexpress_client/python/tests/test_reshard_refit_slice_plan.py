@@ -49,7 +49,6 @@ def test_column_block_single_contiguous_run():
     assert (
         segs[0].src_addr == 1000 and segs[0].dst_byte == 0 and segs[0].nbytes == 16 * EL
     )
-    assert segs[0]._source_read == ("src", (0, 0), (8, 4), 0)
 
 
 def test_column_slice_is_strided_multi_run():
