@@ -35,6 +35,7 @@ from modelexpress.refit.reshard.transfer_plan import (
     bind_transfer,
     execute_transfer,
     plan_transfer,
+    plan_transfer_groups,
 )
 from modelexpress.refit.reshard.slice_plan import (
     LogicalRead,
@@ -98,6 +99,7 @@ __all__ = [
     "paired_runs",
     "plan_pull",
     "plan_transfer",
+    "plan_transfer_groups",
     "shard_region",
     "tensor_digest",
     "wrap_rendezvous_blob",

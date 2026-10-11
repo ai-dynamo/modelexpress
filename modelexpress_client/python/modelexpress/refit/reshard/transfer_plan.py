@@ -232,10 +232,10 @@ def _plan_verified_transfer(
             not copy.op_chain and tuple(copy.dest_shape) == tuple(source.global_shape)
             for copy in copies
         ):
-            part = plan_transfer(
+            part = _plan_transfer(
                 CaptureResult(copies=copies), {name: source},
+                source_buffers, source_indices,
                 max_segments_per_copy=max_segments_per_copy,
-                source_buffers=source_buffers, source_indices=source_indices,
             )
             segments.extend(part.segments)
             converts.extend(part.converts)
@@ -275,8 +275,6 @@ def plan_transfer(
     max_segments_per_copy: int | None = None,
     source_slots: dict[str, str] | None = None,
     verify_full_sources: bool = False,
-    source_buffers: tuple | None = None,
-    source_indices: dict | None = None,
 ) -> LogicalTransferPlan:
     """Build a ``LogicalTransferPlan`` from captured copies + published ``sources``
     (``{src_name: SourceInfo}``). Sources flagged unsupported at capture, missing
@@ -285,32 +283,59 @@ def plan_transfer(
     ``source_slots`` maps transport sessions to logical source slots; omission
     uses session identity. ``verify_full_sources`` reconstructs sources lacking
     an identity copy so receivers can verify whole-shard checksums.
-    Module plans may share ``source_buffers`` and its source-name-to-indices map;
-    both must come from the same source geometry and be supplied together.
     """
-    if (source_buffers is None) != (source_indices is None):
-        raise ValueError("source_buffers and source_indices must be supplied together")
+    source_buffers = []
+    source_indices = {}
+    needed_names = dict.fromkeys(copy.src_name for copy in capture.copies)
+    for name in needed_names:
+        source = sources.get(name)
+        if source is None:
+            continue
+        indices = []
+        for shard in source.shards:
+            indices.append(len(source_buffers))
+            source_buffers.append(SourceBuffer(
+                shard.session if source_slots is None else source_slots[shard.session],
+                name, tuple(shard.shard_offset), tuple(shard.shape),
+            ))
+        source_indices[name] = tuple(indices)
+    source_buffers = tuple(source_buffers)
+    return _plan_transfer(
+        capture, sources, source_buffers, source_indices,
+        max_segments_per_copy=max_segments_per_copy,
+        verify_full_sources=verify_full_sources,
+    )
+
+
+def plan_transfer_groups(
+    captures, sources: dict, complete_plan: LogicalTransferPlan, *,
+    max_segments_per_copy: int | None = None,
+    verify_full_sources: bool = False,
+):
+    """Plan subsets of the complete capture using the same source geometry.
+
+    The source-buffer table and one shared index map stay inside the planner.
+    """
+    source_indices = {}
+    for index, buffer in enumerate(complete_plan.source_buffers):
+        source_indices.setdefault(buffer.src_name, []).append(index)
+    source_indices = {name: tuple(indices) for name, indices in source_indices.items()}
+    for capture in captures:
+        yield _plan_transfer(
+            capture, sources, complete_plan.source_buffers, source_indices,
+            max_segments_per_copy=max_segments_per_copy,
+            verify_full_sources=verify_full_sources,
+        )
+
+
+def _plan_transfer(
+    capture, sources, source_buffers, source_indices, *,
+    max_segments_per_copy=None, verify_full_sources=False,
+) -> LogicalTransferPlan:
     if max_segments_per_copy is None:
         max_segments_per_copy = envs.MX_RESHARD_MAX_SEGMENTS_PER_COPY
     if max_segments_per_copy < 1:
         raise ValueError("max_segments_per_copy must be at least 1")
-    if source_buffers is None:
-        source_buffers = []
-        source_indices = {}
-        needed_names = dict.fromkeys(copy.src_name for copy in capture.copies)
-        for name in needed_names:
-            source = sources.get(name)
-            if source is None:
-                continue
-            indices = []
-            for shard in source.shards:
-                indices.append(len(source_buffers))
-                source_buffers.append(SourceBuffer(
-                    shard.session if source_slots is None else source_slots[shard.session],
-                    name, tuple(shard.shard_offset), tuple(shard.shape),
-                ))
-            source_indices[name] = tuple(indices)
-        source_buffers = tuple(source_buffers)
     if verify_full_sources:
         return _plan_verified_transfer(
             capture, sources, source_buffers, source_indices, max_segments_per_copy

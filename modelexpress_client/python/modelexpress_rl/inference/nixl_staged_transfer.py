@@ -47,6 +47,7 @@ from modelexpress.refit.reshard.transfer_plan import (
     bind_transfer,
     compose_transfer_capture,
     plan_transfer,
+    plan_transfer_groups,
 )
 from modelexpress.refit.reshard.transport import ReadDescriptor
 from modelexpress.refit.reshard.transport.nixl import NixlReshardTransport
@@ -456,10 +457,6 @@ def _bounded_batches(
     if complete is None:
         complete = plan_transfer(capture, sources, source_slots=source_slots,
                                  verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST)
-    source_indices = {}
-    for index, buffer in enumerate(complete.source_buffers):
-        source_indices.setdefault(buffer.src_name, []).append(index)
-    source_indices = {name: tuple(indices) for name, indices in source_indices.items()}
     metrics["bounded_whole_plan_s"] = time.perf_counter() - started
     metrics["bounded_whole_plan_builds"] = int(complete_plan is None)
     started = time.perf_counter()
@@ -474,14 +471,17 @@ def _bounded_batches(
     metrics["owner_plan_s"] = 0.0
     metrics["owner_validation_s"] = 0.0
     metrics["owner_plan_builds"] = 0
-    for module, recv in groups.items():
-        subset = CaptureResult(
-            copies=[c for c in capture.copies if c.param_name in recv]
-        )
+    subsets = tuple(
+        CaptureResult(copies=[c for c in capture.copies if c.param_name in recv])
+        for recv in groups.values()
+    )
+    plans = plan_transfer_groups(
+        subsets, sources, complete,
+        verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST,
+    )
+    for (module, recv), subset in zip(groups.items(), subsets, strict=True):
         started = time.perf_counter()
-        plan = plan_transfer(subset, sources, source_slots=source_slots,
-                             verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST,
-                             source_buffers=complete.source_buffers, source_indices=source_indices)
+        plan = next(plans)
         metrics["owner_plan_s"] += time.perf_counter() - started
         metrics["owner_plan_builds"] += 1
         started = time.perf_counter()

@@ -1732,7 +1732,9 @@ must not mutate the retained canonical capture or destination metadata.
 and full-source pulls index a shared source-buffer table and carry shard-relative
 byte offsets. The table identifies logical source slots and tensor shards; it
 contains no addresses or transport handles. Retained copies snapshot nested view
-arguments once. Module batching and packing preserve the same read order.
+arguments once. `plan_transfer_groups` derives module plans from a complete
+plan, keeping the shared source table and its index map inside the planner.
+Module batching and packing preserve the same read order.
 
 `bind_transfer(plan, resolve_source, resolve_destination)` returns a separate
 `PhysicalTransferPlan`. It resolves each used source buffer and each named
