@@ -124,6 +124,7 @@ class LogicalTransferPlan:
     unbounded_sources: tuple = ()
     exact_descriptor_count: int = 0
     exact_bytes: int = 0
+    verify_full_sources: bool = False
 
     def _all_segments(self):
         """Every planned segment, wherever it lands.
@@ -265,6 +266,7 @@ def _plan_verified_transfer(
         fallback=tuple(fallback), converts=tuple(converts),
         full_pulls=tuple(full_pulls), unbounded_sources=tuple(unbounded_sources),
         exact_descriptor_count=exact_count, exact_bytes=exact_bytes,
+        verify_full_sources=True,
     )
 
 
@@ -310,11 +312,11 @@ def plan_transfer(
 def plan_transfer_groups(
     captures, sources: dict, complete_plan: LogicalTransferPlan, *,
     max_segments_per_copy: int | None = None,
-    verify_full_sources: bool = False,
 ):
     """Plan subsets of the complete capture using the same source geometry.
 
     The source-buffer table and one shared index map stay inside the planner.
+    Full-source verification follows the complete plan.
     """
     source_indices = {}
     for index, buffer in enumerate(complete_plan.source_buffers):
@@ -324,7 +326,7 @@ def plan_transfer_groups(
         yield _plan_transfer(
             capture, sources, complete_plan.source_buffers, source_indices,
             max_segments_per_copy=max_segments_per_copy,
-            verify_full_sources=verify_full_sources,
+            verify_full_sources=complete_plan.verify_full_sources,
         )
 
 

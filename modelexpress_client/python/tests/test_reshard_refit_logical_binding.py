@@ -229,7 +229,8 @@ def test_recorded_copy_rejects_advanced_index_lists():
         )
 
 
-def test_full_pull_replay_preserves_source_order_after_capture_reordering():
+@pytest.mark.parametrize("grouped", [False, True])
+def test_full_pull_replay_preserves_source_order_after_capture_reordering(grouped):
     a = torch.tensor([[1, 2], [3, 4]], dtype=torch.float32)
     b = torch.tensor([[11, 12], [13, 14]], dtype=torch.float32)
 
@@ -251,6 +252,10 @@ def test_full_pull_replay_preserves_source_order_after_capture_reordering():
         max_segments_per_copy=1,
         verify_full_sources=True,
     )
+    if grouped:
+        logical = next(plan_transfer_groups(
+            (capture,), sources, logical, max_segments_per_copy=1,
+        ))
     assert [full.src_name for full in logical.full_pulls] == ["a", "b"]
 
     staging = {"a": torch.empty_like(a), "b": torch.empty_like(b)}

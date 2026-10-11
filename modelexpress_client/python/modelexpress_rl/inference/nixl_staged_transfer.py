@@ -475,10 +475,7 @@ def _bounded_batches(
         CaptureResult(copies=[c for c in capture.copies if c.param_name in recv])
         for recv in groups.values()
     )
-    plans = plan_transfer_groups(
-        subsets, sources, complete,
-        verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST,
-    )
+    plans = plan_transfer_groups(subsets, sources, complete)
     for (module, recv), subset in zip(groups.items(), subsets, strict=True):
         started = time.perf_counter()
         plan = next(plans)
