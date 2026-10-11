@@ -380,7 +380,7 @@ def _plan_transfer(
                 param_name=copy.param_name,
                 dest_offset=0,
                 dest_shape=copy.dest_shape,
-                dest_stride=_row_major_strides(copy.dest_shape),
+                dest_stride=tuple(_row_major_strides(copy.dest_shape)),
                 dest_dtype=src.dtype,
             )
             try:

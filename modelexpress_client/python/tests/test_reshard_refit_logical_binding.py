@@ -182,26 +182,33 @@ def test_binding_failure_does_not_return_a_partial_descriptor_plan():
     assert calls == [("recv", "param")]
 
 
-def test_recorded_operation_arguments_are_snapshotted_before_binding():
+@pytest.mark.parametrize("keyword", [False, True])
+def test_recorded_operation_arguments_are_snapshotted_before_binding(keyword):
+    from modelexpress.refit.reshard.geometry import capture_geometry
+
     dims = [1, 0]
-    kwargs = []
-    copy = RecordedCopy(
-        src_name="weight",
-        op_chain=(("permute", (dims,), kwargs),),
-        param_name="param",
-        dest_offset=0,
-        dest_shape=(3, 2),
-        dest_stride=(2, 1),
-        dest_dtype=torch.float32,
-    )
-    capture = CaptureResult(copies=[copy])
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.param = torch.nn.Parameter(torch.empty(3, 2, device="meta"))
+            self.param.weight_loader = self.load
+
+        def load(self, param, loaded):
+            view = loaded.permute(dims=dims) if keyword else loaded.permute(dims)
+            dims[:] = [0, 1]
+            param.data.copy_(view)
+
+        def load_weights(self, weights):
+            for _name, loaded in weights:
+                self.param.weight_loader(self.param, loaded)
+
+    capture = capture_geometry(Model(), [("weight", torch.float32, (2, 3))])
     source = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     logical = plan_transfer(
         capture, {"weight": _source(source)}, source_slots={"physical-0": "slot-0"},
         max_segments_per_copy=1,
     )
-    dims[:] = [0, 1]
-    kwargs.append(("mutated", True))
 
     destination = torch.zeros(3, 2, dtype=torch.float32)
     staging = torch.empty_like(source)

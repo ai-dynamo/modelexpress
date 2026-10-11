@@ -1731,8 +1731,10 @@ must not mutate the retained canonical capture or destination metadata.
 `LogicalTransferPlan` directly from captured geometry. Exact reads, conversions
 and full-source pulls index a shared source-buffer table and carry shard-relative
 byte offsets. The table identifies logical source slots and tensor shards; it
-contains no addresses or transport handles. Retained copies snapshot nested view
-arguments once. Capture rejects advanced list/tensor indexing; basic integer,
+contains no addresses or transport handles. Operation capture normalizes view
+arguments once; `RecordedCopy` is a plain immutable record. Direct planner callers
+supply immutable tuple shapes, strides and operation arguments. Capture rejects
+advanced list/tensor indexing; basic integer,
 slice, ellipsis and new-axis indexing remain supported. Grouped plans inherit
 the complete plan’s full-source verification policy.
 `plan_transfer_groups` derives module plans from a complete

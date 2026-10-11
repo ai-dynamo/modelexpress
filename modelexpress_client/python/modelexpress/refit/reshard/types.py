@@ -60,7 +60,8 @@ class RecordedCopy:
     into ``param_name`` at ``as_strided(dest_shape, dest_stride, dest_offset)``.
     Offsets/shapes/strides are read off the (meta) destination view, so no real
     storage is needed. ``dest_dtype`` vs the source dtype decides raw-copy vs
-    convert-via-staging downstream."""
+    convert-via-staging downstream. Direct callers supply immutable tuple
+    shapes, strides and operation arguments."""
 
     src_name: str
     op_chain: OpChain
@@ -70,29 +71,6 @@ class RecordedCopy:
     dest_stride: tuple
     dest_dtype: Any
 
-    def __post_init__(self):
-        operations = []
-        for op, args, kwargs in self.op_chain:
-            if op == "__getitem__":
-                index = args[0]
-                indices = index if isinstance(index, tuple) else (index,)
-                if any(not isinstance(item, (int, slice, type(Ellipsis), type(None)))
-                       for item in indices):
-                    raise UnsupportedReshard("advanced indexing is unsupported")
-                frozen_args = tuple(args)
-            else:
-                frozen_args = tuple(
-                    tuple(arg) if isinstance(arg, list) else arg for arg in args
-                )
-            operations.append((
-                op, frozen_args,
-                tuple((name, tuple(value) if isinstance(value, list) else value)
-                      for name, value in kwargs),
-            ))
-        operations = tuple(operations)
-        object.__setattr__(self, "op_chain", operations)
-        object.__setattr__(self, "dest_shape", tuple(self.dest_shape))
-        object.__setattr__(self, "dest_stride", tuple(self.dest_stride))
 
 
 @dataclass
