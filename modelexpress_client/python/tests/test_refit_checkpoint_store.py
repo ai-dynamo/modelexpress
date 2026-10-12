@@ -17,6 +17,54 @@ from modelexpress_rl.inference.checkpoint_store import (
 )
 
 
+@pytest.mark.parametrize("path_method", ["full_path", "delta_path", "materialized_path"])
+@pytest.mark.parametrize("copy_from_neighbor", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_staging_preserves_neighboring_version(
+    tmp_path, path_method, copy_from_neighbor, fail
+):
+    store = LocalCheckpointStore(root=tmp_path, model_name="model")
+    store.initialize()
+    version_path = getattr(store, path_method)
+    neighbor = version_path("v1.tmp")
+    neighbor.mkdir()
+    (neighbor / "weights").write_bytes(b"neighboring checkpoint")
+    store.record_artifact(neighbor)
+    neighbor.chmod(0o750)
+    target = version_path("v1")
+    target.mkdir()
+    (target / "weights").write_bytes(b"original target")
+    directory_mode = target.stat().st_mode & 0o777
+    prepared_mode = 0o750 if copy_from_neighbor else directory_mode
+    before = set(target.parent.iterdir())
+
+    def replace():
+        with store.replace_directory(
+            target, copy_from=neighbor if copy_from_neighbor else None
+        ) as temporary:
+            assert (neighbor / "weights").read_bytes() == b"neighboring checkpoint"
+            assert temporary.stat().st_mode & 0o777 == prepared_mode
+            if copy_from_neighbor:
+                assert (temporary / "weights").read_bytes() == b"neighboring checkpoint"
+            (temporary / "weights").write_bytes(b"replacement")
+            if fail:
+                raise RuntimeError("injected preparation failure")
+
+    if fail:
+        with pytest.raises(RuntimeError, match="injected preparation failure"):
+            replace()
+    else:
+        replace()
+
+    assert (neighbor / "weights").read_bytes() == b"neighboring checkpoint"
+    store.verify_artifact(neighbor)
+    assert (target / "weights").read_bytes() == (
+        b"original target" if fail else b"replacement"
+    )
+    assert target.stat().st_mode & 0o777 == (directory_mode if fail else prepared_mode)
+    assert set(target.parent.iterdir()) == before
+
+
 @pytest.mark.parametrize("clone", [True, False])
 def test_materialization_is_independent_and_preserves_copy_metadata(
     monkeypatch, tmp_path, clone
