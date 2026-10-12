@@ -58,7 +58,8 @@ def summarize_unsupported(
 class RecordedCopy:
     """One recorded scatter: read ``src_name`` sliced by ``op_chain`` and write it
     into ``param_name`` at ``as_strided(dest_shape, dest_stride, dest_offset)``.
-    Offsets/shapes/strides are read off the (meta) destination view, so no real
+    Ordered source replay records physical owner-relative coordinates; legacy
+    destination reconstruction records canonical owner coordinates. No real
     storage is needed. ``dest_dtype`` vs the source dtype decides raw-copy vs
     convert-via-staging downstream."""
 
@@ -69,7 +70,8 @@ class RecordedCopy:
     dest_shape: tuple
     dest_stride: tuple
     dest_dtype: Any
-
+    owner_offset: int | None = None
+    owner_stride: tuple | None = None
 
 @dataclass
 class CaptureResult:
@@ -89,3 +91,8 @@ class CaptureResult:
     unattributed: int = 0
     unsupported_reasons: dict = field(default_factory=dict)
     generator_fingerprint: tuple | None = None
+    source_replay: bool = False
+    generation: int | None = None
+    owner_workspaces: dict = field(default_factory=dict)
+    owner_dependencies: tuple = ()
+    destination_layouts: dict[str, tuple[tuple, tuple]] = field(default_factory=dict)

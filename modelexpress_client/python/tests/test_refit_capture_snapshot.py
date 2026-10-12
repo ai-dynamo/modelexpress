@@ -344,10 +344,60 @@ def test_real_capture_cache_nested_mutable_payload_remains_isolated(
     assert installer.capture(manifest)[0].copies[0].op_chain[0][1][0][0] == 4
 
 
-def test_snapshot_clone_preserves_capture_fingerprint():
+def test_snapshot_preserves_replay_metadata_and_isolates_mutations():
     result = _result()
-    result[0].generator_fingerprint = ("layout", (1, 2))
+    capture = result[0]
+    capture.source_replay = True
+    capture.generation = 7
+    capture.owner_workspaces = {"layer": (32, 16)}
+    capture.owner_dependencies = (("layer", "other"),)
+    capture.destination_layouts = {"weight": ((2, 2), (2, 1))}
+    capture.copies[0].owner_offset = 3
+    capture.copies[0].owner_stride = (4, 1)
+    expected = copy.deepcopy(result)
     snapshot = _CaptureSnapshot.create(result)
     assert type(snapshot) is _CaptureSnapshot
-    assert not hasattr(snapshot, "fingerprint")
-    assert snapshot.clone()[0].generator_fingerprint == result[0].generator_fingerprint
+    first, _ = snapshot.clone()
+    assert (first, result[1]) == expected
+    first.owner_workspaces.clear()
+    first.destination_layouts["weight"] = ((4,), (1,))
+    first.owner_dependencies = ()
+    first.generation = 99
+    first.source_replay = False
+    first.copies[0].owner_offset = 100
+    capture.owner_workspaces.clear()
+    capture.destination_layouts.clear()
+    assert snapshot.clone() == expected
+
+
+@pytest.mark.parametrize("field", ["owner_workspaces", "destination_layouts"])
+def test_aliased_replay_metadata_declines_snapshot(field):
+    result = _result()
+    setattr(result[0], field, result[1])
+    assert _CaptureSnapshot.create(result) is result
+
+
+@pytest.mark.parametrize("tensor_index", [False, True])
+def test_integer_index_payload_deepcopy_remains_isolated(
+    capture_installer, monkeypatch, tensor_index
+):
+    installer, _ = capture_installer
+    capture = module.capture_weights
+    index = torch.tensor([2, 0, 2]) if tensor_index else [2, 0, 2]
+
+    def indexed(*args, **kwargs):
+        result = capture(*args, **kwargs)
+        result.copies[0].op_chain = (("__getitem__", (index,), ()),)
+        return result
+
+    monkeypatch.setattr(module, "capture_weights", indexed)
+    manifest = [("weight", torch.float32, (3, 3))]
+    installer.capture(manifest)
+    assert type(installer._capture_cache[2]) is tuple
+    index[0] = 1
+    first, _ = installer.capture(manifest)
+    first_index = first.copies[0].op_chain[0][1][0]
+    assert list(first_index) == [2, 0, 2]
+    first_index[0] = 0
+    second, _ = installer.capture(manifest)
+    assert list(second.copies[0].op_chain[0][1][0]) == [2, 0, 2]
