@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+{{- $tls := .Values.tls | default dict }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -164,6 +165,27 @@ spec:
               value: {{ .Values.security.cacheTtlSecs | quote }}
             {{- end }}
             {{- end }}
+            {{- if $tls.enabled }}
+            {{- if not $tls.secretName }}
+            {{- fail "tls.enabled requires tls.secretName" }}
+            {{- end }}
+            - name: MODEL_EXPRESS_TLS_CERT_FILE
+              value: /etc/modelexpress/tls/tls.crt
+            - name: MODEL_EXPRESS_TLS_KEY_FILE
+              value: /etc/modelexpress/tls/tls.key
+            {{- with $tls.minVersion }}
+            - name: MODEL_EXPRESS_TLS_MIN_VERSION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $tls.cipherSuites }}
+            - name: MODEL_EXPRESS_TLS_CIPHER_SUITES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with $tls.groups }}
+            - name: MODEL_EXPRESS_TLS_GROUPS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- end }}
           {{- if .Values.command }}
           command:
             {{- toYaml .Values.command | nindent 12 }}
@@ -207,22 +229,32 @@ spec:
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if or (and .Values.persistence .Values.persistence.enabled) .Values.extraVolumeMounts }}
+          {{- if or (and .Values.persistence .Values.persistence.enabled) .Values.extraVolumeMounts $tls.enabled }}
           volumeMounts:
             {{- if and .Values.persistence .Values.persistence.enabled }}
             - name: model-cache
               mountPath: {{ .Values.persistence.mountPath | default "/root" }}
             {{- end }}
+            {{- if $tls.enabled }}
+            - name: tls
+              mountPath: /etc/modelexpress/tls
+              readOnly: true
+            {{- end }}
             {{- if .Values.extraVolumeMounts }}
             {{- toYaml .Values.extraVolumeMounts | nindent 12 }}
             {{- end }}
           {{- end }}
-      {{- if or (and .Values.persistence .Values.persistence.enabled) .Values.extraVolumes }}
+      {{- if or (and .Values.persistence .Values.persistence.enabled) .Values.extraVolumes $tls.enabled }}
       volumes:
         {{- if and .Values.persistence .Values.persistence.enabled }}
         - name: model-cache
           persistentVolumeClaim:
             claimName: {{ include "modelexpress.fullname" . }}-pvc
+        {{- end }}
+        {{- if $tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ $tls.secretName }}
         {{- end }}
         {{- if .Values.extraVolumes }}
         {{- toYaml .Values.extraVolumes | nindent 8 }}

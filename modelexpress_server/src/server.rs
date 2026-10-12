@@ -186,6 +186,11 @@ pub async fn run_server(
         info!("Metrics endpoint is disabled");
     }
 
+    let tls_acceptor = crate::tls::build_acceptor(&config.tls).map_err(|e| {
+        error!("Invalid TLS configuration: {e}");
+        e
+    })?;
+
     // Initialize the model registry manager (Redis or Kubernetes CRDs). Shares the
     // injected backend with the P2P state manager below.
     let registry = Arc::new(
@@ -413,7 +418,7 @@ pub async fn run_server(
             .add_service(p2p)
             .add_optional_service(refit),
     };
-    let server_result = router.serve_with_shutdown(addr, shutdown_signal).await;
+    let server_result = serve(router, addr, tls_acceptor, shutdown_signal).await;
 
     // Wait for background services to complete
     if let Some(handle) = cache_handle
@@ -438,5 +443,33 @@ pub async fn run_server(
 
     server_result?;
     info!("Server shutdown complete");
+    Ok(())
+}
+
+type ServeError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The router as built above: tonic's router under the gRPC metrics layer.
+type GrpcRouter = tonic::transport::server::Router<
+    tower::layer::util::Stack<metrics::grpc::GrpcMetricsLayer, tower::layer::util::Identity>,
+>;
+
+async fn serve(
+    router: GrpcRouter,
+    addr: std::net::SocketAddr,
+    tls_acceptor: Option<crate::tls::TlsAcceptor>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), ServeError> {
+    match tls_acceptor {
+        Some(acceptor) => {
+            info!("gRPC listener is serving TLS");
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|source| crate::tls::TlsError::Bind { addr, source })?;
+            router
+                .serve_with_incoming_shutdown(crate::tls::incoming(listener, acceptor), shutdown)
+                .await?;
+        }
+        None => router.serve_with_shutdown(addr, shutdown).await?,
+    }
     Ok(())
 }

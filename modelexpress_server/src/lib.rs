@@ -11,6 +11,7 @@ pub mod refit;
 pub mod registry;
 pub mod server;
 pub mod services;
+pub mod tls;
 
 // Re-export for testing
 pub use cache::*;
