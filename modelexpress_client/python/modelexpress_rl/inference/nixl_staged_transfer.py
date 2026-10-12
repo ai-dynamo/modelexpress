@@ -33,31 +33,31 @@ from modelexpress.nixl_transfer import (
     NIXL_VRAM_MEM_TYPE,
     NixlTransferManager,
 )
-from modelexpress.refit.reshard import throughput
-from modelexpress.refit.reshard.geometry import _validate_physical_destination
-from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
-from modelexpress.refit.reshard.slice_plan import _row_major_strides
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard import throughput
+from modelexpress_rl.refit.reshard.geometry import _validate_physical_destination
+from modelexpress_rl.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress_rl.refit.reshard.slice_plan import _row_major_strides
+from modelexpress_rl.refit.reshard.rendezvous import (
     build_sources,
     merge_shard_tables,
     unwrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.transfer_plan import (
+from modelexpress_rl.refit.reshard.transfer_plan import (
     LogicalTransferPlan,
     bind_transfer,
     plan_transfer_groups,
     plan_transfer,
     replay_scratch_bytes,
 )
-from modelexpress.refit.reshard.transport import ReadDescriptor
-from modelexpress.refit.reshard.transport.nixl import NixlReshardTransport
-from modelexpress.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.transport import ReadDescriptor
+from modelexpress_rl.refit.reshard.transport.nixl import NixlReshardTransport
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     UnsupportedReshard,
     summarize_unsupported,
 )
-from modelexpress.refit.reshard.verify import shard_region, tensor_digest
+from modelexpress_rl.refit.reshard.verify import shard_region, tensor_digest
 from modelexpress.types import ManifestMismatchError, TensorDescriptor
 
 from modelexpress_rl.inference.plan import SourceReplayBatch, TrainerSourceSnapshot

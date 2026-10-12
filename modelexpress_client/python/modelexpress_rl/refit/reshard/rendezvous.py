@@ -9,7 +9,7 @@ and no per-dim shard geometry. Until the proto has those fields, the trainer pac
 the resharding side-table (per source tensor: full shape + each shard's per-dim
 offset/shape + owning NIXL agent/device/base address) into a self-describing JSON
 blob that rides alongside the NIXL agent metadata; the inference side decodes it
-into the ``modelexpress.refit.reshard`` planning inputs (a ``SourceInfo`` per source +
+into the ``modelexpress_rl.refit.reshard`` planning inputs (a ``SourceInfo`` per source +
 the shard -> owning-agent/device maps). When the proto gains those fields, delete
 the encode/decode here and build the same maps from typed descriptors -
 ``NixlReshardTransport`` and the slice-plan / pull core are untouched.
@@ -52,10 +52,10 @@ from modelexpress.nixl_transfer import (
     NIXL_MEM_TYPES,
     NIXL_VRAM_MEM_TYPE,
 )
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo
 
-logger = logging.getLogger("modelexpress.refit.reshard.rendezvous")
+logger = logging.getLogger("modelexpress_rl.refit.reshard.rendezvous")
 
 _SCHEMA = "mx.reshard.shard_table.v1"
 _HOST_SCHEMA = "mx.reshard.shard_table.v2"
@@ -80,7 +80,7 @@ class PublishedShard:
     to READ it from (owning agent / device / base address).
 
     ``digest`` is a position-sensitive digest over the shard's bytes, from
-    :func:`modelexpress.refit.reshard.verify.tensor_digest`. ``None`` means the
+    :func:`modelexpress_rl.refit.reshard.verify.tensor_digest`. ``None`` means the
     publisher did not compute one, which a checker must read as *unchecked* rather
     than as agreement.
     """

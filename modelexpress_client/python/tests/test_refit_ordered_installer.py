@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from modelexpress.refit.reshard.types import IncompleteRefit
+from modelexpress_rl.refit.reshard.types import IncompleteRefit
 from modelexpress_rl.inference.plan import PreparedStreamingTensors, SourceReplayBatch
 from tests.test_refit_vllm_installer import (
     _cpu_installer,
@@ -116,7 +116,7 @@ def test_persistent_only_owner_skips_materialization(monkeypatch, registry):
 
 @pytest.mark.parametrize("streaming", [False, True])
 def test_replaced_pending_slot_fails_before_its_copy(monkeypatch, streaming):
-    from modelexpress.refit.reshard.types import IncompleteRefit
+    from modelexpress_rl.refit.reshard.types import IncompleteRefit
 
     _install_fake_vllm(monkeypatch, lambda model: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)

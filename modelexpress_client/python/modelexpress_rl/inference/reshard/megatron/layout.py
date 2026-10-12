@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 from numbers import Integral
 from typing import Any
 
-from modelexpress.refit.reshard.slice_plan import _row_major_strides
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.refit.reshard.slice_plan import _row_major_strides
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
 
 REPLICATED = "replicated"
 COLUMN_ROLES = frozenset(

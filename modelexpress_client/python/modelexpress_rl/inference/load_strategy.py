@@ -9,7 +9,7 @@ import logging
 
 import torch.nn as nn
 
-from modelexpress import envs as mx_envs
+from modelexpress_rl import envs as mx_envs
 from modelexpress.adapter import StrategyFailed, StrategyRecoveryError
 from modelexpress.load_strategy import execute_load_strategies
 from modelexpress.load_strategy.context import LoadContext, LoadResult

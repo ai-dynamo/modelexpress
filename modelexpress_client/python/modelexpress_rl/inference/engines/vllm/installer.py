@@ -30,13 +30,13 @@ from modelexpress.accelerators import accelerator_backend_for
 from modelexpress.engines.vllm.host_quantization import (
     refresh_host_quantization_state,
 )
-from modelexpress.refit.reshard.geometry import (
+from modelexpress_rl.refit.reshard.geometry import (
     capture_weights,
     convert_source_weights,
     overlapping_destination_groups,
 )
-from modelexpress.refit.reshard.types import IncompleteRefit
-from modelexpress.refit.timing import refit_span
+from modelexpress_rl.refit.reshard.types import IncompleteRefit
+from modelexpress_rl.refit.timing import refit_span
 
 from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.engines.vllm.surgical import (
@@ -72,7 +72,7 @@ from modelexpress_rl.utils import index_checkpoint_tensors
 
 if TYPE_CHECKING:
     from modelexpress_rl.inference.streaming_checkpoint import StreamedCheckpoint
-    from modelexpress.refit.reshard.types import CaptureResult
+    from modelexpress_rl.refit.reshard.types import CaptureResult
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
 

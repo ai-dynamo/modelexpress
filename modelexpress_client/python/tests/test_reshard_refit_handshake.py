@@ -19,13 +19,13 @@ receiver-trainer pair.
 import logging
 import pytest
 
-from modelexpress import envs
-from modelexpress.refit.reshard.receiver import (
+from modelexpress_rl import envs
+from modelexpress_rl.refit.reshard.receiver import (
     handshake_endpoints_for_plan,
     handshake_with_peers,
 )
-from modelexpress.refit.reshard.slice_plan import LogicalRead, SourceBuffer
-from modelexpress.refit.reshard.transfer_plan import (
+from modelexpress_rl.refit.reshard.slice_plan import LogicalRead, SourceBuffer
+from modelexpress_rl.refit.reshard.transfer_plan import (
     ConvertSource, FullPullSource, LogicalTransferPlan,
 )
 
@@ -186,7 +186,7 @@ def test_a_non_positive_bound_falls_back_to_the_default(monkeypatch, caplog):
     the hang the bound exists to prevent. The documented default is kept instead."""
     monkeypatch.setenv("MX_RESHARD_HANDSHAKE_TIMEOUT_S", "0")
 
-    with caplog.at_level(logging.WARNING, logger="modelexpress.envs"):
+    with caplog.at_level(logging.WARNING, logger="modelexpress_rl.envs"):
         assert envs.MX_RESHARD_HANDSHAKE_TIMEOUT_S == 900.0
 
     assert "must be a finite positive number" in caplog.text

@@ -22,8 +22,8 @@ from modelexpress_rl.inference.plan import (
     PreparedStreamingTensors,
 )
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
-from modelexpress.refit.reshard.types import IncompleteRefit
-from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
+from modelexpress_rl.refit.reshard.types import IncompleteRefit
+from modelexpress_rl.refit.timing import RefitTimingRecorder, use_refit_timing
 from torch import nn
 
 
@@ -37,7 +37,7 @@ def _cpu_installer(model, *, vllm_config=None):
 
 
 def _replay_batches(installer, batches, names):
-    from modelexpress.refit.reshard.types import RecordedCopy
+    from modelexpress_rl.refit.reshard.types import RecordedCopy
     from modelexpress_rl.inference.plan import SourceReplayBatch
 
     supplied_order = tuple(names) if isinstance(names, dict) else None
@@ -748,7 +748,7 @@ def _receive_copy(target, source, bounded):
     from types import SimpleNamespace
     from weakref import ref
 
-    from modelexpress.refit.reshard.types import RecordedCopy
+    from modelexpress_rl.refit.reshard.types import RecordedCopy
     from modelexpress_rl.inference.engines.vllm.install_plan import _LayerInstallPlan
 
     model = nn.Module()
@@ -2305,9 +2305,9 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
     import ctypes
 
     import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
-    from modelexpress.refit.reshard.slice_plan import Shard
-    from modelexpress.refit.reshard.transfer_plan import SourceInfo
-    from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+    from modelexpress_rl.refit.reshard.slice_plan import Shard
+    from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo
+    from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
 
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)

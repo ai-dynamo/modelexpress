@@ -2493,7 +2493,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
     monkeypatch, case
 ):
     import torch
-    from modelexpress.refit.reshard.types import RecordedCopy
+    from modelexpress_rl.refit.reshard.types import RecordedCopy
     from modelexpress_rl.inference.plan import SourceReplayBatch
     from modelexpress_rl.inference.engines.vllm.installer import _VllmInstaller
 
@@ -2746,7 +2746,7 @@ def test_streaming_creates_and_emits_one_timing_cycle(
 ):
     import json
 
-    from modelexpress.refit.timing import (
+    from modelexpress_rl.refit.timing import (
         RefitTimingRecorder,
         current_refit_timing,
         refit_span,

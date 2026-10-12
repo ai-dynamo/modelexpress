@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     MxReshardRendezvous,
     PublishedTensor,
     wrap_rendezvous_blob,

@@ -45,7 +45,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
-from modelexpress.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.types import (
     OpChain,
     RecordedCopy,
     UnsupportedReshard,

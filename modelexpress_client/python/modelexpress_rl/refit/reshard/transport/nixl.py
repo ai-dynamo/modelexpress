@@ -31,7 +31,7 @@ from typing import Any
 
 from modelexpress.nixl_transfer import NIXL_DRAM_MEM_TYPE, NIXL_MEM_TYPES
 
-logger = logging.getLogger("modelexpress.refit.reshard.transport.nixl")
+logger = logging.getLogger("modelexpress_rl.refit.reshard.transport.nixl")
 
 
 def _serial_reads_enabled() -> bool:
