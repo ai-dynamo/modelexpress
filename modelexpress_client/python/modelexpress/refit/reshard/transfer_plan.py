@@ -20,7 +20,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from types import MappingProxyType
+from math import prod
 from typing import Any, Callable
 
 from modelexpress import envs
@@ -30,6 +32,7 @@ from modelexpress.refit.reshard.slice_plan import (
     SourceBuffer,
     _row_major_strides,
     plan_pull,
+    pull_metrics,
 )
 from modelexpress.refit.reshard.transport import ReadDescriptor, Transport
 from modelexpress.refit.reshard.types import (
@@ -123,11 +126,19 @@ class LogicalTransferPlan:
         for full_pull in self.full_pulls:
             yield from full_pull.segments
 
+    @cached_property
+    def _read_cost(self) -> tuple[int, int]:
+        count = nbytes = 0
+        for segment in self._all_segments():
+            count += 1
+            nbytes += segment.nbytes
+        return count, nbytes
+
     def bytes_planned(self) -> int:
-        return sum(segment.nbytes for segment in self._all_segments())
+        return self._read_cost[1]
 
     def descriptor_count(self) -> int:
-        return sum(1 for _ in self._all_segments())
+        return self._read_cost[0]
 
     def descriptor_savings(self) -> int:
         return max(0, self.exact_descriptor_count - self.descriptor_count())
@@ -177,8 +188,10 @@ def replay_scratch_bytes(full):
     return peak
 
 
-def _plan_local_replay(copy, source, index, *, buffer_indices):
-    """Read the longest representable source prefix and replay its suffix locally."""
+def _plan_local_replay(
+    copy, source, index, *, buffer_indices, max_segments_per_copy, max_staging_bytes=None
+):
+    """Choose a capacity-safe source prefix, then replay remaining operations locally."""
     import torch
 
     from modelexpress.refit.reshard.geometry import _SUPPORTED_OPS
@@ -188,6 +201,7 @@ def _plan_local_replay(copy, source, index, *, buffer_indices):
     root = torch.empty(source.global_shape, dtype=source.dtype, device="meta")
     value = root
     exact = None
+    contiguous = []
     for length in range(len(copy.op_chain) + 1):
         if length:
             name, args, kwargs = copy.op_chain[length - 1]
@@ -207,17 +221,35 @@ def _plan_local_replay(copy, source, index, *, buffer_indices):
             dest_dtype=source.dtype,
         )
         try:
-            reads = plan_pull(
+            count, nbytes = pull_metrics(
                 candidate, source.global_shape, source.dtype, source.elsize,
-                source.shards, buffer_indices=buffer_indices,
+                source.shards,
             )
-            count, nbytes = len(reads), sum(read.nbytes for read in reads)
         except UnsupportedReshard:
             break
         exact = (length, candidate, count, nbytes)
+        if value.is_contiguous():
+            contiguous.append(exact)
     if exact is None:
         raise UnsupportedReshard(f"{copy.src_name}: no transferable replay prefix")
     selected = exact
+    if exact[2] > max_segments_per_copy:
+        eligible = [
+            item for item in contiguous
+            if item[2] < exact[2]
+            and (
+                max_staging_bytes is None
+                or ((prod(item[1].dest_shape) * source.elsize + 255) // 256) * 256
+                <= max_staging_bytes
+            )
+        ]
+        selected = min(
+            eligible,
+            key=lambda item: (
+                max(0, item[2] - max_segments_per_copy), item[3], -item[0]
+            ),
+            default=exact,
+        )
     prefix, candidate, _, _ = selected
     segments = plan_pull(
         candidate, source.global_shape, source.dtype, source.elsize, source.shards,
@@ -405,6 +437,7 @@ def plan_transfer(
     max_segments_per_copy: int | None = None,
     source_slots: dict[str, str] | None = None,
     verify_full_sources: bool = False,
+    max_staging_bytes: int | None = None,
 ) -> LogicalTransferPlan:
     """Build a ``LogicalTransferPlan`` from captured copies + published ``sources``
     (``{src_name: SourceInfo}``). Sources flagged unsupported at capture, missing
@@ -434,6 +467,7 @@ def plan_transfer(
         capture, sources, source_buffers, source_indices,
         max_segments_per_copy=max_segments_per_copy,
         verify_full_sources=verify_full_sources,
+        max_staging_bytes=max_staging_bytes,
     )
 
 
@@ -458,7 +492,10 @@ def plan_transfer_groups(
         )
 
 
-def _plan_source_replay(capture, sources, source_buffers, source_indices, *, verify_full_sources):
+def _plan_source_replay(
+    capture, sources, source_buffers, source_indices, *, verify_full_sources,
+    max_segments_per_copy, max_staging_bytes,
+):
     full_pulls = []
     fallback = list(dict.fromkeys(capture.unsupported))
     for index, copy in enumerate(capture.copies):
@@ -470,6 +507,8 @@ def _plan_source_replay(capture, sources, source_buffers, source_indices, *, ver
         pull = _plan_local_replay(
             replace(copy, op_chain=()) if verify_full_sources else copy,
             source, index, buffer_indices=source_indices[copy.src_name],
+            max_segments_per_copy=max_segments_per_copy,
+            max_staging_bytes=max_staging_bytes,
         )
         if verify_full_sources:
             pull = replace(pull, copies=(copy,))
@@ -491,7 +530,7 @@ def _plan_source_replay(capture, sources, source_buffers, source_indices, *, ver
 
 def _plan_transfer(
     capture, sources, source_buffers, source_indices, *,
-    max_segments_per_copy=None, verify_full_sources=False,
+    max_segments_per_copy=None, verify_full_sources=False, max_staging_bytes=None,
 ) -> LogicalTransferPlan:
     if max_segments_per_copy is None:
         max_segments_per_copy = envs.MX_RESHARD_MAX_SEGMENTS_PER_COPY
@@ -501,6 +540,8 @@ def _plan_transfer(
         return _plan_source_replay(
             capture, sources, source_buffers, source_indices,
             verify_full_sources=verify_full_sources,
+            max_segments_per_copy=max_segments_per_copy,
+            max_staging_bytes=max_staging_bytes,
         )
     if verify_full_sources:
         return _plan_verified_transfer(

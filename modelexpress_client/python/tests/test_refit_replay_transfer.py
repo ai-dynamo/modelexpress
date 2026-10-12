@@ -76,3 +76,27 @@ def test_replay_abandonment_drains_prefetched_read(harness):
     iterator.close()
     transport = h.transports[-1]
     assert transport.posted == transport.awaited
+
+
+@pytest.mark.parametrize("harness", [StreamingSettings(512, "cpu", 2)], indirect=True)
+def test_coarsening_preserves_warm_replay_and_reports_wire_tradeoff(harness):
+    h = harness
+    h.capture.source_replay = True
+    h.capture.copies[1] = replace(
+        h.capture.copies[1],
+        op_chain=(("transpose", (0, 1), ()), ("narrow", (0, 0, 2), ())),
+        dest_shape=(2, 4),
+    )
+    for iteration in range(2):
+        h.sources["full"].add_(1)
+        prepared = h.prepare()
+        assert prepared.metrics["descriptor_savings"] > 0
+        assert prepared.metrics["extra_wire_bytes"] == 32
+        assert prepared.metrics["exact_descriptors"] > prepared.metrics["planned_descriptors"]
+        assert prepared.metrics["plan_cache_hits"] == iteration
+        for batch in h.transfer.iter_bounded(prepared, {}):
+            for index, copy, source in batch.writes:
+                if index == 1:
+                    torch.testing.assert_close(
+                        _replay_ops(source, copy.op_chain), h.sources["full"].t()[:2]
+                    )
