@@ -6,11 +6,23 @@
 from __future__ import annotations
 
 from abc import ABC
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
+
+from ..train.manifest import ShardChecksumKey
 
 
 class GeneratorEngineContext(ABC):
     """Typed rank-local inputs used to construct one engine adapter."""
+
+
+@dataclass(frozen=True)
+class ReplicaGroup:
+    """All trainer workers that can serve one logical source slot."""
+
+    source_slot_id: str
+    replicas: list[TrainerSourceShard] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -19,10 +31,16 @@ class TrainerSourceShard:
 
     source_slot_id: str
     worker_id: str
-    manifest_digest: str
-    manifest_endpoint: str
-    manifest: bytes
-    structural_digest: str
+    stable_metadata_digest: str | None
+    metadata_endpoint: str
+    metadata: bytes | None
+    checksum_keys: Mapping[tuple[str, int], ShardChecksumKey] = field(
+        default_factory=dict, compare=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.checksum_keys, MappingProxyType):
+            object.__setattr__(self, "checksum_keys", MappingProxyType(dict(self.checksum_keys)))
 
 
-__all__ = ["GeneratorEngineContext", "TrainerSourceShard"]
+__all__ = ["GeneratorEngineContext", "ReplicaGroup", "TrainerSourceShard"]

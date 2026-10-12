@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from modelexpress.refit.reshard.rendezvous import (
@@ -74,11 +74,15 @@ def build_megatron_reshard_manifest(
             if shard.addr <= 0:
                 raise ValueError(f"{tensor.name}: shard has invalid address")
 
+    stable_tensors = [
+        replace(tensor, shards=[replace(shard, digest=None) for shard in tensor.shards])
+        for tensor in published
+    ]
     blob = wrap_rendezvous_blob(
         manager.nixl_metadata,
         agent_name,
         metadata_endpoint,
-        published,
+        stable_tensors,
     )
     return MegatronReshardManifest(blob=blob, tensors=tuple(published))
 
