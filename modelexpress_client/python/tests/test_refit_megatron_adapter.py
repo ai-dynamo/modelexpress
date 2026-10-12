@@ -70,9 +70,9 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.registration_ttl = request.ttl_seconds
         return refit_pb2.RegisterWorkerResponse(worker=request.worker)
 
-    def GetWeightVersion(self, request, _context):
+    def GetWeightVersion(self, request, _context) -> refit_pb2.GetWeightVersionResponse:
         return refit_pb2.GetWeightVersionResponse(
-            version=refit_pb2.WeightVersion(uid=request.uid, trainer_mesh_id="mesh-a")
+            version=refit_pb2.WeightVersion(uid=request.uid, trainer_mesh_id="mesh-a", trainer_mesh_generation=1)
         )
 
     def CreateWeightVersionShard(self, request, _context):

@@ -25,12 +25,17 @@ if redis.call('EXISTS', KEYS[1]) == 1 then
   return 'COLLISION'
 end
 
+local generation = '0'
 if ARGV[10] ~= '' then
   if redis.call('EXISTS', KEYS[3]) == 0 then
     return 'MESH_NOT_FOUND'
   end
   if redis.call('HGET', KEYS[3], 'model_name') ~= ARGV[2] then
     return 'MESH_MODEL_MISMATCH'
+  end
+  generation = redis.call('HGET', KEYS[3], 'generation')
+  if not generation or generation == '0' then
+    return 'MESH_GENERATION_MISSING'
   end
 end
 
@@ -46,6 +51,7 @@ redis.call('HSET', KEYS[1],
   'state', ARGV[8],
   'created_at_unix_ms', ARGV[9],
   'trainer_mesh_id', ARGV[10],
+  'trainer_mesh_generation', generation,
   'version_number', ARGV[11])
 if ARGV[10] ~= '' then
   redis.call('SADD', KEYS[4], ARGV[1])

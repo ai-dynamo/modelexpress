@@ -63,8 +63,9 @@ def _version(
     base=None,
     model_name="test-model",
     state=WeightVersionState.READY,
-):
+) -> WeightVersion:
     return WeightVersion(
+        trainer_mesh_generation=0,
         version_id=uid,
         model_name=model_name,
         payload_format=payload_format,

@@ -440,6 +440,24 @@ publications and rejects the update while those versions have reader leases.
 listing uses the mesh's version index; metadata reads are pipelined.
 `version_number` is optional caller correlation metadata, not version identity.
 Object-storage callers manage version state; mesh callers do not manage readiness.
+
+Mesh-backed `WeightVersion` records require a positive `trainer_mesh_generation`.
+The unchanged creation API supplies a mesh ID; the server reads and stamps its
+generation atomically while creating the version. Idempotent retries return the
+original stamp. Shard publication, including the final READY transition and
+repeated publications, rejects a changed mesh generation before writing. Trainer
+resolution compares the recorded generation with the current mesh. Stored versions
+require the generation field; decoding parses it as a uint64 without repeating
+creation-time consistency checks. Versions without a trainer mesh, including object-storage
+versions, carry generation zero. A requested version whose recorded mesh
+generation differs from the current trainer mesh fails source resolution.
+
+Any trainer mesh update that changes its generation is rejected while a linked
+weight version has an active consumer lease, including additive replicas that
+leave existing publications intact. An update with unchanged membership remains a no-op.
+After readers release their leases, membership may advance and new weight
+versions capture the new generation; old version stamps are never changed.
+
 DIRECT installation and pipelined worker streaming are
 not implemented by this control-plane slice.
 NIXL manifest endpoints belong to their physical worker shards; a typed object

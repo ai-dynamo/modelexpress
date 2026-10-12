@@ -38,10 +38,11 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.deleted_shards = []
         self.mesh_id = None
 
-    def GetWeightVersion(self, request, _context):
+    def GetWeightVersion(self, request, _context) -> refit_pb2.GetWeightVersionResponse:
         version = refit_pb2.WeightVersion(uid=request.uid)
         if self.mesh_id is not None:
             version.trainer_mesh_id = self.mesh_id
+            version.trainer_mesh_generation = 1
         return refit_pb2.GetWeightVersionResponse(version=version)
 
     def RegisterWorker(self, request, _context):
