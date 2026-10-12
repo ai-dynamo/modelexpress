@@ -11,7 +11,7 @@ Runs after .github/actions/run-mx-dynamo-test has:
   5. Waited for both workers to publish (i.e. the second one completed RDMA)
 
 Asserts:
-  1. Exactly 2 ModelMetadata CRs exist in the test namespace, covering source
+  1. Exactly 2 weight-source ModelMetadata CRs exist in the test namespace, covering source
      ranks 0 and 1 (matches our existing P2P test plumbing — the worker_rank
      filter is what gates rank pairing in rdma_strategy.py).
   2. The second worker actually pulled weights via NIXL RDMA (not via the
@@ -98,10 +98,13 @@ def test_modelmetadata_crs_published(namespace: str, expected_cr_count: int) -> 
     """
     result = kubectl(
         "get", "modelmetadata",
-        "-o", "jsonpath={range .items[*]}{.metadata.name}{\" \"}{.spec.worker_rank}{\"\\n\"}{end}",
+        "-o", "jsonpath={range .items[*]}{.metadata.name}{\" \"}{.spec.worker_rank}{\"|\"}{.spec.sourceType}{\"\\n\"}{end}",
         namespace=namespace,
     )
-    rows = [line for line in result.stdout.splitlines() if line.strip()]
+    rows = [
+        line.rsplit("|", 1)[0] for line in result.stdout.splitlines()
+        if line.strip() and line.rsplit("|", 1)[-1] in ("", "weights")
+    ]
     print(f"[modelmetadata] {len(rows)} CR(s):")
     for row in rows:
         print(f"  {row}")
