@@ -187,7 +187,7 @@ def test_batch_failure_preserves_only_serial_capture_records(failure_position):
                     # A loader may record both attributed and unattributed writes
                     # before encountering an unsupported operation.
                     self.norm.weight_loader(self.norm, tensor[0])
-                    self.norm.data.copy_(tensor[1])
+                    torch.empty_like(self.norm).copy_(tensor[1])
                 super().load_weights([(name, tensor)])
 
     with torch.device("meta"):
@@ -349,17 +349,15 @@ class DefaultLoaderModel(torch.nn.Module):
             weight_loader(p, loaded)
 
 
-def test_default_loader_param_needs_default_weight_loader():
+def test_default_loader_parameter_is_resolved_with_or_without_stamp():
     manifest = [("norm", torch.float32, [4])]
 
-    # Without default_weight_loader: the param has no weight_loader, so it is not
-    # stamped; its copy_ fires with no attribution -> unattributed -> NOT captured
-    # (this is the norm-weights-never-pulled bug the step-0 verify caught).
+    # Registered storage identifies the destination even without a loader stamp.
     with torch.device("meta"):
         model = DefaultLoaderModel()
-    missed = capture_geometry(model, manifest)
-    assert missed.copies == []
-    assert missed.unattributed == 1
+    unstamped = capture_geometry(model, manifest)
+    assert unstamped.unattributed == 0
+    assert not unstamped.unsupported
 
     # With default_weight_loader: the param is stamped and the copy is attributed.
     with torch.device("meta"):
@@ -369,6 +367,7 @@ def test_default_loader_param_needs_default_weight_loader():
     assert got.copies[0].param_name == "norm"
     assert got.copies[0].op_chain == () and got.copies[0].dest_shape == (4,)
     assert got.unattributed == 0
+    assert got.copies == unstamped.copies
 
 
 def test_capture_weights_records_the_converted_source_name():
@@ -448,12 +447,19 @@ def test_convert_source_weights_rejects_a_synthesized_tensor():
         convert_source_weights(convert, _CONVERT_MANIFEST)
 
 
-def test_convert_source_weights_rejects_a_dtype_cast():
+def test_convert_source_weights_retains_a_dtype_cast_for_replay():
     def convert(sd):
         return {"a": sd["model.router.gate.weight"].to(torch.float32)}
 
-    with pytest.raises(UnsupportedReshard):
-        convert_source_weights(convert, _CONVERT_MANIFEST)
+    weight = convert_source_weights(convert, _CONVERT_MANIFEST)["a"]
+    assert weight.dtype == torch.float32
+    assert weight._name == "model.router.gate.weight"
+    assert weight._ops == (("to", (torch.float32,), ()),)
+    original = torch.tensor([0.1, 0.7], dtype=torch.bfloat16)
+    replay = original
+    for op, args, kwargs in weight._ops:
+        replay = getattr(replay, op)(*args, **dict(kwargs))
+    torch.testing.assert_close(replay, convert({weight._name: original})["a"])
 
 
 _E, _I, _H = 3, 2, 4  # experts, intermediate, hidden

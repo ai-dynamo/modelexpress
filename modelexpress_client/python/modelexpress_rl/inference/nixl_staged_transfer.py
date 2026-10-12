@@ -33,6 +33,7 @@ from modelexpress.nixl_transfer import (
     NixlTransferManager,
 )
 from modelexpress.refit.reshard import throughput
+from modelexpress.refit.reshard.geometry import _validate_physical_destination
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import (
     build_sources,
@@ -44,6 +45,7 @@ from modelexpress.refit.reshard.transfer_plan import (
     bind_transfer,
     plan_transfer_groups,
     plan_transfer,
+    replay_scratch_bytes,
 )
 from modelexpress.refit.reshard.transport import ReadDescriptor
 from modelexpress.refit.reshard.transport.nixl import NixlReshardTransport
@@ -56,7 +58,7 @@ from modelexpress.refit.reshard.types import (
 from modelexpress.refit.reshard.verify import shard_region, tensor_digest
 from modelexpress.types import ManifestMismatchError, TensorDescriptor
 
-from modelexpress_rl.inference.plan import TrainerSourceSnapshot
+from modelexpress_rl.inference.plan import SourceReplayBatch, TrainerSourceSnapshot
 
 from ..train.manifest import ShardChecksumKey
 from .plan import StreamingSettings
@@ -182,7 +184,7 @@ class _PreparedNixlTransfer:
 class _StagedNixlWeights:
     """Verified tensors ready for engine installation."""
 
-    tensors: dict[str, torch.Tensor]
+    tensors: dict[str, torch.Tensor] | SourceReplayBatch
     metrics: dict[str, Any]
 
 
@@ -272,6 +274,41 @@ def _bounded_batches(
     metrics["bounded_whole_validation_s"] = time.perf_counter() - started
     if {copy.param_name for copy in capture.copies} - parameter_layout.keys():
         raise IncompleteRefit("bounded capture references unknown engine parameters")
+    if complete.source_replay:
+        batches, current = [], []
+        current_bytes = 0
+
+        def append_batch():
+            plan = replace(complete, full_pulls=tuple(current))
+            subset = CaptureResult(
+                copies=[capture.copies[index] for pull in current for index in pull.copy_indices],
+                source_replay=True,
+                generation=capture.generation,
+                destination_layouts=capture.destination_layouts,
+            )
+            layouts = _StagingLayouts({}, {}, {
+                pull.src_name: (tuple(pull.global_shape), pull.dtype) for pull in current
+            })
+            batches.append(_StreamingBatch(subset, plan, layouts, current_bytes))
+
+        for pull in complete.full_pulls:
+            nbytes = ((math.prod(pull.global_shape) * pull.dtype.itemsize + 255) // 256) * 256
+            if nbytes > max_staging_bytes:
+                raise IncompleteRefit(
+                    f"recorded source write requires {nbytes} staging bytes; "
+                    f"max_staging_bytes={total_staging_bytes or max_staging_bytes}, "
+                    f"staging_buffers={staging_buffers} gives {max_staging_bytes} bytes per arena"
+                )
+            if current and current_bytes + nbytes > max_staging_bytes:
+                append_batch()
+                current, current_bytes = [], 0
+            current.append(pull)
+            current_bytes += nbytes
+        if current:
+            append_batch()
+        if not batches:
+            raise IncompleteRefit("bounded refit has no recorded writes")
+        return tuple(batches)
     groups = {}
     for name in parameter_layout:
         groups.setdefault(name.rpartition(".")[0], {})[name] = parameter_layout[name]
@@ -774,7 +811,7 @@ class _NixlStagedTransfer:
             )
             batches = (
                 _pack_bounded_batches(modules, self._buffer_budget)
-                if self._pack_modules else modules
+                if self._pack_modules and not plan.source_replay else modules
             )
             compiled = _StreamingSchedule(plan, modules, batches)
             logger.info("compiled bounded transfer plan")
@@ -1162,7 +1199,7 @@ class _NixlStagedTransfer:
 
     def iter_bounded(
         self, prepared: _PreparedBoundedTransfer, metrics: dict[str, Any]
-    ) -> Iterator[dict[str, torch.Tensor]]:
+    ) -> Iterator[dict[str, torch.Tensor] | SourceReplayBatch]:
         """Yield staged batches; callers must commit before advancing.
 
         With one arena each batch is read, yielded, and committed in turn.
@@ -1179,6 +1216,11 @@ class _NixlStagedTransfer:
         metrics["staging_peak_bytes"] = sum(a.numel() for a in arenas)
         metrics["staging_buffers"] = len(arenas)
         metrics["batches"] = len(prepared.batches)
+        if prepared.batches[0].transfer_plan.source_replay:
+            metrics["replay_scratch_peak_bytes"] = max(
+                replay_scratch_bytes(pull)
+                for batch in prepared.batches for pull in batch.transfer_plan.full_pulls
+            )
         batches = prepared.batches
         metrics.update(
             descriptor_cache_hits=0, descriptor_cache_misses=0,
@@ -1201,7 +1243,10 @@ class _NixlStagedTransfer:
                     # synchronized one iteration ago, so it is free to refill.
                     pending = self._post_bounded(prepared, index + 1, metrics)
                 for key, value in staged.metrics.items():
-                    metrics[key] = metrics.get(key, 0) + value
+                    metrics[key] = (
+                        max(metrics.get(key, 0), value) if key.endswith("_peak_bytes")
+                        else metrics.get(key, 0) + value
+                    )
                 yield staged.tensors
                 # All installation reads must complete before arena reuse.
                 torch.cuda.synchronize(self._device)
@@ -1263,13 +1308,40 @@ class _NixlStagedTransfer:
             owner_started = time.perf_counter()
             for batch in plan.module_batches:
                 _NixlStagedTransfer._validate_complete(
-                    batch.capture, batch.layouts[0], batch.transfer_plan
+                    batch.capture,
+                    {name: parameter_layout[name] for name in {copy.param_name for copy in batch.capture.copies}}
+                    if batch.transfer_plan.source_replay else batch.layouts[0],
+                    batch.transfer_plan,
                 )
             if metrics is not None:
                 metrics["owner_validation_s"] = time.perf_counter() - owner_started
                 metrics["plan_cache_validate_s"] = time.perf_counter() - started
             return
 
+        if plan.source_replay:
+            for copy in capture.copies:
+                shape, dtype = parameter_layout.get(copy.param_name, ((), None))
+                strides = []
+                step = 1
+                for size in reversed(shape):
+                    strides.insert(0, step)
+                    step *= size
+                owner_shape, owner_stride = capture.destination_layouts.get(
+                    copy.param_name, (shape, tuple(strides))
+                )
+                try:
+                    if dtype != copy.dest_dtype or tuple(owner_shape) != tuple(shape):
+                        raise UnsupportedReshard("recorded destination owner layout differs")
+                    _validate_physical_destination(
+                        copy.dest_shape,
+                        copy.dest_stride if copy.owner_stride is None else copy.owner_stride,
+                        copy.dest_offset if copy.owner_offset is None else copy.owner_offset,
+                        owner_shape, owner_stride,
+                    )
+                except UnsupportedReshard as error:
+                    raise IncompleteRefit(
+                        f"destination {copy.param_name!r} write exceeds physical owner bounds: {error}"
+                    ) from error
         written = {copy.param_name for copy in capture.copies}
         missing = sorted(set(parameter_layout) - written)
         unsupported = list(capture.unsupported)
@@ -1317,7 +1389,7 @@ class _NixlStagedTransfer:
         plan: LogicalTransferPlan,
         parameter_layout: dict[str, tuple[tuple[int, ...], torch.dtype]],
     ) -> None:
-        recv_expected = {
+        recv_expected = {} if plan.source_replay else {
             name: (tuple(shape), dtype)
             for name, (shape, dtype) in parameter_layout.items()
         }
@@ -1389,6 +1461,11 @@ class _NixlStagedTransfer:
             raise RuntimeError("NIXL transfer plan is no longer active")
         started = time.perf_counter()
         try:
+            if prepared.transfer_plan.source_replay:
+                for tensor in self._full_buffers.values():
+                    tensor.zero_()
+                if self._device.type == "cuda":
+                    torch.cuda.synchronize(self._device)
             posted = prepared.transport.post_reads(list(prepared.descriptors))
             return self._complete_stage(prepared, posted, started)
         except BaseException:
@@ -1404,6 +1481,38 @@ class _NixlStagedTransfer:
         prepared.transport.await_reads(posted)
         wire_wait_seconds = time.perf_counter() - wait_started
         wire_seconds = time.perf_counter() - started
+
+        if prepared.transfer_plan.source_replay:
+            plan = prepared.transfer_plan
+            throughput.warn_if_below_floor(
+                wire_bytes=sum(d.nbytes for d in prepared.descriptors),
+                wire_seconds=wire_seconds, log=logger,
+                context={"device_id": self._device_id, "phase": "stage"},
+            )
+            if plan.verify_full_sources:
+                for pull in plan.full_pulls:
+                    name = pull.copies[0].src_name
+                    self._verify_source(prepared, name, self._full_buffers[pull.src_name])
+            writes = tuple(
+                (index, copy, self._full_buffers[pull.src_name])
+                for pull in plan.full_pulls
+                for index, copy in zip(pull.copy_indices, pull.copies, strict=True)
+            )
+            return _StagedNixlWeights(
+                SourceReplayBatch(
+                    writes, plan.replay_parameter_names, plan.replay_last_writes,
+                    plan.replay_total_copies, plan.replay_generation,
+                ),
+                {
+                    "installation_owner_peak_bytes": plan.installation_owner_peak_bytes,
+                    "installation_materialization_peak_bytes": plan.installation_materialization_peak_bytes,
+                    "bytes_received": sum(d.nbytes for d in prepared.descriptors),
+                    "segments": len(prepared.descriptors),
+                    "wire_s": wire_seconds, "wire_wait_s": wire_wait_seconds,
+                    "reconstruct_s": 0.0, "full_pull_sources": len(plan.full_pulls),
+                    "converts": 0,
+                },
+            )
 
         reconstruct_started = time.perf_counter()
         for full in prepared.transfer_plan.full_pulls:
@@ -1635,32 +1744,35 @@ class _NixlStagedTransfer:
         )
 
     def _verify(self, prepared: _PreparedNixlTransfer) -> None:
-        for name, source in prepared.sources.items():
-            tensor = self._verification_tensor(prepared, name)
-            for shard in source.shards:
-                expected = prepared.checksums.get(
-                    (
-                        name, shard.session, shard.addr,
-                        tuple(shard.shard_offset), tuple(shard.shape),
-                    )
+        for name in prepared.sources:
+            self._verify_source(prepared, name, self._verification_tensor(prepared, name))
+
+    def _verify_source(self, prepared, name, tensor) -> None:
+        source = prepared.sources[name]
+        for shard in source.shards:
+            expected = prepared.checksums.get(
+                (
+                    name, shard.session, shard.addr,
+                    tuple(shard.shard_offset), tuple(shard.shape),
                 )
-                if not expected:
-                    raise RuntimeError(
-                        f"source {name!r} did not publish a verification digest"
-                    )
-                actual = tensor_digest(
-                    shard_region(
-                        tensor,
-                        source.global_shape,
-                        shard.shard_offset,
-                        shard.shape,
-                    )
+            )
+            if not expected:
+                raise RuntimeError(
+                    f"source {name!r} did not publish a verification digest"
                 )
-                if actual != expected:
-                    raise RuntimeError(
-                        f"staged weight digest mismatch for source {name!r} "
-                        f"at offset {tuple(shard.shard_offset)}"
-                    )
+            actual = tensor_digest(
+                shard_region(
+                    tensor,
+                    source.global_shape,
+                    shard.shard_offset,
+                    shard.shape,
+                )
+            )
+            if actual != expected:
+                raise RuntimeError(
+                    f"staged weight digest mismatch for source {name!r} "
+                    f"at offset {tuple(shard.shard_offset)}"
+                )
 
     def close(self) -> None:
         if self._closed:
