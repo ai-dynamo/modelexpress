@@ -133,6 +133,10 @@ if TYPE_CHECKING:
     MX_P2P_TOPOLOGY_LEVELS: Optional[str]
     MX_P2P_TOPOLOGY: Optional[str]
     MX_P2P_TOPOLOGY_LOAD_WEIGHT: float
+    # Transfer-domain policy: the topology domain sources must share with this
+    # node, and whether that is required (filter) or preferred (ordering).
+    MX_P2P_TOPOLOGY_DOMAIN: Optional[str]
+    MX_P2P_TOPOLOGY_ENFORCEMENT: Optional[str]
     # Opt-in metrics collector
     MX_METRICS_ENABLED: bool
     MX_METRICS_PORT: Optional[str]
@@ -448,6 +452,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_P2P_TOPOLOGY_LOAD_WEIGHT": lambda: max(
         0.0, _env_float("MX_P2P_TOPOLOGY_LOAD_WEIGHT", 0.0)
     ),
+    # Raw; topology.resolve_policy validates and applies the "required" default.
+    "MX_P2P_TOPOLOGY_DOMAIN": lambda: os.environ.get("MX_P2P_TOPOLOGY_DOMAIN"),
+    "MX_P2P_TOPOLOGY_ENFORCEMENT": lambda: os.environ.get("MX_P2P_TOPOLOGY_ENFORCEMENT"),
     # ── Opt-in metrics collector ───────────────────────────────────────────
     "MX_METRICS_ENABLED": lambda: (
         os.environ.get("MX_METRICS_ENABLED", "0").strip().lower() in _TRUTHY
