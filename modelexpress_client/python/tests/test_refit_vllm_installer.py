@@ -1786,22 +1786,52 @@ def test_load_time_alias_restoration_does_not_ignore_missing_ties(recorded):
         installer._restore_parameter_aliases(aliases)
 
 
-@pytest.mark.parametrize("invalid", ["missing", "unknown", "shape", "dtype"])
-def test_install_validates_received_batch_against_retained_plan(monkeypatch, invalid) -> None:
+@pytest.mark.parametrize("invalid", ["missing", "type", "shape", "dtype", "device"])
+def test_install_validates_graph_buffers_against_retained_layout(monkeypatch, invalid) -> None:
     _install_fake_vllm(monkeypatch, lambda model: None)
-    model = nn.Linear(2, 2)
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.zeros(2))
+    model.state = torch.zeros(2)
     installer = _VllmInstaller(
         model=model, vllm_config=object(), model_config=object(), device=torch.device("cpu")
     )
     _retain_test_layout(installer)
-    tensors = {"weight": torch.ones(2, 2), "bias": torch.ones(2)}
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
     if invalid == "missing":
-        tensors.pop("bias")
-    elif invalid == "unknown":
-        tensors["other"] = torch.ones(2)
+        del model.state
+    elif invalid == "type":
+        model.state = "not a tensor"
     elif invalid == "shape":
-        tensors["weight"] = torch.ones(2, 1)
+        model.state = torch.ones(3)
+    elif invalid == "dtype":
+        model.state = torch.ones(2, dtype=torch.float64)
     else:
-        tensors["weight"] = torch.ones(2, 2, dtype=torch.float64)
-    with pytest.raises(IncompleteRefit, match="install plan"):
-        installer.install_tensors(tensors)
+        model.state = torch.ones(2, device="meta")
+    for _ in range(2):
+        with pytest.raises(IncompleteRefit, match="graph buffer"):
+            installer.install_tensors({"weight": torch.ones(2)})
+
+
+def test_install_retains_graph_buffer_address_across_cold_and_warm_updates(monkeypatch):
+    _install_fake_vllm(monkeypatch, lambda model: None)
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.zeros(2))
+    model.state = torch.zeros(2)
+    installer = _VllmInstaller(
+        model=model, vllm_config=object(), model_config=object(), device=torch.device("cpu")
+    )
+    _retain_test_layout(installer)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    value = 0.0
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    layerwise.finalize_layerwise_reload = lambda _model, _config: setattr(
+        model, "state", torch.full((2,), value)
+    )
+    original = model.state
+    address = original.data_ptr()
+    for value in (3.0, 7.0):
+        installer.install_tensors({"weight": torch.full((2,), value)})
+        assert model.state is original
+        assert model.state.data_ptr() == address
+        assert torch.equal(model.state, torch.full((2,), value))
+        assert torch.equal(model.weight, torch.full((2,), value))

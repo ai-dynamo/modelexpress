@@ -1706,20 +1706,20 @@ an arena. The current alias and buffer restoration execution remains in place.
 An installation redesign based on captured-operation order is deferred.
 
 The vLLM installer lazily creates one canonical installation plan on the first
-successful capture for a generator client. Captured loader operations, destination
-geometry, owning module groups, alias restoration metadata and graph destinations
-belong to that plan. Construction validates complete capture and restores the
-live model before publishing it. Failed construction leaves the client without a
-plan so a later attempt can retry.
+capture for a generator client. It retains captured loader operations, owning
+module groups, alias restoration metadata and graph destinations. Construction
+validates complete coverage and restores the live model before publishing the
+plan. Failed construction leaves the client without a plan so a later attempt
+can retry. The first successful reload after capture validates recreated graph-buffer
+geometry; subsequent reloads trust that generator-lifetime contract.
 
 The plan is reused for every update without source-schema keys, independent
 mapping caches, deep copies or comparisons against current model parameters.
 Architecture, canonical loader-input schema, module ownership, alias topology and
 loader semantics are fixed for
 the client lifetime; changing them requires a new client. Execution resolves the
-current leaf tensors after native materialization. It still checks received batch
-coverage against the retained plan and preserves copy, completion and cleanup
-safety. It does not detect unsupported structural mutations by callbacks.
+current leaf tensors after native materialization. It checks actual stream
+completeness and preserves copy, completion and cleanup safety. It does not detect unsupported structural mutations by callbacks.
 
 Trainer-native conversion and composition of source view operations with the
 canonical capture belong to transfer planning. The first transfer supplies the
@@ -1754,8 +1754,12 @@ The retained compiled plan owns its composed capture and destination layout;
 unchanged trainer structure reuses both without repeating source conversion,
 including when the optional whole-plan cache is disabled. The installer retains
 its separate client-lifetime canonical capture. Immutable logical records need
-no defensive copies on cache reuse. Existing E cache invalidation inputs remain
-in effect; this does not introduce mesh-generation-scoped plan ownership.
+no defensive copies on cache reuse. The generator layout and install plan remain
+stable for the client lifetime; the trainer layout and logical plan remain stable
+for a mesh generation. Validation runs when each is established, and warm reuse
+trusts the retained state. Per-update readiness checks, checksums, stream
+completeness and resource-safety checks remain in place. The existing cache
+invalidation inputs remain in effect; no caching policy changes here.
 
 Alias restoration distinguishes repeated paths to one slot from ties between
 slots. vLLM's recorded parameter metadata separates load-time ties from runtime

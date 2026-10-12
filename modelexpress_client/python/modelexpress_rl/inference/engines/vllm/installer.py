@@ -501,6 +501,7 @@ class _VllmInstaller(EngineInstaller):
         self._runtime_tensors = runtime_tensors
         self._engine_load_layout: _EngineLoadLayout | None = None
         self._native_parameter_dispatch = _native_parameter_dispatch()
+        self._graph_buffers_validated = False
 
     @cached_property
     def _original_loader(self) -> Callable:
@@ -740,8 +741,6 @@ class _VllmInstaller(EngineInstaller):
             nonlocal load_s, commit_s
             load_started = time.perf_counter()
             expected = set(layout.parameters)
-            if expected != prepared.parameter_names:
-                raise IncompleteRefit("streaming parameter coverage differs from the install plan")
             installed = set()
             try:
                 ownership.iterator = iter(prepared.batches())
@@ -903,19 +902,6 @@ class _VllmInstaller(EngineInstaller):
             ) from error
 
         def load(_reload_aliases: _ParameterAliases | None = None) -> None:
-            for name, tensor in tensors.items():
-                if layout.parameters.get(name) != (tuple(tensor.shape), tensor.dtype):
-                    raise IncompleteRefit(
-                        f"received tensor {name!r} differs from the install plan"
-                    )
-            if reload and tensors.keys() != layout.parameters.keys():
-                raise IncompleteRefit("received tensors do not cover the install plan")
-            for _owner, parameters in layout.groups:
-                names = {name for name, _leaf in parameters}
-                if names & tensors.keys() and not names <= tensors.keys():
-                    raise IncompleteRefit(
-                        "received batch splits an owning module in the install plan"
-                    )
             groups = {
                 owner: [(name, leaf) for name, leaf in parameters if name in tensors]
                 for owner, parameters in layout.groups
@@ -1059,7 +1045,17 @@ class _VllmInstaller(EngineInstaller):
             # Preserve the destinations retained by graph consumers.
             for module, attributes in bare_tensors:
                 for name, graph_tensor in attributes.items():
-                    current = getattr(module, name)
+                    current = getattr(module, name, None)
+                    if not self._graph_buffers_validated and (
+                        not isinstance(current, torch.Tensor)
+                        or current.shape != graph_tensor.shape
+                        or current.dtype != graph_tensor.dtype
+                        or current.device != graph_tensor.device
+                    ):
+                        raise IncompleteRefit(
+                            f"graph buffer {type(module).__name__}.{name} "
+                            "differs from the generator layout"
+                        )
                     if current is not graph_tensor:
                         graph_tensor.copy_(current)
                     setattr(module, name, graph_tensor)
@@ -1084,6 +1080,8 @@ class _VllmInstaller(EngineInstaller):
                 "vLLM refit left parameters on the meta device; "
                 f"count={len(meta_parameters)}, names={meta_parameters[:10]}"
             )
+        if layout is not None:
+            self._graph_buffers_validated = True
 
 
 __all__: list[str] = []
