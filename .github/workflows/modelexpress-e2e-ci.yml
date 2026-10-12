@@ -1,0 +1,664 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress K8s CI.
+#
+# Azure GPU test jobs are implemented in modelexpress-gpu-ci.yml and called as a
+# single cancelable PR job; each pool queues its test jobs through cleanup.
+#
+# Jobs:
+#   build-server        — builds and pushes the MX coordination server image
+#                         from ci/k8s/server/Dockerfile.server. Runs on the
+#                         self-hosted builder runner
+#                         (prod-modelexpress-builder-amd-v1).
+#
+#   build-client        — matrix over inference engine frameworks (vllm,
+#                         trt-llm, sglang, dynamo-vllm); builds and pushes
+#                         one worker image per framework. Runs on the
+#                         self-hosted builder runner. All build jobs run in
+#                         parallel.
+#
+#   build-vime-delta-refit — builds the Vime trainer and
+#                            Dynamo/vLLM/ModelExpress worker images.
+#
+#   ensure-vcluster     — bootstraps the persistent mx-ci-cluster vCluster on
+#                         first run (no-ops on re-runs). Runs in parallel with
+#                         the build jobs.
+#
+#   test-p2p            — matrix over frameworks; needs build-client,
+#                         build-server, and ensure-vcluster. Each matrix entry
+#                         creates its own isolated namespace, deploys a full
+#                         stack (mx-server + workers), runs pytest, then
+#                         deletes the namespace. Runs up to max-parallel: 3
+#                         entries concurrently to bound simultaneous HF model
+#                         downloads and GPU footprint.
+#
+#   test-tp             — TP > 1 variant of test-p2p. Multi-node TP=2 only
+#                         (StatefulSet + Ray, one GPU per pod on a100a, 2 pods
+#                         per role). Single-node TP=2 is covered by
+#                         test-p2p-mla-model (same manifest, plus VRAM parity)
+#                         and was dropped here to avoid doubling a100b demand.
+#                         See TEST_PLAN row 5.1.
+#
+#   test-parallel       — DP > 1 and EP > 1 variants of test-p2p, matrixed and
+#                         serialized (max-parallel: 1) since both are single-node
+#                         full-GPU jobs on the scarce non-MIG pool. DP uses vLLM
+#                         native data parallelism (--data-parallel-size 2, N full
+#                         interchangeable copies at worker_rank 0, tp_size=1); EP
+#                         uses expert parallelism (--enable-expert-parallel over a
+#                         TP=2 MoE world, rank-distinct weights, tp_size=2, the
+#                         identity hash carrying a derived expert-parallel world
+#                         size of tp * dp * pcp rather than a constant). See
+#                         TEST_PLAN rows 5.2 and 5.3.
+#
+#   test-p2p-mla-model — vLLM + SGLang MLA/MoE P2P test on the full-GPU A100b
+#                        pool, matrixed over framework and serialized
+#                        (max-parallel: 1). Uses a TP=2 DeepSeek MLA + MoE model
+#                        and runs the source/target VRAM parity assertions. The
+#                        vLLM entry doubles as the single-node TP=2 coverage
+#                        (same manifest-azure-tp2.yaml + test_p2p_k8s.py as the
+#                        dropped test-tp single-node entry); the SGLang entry
+#                        covers the remote_instance + NIXL path.
+#
+#   test-with-dynamo    — P2P test orchestrated through a DynamoGraphDeployment.
+#                         Matrix over serving topology (aggregated /
+#                         disaggregated). Different shape than test-p2p (DGD CR
+#                         + grove-managed pods, not a raw K8s Job), so it's
+#                         its own top-level job rather than a test-p2p matrix
+#                         entry. Relies on the cluster-wide Dynamo operator
+#                         installed in dynamo-system by setup-mx-vcluster.
+#
+#   test-vime-delta-refit — uses a CPU deploy runner to create TP2 trainer and
+#                           TP1 rollout pods directly on the H100 cluster.
+#
+#   test-stale-metadata — Reaper-correctness check. mx-server runs with the
+#                         Redis backend (sidecar) and compressed reaper knobs
+#                         (heartbeat=30s, scan=10s); a single source pod
+#                         publishes, the action force-kills it, and pytest
+#                         asserts ListSources(status_filter=READY) returns 0
+#                         after the heartbeat window. Matrix over framework
+#                         (vllm / sglang). No target pod — the assertion runs
+#                         against mx-server directly via gRPC.
+#
+#   model-streamer       — matrix over frameworks; single worker pod, no
+#                          vCluster, no P2P. Streams weights directly from S3
+#                          via runai-model-streamer + IRSA. Validates the
+#                          streamer path independently of the P2P plumbing.
+#                          Only vllm is active today — the SGLang adapter's
+#                          streamer path currently crashes inside
+#                          ModelStreamerStrategy.load on
+#                          `ctx.model_config.model` (vLLM-specific attribute),
+#                          and the composite action also hard-codes vLLM's
+#                          launch command. Uncomment the sglang matrix entry
+#                          once both are addressed.
+#
+#   ci-status-check     — umbrella job that needs every gating job above.
+#                         Single check that the branch-protection rule on
+#                         `main` requires; adding a new gating job means
+#                         appending it to this job's `needs:` list, no
+#                         branch-protection reconfigure needed.
+#
+# To add a new inference engine:
+#   1. Add ci/k8s/client/<engine>/Dockerfile
+#   2. Add ci/k8s/client/<engine>/manifest-*.yaml + test_p2p_k8s.py
+#   3. Add an entry to the build-client and test-p2p matrix include lists below.
+#   4. If the engine's S3 streamer path works end-to-end, add the framework to
+#      the model-streamer matrix and generalize the run-mx-streamer-test
+#      composite action to dispatch on framework.
+#   5. If the engine also runs under a Dynamo DGD (`dynamo-<engine>`), add it
+#      to the build-client matrix with the dynamo-specific Dockerfile and
+#      consider extending test-with-dynamo to a matrix.
+#   6. If you add a new top-level test job (not just a matrix entry), add
+#      its job key to `ci-status-check`'s `needs:` list so it's covered by
+#      the branch-protection gate.
+#
+# Required secrets:
+#   AZURE_AKS_CI_KUBECONFIG_B64   — base64-encoded kubeconfig for the AKS host cluster
+#   NGC_API_KEY                   — push/pull registry images
+#   HF_TOKEN                      — Hugging Face token for the model-cache Job
+name: ModelExpress E2E CI
+
+on:
+  # copy-pr-bot mediated trigger. Direct `pull_request:` events are forbidden
+  # on self-hosted runners (PR-head code is untrusted); copy-pr-bot
+  # copies a PR's content to `pull-request/<N>` in this repo AFTER a
+  # maintainer approves (or all commits are GPG-signed by Nvidians), and
+  # the push to that internal branch is what fires this workflow.
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+# Cancel superseded work per job; cleanup remains independent of newer runs.
+
+env:
+  MX_CI_MODEL: Qwen/Qwen2.5-0.5B
+  VCLUSTER_NAME: mx-ci-cluster
+  VCLUSTER_NAMESPACE: mx-ci
+  VIME_DYNAMO_REF: c3e05f0244ae6264d7953f68e2499c6dc2f54723
+  MX_CI_S3_BUCKET: ai-dynamo-modelexpress-ci
+  MX_CI_S3_REGION: us-west-2
+  MX_IMAGE_REPO: nvcr.io/0980761089281446
+
+jobs:
+  azure-gpu-tests:
+    name: Azure GPU tests
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-azure-gpu-tests
+      cancel-in-progress: true
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/modelexpress-gpu-ci.yml
+    secrets: inherit
+
+  azure-gpu-cleanup:
+    name: Azure GPU cleanup
+    needs: [azure-gpu-tests]
+    if: always()
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Connect to vCluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+      - name: Reclaim namespaces owned by this run attempt
+        env:
+          KUBECONFIG: ${{ github.workspace }}/.kubeconfig-vcluster
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          namespaces=$(ci_kubectl get namespaces \
+            -l "ci.modelexpress.nvidia.com/run-id=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+          host_namespaces=$(ci_kubectl get pods --kubeconfig="$GITHUB_WORKSPACE/.kubeconfig-host" \
+            -n "$VCLUSTER_NAMESPACE" -l "vcluster.loft.sh/managed-by=$VCLUSTER_NAME" -o json \
+            | jq -r --arg suffix "-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              '.items[].metadata.labels["vcluster.loft.sh/namespace"] | select(. != null and startswith("mx-ci-") and endswith($suffix))')
+          namespaces=$(printf '%s\n%s\n' "$namespaces" "$host_namespaces" | sort -u)
+          if [ -n "$namespaces" ]; then
+            printf '%s\n' "$namespaces" | sed '/^$/d' \
+              | xargs -r -n 1 -P 4 bash .github/scripts/ci-namespace.sh cleanup
+          fi
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "$VCLUSTER_PF_PID" 2>/dev/null || true
+          fi
+
+  small-model-s3-refit:
+    name: RL generator-only delta refit (vllm, s3)
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/modelexpress-rl-refit-ci.yml
+    with:
+      model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+      scenario: delta
+      sha: ${{ github.sha }}
+      runtime: ${{ fromJSON(vars.MX_BENCH_RUNTIME_BASES || '{}').nemotron || '' }}
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  build-server:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-build-server
+      cancel-in-progress: true
+    name: Build server image
+    runs-on: prod-modelexpress-builder-amd-v1
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Compute SERVER_IMAGE
+        # Persist the tag in $GITHUB_ENV so both the build step and the
+        # cleanup step reference the same value without re-templating.
+        run: |
+          echo "SERVER_IMAGE=${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}" >> "$GITHUB_ENV"
+
+      - name: Log in to image registry
+        run: |
+          echo "${{ secrets.NGC_API_KEY }}" | \
+            docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build and push
+        run: |
+          bash .github/scripts/build-with-registry-retry.sh \
+            --platform linux/amd64 \
+            -f ci/k8s/server/Dockerfile.server \
+            --cache-from "type=registry,ref=${SERVER_IMAGE%:*}:buildcache-${GITHUB_REF_NAME//\//-}" \
+            --cache-to "type=registry,ref=${SERVER_IMAGE%:*}:buildcache-${GITHUB_REF_NAME//\//-},mode=max,ignore-error=true" \
+            -t "${SERVER_IMAGE}" \
+            --push \
+            .
+
+      - name: Cleanup local image
+        # buildx with --push typically doesn't materialize a local image,
+        # but reap defensively in case the buildx driver was switched.
+        # `if: always()` survives failure + cancel-in-progress so the
+        # self-hosted builder runner's Docker daemon doesn't accumulate
+        # stale images across runs.
+        if: always()
+        run: |
+          docker image rm -f "${SERVER_IMAGE}" 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------
+  build-client:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-build-client-${{ strategy.job-index }}
+      cancel-in-progress: true
+    name: Build worker image (${{ matrix.framework }})
+    runs-on: prod-modelexpress-builder-amd-v1
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+            dockerfile: ci/k8s/client/vllm/Dockerfile
+          - framework: sglang
+            dockerfile: ci/k8s/client/sgl/Dockerfile
+          - framework: sglang-mooncake
+            dockerfile: ci/k8s/client/sgl/Dockerfile.mooncake
+          - framework: dynamo-vllm
+            dockerfile: ci/k8s/client/vllm/dynamo/Dockerfile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Compute WORKER_IMAGE
+        # Persist the tag in $GITHUB_ENV so both the build step and the
+        # cleanup step reference the same value without re-templating.
+        run: |
+          echo "WORKER_IMAGE=${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}" >> "$GITHUB_ENV"
+
+      - name: Log in to image registry
+        run: |
+          echo "${{ secrets.NGC_API_KEY }}" | \
+            docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build and push
+        # Build context is repo root — Dockerfiles COPY from modelexpress_client/python/.
+        run: |
+          bash .github/scripts/build-with-registry-retry.sh \
+            --platform linux/amd64 \
+            -f "${{ matrix.dockerfile }}" \
+            --cache-from "type=registry,ref=${WORKER_IMAGE%:*}:buildcache-${GITHUB_REF_NAME//\//-}" \
+            --cache-to "type=registry,ref=${WORKER_IMAGE%:*}:buildcache-${GITHUB_REF_NAME//\//-},mode=max,ignore-error=true" \
+            -t "${WORKER_IMAGE}" \
+            --push \
+            .
+
+      - name: Cleanup local image
+        # buildx with --push typically doesn't materialize a local image,
+        # but reap defensively in case the buildx driver was switched.
+        # `if: always()` survives failure + cancel-in-progress so the
+        # self-hosted builder runner's Docker daemon doesn't accumulate
+        # stale images across runs (each matrix entry adds a multi-GB image).
+        if: always()
+        run: |
+          docker image rm -f "${WORKER_IMAGE}" 2>/dev/null || true
+
+  # Build the trainer and rollout images used by the Vime delta-refit smoke.
+  build-vime-delta-refit:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-build-vime-delta-refit
+      cancel-in-progress: true
+    name: RL Vime delta-refit build
+    runs-on: prod-modelexpress-builder-amd-v1
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout pinned Dynamo nightly
+        run: |
+          rm -rf "${RUNNER_TEMP}/dynamo"
+          git init --quiet "${RUNNER_TEMP}/dynamo"
+          git -C "${RUNNER_TEMP}/dynamo" remote add origin \
+            https://github.com/ai-dynamo/dynamo.git
+          git -C "${RUNNER_TEMP}/dynamo" fetch --depth 1 --filter=blob:none \
+            origin "${VIME_DYNAMO_REF}"
+          git -C "${RUNNER_TEMP}/dynamo" checkout --detach FETCH_HEAD
+          git -C "${RUNNER_TEMP}/dynamo" rev-parse HEAD
+
+      - name: Log in to image registry
+        run: |
+          echo "${{ secrets.NGC_API_KEY }}" | \
+            docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build and push trainer and rollout
+        run: |
+          bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 \
+            -f examples/rl/vime_dynamo_delta_refit/Dockerfile \
+            --cache-from "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:buildcache-${GITHUB_REF_NAME//\//-}" \
+            --cache-to "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:buildcache-${GITHUB_REF_NAME//\//-},mode=max,ignore-error=true" \
+            --target trainer --push \
+            -t "${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:${{ github.sha }}" .
+          bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 \
+            -f examples/rl/vime_dynamo_delta_refit/Dockerfile \
+            --build-context dynamo="${RUNNER_TEMP}/dynamo" \
+            --cache-from "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-worker:buildcache-${GITHUB_REF_NAME//\//-}" \
+            --cache-to "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-worker:buildcache-${GITHUB_REF_NAME//\//-},mode=max,ignore-error=true" \
+            --target worker --push \
+            -t "${MX_IMAGE_REPO}/vime-dynamo-mx-worker:${{ github.sha }}" .
+
+  # ---------------------------------------------------------------------------
+  ensure-vcluster:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-ensure-vcluster
+      cancel-in-progress: true
+    name: Ensure vCluster
+    runs-on: prod-modelexpress-builder-amd-v1
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Check if vCluster exists
+        id: vcluster-check
+        uses: ./.github/actions/check-vcluster-exists
+        with:
+          kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Bootstrap vCluster (first run only)
+        if: steps.vcluster-check.outputs.exists != 'true'
+        uses: ./.github/actions/setup-mx-vcluster
+        with:
+          kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Connect to vCluster
+        # Always connect — verifies the vCluster is accessible on re-runs
+        # where bootstrap was skipped.
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Guard against host / vCluster version skew
+        # The control-plane version is a pinned constant (vcluster_k8s_version
+        # in setup-mx-vcluster). What broke CI once was the AKS host
+        # auto-upgrading PAST that pin: Kubernetes 1.34 added observedGeneration
+        # on pod conditions, and a vCluster minor below the host makes the
+        # syncer loop, dropping that field and overwriting Ready=True with stale
+        # data so pods never surface as Ready. setup-mx-vcluster is gated (only
+        # runs when the vCluster is absent), so a running cluster silently
+        # skewed after a host bump is never re-checked there. Compare the LIVE
+        # vCluster server minor against the host's on every run and fail loudly
+        # with the fix — so the next host bump is a red step with the answer in
+        # it instead of days of digging. Compares major.minor only (the skew is
+        # a minor-version feature; patch differences are fine). Fails closed on
+        # a confirmed skew and also when either version can't be read.
+        # Incident writeup + context: MX-429.
+        shell: bash
+        run: |
+          # `|| true`: the default GitHub bash runs with `-eo pipefail`, so a
+          # no-match grep would abort the `VAR=$(server_minor ...)` assignment
+          # before the empty-value check runs. Swallow the pipeline status and
+          # let the explicit check below produce the parse-error diagnostic.
+          server_minor() {
+            kubectl --kubeconfig="$1" version 2>/dev/null \
+              | grep -iE 'server version' | grep -oE '[0-9]+\.[0-9]+' | head -1 || true
+          }
+          HOST_MM=$(server_minor "${{ github.workspace }}/.kubeconfig-host")
+          VC_MM=$(server_minor "${{ github.workspace }}/.kubeconfig-vcluster")
+          echo "Host k8s minor: ${HOST_MM:-unknown}; vCluster k8s minor: ${VC_MM:-unknown}"
+          if [ -z "${HOST_MM}" ] || [ -z "${VC_MM}" ]; then
+            # Fail closed: reachability is already verified above, so an
+            # unreadable version means the parse broke, not connectivity. Fail
+            # loudly rather than let the guard silently stop protecting.
+            echo "::error::Could not read host and/or vCluster server version (host='${HOST_MM:-}', vCluster='${VC_MM:-}'). Fix the version parse in this step."
+            exit 1
+          fi
+          HOST_MAJOR=${HOST_MM%.*}; HOST_MINOR=${HOST_MM#*.}
+          VC_MAJOR=${VC_MM%.*};     VC_MINOR=${VC_MM#*.}
+          if [ "${VC_MAJOR}" -lt "${HOST_MAJOR}" ] \
+             || { [ "${VC_MAJOR}" -eq "${HOST_MAJOR}" ] && [ "${VC_MINOR}" -lt "${HOST_MINOR}" ]; }; then
+            echo "::error::vCluster control plane is ${VC_MM} but the AKS host is ${HOST_MM}. A vCluster minor below the host stalls pod-ready propagation (observedGeneration, added in k8s 1.34, makes the syncer overwrite Ready=True). Bump vcluster_k8s_version in .github/actions/setup-mx-vcluster to >= ${HOST_MM}, then recreate the vCluster (delete it so the gated bootstrap rebuilds at the new version)."
+            exit 1
+          fi
+          echo "No host/vCluster version skew (vCluster ${VC_MM} >= host ${HOST_MM})."
+
+      - name: vCluster baseline health
+        # Snapshot vCluster control-plane state before any test job runs. When
+        # downstream jobs fail with "connection refused" mid-run, this baseline
+        # tells us whether the vCluster was already showing signs of strain
+        # (restarts, OOMs, evictions, low headroom) or was healthy at the start
+        # — pointing the investigation at either cluster-health or test-load.
+        # Same action is invoked with `if: failure()` from each test job to
+        # capture state at the moment a test failed (which may post-date
+        # this baseline).
+        if: always()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        # connect-vcluster backgrounds a `kubectl port-forward` and exports
+        # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
+        # the next job on this self-hosted runner doesn't inherit an orphan.
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
+  test-vime-delta-refit:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-test-vime-delta-refit
+      cancel-in-progress: true
+    name: RL Vime delta-refit smoke
+    runs-on: prod-deploy-tester-v1
+    timeout-minutes: 120
+    needs: [build-vime-delta-refit]
+    permissions:
+      contents: read
+    env:
+      KUBE_CONTEXT: nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
+      NAMESPACE: mx-ci-h100-vime-${{ github.run_id }}-${{ github.run_attempt }}
+      WORKER_IMAGE: nvcr.io/0980761089281446/vime-dynamo-mx-worker:${{ github.sha }}
+      TRAINER_IMAGE: nvcr.io/0980761089281446/vime-dynamo-mx-trainer:${{ github.sha }}
+      MODEL_SUBPATH: Qwen/Qwen3-0.6B
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Prepare direct H100 workload
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          kc=(kubectl --kubeconfig=/teleport/kubeconfig.yaml --context="$KUBE_CONTEXT")
+          k=("${kc[@]}" --namespace="$NAMESPACE")
+          "${kc[@]}" config get-contexts "$KUBE_CONTEXT" -o name | grep -qx "$KUBE_CONTEXT"
+          "${kc[@]}" create namespace "$NAMESPACE" --dry-run=client -o yaml \
+            | "${kc[@]}" label --local -f - \
+                ci.modelexpress.nvidia.com/run-id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+                -o yaml \
+            | "${kc[@]}" create -f -
+          "${k[@]}" create quota vime-delta-refit-gpu-budget \
+            --hard=requests.nvidia.com/gpu=3,limits.nvidia.com/gpu=3
+          "${k[@]}" create secret docker-registry nvcr-imagepullsecret \
+            --docker-server=nvcr.io \
+            --docker-username="\$oauthtoken" \
+            --docker-password="$NGC_API_KEY"
+          "${k[@]}" create secret generic mx-s3-creds \
+            --from-literal=AWS_ACCESS_KEY_ID=delta-refit \
+            --from-literal=AWS_SECRET_ACCESS_KEY=delta-refit-smoke
+          "${k[@]}" create secret generic hf-token-secret \
+            --from-literal=HF_TOKEN="$HF_TOKEN"
+          "${k[@]}" wait --for=create persistentvolumeclaim/shared-model-cache --timeout=2m
+          "${k[@]}" wait --for=jsonpath='{.status.phase}'=Bound \
+            persistentvolumeclaim/shared-model-cache --timeout=5m
+          sed "s|WORKER_IMAGE|$WORKER_IMAGE|g" ci/rl/model-download.yaml \
+            | "${k[@]}" create -f -
+          "${k[@]}" wait --for=condition=complete \
+            job/vime-delta-refit-model-download --timeout=20m
+
+      - name: Run Kubernetes Vime delta-refit smoke
+        run: ci/rl/smoke_vime_delta_refit.sh
+
+      - name: Dump direct H100 diagnostics
+        if: failure()
+        run: |
+          k=(kubectl --kubeconfig=/teleport/kubeconfig.yaml \
+            --context="$KUBE_CONTEXT" --namespace="$NAMESPACE")
+          "${k[@]}" get pods,jobs,deployments,services,dynamographdeployments -o wide || true
+          "${k[@]}" describe dynamographdeployment/vime-delta-refit || true
+          "${k[@]}" get events --sort-by='.lastTimestamp' || true
+          for pod in $("${k[@]}" get pods -o name 2>/dev/null); do
+            "${k[@]}" describe "$pod" | tail -60 || true
+            "${k[@]}" logs "$pod" --all-containers --tail=200 || true
+          done
+
+      - name: Reap direct H100 workload
+        if: always()
+        run: |
+          kc=(kubectl --kubeconfig=/teleport/kubeconfig.yaml --context="$KUBE_CONTEXT")
+          owner=$("${kc[@]}" get namespace "$NAMESPACE" --ignore-not-found \
+            -o go-template='{{ index .metadata.labels "ci.modelexpress.nvidia.com/run-id" }}')
+          if [ "$owner" = "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ]; then
+            "${kc[@]}" delete namespace "$NAMESPACE" --wait=false
+          fi
+
+  test-vime-delta-refit-cleanup:
+    name: RL Vime delta-refit cleanup
+    runs-on: prod-deploy-tester-v1
+    needs: [test-vime-delta-refit]
+    if: always()
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      KUBE_CONTEXT: nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
+      NAMESPACE: mx-ci-h100-vime-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Delete direct H100 workload namespace
+        run: |
+          set -euo pipefail
+          kc=(kubectl --kubeconfig=/teleport/kubeconfig.yaml --context="$KUBE_CONTEXT")
+          owner=$("${kc[@]}" get namespace "$NAMESPACE" --ignore-not-found \
+            -o go-template='{{ index .metadata.labels "ci.modelexpress.nvidia.com/run-id" }}')
+          if [ -z "$owner" ]; then
+            exit 0
+          fi
+          if [ "$owner" != "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ]; then
+            echo "Refusing to delete $NAMESPACE owned by $owner" >&2
+            exit 1
+          fi
+          "${kc[@]}" delete namespace "$NAMESPACE" --wait=false
+
+  model-streamer:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref_name }}-model-streamer-${{ strategy.job-index }}
+      cancel-in-progress: true
+    name: Model Streamer ${{ matrix.mode }} test (${{ matrix.framework }}, S3)
+    runs-on: prod-modelexpress-tester-amd-gpu-v1
+    needs: [build-client]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+            mode: direct
+            test_model_streamer_fallback: 'false'
+          - framework: vllm
+            mode: fallback
+            test_model_streamer_fallback: 'true'
+          - framework: sglang
+            mode: direct
+            test_model_streamer_fallback: 'false'
+          - framework: sglang
+            mode: fallback
+            test_model_streamer_fallback: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Log in to image registry
+        run: |
+          echo "${{ secrets.NGC_API_KEY }}" | \
+            docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: Run model streamer test
+        uses: ./.github/actions/run-mx-streamer-test
+        with:
+          framework: ${{ matrix.framework }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          model: ${{ env.MX_CI_MODEL }}
+          s3_bucket: ${{ env.MX_CI_S3_BUCKET }}
+          s3_region: ${{ env.MX_CI_S3_REGION }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          test_model_streamer_fallback: ${{ matrix.test_model_streamer_fallback }}
+
+  ci-status-check:
+    name: CI status check
+    runs-on: ubuntu-latest
+    needs:
+      - build-server
+      - build-client
+      - build-vime-delta-refit
+      - ensure-vcluster
+      - azure-gpu-tests
+      - azure-gpu-cleanup
+      - test-vime-delta-refit
+      - test-vime-delta-refit-cleanup
+      - model-streamer
+      - small-model-s3-refit
+    if: always()
+    steps:
+      - name: All dependent jobs succeeded
+        if: always()
+        run: |
+          echo '${{ toJson(needs) }}' \
+            | jq -e 'to_entries | map(.value.result) | all(. == "success")'

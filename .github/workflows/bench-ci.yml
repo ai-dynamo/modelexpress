@@ -46,7 +46,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    uses: ./.github/workflows/rl-refit-ci.yml
+    uses: ./.github/workflows/modelexpress-rl-refit-ci.yml
     with:
       pull_request: ${{ github.event.issue.number }}
       model: ${{ needs.authorize.outputs.model }}

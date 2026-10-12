@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # CI Test Plan
 
-Coverage matrix for the ModelExpress CI infrastructure. Reflects what's currently in `.github/workflows/modelexpress-ci-tests.yml` plus the engine integrations under `ci/k8s/client/`.
+Coverage matrix for the ModelExpress CI infrastructure. Reflects what's currently in `.github/workflows/modelexpress-e2e-ci.yml` and its reusable `.github/workflows/modelexpress-gpu-ci.yml` plus the engine integrations under `ci/k8s/client/`.
 
 | Pri | Test Area | Engine(s) | Status | Key Blocker |
 |---|---|---|---|---|
@@ -21,7 +21,7 @@ Coverage matrix for the ModelExpress CI infrastructure. Reflects what's currentl
 | 5.2 | Parallelism > 1 — DP | vLLM, TRT-LLM, SGLang | **In CI (vLLM single-node DP=2); TRT-LLM/SGLang follow-ups** — `test-dp` matrix job runs vLLM native data parallelism (`--data-parallel-size 2`, `--tensor-parallel-size 1`) via `manifest-azure-dp2.yaml`, pinned to the same non-MIG `a100b` pool as `test-tp` (DP wants one full GPU per core; MIG slices break vLLM's DP coordination). Crucially this runs with `tp_size=1`, NOT 2: DP cores are full, interchangeable model copies and `build_source_identity` carries no DP dimension (tp/pp/ep only), so every DP core resolves to `worker_rank` 0. The source publishes a single rank-0 ModelMetadata CR and the target's DP cores each pull the full rank-0 weight set over RDMA — N concurrent pulls from one source, not rank-paired transfers. The per-rank agent assertion therefore correctly expects exactly one distinct source agent (rank 0). Reuses `run-mx-p2p-test` + `test_p2p_k8s.py` unchanged. TRT-LLM/SGLang DP variants are follow-ups | (a) Per-replica inference assertion (row 5.2 ideal) is not achievable with vLLM native DP: the deployment exposes a single HTTP endpoint that load-balances across DP cores, so individual cores can't be addressed from outside — the existing target inference assertion covers "the DP deployment serves." A true per-replica check would need a router-fronted multi-Deployment topology (or Dynamo DP, where replicas are first-class). (b) TRT-LLM/SGLang DP variants |
 | 5.3 | Parallelism > 1 — EP | vLLM, TRT-LLM, SGLang | **In CI (vLLM single-node EP=2); TRT-LLM/SGLang follow-ups** — `test-ep` matrix job runs vLLM expert parallelism (`--tensor-parallel-size 2 --enable-expert-parallel`) on an MoE model (`deepseek-ai/DeepSeek-V2-Lite`, the same model the MLA job uses) via `manifest-azure-ep2.yaml`, pinned to the non-MIG `a100b` pool. In vLLM, EP layers on top of the TP world: attention stays TP-sharded while the MoE experts are distributed expert-parallel across the same ranks, so each rank owns distinct weights, the source publishes one CR per rank, and the target pairs rank-for-rank — hence `tp_size=2` and the per-rank agent assertion expects two distinct source agents (ranks 0,1), identical in shape to the TP test. The coverage beyond `test-tp` is the identity hash: enabling EP sets `parallel_config.enable_expert_parallel`, from which `build_source_identity` derives an expert-parallel world size of `tp * dp * pcp` and folds that into `mx_source_id` — this is the first job to exercise `rdma_strategy` rank pairing with a derived expert-parallel size above 1 (a source/target mismatch in that field would force a disk fallback and fail the marker assertion). vLLM's `ParallelConfig` carries no `expert_parallel_size` attribute; before MX-440 the published value was a constant 0 for every vLLM source, so this job passed with source and target publishing the same wrong number. Reuses `run-mx-p2p-test` + `test_p2p_k8s.py` unchanged | (a) `TP=1 × EP=N` pure-EP shape (vLLM expresses EP over the TP/DP world, so EP>1 needs `TP*DP>1`; the single-pod TP=2+EP shape is the simplest that exercises a derived expert-parallel size above 1). (b) Per-expert-subset transfer assertion — current coverage confirms rank-paired transfer + correct identity hash, not that rank N pulled only expert subset N. (c) TRT-LLM/SGLang EP variants; TP × EP multi-node combo |
 | 6 | Model Streamer — S3 *(direct streaming, no server cache)* | vLLM, SGLang | **In CI** — direct-streaming matrix entries run for vLLM and SGLang on `prod-modelexpress-tester-amd-gpu-v1` in a single Docker container with no vCluster or MX server. IRSA provides S3 access; the first run uploads safetensors to `s3://ai-dynamo-modelexpress-ci/models/...`. The shared composite action dispatches vLLM's `modelexpress` load format or SGLang's `remote_instance` + `backend=modelexpress` command, then verifies the MX ModelStreamer completion marker, server health, and inference. TRT-LLM remains gated because it has no `build_model_streamer_weight_iter` adapter ([MX-299](https://linear.app/nvidia/issue/MX-299/trt-llm-adapter)). | — |
-| 7 | Dynamo Integration (without Disaggregated Serving) | vLLM, TRT-LLM, SGLang | **In CI (vLLM); TRT-LLM/SGLang follow-ups** — vLLM aggregated serving active as the `aggregated` matrix entry of `test-with-dynamo` in `modelexpress-ci-tests.yml`, with `dynamo-vllm` in the `build-client` matrix. Dynamo operator installed cluster-wide in `dynamo-system` by `setup-mx-vcluster`; per-run action applies a `DynamoGraphDeployment` (ModelExpress + Frontend + VllmWorker, Qwen2.5-0.5B, TP=1, replicas=1 then scaled to 2). DGD name parameterized end-to-end (`mx-dynamo-${{ github.run_id }}`) so concurrent runs don't collide. TRT-LLM/SGLang variants are follow-ups | TRT-LLM/SGLang variants only |
+| 7 | Dynamo Integration (without Disaggregated Serving) | vLLM, TRT-LLM, SGLang | **In CI (vLLM); TRT-LLM/SGLang follow-ups** — vLLM aggregated serving active as the `aggregated` matrix entry of `test-with-dynamo` in `modelexpress-e2e-ci.yml`, with `dynamo-vllm` in the `build-client` matrix. Dynamo operator installed cluster-wide in `dynamo-system` by `setup-mx-vcluster`; per-run action applies a `DynamoGraphDeployment` (ModelExpress + Frontend + VllmWorker, Qwen2.5-0.5B, TP=1, replicas=1 then scaled to 2). DGD name parameterized end-to-end (`mx-dynamo-${{ github.run_id }}`) so concurrent runs don't collide. TRT-LLM/SGLang variants are follow-ups | TRT-LLM/SGLang variants only |
 | 8 | Disaggregated Serving | vLLM, TRT-LLM, SGLang | **In CI (vLLM); TRT-LLM/SGLang follow-ups** — vLLM disaggregated serving active as the `disaggregated` matrix entry of `test-with-dynamo`. Manifest at `ci/k8s/client/vllm/dynamo/manifest-azure-disaggregated.yaml` splits the single VllmWorker into VllmPrefillWorker + VllmDecodeWorker; test scales VllmDecodeWorker to 2 replicas, exercising both the prefill↔decode KV-transfer path (unique to disagg) and decode↔decode P2P weight transfer. Shares the `run-mx-dynamo-test` action with row 7 via a `mode` input that drives the wait gates and the scale-patch target. TRT-LLM/SGLang disagg variants are follow-ups; TP × disagg combo is long-term | TRT-LLM/SGLang variants; TP × disagg combo |
 | 9.1 | Metadata Backend — K8s CRD | — | **Covered implicitly** — exercised by the active P1 and P3 runs (mx-server uses `MX_METADATA_BACKEND=kubernetes`) | — |
 | 9.2 | Metadata Backend — Redis | — | **Covered implicitly** — exercised by row 18's stale-metadata test, which deploys mx-server with the Redis backend (sidecar pattern at `ci/k8s/server/mx-server-redis.yaml`, `MX_METADATA_BACKEND=redis` + `REDIS_URL=redis://localhost:6379`). Confirms the Redis backend round-trips metadata correctly under the same publish + list code paths a full P2P workload would use. If we ever need explicit Redis coverage on a full source/target P2P run (vs the source-only staleness test), `run-mx-p2p-test` could grow a `backend` input to switch between mx-server manifests | — |
@@ -64,7 +64,7 @@ the benchmark CI workflow.
 contracts run on every PR in `RL refit harness tests`. `bench-ci.yml` accepts `/bench [--model PROFILE]
 [--scenario delta] [--sha FULL_SHA]` from repository writers after copy-pr-bot mirrors the current
 head. Every trusted PR also runs the one-GPU Nemotron S3 delta-weight refit through
-`rl-refit-ci.yml`; `CI status check` requires its build, GPU test, and cleanup to succeed.
+`modelexpress-rl-refit-ci.yml`; `CI status check` requires its build, GPU test, and cleanup to succeed.
 Automatic and comment-triggered CI use the Vime example's SeaweedFS setup in an isolated
 namespace and upload the pinned seed snapshot before measurement; they need no AWS IAM role.
 Kimi remains opt-in. The reusable workflow independently validates the current
@@ -79,3 +79,78 @@ not established. Peer coverage stays manual. See
 Benchmark success requires both weight/checkpoint validation and complete latency
 measurements. Reports retain per-rank times and the slowest rank; failed trials are excluded from successful summaries. This is independent
 of the existing Vime/Dynamo E2E smoke and does not enforce performance thresholds.
+
+## CI build caches
+
+Image builds import and export registry caches in their existing NVCR image
+repositories. Cache tags are scoped to the PR or branch and image, with separate
+Vime trainer and worker caches. `mode=max` preserves intermediate build layers;
+cache export failure does not fail an otherwise successful build. The pinned
+Dynamo sidecar builds before copying ModelExpress sources so ModelExpress-only
+edits can reuse that compile layer. The first build for a cache scope is cold;
+subsequent builds can reuse matching layers without changing GPU allocations.
+
+## vCluster connectivity recovery
+
+CI supervises each vCluster API tunnel and pytest service tunnel, restarting an
+exited `kubectl port-forward` on the same local port. Existing job cleanup stops
+the supervisor and its child. vCluster diagnostics include its timestamped tunnel
+log; pytest prints service tunnel logs. Dynamo metadata polling preserves API
+errors and retries failed reads within the existing readiness deadline. Worker
+liveness polling refreshes active pods on every pass, excludes terminating pods,
+and checks the DGD replica count within one shared deadline.
+
+Pytest API `get` calls retry connection refusal, resets, and unexpected EOF up to
+three times, including API request and TLS handshake timeouts. Completion requests retry connection refusal or reset twice, with a
+fresh request through the reconnecting tunnel. HTTP errors, malformed responses,
+and model correctness assertions still fail. These measures recover brief tunnel
+interruptions; they do not establish the cause of the host API resets.
+
+## Azure GPU admission and readiness budgets
+
+The parent workflow calls the Azure tests through a per-PR concurrency group
+that cancels superseded GPU work. Inside the reusable workflow, all A100a tests
+share one repository-wide queued concurrency group; MLA and DP/EP tests share a
+separate A100b group. Each pool runs one test workload, including its complete
+source/target topology and cleanup, at a time. Builds, AWS tests and independent
+cleanup jobs retain their existing concurrency. GitHub's `queue: max` keeps up to
+100 pending jobs per pool instead of replacing the previous pending job.
+
+P2P sources and targets, the fleet seed, and every fleet scale wave wait for all
+controller-desired pods to be scheduled before starting their startup deadline.
+Scheduling and startup each retain the configured readiness budget; each Azure
+test job also has a two-hour limit. Both MLA framework variants use 900 seconds
+per scheduling/startup phase instead of 3,600 seconds. Source/target topology, fleet size, metadata,
+artifact and inference assertions are unchanged. Shell polling preserves API
+stderr and retries transient read interruptions three times, with bounded API
+requests; permanent read errors fail. A rollout retains its existing total
+rollout budget rather than extending it for each replacement.
+
+## Capacity recovery and qualification
+
+Azure test namespaces include the run ID and attempt in their names and carry a
+`ci.modelexpress.nvidia.com/run-id=<run>-<attempt>` owner label. Cleanup refuses
+unowned namespaces, stops the owned workload controllers, requests normal
+namespace deletion, and verifies absence through successful API reads. It also
+waits for the corresponding host pods to disappear. API errors cannot masquerade
+as successful cleanup. Cleanup preserves namespace/metadata finalizers and reports
+stalled finalization. The parent `Azure GPU cleanup` job independently reconnects
+after the test workflow finishes or is cancelled, retries remaining namespaces
+owned by the attempt, and checks surviving host pods. The umbrella status check
+requires cleanup success. Legacy namespaces without ownership labels are not
+automatically deleted.
+
+Fleet and rolling workers request 2 CPU cores by default (30 cores for a complete
+15-worker fleet, formerly 60). `MX_CI_FLEET_CPU` overrides that integer request;
+use 4 to restore the previous reservation if live startup measurements regress.
+These are scheduling reservations; CPU usage and performance still require live
+qualification.
+
+SGLang CI manifests select ModelStreamer through `MX_MODEL_URI` for the first
+replica when no compatible P2P source exists. The pinned SGLang loader downloads
+safetensors from the configured Hugging Face model and streams the local files;
+no object-store credentials are required. Later replicas still try P2P first.
+This applies to NIXL P2P, TP/MLA, rolling-update, and stale-metadata cases.
+Mooncake retains its separate native-first loading path.
+The existing P2P and inference assertions remain in place. Live GPU qualification
+of this CI configuration remains pending.

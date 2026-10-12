@@ -40,6 +40,11 @@ runs:
         VCLUSTER_NAMESPACE: ${{ inputs.vcluster_namespace }}
       run: |
         set +e
+        echo "::group::vCluster port-forward log"
+        if [ -n "${VCLUSTER_PF_LOG:-}" ]; then
+          cat "$VCLUSTER_PF_LOG" 2>&1 || true
+        fi
+        echo "::endgroup::"
         SELECTOR="app=vcluster,release=${VCLUSTER_NAME}"
         # Always read from the host kubeconfig written by connect-vcluster.
         KCTL="kubectl --kubeconfig=${{ github.workspace }}/.kubeconfig-host"
