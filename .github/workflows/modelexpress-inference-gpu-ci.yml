@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: ModelExpress GPU CI
+name: ModelExpress Inference GPU CI
 
 on:
   workflow_call:
@@ -282,6 +282,8 @@ jobs:
     name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }} ${{ matrix.topology }})
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 120
+    env:
+      MX_CI_GPU_POOL: a100a
     permissions:
       contents: read
     strategy:
@@ -311,6 +313,11 @@ jobs:
           host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
           vcluster_name: ${{ env.VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
 
       - name: Run P2P RDMA transfer test (TP > 1)
         uses: ./.github/actions/run-mx-p2p-test
@@ -357,6 +364,8 @@ jobs:
     name: P2P ${{ matrix.label }} test (vllm)
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 120
+    env:
+      MX_CI_GPU_POOL: a100b
     permissions:
       contents: read
     strategy:
@@ -394,6 +403,11 @@ jobs:
           host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
           vcluster_name: ${{ env.VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
 
       - name: Run P2P RDMA transfer test (${{ matrix.label }})
         uses: ./.github/actions/run-mx-p2p-test
@@ -444,6 +458,8 @@ jobs:
     name: P2P test with Dynamo (${{ matrix.mode }})
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 120
+    env:
+      MX_CI_GPU_POOL: a100a
     permissions:
       contents: read
     strategy:
@@ -472,6 +488,11 @@ jobs:
           host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
           vcluster_name: ${{ env.VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
 
       - name: Run Dynamo P2P test
         uses: ./.github/actions/run-mx-dynamo-test
@@ -515,6 +536,8 @@ jobs:
     name: Fleet scale test (vLLM, 15 workers)
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 120
+    env:
+      MX_CI_GPU_POOL: a100a
     permissions:
       contents: read
     steps:
@@ -530,6 +553,11 @@ jobs:
           host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
           vcluster_name: ${{ env.VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
 
       - name: Run fleet scale test
         uses: ./.github/actions/run-mx-fleet-test
@@ -569,6 +597,8 @@ jobs:
     name: Rolling-update test (${{ matrix.framework }}, 5 workers)
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 120
+    env:
+      MX_CI_GPU_POOL: a100a
     permissions:
       contents: read
     strategy:
@@ -594,6 +624,11 @@ jobs:
           host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
           vcluster_name: ${{ env.VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
 
       - name: Run rolling-update test
         uses: ./.github/actions/run-mx-fleet-test
@@ -637,6 +672,8 @@ jobs:
     name: Stale metadata test (${{ matrix.framework }})
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 120
+    env:
+      MX_CI_GPU_POOL: a100a
     permissions:
       contents: read
     strategy:
@@ -665,6 +702,11 @@ jobs:
           host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
           vcluster_name: ${{ env.VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
 
       - name: Run stale-metadata test
         uses: ./.github/actions/run-mx-stale-metadata-test

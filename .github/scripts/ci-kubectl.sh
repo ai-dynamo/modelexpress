@@ -76,3 +76,29 @@ wait_for_worker_liveness() {
   echo "ERROR: workers did not become live within ${timeout}s" >&2
   return 1
 }
+
+# GitHub releases a cancelled job's queue slot before independent cleanup finishes.
+# Wait for the previous CI namespaces and physical pods before allocating a new workload.
+wait_for_gpu_pool_cleanup() {
+  local pool="$1" deadline=$((SECONDS + 900)) namespaces pods remaining
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [[ "$pool" == a100* ]]; then
+      namespaces=$(ci_kubectl get namespaces -l "ci.modelexpress.nvidia.com/gpu-pool=$pool" -o json) || return 1
+      pods=$(ci_kubectl get pods -A --kubeconfig="$GITHUB_WORKSPACE/.kubeconfig-host" -o json) || return 1
+      remaining=$(printf '%s\n' "$pods" | jq --arg pool "$pool" '[.items[] | select(.status.phase != "Succeeded" and .status.phase != "Failed") | select(.spec.nodeSelector.agentpool == $pool or ((.spec.nodeName // "") | startswith("aks-" + $pool + "-"))) | select(any(.spec.containers[]?, .spec.initContainers[]?; (.resources.requests["nvidia.com/gpu"] // .resources.limits["nvidia.com/gpu"] // "0" | tonumber) > 0))] | length')
+    else
+      namespaces=$(ci_kubectl get namespaces --context="$KUBE_CONTEXT" -o json) || return 1
+      namespaces=$(printf '%s\n' "$namespaces" | jq '{items: [.items[] | select(.metadata.name | startswith("mx-ci-bench-") or startswith("mx-ci-h100-vime-"))]}')
+      pods=$(ci_kubectl get pods -A --context="$KUBE_CONTEXT" -o json) || return 1
+      remaining=$(printf '%s\n' "$pods" | jq '[.items[] | select(.metadata.namespace | startswith("mx-ci-bench-") or startswith("mx-ci-h100-vime-"))] | length')
+    fi
+    if [ "$(printf '%s\n' "$namespaces" | jq '.items | length')" -eq 0 ] && [ "$remaining" -eq 0 ]; then
+      echo "GPU pool $pool has no previous CI workload awaiting cleanup"
+      return 0
+    fi
+    echo "Waiting for GPU pool $pool cleanup ($remaining physical pods remain)"
+    sleep 10
+  done
+  echo "ERROR: previous workload still occupies GPU pool $pool after 900s" >&2
+  return 1
+}

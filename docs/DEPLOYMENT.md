@@ -1654,8 +1654,8 @@ and commenters without write permission are rejected. New revisions need new
 requests. Labels do not trigger this workflow.
 
 The hosted gate checks permission and resolves immutable source/model/scenario outputs.
-`bench-ci.yml` handles comment authorization and configured runtime selection, then
-calls `modelexpress-rl-refit-ci.yml`. The reusable workflow accepts PR number, exact source SHA,
+`modelexpress-rl-ci.yml` handles both authorized `/bench` comments and reusable
+CI calls. The workflow accepts PR number, exact source SHA,
 model, scenario and digest-pinned runtime inputs. Comment runs repeat the caller
 permission, current-head and mirror checks before privileged builds. Automatic
 runs derive the PR number from the upstream `pull-request/<N>` push and require
@@ -1727,7 +1727,7 @@ manifest and checks downloaded file sizes against S3 object sizes. Manual runs c
 through their environment configuration.
 
 The `RL weight refit CI` comment workflow delegates execution to the shared
-`ModelExpress RL Refit CI` workflow for the selected profile and scenario. The GPU job is named
+`ModelExpress RL CI` workflow for the selected profile and scenario. The GPU job is named
 `RL refit / Refit (PROFILE)` for the delta scenario. Every trusted
 PR automatically calls the same workflow for Nemotron, under
 `RL generator-only delta refit (vllm, s3) / Refit (nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4)`.

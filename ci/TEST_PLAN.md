@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # CI Test Plan
 
-Coverage matrix for the ModelExpress CI infrastructure. Reflects what's currently in `.github/workflows/modelexpress-e2e-ci.yml` and its reusable `.github/workflows/modelexpress-gpu-ci.yml` plus the engine integrations under `ci/k8s/client/`.
+Coverage matrix for the ModelExpress CI infrastructure. Reflects what's currently in `.github/workflows/modelexpress-e2e-ci.yml` and its reusable inference, GPU, and RL workflows plus the engine integrations under `ci/k8s/client/`.
 
 | Pri | Test Area | Engine(s) | Status | Key Blocker |
 |---|---|---|---|---|
@@ -61,10 +61,10 @@ the benchmark CI workflow.
 ## Comment-triggered model benchmark CI
 
 `ci/bench/` contains registered Nemotron and Kimi-K2.7-Code profiles. Offline
-contracts run on every PR in `RL refit harness tests`. `bench-ci.yml` accepts `/bench [--model PROFILE]
+contracts run on every PR in `RL refit harness tests`. `modelexpress-rl-ci.yml` accepts `/bench [--model PROFILE]
 [--scenario delta] [--sha FULL_SHA]` from repository writers after copy-pr-bot mirrors the current
 head. Every trusted PR also runs the one-GPU Nemotron S3 delta-weight refit through
-`modelexpress-rl-refit-ci.yml`; `CI status check` requires its build, GPU test, and cleanup to succeed.
+`modelexpress-rl-ci.yml`; `CI status check` requires its build, GPU test, and cleanup to succeed.
 Automatic and comment-triggered CI use the Vime example's SeaweedFS setup in an isolated
 namespace and upload the pinned seed snapshot before measurement; they need no AWS IAM role.
 Kimi remains opt-in. The reusable workflow independently validates the current
@@ -79,6 +79,17 @@ not established. Peer coverage stays manual. See
 Benchmark success requires both weight/checkpoint validation and complete latency
 measurements. Reports retain per-rank times and the slowest rank; failed trials are excluded from successful summaries. This is independent
 of the existing Vime/Dynamo E2E smoke and does not enforce performance thresholds.
+
+## Workflow responsibilities
+
+`modelexpress-e2e-ci.yml` calls independent `modelexpress-inference-ci.yml` and
+`modelexpress-rl-ci.yml` workflows. The existing required `CI status check` requires
+both to succeed. Each child checks all of its test and cleanup results.
+Inference owns image builds, ModelStreamer, and the reusable GPU test workflow.
+RL owns Vime and generator-only refit, including their builds and cleanup.
+The RL workflow also handles `/bench` comments with the existing writer and
+approved-mirror checks; comment runs execute only the selected refit profile.
+Ordinary comments do not start RL builds, GPU tests, or Vime jobs.
 
 ## CI build caches
 
@@ -106,7 +117,7 @@ fresh request through the reconnecting tunnel. HTTP errors, malformed responses,
 and model correctness assertions still fail. These measures recover brief tunnel
 interruptions; they do not establish the cause of the host API resets.
 
-## Azure GPU admission and readiness budgets
+## GPU test admission and readiness budgets
 
 The parent workflow calls the Azure tests through a per-PR concurrency group
 that cancels superseded GPU work. Inside the reusable workflow, all A100a tests
@@ -118,7 +129,7 @@ cleanup jobs retain their existing concurrency. GitHub's `queue: max` keeps up t
 
 P2P sources and targets, the fleet seed, and every fleet scale wave wait for all
 controller-desired pods to be scheduled before starting their startup deadline.
-Scheduling and startup each retain the configured readiness budget; each Azure
+Scheduling and startup each retain the configured readiness budget; each GPU
 test job also has a two-hour limit. Both MLA framework variants use 900 seconds
 per scheduling/startup phase instead of 3,600 seconds. Source/target topology, fleet size, metadata,
 artifact and inference assertions are unchanged. Shell polling preserves API
@@ -128,13 +139,13 @@ rollout budget rather than extending it for each replacement.
 
 ## Capacity recovery and qualification
 
-Azure test namespaces include the run ID and attempt in their names and carry a
+GPU test namespaces include the run ID and attempt in their names and carry a
 `ci.modelexpress.nvidia.com/run-id=<run>-<attempt>` owner label. Cleanup refuses
 unowned namespaces, stops the owned workload controllers, requests normal
 namespace deletion, and verifies absence through successful API reads. It also
 waits for the corresponding host pods to disappear. API errors cannot masquerade
 as successful cleanup. Cleanup preserves namespace/metadata finalizers and reports
-stalled finalization. The parent `Azure GPU cleanup` job independently reconnects
+stalled finalization. The parent `GPU test cleanup` job independently reconnects
 after the test workflow finishes or is cancelled, retries remaining namespaces
 owned by the attempt, and checks surviving host pods. The umbrella status check
 requires cleanup success. Legacy namespaces without ownership labels are not
@@ -154,3 +165,23 @@ This applies to NIXL P2P, TP/MLA, rolling-update, and stale-metadata cases.
 Mooncake retains its separate native-first loading path.
 The existing P2P and inference assertions remain in place. Live GPU qualification
 of this CI configuration remains pending.
+
+## GPU admission during cleanup
+
+Each inference pool queue covers its full source/target lifecycle. Before a new
+job allocates resources, admission waits up to 900 seconds for previous labeled
+pool namespaces and physical GPU pods to disappear, including after cancellation.
+Running and pending pods from other workloads on the inference pool also block
+admission. Namespace creation records the pool label; cleanup errors fail closed.
+
+Vime and refit GPU jobs share a repository-wide queue keyed by Kubernetes context.
+Refit jobs have a two-hour budget that includes admission, setup, execution,
+and cleanup. They verify normal namespace deletion before releasing admission. Independent
+cleanup jobs remain outside that queue. New RL jobs wait for previous benchmark
+and Vime namespaces and pods, including legacy CI namespaces, before provisioning.
+Namespace quotas bound an individual run but do not reserve cluster-wide capacity.
+
+These are conservative one-workload limits, not capacity-based packing. Additional
+parallelism needs live allocatable GPU/MIG, CPU, memory, RDMA, and placement data.
+RL workloads outside CI can still contend through the Kubernetes scheduler;
+these queues do not reserve resources against them. No additional lanes are enabled.

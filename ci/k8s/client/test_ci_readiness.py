@@ -179,3 +179,36 @@ exit 1
     assert result.returncode == 0, result.stderr
     assert "pod old not found" in result.stderr
     assert int((tmp_path / "calls").read_text()) == 2
+
+
+@pytest.mark.parametrize("pool", ["a100a", "rl"])
+def test_admission_waits_for_previous_namespace_and_physical_pods(tmp_path, pool):
+    command = '''if [[ " $* " == *" get namespaces "* ]]; then
+  count=$(cat "$FIXTURE/calls" 2>/dev/null || echo 0)
+  count=$((count + 1)); echo "$count" > "$FIXTURE/calls"
+  if [ "$count" -eq 1 ]; then echo '{"items":[{"metadata":{"name":"mx-ci-bench-old"}}]}'; else echo '{"items":[]}'; fi
+  exit 0
+fi
+if [ "$(cat "$FIXTURE/calls")" -eq 1 ]; then
+  echo '{"items":[{"metadata":{"namespace":"mx-ci-bench-old"},"spec":{"nodeSelector":{"agentpool":"a100a"},"containers":[{"resources":{"requests":{"nvidia.com/gpu":"1"}}}]},"status":{"phase":"Pending"}}]}'
+else echo '{"items":[]}'; fi
+'''
+    result = run_shell(tmp_path, f'export GITHUB_WORKSPACE="{tmp_path}" KUBE_CONTEXT=fixture\nwait_for_gpu_pool_cleanup {pool}', command)
+    assert result.returncode == 0, result.stderr
+    assert "Waiting for GPU pool" in result.stdout
+    assert int((tmp_path / "calls").read_text()) == 2
+
+
+def test_admission_does_not_treat_api_failure_as_free_capacity(tmp_path):
+    result = run_shell(tmp_path, 'wait_for_gpu_pool_cleanup a100a', 'echo Forbidden >&2; exit 17')
+    assert result.returncode != 0
+    assert "Forbidden" in result.stderr
+
+
+def test_admission_waits_for_host_pods_after_virtual_namespace_disappears(tmp_path):
+    command = '''if [[ " $* " == *" get namespaces "* ]]; then echo '{"items":[]}'; exit 0; fi
+ echo '{"items":[{"spec":{"nodeSelector":{"agentpool":"a100a"},"containers":[{"resources":{"limits":{"nvidia.com/gpu":"1"}}}]},"status":{"phase":"Running"}}]}'
+'''
+    result = run_shell(tmp_path, 'export GITHUB_WORKSPACE=.\nwait_for_gpu_pool_cleanup a100a', command)
+    assert result.returncode != 0
+    assert "after 900s" in result.stderr
