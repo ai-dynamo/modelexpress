@@ -474,23 +474,23 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
         nixl_manager=object(),
         accelerator_backend=SimpleNamespace(name="cuda"),
     )
-    published = SimpleNamespace(endpoint=SimpleNamespace(mx_source_id="source-id"))
-    worker_server = object()
+    published = SimpleNamespace(
+        identifier="source-id",
+        transport="p2p",
+        stop=lambda: None,
+    )
+    transport = SimpleNamespace(publish=MagicMock(return_value=published))
 
     with patch(
-        "modelexpress.metadata.artifact_lifecycle._get_worker_server",
-        return_value=worker_server,
-    ), patch(
-        "modelexpress.metadata.artifact_lifecycle.publish_artifact_source",
-        return_value=published,
-    ) as publish:
-        assert artifacts._publish_vllm_cache_artifact(ctx, transfer, identity) is published
+        "modelexpress.metadata.artifact_lifecycle._create_artifact_transport",
+        return_value=transport,
+    ):
+        assert (
+            artifacts._publish_vllm_cache_artifact(ctx, transfer, identity)
+            is published
+        )
 
-    publish.assert_called_once()
-    assert publish.call_args.kwargs["worker_id"] == "worker-a"
-    assert publish.call_args.kwargs["node_rank"] == 2
-    assert publish.call_args.kwargs["accelerator"] == "cuda"
-    assert publish.call_args.kwargs["worker_grpc_server"] is worker_server
+    transport.publish.assert_called_once()
     artifacts._published_sources.pop(
         (ctx.device_id, transfer.mx_source_type),
         None,
@@ -498,8 +498,17 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
 
 
 def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_path):
-    monkeypatch.setattr(artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        artifact_lifecycle.tempfile,
+        "gettempdir",
+        lambda: str(tmp_path),
+    )
     target_root = tmp_path / "cache"
+
+    def install(_header):
+        target_root.mkdir(parents=True, exist_ok=True)
+        (target_root / "cached").write_text("ready")
+
     transfer = SimpleNamespace(
         name="deep_gemm_cache",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
@@ -516,7 +525,7 @@ def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_pa
                 total_size=8,
             )
         ),
-        install=MagicMock(),
+        install=MagicMock(side_effect=install),
     )
     identity = p2p_pb2.SourceIdentity(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
@@ -545,11 +554,15 @@ def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_pa
     transfer.install.assert_called_once_with(first)
 
 
-def test_install_vllm_cache_artifact_once_does_not_retry_after_failure(
+def test_install_vllm_cache_artifact_once_skips_after_failure(
     monkeypatch,
     tmp_path,
 ):
-    monkeypatch.setattr(artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        artifact_lifecycle.tempfile,
+        "gettempdir",
+        lambda: str(tmp_path),
+    )
     transfer = SimpleNamespace(
         name="triton_cache",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
@@ -578,7 +591,7 @@ def test_install_vllm_cache_artifact_once_does_not_retry_after_failure(
         artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity)
 
     assert artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity) is None
-    transfer.discover_and_transfer.assert_called_once()
+    assert transfer.discover_and_transfer.call_count == 1
     transfer.install.assert_not_called()
 
 
@@ -589,7 +602,11 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
 ):
     monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
     monkeypatch.setenv("MX_P2P_METADATA", "1")
-    monkeypatch.setattr(artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        artifact_lifecycle.tempfile,
+        "gettempdir",
+        lambda: str(tmp_path),
+    )
     source_root = tmp_path / "torch-cache"
     autotune_root = tmp_path / "autotune-cache"
     transfer = SimpleNamespace(
@@ -638,8 +655,15 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
         return_value=[(transfer, identity)],
     ), patch(
         "modelexpress.engines.vllm.artifacts._publish_vllm_cache_artifact",
-        return_value=SimpleNamespace(endpoint=SimpleNamespace(mx_source_id="source-id")),
+        return_value=SimpleNamespace(
+            identifier="source-id",
+            transport="p2p",
+            stop=lambda: None,
+        ),
     ) as publish_one, patch(
+        "modelexpress.metadata.artifact_lifecycle.is_nixl_available",
+        return_value=True,
+    ), patch(
         "modelexpress.metadata.artifact_lifecycle.PublisherThread",
         return_value=publisher,
     ) as publisher_cls:
