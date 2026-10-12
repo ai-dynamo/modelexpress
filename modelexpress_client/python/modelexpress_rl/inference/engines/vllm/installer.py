@@ -1063,17 +1063,10 @@ class _VllmInstaller(EngineInstaller):
         # A parameter left on meta has no backing storage. CUDA-graph replay would
         # read an invalid address, so reject the update and let the framework
         # restart the engine.
-        parameters = (
-            (
-                (name, getattr(owner, leaf))
-                for owner, group in layout.groups
-                for name, leaf in group
-            )
-            if layout is not None
-            else self._model.named_parameters()
-        )
         meta_parameters = [
-            name for name, parameter in parameters if parameter.device.type == "meta"
+            name
+            for name, parameter in self._model.named_parameters()
+            if parameter.device.type == "meta"
         ]
         if meta_parameters:
             raise IncompleteRefit(

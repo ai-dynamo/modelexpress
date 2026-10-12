@@ -1697,6 +1697,8 @@ performs post-load processing and restores the original kernel tensor bindings;
 finalization handles attention dependencies after all inputs arrive. Native
 materialization selects its recorded device, while host bookkeeping can be
 recreated on CPU. Bare tensors retained by graph consumers keep their storage.
+After finalization, the meta-device guard checks runtime parameter names, which
+can differ from load-time names after quantization post-processing.
 
 Receive-arena tensors are never attached to the model or passed to post-load
 callbacks. The copy boundary requires ordinary Tensor storage views and rejects

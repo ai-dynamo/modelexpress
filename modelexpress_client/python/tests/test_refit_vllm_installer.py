@@ -1835,3 +1835,36 @@ def test_install_retains_graph_buffer_address_across_cold_and_warm_updates(monke
         assert model.state.data_ptr() == address
         assert torch.equal(model.state, torch.full((2,), value))
         assert torch.equal(model.weight, torch.full((2,), value))
+
+
+@pytest.mark.parametrize("runtime_device", ["cpu", "meta"])
+def test_install_checks_finalized_runtime_parameters(monkeypatch, runtime_device):
+    model = nn.Module()
+    model.weight_packed = nn.Parameter(torch.zeros(2))
+
+    def initialize(model):
+        if hasattr(model, "weight"):
+            model.weight_packed = model.weight
+            del model.weight
+
+    _install_fake_vllm(monkeypatch, initialize)
+    installer = _VllmInstaller(
+        model=model, vllm_config=object(), model_config=object(), device=torch.device("cpu")
+    )
+    _retain_test_layout(installer)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+
+    def finalize(model, _config):
+        model.weight = nn.Parameter(model.weight_packed.to(runtime_device))
+        del model.weight_packed
+
+    layerwise.finalize_layerwise_reload = finalize
+    for value in (3.0, 7.0):
+        tensors = {"weight_packed": torch.full((2,), value)}
+        if runtime_device == "meta":
+            with pytest.raises(IncompleteRefit, match="left parameters on the meta device"):
+                installer.install_tensors(tensors)
+        else:
+            installer.install_tensors(tensors)
+            assert torch.equal(model.weight, tensors["weight_packed"])
