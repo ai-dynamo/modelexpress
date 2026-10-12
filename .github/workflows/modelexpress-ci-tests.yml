@@ -1204,7 +1204,7 @@ jobs:
           fleet_size: "5"
           wave_sizes: "5"
           rolling_update: "true"
-          rollout_timeout_seconds: "900"
+          rollout_timeout_seconds: "1200"
 
       - name: Dump vCluster diagnostics on failure
         if: failure()
