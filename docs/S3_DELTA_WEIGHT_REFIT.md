@@ -323,6 +323,9 @@ their kernel tensors. If a fed module is still incomplete, the installer loads
 the rest of the checkpoint in the same reload, which is exactly a full reload.
 Peer installs, bounded tensor streaming, cold start, and failed installs leave the live version unknown,
 so the next checkpoint install is a full reload.
+Delta lineage uses registry version IDs validated during replay. Writer versions
+in cached XOR index metadata may differ from those IDs and do not determine
+surgical reload eligibility.
 
 All ranks sharing one host filesystem can share the same cache. Each host without
 a shared filesystem needs its own cache.

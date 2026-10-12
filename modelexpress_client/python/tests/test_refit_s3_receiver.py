@@ -1272,6 +1272,34 @@ def test_canonical_s3_prepared_delta_records_changed_tensor_lineage(
     adapter.close()
 
 
+def test_changed_tensor_lineage_does_not_require_writer_versions_to_match_ids(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
+    objects = _two_delta_objects()
+    for label, base, version in ((1, "000000", "000001"), (2, "000001", "000002")):
+        key = f"s3://weights/test/v{label}/model.safetensors.index.json"
+        index = json.loads(objects[key])
+        index["metadata"].update(base_version=base, version=version)
+        objects[key] = json.dumps(index).encode()
+    adapter, _ = _build(monkeypatch, tmp_path, objects)
+    follower = _colocated(tmp_path)
+
+    staged = adapter.stage_chain(_two_delta_chain())
+    reused = follower.stage_chain(_two_delta_chain())
+
+    assert staged.delta_changes == (
+        receiver_module.DeltaChange("base-a", "target-a", frozenset({"weight"})),
+        receiver_module.DeltaChange("target-a", "target-b", frozenset({"weight"})),
+    )
+    assert reused.delta_changes == staged.delta_changes
+    assert reused.metrics["perf/mx_receive_delta_download"] == 0.0
+    follower.release_staged_weight(reused)
+    adapter.release_staged_weight(staged)
+    follower.close()
+    adapter.close()
+
+
 def test_colocated_rank_reusing_prepared_target_gets_the_same_lineage(
     monkeypatch, tmp_path
 ):
@@ -3428,7 +3456,7 @@ def test_disabled_surgical_does_not_read_lineage(monkeypatch, tmp_path, flag):
     [
         [],
         {"metadata": [], "weight_map": {}},
-        {"metadata": {"base_version": "wrong"}, "weight_map": {}},
+        {"metadata": {"delta_encoding": "overwrite"}, "weight_map": {}},
     ],
 )
 def test_malformed_delta_lineage_falls_back(monkeypatch, tmp_path, index):

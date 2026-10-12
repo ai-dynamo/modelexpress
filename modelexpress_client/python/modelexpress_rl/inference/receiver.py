@@ -743,7 +743,7 @@ class _LocalCheckpoint:
             if (
                 not isinstance(weight_map, dict)
                 or not isinstance(metadata, dict)
-                or metadata.get("base_version") != base
+                or metadata.get("delta_encoding") != "xor"
             ):
                 return ()
             changes.append(DeltaChange(base, delta, frozenset(weight_map)))
