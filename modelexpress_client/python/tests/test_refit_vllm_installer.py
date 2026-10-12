@@ -1659,7 +1659,6 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
     )
     transfer = object.__new__(transfer_module._NixlStagedTransfer)
     transfer._descriptor_cache = None
-    transfer._workspace_generation = 0
     transfer._closed = False
     transfer._active = prepared
     transfer._device = torch.device("cpu")

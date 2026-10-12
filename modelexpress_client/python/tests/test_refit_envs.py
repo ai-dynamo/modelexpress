@@ -141,3 +141,15 @@ def test_s3_tcp_keepalive_rejects_invalid_boolean(monkeypatch):
     monkeypatch.setenv("MX_S3_TCP_KEEPALIVE", "sometimes")
     with pytest.raises(ValueError, match="MX_S3_TCP_KEEPALIVE must be a boolean"):
         _ = envs.MX_S3_TCP_KEEPALIVE
+
+
+def test_streaming_diagnostics_default_off_and_packing_on(monkeypatch) -> None:
+    from modelexpress import envs as refit_envs
+
+    for name in (
+        "MX_REFIT_DEBUG_VALIDATE_PLAN",
+        "MX_REFIT_PACK_MODULES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert refit_envs.MX_REFIT_DEBUG_VALIDATE_PLAN is False
+    assert refit_envs.MX_REFIT_PACK_MODULES is True

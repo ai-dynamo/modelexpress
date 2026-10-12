@@ -15,6 +15,9 @@ from .. import refit_pb2, refit_pb2_grpc
 from .adapter import WeightVersionShardManifest
 
 
+ShardChecksumKey = tuple[str, str, int, tuple[int, ...], tuple[int, ...]]
+
+
 def bound_tensor_manifest(tensor_coverage: list[dict]) -> bytes:
     """Canonical address- and content-independent coverage of one binding."""
     tensors = []

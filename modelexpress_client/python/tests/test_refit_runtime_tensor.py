@@ -13,7 +13,7 @@ from modelexpress_rl.inference.methods import (
 from modelexpress_rl.inference.plan import (
     GeneratorPeerUpdateSource,
     PreparedRuntimeTensors,
-    TrainerUpdateSource,
+    TrainerSourceSnapshot,
     WeightSource,
 )
 
@@ -215,7 +215,7 @@ def test_runtime_method_rejects_a_trainer_source():
         transfer=_Transfer(),
         runtime_tensors={},
     )
-    source = TrainerUpdateSource(inputs=object())
+    source = TrainerSourceSnapshot(mesh_id="mesh", mesh_generation=1, shards=())
 
     try:
         method.prepare(version=object(), source=source)

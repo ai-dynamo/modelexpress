@@ -1569,21 +1569,17 @@ total rather than describing the entire streaming operation as wire or install.
 | DeepSeek-V3 (671B, FP8) | 681 GB (8 GPUs) | ~15 seconds | ~45 Gbps |
 | Llama 3.3 70B | 140 GB (8 GPUs) | ~5 seconds | ~28 Gbps |
 
-### Internal streaming cache controls
+### Internal streaming diagnostics
 
-Benchmarks record the following implementation switches in their experiment
-manifest. They are internal qualification controls, separate from the public
-integration choices above. Integrations should not expose cache algorithms as
-application configuration. This table records the existing controls and defaults;
-it does not establish a stable configuration API.
+Validated source metadata and transfer plans are reused automatically. These
+internal diagnostics are read once when the transfer is constructed; they are
+separate from the public integration configuration.
 
-| Internal environment variable | Default | Qualification purpose |
+| Internal environment variable | Default | Purpose |
 | --- | --- | --- |
-| `MX_REFIT_CACHE_RESOLVED_SOURCES` | `0` | Reuse decoded, merged source tables only when every ordered manifest byte matches. |
-| `MX_REFIT_CACHE_BOUNDED_PLANS` | `0` | Reuse logical plans when source fingerprints, source geometry/addresses, load capture, destination layout, staging configuration, and planning controls match. |
-| `MX_REFIT_REUSE_COMPLETE_PLAN` | `0` | Use the already-built whole-model plan for bounded coverage validation. |
-| `MX_REFIT_COPY_PLAN_KEY_ON_MISS` | `0` | Reject overlapping compilation. Immutable captured inputs now need no key copies in either setting; the copy counter remains zero. |
-| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Existing descriptor budget before full-source reconstruction; changing it invalidates cached plans. |
+| `MX_REFIT_DEBUG_VALIDATE_PLAN` | `0` | Recheck cached whole-model and owning-module transfer coverage. |
+| `MX_REFIT_PACK_MODULES` | `1` | Pack complete owning modules within each bounded staging arena. |
+| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Descriptor budget before full-source reconstruction. |
 
 Bounded streaming requires the framework to hold its update guard through
 transfer, installation and verification. Each group is copied from a receive
