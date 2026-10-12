@@ -99,6 +99,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
     ) -> PreparedArtifact:
         if self._active is not None:
             raise RuntimeError("release staged weight before staging another version")
+        self._streams = [stream for stream in self._streams if not stream.cache_succeeded]
         versions = [self._version(version, source) for version, source in chain]
         try:
             checkpoint = None
@@ -135,9 +136,18 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                         streaming=stream,
                     )
             if checkpoint is None:
-                for stream in self._streams:
-                    stream.wait_cache()
-                self._streams.clear()
+                streams, self._streams = self._streams, []
+                cache_error = None
+                for stream in streams:
+                    try:
+                        stream.wait_cache()
+                    except Exception as error:
+                        if cache_error is None:
+                            cache_error = error
+                if cache_error is not None:
+                    raise RuntimeError(
+                        "streamed full checkpoint cache failed"
+                    ) from cache_error
                 if not self._initialized:
                     if (
                         not versions

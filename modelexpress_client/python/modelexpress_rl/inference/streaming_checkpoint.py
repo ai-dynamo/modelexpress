@@ -81,9 +81,25 @@ class StreamedCheckpoint:
         if self._writer is not None:
             self._writer.wait()
 
+    @property
+    def cache_succeeded(self) -> bool:
+        """Whether this stream has no pending writer or unreported writer failure."""
+        if self._writer is None:
+            return True
+        future = self._writer._future
+        return future.done() and future.exception() is None
+
     def activate_cache(self) -> None:
         """Adopt the published cache as the head after deferred activation."""
-        self.wait_cache()
+        try:
+            self.wait_cache()
+        except Exception:
+            logger.warning(
+                "Streamed checkpoint cache failed before activation version=%s",
+                self.version.version_id,
+                exc_info=True,
+            )
+            return
         store = self.store
         with store.installation_locked(), store.locked():
             if store.full_path(self.version.version_id).exists():

@@ -1401,9 +1401,12 @@ promotion. It publishes only after complete streaming and successful installatio
 and adopts the checkpoint in `state.json` and `active.json` when activated.
 Deferred activation waits for cache publication before adopting it. The next
 canonical replay waits for local writer completion and can reuse its full ancestor
-without another payload download. A writer failure is logged and reported before
-the owning rank prepares
-a subsequent canonical update. Shutdown drains or discards outstanding writes.
+without another payload download. A writer failure is logged without failing
+deferred activation and is reported once as a preparation error before the owning
+rank prepares a subsequent canonical update. All tracked writers are drained
+before that error is surfaced, so a retry can proceed. Completed successful
+streams are pruned during subsequent preparation. Shutdown drains or discards
+outstanding writes.
 The operation lease already covers all remote reads; the disk tail consumes only
 owned local snapshots. Cache readiness is logged separately from serving readiness.
 CPU snapshot and backpressure times appear in the install metrics as

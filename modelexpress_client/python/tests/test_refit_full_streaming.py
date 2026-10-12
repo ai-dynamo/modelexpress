@@ -260,7 +260,7 @@ def test_cache_failure_is_reported_before_delta_without_second_download(
             full.streaming.wait_cache()
         adapter.release_staged_weight(full)
         calls = list(storage.calls)
-        with pytest.raises(OSError, match="disk unavailable"):
+        with pytest.raises(RuntimeError, match="cache failed") as failure:
             adapter.stage_chain(
                 [
                     _full_inputs(),
@@ -269,8 +269,29 @@ def test_cache_failure_is_reported_before_delta_without_second_download(
                     ),
                 ]
             )
+        assert isinstance(failure.value.__cause__, OSError)
         assert storage.calls == calls
         assert not full.path.exists()
+        storage.objects.update(
+            _artifact(
+                torch.tensor([7.0, 8.0]).view(torch.uint8).numpy(),
+                torch.tensor([9.0, 10.0]).view(torch.uint8).numpy(),
+                version="delta-b",
+                version_label=3,
+                base_version="full-a",
+            )
+        )
+        delta = adapter.stage_chain(
+            [
+                _full_inputs(),
+                _inputs(None, base_version="full-a", version="delta-b", version_label=3),
+            ]
+        )
+        assert torch.equal(
+            load_file(delta.path / "model-00001-of-00001.safetensors")["weight"],
+            torch.tensor([9.0, 10.0]),
+        )
+        adapter.release_staged_weight(delta)
     finally:
         adapter.close()
 
@@ -543,5 +564,66 @@ def test_deferred_activation_adopts_stream_only_on_activate(monkeypatch, tmp_pat
         assert _head(store) == before
         adapter._method.activate(adapter._active)
         assert _head(store) == ("full-a", CheckpointState.READY, "full-a")
+    finally:
+        adapter.close()
+
+
+def test_deferred_activation_tolerates_failed_cache(monkeypatch, tmp_path, caplog):
+    from modelexpress_rl.inference.streaming_checkpoint import _CheckpointWriter
+
+    adapter, _ = build(monkeypatch, tmp_path)
+    before = _head(adapter._checkpoint.store)
+
+    def fail(*args):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(_CheckpointWriter, "_write_tensor", fail)
+    try:
+        full = adapter.stage_weight(_full_inputs())
+        with adapter._method.installation_context(adapter._active, activate=False):
+            consume(full)
+        adapter._method.activate(adapter._active)
+        assert "cache failed before activation" in caplog.text
+        assert _head(adapter._checkpoint.store) == before
+        assert not full.path.exists()
+        assert not full.streaming.cache_succeeded
+        adapter.release_staged_weight(full)
+        adapter._method._stream_full_checkpoints = False
+        with pytest.raises(RuntimeError, match="cache failed") as failure:
+            adapter.stage_weight(_full_inputs())
+        assert isinstance(failure.value.__cause__, OSError)
+    finally:
+        adapter.close()
+
+
+def test_consecutive_full_streams_release_successful_writers(monkeypatch, tmp_path):
+    adapter, _ = build(monkeypatch, tmp_path)
+    try:
+        for _ in range(3):
+            full = adapter.stage_weight(_full_inputs())
+            assert len(adapter._method._streams) == 1
+            with adapter._method.installation_context(adapter._active):
+                consume(full)
+            full.streaming.wait_cache()
+            assert full.streaming.cache_succeeded
+            adapter.release_staged_weight(full)
+    finally:
+        adapter.close()
+
+
+def test_cache_failure_still_drains_other_pending_writers(monkeypatch, tmp_path):
+    from unittest.mock import Mock
+
+    adapter, _ = build(monkeypatch, tmp_path)
+    failed = Mock(cache_succeeded=False)
+    failed.wait_cache.side_effect = OSError("disk unavailable")
+    pending = Mock(cache_succeeded=False)
+    adapter._method._streams = [failed, pending]
+    adapter._method._stream_full_checkpoints = False
+    try:
+        with pytest.raises(RuntimeError, match="cache failed"):
+            adapter.stage_weight(_full_inputs())
+        pending.wait_cache.assert_called_once_with()
+        assert adapter._method._streams == []
     finally:
         adapter.close()
