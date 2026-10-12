@@ -14,12 +14,17 @@ keywords.workspace = true
 publish = false
 
 [features]
-default = ["gcs", "tls-rustls"]
+default = ["gcs", "tls-rustls", "s3"]
 openssl = ["tls-openssl"]
 gcs = [
     "modelexpress-client/gcs",
     "modelexpress-common/gcs",
     "modelexpress-server/gcs",
+]
+s3 = [
+    "modelexpress-client/s3",
+    "modelexpress-common/s3",
+    "modelexpress-server/s3",
 ]
 tls-openssl = [
     "kube/openssl-tls",
