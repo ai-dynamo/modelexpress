@@ -52,6 +52,9 @@ if _nixl_api is not None:
 SUPPORTED_NIXL_BACKENDS = ("UCX", "LIBFABRIC")
 DEFAULT_NIXL_BACKEND = "UCX"
 NIXL_DRAM_MEM_TYPE = "DRAM"
+NIXL_VRAM_MEM_TYPE = "VRAM"
+#: The memory kinds a published shard may live in, as NIXL names them.
+NIXL_MEM_TYPES = (NIXL_VRAM_MEM_TYPE, NIXL_DRAM_MEM_TYPE)
 
 
 def is_nixl_available() -> bool:
@@ -381,7 +384,11 @@ class NixlTransferManager:
 
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
         alloc_discovery_start = time.perf_counter()
-        if _pool_reg_enabled() and not force_per_tensor:
+        if (
+            _pool_reg_enabled()
+            and not force_per_tensor
+            and all(t.is_cuda for t in registrable_tensors)
+        ):
             if self._accelerator_backend.supports_pool_reg():
                 allocations = self._find_cuda_allocations(registrable_descriptors)
             else:
@@ -394,7 +401,7 @@ class NixlTransferManager:
         else:
             allocations = None
             logger.info(
-                "Pool registration disabled (MX_POOL_REG != '1'), using per-tensor registration"
+                "Using per-tensor registration (pool disabled, forced, or non-CUDA tensors)"
             )
         alloc_discovery_time = time.perf_counter() - alloc_discovery_start
 
@@ -1038,6 +1045,7 @@ class NixlTransferManager:
         ranges: list[tuple[int, int, int, int]],
         mem_type: str | None = None,
         timeout_seconds: float | None = None,
+        local_mem_type: str | None = None,
     ) -> tuple[int, int, float]:
         """Issue one batched one-sided RDMA READ over arbitrary byte ranges.
 
@@ -1055,7 +1063,9 @@ class NixlTransferManager:
 
         Returns ``(total_bytes, num_reads, duration)``.
         """
-        posted = self.post_read_batch(remote_agent_name, ranges, mem_type=mem_type)
+        posted = self.post_read_batch(
+            remote_agent_name, ranges, mem_type=mem_type, local_mem_type=local_mem_type
+        )
         if posted is None:
             return 0, 0, 0.0
         return self.await_read_batches([posted], timeout_seconds=timeout_seconds)
@@ -1065,6 +1075,7 @@ class NixlTransferManager:
         remote_agent_name: str,
         ranges: list[tuple[int, int, int, int]],
         mem_type: str | None = None,
+        local_mem_type: str | None = None,
     ) -> PostedRead | None:
         """Prepare and post one batched RDMA READ **without** waiting for it.
 
@@ -1072,6 +1083,11 @@ class NixlTransferManager:
         when there are no bytes to move. Every returned :class:`PostedRead` must
         be handed to :meth:`await_read_batches`, which owns releasing the handle;
         dropping one leaks it.
+
+        ``mem_type`` describes the remote memory; ``local_mem_type`` describes
+        the destination and defaults to ``mem_type``. Pass
+        ``local_mem_type="DRAM"`` to read remote accelerator memory into a
+        registered pinned host buffer.
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
@@ -1080,11 +1096,13 @@ class NixlTransferManager:
             return None
 
         mem = mem_type or self._accelerator_backend.nixl_mem_type
+        local_mem = local_mem_type or mem
+        local_dev = 0 if local_mem == NIXL_DRAM_MEM_TYPE else self._device_id
         remote_descs = [
             (remote_addr, nbytes, dev) for (remote_addr, _local, nbytes, dev) in ranges
         ]
         local_descs = [
-            (local_addr, nbytes, self._device_id)
+            (local_addr, nbytes, local_dev)
             for (_remote, local_addr, nbytes, _dev) in ranges
         ]
 
@@ -1119,7 +1137,7 @@ class NixlTransferManager:
             dst_prepped = self._agent.prep_xfer_dlist(
                 agent_name="",
                 xfer_list=local_descs,
-                mem_type=mem,
+                mem_type=local_mem,
                 backends=self._backends,
             )
             indices = list(range(len(ranges)))
