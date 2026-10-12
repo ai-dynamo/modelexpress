@@ -169,7 +169,7 @@ runs:
         DGD_NAME: ${{ inputs.dgd_name }}
       run: |
         echo "::group::Apply DGD ${MANIFEST} (name=${DGD_NAME})"
-        envsubst < "${MANIFEST}" | kubectl apply -n "${NAMESPACE}" -f -
+        bash "${{ github.action_path }}/apply-dgd.sh" "${MANIFEST}" "${NAMESPACE}"
         echo "::endgroup::"
 
     - name: Resolve mode-specific parameters
@@ -211,7 +211,7 @@ runs:
         echo "::group::Wait for initial workers to publish ${INITIAL_CR_COUNT} ModelMetadata CR(s)"
         deadline=$((SECONDS + TIMEOUT))
         while [ $SECONDS -lt $deadline ]; do
-          CR_COUNT=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          CR_COUNT=$(kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"\n"}{end}' 2>/dev/null | awk '$0 == "weights" || $0 == "" { count++ } END { print count + 0 }')
           if [ "${CR_COUNT}" -ge "${INITIAL_CR_COUNT}" ]; then
             echo "Initial workers published metadata (${CR_COUNT} CR(s))."
             break
@@ -226,7 +226,7 @@ runs:
           echo "Have ${CR_COUNT}/${INITIAL_CR_COUNT} ModelMetadata CR(s), retrying in 15s..."
           sleep 15
         done
-        FINAL=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        FINAL=$(kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"\n"}{end}' 2>/dev/null | awk '$0 == "weights" || $0 == "" { count++ } END { print count + 0 }')
         if [ "${FINAL}" -lt "${INITIAL_CR_COUNT}" ]; then
           echo "ERROR: only ${FINAL}/${INITIAL_CR_COUNT} ModelMetadata CRs after ${TIMEOUT}s"
           exit 1
@@ -258,7 +258,7 @@ runs:
         # the new replica reached the publish phase (which happens AFTER
         # successful RDMA receive).
         while [ $SECONDS -lt $deadline ]; do
-          CR_COUNT=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          CR_COUNT=$(kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"\n"}{end}' 2>/dev/null | awk '$0 == "weights" || $0 == "" { count++ } END { print count + 0 }')
           if [ "${CR_COUNT}" -ge "${FINAL_CR_COUNT}" ]; then
             echo "All workers have published metadata (${CR_COUNT} CRs)."
             break
@@ -272,7 +272,7 @@ runs:
           echo "Have ${CR_COUNT}/${FINAL_CR_COUNT} ModelMetadata CRs, retrying in 15s..."
           sleep 15
         done
-        FINAL=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        FINAL=$(kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"\n"}{end}' 2>/dev/null | awk '$0 == "weights" || $0 == "" { count++ } END { print count + 0 }')
         if [ "${FINAL}" -lt "${FINAL_CR_COUNT}" ]; then
           echo "ERROR: only ${FINAL} ModelMetadata CRs after ${TIMEOUT}s (expected ${FINAL_CR_COUNT})"
           exit 1
