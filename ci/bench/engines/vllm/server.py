@@ -22,6 +22,7 @@ def main():
         model=os.environ["BENCH_MODEL"],
         revision=os.environ["BENCH_REVISION"],
         load_format="modelexpress",
+        compilation_config={"cache_dir": "/root/.cache/vllm/torch_compile_cache/mx-ci"},
         model_loader_extra_config={"memory_limit": 8589934592, "concurrency": 8},
         tensor_parallel_size=config["tp"],
         limit_mm_per_prompt=config["limit_mm_per_prompt"],

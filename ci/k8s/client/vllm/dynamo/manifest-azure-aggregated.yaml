@@ -169,6 +169,10 @@ spec:
           value: "modelexpress"
         - name: MX_SERVER_ADDRESS
           value: "${DGD_NAME}-modelexpress:8000"
+        - name: MX_ARTIFACT_TRANSFER
+          value: "1"
+        - name: MX_ARTIFACT_READY_URL
+          value: "http://127.0.0.1:9090/health"
         # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
         - name: MX_RDMA_NIC_PIN
           value: "auto"
