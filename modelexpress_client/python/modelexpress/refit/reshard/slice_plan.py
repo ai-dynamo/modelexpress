@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from modelexpress.refit.reshard.types import (
     OpChain,
@@ -80,8 +80,7 @@ class SourceBuffer:
     shape: tuple
 
 
-@dataclass(frozen=True)
-class LogicalRead:
+class LogicalRead(NamedTuple):
     """A source-relative byte run into a named destination."""
 
     source_buffer: int
