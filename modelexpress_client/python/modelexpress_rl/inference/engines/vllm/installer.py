@@ -733,6 +733,30 @@ class _VllmInstaller(EngineInstaller):
                     f"parameter alias owner {path!r} was replaced during refit"
                 )
 
+    def _load_time_parameter_aliases(
+        self, aliases: _ParameterAliases, layerwise_info: Mapping
+    ) -> _ParameterAliases:
+        """Exclude runtime-only slots using vLLM's recorded load-time metadata."""
+        self._validate_alias_owners(aliases)
+        owners = iter(aliases.owners)
+        groups = []
+        changed = False
+        for group in aliases.groups:
+            load_group = []
+            for module, name in group:
+                path, _ = next(owners)
+                info = layerwise_info.get(module)
+                metadata = getattr(info, "restore_metadata", None)
+                if metadata is not None and name not in metadata[0]:
+                    changed = True
+                    continue
+                load_group.append((path, module, name))
+            groups.append(load_group)
+        if not changed:
+            return aliases
+        modules = dict(self._model.named_modules(remove_duplicate=False))
+        return _compile_parameter_aliases(self._model, groups, modules)
+
     def _restore_parameter_aliases(self, aliases: _ParameterAliases) -> None:
         # vLLM restores metadata separately for each module. Reconnect shared
         # parameters so a tied loader still covers one canonical destination.
@@ -794,7 +818,9 @@ class _VllmInstaller(EngineInstaller):
 
         original_loader = self._original_loader
         model = self._model
-        aliases = self._parameter_aliases(model)
+        aliases = self._load_time_parameter_aliases(
+            self._parameter_aliases(model), LAYERWISE_INFO
+        )
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(model)
             try:
@@ -1262,14 +1288,15 @@ class _VllmInstaller(EngineInstaller):
         ]
         bare_tensors = [entry for entry in bare_tensors if entry[2]]
         aliases = self._parameter_aliases(self._model)
+        load_aliases = self._load_time_parameter_aliases(aliases, LAYERWISE_INFO)
 
         # Native materialization enters each layer's recorded restore device.
         # PWAL also creates host tensors, so it must keep the ambient device.
         with set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(self._model)
-            self._restore_parameter_aliases(aliases)
+            self._restore_parameter_aliases(load_aliases)
             _reserve_runtime_buffer_slots(self._model, LAYERWISE_INFO)
-            load(aliases)
+            load(load_aliases)
             finalize_layerwise_reload(self._model, self._model_config)
             self._validate_alias_owners(aliases)
 
