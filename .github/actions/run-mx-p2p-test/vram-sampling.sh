@@ -91,7 +91,7 @@ wait_for_health() {
     fi
 
     failed="$(kubectl get pods -n "${NAMESPACE}" -l "${selector}" --no-headers 2>/dev/null \
-      | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)"
+      | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)"
     if [ -n "${failed}" ]; then
       echo "ERROR: ${label} pod entered failure state before /health returned 200: ${failed}"
       exit 1

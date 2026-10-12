@@ -185,8 +185,8 @@ runs:
         # actual healthy state test_fleet_scale.py asserts.
         ready_count() {
           kubectl get modelmetadata -n "${NAMESPACE}" \
-            -o jsonpath='{range .items[*]}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
-            | grep -c '^Ready$' || true
+            -o jsonpath='{range .items[*]}{.spec.sourceType}{"|"}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
+            | awk -F '|' '($1 == "weights" || $1 == "") && $2 == "Ready" { count++ } END { print count + 0 }' || true
         }
         echo "::group::Wait for source worker to reach Ready"
         deadline=$((SECONDS + TIMEOUT))
@@ -229,8 +229,8 @@ runs:
         # wave that caused it, not several waves later.
         ready_count() {
           kubectl get modelmetadata -n "${NAMESPACE}" \
-            -o jsonpath='{range .items[*]}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
-            | grep -c '^Ready$' || true
+            -o jsonpath='{range .items[*]}{.spec.sourceType}{"|"}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
+            | awk -F '|' '($1 == "weights" || $1 == "") && $2 == "Ready" { count++ } END { print count + 0 }' || true
         }
         for WAVE in ${WAVE_SIZES}; do
           echo "::group::Scale to replicas=${WAVE}"

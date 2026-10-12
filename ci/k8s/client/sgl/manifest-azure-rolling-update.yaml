@@ -79,7 +79,9 @@ spec:
             - name: MX_P2P_METADATA
               value: "1"
             - name: MX_ARTIFACT_TRANSFER
-              value: "0"
+              value: "1"
+            - name: MX_ARTIFACT_READY_URL
+              value: "http://127.0.0.1:30000/health"
             - name: MX_CONTIGUOUS_REG
               value: "0"
             - name: NIXL_UCX_TLS
