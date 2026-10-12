@@ -15,8 +15,10 @@ also uses the same agent for host DRAM chunk staging.
 from __future__ import annotations
 
 import atexit
+import ipaddress
 import logging
 import os
+import socket
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -55,6 +57,34 @@ NIXL_DRAM_MEM_TYPE = "DRAM"
 NIXL_VRAM_MEM_TYPE = "VRAM"
 #: The memory kinds a published shard may live in, as NIXL names them.
 NIXL_MEM_TYPES = (NIXL_VRAM_MEM_TYPE, NIXL_DRAM_MEM_TYPE)
+
+
+def _resolve_metadata_host(host: str, port: int) -> str:
+    """Resolve a worker host to the numeric address required by NIXL's socket API."""
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+
+    try:
+        addresses = socket.getaddrinfo(
+            host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise RuntimeError(f"Could not resolve NIXL metadata host {host!r}: {exc}") from exc
+
+    for family, _, _, _, sockaddr in addresses:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        address = sockaddr[0]
+        if family == socket.AF_INET6 and sockaddr[3] and "%" not in address:
+            address = f"{address}%{sockaddr[3]}"
+        return address
+
+    raise RuntimeError(f"No IPv4 or IPv6 address found for NIXL metadata host {host!r}")
 
 
 def is_nixl_available() -> bool:
@@ -746,8 +776,12 @@ class NixlTransferManager:
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
 
-        logger.info(f"Fetching remote metadata from {remote_agent_name} at {ip}:{port}")
-        self._agent.fetch_remote_metadata(remote_agent_name, ip, port)
+        metadata_ip = _resolve_metadata_host(ip, port)
+        logger.info(
+            "Fetching remote metadata from %s at %s:%s (host=%s)",
+            remote_agent_name, metadata_ip, port, ip,
+        )
+        self._agent.fetch_remote_metadata(remote_agent_name, metadata_ip, port)
 
         start = time.perf_counter()
         while True:
@@ -761,7 +795,7 @@ class NixlTransferManager:
                     f"Remote metadata loaded for {remote_agent_name} "
                     f"({time.perf_counter() - start:.2f}s)"
                 )
-                self._remote_agents[remote_agent_name] = (ip, port)
+                self._remote_agents[remote_agent_name] = (metadata_ip, port)
                 return
             time.sleep(0.01)
 
