@@ -2036,6 +2036,13 @@ stages a source-view prefix, enabling verification rejects the plan before
 transfer: a whole-shard digest cannot verify that partial or rearranged view.
 Verification does not substitute a separate full-source transfer plan or claim
 to validate the final installed tensor.
+When an exact prefix exceeds `MX_RESHARD_MAX_SEGMENTS_PER_COPY`, the planner
+considers contiguous earlier prefixes within the aligned per-arena capacity.
+It chooses the least wire overhead that meets the descriptor target, or the
+greatest available reduction when fragmentation prevents meeting it. Arithmetic
+cost counting avoids constructing discarded descriptor lists. Preparation reports
+exact and planned descriptor counts, descriptor savings and extra wire bytes,
+including on warm updates.
 
 The combined capture is the reusable capture artifact; ordered replay planning
 consumes it directly and does not separately compose trainer conversion with an
