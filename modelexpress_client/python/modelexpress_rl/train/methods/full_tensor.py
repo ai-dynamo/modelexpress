@@ -57,9 +57,9 @@ class FullTensorNixlPublicationMethod:
         self._binding: TrainerTensorsMetadata | None = None
 
     @property
-    def source_slot_id(self) -> str:
+    def logical_shard_id(self) -> str:
         if self._binding is None:
-            raise RuntimeError("bind_tensors() must be called before source_slot_id")
+            raise RuntimeError("bind_tensors() must be called before logical_shard_id")
         return self._binding.logical_shard_id
 
     def bind_tensors(self, tensors: Any) -> TrainerTensorsMetadata:
@@ -67,6 +67,7 @@ class FullTensorNixlPublicationMethod:
             logical_shard_id=self._adapter.bind_tensors(tensors),
             metadata_endpoint=self._manifest_publisher.endpoint,
         )
+        self._manifest_publisher.publish_binding(self._adapter.bound_manifest)
         return self._binding
 
     def stage(
@@ -100,7 +101,7 @@ class FullTensorNixlPublicationMethod:
             raise RuntimeError("trainer publication requires trainer_mesh_id")
         if self._binding is None:
             raise RuntimeError("mesh publication requires bind_tensors()")
-        source_slot_id = self._binding.logical_shard_id
+        logical_shard_id = self._binding.logical_shard_id
         with refit_span(
             "source_preparation",
             metadata={"staging_syncs": 1},
@@ -129,14 +130,14 @@ class FullTensorNixlPublicationMethod:
         ):
             endpoint = self._manifest_publisher.publish_manifest(
                 version_id=version.version_id,
-                source_slot_id=source_slot_id,
+                logical_shard_id=logical_shard_id,
                 manifest=staged.manifest,
             )
         if not endpoint.strip():
             raise ValueError("manifest_endpoint is required")
         shard = refit_pb2.WeightVersionShard(
             version_id=version.version_id,
-            logical_shard_id=source_slot_id,
+            logical_shard_id=logical_shard_id,
             worker_id=self._worker_id,
             tensor_count=staged.manifest.tensor_count,
             total_bytes=staged.manifest.total_bytes,
@@ -158,10 +159,10 @@ class FullTensorNixlPublicationMethod:
     def release(self, *, version: WeightVersionRef) -> None:
         if version.version_id not in self.published:
             return
-        source_slot_id = self.source_slot_id
+        logical_shard_id = self.logical_shard_id
         request = refit_pb2.DeleteWeightVersionShardRequest(
             version_id=version.version_id,
-            logical_shard_id=source_slot_id,
+            logical_shard_id=logical_shard_id,
             worker_id=self._worker_id,
         )
         deadline = monotonic() + self._rpc_timeout_seconds
@@ -182,7 +183,7 @@ class FullTensorNixlPublicationMethod:
                 sleep(min(0.05, max(deadline - monotonic(), 0)))
         self._manifest_publisher.release_manifest(
             version_id=version.version_id,
-            source_slot_id=source_slot_id,
+            logical_shard_id=logical_shard_id,
         )
         del self.published[version.version_id]
 

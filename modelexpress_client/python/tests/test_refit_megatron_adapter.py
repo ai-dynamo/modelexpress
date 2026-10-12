@@ -136,10 +136,10 @@ def test_megatron_source_slot_groups_replicas_by_logical_partition(monkeypatch):
     )
 
     assert first.bind_tensors(tensors) == second.bind_tensors(tensors)
-    assert first.source_slot_id == second.source_slot_id
+    assert first.logical_shard_id == second.logical_shard_id
     assert (
         other_partition.bind_tensors([replace(tensors[0], local_shard_range=(8, 16))])
-        != first.source_slot_id
+        != first.logical_shard_id
     )
 
 
@@ -220,7 +220,7 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
             )
         )
         metadata = refit_client.bind_tensors(tensors)
-        source_slot_id = refit_client.source_slot_id
+        logical_shard_id = refit_client.logical_shard_id
         selected_adapter = refit_client._runtime.method._adapter
         refit_client.publish_version(version=WeightVersionRef("version-a"))
         worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
@@ -246,7 +246,7 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     assert refit_service.registration_ttl == 60
     assert len(resources.manager.registered) == 1
     assert refit_service.shard.version_id == "version-a"
-    assert source_slot_id == metadata.logical_shard_id
+    assert logical_shard_id == metadata.logical_shard_id
     assert len(metadata.logical_shard_id) == 64
     assert refit_service.shard.logical_shard_id == metadata.logical_shard_id
     assert refit_service.shard.worker_id == "worker-3"

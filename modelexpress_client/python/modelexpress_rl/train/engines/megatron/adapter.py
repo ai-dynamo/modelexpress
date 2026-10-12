@@ -42,16 +42,17 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
             raise RuntimeError("Megatron distributed process group is not initialized")
         self._manager = manager
         self._nixl_metadata_endpoint = nixl_metadata_endpoint
-        self._source_slot_id: str | None = None
+        self._logical_shard_id: str | None = None
+        self._bound_manifest: bytes | None = None
         self._registered_addrs: dict[str, int] | None = None
         self._manifest: WeightVersionShardManifest | None = None
 
     @property
-    def source_slot_id(self) -> str:
+    def logical_shard_id(self) -> str:
         """Return the logical trainer contribution represented by this rank."""
-        if self._source_slot_id is None:
-            raise RuntimeError("bind_tensors() must be called before source_slot_id")
-        return self._source_slot_id
+        if self._logical_shard_id is None:
+            raise RuntimeError("bind_tensors() must be called before logical_shard_id")
+        return self._logical_shard_id
 
     def bind_tensors(self, tensors: Any) -> str:
         """Bind one logical model partition independently of its DP replica."""
@@ -65,13 +66,21 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
                 tensors, agent_name=str(self._manager.agent_name)
             )
         ]
-        source_slot_id = hashlib.sha256(bound_tensor_manifest(coverage)).hexdigest()
-        if self._source_slot_id is not None and self._source_slot_id != source_slot_id:
+        manifest = bound_tensor_manifest(coverage)
+        logical_shard_id = hashlib.sha256(manifest).hexdigest()
+        if self._logical_shard_id is not None and self._logical_shard_id != logical_shard_id:
             raise RuntimeError(
                 "Megatron logical tensor partition changed after binding"
             )
-        self._source_slot_id = source_slot_id
-        return source_slot_id
+        self._logical_shard_id = logical_shard_id
+        self._bound_manifest = manifest
+        return logical_shard_id
+
+    @property
+    def bound_manifest(self) -> bytes:
+        if self._bound_manifest is None:
+            raise RuntimeError("bind_tensors() must be called before bound_manifest")
+        return self._bound_manifest
 
     @property
     def supported_staging_modes(self) -> frozenset[TrainerStagingMode]:

@@ -197,8 +197,8 @@ class TrainerRuntime:
         return self.method
 
     @property
-    def source_slot_id(self) -> str:
-        return self._full_tensor().source_slot_id
+    def logical_shard_id(self) -> str:
+        return self._full_tensor().logical_shard_id
 
     def bind_tensors(self, tensors: Any) -> TrainerTensorsMetadata:
         if tensors is None:

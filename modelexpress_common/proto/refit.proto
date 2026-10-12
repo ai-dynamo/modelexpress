@@ -247,6 +247,8 @@ message ListWeightVersionShardsResponse {
 }
 
 message GetWeightVersionShardManifestRequest {
+  // Empty for immutable bound coverage used during trainer mesh admission.
+  // Otherwise identifies the versioned source-buffer manifest.
   string version_id = 1;
   string logical_shard_id = 2;
 }
