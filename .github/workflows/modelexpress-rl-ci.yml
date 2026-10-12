@@ -86,6 +86,7 @@ jobs:
       harness_sha: ${{ steps.inputs.outputs.harness_sha }}
       sha: ${{ steps.inputs.outputs.sha }}
       scenario: ${{ steps.inputs.outputs.scenario }}
+      gpu_slot: ${{ steps.inputs.outputs.gpu_slot }}
       model: ${{ steps.inputs.outputs.model }}
       runtime: ${{ steps.inputs.outputs.runtime }}
     steps:
@@ -106,6 +107,7 @@ jobs:
         run: |
           python3 ci/bench/scripts/comment_gate.py --workflow-call
           echo "harness_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          python3 -c 'import os; number = int(os.environ["PR_NUMBER"]) or int(os.environ["GITHUB_REF"].rsplit("/", 1)[1]); print("gpu_slot=" + str(number % 4))' >> "$GITHUB_OUTPUT"
 
   build:
     if: ${{ !cancelled() && needs.validate.result == 'success' }}
@@ -168,7 +170,7 @@ jobs:
   test:
     if: ${{ !cancelled() && needs.validate.result == 'success' && needs.build.result == 'success' }}
     concurrency:
-      group: modelexpress-rl-gpu-${{ vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02' }}
+      group: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && format('modelexpress-rl-gpu-{0}', vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02') || vars.MX_CI_GPU_CONCURRENCY == '2' && format('modelexpress-rl-gpu-{0}-refit', vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02') || format('modelexpress-rl-gpu-{0}-slot-{1}', vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', needs.validate.outputs.gpu_slot) }}
       queue: max
       cancel-in-progress: false
     name: "RL refit (${{ needs.validate.outputs.model }})"
@@ -176,6 +178,8 @@ jobs:
     runs-on: prod-deploy-tester-v1
     timeout-minutes: 120
     env:
+      MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '4' }}
+      MX_CI_GPU_LANE: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'all' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'refit' || format('slot-{0}', needs.validate.outputs.gpu_slot) }}
       MODEL_PROFILE: ${{ needs.validate.outputs.model }}
       SCENARIO: ${{ needs.validate.outputs.scenario }}
       RUN_ID: ${{ needs.validate.outputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -315,7 +319,7 @@ jobs:
 
   test-vime-delta-refit:
     concurrency:
-      group: modelexpress-rl-gpu-nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
+      group: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && format('modelexpress-rl-gpu-{0}', 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02') || vars.MX_CI_GPU_CONCURRENCY == '2' && format('modelexpress-rl-gpu-{0}-vime', 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02') || format('modelexpress-rl-gpu-{0}-slot-{1}', 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', 3) }}
       queue: max
       cancel-in-progress: false
     name: RL Vime delta-refit smoke
@@ -325,6 +329,8 @@ jobs:
     permissions:
       contents: read
     env:
+      MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '4' }}
+      MX_CI_GPU_LANE: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'all' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'vime' || format('slot-{0}', 3) }}
       KUBE_CONTEXT: nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
       NAMESPACE: mx-ci-h100-vime-${{ github.run_id }}-${{ github.run_attempt }}
       WORKER_IMAGE: nvcr.io/0980761089281446/vime-dynamo-mx-worker:${{ github.sha }}
@@ -354,6 +360,7 @@ jobs:
           "${kc[@]}" create namespace "$NAMESPACE" --dry-run=client -o yaml \
             | "${kc[@]}" label --local -f - \
                 ci.modelexpress.nvidia.com/run-id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+                ci.modelexpress.nvidia.com/gpu-lane="$MX_CI_GPU_LANE" \
                 -o yaml \
             | "${kc[@]}" create -f -
           "${k[@]}" create quota vime-delta-refit-gpu-budget \

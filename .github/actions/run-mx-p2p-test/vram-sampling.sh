@@ -18,7 +18,7 @@ sample_peak_vram() {
   if [ -z "${pod}" ]; then
     pod="$(ci_kubectl get pods -n "${NAMESPACE}" \
       -l "${selector}" \
-      -o jsonpath='{.items[0].metadata.name}')"
+      -o json | jq -r '.items[0].metadata.name // empty')"
   fi
   if [ -z "${pod}" ]; then
     return 0
@@ -77,7 +77,7 @@ wait_for_health() {
   while [ $SECONDS -lt $deadline ]; do
     pod="$(ci_kubectl get pods -n "${NAMESPACE}" \
       -l "${selector}" \
-      -o jsonpath='{.items[0].metadata.name}')"
+      -o json | jq -r '.items[0].metadata.name // empty')"
     printf -v "${pod_var}" '%s' "${pod}"
 
     if [ "${measure_vram}" = "true" ]; then

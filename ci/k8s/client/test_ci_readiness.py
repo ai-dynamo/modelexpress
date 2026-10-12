@@ -207,8 +207,90 @@ def test_admission_does_not_treat_api_failure_as_free_capacity(tmp_path):
 
 def test_admission_waits_for_host_pods_after_virtual_namespace_disappears(tmp_path):
     command = '''if [[ " $* " == *" get namespaces "* ]]; then echo '{"items":[]}'; exit 0; fi
- echo '{"items":[{"spec":{"nodeSelector":{"agentpool":"a100a"},"containers":[{"resources":{"limits":{"nvidia.com/gpu":"1"}}}]},"status":{"phase":"Running"}}]}'
+ echo '{"items":[{"metadata":{"namespace":"mx-ci-old"},"spec":{"nodeSelector":{"agentpool":"a100a"},"containers":[{"resources":{"limits":{"nvidia.com/gpu":"1"}}}]},"status":{"phase":"Running"}}]}'
 '''
     result = run_shell(tmp_path, 'export GITHUB_WORKSPACE=.\nwait_for_gpu_pool_cleanup a100a', command)
     assert result.returncode != 0
     assert "after 900s" in result.stderr
+
+
+@pytest.mark.parametrize("pool,lane,other,namespace", [
+    ("a100a", "rdma", "tcp", "mx-ci-rolling-fixture"),
+    ("a100b", "mla", "parallel", "mx-ci-vllm-dp2-fixture"),
+    ("rl", "refit", "vime", "mx-ci-h100-vime-fixture"),
+])
+@pytest.mark.parametrize("concurrency,status", [(2, 0), (1, 1)])
+def test_cleanup_guard_allows_other_lane_only_in_two_job_mode(tmp_path, pool, lane, other, namespace, concurrency, status):
+    namespaces = json.dumps({"items": [{"metadata": {"name": namespace, "labels": {"ci.modelexpress.nvidia.com/gpu-lane": other}}}]})
+    pods = json.dumps({"items": [{"metadata": {"namespace": "mx-ci", "labels": {"vcluster.loft.sh/namespace": namespace}}, "spec": {"nodeSelector": {"agentpool": pool}, "containers": [{"resources": {"requests": {"nvidia.com/gpu": "1"}}}]}, "status": {"phase": "Running"}}]})
+    command = f'''if [[ " $* " == *" get namespaces "* ]]; then echo '{namespaces}'; else echo '{pods}'; fi
+'''
+    result = run_shell(tmp_path, f'export GITHUB_WORKSPACE=. KUBE_CONTEXT=fixture MX_CI_GPU_LANE={lane} MX_CI_GPU_CONCURRENCY={concurrency}\nwait_for_gpu_pool_cleanup {pool}', command)
+    assert result.returncode == status, result.stderr
+    if status:
+        assert "after 900s" in result.stderr
+
+
+def test_cleanup_guard_keeps_same_lane_orphan_blocked(tmp_path):
+    command = '''if [[ " $* " == *" get namespaces "* ]]; then echo '{"items":[]}'; exit 0; fi
+ echo '{"items":[{"metadata":{"namespace":"mx-ci","labels":{"vcluster.loft.sh/namespace":"mx-ci-vllm-old"}},"spec":{"nodeSelector":{"agentpool":"a100a"},"containers":[{"resources":{"requests":{"nvidia.com/gpu":"1"}}}]},"status":{"phase":"Pending"}}]}'
+'''
+    result = run_shell(tmp_path, 'export GITHUB_WORKSPACE=. MX_CI_GPU_LANE=rdma MX_CI_GPU_CONCURRENCY=2\nwait_for_gpu_pool_cleanup a100a', command)
+    assert result.returncode != 0
+    assert "after 900s" in result.stderr
+
+
+@pytest.mark.parametrize("lane,other,status", [
+    ("slot-0", "slot-1", 0),
+    ("slot-0", "slot-0", 1),
+    ("slot-0", "rdma", 1),
+    ("rdma", "slot-0", 1),
+])
+def test_four_slot_cleanup_and_mode_transition(tmp_path, lane, other, status):
+    namespaces = json.dumps({"items": [{"metadata": {"name": "mx-ci-vllm-old", "labels": {"ci.modelexpress.nvidia.com/gpu-lane": other}}}]})
+    command = f'''if [[ " $* " == *" get namespaces "* ]]; then echo '{namespaces}'; else echo '{{"items":[]}}'; fi
+'''
+    result = run_shell(tmp_path, f'export GITHUB_WORKSPACE=. MX_CI_GPU_LANE={lane} MX_CI_GPU_CONCURRENCY=4\nwait_for_gpu_pool_cleanup a100a', command)
+    assert result.returncode == status, result.stderr
+    if status:
+        assert "after 900s" in result.stderr
+
+
+def test_invalid_concurrency_fails_before_reading_capacity(tmp_path):
+    result = run_shell(tmp_path, 'export MX_CI_GPU_CONCURRENCY=3\nwait_for_gpu_pool_cleanup a100a', 'exit 0')
+    assert result.returncode != 0
+    assert "must be 1, 2, or 4" in result.stderr
+
+
+@pytest.mark.parametrize("operation", ["health", "vram"])
+def test_empty_pod_list_recovers_when_replacement_appears(tmp_path, operation):
+    command = '''if [[ " $* " == *" -o json "* ]]; then
+  count=$(cat "$FIXTURE/calls" 2>/dev/null || echo 0)
+  count=$((count + 1)); echo "$count" > "$FIXTURE/calls"
+  if [ "$count" -eq 1 ]; then echo '{"items":[]}'; else echo '{"items":[{"metadata":{"name":"replacement"}}]}'; fi
+  exit 0
+fi
+if [[ " $* " == *" jsonpath="* ]]; then echo 'array index out of bounds: index 0, length 0' >&2; exit 17; fi
+if [[ " $* " == *" nvidia-smi "* ]]; then echo 123; fi
+exit 0
+'''
+    body = 'source .github/actions/run-mx-p2p-test/vram-sampling.sh\ntest_pod=; test_peak=0; test_samples=0\n'
+    if operation == "health":
+        body += 'wait_for_health Target fixture worker 8000 test_pod 30\necho "pod=$test_pod"'
+    else:
+        body += 'sample_peak_vram Target fixture worker test_pod test_peak test_samples\n[ "$test_samples" -eq 0 ]\nsample_peak_vram Target fixture worker test_pod test_peak test_samples\necho "pod=$test_pod peak=$test_peak samples=$test_samples"'
+    result = run_shell(tmp_path, body, command)
+    assert result.returncode == 0, result.stderr
+    assert "pod=replacement" in result.stdout
+    assert int((tmp_path / "calls").read_text()) == 2
+    if operation == "vram":
+        assert "peak=123 samples=1" in result.stdout
+
+
+@pytest.mark.parametrize("operation", ["health", "vram"])
+def test_pod_lookup_api_errors_still_fail(tmp_path, operation):
+    body = 'source .github/actions/run-mx-p2p-test/vram-sampling.sh\ntest_pod=; test_peak=0; test_samples=0\n'
+    body += 'wait_for_health Target fixture worker 8000 test_pod 30' if operation == "health" else 'sample_peak_vram Target fixture worker test_pod test_peak test_samples'
+    result = run_shell(tmp_path, body, 'echo Forbidden >&2; exit 17')
+    assert result.returncode != 0
+    assert "Forbidden" in result.stderr

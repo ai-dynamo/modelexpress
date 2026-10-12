@@ -81,24 +81,46 @@ wait_for_worker_liveness() {
 # Wait for the previous CI namespaces and physical pods before allocating a new workload.
 wait_for_gpu_pool_cleanup() {
   local pool="$1" deadline=$((SECONDS + 900)) namespaces pods remaining
+  local lane="${MX_CI_GPU_LANE:-all}" concurrency="${MX_CI_GPU_CONCURRENCY:-4}"
+  [[ "$concurrency" == 1 || "$concurrency" == 2 || "$concurrency" == 4 ]] || { echo "MX_CI_GPU_CONCURRENCY must be 1, 2, or 4" >&2; return 1; }
+  if [ "$concurrency" = 1 ]; then lane=all; fi
   while [ "$SECONDS" -lt "$deadline" ]; do
     if [[ "$pool" == a100* ]]; then
       namespaces=$(ci_kubectl get namespaces -l "ci.modelexpress.nvidia.com/gpu-pool=$pool" -o json) || return 1
       pods=$(ci_kubectl get pods -A --kubeconfig="$GITHUB_WORKSPACE/.kubeconfig-host" -o json) || return 1
-      remaining=$(printf '%s\n' "$pods" | jq --arg pool "$pool" '[.items[] | select(.status.phase != "Succeeded" and .status.phase != "Failed") | select(.spec.nodeSelector.agentpool == $pool or ((.spec.nodeName // "") | startswith("aks-" + $pool + "-"))) | select(any(.spec.containers[]?, .spec.initContainers[]?; (.resources.requests["nvidia.com/gpu"] // .resources.limits["nvidia.com/gpu"] // "0" | tonumber) > 0))] | length')
     else
       namespaces=$(ci_kubectl get namespaces --context="$KUBE_CONTEXT" -o json) || return 1
-      namespaces=$(printf '%s\n' "$namespaces" | jq '{items: [.items[] | select(.metadata.name | startswith("mx-ci-bench-") or startswith("mx-ci-h100-vime-"))]}')
       pods=$(ci_kubectl get pods -A --context="$KUBE_CONTEXT" -o json) || return 1
-      remaining=$(printf '%s\n' "$pods" | jq '[.items[] | select(.metadata.namespace | startswith("mx-ci-bench-") or startswith("mx-ci-h100-vime-"))] | length')
     fi
-    if [ "$(printf '%s\n' "$namespaces" | jq '.items | length')" -eq 0 ] && [ "$remaining" -eq 0 ]; then
-      echo "GPU pool $pool has no previous CI workload awaiting cleanup"
+    remaining=$(jq -n --arg pool "$pool" --arg lane "$lane" --argjson namespaces "$namespaces" --argjson pods "$pods" '
+      def classify($name):
+        if ($name | test("^mx-ci-(fleet|rolling)-")) then "tcp"
+        elif ($name | test("^mx-ci-h100-vime-")) then "vime"
+        elif ($name | test("^mx-ci-bench-")) then "refit"
+        elif ($name | test("-mla-")) then "mla"
+        elif ($name | test("-(dp2|ep2)-")) then "parallel"
+        else "rdma" end;
+      def selected($name):
+        ([$namespaces.items[] | select(.metadata.name == $name) | .metadata.labels["ci.modelexpress.nvidia.com/gpu-lane"] | select(. != null and length > 0)][0] // classify($name)) as $actual |
+        $lane == "all" or $actual == $lane or (($lane | startswith("slot-")) != ($actual | startswith("slot-")));
+      def rl($name): $name | startswith("mx-ci-bench-") or startswith("mx-ci-h100-vime-");
+      ([$namespaces.items[] | select(selected(.metadata.name)) | select(($pool | startswith("a100")) or rl(.metadata.name))] | length) +
+      ([$pods.items[] |
+        (.metadata.labels["vcluster.loft.sh/namespace"] // .metadata.namespace // "") as $ns |
+        select(selected($ns)) |
+        if ($pool | startswith("a100")) then
+          select($ns | startswith("mx-ci-")) |
+          select(.status.phase != "Succeeded" and .status.phase != "Failed") |
+          select(.spec.nodeSelector.agentpool == $pool or ((.spec.nodeName // "") | startswith("aks-" + $pool + "-"))) |
+          select(any(.spec.containers[]?, .spec.initContainers[]?; (.resources.requests["nvidia.com/gpu"] // .resources.limits["nvidia.com/gpu"] // "0" | tonumber) > 0))
+        else select(rl($ns)) end] | length)') || return 1
+    if [ "$remaining" -eq 0 ]; then
+      echo "GPU pool $pool lane $lane has no previous CI workload awaiting cleanup"
       return 0
     fi
-    echo "Waiting for GPU pool $pool cleanup ($remaining physical pods remain)"
+    echo "Waiting for GPU pool $pool lane $lane cleanup ($remaining namespaces/pods remain)"
     sleep 10
   done
-  echo "ERROR: previous workload still occupies GPU pool $pool after 900s" >&2
+  echo "ERROR: previous workload still occupies GPU pool $pool lane $lane after 900s" >&2
   return 1
 }

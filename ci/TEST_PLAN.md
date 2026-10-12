@@ -119,13 +119,19 @@ interruptions; they do not establish the cause of the host API resets.
 
 ## GPU test admission and readiness budgets
 
-The parent workflow calls the Azure tests through a per-PR concurrency group
-that cancels superseded GPU work. Inside the reusable workflow, all A100a tests
-share one repository-wide queued concurrency group; MLA and DP/EP tests share a
-separate A100b group. Each pool runs one test workload, including its complete
-source/target topology and cleanup, at a time. Builds, AWS tests and independent
-cleanup jobs retain their existing concurrency. GitHub's `queue: max` keeps up to
-100 pending jobs per pool instead of replacing the previous pending job.
+The parent workflow calls inference GPU tests through a per-PR concurrency group
+that cancels superseded work. Each pool defaults to four repository-wide test
+slots. Matrix cases are assigned slots 0–3; one complete workload occupies each
+slot through source/target execution and cleanup. P2P, MLA and DP/EP matrices
+allow up to four entries to dispatch concurrently. Builds and independent
+cleanup remain outside these queues. GitHub's `queue: max` retains pending jobs.
+
+`MX_CI_GPU_CONCURRENCY=2` selects two lanes: RDMA versus TCP fleet/rolling on A100a,
+and MLA versus DP/EP on A100b. Set it to 1 for full pool serialization. Only 1, 2
+and 4 are accepted. Four is an experimental upper limit, not a capacity
+reservation; slot collisions or runner availability may reduce actual concurrency.
+Drain current runs (or cancel and finish cleanup) before changing modes, because
+changing concurrency-group names does not move already queued or running jobs.
 
 P2P sources and targets, the fleet seed, and every fleet scale wave wait for all
 controller-desired pods to be scheduled before starting their startup deadline.
@@ -168,20 +174,21 @@ of this CI configuration remains pending.
 
 ## GPU admission during cleanup
 
-Each inference pool queue covers its full source/target lifecycle. Before a new
-job allocates resources, admission waits up to 900 seconds for previous labeled
-pool namespaces and physical GPU pods to disappear, including after cancellation.
-Running and pending pods from other workloads on the inference pool also block
-admission. Namespace creation records the pool label; cleanup errors fail closed.
+Before a slot starts a new workload, it waits up to 900 seconds for previous CI
+namespaces and physical GPU pods in that slot to disappear, including after
+cancellation. Pool and slot labels identify new namespaces. Other labeled slots
+can proceed concurrently. Legacy namespaces and workloads from a different
+concurrency mode block admission until their cleanup completes. API errors fail
+closed. Non-CI workloads are left to Kubernetes resource scheduling.
 
-Vime and refit GPU jobs share a repository-wide queue keyed by Kubernetes context.
-Refit jobs have a two-hour budget that includes admission, setup, execution,
-and cleanup. They verify normal namespace deletion before releasing admission. Independent
-cleanup jobs remain outside that queue. New RL jobs wait for previous benchmark
-and Vime namespaces and pods, including legacy CI namespaces, before provisioning.
-Namespace quotas bound an individual run but do not reserve cluster-wide capacity.
+RL GPU jobs default to four repository-wide slots per Kubernetes context. Refit
+runs choose a slot from the PR number modulo four; Vime uses slot 3. This bounds
+concurrency across PRs without a reservation ledger. Two-job mode separates Vime
+and refit, and one-job mode merges them. Normal namespace deletion finishes before
+releasing a slot. Independent cleanup remains outside the queues. Refit jobs have
+a two-hour budget including admission, setup, execution and cleanup.
 
-These are conservative one-workload limits, not capacity-based packing. Additional
-parallelism needs live allocatable GPU/MIG, CPU, memory, RDMA, and placement data.
-RL workloads outside CI can still contend through the Kubernetes scheduler;
-these queues do not reserve resources against them. No additional lanes are enabled.
+Four-job mode needs live qualification of CPU, memory, GPU/MIG and RDMA headroom.
+Lower the limit when scheduling delays or resource contention appear. Source/target,
+artifact, metadata and model assertions remain unchanged. These limits neither
+reserve cluster-wide capacity nor guarantee placement against other workloads.

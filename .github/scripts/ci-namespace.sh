@@ -40,8 +40,8 @@ wait_for_host_cleanup() {
 if [ "$operation" = create ]; then
   if [ -z "$info" ]; then
     kubectl create namespace "$namespace" --dry-run=client -o json \
-      | jq --arg owner "$owner" --arg kind "${3:-plain}" --arg pool "${MX_CI_GPU_POOL:-}" \
-          '.metadata.labels = {"ci.modelexpress.nvidia.com/run-id": $owner, "ci.modelexpress.nvidia.com/workload-type": $kind, "ci.modelexpress.nvidia.com/gpu-pool": $pool}' \
+      | jq --arg owner "$owner" --arg kind "${3:-plain}" --arg pool "${MX_CI_GPU_POOL:-}" --arg lane "${MX_CI_GPU_LANE:-}" \
+          '.metadata.labels = {"ci.modelexpress.nvidia.com/run-id": $owner, "ci.modelexpress.nvidia.com/workload-type": $kind, "ci.modelexpress.nvidia.com/gpu-pool": $pool, "ci.modelexpress.nvidia.com/gpu-lane": $lane}' \
       | kubectl --request-timeout=10s apply -f -
   fi
   exit 0
