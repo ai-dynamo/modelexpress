@@ -75,6 +75,8 @@ if TYPE_CHECKING:
     MX_REFIT_STAGE_RECORD: bool
     MX_REFIT_PACK_MODULES: bool
     MX_REFIT_DEBUG_VALIDATE_PLAN: bool
+    MX_REFIT_PREFETCH_REPLICA_METADATA: bool
+    MX_REFIT_DEBUG_VALIDATE_REPLICAS: bool
     MX_RESHARD_MAX_SEGMENTS_PER_COPY: int
     MX_RESHARD_MAX_GBPS: float
     MX_RESHARD_MIN_GBPS: float
@@ -338,6 +340,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_STAGE_RECORD": lambda: _env_bool("MX_REFIT_STAGE_RECORD", True),
     "MX_REFIT_DEBUG_VALIDATE_PLAN": lambda: _env_bool(
         "MX_REFIT_DEBUG_VALIDATE_PLAN", False
+    ),
+    "MX_REFIT_PREFETCH_REPLICA_METADATA": lambda: _env_bool(
+        "MX_REFIT_PREFETCH_REPLICA_METADATA", False
+    ),
+    "MX_REFIT_DEBUG_VALIDATE_REPLICAS": lambda: _env_bool(
+        "MX_REFIT_DEBUG_VALIDATE_REPLICAS", False
     ),
     "MX_RESHARD_MAX_SEGMENTS_PER_COPY": lambda: int(
         os.environ.get("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "64")

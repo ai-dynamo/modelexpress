@@ -1658,12 +1658,14 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
         planned, {"w": source}, Transport(), source_binding
     )
     transfer = object.__new__(transfer_module._NixlStagedTransfer)
-    transfer._descriptor_cache = None
+    transfer._weight_update_plan = None
     transfer._closed = False
     transfer._active = prepared
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
     transfer._staging_arenas = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
+    from tests.test_refit_nixl_staged_transfer import _bind_test_execution
+    _bind_test_execution(transfer, prepared)
 
     class Owner(nn.Module):
         def __init__(self, dtype):

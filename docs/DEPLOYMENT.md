@@ -1112,8 +1112,16 @@ server, worker gRPC endpoints, and Mooncake store from untrusted clients.
 ModelExpress does not currently sign cache artifacts.
 
 RL refit has the same trusted-network requirement. Its trainer-local
-`RefitWorkerService` serves exact-version manifests over plaintext gRPC; the
-manifest digest detects corruption but does not authenticate the trainer.
+`RefitWorkerService` serves stable trainer metadata and separate version checksum
+records over plaintext gRPC. Metadata digests detect corruption but do not
+authenticate the trainer.
+
+The split worker metadata protocol requires a coordinated upgrade of the MX server,
+trainers, and generators. It replaces `GetWeightVersionShardManifest` and retires the
+old `WeightVersionShard` manifest, endpoint, and count fields; mixed protocol versions
+are unsupported. Retire active refit rounds and their leases before stopping workers.
+Restart workers and remove obsolete refit metadata during the upgrade, preserving
+unrelated Redis and model-cache state.
 
 Canonical S3 trainers consume Hugging Face tensor buckets produced by the
 training framework. Framework-native bucket settings remain the default.
@@ -1580,6 +1588,19 @@ separate from the public integration configuration.
 | `MX_REFIT_DEBUG_VALIDATE_PLAN` | `0` | Recheck cached whole-model and owning-module transfer coverage. |
 | `MX_REFIT_PACK_MODULES` | `1` | Pack complete owning modules within each bounded staging arena. |
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Descriptor budget before full-source reconstruction. |
+| `MX_REFIT_PREFETCH_REPLICA_METADATA` | `0` | Fetch stable metadata for all replicas in needed logical-shard groups on first preparation. |
+| `MX_REFIT_DEBUG_VALIDATE_REPLICAS` | `0` | Check that replicas in each logical-shard group have equivalent canonical coverage. |
+
+`none` sorts workers by ID. `rotate` sorts them and rotates the order by engine
+rank; it is the default. `random` shuffles once when the complete group is
+constructed; its list order remains stable for that mesh generation. Metadata prefetch is
+limited to replica members of logical-shard groups needed by the transfer plan.
+An unavailable nonselected replica remains unresolved and can be retried later;
+`replica_metadata_prefetch_unavailable` records incomplete prefetch. Digest and
+identity errors still fail preparation. Debug validation requires all published
+replicas to resolve and fails if any is unavailable.
+Replica equivalence compares canonical tensor coverage and geometry while
+ignoring physical addresses, which vary by replica.
 
 Bounded streaming requires the framework to hold its update guard through
 transfer, installation and verification. Each group is copied from a receive

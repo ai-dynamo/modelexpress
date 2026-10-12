@@ -227,6 +227,7 @@ def _create_resolvers(
     p2p_client: MxClient | None,
     rpc_timeout_seconds: float,
     service: Callable,
+    methods: tuple[UpdateMethod, ...],
 ) -> tuple[SourceResolver, ...]:
     resolvers = []
     for source in source_order:
@@ -251,6 +252,14 @@ def _create_resolvers(
                 TrainerSourceResolver(
                     service=service,
                     rpc_timeout_seconds=rpc_timeout_seconds,
+                    cached_source=next(
+                        (
+                            method.cached_trainer_source
+                            for method in methods
+                            if isinstance(method, LoadTimeTensorNixlUpdateMethod)
+                        ),
+                        None,
+                    ),
                 )
             )
         else:
@@ -393,6 +402,7 @@ def initialize_generator_runtime(
                         p2p_client=p2p_client,
                         rpc_timeout_seconds=rpc_timeout_seconds,
                         service=service,
+                        methods=method_tuple,
                     ),
                     methods=method_tuple,
                     installer=engine.installer,
