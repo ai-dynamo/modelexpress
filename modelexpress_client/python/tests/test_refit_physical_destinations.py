@@ -4,8 +4,8 @@
 from itertools import product
 import pytest
 import torch
-from modelexpress.refit.reshard import geometry
-from modelexpress.refit.reshard.geometry import build_lazy_weights, capture_weights
+from modelexpress_rl.refit.reshard import geometry
+from modelexpress_rl.refit.reshard.geometry import build_lazy_weights, capture_weights
 
 class PhysicalViewModel(torch.nn.Module):
     def __init__(self, *, step=1, registry="buffer", stamped=False, start=0, size=6):
@@ -116,7 +116,7 @@ def test_physical_owner_resolution_rejects_ambiguous_views():
     ],
 )
 def test_physical_bounds_match_element_address_ownership(owner_shape, owner_stride):
-    from modelexpress.refit.reshard.types import UnsupportedReshard
+    from modelexpress_rl.refit.reshard.types import UnsupportedReshard
 
     owned = {
         sum(i * step for i, step in zip(index, owner_stride))

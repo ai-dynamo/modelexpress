@@ -28,9 +28,9 @@ import types
 import pytest
 import torch
 
-from modelexpress.refit.reshard import receiver as receiver_mod
-from modelexpress.refit.reshard.receiver import ReshardReceiver
-from modelexpress.refit.reshard.types import IncompleteRefit, UnsupportedReshard
+from modelexpress_rl.refit.reshard import receiver as receiver_mod
+from modelexpress_rl.refit.reshard.receiver import ReshardReceiver
+from modelexpress_rl.refit.reshard.types import IncompleteRefit, UnsupportedReshard
 
 
 class _Plan:

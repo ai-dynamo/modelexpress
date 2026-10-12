@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from modelexpress.refit.reshard.receiver import ReshardReceiver
+from modelexpress_rl.refit.reshard.receiver import ReshardReceiver
 
 from .layout import (
     MegatronTargetLayout,

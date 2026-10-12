@@ -15,7 +15,7 @@ import torch
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 
 from tests.test_refit_bounded_descriptors import harness
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard, PublishedTensor, structural_manifest_digest, wrap_rendezvous_blob,
 )
 from modelexpress_rl.train import WeightPayloadFormat

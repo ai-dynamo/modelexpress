@@ -2,16 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
-from importlib import import_module
 
 import pytest
 import torch
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     MxReshardRendezvous,
     unwrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, plan_transfer
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
 from modelexpress_rl.inference.reshard.megatron import (
     MegatronReshardReceiver,
     MegatronTargetLayout,
@@ -25,7 +24,6 @@ from modelexpress_rl.train.engines.megatron import (
     build_hf_aliases,
     build_megatron_reshard_manifest,
     publish_megatron_reshard_view,
-    publish_registered_shard_table,
 )
 
 
@@ -176,22 +174,6 @@ def test_target_spec_rejects_non_integral_global_shape(extent):
 def test_target_layout_rejects_non_integral_geometry(tp_size, tp_rank, message):
     with pytest.raises(ValueError, match=message):
         MegatronTargetLayout(tp_size=tp_size, tp_rank=tp_rank)
-
-
-def test_legacy_megatron_publisher_imports_remain_available():
-    legacy_aliases = import_module(
-        "modelexpress.refit.reshard.megatron_aliases"
-    )
-    legacy_publisher = import_module(
-        "modelexpress.refit.reshard.megatron_publisher"
-    )
-
-    assert legacy_aliases.MegatronAliasInput is MegatronAliasInput
-    assert legacy_aliases.build_hf_aliases is build_hf_aliases
-    assert (
-        legacy_publisher.publish_registered_shard_table
-        is publish_registered_shard_table
-    )
 
 
 def test_receiver_seam_validates_manifest_and_invokes_installer():

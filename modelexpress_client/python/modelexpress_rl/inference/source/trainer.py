@@ -12,9 +12,9 @@ from collections.abc import Callable, Iterator, Mapping
 from time import perf_counter
 
 import grpc
-from modelexpress import envs
-from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
-from modelexpress.refit.timing import add_refit_duration, refit_span
+from modelexpress_rl import envs
+from modelexpress_rl.refit.reshard.rendezvous import unwrap_rendezvous_blob
+from modelexpress_rl.refit.timing import add_refit_duration, refit_span
 
 from ... import refit_pb2, refit_pb2_grpc
 from ...control import WeightVersion

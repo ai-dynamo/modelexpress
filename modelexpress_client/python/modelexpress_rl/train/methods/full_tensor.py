@@ -11,11 +11,11 @@ from time import monotonic, sleep
 
 import grpc
 
-from modelexpress.refit.timing import refit_span
+from modelexpress_rl.refit.timing import refit_span
 
 from ... import refit_pb2, refit_pb2_grpc
 from ..manifest import version_metadata, version_metadata_digest
-from modelexpress import envs as mx_envs
+from modelexpress_rl import envs as mx_envs
 from ...version import TrainerTensorsMetadata, WeightVersionRef
 from ..adapter import (
     StagedWeightVersionShardData,

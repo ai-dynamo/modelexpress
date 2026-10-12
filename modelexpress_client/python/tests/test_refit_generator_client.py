@@ -2742,7 +2742,7 @@ def test_streaming_creates_and_emits_one_timing_cycle(
 ):
     import json
 
-    from modelexpress.refit.timing import (
+    from modelexpress_rl.refit.timing import (
         RefitTimingRecorder,
         current_refit_timing,
         refit_span,

@@ -23,11 +23,11 @@ import torch
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress import p2p_pb2
-from modelexpress.refit.reshard import throughput
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import LogicalTransferPlan, SourceInfo
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
-from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.refit.reshard import throughput
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import LogicalTransferPlan, SourceInfo
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.nixl_staged_transfer import (
     _NixlStagedTransfer,
     _PreparedNixlTransfer,
@@ -315,7 +315,7 @@ def test_both_receivers_report_the_same_marker_and_schema(monkeypatch, caplog):
     the shared implementation.
     """
     _floor(monkeypatch, FLOOR_GBPS)
-    from modelexpress.refit.reshard import receiver
+    from modelexpress_rl.refit.reshard import receiver
 
     class _Rig:
         _global_rank = 3

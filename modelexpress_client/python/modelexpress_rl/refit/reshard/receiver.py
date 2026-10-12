@@ -31,26 +31,26 @@ from collections import deque
 
 import torch
 
-from modelexpress import envs
+from modelexpress_rl import envs
 from modelexpress.client import MxClient
 from modelexpress.nixl_transfer import NixlTransferManager
-from modelexpress.refit.reshard import throughput
-from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
-from modelexpress.refit.reshard.rendezvous import gather_sources
-from modelexpress.refit.reshard.transfer_plan import (
+from modelexpress_rl.refit.reshard import throughput
+from modelexpress_rl.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress_rl.refit.reshard.rendezvous import gather_sources
+from modelexpress_rl.refit.reshard.transfer_plan import (
     bind_transfer,
     execute_transfer,
     plan_transfer,
 )
-from modelexpress.refit.reshard.transport import NixlReshardTransport
-from modelexpress.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.transport import NixlReshardTransport
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     UnsupportedReshard,
     summarize_unsupported,
 )
 
-logger = logging.getLogger("modelexpress.refit.reshard.receiver")
+logger = logging.getLogger("modelexpress_rl.refit.reshard.receiver")
 
 
 def _max_gbps() -> float:

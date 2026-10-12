@@ -24,11 +24,11 @@ Run: pytest tests/test_reshard_refit_batch_install.py
 
 import torch
 
-from modelexpress.refit.reshard.receiver import ReshardReceiver
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, plan_transfer
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
-from modelexpress.refit.reshard.transport import InMemoryReferenceTransport
+from modelexpress_rl.refit.reshard.receiver import ReshardReceiver
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.refit.reshard.transport import InMemoryReferenceTransport
 
 EL = 4  # float32 element size
 

@@ -15,15 +15,15 @@ import re
 
 import pytest
 import torch
-from modelexpress.refit.reshard.geometry import (
+from modelexpress_rl.refit.reshard.geometry import (
     LazyWeight,
     build_lazy_weights,
     capture_geometry,
     capture_weights,
     convert_source_weights,
 )
-from modelexpress.refit.reshard.slice_plan import Shard, plan_pull
-from modelexpress.refit.reshard.types import UnsupportedReshard
+from modelexpress_rl.refit.reshard.slice_plan import Shard, plan_pull
+from modelexpress_rl.refit.reshard.types import UnsupportedReshard
 
 TP_RANK = 0
 
@@ -236,7 +236,7 @@ def test_bulk_only_failure_is_reported_even_when_every_source_retries_clean(capl
     with torch.device("meta"):
         model = BulkOnlyFailureModel()
     originals = {name: param.weight_loader for name, param in model.named_parameters()}
-    with caplog.at_level(logging.WARNING, logger="modelexpress.refit.reshard.geometry"):
+    with caplog.at_level(logging.WARNING, logger="modelexpress_rl.refit.reshard.geometry"):
         result = capture_geometry(model, _manifest())
 
     assert result.unsupported == [] and result.unattributed == 0
@@ -272,7 +272,7 @@ def test_batch_unsupported_operation_keeps_original_converted_source_name():
 def test_summarize_unsupported_groups_one_cause_across_many_sources():
     """Thousands of sources failing for one reason must read as one cause. Each
     message embeds its own source name, so grouping has to ignore that tail."""
-    from modelexpress.refit.reshard.types import summarize_unsupported
+    from modelexpress_rl.refit.reshard.types import summarize_unsupported
 
     reasons = {
         f"model.layers.0.mlp.experts.{i}.gate_proj.weight": (
@@ -290,7 +290,7 @@ def test_summarize_unsupported_groups_one_cause_across_many_sources():
 
 
 def test_summarize_unsupported_accepts_none_for_all_causes():
-    from modelexpress.refit.reshard.types import summarize_unsupported
+    from modelexpress_rl.refit.reshard.types import summarize_unsupported
 
     reasons = {
         f"source-{index}": f"cause-{index} on lazy 'source-{index}'"
@@ -306,7 +306,7 @@ def test_capture_feeds_slice_plan():
     """Compose capture -> slice-plan: real captured copies drive plan_pull. The
     row-parallel source (full [4,8], need cols [0:4]) is strided -> 4 runs
     covering exactly the needed 16 elements, landing contiguously in the dest."""
-    from modelexpress.refit.reshard.slice_plan import Shard, plan_pull
+    from modelexpress_rl.refit.reshard.slice_plan import Shard, plan_pull
 
     with torch.device("meta"):
         model = ToyModel()

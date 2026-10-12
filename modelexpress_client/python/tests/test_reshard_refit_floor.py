@@ -52,7 +52,7 @@ def _receiver(monkeypatch, floor):
         monkeypatch.delenv("MX_RESHARD_MIN_GBPS", raising=False)
     else:
         monkeypatch.setenv("MX_RESHARD_MIN_GBPS", str(floor))
-    from modelexpress.refit.reshard import receiver
+    from modelexpress_rl.refit.reshard import receiver
 
     return receiver
 
@@ -286,7 +286,7 @@ def test_floor_and_ceiling_can_both_be_configured(monkeypatch, caplog):
     rate between them is the healthy case and should produce neither record."""
     monkeypatch.setenv("MX_RESHARD_MIN_GBPS", str(FLOOR_GBPS))
     monkeypatch.setenv("MX_RESHARD_MAX_GBPS", "400")
-    from modelexpress.refit.reshard import receiver
+    from modelexpress_rl.refit.reshard import receiver
 
     with caplog.at_level(logging.WARNING):
         receiver.ReshardReceiver._check_throughput_floor(

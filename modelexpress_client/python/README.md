@@ -215,9 +215,10 @@ framework-orchestrator responsibilities. Each trainer adapter derives its own
 source slot from the engine's native topology; the orchestrator declares the
 expected slots using the same adapter-defined convention. `initialize()`
 constructs the adapter selected by `engine_context` internally.
-Megatron and FSDP implementations are available. Megatron-specific APIs live under
-`modelexpress_rl`;
-`modelexpress.refit.reshard` remains the shared, engine-neutral transfer core.
+Megatron and FSDP implementations are available. Megatron-specific APIs live
+under `modelexpress_rl`. RL refit timing and engine-neutral reshard planning
+live in `modelexpress_rl.refit`; shared client settings remain in
+`modelexpress.envs`, while RL settings are registered in `modelexpress_rl.envs`.
 
 ### MxClient
 
@@ -257,6 +258,10 @@ register_modelexpress_loaders()
 
 ## Environment Variables
 
+Shared client settings are registered in `modelexpress.envs`. RL-specific
+refit, reshard, trainer, and generator settings are registered in
+`modelexpress_rl.envs`.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MX_SERVER_ADDRESS` | `localhost:8001` | ModelExpress gRPC server address (recommended) |
@@ -288,7 +293,7 @@ register_modelexpress_loaders()
 | `MX_RESHARD_HANDSHAKE_ATTEMPT_S` | `20` | Ceiling on a single peer dial. A reachable peer answers in well under a second, so a short attempt frees the budget to try a different peer rather than block on one |
 | `MX_RESHARD_HANDSHAKE_BACKOFF_S` | `2` | Pause after a full pass over the pending peers makes no progress, so a transient stall is waited out rather than hammered |
 | `MX_REFIT_STAGE_RECORD` | `1` | Emit one `refit-stage-v2` JSON record per refit, giving a benchmark harness the per-stage timings without parsing logs. Set to `0` to silence it |
-| `MX_REFIT_PACK_MODULES` | `0` | Coalesce consecutive owning-module batches in a bounded refit up to the same `max_staging_bytes`, trading a larger arena residency for fewer of them. The packed batch reads exactly the bytes its modules read — same copies, planned bytes and READ descriptors — and modules pulling the same complete source are never packed together. Off by default because one module per batch is the smallest arena a model can refit through |
+| `MX_REFIT_PACK_MODULES` | `1` | Coalesce consecutive owning-module batches in a bounded refit up to the same `max_staging_bytes`, trading a larger arena residency for fewer of them. The packed batch reads exactly the bytes its modules read — same copies, planned bytes and READ descriptors — and modules pulling the same complete source are never packed together. Set to `0` to use one module per batch |
 | `MX_RESHARD_MAX_GBPS` | `0` | Per-rank fabric ceiling in Gbps. A measured wire rate above it means the timing is wrong rather than the transfer being fast, so the refit is rejected. `0` disables the check, since only the operator knows the real per-rank limit |
 | `MX_RESHARD_MIN_GBPS` | `0` | Per-rank floor in Gbps. Below it, the refit emits a `refit-slow-throughput-v1` JSON warning naming the rate, the bound and the shortfall. Applies to both receivers — the Megatron slice-reshard receiver and the staged receiver the FSDP trainers pull over, including its peer-to-peer pull — so one setting covers a job whichever path it refits on. Warns rather than aborting, unlike the ceiling: an impossible rate means the payload never moved, but a slow one is still correct, so enforcement belongs in a CI gate reading the record rather than in a running job. `0` disables it. Worth setting for any throughput run — a 20x collapse has been observed with byte counts exact, descriptor counts exact, coverage 100%, fallback 0 and no error anywhere, and without a lower bound there is nothing in the telemetry that dissents. When choosing a value, note that it is compared per rank against the rate one receiver sees *while its siblings are also receiving*, which is well below the rate a single receiver reaches alone; sizing it against the solo number puts the floor above the healthy concurrent rate and it will fire on good runs. Aim between the two — roughly the geometric mean of the collapsed rate and the healthy concurrent rate leaves both verdicts off a tight margin |
 | `MX_RESHARD_PUBLISH_DIGEST` | `0` | Have each trainer publish a position-sensitive digest of every shard it advertises, so a receiver can later confirm it installed the bytes the publisher held. Off by default: the reduction costs a pass over every published tensor, which is large next to a ~1.5 s wire, so turn it on when qualifying a build rather than when measuring throughput |
@@ -332,15 +337,20 @@ below bound queued chunks, not the final object size.
 |--------|-------------|
 | `modelexpress.client` | `MxClient` -- gRPC client for the ModelExpress server |
 | `modelexpress.metadata` | Metadata clients, source identity, publishing, and worker manifest serving |
-| [`modelexpress.refit`](modelexpress/refit/README.md) | Experimental RL weight-refit timing, receiver-driven resharding, and engine adapter contracts |
 | `modelexpress.engines.vllm.loader` | `MxModelLoader` -- vLLM integration |
-| `modelexpress.refit.reshard` | Engine-agnostic loader-geometry capture and bounded no-gather transfer planning |
 | `modelexpress.engines.sglang.loader` | `MxModelLoader` -- SGLang `remote_instance` integration |
 | `modelexpress.engines.trtllm.loader` | `MxModelLoader` -- TensorRT-LLM shared-strategy integration |
 | `modelexpress.vllm_loader` | Compatibility shim for the vLLM loader |
 | `modelexpress.nixl_transfer` | `NixlTransferManager` -- NIXL agent lifecycle and RDMA transfers |
 | `modelexpress.types` | `TensorDescriptor`, `WorkerMetadata` -- core data types |
 | `modelexpress.vllm_worker` | Compatibility worker extension for older manual-registration workflows |
+
+RL refit components live in the separate `modelexpress_rl` package:
+
+| Module | Description |
+|--------|-------------|
+| [`modelexpress_rl.refit`](modelexpress_rl/refit/__init__.py) | RL refit timing and engine-neutral reshard geometry and transfer planning |
+| `modelexpress_rl.inference.engines.vllm.installer` | Captures vLLM load geometry and installs staged or replayed RL updates |
 
 ## How It Works
 

@@ -16,16 +16,16 @@ from modelexpress_rl.inference.plan import StreamingSettings
 
 import pytest
 import torch
-from modelexpress import envs
+from modelexpress_rl import envs
 from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     wrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot
-from modelexpress.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     RecordedCopy,

@@ -223,4 +223,4 @@ See [Metrics](METRICS.md) for endpoint behavior and PromQL.
 
 ## Advanced refit and resharding
 
-Live refit and resharding have additional `MX_REFIT_*` and `MX_RESHARD_*` settings that are intentionally documented with the feature implementation because their defaults and safety contracts are workload-specific. See [the refit README](../modelexpress_client/python/modelexpress/refit/README.md) and the [architecture reference](ARCHITECTURE.md) before enabling them.
+Live refit and resharding have additional `MX_REFIT_*` and `MX_RESHARD_*` settings whose defaults and safety contracts are workload-specific. RL-only settings are registered in `modelexpress_rl.envs`; shared client settings remain in `modelexpress.envs`. See the [no-gather refit architecture](ARCHITECTURE.md#no-gather-refit-resharding) before enabling them.

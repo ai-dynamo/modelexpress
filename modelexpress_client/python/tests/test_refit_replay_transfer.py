@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from modelexpress.refit.reshard.types import IncompleteRefit
+from modelexpress_rl.refit.reshard.types import IncompleteRefit
 import modelexpress_rl.inference.nixl_staged_transfer as module
 from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
 from modelexpress_rl.inference.plan import StreamingSettings

@@ -10,12 +10,35 @@ endpoints are derived from the initialized engine.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from modelexpress.envs import _TRUTHY, _env_bool, _env_float, _env_positive_float
+
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
+    MX_RESHARD_FUSED_WIRE: bool
+    MX_RESHARD_BATCH_INSTALL: bool
+    MX_RESHARD_CACHE_DESCRIPTORS: bool
+    MX_RESHARD_REQUIRE_FULL_COVERAGE: bool
+    MX_RESHARD_COVERAGE_FLOOR: float
+    MX_RESHARD_HANDSHAKE_TIMEOUT_S: float
+    MX_RESHARD_HANDSHAKE_ATTEMPT_S: float
+    MX_RESHARD_HANDSHAKE_BACKOFF_S: float
+    MX_REFIT_STAGE_RECORD: bool
+    MX_REFIT_PACK_MODULES: bool
+    MX_REFIT_PREFETCH_REPLICA_METADATA: bool
+    MX_REFIT_DEBUG_VALIDATE_REPLICAS: bool
+    MX_RESHARD_MAX_SEGMENTS_PER_COPY: int
+    MX_RESHARD_MAX_GBPS: float
+    MX_RESHARD_MIN_GBPS: float
+    MX_RESHARD_PUBLISH_DIGEST: bool
+    MX_REDIS_URL: str
+    MX_GENERATOR_SOURCE_ORDER: str | None
     AZURE_STORAGE_ACCOUNT_NAME: str | None
     AZURE_STORAGE_ACCOUNT_URL: str | None
     AZURE_STORAGE_CONNECTION_STRING: str | None
@@ -55,6 +78,90 @@ if TYPE_CHECKING:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "MX_RESHARD_FUSED_WIRE": lambda: _env_bool("MX_RESHARD_FUSED_WIRE", True),
+    # Issue the per-view re-slice copies of full-pulled sources as one batched
+    # _foreach_copy_ instead of a copy_() per view. On by default: it is the same
+    # set of copies, and one launch per view means thousands of launches whose
+    # Python and launch overhead can rival the RDMA itself. Set to 0 to fall back
+    # to the per-view loop. See modelexpress_rl.refit.reshard.receiver.
+    "MX_RESHARD_BATCH_INSTALL": lambda: _env_bool("MX_RESHARD_BATCH_INSTALL", True),
+    # Build the RDMA read descriptor lists once per plan instead of once per step.
+    # The descriptors are a pure function of the cached plan and the registered
+    # buffer addresses, neither of which changes between steps, so rebuilding them
+    # every refit re-derives an identical list of hundreds of thousands of objects
+    # in Python. On by default; set to 0 to rebuild per step for an A/B. The cache
+    # is dropped whenever the plan is rebuilt. See
+    # modelexpress_rl.refit.reshard.receiver.
+    "MX_RESHARD_CACHE_DESCRIPTORS": lambda: _env_bool(
+        "MX_RESHARD_CACHE_DESCRIPTORS", True
+    ),
+    # Refit coverage gate. The floor is a fraction of the engine's parameter
+    # bytes; ReshardReceiver validates its range at the point of use. What a
+    # complete refit scores is engine- and model-specific, so the default is set
+    # loose enough to pass any complete refit and still catch a gross hole; see
+    # modelexpress_rl.refit.reshard.receiver._coverage_floor.
+    "MX_RESHARD_REQUIRE_FULL_COVERAGE": lambda: (
+        os.environ.get("MX_RESHARD_REQUIRE_FULL_COVERAGE", "").strip().lower()
+        in _TRUTHY
+    ),
+    "MX_RESHARD_COVERAGE_FLOOR": lambda: _env_float("MX_RESHARD_COVERAGE_FLOOR", 0.995),
+    # Bounds for the reshard peer handshake; see
+    # modelexpress_rl.refit.reshard.receiver.handshake_with_peers.
+    #
+    # TIMEOUT_S is the budget across every peer and every retry. A refit timeout is
+    # the wrong bound, since it lets one unreachable peer consume the whole refit,
+    # but it must stay generous: a peer registering tens of GB with the fabric
+    # provider blocks its listen thread for minutes, and waiting is the correct
+    # response to that. ATTEMPT_S caps a single dial, so an unreachable peer frees
+    # the budget for a different one instead of blocking on it. BACKOFF_S is the
+    # pause after a full pass over the pending peers makes no progress.
+    "MX_RESHARD_HANDSHAKE_TIMEOUT_S": lambda: _env_positive_float(
+        "MX_RESHARD_HANDSHAKE_TIMEOUT_S", 900.0
+    ),
+    "MX_RESHARD_HANDSHAKE_ATTEMPT_S": lambda: _env_positive_float(
+        "MX_RESHARD_HANDSHAKE_ATTEMPT_S", 20.0
+    ),
+    "MX_RESHARD_HANDSHAKE_BACKOFF_S": lambda: _env_positive_float(
+        "MX_RESHARD_HANDSHAKE_BACKOFF_S", 2.0
+    ),
+    # One JSON stage record per refit. On by default: the timings are already
+    # computed, and at INFO they were never captured by a benchmark run.
+    "MX_REFIT_STAGE_RECORD": lambda: _env_bool("MX_REFIT_STAGE_RECORD", True),
+    "MX_REFIT_PREFETCH_REPLICA_METADATA": lambda: _env_bool(
+        "MX_REFIT_PREFETCH_REPLICA_METADATA", False
+    ),
+    "MX_REFIT_DEBUG_VALIDATE_REPLICAS": lambda: _env_bool(
+        "MX_REFIT_DEBUG_VALIDATE_REPLICAS", False
+    ),
+    "MX_RESHARD_MAX_SEGMENTS_PER_COPY": lambda: int(
+        os.environ.get("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "64")
+    ),
+    # Coalesce consecutive owning-module batches up to the staging budget.
+    "MX_REFIT_PACK_MODULES": lambda: _env_bool("MX_REFIT_PACK_MODULES", True),
+    # Per-rank fabric ceiling in Gbps used to reject impossible wire rates. Zero
+    # disables the check, and is the default because only the operator knows the
+    # real per-rank limit for their fabric.
+    "MX_RESHARD_MAX_GBPS": lambda: _env_float("MX_RESHARD_MAX_GBPS", 0.0),
+    # Per-rank floor in Gbps below which a refit is reported as degraded. Zero
+    # disables it, and is the default for the same reason as the ceiling.
+    #
+    # The ceiling catches transfers that did not happen. Nothing caught a transfer
+    # that happened 20x too slowly: four concurrent receivers collapsed from
+    # ~26 GB/s to ~1.5 GB/s with no error, no warning, byte counts exact,
+    # descriptor counts exact, coverage 100% and fallback 0. Every signal we had
+    # said the refit was healthy. A rate is only interpretable against a bound,
+    # and we only ever had the upper one.
+    "MX_RESHARD_MIN_GBPS": lambda: _env_float("MX_RESHARD_MIN_GBPS", 0.0),
+    # Have publishers digest each shard they advertise, so a receiver-side check has
+    # something to compare against. Off by default: it costs a reduction over every
+    # published tensor, which is a large relative cost against a ~1.5 s wire, so it
+    # belongs in a qualification run rather than a throughput measurement. See
+    # modelexpress_rl.refit.reshard.verify.
+    "MX_RESHARD_PUBLISH_DIGEST": lambda: _env_bool("MX_RESHARD_PUBLISH_DIGEST", False),
+    # ── Trainer pull (live weight sync from a running trainer) ─────────────
+    "MX_REDIS_URL": lambda: os.environ.get("MX_REDIS_URL", "redis://localhost:6379"),
+    # ── Generator weight sync ──────────────────────────────────────────────
+    "MX_GENERATOR_SOURCE_ORDER": lambda: os.environ.get("MX_GENERATOR_SOURCE_ORDER"),
     "AZURE_STORAGE_ACCOUNT_NAME": lambda: (
         os.environ.get("AZURE_STORAGE_ACCOUNT_NAME", "").strip() or None
     ),

@@ -21,7 +21,7 @@ import json
 import logging
 import math
 
-from modelexpress import envs
+from modelexpress_rl import envs
 
 # Grepped by the CI perf gate, so it is named once rather than spelled at each
 # call site.

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from modelexpress import p2p_pb2
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     MxReshardRendezvous,
     PublishedShard,
     PublishedTensor,
@@ -430,7 +430,7 @@ def test_decoding_parsed_entries_matches_decoding_the_blob():
     that round-trip must not change a single decoded field."""
     import json
 
-    from modelexpress.refit.reshard.rendezvous import (
+    from modelexpress_rl.refit.reshard.rendezvous import (
         _SCHEMA,
         decode_shard_entries,
         decode_shard_table,

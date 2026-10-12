@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from modelexpress.refit import (
+from modelexpress_rl.refit import (
     RefitTimingRecorder,
     current_refit_timing,
     set_refit_cold,

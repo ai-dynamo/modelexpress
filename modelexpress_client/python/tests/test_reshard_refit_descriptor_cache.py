@@ -31,9 +31,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from modelexpress.refit.reshard import receiver as receiver_mod
-from modelexpress.refit.reshard.transfer_plan import LogicalTransferPlan
-from modelexpress.refit.reshard.types import CaptureResult
+from modelexpress_rl.refit.reshard import receiver as receiver_mod
+from modelexpress_rl.refit.reshard.transfer_plan import LogicalTransferPlan
+from modelexpress_rl.refit.reshard.types import CaptureResult
 from tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
 
 

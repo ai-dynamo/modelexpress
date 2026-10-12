@@ -46,7 +46,7 @@ def _receiver(monkeypatch, ceiling):
         monkeypatch.delenv("MX_RESHARD_MAX_GBPS", raising=False)
     else:
         monkeypatch.setenv("MX_RESHARD_MAX_GBPS", str(ceiling))
-    from modelexpress.refit.reshard import receiver
+    from modelexpress_rl.refit.reshard import receiver
 
     return receiver
 

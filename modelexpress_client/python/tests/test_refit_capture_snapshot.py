@@ -9,7 +9,7 @@ from types import ModuleType
 
 import pytest
 import torch
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
 from modelexpress_rl.inference.engines.vllm import _capture_snapshot as snapshot_module
 from modelexpress_rl.inference.engines.vllm import installer as module
 from modelexpress_rl.inference.engines.vllm._capture_snapshot import _CaptureSnapshot

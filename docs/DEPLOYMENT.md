@@ -1619,8 +1619,11 @@ total rather than describing the entire streaming operation as wire or install.
 
 ### Internal streaming diagnostics
 
-Source metadata and transfer plans are reused automatically. These internal
-settings are read when the transfer is constructed.
+Validated source metadata and transfer plans are reused automatically. These
+internal diagnostics are read once when the transfer is constructed; they are
+separate from the public integration configuration.
+RL-only refit and reshard settings are registered in `modelexpress_rl.envs`;
+shared client settings remain in `modelexpress.envs`.
 
 | Internal environment variable | Default | Purpose |
 | --- | --- | --- |

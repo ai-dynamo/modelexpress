@@ -12,22 +12,22 @@ from modelexpress_rl.inference.plan import StreamingSettings
 
 import pytest
 import torch
-from modelexpress import envs
+from modelexpress_rl import envs
 from modelexpress import p2p_pb2
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     unwrap_rendezvous_blob,
     wrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.slice_plan import LogicalRead, SourceBuffer, Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, LogicalTransferPlan, plan_transfer
-from modelexpress.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.slice_plan import LogicalRead, SourceBuffer, Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, LogicalTransferPlan, plan_transfer
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     RecordedCopy,
 )
-from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.adapter import TrainerSourceShard
 from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 from modelexpress_rl.inference.nixl_staged_transfer import (

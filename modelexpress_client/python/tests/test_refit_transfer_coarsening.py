@@ -6,11 +6,11 @@ import ctypes
 import pytest
 import torch
 from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
-from modelexpress.refit.reshard.transfer_plan import plan_transfer as _plan_staged_transfer
+from modelexpress_rl.refit.reshard.transfer_plan import plan_transfer as _plan_staged_transfer
 
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
 
 
 @pytest.fixture(autouse=True)

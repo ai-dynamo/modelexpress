@@ -5,9 +5,9 @@ import ctypes
 import pytest
 
 import torch
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, plan_transfer
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
 from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
 
 
@@ -41,7 +41,7 @@ def test_replay_materializes_transposed_source_before_flattening():
     [], [-1, 0],
 ])
 def test_integer_index_capture_transfer_and_replay(index):
-    from modelexpress.refit.reshard.geometry import build_lazy_weights, capture_weights
+    from modelexpress_rl.refit.reshard.geometry import build_lazy_weights, capture_weights
 
     source = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     expected = source[index].clone()
