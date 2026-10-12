@@ -200,6 +200,8 @@ def prepare(
             "MX_INSTANT_TENSOR": "0",
             "MX_MS_DISTRIBUTED": "0",
             "MX_P2P_METADATA": "1",
+            "MX_ARTIFACT_TRANSFER": "1",
+            "MX_ARTIFACT_READY_URL": "http://127.0.0.1:8080/health",
             "MX_POOL_REG": "1",
             "MX_METRICS_ENABLED": "1",
             "PROMETHEUS_MULTIPROC_DIR": "/tmp/mx-metrics",
