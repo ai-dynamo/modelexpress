@@ -143,6 +143,7 @@ def test_expert_copies_plan_to_the_right_source_bytes():
         src_dtype=torch.float32,
         elsize=4,
         shards=[shard],
+        buffer_indices=(0,),
     )
 
     assert segments, "expert copy produced no pull segments"
@@ -150,7 +151,7 @@ def test_expert_copies_plan_to_the_right_source_bytes():
     # Exactly this rank's slice: INTER_PER_TP rows of HIDDEN float32 elements.
     assert pulled == INTER_PER_TP * HIDDEN * 4
     # Rank 0 reads from the start of the source.
-    assert min(s.src_addr for s in segments) == 0
+    assert min(s.src_byte for s in segments) == 0
     # It lands in expert 1's w3 (upper) half of the fused destination.
     expected_dst = (
         1 * (2 * INTER_PER_TP) * HIDDEN + INTER_PER_TP * HIDDEN

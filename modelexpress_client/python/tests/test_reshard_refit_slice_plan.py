@@ -38,16 +38,23 @@ def _copy(op_chain, param_name, dest_offset, dest_shape, dest_stride):
     )
 
 
+def _plan_pull(copy, *, global_shape, src_dtype, elsize, shards):
+    return plan_pull(
+        copy, global_shape, src_dtype, elsize, shards,
+        buffer_indices=tuple(range(len(shards))),
+    )
+
+
 def test_column_block_single_contiguous_run():
     # ColumnParallel rank 0: full [8,4], need rows [0:4] -> contiguous block.
     copy = _copy((("narrow", (0, 0, 4), ()),), "col", 0, (4, 4), (4, 1))
     shard = Shard(shard_offset=(0, 0), shape=(8, 4), session="s0", addr=1000, elsize=EL)
-    segs = plan_pull(
+    segs = _plan_pull(
         copy, global_shape=(8, 4), src_dtype=F32, elsize=EL, shards=[shard]
     )
     assert len(segs) == 1
     assert (
-        segs[0].src_addr == 1000 and segs[0].dst_byte == 0 and segs[0].nbytes == 16 * EL
+        segs[0].source_buffer == 0 and segs[0].src_byte == 0 and segs[0].dst_byte == 0 and segs[0].nbytes == 16 * EL
     )
 
 
@@ -55,12 +62,12 @@ def test_column_slice_is_strided_multi_run():
     # RowParallel rank 0: full [4,8], need cols [0:4] -> strided, one run per row.
     copy = _copy((("narrow", (1, 0, 4), ()),), "row", 0, (4, 4), (4, 1))
     shard = Shard(shard_offset=(0, 0), shape=(4, 8), session="s0", addr=2000, elsize=EL)
-    segs = plan_pull(
+    segs = _plan_pull(
         copy, global_shape=(4, 8), src_dtype=F32, elsize=EL, shards=[shard]
     )
     assert len(segs) == 4  # 4 rows, each a 4-element run
     # Row r: src starts at r*8 elements, dst at r*4 elements, 4 elems each.
-    assert [(s.src_addr - 2000) // EL for s in segs] == [0, 8, 16, 24]
+    assert [s.src_byte // EL for s in segs] == [0, 8, 16, 24]
     assert [s.dst_byte // EL for s in segs] == [0, 4, 8, 12]
     assert all(s.nbytes == 4 * EL for s in segs)
 
@@ -70,11 +77,11 @@ def test_fused_shard_dest_offset():
     # -> dest_offset 16 (4 rows * 4 cols).
     copy = _copy((), "qkv", 16, (2, 4), (4, 1))
     shard = Shard(shard_offset=(0, 0), shape=(2, 4), session="s0", addr=3000, elsize=EL)
-    segs = plan_pull(
+    segs = _plan_pull(
         copy, global_shape=(2, 4), src_dtype=F32, elsize=EL, shards=[shard]
     )
     assert len(segs) == 1
-    assert segs[0].src_addr == 3000
+    assert segs[0].source_buffer == 0 and segs[0].src_byte == 0
     assert segs[0].dst_byte == 16 * EL and segs[0].nbytes == 8 * EL
     assert segs[0].param_name == "qkv"
 
@@ -84,23 +91,23 @@ def test_multi_shard_fan_in():
     copy = _copy((), "w", 0, (4, 8), (8, 1))
     left = Shard(shard_offset=(0, 0), shape=(4, 4), session="a", addr=100, elsize=EL)
     right = Shard(shard_offset=(0, 4), shape=(4, 4), session="b", addr=200, elsize=EL)
-    segs = plan_pull(
+    segs = _plan_pull(
         copy, global_shape=(4, 8), src_dtype=F32, elsize=EL, shards=[left, right]
     )
     # Each half is strided in the full row -> 4 runs per shard, 8 total.
     assert len(segs) == 8
-    assert {s.session for s in segs} == {"a", "b"}
-    left_dst = sorted(s.dst_byte // EL for s in segs if s.session == "a")
+    assert {s.source_buffer for s in segs} == {0, 1}
+    left_dst = sorted(s.dst_byte // EL for s in segs if s.source_buffer == 0)
     assert left_dst == [0, 8, 16, 24]  # left half lands at col 0 of each 8-wide row
-    right_dst = sorted(s.dst_byte // EL for s in segs if s.session == "b")
+    right_dst = sorted(s.dst_byte // EL for s in segs if s.source_buffer == 1)
     assert right_dst == [4, 12, 20, 28]  # right half lands at col 4
 
 
 def test_disjoint_shard_skipped():
     copy = _copy((("narrow", (0, 0, 4), ()),), "col", 0, (4, 4), (4, 1))
     far = Shard(shard_offset=(4, 0), shape=(4, 4), session="s0", addr=9000, elsize=EL)
-    segs = plan_pull(copy, global_shape=(8, 4), src_dtype=F32, elsize=EL, shards=[far])
-    assert segs == []
+    segs = _plan_pull(copy, global_shape=(8, 4), src_dtype=F32, elsize=EL, shards=[far])
+    assert segs == ()
 
 
 def test_rank_mismatched_geometry_raises():
@@ -116,7 +123,7 @@ def test_rank_mismatched_geometry_raises():
         elsize=EL,
     )
     with pytest.raises(ValueError):
-        plan_pull(
+        _plan_pull(
             copy,
             global_shape=(4, 4),
             src_dtype=F32,
@@ -136,17 +143,18 @@ def _reconstruct(src_2d, copy, shards, segs):
     reshaped, so a test can assert it equals the loader's ground-truth view."""
     import torch
 
-    src_buf = src_2d.reshape(-1).contiguous()
     dest_numel = 1
     for s in copy.dest_shape:
         dest_numel *= s
     dst_buf = torch.zeros(copy.dest_offset + dest_numel, dtype=src_2d.dtype)
-    addr_of = {sh.session: sh.addr for sh in shards}
+    local_buffers = [src_2d[tuple(slice(o, o + n) for o, n in zip(
+        sh.shard_offset, sh.shape
+    ))].contiguous().reshape(-1) for sh in shards]
     for seg in segs:
-        s_el = (seg.src_addr - addr_of[seg.session]) // EL
+        s_el = seg.src_byte // EL
         d_el = seg.dst_byte // EL
         n = seg.nbytes // EL
-        dst_buf[d_el : d_el + n] = src_buf[s_el : s_el + n]
+        dst_buf[d_el : d_el + n] = local_buffers[seg.source_buffer][s_el : s_el + n]
     return dst_buf[copy.dest_offset : copy.dest_offset + dest_numel].reshape(
         copy.dest_shape
     )
@@ -160,7 +168,7 @@ def test_transpose_reconstructs_bit_for_bit():
     ground_truth = src.transpose(0, 1)  # [4,3]
     copy = _copy((("transpose", (0, 1), ()),), "wT", 0, (4, 3), (3, 1))
     shard = Shard(shard_offset=(0, 0), shape=(3, 4), session="s0", addr=0, elsize=EL)
-    segs = plan_pull(
+    segs = _plan_pull(
         copy, global_shape=(3, 4), src_dtype=F32, elsize=EL, shards=[shard]
     )
     assert torch.equal(_reconstruct(src, copy, [shard], segs), ground_truth)
@@ -175,7 +183,7 @@ def test_permute_3d_reconstructs_bit_for_bit():
     shard = Shard(
         shard_offset=(0, 0, 0), shape=(2, 3, 4), session="s0", addr=0, elsize=EL
     )
-    segs = plan_pull(
+    segs = _plan_pull(
         copy, global_shape=(2, 3, 4), src_dtype=F32, elsize=EL, shards=[shard]
     )
     assert torch.equal(_reconstruct(src, copy, [shard], segs), ground_truth)
@@ -191,7 +199,7 @@ def test_transpose_of_narrowed_block_reconstructs():
         (("narrow", (0, 1, 2), ()), ("transpose", (0, 1), ())), "wNT", 0, (5, 2), (2, 1)
     )
     shard = Shard(shard_offset=(0, 0), shape=(4, 5), session="s0", addr=0, elsize=EL)
-    segs = plan_pull(
+    segs = _plan_pull(
         copy, global_shape=(4, 5), src_dtype=F32, elsize=EL, shards=[shard]
     )
     assert torch.equal(_reconstruct(src, copy, [shard], segs), ground_truth)
@@ -202,7 +210,7 @@ def test_dim_merge_reshape_still_unsupported():
     copy = _copy((("reshape", ((12,),), ()),), "w", 0, (12,), (1,))
     shard = Shard(shard_offset=(0, 0), shape=(3, 4), session="s0", addr=0, elsize=EL)
     with pytest.raises(UnsupportedReshard):
-        plan_pull(copy, global_shape=(3, 4), src_dtype=F32, elsize=EL, shards=[shard])
+        _plan_pull(copy, global_shape=(3, 4), src_dtype=F32, elsize=EL, shards=[shard])
 
 
 def test_transpose_then_contiguous_materializes_falls_back():
@@ -215,14 +223,14 @@ def test_transpose_then_contiguous_materializes_falls_back():
     )
     shard = Shard(shard_offset=(0, 0), shape=(4, 4), session="s0", addr=0, elsize=EL)
     with pytest.raises(UnsupportedReshard):
-        plan_pull(copy, global_shape=(4, 4), src_dtype=F32, elsize=EL, shards=[shard])
+        _plan_pull(copy, global_shape=(4, 4), src_dtype=F32, elsize=EL, shards=[shard])
 
 
 def test_dtype_mismatch_raises():
     copy = _copy((), "w", 0, (4, 4), (4, 1))
     shard = Shard(shard_offset=(0, 0), shape=(4, 4), session="s0", addr=0, elsize=EL)
     with pytest.raises(UnsupportedReshard):
-        plan_pull(
+        _plan_pull(
             copy, global_shape=(4, 4), src_dtype="bf16", elsize=EL, shards=[shard]
         )
 
@@ -238,7 +246,7 @@ def test_select_expert_slab_reconstructs_bit_for_bit():
     shard = Shard(
         shard_offset=(0, 0, 0), shape=(3, 2, 4), session="s0", addr=0, elsize=EL
     )
-    segs = plan_pull(
+    segs = _plan_pull(
         copy, global_shape=(3, 2, 4), src_dtype=F32, elsize=EL, shards=[shard]
     )
     assert len(segs) == 1  # contiguous slab
@@ -259,7 +267,7 @@ def test_unbind_piece_reconstructs_bit_for_bit():
         (1,),
     )
     shard = Shard(shard_offset=(0, 0), shape=(4, 3), session="s0", addr=0, elsize=EL)
-    segs = plan_pull(
+    segs = _plan_pull(
         copy, global_shape=(4, 3), src_dtype=F32, elsize=EL, shards=[shard]
     )
     assert torch.equal(_reconstruct(src, copy, [shard], segs), ground_truth)
@@ -276,7 +284,7 @@ def test_split_piece_reconstructs_bit_for_bit():
         (("split", (2, 1), ()), ("__getitem__", (1,), ())), "s1", 0, (4, 2), (2, 1)
     )
     shard = Shard(shard_offset=(0, 0), shape=(4, 4), session="s0", addr=0, elsize=EL)
-    segs = plan_pull(
+    segs = _plan_pull(
         copy, global_shape=(4, 4), src_dtype=F32, elsize=EL, shards=[shard]
     )
     assert len(segs) == 4  # strided column-block: one run per row
@@ -291,13 +299,13 @@ def test_select_reads_only_the_expert_owning_shard():
     b = Shard(
         shard_offset=(2, 0, 0), shape=(2, 2, 3), session="b", addr=5000, elsize=EL
     )
-    segs = plan_pull(
+    segs = _plan_pull(
         copy, global_shape=(4, 2, 3), src_dtype=F32, elsize=EL, shards=[a, b]
     )
-    assert {s.session for s in segs} == {"b"}
+    assert {s.source_buffer for s in segs} == {1}
     assert len(segs) == 1
     # expert 3 is local row 1 of shard b -> element offset (3-2)*2*3 = 6.
-    assert (segs[0].src_addr - 5000) // EL == 6
+    assert segs[0].src_byte // EL == 6
     assert segs[0].nbytes == 6 * EL and segs[0].dst_byte == 0
 
 
@@ -306,7 +314,7 @@ def test_unsqueeze_rank_increase_unsupported():
     copy = _copy((("unsqueeze", (0,), ()),), "w", 0, (1, 4), (4, 1))
     shard = Shard(shard_offset=(0,), shape=(4,), session="s0", addr=0, elsize=EL)
     with pytest.raises(UnsupportedReshard):
-        plan_pull(copy, global_shape=(4,), src_dtype=F32, elsize=EL, shards=[shard])
+        _plan_pull(copy, global_shape=(4,), src_dtype=F32, elsize=EL, shards=[shard])
 
 
 def test_int_index_collapse_unsupported():

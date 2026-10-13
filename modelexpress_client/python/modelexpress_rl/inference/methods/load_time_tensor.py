@@ -43,6 +43,10 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         transfer: _NixlStagedTransfer,
         capture_layout: Callable,
     ) -> None:
+        if transfer is None:
+            raise ValueError("transfer is required")
+        if not callable(capture_layout):
+            raise TypeError("capture_layout must be callable")
         self._transfer = transfer
         self._capture_layout = capture_layout
         self._active_plan: _PreparedNixlTransfer | None = None
@@ -89,7 +93,11 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             if not reusable:
                 self._active_plan = self._transfer.prepare(
                     manifests=manifests,
+                    source_fingerprints=tuple(
+                        item.physical_fingerprint for item in inputs.sources
+                    ),
                     capture_layout=self._capture_layout,
+                    source_slot_ids=tuple(item.source_slot_id for item in inputs.sources),
                 )
                 self._active_fingerprint = inputs.physical_fingerprint
         if reusable and manifest_digests != self._active_manifest_digests:
@@ -132,7 +140,11 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         try:
             prepared = self._transfer.prepare(
                 manifests=[item.transport.manifest for item in source.inputs.sources],
+                source_fingerprints=tuple(
+                    item.physical_fingerprint for item in source.inputs.sources
+                ),
                 capture_layout=self._capture_layout,
+                source_slot_ids=tuple(item.source_slot_id for item in source.inputs.sources),
                 max_staging_bytes=max_staging_bytes,
                 staging_device=staging_device,
                 staging_buffers=staging_buffers,

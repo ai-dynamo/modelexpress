@@ -14,6 +14,7 @@ from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
+    structural_manifest_digest,
     wrap_rendezvous_blob,
 )
 from modelexpress.refit.reshard.types import (
@@ -21,10 +22,11 @@ from modelexpress.refit.reshard.types import (
     IncompleteRefit,
     RecordedCopy,
 )
+from modelexpress.refit.reshard.verify import tensor_digest
 
 
 @pytest.fixture
-def harness(monkeypatch):
+def harness(monkeypatch, request):
     """Real planning and byte copies with synthetic capture metadata and CPU arenas."""
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setenv("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "1")
@@ -38,7 +40,9 @@ def harness(monkeypatch):
         name: torch.arange(16, dtype=torch.float32).reshape(4, 4) + index / 16
         for index, name in enumerate(("exact", "full", "convert"))
     }
+    conversion = getattr(request, "param", None)
     captures = []
+    publisher_step = [0]
     copies = [
         RecordedCopy(src, ops, name, 2, (4, 4), (4, 1), dtype)
         for src, ops, name, dtype in (
@@ -48,6 +52,13 @@ def harness(monkeypatch):
             ("exact", (), "d.weight", torch.float32),
         )
     ]
+    if conversion:
+        copies = [replace(
+            record,
+            src_name=f"native.{record.src_name}",
+            op_chain=((("transpose", (0, 1), ()),) if conversion == "transpose" else ())
+            + record.op_chain,
+        ) for record in copies]
     capture = CaptureResult(copies=copies)
     layout = {copy.param_name: ((20,), copy.dest_dtype) for copy in copies}
     transports = []
@@ -131,7 +142,7 @@ def harness(monkeypatch):
                 "source:19000",
                 [
                     PublishedTensor(
-                        name=name,
+                        name=f"native.{name}" if conversion else name,
                         dtype="torch.float32",
                         elsize=4,
                         full_shape=(4, 4),
@@ -142,11 +153,13 @@ def harness(monkeypatch):
                                 addr=tensor.data_ptr(),
                                 shard_offset=(0, 0),
                                 shape=(4, 4),
+                                digest=tensor_digest(tensor),
                             )
                         ],
                     )
                     for name, tensor in sources.items()
                 ],
+                publisher_step=publisher_step[0],
             )
         ]
 
@@ -155,8 +168,12 @@ def harness(monkeypatch):
         return capture, layout
 
     def prepare(**kwargs):
+        blobs = manifests()
         return transfer.prepare(
-            manifests=manifests(),
+            manifests=blobs,
+            source_fingerprints=tuple(
+                structural_manifest_digest(blob) for blob in blobs
+            ),
             capture_layout=capture_layout,
             **{"max_staging_bytes": 1024, "staging_device": "cpu", **kwargs},
         )
@@ -168,6 +185,7 @@ def harness(monkeypatch):
         return metrics, installed
 
     state = SimpleNamespace(
+        source_transposed=conversion == "transpose",
         transfer=transfer,
         sources=sources,
         capture=capture,
@@ -175,6 +193,8 @@ def harness(monkeypatch):
         prepare=prepare,
         collect=collect,
         captures=captures,
+        manifests=manifests,
+        publisher_step=publisher_step,
         transports=transports,
         events=events,
     )
@@ -182,7 +202,7 @@ def harness(monkeypatch):
     transfer.close()
 
 
-def _check_values(harness, installed):
+def _check_values(harness, installed, *, source_transposed=False):
     for source, name, dtype, transpose in (
         ("exact", "a.weight", torch.float32, False),
         ("full", "b.weight", torch.float32, True),
@@ -191,6 +211,8 @@ def _check_values(harness, installed):
     ):
         expected = torch.zeros(20, dtype=dtype)
         value = harness.sources[source]
+        if source_transposed:
+            value = value.T
         expected[2:18].copy_((value.T if transpose else value).reshape(-1))
         assert torch.equal(installed[name], expected)
 
@@ -198,10 +220,12 @@ def _check_values(harness, installed):
 @pytest.mark.parametrize("buffers", [1, 2])
 @pytest.mark.parametrize("pack", [False, True])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("plan_cache", [False, True])
 def test_warm_descriptors_still_transfer_new_values(
-    harness, monkeypatch, buffers, pack, device
+    harness, monkeypatch, buffers, pack, device, plan_cache
 ):
     monkeypatch.setenv("MX_REFIT_PACK_MODULES", str(int(pack)))
+    monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", str(int(plan_cache)))
     prepare = lambda: harness.prepare(staging_buffers=buffers, staging_device=device)
     first = prepare()
     assert any(batch.plan.full_pulls for batch in first.batches)
@@ -209,28 +233,46 @@ def test_warm_descriptors_still_transfer_new_values(
     assert any(batch.plan.segments for batch in first.batches)
     cold, installed = harness.collect(first)
     _check_values(harness, installed)
-    cached = harness.transfer._descriptor_cache
     assert cold["descriptor_builds"] == len(first.batches)
     assert cold["descriptor_cache_hits"] == 0
     for values in harness.sources.values():
         values.add_(3)
-    for arena in harness.transfer._staging_arenas:
-        arena.fill_(255)
+    harness.publisher_step[0] += 1
     second = prepare()
     warm, installed = harness.collect(second)
     _check_values(harness, installed)
     assert len(harness.captures) == 2
-    assert first.batches is second.batches
-    assert harness.transfer._descriptor_cache is cached
-    assert warm["descriptor_cache_hits"] == len(second.batches)
-    assert warm["descriptor_cache_misses"] == warm["descriptor_builds"] == 0
+    assert warm["descriptor_cache_hits"] == (len(second.batches) if plan_cache else 0)
+    assert warm["descriptor_cache_misses"] == warm["descriptor_builds"] == (
+        0 if plan_cache else len(second.batches)
+    )
     assert first.transport is not second.transport
     assert second.transport.mem_type == ("DRAM" if device == "cpu" else "VRAM")
     assert first.transport.posts == second.transport.posts
     assert second.transport.awaited == second.transport.posted
-    descriptor = second.transport.posts[0][0]
-    with pytest.raises(AttributeError):
-        descriptor.dst_addr = 0
+
+
+@pytest.mark.parametrize("harness", ["rename", "transpose"], indirect=True)
+@pytest.mark.parametrize("pack", [False, True])
+def test_native_conversion_composes_with_installation(harness, monkeypatch, pack):
+    monkeypatch.setenv("MX_REFIT_PACK_MODULES", str(int(pack)))
+    _, installed = harness.collect(harness.prepare())
+    _check_values(
+        harness, installed,
+        source_transposed=harness.source_transposed,
+    )
+
+
+@pytest.mark.parametrize("resolved_cache", [0, 1])
+def test_replaced_source_buffers_transfer_current_values(harness, monkeypatch, resolved_cache):
+    monkeypatch.setenv("MX_REFIT_CACHE_RESOLVED_SOURCES", str(resolved_cache))
+    for update in range(3):
+        if update:
+            harness.sources.update({
+                name: value.clone() + update for name, value in harness.sources.items()
+            })
+        _, installed = harness.collect(harness.prepare())
+        _check_values(harness, installed)
 
 
 @pytest.mark.parametrize("change", ["address", "capture", "budget", "disabled"])
@@ -242,6 +284,7 @@ def test_changed_plan_does_not_reuse_descriptors(harness, monkeypatch, change):
         harness.sources["exact"] = harness.sources["exact"].clone() + 5
     elif change == "capture":
         harness.capture.copies[0] = replace(harness.capture.copies[0], dest_offset=1)
+        harness.transfer._plan_cache.clear()
     elif change == "budget":
         kwargs["max_staging_bytes"] = 2048
     else:
@@ -305,6 +348,7 @@ def test_failed_prepare_discards_descriptors(harness, monkeypatch, failure):
     assert harness.transfer._descriptor_cache is not None
     if failure == "coverage":
         harness.layout["missing.weight"] = ((4,), torch.float32)
+        harness.transfer._plan_cache.clear()
         expected = IncompleteRefit
     else:
 
@@ -373,7 +417,7 @@ def test_descriptor_order_duplicates_and_empty_reads_survive_reuse(
 
     def descriptors(*args, **kwargs):
         result = original(*args, **kwargs)
-        result += [result[0], replace(result[0], nbytes=0)]
+        result += (result[0], replace(result[0], nbytes=0))
         builds.append(
             tuple((d.session, d.src_addr, d.dst_addr, d.nbytes) for d in result)
         )

@@ -25,8 +25,9 @@ Run: pytest tests/test_reshard_refit_batch_install.py
 import torch
 
 from modelexpress.refit.reshard.receiver import ReshardReceiver
-from modelexpress.refit.reshard.slice_plan import PullSegment
-from modelexpress.refit.reshard.transfer_plan import FullPullSource, TransferPlan
+from modelexpress.refit.reshard.slice_plan import Shard
+from modelexpress.refit.reshard.transfer_plan import SourceInfo, plan_transfer
+from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
 from modelexpress.refit.reshard.transport import InMemoryReferenceTransport
 
 EL = 4  # float32 element size
@@ -61,7 +62,7 @@ class _Harness(ReshardReceiver):
         pass
 
 
-def _build(transport):
+def _build(transport, *, overlapping_rows=False):
     """Two full-pulled sources, four views in total.
 
     ``qkv`` is a 4x6 source re-sliced into three column blocks, the shape a
@@ -99,67 +100,34 @@ def _build(transport):
     harness._staging = {}
     harness._staging_ptr = {}
 
-    plan = TransferPlan(
-        segments=[],
-        full_pulls=[
-            FullPullSource(
-                src_name="qkv",
-                global_shape=(4, 6),
-                dtype=torch.float32,
-                elsize=EL,
-                segments=[
-                    PullSegment(
-                        session="s0",
-                        src_addr=qkv_src.data_ptr(),
-                        dst_byte=0,
-                        nbytes=24 * EL,
-                        param_name="qkv",
-                    )
-                ],
-                copies=[
-                    _Copy(
-                        param_name=name,
-                        op_chain=(("narrow", (1, start, 2), ()),),
-                        dest_shape=(4, 2),
-                        dest_stride=(2, 1),
-                        dest_offset=0,
-                    )
-                    for name, start in (("q", 0), ("k", 2), ("v", 4))
-                ],
-            ),
-            FullPullSource(
-                src_name="rows",
-                global_shape=(4, 4),
-                dtype=torch.float32,
-                elsize=EL,
-                segments=[
-                    PullSegment(
-                        session="s1",
-                        src_addr=rows_src.data_ptr(),
-                        dst_byte=0,
-                        nbytes=16 * EL,
-                        param_name="rows",
-                    )
-                ],
-                # Two row blocks into one buffer, so the destination offset is
-                # exercised as well as the shape.
-                copies=[
-                    _Copy(
-                        param_name="rows",
-                        op_chain=(("narrow", (0, start, 2), ()),),
-                        dest_shape=(2, 4),
-                        dest_stride=(4, 1),
-                        dest_offset=start * 4,
-                    )
-                    for start in (0, 2)
-                ],
-            ),
-        ],
-        converts=[],
-        exact_bytes=0,
-        exact_descriptor_count=0,
+    copies = [
+        RecordedCopy("qkv", (("narrow", (1, start, 2), ()),), name, 0,
+                     (4, 2), (2, 1), torch.float32)
+        for name, start in (("q", 0), ("k", 2), ("v", 4))
+    ]
+    copies.extend(
+        RecordedCopy("rows", (("narrow", (0, start, 2), ()),), "rows",
+                     0 if overlapping_rows else start * 4, (2, 4), (4, 1), torch.float32)
+        for start in (0, 2)
     )
+    sources = {
+        name: SourceInfo(tuple(tensor.shape), torch.float32, EL, [Shard(
+            (0,) * tensor.ndim, tuple(tensor.shape), session, tensor.data_ptr(), EL
+        )])
+        for name, tensor, session in (
+            ("qkv", qkv_src, "s0"), ("rows", rows_src, "s1")
+        )
+    }
+    plan = plan_transfer(CaptureResult(copies=copies), sources, verify_full_sources=True)
     harness._plan = plan
+    harness._resolve_source = lambda buffer: (
+        buffer.source_slot_id, sources[buffer.src_name].shards[0].addr
+    )
+    harness._resolve_destination = lambda kind, name: (
+        harness._full_staging_ptr[name] if kind == "full"
+        else harness._recv_buffers[name].data_ptr()
+    )
+    harness._bind_physical_plan()
     keepalive = (qkv_src, rows_src)
     return harness, keepalive
 
@@ -232,9 +200,7 @@ def test_overlapping_destinations_fall_back_to_plan_order(monkeypatch):
             AssertionError("overlapping destinations must not be batched")
         ),
     )
-    harness, keepalive = _build(InMemoryReferenceTransport())
-    for copy in harness._plan.full_pulls[1].copies:
-        copy.dest_offset = 0
+    harness, keepalive = _build(InMemoryReferenceTransport(), overlapping_rows=True)
 
     harness.update_weights(step=1)
 
@@ -276,7 +242,9 @@ def test_empty_full_pulls_is_a_no_op(monkeypatch):
         monkeypatch.setenv("MX_RESHARD_BATCH_INSTALL", "1" if batched else "0")
         transport = InMemoryReferenceTransport()
         harness, keepalive = _build(transport)
-        harness._plan.full_pulls = []
+        from dataclasses import replace
+        harness._plan = replace(harness._plan, full_pulls=())
+        harness._bind_physical_plan()
 
         metrics = harness.update_weights(step=1)
 

@@ -8,9 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     clang cmake libprotobuf-dev pkg-config protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=dynamo . /src/dynamo
-COPY . /src/modelexpress
 WORKDIR /src/dynamo
 RUN cargo build --release --locked -p dynamo-vllm-sidecar
+COPY . /src/modelexpress
 WORKDIR /src/modelexpress
 RUN cargo build --release --locked --bin modelexpress-server
 

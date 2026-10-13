@@ -315,7 +315,8 @@ def test_capture_feeds_slice_plan():
 
     shard = Shard(shard_offset=(0, 0), shape=(4, 8), session="s0", addr=0, elsize=4)
     segs = plan_pull(
-        row, global_shape=(4, 8), src_dtype=torch.float32, elsize=4, shards=[shard]
+        row, global_shape=(4, 8), src_dtype=torch.float32, elsize=4, shards=[shard],
+        buffer_indices=(0,),
     )
 
     assert len(segs) == 4
@@ -537,11 +538,12 @@ def test_moe_convert_capture_plan_reconstructs_end_to_end():
             shard_offset=(0,) * len(shape), shape=shape, session="s", addr=0, elsize=4
         )
         segs = plan_pull(
-            copy, global_shape=shape, src_dtype=f32, elsize=4, shards=[shard]
+            copy, global_shape=shape, src_dtype=f32, elsize=4, shards=[shard],
+            buffer_indices=(0,),
         )
         source, dest = src_buf[copy.src_name], dst[copy.param_name]
         for seg in segs:
-            s0, d0, n = seg.src_addr // 4, seg.dst_byte // 4, seg.nbytes // 4
+            s0, d0, n = seg.src_byte // 4, seg.dst_byte // 4, seg.nbytes // 4
             dest[d0 : d0 + n] = source[s0 : s0 + n]
 
     gate_out = dst["gate"].reshape(_E, _H)
@@ -628,11 +630,12 @@ def test_stacked_moe_convert_capture_plan_reconstructs_end_to_end():
             shard_offset=(0,) * len(shape), shape=shape, session="s", addr=0, elsize=4
         )
         segs = plan_pull(
-            copy, global_shape=shape, src_dtype=f32, elsize=4, shards=[shard]
+            copy, global_shape=shape, src_dtype=f32, elsize=4, shards=[shard],
+            buffer_indices=(0,),
         )
         source, dest = src_buf[copy.src_name], dst[copy.param_name]
         for seg in segs:
-            s0, d0, n = seg.src_addr // 4, seg.dst_byte // 4, seg.nbytes // 4
+            s0, d0, n = seg.src_byte // 4, seg.dst_byte // 4, seg.nbytes // 4
             dest[d0 : d0 + n] = source[s0 : s0 + n]
 
     gate_out = dst["gate"].reshape(_E, _H)
@@ -649,3 +652,15 @@ if __name__ == "__main__":
     test_capture_feeds_slice_plan()
     test_default_loader_param_needs_default_weight_loader()
     print("OK: geometry capture + unsupported attribution + slice-plan compose")
+
+
+@pytest.mark.parametrize("index", [
+    [0, 2], torch.tensor([0, 2]), (slice(None), [0, 2]), ((0, 2),),
+])
+def test_capture_rejects_advanced_indices(index):
+    with torch.device("meta"):
+        model = ToyModel()
+    model.col.weight_loader = lambda param, loaded: param.data.copy_(loaded[index])
+    result = capture_geometry(model, [("col", torch.float32, (8, 4))])
+    assert result.unsupported == ["col"]
+    assert not result.copies
