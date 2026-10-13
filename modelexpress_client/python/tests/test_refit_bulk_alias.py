@@ -339,5 +339,3 @@ def test_reused_plan_keeps_complete_ties_in_owner_views():
     model.other = torch.nn.Linear(2, 2)
     with pytest.raises(api.IncompleteRefit, match="replaced during refit"):
         installer._restore_parameter_aliases(views[model.branch])
-
-

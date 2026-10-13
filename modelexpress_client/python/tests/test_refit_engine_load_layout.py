@@ -199,3 +199,39 @@ def test_conversion_and_loader_are_captured_together(capture_installer):
     assert {record.src_name for record in changed.copies} == {"native"}
     assert first.copies[0].op_chain != changed.copies[0].op_chain
     assert model.capture_calls == 2
+
+
+@pytest.mark.parametrize("change", ["rebind", "shape", "stride", "values"])
+def test_float_buffer_generation_compatibility(capture_installer, change):
+    installer, model = capture_installer
+    model.register_buffer("state", torch.zeros(2, 2))
+    manifest = [("weight", torch.float32, (3, 3))]
+    original, _ = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    if change == "rebind":
+        model.state = model.state.clone()
+    elif change == "shape":
+        model.state.resize_(4)
+    elif change == "stride":
+        model.state.transpose_(0, 1)
+    else:
+        model.state.add_(1)
+    current, _ = installer.capture(manifest, trainer_mesh=("trainer", 2))
+    assert model.capture_calls == (1 if change == "values" else 2)
+    assert (current.generation == original.generation) == (change == "values")
+
+
+def test_float_buffer_rebinding_rebuilds_overlap_schedule(monkeypatch):
+    from tests.test_refit_combined_replay import _fixture
+    from tests.test_refit_ordered_installer import _transfer_and_install
+
+    model, installer, source, manifest = _fixture(monkeypatch)
+    previous, _ = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    model.a = model.a.clone()
+    current, layout = installer.capture(manifest, trainer_mesh=("trainer", 2))
+    assert current.generation != previous.generation
+    assert model.calls == 2
+    _transfer_and_install(
+        installer, {"trainer.weight": source}, current, layout, False
+    )
+    torch.testing.assert_close(model.a, source[:, 1], rtol=0, atol=0)
+    torch.testing.assert_close(model.b, source[:, 0], rtol=0, atol=0)

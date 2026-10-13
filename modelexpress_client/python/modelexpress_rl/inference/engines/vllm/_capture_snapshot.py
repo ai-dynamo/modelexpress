@@ -23,13 +23,23 @@ _RECORD_FIELDS = (
     "owner_stride",
 )
 _CAPTURE_FIELDS = (
-    "copies", "unsupported", "unattributed", "unsupported_reasons",
-    "source_replay", "generation", "owner_workspaces", "owner_dependencies",
+    "copies",
+    "unsupported",
+    "unattributed",
+    "unsupported_reasons",
+    "source_replay",
+    "generation",
+    "owner_workspaces",
+    "owner_dependencies",
     "destination_layouts",
 )
 _CLASS_DEFAULTS = {
-    CaptureResult: {"unattributed": 0, "source_replay": False, "generation": None,
-                    "owner_dependencies": ()},
+    CaptureResult: {
+        "unattributed": 0,
+        "source_replay": False,
+        "generation": None,
+        "owner_dependencies": (),
+    },
     RecordedCopy: {"owner_offset": None, "owner_stride": None},
 }
 _CAPTURE_CLASS = CaptureResult
@@ -198,15 +208,20 @@ class _CaptureSnapshot:
         ):
             return result
         metadata = (capture.source_replay, capture.generation, capture.owner_dependencies)
-        mappings = (layout, capture.unsupported_reasons,
-                    capture.owner_workspaces, capture.destination_layouts)
+        mappings = (
+            layout,
+            capture.unsupported_reasons,
+            capture.owner_workspaces,
+            capture.destination_layouts,
+        )
         if (
             not all(_immutable(value) for value in metadata)
             or any(type(mapping) is not dict for mapping in mappings)
             or len({id(mapping) for mapping in mappings}) != len(mappings)
             or not all(
                 type(name) is str and _immutable(value)
-                for mapping in mappings for name, value in mapping.items()
+                for mapping in mappings
+                for name, value in mapping.items()
             )
         ):
             return result
@@ -235,7 +250,11 @@ class _CaptureSnapshot:
         if not _ordinary_copy_classes():
             return result
         return cls(
-            result, tuple(records), tuple(indices), tuple(layout.items()), metadata,
+            result,
+            tuple(records),
+            tuple(indices),
+            tuple(layout.items()),
+            metadata,
             tuple(capture.owner_workspaces.items()),
             tuple(capture.destination_layouts.items()),
         )

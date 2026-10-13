@@ -1731,10 +1731,10 @@ flowchart LR
 
 The installer lazily captures the trainer-to-Hugging-Face conversion together
 with vLLM's native loading operations, destination geometry, owning module groups,
-alias restoration metadata and graph destinations. This single canonical capture
-is published only after complete validation and restoration of the live model;
-unrecorded writes to persistent destination storage and missing parameter coverage
-fail capture, and failed construction can be retried. Each update opens one reload
+alias restoration metadata and graph destinations. The capture cache and replay schedule
+are published only after complete coverage and restoration of the live model.
+An incomplete capture returns its diagnostics without caching a replay plan;
+failed or incomplete construction can be retried. Each update opens one reload
 window, materializes load-time destinations, then replays captured writes in their
 original order. vLLM performs post-load processing and restores kernel tensor
 bindings; finalization handles attention dependencies after all inputs arrive.
@@ -1763,7 +1763,7 @@ validation remains required.
 Capture reuse checks the mesh ID and generation first. A validated same-generation
 hit skips the source-schema and engine-layout walk. On a changed generation, the
 installer compares the native source schema, converter identity and engine loading
-layout. Compatible changes reuse the combined capture; incompatible changes
+layout, including buffer geometry and integer routing state. Compatible changes reuse the combined capture; incompatible changes
 recapture. Trainer rank, source address and shard-placement changes alone do not
 invalidate capture. The cached generation advances only after successful
 validation or recapture; a failed recapture leaves no valid cache entry for the
@@ -1777,7 +1777,7 @@ This adds no validation in source resolution.
 and full-source pulls index a shared source-buffer table and carry shard-relative
 byte offsets. The table identifies logical source slots and tensor shards; it
 contains no addresses or transport handles. Operation capture normalizes view
-arguments once; `RecordedCopy` is a plain immutable record. Direct planner callers
+arguments once; cached records are isolated from caller mutation. Direct planner callers
 supply immutable tuple shapes, strides and operation arguments. Capture safely
 copies constant integer list/tensor indices, preserving negative and empty-index
 semantics. Boolean masks and indices without concrete values remain unsupported.
@@ -1810,37 +1810,18 @@ metadata, leases, transport connections and staging allocation remain outside
 the shared planner. Equivalent replicas can bind the same logical reads to
 current sessions and addresses without rebuilding geometry.
 
-Alias validation uses Python module lookup and parameter registration semantics.
-Each streaming batch checks current ownership and reuses the initial reload's
-alias metadata when paths, owners, ordering and classes still match. Native reload
-can reorder parameter groups without changing their members. Those batches retain
-fresh callback order while sharing per-owner views of the initial owners. Changed
-group membership, paths, classes or ancestors prevents that sharing. No validation
-verdict survives an engine callback. The initial metadata and its per-owner views
-live only for that reload window; plans referring to later owners are released
-with the batch. Within one signature calculation, entries with the same current
-inheritance chain share its identity tuple. For owners with ordinary object
-hashing and equality, complete group signatures are also shared when building
-per-owner cache keys. Custom hashing or equality retains per-owner signature
-calculation.
+The replay plan records alias groups and owning modules during capture. Each
+update validates the live owners, load-time inputs and graph-bound storage.
+Per-owner alias views reconnect complete ties during materialization and native
+post-load processing. Finalization validates all captured module paths and
+restores runtime aliases. Changed capture compatibility invalidates the engine
+bindings and replay schedule together; no validation verdict is reused across
+updates. Custom attribute access, setters and parameter-registration hooks retain
+Python lookup and assignment semantics.
 
-For ordinary layer-local materialization, a per-owner view restores each complete
-shared-parameter group touched by that layer. Ordinary tensor buffers and vLLM's
-stock parameter forwarding method are supported; the latter's function, code and
-inheritance are recorded when the installer is created and checked before use.
-Ordinary instance dictionaries inherited from mixins are also supported; custom
-dictionary descriptors use the full restoration path. Custom ancestor lookup,
-setters, registration hooks, tensor dispatch or restore contexts use the full
-restoration path. Post-load callbacks retain whole-model alias validation and
-restoration, including changes to unrelated owners that a later callback could
-otherwise hide. This path adds no native extension or CPython-internal
-dependency.
-
-Alias restoration distinguishes repeated paths to one slot from ties between
-slots. vLLM's recorded parameter metadata separates load-time ties from runtime
-aliases such as WNA16's `w13_weight` and `w2_weight`; native post-processing
-recreates runtime aliases. Quantized full-copy refits retain the existing support
-guard. Quantized streaming remains guarded and unsupported.
+Quantized streaming retains the original guard. Supported quantized full-copy
+refits retain native processing and restoration; capture cleanup also restores
+vLLM's TorchAO reload flag on success and failure.
 
 The staging limit bounds registered receive arenas. Replay operations can require
 additional local scratch, reported as `replay_scratch_peak_bytes`. Estimated
