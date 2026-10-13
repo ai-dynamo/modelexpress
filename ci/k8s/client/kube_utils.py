@@ -115,7 +115,13 @@ def port_forward(namespace: str, target: str, local_port: int, remote_port: int)
         finally:
             try:
                 log.seek(0)
-                print(f"Port-forward log ({namespace}/{target}):\n{log.read()}", file=sys.stderr)
+                diagnostics = "\n".join(
+                    line for line in log.read().splitlines()
+                    if not line.startswith(("Forwarding from ", "Handling connection for "))
+                    and not line.endswith("Starting kubectl port-forward")
+                )
+                if diagnostics:
+                    print(f"Port-forward log ({namespace}/{target}):\n{diagnostics}", file=sys.stderr)
             finally:
                 log.close()
 

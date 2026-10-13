@@ -110,7 +110,7 @@ def test_tunnel_diagnostics_keep_stdout_parseable(capsys):
             print("2 1")
     captured = capsys.readouterr()
     assert captured.out == "2 1\n"
-    assert "Port-forward log" in captured.err
+    assert captured.err == ""
 
 
 def test_tunnel_exit_during_kill_preserves_original_failure(capsys):
@@ -118,8 +118,36 @@ def test_tunnel_exit_during_kill_preserves_original_failure(capsys):
 
     with patch("kube_utils.subprocess.Popen") as popen, patch("kube_utils.socket.socket"), \
             patch("kube_utils.os.killpg", side_effect=ProcessLookupError):
+        popen.side_effect = lambda *args, **kwargs: (
+            kwargs["stdout"].write("lost connection to pod\n"), popen.return_value
+        )[1]
         popen.return_value.wait.side_effect = [subprocess.TimeoutExpired("supervisor", 5), 0]
         with pytest.raises(ValueError, match="original test failure"):
             with port_forward("fixture", "svc/mx-server", 18000, 8000):
                 raise ValueError("original test failure")
     assert "Port-forward log" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("error", ["", "lost connection to pod\n"])
+def test_port_forward_suppresses_routine_output_and_retains_errors(capsys, error):
+    from kube_utils import port_forward
+
+    output = (
+        "2026-10-13T00:00:00Z Starting kubectl port-forward\n"
+        "Forwarding from 127.0.0.1:18000 -> 8000\n"
+        "Forwarding from [::1]:18000 -> 8000\n"
+        "Handling connection for 18000\n" + error
+    )
+    with patch("kube_utils.subprocess.Popen") as popen, patch("kube_utils.socket.socket"):
+        popen.side_effect = lambda *args, **kwargs: (
+            kwargs["stdout"].write(output), popen.return_value
+        )[1]
+        with port_forward("fixture", "svc/mx-server", 18000, 8000):
+            pass
+    captured = capsys.readouterr()
+    assert "Forwarding from" not in captured.err
+    assert "Handling connection" not in captured.err
+    if error:
+        assert error in captured.err
+    else:
+        assert captured.err == ""

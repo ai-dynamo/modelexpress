@@ -244,6 +244,7 @@ def test_cleanup_guard_keeps_same_lane_orphan_blocked(tmp_path):
     ("slot-0", "slot-1", 0),
     ("slot-0", "slot-0", 1),
     ("slot-0", "rdma", 1),
+    ("slot-0", "slot-9", 1),
     ("rdma", "slot-0", 1),
 ])
 def test_four_slot_cleanup_and_mode_transition(tmp_path, lane, other, status):
@@ -305,3 +306,21 @@ def test_pod_lookup_api_errors_still_fail(tmp_path, operation):
     result = run_shell(tmp_path, body, 'echo Forbidden >&2; exit 17')
     assert result.returncode != 0
     assert "Forbidden" in result.stderr
+
+
+def test_cleanup_waits_for_slow_vcluster_namespace_finalization(tmp_path):
+    command = '''if [[ " $* " == *" get namespace "* ]]; then
+  if [ -f "$FIXTURE/deleted" ]; then
+    reads=$(cat "$FIXTURE/reads" 2>/dev/null || echo 0)
+    reads=$((reads + 1)); echo "$reads" > "$FIXTURE/reads"
+    if [ "$reads" -ge 100 ]; then exit 0; fi
+  fi
+  echo '{"metadata":{"labels":{"ci.modelexpress.nvidia.com/run-id":"123-2"}}}'; exit 0
+fi
+if [[ " $* " == *" delete namespace "* ]]; then touch "$FIXTURE/deleted"; fi
+'''
+    body = 'export GITHUB_RUN_ID=123 GITHUB_RUN_ATTEMPT=2\nexport -f sleep\nbash .github/scripts/ci-namespace.sh cleanup mx-ci-fixture-123-2'
+    result = run_shell(tmp_path, body, command)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert int((tmp_path / "reads").read_text()) == 100
+    assert "host pods are gone" in result.stdout

@@ -92,7 +92,7 @@ wait_for_gpu_pool_cleanup() {
       namespaces=$(ci_kubectl get namespaces --context="$KUBE_CONTEXT" -o json) || return 1
       pods=$(ci_kubectl get pods -A --context="$KUBE_CONTEXT" -o json) || return 1
     fi
-    remaining=$(printf '%s\n%s\n' "$namespaces" "$pods" | jq -s --arg pool "$pool" --arg lane "$lane" '
+    remaining=$(printf '%s\n%s\n' "$namespaces" "$pods" | jq -s --arg pool "$pool" --arg lane "$lane" --argjson limit "$concurrency" '
       .[0] as $namespaces | .[1] as $pods |
       def classify($name):
         if ($name | test("^mx-ci-(fleet|rolling)-")) then "tcp"
@@ -103,7 +103,9 @@ wait_for_gpu_pool_cleanup() {
         else "rdma" end;
       def selected($name):
         ([$namespaces.items[] | select(.metadata.name == $name) | .metadata.labels["ci.modelexpress.nvidia.com/gpu-lane"] | select(. != null and length > 0)][0] // classify($name)) as $actual |
-        $lane == "all" or $actual == $lane or (($lane | startswith("slot-")) != ($actual | startswith("slot-")));
+        $lane == "all" or $actual == $lane or
+        (($actual | startswith("slot-")) and (($actual | ltrimstr("slot-") | tonumber? // $limit) >= $limit)) or
+        (($lane | startswith("slot-")) != ($actual | startswith("slot-")));
       def rl($name): $name | startswith("mx-ci-bench-") or startswith("mx-ci-h100-vime-");
       ([$namespaces.items[] | select(selected(.metadata.name)) | select(($pool | startswith("a100")) or rl(.metadata.name))] | length) +
       ([$pods.items[] |

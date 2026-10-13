@@ -70,7 +70,7 @@ for attempt in 1 2 3 4; do
   sleep 2
 done
 
-deadline=$((SECONDS + 180))
+deadline=$((SECONDS + 600))
 while [ "$SECONDS" -lt "$deadline" ]; do
   read_owned_namespace
   if [ -z "$info" ]; then
@@ -80,5 +80,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
   fi
   sleep 5
 done
-echo "ERROR: namespace $namespace still exists after cleanup; finalizers were preserved" >&2
+echo "ERROR: namespace $namespace still exists after 600s of cleanup; finalizers were preserved" >&2
+ci_kubectl get namespace "$namespace" -o json | jq '{spec, status}' >&2 || true
+ci_kubectl get pods -n "$namespace" -o wide >&2 || true
 exit 1

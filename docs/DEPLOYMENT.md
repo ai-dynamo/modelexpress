@@ -1726,11 +1726,11 @@ FlashInfer compatibility checks. The seed-download step reads the snapshot
 manifest and checks downloaded file sizes against S3 object sizes. Manual runs can use external S3
 through their environment configuration.
 
-The `RL weight refit CI` comment workflow delegates execution to the shared
-`ModelExpress RL CI` workflow for the selected profile and scenario. The GPU job is named
-`RL refit / Refit (PROFILE)` for the delta scenario. Every trusted
+`ModelExpress RL CI` handles `/bench` comments and reusable workflow calls directly
+for the selected profile and scenario. The GPU job is named
+`RL generator-only delta refit (PROFILE)` for the delta scenario. Every trusted
 PR automatically calls the same workflow for Nemotron, under
-`RL generator-only delta refit (vllm, s3) / Refit (nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4)`.
+`RL / GPU / RL generator-only delta refit (nemotron)`.
 Workflow callers can pass a profile key or its registered full model name; validation
 resolves it to the profile key for resource names and configuration. The required `CI status check`
 depends on this workflow, including cleanup; seed download, storage or refit failures
