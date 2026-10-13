@@ -18,6 +18,7 @@ from ...accelerators import accelerator_backend_for
 from ...adapter import EngineAdapter
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
+from ...metadata.source_domain import apply_source_domain
 
 _SOURCE_IDENTITY_KEY = "trtllm_source_identity"
 _WEIGHT_LAYOUT_KEY = "trtllm_weight_layout"
@@ -104,7 +105,7 @@ def build_mx_identity(
         separators=(",", ":"),
         default=str,
     )
-    return p2p_pb2.SourceIdentity(
+    identity = p2p_pb2.SourceIdentity(
         mx_version=_mx_version(),
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
         model_name=model_name,
@@ -119,6 +120,7 @@ def build_mx_identity(
             _TRANSFORM_PROTOCOL_KEY: str(transform_protocol_version),
         },
     )
+    return apply_source_domain(identity)
 
 
 class TrtllmAdapter(EngineAdapter):
