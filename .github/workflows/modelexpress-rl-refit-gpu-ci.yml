@@ -1,0 +1,109 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+name: ModelExpress RL Refit GPU CI
+
+on:
+  workflow_call:
+    inputs:
+      gpu_limit:
+        type: string
+        required: true
+      gpu_slot:
+        type: string
+        required: true
+      model:
+        type: string
+        default: ""
+      scenario:
+        type: string
+        default: ""
+      sha:
+        type: string
+        default: ""
+      harness_sha:
+        type: string
+        default: ""
+      server_image:
+        type: string
+        default: ""
+      worker_image:
+        type: string
+        default: ""
+      cleanup_image:
+        type: string
+        default: ""
+    secrets:
+      NGC_API_KEY:
+        required: true
+      HF_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  KUBECONFIG: /teleport/kubeconfig.yaml
+  KUBE_CONTEXT: ${{ vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02' }}
+  NAMESPACE: mx-ci-bench-${{ github.run_id }}-${{ github.run_attempt }}
+  RESULTS_DIR: ${{ github.workspace }}/bench-results
+
+jobs:
+  refit:
+    concurrency:
+      group: ${{ format('modelexpress-rl-gpu-{0}-slot-{1}', vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', inputs.gpu_slot) }}
+      queue: max
+      cancel-in-progress: false
+    name: "RL generator-only ${{ inputs.scenario }} refit (${{ inputs.model }})"
+    runs-on: prod-deploy-tester-v1
+    timeout-minutes: 120
+    env:
+      MX_CI_GPU_CONCURRENCY: ${{ inputs.gpu_limit }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', inputs.gpu_slot) }}
+      MODEL_PROFILE: ${{ inputs.model }}
+      SCENARIO: ${{ inputs.scenario }}
+      RUN_ID: ${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
+      SERVER_IMAGE: ${{ inputs.server_image }}
+      WORKER_IMAGE: ${{ inputs.worker_image }}
+      CLEANUP_IMAGE: ${{ inputs.cleanup_image }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ inputs.harness_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install manifest parser
+        run: python3 -m pip install pyyaml
+      - name: Wait for previous RL GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup rl
+      - name: Provision storage and profile-sized namespace
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python3 ci/bench/scripts/ci.py setup
+      - name: Verify refitted GPU weights and measure cold-load and refit latency
+        timeout-minutes: 45
+        run: python3 ci/bench/scripts/ci.py run
+      - name: Collect missing run evidence
+        if: ${{ always() && hashFiles('bench-results/report.json') == '' }}
+        run: python3 ci/bench/scripts/ci.py collect
+      - name: Save evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Record tested revision
+        if: always()
+        env:
+          TEST_SHA: ${{ inputs.sha }}
+        run: echo "RL weight refit CI of $TEST_SHA; evidence is attached to this run." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove owned workload before releasing GPU admission
+        if: always()
+        run: python3 ci/bench/scripts/ci.py cleanup

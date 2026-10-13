@@ -48,7 +48,7 @@ import urllib.request
 
 import pytest
 
-from kube_utils import kubectl, port_forward
+from kube_utils import completion_response, kubectl, port_forward
 
 
 def _pod_name(namespace: str, job_name: str, ordinal: int | None = None) -> str:
@@ -193,8 +193,7 @@ def _assert_inference(
         # capture + JIT compile) which can exceed 60s, especially when source
         # and target share a node and contend for GPU scheduling.
         # Subsequent requests are sub-second.
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            body = json.loads(resp.read())
+        body = completion_response(req)
     print(f"[{job_name}] response: {json.dumps(body, indent=2)}")
     choices = body.get("choices", [])
     assert choices, f"No choices in response from {job_name}: {body}"
