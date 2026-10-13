@@ -661,9 +661,9 @@ if __name__ == "__main__":
 
 
 @pytest.mark.parametrize("index", [
-    [0, 2], torch.tensor([0, 2]), (slice(None), [0, 2]), ((0, 2),),
+    torch.tensor([True, False]), [True, False], torch.empty(2, dtype=torch.int64, device="meta"),
 ])
-def test_capture_rejects_advanced_indices(index):
+def test_capture_rejects_data_dependent_indices(index):
     with torch.device("meta"):
         model = ToyModel()
     model.col.weight_loader = lambda param, loaded: param.data.copy_(loaded[index])

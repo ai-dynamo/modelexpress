@@ -41,7 +41,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-from torch.utils._python_dispatch import TorchDispatchMode
 
 from modelexpress.refit.reshard.types import (
     CaptureResult,
@@ -102,6 +101,25 @@ _SUPPORTED_OPS: dict[Callable, str] = {
     torch.Tensor.double: "double",
     torch.Tensor.zero_: "zero_",
 }
+
+
+def _snapshot_index(index):
+    """Own constant indices without changing list-versus-tuple semantics."""
+    if isinstance(index, torch.Tensor):
+        if (
+            isinstance(index, LazyWeight)
+            or index.is_meta
+            or index.dtype not in (torch.int32, torch.int64)
+        ):
+            raise UnsupportedReshard("index tensors must contain concrete integers")
+        return index.detach().to(device="cpu", copy=True)
+    if isinstance(index, (list, tuple)):
+        return type(index)(_snapshot_index(item) for item in index)
+    if isinstance(index, bool) or not isinstance(
+        index, (int, slice, type(Ellipsis), type(None))
+    ):
+        raise UnsupportedReshard("only integer and slice indexing is supported")
+    return index
 
 
 def _freeze_kwargs(kwargs: dict[str, Any]) -> tuple:
@@ -557,11 +575,7 @@ class LazyWeight(torch.Tensor):
     @classmethod
     def _intercept(cls, self_, func, op_name, args, kwargs):
         if op_name == "__getitem__":
-            index = args[0]
-            indices = index if isinstance(index, tuple) else (index,)
-            if any(not isinstance(item, (int, slice, type(Ellipsis), type(None)))
-                   for item in indices):
-                raise UnsupportedReshard("advanced indexing is unsupported")
+            args = (_snapshot_index(args[0]), *args[1:])
         meta = self_._meta()
         device = self_.device
         meta_args, meta_kwargs = args, kwargs
@@ -599,7 +613,11 @@ class LazyWeight(torch.Tensor):
                 == meta.untyped_storage()._cdata
             ):
                 meta_result = meta_result.clone(memory_format=torch.preserve_format)
-        base_op = (op_name, tuple(tuple(arg) if isinstance(arg, list) else arg for arg in args), _freeze_kwargs(kwargs))
+        recorded_args = (
+            args if op_name == "__getitem__"
+            else tuple(tuple(arg) if isinstance(arg, list) else arg for arg in args)
+        )
+        base_op = (op_name, recorded_args, _freeze_kwargs(kwargs))
         if op_name == "zero_":
             if any(ref() is not None and ref() is not self_ for ref in self_._aliases):
                 raise UnsupportedReshard(
@@ -687,37 +705,6 @@ def _restore_stamps(saved: list) -> None:
             param.weight_loader = original
 
 
-class _CaptureMutationGuard(TorchDispatchMode):
-    """Reject writes to live destinations that bypass recorded source copies."""
-
-    def __init__(self, destinations):
-        super().__init__()
-        self.storages = {
-            tensor.untyped_storage()._cdata
-            for _, tensor in destinations
-            if not tensor.is_meta
-        }
-
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        kwargs = kwargs or {}
-        if func._schema.is_mutable:
-            for index, argument in enumerate(func._schema.arguments):
-                if argument.alias_info is None or not argument.alias_info.is_write:
-                    continue
-                value = args[index] if index < len(args) else kwargs.get(argument.name)
-                tensors = value if isinstance(value, (tuple, list)) else (value,)
-                if any(
-                    isinstance(tensor, torch.Tensor)
-                    and not isinstance(tensor, LazyWeight)
-                    and tensor.untyped_storage()._cdata in self.storages
-                    for tensor in tensors
-                ):
-                    raise UnsupportedReshard(
-                        f"live destination mutation {func} cannot be captured safely"
-                    )
-        return func(*args, **kwargs)
-
-
 def build_lazy_weights(
     manifest: list[tuple[str, Any, tuple]],
     *,
@@ -803,7 +790,7 @@ def capture_weights(
         # Large MoE loaders rebuild model-wide parameter/expert maps on entry.
         # LazyWeights carry their own source identity across one bulk invocation.
         try:
-            with _CaptureMutationGuard(recorder.destinations), recorder.attempt():
+            with recorder.attempt():
                 model.load_weights(sorted(weights.items()))
         except UnsupportedReshard as bulk_error:
             # The per-source retry can succeed for every source even when bulk
@@ -817,8 +804,7 @@ def capture_weights(
             for name, tensor in sorted(weights.items()):
                 source = getattr(tensor, "_name", name)
                 try:
-                    with _CaptureMutationGuard(recorder.destinations):
-                        model.load_weights([(name, tensor)])
+                    model.load_weights([(name, tensor)])
                 except UnsupportedReshard as exc:
                     unsupported.append(source)
                     unsupported_reasons[source] = str(exc)
