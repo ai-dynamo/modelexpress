@@ -1716,8 +1716,7 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering serv
 The generator streams captured source writes through reusable receive arenas in
 loader order, including writes that revisit an earlier owner. Each source write
 must fit one arena; preparation rejects oversized writes before connecting sources.
-One installer uses vLLM's reload lifecycle for supported unquantized and quantized
-models. Online FP8 reloads requiring changes to vLLM internals are unsupported.
+One installer uses vLLM's reload lifecycle for all supported unquantized models.
 
 ```mermaid
 flowchart LR
