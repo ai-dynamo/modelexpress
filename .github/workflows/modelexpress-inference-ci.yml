@@ -29,7 +29,7 @@ jobs:
   gpu-cleanup:
     name: GPU cleanup
     needs: [gpu-tests]
-    if: always()
+    if: ${{ always() && needs.gpu-tests.result != 'success' }}
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 30
     permissions:
@@ -351,4 +351,7 @@ jobs:
       - name: All dependent jobs succeeded
         run: |
           echo '${{ toJson(needs) }}' \
-            | jq -e 'to_entries | map(.value.result) | all(. == "success")'
+            | jq -e '. as $needs | to_entries | all(
+                .value.result == "success" or
+                (.key == "gpu-cleanup" and .value.result == "skipped" and $needs["gpu-tests"].result == "success")
+              )'

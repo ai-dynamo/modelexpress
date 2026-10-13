@@ -40,39 +40,13 @@ env:
   RESULTS_DIR: ${{ github.workspace }}/bench-results
 
 jobs:
-  authorize:
-    concurrency:
-      group: bench-pr-${{ github.event.issue.number }}-authorize
-      cancel-in-progress: true
-    name: RL generator-only refit authorization
-    if: >-
-      github.event_name == 'issue_comment' &&
-      github.repository == 'ai-dynamo/modelexpress' &&
-      github.event.issue.pull_request &&
-      (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench '))
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      sha: ${{ steps.gate.outputs.sha }}
-      model: ${{ steps.gate.outputs.model }}
-      scenario: ${{ steps.gate.outputs.scenario }}
-    steps:
-      # issue_comment uses default-branch code. Never check out PR code here.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          persist-credentials: false
-      - name: Validate caller and copy-pr-bot mirror
-        id: gate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 ci/bench/scripts/comment_gate.py
-
   validate:
-    needs: authorize
-    if: ${{ !cancelled() && (github.event_name != 'issue_comment' || needs.authorize.result == 'success') }}
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'issue_comment' ||
+       (github.repository == 'ai-dynamo/modelexpress' &&
+        github.event.issue.pull_request &&
+        (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench '))))
     concurrency:
       group: ${{ github.workflow }}-${{ inputs.pull_request || github.event.issue.number || github.ref_name }}-rl-refit-validate
       cancel-in-progress: true
@@ -96,16 +70,22 @@ jobs:
         with:
           ref: ${{ github.event_name == 'push' && inputs.sha || github.event.repository.default_branch }}
           persist-credentials: false
+      - name: Authorize /bench caller and copy-pr-bot mirror
+        if: ${{ github.event_name == 'issue_comment' }}
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/bench/scripts/comment_gate.py
       - name: Validate immutable source and registered experiment
         id: inputs
         env:
-          TEST_SHA: ${{ inputs.sha || needs.authorize.outputs.sha }}
+          TEST_SHA: ${{ inputs.sha || steps.gate.outputs.sha }}
           MX_CI_RL_GPU_CONCURRENCY: ${{ vars.MX_CI_RL_GPU_CONCURRENCY || '4' }}
           PR_NUMBER: ${{ inputs.pull_request || github.event.issue.number || 0 }}
           GH_TOKEN: ${{ github.token }}
-          MODEL_PROFILE: ${{ inputs.model || needs.authorize.outputs.model }}
-          SCENARIO: ${{ inputs.scenario || needs.authorize.outputs.scenario }}
-          RUNTIME_BASE: ${{ inputs.runtime || fromJSON(vars.MX_BENCH_RUNTIME_BASES || '{}')[needs.authorize.outputs.model] || '' }}
+          MODEL_PROFILE: ${{ inputs.model || steps.gate.outputs.model }}
+          SCENARIO: ${{ inputs.scenario || steps.gate.outputs.scenario }}
+          RUNTIME_BASE: ${{ inputs.runtime || fromJSON(vars.MX_BENCH_RUNTIME_BASES || '{}')[steps.gate.outputs.model] || '' }}
         run: |
           python3 ci/bench/scripts/comment_gate.py --workflow-call
           echo "harness_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -184,10 +164,9 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-${{ inputs.pull_request || github.event.issue.number || github.ref_name }}-rl-refit-test
       cancel-in-progress: true
-    uses: ./.github/workflows/modelexpress-rl-gpu-ci.yml
+    uses: ./.github/workflows/modelexpress-rl-refit-gpu-ci.yml
     secrets: inherit
     with:
-      suite: refit
       gpu_limit: ${{ needs.validate.outputs.gpu_limit }}
       gpu_slot: ${{ needs.validate.outputs.gpu_slot }}
       model: ${{ needs.validate.outputs.model }}
@@ -202,7 +181,7 @@ jobs:
   cleanup:
     name: RL generator-only refit cleanup
     needs: [validate, build, test]
-    if: ${{ always() && needs.build.result == 'success' && needs.test.result != 'skipped' }}
+    if: ${{ always() && needs.build.result == 'success' && needs.test.result != 'skipped' && needs.test.result != 'success' }}
     runs-on: prod-deploy-tester-v1
     timeout-minutes: 15
     env:
@@ -311,10 +290,9 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref_name }}-rl-vime-test
       cancel-in-progress: true
-    uses: ./.github/workflows/modelexpress-rl-gpu-ci.yml
+    uses: ./.github/workflows/modelexpress-rl-vime-gpu-ci.yml
     secrets: inherit
     with:
-      suite: vime
       gpu_limit: ${{ needs.build-vime-delta-refit.outputs.gpu_limit }}
       gpu_slot: ${{ needs.build-vime-delta-refit.outputs.gpu_slot }}
 
@@ -322,7 +300,7 @@ jobs:
     name: RL Vime delta-refit cleanup
     runs-on: prod-deploy-tester-v1
     needs: [test-vime-delta-refit]
-    if: ${{ always() && github.event_name != 'issue_comment' }}
+    if: ${{ always() && github.event_name != 'issue_comment' && needs.test-vime-delta-refit.result != 'success' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -357,4 +335,10 @@ jobs:
           COMMENT_RUN: ${{ github.event_name == 'issue_comment' }}
         run: |
           echo '${{ toJson(needs) }}' \
-            | jq -e --arg comment "$COMMENT_RUN" 'to_entries | map(select($comment != "true" or (.key | contains("vime") | not))) | map(.value.result) | all(. == "success")'
+            | jq -e --arg comment "$COMMENT_RUN" '. as $needs | to_entries
+              | map(select($comment != "true" or (.key | contains("vime") | not)))
+              | all(
+                  .value.result == "success" or
+                  (.key == "cleanup" and .value.result == "skipped" and $needs.test.result == "success") or
+                  (.key == "test-vime-delta-refit-cleanup" and .value.result == "skipped" and $needs["test-vime-delta-refit"].result == "success")
+                )'

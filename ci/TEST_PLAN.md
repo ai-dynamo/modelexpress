@@ -88,12 +88,15 @@ of the existing Vime/Dynamo E2E smoke and does not enforce performance threshold
 both to succeed. Each child checks all of its test and cleanup results.
 Inference owns image builds, ModelStreamer, and the reusable GPU test workflow.
 RL owns Vime and generator-only refit, including their builds and cleanup.
-`modelexpress-rl-gpu-ci.yml` contains their GPU execution. Per-PR caller groups
+`modelexpress-rl-refit-gpu-ci.yml` and `modelexpress-rl-vime-gpu-ci.yml`
+contain one GPU job each, avoiding skipped jobs for the other suite. Per-PR caller groups
 cancel superseded tests while repository-wide child groups retain GPU slots.
-Independent cleanup stays in `modelexpress-rl-ci.yml`, outside those cancellation
-queues.
-The RL workflow also handles `/bench` comments with the existing writer and
-approved-mirror checks; comment runs execute only the selected refit profile.
+Independent fallback cleanup stays outside the cancellation queues. Inference
+and RL skip it when the GPU tests and their inline cleanup succeed; failures and
+cancellations retain fallback cleanup. Status checks accept a skipped fallback
+only when its corresponding tests succeeded.
+The RL validation job also handles `/bench` authorization with the existing
+writer and approved-mirror checks; comment runs execute only the selected refit profile.
 Ordinary comments do not start RL builds, GPU tests, or Vime jobs.
 
 ## CI build caches
