@@ -326,7 +326,7 @@ class TestVllmModelStreamerIterator:
         vllm_config.load_config = load_config
         vllm_config.device_config.device = "cuda"
         vllm_config.parallel_config.tensor_parallel_size = tp_size
-        model_config = SimpleNamespace(revision="main")
+        model_config = SimpleNamespace(model="test/model", revision="main")
         return VllmAdapter(vllm_config, model_config), load_config
 
     def _patch_runai_loader(self, tensors):

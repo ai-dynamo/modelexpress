@@ -70,7 +70,7 @@ spec:
           - secretRef:
               name: hf-token-secret
           env:
-          - name: MODEL_NAME
+          - name: MX_MODEL_NAME_OVERRIDE
             value: ${MODEL_NAME}
           - name: MX_SERVER_ADDRESS
             value: mx-vllm-refit-server:8000

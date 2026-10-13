@@ -16,6 +16,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _VLLM_ATTENTION_SCALE_NAMES: tuple[str, ...] = ("q", "k", "v")
+_DEEPSEEK_V4_ATTENTION_MODULES = (
+    "vllm.models.deepseek_v4.attention",
+    "vllm.models.deepseek_v41.attention",
+)
 
 
 @torch.no_grad()
@@ -33,6 +37,9 @@ def refresh_host_quantization_state(
     invalidate them for vLLM to recompute on the next forward; captured graph
     scalars cannot be updated this way.
     """
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+    from vllm.model_executor.layers.mamba.abstract import MambaBase
+
     model_config = getattr(vllm_config, "model_config", None)
     if allow_warm and not getattr(model_config, "enforce_eager", False):
         raise RuntimeError("Warm vLLM host-scale refresh requires enforce_eager")
@@ -45,7 +52,7 @@ def refresh_host_quantization_state(
     device_names = tuple(
         f"_{scale_name}_scale" for scale_name in _VLLM_ATTENTION_SCALE_NAMES
     )
-    required_names = device_names + float_names + ("_o_scale_float",)
+    required_names = device_names + float_names
     flashinfer_cache_names = ("bmm1_scale", "bmm2_scale", "o_sf_scale")
 
     cache_config = getattr(vllm_config, "cache_config", None)
@@ -61,14 +68,66 @@ def refresh_host_quantization_state(
     refreshed_values = 0
     stale_values = 0
     refreshed_modules = 0
+    packed_attention_modules = 0
     for module_name, module in model.named_modules():
         module_label = module_name or type(module).__name__
         kv_cache_dtype = getattr(module, "kv_cache_dtype", None)
-        if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
+        fp8_cache = isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8")
+        if fp8_cache:
             fp8_expected = True
+
+        deepseek_device_names = (
+            "_flashinfer_fp8_q_scale", "_flashinfer_fp8_kv_scale",
+        )
+        deepseek_host_names = (
+            "_flashinfer_fp8_bmm1_scale", "_flashinfer_fp8_bmm2_scale",
+        )
+        deepseek_names = deepseek_device_names + deepseek_host_names
+        if any(hasattr(module, name) for name in deepseek_names):
+            missing_names = [
+                name for name in deepseek_names + ("scale",)
+                if not hasattr(module, name)
+            ]
+            if missing_names:
+                raise RuntimeError(
+                    "Incomplete DeepSeek FlashInfer scale contract on "
+                    f"{module_label}: missing {', '.join(missing_names)}"
+                )
+            q_scale, kv_scale = (
+                _scale_value(
+                    getattr(module, name), accelerator_backend,
+                    f"{module_label}.{name}", singleton=True,
+                )
+                for name in deepseek_device_names
+            )
+            # These scalars are initialized in the constructor, unlike the
+            # generic FlashInfer caches populated by the first forward.
+            values = (module.scale * q_scale * kv_scale, kv_scale)
+            for name, value in zip(deepseek_host_names, values, strict=True):
+                stale_values += getattr(module, name) != value
+                setattr(module, name, value)
+            refreshed_values += len(values)
+            refreshed_modules += 1
+            continue
 
         host_names = float_names + cpu_names
         if not any(hasattr(module, name) for name in host_names):
+            # V4/V4.1 FlashMLA embeds per-block scales in the packed KV record.
+            if kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla") and any(
+                cls.__name__ == "DeepseekV4Attention"
+                and cls.__module__ in _DEEPSEEK_V4_ATTENTION_MODULES
+                for cls in type(module).__mro__
+            ):
+                packed_attention_modules += 1
+            elif (
+                fp8_cache
+                and isinstance(module, AttentionLayerBase)
+                and not isinstance(module, MambaBase)
+            ):
+                raise RuntimeError(
+                    "Unrecognized FP8 vLLM attention scale contract on "
+                    f"{module_label}: {type(module).__name__}"
+                )
             continue
 
         missing_names = [
@@ -104,7 +163,7 @@ def refresh_host_quantization_state(
 
         impl = getattr(module, "impl", None)
         initialized_cache_names = []
-        if module._o_scale_float is not None:
+        if getattr(module, "_o_scale_float", None) is not None:
             initialized_cache_names.append("_o_scale_float")
         initialized_cache_names.extend(
             cache_name
@@ -121,29 +180,10 @@ def refresh_host_quantization_state(
         for scale_name, tensor_name in zip(
             _VLLM_ATTENTION_SCALE_NAMES, device_names, strict=True
         ):
-            scale = getattr(module, tensor_name)
-            if (
-                not isinstance(scale, torch.Tensor)
-                or not accelerator_backend.is_accel_tensor(scale)
-                or scale.numel() == 0
-                or not torch.is_floating_point(scale)
-            ):
-                raise RuntimeError(
-                    "Invalid vLLM accelerator attention scale on "
-                    f"{module_label}: {tensor_name} must be a nonempty "
-                    "floating-point accelerator tensor"
-                )
-
-            scale_float = scale.detach().float()
-            if not bool(torch.isfinite(scale_float).all().item()) or not bool(
-                (scale_float > 0).all().item()
-            ):
-                raise RuntimeError(
-                    "Invalid vLLM accelerator attention scale on "
-                    f"{module_label}: {tensor_name} must contain only finite, "
-                    "positive values"
-                )
-            value = float(scale_float.max().item())
+            value = _scale_value(
+                getattr(module, tensor_name), accelerator_backend,
+                f"{module_label}.{tensor_name}",
+            )
             float_name = f"_{scale_name}_scale_float"
             previous = getattr(module, float_name)
             if previous != value:
@@ -165,13 +205,18 @@ def refresh_host_quantization_state(
         if allow_warm:
             # vLLM lazily rebuilds these from q/k/v and the next output_scale.
             # Reset them together so output quantization is applied exactly once.
-            module._o_scale_float = None
+            if hasattr(module, "_o_scale_float"):
+                module._o_scale_float = None
             for cache_name in flashinfer_cache_names:
                 if hasattr(impl, cache_name):
                     setattr(impl, cache_name, None)
         refreshed_modules += 1
 
-    if fp8_expected and not refreshed_modules:
+    # TODO: distinguish hybrid PP stages with only state-space layers via this
+    # model's rank-local MambaBase/AttentionLayerBase owners (MambaSpec versus
+    # AttentionSpec once cache sizing is initialized). A global FP8 cache dtype
+    # does not imply host scales on every rank; keep unknown attention guarded.
+    if fp8_expected and not (refreshed_modules or packed_attention_modules):
         raise RuntimeError(
             "FP8 KV cache requires recognizable vLLM q/k/v host scale state, "
             "but no attention module was refreshed"
@@ -185,3 +230,34 @@ def refresh_host_quantization_state(
             refreshed_modules,
             stale_values,
         )
+
+
+def _scale_value(
+    scale: torch.Tensor,
+    accelerator_backend: AcceleratorBackend,
+    label: str,
+    *,
+    singleton: bool = False,
+) -> float:
+    if (
+        not isinstance(scale, torch.Tensor)
+        or not accelerator_backend.is_accel_tensor(scale)
+        or not torch.is_floating_point(scale)
+        or scale.numel() == 0
+        or (singleton and scale.numel() != 1)
+    ):
+        shape = "singleton" if singleton else "nonempty"
+        raise RuntimeError(
+            f"Invalid vLLM accelerator attention scale on {label}: "
+            f"must be a {shape} floating-point accelerator tensor"
+        )
+
+    value = scale.detach().float()
+    if not bool(torch.isfinite(value).all().item()) or not bool(
+        (value > 0).all().item()
+    ):
+        raise RuntimeError(
+            f"Invalid vLLM accelerator attention scale on {label}: "
+            "must contain only finite, positive values"
+        )
+    return float(value.max().item())
