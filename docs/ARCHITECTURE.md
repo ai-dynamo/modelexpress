@@ -691,8 +691,8 @@ full-copy descriptors before entering bounded preparation. Preparation retries
 retain one version lease and discard failed setup state; installation failures
 still fence the engine rather than retrying a partially committed update.
 
-Streaming is opt-in, trainer-only, and currently limited to unquantized vLLM
-models. It does not publish generator peers or roll back partially installed
+Streaming is opt-in and trainer-only for supported vLLM models, including
+quantized models. It does not publish generator peers or roll back partially installed
 versions. An installation failure marks the client engine state uncertain and
 makes the failed handle unusable for another installation. A subsequent
 `stage_weight()` releases the failed transaction after proven cleanup, acquires
@@ -1808,7 +1808,8 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering serv
 The generator streams complete owning-module groups through reusable receive
 arenas. The transport planner derives those groups from captured loader geometry;
 applications do not select individual layers or depend on model-specific names.
-One installer uses vLLM's reload lifecycle for all supported unquantized models.
+Quantized MoE graphs captured between refits can retain stale scale references;
+use eager execution or startup-captured graphs.
 
 ```mermaid
 flowchart LR
@@ -1927,8 +1928,8 @@ failure chained as its cause. Partial installation has no rollback.
 
 The adapter depends on vLLM's layerwise reload helpers. Runtime compatibility must
 be qualified with changing weights, shared parameters, graph-bound addresses,
-post-load state and failure cleanup. Quantized bounded installation remains
-unsupported. The same generic path is used for small-model validation and GLM;
+post-load state and failure cleanup. The same generic path is used for
+small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
 
 
