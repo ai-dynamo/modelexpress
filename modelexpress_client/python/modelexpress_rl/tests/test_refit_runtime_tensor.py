@@ -5,12 +5,12 @@ import pytest
 import torch
 from modelexpress import p2p_pb2
 
-from modelexpress_rl import WeightPayloadFormat
-from modelexpress_rl.inference.methods import (
+from modelexpress.rl import WeightPayloadFormat
+from modelexpress.rl.inference.methods import (
     LoadTimeTensorNixlUpdateMethod,
     RuntimeTensorNixlUpdateMethod,
 )
-from modelexpress_rl.inference.plan import (
+from modelexpress.rl.inference.plan import (
     GeneratorPeerUpdateSource,
     PreparedRuntimeTensors,
     TrainerSourceSnapshot,
@@ -231,7 +231,7 @@ def test_load_time_method_rejects_missing_transfer():
 
 @pytest.mark.parametrize("capture_layout", [None, object(), False])
 def test_staged_transfer_rejects_invalid_capture_layout(capture_layout):
-    from modelexpress_rl.inference.nixl_staged_transfer import _NixlStagedTransfer
+    from modelexpress.rl.inference.nixl_staged_transfer import _NixlStagedTransfer
 
     with pytest.raises(TypeError, match="capture_layout must be callable"):
         _NixlStagedTransfer(
@@ -244,7 +244,7 @@ def test_staged_transfer_rejects_invalid_capture_layout(capture_layout):
 
 
 def test_staged_transfer_requires_capture_layout():
-    from modelexpress_rl.inference.nixl_staged_transfer import _NixlStagedTransfer
+    from modelexpress.rl.inference.nixl_staged_transfer import _NixlStagedTransfer
 
     with pytest.raises(TypeError, match="capture_layout"):
         _NixlStagedTransfer(

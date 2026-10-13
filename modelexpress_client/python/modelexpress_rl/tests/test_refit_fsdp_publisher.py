@@ -6,8 +6,8 @@ import json
 import pytest
 import torch
 
-from modelexpress_rl.refit.reshard.rendezvous import unwrap_rendezvous_blob
-from modelexpress_rl.train.engines.fsdp.publisher import (
+from modelexpress.rl.refit.reshard.rendezvous import unwrap_rendezvous_blob
+from modelexpress.rl.train.engines.fsdp.publisher import (
     LocalTensorShard,
     build_fsdp_reshard_manifest,
     capture_local_shards,

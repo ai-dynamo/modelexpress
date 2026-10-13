@@ -12,28 +12,28 @@ import hashlib
 
 import pytest
 import torch
-import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
+import modelexpress.rl.inference.nixl_staged_transfer as transfer_module
 
-from modelexpress_rl.tests.test_refit_bounded_descriptors import harness
-from modelexpress_rl.refit.reshard.rendezvous import (
+from modelexpress.rl.tests.test_refit_bounded_descriptors import harness
+from modelexpress.rl.refit.reshard.rendezvous import (
     PublishedShard, PublishedTensor, structural_manifest_digest, wrap_rendezvous_blob,
 )
-from modelexpress_rl.train import WeightPayloadFormat
-from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
+from modelexpress.rl.train import WeightPayloadFormat
+from modelexpress.rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 
 try:
-    from modelexpress_rl.inference.adapter import TrainerSourceShard
-    from modelexpress_rl.inference.plan import ResolvedTrainerSource, TrainerSourceSnapshot
+    from modelexpress.rl.inference.adapter import TrainerSourceShard
+    from modelexpress.rl.inference.plan import ResolvedTrainerSource, TrainerSourceSnapshot
 except ImportError:
     TrainerSourceShard = None
     ResolvedTrainerSource = None
     TrainerSourceSnapshot = None
 
 if TrainerSourceSnapshot is None:
-    from modelexpress_rl.inference.adapter import (
+    from modelexpress.rl.inference.adapter import (
         GeneratorSource, GeneratorTransferInputs, NixlGeneratorSource,
     )
-    from modelexpress_rl.inference.plan import TrainerUpdateSource
+    from modelexpress.rl.inference.plan import TrainerUpdateSource
 
 
 def _initialize_replicas(harness):

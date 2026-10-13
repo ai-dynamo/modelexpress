@@ -10,21 +10,21 @@ import torch
 from modelexpress.engines.vllm.host_quantization import (
     refresh_host_quantization_state,
 )
-from modelexpress_rl.inference.engines.vllm.installer import (
+from modelexpress.rl.inference.engines.vllm.installer import (
     _copy_received,
     _standard_module_access,
     _standard_parameter_writes,
     _VllmInstaller,
 )
-from modelexpress_rl.inference.plan import (
+from modelexpress.rl.inference.plan import (
     PreparedCheckpointArtifact,
     PreparedEngineTensors,
     PreparedRuntimeTensors,
     PreparedStreamingTensors,
 )
-from modelexpress_rl.inference.receiver import PreparedCheckpoint
-from modelexpress_rl.refit.reshard.types import IncompleteRefit
-from modelexpress_rl.refit.timing import RefitTimingRecorder, use_refit_timing
+from modelexpress.rl.inference.receiver import PreparedCheckpoint
+from modelexpress.rl.refit.reshard.types import IncompleteRefit
+from modelexpress.rl.refit.timing import RefitTimingRecorder, use_refit_timing
 from torch import nn
 
 
@@ -400,7 +400,7 @@ def test_installer_rejects_a_runtime_staging_copy():
 def warm_runtime_install(monkeypatch, mock_accelerator_backend_cls):
     backend = mock_accelerator_backend_cls(torch_device_type="cpu")
     monkeypatch.setattr(
-        "modelexpress_rl.inference.engines.vllm.installer.accelerator_backend_for",
+        "modelexpress.rl.inference.engines.vllm.installer.accelerator_backend_for",
         lambda _device: backend,
     )
     model = nn.Module()
@@ -2183,10 +2183,10 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
     """
     import ctypes
 
-    import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
-    from modelexpress_rl.refit.reshard.slice_plan import Shard
-    from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo
-    from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
+    import modelexpress.rl.inference.nixl_staged_transfer as transfer_module
+    from modelexpress.rl.refit.reshard.slice_plan import Shard
+    from modelexpress.rl.refit.reshard.transfer_plan import SourceInfo
+    from modelexpress.rl.refit.reshard.types import CaptureResult, RecordedCopy
 
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
@@ -2244,7 +2244,7 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
     transfer._staging_arenas = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
-    from modelexpress_rl.tests.test_refit_nixl_staged_transfer import _bind_test_execution
+    from modelexpress.rl.tests.test_refit_nixl_staged_transfer import _bind_test_execution
     _bind_test_execution(transfer, prepared)
 
     class Owner(nn.Module):
@@ -2758,7 +2758,7 @@ def test_streaming_preserves_destructor_boundaries(monkeypatch, owner_kind):
 def test_custom_metaclass_ties_use_owner_views(
     monkeypatch, bounded, source_replay
 ):
-    from modelexpress_rl.tests.test_refit_ordered_installer import _transfer_and_install
+    from modelexpress.rl.tests.test_refit_ordered_installer import _transfer_and_install
 
     class Meta(type):
         pass

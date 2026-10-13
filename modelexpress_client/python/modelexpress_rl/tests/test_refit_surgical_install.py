@@ -9,14 +9,14 @@ from typing import ClassVar
 
 import pytest
 import torch
-from modelexpress_rl.inference.engines.vllm.installer import _VllmInstaller
-from modelexpress_rl.inference.plan import (
+from modelexpress.rl.inference.engines.vllm.installer import _VllmInstaller
+from modelexpress.rl.inference.plan import (
     PreparedCheckpointArtifact,
     PreparedEngineTensors,
     PreparedRuntimeTensors,
     PreparedStreamingTensors,
 )
-from modelexpress_rl.inference.receiver import DeltaChange, PreparedCheckpoint
+from modelexpress.rl.inference.receiver import DeltaChange, PreparedCheckpoint
 from safetensors.torch import save_file
 from torch import nn
 

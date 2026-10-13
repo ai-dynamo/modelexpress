@@ -6,9 +6,9 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-from modelexpress_rl.inference.engines.vllm import installer as module
+from modelexpress.rl.inference.engines.vllm import installer as module
 from torch import nn
-from modelexpress_rl.tests.test_refit_vllm_installer import _install_fake_vllm
+from modelexpress.rl.tests.test_refit_vllm_installer import _install_fake_vllm
 
 
 @pytest.fixture(params=[False, True], ids=["unquantized", "quantized"])
@@ -214,8 +214,8 @@ def test_float_buffer_generation_compatibility(capture_installer, change):
 
 
 def test_float_buffer_rebinding_rebuilds_overlap_schedule(monkeypatch):
-    from modelexpress_rl.tests.test_refit_combined_replay import _fixture
-    from modelexpress_rl.tests.test_refit_ordered_installer import _transfer_and_install
+    from modelexpress.rl.tests.test_refit_combined_replay import _fixture
+    from modelexpress.rl.tests.test_refit_ordered_installer import _transfer_and_install
 
     model, installer, source, manifest = _fixture(monkeypatch)
     previous, _ = installer.capture(manifest)

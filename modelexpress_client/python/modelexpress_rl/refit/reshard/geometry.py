@@ -42,7 +42,7 @@ from typing import Any
 
 import torch
 
-from modelexpress_rl.refit.reshard.types import (
+from modelexpress.rl.refit.reshard.types import (
     CaptureResult,
     OpChain,
     OpSpec,
@@ -129,7 +129,7 @@ def _freeze_kwargs(kwargs: dict[str, Any]) -> tuple:
 
 def _canonical_destination(tensor, owner):
     """Express a physical destination view in contiguous owner coordinates."""
-    from modelexpress_rl.refit.reshard.slice_plan import _row_major_strides
+    from modelexpress.rl.refit.reshard.slice_plan import _row_major_strides
 
     offset = tensor.storage_offset() - owner.storage_offset()
     span = 1

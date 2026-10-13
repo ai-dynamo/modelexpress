@@ -206,7 +206,7 @@ below bound queued chunks, not the final object size.
 | `modelexpress.types` | `TensorDescriptor`, `WorkerMetadata` -- core data types |
 | `modelexpress.vllm_worker` | Compatibility worker extension for older manual-registration workflows |
 
-The optional RL APIs are installed with this distribution under the `modelexpress_rl` namespace. See the [RL package guide](../../docs/rl/README.md).
+The optional RL APIs are installed with this distribution under the `modelexpress.rl` namespace. See the [RL package guide](../../docs/rl/README.md).
 
 ## How It Works
 

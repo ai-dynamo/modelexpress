@@ -7,8 +7,8 @@ import pytest
 import torch
 from torch import nn
 
-from modelexpress_rl.refit.reshard.types import IncompleteRefit
-from modelexpress_rl.tests.test_refit_ordered_installer import (
+from modelexpress.rl.refit.reshard.types import IncompleteRefit
+from modelexpress.rl.tests.test_refit_ordered_installer import (
     _persistent_installer,
     _transfer_and_install,
 )

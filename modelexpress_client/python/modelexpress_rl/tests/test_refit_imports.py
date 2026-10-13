@@ -17,7 +17,7 @@ def import_without_zstandard(name, *args, **kwargs):
     return original_import(name, *args, **kwargs)
 
 builtins.__import__ = import_without_zstandard
-import modelexpress_rl
+import modelexpress.rl
 """
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -32,11 +32,11 @@ import modelexpress_rl
 def test_package_import_does_not_load_optional_engine_implementations():
     code = """
 import sys
-import modelexpress_rl
+import modelexpress.rl
 
 assert "modelexpress.engines.vllm.adapter" not in sys.modules
-assert "modelexpress_rl.inference.engines.vllm.installer" not in sys.modules
-assert "modelexpress_rl.inference.engines.sglang.installer" not in sys.modules
+assert "modelexpress.rl.inference.engines.vllm.installer" not in sys.modules
+assert "modelexpress.rl.inference.engines.sglang.installer" not in sys.modules
 """
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -60,8 +60,8 @@ def import_without_optional_dependencies(name, globals=None, locals=None, fromli
     return original_import(name, globals, locals, fromlist, level)
 
 builtins.__import__ = import_without_optional_dependencies
-from modelexpress_rl.s3 import S3Client
-from modelexpress_rl.azure import AzureBlobReader
+from modelexpress.rl.s3 import S3Client
+from modelexpress.rl.azure import AzureBlobReader
 
 try:
     AzureBlobReader()

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from modelexpress_rl.refit.reshard.transport import (
+from modelexpress.rl.refit.reshard.transport import (
     NixlReshardTransport,
     ReadDescriptor,
 )

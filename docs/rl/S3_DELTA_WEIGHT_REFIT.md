@@ -69,7 +69,7 @@ clients. The current API requires a syntactically valid object-storage URI, but
 this local seed-checkpoint flow does not upload or read an object at that URI.
 
 ```python
-from modelexpress_rl import (
+from modelexpress.rl import (
     ModelExpressControlClient,
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
@@ -151,7 +151,7 @@ Install the `modelexpress` Python package in the same environment used to run
 
 ```toml
 [project.entry-points."vllm.general_plugins"]
-modelexpress_rl = "modelexpress_rl.inference.engines.vllm.registration:register"
+modelexpress_rl = "modelexpress.rl.inference.engines.vllm.registration:register"
 ```
 
 `VLLM_PLUGINS=modelexpress_rl` selects that installed plugin. Then start vLLM:
@@ -533,7 +533,7 @@ READY. The S3 URI is the exact index URI, not a directory prefix.
 ```python
 import torch.distributed as dist
 
-from modelexpress_rl import (
+from modelexpress.rl import (
     ModelExpressControlClient,
     ObjectStorageSource,
     ObjectStorageType,

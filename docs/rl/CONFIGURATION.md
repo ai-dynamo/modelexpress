@@ -5,11 +5,11 @@ SPDX-License-Identifier: Apache-2.0
 
 # RL configuration reference
 
-This page covers settings registered by the optional RL package. Shared ModelExpress client settings remain in [base configuration](../CONFIGURATION.md); S3 transfer settings shared with normal client operations remain in the [Python client README](../../modelexpress_client/python/README.md#canonical-s3-transfer-tuning). RL variables are read by `modelexpress_rl` APIs and registered in the source package `modelexpress_rl/envs.py`.
+This page covers settings registered by the optional RL package. Shared ModelExpress client settings remain in [base configuration](../CONFIGURATION.md); S3 transfer settings shared with normal client operations remain in the [Python client README](../../modelexpress_client/python/README.md#canonical-s3-transfer-tuning). RL variables are read by `modelexpress.rl` APIs and registered in the source package `modelexpress_rl/envs.py`.
 
 ## RL environment settings
 
-RL-specific settings are registered in `modelexpress_rl/envs.py` and imported through the installed `modelexpress_rl` namespace. See [base configuration](../CONFIGURATION.md) for shared settings.
+RL-specific settings are registered in `modelexpress_rl/envs.py` and imported through the installed `modelexpress.rl` namespace. See [base configuration](../CONFIGURATION.md) for shared settings.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -67,7 +67,7 @@ state-dict names through the trainer context:
 
 ```python
 import torch
-from modelexpress_rl import FSDPTrainerContext, ModelExpressTrainerConfig
+from modelexpress.rl import FSDPTrainerContext, ModelExpressTrainerConfig
 
 config = ModelExpressTrainerConfig(
     engine_context=FSDPTrainerContext(

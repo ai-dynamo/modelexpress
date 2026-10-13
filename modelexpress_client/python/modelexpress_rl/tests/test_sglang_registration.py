@@ -14,11 +14,11 @@ from modelexpress.tests.test_sglang_loader import (
     _load_config,
     _model_config,
 )
-from modelexpress_rl.inference.engines.sglang.loader import RLMxModelLoader
+from modelexpress.rl.inference.engines.sglang.loader import RLMxModelLoader
 
 
 def test_register_replaces_base_loader_only_for_rl(monkeypatch):
-    from modelexpress_rl.inference.engines.sglang import registration
+    from modelexpress.rl.inference.engines.sglang import registration
 
     calls = []
     for name in ("sglang", "sglang.srt", "sglang.srt.plugins"):

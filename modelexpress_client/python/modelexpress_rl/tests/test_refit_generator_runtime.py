@@ -5,14 +5,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import modelexpress_rl.inference.engines as engines_module
-import modelexpress_rl.inference.runtime as runtime_module
+import modelexpress.rl.inference.engines as engines_module
+import modelexpress.rl.inference.runtime as runtime_module
 import pytest
 import torch
 from modelexpress import p2p_pb2
-from modelexpress_rl import ObjectStorageType, WeightPayloadFormat, WeightSource
-from modelexpress_rl.inference.adapter import GeneratorEngineContext
-from modelexpress_rl.inference.plan import (
+from modelexpress.rl import ObjectStorageType, WeightPayloadFormat, WeightSource
+from modelexpress.rl.inference.adapter import GeneratorEngineContext
+from modelexpress.rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
     MethodCapabilities,
@@ -21,13 +21,13 @@ from modelexpress_rl.inference.plan import (
     StreamingSettings,
     UpdateMethod,
 )
-from modelexpress_rl.inference.receiver import ObjectStorageGeneratorConfig
-from modelexpress_rl.inference.runtime import (
+from modelexpress.rl.inference.receiver import ObjectStorageGeneratorConfig
+from modelexpress.rl.inference.runtime import (
     EngineRuntime,
     FullTensorEngineCapability,
     initialize_generator_runtime,
 )
-from modelexpress_rl.inference.version_chain import resolve_replay_chain
+from modelexpress.rl.inference.version_chain import resolve_replay_chain
 
 
 class _Installer(EngineInstaller):
@@ -486,9 +486,9 @@ def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
 ):
     from types import SimpleNamespace
 
-    from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
-    from modelexpress_rl.inference.plan import PreparedStreamingTensors
-    from modelexpress_rl.inference.runtime import GeneratorRuntime
+    from modelexpress.rl.inference.methods import LoadTimeTensorNixlUpdateMethod
+    from modelexpress.rl.inference.plan import PreparedStreamingTensors
+    from modelexpress.rl.inference.runtime import GeneratorRuntime
 
     arena = torch.ones(2)
     closed = []

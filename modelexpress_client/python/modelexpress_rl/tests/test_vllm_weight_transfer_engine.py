@@ -8,10 +8,10 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from modelexpress_rl import ObjectStorageType
-from modelexpress_rl.inference.plan import WeightSource
-from modelexpress_rl.inference.engines.vllm import weight_transfer_engine
-from modelexpress_rl.inference.engines.vllm.weight_transfer_engine import (
+from modelexpress.rl import ObjectStorageType
+from modelexpress.rl.inference.plan import WeightSource
+from modelexpress.rl.inference.engines.vllm import weight_transfer_engine
+from modelexpress.rl.inference.engines.vllm.weight_transfer_engine import (
     ModelExpressWeightTransferEngine,
 )
 
@@ -19,7 +19,7 @@ from modelexpress_rl.inference.engines.vllm.weight_transfer_engine import (
 def _engine(monkeypatch, client=None, *, initialize=True):
     client = client or MagicMock()
     monkeypatch.setattr(
-        "modelexpress_rl.inference.engines.vllm.weight_transfer_engine."
+        "modelexpress.rl.inference.engines.vllm.weight_transfer_engine."
         "ModelExpressGeneratorClient.initialize",
         lambda config: client,
     )
@@ -57,7 +57,7 @@ def test_weight_transfer_engine_initializes_client_in_init_hook(
     client = MagicMock()
     initialize = MagicMock(return_value=client)
     monkeypatch.setattr(
-        "modelexpress_rl.inference.engines.vllm.weight_transfer_engine."
+        "modelexpress.rl.inference.engines.vllm.weight_transfer_engine."
         "ModelExpressGeneratorClient.initialize",
         initialize,
     )
@@ -413,7 +413,7 @@ def test_weight_transfer_engine_rejects_invalid_version_id(version_id):
 def test_vllm_plugin_registers_weight_transfer_engine(monkeypatch):
     from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
 
-    from modelexpress_rl.inference.engines.vllm import registration
+    from modelexpress.rl.inference.engines.vllm import registration
 
     calls = []
     monkeypatch.setattr(WeightTransferEngineFactory, "_registry", {})
@@ -430,7 +430,7 @@ def test_vllm_plugin_registers_weight_transfer_engine(monkeypatch):
     assert calls == [
         (
             "modelexpress",
-            "modelexpress_rl.inference.engines.vllm.weight_transfer_engine",
+            "modelexpress.rl.inference.engines.vllm.weight_transfer_engine",
             "ModelExpressWeightTransferEngine",
         )
     ]

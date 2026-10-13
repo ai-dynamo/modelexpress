@@ -4,10 +4,10 @@
 import pytest
 import torch
 
-from modelexpress_rl.refit.reshard.rendezvous import build_sources, merge_shard_tables
-from modelexpress_rl.refit.reshard.transfer_plan import plan_transfer
-from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
-from modelexpress_rl.train.engines.megatron import (
+from modelexpress.rl.refit.reshard.rendezvous import build_sources, merge_shard_tables
+from modelexpress.rl.refit.reshard.transfer_plan import plan_transfer
+from modelexpress.rl.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress.rl.train.engines.megatron import (
     MegatronTensorSpec,
     build_hf_aliases,
 )

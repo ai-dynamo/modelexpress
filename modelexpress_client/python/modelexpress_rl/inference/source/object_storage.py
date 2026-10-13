@@ -15,7 +15,7 @@ from ..plan import (
     WeightSource,
 )
 
-logger = logging.getLogger("modelexpress_rl.inference.source.object_storage")
+logger = logging.getLogger("modelexpress.rl.inference.source.object_storage")
 
 
 class ObjectStorageSourceResolver(SourceResolver):

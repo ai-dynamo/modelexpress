@@ -9,25 +9,25 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 import torch
-from modelexpress_rl.refit.reshard.rendezvous import (
+from modelexpress.rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     unwrap_rendezvous_blob,
     wrap_rendezvous_blob,
 )
-from modelexpress_rl.refit.reshard.slice_plan import Shard
-from modelexpress_rl.refit.reshard.transfer_plan import (
+from modelexpress.rl.refit.reshard.slice_plan import Shard
+from modelexpress.rl.refit.reshard.transfer_plan import (
     ConvertSource,
     SourceInfo,
     LogicalTransferPlan,
     plan_transfer,
 )
-from modelexpress_rl.refit.reshard.types import (
+from modelexpress.rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     RecordedCopy,
 )
-from modelexpress_rl.inference.nixl_staged_transfer import (
+from modelexpress.rl.inference.nixl_staged_transfer import (
     _bounded_batches,
     _NixlStagedTransfer,
     _PreparedNixlTransfer,
@@ -38,10 +38,10 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _WeightUpdatePlan,
 )
 
-from modelexpress_rl.inference.adapter import TrainerSourceShard
-from modelexpress_rl.inference.plan import TrainerSourceSnapshot
+from modelexpress.rl.inference.adapter import TrainerSourceShard
+from modelexpress.rl.inference.plan import TrainerSourceSnapshot
 
-from modelexpress_rl.tests.test_refit_bounded_descriptors import harness, _check_values
+from modelexpress.rl.tests.test_refit_bounded_descriptors import harness, _check_values
 
 
 def _manifest(

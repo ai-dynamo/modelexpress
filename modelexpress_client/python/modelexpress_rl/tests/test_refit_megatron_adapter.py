@@ -10,9 +10,9 @@ from types import SimpleNamespace
 import grpc
 import pytest
 
-import modelexpress_rl.train.runtime as runtime_module
-from modelexpress_rl.refit.reshard.rendezvous import unwrap_rendezvous_blob
-from modelexpress_rl import (
+import modelexpress.rl.train.runtime as runtime_module
+from modelexpress.rl.refit.reshard.rendezvous import unwrap_rendezvous_blob
+from modelexpress.rl import (
     MegatronTrainerContext,
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
@@ -22,13 +22,13 @@ from modelexpress_rl import (
     refit_pb2,
     refit_pb2_grpc,
 )
-from modelexpress_rl.train.adapter import TrainerEngineAdapter
-from modelexpress_rl.train.manifest import bound_tensor_manifest
-from modelexpress_rl.train.engines.megatron import (
+from modelexpress.rl.train.adapter import TrainerEngineAdapter
+from modelexpress.rl.train.manifest import bound_tensor_manifest
+from modelexpress.rl.train.engines.megatron import (
     MegatronTensorSpec,
     MegatronTrainerAdapter,
 )
-from modelexpress_rl.train.manifest import RefitWorkerService
+from modelexpress.rl.train.manifest import RefitWorkerService
 
 
 class _Tensor:
@@ -89,7 +89,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
 
 def test_megatron_adapter_requires_initialized_distributed_engine(monkeypatch):
     monkeypatch.setattr(
-        "modelexpress_rl.train.engines.megatron.adapter.dist.is_initialized",
+        "modelexpress.rl.train.engines.megatron.adapter.dist.is_initialized",
         lambda: False,
     )
 
@@ -102,11 +102,11 @@ def test_megatron_adapter_requires_initialized_distributed_engine(monkeypatch):
 
 def test_megatron_source_slot_groups_replicas_by_logical_partition(monkeypatch):
     monkeypatch.setattr(
-        "modelexpress_rl.train.engines.megatron.adapter.dist.is_initialized",
+        "modelexpress.rl.train.engines.megatron.adapter.dist.is_initialized",
         lambda: True,
     )
     monkeypatch.setattr(
-        "modelexpress_rl.train.engines.megatron.adapter.dist.get_rank",
+        "modelexpress.rl.train.engines.megatron.adapter.dist.get_rank",
         lambda: 3,
     )
     tensors = [
@@ -145,15 +145,15 @@ def test_megatron_source_slot_groups_replicas_by_logical_partition(monkeypatch):
 
 def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     monkeypatch.setattr(
-        "modelexpress_rl.train.engines.megatron.aliases.published_digest",
+        "modelexpress.rl.train.engines.megatron.aliases.published_digest",
         lambda _tensor: "tensor-digest",
     )
     monkeypatch.setattr(
-        "modelexpress_rl.train.engines.megatron.adapter.dist.is_initialized",
+        "modelexpress.rl.train.engines.megatron.adapter.dist.is_initialized",
         lambda: True,
     )
     monkeypatch.setattr(
-        "modelexpress_rl.train.engines.megatron.adapter.dist.get_rank",
+        "modelexpress.rl.train.engines.megatron.adapter.dist.get_rank",
         lambda: 3,
     )
     monkeypatch.setenv("MX_WORKER_HOST", "10.0.0.3")
@@ -279,7 +279,7 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
 
 
 def test_megatron_aliases_are_reused_without_content_verification(monkeypatch):
-    import modelexpress_rl.train.engines.megatron.adapter as adapter_module
+    import modelexpress.rl.train.engines.megatron.adapter as adapter_module
 
     monkeypatch.setattr(adapter_module.dist, "is_initialized", lambda: True)
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")

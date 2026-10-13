@@ -7,10 +7,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from modelexpress_rl.refit.reshard.types import IncompleteRefit
-from modelexpress_rl.inference.engines.vllm.installer import _VllmInstaller
-from modelexpress_rl.inference.plan import PreparedStreamingTensors, SourceReplayBatch
-from modelexpress_rl.tests.test_refit_vllm_installer import _install_fake_vllm
+from modelexpress.rl.refit.reshard.types import IncompleteRefit
+from modelexpress.rl.inference.engines.vllm.installer import _VllmInstaller
+from modelexpress.rl.inference.plan import PreparedStreamingTensors, SourceReplayBatch
+from modelexpress.rl.tests.test_refit_vllm_installer import _install_fake_vllm
 
 
 def _transfer_and_install(installer, sources, captured, layout, bounded):
@@ -121,7 +121,7 @@ def test_persistent_only_owner_skips_materialization(monkeypatch, registry):
 
 @pytest.mark.parametrize("streaming", [False, True])
 def test_replaced_pending_slot_fails_before_its_copy(monkeypatch, streaming):
-    from modelexpress_rl.refit.reshard.types import IncompleteRefit
+    from modelexpress.rl.refit.reshard.types import IncompleteRefit
 
     _install_fake_vllm(monkeypatch, lambda model: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
@@ -163,7 +163,7 @@ def _persistent_installer(monkeypatch, model, *, quantized=False):
     from contextlib import nullcontext
     from types import ModuleType
 
-    import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
+    import modelexpress.rl.inference.nixl_staged_transfer as transfer_module
 
     _install_fake_vllm(monkeypatch, lambda model: None)
     layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]

@@ -10,13 +10,13 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import grpc
-import modelexpress_rl.inference.client as client_module
+import modelexpress.rl.inference.client as client_module
 import pytest
 from modelexpress import p2p_pb2, p2p_pb2_grpc
 from modelexpress.adapter import StrategyRecoveryError
 from modelexpress.client import MxClient
 from modelexpress.types import ManifestMismatchError
-from modelexpress_rl import (
+from modelexpress.rl import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
     ObjectStorageGeneratorConfig,
@@ -29,8 +29,8 @@ from modelexpress_rl import (
     refit_pb2,
     refit_pb2_grpc,
 )
-from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
-from modelexpress_rl.inference.plan import (
+from modelexpress.rl.inference.methods import LoadTimeTensorNixlUpdateMethod
+from modelexpress.rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
     GeneratorPeerUpdateSource,
@@ -44,13 +44,13 @@ from modelexpress_rl.inference.plan import (
     UpdateMethod,
     WeightUpdatePlanner,
 )
-from modelexpress_rl.inference.runtime import (
+from modelexpress.rl.inference.runtime import (
     EngineRuntime,
     FullTensorEngineCapability,
     GeneratorRuntime,
 )
-from modelexpress_rl.inference.session import WeightUpdateSession
-from modelexpress_rl.inference.source import (
+from modelexpress.rl.inference.session import WeightUpdateSession
+from modelexpress.rl.inference.source import (
     GeneratorSourceResolver,
     ObjectStorageSourceResolver,
     TrainerSourceResolver,
@@ -1039,7 +1039,7 @@ def test_generator_logs_weight_update_lifecycle(monkeypatch, caplog):
     try:
         with caplog.at_level(
             logging.INFO,
-            logger="modelexpress_rl.inference.session",
+            logger="modelexpress.rl.inference.session",
         ):
             staged = generator.stage_weight(version=WeightVersionRef("version-a"))
             generator.apply_weight(staged)
@@ -2182,7 +2182,7 @@ def test_generator_discovers_rank_matched_p2p_peer(monkeypatch):
 
 def test_generator_tries_next_peer_after_manifest_mismatch(monkeypatch):
     monkeypatch.setattr(
-        "modelexpress_rl.inference.source.generator.random.Random.shuffle",
+        "modelexpress.rl.inference.source.generator.random.Random.shuffle",
         lambda _random, _sources: None,
     )
     server, endpoint, service = _start_server()
@@ -2246,7 +2246,7 @@ def test_generator_tries_next_peer_after_manifest_mismatch(monkeypatch):
 
 def test_generator_randomizes_and_limits_peers_before_trainer_fallback(monkeypatch):
     monkeypatch.setattr(
-        "modelexpress_rl.inference.source.generator.random.Random.shuffle",
+        "modelexpress.rl.inference.source.generator.random.Random.shuffle",
         lambda _random, sources: sources.reverse(),
     )
     server, endpoint, service = _start_server()
@@ -2499,7 +2499,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
     monkeypatch, case
 ):
     import torch
-    from modelexpress_rl.inference.engines.vllm.installer import _VllmInstaller
+    from modelexpress.rl.inference.engines.vllm.installer import _VllmInstaller
 
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
@@ -2742,7 +2742,7 @@ def test_streaming_creates_and_emits_one_timing_cycle(
 ):
     import json
 
-    from modelexpress_rl.refit.timing import (
+    from modelexpress.rl.refit.timing import (
         RefitTimingRecorder,
         current_refit_timing,
         refit_span,

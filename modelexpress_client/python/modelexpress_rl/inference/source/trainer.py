@@ -12,9 +12,9 @@ from collections.abc import Callable, Iterator, Mapping
 from time import perf_counter
 
 import grpc
-from modelexpress_rl import envs
-from modelexpress_rl.refit.reshard.rendezvous import unwrap_rendezvous_blob
-from modelexpress_rl.refit.timing import add_refit_duration, refit_span
+from modelexpress.rl import envs
+from modelexpress.rl.refit.reshard.rendezvous import unwrap_rendezvous_blob
+from modelexpress.rl.refit.timing import add_refit_duration, refit_span
 
 from ... import refit_pb2, refit_pb2_grpc
 from ...control import WeightVersion
@@ -29,7 +29,7 @@ from ..plan import (
     WeightSource,
 )
 
-logger = logging.getLogger("modelexpress_rl.inference.source.trainer")
+logger = logging.getLogger("modelexpress.rl.inference.source.trainer")
 
 _MAX_MANIFEST_MESSAGE_SIZE_BYTES = 100 * 1024 * 1024
 
