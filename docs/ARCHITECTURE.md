@@ -1315,9 +1315,13 @@ state before retrying each source individually for precise diagnostics, so bulk
 capture still never produces an incorrect partial plan. The bulk cause is logged
 even when the per-source retry then succeeds for every source, because bulk order
 can trip a loader that per-source order does not. Unexpected engine errors
-propagate, and parameter loader hooks are restored on every exit. The RL installer
-retains its first successful canonical capture for the generator-client lifetime;
-transfer planning composes trainer source views with that fixed capture.
+propagate, and parameter loader hooks are restored on every exit. The RL
+installer owns one successful combined capture of trainer-native-to-HF source
+views and engine loader operations for each mesh generation. This retains the
+combined capture at the installer boundary; transfer planning composes logical
+plans from it. Logical plans use address-independent source regions; current
+NIXL addresses and agent bindings are resolved separately for each transfer;
+physical transfer binding stays outside the logical plan cache.
 
 The minimal rendezvous publisher is called only after its NIXL agent and source
 buffers are registered, so `publish()` stores the worker as READY and repeated
@@ -1332,15 +1336,18 @@ work.
 `modelexpress_rl/inference/nixl_staged_transfer.py` owns exact-manifest planning,
 trainer staging buffers, direct generator-peer transfer, and verification. The
 vLLM-specific
-`installer.py` captures canonical engine load-time geometry through layerwise reload and
+`installer.py` captures trainer load-time geometry through layerwise reload and
 installs it through `process_weights_after_loading`. For tensor and checkpoint
 reloads, vLLM owns quantization-aware refresh of MLA's `W_UV` and `W_UK_T`;
 ModelExpress preserves their graph-bound storage when post-load processing
 replaces these bare tensor attributes. The RL installer does not recompute MLA
 weights from `kv_b_proj.weight` or reject quantized MLA models. After reload,
-replacement tensors are copied back into the original graph-bound storage.
-The engine's loader semantics remain fixed for the client lifetime; a failed
-refit requires engine recovery before serving resumes.
+the installer checks that vLLM replaced each existing `W_UV` and `W_UK_T`
+before copying it back into its original graph-bound storage. An unchanged tensor
+identity raises `IncompleteRefit` rather than accepting a potentially stale update.
+Compatibility is checked through this post-load behavior, not a version-string
+gate, so nightly and source builds can be used. The check runs after weight
+loading; a failed refit requires engine recovery before serving resumes.
 Generator peers instead
 transfer the complete post-load runtime tensor set directly into existing live
 storage without re-running PWAL. The adapter rebuilds a trainer plan when
@@ -1691,84 +1698,77 @@ flowchart LR
     G -.-> F
 ```
 
-The installer opens one reload window per update. It materializes the engine's
-load-time destinations and copies each completed receive group into them. vLLM
-performs post-load processing and restores the original kernel tensor bindings;
-finalization handles attention dependencies after all inputs arrive. Native
-materialization selects its recorded device, while host bookkeeping can be
-recreated on CPU. Bare tensors retained by graph consumers keep their storage.
-After finalization, the meta-device guard checks runtime parameter names, which
-can differ from load-time names after quantization post-processing.
+The installer opens one reload window per update. For each completed group, it
+validates live owners, input coverage and shared parameters, materializes the
+engine's load-time destinations, and copies received values into them. vLLM then
+performs post-load processing, reconciles parameter state and restores the
+original kernel tensor bindings. Its finalization handles attention dependencies
+after all required inputs have arrived. Engine reload runs in its native device
+context: layer materialization selects its recorded device, while host bookkeeping
+can be recreated on CPU. Bare tensors on the installer device keep the storage
+referenced by graph consumers. MX does not implement model-family
+admission tables or attention-specific weight transformations.
 
 Receive-arena tensors are never attached to the model or passed to post-load
 callbacks. The copy boundary requires ordinary Tensor storage views and rejects
-custom dispatch modes. A callback may retain an engine-owned tensor without
-preventing arena reuse; CUDA completion is required before another READ overwrites
-an arena. The current alias and buffer restoration execution remains in place.
-An installation redesign based on captured-operation order is deferred.
+custom dispatch modes instead of bypassing their semantics. A callback may retain an engine-owned tensor without preventing arena
+reuse. CUDA completion is still required before the next READ overwrites an
+arena. This ownership boundary removes receive-retention scans; it does not
+remove checks that a callback changed another module or a shared parameter.
 
-The vLLM installer lazily creates one canonical installation plan on the first
-capture for a generator client. It retains captured loader operations, owning
-module groups, alias restoration metadata and graph destinations. Construction
-validates complete coverage and restores the live model before publishing the
-plan. Failed construction leaves the client without a plan so a later attempt
-can retry. The first successful reload after capture validates recreated graph-buffer
-geometry; subsequent reloads trust that generator-lifetime contract.
+Alias validation distinguishes multiple paths to one parameter slot from ties
+between distinct slots. It records shared parent-to-child edges in reusable reload metadata,
+then checks every edge afresh after each callback, including ancestors and all
+incoming alias paths. Only distinct changed slots need reassignment. Custom
+attribute access, setters and parameter-registration hooks retain the original
+path lookup and assignment behavior; no validation verdict is cached across
+callbacks or updates.
 
-The plan is reused for every update without source-schema keys, independent
-mapping caches, deep copies or comparisons against current model parameters.
-Architecture, canonical loader-input schema, module ownership, alias topology and
-loader semantics are fixed for
-the client lifetime; changing them requires a new client. Execution resolves the
-current leaf tensors after native materialization. It checks actual stream
-completeness and preserves copy, completion and cleanup safety. It does not detect unsupported structural mutations by callbacks.
+Before reload initialization, alias restoration uses vLLM's recorded parameter
+metadata to separate load-time ties from runtime-only aliases such as WNA16's
+`w13_weight` and `w2_weight`. Capture and checkpoint loading reconnect only the
+load-time slots; native post-processing recreates runtime aliases. Missing
+load-time slots still fail restoration, and final runtime identity and storage
+validation remains required.
 
-Trainer-native conversion and composition of source view operations with the
-canonical capture belong to transfer planning. The first transfer supplies the
-canonical loader-input schema needed for lazy capture; the installer retains no
-trainer identity, source conversion or source-bound mapping. Transfer consumers
-must not mutate the retained canonical capture or destination metadata.
+Capture reuse checks the mesh ID and generation first. A validated same-generation
+hit skips the source-schema and engine-layout walk. On a changed generation, the
+installer compares the native source schema, converter identity and engine loading
+layout. Compatible changes reuse the combined capture; incompatible changes
+recapture. Trainer rank, source address and shard-placement changes alone do not invalidate
+capture.
+The cached generation advances only after successful validation or recapture;
+a failed recapture leaves no valid cache entry for the attempted generation.
+Quantized captures retain the existing support guard. Converter and engine
+loading semantics are fixed for the runtime lifetime; changing either requires
+recreating the whole runtime, including transfer caches. This adds no validation
+in source resolution.
 
-`modelexpress.refit.reshard.plan_transfer` builds an immutable
-`LogicalTransferPlan` directly from captured geometry. Exact reads, conversions
-and full-source pulls index a shared source-buffer table and carry shard-relative
-byte offsets. The table identifies logical source slots and tensor shards; it
-contains no addresses or transport handles. Operation capture normalizes view
-arguments once; `RecordedCopy` is a plain immutable record. Direct planner callers
-supply immutable tuple shapes, strides and operation arguments. Capture rejects
-advanced list/tensor indexing; basic integer,
-slice, ellipsis and new-axis indexing remain supported. Grouped plans inherit
-the complete plan’s full-source verification policy.
-`plan_transfer_groups` derives module plans from a complete
-plan, keeping the shared source table and its index map inside the planner.
-Module batching and packing preserve the same read order.
+Alias validation uses Python module lookup and parameter registration semantics.
+Each streaming batch checks the current ownership structure and reuses the
+initial reload's alias metadata when paths, owners, ordering and classes still
+match. Native reload can reorder parameter groups without changing their members.
+Those batches retain fresh callback order while sharing per-owner views of the
+initial owners. Changed group membership, paths, classes or ancestors prevents
+that sharing. No validation verdict survives an engine callback. The initial
+metadata and its per-owner views live only for that reload window; plans referring
+to later owners are released with the batch.
+Within one signature calculation, entries with the same current inheritance
+chain share its identity tuple. For owners with ordinary object hashing and
+equality, complete group signatures are also shared when building per-owner
+cache keys. Custom hashing or equality retains per-owner signature calculation.
 
-`bind_transfer(plan, resolve_source, resolve_destination)` returns a separate
-`PhysicalTransferPlan`. It resolves each used source buffer and each named
-receive, conversion or full-source destination once. The staged and legacy
-receivers both use this binder. The staged receiver explicitly associates each
-selected source slot with the agent parsed from its corresponding manifest;
-metadata, leases, transport connections and staging allocation remain outside
-the shared planner. Equivalent replicas can bind the same logical reads to
-current sessions and addresses without rebuilding geometry.
-
-The retained compiled plan owns its composed capture and destination layout;
-unchanged trainer structure reuses both without repeating source conversion,
-including when the optional whole-plan cache is disabled. The installer retains
-its separate client-lifetime canonical capture. Immutable logical records need
-no defensive copies on cache reuse. The generator layout and install plan remain
-stable for the client lifetime; the trainer layout and logical plan remain stable
-for a mesh generation. Validation runs when each is established, and warm reuse
-trusts the retained state. Per-update readiness checks, checksums, stream
-completeness and resource-safety checks remain in place. The existing cache
-invalidation inputs remain in effect; no caching policy changes here.
-
-Alias restoration distinguishes repeated paths to one slot from ties between
-slots. vLLM's recorded parameter metadata separates load-time ties from runtime
-aliases such as WNA16's `w13_weight` and `w2_weight`; native post-processing
-recreates runtime aliases. Existing local-materialization and custom-assignment
-paths remain. Supported quantized FullCopy refits use the same fixed-client
-contract; quantized streaming remains unsupported.
+For ordinary layer-local materialization, a per-owner view restores each complete
+shared-parameter group touched by that layer. Ordinary tensor buffers and vLLM's
+stock parameter forwarding method are supported; the latter's function, code and
+inheritance are recorded when the installer is created and checked before use.
+Ordinary instance dictionaries inherited from mixins are also supported; custom
+dictionary descriptors use the full restoration path.
+Custom ancestor lookup, setters, registration hooks, tensor dispatch or restore
+contexts use the full restoration path. Post-load
+callbacks always retain whole-model alias validation and restoration, including
+changes to unrelated owners that a later callback could otherwise hide.
+This path adds no native extension or CPython-internal dependency.
 
 The staging limit bounds receive, conversion and transfer scratch allocations.
 Engine-owned materialized destinations and post-load workspaces consume
@@ -1778,8 +1778,7 @@ installation of the current group; the benefit must be measured on the target
 hardware. Trainer staging mode and receiver arena location are separate choices.
 
 Bounded transfer can reuse immutable READ addresses and sizes for the currently
-validated compiled plan. The one-entry cache checks the selected replicas'
-structural fingerprints, slot binding, workspace generation and
+validated compiled plan. The one-entry cache checks the workspace generation and
 the identity, order and geometry of all receive arenas before every batch. It
 holds only weak arena references; source leases, tensor views and transport
 handles remain owned by the update. Preparation still validates current source
@@ -1795,7 +1794,7 @@ the resolved source table is the snapshot's table. All other resolved fields
 and maps keep their original schema and ownership. The snapshot contains only
 host metadata; it owns no tensors, transport handles or source leases. Custom
 or mutable source rows retain the original field-by-field checks. Ordered
-structural manifest fingerprints, agent and device maps,
+manifest bytes, agent and device maps,
 captured layouts and the staging configuration still participate in invalidation,
 and current source coverage is checked before transfer. Snapshot construction is
 charged to source preparation on a cache miss.

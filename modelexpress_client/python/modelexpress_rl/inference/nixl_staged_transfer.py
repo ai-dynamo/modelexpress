@@ -18,10 +18,10 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Iterator
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import Any, NamedTuple
-from types import MappingProxyType
 
 import torch
 from modelexpress import envs, p2p_pb2
@@ -34,7 +34,6 @@ from modelexpress.nixl_transfer import (
     NIXL_VRAM_MEM_TYPE,
     NixlTransferManager,
 )
-from modelexpress.refit.reshard.geometry import convert_source_weights
 from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import (
@@ -45,7 +44,6 @@ from modelexpress.refit.reshard.rendezvous import (
 from modelexpress.refit.reshard.transfer_plan import (
     LogicalTransferPlan,
     bind_transfer,
-    compose_transfer_capture,
     plan_transfer,
     plan_transfer_groups,
 )
@@ -175,8 +173,6 @@ class _CompiledBoundedPlan:
     plan: LogicalTransferPlan
     module_batches: tuple[_BoundedBatch, ...]
     batches: tuple[_BoundedBatch, ...]
-    capture: CaptureResult
-    parameter_layout: _StagingLayout
     fingerprint: str | None = None
 
 
@@ -242,12 +238,6 @@ class _BoundedPlanCache:
 
     def clear(self) -> None:
         self._entry = None
-
-    def layout(self, source_fingerprints: tuple) -> tuple | None:
-        if self._entry is None or self._entry[0][0] != source_fingerprints:
-            return None
-        compiled = self._entry[1]
-        return compiled.capture, compiled.parameter_layout
 
     def compile(
         self,
@@ -350,6 +340,9 @@ class _BoundedPlanCache:
             if any(not isinstance(blob, bytes) for blob in manifests):
                 raise TypeError("cached plan manifests must be immutable bytes")
             capture_key = (capture, tuple(parameter_layout.items()))
+            if not copy_key_on_miss:
+                capture_key = deepcopy(capture_key)
+                metrics["plan_cache_key_copies"] = 1
             source_key = _snapshot_structure(resolved, source_snapshot)
             if source_key is None:
                 source_key = tuple(
@@ -374,6 +367,9 @@ class _BoundedPlanCache:
                 tuple(slots_by_agent.items()),
             )
             hit = entry is not None and entry[0] == key
+            if not hit and copy_key_on_miss:
+                key = (*key[:5], deepcopy(capture_key), *key[6:])
+                metrics["plan_cache_key_copies"] = 1
             metrics["plan_cache_lookup_s"] = time.perf_counter() - started
             metrics["plan_cache_hits"] = int(hit)
             metrics["plan_cache_misses"] = int(not hit)
@@ -396,6 +392,8 @@ class _BoundedPlanCache:
                 logger.info("reusing bounded logical plan %s", compiled.fingerprint)
                 return compiled
         started = time.perf_counter()
+        if enabled:
+            capture, parameter_layout = deepcopy((capture, parameter_layout))
         source_slots = {session: slots_by_agent[agent]
                         for session, agent in resolved.session_to_agent.items()}
         plan = plan_transfer(capture, resolved.sources, source_slots=source_slots,
@@ -423,10 +421,10 @@ class _BoundedPlanCache:
             metrics["plan_cache_fingerprint_s"] = time.perf_counter() - started
         batches = _pack_bounded_batches(modules, max_staging_bytes) if pack else modules
         compiled = _CompiledBoundedPlan(
-            plan, modules, batches, capture, parameter_layout, fingerprint
+            plan, modules, batches, fingerprint
         )
-        self._entry = (key if key is not None else (source_fingerprints,), compiled)
         if key is not None:
+            self._entry = (key, compiled)
             logger.info("compiled bounded logical plan %s", fingerprint)
         return compiled
 
@@ -728,7 +726,6 @@ class _NixlStagedTransfer:
         listen_port: int | None = None,
         timeout_seconds: float | None = None,
         manager: NixlTransferManager | None = None,
-        convert_native_to_hf: Callable[[dict], dict] | None = None,
     ) -> None:
         self._device_id = device_id
         self._device = device
@@ -745,7 +742,6 @@ class _NixlStagedTransfer:
                 listen_port=listen_port,
             )
         self._manager = manager
-        self._convert_native_to_hf = convert_native_to_hf
         if self._owns_manager:
             try:
                 self._manager.initialize()
@@ -917,27 +913,11 @@ class _NixlStagedTransfer:
         )
         metrics["source_metadata_s"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
-        layout = (
-            self._plan_cache.layout(source_fingerprints)
-            if max_staging_bytes is not None
-            else None
-        )
-        if layout is None:
-            manifest = [
-                (name, source.dtype, tuple(source.global_shape))
-                for name, source in resolved.sources.items()
-            ]
-            weights = convert_source_weights(self._convert_native_to_hf, manifest)
-            schema = [
-                (name, weight.dtype, tuple(weight.shape))
-                for name, weight in weights.items()
-            ]
-            install_capture, parameter_layout = capture_layout(schema)
-            capture = compose_transfer_capture(install_capture, weights)
-            layout = (capture, MappingProxyType({
-                name: (tuple(shape), dtype) for name, (shape, dtype) in parameter_layout.items()
-            }))
-        capture, parameter_layout = layout
+        manifest = [
+            (name, source.dtype, tuple(source.global_shape))
+            for name, source in sorted(resolved.sources.items())
+        ]
+        capture, parameter_layout = capture_layout(manifest)
         metrics["layout_capture_s"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
         batches = None

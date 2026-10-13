@@ -80,7 +80,6 @@ def _full_tensor_engine(
     *,
     runtime_tensors=_DEFAULT_RUNTIME_TENSORS,
     nixl_manager=_DEFAULT_NIXL_MANAGER,
-    convert_native_to_hf=None,
 ):
     if runtime_tensors is _DEFAULT_RUNTIME_TENSORS:
         runtime_tensors = {"weight": torch.ones(1)}
@@ -105,7 +104,6 @@ def _full_tensor_engine(
                 revision=version_id,
             ),
             nixl_manager=nixl_manager,
-            convert_native_to_hf=convert_native_to_hf,
         ),
     )
 
@@ -296,13 +294,8 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
 
 def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
     context = GeneratorEngineContext()
-    convert_native_to_hf = lambda weights: weights
     monkeypatch.setattr(
-        engines_module,
-        "_create_engine_runtime",
-        lambda received: _full_tensor_engine(
-            convert_native_to_hf=convert_native_to_hf
-        ),
+        engines_module, "_create_engine_runtime", lambda received: _full_tensor_engine()
     )
     transfer_kwargs = {}
 
@@ -337,7 +330,6 @@ def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
     )
 
     assert transfer_kwargs["listen_port"] is None
-    assert transfer_kwargs["convert_native_to_hf"] is convert_native_to_hf
     assert set(method_kwargs) == {"transfer", "capture_layout"}
     assert runtime.p2p_client is None
     runtime.close()

@@ -56,7 +56,6 @@ class FullTensorEngineCapability:
     publish_runtime_tensors: Callable[[str], None]
     build_identity: Callable[[str], p2p_pb2.SourceIdentity]
     nixl_manager: Any | None = None
-    convert_native_to_hf: Callable[[dict], dict] | None = None
 
 
 @dataclass(frozen=True)
@@ -186,7 +185,6 @@ def _create_load_time_tensor_method(
         device_id=capability.device_id,
         device=capability.device,
         listen_port=None,
-        convert_native_to_hf=capability.convert_native_to_hf,
     )
     return LoadTimeTensorNixlUpdateMethod(
         transfer=transfer,

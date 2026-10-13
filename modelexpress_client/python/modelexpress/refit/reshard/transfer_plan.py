@@ -18,8 +18,7 @@ also use its full-pull and conversion phases.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from types import MappingProxyType
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from modelexpress import envs
@@ -35,34 +34,6 @@ from modelexpress.refit.reshard.types import (
     RecordedCopy,
     UnsupportedReshard,
 )
-
-
-@dataclass(frozen=True)
-class PlannedCapture:
-    copies: tuple
-    unsupported: tuple[str, ...]
-    unattributed: int
-    unsupported_reasons: MappingProxyType
-
-
-def compose_transfer_capture(capture: CaptureResult, weights: dict) -> PlannedCapture:
-    """Compose trainer views with a generator-owned capture once when planning."""
-    names = {name: weight._name for name, weight in weights.items()}
-    return PlannedCapture(
-        tuple(
-            replace(
-                copy, src_name=weights[copy.src_name]._name,
-                op_chain=weights[copy.src_name]._ops + copy.op_chain,
-            )
-            for copy in capture.copies
-        ),
-        tuple(names[name] for name in capture.unsupported),
-        capture.unattributed,
-        MappingProxyType({
-            names[name]: reason
-            for name, reason in capture.unsupported_reasons.items()
-        }),
-    )
 
 
 @dataclass

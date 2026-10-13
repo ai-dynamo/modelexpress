@@ -285,4 +285,4 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(
     prepared = harness.transfer.prepare(**request)
     _second_metrics, second_install = harness.collect(prepared)
     assert torch.equal(second_install["weight"], torch.cat((first, second)))
-    assert len(capture_calls) == 1
+    assert len(capture_calls) == 2

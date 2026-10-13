@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import contextmanager
+from functools import partial
 
 from modelexpress.refit.timing import (
     add_refit_bytes,
@@ -92,7 +93,10 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                     source_fingerprints=tuple(
                         item.physical_fingerprint for item in inputs.sources
                     ),
-                    capture_layout=self._capture_layout,
+                    capture_layout=partial(
+                        self._capture_layout,
+                        trainer_mesh=(source.inputs.trainer_mesh_id, source.inputs.trainer_mesh_generation),
+                    ),
                     source_slot_ids=tuple(item.source_slot_id for item in inputs.sources),
                 )
                 self._active_fingerprint = inputs.physical_fingerprint
@@ -139,7 +143,10 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                 source_fingerprints=tuple(
                     item.physical_fingerprint for item in source.inputs.sources
                 ),
-                capture_layout=self._capture_layout,
+                capture_layout=partial(
+                    self._capture_layout,
+                    trainer_mesh=(source.inputs.trainer_mesh_id, source.inputs.trainer_mesh_generation),
+                ),
                 source_slot_ids=tuple(item.source_slot_id for item in source.inputs.sources),
                 max_staging_bytes=max_staging_bytes,
                 staging_device=staging_device,

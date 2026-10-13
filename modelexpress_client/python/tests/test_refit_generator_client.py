@@ -2544,16 +2544,6 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
 
     class Installer(_VllmInstaller):
         def __init__(self):
-            self._engine_load_layout = SimpleNamespace(
-                parameters={
-                    name: (tuple(parameter.shape), parameter.dtype)
-                    for name, parameter in model.named_parameters()
-                },
-                runtime_storages=frozenset(
-                    parameter.untyped_storage().data_ptr()
-                    for parameter in model.parameters()
-                ),
-            )
             self._model = model
             self._device = torch.device("cpu")
             self._vllm_config = SimpleNamespace(quant_config=None)

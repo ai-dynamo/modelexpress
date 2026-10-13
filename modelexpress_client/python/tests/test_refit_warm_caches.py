@@ -18,13 +18,11 @@ from modelexpress.refit.reshard.rendezvous import (
     wrap_rendezvous_blob,
 )
 from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.geometry import convert_source_weights
 from modelexpress.refit.reshard.transfer_plan import (
     ConvertSource,
     SourceInfo,
     LogicalTransferPlan,
     plan_transfer,
-    compose_transfer_capture,
 )
 from modelexpress.refit.reshard.types import (
     CaptureResult,
@@ -118,12 +116,9 @@ def _bounded_cache_inputs():
             structural_manifest_digest(blob) for blob in manifests
         ),
         "resolved": _resolve_sources(manifests),
-        "capture": compose_transfer_capture(
-            CaptureResult(copies=[
-                RecordedCopy("weight", (), "layer.weight", 0, (4,), (1,), torch.float32)
-            ]),
-            convert_source_weights(None, [("weight", torch.float32, (4,))]),
-        ),
+        "capture": CaptureResult(copies=[
+            RecordedCopy("weight", (), "layer.weight", 0, (4,), (1,), torch.float32)
+        ]),
         "parameter_layout": {"layer.weight": ((4,), torch.float32)},
         "max_staging_bytes": 512,
         "enabled": True,
@@ -251,7 +246,7 @@ def test_bounded_plan_cache_snapshots_callback_inputs_and_revalidates(
     assert metrics["plan_cache_misses"] == metrics["owner_plan_builds"] == 1
     assert cache.compile(**pristine, metrics=metrics) is first
     assert metrics["plan_cache_hits"] == 1
-    assert metrics["plan_cache_key_copies"] == 0
+    assert metrics["plan_cache_key_copies"] == int(not copy_key_on_miss)
     assert metrics["owner_plan_builds"] == metrics["bounded_whole_plan_builds"] == 0
     args["capture"] = replace(args["capture"], copies=(replace(args["capture"].copies[0], dest_offset=1),))
     args["parameter_layout"] = {"layer.weight": ((5,), torch.float32)}
