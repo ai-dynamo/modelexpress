@@ -152,7 +152,7 @@ def test_transfer_timing_reports_cache_reuse_and_consumed_bytes(bounded, outcome
                 raise RuntimeError("transfer failed")
 
     method = LoadTimeTensorNixlUpdateMethod(
-        transfer=Transfer(), capture_layout=lambda _manifest, *, trainer_mesh: None
+        transfer=Transfer(), capture_layout=lambda _manifest: None
     )
     source = ResolvedTrainerSource(TrainerSourceSnapshot("mesh", 1, ()))
     version = SimpleNamespace(
