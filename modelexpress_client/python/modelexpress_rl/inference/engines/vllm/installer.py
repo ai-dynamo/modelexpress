@@ -1382,8 +1382,8 @@ class _VllmInstaller(EngineInstaller):
     def _reload_plan(self):
         from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
 
-        # Layerwise reload does not save bare device tensors referenced by
-        # captured graphs. Host bookkeeping follows the native reload lifecycle.
+        # Deferred post-load hooks can replace bare tensors and registered buffers.
+        # Preserve both for graph consumers and ModelExpress tensor registrations.
         owners = tuple(
             (path, ref(module))
             for path, module in self._model.named_modules(remove_duplicate=False)
@@ -1404,7 +1404,7 @@ class _VllmInstaller(EngineInstaller):
                 module,
                 {
                     name: (value, _tensor_geometry(value))
-                    for name, value in module.__dict__.items()
+                    for name, value in {**module.__dict__, **module._buffers}.items()
                     if isinstance(value, torch.Tensor)
                     and value.device.type == self._device.type
                     and (
@@ -1525,7 +1525,7 @@ class _VllmInstaller(EngineInstaller):
                         f"graph-bound tensor owner {path!r} was replaced"
                     )
                 for name, (graph_tensor, original_geometry) in attributes.items():
-                    current = module.__dict__.get(name)
+                    current = getattr(module, name, None)
                     if (
                         not isinstance(current, torch.Tensor)
                         or _tensor_geometry(graph_tensor) != original_geometry

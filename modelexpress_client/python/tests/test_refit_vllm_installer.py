@@ -3112,3 +3112,26 @@ def test_completed_tensor_installation_is_rejected(monkeypatch, streaming):
         else:
             installer.install_tensors(tensors)
     assert torch.equal(model.weight, original)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_reload_preserves_registered_buffer_storage_after_deferred_hook(monkeypatch, persistent):
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    model = nn.Module()
+    model.register_buffer("scale_inv", torch.ones(1), persistent=persistent)
+    registered = model.scale_inv
+    pointer = registered.data_ptr()
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+
+    def finalize(target, _config):
+        target.register_buffer("scale_inv", torch.full((1,), 4.0), persistent=persistent)
+
+    layerwise.finalize_layerwise_reload = finalize
+    installer = _VllmInstaller(
+        model=model, vllm_config=object(), model_config=object(), device=torch.device("cpu")
+    )
+    installer._reload(lambda _aliases: None)
+    assert model.scale_inv is registered
+    assert model.scale_inv.data_ptr() == pointer
+    assert registered.item() == 4.0
+    assert ("scale_inv" in model.state_dict()) is persistent
