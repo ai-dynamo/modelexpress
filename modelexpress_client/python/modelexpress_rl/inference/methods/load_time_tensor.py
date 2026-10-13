@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from modelexpress_rl.refit.timing import (
+from modelexpress.rl.refit.timing import (
     add_refit_bytes,
     add_refit_duration,
     refit_span,

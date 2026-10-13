@@ -15,7 +15,7 @@ import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 
-from modelexpress_rl.inference.receiver import DeltaChange
+from modelexpress.rl.inference.receiver import DeltaChange
 
 _EXPERT = re.compile(r"\.experts\.\d+\.[^.]+$")
 _DEFAULT_PACKED = {

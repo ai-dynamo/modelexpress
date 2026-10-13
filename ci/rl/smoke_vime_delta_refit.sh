@@ -57,7 +57,7 @@ test "${#version_ids[@]}" -eq 10
 "${k[@]}" exec deployment/vime-delta-refit-mx -c modelexpress -- python3 -c '
 import sys
 
-from modelexpress_rl import ModelExpressControlClient, WeightPayloadFormat
+from modelexpress.rl import ModelExpressControlClient, WeightPayloadFormat
 version_ids = ["vime-delta-refit-v0", *sys.argv[1:]]
 with ModelExpressControlClient.connect(server_url="127.0.0.1:8101") as control:
     actual = [control.get_weight_version(version_id).payload_format for version_id in version_ids]

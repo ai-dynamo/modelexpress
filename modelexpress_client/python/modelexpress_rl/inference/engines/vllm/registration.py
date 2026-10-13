@@ -38,6 +38,6 @@ def register_plugin_weight_transfer_engine() -> None:
     WeightTransferEngineFactory._registry.pop(_WEIGHT_TRANSFER_BACKEND, None)
     WeightTransferEngineFactory.register_engine(
         _WEIGHT_TRANSFER_BACKEND,
-        "modelexpress_rl.inference.engines.vllm.weight_transfer_engine",
+        "modelexpress.rl.inference.engines.vllm.weight_transfer_engine",
         "ModelExpressWeightTransferEngine",
     )

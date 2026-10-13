@@ -27,10 +27,10 @@ def test_refit_timers_exclude_recording_and_pointer_checks(monkeypatch):
         synchronize=lambda device: advance(0.5),
     )
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
-    monkeypatch.setitem(sys.modules, "modelexpress_rl", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "modelexpress.rl", SimpleNamespace())
     monkeypatch.setitem(
         sys.modules,
-        "modelexpress_rl.version",
+        "modelexpress.rl.version",
         SimpleNamespace(WeightVersionRef=lambda value: value),
     )
     monkeypatch.setitem(sys.modules, "modelexpress", SimpleNamespace())

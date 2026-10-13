@@ -5,8 +5,8 @@ from concurrent import futures
 
 import grpc
 import pytest
-from modelexpress_rl import control as control_module
-from modelexpress_rl import (
+from modelexpress.rl import control as control_module
+from modelexpress.rl import (
     ModelExpressControlClient,
     ObjectStorageSource,
     ObjectStorageType,

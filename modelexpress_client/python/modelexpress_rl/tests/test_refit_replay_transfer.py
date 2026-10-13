@@ -7,11 +7,11 @@ from dataclasses import replace
 import pytest
 import torch
 
-from modelexpress_rl.refit.reshard.types import IncompleteRefit, UnsupportedReshard
-import modelexpress_rl.inference.nixl_staged_transfer as module
-from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
-from modelexpress_rl.inference.plan import StreamingSettings
-from modelexpress_rl.modelexpress_rl.tests.test_refit_bounded_descriptors import harness
+from modelexpress.rl.refit.reshard.types import IncompleteRefit, UnsupportedReshard
+import modelexpress.rl.inference.nixl_staged_transfer as module
+from modelexpress.rl.inference.nixl_staged_transfer import _replay_ops
+from modelexpress.rl.inference.plan import StreamingSettings
+from modelexpress.rl.tests.test_refit_bounded_descriptors import harness
 
 
 @pytest.mark.parametrize("harness", [None, StreamingSettings(512, "cpu", 2)], indirect=True)
@@ -58,7 +58,7 @@ def test_replay_digest_verification_rejects_missing_or_stale_digests(
     h.capture.source_replay = True
     if missing:
         monkeypatch.setattr(
-            "modelexpress_rl.tests.test_refit_bounded_descriptors.tensor_digest", lambda _tensor: ""
+            "modelexpress.rl.tests.test_refit_bounded_descriptors.tensor_digest", lambda _tensor: ""
         )
     prepared = h.prepare()
     if not missing:

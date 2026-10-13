@@ -18,20 +18,20 @@ Run: pytest modelexpress_rl/tests/test_reshard_refit_transfer.py
 
 import torch
 
-from modelexpress_rl.refit.reshard.geometry import capture_geometry
-from modelexpress_rl.refit.reshard.receiver import _replay_ops
-from modelexpress_rl.refit.reshard.slice_plan import Shard
-from modelexpress_rl.refit.reshard.transfer_plan import (
+from modelexpress.rl.refit.reshard.geometry import capture_geometry
+from modelexpress.rl.refit.reshard.receiver import _replay_ops
+from modelexpress.rl.refit.reshard.slice_plan import Shard
+from modelexpress.rl.refit.reshard.transfer_plan import (
     SourceInfo,
     bind_transfer,
     execute_transfer,
     plan_transfer,
 )
-from modelexpress_rl.refit.reshard.transport import InMemoryReferenceTransport
-from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress.rl.refit.reshard.transport import InMemoryReferenceTransport
+from modelexpress.rl.refit.reshard.types import CaptureResult, RecordedCopy
 
 # Reuse the ToyModel + manifest from the geometry test (same package, same dir).
-from modelexpress_rl.modelexpress_rl.tests.test_reshard_refit_geometry import ToyModel, _manifest
+from modelexpress.rl.tests.test_reshard_refit_geometry import ToyModel, _manifest
 
 EL = 4  # float32
 

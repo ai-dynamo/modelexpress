@@ -7,31 +7,31 @@ from contextlib import nullcontext
 from dataclasses import replace
 from types import MappingProxyType
 
-import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
-from modelexpress_rl.inference.plan import StreamingSettings
-from modelexpress_rl.version import MeshIdentity
+import modelexpress.rl.inference.nixl_staged_transfer as transfer_module
+from modelexpress.rl.inference.plan import StreamingSettings
+from modelexpress.rl.version import MeshIdentity
 
 import pytest
 import torch
-from modelexpress_rl import envs
+from modelexpress.rl import envs
 from modelexpress import p2p_pb2
-from modelexpress_rl.refit.reshard.rendezvous import (
+from modelexpress.rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     unwrap_rendezvous_blob,
     wrap_rendezvous_blob,
 )
-from modelexpress_rl.refit.reshard.slice_plan import LogicalRead, SourceBuffer, Shard
-from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, LogicalTransferPlan, plan_transfer
-from modelexpress_rl.refit.reshard.types import (
+from modelexpress.rl.refit.reshard.slice_plan import LogicalRead, SourceBuffer, Shard
+from modelexpress.rl.refit.reshard.transfer_plan import SourceInfo, LogicalTransferPlan, plan_transfer
+from modelexpress.rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     RecordedCopy,
 )
-from modelexpress_rl.refit.reshard.verify import tensor_digest
-from modelexpress_rl.inference.adapter import TrainerSourceShard
-from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
-from modelexpress_rl.inference.nixl_staged_transfer import (
+from modelexpress.rl.refit.reshard.verify import tensor_digest
+from modelexpress.rl.inference.adapter import TrainerSourceShard
+from modelexpress.rl.inference.methods import LoadTimeTensorNixlUpdateMethod
+from modelexpress.rl.inference.nixl_staged_transfer import (
     _SourceBinding,
     _bounded_batches,
     _load_agent_metadata,
@@ -43,8 +43,8 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _resolve_sources,
     _ResolvedSources,
 )
-from modelexpress_rl.inference.plan import TrainerSourceSnapshot, ResolvedTrainerSource
-from modelexpress_rl.modelexpress_rl.tests.test_refit_bounded_descriptors import harness, _check_values
+from modelexpress.rl.inference.plan import TrainerSourceSnapshot, ResolvedTrainerSource
+from modelexpress.rl.tests.test_refit_bounded_descriptors import harness, _check_values
 
 
 def _bind_test_execution(transfer, prepared) -> None:
@@ -1402,7 +1402,7 @@ def test_generator_layout_debug_requires_adapter_callback(harness, monkeypatch):
 
 
 def test_changed_agent_metadata_reconnects(harness, monkeypatch):
-    from modelexpress_rl.modelexpress_rl.tests.test_refit_bounded_descriptors import _agent_registration_snapshot
+    from modelexpress.rl.tests.test_refit_bounded_descriptors import _agent_registration_snapshot
 
     harness.collect(harness.prepare())
     transfer = harness.transfer

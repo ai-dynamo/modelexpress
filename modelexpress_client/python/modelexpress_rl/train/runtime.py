@@ -39,7 +39,7 @@ PublicationArtifact = (
     StagedWeightVersionShardData | StagedCanonicalDelta | StagedFullCheckpoint
 )
 
-logger = logging.getLogger("modelexpress_rl.train.runtime")
+logger = logging.getLogger("modelexpress.rl.train.runtime")
 
 
 def _flatten_timing(payload: dict[str, Any]) -> dict[str, int | float]:

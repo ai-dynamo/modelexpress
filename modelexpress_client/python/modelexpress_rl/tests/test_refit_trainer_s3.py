@@ -16,7 +16,7 @@ import safetensors.numpy
 import safetensors.torch
 import torch
 import zstandard
-from modelexpress_rl import (
+from modelexpress.rl import (
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
     ObjectStorageConfig,
@@ -27,10 +27,10 @@ from modelexpress_rl import (
     refit_pb2,
     refit_pb2_grpc,
 )
-from modelexpress_rl.s3 import S3Client
-from modelexpress_rl.train import client as trainer_client_module
-from modelexpress_rl.train import runtime as trainer_runtime_module
-from modelexpress_rl.train.methods import canonical_delta as canonical_delta_module
+from modelexpress.rl.s3 import S3Client
+from modelexpress.rl.train import client as trainer_client_module
+from modelexpress.rl.train import runtime as trainer_runtime_module
+from modelexpress.rl.train.methods import canonical_delta as canonical_delta_module
 
 
 class _MemoryS3:

@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from modelexpress.engines.vllm.adapter import VllmAdapter
-from modelexpress_rl.inference.engines.vllm import (
+from modelexpress.rl.inference.engines.vllm import (
     VllmGeneratorContext,
     _create_vllm_engine_runtime,
 )
@@ -119,12 +119,12 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     )
     publication_events = []
     installer_module = ModuleType(
-        "modelexpress_rl.inference.engines.vllm.installer"
+        "modelexpress.rl.inference.engines.vllm.installer"
     )
     installer_module._VllmInstaller = Installer
     monkeypatch.setitem(
         sys.modules,
-        "modelexpress_rl.inference.engines.vllm.installer",
+        "modelexpress.rl.inference.engines.vllm.installer",
         installer_module,
     )
 

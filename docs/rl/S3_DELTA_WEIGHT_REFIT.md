@@ -83,7 +83,7 @@ clients. The current API requires a syntactically valid object-storage URI, but
 this local seed-checkpoint flow does not upload or read an object at that URI.
 
 ```python
-from modelexpress_rl import (
+from modelexpress.rl import (
     ModelExpressControlClient,
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
@@ -117,7 +117,7 @@ Trainer and generator initialization use `base.version_id` as their initial base
 ID. They read the real weights from `seed_checkpoint_path`; the base version URI
 is not downloaded.
 
-See [`refit.proto`](../modelexpress_common/proto/refit.proto) for the complete
+See [`refit.proto`](../../modelexpress_common/proto/refit.proto) for the complete
 control-plane request and response schemas.
 
 ### Initialize the trainer client
@@ -346,7 +346,7 @@ checkpoint exists, the receiver reconstructs from the full root.
 
 Use an SGLang build with the `/update_weights_from_modelexpress` endpoint and an
 MX build exposing `get_modelexpress_generator()` in
-`modelexpress_rl.inference.engines.sglang`. The ModelExpress package must be
+`modelexpress.rl.inference.engines.sglang`. The ModelExpress package must be
 installed in each SGLang worker's environment.
 
 ### Start SGLang
@@ -394,7 +394,7 @@ for later versions. There is no separate initialization HTTP request. The
 SGLang handler obtains the client through this public MX API:
 
 ```python
-from modelexpress_rl.inference.engines.sglang import get_modelexpress_generator
+from modelexpress.rl.inference.engines.sglang import get_modelexpress_generator
 
 generator = get_modelexpress_generator(model_runner)
 ```
@@ -463,7 +463,7 @@ READY. The S3 URI is the exact index URI, not a directory prefix.
 ```python
 import torch.distributed as dist
 
-from modelexpress_rl import (
+from modelexpress.rl import (
     ModelExpressControlClient,
     ObjectStorageSource,
     ObjectStorageType,

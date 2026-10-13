@@ -14,15 +14,15 @@ import torch.nn as nn
 from modelexpress.adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
 from modelexpress.engines.vllm.adapter import VllmAdapter
 from modelexpress.load_strategy import LoadResult
-from modelexpress_rl import (
+from modelexpress.rl import (
     ObjectStorageSource,
     ObjectStorageType,
     WeightPayloadFormat,
     WeightVersion,
     WeightVersionState,
 )
-from modelexpress_rl import envs as rl_envs
-from modelexpress_rl.inference.load_strategy import (
+from modelexpress.rl import envs as rl_envs
+from modelexpress.rl.inference.load_strategy import (
     DesiredVersionP2PStrategy,
     DesiredVersionS3Strategy,
     RLLoadStrategyChain,
@@ -41,10 +41,10 @@ def test_rl_policy_bypasses_selected_base_plugin(monkeypatch, tmp_path):
     model = nn.Linear(1, 1)
     ctx = _context()
     with patch(
-        "modelexpress_rl.inference.load_strategy._agree_desired_version",
+        "modelexpress.rl.inference.load_strategy._agree_desired_version",
         return_value=None,
     ), patch(
-        "modelexpress_rl.inference.load_strategy.execute_load_strategies",
+        "modelexpress.rl.inference.load_strategy.execute_load_strategies",
         return_value=model,
     ) as execute:
         assert RLLoadStrategyChain.run(model, ctx) is model
@@ -116,16 +116,16 @@ def test_desired_version_does_not_use_version_agnostic_fallbacks(monkeypatch):
     fallback.load.return_value = LoadResult(value=model, model=model)
 
     with patch(
-        "modelexpress_rl.inference.load_strategy.DesiredVersionP2PStrategy",
+        "modelexpress.rl.inference.load_strategy.DesiredVersionP2PStrategy",
         return_value=unavailable_p2p,
     ), patch(
-        "modelexpress_rl.inference.load_strategy.DesiredVersionS3Strategy",
+        "modelexpress.rl.inference.load_strategy.DesiredVersionS3Strategy",
         return_value=unavailable_s3,
     ), patch(
-        "modelexpress_rl.inference.load_strategy.ModelStreamerStrategy",
+        "modelexpress.rl.inference.load_strategy.ModelStreamerStrategy",
         return_value=fallback,
     ), patch(
-        "modelexpress_rl.inference.load_strategy.DefaultStrategy",
+        "modelexpress.rl.inference.load_strategy.DefaultStrategy",
         return_value=fallback,
     ), pytest.raises(RuntimeError, match="No loading strategy succeeded"):
         RLLoadStrategyChain.run(model, ctx)
@@ -158,7 +158,7 @@ def test_desired_version_uses_configured_source_order(
     model = nn.Linear(1, 1)
 
     with patch(
-        "modelexpress_rl.inference.load_strategy.execute_load_strategies",
+        "modelexpress.rl.inference.load_strategy.execute_load_strategies",
         return_value=model,
     ) as execute:
         assert RLLoadStrategyChain.run(model, _context()) is model
@@ -245,7 +245,7 @@ def test_p2p_rejects_desired_version_change_during_load(monkeypatch):
         return result
 
     with patch(
-        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
+        "modelexpress.rl.inference.load_strategy.ModelExpressControlClient.connect",
         return_value=client,
     ), patch(
         "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.load",
@@ -277,7 +277,7 @@ def test_p2p_rejects_rank_load_outcome_disagreement(monkeypatch):
     )
 
     with patch(
-        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
+        "modelexpress.rl.inference.load_strategy.ModelExpressControlClient.connect",
         return_value=client,
     ), patch(
         "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.load",
@@ -325,7 +325,7 @@ def test_desired_p2p_uses_exact_revision(monkeypatch, model_name):
     )
 
     with patch(
-        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
+        "modelexpress.rl.inference.load_strategy.ModelExpressControlClient.connect",
         return_value=client,
     ), patch(
         "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.load",
@@ -374,7 +374,7 @@ def test_desired_p2p_requires_matching_ready_control_record(
     client.get_weight_version.return_value = version
 
     with patch(
-        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
+        "modelexpress.rl.inference.load_strategy.ModelExpressControlClient.connect",
         return_value=client,
     ), patch(
         "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.load"
@@ -396,7 +396,7 @@ def test_desired_p2p_restores_revision_on_miss(monkeypatch):
     )
 
     with patch(
-        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
+        "modelexpress.rl.inference.load_strategy.ModelExpressControlClient.connect",
         return_value=client,
     ), patch(
         "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.load",
@@ -422,16 +422,16 @@ def test_missing_optional_sources_reaches_engine_default(monkeypatch, caplog):
     fallback.load.return_value = LoadResult(value=model, model=model)
 
     with caplog.at_level("WARNING"), patch(
-        "modelexpress_rl.inference.load_strategy.DesiredVersionP2PStrategy",
+        "modelexpress.rl.inference.load_strategy.DesiredVersionP2PStrategy",
         return_value=unavailable,
     ), patch(
-        "modelexpress_rl.inference.load_strategy.DesiredVersionS3Strategy",
+        "modelexpress.rl.inference.load_strategy.DesiredVersionS3Strategy",
         return_value=unavailable,
     ), patch(
-        "modelexpress_rl.inference.load_strategy.ModelStreamerStrategy",
+        "modelexpress.rl.inference.load_strategy.ModelStreamerStrategy",
         return_value=unavailable,
     ), patch(
-        "modelexpress_rl.inference.load_strategy.DefaultStrategy",
+        "modelexpress.rl.inference.load_strategy.DefaultStrategy",
         return_value=fallback,
     ):
         assert RLLoadStrategyChain.run(model, ctx) is model
@@ -454,7 +454,7 @@ def test_resolve_s3_chain_returns_full_root_then_deltas():
     client.get_weight_version.side_effect = [delta, root]
 
     with patch(
-        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
+        "modelexpress.rl.inference.load_strategy.ModelExpressControlClient.connect",
         return_value=client,
     ):
         assert _resolve_s3_replay_chain(_context(), "delta") == (root, delta)
@@ -468,7 +468,7 @@ def test_resolve_s3_chain_rejects_mismatched_returned_uid():
     )
 
     with patch(
-        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
+        "modelexpress.rl.inference.load_strategy.ModelExpressControlClient.connect",
         return_value=client,
     ), pytest.raises(
         RuntimeError,
@@ -495,15 +495,15 @@ def test_desired_s3_loads_materialized_checkpoint(monkeypatch, tmp_path):
     strategy = DesiredVersionS3Strategy()
 
     with patch(
-        "modelexpress_rl.inference.load_strategy._resolve_s3_replay_chain",
+        "modelexpress.rl.inference.load_strategy._resolve_s3_replay_chain",
         return_value=(root, delta),
     ), patch(
-        "modelexpress_rl.inference.load_strategy.S3Client", return_value=s3
+        "modelexpress.rl.inference.load_strategy.S3Client", return_value=s3
     ), patch(
-        "modelexpress_rl.inference.load_strategy.bootstrap_s3_checkpoint",
+        "modelexpress.rl.inference.load_strategy.bootstrap_s3_checkpoint",
         return_value=Path("/cache/root"),
     ), patch(
-        "modelexpress_rl.inference.load_strategy.CanonicalDeltaUpdateMethod",
+        "modelexpress.rl.inference.load_strategy.CanonicalDeltaUpdateMethod",
         return_value=method,
     ), patch.object(strategy, "load_uri", return_value=loaded) as load_uri:
         assert strategy.load(result, ctx) is loaded
@@ -543,7 +543,7 @@ def test_desired_s3_does_not_activate_until_every_rank_loads(monkeypatch, tmp_pa
     )
 
     with patch(
-        "modelexpress_rl.inference.load_strategy._resolve_s3_replay_chain",
+        "modelexpress.rl.inference.load_strategy._resolve_s3_replay_chain",
         return_value=(root, delta),
     ), patch.object(
         DesiredVersionS3Strategy,
@@ -600,7 +600,7 @@ def test_desired_s3_only_local_leader_activates(monkeypatch, tmp_path):
         return method, method.prepare_chain.return_value
 
     with patch(
-        "modelexpress_rl.inference.load_strategy._resolve_s3_replay_chain",
+        "modelexpress.rl.inference.load_strategy._resolve_s3_replay_chain",
         return_value=(root, delta),
     ), patch.object(
         DesiredVersionS3Strategy,

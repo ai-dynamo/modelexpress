@@ -9,10 +9,10 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from modelexpress_rl import envs
-from modelexpress_rl.inference import receiver
-from modelexpress_rl.inference.methods import canonical_delta
-from modelexpress_rl.tests.test_refit_s3_receiver import (
+from modelexpress.rl import envs
+from modelexpress.rl.inference import receiver
+from modelexpress.rl.inference.methods import canonical_delta
+from modelexpress.rl.tests.test_refit_s3_receiver import (
     _Adapter,
     _MemoryS3,
     _artifact,
@@ -150,7 +150,7 @@ def test_cache_uses_stream_bytes_and_next_delta_never_downloads_full(
 
 
 def test_install_returns_before_disk_tail_completes(monkeypatch, tmp_path):
-    from modelexpress_rl.inference.streaming_checkpoint import _CheckpointWriter
+    from modelexpress.rl.inference.streaming_checkpoint import _CheckpointWriter
 
     adapter, _ = build(monkeypatch, tmp_path)
     started, unblock = threading.Event(), threading.Event()
@@ -244,7 +244,7 @@ def test_snapshot_is_owned_and_preserves_raw_bytes(monkeypatch, tmp_path):
 def test_cache_failure_is_reported_before_delta_without_second_download(
     monkeypatch, tmp_path
 ):
-    from modelexpress_rl.inference.streaming_checkpoint import _CheckpointWriter
+    from modelexpress.rl.inference.streaming_checkpoint import _CheckpointWriter
 
     adapter, storage = build(monkeypatch, tmp_path)
     full = adapter.stage_weight(_full_inputs())
@@ -297,7 +297,7 @@ def test_cache_failure_is_reported_before_delta_without_second_download(
 
 
 def test_writer_backpressure_and_close_drain(monkeypatch, tmp_path):
-    from modelexpress_rl.inference import streaming_checkpoint as module
+    from modelexpress.rl.inference import streaming_checkpoint as module
 
     adapter, _ = build(monkeypatch, tmp_path)
     full = adapter.stage_weight(_full_inputs())
@@ -384,7 +384,7 @@ def test_cache_preserves_quantized_tensor_bytes(
 
 
 def test_repeat_full_reuses_cache_without_replacing_state_files(monkeypatch, tmp_path):
-    from modelexpress_rl.inference.checkpoint_store import checkpoint_files_state
+    from modelexpress.rl.inference.checkpoint_store import checkpoint_files_state
 
     adapter, _ = build(monkeypatch, tmp_path)
     try:
@@ -405,7 +405,7 @@ def test_repeat_full_reuses_cache_without_replacing_state_files(monkeypatch, tmp
 
 
 def test_other_rank_waits_for_shared_cache_then_replays_delta(monkeypatch, tmp_path):
-    from modelexpress_rl.inference.streaming_checkpoint import _CheckpointWriter
+    from modelexpress.rl.inference.streaming_checkpoint import _CheckpointWriter
 
     owner, storage = build(monkeypatch, tmp_path)
     follower = _Adapter(
@@ -493,11 +493,11 @@ def _head(store):
 def test_streamed_full_becomes_cache_head_so_old_chain_is_evictable(
     monkeypatch, tmp_path
 ):
-    from modelexpress_rl.inference.checkpoint_store import (
+    from modelexpress.rl.inference.checkpoint_store import (
         CheckpointState,
         checkpoint_files_state,
     )
-    from modelexpress_rl.utils import index_checkpoint_tensors
+    from modelexpress.rl.utils import index_checkpoint_tensors
 
     adapter, _ = build(monkeypatch, tmp_path)
     store = adapter._checkpoint.store
@@ -528,7 +528,7 @@ def test_streamed_full_becomes_cache_head_so_old_chain_is_evictable(
 
 
 def test_failed_cache_keeps_previous_cache_head(monkeypatch, tmp_path):
-    from modelexpress_rl.inference.streaming_checkpoint import _CheckpointWriter
+    from modelexpress.rl.inference.streaming_checkpoint import _CheckpointWriter
 
     adapter, _ = build(monkeypatch, tmp_path)
     store = adapter._checkpoint.store
@@ -550,7 +550,7 @@ def test_failed_cache_keeps_previous_cache_head(monkeypatch, tmp_path):
 
 
 def test_deferred_activation_adopts_stream_only_on_activate(monkeypatch, tmp_path):
-    from modelexpress_rl.inference.checkpoint_store import CheckpointState
+    from modelexpress.rl.inference.checkpoint_store import CheckpointState
 
     adapter, _ = build(monkeypatch, tmp_path)
     store = adapter._checkpoint.store
@@ -569,7 +569,7 @@ def test_deferred_activation_adopts_stream_only_on_activate(monkeypatch, tmp_pat
 
 
 def test_deferred_activation_tolerates_failed_cache(monkeypatch, tmp_path, caplog):
-    from modelexpress_rl.inference.streaming_checkpoint import _CheckpointWriter
+    from modelexpress.rl.inference.streaming_checkpoint import _CheckpointWriter
 
     adapter, _ = build(monkeypatch, tmp_path)
     before = _head(adapter._checkpoint.store)

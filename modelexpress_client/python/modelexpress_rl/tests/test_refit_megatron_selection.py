@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from modelexpress_rl.train.engines.megatron.selection import (
+from modelexpress.rl.train.engines.megatron.selection import (
     _qkv_descriptor_extras,
     build_megatron_tensor_specs,
     model_express_role_for_mapping,

@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from modelexpress_rl.inference.engines.vllm.loader import RLMxModelLoader
+from modelexpress.rl.inference.engines.vllm.loader import RLMxModelLoader
 
 
 def test_rl_loader_runs_rl_chain():
@@ -17,7 +17,7 @@ def test_rl_loader_runs_rl_chain():
     model, ctx = MagicMock(), MagicMock()
 
     with patch(
-        "modelexpress_rl.inference.engines.vllm.loader.RLLoadStrategyChain.run",
+        "modelexpress.rl.inference.engines.vllm.loader.RLLoadStrategyChain.run",
         return_value=model,
     ) as run:
         assert loader._run_load_strategy_chain(model, ctx) is model
@@ -51,11 +51,11 @@ def test_rl_drafter_is_rejected_before_initialization():
 
 
 def test_rl_log_emits_once_when_vllm_handler_arrives_late(monkeypatch):
-    from modelexpress_rl.inference.engines import configure_engine_logging
+    from modelexpress.rl.inference.engines import configure_engine_logging
 
     vllm_logger = logging.getLogger("vllm")
     mx_logger = logging.getLogger("modelexpress")
-    rl_logger = logging.getLogger("modelexpress_rl")
+    rl_logger = logging.getLogger("modelexpress.rl")
     handler = logging.Handler()
     handler.emit = MagicMock()
     old_vllm_handlers = list(vllm_logger.handlers)
@@ -79,7 +79,7 @@ def test_rl_log_emits_once_when_vllm_handler_arrives_late(monkeypatch):
         vllm_logger.addHandler(handler)
         configure_engine_logging("vllm")
         configure_engine_logging("vllm")
-        logging.getLogger("modelexpress_rl.inference.session").info("RL ready")
+        logging.getLogger("modelexpress.rl.inference.session").info("RL ready")
 
         handler.emit.assert_called_once()
         assert handler.emit.call_args.args[0].getMessage() == "RL ready"
@@ -96,7 +96,7 @@ def test_rl_log_emits_once_when_vllm_handler_arrives_late(monkeypatch):
 @pytest.mark.parametrize("policy, uses_rl", [("INFERENCE", False), ("RL", True)])
 def test_plugin_registers_rl_loader_only_for_rl_policy(monkeypatch, policy, uses_rl):
     from modelexpress.engines.vllm.loader import MxModelLoader
-    from modelexpress_rl.inference.engines.vllm import registration
+    from modelexpress.rl.inference.engines.vllm import registration
     from vllm.model_executor import model_loader
 
     monkeypatch.setenv("MX_LOAD_STRATEGY_CHAIN", policy)
@@ -113,13 +113,13 @@ def test_plugin_registers_rl_loader_only_for_rl_policy(monkeypatch, policy, uses
 @pytest.mark.parametrize(
     "old_entry",
     [
-        ("modelexpress_rl.inference.engines.vllm.weight_transfer_engine", "OldEngine"),
+        ("modelexpress.rl.inference.engines.vllm.weight_transfer_engine", "OldEngine"),
         ("vllm.distributed.weight_transfer.native", "NativeEngine"),
     ],
 )
 def test_plugin_replaces_weight_transfer_entry_and_is_idempotent(monkeypatch, old_entry):
-    from modelexpress_rl.inference.engines.vllm import registration
-    from modelexpress_rl.inference.engines.vllm.weight_transfer_engine import (
+    from modelexpress.rl.inference.engines.vllm import registration
+    from modelexpress.rl.inference.engines.vllm.weight_transfer_engine import (
         ModelExpressWeightTransferEngine,
     )
     from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
@@ -137,6 +137,6 @@ def test_plugin_replaces_weight_transfer_entry_and_is_idempotent(monkeypatch, ol
     registration.register()
 
     module_path, class_name = registry["modelexpress"]
-    assert module_path.startswith("modelexpress_rl.")
+    assert module_path.startswith("modelexpress.rl.")
     assert getattr(importlib.import_module(module_path), class_name) is ModelExpressWeightTransferEngine
     assert registry["other"] == ("other.engine", "OtherEngine")

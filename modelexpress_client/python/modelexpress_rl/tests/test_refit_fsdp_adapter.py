@@ -8,14 +8,14 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from modelexpress_rl.refit.reshard.rendezvous import unwrap_rendezvous_blob
-from modelexpress_rl.train.adapter import TrainerStagingMode, WeightPayloadFormat
-from modelexpress_rl.train.context import FSDPTrainerContext
-from modelexpress_rl.train.engines import _create_trainer_adapter
-from modelexpress_rl.train.engines.fsdp.adapter import FSDPTrainerAdapter
-from modelexpress_rl.train.manifest import bound_tensor_manifest
+from modelexpress.rl.refit.reshard.rendezvous import unwrap_rendezvous_blob
+from modelexpress.rl.train.adapter import TrainerStagingMode, WeightPayloadFormat
+from modelexpress.rl.train.context import FSDPTrainerContext
+from modelexpress.rl.train.engines import _create_trainer_adapter
+from modelexpress.rl.train.engines.fsdp.adapter import FSDPTrainerAdapter
+from modelexpress.rl.train.manifest import bound_tensor_manifest
 
-ADAPTER = "modelexpress_rl.train.engines.fsdp.adapter"
+ADAPTER = "modelexpress.rl.train.engines.fsdp.adapter"
 
 
 def _mock_host_allocation_without_cuda(monkeypatch):

@@ -25,8 +25,8 @@ from math import prod
 from types import MappingProxyType
 from typing import Any, Callable
 
-from modelexpress_rl import envs
-from modelexpress_rl.refit.reshard.slice_plan import (
+from modelexpress.rl import envs
+from modelexpress.rl.refit.reshard.slice_plan import (
     LogicalRead,
     Shard,
     SourceBuffer,
@@ -34,8 +34,8 @@ from modelexpress_rl.refit.reshard.slice_plan import (
     plan_pull,
     pull_metrics,
 )
-from modelexpress_rl.refit.reshard.transport import ReadDescriptor, Transport
-from modelexpress_rl.refit.reshard.types import (
+from modelexpress.rl.refit.reshard.transport import ReadDescriptor, Transport
+from modelexpress.rl.refit.reshard.types import (
     CaptureResult,
     RecordedCopy,
     UnsupportedReshard,
@@ -191,7 +191,7 @@ def _plan_local_replay(
     """Choose a capacity-safe source prefix, then replay remaining operations locally."""
     import torch
 
-    from modelexpress_rl.refit.reshard.geometry import _SUPPORTED_OPS
+    from modelexpress.rl.refit.reshard.geometry import _SUPPORTED_OPS
 
     if any(op[0] not in _SUPPORTED_OPS.values() for op in copy.op_chain):
         raise UnsupportedReshard(f"{copy.src_name}: unsupported replay operation")

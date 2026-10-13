@@ -5,8 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import modelexpress_rl
-from modelexpress_rl.train.resources import _TrainerResources
+import modelexpress.rl
+from modelexpress.rl.train.resources import _TrainerResources
 
 
 @pytest.mark.parametrize(
@@ -32,7 +32,7 @@ def test_resources_initialize_transport_and_manifest_service(
 
     with (
         patch(
-            "modelexpress_rl.train.resources.uuid.uuid4",
+            "modelexpress.rl.train.resources.uuid.uuid4",
             return_value=MagicMock(hex="0123456789abcdef"),
         ),
         patch(
@@ -40,7 +40,7 @@ def test_resources_initialize_transport_and_manifest_service(
             return_value=manager,
         ) as manager_type,
         patch(
-            "modelexpress_rl.train.resources.grpc.server",
+            "modelexpress.rl.train.resources.grpc.server",
             return_value=server,
         ),
     ):
@@ -82,4 +82,4 @@ def test_resources_own_only_private_transport_resources():
 
 
 def test_resources_are_not_part_of_public_api():
-    assert not hasattr(modelexpress_rl, "TrainerResources")
+    assert not hasattr(modelexpress.rl, "TrainerResources")

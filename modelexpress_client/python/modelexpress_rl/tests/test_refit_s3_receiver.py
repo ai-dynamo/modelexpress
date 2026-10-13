@@ -19,7 +19,7 @@ import zstandard
 from safetensors.torch import load_file, save_file
 
 from modelexpress import p2p_pb2
-from modelexpress_rl import (
+from modelexpress.rl import (
     ModelExpressGeneratorClient,
     ObjectStorageGeneratorConfig,
     ObjectStorageSource,
@@ -30,15 +30,15 @@ from modelexpress_rl import (
     WeightVersionRef,
     WeightVersionState,
 )
-from modelexpress_rl.inference import checkpoint_store as checkpoint_store_module
-from modelexpress_rl.inference import receiver as receiver_module
-from modelexpress_rl.inference.methods import (
+from modelexpress.rl.inference import checkpoint_store as checkpoint_store_module
+from modelexpress.rl.inference import receiver as receiver_module
+from modelexpress.rl.inference.methods import (
     CanonicalDeltaUpdateMethod,
     RuntimeTensorNixlUpdateMethod,
 )
-import modelexpress_rl.inference.methods.canonical_delta as canonical_delta_module
-from modelexpress_rl.inference.receiver import PreparedCheckpoint
-from modelexpress_rl.inference.plan import (
+import modelexpress.rl.inference.methods.canonical_delta as canonical_delta_module
+from modelexpress.rl.inference.receiver import PreparedCheckpoint
+from modelexpress.rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
     GeneratorPeerUpdateSource,
@@ -48,11 +48,11 @@ from modelexpress_rl.inference.plan import (
     SourceResolver,
     WeightUpdatePlanner,
 )
-from modelexpress_rl.inference.runtime import EngineRuntime, GeneratorRuntime
-from modelexpress_rl.inference.session import WeightUpdateSession
-from modelexpress_rl.inference.source import ObjectStorageSourceResolver
-from modelexpress_rl.s3 import ImmutableS3Conflict, S3Client
-from modelexpress_rl.utils import checksum_factory, compress_delta, compute_delta
+from modelexpress.rl.inference.runtime import EngineRuntime, GeneratorRuntime
+from modelexpress.rl.inference.session import WeightUpdateSession
+from modelexpress.rl.inference.source import ObjectStorageSourceResolver
+from modelexpress.rl.s3 import ImmutableS3Conflict, S3Client
+from modelexpress.rl.utils import checksum_factory, compress_delta, compute_delta
 
 
 def _checksum(value):

@@ -5,18 +5,18 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from modelexpress_rl.inference import runtime
-from modelexpress_rl.inference.adapter import (
+from modelexpress.rl.inference import runtime
+from modelexpress.rl.inference.adapter import (
     TrainerSourceShard,
 )
-from modelexpress_rl.inference.plan import (
+from modelexpress.rl.inference.plan import (
     PreparedStreamingTensors,
     TrainerSourceSnapshot,
     ResolvedTrainerSource,
     StreamingSettings,
 )
-from modelexpress_rl.train import WeightPayloadFormat
-from modelexpress_rl.version import MeshIdentity
+from modelexpress.rl.train import WeightPayloadFormat
+from modelexpress.rl.version import MeshIdentity
 
 
 def setup_method(monkeypatch, *, staging_device="cuda", staging_buffers=1) -> tuple:

@@ -26,7 +26,7 @@ import logging
 import pytest
 import torch
 
-from modelexpress_rl.modelexpress_rl.tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
+from modelexpress.rl.tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
 
 # The observed incident, verbatim, from MX_STAGE_COST.
 SLOW_BYTES = 15_889_231_872
@@ -52,7 +52,7 @@ def _receiver(monkeypatch, floor):
         monkeypatch.delenv("MX_RESHARD_MIN_GBPS", raising=False)
     else:
         monkeypatch.setenv("MX_RESHARD_MIN_GBPS", str(floor))
-    from modelexpress_rl.refit.reshard import receiver
+    from modelexpress.rl.refit.reshard import receiver
 
     return receiver
 
@@ -286,7 +286,7 @@ def test_floor_and_ceiling_can_both_be_configured(monkeypatch, caplog):
     rate between them is the healthy case and should produce neither record."""
     monkeypatch.setenv("MX_RESHARD_MIN_GBPS", str(FLOOR_GBPS))
     monkeypatch.setenv("MX_RESHARD_MAX_GBPS", "400")
-    from modelexpress_rl.refit.reshard import receiver
+    from modelexpress.rl.refit.reshard import receiver
 
     with caplog.at_level(logging.WARNING):
         receiver.ReshardReceiver._check_throughput_floor(

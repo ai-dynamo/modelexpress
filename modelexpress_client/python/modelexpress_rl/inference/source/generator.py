@@ -21,7 +21,7 @@ from ..plan import (
     WeightSource,
 )
 
-logger = logging.getLogger("modelexpress_rl.inference.source.generator")
+logger = logging.getLogger("modelexpress.rl.inference.source.generator")
 
 
 class GeneratorSourceResolver(SourceResolver):

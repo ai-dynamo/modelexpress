@@ -30,25 +30,25 @@ from modelexpress.accelerators import accelerator_backend_for
 from modelexpress.engines.vllm.host_quantization import (
     refresh_host_quantization_state,
 )
-from modelexpress_rl.refit.reshard.geometry import (
+from modelexpress.rl.refit.reshard.geometry import (
     capture_weights,
     convert_source_weights,
     overlapping_destination_groups,
 )
-from modelexpress_rl.refit.reshard.types import IncompleteRefit
-from modelexpress_rl.refit.timing import refit_span
+from modelexpress.rl.refit.reshard.types import IncompleteRefit
+from modelexpress.rl.refit.timing import refit_span
 
-from modelexpress_rl import envs as rl_envs
-from modelexpress_rl.inference.engines.vllm.surgical import (
+from modelexpress.rl import envs as rl_envs
+from modelexpress.rl.inference.engines.vllm.surgical import (
     changed_since,
     module_groups,
 )
-from modelexpress_rl.inference.engines.vllm.stream_windows import (
+from modelexpress.rl.inference.engines.vllm.stream_windows import (
     layer_windows,
     windowed_weights,
 )
 
-from modelexpress_rl.inference.engines.vllm.install_plan import (
+from modelexpress.rl.inference.engines.vllm.install_plan import (
     EngineInstallPlan,
     SourceInstallPlan,
     _EngineRuntimeBindings,
@@ -57,7 +57,7 @@ from modelexpress_rl.inference.engines.vllm.install_plan import (
     _InstallExecution,
     _ReplaySchedule,
 )
-from modelexpress_rl.inference.plan import (
+from modelexpress.rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
     PreparedArtifact,
@@ -67,16 +67,16 @@ from modelexpress_rl.inference.plan import (
     PreparedStreamingTensors,
     SourceReplayBatch,
 )
-from modelexpress_rl.inference.receiver import PreparedCheckpoint
-from modelexpress_rl.utils import index_checkpoint_tensors
+from modelexpress.rl.inference.receiver import PreparedCheckpoint
+from modelexpress.rl.utils import index_checkpoint_tensors
 
 if TYPE_CHECKING:
-    from modelexpress_rl.inference.streaming_checkpoint import StreamedCheckpoint
-    from modelexpress_rl.refit.reshard.types import CaptureResult
+    from modelexpress.rl.inference.streaming_checkpoint import StreamedCheckpoint
+    from modelexpress.rl.refit.reshard.types import CaptureResult
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
 
-logger = logging.getLogger("modelexpress_rl.inference.engines.vllm.installer")
+logger = logging.getLogger("modelexpress.rl.inference.engines.vllm.installer")
 _LAYERWISE_LOGGER = "vllm.model_executor.model_loader.reload.layerwise"
 
 
@@ -1255,7 +1255,7 @@ class _VllmInstaller(EngineInstaller):
             plan.installed.update(canonical for _, _, canonical in owner.parameters)
 
     def _copy_source_write(self, owner, plan, recorded, source):
-        from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
+        from modelexpress.rl.inference.nixl_staged_transfer import _replay_ops
 
         if self._model.get_submodule(owner.path) is not owner.layer:
             raise IncompleteRefit(f"replay owner {owner.path!r} was replaced")

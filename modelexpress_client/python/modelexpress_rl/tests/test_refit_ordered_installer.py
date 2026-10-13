@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from modelexpress_rl.refit.reshard.types import IncompleteRefit
-from modelexpress_rl.inference.plan import PreparedStreamingTensors, SourceReplayBatch
-from modelexpress_rl.tests.test_refit_vllm_installer import (
+from modelexpress.rl.refit.reshard.types import IncompleteRefit
+from modelexpress.rl.inference.plan import PreparedStreamingTensors, SourceReplayBatch
+from modelexpress.rl.tests.test_refit_vllm_installer import (
     _cpu_installer,
     _install_fake_vllm,
     _install_tensors,
@@ -116,7 +116,7 @@ def test_persistent_only_owner_skips_materialization(monkeypatch, registry):
 
 @pytest.mark.parametrize("streaming", [False, True])
 def test_replaced_pending_slot_fails_before_its_copy(monkeypatch, streaming):
-    from modelexpress_rl.refit.reshard.types import IncompleteRefit
+    from modelexpress.rl.refit.reshard.types import IncompleteRefit
 
     _install_fake_vllm(monkeypatch, lambda model: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
@@ -147,7 +147,7 @@ def _persistent_installer(monkeypatch, model, *, quantized=False):
     from contextlib import nullcontext
     from types import ModuleType
 
-    import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
+    import modelexpress.rl.inference.nixl_staged_transfer as transfer_module
 
     _install_fake_vllm(monkeypatch, lambda model: None)
     layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
@@ -161,7 +161,10 @@ def _persistent_installer(monkeypatch, model, *, quantized=False):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
-    return _cpu_installer(model)
+    return _cpu_installer(
+        model,
+        vllm_config=SimpleNamespace(quant_config=object()) if quantized else None,
+    )
 
 
 @pytest.mark.parametrize("registry", ["parameter", "buffer"])
@@ -486,8 +489,9 @@ def test_online_fp8_streaming_keeps_live_storage(monkeypatch):
     original = model.weight
     installer = _persistent_installer(monkeypatch, model, quantized=True)
     assert PreparedStreamingTensors in installer.capabilities.artifact_types
-    prepared = PreparedStreamingTensors(
-        lambda: iter([{"weight": torch.ones(2, 2)}]), frozenset({"weight"}), {}
+    prepared = _streamed_tensors(
+        installer, lambda: iter([{"weight": torch.ones(2, 2)}]),
+        frozenset({"weight"}), {},
     )
     installer.install_streaming(prepared)
     assert model.weight is original
@@ -572,11 +576,8 @@ def test_quantized_replay_reuses_capture_and_restores_renamed_storage(monkeypatc
     manifest = [
         (name, tensor.dtype, tuple(tensor.shape)) for name, tensor in sources.items()
     ]
-    installer = _VllmInstaller(
-        model=model,
-        vllm_config=SimpleNamespace(quant_config=object()),
-        model_config=object(),
-        device=torch.device("cpu"),
+    installer = _cpu_installer(
+        model, vllm_config=SimpleNamespace(quant_config=object()),
     )
     captured, layout = installer.capture(manifest)
     assert model.capture_calls == 1

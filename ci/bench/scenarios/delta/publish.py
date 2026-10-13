@@ -18,7 +18,7 @@ import torch
 import torch.distributed as dist
 from botocore.config import Config
 from harness.config import load_config
-from modelexpress_rl import (
+from modelexpress.rl import (
     ModelExpressControlClient,
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
@@ -29,7 +29,7 @@ from modelexpress_rl import (
     WeightPayloadFormat,
     WeightVersionState,
 )
-from modelexpress_rl.utils import compress_delta
+from modelexpress.rl.utils import compress_delta
 from safetensors import safe_open
 from safetensors.torch import save_file
 

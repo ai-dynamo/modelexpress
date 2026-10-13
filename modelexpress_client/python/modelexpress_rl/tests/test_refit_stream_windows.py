@@ -6,7 +6,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-from modelexpress_rl.inference.engines.vllm.stream_windows import (
+from modelexpress.rl.inference.engines.vllm.stream_windows import (
     layer_windows,
     windowed_weights,
 )

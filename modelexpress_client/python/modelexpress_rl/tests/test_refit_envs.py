@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from modelexpress_rl import envs
+from modelexpress.rl import envs
 
 
 def test_defaults_when_unset(monkeypatch):
@@ -165,7 +165,7 @@ def test_s3_tcp_keepalive_rejects_invalid_boolean(monkeypatch):
 
 
 def test_streaming_diagnostics_default_off_and_packing_on(monkeypatch) -> None:
-    from modelexpress_rl import envs as refit_envs
+    from modelexpress.rl import envs as refit_envs
 
     for name in (
         "MX_REFIT_DEBUG_VALIDATE_PLAN",
@@ -179,7 +179,7 @@ def test_streaming_diagnostics_default_off_and_packing_on(monkeypatch) -> None:
 
 
 def test_refit_replica_settings_default_and_normalization(monkeypatch) -> None:
-    from modelexpress_rl import envs as refit_envs
+    from modelexpress.rl import envs as refit_envs
 
     names = (
         "MX_REFIT_PREFETCH_REPLICA_METADATA",
@@ -241,7 +241,7 @@ def test_moved_reshard_settings_keep_model_express_boolean_parsing(monkeypatch, 
         monkeypatch.setenv(name, truthy)
         assert getattr(envs, name) is True
         monkeypatch.setenv(name, "invalid")
-        with caplog.at_level("WARNING", logger="modelexpress_rl.envs"):
+        with caplog.at_level("WARNING", logger="modelexpress.rl.envs"):
             assert getattr(envs, name) is default
         assert f"Invalid {name}=" in caplog.text
 

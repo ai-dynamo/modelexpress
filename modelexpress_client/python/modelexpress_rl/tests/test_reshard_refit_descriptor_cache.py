@@ -31,10 +31,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from modelexpress_rl.refit.reshard import receiver as receiver_mod
-from modelexpress_rl.refit.reshard.transfer_plan import LogicalTransferPlan
-from modelexpress_rl.refit.reshard.types import CaptureResult
-from modelexpress_rl.modelexpress_rl.tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
+from modelexpress.rl.refit.reshard import receiver as receiver_mod
+from modelexpress.rl.refit.reshard.transfer_plan import LogicalTransferPlan
+from modelexpress.rl.refit.reshard.types import CaptureResult
+from modelexpress.rl.tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
 
 
 @pytest.fixture(autouse=True)

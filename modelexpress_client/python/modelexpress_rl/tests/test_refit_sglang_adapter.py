@@ -11,15 +11,15 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from modelexpress_rl import ModelExpressGeneratorClient, ObjectStorageType
-from modelexpress_rl.inference.engines.sglang import (
+from modelexpress.rl import ModelExpressGeneratorClient, ObjectStorageType
+from modelexpress.rl.inference.engines.sglang import (
     SglangGeneratorContext,
     _create_sglang_engine_runtime,
     get_modelexpress_generator,
 )
-from modelexpress_rl.inference.engines.sglang.installer import _SglangInstaller
-from modelexpress_rl.inference.plan import PreparedCheckpointArtifact
-from modelexpress_rl.inference.receiver import (
+from modelexpress.rl.inference.engines.sglang.installer import _SglangInstaller
+from modelexpress.rl.inference.plan import PreparedCheckpointArtifact
+from modelexpress.rl.inference.receiver import (
     PreparedCheckpoint,
     ReceiverInstallError,
 )

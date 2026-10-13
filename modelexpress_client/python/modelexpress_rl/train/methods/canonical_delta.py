@@ -31,7 +31,7 @@ from ...utils import (
 )
 from ...version import WeightVersionRef
 
-logger = logging.getLogger("modelexpress_rl.train.client")
+logger = logging.getLogger("modelexpress.rl.train.client")
 
 
 @dataclass
