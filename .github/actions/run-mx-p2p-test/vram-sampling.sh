@@ -16,9 +16,9 @@ sample_peak_vram() {
   local samples="${!samples_var}"
 
   if [ -z "${pod}" ]; then
-    pod="$(kubectl get pods -n "${NAMESPACE}" \
+    pod="$(ci_kubectl get pods -n "${NAMESPACE}" \
       -l "${selector}" \
-      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+      -o json | jq -r '.items[0].metadata.name // empty')"
   fi
   if [ -z "${pod}" ]; then
     return 0
@@ -75,9 +75,9 @@ wait_for_health() {
   local deadline failed pod
   deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
-    pod="$(kubectl get pods -n "${NAMESPACE}" \
+    pod="$(ci_kubectl get pods -n "${NAMESPACE}" \
       -l "${selector}" \
-      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+      -o json | jq -r '.items[0].metadata.name // empty')"
     printf -v "${pod_var}" '%s' "${pod}"
 
     if [ "${measure_vram}" = "true" ]; then
@@ -85,12 +85,12 @@ wait_for_health() {
         "${pod_var}" "${peak_var}" "${samples_var}" "${final_var}"
     fi
     if [ -n "${pod}" ] && kubectl exec -n "${NAMESPACE}" "${pod}" -c "${container}" -- \
-         curl -sf -m 5 "http://localhost:${port}/health" >/dev/null 2>&1; then
+         curl -sf -m 5 "http://localhost:${port}/health" >/dev/null; then
       echo "${label} ${pod} /health returned 200."
       break
     fi
 
-    failed="$(kubectl get pods -n "${NAMESPACE}" -l "${selector}" --no-headers 2>/dev/null \
+    failed="$(ci_kubectl get pods -n "${NAMESPACE}" -l "${selector}" --no-headers \
       | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)"
     if [ -n "${failed}" ]; then
       echo "ERROR: ${label} pod entered failure state before /health returned 200: ${failed}"
@@ -107,7 +107,7 @@ wait_for_health() {
   fi
   pod="${!pod_var}"
   if [ -z "${pod}" ] || ! kubectl exec -n "${NAMESPACE}" "${pod}" -c "${container}" -- \
-       curl -sf -m 5 "http://localhost:${port}/health" >/dev/null 2>&1; then
+       curl -sf -m 5 "http://localhost:${port}/health" >/dev/null; then
     echo "ERROR: ${label} /health did not return 200 within ${timeout}s${timeout_detail}"
     exit 1
   fi
