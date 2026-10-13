@@ -1011,7 +1011,7 @@ def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch):
         model_config=object(),
         device=torch.device("cpu"),
     )
-    capture, layout = installer.capture([("embedding.weight", torch.float32, (2, 2))], trainer_mesh=("trainer", 1))
+    capture, layout = installer.capture([("embedding.weight", torch.float32, (2, 2))])
     assert (
         set(layout)
         == {copy.param_name for copy in capture.copies}
@@ -2022,7 +2022,7 @@ def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypa
         model_config=object(),
         device=torch.device("cpu"),
     )
-    capture, layout = installer.capture([("embedding.weight", torch.float32, (2, 2))], trainer_mesh=("trainer", 1))
+    capture, layout = installer.capture([("embedding.weight", torch.float32, (2, 2))])
     assert (
         set(layout)
         == {copy.param_name for copy in capture.copies}
@@ -2031,19 +2031,19 @@ def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypa
     assert model.embedding.weight is model.lm_head.weight
     assert torch.equal(model.embedding.weight, original)
     manifest = [("embedding.weight", torch.float32, (2, 2))]
-    cached, _ = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    cached, _ = installer.capture(manifest)
     assert model.capture_calls == 1
     cached.copies.clear()
-    assert installer.capture(manifest, trainer_mesh=("trainer", 1))[0].copies
+    assert installer.capture(manifest)[0].copies
     model.routing.add_(1)
-    installer.capture(manifest, trainer_mesh=("trainer", 2))
+    installer.capture(manifest)
     assert model.capture_calls == 2
     with torch.inference_mode():
         model.routing = torch.tensor([3, 4])
-        installer.capture(manifest, trainer_mesh=("trainer", 3))
+        installer.capture(manifest)
         assert model.capture_calls == 3
         model.routing.add_(1)
-        installer.capture(manifest, trainer_mesh=("trainer", 4))
+        installer.capture(manifest)
         assert model.capture_calls == 4
 
     for value in (7.0, 11.0, -3.0):
@@ -2058,7 +2058,7 @@ def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypa
         assert torch.equal(model.lm_head.weight, torch.full((2, 2), value))
         assert "retention_batch_scans" not in prepared.transfer_metrics
         assert "retention_final_scans" not in prepared.transfer_metrics
-        installer.capture(manifest, trainer_mesh=("trainer", 4))
+        installer.capture(manifest)
         assert model.capture_calls == 4
 
 

@@ -269,39 +269,39 @@ def test_real_capture_cache_uses_snapshot_for_slicing_and_retains_invalidation(
 ):
     installer, model = capture_installer
     manifest = [("weight", torch.float32, (3, 3))]
-    cold, _ = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    cold, _ = installer.capture(manifest)
     assert type(installer._capture_cache[1]) is _CaptureSnapshot
     assert cold.copies[0].op_chain[0][0] == "__getitem__"
     original = copy.deepcopy(cold)
     cold.copies[0].dest_offset = 55
-    first, layout = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    first, layout = installer.capture(manifest)
     assert first == original and model.capture_calls == 1
     first.copies[0].op_chain = (("view", ([4],), ()),)
     first.copies.clear()
     layout.clear()
-    assert installer.capture(manifest, trainer_mesh=("trainer", 1))[0] == original
+    assert installer.capture(manifest)[0] == original
     assert model.capture_calls == 1
-    installer.capture([("weight", torch.float32, (4, 4))], trainer_mesh=("trainer", 2))
+    installer.capture([("weight", torch.float32, (4, 4))])
     assert model.capture_calls == 2
     model.weight = nn.Parameter(torch.zeros(1, 2))
-    changed, changed_layout = installer.capture(manifest, trainer_mesh=("trainer", 3))
+    changed, changed_layout = installer.capture(manifest)
     assert model.capture_calls == 3
     assert changed.copies[0].dest_shape == (1, 2)
     assert changed_layout == {"weight": ((1, 2), torch.float32)}
-    assert installer.capture(manifest, trainer_mesh=("trainer", 3)) == (changed, changed_layout)
+    assert installer.capture(manifest) == (changed, changed_layout)
     assert model.capture_calls == 3
 
 
 def test_failed_fresh_capture_discards_snapshot(capture_installer, monkeypatch):
     installer, _ = capture_installer
-    installer.capture([("weight", torch.float32, (3, 3))], trainer_mesh=("trainer", 1))
+    installer.capture([("weight", torch.float32, (3, 3))])
 
     def fail(*args, **kwargs):
         raise RuntimeError("capture failed")
 
     monkeypatch.setattr(module, "capture_weights", fail)
     with pytest.raises(RuntimeError, match="capture failed"):
-        installer.capture([("weight", torch.float32, (4, 4))], trainer_mesh=("trainer", 2))
+        installer.capture([("weight", torch.float32, (4, 4))])
     assert installer._capture_cache is None
 
 
@@ -318,8 +318,8 @@ def test_real_capture_cache_preserves_duplicate_record_identity(
 
     monkeypatch.setattr(module, "capture_weights", duplicate)
     manifest = [("weight", torch.float32, (3, 3))]
-    installer.capture(manifest, trainer_mesh=("trainer", 1))
-    warm, _ = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    installer.capture(manifest)
+    warm, _ = installer.capture(manifest)
     assert type(installer._capture_cache[1]) is _CaptureSnapshot
     assert warm.copies[0] is warm.copies[1]
 
@@ -337,8 +337,8 @@ def test_real_capture_cache_nested_mutable_payload_remains_isolated(
 
     monkeypatch.setattr(module, "capture_weights", mutable)
     manifest = [("weight", torch.float32, (3, 3))]
-    installer.capture(manifest, trainer_mesh=("trainer", 1))
+    installer.capture(manifest)
     assert type(installer._capture_cache[1]) is tuple
-    first, _ = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    first, _ = installer.capture(manifest)
     first.copies[0].op_chain[0][1][0][0] = 99
-    assert installer.capture(manifest, trainer_mesh=("trainer", 1))[0].copies[0].op_chain[0][1][0][0] == 4
+    assert installer.capture(manifest)[0].copies[0].op_chain[0][1][0][0] == 4

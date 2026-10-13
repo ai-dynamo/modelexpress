@@ -1611,17 +1611,12 @@ beyond the arena cap. Trainer staging is a separate choice. See
 [bounded vLLM streaming installation](ARCHITECTURE.md#bounded-vllm-streaming-installation)
 for the ownership and failure contract.
 
-The RL installer retains a validated combined capture of trainer-native-to-HF
-source views and vLLM loader operations. A matching mesh ID and generation take
-a fast path that skips the source-schema and engine-layout walk. A changed
-generation compares the native source schema, converter identity and engine
-loading layout. Compatible changes reuse capture; incompatible changes recapture.
-The cached generation advances only after successful validation or recapture.
-Trainer rank, source address and shard-placement changes alone do not invalidate
-capture. Quantized
-captures remain subject to the existing support guard. Converter and engine
-loading semantics are fixed for the runtime lifetime; changing them requires
-recreating the runtime, including its transfer caches.
+The unquantized vLLM installer also reuses a successful load-layout capture while
+parameter identities, addresses, shapes, strides, dtypes, devices, original
+loaders, module identities/loaders, routing-buffer versions or contents, and
+the source converter match. Cache results are copied before returning them.
+Quantized and incomplete captures are never retained. Callers must keep model
+configuration and loader behavior fixed while using an installer.
 
 These caches hold layouts and plans, not weight values or readiness. Every
 update still obtains its version and lease and reads fresh tensor values.
