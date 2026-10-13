@@ -29,7 +29,7 @@ jobs:
   gpu-cleanup:
     name: GPU cleanup
     needs: [gpu-tests]
-    if: ${{ always() && needs.gpu-tests.result != 'success' }}
+    if: ${{ always() && needs.gpu-tests.result != 'skipped' && needs.gpu-tests.result != 'success' }}
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 30
     permissions:

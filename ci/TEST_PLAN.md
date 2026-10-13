@@ -179,7 +179,9 @@ waits for the corresponding host pods to disappear. API errors cannot masquerade
 as successful cleanup. Cleanup preserves namespace/metadata finalizers and reports
 stalled finalization. The parent `GPU test cleanup` job independently reconnects
 after the test workflow finishes or is cancelled, retries remaining namespaces
-owned by the attempt, and checks surviving host pods. The umbrella status check
+owned by the attempt, and checks surviving host pods. Fallback cleanup is skipped
+when tests succeeded or were skipped before starting; failed or cancelled tests
+retain it. The umbrella status check
 requires cleanup success. Legacy namespaces without ownership labels are not
 automatically deleted.
 
