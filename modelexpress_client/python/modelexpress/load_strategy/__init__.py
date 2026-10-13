@@ -167,18 +167,18 @@ def execute_load_strategies(
     )
 
 
-def run_load_strategy_chain(model: nn.Module, ctx: LoadContext) -> nn.Module:
-    """Dispatch to the configured engine-neutral loading policy."""
+def validate_load_strategy_chain() -> None:
+    """Reject policies that require a separate engine integration."""
     from .. import envs
 
-    chain = envs.MX_LOAD_STRATEGY_CHAIN
-    if chain == "INFERENCE":
-        return LoadStrategyChain.run(model, ctx)
-    if chain == "RL":
-        from modelexpress_rl.inference.load_strategy import RLLoadStrategyChain
+    if envs.MX_LOAD_STRATEGY_CHAIN != "INFERENCE":
+        raise ValueError(
+            f"Loading policy {envs.MX_LOAD_STRATEGY_CHAIN!r} requires its engine "
+            "integration plugin; the base loader supports only 'INFERENCE'"
+        )
 
-        return RLLoadStrategyChain.run(model, ctx)
-    raise ValueError(
-        "MX_LOAD_STRATEGY_CHAIN must be 'INFERENCE' or 'RL', "
-        f"got {chain!r}"
-    )
+
+def run_load_strategy_chain(model: nn.Module, ctx: LoadContext) -> nn.Module:
+    """Execute the standalone inference loading policy."""
+    validate_load_strategy_chain()
+    return LoadStrategyChain.run(model, ctx)

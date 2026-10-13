@@ -16,10 +16,7 @@ def register_modelexpress_loaders() -> None:
     global _loaders_registered
     if _loaders_registered:
         return
-    from .registration import (
-        register_plugin_model_loader,
-        register_plugin_weight_transfer_engine,
-    )
+    from .registration import register_plugin_model_loader
 
     configure_vllm_logging()
     apply_patches(VLLM_PATCHES)
@@ -27,7 +24,6 @@ def register_modelexpress_loaders() -> None:
     # Needed for older vLLM versions before native ModelExpress loader
     # registration is available.
     register_plugin_model_loader()
-    register_plugin_weight_transfer_engine()
 
     _loaders_registered = True
 
