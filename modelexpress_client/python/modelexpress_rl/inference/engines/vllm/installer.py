@@ -577,7 +577,6 @@ class _VllmInstaller(EngineInstaller):
         self._convert_native_to_hf = convert_native_to_hf
         self._runtime_tensors = runtime_tensors
         self._capture_cache = None
-        self._capture_mesh = None
         self._native_parameter_dispatch = _native_parameter_dispatch()
 
     @cached_property
@@ -776,10 +775,7 @@ class _VllmInstaller(EngineInstaller):
                     setattr(module, name, parameter)
 
     def capture(
-        self,
-        manifest: list[tuple[str, torch.dtype, tuple[int, ...]]],
-        *,
-        trainer_mesh: tuple[str, int],
+        self, manifest: list[tuple[str, torch.dtype, tuple[int, ...]]]
     ) -> tuple[
         CaptureResult,
         dict[str, tuple[tuple[int, ...], torch.dtype]],
@@ -789,16 +785,12 @@ class _VllmInstaller(EngineInstaller):
         Captures on the LIVE model with its params reverted to engine load-time
         skeletons via layerwise reload; graph-bound kernel tensors are restored
         afterward without finalizing (finalizing would commit the empty skeletons
-        and corrupt the live params). The caller supplies validated mesh identity;
-        source schema, conversion, and engine semantics are fixed within it.
+        and corrupt the live params).
         """
-        same_generation = (
-            self._capture_cache is not None
-            and trainer_mesh == self._capture_mesh
-        )
         if not self._is_quantized and self._capture_cache is not None:
             key, result = self._capture_cache
-            if same_generation or key == self._capture_key(manifest):
+            current_key = self._capture_key(manifest)
+            if key == current_key:
                 copies = (
                     result.indices
                     if type(result) is _CaptureSnapshot
@@ -806,13 +798,9 @@ class _VllmInstaller(EngineInstaller):
                 )
                 logger.info("reusing cached vLLM load layout (%d copies)", len(copies))
                 if type(result) is _CaptureSnapshot:
-                    captured = result.clone()
-                else:
-                    captured = copy.deepcopy(result)
-                self._capture_mesh = trainer_mesh
-                return captured
+                    return result.clone()
+                return copy.deepcopy(result)
         self._capture_cache = None
-        self._capture_mesh = None
         try:
             from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.reload.layerwise import (
@@ -873,7 +861,6 @@ class _VllmInstaller(EngineInstaller):
                 self._capture_key(manifest),
                 _CaptureSnapshot.create(copy.deepcopy((capture, param_layout))),
             )
-            self._capture_mesh = trainer_mesh
         return capture, param_layout
 
     def install_tensors(self, tensors: dict[str, torch.Tensor]) -> None:

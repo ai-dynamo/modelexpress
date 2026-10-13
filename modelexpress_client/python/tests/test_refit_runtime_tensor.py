@@ -223,3 +223,20 @@ def test_runtime_method_rejects_a_trainer_source():
         assert "generator" in str(error).lower()
     else:
         raise AssertionError("runtime tensor method accepted a trainer source")
+
+
+@pytest.mark.parametrize(
+    ("transfer", "capture_layout", "error", "message"),
+    [
+        (None, lambda manifest: manifest, ValueError, "transfer is required"),
+        (object(), None, TypeError, "capture_layout must be callable"),
+        (object(), object(), TypeError, "capture_layout must be callable"),
+    ],
+)
+def test_load_time_method_rejects_invalid_dependencies(
+    transfer, capture_layout, error, message
+):
+    with pytest.raises(error, match=message):
+        LoadTimeTensorNixlUpdateMethod(
+            transfer=transfer, capture_layout=capture_layout
+        )

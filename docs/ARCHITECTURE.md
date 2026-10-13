@@ -1315,13 +1315,8 @@ state before retrying each source individually for precise diagnostics, so bulk
 capture still never produces an incorrect partial plan. The bulk cause is logged
 even when the per-source retry then succeeds for every source, because bulk order
 can trip a loader that per-source order does not. Unexpected engine errors
-propagate, and parameter loader hooks are restored on every exit. The RL
-installer owns one successful combined capture of trainer-native-to-HF source
-views and engine loader operations for each mesh generation. This retains the
-combined capture at the installer boundary; transfer planning composes logical
-plans from it. Logical plans use address-independent source regions; current
-NIXL addresses and agent bindings are resolved separately for each transfer;
-physical transfer binding stays outside the logical plan cache.
+propagate, and parameter loader hooks are restored on every exit. This optimizes
+the first capture without caching layouts across model or source changes.
 
 The minimal rendezvous publisher is called only after its NIXL agent and source
 buffers are registered, so `publish()` stores the worker as READY and repeated
@@ -1731,18 +1726,12 @@ load-time slots; native post-processing recreates runtime aliases. Missing
 load-time slots still fail restoration, and final runtime identity and storage
 validation remains required.
 
-Capture reuse checks the mesh ID and generation first. A validated same-generation
-hit skips the source-schema and engine-layout walk. On a changed generation, the
-installer compares the native source schema, converter identity and engine loading
-layout. Compatible changes reuse the combined capture; incompatible changes
-recapture. Trainer rank, source address and shard-placement changes alone do not invalidate
-capture.
-The cached generation advances only after successful validation or recapture;
-a failed recapture leaves no valid cache entry for the attempted generation.
-Quantized captures retain the existing support guard. Converter and engine
-loading semantics are fixed for the runtime lifetime; changing either requires
-recreating the whole runtime, including transfer caches. This adds no validation
-in source resolution.
+Warm load-layout capture keeps a private snapshot when records contain only
+ordinary immutable metadata. Each caller receives fresh mutable capture records
+and containers, with duplicate record references preserved. Slice-containing
+operation tuples are copied with a shared memo. Mutable or custom payloads and
+changed copy protocols use whole-result deep copying. The existing model,
+loader, routing and manifest keys still decide whether a capture can be reused.
 
 Alias validation uses Python module lookup and parameter registration semantics.
 Each streaming batch checks the current ownership structure and reuses the

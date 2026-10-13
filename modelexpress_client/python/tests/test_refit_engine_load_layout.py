@@ -44,11 +44,10 @@ def capture_installer(monkeypatch) -> tuple:
     return installer, model
 
 
-@pytest.mark.parametrize("mesh", [("trainer", 2), ("replacement-trainer", 1)])
-def test_compatible_mesh_change_reuses_capture(capture_installer, monkeypatch, mesh):
+def test_unchanged_layout_checks_key_and_reuses_capture(capture_installer, monkeypatch):
     installer, model = capture_installer
     manifest = [("weight", torch.float32, (3, 3))]
-    installer.capture(manifest, trainer_mesh=("trainer", 1))
+    installer.capture(manifest)
     original_key = installer._capture_key
     checked = []
 
@@ -57,10 +56,9 @@ def test_compatible_mesh_change_reuses_capture(capture_installer, monkeypatch, m
         return original_key(manifest)
 
     monkeypatch.setattr(installer, "_capture_key", capture_key)
-    capture, layout = installer.capture(manifest, trainer_mesh=mesh)
+    capture, layout = installer.capture(manifest)
     assert checked == [manifest]
     assert capture.copies and layout == {"weight": ((2, 2), torch.float32)}
-    assert installer._capture_mesh == mesh
     assert model.capture_calls == 1
 
 
@@ -81,37 +79,29 @@ def test_failed_initial_capture_can_be_retried(
     elif failure == "restoration":
         layerwise.LAYERWISE_INFO[model] = SimpleNamespace(kernel_tensors=None, reset=fail)
     with pytest.raises(RuntimeError):
-        installer.capture(manifest, trainer_mesh=("trainer", 1))
+        installer.capture(manifest)
     model.load_weights = original_loader
     layerwise.LAYERWISE_INFO.clear()
 
-    capture, layout = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    capture, layout = installer.capture(manifest)
     assert capture.copies and layout == {"weight": ((2, 2), torch.float32)}
 
 
-def test_same_generation_skips_deep_key(capture_installer, monkeypatch):
+def test_changed_source_schema_recaptures(capture_installer):
     installer, model = capture_installer
-    manifest = [("weight", torch.float32, (3, 3))]
-    installer.capture(manifest, trainer_mesh=("trainer", 1))
-
-    def fail(_manifest):
-        raise AssertionError("deep key on generation hit")
-
-    monkeypatch.setattr(installer, "_capture_key", fail)
-    first, _ = installer.capture(manifest, trainer_mesh=("trainer", 1))
-    first.copies.clear()
-    assert installer.capture(manifest, trainer_mesh=("trainer", 1))[0].copies
-    assert model.capture_calls == 1
+    installer.capture([("weight", torch.float32, (3, 3))])
+    installer.capture([("weight", torch.float32, (4, 4))])
+    assert model.capture_calls == 2
 
 
 @pytest.mark.parametrize(
     "change", ["schema", "converter", "loader", "routing", "alias"]
 )
-def test_changed_generation_checks_compatibility(capture_installer, change):
+def test_changed_layout_checks_compatibility(capture_installer, change):
     installer, model = capture_installer
     model.register_buffer("routing", torch.tensor([0, 1]))
     manifest = [("weight", torch.float32, (3, 3))]
-    installer.capture(manifest, trainer_mesh=("trainer", 1))
+    installer.capture(manifest)
     if change == "schema":
         manifest = [("weight", torch.float32, (4, 4))]
     elif change == "converter":
@@ -123,18 +113,17 @@ def test_changed_generation_checks_compatibility(capture_installer, change):
         model.routing = torch.tensor([1, 0])
     else:
         model.other = model.weight
-    installer.capture(manifest, trainer_mesh=("trainer", 2))
+    installer.capture(manifest)
     assert model.capture_calls == 2
-    assert installer._capture_mesh == ("trainer", 2)
 
 
 @pytest.mark.parametrize(
     "failure", ["converter", "loader", "restoration", "snapshot"]
 )
-def test_failed_generation_recapture_retries(capture_installer, monkeypatch, failure):
+def test_failed_recapture_retries(capture_installer, monkeypatch, failure):
     installer, model = capture_installer
     manifest = [("weight", torch.float32, (3, 3))]
-    installer.capture(manifest, trainer_mesh=("trainer", 1))
+    installer.capture(manifest)
     original_loader = model.load_weights
     layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
 
@@ -156,20 +145,20 @@ def test_failed_generation_recapture_retries(capture_installer, monkeypatch, fai
         else:
             patch.setattr(module._CaptureSnapshot, "create", fail)
         with pytest.raises(RuntimeError):
-            installer.capture(manifest, trainer_mesh=("trainer", 2))
-        assert installer._capture_mesh != ("trainer", 2)
+            installer.capture(manifest)
+
     assert model.load_weights == original_loader
-    assert installer.capture(manifest, trainer_mesh=("trainer", 2))[0].copies
-    assert installer._capture_mesh == ("trainer", 2)
+    assert installer.capture(manifest)[0].copies
 
 
 @pytest.mark.parametrize("failure", ["key", "clone"])
-def test_failed_generation_validation_does_not_advance_cache(
+def test_failed_cache_validation_preserves_cache(
     capture_installer, monkeypatch, failure
 ):
     installer, model = capture_installer
     manifest = [("weight", torch.float32, (3, 3))]
-    installer.capture(manifest, trainer_mesh=("trainer", 1))
+    installer.capture(manifest)
+    cache = installer._capture_cache
 
     def fail(*_args):
         raise RuntimeError("validation failed")
@@ -180,10 +169,10 @@ def test_failed_generation_validation_does_not_advance_cache(
         else:
             patch.setattr(module._CaptureSnapshot, "clone", fail)
         with pytest.raises(RuntimeError, match="validation failed"):
-            installer.capture(manifest, trainer_mesh=("trainer", 2))
-        assert installer._capture_mesh == ("trainer", 1)
-    assert installer.capture(manifest, trainer_mesh=("trainer", 2))[0].copies
-    assert installer._capture_mesh == ("trainer", 2)
+            installer.capture(manifest)
+        assert installer._capture_cache is cache
+
+    assert installer.capture(manifest)[0].copies
     assert model.capture_calls == 1
 
 
@@ -191,11 +180,11 @@ def test_conversion_and_loader_are_captured_together(capture_installer):
     installer, model = capture_installer
     manifest = [("native", torch.float32, (4, 4))]
     installer._convert_native_to_hf = lambda weights: {"weight": weights["native"]}
-    first, _ = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    first, _ = installer.capture(manifest)
     installer._convert_native_to_hf = lambda weights: {
         "weight": weights["native"][1:, :]
     }
-    changed, _ = installer.capture(manifest, trainer_mesh=("trainer", 2))
+    changed, _ = installer.capture(manifest)
     assert {record.src_name for record in changed.copies} == {"native"}
     assert first.copies[0].op_chain != changed.copies[0].op_chain
     assert model.capture_calls == 2

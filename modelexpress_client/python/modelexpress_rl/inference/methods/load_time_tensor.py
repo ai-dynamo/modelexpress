@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import contextmanager
-from functools import partial
 
 from modelexpress.refit.timing import (
     add_refit_bytes,
@@ -44,6 +43,10 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         transfer: _NixlStagedTransfer,
         capture_layout: Callable,
     ) -> None:
+        if transfer is None:
+            raise ValueError("transfer is required")
+        if not callable(capture_layout):
+            raise TypeError("capture_layout must be callable")
         self._transfer = transfer
         self._capture_layout = capture_layout
         self._active_plan: _PreparedNixlTransfer | None = None
@@ -93,10 +96,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                     source_fingerprints=tuple(
                         item.physical_fingerprint for item in inputs.sources
                     ),
-                    capture_layout=partial(
-                        self._capture_layout,
-                        trainer_mesh=(source.inputs.trainer_mesh_id, source.inputs.trainer_mesh_generation),
-                    ),
+                    capture_layout=self._capture_layout,
                     source_slot_ids=tuple(item.source_slot_id for item in inputs.sources),
                 )
                 self._active_fingerprint = inputs.physical_fingerprint
@@ -143,10 +143,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                 source_fingerprints=tuple(
                     item.physical_fingerprint for item in source.inputs.sources
                 ),
-                capture_layout=partial(
-                    self._capture_layout,
-                    trainer_mesh=(source.inputs.trainer_mesh_id, source.inputs.trainer_mesh_generation),
-                ),
+                capture_layout=self._capture_layout,
                 source_slot_ids=tuple(item.source_slot_id for item in source.inputs.sources),
                 max_staging_bytes=max_staging_bytes,
                 staging_device=staging_device,

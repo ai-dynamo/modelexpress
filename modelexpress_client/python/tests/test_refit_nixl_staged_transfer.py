@@ -420,7 +420,7 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
     )
     method = LoadTimeTensorNixlUpdateMethod(
         transfer=transfer,
-        capture_layout=lambda manifest, *, trainer_mesh: (
+        capture_layout=lambda manifest: (
             capture,
             {"layer.weight": ((4,), torch.float32)},
         ),
