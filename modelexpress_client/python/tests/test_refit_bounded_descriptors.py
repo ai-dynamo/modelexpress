@@ -62,6 +62,13 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
             ("exact", (), "d.weight", torch.float32),
         )
     ]
+    if conversion:
+        copies = [replace(
+            record,
+            src_name=f"native.{record.src_name}",
+            op_chain=((("transpose", (0, 1), ()),) if conversion == "transpose" else ())
+            + record.op_chain,
+        ) for record in copies]
     capture = CaptureResult(copies=copies)
     layout = {copy.param_name: ((20,), copy.dest_dtype) for copy in copies}
     transports = []
@@ -142,16 +149,6 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
         listen_port=None,
         manager=Manager() if parameters.get("borrowed_manager") else None,
         streaming=settings,
-        convert_native_to_hf=(
-            (lambda weights: {
-                name.removeprefix("native."): (
-                    value.transpose(0, 1)
-                    if conversion == "transpose"
-                    else value
-                )
-                for name, value in weights.items()
-            }) if conversion else None
-        ),
     )
 
     def manifests():

@@ -293,8 +293,10 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
     monkeypatch.setattr(transfer, "_device", torch.device("cpu"))
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
     capture_failure = False
+    capture_meshes = []
 
-    def capture_layout(schema):
+    def capture_layout(schema, *, trainer_mesh):
+        capture_meshes.append(trainer_mesh)
         if capture_failure:
             raise RuntimeError("layout capture failed")
         harness.captures.append(schema)
@@ -317,8 +319,11 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
     method = LoadTimeTensorNixlUpdateMethod(transfer=transfer, capture_layout=capture_layout)
 
     def update(source):
+        captures_before = len(capture_meshes)
         prepared = method.prepare(version=None, source=ResolvedTrainerSource(source))
         try:
+            if len(capture_meshes) != captures_before:
+                assert capture_meshes[-1] == (source.mesh_id, source.mesh_generation)
             if harness.streaming:
                 installed = {name: value.clone() for batch in prepared.batches()
                              for name, value in batch.items()}

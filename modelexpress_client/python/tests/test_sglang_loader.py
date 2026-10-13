@@ -90,37 +90,107 @@ def test_sglang_context_uses_tp_rank_for_matching_and_url_override():
 
     assert ctx.worker_rank == 5
     assert ctx.global_rank == 5
+    assert ctx.local_rank == 0
+    assert ctx.identity.tensor_parallel_size == 1
+    assert ctx.identity.pipeline_parallel_size == 1
+    assert ctx.identity.expert_parallel_size == 1
     assert ctx.mx_client.server_url == "mx.example:9000"
 
 
-def test_sglang_context_separates_worker_rank_from_global_rank(monkeypatch):
-    """Keep SGLang's engine worker rank separate from the distributed rank."""
+@pytest.fixture(params=["legacy", "runtime_context"])
+def sglang_parallel(request, monkeypatch):
+    """Represent the two SGLang parallel-state API surfaces."""
+    parallel = SimpleNamespace(
+        tp_rank=3,
+        pp_rank=1,
+        tp_size=8,
+        pp_size=2,
+        moe_ep_size=4,
+        world_group=SimpleNamespace(local_rank=3),
+    )
     sglang_mod = ModuleType("sglang")
     srt_mod = ModuleType("sglang.srt")
     distributed_mod = ModuleType("sglang.srt.distributed")
-    distributed_mod.get_tensor_model_parallel_rank = lambda: 1
-    distributed_mod.get_pipeline_model_parallel_rank = lambda: 2
-    distributed_mod.get_tensor_model_parallel_world_size = lambda: 4
-    distributed_mod.get_world_group = lambda: SimpleNamespace(local_rank=3)
+    parallel_state_mod = ModuleType("sglang.srt.distributed.parallel_state")
+    parallel_state_mod.get_tensor_model_parallel_rank = lambda: parallel.tp_rank
+    parallel_state_mod.get_pipeline_model_parallel_rank = lambda: parallel.pp_rank
+    parallel_state_mod.get_tensor_model_parallel_world_size = lambda: parallel.tp_size
+    parallel_state_mod.get_pipeline_model_parallel_world_size = lambda: parallel.pp_size
+    parallel_state_mod.get_moe_expert_parallel_world_size = lambda: parallel.moe_ep_size
+    parallel_state_mod.get_world_group = lambda: parallel.world_group
+    distributed_mod.parallel_state = parallel_state_mod
     srt_mod.distributed = distributed_mod
 
     monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
     monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
     monkeypatch.setitem(sys.modules, "sglang.srt.distributed", distributed_mod)
+    monkeypatch.setitem(
+        sys.modules, "sglang.srt.distributed.parallel_state", parallel_state_mod
+    )
+    if request.param == "legacy":
+        for name in (
+            "get_tensor_model_parallel_rank",
+            "get_pipeline_model_parallel_rank",
+            "get_tensor_model_parallel_world_size",
+            "get_pipeline_model_parallel_world_size",
+            "get_moe_expert_parallel_world_size",
+            "get_world_group",
+        ):
+            setattr(distributed_mod, name, getattr(parallel_state_mod, name))
+        monkeypatch.setitem(sys.modules, "sglang.srt.runtime_context", None)
+    else:
+        context_mod = ModuleType("sglang.srt.runtime_context")
+        context_mod.get_parallel = lambda: parallel
+        monkeypatch.setitem(sys.modules, "sglang.srt.runtime_context", context_mod)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 17)
+    return parallel
 
-    with patch("torch.distributed.is_available", return_value=True), patch(
-        "torch.distributed.is_initialized", return_value=True,
-    ), patch("torch.distributed.get_rank", return_value=17):
-        ctx = build_sglang_load_context(
-            _load_config(tp_rank=5, modelexpress_url="mx.example:9000"),
-            _model_config(),
-            _device_config(),
-        )
 
-    assert ctx.worker_rank == 9
+def test_sglang_context_separates_worker_rank_from_global_rank(sglang_parallel):
+    """Keep shard identity correct when package-level getters are absent."""
+    ctx = build_sglang_load_context(
+        _load_config(tp_rank=5, modelexpress_url="mx.example:9000"),
+        _model_config(),
+        _device_config(),
+    )
+
+    assert ctx.worker_rank == 11
     assert ctx.global_rank == 17
     assert ctx.local_rank == 3
+    assert ctx.identity.tensor_parallel_size == 8
+    assert ctx.identity.pipeline_parallel_size == 2
+    assert ctx.identity.expert_parallel_size == 4
     assert ctx.mx_client.server_url == "mx.example:9000"
+
+
+def test_sglang_parallel_state_is_read_for_each_load(sglang_parallel):
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    assert adapter.get_worker_rank() == 11
+    assert adapter.build_identity().tensor_parallel_size == 8
+
+    sglang_parallel.tp_rank = 1
+    sglang_parallel.tp_size = 2
+
+    assert adapter.get_worker_rank() == 3
+    assert adapter.build_identity().tensor_parallel_size == 2
+
+
+def test_sglang_initialized_worker_does_not_default_its_rank(sglang_parallel):
+    del sglang_parallel.tp_rank
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+
+    with pytest.raises(AttributeError, match="tp_rank"):
+        adapter.get_worker_rank()
+
+
+def test_sglang_initialized_worker_does_not_default_its_size(sglang_parallel):
+    del sglang_parallel.tp_size
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+
+    with pytest.raises(AttributeError, match="tp_size"):
+        adapter.build_identity()
 
 
 def test_sglang_is_cuda_alike_uses_sglang_platform_helper(monkeypatch):

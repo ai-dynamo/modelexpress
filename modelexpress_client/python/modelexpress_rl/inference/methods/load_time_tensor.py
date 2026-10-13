@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from functools import partial
 
 from modelexpress.refit.timing import (
     add_refit_bytes,
@@ -71,7 +72,10 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                 trainer_snapshot=source.snapshot,
                 checksums=source.checksums,
                 prepare_groups=source.prepare_groups,
-                capture_layout=self._capture_layout,
+                capture_layout=partial(
+                    self._capture_layout,
+                    trainer_mesh=(source.snapshot.mesh_id, source.snapshot.mesh_generation),
+                ),
             )
             counters.update(prepared.metrics)
         set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))

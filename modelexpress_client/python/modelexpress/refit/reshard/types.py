@@ -54,14 +54,13 @@ def summarize_unsupported(
     return ranked[:limit] if limit is not None else ranked
 
 
-@dataclass(frozen=True)
+@dataclass
 class RecordedCopy:
     """One recorded scatter: read ``src_name`` sliced by ``op_chain`` and write it
     into ``param_name`` at ``as_strided(dest_shape, dest_stride, dest_offset)``.
     Offsets/shapes/strides are read off the (meta) destination view, so no real
     storage is needed. ``dest_dtype`` vs the source dtype decides raw-copy vs
-    convert-via-staging downstream. Direct callers supply immutable tuple
-    shapes, strides and operation arguments."""
+    convert-via-staging downstream."""
 
     src_name: str
     op_chain: OpChain
@@ -70,7 +69,6 @@ class RecordedCopy:
     dest_shape: tuple
     dest_stride: tuple
     dest_dtype: Any
-
 
 
 @dataclass

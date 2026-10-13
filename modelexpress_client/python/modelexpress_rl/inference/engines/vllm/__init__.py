@@ -50,6 +50,7 @@ def _create_vllm_engine_runtime(
         vllm_config=vllm_config,
         model_config=model_config,
         device=engine.get_target_device(),
+        convert_native_to_hf=engine_context.convert_native_to_hf,
         runtime_tensors=runtime_tensors,
     )
 
@@ -82,7 +83,6 @@ def _create_vllm_engine_runtime(
             publish_runtime_tensors=publish_runtime_tensors,
             build_identity=build_identity,
             nixl_manager=loader.nixl_manager if loader is not None else None,
-            convert_native_to_hf=engine_context.convert_native_to_hf,
         ),
     )
 
