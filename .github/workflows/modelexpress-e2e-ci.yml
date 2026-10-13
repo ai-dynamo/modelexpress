@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   inference-tests:
-    name: Inference tests
+    name: Inference
     uses: ./.github/workflows/modelexpress-inference-ci.yml
     secrets: inherit
 

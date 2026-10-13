@@ -256,10 +256,21 @@ def test_four_slot_cleanup_and_mode_transition(tmp_path, lane, other, status):
         assert "after 900s" in result.stderr
 
 
+@pytest.mark.parametrize("pool", ["a100a", "rl"])
+def test_cleanup_accepts_large_cluster_pod_list(tmp_path, pool):
+    pods = {"items": [{"metadata": {"namespace": "other-workload", "annotations": {"fixture": "x" * 2_000_000}}, "spec": {}, "status": {"phase": "Running"}}]}
+    (tmp_path / "pods.json").write_text(json.dumps(pods))
+    command = '''if [[ " $* " == *" get namespaces "* ]]; then echo '{"items":[]}'; else cat "$FIXTURE/pods.json"; fi
+'''
+    result = run_shell(tmp_path, f'export GITHUB_WORKSPACE=. KUBE_CONTEXT=fixture MX_CI_GPU_LANE=slot-15 MX_CI_GPU_CONCURRENCY=16\nwait_for_gpu_pool_cleanup {pool}', command)
+    assert result.returncode == 0, result.stderr
+    assert "no previous CI workload" in result.stdout
+
+
 def test_invalid_concurrency_fails_before_reading_capacity(tmp_path):
-    result = run_shell(tmp_path, 'export MX_CI_GPU_CONCURRENCY=3\nwait_for_gpu_pool_cleanup a100a', 'exit 0')
+    result = run_shell(tmp_path, 'export MX_CI_GPU_CONCURRENCY=17\nwait_for_gpu_pool_cleanup a100a', 'exit 0')
     assert result.returncode != 0
-    assert "must be 1, 2, or 4" in result.stderr
+    assert "must be between 1 and 16" in result.stderr
 
 
 @pytest.mark.parametrize("operation", ["health", "vram"])

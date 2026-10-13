@@ -87,6 +87,7 @@ jobs:
       sha: ${{ steps.inputs.outputs.sha }}
       scenario: ${{ steps.inputs.outputs.scenario }}
       gpu_slot: ${{ steps.inputs.outputs.gpu_slot }}
+      gpu_limit: ${{ steps.inputs.outputs.gpu_limit }}
       model: ${{ steps.inputs.outputs.model }}
       runtime: ${{ steps.inputs.outputs.runtime }}
     steps:
@@ -99,6 +100,7 @@ jobs:
         id: inputs
         env:
           TEST_SHA: ${{ inputs.sha || needs.authorize.outputs.sha }}
+          MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '16' }}
           PR_NUMBER: ${{ inputs.pull_request || github.event.issue.number || 0 }}
           GH_TOKEN: ${{ github.token }}
           MODEL_PROFILE: ${{ inputs.model || needs.authorize.outputs.model }}
@@ -107,7 +109,15 @@ jobs:
         run: |
           python3 ci/bench/scripts/comment_gate.py --workflow-call
           echo "harness_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          python3 -c 'import os; number = int(os.environ["PR_NUMBER"]) or int(os.environ["GITHUB_REF"].rsplit("/", 1)[1]); print("gpu_slot=" + str(number % 4))' >> "$GITHUB_OUTPUT"
+          python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
+          import os
+          count = int(os.environ["MX_CI_GPU_CONCURRENCY"])
+          if not 1 <= count <= 16:
+              raise SystemExit("MX_CI_GPU_CONCURRENCY must be between 1 and 16")
+          number = int(os.environ["PR_NUMBER"]) or int(os.environ["GITHUB_REF"].rsplit("/", 1)[1])
+          print(f"gpu_limit={count}")
+          print(f"gpu_slot={number % count}")
+          PYTHON
 
   build:
     if: ${{ !cancelled() && needs.validate.result == 'success' }}
@@ -170,7 +180,7 @@ jobs:
   test:
     if: ${{ !cancelled() && needs.validate.result == 'success' && needs.build.result == 'success' }}
     concurrency:
-      group: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && format('modelexpress-rl-gpu-{0}', vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02') || vars.MX_CI_GPU_CONCURRENCY == '2' && format('modelexpress-rl-gpu-{0}-refit', vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02') || format('modelexpress-rl-gpu-{0}-slot-{1}', vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', needs.validate.outputs.gpu_slot) }}
+      group: ${{ needs.validate.outputs.gpu_limit == '1' && format('modelexpress-rl-gpu-{0}', vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02') || format('modelexpress-rl-gpu-{0}-slot-{1}', vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', needs.validate.outputs.gpu_slot) }}
       queue: max
       cancel-in-progress: false
     name: "RL refit (${{ needs.validate.outputs.model }})"
@@ -178,8 +188,8 @@ jobs:
     runs-on: prod-deploy-tester-v1
     timeout-minutes: 120
     env:
-      MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '4' }}
-      MX_CI_GPU_LANE: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'all' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'refit' || format('slot-{0}', needs.validate.outputs.gpu_slot) }}
+      MX_CI_GPU_CONCURRENCY: ${{ needs.validate.outputs.gpu_limit }}
+      MX_CI_GPU_LANE: ${{ needs.validate.outputs.gpu_limit == '1' && 'all' || format('slot-{0}', needs.validate.outputs.gpu_slot) }}
       MODEL_PROFILE: ${{ needs.validate.outputs.model }}
       SCENARIO: ${{ needs.validate.outputs.scenario }}
       RUN_ID: ${{ needs.validate.outputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -274,7 +284,26 @@ jobs:
     permissions:
       contents: read
 
+    outputs:
+      gpu_slot: ${{ steps.slots.outputs.gpu_slot }}
+      gpu_limit: ${{ steps.slots.outputs.gpu_limit }}
     steps:
+      - name: Assign GPU slot
+        id: slots
+        env:
+          MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '16' }}
+          PR_NUMBER: "0"
+        run: |
+          python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
+          import os
+          count = int(os.environ["MX_CI_GPU_CONCURRENCY"])
+          if not 1 <= count <= 16:
+              raise SystemExit("MX_CI_GPU_CONCURRENCY must be between 1 and 16")
+          number = int(os.environ["PR_NUMBER"]) or int(os.environ["GITHUB_REF"].rsplit("/", 1)[1])
+          print(f"gpu_limit={count}")
+          print(f"gpu_slot={(number + 1) % count}")
+          PYTHON
+
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -319,7 +348,7 @@ jobs:
 
   test-vime-delta-refit:
     concurrency:
-      group: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && format('modelexpress-rl-gpu-{0}', 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02') || vars.MX_CI_GPU_CONCURRENCY == '2' && format('modelexpress-rl-gpu-{0}-vime', 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02') || format('modelexpress-rl-gpu-{0}-slot-{1}', 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', 3) }}
+      group: ${{ needs.build-vime-delta-refit.outputs.gpu_limit == '1' && format('modelexpress-rl-gpu-{0}', 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02') || format('modelexpress-rl-gpu-{0}-slot-{1}', 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', needs.build-vime-delta-refit.outputs.gpu_slot) }}
       queue: max
       cancel-in-progress: false
     name: RL Vime delta-refit smoke
@@ -329,8 +358,8 @@ jobs:
     permissions:
       contents: read
     env:
-      MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '4' }}
-      MX_CI_GPU_LANE: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'all' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'vime' || format('slot-{0}', 3) }}
+      MX_CI_GPU_CONCURRENCY: ${{ needs.build-vime-delta-refit.outputs.gpu_limit }}
+      MX_CI_GPU_LANE: ${{ needs.build-vime-delta-refit.outputs.gpu_limit == '1' && 'all' || format('slot-{0}', needs.build-vime-delta-refit.outputs.gpu_slot) }}
       KUBE_CONTEXT: nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
       NAMESPACE: mx-ci-h100-vime-${{ github.run_id }}-${{ github.run_attempt }}
       WORKER_IMAGE: nvcr.io/0980761089281446/vime-dynamo-mx-worker:${{ github.sha }}

@@ -16,7 +16,7 @@ env:
 
 jobs:
   gpu-tests:
-    name: GPU tests
+    name: GPU
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref_name }}-azure-gpu-tests
       cancel-in-progress: true

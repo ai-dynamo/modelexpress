@@ -120,18 +120,20 @@ interruptions; they do not establish the cause of the host API resets.
 ## GPU test admission and readiness budgets
 
 The parent workflow calls inference GPU tests through a per-PR concurrency group
-that cancels superseded work. Each pool defaults to four repository-wide test
-slots. Matrix cases are assigned slots 0–3; one complete workload occupies each
-slot through source/target execution and cleanup. P2P, MLA and DP/EP matrices
-allow up to four entries to dispatch concurrently. Builds and independent
+that cancels superseded work. Each pool defaults to 16 repository-wide test
+slots. Inference cases have distinct indices rotated by PR number and reduced
+modulo the configured limit; RL refit and Vime use PR-based slots per Kubernetes
+context. One complete workload occupies each slot through execution and cleanup.
+Matrices allow up to 16 entries to dispatch concurrently. Builds and independent
 cleanup remain outside these queues. GitHub's `queue: max` retains pending jobs.
 
-`MX_CI_GPU_CONCURRENCY=2` selects two lanes: RDMA versus TCP fleet/rolling on A100a,
-and MLA versus DP/EP on A100b. Set it to 1 for full pool serialization. Only 1, 2
-and 4 are accepted. Four is an experimental upper limit, not a capacity
-reservation; slot collisions or runner availability may reduce actual concurrency.
-Drain current runs (or cancel and finish cleanup) before changing modes, because
-changing concurrency-group names does not move already queued or running jobs.
+Set `MX_CI_GPU_CONCURRENCY` to any integer from 1 to 16 to lower the limit; 1
+serializes each pool/context. Sixteen is an experimental upper limit, not a
+capacity reservation; slot collisions or runner availability may reduce actual
+concurrency. Drain current runs (or cancel and finish cleanup) before changing
+limits, because changing slot assignments does not move already queued or
+running jobs. The cleanup guard streams cluster JSON to jq so large pod lists
+do not exceed operating-system command argument limits.
 
 P2P sources and targets, the fleet seed, and every fleet scale wave wait for all
 controller-desired pods to be scheduled before starting their startup deadline.
@@ -181,14 +183,14 @@ can proceed concurrently. Legacy namespaces and workloads from a different
 concurrency mode block admission until their cleanup completes. API errors fail
 closed. Non-CI workloads are left to Kubernetes resource scheduling.
 
-RL GPU jobs default to four repository-wide slots per Kubernetes context. Refit
-runs choose a slot from the PR number modulo four; Vime uses slot 3. This bounds
-concurrency across PRs without a reservation ledger. Two-job mode separates Vime
-and refit, and one-job mode merges them. Normal namespace deletion finishes before
+RL GPU jobs default to 16 repository-wide slots per Kubernetes context. Refit
+runs choose PR number modulo the configured limit; Vime uses PR number plus one
+modulo that limit. This bounds concurrency across PRs without a reservation
+ledger. One-job mode serializes both workloads. Normal namespace deletion finishes before
 releasing a slot. Independent cleanup remains outside the queues. Refit jobs have
 a two-hour budget including admission, setup, execution and cleanup.
 
-Four-job mode needs live qualification of CPU, memory, GPU/MIG and RDMA headroom.
+The 16-slot limit needs live qualification of CPU, memory, GPU/MIG and RDMA headroom.
 Lower the limit when scheduling delays or resource contention appear. Source/target,
 artifact, metadata and model assertions remain unchanged. These limits neither
 reserve cluster-wide capacity nor guarantee placement against other workloads.

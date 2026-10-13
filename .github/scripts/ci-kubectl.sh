@@ -81,8 +81,8 @@ wait_for_worker_liveness() {
 # Wait for the previous CI namespaces and physical pods before allocating a new workload.
 wait_for_gpu_pool_cleanup() {
   local pool="$1" deadline=$((SECONDS + 900)) namespaces pods remaining
-  local lane="${MX_CI_GPU_LANE:-all}" concurrency="${MX_CI_GPU_CONCURRENCY:-4}"
-  [[ "$concurrency" == 1 || "$concurrency" == 2 || "$concurrency" == 4 ]] || { echo "MX_CI_GPU_CONCURRENCY must be 1, 2, or 4" >&2; return 1; }
+  local lane="${MX_CI_GPU_LANE:-all}" concurrency="${MX_CI_GPU_CONCURRENCY:-16}"
+  [[ "$concurrency" =~ ^([1-9]|1[0-6])$ ]] || { echo "MX_CI_GPU_CONCURRENCY must be between 1 and 16" >&2; return 1; }
   if [ "$concurrency" = 1 ]; then lane=all; fi
   while [ "$SECONDS" -lt "$deadline" ]; do
     if [[ "$pool" == a100* ]]; then
@@ -92,7 +92,8 @@ wait_for_gpu_pool_cleanup() {
       namespaces=$(ci_kubectl get namespaces --context="$KUBE_CONTEXT" -o json) || return 1
       pods=$(ci_kubectl get pods -A --context="$KUBE_CONTEXT" -o json) || return 1
     fi
-    remaining=$(jq -n --arg pool "$pool" --arg lane "$lane" --argjson namespaces "$namespaces" --argjson pods "$pods" '
+    remaining=$(printf '%s\n%s\n' "$namespaces" "$pods" | jq -s --arg pool "$pool" --arg lane "$lane" '
+      .[0] as $namespaces | .[1] as $pods |
       def classify($name):
         if ($name | test("^mx-ci-(fleet|rolling)-")) then "tcp"
         elif ($name | test("^mx-ci-h100-vime-")) then "vime"

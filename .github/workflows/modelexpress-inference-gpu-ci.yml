@@ -13,9 +13,30 @@ env:
   MX_IMAGE_REPO: nvcr.io/0980761089281446
 
 jobs:
+  admission-slots:
+    runs-on: ubuntu-latest
+    outputs:
+      slots: ${{ steps.slots.outputs.slots }}
+      count: ${{ steps.slots.outputs.count }}
+    steps:
+      - id: slots
+        env:
+          MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '16' }}
+        run: |
+          python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
+          import json, os
+          count = int(os.environ["MX_CI_GPU_CONCURRENCY"])
+          if not 1 <= count <= 16:
+              raise SystemExit("MX_CI_GPU_CONCURRENCY must be between 1 and 16")
+          seed = int(os.environ["GITHUB_REF"].rsplit("/", 1)[1])
+          print(f"count={count}")
+          print("slots=" + json.dumps([(seed + i) % count for i in range(16)]))
+          PYTHON
+
   test-p2p:
+    needs: admission-slots
     concurrency:
-      group: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'modelexpress-azure-a100a' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'modelexpress-azure-a100a-rdma' || format('modelexpress-gpu-a100a-slot-{0}', matrix.gpu_slot) }}
+      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
     name: P2P test (${{ matrix.label || matrix.framework }})
@@ -23,15 +44,15 @@ jobs:
     timeout-minutes: 120
     env:
       MX_CI_GPU_POOL: a100a
-      MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '4' }}
-      MX_CI_GPU_LANE: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'all' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'rdma' || format('slot-{0}', matrix.gpu_slot) }}
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
       # Bound matrix dispatch; the shared pool concurrency group
       # controls which queued workload can allocate GPUs.
-      max-parallel: 4
+      max-parallel: 16
       matrix:
         include:
           - framework: vllm
@@ -91,7 +112,7 @@ jobs:
           # field). same-version only guards the path against future same-build
           # breaks.
           - framework: vllm
-            gpu_slot: 0
+            gpu_slot: 4
             label: vllm full-manifest same-version
             namespace: mx-ci-full-manifest-same-${{ github.run_id }}-${{ github.run_attempt }}
             manifest: ci/k8s/client/vllm/manifest-azure.yaml
@@ -102,7 +123,7 @@ jobs:
             worker_port: "8022"
             mx_p2p_metadata: "0"
           - framework: vllm
-            gpu_slot: 1
+            gpu_slot: 5
             label: vllm full-manifest mixed-version
             namespace: mx-ci-full-manifest-mixed-${{ github.run_id }}-${{ github.run_attempt }}
             manifest: ci/k8s/client/vllm/manifest-azure.yaml
@@ -124,7 +145,7 @@ jobs:
           # agnostic), so it works even though Redis publishes no ModelMetadata
           # CRs.
           - framework: vllm
-            gpu_slot: 2
+            gpu_slot: 6
             label: vllm full-manifest redis same-version
             namespace: mx-ci-full-manifest-redis-same-${{ github.run_id }}-${{ github.run_attempt }}
             manifest: ci/k8s/client/vllm/manifest-azure.yaml
@@ -136,7 +157,7 @@ jobs:
             mx_p2p_metadata: "0"
             server_manifest: ci/k8s/server/mx-server-redis.yaml
           - framework: vllm
-            gpu_slot: 3
+            gpu_slot: 7
             label: vllm full-manifest redis mixed-version
             namespace: mx-ci-full-manifest-redis-mixed-${{ github.run_id }}-${{ github.run_attempt }}
             manifest: ci/k8s/client/vllm/manifest-azure.yaml
@@ -216,8 +237,9 @@ jobs:
 
 
   test-p2p-mla-model:
+    needs: admission-slots
     concurrency:
-      group: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'modelexpress-azure-a100b' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'modelexpress-azure-a100b-mla' || format('modelexpress-gpu-a100b-slot-{0}', matrix.gpu_slot) }}
+      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100b' || format('modelexpress-gpu-a100b-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
     name: P2P MLA model test (${{ matrix.framework }} TP=2)
@@ -226,13 +248,13 @@ jobs:
     # Full-GPU pool is required because VRAM sampling is blocked on MIG slices.
     env:
       MX_CI_GPU_POOL: a100b
-      MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '4' }}
-      MX_CI_GPU_LANE: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'all' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'mla' || format('slot-{0}', matrix.gpu_slot) }}
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 16
       matrix:
         include:
           - framework: vllm
@@ -303,8 +325,9 @@ jobs:
 
 
   test-tp:
+    needs: admission-slots
     concurrency:
-      group: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'modelexpress-azure-a100a' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'modelexpress-azure-a100a-rdma' || format('modelexpress-gpu-a100a-slot-{0}', matrix.gpu_slot) }}
+      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
     name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }} ${{ matrix.topology }})
@@ -312,8 +335,8 @@ jobs:
     timeout-minutes: 120
     env:
       MX_CI_GPU_POOL: a100a
-      MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '4' }}
-      MX_CI_GPU_LANE: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'all' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'rdma' || format('slot-{0}', matrix.gpu_slot) }}
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:
@@ -323,7 +346,7 @@ jobs:
           # Multi-node TP=2 (vLLM). StatefulSet + Ray topology; see the
           # manifest header for the cross-host pod-pairing rationale.
           - framework: vllm
-            gpu_slot: 3
+            gpu_slot: 8
             tp_size: 2
             topology: multi-node
             namespace: mx-ci-vllm-multinode-tp2-${{ github.run_id }}-${{ github.run_attempt }}
@@ -388,8 +411,9 @@ jobs:
 
 
   test-parallel:
+    needs: admission-slots
     concurrency:
-      group: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'modelexpress-azure-a100b' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'modelexpress-azure-a100b-parallel' || format('modelexpress-gpu-a100b-slot-{0}', matrix.gpu_slot) }}
+      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100b' || format('modelexpress-gpu-a100b-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
     name: P2P ${{ matrix.label }} test (vllm)
@@ -397,13 +421,13 @@ jobs:
     timeout-minutes: 120
     env:
       MX_CI_GPU_POOL: a100b
-      MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '4' }}
-      MX_CI_GPU_LANE: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'all' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'parallel' || format('slot-{0}', matrix.gpu_slot) }}
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 16
       matrix:
         include:
           - label: DP=2
@@ -486,8 +510,9 @@ jobs:
 
 
   test-with-dynamo:
+    needs: admission-slots
     concurrency:
-      group: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'modelexpress-azure-a100a' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'modelexpress-azure-a100a-rdma' || format('modelexpress-gpu-a100a-slot-{0}', matrix.gpu_slot) }}
+      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
     name: P2P test with Dynamo (${{ matrix.mode }})
@@ -495,8 +520,8 @@ jobs:
     timeout-minutes: 120
     env:
       MX_CI_GPU_POOL: a100a
-      MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '4' }}
-      MX_CI_GPU_LANE: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'all' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'rdma' || format('slot-{0}', matrix.gpu_slot) }}
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:
@@ -504,12 +529,12 @@ jobs:
       matrix:
         include:
           - mode: aggregated
-            gpu_slot: 0
+            gpu_slot: 9
             manifest: ci/k8s/client/vllm/dynamo/manifest-azure-aggregated.yaml
             namespace: mx-ci-dynamo-agg-${{ github.run_id }}-${{ github.run_attempt }}
             dgd_name: mx-dynamo-agg-${{ github.run_id }}-${{ github.run_attempt }}
           - mode: disaggregated
-            gpu_slot: 1
+            gpu_slot: 10
             manifest: ci/k8s/client/vllm/dynamo/manifest-azure-disaggregated.yaml
             namespace: mx-ci-dynamo-disagg-${{ github.run_id }}-${{ github.run_attempt }}
             dgd_name: mx-dynamo-disagg-${{ github.run_id }}-${{ github.run_attempt }}
@@ -568,8 +593,9 @@ jobs:
   # Ten-step TP2 trainer + TP1 Dynamo rollout smoke on three H100s.
 
   test-fleet-scale:
+    needs: admission-slots
     concurrency:
-      group: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'modelexpress-azure-a100a' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'modelexpress-azure-a100a-tcp' || format('modelexpress-gpu-a100a-slot-{0}', 2) }}
+      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[11]) }}
       queue: max
       cancel-in-progress: false
     name: Fleet scale test (vLLM, 15 workers)
@@ -577,8 +603,8 @@ jobs:
     timeout-minutes: 120
     env:
       MX_CI_GPU_POOL: a100a
-      MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '4' }}
-      MX_CI_GPU_LANE: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'all' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'tcp' || format('slot-{0}', 2) }}
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[11]) }}
     permissions:
       contents: read
     steps:
@@ -631,8 +657,9 @@ jobs:
 
 
   test-rolling-update:
+    needs: admission-slots
     concurrency:
-      group: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'modelexpress-azure-a100a' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'modelexpress-azure-a100a-tcp' || format('modelexpress-gpu-a100a-slot-{0}', matrix.gpu_slot) }}
+      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
     name: Rolling-update test (${{ matrix.framework }}, 5 workers)
@@ -640,8 +667,8 @@ jobs:
     timeout-minutes: 120
     env:
       MX_CI_GPU_POOL: a100a
-      MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '4' }}
-      MX_CI_GPU_LANE: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'all' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'tcp' || format('slot-{0}', matrix.gpu_slot) }}
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:
@@ -649,11 +676,11 @@ jobs:
       matrix:
         include:
           - framework: vllm
-            gpu_slot: 2
+            gpu_slot: 12
             namespace: mx-ci-rolling-vllm-${{ github.run_id }}-${{ github.run_attempt }}
             manifest: ci/k8s/client/vllm/manifest-azure-rolling-update.yaml
           - framework: sglang
-            gpu_slot: 3
+            gpu_slot: 13
             namespace: mx-ci-rolling-sglang-${{ github.run_id }}-${{ github.run_attempt }}
             manifest: ci/k8s/client/sgl/manifest-azure-rolling-update.yaml
     steps:
@@ -710,17 +737,18 @@ jobs:
 
 
   test-stale-metadata:
+    needs: admission-slots
     concurrency:
-      group: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'modelexpress-azure-a100a' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'modelexpress-azure-a100a-rdma' || format('modelexpress-gpu-a100a-slot-{0}', matrix.gpu_slot) }}
+      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
-    name: Stale metadata test (${{ matrix.framework }})
+    name: P2P Stale metadata test (${{ matrix.framework }})
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 120
     env:
       MX_CI_GPU_POOL: a100a
-      MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '4' }}
-      MX_CI_GPU_LANE: ${{ vars.MX_CI_GPU_CONCURRENCY == '1' && 'all' || vars.MX_CI_GPU_CONCURRENCY == '2' && 'rdma' || format('slot-{0}', matrix.gpu_slot) }}
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:
@@ -728,12 +756,12 @@ jobs:
       matrix:
         include:
           - framework: vllm
-            gpu_slot: 0
+            gpu_slot: 14
             manifest: ci/k8s/client/vllm/manifest-azure.yaml
             namespace: mx-ci-stale-vllm-${{ github.run_id }}-${{ github.run_attempt }}
             source_port: "8011"
           - framework: sglang
-            gpu_slot: 1
+            gpu_slot: 15
             manifest: ci/k8s/client/sgl/manifest-azure.yaml
             namespace: mx-ci-stale-sgl-${{ github.run_id }}-${{ github.run_attempt }}
             source_port: "8012"
