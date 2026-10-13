@@ -8,7 +8,7 @@
 # (the dynamo-shipped vLLM entrypoint, not bare vllm.entrypoints.openai).
 # That entrypoint lives in the dynamo `vllm-runtime` base image.
 #
-# Built and pushed by the `build` job in .github/workflows/modelexpress-ci-tests.yml
+# Built and pushed by the `build-client` job in .github/workflows/modelexpress-inference-ci.yml
 # under tag <MX_IMAGE_REPO>/mx-worker-vllm-dynamo:<sha>.
 FROM nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
 

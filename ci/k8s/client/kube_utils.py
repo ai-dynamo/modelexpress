@@ -9,10 +9,19 @@ copy-pasted across `test_p2p_k8s.py`, `test_dynamo_p2p.py`, and
 only one test, it belongs in that test file, not here.
 """
 
+import errno
+import json
+import os
+import signal
 import socket
 import subprocess
+import sys
+import tempfile
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
+from pathlib import Path
 
 
 def kubectl(*args: str, namespace: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -23,12 +32,21 @@ def kubectl(*args: str, namespace: str, check: bool = True) -> subprocess.Comple
     where a missing resource shouldn't be treated as a test failure (e.g.
     log dumps during cleanup).
     """
-    return subprocess.run(
-        ["kubectl", "-n", namespace, *args],
-        capture_output=True,
-        text=True,
-        check=check,
-    )
+    command = ["kubectl", "-n", namespace, *args]
+    if args and args[0] == "get":
+        command.insert(1, "--request-timeout=10s")
+    for attempt in range(4):
+        result = subprocess.run(command, capture_output=True, text=True)
+        transient = any(error in result.stderr.lower() for error in (
+            "connection refused", "connection reset by peer", "unexpected eof",
+            "context deadline exceeded", "client.timeout exceeded", "i/o timeout", "tls handshake timeout",
+        ))
+        if result.returncode == 0 or not transient or not args or args[0] != "get" or attempt == 3:
+            if check:
+                result.check_returncode()
+            return result
+        print(f"kubectl API read failed; retrying: {result.stderr.strip()}", file=sys.stderr)
+        time.sleep(2)
 
 
 @contextmanager
@@ -46,15 +64,18 @@ def port_forward(namespace: str, target: str, local_port: int, remote_port: int)
     without the BadStatusLine failure mode when speaking HTTP/1.x at a
     gRPC server.
 
-    On exit, SIGTERM the port-forward and reap; if it doesn't die within
-    5s, escalate to SIGKILL. Without the SIGKILL fallback a stuck
+    On exit, SIGTERM the supervisor and reap; if it doesn't die within
+    5s, SIGKILL its process group. Without this fallback a stuck
     kubectl could outlive the test process and hold the local port,
     breaking later tests on the same runner.
     """
+    log = tempfile.TemporaryFile(mode="w+")
+    supervisor = Path(__file__).resolve().parents[3] / ".github/scripts/keep-port-forward.sh"
     proc = subprocess.Popen(
-        ["kubectl", "-n", namespace, "port-forward", target, f"{local_port}:{remote_port}"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        ["bash", str(supervisor), "-n", namespace, "port-forward", target, f"{local_port}:{remote_port}"],
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
     )
     try:
         deadline = time.perf_counter() + 60
@@ -81,9 +102,39 @@ def port_forward(namespace: str, target: str, local_port: int, remote_port: int)
             )
         yield local_port
     finally:
-        proc.terminate()
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+        finally:
+            try:
+                log.seek(0)
+                diagnostics = "\n".join(
+                    line for line in log.read().splitlines()
+                    if not line.startswith(("Forwarding from ", "Handling connection for "))
+                    and not line.endswith("Starting kubectl port-forward")
+                )
+                if diagnostics:
+                    print(f"Port-forward log ({namespace}/{target}):\n{diagnostics}", file=sys.stderr)
+            finally:
+                log.close()
+
+
+def completion_response(request: urllib.request.Request) -> dict:
+    """Retry connection resets/refusals while the port-forward reconnects."""
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
+                return json.loads(response.read())
+        except (ConnectionError, urllib.error.URLError) as error:
+            reason = error.reason if isinstance(error, urllib.error.URLError) else error
+            if not isinstance(reason, OSError) or reason.errno not in (errno.ECONNRESET, errno.ECONNREFUSED) or attempt == 2:
+                raise
+            print(f"Inference connection interrupted; retrying: {error}")
+            time.sleep(3)

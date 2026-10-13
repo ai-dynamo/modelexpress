@@ -110,7 +110,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
     def DeleteWeightVersionShard(self, request, context):
         if any(
             deleted.version_id == request.version_id
-            and deleted.source_slot_id == request.source_slot_id
+            and deleted.logical_shard_id == request.logical_shard_id
             and deleted.worker_id == request.worker_id
             for deleted in self.deleted_shards
         ):
@@ -358,7 +358,7 @@ def test_s3_stage_is_local_then_publish_uploads_version_root(
 
     try:
         with pytest.raises(RuntimeError, match="requires full-tensor publication"):
-            _ = trainer.source_slot_id
+            _ = trainer.logical_shard_id
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
             hf_tensor_iter=iter([[("weight", current)]]),

@@ -115,6 +115,11 @@ if TYPE_CHECKING:
     MX_ARTIFACT_TRANSFER: bool
     MX_ARTIFACT_BUNDLE_ROOT: Optional[str]
     MX_ARTIFACT_COMPILE_CONFIG_DIGEST: str
+    MX_ARTIFACT_BACKEND: str
+    MX_ARTIFACT_MOONCAKE_NAMESPACE: str
+    MX_ARTIFACT_MOONCAKE_POOL_BYTES: int
+    MX_ARTIFACT_MOONCAKE_DELETE_RETRIES: int
+    MX_ARTIFACT_MOONCAKE_DELETE_RETRY_DELAY_SECS: float
     MX_ARTIFACT_READY_URL: str
     MX_ARTIFACT_READY_TIMEOUT_SECS: int
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
@@ -133,6 +138,10 @@ if TYPE_CHECKING:
     MX_P2P_TOPOLOGY_LEVELS: Optional[str]
     MX_P2P_TOPOLOGY: Optional[str]
     MX_P2P_TOPOLOGY_LOAD_WEIGHT: float
+    # Transfer-domain policy: the topology domain sources must share with this
+    # node, and whether that is required (filter) or preferred (ordering).
+    MX_P2P_TOPOLOGY_DOMAIN: Optional[str]
+    MX_P2P_TOPOLOGY_ENFORCEMENT: Optional[str]
     # Opt-in metrics collector
     MX_METRICS_ENABLED: bool
     MX_METRICS_PORT: Optional[str]
@@ -421,6 +430,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_ARTIFACT_COMPILE_CONFIG_DIGEST": lambda: os.environ.get(
         "MX_ARTIFACT_COMPILE_CONFIG_DIGEST", ""
     ),
+    "MX_ARTIFACT_BACKEND": lambda: os.environ.get("MX_ARTIFACT_BACKEND", "nixl")
+    .strip()
+    .lower(),
+    "MX_ARTIFACT_MOONCAKE_NAMESPACE": lambda: os.environ.get(
+        "MX_ARTIFACT_MOONCAKE_NAMESPACE", "modelexpress/artifacts"
+    ).strip(),
+    "MX_ARTIFACT_MOONCAKE_POOL_BYTES": lambda: _env_int(
+        "MX_ARTIFACT_MOONCAKE_POOL_BYTES", 512 * 1024 * 1024
+    ),
+    "MX_ARTIFACT_MOONCAKE_DELETE_RETRIES": lambda: _env_int(
+        "MX_ARTIFACT_MOONCAKE_DELETE_RETRIES", 10
+    ),
+    "MX_ARTIFACT_MOONCAKE_DELETE_RETRY_DELAY_SECS": lambda: _env_float(
+        "MX_ARTIFACT_MOONCAKE_DELETE_RETRY_DELAY_SECS", 0.7
+    ),
     "MX_ARTIFACT_READY_URL": lambda: os.environ.get("MX_ARTIFACT_READY_URL", ""),
     "MX_ARTIFACT_READY_TIMEOUT_SECS": lambda: _env_int(
         "MX_ARTIFACT_READY_TIMEOUT_SECS", 1800
@@ -448,6 +472,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_P2P_TOPOLOGY_LOAD_WEIGHT": lambda: max(
         0.0, _env_float("MX_P2P_TOPOLOGY_LOAD_WEIGHT", 0.0)
     ),
+    # Raw; topology.resolve_policy validates and applies the "required" default.
+    "MX_P2P_TOPOLOGY_DOMAIN": lambda: os.environ.get("MX_P2P_TOPOLOGY_DOMAIN"),
+    "MX_P2P_TOPOLOGY_ENFORCEMENT": lambda: os.environ.get("MX_P2P_TOPOLOGY_ENFORCEMENT"),
     # ── Opt-in metrics collector ───────────────────────────────────────────
     "MX_METRICS_ENABLED": lambda: (
         os.environ.get("MX_METRICS_ENABLED", "0").strip().lower() in _TRUTHY

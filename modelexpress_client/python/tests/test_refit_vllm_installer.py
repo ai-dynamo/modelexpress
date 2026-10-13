@@ -2415,3 +2415,94 @@ def test_streaming_alias_plans_preserve_destructor_boundaries(monkeypatch, owner
     if owner_kind != "initial_alias":
         assert "batch splits an owning module" in reused[0]
         assert reused[1] == ["detach", "destructor", "second-yield"]
+
+
+@pytest.mark.parametrize("case", ["no_alias", "load_time_tie", "runtime_alias", "mixed"])
+@pytest.mark.parametrize("runtime_first", [False, True])
+def test_checkpoint_reload_distinguishes_wna16_runtime_aliases(
+    monkeypatch, tmp_path, case, runtime_first
+):
+    model = nn.Module()
+    for name in ("w13", "w2"):
+        packed = nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+        setattr(model, f"{name}_weight_packed", packed)
+        if case in ("load_time_tie", "mixed"):
+            setattr(model, f"{name}_tied", packed)
+    metadata = dict(model._parameters)
+    if case in ("runtime_alias", "mixed"):
+        for name in ("w13", "w2"):
+            setattr(model, f"{name}_weight", getattr(model, f"{name}_weight_packed"))
+        if runtime_first:
+            model._parameters = dict(reversed(list(model._parameters.items())))
+    originals = dict(model._parameters)
+    pointers = {name: value.data_ptr() for name, value in originals.items()}
+
+    def initialize(target):
+        target._parameters = {
+            name: nn.Parameter(torch.empty_like(value), requires_grad=False)
+            for name, value in metadata.items()
+        }
+
+    _install_fake_vllm(monkeypatch, initialize)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    layerwise.LAYERWISE_INFO[model] = SimpleNamespace(
+        restore_metadata=(metadata, {}), kernel_tensors=None
+    )
+    loaded = []
+
+    class DefaultModelLoader:
+        def __init__(self, _config):
+            pass
+
+        def load_weights(self, target, _config):
+            assert set(target._parameters) == set(metadata)
+            for name in ("w13", "w2"):
+                packed = getattr(target, f"{name}_weight_packed")
+                if case in ("load_time_tie", "mixed"):
+                    assert getattr(target, f"{name}_tied") is packed
+                packed.data.fill_(7)
+            loaded.append(True)
+
+    def finalize(target, _config):
+        for name in ("w13", "w2"):
+            if case in ("runtime_alias", "mixed"):
+                setattr(target, f"{name}_weight", getattr(target, f"{name}_weight_packed"))
+        for name, value in originals.items():
+            value.data.copy_(getattr(target, name))
+        target._parameters = dict(originals)
+
+    layerwise.finalize_layerwise_reload = finalize
+    sys.modules[
+        "vllm.model_executor.model_loader.default_loader"
+    ].DefaultModelLoader = DefaultModelLoader
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=SimpleNamespace(
+            quant_config=object(), load_config=SimpleNamespace(load_format="modelexpress")
+        ),
+        model_config=SimpleNamespace(model="/launch", revision="main"),
+        device=torch.device("cpu"),
+    )
+    installer.install_checkpoint(tmp_path)
+    assert loaded == [True]
+    for name, original in originals.items():
+        assert getattr(model, name) is original
+        assert original.data_ptr() == pointers[name]
+        assert torch.equal(original, torch.full((2, 2), 7.0))
+
+
+@pytest.mark.parametrize("recorded", [False, True])
+def test_load_time_alias_restoration_does_not_ignore_missing_ties(recorded):
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.zeros(2))
+    model.tied = model.weight
+    installer = object.__new__(_VllmInstaller)
+    installer._model = model
+    info = {model: SimpleNamespace(restore_metadata=(dict(model._parameters), {}))}
+    aliases = installer._load_time_parameter_aliases(
+        installer._parameter_aliases(model), info if recorded else {}
+    )
+    del model.tied
+    with pytest.raises(AttributeError):
+        installer._restore_parameter_aliases(aliases)

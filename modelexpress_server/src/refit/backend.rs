@@ -7,10 +7,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use modelexpress_common::grpc::refit::{
-    CreateWeightVersionRequest, DeleteVersionLeaseRequest, DeleteWeightVersionShardRequest,
-    RegisterVersionLeaseRequest, UpdateWeightVersionStateRequest, VersionLease, WeightVersion,
+    CreateTrainerMeshRequest, CreateWeightVersionRequest, DeleteVersionLeaseRequest,
+    DeleteWeightVersionShardRequest, RegisterVersionLeaseRequest, TrainerMesh,
+    TrainerTensorsMetadata, UpdateWeightVersionStateRequest, VersionLease, WeightVersion,
     WeightVersionShard, WorkerRegistration,
 };
+use std::collections::HashMap;
 
 use crate::backend_config::BackendConfig;
 
@@ -37,13 +39,41 @@ pub enum RefitBackendError {
     Unavailable(String),
 }
 
-/// Atomic domain operations required by `RefitService`.
+/// Domain operations required by `RefitService`.
 ///
-/// Each method is one backend transaction boundary. Redis implements these
+/// Each mutation is one backend transaction boundary. Redis implements these
 /// operations with Lua; a Kubernetes implementation can use a version-scoped
 /// coordination CR and `resourceVersion` compare-and-swap.
 #[async_trait]
 pub trait RefitBackend: Send + Sync {
+    /// Read-only admission preflight; membership mutations must recheck atomically.
+    async fn validate_trainer_mesh_workers(
+        &self,
+        model_name: &str,
+        workers: &HashMap<String, TrainerTensorsMetadata>,
+    ) -> RefitResult<()>;
+
+    async fn create_trainer_mesh(
+        &self,
+        request: &CreateTrainerMeshRequest,
+    ) -> RefitResult<TrainerMesh>;
+
+    async fn get_trainer_mesh(&self, mesh_id: &str) -> RefitResult<TrainerMesh>;
+
+    async fn find_trainer_mesh_for_request(
+        &self,
+        request: &CreateTrainerMeshRequest,
+    ) -> RefitResult<Option<TrainerMesh>>;
+
+    async fn update_trainer_mesh(
+        &self,
+        mesh_id: &str,
+        expected_generation: u64,
+        workers: HashMap<String, TrainerTensorsMetadata>,
+    ) -> RefitResult<TrainerMesh>;
+
+    async fn delete_trainer_mesh(&self, mesh_id: &str) -> RefitResult<()>;
+
     async fn register_worker(
         &self,
         worker: WorkerRegistration,
@@ -56,6 +86,12 @@ pub trait RefitBackend: Send + Sync {
     ) -> RefitResult<WeightVersion>;
 
     async fn get_weight_version(&self, uid: &str) -> RefitResult<WeightVersion>;
+
+    async fn list_weight_versions(
+        &self,
+        model_name: &str,
+        trainer_mesh_id: Option<&str>,
+    ) -> RefitResult<Vec<WeightVersion>>;
 
     async fn delete_weight_version(&self, uid: &str) -> RefitResult<WeightVersion>;
 
