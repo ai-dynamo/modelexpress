@@ -28,19 +28,13 @@ from .load_strategy import (
 logger = logging.getLogger("modelexpress.plugins")
 
 plugins: dict[str, type[LoadStrategy]] = {}
-_builtin_names: set[str] = set()
 _loaded_directories: dict[Path, ModuleType] = {}
 _lock = threading.RLock()
 
 
 def register_plugin(name: str, strategy_class: type[LoadStrategy]) -> None:
-    """Register a concrete, no-argument strategy class under its declared name.
-
-    Built-in names are reserved when the inference chain initializes plugins.
-    """
+    """Register a concrete, no-argument strategy class under its declared name."""
     with _lock:
-        if name in _builtin_names:
-            raise ValueError(f"Plugin {name!r} conflicts with a built-in strategy")
         if name in plugins:
             raise ValueError(f"Plugin {name!r} is already registered")
         if (
@@ -58,13 +52,17 @@ def register_plugin(name: str, strategy_class: type[LoadStrategy]) -> None:
         plugins[name] = strategy_class
 
 
-def initialize_plugins(builtin_names: set[str]) -> None:
-    """Validate reserved names and import each directory once per worker."""
+def validate_plugin_names(builtin_names: set[str]) -> None:
+    """Reject external names reserved by the loading chain."""
     with _lock:
-        _builtin_names.update(builtin_names)
-        conflicts = _builtin_names.intersection(plugins)
+        conflicts = builtin_names.intersection(plugins)
         if conflicts:
             raise ValueError(f"Plugins conflict with built-in strategies: {sorted(conflicts)}")
+
+
+def initialize_plugins() -> None:
+    """Import and validate each directory once per worker."""
+    with _lock:
         directory = Path(envs.MX_PLUGIN_DIR).resolve()
         if directory in _loaded_directories or not directory.exists():
             return
@@ -147,7 +145,6 @@ class _PluginStrategy(LoadStrategy):
 def get_plugin(name: str) -> LoadStrategy:
     """Return a fresh selected strategy with conservative failure recovery."""
     with _lock:
-        initialize_plugins(set())
         if name not in plugins:
             raise ValueError(f"Selected loading plugin {name!r} is not registered")
         return _PluginStrategy(plugins[name]())
