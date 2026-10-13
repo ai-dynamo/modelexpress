@@ -100,6 +100,8 @@ class GeneratorRuntime:
         if self._closed:
             return
         for method in self.methods:
+            method.validate_close()
+        for method in self.methods:
             try:
                 method.close()
             except Exception:
@@ -133,7 +135,9 @@ def _resolve_source_order(
                 "inference P2P state is unavailable; using object storage only"
             )
             return tuple(
-                source for source in source_order if source is not WeightSource.GENERATOR
+                source
+                for source in source_order
+                if source is not WeightSource.GENERATOR
             )
         return source_order
     if object_storage is not None:
@@ -167,8 +171,7 @@ def _validate_source_order(
     for source in source_order:
         if source not in supported_sources:
             raise ValueError(
-                f"{type(engine_context).__name__} does not support "
-                f"{source.value} refit"
+                f"{type(engine_context).__name__} does not support {source.value} refit"
             )
 
 
@@ -280,9 +283,7 @@ def initialize_generator_runtime(
     rpc_timeout_seconds: float,
     service: Callable,
     start_lease: Callable[[str], Any],
-    resolve_replay_chain: Callable[
-        [str, bool], tuple[WeightVersion, ...]
-    ]
+    resolve_replay_chain: Callable[[str, bool], tuple[WeightVersion, ...]]
     | None = None,
 ) -> GeneratorRuntime:
     """Resolve construction policy and build one rank-local runtime."""
@@ -302,16 +303,16 @@ def initialize_generator_runtime(
     )
     methods: list[UpdateMethod] = []
     p2p_client = None
+    canonical_method = None
     try:
         if WeightSource.OBJECT_STORAGE in resolved_source_order:
             if object_storage is None:
                 raise ValueError("object storage source requires configuration")
-            methods.append(
-                CanonicalDeltaUpdateMethod(
-                    model_name=engine.model_name,
-                    config=object_storage,
-                )
+            canonical_method = CanonicalDeltaUpdateMethod(
+                model_name=engine.model_name,
+                config=object_storage,
             )
+            methods.append(canonical_method)
         if any(
             source in {WeightSource.GENERATOR, WeightSource.TRAINER}
             for source in resolved_source_order
@@ -361,7 +362,7 @@ def initialize_generator_runtime(
                 p2p_client = None
                 resolved_source_order = (WeightSource.OBJECT_STORAGE,)
         method_tuple = tuple(methods)
-        resolve_from_full_root = {
+        force_full_root = {
             WeightSource.GENERATOR,
             WeightSource.OBJECT_STORAGE,
         }.issubset(resolved_source_order)
@@ -387,7 +388,11 @@ def initialize_generator_runtime(
                     if resolve_replay_chain is None
                     else lambda version: resolve_replay_chain(
                         version.version_id,
-                        resolve_from_full_root,
+                        force_full_root
+                        or (
+                            canonical_method is not None
+                            and canonical_method.requires_full_root
+                        ),
                     )
                 ),
             ),

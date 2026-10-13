@@ -140,6 +140,10 @@ class TestIsAvailable:
         ctx = _make_context("/opt/models/llama")
         assert ServerCacheStrategy().is_available(ctx) is False
 
+    def test_logical_name_does_not_override_an_unknown_model_path(self, enabled):
+        ctx = _make_context("org/logical-name", model_path="/opt/models/llama")
+        assert ServerCacheStrategy().is_available(ctx) is False
+
     def test_available_in_a_process_that_never_ran_the_prefetch(self, enabled, snapshot):
         """The EngineCore process has no prefetch record; the path must suffice.
 
@@ -153,6 +157,17 @@ class TestIsAvailable:
 
 
 class TestLoad:
+    def test_logical_name_does_not_change_downloaded_model(
+        self, enabled, snapshot, fake_client
+    ):
+        ctx = _make_context("org/logical-name", model_path=str(snapshot))
+
+        assert ServerCacheStrategy().is_available(ctx)
+        with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
+            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+
+        assert FakeClient.instances[0].calls == [(REPO, snapshot)]
+
     def test_installs_weights_then_loads_natively(self, enabled, snapshot, fake_client):
         adapter = _FakeAdapter()
         ctx = _make_context(REPO, adapter=adapter, model_path=str(snapshot))
