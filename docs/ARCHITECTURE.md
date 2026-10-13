@@ -1680,7 +1680,6 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering serv
 The generator streams complete owning-module groups through reusable receive
 arenas. The transport planner derives those groups from captured loader geometry;
 applications do not select individual layers or depend on model-specific names.
-One installer uses vLLM's reload lifecycle for all supported models.
 Quantized MoE graphs captured between refits can retain stale scale references;
 use eager execution or startup-captured graphs.
 
