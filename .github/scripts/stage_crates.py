@@ -106,10 +106,10 @@ def rewrite_versions(root: Path, pkgs: dict[str, dict], old: str, new: str) -> i
         rf'(?m)^(\s*(?:{member_alt})\s*=\s*\{{[^}}\n]*?\bversion\s*=\s*")=?{re.escape(old)}(")'
     )
     wp_pat = re.compile(
-        rf'(?ms)(\[workspace\.package\].*?\n\s*version\s*=\s*"){re.escape(old)}(")'
+        rf'(?ms)(^\[workspace\.package\](?:(?!^[ \t]*\[).)*?\n[ \t]*version[ \t]*=[ \t]*"){re.escape(old)}(")'
     )
     pkg_pat = re.compile(
-        rf'(?ms)(\[package\].*?\n\s*version\s*=\s*"){re.escape(old)}(")'
+        rf'(?ms)(^\[package\](?:(?!^[ \t]*\[).)*?\n[ \t]*version[ \t]*=[ \t]*"){re.escape(old)}(")'
     )
 
     changed = 0

@@ -428,11 +428,24 @@ run logs: `MX_IMAGE_REPO`, `NGC_PUBLISH_ORG` (repo scope) and `ARTIFACTORY_CARGO
 
 `.github/workflows/nightly-ci.yml` runs daily at 09:00 UTC (01:00 PST)
 against `main`, builds every release artifact from that commit, runs the
-full hosted and K8s/GPU test suites, and stages the artifacts internally.
+core, inference and RL test suites, and stages the artifacts internally.
 It can also be dispatched manually; a manual run only stages after
 approval through the `manual-release-approval` GitHub environment.
 
-Every job runs on the velonix self-hosted runners.
+Scheduled and manual runs require the upstream repository and `refs/heads/main`,
+including runs that only build and test. The nightly calls
+`modelexpress-core-ci.yml`, `modelexpress-inference-ci.yml` and
+`modelexpress-rl-ci.yml`; `nightly-status` requires all three to succeed when
+`run_tests` is enabled. The RL suite runs the same Nemotron delta-refit and
+Vime coverage as E2E CI, using the exact triggering `main` SHA.
+
+Every job runs on the velonix self-hosted runners. The runner override reaches
+the child workflows' control jobs while GPU jobs keep their dedicated runners.
+Run-specific caller groups prevent one nightly from cancelling another; the
+GPU children retain the repository-wide capacity queues shared with PR tests.
+Nightly GPU slots use the run ID, while PR runs continue using the PR number.
+PR mirror and `/bench` authorization checks remain in place. Nightlies suppress
+RL evidence uploads to preserve the compliance-only GitHub artifact policy.
 
 | Artifact | Version | Destination |
 |---|---|---|
@@ -440,6 +453,11 @@ Every job runs on the velonix self-hosted runners.
 | Python wheels + sdist | `<base>.dev<date>` | `${ARTIFACTORY_PYPI_REPO_NAME}/nightly/<run_id>/` |
 | Rust crates (`.crate`) | `<base>-nightly.<date>.g<sha7>` | `${ARTIFACTORY_CARGO_REPO_NAME}/nightly/<run_id>/` |
 | Helm chart `modelexpress-nightly` | `<base>-nightly.<date>.g<sha7>` | `helm.ngc.nvidia.com/${NGC_PUBLISH_ORG}/ai-dynamo` |
+
+Wheel versions deliberately identify the UTC day rather than the commit.
+Two runs on the same day can therefore contain different code under the same
+wheel version. Use the run-specific Artifactory path to select an exact build;
+the wheel version alone does not identify its source commit.
 
 The packaged nightly chart is stamped to reference the nightly server
 image, so `helm install` of a nightly chart deploys nightly code — it does

@@ -6,10 +6,6 @@ name: ModelExpress Nightly CI
 on:
   schedule:
     - cron: '0 9 * * *'   # 09:00 UTC = 01:00 PST daily
-  # TEMPORARY(test): revert before merge.
-  push:
-    branches:
-      - "pull-request/603"
   workflow_dispatch:
     inputs:
       release:
@@ -33,7 +29,6 @@ on:
 permissions:
   contents: read
 
-# TEMPORARY(test): revert before merge.
 concurrency:
   group: nightly-ci-${{ github.run_id }}-${{ github.run_attempt }}
   cancel-in-progress: false
@@ -58,6 +53,16 @@ jobs:
       release: ${{ steps.mode.outputs.release }}
       run_tests: ${{ steps.mode.outputs.run_tests }}
     steps:
+      - name: Require a trusted main run
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ "${REPOSITORY}" != "ai-dynamo/modelexpress" ] || [ "${REF}" != "refs/heads/main" ]; then
+            echo "::error::nightly runs require ai-dynamo/modelexpress on refs/heads/main"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -104,23 +109,17 @@ jobs:
             schedule)
               RELEASE=true
               ;;
-            push)
-              # TEMPORARY(test): revert before merge.
-              RELEASE=true
-              RUN_TESTS=true
-              ;;
             workflow_dispatch)
               RELEASE="${DISPATCH_RELEASE}"
               RUN_TESTS="${DISPATCH_RUN_TESTS}"
               ;;
           esac
 
-          # TEMPORARY(test): revert before merge.
           if [ "${RELEASE}" = "true" ]; then
             case "${REF}" in
-              refs/heads/main|refs/heads/pvijayakrish/mx-nightly-ci|refs/heads/pull-request/603) ;;
+              refs/heads/main) ;;
               *)
-                echo "::error::release mode requested from ${REF}; staging is only permitted from refs/heads/main (or the temporary development branch)."
+                echo "::error::release mode requested from ${REF}; staging is only permitted from refs/heads/main."
                 exit 1
                 ;;
             esac
@@ -181,10 +180,8 @@ jobs:
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 10
     needs: [preflight]
-    # TEMPORARY(test): revert before merge.
     if: >-
-      ${{ !cancelled() && needs.preflight.result == 'success' &&
-          github.event_name != 'push' }}
+      ${{ !cancelled() && needs.preflight.result == 'success' }}
     outputs:
       thread_ts: ${{ steps.post.outputs.thread_ts }}
     steps:
@@ -231,25 +228,44 @@ jobs:
           fi
           echo "thread_ts=$(echo "${RESPONSE}" | jq -r '.ts')" >> "$GITHUB_OUTPUT"
 
-  hosted-tests:
-    name: Hosted test suite
+  core-tests:
+    name: Core test suite
     needs: [preflight]
     if: ${{ needs.preflight.outputs.run_tests == 'true' }}
     permissions:
       contents: read
       id-token: write
-    uses: ./.github/workflows/ci.yml
+    uses: ./.github/workflows/modelexpress-core-ci.yml
     with:
       runs_on: prod-modelexpress-builder-amd-v1
     secrets: inherit
 
-  e2e-tests:
-    name: K8s/GPU e2e suite
+  inference-tests:
+    name: Inference test suite
     needs: [preflight]
     if: ${{ needs.preflight.outputs.run_tests == 'true' }}
-    uses: ./.github/workflows/modelexpress-ci-tests.yml
+    uses: ./.github/workflows/modelexpress-inference-ci.yml
     with:
+      runs_on: prod-modelexpress-builder-amd-v1
       concurrency_key: nightly-${{ github.run_id }}-${{ github.run_attempt }}
+    secrets: inherit
+
+  rl-tests:
+    name: RL test suite
+    needs: [preflight]
+    if: ${{ needs.preflight.outputs.run_tests == 'true' }}
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/modelexpress-rl-ci.yml
+    with:
+      runs_on: prod-modelexpress-builder-amd-v1
+      concurrency_key: nightly-${{ github.run_id }}-${{ github.run_attempt }}
+      upload_evidence: false
+      model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+      scenario: delta
+      sha: ${{ github.sha }}
+      runtime: ${{ fromJSON(vars.MX_BENCH_RUNTIME_BASES || '{}').nemotron || '' }}
     secrets: inherit
 
   build-server-image:
@@ -281,8 +297,10 @@ jobs:
           echo "SERVER_IMAGE=${{ secrets.MX_IMAGE_REPO }}/modelexpress-server:${{ needs.preflight.outputs.build_tag }}-${{ matrix.arch }}" >> "$GITHUB_ENV"
 
       - name: Log in to image registry
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
         run: |
-          echo "${{ secrets.NGC_API_KEY }}" | \
+          echo "${NGC_API_KEY}" | \
             docker login nvcr.io -u '$oauthtoken' --password-stdin
 
       - name: Set up Docker Buildx
@@ -318,8 +336,10 @@ jobs:
           echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-manifest" >> "$GITHUB_ENV"
 
       - name: Log in to image registry
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
         run: |
-          echo "${{ secrets.NGC_API_KEY }}" | \
+          echo "${NGC_API_KEY}" | \
             docker login nvcr.io -u '$oauthtoken' --password-stdin
 
       - name: Create multi-arch manifest
@@ -341,7 +361,6 @@ jobs:
   build-wheels:
     name: Client wheels
     needs: [preflight, manual-release-approval]
-    # TEMPORARY(test): revert before merge.
     if: >-
       ${{ !cancelled() &&
           needs.preflight.result == 'success' &&
@@ -429,11 +448,13 @@ jobs:
             --out-dir osrb-out/license
 
       - name: Log in to the CI image registry
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
         run: |
           set -euo pipefail
           echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-compliance" >> "$GITHUB_ENV"
           export DOCKER_CONFIG="${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-compliance"
-          echo "${{ secrets.NGC_API_KEY }}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+          echo "${NGC_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
@@ -548,7 +569,7 @@ jobs:
       - name: Install build prerequisites
         run: |
           set -euo pipefail
-          sudo apt-get update && sudo apt-get install -y protobuf-compiler build-essential
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config libssl-dev build-essential
           if ! command -v cargo >/dev/null; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           fi
@@ -793,11 +814,9 @@ jobs:
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 10
     needs: [preflight, notify-slack-start, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc]
-    # TEMPORARY(test): revert before merge.
     if: >-
       ${{ !cancelled() &&
           needs.preflight.outputs.release == 'true' &&
-          github.event_name != 'push' &&
           needs.notify-slack-start.outputs.thread_ts != '' }}
     continue-on-error: true
     steps:
@@ -1004,8 +1023,9 @@ jobs:
     needs:
       - preflight
       - manual-release-approval
-      - hosted-tests
-      - e2e-tests
+      - core-tests
+      - inference-tests
+      - rl-tests
       - build-server-image
       - assemble-server-manifest
       - build-wheels
@@ -1021,26 +1041,29 @@ jobs:
         env:
           RESULTS: ${{ toJSON(needs) }}
           RELEASE: ${{ needs.preflight.outputs.release }}
+          RUN_TESTS: ${{ needs.preflight.outputs.run_tests }}
           SKIP_GITLAB: ${{ inputs.skip_gitlab_pipeline }}
         run: |
           set -uo pipefail
           echo "${RESULTS}" | jq .
           FAILED=$(echo "${RESULTS}" | jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key')
+          MANDATORY=""
+          [ "${RUN_TESTS}" = "true" ] && MANDATORY="core-tests inference-tests rl-tests"
           if [ "${RELEASE}" = "true" ]; then
-            MANDATORY="build-server-image assemble-server-manifest build-wheels stage-crates package-helm-chart stage-helm-ngc stage-containers-ngc compliance"
+            MANDATORY="${MANDATORY} build-server-image assemble-server-manifest build-wheels stage-crates package-helm-chart stage-helm-ngc stage-containers-ngc compliance"
             [ "${SKIP_GITLAB}" != "true" ] && MANDATORY="${MANDATORY} trigger-gitlab-release"
-            for JOB in ${MANDATORY}; do
-              RESULT=$(echo "${RESULTS}" | jq -r --arg j "${JOB}" 'if has($j) then .[$j].result else "MISSING" end')
-              if [ "${RESULT}" = "MISSING" ]; then
-                echo "::error::nightly-status references unknown job '${JOB}' — add it to needs: or fix the name."
-                exit 1
-              fi
-              if [ "${RESULT}" != "success" ]; then
-                FAILED="${FAILED}
-          ${JOB} (release-mandatory, result: ${RESULT})"
-              fi
-            done
           fi
+          for JOB in ${MANDATORY}; do
+            RESULT=$(echo "${RESULTS}" | jq -r --arg j "${JOB}" 'if has($j) then .[$j].result else "MISSING" end')
+            if [ "${RESULT}" = "MISSING" ]; then
+              echo "::error::nightly-status references unknown job '${JOB}' — add it to needs: or fix the name."
+              exit 1
+            fi
+            if [ "${RESULT}" != "success" ]; then
+              FAILED="${FAILED}
+          ${JOB} (required, result: ${RESULT})"
+            fi
+          done
           if [ -n "$(echo "${FAILED}" | tr -d '[:space:]')" ]; then
             echo "::error::Nightly jobs failed: ${FAILED}"
             exit 1
@@ -1050,8 +1073,7 @@ jobs:
   notify-slack-failure:
     name: Notify Slack — run status
     needs: [nightly-status]
-    # TEMPORARY(test): revert before merge.
-    if: ${{ always() && github.event_name != 'push' }}
+    if: always()
     uses: ./.github/workflows/notify-slack.yml
     permissions:
       contents: read

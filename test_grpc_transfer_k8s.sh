@@ -10,7 +10,7 @@
 #   - env: Test using environment variables (MODEL_EXPRESS_NO_SHARED_STORAGE, etc.)
 #   - all: Run both tests (default)
 
-set -e
+set -eo pipefail
 
 # Configuration
 RELEASE_NAME="modelexpress-test"
@@ -146,9 +146,11 @@ check_prerequisites() {
     else
         log_info "Using existing kind cluster ${KIND_CLUSTER_NAME}"
     fi
-    CONTAINER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${KIND_CLUSTER_NAME}-control-plane" 2>/dev/null || true)
-    if [ -n "${CONTAINER_IP}" ]; then
-        kubectl config set-cluster "kind-${KIND_CLUSTER_NAME}" --server="https://${CONTAINER_IP}:6443" --insecure-skip-tls-verify=true >/dev/null
+    if [ "$CREATED_CLUSTER" = true ]; then
+        CONTAINER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${KIND_CLUSTER_NAME}-control-plane" 2>/dev/null || true)
+        if [ -n "${CONTAINER_IP}" ]; then
+            kubectl config set-cluster "kind-${KIND_CLUSTER_NAME}" --server="https://${CONTAINER_IP}:6443" --insecure-skip-tls-verify=true >/dev/null
+        fi
     fi
     kubectl config use-context "kind-${KIND_CLUSTER_NAME}" >/dev/null 2>&1 || true
 
