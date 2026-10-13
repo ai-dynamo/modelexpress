@@ -302,7 +302,7 @@ ModelExpress/
 │   ├── copilot-instructions.md         # Copilot Chat pointer to AGENTS.md
 │   ├── dco.yml                         # DCO enforcement
 │   └── workflows/
-│       ├── ci.yml                      # CI pipeline
+│       ├── modelexpress-core-ci.yml     # CI pipeline
 │       └── codeql.yml                  # Security scanning
 │
 ├── .pre-commit-config.yaml             # Pre-commit hooks config
@@ -1807,9 +1807,9 @@ passing the former does not establish full-model correctness or performance.
 ## RL refit CI harness
 
 `ci/bench/` shares one Kubernetes lifecycle and pause/refit/verify/resume protocol
-between manual runs and the reusable `.github/workflows/rl-refit-ci.yml` workflow.
-The comment-triggered `bench-ci.yml` authorizes requests and selects inputs; the
-reusable workflow independently verifies the caller, approved PR revision, model,
+between manual runs and the reusable `.github/workflows/modelexpress-rl-ci.yml` workflow.
+The same workflow authorizes `/bench` comments and independently verifies reusable
+CI calls against the caller, approved PR revision, model,
 scenario and runtime before building images.
 The trusted-PR GPU workflow also calls it automatically for Nemotron S3 delta refit,
 using the approved mirrored harness revision. Its result, including cleanup, gates

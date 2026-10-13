@@ -81,7 +81,7 @@ inputs:
     required: false
     default: '8002'
   pod_ready_timeout_seconds:
-    description: 'Seconds to wait for test pods to leave Pending state'
+    description: 'Separate scheduling and startup budgets in seconds for each source/target workload'
     required: false
     default: '900'
   worker_registry:
@@ -125,6 +125,7 @@ inputs:
     description: 'Comma-separated non-weight artifact sourceType values expected by pytest.'
     required: false
     default: ''
+
 runs:
   using: "composite"
   steps:
@@ -143,7 +144,7 @@ runs:
         NAMESPACE: ${{ inputs.namespace }}
       run: |
         echo "::group::Create namespace ${NAMESPACE} and install prerequisites"
-        kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+        bash .github/scripts/ci-namespace.sh create "$NAMESPACE" plain
 
         # CRD is cluster-scoped — idempotent, safe to re-apply on every run.
         kubectl apply -f examples/crds.yaml
@@ -279,6 +280,7 @@ runs:
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: pod_ready_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
         [[ "${MEASURE_VRAM}" == "true" || "${MEASURE_VRAM}" == "false" ]] || { echo "ERROR: measure_vram must be 'true' or 'false', got '${MEASURE_VRAM}'"; exit 1; }
         [[ "${EXPECTED_ARTIFACT_SOURCES}" =~ ^[0-9]+$ ]] || { echo "ERROR: expected_artifact_sources must be a non-negative integer, got '${EXPECTED_ARTIFACT_SOURCES}'"; exit 1; }
+        source .github/scripts/ci-kubectl.sh
         source .github/actions/run-mx-p2p-test/vram-sampling.sh
         # Source-readiness counts come from mx-server's gRPC ListSources rather
         # than `kubectl get modelmetadata`, so the gate is backend-agnostic: the
@@ -304,7 +306,7 @@ runs:
               return 0
             fi
             local failed
-            failed=$(kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers 2>/dev/null \
+            failed=$(ci_kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers \
               | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)
             if [ -n "${failed}" ]; then
               echo "ERROR: source pod failed before publishing artifact metadata: ${failed}"
@@ -322,6 +324,7 @@ runs:
           fi
         }
         echo "::group::Wait for source to publish ${TP_SIZE} weight source(s)"
+        wait_for_scheduling "Source" mx-source "job-name=mx-source" "$TIMEOUT"
         # Wait for one CR per source rank. Under TP=N each rank publishes
         # its own source (worker_rank=0..N-1), and the target's
         # rdma_strategy filters source candidates by matching worker_rank.
@@ -347,7 +350,7 @@ runs:
             echo "Source published ${CR_COUNT}/${TP_SIZE} weight sources."
             break
           fi
-          FAILED=$(kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers 2>/dev/null \
+          FAILED=$(ci_kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers \
             | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)
           if [ -n "${FAILED}" ]; then
             echo "ERROR: source pod failed before publishing metadata: ${FAILED}"
@@ -416,8 +419,10 @@ runs:
       run: |
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: pod_ready_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
         [[ "${MEASURE_VRAM}" == "true" || "${MEASURE_VRAM}" == "false" ]] || { echo "ERROR: measure_vram must be 'true' or 'false', got '${MEASURE_VRAM}'"; exit 1; }
+        source .github/scripts/ci-kubectl.sh
         source .github/actions/run-mx-p2p-test/vram-sampling.sh
         echo "::group::Waiting for target /health to return 200"
+        wait_for_scheduling "Target" mx-target "job-name=mx-target" "$TIMEOUT"
         # Only wait on the target — source was already gated by the
         # `Wait for source to publish metadata` step (publishing requires
         # the worker to be fully Running with the MX plugin loaded), and
@@ -535,7 +540,7 @@ runs:
         # Dump logs from EVERY pod in the namespace, including mx-server.
         # Earlier version excluded mx-server to reduce noise when only test
         # pods were suspect, but that masked mx-server's own startup failures.
-        for POD in $(kubectl get pods -n ${NAMESPACE} --no-headers 2>/dev/null \
+        for POD in $(kubectl get pods -n ${NAMESPACE} --no-headers \
             | awk '{print $1}'); do
           echo "::group::describe ${POD}"
           kubectl describe pod -n ${NAMESPACE} "${POD}" 2>&1 | tail -60 || true
@@ -551,41 +556,4 @@ runs:
       env:
         NAMESPACE: ${{ inputs.namespace }}
       run: |
-        echo "::group::Delete namespace ${NAMESPACE}"
-        # No `|| true` here on purpose: with per-run-id namespace names, an
-        # orphaned namespace from a failed cleanup would leak silently and
-        # accumulate over time (one new namespace per run, none ever GC'd).
-        # Surface the failure immediately so it can be investigated.
-        #
-        # Timeout sized for our slowest realistic case:
-        #   - 3 pods (mx-server, mx-source, mx-target) each with a 30s
-        #     graceful-shutdown grace period under K8s default settings
-        #   - ModelMetadata + ModelCacheEntry CR finalizers (driven by the
-        #     mx-server controller) — usually <30s but can stretch
-        #   - K8s namespace finalizer clearance after all child resources
-        # 3 min is enough buffer for the legitimate slow path; in practice the
-        # safeguard (force-finalize via kubectl replace --raw) is what
-        # consistently completes the delete because stuck finalizers from
-        # CR controllers / dynamo operator are the common case, not the
-        # exception. The ::warning:: still fires so unhealthy cleanup
-        # conditions are visible in the GHA UI.
-        if ! kubectl delete namespace "${NAMESPACE}" --ignore-not-found --timeout=180s; then
-          echo "::warning::Namespace ${NAMESPACE} did not finalize within 180s; force-clearing finalizers as a safeguard. Investigate the underlying stuck resource."
-          kubectl get ns "${NAMESPACE}" -o json 2>/dev/null \
-            | jq '.spec.finalizers = []' \
-            | kubectl replace --raw "/api/v1/namespaces/${NAMESPACE}/finalize" -f - || true
-          # Verify the namespace actually finalized. If it didn't, that means
-          # the API rejected our force-clear too — there's something deeper
-          # broken (e.g., dead admission webhook, unreachable conversion
-          # service). Fail loud so it gets investigated. If the namespace IS
-          # gone, the safeguard did its job — exit 0 and rely on the
-          # ::warning:: above for visibility.
-          sleep 5
-          if kubectl get ns "${NAMESPACE}" --no-headers 2>/dev/null | grep -q .; then
-            echo "::error::Namespace ${NAMESPACE} still present after force-finalize. Force-clear was rejected; deeper cluster issue."
-            kubectl get ns "${NAMESPACE}" -o yaml 2>&1 | tail -40
-            exit 1
-          fi
-          echo "Namespace ${NAMESPACE} is gone (safeguard cleared finalizers successfully)."
-        fi
-        echo "::endgroup::"
+        bash .github/scripts/ci-namespace.sh cleanup "$NAMESPACE"
