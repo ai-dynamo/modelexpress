@@ -1154,6 +1154,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
+| `plugins.py` | Discovery, validation, and selection of external loading strategy classes |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection, and engine-agnostic cache-artifact transfer |
 | `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ServerCacheStrategy` (weights streamed from MX Server), `InstantTensorStrategy` (fast local safetensors), `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
@@ -1395,6 +1396,29 @@ cycles are collected before the allocator cache is emptied and initialization st
 If initialization fails, recovery aborts without attempting another loader.
 
 See [ModelExpress Benchmarks](BENCHMARKS.md) for measured loading-path, NIXL registration, and artifact-transfer results with explicit timing boundaries.
+
+### External Loading Strategies
+
+`plugins.py` loads external `LoadStrategy` implementations for the shared `INFERENCE` chain. `MX_LOAD_PLUGIN` selects one plugin, inserted after `RdmaStrategy` and before `ServerCacheStrategy`. The six built-in strategies retain their relative order. RL and SGLang's `transfer_engine` path are unchanged. Unset or empty `MX_LOAD_PLUGIN` skips discovery and external imports.
+
+Entries are named `mx_plugin_<name>.py` and export a no-argument `register_plugin()` returning a concrete, no-argument `LoadStrategy` class with the matching `name`. The registry stores external classes only; built-in name collisions, duplicate names, invalid entries, and unknown selections fail before loading. Modules are cached per worker, while each model load creates a new instance of the selected class. Unselected classes are not instantiated.
+
+Plugins reuse the interfaces exported by `modelexpress.load_strategy`:
+
+| Interface | Contract |
+|-----------|----------|
+| `requires` | Declare required `EngineAdapter` capabilities. |
+| `is_available(ctx)` | Check suitability without downloading artifacts or mutating the model. |
+| `load(result, ctx)` | Complete weight loading and engine post-processing, then return `LoadResult`. Preparing files alone is not success. Use `register_tensors` for results that can serve as transfer sources; the executor owns publication. |
+| `rollback(ctx)` | Release strategy-owned resources. Model reinitialization belongs to the executor. |
+| `StrategyFailed` | A clean miss uses `mutated=False`; a failure requiring model recovery uses `mutated=True`. |
+| `StrategyRecoveryError` | Abort loading rather than attempt another strategy. |
+
+A private strategy wrapper delegates availability and cleanup to the plugin. Unknown load exceptions and invalid results become mutated failures, so the existing executor rolls back and attempts model reinitialization before fallback. Availability, cleanup, and recovery errors abort loading. Built-in exception behavior is unchanged. Import and construction must not load weights.
+
+`LoadContext` provides model identity, ranks, target device, and engine capabilities. Plugins must not change identity or publish sources themselves. Internal context fields are not a cross-version compatibility guarantee; validate plugins against the target client and adapter. Distributed plugins must coordinate their ranks and agree on availability.
+
+See [Loading Strategy Plugins](DEPLOYMENT.md#loading-strategy-plugins) for deployment and the [strategy template](../examples/plugins/mx_plugin_example.py) for the entry interface.
 
 ### Server-Backed Model Cache
 
