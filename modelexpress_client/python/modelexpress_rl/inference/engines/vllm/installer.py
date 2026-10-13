@@ -868,10 +868,14 @@ class _VllmInstaller(EngineInstaller):
         self._process_and_commit(tensors)
         # Synchronization is paid once per install, separately from per-layer work.
         with refit_span("post_install"):
-            torch.cuda.synchronize(self._device)
+            self._synchronize()
+
+    def _synchronize(self) -> None:
+        if self._device.type != "cpu":
+            accelerator_backend_for(self._device).synchronize(self._device.index)
 
     def _drain_streaming(self) -> None:
-        torch.cuda.synchronize(self._device)
+        self._synchronize()
 
     @torch.no_grad()
     def install_streaming(self, prepared: PreparedStreamingTensors) -> None:
@@ -1047,7 +1051,7 @@ class _VllmInstaller(EngineInstaller):
         # Same synchronize as install_tensors, so a checkpoint refit
         # reports the stage too rather than charging it to the caller's total.
         with refit_span("post_install"):
-            torch.cuda.synchronize(self._device)
+            self._synchronize()
 
     @torch.no_grad()
     def _process_and_commit(

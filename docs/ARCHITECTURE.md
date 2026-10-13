@@ -640,13 +640,15 @@ geometry, and framework orchestration independently replaceable.
 `ModelExpressGeneratorConfig.staging_buffer_bytes` sets bounded-streaming
 capacity per arena, and `staging_buffers_count` defaults to one. The streaming
 client uses their product as its total staging limit. `staging_device` selects
-CUDA or pinned host receive memory.
+accelerator (`"cuda"`, any family) or pinned host receive memory.
 
 The `stage_weight()` / `apply_weight()` generator APIs hold a version lease
 across metadata preparation and incremental installation. The NIXL receiver
 plans complete owning-module batches and uses
-one or two registered byte arenas (`staging_buffers`) on CUDA or pinned host
-memory (`staging_device`). Receive tensors, wire-dtype conversion buffers,
+one or two registered byte arenas (`staging_buffers`) on the accelerator or pinned
+host memory (`staging_device`). Its owned NIXL agent, registered-buffer allocation
+scope, and completion fences come from the engine device's `AcceleratorBackend`,
+so CUDA and XPU generators share one path. Receive tensors, wire-dtype conversion buffers,
 full-source reconstruction buffers, and alignment all count toward each
 buffer's capacity. With two arenas the READ for batch
 `i + 1` is posted before batch `i` is yielded for commit, allowing asynchronous

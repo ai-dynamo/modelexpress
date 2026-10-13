@@ -1508,7 +1508,8 @@ post-load workspaces and live weights require additional headroom; the limit is
 not a total process-memory cap.
 
 `staging_device` selects where the arenas live. `"cuda"` (default) lands RDMA
-in VRAM and commits with a device copy. `"cpu"` allocates pinned host memory,
+in the engine accelerator's device memory, whatever its family (XPU included),
+and commits with a device copy. `"cpu"` allocates pinned host memory,
 registers it as NIXL DRAM, and commits with a host-to-device copy, so the arena
 costs no VRAM. Host staging adds a host-to-device copy and depends on the
 available host-memory and CPU-to-GPU bandwidth. `staging_buffers_count=2` posts the

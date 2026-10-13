@@ -268,7 +268,9 @@ def test_released_updates_switch_workspaces_without_reusing_stale_plans(
         "MX_REFIT_REUSE_COMPLETE_PLAN",
     ):
         monkeypatch.setenv(flag, str(int(warm_cache)))
-    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        transfer_module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
 
     def empty(shape, **kwargs):
@@ -927,7 +929,9 @@ def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch):
 
 
 def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch):
-    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        transfer_module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._descriptor_cache = None
     transfer._workspace_generation = 0
@@ -1098,7 +1102,7 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
     source_tensor = torch.arange(4, dtype=torch.float32)
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
 
     class Manager:
         def __init__(self, **kwargs):
@@ -1412,3 +1416,78 @@ def test_bounded_batch_layouts_are_named_however_they_are_built():
     swapped = replace(built, layouts=(recv, convert, {}))
     assert isinstance(swapped.layouts, transfer_module._StagingLayouts)
     assert swapped.layouts.full == {}
+
+
+def _unexpected_cuda_call(*_args, **_kwargs):
+    raise AssertionError("generator staging must not reach torch.cuda on XPU")
+
+
+@pytest.fixture
+def xpu_backend(monkeypatch, mock_accelerator_backend_cls):
+    backend = mock_accelerator_backend_cls(name="xpu", torch_device_type="xpu")
+    requested = []
+
+    def backend_for(device):
+        requested.append(device)
+        return backend
+
+    monkeypatch.setattr(transfer_module, "accelerator_backend_for", backend_for)
+    monkeypatch.setattr(torch.cuda, "synchronize", _unexpected_cuda_call)
+    backend.requested = requested
+    return backend
+
+
+def test_owned_manager_uses_the_engine_device_backend(monkeypatch, xpu_backend):
+    created = []
+
+    class _Manager:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        def initialize(self):
+            pass
+
+    monkeypatch.setattr(transfer_module, "NixlTransferManager", _Manager)
+    _NixlStagedTransfer(
+        agent_name="generator",
+        device_id=1,
+        device=torch.device("xpu", 1),
+        listen_port=None,
+    )
+
+    (kwargs,) = created
+    assert kwargs["accelerator_backend"] is xpu_backend
+
+
+def test_staging_synchronizes_and_allocates_through_the_device_backend(
+    monkeypatch, xpu_backend
+):
+    scopes = []
+    monkeypatch.setattr(
+        transfer_module,
+        "registered_buffer_alloc_scope",
+        lambda backend: scopes.append(backend) or nullcontext(),
+    )
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._device = torch.device("xpu", 1)
+
+    transfer._synchronize()
+    with transfer._registered_alloc_scope():
+        pass
+
+    assert xpu_backend.synchronize_calls == [1]
+    assert scopes == [xpu_backend]
+
+
+def test_host_device_staging_needs_no_backend(monkeypatch, xpu_backend):
+    monkeypatch.setattr(
+        transfer_module, "registered_buffer_alloc_scope", _unexpected_cuda_call
+    )
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._device = torch.device("cpu")
+
+    transfer._synchronize()
+    with transfer._registered_alloc_scope():
+        pass
+
+    assert xpu_backend.requested == []
