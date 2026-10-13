@@ -2969,3 +2969,80 @@ def test_streaming_preserves_destructor_boundaries(monkeypatch, owner_kind):
         assert "batch splits an owning module" in reused[0]
         assert reused[1] == ["detach", "destructor", "second-yield"]
 
+
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("source_replay", [False, True])
+def test_custom_metaclass_ties_use_whole_alias_fallback(
+    monkeypatch, bounded, source_replay
+):
+    from tests.test_refit_ordered_installer import _transfer_and_install
+
+    class Meta(type):
+        pass
+
+    class Layer(nn.Module, metaclass=Meta):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(2), requires_grad=False)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = Layer()
+            self.second = Layer()
+            self.second.weight = self.first.weight
+
+        def load_weights(self, weights):
+            for _, value in weights:
+                self.first.weight.weight_loader(self.first.weight, value)
+
+    model = Model()
+    original = model.first.weight
+    pointer = original.data_ptr()
+
+    def initialize(target):
+        for layer in (target.first, target.second):
+            info = SimpleNamespace(
+                kernel_tensors=({"weight": layer.weight}, {}), loaded_weights=()
+            )
+            info.reset = lambda info=info: setattr(info, "kernel_tensors", None)
+            layerwise.LAYERWISE_INFO[layer] = info
+            layer.weight = nn.Parameter(torch.empty(2, device="meta"), requires_grad=False)
+
+    _install_fake_vllm(monkeypatch, initialize)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+
+    def place(layer, info):
+        layer.weight = info.kernel_tensors[0]["weight"]
+
+    def commit(layer, info):
+        info.kernel_tensors[0]["weight"].copy_(layer.weight)
+        place(layer, info)
+
+    layerwise._place_kernel_tensors = place
+    layerwise._copy_and_restore_kernel_tensors = commit
+    utils = ModuleType("vllm.model_executor.model_loader.weight_utils")
+    utils.default_weight_loader = lambda target, value: target.copy_(value)
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
+    installer = _VllmInstaller(
+        model=model, vllm_config=object(), model_config=object(),
+        device=torch.device("cpu"),
+    )
+    assert installer._parameter_aliases(model).by_owner is None
+    captured, layout = installer.capture(
+        [("first.weight", torch.float32, (2,))], trainer_mesh=("trainer", 1)
+    )
+    for value in (3.0, 7.0):
+        tensors = {"first.weight": torch.full((2,), value)}
+        if source_replay:
+            _transfer_and_install(installer, tensors, captured, layout, bounded)
+        elif bounded:
+            installer.install_streaming(PreparedStreamingTensors(
+                lambda: iter([tensors]), frozenset(tensors), {}
+            ))
+        else:
+            installer.install_tensors(tensors)
+        assert model.first.weight is model.second.weight is original
+        assert original.data_ptr() == pointer
+        torch.testing.assert_close(original, tensors["first.weight"])

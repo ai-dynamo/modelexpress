@@ -109,7 +109,7 @@ def test_persistent_only_owner_skips_materialization(monkeypatch, registry):
         model_config=object(),
         device=torch.device("cpu"),
     )
-    captured, layout = installer.capture([("bias", torch.float32, (2,))])
+    captured, layout = installer.capture([("bias", torch.float32, (2,))], trainer_mesh=("trainer", 1))
     assert len(captured.copies) == 1 and set(layout) == {"bias"}
     installer.install_streaming(
         PreparedStreamingTensors(
@@ -214,7 +214,7 @@ def test_transposed_persistent_destination_reload(
     )
     native = Model()
     native.load_weights([("bias", source)])
-    captured, layout = installer.capture([("bias", source.dtype, tuple(source.shape))])
+    captured, layout = installer.capture([("bias", source.dtype, tuple(source.shape))], trainer_mesh=("trainer", 1))
     _transfer_and_install(installer, {"bias": source}, captured, layout, bounded)
     assert model.bias is original and model.bias.data_ptr() == pointer
     assert model.bias.stride() == stride
@@ -247,7 +247,7 @@ def test_shared_storage_buffer_destinations_remain_distinct(
     sources = {"a": torch.tensor([1.0, 2.0]), "b": torch.tensor([7.0, 9.0])}
     captured, layout = installer.capture(
         [(name, value.dtype, tuple(value.shape)) for name, value in sources.items()]
-    )
+    , trainer_mesh=("trainer", 1))
     assert [copy.param_name for copy in captured.copies] == ["a", "b"]
     assert all(copy.dest_offset == 0 for copy in captured.copies)
     _transfer_and_install(installer, sources, captured, layout, bounded)
@@ -286,7 +286,7 @@ def test_mixed_replay_and_direct_overwrite_preserves_capture_order(
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1" if digest else "0")
     captured, layout = installer.capture(
         [(name, value.dtype, tuple(value.shape)) for name, value in sources.items()]
-    )
+    , trainer_mesh=("trainer", 1))
     _transfer_and_install(installer, sources, captured, layout, bounded)
     assert torch.equal(model.bias, native.bias)
 
@@ -326,7 +326,7 @@ def test_overlapping_registered_destinations_replay_in_recorded_order(
     originals = [(tensor, tensor.data_ptr()) for tensor in model.buffers()]
     captured, layout = installer.capture(
         [(name, source.dtype, tuple(source.shape)) for name, source in sources.items()]
-    )
+    , trainer_mesh=("trainer", 1))
     _transfer_and_install(installer, sources, captured, layout, bounded)
     assert torch.equal(model.backing, native.backing)
     for tensor, (original, pointer) in zip(model.buffers(), originals):
@@ -352,7 +352,7 @@ def test_identical_persistent_buffer_aliases_remain_supported(monkeypatch, bound
     installer = _persistent_installer(monkeypatch, model)
     captured, layout = installer.capture(
         [("source", source.dtype, tuple(source.shape))]
-    )
+    , trainer_mesh=("trainer", 1))
     assert not captured.unsupported
     _transfer_and_install(installer, {"source": source}, captured, layout, bounded)
     assert model.a is model.b is original
@@ -381,7 +381,7 @@ def test_interleaved_owners_replay_across_source_batches(monkeypatch, bounded):
     installer = _persistent_installer(monkeypatch, model)
     captured, layout = installer.capture(
         [(name, tensor.dtype, tuple(tensor.shape)) for name, tensor in source.items()]
-    )
+    , trainer_mesh=("trainer", 1))
     assert [copy.param_name for copy in captured.copies] == [
         "a.weight",
         "b.weight",
@@ -448,7 +448,7 @@ def test_materialized_overlapping_owners_keep_recorded_effects(monkeypatch, boun
                 (name, tensor.dtype, tuple(tensor.shape))
                 for name, tensor in source.items()
             ]
-        )
+        , trainer_mesh=("trainer", 1))
         _transfer_and_install(installer, source, captured, layout, bounded)
         assert torch.equal(model.backing, native.backing)
         assert torch.equal(model.untouched_alias, native.untouched_alias)
@@ -471,7 +471,7 @@ def test_replay_rejects_invalid_update(monkeypatch, invalid):
 
     model = Model()
     installer = _persistent_installer(monkeypatch, model)
-    capture, layout = installer.capture([("a", torch.float32, (2,)), ("b", torch.float32, (2,))])
+    capture, layout = installer.capture([("a", torch.float32, (2,)), ("b", torch.float32, (2,))], trainer_mesh=("trainer", 1))
     writes = tuple((i, recorded, torch.ones(2)) for i, recorded in enumerate(capture.copies))
     if invalid == "reordered":
         writes = tuple(reversed(writes))
@@ -479,7 +479,7 @@ def test_replay_rejects_invalid_update(monkeypatch, invalid):
         writes = writes[:1]
     batch = SourceReplayBatch(
         writes, frozenset(layout), {"weight": 1}, 2,
-        1 if invalid == "generation" else 0,
+        capture.generation + 1 if invalid == "generation" else capture.generation,
     )
     with pytest.raises(IncompleteRefit, match="recorded order|before every|invalidated"):
         installer.install_tensors(batch)

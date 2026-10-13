@@ -533,25 +533,32 @@ class _VllmInstaller(EngineInstaller):
             (name, id(module), function_identity(getattr(module, "load_weights", None)))
             for name, module in self._model.named_modules()
         )
-        routing_buffers = tuple(
+        buffers = tuple(
             (
                 name,
                 id(buffer),
                 buffer.data_ptr(),
                 tuple(buffer.shape),
-                hashlib.sha256(
-                    buffer.detach().cpu().contiguous().numpy().tobytes()
-                ).digest()
-                if buffer.is_inference()
-                else buffer._version,
+                tuple(buffer.stride()),
+                buffer.dtype,
+                buffer.device,
+                function_identity(original_loader(buffer)),
+                None
+                if buffer.is_floating_point() or buffer.is_complex()
+                else (
+                    hashlib.sha256(
+                        buffer.detach().cpu().contiguous().numpy().tobytes()
+                    ).digest()
+                    if buffer.is_inference()
+                    else buffer._version
+                ),
             )
-            for name, buffer in self._model.named_buffers()
-            if not buffer.is_floating_point() and not buffer.is_complex()
+            for name, buffer in self._model.named_buffers(remove_duplicate=False)
         )
         return (
             parameters,
             modules,
-            routing_buffers,
+            buffers,
             id(self._convert_native_to_hf),
         )
 
@@ -1442,7 +1449,11 @@ class _VllmInstaller(EngineInstaller):
         for owner in owners:
             self._restore_source_owner(owner, plan.replay_started[owner][0])
         for owner in owners:
-            aliases = plan.owner_aliases.get(owner.layer)
+            aliases = (
+                plan.aliases
+                if plan.owner_aliases is None
+                else plan.owner_aliases.get(owner.layer)
+            )
             if aliases is not None:
                 self._restore_parameter_aliases(aliases)
             plan.replay_started.pop(owner)
@@ -1503,7 +1514,11 @@ class _VllmInstaller(EngineInstaller):
         )
         if info is not None and not persistent:
             materialize_layer(layer, info)
-            aliases = plan.owner_aliases.get(layer)
+            aliases = (
+                plan.aliases
+                if plan.owner_aliases is None
+                else plan.owner_aliases.get(layer)
+            )
             if aliases is not None:
                 self._restore_parameter_aliases(aliases)
                 for tied_owner in plan.replay_groups[owner]:
@@ -1600,7 +1615,9 @@ class _VllmInstaller(EngineInstaller):
         managed = info is not None and info.kernel_tensors is not None
         if getattr(info, "loaded_weights", ()):
             raise IncompleteRefit("engine reload has pending checkpoint-loader calls")
-        aliases = plan.owner_aliases.get(layer)
+        aliases = (
+            plan.aliases if plan.owner_aliases is None else plan.owner_aliases.get(layer)
+        )
         persistent_only = managed and all(
             name in self._persistent_names and not getattr(layer, leaf).is_meta
             for name, leaf, _ in layer_plan.parameters
