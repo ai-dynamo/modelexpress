@@ -648,8 +648,8 @@ class _VllmInstaller(EngineInstaller):
                     PreparedEngineTensors,
                     PreparedRuntimeTensors,
                     PreparedCheckpointArtifact,
+                    PreparedStreamingTensors,
                 }
-                | ({PreparedStreamingTensors} if not self._is_quantized else set())
             )
         )
 
@@ -876,10 +876,6 @@ class _VllmInstaller(EngineInstaller):
     @torch.no_grad()
     def install_streaming(self, prepared: PreparedStreamingTensors) -> None:
         """Copy complete groups into engine-owned storage before arena reuse."""
-        if self._is_quantized:
-            raise IncompleteRefit(
-                "bounded streaming currently requires an unquantized engine"
-            )
         ownership = prepared.ownership
         if ownership.iterator is not None or ownership.release_blocked:
             raise IncompleteRefit(

@@ -686,9 +686,9 @@ full-copy descriptors before entering bounded preparation. Preparation retries
 retain one version lease and discard failed setup state; installation failures
 still fence the engine rather than retrying a partially committed update.
 
-Streaming is opt-in, trainer-only, and currently limited to unquantized vLLM
-models. It does not publish generator peers or roll back partially installed
-versions. An installation failure marks the client engine state uncertain and
+Streaming is opt-in and trainer-only for vLLM models, including quantized models
+that support vLLM's native layerwise reload. It does not publish generator peers
+or roll back partially installed versions. An installation failure marks the client engine state uncertain and
 makes the failed handle unusable for another installation. A subsequent
 `stage_weight()` releases the failed transaction after proven cleanup, acquires
 a new version lease, rediscovers sources, and prepares a complete full-tensor
@@ -1680,7 +1680,23 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering serv
 The generator streams complete owning-module groups through reusable receive
 arenas. The transport planner derives those groups from captured loader geometry;
 applications do not select individual layers or depend on model-specific names.
-One installer uses vLLM's reload lifecycle for all supported unquantized models.
+One installer uses vLLM's reload lifecycle for both unquantized and quantized models.
+Quantization and scale updates remain owned by vLLM. SGLang uses checkpoint
+installation and does not support bounded streaming.
+Its existing checkpoint path also has a separate online-FP8 reload limitation:
+with SGLang 0.5.13.post1 on A100, an initial native FP8 linear load succeeds,
+but the next BF16 checkpoint load is rejected because Marlin-packed parameters
+no longer have the checkpoint shape. BF16 reloads pass. The vLLM streaming
+guard removal does not change or fix this SGLang behavior.
+
+Repeated-refit checks on vLLM 0.31.0/A100 cover FP8 per-tensor and per-block,
+INT8 per-channel weight-only, and MXFP8 MoE layers, with BF16 as a control.
+They compare weights, scales, eager output, and graphs captured before refits
+against fresh loads. This is not qualification of every model, quantizer, or
+parallel layout. Capturing a new MoE graph between refits can retain temporary
+scale tensors in vLLM's quantization configuration and produce stale results on
+the next refit; use startup-captured graphs or eager execution. Removing the
+streaming guard does not repair that native reload limitation.
 
 ```mermaid
 flowchart LR
