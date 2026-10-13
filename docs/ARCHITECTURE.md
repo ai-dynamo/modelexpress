@@ -406,11 +406,17 @@ The control plane stores long-lived `TrainerMesh` membership as
 `bind_tensors()` computes address-independent coverage locally and returns
 this compact reference. Adapters derive wire coverage without copying weights,
 registering source buffers, or publishing a version. The adapter binding and
-trainer `source_slot_id` identify the same logical shard. Logical IDs hash canonical
+trainer `logical_shard_id` identify the same logical shard. Logical IDs hash canonical
 coverage, so equivalent replicas share an ID. The orchestrator supplies the complete
 trainer worker set and is responsible for logical-shard completeness. Mesh creation
-and update validate compact membership metadata without fetching coverage manifests;
-large manifests never live in Redis.
+resolves idempotent retries before contacting trainers and validates every binding
+only for a new mesh. Mesh updates validate new workers and changed endpoints or
+logical shards; unchanged members are not refetched. Large manifests never live
+in Redis.
+Admission first preflights worker registrations, then validates bindings with at
+most 32 concurrent callbacks per request. Redis rechecks registrations atomically
+when committing membership. Callback logs include the worker, endpoint, elapsed
+time, and failures.
 `CreateTrainerMesh` is idempotent; `UpdateTrainerMesh` replaces the complete
 worker map with generation compare-and-swap while preserving logical coverage.
 Every member requires an active model-matching trainer registration whose
@@ -418,8 +424,7 @@ Every member requires an active model-matching trainer registration whose
 requires a trainer mesh; MX checks its existence and model atomically with version
 creation. Object-storage versions omit the mesh. For worker-sharded versions,
 `logical_shard_id` identifies a logical shard. MX accepts publications only from
-workers in that shard's current membership, validates the publication manifest
-against its bound coverage, and marks the version READY
+workers in that shard's current membership and marks the version READY
 when every logical shard has a current, live publication. Mesh-backed readiness
 is computed from physical publications and their binding endpoints, not historical
 coverage. Generator discovery reads the mesh
@@ -437,6 +442,24 @@ publications and rejects the update while those versions have reader leases.
 listing uses the mesh's version index; metadata reads are pipelined.
 `version_number` is optional caller correlation metadata, not version identity.
 Object-storage callers manage version state; mesh callers do not manage readiness.
+
+Mesh-backed `WeightVersion` records require a positive `trainer_mesh_generation`.
+The unchanged creation API supplies a mesh ID; the server reads and stamps its
+generation atomically while creating the version. Idempotent retries return the
+original stamp. Shard publication, including the final READY transition and
+repeated publications, rejects a changed mesh generation before writing. Trainer
+resolution compares the recorded generation with the current mesh. Stored versions
+require the generation field; decoding parses it as a uint64 without repeating
+creation-time consistency checks. Versions without a trainer mesh, including object-storage
+versions, carry generation zero. A requested version whose recorded mesh
+generation differs from the current trainer mesh fails source resolution.
+
+Any trainer mesh update that changes its generation is rejected while a linked
+weight version has an active consumer lease, including additive replicas that
+leave existing publications intact. An update with unchanged membership remains a no-op.
+After readers release their leases, membership may advance and new weight
+versions capture the new generation; old version stamps are never changed.
+
 DIRECT installation and pipelined worker streaming are
 not implemented by this control-plane slice.
 NIXL manifest endpoints belong to their physical worker shards; a typed object
@@ -534,6 +557,15 @@ and leases, but it does not discover engine tensor layouts or transfer weights.
 For NIXL, `RefitWorkerService` is the trainer-local manifest endpoint.
 The manifest is an opaque description of the exact published source buffers;
 the generator uses it to compile and validate its receiver-local transfer plan.
+Trainers serve canonical, address-independent coverage after `bind_tensors()`.
+`GetWeightVersionShardManifest` with an empty version ID retrieves this binding
+by logical shard ID. Mesh creation resolves idempotent retries before contacting trainers and validates
+every binding only for a new mesh; mesh updates validate
+new workers and changed endpoints or logical shards. Unchanged members are not
+refetched. Shard publication retains atomic registration, membership, endpoint,
+and conflict checks in Redis without fetching or parsing a trainer manifest.
+Per-version tensor counts and coverage are trusted at publication; generators
+still verify versioned manifest digests and validate transfer coverage.
 Full-tensor trainers reuse manifest bytes while registrations, addresses, and
 tensor geometry remain stable and content digests are disabled. Generators
 cache each selected worker manifest by endpoint and digest. A changed endpoint,
@@ -676,7 +708,7 @@ engine-owned post-load workspace, CUDA allocator overhead, and transport metadat
 | `GetWeightVersion` | `GetWeightVersionRequest` | `GetWeightVersionResponse` | Read the version and its lifecycle state |
 | `DeleteWeightVersion` | `DeleteWeightVersionRequest` | `DeleteWeightVersionResponse` | Cancel a `STAGING` version or move a `READY` version to `RELEASING` for retirement |
 | `UpdateWeightVersionState` | `UpdateWeightVersionStateRequest` | `UpdateWeightVersionStateResponse` | Explicitly update lifecycle state, including S3 `STAGING` to `READY` |
-| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker manifest for a required source slot |
+| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker manifest for a required logical shard |
 | `ListWeightVersionShards` | `ListWeightVersionShardsRequest` | `ListWeightVersionShardsResponse` | List the version's physical source publications |
 | `DeleteWeightVersionShard` | `DeleteWeightVersionShardRequest` | `DeleteWeightVersionShardResponse` | Evict one source shard after release when no lease protects the version |
 | `RegisterVersionLease` | `RegisterVersionLeaseRequest` | `RegisterVersionLeaseResponse` | Acquire or renew protection while installing a version |
@@ -847,14 +879,14 @@ fields and may differ from the MX IDs. Cache paths and chain records use MX IDs;
 MX lineage checks and payload validation remain enabled. The registering caller
 is responsible for selecting the correct S3 artifacts and base mapping.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
-Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
-identifies the required, version-scoped source contribution it covers, and
+Its identity is `(version_id, worker_id, logical_shard_id)`: `logical_shard_id`
+identifies the logical shard covered by the publication, and
 `worker_id` identifies the publishing process. The trainer engine adapter
-derives the slot from its native topology; the Megatron adapter uses
+derives the logical shard ID from its native topology; the Megatron adapter uses
 the logical tensor names and shard geometry, excluding physical process and DP
-replica identity. The orchestrator deduplicates those adapter-defined slots when
+replica identity. The orchestrator deduplicates those adapter-defined logical shards when
 declaring the version's expected contributions. Multiple DP workers may therefore
-advertise the same source slot; generators rotate through those publications on
+advertise the same logical shard; generators rotate through those publications on
 transfer retry. Each shard carries its trainer-local `manifest_endpoint`.
 Deployments configured with
 Kubernetes or the test-only memory backend do not expose `RefitService` yet.
@@ -1408,6 +1440,8 @@ The selector controls ordering only; `RdmaStrategy` enforces the fixed three-can
 
 **Topology mechanism.** A worker reports its RDMA-fabric location as a `{domain: value}` map keyed by **Grove `ClusterTopology` domain** (the enum `region`/`zone`/`datacenter`/`block`/`rack`/`host`/`numa`), e.g. `{"block": "b1", "rack": "r3", "host": "node7"}`, read from the environment (`MX_P2P_TOPOLOGY`, populated by the operator from the node's labels via the `ClusterTopology` domain→key mapping) by `topology.py` and published **once at registration** on `WorkerMetadata.topology`. Because it is static per node, it rides the existing publish path (not the heartbeat) — the server passes it straight through onto `SourceInstanceRef.topology`, keeping it stateless. `TopologyAwareSelector.score` returns `(shared_depth, tiebreak)`: `shared_depth` is the deepest configured level at which the target and candidate maps agree, so `order()` puts the closest source first. Setting `MX_P2P_TOPOLOGY_LOAD_WEIGHT > 0` swaps the intra-tier tiebreak for `unit_hash − w·source_load` (read defensively), so **within a locality tier** selection also steers away from busy sources — this is how topology- and load-aware selection compose without either depending on the other. Missing node topology, or an old server that predates the field, collapses the policy to `rendezvous_hash`, so it is never worse than the deterministic baseline; missing levels alone do not, since `MX_P2P_TOPOLOGY_LEVELS` defaults to the full Grove order. Meaningful benefit needs a topology-diverse allocation (sources across multiple racks/blocks); packed into one rack all sources are equidistant and the policy collapses to `rendezvous_hash`.
 
+**Transfer-domain policy.** Ordering alone cannot keep a target off an unreachable source: with fewer than three same-domain sources, the retry slice still reaches cross-domain ones. `MX_P2P_TOPOLOGY_DOMAIN` / `MX_P2P_TOPOLOGY_ENFORCEMENT` add a constraint modeled on Dynamo's KV-transfer policy (`DYN_KV_TRANSFER_DOMAIN` / `DYN_KV_TRANSFER_ENFORCEMENT`). `topology.apply_policy` runs on the selector's output in both `RdmaStrategy._find_source_instances` and the SGLang transfer-engine path. `required` keeps only sources whose published value for the domain equals this node's, failing closed on missing values; `preferred` is a stable same-domain-first partition. When a policy is set, the `mx_p2p_candidates` funnel gains a `topology_matched` stage counting same-domain candidates; without one the stage is not emitted.
+
 #### Selection efficacy (measured)
 
 The two Phase 1 policies were compared two ways. An offline simulation drives the real selector code over synthetic `(target, source)` identity sets; because the score depends only on identity and policy (not on hardware or RDMA), it reproduces the on-cluster `mx_p2p_source_selections_total` distribution without standing up transfers. Across M sources / N targets configs (4×20, 4×40, 8×32), **first-choice balance is equivalent** for both policies (both are uniform hashes — max-source share within a few percent of each other and of the `ceil(N/M)/N` ideal). The difference is elsewhere: `rendezvous_hash` has **0% re-pick churn** on a repeated, unchanged source set (vs `random`'s ~`(M-1)/M`), and removing one source changes only ~`1/M` of the unaffected targets' picks.
@@ -1583,7 +1617,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving; effective port is `MX_WORKER_GRPC_PORT + device_id` |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
-| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses it for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer |
+| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses it for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. The default `nixl` artifact backend requires P2P metadata and is skipped when `MX_P2P_METADATA=0`; the `mooncake` backend is independent of P2P metadata. |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
@@ -1770,3 +1804,51 @@ be qualified with changing weights, shared parameters, graph-bound addresses,
 post-load state and failure cleanup. Quantized bounded installation remains
 unsupported. The same generic path is used for small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
+
+
+## RL refit CI harness
+
+`ci/bench/` shares one Kubernetes lifecycle and pause/refit/verify/resume protocol
+between manual runs and the reusable `.github/workflows/rl-refit-ci.yml` workflow.
+The comment-triggered `bench-ci.yml` authorizes requests and selects inputs; the
+reusable workflow independently verifies the caller, approved PR revision, model,
+scenario and runtime before building images.
+The trusted-PR GPU workflow also calls it automatically for Nemotron S3 delta refit,
+using the approved mirrored harness revision. Its result, including cleanup, gates
+the required `CI status check`; Kimi remains comment-triggered. Required Nemotron
+Both automatic and comment-triggered CI reuse the Vime example's SeaweedFS Deployment
+and Service in an isolated namespace, then seed the pinned snapshot before timing.
+`scripts/ci.py` owns namespace ownership, GPU quotas, storage and image credentials. `harness/lifecycle.py` owns
+workload execution, evidence collection and cleanup for both entry points.
+
+`harness/scenario.py` selects the registered scenario. The implemented delta/S3
+scenario in `scenarios/delta/scenario.py` configures preparation modules,
+publication location, initial/target versions and explicit worker sources. The
+`DeltaScenario` instance owns checkpoint, installed tensor and inventory validation.
+`RefitRunner` holds the run configuration, HTTP endpoints and evidence directory
+without executing the protocol at import time. The shared driver does not derive
+versions or dispatch sources from role names. Another refit scenario can supply
+its own preparation and verification without changing the common RL protocol;
+no reshard scenario or CI case is registered yet.
+
+The worker extension exposes direct RPCs for initialization, refit, tensor hashes,
+host scales, checkpoint verification and installed runtime tensor verification.
+Installed embedding verification uses vLLM's vocabulary-parallel weight loader
+on a separate CPU parameter, preserving its sharding, padding and dtype rules.
+Unsupported packed embeddings fail verification. Validation remains outside
+transfer and installation timing.
+
+Cleanup stops all benchmark producers before deleting the exact run's S3 artifact
+prefix, including incomplete publications. A separate CPU pod performs cleanup,
+so failed or expired benchmark pods are not required for recovery. CI deletes the
+owned namespace only after cleanup is verified; a failed attempt releases GPUs
+and preserves namespace credentials for retry.
+
+Runtime code is organized into `harness/` for shared orchestration and validation,
+`scenarios/delta/` for seed download, delta publication and delta-specific checks,
+and `engines/vllm/` for the vLLM server and worker extension. `scripts/` contains
+CLI entry points and CI authorization/provisioning. The renderer bundles shared
+runtime code, the selected scenario and the vLLM adapter; host rendering and
+Kubernetes lifecycle code are not mounted in workload pods. ConfigMap item paths
+preserve Python packages, and pod commands use `python3 -m` with ordinary package
+imports. Configuration is loaded explicitly when a command starts.

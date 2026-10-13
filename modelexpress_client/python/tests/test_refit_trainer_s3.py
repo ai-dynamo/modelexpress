@@ -358,7 +358,7 @@ def test_s3_stage_is_local_then_publish_uploads_version_root(
 
     try:
         with pytest.raises(RuntimeError, match="requires full-tensor publication"):
-            _ = trainer.source_slot_id
+            _ = trainer.logical_shard_id
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
             hf_tensor_iter=iter([[("weight", current)]]),

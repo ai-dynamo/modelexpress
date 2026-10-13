@@ -80,6 +80,8 @@ spec:
             - "1024"
             - --kv-cache-memory-bytes
             - "1073741824"
+            - --compilation-config
+            - '{"cache_dir":"/root/.cache/vllm/torch_compile_cache/mx-ci"}'
             - --trust-remote-code
             - --port
             - "8000"
@@ -88,6 +90,10 @@ spec:
               value: "modelexpress"
             - name: MX_SERVER_ADDRESS
               value: "mx-server:8000"
+            - name: MX_ARTIFACT_TRANSFER
+              value: "1"
+            - name: MX_ARTIFACT_READY_URL
+              value: "http://127.0.0.1:8000/health"
             - name: MX_CONTIGUOUS_REG
               value: "0"
             # Force NIXL's UCX context to TCP + CUDA memory staging. Plain
