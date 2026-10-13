@@ -6,7 +6,6 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress_rl.inference.engines.vllm import installer as module
 from torch import nn
 from tests.test_refit_vllm_installer import _install_fake_vllm
@@ -45,32 +44,30 @@ def capture_installer(monkeypatch) -> tuple:
     return installer, model
 
 
-@pytest.mark.parametrize("clients", [1, 2])
-def test_capture_is_reused_across_runtime_parameter_replacement(capture_installer, clients) -> None:
+@pytest.mark.parametrize("mesh", [("trainer", 2), ("replacement-trainer", 1)])
+def test_compatible_mesh_change_reuses_capture(capture_installer, monkeypatch, mesh):
     installer, model = capture_installer
     manifest = [("weight", torch.float32, (3, 3))]
-    installers = [installer]
-    if clients == 2:
-        installers.append(module._VllmInstaller(
-            model=model, vllm_config=object(), model_config=object(), device=torch.device("cpu")
-        ))
-    for value in (2.0, 7.0, -3.0):
-        model.weight = nn.Parameter(torch.full((2, 2), value))
-        for installer in installers:
-            capture, layout = installer.capture(manifest)
-            assert layout == {"weight": ((2, 2), torch.float32)}
-            assert [(copy.src_name, copy.param_name) for copy in capture.copies] == [
-                ("weight", "weight")
-            ]
-            assert torch.equal(model.weight, torch.full((2, 2), value))
-    assert model.capture_calls == clients
+    installer.capture(manifest, trainer_mesh=("trainer", 1))
+    original_key = installer._capture_key
+    checked = []
+
+    def capture_key(manifest):
+        checked.append(manifest)
+        return original_key(manifest)
+
+    monkeypatch.setattr(installer, "_capture_key", capture_key)
+    capture, layout = installer.capture(manifest, trainer_mesh=mesh)
+    assert checked == [manifest]
+    assert capture.copies and layout == {"weight": ((2, 2), torch.float32)}
+    assert installer._capture_mesh == mesh
+    assert model.capture_calls == 1
 
 
-@pytest.mark.parametrize(
-    "failure,error",
-    [("loader", RuntimeError), ("restoration", RuntimeError), ("coverage", IncompleteRefit)],
-)
-def test_failed_initial_capture_can_be_retried(capture_installer, failure, error) -> None:
+@pytest.mark.parametrize("failure", ["loader", "restoration"])
+def test_failed_initial_capture_can_be_retried(
+    capture_installer, failure
+) -> None:
     installer, model = capture_installer
     layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
     original_loader = model.load_weights
@@ -83,12 +80,122 @@ def test_failed_initial_capture_can_be_retried(capture_installer, failure, error
         model.load_weights = fail
     elif failure == "restoration":
         layerwise.LAYERWISE_INFO[model] = SimpleNamespace(kernel_tensors=None, reset=fail)
-    else:
-        model.load_weights = lambda weights: None
-    with pytest.raises(error):
-        installer.capture(manifest)
+    with pytest.raises(RuntimeError):
+        installer.capture(manifest, trainer_mesh=("trainer", 1))
     model.load_weights = original_loader
     layerwise.LAYERWISE_INFO.clear()
 
-    capture, layout = installer.capture(manifest)
+    capture, layout = installer.capture(manifest, trainer_mesh=("trainer", 1))
     assert capture.copies and layout == {"weight": ((2, 2), torch.float32)}
+
+
+def test_same_generation_skips_deep_key(capture_installer, monkeypatch):
+    installer, model = capture_installer
+    manifest = [("weight", torch.float32, (3, 3))]
+    installer.capture(manifest, trainer_mesh=("trainer", 1))
+
+    def fail(_manifest):
+        raise AssertionError("deep key on generation hit")
+
+    monkeypatch.setattr(installer, "_capture_key", fail)
+    first, _ = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    first.copies.clear()
+    assert installer.capture(manifest, trainer_mesh=("trainer", 1))[0].copies
+    assert model.capture_calls == 1
+
+
+@pytest.mark.parametrize(
+    "change", ["schema", "converter", "loader", "routing", "alias"]
+)
+def test_changed_generation_checks_compatibility(capture_installer, change):
+    installer, model = capture_installer
+    model.register_buffer("routing", torch.tensor([0, 1]))
+    manifest = [("weight", torch.float32, (3, 3))]
+    installer.capture(manifest, trainer_mesh=("trainer", 1))
+    if change == "schema":
+        manifest = [("weight", torch.float32, (4, 4))]
+    elif change == "converter":
+        installer._convert_native_to_hf = lambda weights: weights
+    elif change == "loader":
+        original = model.load_weights
+        model.load_weights = lambda weights: original(weights)
+    elif change == "routing":
+        model.routing = torch.tensor([1, 0])
+    else:
+        model.other = model.weight
+    installer.capture(manifest, trainer_mesh=("trainer", 2))
+    assert model.capture_calls == 2
+    assert installer._capture_mesh == ("trainer", 2)
+
+
+@pytest.mark.parametrize(
+    "failure", ["converter", "loader", "restoration", "snapshot"]
+)
+def test_failed_generation_recapture_retries(capture_installer, monkeypatch, failure):
+    installer, model = capture_installer
+    manifest = [("weight", torch.float32, (3, 3))]
+    installer.capture(manifest, trainer_mesh=("trainer", 1))
+    original_loader = model.load_weights
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+
+    def fail(*_args):
+        raise RuntimeError("recapture failed")
+
+    manifest = [("weight", torch.float32, (4, 4))]
+    with monkeypatch.context() as patch:
+        if failure == "converter":
+            patch.setattr(installer, "_convert_native_to_hf", fail)
+        elif failure == "loader":
+            patch.setattr(model, "load_weights", fail)
+        elif failure == "restoration":
+            patch.setitem(
+                layerwise.LAYERWISE_INFO,
+                model,
+                SimpleNamespace(kernel_tensors=None, reset=fail),
+            )
+        else:
+            patch.setattr(module._CaptureSnapshot, "create", fail)
+        with pytest.raises(RuntimeError):
+            installer.capture(manifest, trainer_mesh=("trainer", 2))
+        assert installer._capture_mesh != ("trainer", 2)
+    assert model.load_weights == original_loader
+    assert installer.capture(manifest, trainer_mesh=("trainer", 2))[0].copies
+    assert installer._capture_mesh == ("trainer", 2)
+
+
+@pytest.mark.parametrize("failure", ["key", "clone"])
+def test_failed_generation_validation_does_not_advance_cache(
+    capture_installer, monkeypatch, failure
+):
+    installer, model = capture_installer
+    manifest = [("weight", torch.float32, (3, 3))]
+    installer.capture(manifest, trainer_mesh=("trainer", 1))
+
+    def fail(*_args):
+        raise RuntimeError("validation failed")
+
+    with monkeypatch.context() as patch:
+        if failure == "key":
+            patch.setattr(installer, "_capture_key", fail)
+        else:
+            patch.setattr(module._CaptureSnapshot, "clone", fail)
+        with pytest.raises(RuntimeError, match="validation failed"):
+            installer.capture(manifest, trainer_mesh=("trainer", 2))
+        assert installer._capture_mesh == ("trainer", 1)
+    assert installer.capture(manifest, trainer_mesh=("trainer", 2))[0].copies
+    assert installer._capture_mesh == ("trainer", 2)
+    assert model.capture_calls == 1
+
+
+def test_conversion_and_loader_are_captured_together(capture_installer):
+    installer, model = capture_installer
+    manifest = [("native", torch.float32, (4, 4))]
+    installer._convert_native_to_hf = lambda weights: {"weight": weights["native"]}
+    first, _ = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    installer._convert_native_to_hf = lambda weights: {
+        "weight": weights["native"][1:, :]
+    }
+    changed, _ = installer.capture(manifest, trainer_mesh=("trainer", 2))
+    assert {record.src_name for record in changed.copies} == {"native"}
+    assert first.copies[0].op_chain != changed.copies[0].op_chain
+    assert model.capture_calls == 2

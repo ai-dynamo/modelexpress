@@ -1590,23 +1590,26 @@ beyond the arena cap. Trainer staging is a separate choice. See
 [bounded vLLM streaming installation](ARCHITECTURE.md#bounded-vllm-streaming-installation)
 for the ownership and failure contract.
 
-The vLLM installer retains its first successful canonical installation plan for
-the generator client's lifetime, including supported quantized FullCopy updates.
-Canonical input schema, model architecture, module ownership, alias topology,
-configuration and loader behavior must remain fixed for that lifetime. The
-installer reuses its captured operations and destination metadata without
-comparing them against the live model or copying cached plan fragments.
-Trainer source conversion and its composition with these operations belong to
-transfer planning.
+The RL installer retains a validated combined capture of trainer-native-to-HF
+source views and vLLM loader operations. A matching mesh ID and generation take
+a fast path that skips the source-schema and engine-layout walk. A changed
+generation compares the native source schema, converter identity and engine
+loading layout. Compatible changes reuse capture; incompatible changes recapture.
+The cached generation advances only after successful validation or recapture.
+Trainer rank, source address and shard-placement changes alone do not invalidate
+capture. Quantized
+captures remain subject to the existing support guard. Converter and engine
+loading semantics are fixed for the runtime lifetime; changing them requires
+recreating the runtime, including its transfer caches.
 
-Received batches are checked against the retained installation plan, including
-expected names, shapes, dtypes and complete module inputs. Engine callbacks
-receive independent storage, so they cannot retain a view into the receive
-arena. Every update still obtains its current version and lease and reads fresh
-tensor values. Transfer plans and physical bindings contain no cached weight
-values or readiness. Workspace reset discards physical bindings; the logical
-transfer-plan reuse policy is described in the architecture reference. Resetting
-transport resources does not recreate the client's installation plan.
+These caches hold layouts and plans, not weight values or readiness. Every
+update still obtains its version and lease and reads fresh tensor values.
+The installer checks live owners, shared parameters and complete module inputs.
+Engine callbacks receive independent storage, so they cannot retain a view into
+the receive arena.
+Workspace reset and close discard source and plan caches. Cache counters and
+lookup/build/validation times accompany streaming preparation metrics; a miss
+rebuilds the entry rather than using a stale layout.
 Wire-to-engine dtype conversion respects the captured destination slice, strides
 and arena storage offset, including padding surrounding the destination view.
 Bounded staging views are zeroed before each READ so untouched loader padding

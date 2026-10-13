@@ -34,7 +34,6 @@ from modelexpress.nixl_transfer import (
     NixlTransferManager,
 )
 from modelexpress.refit.reshard import throughput
-from modelexpress.refit.reshard.geometry import convert_source_weights
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import (
     build_sources,
@@ -43,9 +42,7 @@ from modelexpress.refit.reshard.rendezvous import (
 )
 from modelexpress.refit.reshard.transfer_plan import (
     LogicalTransferPlan,
-    PlannedCapture,
     bind_transfer,
-    compose_transfer_capture,
     plan_transfer_groups,
     plan_transfer,
 )
@@ -114,7 +111,7 @@ class _SourceBinding:
 @dataclass(frozen=True)
 class _WeightUpdatePlan:
     trainer_source_snapshot: TrainerSourceSnapshot
-    generator_capture_snapshot: PlannedCapture
+    generator_capture_snapshot: CaptureResult
     parameter_layout: MappingProxyType
     transfer_plan: LogicalTransferPlan | _StreamingSchedule
     source_binding: _SourceBinding
@@ -439,11 +436,9 @@ class _NixlStagedTransfer:
         timeout_seconds: float | None = None,
         manager: NixlTransferManager | None = None,
         streaming: StreamingSettings | None = None,
-        convert_native_to_hf: Callable[[dict], dict] | None = None,
     ) -> None:
         if streaming is not None and device.type != "cuda":
             raise ValueError("bounded NIXL staging requires a CUDA device")
-        self._convert_native_to_hf = convert_native_to_hf
         self._streaming = streaming
         self._buffer_budget = (
             None
@@ -623,17 +618,11 @@ class _NixlStagedTransfer:
         trainer = replace(trainer_snapshot, resolved_metadata=resolved)
         source_schema = tuple(
             (name, source.dtype, tuple(source.global_shape))
-            for name, source in resolved.sources.items()
+            for name, source in sorted(resolved.sources.items())
         )
         metrics["source_metadata_s"] = time.perf_counter() - started
         started = time.perf_counter()
-        weights = convert_source_weights(self._convert_native_to_hf, list(source_schema))
-        schema = [
-            (name, weight.dtype, tuple(weight.shape))
-            for name, weight in weights.items()
-        ]
-        install_capture, parameter_layout = capture_layout(schema)
-        capture = compose_transfer_capture(install_capture, weights)
+        capture, parameter_layout = capture_layout(list(source_schema))
         metrics["layout_capture_s"] = time.perf_counter() - started
         return trainer, capture, parameter_layout
 
