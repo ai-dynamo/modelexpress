@@ -23,7 +23,7 @@ jobs:
     steps:
       - id: slots
         env:
-          MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '16' }}
+          MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '8' }}
           MX_CI_A100B_CONCURRENCY: ${{ vars.MX_CI_A100B_CONCURRENCY || '4' }}
         run: |
           python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
@@ -61,7 +61,7 @@ jobs:
       fail-fast: false
       # Bound matrix dispatch; the shared pool concurrency group
       # controls which queued workload can allocate GPUs.
-      max-parallel: 16
+      max-parallel: 8
       matrix:
         include:
           - framework: vllm

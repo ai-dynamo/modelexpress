@@ -18,7 +18,7 @@ ci_kubectl() {
       return 0
     fi
     if [ "$1" != get ] || [ "$attempt" -eq 4 ] || \
-       ! grep -qiE 'connection refused|connection reset by peer|unexpected EOF|context deadline exceeded|Client\.Timeout exceeded|i/o timeout|TLS handshake timeout' "$error_file"; then
+       ! grep -qiE 'connection refused|connection reset by peer|unexpected EOF|context deadline exceeded|Client\.Timeout|context cancellation while reading body|i/o timeout|TLS handshake timeout' "$error_file"; then
       rm -f "$error_file"
       return "$status"
     fi
@@ -81,42 +81,30 @@ wait_for_worker_liveness() {
 # Wait for the previous CI namespaces and physical pods before allocating a new workload.
 wait_for_gpu_pool_cleanup() {
   local pool="$1" deadline=$((SECONDS + 900)) namespaces pods remaining
-  local lane="${MX_CI_GPU_LANE:-all}" concurrency="${MX_CI_GPU_CONCURRENCY:-16}"
+  local lane="${MX_CI_GPU_LANE:-all}" concurrency="${MX_CI_GPU_CONCURRENCY:-8}"
   [[ "$concurrency" =~ ^([1-9]|1[0-6])$ ]] || { echo "MX_CI_GPU_CONCURRENCY must be between 1 and 16" >&2; return 1; }
   if [ "$concurrency" = 1 ]; then lane=all; fi
+  local slot_selector="ci.modelexpress.nvidia.com/gpu-lane=$lane"
+  # vCluster mirrors namespace labels using SHA256(label key)[:10].
+  local host_lane="vcluster.loft.sh/ns-label-${VCLUSTER_NAME:-mx-ci-cluster}-x-9c8bc18f28"
+  local host_pool="vcluster.loft.sh/ns-label-${VCLUSTER_NAME:-mx-ci-cluster}-x-dc1dfe5427"
   while [ "$SECONDS" -lt "$deadline" ]; do
+    pods='{"items":[]}'
     if [[ "$pool" == a100* ]]; then
-      namespaces=$(ci_kubectl get namespaces -l "ci.modelexpress.nvidia.com/gpu-pool=$pool" -o json) || return 1
-      pods=$(ci_kubectl get pods -A --kubeconfig="$GITHUB_WORKSPACE/.kubeconfig-host" -o json) || return 1
+      namespaces=$(ci_kubectl get namespaces -l "$slot_selector,ci.modelexpress.nvidia.com/gpu-pool=$pool" -o json) || return 1
+      pods=$(ci_kubectl get pods --kubeconfig="$GITHUB_WORKSPACE/.kubeconfig-host" \
+        -n "${VCLUSTER_NAMESPACE:-mx-ci}" -l "$host_lane=$lane,$host_pool=$pool" -o json) || return 1
     else
-      namespaces=$(ci_kubectl get namespaces --context="$KUBE_CONTEXT" -o json) || return 1
-      pods=$(ci_kubectl get pods -A --context="$KUBE_CONTEXT" -o json) || return 1
+      namespaces=$(ci_kubectl get namespaces --context="$KUBE_CONTEXT" -l "$slot_selector" -o json) || return 1
     fi
-    remaining=$(printf '%s\n%s\n' "$namespaces" "$pods" | jq -s --arg pool "$pool" --arg lane "$lane" --argjson limit "$concurrency" '
-      .[0] as $namespaces | .[1] as $pods |
-      def classify($name):
-        if ($name | test("^mx-ci-(fleet|rolling)-")) then "tcp"
-        elif ($name | test("^mx-ci-h100-vime-")) then "vime"
-        elif ($name | test("^mx-ci-bench-")) then "refit"
-        elif ($name | test("-mla-")) then "mla"
-        elif ($name | test("-(dp2|ep2)-")) then "parallel"
-        else "rdma" end;
-      def selected($name):
-        ([$namespaces.items[] | select(.metadata.name == $name) | .metadata.labels["ci.modelexpress.nvidia.com/gpu-lane"] | select(. != null and length > 0)][0] // classify($name)) as $actual |
-        $lane == "all" or $actual == $lane or
-        (($actual | startswith("slot-")) and (($actual | ltrimstr("slot-") | tonumber? // $limit) >= $limit)) or
-        (($lane | startswith("slot-")) != ($actual | startswith("slot-")));
-      def rl($name): $name | startswith("mx-ci-bench-") or startswith("mx-ci-h100-vime-");
-      ([$namespaces.items[] | select(selected(.metadata.name)) | select(($pool | startswith("a100")) or rl(.metadata.name))] | length) +
-      ([$pods.items[] |
-        (.metadata.labels["vcluster.loft.sh/namespace"] // .metadata.namespace // "") as $ns |
-        select(selected($ns)) |
-        if ($pool | startswith("a100")) then
-          select($ns | startswith("mx-ci-")) |
-          select(.status.phase != "Succeeded" and .status.phase != "Failed") |
-          select(.spec.nodeSelector.agentpool == $pool or ((.spec.nodeName // "") | startswith("aks-" + $pool + "-"))) |
-          select(any(.spec.containers[]?, .spec.initContainers[]?; (.resources.requests["nvidia.com/gpu"] // .resources.limits["nvidia.com/gpu"] // "0" | tonumber) > 0))
-        else select(rl($ns)) end] | length)') || return 1
+    remaining=$(printf '%s\n%s\n' "$namespaces" "$pods" | jq -s \
+      --arg pool "$pool" --arg lane "$lane" --arg host_lane "$host_lane" --arg host_pool "$host_pool" '
+      ([.[0].items[] |
+        select(.metadata.name | startswith("mx-ci-")) |
+        select(.metadata.labels["ci.modelexpress.nvidia.com/gpu-lane"] == $lane) |
+        select(($pool | startswith("a100") | not) or .metadata.labels["ci.modelexpress.nvidia.com/gpu-pool"] == $pool)] | length) +
+      ([.[1].items[] |
+        select(.metadata.labels[$host_lane] == $lane and .metadata.labels[$host_pool] == $pool)] | length)') || return 1
     if [ "$remaining" -eq 0 ]; then
       echo "GPU pool $pool lane $lane has no previous CI workload awaiting cleanup"
       return 0

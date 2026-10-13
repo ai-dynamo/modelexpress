@@ -128,16 +128,16 @@ interruptions; they do not establish the cause of the host API resets.
 ## GPU test admission and readiness budgets
 
 The parent workflow calls inference GPU tests through a per-PR concurrency group
-that cancels superseded work. A100a defaults to 16 repository-wide test
+that cancels superseded work. A100a defaults to 8 repository-wide test
 slots; A100b is capped at four. `MX_CI_A100B_CONCURRENCY` can lower its cap
 to 1–4, and the common `MX_CI_GPU_CONCURRENCY` limit also applies. Inference cases have distinct indices rotated by PR number and reduced
 modulo the configured limit; RL refit and Vime use PR-based slots per Kubernetes
 context. One complete workload occupies each slot through execution and cleanup.
-Matrices allow up to 16 entries to dispatch concurrently. Builds and independent
+Matrices allow up to 8 entries to dispatch concurrently. Builds and independent
 cleanup remain outside these queues. GitHub's `queue: max` retains pending jobs.
 
-Set `MX_CI_GPU_CONCURRENCY` to any integer from 1 to 16 to lower the limit; 1
-serializes each pool/context. Sixteen is an experimental upper limit, not a
+`MX_CI_GPU_CONCURRENCY` overrides the default of 8 and accepts integers from 1 to 16; 1
+serializes each pool/context. Eight is an experimental default, not a
 capacity reservation; slot collisions or runner availability may reduce actual
 concurrency. Drain current runs (or cancel and finish cleanup) before changing
 limits, because changing slot assignments does not move already queued or
@@ -190,20 +190,25 @@ namespaces and physical GPU pods in that slot to disappear, including after
 cancellation. Namespace cleanup allows 600 seconds for vCluster pod removal
 and namespace finalization, then verifies host pod removal. A DP2 run needed
 about eight minutes to finalize after deletion, exceeding the previous 180-second
-budget. Ownership checks and finalizers remain intact. Pool and slot labels identify new namespaces. Other labeled slots
-can proceed concurrently. Workloads in slots outside a newly lowered limit
-block admission until they drain. Legacy namespaces and workloads from a different
-concurrency mode block admission until their cleanup completes. API errors fail
-closed. Non-CI workloads are left to Kubernetes resource scheduling.
+budget. Ownership checks and finalizers remain intact. The guard only reads
+namespaces in the same labeled slot; inference also checks vCluster host pods
+using their mirrored pool/slot labels, including after virtual namespace deletion.
+Reads use server-side label selectors and the host namespace instead of listing
+all cluster pods. RL namespace finalization already covers its directly hosted
+pods. Other slots, unlabeled legacy workloads, and previous concurrency modes
+are left to Kubernetes scheduling. API errors fail closed after bounded retries,
+including timeouts while reading the response body. GitHub concurrency groups
+remain the queue, with normal cleanup inside test jobs and independent fallback
+cleanup outside per-PR cancellation groups.
 
-RL GPU jobs default to 16 repository-wide slots per Kubernetes context. Refit
+RL GPU jobs default to 8 repository-wide slots per Kubernetes context. Refit
 runs choose PR number modulo the configured limit; Vime uses PR number plus one
 modulo that limit. This bounds concurrency across PRs without a reservation
 ledger. One-job mode serializes both workloads. Normal namespace deletion finishes before
 releasing a slot. Independent cleanup remains outside the queues. Refit jobs have
 a two-hour budget including admission, setup, execution and cleanup.
 
-The 16-slot limit needs live qualification of CPU, memory, GPU/MIG and RDMA headroom.
+The 8-slot default needs live qualification of CPU, memory, GPU/MIG and RDMA headroom.
 Lower the limit when scheduling delays or resource contention appear. Source/target,
 artifact, metadata and model assertions remain unchanged. These limits neither
 reserve cluster-wide capacity nor guarantee placement against other workloads.

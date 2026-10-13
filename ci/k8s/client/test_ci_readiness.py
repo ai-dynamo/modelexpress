@@ -32,6 +32,7 @@ def run_shell(tmp_path, body, command):
     ("unexpected EOF", "get", 0, 2),
     ("context deadline exceeded", "get", 0, 2),
     ("Client.Timeout exceeded", "get", 0, 2),
+    ("request canceled (Client.Timeout or context cancellation while reading body)", "get", 0, 2),
     ("i/o timeout", "get", 0, 2),
     ("TLS handshake timeout", "get", 0, 2),
 
@@ -50,6 +51,18 @@ echo '{{"items":[]}}'
     assert error in result.stderr
     if status == 0:
         assert json.loads(result.stdout) == {"items": []}
+
+
+
+def test_response_body_timeout_retries_are_bounded(tmp_path):
+    command = '''count=$(cat "$FIXTURE/calls" 2>/dev/null || echo 0)
+count=$((count + 1)); echo "$count" > "$FIXTURE/calls"
+echo 'request canceled (Client.Timeout or context cancellation while reading body)' >&2
+exit 17
+'''
+    result = run_shell(tmp_path, "ci_kubectl get pods", command)
+    assert result.returncode == 17
+    assert int((tmp_path / "calls").read_text()) == 4
 
 
 def test_all_replicas_schedule_before_startup(tmp_path):
@@ -182,18 +195,18 @@ exit 1
 
 
 @pytest.mark.parametrize("pool", ["a100a", "rl"])
-def test_admission_waits_for_previous_namespace_and_physical_pods(tmp_path, pool):
-    command = '''if [[ " $* " == *" get namespaces "* ]]; then
+def test_admission_waits_for_previous_labeled_namespace(tmp_path, pool):
+    namespace = json.dumps({"items": [{"metadata": {"name": "mx-ci-bench-old", "labels": {
+        "ci.modelexpress.nvidia.com/gpu-lane": "slot-0",
+        "ci.modelexpress.nvidia.com/gpu-pool": pool,
+    }}}]})
+    command = f'''if [[ " $* " == *" get namespaces "* ]]; then
   count=$(cat "$FIXTURE/calls" 2>/dev/null || echo 0)
   count=$((count + 1)); echo "$count" > "$FIXTURE/calls"
-  if [ "$count" -eq 1 ]; then echo '{"items":[{"metadata":{"name":"mx-ci-bench-old"}}]}'; else echo '{"items":[]}'; fi
-  exit 0
-fi
-if [ "$(cat "$FIXTURE/calls")" -eq 1 ]; then
-  echo '{"items":[{"metadata":{"namespace":"mx-ci-bench-old"},"spec":{"nodeSelector":{"agentpool":"a100a"},"containers":[{"resources":{"requests":{"nvidia.com/gpu":"1"}}}]},"status":{"phase":"Pending"}}]}'
-else echo '{"items":[]}'; fi
+  if [ "$count" -eq 1 ]; then echo '{namespace}'; else echo '{{"items":[]}}'; fi
+else echo '{{"items":[]}}'; fi
 '''
-    result = run_shell(tmp_path, f'export GITHUB_WORKSPACE="{tmp_path}" KUBE_CONTEXT=fixture\nwait_for_gpu_pool_cleanup {pool}', command)
+    result = run_shell(tmp_path, f'export GITHUB_WORKSPACE=. KUBE_CONTEXT=fixture MX_CI_GPU_LANE=slot-0\nwait_for_gpu_pool_cleanup {pool}', command)
     assert result.returncode == 0, result.stderr
     assert "Waiting for GPU pool" in result.stdout
     assert int((tmp_path / "calls").read_text()) == 2
@@ -205,54 +218,55 @@ def test_admission_does_not_treat_api_failure_as_free_capacity(tmp_path):
     assert "Forbidden" in result.stderr
 
 
-def test_admission_waits_for_host_pods_after_virtual_namespace_disappears(tmp_path):
-    command = '''if [[ " $* " == *" get namespaces "* ]]; then echo '{"items":[]}'; exit 0; fi
- echo '{"items":[{"metadata":{"namespace":"mx-ci-old"},"spec":{"nodeSelector":{"agentpool":"a100a"},"containers":[{"resources":{"limits":{"nvidia.com/gpu":"1"}}}]},"status":{"phase":"Running"}}]}'
-'''
-    result = run_shell(tmp_path, 'export GITHUB_WORKSPACE=.\nwait_for_gpu_pool_cleanup a100a', command)
-    assert result.returncode != 0
-    assert "after 900s" in result.stderr
-
-
-@pytest.mark.parametrize("pool,lane,other,namespace", [
-    ("a100a", "rdma", "tcp", "mx-ci-rolling-fixture"),
-    ("a100b", "mla", "parallel", "mx-ci-vllm-dp2-fixture"),
-    ("rl", "refit", "vime", "mx-ci-h100-vime-fixture"),
+@pytest.mark.parametrize("lane,pool,status", [
+    ("slot-0", "a100a", 1),
+    ("slot-1", "a100a", 0),
+    ("slot-0", "a100b", 0),
+    (None, "a100a", 0),
 ])
-@pytest.mark.parametrize("concurrency,status", [(2, 0), (1, 1)])
-def test_cleanup_guard_allows_other_lane_only_in_two_job_mode(tmp_path, pool, lane, other, namespace, concurrency, status):
-    namespaces = json.dumps({"items": [{"metadata": {"name": namespace, "labels": {"ci.modelexpress.nvidia.com/gpu-lane": other}}}]})
-    pods = json.dumps({"items": [{"metadata": {"namespace": "mx-ci", "labels": {"vcluster.loft.sh/namespace": namespace}}, "spec": {"nodeSelector": {"agentpool": pool}, "containers": [{"resources": {"requests": {"nvidia.com/gpu": "1"}}}]}, "status": {"phase": "Running"}}]})
-    command = f'''if [[ " $* " == *" get namespaces "* ]]; then echo '{namespaces}'; else echo '{pods}'; fi
+def test_orphan_host_pods_require_matching_mirrored_slot_and_pool(tmp_path, lane, pool, status):
+    pods = json.dumps({"items": [{"metadata": {"namespace": "mx-ci", "labels": {
+        "vcluster.loft.sh/namespace": "mx-ci-vllm-old",
+        "vcluster.loft.sh/ns-label-mx-ci-cluster-x-9c8bc18f28": lane,
+        "vcluster.loft.sh/ns-label-mx-ci-cluster-x-dc1dfe5427": pool,
+    }}}]})
+    command = f'''echo "$*" >> "$FIXTURE/commands"
+if [[ " $* " == *" get namespaces "* ]]; then echo '{{"items":[]}}'; else echo '{pods}'; fi
 '''
-    result = run_shell(tmp_path, f'export GITHUB_WORKSPACE=. KUBE_CONTEXT=fixture MX_CI_GPU_LANE={lane} MX_CI_GPU_CONCURRENCY={concurrency}\nwait_for_gpu_pool_cleanup {pool}', command)
+    result = run_shell(tmp_path, 'export GITHUB_WORKSPACE=. MX_CI_GPU_LANE=slot-0\nwait_for_gpu_pool_cleanup a100a', command)
     assert result.returncode == status, result.stderr
+    calls = (tmp_path / "commands").read_text()
+    assert " -A " not in calls
+    assert "-n mx-ci" in calls
+    assert "ns-label-mx-ci-cluster-x-9c8bc18f28=slot-0" in calls
     if status:
         assert "after 900s" in result.stderr
-
-
-def test_cleanup_guard_keeps_same_lane_orphan_blocked(tmp_path):
-    command = '''if [[ " $* " == *" get namespaces "* ]]; then echo '{"items":[]}'; exit 0; fi
- echo '{"items":[{"metadata":{"namespace":"mx-ci","labels":{"vcluster.loft.sh/namespace":"mx-ci-vllm-old"}},"spec":{"nodeSelector":{"agentpool":"a100a"},"containers":[{"resources":{"requests":{"nvidia.com/gpu":"1"}}}]},"status":{"phase":"Pending"}}]}'
-'''
-    result = run_shell(tmp_path, 'export GITHUB_WORKSPACE=. MX_CI_GPU_LANE=rdma MX_CI_GPU_CONCURRENCY=2\nwait_for_gpu_pool_cleanup a100a', command)
-    assert result.returncode != 0
-    assert "after 900s" in result.stderr
 
 
 @pytest.mark.parametrize("lane,other,status", [
     ("slot-0", "slot-1", 0),
     ("slot-0", "slot-0", 1),
-    ("slot-0", "rdma", 1),
-    ("slot-0", "slot-9", 1),
-    ("rdma", "slot-0", 1),
+    ("slot-0", "rdma", 0),
+    ("slot-0", "slot-9", 0),
+    ("slot-0", None, 0),
+    ("all", "slot-0", 0),
+    ("all", "all", 1),
 ])
-def test_four_slot_cleanup_and_mode_transition(tmp_path, lane, other, status):
-    namespaces = json.dumps({"items": [{"metadata": {"name": "mx-ci-vllm-old", "labels": {"ci.modelexpress.nvidia.com/gpu-lane": other}}}]})
-    command = f'''if [[ " $* " == *" get namespaces "* ]]; then echo '{namespaces}'; else echo '{{"items":[]}}'; fi
+@pytest.mark.parametrize("pool", ["a100a", "rl"])
+def test_cleanup_guard_only_blocks_exact_labeled_slot(tmp_path, lane, other, status, pool):
+    namespaces = json.dumps({"items": [{"metadata": {"name": "mx-ci-vllm-old", "labels": {
+        "ci.modelexpress.nvidia.com/gpu-lane": other,
+        "ci.modelexpress.nvidia.com/gpu-pool": pool,
+    }}}]})
+    command = f'''echo "$*" >> "$FIXTURE/commands"
+if [[ " $* " == *" get namespaces "* ]]; then echo '{namespaces}'; else echo '{{"items":[]}}'; fi
 '''
-    result = run_shell(tmp_path, f'export GITHUB_WORKSPACE=. MX_CI_GPU_LANE={lane} MX_CI_GPU_CONCURRENCY=4\nwait_for_gpu_pool_cleanup a100a', command)
+    result = run_shell(tmp_path, f'export GITHUB_WORKSPACE=. KUBE_CONTEXT=fixture MX_CI_GPU_LANE={lane} MX_CI_GPU_CONCURRENCY=4\nwait_for_gpu_pool_cleanup {pool}', command)
     assert result.returncode == status, result.stderr
+    calls = (tmp_path / "commands").read_text()
+    assert f"ci.modelexpress.nvidia.com/gpu-lane={lane}" in calls
+    if pool == "rl":
+        assert "get pods" not in calls
     if status:
         assert "after 900s" in result.stderr
 

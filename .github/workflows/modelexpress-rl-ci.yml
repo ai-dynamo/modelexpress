@@ -100,7 +100,7 @@ jobs:
         id: inputs
         env:
           TEST_SHA: ${{ inputs.sha || needs.authorize.outputs.sha }}
-          MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '16' }}
+          MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '8' }}
           PR_NUMBER: ${{ inputs.pull_request || github.event.issue.number || 0 }}
           GH_TOKEN: ${{ github.token }}
           MODEL_PROFILE: ${{ inputs.model || needs.authorize.outputs.model }}
@@ -250,7 +250,7 @@ jobs:
       - name: Assign GPU slot
         id: slots
         env:
-          MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '16' }}
+          MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '8' }}
           PR_NUMBER: "0"
         run: |
           python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
