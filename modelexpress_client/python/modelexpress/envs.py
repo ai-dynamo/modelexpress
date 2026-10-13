@@ -62,6 +62,9 @@ if TYPE_CHECKING:
     MX_PUBLISH_TIMEOUT_SECS: int
     MX_MODEL_REVISION: str
     MX_MODEL_URI: Optional[str]
+    MX_PLUGIN_DIR: str
+    MX_LOAD_PLUGIN: Optional[str]
+    MX_LOAD_PLUGIN_BEFORE: str
     MX_LOAD_STRATEGY_CHAIN: str
     MX_P2P_METADATA: str
     MX_RESHARD_FUSED_WIRE: bool
@@ -287,6 +290,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_PUBLISH_TIMEOUT_SECS": lambda: _env_int("MX_PUBLISH_TIMEOUT_SECS", 30 * 60),
     "MX_MODEL_REVISION": lambda: os.environ.get("MX_MODEL_REVISION", ""),
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
+    "MX_PLUGIN_DIR": lambda: os.environ.get("MX_PLUGIN_DIR", "/opt/modelexpress/plugins"),
+    "MX_LOAD_PLUGIN": lambda: os.environ.get("MX_LOAD_PLUGIN"),
+    "MX_LOAD_PLUGIN_BEFORE": lambda: os.environ.get("MX_LOAD_PLUGIN_BEFORE", "server-cache"),
     "MX_LOAD_STRATEGY_CHAIN": lambda: (
         os.environ.get("MX_LOAD_STRATEGY_CHAIN", "INFERENCE").strip().upper()
     ),
