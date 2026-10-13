@@ -527,11 +527,7 @@ class _VllmInstaller(EngineInstaller):
                     PreparedRuntimeTensors,
                     PreparedCheckpointArtifact,
                 }
-                | (
-                    {PreparedStreamingTensors}
-                    if not self._unsupported_online_fp8
-                    else set()
-                )
+                | ({PreparedStreamingTensors} if not self._is_quantized else set())
             )
         )
 
@@ -885,9 +881,9 @@ class _VllmInstaller(EngineInstaller):
     @torch.no_grad()
     def install_streaming(self, prepared: PreparedStreamingTensors) -> None:
         """Copy complete groups into engine-owned storage before arena reuse."""
-        if self._unsupported_online_fp8:
+        if self._is_quantized:
             raise IncompleteRefit(
-                "online block-FP8 streaming requires native vLLM plain-tensor support"
+                "bounded streaming currently requires an unquantized engine"
             )
         _check_install_dispatch(bounded=True)
         ownership = prepared.ownership
@@ -1662,16 +1658,6 @@ class _VllmInstaller(EngineInstaller):
                 f"count={len(meta_parameters)}, names={meta_parameters[:10]}"
             )
 
-    @cached_property
-    def _unsupported_online_fp8(self) -> bool:
-        module_name = "vllm.model_executor.layers.quantization.online.fp8"
-        return any(
-            any(
-                base.__module__ == module_name
-                for base in type(getattr(layer, "quant_method", None)).__mro__
-            )
-            for layer in self._model.modules()
-        )
 
 
 __all__: list[str] = []

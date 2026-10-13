@@ -715,8 +715,8 @@ full-copy descriptors before entering bounded preparation. Preparation retries
 retain one version lease and discard failed setup state; installation failures
 still fence the engine rather than retrying a partially committed update.
 
-Streaming is opt-in and trainer-only. vLLM supports unquantized and captured
-quantized reloads; online FP8 configurations requiring loader patching are rejected. It does not publish generator peers or roll back partially installed
+Streaming is opt-in, trainer-only, and currently limited to unquantized vLLM
+models. It does not publish generator peers or roll back partially installed
 versions. An installation failure marks the client engine state uncertain and
 makes the failed handle unusable for another installation. A subsequent
 `stage_weight()` releases the failed transaction after proven cleanup, acquires
