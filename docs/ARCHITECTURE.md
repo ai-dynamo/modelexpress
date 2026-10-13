@@ -1801,8 +1801,8 @@ failure chained as its cause. Partial installation has no rollback.
 
 The adapter depends on vLLM's layerwise reload helpers. Runtime compatibility must
 be qualified with changing weights, shared parameters, graph-bound addresses,
-post-load state and failure cleanup. Quantized bounded installation remains
-unsupported. The same generic path is used for small-model validation and GLM;
+post-load state and failure cleanup. The same generic path is used for
+small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
 
 
