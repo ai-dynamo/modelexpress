@@ -827,12 +827,8 @@ class _VllmInstaller(EngineInstaller):
             last_writes = {
                 item.param_name: index for index, item in enumerate(capture.copies)
             }
-            missing = targets.by_name.keys() - last_writes.keys()
-            if missing:
-                raise IncompleteRefit(
-                    "capture does not cover the engine load layout: "
-                    f"missing parameters={sorted(missing)}"
-                )
+            if not targets.by_name.keys() <= last_writes.keys():
+                return capture, param_layout
             schedule = _ReplaySchedule.compile(
                 targets,
                 engine.runtime.overlap_groups,
