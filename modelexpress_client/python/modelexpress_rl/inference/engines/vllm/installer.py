@@ -813,6 +813,8 @@ class _VllmInstaller(EngineInstaller):
                         if info.kernel_tensors is not None:
                             _place_kernel_tensors(layer, info)
                         info.reset()
+                if hasattr(model, "_original_do_torchao_reload"):
+                    model._do_torchao_reload = model._original_do_torchao_reload
         logger.info(
             "captured %d copies and %d unsupported sources (quantized=%s)",
             len(capture.copies),
