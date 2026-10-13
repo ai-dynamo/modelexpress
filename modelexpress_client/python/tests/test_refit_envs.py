@@ -34,6 +34,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_S3_MAX_POOL_CONNECTIONS == 32
     assert envs.MX_S3_MAX_ATTEMPTS == 5
     assert envs.MX_S3_TCP_KEEPALIVE is True
+    assert envs.MX_REFIT_DELTA_SURGICAL is False
 
 
 def test_values_are_normalized_and_read_live(monkeypatch):
@@ -173,3 +174,11 @@ def test_refit_replica_settings_default_and_normalization(monkeypatch) -> None:
 
     assert refit_envs.MX_REFIT_PREFETCH_REPLICA_METADATA is True
     assert refit_envs.MX_REFIT_DEBUG_VALIDATE_REPLICAS is True
+
+
+def test_delta_surgical_parses_boolean(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
+    assert envs.MX_REFIT_DELTA_SURGICAL is True
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "maybe")
+    with pytest.raises(ValueError, match="MX_REFIT_DELTA_SURGICAL"):
+        envs.MX_REFIT_DELTA_SURGICAL

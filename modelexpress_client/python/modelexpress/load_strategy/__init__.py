@@ -34,6 +34,8 @@ __all__ = [
     "LoadContext",
     "LoadResult",
     "LoadStrategy",
+    "StrategyFailed",
+    "StrategyRecoveryError",
     "LoadStrategyChain",
     "execute_load_strategies",
     "run_load_strategy_chain",
@@ -72,6 +74,8 @@ class LoadStrategyChain:
         from .model_streamer_strategy import ModelStreamerStrategy
         from .gds_strategy import GdsStrategy
         from .default_strategy import DefaultStrategy
+        from .. import envs
+        from ..plugins import get_plugin, initialize_plugins, validate_plugin_names
 
         all_strategies: list[LoadStrategy] = [
             RdmaStrategy(),
@@ -81,6 +85,18 @@ class LoadStrategyChain:
             GdsStrategy(),
             DefaultStrategy(),
         ]
+
+        if name := envs.MX_LOAD_PLUGIN:
+            before = envs.MX_LOAD_PLUGIN_BEFORE
+            strategy_names = [strategy.name for strategy in all_strategies]
+            if before not in strategy_names:
+                raise ValueError(
+                    f"MX_LOAD_PLUGIN_BEFORE must name a built-in strategy "
+                    f"from {strategy_names}, got {before!r}"
+                )
+            initialize_plugins()
+            validate_plugin_names(set(strategy_names))
+            all_strategies.insert(strategy_names.index(before), get_plugin(name))
         return execute_load_strategies(model, ctx, all_strategies)
 
     @staticmethod
