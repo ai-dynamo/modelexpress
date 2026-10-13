@@ -275,7 +275,7 @@ jobs:
     - name: Run tests
       working-directory: modelexpress_client/python
       run: |
-        .venv/bin/python -m pytest tests/ -v
+        .venv/bin/python -m pytest modelexpress/tests/ modelexpress_rl/tests/ -v
 
   python-proto-bindings:
     name: Python Generated Bindings

@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Configuration reference
 
-This is the canonical reference for ModelExpress-owned server, client, loader, transport, artifact, and metrics configuration. The Python client reads its environment values at use time from [modelexpress/envs.py](../modelexpress_client/python/modelexpress/envs.py); the Rust server and CLI use [modelexpress_common/src/envs.rs](../modelexpress_common/src/envs.rs) and the server configuration types. Advanced refit and resharding controls remain with the feature implementation because their safety contracts are workload-specific. When a third-party runtime owns a setting, this page names the runtime rather than pretending it is an MX setting.
+This is the canonical reference for ModelExpress-owned server, client, loader, transport, artifact, and metrics configuration. The Python client reads its environment values at use time from [modelexpress/envs.py](../modelexpress_client/python/modelexpress/envs.py); the Rust server and CLI use [modelexpress_common/src/envs.rs](../modelexpress_common/src/envs.rs) and the server configuration types. When a third-party runtime owns a setting, this page names the runtime rather than pretending it is an MX setting.
 
 ## Precedence
 
@@ -221,6 +221,6 @@ model-weight transfer.
 
 See [Metrics](METRICS.md) for endpoint behavior and PromQL.
 
-## Advanced refit and resharding
+## RL refit settings
 
-Live refit and resharding have additional `MX_REFIT_*` and `MX_RESHARD_*` settings whose defaults and safety contracts are workload-specific. RL-only settings are registered in `modelexpress_rl.envs`; shared client settings remain in `modelexpress.envs`. See the [no-gather refit architecture](ARCHITECTURE.md#no-gather-refit-resharding) before enabling them.
+RL trainer and generator settings are documented in the [RL configuration reference](rl/CONFIGURATION.md).

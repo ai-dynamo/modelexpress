@@ -28,7 +28,7 @@ use tower::{Layer, ServiceExt};
 
 /// Families exported by the Python client, which cannot be enumerated from Rust.
 ///
-/// `modelexpress_client/python/tests/test_metrics.py::test_alert_rule_client_families_exist`
+/// `modelexpress_client/python/modelexpress/tests/test_metrics.py::test_alert_rule_client_families_exist`
 /// asserts this same list against the client's real registry. The two halves
 /// cross-check: a rename on the Python side fails there, and a name added here
 /// that Python does not export fails there too. Keep them in step.

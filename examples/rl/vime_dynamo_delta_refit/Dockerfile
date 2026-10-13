@@ -21,7 +21,7 @@ RUN --mount=type=bind,source=modelexpress_client/python,target=/opt/modelexpress
 COPY --from=rust-builder /src/dynamo/target/release/dynamo-vllm-sidecar /usr/local/bin/
 COPY --from=rust-builder /src/modelexpress/target/release/modelexpress-server /usr/local/bin/
 RUN python3 -B -c \
-    "import boto3, modelexpress_rl, vllm, zstandard; from modelexpress import register_modelexpress; register_modelexpress()"
+    "import boto3, modelexpress_rl, vllm, zstandard"
 
 FROM vllm/vime@sha256:5b48444d8e9962b5525ec11aaa012a75c5170544f4500d28451bc0b46a2f7728 AS trainer
 RUN rm -rf /root/vime
