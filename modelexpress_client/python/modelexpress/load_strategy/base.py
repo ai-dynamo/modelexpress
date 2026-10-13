@@ -70,6 +70,11 @@ class LoadStrategy(ABC):
       - raise StrategyFailed(mutated=False) for expected fallback paths
       - raise StrategyFailed(mutated=True) after mutating the model
       - reserve unexpected errors for rare defensive fallback in the chain
+
+    External plugins use this same contract. Their unexpected load exceptions
+    and non-LoadResult returns are treated as mutated failures so retry always
+    restores the model. Import and construction must not load model weights;
+    availability checks must not mutate the model or download artifacts.
     """
 
     name: str

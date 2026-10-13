@@ -710,6 +710,25 @@ Receiver-driven RL refit and live fine-tune broadcast are under development. The
 
 See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale, limitations, and the structural reasons these backend families differ.
 
+### Loading Strategy Plugins
+
+External loading strategies run after RDMA and before ServerCache by default in the shared `INFERENCE` chain. In that order, RDMA success skips the plugin's `load()`; plugin failure follows the existing recovery and fallback lifecycle. RL and SGLang's `transfer_engine` path are unchanged.
+
+Implement `is_available`, `load`, and `rollback` in the [strategy template](../examples/plugins/mx_plugin_example.py) before enabling it. The template raises `NotImplementedError` for each method. Mount the plugin directory read-only into each worker and set:
+
+```bash
+export MX_PLUGIN_DIR=/opt/modelexpress/plugins
+export MX_LOAD_PLUGIN=example
+```
+
+Set `MX_LOAD_PLUGIN_BEFORE` to insert the plugin immediately before a built-in strategy: `rdma`, `server-cache`, `instant_tensor`, `model_streamer`, `gds`, or `default`. The default is `server-cache`. For example, `export MX_LOAD_PLUGIN_BEFORE=rdma` tries the plugin first. Built-in strategies retain their relative order. Unknown or empty target names fail before discovery or weight loading; the setting is ignored when no plugin is selected.
+
+The directory must contain `mx_plugin_example.py`, whose no-argument `register_plugin()` returns a strategy class named `example`. No inference-engine code or `PYTHONPATH` changes are required. Multiple entries may be mounted; all are imported and validated, but only the selected class is instantiated. Entry imports, registration, and construction must not download or load weights.
+
+Unset or empty `MX_LOAD_PLUGIN` disables discovery. An unknown selection, missing plugin directory, invalid entry, or name collision fails before weight loading.
+
+Plugins execute inside the worker without sandboxing. Deploy trusted artifacts and restart workers to activate updates; imported modules are cached for the worker lifetime. See [External Loading Strategies](ARCHITECTURE.md#external-loading-strategies) for the interface and failure contract.
+
 ### P2P Environment Variables
 
 `MX_SERVER_ADDRESS` is the variable ModelExpress is standardizing on for the client's gRPC server address; `MODEL_EXPRESS_URL` is deprecated and will be removed in a future release. During the transition, set both to the same value: some client paths (notably the TRT-LLM live-transfer integration) currently read only `MODEL_EXPRESS_URL`, and when both are set `MODEL_EXPRESS_URL` takes precedence. Do not drop `MODEL_EXPRESS_URL` yet.
@@ -721,6 +740,9 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_MODEL_NAME_OVERRIDE` | (unset) | Override vLLM's MX model identity without changing its model-loading path. Set before worker startup and use the same name for RL trainers and WeightVersions. Unset or empty preserves vLLM's configured model path/ID, including rewritten S3 cache paths. See [S3 Delta Weight Refit](S3_DELTA_WEIGHT_REFIT.md). |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Initial-load policy. `RL` uses exact desired-version P2P and canonical S3 replay when `MX_REFIT_DESIRED_VERSION_UID` is set; otherwise it tries `MX_MODEL_URI` and then the engine-native loader. vLLM speculative draft models are rejected because the desired UID identifies only the main model. |
+| `MX_LOAD_PLUGIN` | (unset) | Select one external loading strategy by name for the shared `INFERENCE` chain. Unset or empty disables plugin discovery. See [Loading Strategy Plugins](#loading-strategy-plugins). |
+| `MX_LOAD_PLUGIN_BEFORE` | `server-cache` | Insert the selected plugin immediately before this built-in strategy. Ignored when no plugin is selected. See [Loading Strategy Plugins](#loading-strategy-plugins) for valid names. |
+| `MX_PLUGIN_DIR` | `/opt/modelexpress/plugins` | Directory containing `mx_plugin_<name>.py` entries; read only when a plugin is selected. |
 | `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact immutable version required by the RL initial-load policy. When set, startup fails if neither desired-version P2P nor S3 replay succeeds; version-agnostic fallbacks are not allowed. |
 | `MX_GENERATOR_SOURCE_ORDER` | Auto-detected | Ordered RL weight sources. For desired-version cold start, the default is `GENERATOR,OBJECT_STORAGE`; supported entries are `GENERATOR` (P2P) and `OBJECT_STORAGE` (canonical S3 replay). The same order controls active refit. `OBJECT_STORAGE` disables P2P for both paths. `TRAINER` is supported by active refit only and is rejected during desired-version cold start. |
 | `MX_REFIT_CHECKPOINT_DIR` | (unset) | Local cache for RL full checkpoints, deltas, and materialized checkpoints. Required for desired-version S3 replay. Cache persistence and capacity are determined by the mounted volume. |
@@ -745,6 +767,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_ARENA_SINGLE_MR` | `0` | Keep single-MR arena registration even when the arena spans several `cuMemCreate` handles. Only safe on transports that can register across handles (dmabuf/IB); cuda_ipc cannot, so the default falls back to per-tensor registration. See [VMM Arena](#vmm-arena-single-mr-registration). |
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` on any UCX predating the `cuda_copy_md` length-truncation fix (openucx/ucx#11461). Scoped to the `cuda_copy` transport; it does not affect `cuda_ipc`. |
 | `MX_NIXL_BACKEND` | `UCX` | NIXL backend for GPU-to-GPU RDMA. `UCX` (default) for InfiniBand / RoCE. `LIBFABRIC` for AWS EFA — see [NIXL Backend Selection](#nixl-backend-selection). |
+| `MX_NIXL_METADATA_TIMEOUT` | `120.0` | Timeout in seconds for fetching peer NIXL metadata during RDMA loading, separate from `MX_TRANSFER_TIMEOUT`. Accepts finite positive numbers, including fractions. Invalid values fall back to the default. |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Addresses both openucx/ucx#11259 and rail convergence, the latter measured at 4.45x on an under-provisioned pod. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MX_UCX_DISABLE_MEM_EVENTS` | `0` | Opt-in. `1` sets `UCX_MEM_EVENTS=n` before NIXL agent creation on the UCX backend (no-op on `LIBFABRIC`), which roughly halves NIXL agent creation time by skipping UCX's mem-hook / VM-unmap tracking. Off by default because the effect is process-wide and permanent: `UCX_MEM_EVENTS` backs registration-cache invalidation for every UCP context in the process, not just ModelExpress's, so this is only safe when the process owns UCX exclusively for ModelExpress transfers. Never overrides an operator-set `UCX_MEM_EVENTS`. UCX reads this option in a shared-library constructor, so if UCX was already loaded elsewhere in the process before agent creation, setting it here can be a no-op. |
