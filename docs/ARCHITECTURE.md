@@ -451,16 +451,11 @@ require the generation field; decoding parses it as a uint64 without repeating
 creation-time consistency checks. Versions without a trainer mesh, including object-storage
 versions, carry generation zero. A requested version whose recorded mesh
 generation differs from the current trainer mesh fails trainer source resolution.
-The session tries configured source kinds in order, so this failure can fall back
-to a generator peer serving the requested version. Bounded staging applies to
-trainer transfers; peers retain their normal runtime-tensor preparation path.
-An engine left uncertain by a failed installation can recover through a complete
-peer tensor transfer even when the requested version was published as a delta.
-The publication format does not determine the peer's transfer representation;
-failed-handle and undrained-transfer protections still apply.
-Trainer and peer paths check compatibility during plan selection without a
-separate preflight pass. Object-storage replay retains preflight validation of
-every revision before acquiring the chain's leases.
+The session can fall back to a generator peer serving the requested version.
+Peer reads use complete runtime tensors, allowing recovery from an uncertain
+installation even for a version published as a delta. Trainer and peer paths
+check compatibility during plan selection; object-storage replay validates every
+revision before acquiring the chain's leases.
 
 Any trainer mesh update that changes its generation is rejected while a linked
 weight version has an active consumer lease, including additive replicas that
@@ -553,7 +548,7 @@ flowchart LR
     G -->|"Register worker; lease version; NIXL: discover shards"| S
     G -->|"Discover exact-version same-rank peer"| P
     G --> GR --> SR --> UM --> I
-    G -->|"Fetch exact-version manifest"| M
+    G -->|"Fetch trainer metadata"| M
     B -->|"NIXL reads"| UM
     PG -->|"Publish READY version identity"| P
     PG -->|"Peer manifest + NIXL reads"| UM
@@ -562,29 +557,17 @@ flowchart LR
 `RefitService` is the central metadata service defined by `refit.proto`. It
 coordinates immutable versions, worker registrations, shard advertisements,
 and leases, but it does not discover engine tensor layouts or transfer weights.
-For NIXL, `RefitWorkerService.GetTrainerShardMetadata` serves stable coverage,
-geometry, addresses, registrations, and counts by digest. Coverage exists after
-`bind_tensors()`; physical metadata follows buffer registration. Mesh creation
-validates every binding, while updates validate only changed members.
-`GetWeightVersionShardMetadata` binds a version and shard to that digest and its
-ordered checksums. Generators verify identities, digests, and checksum coverage,
-then cache stable metadata by mesh generation, shard, and worker. Each update
-checks its publication and uses fresh checksums; disabled verification skips the
-version metadata RPC. Redis pins each worker/shard digest for the generation and
-rejects changes until a successful generation update.
-The worker publishes stable metadata before optional version checksums and central
-advertisement. It keeps one current physical record and a separate coverage
-binding; replacement waits for all owned versions to retire. Version deletion
-passes the lease fence before removing its checksum record, while stable metadata
-remains available for reuse. The FSDP and Megatron builders and worker service
-share `modelexpress_rl/train/manifest.py`.
-Trainer source resolution retains per-update results, checksums, and timing in a
-resolution round. Transfer preparation separates connection setup from plan
-selection, and streaming posts batches through a dedicated method.
-`build_sources()` constructs read-only mappings and frozen source/shard records
-with tuple geometry and shard collections directly; both staging modes retain the
-transport's
-read descriptors directly instead of copying them into another descriptor type.
+For NIXL, `GetTrainerShardMetadata` serves stable tensor geometry, buffer
+addresses and registrations by digest. `GetWeightVersionShardMetadata` supplies
+version-specific checksums separately. Generators cache stable metadata by mesh
+generation, shard and worker, but check each version's publication and checksums.
+With checksum verification disabled, the version metadata RPC is skipped.
+Redis pins each worker/shard digest for the generation and rejects changes.
+
+Trainers publish stable metadata before version checksums and advertisements.
+Replacing physical metadata requires all owned versions to retire; version
+checksum records are deleted only after the lease fence. Stable metadata remains
+available for reuse. Mesh creation validates bindings; updates validate changed members.
 For S3, `WeightVersion.object_storage` identifies the storage type and global
 `model.safetensors.index.json` URI directly; the server validates only this
 typed location and does not contact S3.
@@ -600,9 +583,8 @@ point. Applying the weights or releasing an unapplied handle ends the lease.
 With bounded staging configured, the same handle holds deferred batch reads;
 `apply_weight()` performs pipelined transfer and installation.
 
-The initial worker manifest channel uses plaintext gRPC and does not authenticate
-the publishing worker. Manifest digests detect corruption but do not establish
-source identity. Deploy RL refit only on a trusted, network-isolated cluster and
+Trainer metadata uses plaintext gRPC without worker authentication. Metadata
+digests detect corruption but do not establish source identity. Deploy RL refit only on a trusted, network-isolated cluster and
 prevent untrusted clients from reaching MX server and worker gRPC endpoints.
 Transport authentication and TLS require a separate protocol and deployment
 design; they are not provided by this implementation.
@@ -653,11 +635,6 @@ geometry, and framework orchestration independently replaceable.
 capacity per arena, and `staging_buffers_count` defaults to one. The streaming
 client uses their product as its total staging limit. `staging_device` selects
 CUDA or pinned host receive memory.
-The setting fixes the receiver's staging mode at construction; load-time
-updates use one `prepare()` entry point, which selects full-copy or bounded
-preparation from that fixed configuration. Both modes record planning and cache
-reuse during preparation; streaming transfer bytes and durations are recorded
-when installation exits, including failure paths.
 
 The `stage_weight()` / `apply_weight()` generator APIs hold a version lease
 across metadata preparation and incremental installation. The NIXL receiver
@@ -675,18 +652,16 @@ storage. Receive-arena views are never passed to engine callbacks. For trainer
 sources without bounded staging configured, `stage_weight()` transfers a full
 independent copy before installation.
 
-The generator compiles one logical plan per mesh ID and generation from its
-fixed installation plan and needed shard groups. Each leased update selects
-replicas and validates fresh checksums. Physical source bindings are reused only
-while the selected-source fingerprint stays unchanged; a replica switch rebinds
-physical sources, and a mesh change recompiles logical reads. Replica groups
-persist until the mesh changes, with selection order stable for that generation.
-The cache retains decoded metadata; the plan limits replica selection and agent connections
-to the groups it needs.
-`MX_REFIT_PREFETCH_REPLICA_METADATA=1` fetches all needed replicas up front;
-otherwise metadata is fetched on selection. `MX_REFIT_DEBUG_VALIDATE_REPLICAS`
-compares coverage and geometry across replicas. Failed native preparation
-discards physical state while retaining the logical plan.
+The logical plan is cached for one mesh ID and generation and contains only the
+shard groups needed by the generator. Groups list all replicas in worker-ID
+order; metadata is fetched lazily when a published replica is selected.
+Changing replicas rebinds physical sources without recompiling logical reads.
+A mesh change rebuilds the logical plan. Native preparation failures discard
+physical state while retaining the logical plan; each update has fresh checksums
+and a lease.
+
+`MX_REFIT_PREFETCH_REPLICA_METADATA` fetches all needed replicas up front.
+`MX_REFIT_DEBUG_VALIDATE_REPLICAS` checks equivalent canonical coverage.
 
 `MX_REFIT_PACK_MODULES` coalesces consecutive owning-module batches up to the
 same staging limit, trading a larger arena residency for fewer of them. It never
@@ -708,12 +683,9 @@ only while it still points to that exact committed object; a missing or rebound
 parameter is rejected. Installation reconnects shared bindings after each
 managed owner's kernel-storage restoration, before dependent hooks execute.
 
-Released full-copy and bounded updates may alternate on one client. The transfer
-owner tears down its agent before clearing the mode-specific buffers and reloads
-source metadata into the new registrations. The update method invalidates cached
-full-copy descriptors before entering bounded preparation. Preparation retries
-retain one version lease and discard failed setup state; installation failures
-still fence the engine rather than retrying a partially committed update.
+Full-copy or bounded mode is fixed for the client's lifetime. Preparation retries
+retain one version lease and discard failed physical setup; installation failures
+fence the engine rather than retrying a partially committed update.
 
 Streaming is opt-in, trainer-only, and currently limited to unquantized vLLM
 models. It does not publish generator peers or roll back partially installed
@@ -735,7 +707,7 @@ engine-owned post-load workspace, CUDA allocator overhead, and transport metadat
 | `GetWeightVersion` | `GetWeightVersionRequest` | `GetWeightVersionResponse` | Read the version and its lifecycle state |
 | `DeleteWeightVersion` | `DeleteWeightVersionRequest` | `DeleteWeightVersionResponse` | Cancel a `STAGING` version or move a `READY` version to `RELEASING` for retirement |
 | `UpdateWeightVersionState` | `UpdateWeightVersionStateRequest` | `UpdateWeightVersionStateResponse` | Explicitly update lifecycle state, including S3 `STAGING` to `READY` |
-| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker metadata reference for a required logical shard |
+| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker manifest for a required logical shard |
 | `ListWeightVersionShards` | `ListWeightVersionShardsRequest` | `ListWeightVersionShardsResponse` | List the version's physical source publications |
 | `DeleteWeightVersionShard` | `DeleteWeightVersionShardRequest` | `DeleteWeightVersionShardResponse` | Evict one source shard after release when no lease protects the version |
 | `RegisterVersionLease` | `RegisterVersionLeaseRequest` | `RegisterVersionLeaseResponse` | Acquire or renew protection while installing a version |
@@ -1801,22 +1773,15 @@ therefore not a total GPU-memory bound. Two arenas can overlap the next READ wit
 installation of the current group; the benefit must be measured on the target
 hardware. Trainer staging mode and receiver arena location are separate choices.
 
-The update plan holds one descriptor-cache tuple: one entry for full-copy mode,
-or one per bounded batch. Each entry caches READ descriptors by source group and
-replica, populated on selection. Switching one group builds only missing replica descriptors;
-returning to a cached replica reuses them in the original read order. Bounded
-batches recreate views over the staging arenas during execution. Each batch
-zeroes padding and posts fresh READs.
-Mesh changes and destination teardown clear execution caches. Failed attempts
-invalidate the active binding while retaining descriptors if destination
-resources remain valid; existing drain and recovery rules still apply.
-Descriptor setup stays outside wire timing.
+READ descriptors are cached by source group and replica while destinations
+remain valid. A replica switch builds only missing descriptors; returning to a
+cached replica reuses them. Each batch recreates views, zeroes padding and posts
+fresh READs. Mesh changes and destination teardown clear execution caches;
+failed attempts invalidate the active binding and retain only safe resources.
 
-Trainer discovery selects replicas only for needed shard groups.
-Replica fingerprints reuse parsed sources without rescanning reads or batches;
-snapshots hold no tensors, handles, checksums, or leases. Coverage and capacity
-are checked at compilation. Discovery reports cache, fetch, verification, and
-stable RPC timing per candidate, excluding time spent in transfer or install.
+Trainer discovery selects replicas for needed shard groups and reuses parsed
+metadata. Snapshots hold no tensors, handles, checksums or leases. Coverage and
+capacity are checked during compilation.
 
 The prepared streaming artifact owns its iterator and remains protected by the
 version lease. An installation failure fences the engine and never falls back
@@ -1834,39 +1799,17 @@ unsupported. The same generic path is used for small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
 
 
-Full-copy and bounded updates enter one session staging flow. Immutable streaming
-settings bind the mode, placement, buffer count and total budget at runtime
-construction; each transfer retains that configuration for its lifetime. Public
-`staging_buffer_bytes` remains the capacity of each buffer, multiplied by the
-buffer count for the internal total budget. Bounded device compatibility is
-checked before creating its NIXL manager. Streaming installer support is checked
-once during runtime initialization, before allocating transfers. Runtime
-construction selects the trainer method; per-update candidate selection does not
-repeat method-type or streaming-installer checks. Generator peer reads retain a separate
-full-copy transfer borrowing the engine manager. The version lease remains held through
-installation or release. Preparation retry and recovery behavior stays scoped
-to the selected update strategy; failures after a possible write fence the engine.
+Full-copy and bounded updates share one `prepare()` flow with staging settings
+fixed at construction. Logical reads use source-relative offsets; physical
+bindings resolve selected replica addresses. Matching bindings reuse transport
+and workspace setup. Coverage and capacity are checked during compilation, with
+optional debug revalidation. Plans are published only after setup succeeds.
 
-The immutable update plan combines the fixed engine layout, trainer conversion,
-and source-relative logical reads. It is reused for the mesh ID and generation
-in both transfer modes. Physical bindings and transports follow the selected
-replica fingerprint; checksums, leases, and preparation metrics are per update.
-Full-copy updates with an unchanged physical binding skip workspace layout
-checks; bounded capacity is validated during compilation. Optional
-`MX_REFIT_DEBUG_VALIDATE_PLAN` rechecks cached plan coverage.
-`prepare()` handles lookup, binding, connection, and cleanup, then publishes
-only after setup succeeds. Full-copy and bounded modes manage their own
-workspaces and descriptors. Failed preparation or READ invalidates physical
-state while retaining the logical plan; outstanding reads must still drain
-before native resources can be reused.
-
-The transfer owns cleanup of partial native preparation. Metadata, layout and
-compilation failures leave registered storage and existing connections intact.
-A failed preparation that attempted manager initialization, source connection or
-registration resets an owned manager before releasing its storage; cleanup failure
-remains fatal with its cause retained. Borrowed managers cannot be reset by the
-transfer. Streaming READ drain, retained leases and uncertain-resource quarantine
-keep their existing installation behavior.
+Metadata or planning failures leave existing connections and storage intact.
+Native setup failure resets an owned manager before releasing its storage;
+borrowed managers cannot be reset. Failed preparation or READ discards physical
+state while retaining the logical plan. Undrained resources and leases remain
+protected by the installation failure rules.
 
 ## RL refit CI harness
 

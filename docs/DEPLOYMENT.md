@@ -1579,9 +1579,8 @@ total rather than describing the entire streaming operation as wire or install.
 
 ### Internal streaming diagnostics
 
-Validated source metadata and transfer plans are reused automatically. These
-internal diagnostics are read once when the transfer is constructed; they are
-separate from the public integration configuration.
+Source metadata and transfer plans are reused automatically. These internal
+settings are read when the transfer is constructed.
 
 | Internal environment variable | Default | Purpose |
 | --- | --- | --- |
@@ -1591,16 +1590,11 @@ separate from the public integration configuration.
 | `MX_REFIT_PREFETCH_REPLICA_METADATA` | `0` | Fetch stable metadata for all replicas in needed logical-shard groups on first preparation. |
 | `MX_REFIT_DEBUG_VALIDATE_REPLICAS` | `0` | Check that replicas in each logical-shard group have equivalent canonical coverage. |
 
-`none` sorts workers by ID. `rotate` sorts them and rotates the order by engine
-rank; it is the default. `random` shuffles once when the complete group is
-constructed; its list order remains stable for that mesh generation. Metadata prefetch is
-limited to replica members of logical-shard groups needed by the transfer plan.
-An unavailable nonselected replica remains unresolved and can be retried later;
-`replica_metadata_prefetch_unavailable` records incomplete prefetch. Digest and
-identity errors still fail preparation. Debug validation requires all published
-replicas to resolve and fails if any is unavailable.
-Replica equivalence compares canonical tensor coverage and geometry while
-ignoring physical addresses, which vary by replica.
+Replicas are tried in worker-ID order. Metadata prefetch is limited to groups
+needed by the transfer plan; unavailable replicas can be retried later.
+Digest and identity errors fail preparation. Debug validation requires every
+published replica to resolve and compares canonical coverage and geometry,
+ignoring replica-specific physical addresses.
 
 Bounded streaming requires the framework to hold its update guard through
 transfer, installation and verification. Each group is copied from a receive
