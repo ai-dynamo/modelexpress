@@ -89,6 +89,10 @@ inputs:
     description: 'Seconds to wait for the rolling update and metadata transitions'
     required: false
     default: '600'
+  worker_cpu_request:
+    description: 'CPU cores requested per TP1 fleet worker'
+    required: false
+    default: '2'
 
 runs:
   using: "composite"
@@ -108,7 +112,7 @@ runs:
         NAMESPACE: ${{ inputs.namespace }}
       run: |
         echo "::group::Create namespace ${NAMESPACE} and install prerequisites"
-        kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+        bash .github/scripts/ci-namespace.sh create "$NAMESPACE" plain
         kubectl apply -f examples/crds.yaml
         NAMESPACE=${NAMESPACE} envsubst < ci/k8s/server/rbac-modelmetadata.yaml | \
           kubectl apply -n ${NAMESPACE} -f -
@@ -161,7 +165,9 @@ runs:
         MX_CI_MODEL: ${{ inputs.model }}
         NAMESPACE: ${{ inputs.namespace }}
         MANIFEST: ${{ inputs.manifest }}
+        MX_CI_FLEET_CPU: ${{ inputs.worker_cpu_request }}
       run: |
+        [[ "$MX_CI_FLEET_CPU" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid fleet CPU request: $MX_CI_FLEET_CPU" >&2; exit 1; }
         echo "::group::Deploy fleet workers Deployment at replicas=1"
         envsubst < "${MANIFEST}" | \
           kubectl apply -n ${NAMESPACE} -f -
@@ -173,6 +179,7 @@ runs:
         NAMESPACE: ${{ inputs.namespace }}
         TIMEOUT: ${{ inputs.source_load_timeout_seconds }}
       run: |
+        source .github/scripts/ci-kubectl.sh
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || {
           echo "ERROR: source_load_timeout_seconds must be a positive integer, got '${TIMEOUT}'"
           exit 1
@@ -184,11 +191,12 @@ runs:
         # to HF disk load. Counting only Ready CRs makes the gate match the
         # actual healthy state test_fleet_scale.py asserts.
         ready_count() {
-          kubectl get modelmetadata -n "${NAMESPACE}" \
-            -o jsonpath='{range .items[*]}{.spec.sourceType}{"|"}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
-            | awk -F '|' '($1 == "weights" || $1 == "") && $2 == "Ready" { count++ } END { print count + 0 }' || true
+          ci_kubectl get modelmetadata -n "${NAMESPACE}" \
+            -o jsonpath='{range .items[*]}{.spec.sourceType}{"|"}{.status.worker.status}{"\n"}{end}' \
+            | awk -F '|' '($1 == "weights" || $1 == "") && $2 == "Ready" { count++ } END { print count + 0 }'
         }
         echo "::group::Wait for source worker to reach Ready"
+        wait_for_scheduling "Fleet source" mx-fleet-workers "app=mx-fleet-worker" "$TIMEOUT"
         deadline=$((SECONDS + TIMEOUT))
         while [ $SECONDS -lt $deadline ]; do
           READY=$(ready_count)
@@ -196,7 +204,7 @@ runs:
             echo "Source worker is Ready (${READY} Ready CR)."
             break
           fi
-          FAILED=$(kubectl get pods -n "${NAMESPACE}" -l app=mx-fleet-worker --no-headers 2>/dev/null \
+          FAILED=$(ci_kubectl get pods -n "${NAMESPACE}" -l app=mx-fleet-worker --no-headers \
             | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)
           if [ -n "${FAILED}" ]; then
             echo "ERROR: worker pod failed before becoming Ready: ${FAILED}"
@@ -219,6 +227,7 @@ runs:
         WAVE_SIZES: ${{ inputs.wave_sizes }}
         WAVE_TIMEOUT: ${{ inputs.wave_timeout_seconds }}
       run: |
+        source .github/scripts/ci-kubectl.sh
         [[ "${WAVE_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || {
           echo "ERROR: wave_timeout_seconds must be a positive integer, got '${WAVE_TIMEOUT}'"
           exit 1
@@ -228,13 +237,14 @@ runs:
         # This is what makes wave isolation real: a failure shows up in the
         # wave that caused it, not several waves later.
         ready_count() {
-          kubectl get modelmetadata -n "${NAMESPACE}" \
-            -o jsonpath='{range .items[*]}{.spec.sourceType}{"|"}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
-            | awk -F '|' '($1 == "weights" || $1 == "") && $2 == "Ready" { count++ } END { print count + 0 }' || true
+          ci_kubectl get modelmetadata -n "${NAMESPACE}" \
+            -o jsonpath='{range .items[*]}{.spec.sourceType}{"|"}{.status.worker.status}{"\n"}{end}' \
+            | awk -F '|' '($1 == "weights" || $1 == "") && $2 == "Ready" { count++ } END { print count + 0 }'
         }
         for WAVE in ${WAVE_SIZES}; do
           echo "::group::Scale to replicas=${WAVE}"
           kubectl scale deployment/mx-fleet-workers -n "${NAMESPACE}" --replicas="${WAVE}"
+          wait_for_scheduling "Fleet wave ${WAVE}" mx-fleet-workers "app=mx-fleet-worker" "$WAVE_TIMEOUT"
           deadline=$((SECONDS + WAVE_TIMEOUT))
           while [ $SECONDS -lt $deadline ]; do
             READY=$(ready_count)
@@ -242,7 +252,7 @@ runs:
               echo "Wave complete: ${READY}/${WAVE} workers Ready."
               break
             fi
-            FAILED=$(kubectl get pods -n "${NAMESPACE}" -l app=mx-fleet-worker --no-headers 2>/dev/null \
+            FAILED=$(ci_kubectl get pods -n "${NAMESPACE}" -l app=mx-fleet-worker --no-headers \
               | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)
             if [ -n "${FAILED}" ]; then
               echo "ERROR: a worker pod failed during wave ${WAVE}: ${FAILED}"
@@ -274,11 +284,12 @@ runs:
         FLEET_SIZE: ${{ inputs.fleet_size }}
         TIMEOUT: ${{ inputs.rollout_timeout_seconds }}
       run: |
+        source .github/scripts/ci-kubectl.sh
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || {
           echo "ERROR: rollout_timeout_seconds must be a positive integer, got '${TIMEOUT}'"
           exit 1
         }
-        INITIAL_PODS=$(kubectl get pods -n "${NAMESPACE}" \
+        INITIAL_PODS=$(ci_kubectl get pods -n "${NAMESPACE}" \
           -l app=mx-fleet-worker \
           -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
         INITIAL_COUNT=$(echo "${INITIAL_PODS}" | grep -c . || true)
@@ -287,8 +298,8 @@ runs:
           echo "${INITIAL_PODS}"
           exit 1
         fi
-        PRE_ROLL_READY_CRS=$(kubectl get modelmetadata -n "${NAMESPACE}" \
-          -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.sourceType}{"|"}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
+        PRE_ROLL_READY_CRS=$(ci_kubectl get modelmetadata -n "${NAMESPACE}" \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.sourceType}{"|"}{.status.worker.status}{"\n"}{end}' \
           | awk -F '|' '($2 == "weights" || $2 == "") && $3 == "Ready" { print $1 }' \
           | sort)
         PRE_ROLL_READY_COUNT=$(echo "${PRE_ROLL_READY_CRS}" | grep -c . || true)
@@ -314,7 +325,7 @@ runs:
         echo "::group::Wait for original pod objects to terminate"
         deadline=$((SECONDS + TIMEOUT))
         while [ $SECONDS -lt $deadline ]; do
-          CURRENT_PODS=$(kubectl get pods -n "${NAMESPACE}" \
+          CURRENT_PODS=$(ci_kubectl get pods -n "${NAMESPACE}" \
             -l app=mx-fleet-worker \
             -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
           CURRENT_COUNT=$(echo "${CURRENT_PODS}" | grep -c . || true)
@@ -339,16 +350,16 @@ runs:
         echo "::endgroup::"
 
         ready_generation_count() {
-          kubectl get modelmetadata -n "${NAMESPACE}" \
-            -o jsonpath='{range .items[*]}{.spec.sourceType}{"|"}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
+          ci_kubectl get modelmetadata -n "${NAMESPACE}" \
+            -o jsonpath='{range .items[*]}{.spec.sourceType}{"|"}{.status.worker.status}{"\n"}{end}' \
             | awk -F '|' '($1 == "weights" || $1 == "") && $2 == "Ready" { count++ } END { print count + 0 }'
         }
         captured_stale_count() {
           STALE_COUNT=0
           while IFS= read -r CR; do
             [ -n "${CR}" ] || continue
-            STATUS=$(kubectl get modelmetadata "${CR}" -n "${NAMESPACE}" \
-              -o jsonpath='{.status.worker.status}' 2>/dev/null || true)
+            STATUS=$(ci_kubectl get modelmetadata "${CR}" -n "${NAMESPACE}" \
+              -o jsonpath='{.status.worker.status}' || true)
             if [ "${STATUS}" = "Stale" ]; then
               STALE_COUNT=$((STALE_COUNT + 1))
             fi
@@ -358,8 +369,8 @@ runs:
         print_captured_generation_states() {
           while IFS= read -r CR; do
             [ -n "${CR}" ] || continue
-            STATUS=$(kubectl get modelmetadata "${CR}" -n "${NAMESPACE}" \
-              -o jsonpath='{.status.worker.status}' 2>/dev/null || true)
+            STATUS=$(ci_kubectl get modelmetadata "${CR}" -n "${NAMESPACE}" \
+              -o jsonpath='{.status.worker.status}' || true)
             echo "${CR} ${STATUS:-Missing}"
           done <<< "${PRE_ROLL_READY_CRS}"
         }
@@ -436,18 +447,4 @@ runs:
       env:
         NAMESPACE: ${{ inputs.namespace }}
       run: |
-        echo "::group::Delete namespace ${NAMESPACE}"
-        if ! kubectl delete namespace "${NAMESPACE}" --ignore-not-found --timeout=180s; then
-          echo "::warning::Namespace ${NAMESPACE} did not finalize within 180s; force-clearing finalizers."
-          kubectl get ns "${NAMESPACE}" -o json 2>/dev/null \
-            | jq '.spec.finalizers = []' \
-            | kubectl replace --raw "/api/v1/namespaces/${NAMESPACE}/finalize" -f - || true
-          sleep 5
-          if kubectl get ns "${NAMESPACE}" --no-headers 2>/dev/null | grep -q .; then
-            echo "::error::Namespace ${NAMESPACE} still present after force-finalize."
-            kubectl get ns "${NAMESPACE}" -o yaml 2>&1 | tail -40
-            exit 1
-          fi
-          echo "Namespace ${NAMESPACE} is gone (safeguard cleared finalizers successfully)."
-        fi
-        echo "::endgroup::"
+        bash .github/scripts/ci-namespace.sh cleanup "$NAMESPACE"

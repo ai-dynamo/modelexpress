@@ -114,12 +114,15 @@ def ci(mode):
             raise RuntimeError("Namespace ownership mismatch; refusing operation")
 
     if mode == "setup":
+        namespace_labels = {OWNER_LABEL: owner}
+        if env.get("MX_CI_GPU_LANE"):
+            namespace_labels["ci.modelexpress.nvidia.com/gpu-lane"] = env["MX_CI_GPU_LANE"]
         k.manifest(
             "create",
             {
                 "apiVersion": "v1",
                 "kind": "Namespace",
-                "metadata": {"name": namespace, "labels": {OWNER_LABEL: owner}},
+                "metadata": {"name": namespace, "labels": namespace_labels},
             },
         )
         config = render()
