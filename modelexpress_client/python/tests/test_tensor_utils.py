@@ -419,3 +419,29 @@ class TestTraversalRobustness:
             holder, visited=set(), accelerator_backend=backend
         )
         assert [t.numel() for _, t in found] == [4]
+
+
+def test_k3_collective_state_stays_local_during_registration(
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    module = ModuleWithQuant()
+    op_cls = type(
+        "KimiK3LatentMoETailOp",
+        (),
+        {
+            "__module__": "vllm.models.kimi_k3.nvidia.ops.latent_moe_tail",
+        },
+    )
+    op = op_cls()
+    pointers = torch.tensor([1234, 5678], dtype=torch.int64)
+    op.collective = types.SimpleNamespace(peer_ptrs=pointers, flags=torch.zeros(8))
+    module.tail = op
+    adopt_hidden_tensors(module, backend)
+    registered = collect_module_tensors(module, backend)
+    assert all(t.data_ptr() != pointers.data_ptr() for t in registered.values())
+    assert any(
+        t.data_ptr() == module.quant_method.config.a1_gscale.data_ptr()
+        for t in registered.values()
+    )
+    assert op.collective.peer_ptrs is pointers

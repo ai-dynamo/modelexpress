@@ -116,6 +116,15 @@ def _find_hidden_accel_tensors(
         return []
     visited.add(id(obj))
 
+    # K3 collectives own local peer pointers, barriers and symmetric-memory
+    # workspaces. Copying those from a donor corrupts the receiver's collectives.
+    cls = type(obj)
+    if (
+        cls.__module__ == "vllm.models.kimi_k3.nvidia.ops.latent_moe_tail"
+        and cls.__name__ == "KimiK3LatentMoETailOp"
+    ):
+        return []
+
     results: list[tuple[str, torch.Tensor]] = []
 
     if isinstance(obj, torch.Tensor):
