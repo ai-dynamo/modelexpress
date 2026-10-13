@@ -5,10 +5,14 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import logging
 import shutil
+import stat
+import sys
+import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,6 +21,36 @@ from pathlib import Path
 from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
+
+
+def _copy_checkpoint_file(source: str, destination: str) -> str:
+    """Copy a file with copy2 metadata, using Linux copy-on-write if supported."""
+    if sys.platform != "linux" or not stat.S_ISREG(Path(source).stat().st_mode):
+        return shutil.copy2(source, destination)
+
+    # FICLONE from linux/fs.h; Python exposes the constant starting in 3.12.
+    with open(source, "rb") as src, open(destination, "xb") as dst:
+        try:
+            fcntl.ioctl(
+                dst.fileno(), getattr(fcntl, "FICLONE", 0x40049409), src.fileno()
+            )
+        except OSError as error:
+            # Whole-file cloning can be unsupported for a filesystem, mount
+            # pair, or file layout. Permission, capacity and I/O errors are fatal.
+            if error.errno not in {
+                errno.EBADF,  # Also means the source filesystem cannot reflink.
+                errno.EOPNOTSUPP,
+                errno.ENOTTY,
+                errno.EXDEV,
+                errno.EINVAL,
+                errno.ENOSYS,
+            }:
+                raise
+        else:
+            shutil.copystat(source, destination)
+            return destination
+
+    return shutil.copy2(source, destination)
 
 
 def _encode_cache_component(value: str) -> str:
@@ -124,7 +158,8 @@ class LocalCheckpointStore:
         #     state.json                current preparation transaction
         #     active.json               version committed after engine install
         #     .lock                     cross-process cache coordination
-        #     .install.lock             blocks preparation during engine install
+        #     .prepare.lock             serializes preparation requests
+        #     .install.lock             excludes mutation during engine install
         #
         # Full checkpoints, deltas, and chain manifests are the canonical
         # lineage. Materialized checkpoints are rebuildable outputs for engines
@@ -139,6 +174,7 @@ class LocalCheckpointStore:
         self.state_path = self.cache / "state.json"
         self.active_path = self.cache / "active.json"
         self.lock_path = self.cache / ".lock"
+        self.prepare_lock_path = self.cache / ".prepare.lock"
         self.install_lock_path = self.cache / ".install.lock"
         self.max_size_bytes = max_size_bytes
 
@@ -178,6 +214,9 @@ class LocalCheckpointStore:
     def installation_locked(self, *, shared: bool = False):
         return self._locked(self.install_lock_path, shared=shared)
 
+    def preparation_locked(self):
+        return self._locked(self.prepare_lock_path, shared=False)
+
     @contextmanager
     def replace_directory(
         self,
@@ -186,13 +225,16 @@ class LocalCheckpointStore:
         copy_from: Path | None = None,
     ) -> Iterator[Path]:
         """Populate a temporary directory and promote it to ``target``."""
-        temporary = target.with_name(f"{target.name}.tmp")
-        shutil.rmtree(temporary, ignore_errors=True)
+        temporary = target.with_name(f".checkpoint-{uuid.uuid4().hex}")
+        temporary.mkdir(parents=True)
         try:
-            if copy_from is None:
-                temporary.mkdir(parents=True)
-            else:
-                shutil.copytree(copy_from, temporary)
+            if copy_from is not None:
+                shutil.copytree(
+                    copy_from,
+                    temporary,
+                    copy_function=_copy_checkpoint_file,
+                    dirs_exist_ok=True,
+                )
             yield temporary
             shutil.rmtree(target, ignore_errors=True)
             temporary.replace(target)
@@ -433,6 +475,9 @@ class LocalCheckpointStore:
                 "files": _artifact_files_state(artifact),
             },
         )
+
+    def has_artifact_record(self, artifact: Path) -> bool:
+        return self._source_path(artifact).exists()
 
     def _verified_artifact_metadata(self, artifact: Path) -> dict:
         metadata = self._read_json(self._source_path(artifact))

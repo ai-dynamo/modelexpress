@@ -29,6 +29,8 @@ import os
 from collections import defaultdict
 from typing import Any
 
+from modelexpress.nixl_transfer import NIXL_DRAM_MEM_TYPE, NIXL_MEM_TYPES
+
 logger = logging.getLogger("modelexpress.refit.reshard.transport.nixl")
 
 
@@ -51,6 +53,10 @@ class NixlReshardTransport:
             lives on. Every agent session must have a matching device entry.
         mem_type: NIXL memory type override (defaults to the manager's
             accelerator mem type, e.g. VRAM).
+        local_mem_type: memory type of the local destination buffers when it
+            differs from ``mem_type`` (``"DRAM"`` for pinned host staging).
+        session_to_memory: per-source memory kinds from the manifest; host
+            sources require an explicit local memory type.
         timeout_seconds: per-batch READ timeout.
     """
 
@@ -61,47 +67,73 @@ class NixlReshardTransport:
         session_to_device: dict | None = None,
         mem_type: str | None = None,
         timeout_seconds: float | None = None,
+        local_mem_type: str | None = None,
+        session_to_memory: dict | None = None,
     ) -> None:
         self._manager = manager
         self._session_to_agent = session_to_agent
         self._session_to_device = session_to_device or {}
         self._mem_type = mem_type
+        self._local_mem_type = local_mem_type
+        self._session_to_memory = dict(session_to_memory or {})
+        for kind in self._session_to_memory.values():
+            if kind not in NIXL_MEM_TYPES:
+                raise ValueError(f"unsupported source memory type {kind!r}")
+            if kind == NIXL_DRAM_MEM_TYPE and local_mem_type is None:
+                raise ValueError("host sources require an explicit local_mem_type")
+            if mem_type is not None and mem_type != kind:
+                raise ValueError("mem_type override conflicts with source manifest")
         self._timeout = timeout_seconds
         self.bytes_moved = 0
         self.reads_issued = 0
 
     def read(self, descriptors: list) -> None:
+        self.await_reads(self.post_reads(descriptors))
+
+    def post_reads(self, descriptors: list) -> list:
+        """Post every READ batch and return the in-flight handles.
+
+        The caller must pass the result to :meth:`await_reads`. With serial
+        reads enabled the batches complete here and an empty list is returned,
+        so the two-phase contract holds either way.
+        """
         by_session: dict = defaultdict(list)
         for d in descriptors:
             by_session[d.session].append(d)
         if not by_session:
-            return
+            return []
 
         batches = [
-            (self._agent_for(session), self._ranges_for(session, group))
+            (
+                self._agent_for(session),
+                self._ranges_for(session, group),
+                self._session_to_memory.get(session, self._mem_type),
+            )
             for session, group in by_session.items()
         ]
 
         if _serial_reads_enabled():
-            for agent, ranges in batches:
+            for agent, ranges, memory_type in batches:
                 total_bytes, num_reads, _duration = self._manager.execute_read_batch(
                     remote_agent_name=agent,
                     ranges=ranges,
-                    mem_type=self._mem_type,
+                    mem_type=memory_type,
                     timeout_seconds=self._timeout,
+                    local_mem_type=self._local_mem_type,
                 )
                 self.bytes_moved += total_bytes
                 self.reads_issued += num_reads
-            return
+            return []
 
         posted: list = []
         try:
-            for agent, ranges in batches:
+            for agent, ranges, memory_type in batches:
                 posted.append(
                     self._manager.post_read_batch(
                         remote_agent_name=agent,
                         ranges=ranges,
-                        mem_type=self._mem_type,
+                        mem_type=memory_type,
+                        local_mem_type=self._local_mem_type,
                     )
                 )
         except Exception:
@@ -121,7 +153,12 @@ class NixlReshardTransport:
                         exc,
                     )
             raise
+        return posted
 
+    def await_reads(self, posted: list) -> None:
+        """Complete batches returned by :meth:`post_reads` and release them."""
+        if not posted:
+            return
         total_bytes, num_reads, _duration = self._manager.await_read_batches(
             posted, timeout_seconds=self._timeout
         )

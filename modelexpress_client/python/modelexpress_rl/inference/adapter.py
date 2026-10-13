@@ -60,6 +60,8 @@ class GeneratorTransferInputs:
     payload_format: WeightPayloadFormat
     sources: tuple[GeneratorSource, ...]
     object_storage: ObjectStorageSource | None = None
+    trainer_mesh_id: str | None = None
+    trainer_mesh_generation: int | None = None
 
     @property
     def physical_fingerprint(self) -> tuple:
@@ -69,6 +71,8 @@ class GeneratorTransferInputs:
             self.layout_signature,
             self.payload_format,
             self.object_storage,
+            self.trainer_mesh_id,
+            self.trainer_mesh_generation,
             tuple(
                 (
                     source.source_slot_id,

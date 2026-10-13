@@ -6,23 +6,24 @@ Setup is one-time; the per-step source geometry is re-read from the state_dict
 the client passes each stage, so a trainer that re-materializes its state_dict
 (CPU offload, gathered state dict) still publishes the latest weights:
 
-- COPY_TO_DEVICE (default): ``initialize`` allocates one persistent wire-dtype
-  arena per shard and registers them once. Each stage snapshots the live weights
-  into those stable arenas (cast to the wire dtype only when the source differs);
-  ``publish_ready`` fences the async copy on the arena's own device, so the
-  arenas of one rank must all be on a single device. Robust to a moving source
-  because the registered arena never moves.
-- IN_PLACE (optimization): ``initialize`` registers the DTensor local storage
+- IN_PLACE (recommended for synchronous updates): registers DTensor local storage
   directly (contiguous, so RDMA-registerable) and serves it with no copy. Its
   premise is stable storage: the registered address must not change, so each
-  stage asserts the source still sits where it was registered and fails toward
-  COPY_TO_DEVICE otherwise. The source must already be the wire dtype (no
-  in-place cast).
+  stage rejects address changes and recommends COPY_TO_HOST instead.
+  Sources must remain immutable until version retirement
+  and already match the wire dtype; trainer-side conversion is incompatible.
+- COPY_TO_HOST (recommended when IN_PLACE is unavailable): allocates persistent
+  pinned CPU buffers in the wire dtype and registers them once. Each stage copies
+  the current shards into those buffers; publish_ready fences CUDA copies.
+- COPY_TO_DEVICE: retains an additional wire-format copy on the source device.
+  This can reduce latency compared with host staging, but its VRAM cost makes it
+  an explicit choice for exceptional cases such as small models.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import math
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -46,6 +47,7 @@ from modelexpress_rl.train.adapter import (
     WeightPayloadFormat,
     WeightVersionShardManifest,
 )
+from modelexpress_rl.train.manifest import bound_tensor_manifest
 
 from .publisher import (
     WIRE_DTYPE,
@@ -80,7 +82,8 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
             if dtype not in (torch.float16, torch.bfloat16, torch.float32):
                 raise ValueError(f"unsupported wire dtype {dtype!r} for {name!r}")
         self._nixl_metadata_endpoint = nixl_metadata_endpoint
-        self._source_slot_id = f"publisher:global-rank:{dist.get_rank()}"
+        self._logical_shard_id: str | None = None
+        self._bound_manifest: bytes | None = None
         self._initialized = False
         self._staging_mode: TrainerStagingMode | None = None
         # name -> (global_shape, shard_offset, local_shape) fixed at initialize().
@@ -95,18 +98,46 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         self._manifest: WeightVersionShardManifest | None = None
 
     @property
-    def source_slot_id(self) -> str:
-        return self._source_slot_id
+    def logical_shard_id(self) -> str:
+        if self._logical_shard_id is None:
+            raise RuntimeError("bind_tensors() must be called before logical_shard_id")
+        return self._logical_shard_id
 
     def bind_tensors(self, tensors: Any) -> str:
-        """Validate the local state dict and bind it to this global-rank slot."""
-        self._capture(tensors)
-        return self.source_slot_id
+        """Bind address-independent wire coverage without staging source bytes."""
+        shards = self._capture(tensors)
+        coverage = [
+            {
+                "name": shard.name,
+                "dtype": str(self._wire_dtype(shard)),
+                "elsize": self._wire_dtype(shard).itemsize,
+                "full_shape": shard.global_shape,
+                "shards": [{"shard_offset": shard.shard_offset, "shape": shard.local_shape}],
+            }
+            for shard in shards
+        ]
+        manifest = bound_tensor_manifest(coverage)
+        logical_shard_id = hashlib.sha256(manifest).hexdigest()
+        if self._logical_shard_id is not None and self._logical_shard_id != logical_shard_id:
+            raise RuntimeError("FSDP tensor coverage changed after binding")
+        self._logical_shard_id = logical_shard_id
+        self._bound_manifest = manifest
+        return logical_shard_id
+
+    @property
+    def bound_manifest(self) -> bytes:
+        if self._bound_manifest is None:
+            raise RuntimeError("bind_tensors() must be called before bound_manifest")
+        return self._bound_manifest
 
     @property
     def supported_staging_modes(self) -> frozenset[TrainerStagingMode]:
         return frozenset(
-            {TrainerStagingMode.COPY_TO_DEVICE, TrainerStagingMode.IN_PLACE}
+            {
+                TrainerStagingMode.IN_PLACE,
+                TrainerStagingMode.COPY_TO_HOST,
+                TrainerStagingMode.COPY_TO_DEVICE,
+            }
         )
 
     @property
@@ -132,33 +163,35 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         }
         self._expected_source_dtypes = {s.name: s.source_tensor.dtype for s in shards}
 
-        if staging_mode is TrainerStagingMode.COPY_TO_DEVICE:
-            self._allocate_and_register_arenas(shards)
-        else:  # IN_PLACE
+        if staging_mode is TrainerStagingMode.IN_PLACE:
             self._register_sources_in_place(shards)
+        else:
+            self._allocate_and_register_arenas(shards, staging_mode)
 
         self._staging_mode = staging_mode
         self._initialized = True
 
-    def _allocate_and_register_arenas(self, shards: list[LocalTensorShard]) -> None:
+    def _allocate_and_register_arenas(
+        self, shards: list[LocalTensorShard], staging_mode: TrainerStagingMode
+    ) -> None:
         """Allocate one persistent arena per shard in its selected wire dtype."""
-        # TODO(staging-followups):
-        # - register via a single VmmArena + register_arena (one dmabuf MR).
-        # - env var to stage into CPU pinned host memory vs GPU device memory
-        #   (host staging frees device memory when the GPU is tight).
-        with classic_cuda_alloc():
-            arenas = {
+        host = staging_mode is TrainerStagingMode.COPY_TO_HOST
+        if host and not torch.cuda.is_available():
+            # Arenas are allocated pinned so the non_blocking snapshot copy is an
+            # asynchronous DMA the completion fence tracks; RDMA registration
+            # pins the pages regardless. torch cannot pin without CUDA, and a
+            # trainer without CUDA has no device shards to stage from.
+            raise RuntimeError("COPY_TO_HOST staging requires CUDA for pinned memory")
+        with contextlib.nullcontext() if host else classic_cuda_alloc():
+            self._arenas = {
                 s.name: torch.empty(
                     s.local_shape,
                     dtype=self._wire_dtype(s),
-                    device=s.source_tensor.device,
+                    device="cpu" if host else s.source_tensor.device,
+                    pin_memory=host,
                 )
                 for s in shards
             }
-        # Reject before registering: a mixed-device set would otherwise bind
-        # buffers to a manager configured for a single device.
-        self._arena_device(arenas.values())
-        self._arenas = arenas
         self._manager.register_tensors(
             {
                 self._register_key(i, s.name): self._arenas[s.name]
@@ -236,7 +269,7 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         ):
             self._require_same_layout(shards)
 
-        if staging_mode is TrainerStagingMode.COPY_TO_DEVICE:
+        if staging_mode is not TrainerStagingMode.IN_PLACE:
             with refit_span(
                 "source_preparation",
                 metadata={"staging_copy_enqueues": 1},
@@ -248,6 +281,9 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
             self._require_sources_pinned(shards)
             publish_ready = CompletionFence(lambda: None)
 
+        if mx_envs.MX_RESHARD_PUBLISH_DIGEST:
+            # Host digests must not read buffers before asynchronous copies finish.
+            publish_ready.wait()
         return self._staged(shards, publish_ready)
 
     def _snapshot_into_arenas(self, shards: list[LocalTensorShard]) -> CompletionFence:
@@ -256,50 +292,51 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         ``copy_`` casts to the selected wire dtype when the source dtype differs. The arena is
         the served buffer, so point each shard at it.
 
-        The fence is recorded on the arena device's own current stream. ``copy_``
-        runs on the destination device, while the process current device belongs
-        to whichever library set it last, so fencing the process default can
-        record on a different device than the copy and complete while the copy is
-        still in flight.
+        The fence covers every accelerator device an arena or source sits on, and
+        records on that device's own current stream through its own device
+        module. A cross-device copy can be enqueued on either side, while the
+        process current device belongs to whichever library set it last, so
+        fencing the process default can complete while the copy is still in
+        flight.
         """
-        device = self._arena_device(self._arenas[shard.name] for shard in shards)
+        devices = set()
         for shard in shards:
             arena = self._arenas[shard.name]
-            arena.copy_(shard.source_tensor)
+            arena.copy_(shard.source_tensor, non_blocking=True)
             shard.staging_tensor = arena
-        device_module = torch.get_device_module(device)
-        done = device_module.Event()
-        done.record(device_module.current_stream(device))
-        return CompletionFence(done.synchronize)
+            devices.update(
+                t.device for t in (arena, shard.source_tensor) if t.device.type != "cpu"
+            )
+        return self._device_fence(devices)
 
     @staticmethod
-    def _arena_device(arenas: Iterable[torch.Tensor]) -> torch.device:
-        """Return the single device every COPY_TO_DEVICE arena lives on.
+    def _device_fence(devices: Iterable[torch.device]) -> CompletionFence:
+        """Record one event per accelerator device on its current stream."""
+        events = []
+        for device in sorted(set(devices), key=str):
+            device_module = torch.get_device_module(device)
+            done = device_module.Event()
+            done.record(device_module.current_stream(device))
+            events.append(done)
 
-        Arenas spanning devices cannot be fenced by one event, and cannot all
-        belong to the one device the rank's manager is configured for.
-        """
-        devices = {arena.device for arena in arenas}
-        if len(devices) > 1:
-            raise NotImplementedError(
-                "FSDP arenas span multiple devices "
-                f"({sorted(str(device) for device in devices)}); "
-                "one device per rank is required"
-            )
-        return devices.pop()
+        def wait() -> None:
+            for event in events:
+                event.synchronize()
+
+        return CompletionFence(wait)
 
     def _require_sources_pinned(self, shards: list[LocalTensorShard]) -> None:
         """Fail unless every source still sits where it was registered.
 
         IN_PLACE publishes the registered address, so a moved source would
-        advertise stale (freed or reused) memory. Fail toward COPY_TO_DEVICE.
+        advertise stale (freed or reused) memory. Recommend COPY_TO_HOST.
         """
         for shard in shards:
             self._require_in_place_servable(shard)
             if shard.source_tensor.data_ptr() != self._registered_addrs[shard.name]:
                 raise NotImplementedError(
                     f"{shard.name}: source storage moved since registration; "
-                    "IN_PLACE requires stable storage, use COPY_TO_DEVICE"
+                    "IN_PLACE requires stable storage; use COPY_TO_HOST"
                 )
 
     def _capture(self, tensors: Any) -> list[LocalTensorShard]:
@@ -353,12 +390,12 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         if shard.source_tensor.dtype != dtype:
             raise NotImplementedError(
                 f"{shard.name}: IN_PLACE serves the source dtype but wire is "
-                f"{dtype}; use COPY_TO_DEVICE to cast"
+                f"{dtype}; use COPY_TO_HOST to cast"
             )
         if not shard.source_tensor.is_contiguous():
             raise NotImplementedError(
                 f"{shard.name}: IN_PLACE requires a contiguous local shard; "
-                "use COPY_TO_DEVICE for this tensor"
+                "use COPY_TO_HOST for this tensor"
             )
 
     def _staged(

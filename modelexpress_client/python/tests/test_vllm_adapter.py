@@ -1139,6 +1139,27 @@ class TestMtpLayerPrefixes:
             "model.language_model.layers.62.",
         )
 
+    def test_multimodal_text_config(self):
+        """Multimodal GLM nests the counts under text_config (GLM-5.3-Flash)."""
+        config = {
+            "architectures": ["Glm5NextForConditionalGeneration"],
+            "text_config": {"num_hidden_layers": 45, "num_nextn_predict_layers": 1},
+        }
+        assert _mtp_layer_prefixes(config) == (
+            "model.layers.45.",
+            "layers.45.",
+            "model.language_model.layers.45.",
+        )
+
+    def test_top_level_counts_win_over_text_config(self):
+        """A top-level num_hidden_layers is authoritative; text_config is a fallback."""
+        config = {
+            "num_hidden_layers": 92,
+            "num_nextn_predict_layers": 1,
+            "text_config": {"num_hidden_layers": 45, "num_nextn_predict_layers": 1},
+        }
+        assert _mtp_layer_prefixes(config)[0] == "model.layers.92."
+
     def test_no_mtp_layers_returns_empty(self):
         """num_nextn_predict_layers=0 yields no prefixes."""
         config = {"num_hidden_layers": 92, "num_nextn_predict_layers": 0}
@@ -1155,12 +1176,10 @@ class TestMtpLayerPrefixes:
         config = {"num_hidden_layers": 0, "num_nextn_predict_layers": 1}
         assert _mtp_layer_prefixes(config) == ()
 
-    def test_nested_text_config_returns_empty(self):
-        """Fields nested under text_config are not the supported top-level GLM
-        shape, so no prefixes are derived."""
-        config = {
-            "text_config": {"num_hidden_layers": 92, "num_nextn_predict_layers": 1}
-        }
+    def test_nested_text_config_without_nextn_returns_empty(self):
+        """A multimodal config whose text_config declares no nextn layers
+        (e.g. a VL model without MTP) derives no prefixes."""
+        config = {"text_config": {"num_hidden_layers": 92}}
         assert _mtp_layer_prefixes(config) == ()
 
 

@@ -1,7 +1,7 @@
 -- Atomically register or refresh one TTL-bound worker process.
 --
 -- KEYS[1]: expiring worker registration hash
--- ARGV: worker_id, role, model_name, ttl_milliseconds
+-- ARGV: worker_id, role, model_name, ttl_milliseconds, refit_endpoint
 --
 -- Returns:
 --   OK:<expiry_ms>       registration stored and TTL refreshed
@@ -11,6 +11,7 @@ if redis.call('EXISTS', KEYS[1]) == 1 then
   local same_registration =
     redis.call('HGET', KEYS[1], 'role') == ARGV[2]
     and redis.call('HGET', KEYS[1], 'model_name') == ARGV[3]
+    and (redis.call('HGET', KEYS[1], 'refit_endpoint') or '') == ARGV[5]
   if not same_registration then
     return 'CONFLICT'
   end
@@ -24,6 +25,7 @@ redis.call('HSET', KEYS[1],
   'worker_id', ARGV[1],
   'role', ARGV[2],
   'model_name', ARGV[3],
+  'refit_endpoint', ARGV[5],
   'expires_at_unix_ms', expires_at)
 redis.call('PEXPIRE', KEYS[1], ARGV[4])
 

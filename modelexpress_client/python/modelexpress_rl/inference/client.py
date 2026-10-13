@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 import grpc
 from modelexpress import auth, envs
@@ -24,6 +25,7 @@ from modelexpress_rl.version import WeightVersionRef
 from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
+from ..train import WeightPayloadFormat
 from .adapter import GeneratorEngineContext
 from .plan import WeightSource, parse_weight_source_order
 from .receiver import ObjectStorageGeneratorConfig
@@ -67,6 +69,12 @@ class ModelExpressGeneratorConfig:
     max_replay_chain_length: int = 64
     # Deadline applied independently to each control-plane or manifest RPC.
     rpc_timeout_seconds: float = 30.0
+    # Capacity per bounded-streaming arena; None stages a full update.
+    staging_buffer_bytes: int | None = None
+    # One arena serializes reads and installs; two allow their overlap.
+    staging_buffers_count: int = 1
+    # Receive arenas use CUDA memory or pinned host memory.
+    staging_device: Literal["cuda", "cpu"] = "cuda"
     # Canonical object-storage checkpoint settings.
     object_storage: ObjectStorageGeneratorConfig | None = None
     # Version read from the engine's serving-version API after cold start.
@@ -102,6 +110,23 @@ class ModelExpressGeneratorConfig:
             self.max_replay_chain_length, "max_replay_chain_length"
         )
         rl_envs.require_positive_float(self.rpc_timeout_seconds, "rpc_timeout_seconds")
+        if self.staging_buffer_bytes is not None:
+            if isinstance(self.staging_buffer_bytes, bool) or not isinstance(
+                self.staging_buffer_bytes, int
+            ):
+                raise ValueError("staging_buffer_bytes must be a positive integer")
+            rl_envs.require_positive_int(
+                self.staging_buffer_bytes, "staging_buffer_bytes"
+            )
+        if isinstance(self.staging_buffers_count, bool) or not isinstance(
+            self.staging_buffers_count, int
+        ):
+            raise ValueError("staging_buffers_count must be a positive integer")
+        rl_envs.require_positive_int(
+            self.staging_buffers_count, "staging_buffers_count"
+        )
+        if self.staging_device not in ("cuda", "cpu"):
+            raise ValueError("staging_device must be 'cuda' or 'cpu'")
         if self.source_order is not None:
             if not isinstance(self.source_order, tuple) or not self.source_order:
                 raise ValueError("source_order must be a non-empty tuple")
@@ -162,12 +187,12 @@ class StagedWeightHandle:
         self._timing = timing
 
     def release(self) -> None:
-        """Release local staging buffers; repeated calls are idempotent."""
+        """Release this update; reusable receive buffers may remain allocated."""
         self._client._release_staged(self)
 
     @property
     def metrics(self) -> dict[str, float]:
-        """Return preparation metrics exposed by the selected adapter."""
+        """Return metrics recorded for this update by the selected adapter."""
         if self._update is None:
             return {}
         return self._update.prepared.metrics
@@ -178,6 +203,12 @@ class StagedWeightHandle:
         if self._update is None:
             return True
         return self._update.applied
+
+    @property
+    def _installation_failed(self) -> bool:
+        if self._update is None:
+            return False
+        return self._update.installation_started and not self._update.applied
 
 
 class _VersionLease:
@@ -268,6 +299,9 @@ class ModelExpressGeneratorClient:
         client._lease_ttl_seconds = lease_ttl_seconds
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         client._max_replay_chain_length = config.max_replay_chain_length
+        client._staging_buffer_bytes = config.staging_buffer_bytes
+        client._staging_buffers_count = config.staging_buffers_count
+        client._staging_device = config.staging_device
         try:
             runtime = initialize_generator_runtime(
                 engine_context=config.engine_context,
@@ -307,14 +341,24 @@ class ModelExpressGeneratorClient:
         return client
 
     def stage_weight(self, *, version: WeightVersionRef) -> StagedWeightHandle:
-        """Synchronously transfer and verify one full-weight version."""
+        """Prepare an exact version without installing it into the live engine.
+
+        With ``staging_buffer_bytes`` configured, reserve bounded buffers and
+        prepare deferred reads. ``apply_weight`` then pipelines read/install.
+        Otherwise, trainer sources transfer a complete independent staged copy.
+        Staging prepares an update; it does not guarantee that weight bytes have
+        been transferred. Streaming transfers start during ``apply_weight``.
+        """
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
         with self._operation_lock:
             if self._active_handle is not None:
-                if self._active_handle.version_id == version.version_id:
-                    return self._active_handle
-                raise RuntimeError("another generator update is still active")
+                if self._active_handle._installation_failed:
+                    self._release_staged(self._active_handle)
+                else:
+                    if self._active_handle.version_id == version.version_id:
+                        return self._active_handle
+                    raise RuntimeError("another generator update is still active")
             runtime = self._require_runtime()
             if (
                 (
@@ -342,7 +386,25 @@ class ModelExpressGeneratorClient:
                 with timing.active(recorder):
                     with refit_span("control_discovery"):
                         ready = self._get_ready_version(version.version_id)
-                    update = runtime.session.stage(ready)
+                    if self._staging_buffer_bytes is None:
+                        update = runtime.session.stage(ready)
+                    else:
+                        if (
+                            self._engine_state is _EngineState.UNCERTAIN
+                            and ready.payload_format
+                            is not WeightPayloadFormat.FULL_TENSOR
+                        ):
+                            raise RuntimeError(
+                                "uncertain streaming engine requires a full tensor update"
+                            )
+                        update = runtime.session.prepare_streaming(
+                            ready,
+                            max_staging_bytes=(
+                                self._staging_buffer_bytes * self._staging_buffers_count
+                            ),
+                            staging_device=self._staging_device,
+                            staging_buffers=self._staging_buffers_count,
+                        )
             except BaseException:
                 # Nothing else will report this cycle: the recorder is handed on
                 # through the staged handle, and staging failed before there was
@@ -359,7 +421,7 @@ class ModelExpressGeneratorClient:
             return self._active_handle
 
     def apply_weight(self, staged: StagedWeightHandle) -> Any:
-        """Install a verified local staged version at the caller's safe point."""
+        """Install a prepared update at the caller's safe point."""
         if not isinstance(staged, StagedWeightHandle) or staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
@@ -369,24 +431,30 @@ class ModelExpressGeneratorClient:
                 return None
             if staged._update.released:
                 raise RuntimeError("staged weight has already been released")
+            if staged._installation_failed:
+                raise RuntimeError(
+                    "staged weight installation failed; stage a fresh transaction"
+                )
             runtime = self._require_runtime()
             was_applied = staged._update.applied
-            serving_version_id = self._serving_version_id
+            restore_version_id = None
+            if self._engine_state is _EngineState.READY:
+                restore_version_id = self._serving_version_id
             if not was_applied:
                 runtime.unpublish_runtime_tensors()
             try:
                 with timing.active(staged._timing):
                     result = runtime.session.apply(staged._update)
             except BaseException:
-                if staged._update.installation_started and not staged._update.applied:
+                if staged._installation_failed:
                     self._engine_state = _EngineState.UNCERTAIN
-                elif not was_applied and serving_version_id is not None:
+                elif not was_applied and restore_version_id is not None:
                     try:
-                        runtime.publish_runtime_tensors(serving_version_id)
+                        runtime.publish_runtime_tensors(restore_version_id)
                     except Exception:
                         logger.exception(
                             "failed to republish unchanged runtime tensors for %s",
-                            serving_version_id,
+                            restore_version_id,
                         )
                 raise
             finally:
@@ -463,14 +531,18 @@ class ModelExpressGeneratorClient:
     def _renew_worker_registration(self) -> None:
         interval_seconds = max(self._registration_ttl_seconds / 3, 0.1)
         while not self._registration_stop.wait(interval_seconds):
-            try:
-                self._register_worker()
-            except grpc.RpcError as error:
-                logger.warning("worker registration renewal failed: %s", error)
-                continue
-            except Exception:
-                logger.exception("unexpected worker registration renewal failure")
-                continue
+            self._try_register_worker()
+
+    def _try_register_worker(self) -> bool:
+        try:
+            self._register_worker()
+        except grpc.RpcError as error:
+            logger.warning("worker registration renewal failed: %s", error)
+        except Exception:
+            logger.exception("unexpected worker registration renewal failure")
+        else:
+            return True
+        return False
 
     def _get_ready_version(self, version_id: str) -> WeightVersion:
         return self._fetch_ready_version(
@@ -546,9 +618,7 @@ class ModelExpressGeneratorClient:
             raise RuntimeError("MX GetWeightVersion response is missing version")
         version = _weight_version(response.version)
         if version.state is not WeightVersionState.READY:
-            raise RuntimeError(
-                f"initial serving version {version_id!r} is not READY"
-            )
+            raise RuntimeError(f"initial serving version {version_id!r} is not READY")
         if version.model_name != self.model_name:
             raise RuntimeError(
                 "initial serving version model_name does not match the generator"
@@ -567,26 +637,35 @@ class ModelExpressGeneratorClient:
             raise RuntimeError("MX RegisterVersionLease response is missing lease")
         return response.lease
 
+    def _try_renew_lease(self, version_id: str) -> grpc.StatusCode | None:
+        """Renew one lease and return the RPC failure code, never raising."""
+        try:
+            self._register_lease(version_id)
+        except grpc.RpcError as error:
+            logger.warning("version %s lease renewal failed: %s", version_id, error)
+            return error.code()
+        except Exception:
+            logger.exception("unexpected version %s lease renewal failure", version_id)
+        return None
+
     def _start_version_lease(self, version_id: str) -> _VersionLease:
+        # A restarted MX server loses registrations until the next renewal tick.
+        self._register_worker()
         lease = self._register_lease(version_id)
         stop = threading.Event()
 
         def renew() -> None:
             interval_seconds = max(self._lease_ttl_seconds / 3, 0.1)
             while not stop.wait(interval_seconds):
-                try:
-                    self._register_lease(version_id)
-                except grpc.RpcError as error:
-                    logger.warning(
-                        "version %s lease renewal failed: %s",
-                        version_id,
-                        error,
-                    )
-                except Exception:
-                    logger.exception(
-                        "unexpected version %s lease renewal failure",
-                        version_id,
-                    )
+                code = self._try_renew_lease(version_id)
+                # FAILED_PRECONDITION includes a missing worker registration (e.g. after an
+                # MX restart). RegisterWorker is an idempotent upsert, so it is harmless for
+                # the other causes.
+                if (
+                    code is grpc.StatusCode.FAILED_PRECONDITION
+                    and self._try_register_worker()
+                ):
+                    self._try_renew_lease(version_id)
 
         renewal = threading.Thread(
             target=renew,
@@ -620,6 +699,7 @@ class ModelExpressGeneratorClient:
         )
 
     def _release_staged(self, staged: StagedWeightHandle) -> None:
+        """Free the active slot once locally released, including cleanup errors."""
         if staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
@@ -634,7 +714,9 @@ class ModelExpressGeneratorClient:
                 elif staged._update is None:
                     staged._no_op_released = True
             finally:
-                if self._active_handle is staged:
+                if self._active_handle is staged and (
+                    staged._update is None or staged._update.released
+                ):
                     self._active_handle = None
 
 

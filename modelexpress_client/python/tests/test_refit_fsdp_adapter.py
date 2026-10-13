@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
+import json
 from contextlib import nullcontext
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -10,12 +13,35 @@ from modelexpress_rl.train.adapter import TrainerStagingMode, WeightPayloadForma
 from modelexpress_rl.train.context import FSDPTrainerContext
 from modelexpress_rl.train.engines import _create_trainer_adapter
 from modelexpress_rl.train.engines.fsdp.adapter import FSDPTrainerAdapter
+from modelexpress_rl.train.manifest import bound_tensor_manifest
 
 ADAPTER = "modelexpress_rl.train.engines.fsdp.adapter"
 
 
-def test_copy_preserves_per_tensor_dtype_and_warm_buffers(dist_ready, monkeypatch):
+def _mock_host_allocation_without_cuda(monkeypatch):
+    """Exercise snapshot logic on CPU; the CUDA test checks real pinned copies."""
+    if torch.cuda.is_available():
+        return
+    empty = torch.empty
+
+    def allocate(size, *, dtype, device, pin_memory):
+        assert device == "cpu"
+        assert pin_memory is True
+        return empty(size, dtype=dtype, device=device)
+
+    monkeypatch.setattr(f"{ADAPTER}.torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr(f"{ADAPTER}.torch.empty", allocate)
+
+
+@pytest.mark.parametrize(
+    "mode", [TrainerStagingMode.COPY_TO_HOST, TrainerStagingMode.COPY_TO_DEVICE]
+)
+def test_copy_preserves_per_tensor_dtype_and_warm_buffers(
+    dist_ready, monkeypatch, mode
+):
     monkeypatch.setattr(f"{ADAPTER}.classic_cuda_alloc", nullcontext)
+    if mode is TrainerStagingMode.COPY_TO_HOST:
+        _mock_host_allocation_without_cuda(monkeypatch)
     manager = _Manager()
     overrides = {"bias": torch.float32}
     adapter = _create_trainer_adapter(
@@ -27,7 +53,7 @@ def test_copy_preserves_per_tensor_dtype_and_warm_buffers(dist_ready, monkeypatc
     bias = torch.tensor([1.000123, -2.0031, 0.015540123], dtype=torch.float32)
     weights = torch.tensor([1.000123, 2.0031], dtype=torch.float32)
     state = {"bias": bias, "weights": weights}
-    first = _stage(adapter, state, TrainerStagingMode.COPY_TO_DEVICE)
+    first = _stage(adapter, state, mode)
     first.publish_ready.wait()
     served = {
         key.split("__", 3)[-1]: value for key, value in manager.registered[0].items()
@@ -46,7 +72,7 @@ def test_copy_preserves_per_tensor_dtype_and_warm_buffers(dist_ready, monkeypatc
     addresses = {name: value.data_ptr() for name, value in served.items()}
     overrides["bias"] = torch.bfloat16  # Caller mutation cannot change a bound policy.
     bias.add_(0.000321)
-    second = _stage(adapter, state, TrainerStagingMode.COPY_TO_DEVICE)
+    second = _stage(adapter, state, mode)
     second.publish_ready.wait()
     assert torch.equal(served["bias"], bias)
     assert second.manifest.total_bytes == first.manifest.total_bytes
@@ -174,16 +200,31 @@ def test_requires_initialized_distributed_engine(monkeypatch):
         _adapter()
 
 
-def test_source_slot_id_is_rank_stamped(dist_ready):
-    assert _adapter().source_slot_id == "publisher:global-rank:0"
+def test_logical_shard_id_requires_binding(dist_ready):
+    with pytest.raises(RuntimeError, match="bind_tensors"):
+        _ = _adapter().logical_shard_id
 
 
-def test_bind_tensors_validates_state_dict_and_returns_rank_slot(dist_ready):
+def test_bind_tensors_validates_state_dict_and_returns_wire_coverage(dist_ready):
     adapter = _adapter()
 
-    assert adapter.bind_tensors({"w": torch.ones(2, 4)}) == ("publisher:global-rank:0")
+    binding = adapter.bind_tensors({"w": torch.ones(2, 4)})
+    assert len(binding) == 64
+    assert adapter.logical_shard_id == binding
+    assert not adapter._manager.registered
+    assert adapter._arenas == {}
+    assert _adapter().bind_tensors({"w": torch.zeros(2, 4)}) == binding
+    assert _adapter().bind_tensors({"w": torch.zeros(4, 4)}) != binding
+    assert _adapter().bind_tensors({"w": torch.ones(2, 4, dtype=torch.bfloat16)}) == binding
+    with pytest.raises(RuntimeError, match="coverage changed"):
+        adapter.bind_tensors({"w": torch.ones(4, 4)})
     with pytest.raises(TypeError, match="state_dict"):
         adapter.bind_tensors([torch.ones(2, 4)])
+
+    staged = _stage(adapter, {"w": torch.ones(2, 4, dtype=torch.bfloat16)})
+    assert binding == hashlib.sha256(
+        bound_tensor_manifest(json.loads(staged.manifest.data)["tensors"])
+    ).hexdigest()
 
 
 def test_in_place_stage_registers_once(dist_ready):
@@ -257,7 +298,7 @@ def test_stage_rejects_a_changed_shard_geometry(dist_ready):
 
 def test_in_place_requires_wire_dtype_source(dist_ready):
     adapter = _adapter()
-    with pytest.raises(NotImplementedError, match="use COPY_TO_DEVICE to cast"):
+    with pytest.raises(NotImplementedError, match="use COPY_TO_HOST to cast"):
         _stage(adapter, {"w": torch.ones(2, 4, dtype=torch.float32)})
 
 
@@ -282,11 +323,11 @@ def test_staging_mode_cannot_change_after_initialize(dist_ready):
 
 def test_unsupported_staging_mode_is_rejected(dist_ready):
     adapter = _adapter()
-    with pytest.raises(NotImplementedError, match="COPY_TO_HOST"):
+    with pytest.raises(NotImplementedError, match="WRITE_TO_STORAGE"):
         _stage(
             adapter,
             {"w": torch.ones(2, 4, dtype=torch.bfloat16)},
-            mode=TrainerStagingMode.COPY_TO_HOST,
+            mode=TrainerStagingMode.WRITE_TO_STORAGE,
         )
 
 
@@ -337,7 +378,7 @@ class _FakeDeviceModule:
 
 
 def _unexpected_cuda_call(*args, **kwargs):
-    raise AssertionError("the arena fence must not touch the process CUDA device")
+    raise AssertionError("the snapshot fence must not touch the process CUDA device")
 
 
 @pytest.fixture
@@ -353,83 +394,122 @@ def device_module(monkeypatch):
     return module
 
 
-def test_copy_to_device_fences_the_arena_device(dist_ready, device_module):
-    adapter = _adapter()
+def test_device_fence_records_on_each_device_stream(device_module):
+    xpu0, xpu1 = torch.device("xpu:0"), torch.device("xpu:1")
 
-    staged = _stage(
-        adapter,
-        {"w": torch.ones(2, 4, dtype=torch.bfloat16)},
-        mode=TrainerStagingMode.COPY_TO_DEVICE,
-    )
+    fence = FSDPTrainerAdapter._device_fence([xpu1, xpu0, xpu1])
 
-    # The fence comes from the arena's own device, and is recorded on that
-    # device's stream rather than whatever stream the process happens to be on.
-    assert device_module.requested == [torch.device("cpu")]
-    assert device_module.streams_for == [torch.device("cpu")]
-    (event,) = device_module.events
-    assert event.recorded_on == "stream:cpu"
+    # One event per distinct device, each from that device's own module and
+    # recorded on that device's stream rather than the process current stream.
+    assert device_module.requested == [xpu0, xpu1]
+    assert device_module.streams_for == [xpu0, xpu1]
+    assert [e.recorded_on for e in device_module.events] == [
+        "stream:xpu:0",
+        "stream:xpu:1",
+    ]
 
-    assert event.waits == 0
-    staged.publish_ready.wait()
-    assert event.waits == 1
+    assert [e.waits for e in device_module.events] == [0, 0]
+    fence.wait()
+    assert [e.waits for e in device_module.events] == [1, 1]
 
 
-def test_copy_to_device_fence_ignores_the_process_cuda_device(
-    dist_ready, device_module, monkeypatch
-):
-    # The previous fence read torch.cuda.current_stream() with no device, so a
-    # CUDA-capable process fenced its current device instead of the arena's.
+def test_device_fence_ignores_the_process_cuda_device(device_module, monkeypatch):
+    # The fence must come from the device's own module, so a non-CUDA
+    # accelerator never reaches torch.cuda.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_stream", _unexpected_cuda_call)
     monkeypatch.setattr(torch.cuda, "Event", _unexpected_cuda_call)
 
-    adapter = _adapter()
+    FSDPTrainerAdapter._device_fence([torch.device("xpu:0")]).wait()
+
+    assert device_module.requested == [torch.device("xpu:0")]
+
+
+def test_cpu_snapshot_needs_no_device_fence(dist_ready, device_module):
     staged = _stage(
-        adapter,
+        _adapter(),
         {"w": torch.ones(2, 4, dtype=torch.bfloat16)},
         mode=TrainerStagingMode.COPY_TO_DEVICE,
     )
     staged.publish_ready.wait()
 
-    assert device_module.requested == [torch.device("cpu")]
+    assert device_module.requested == []
 
 
-def test_copy_to_device_rejects_arenas_spanning_devices(dist_ready, device_module):
+def test_host_staging_without_cuda_rejects_before_allocation(dist_ready, monkeypatch):
     manager = _Manager()
     adapter = _adapter(manager)
+    source = torch.ones(2, dtype=torch.float32)
+    allocate = Mock(side_effect=AssertionError("must reject before allocation"))
+    monkeypatch.setattr(f"{ADAPTER}.torch.cuda.is_available", lambda: False)
+    monkeypatch.setattr(f"{ADAPTER}.torch.empty", allocate)
 
-    # One rank serves one device: a shard set that lands arenas on two devices
-    # cannot be covered by a single fence.
-    with pytest.raises(NotImplementedError, match="one device per rank"):
-        _stage(
-            adapter,
-            {
-                "w": torch.ones(2, 4, dtype=torch.bfloat16),
-                "b": torch.ones(4, dtype=torch.bfloat16, device="meta"),
-            },
-            mode=TrainerStagingMode.COPY_TO_DEVICE,
-        )
+    with pytest.raises(RuntimeError, match="COPY_TO_HOST staging requires CUDA"):
+        _stage(adapter, {"w": source}, TrainerStagingMode.COPY_TO_HOST)
 
-    # Rejection must precede registration: nothing may be bound to the manager,
-    # which is configured for one device.
+    allocate.assert_not_called()
     assert manager.registered == []
 
 
-class _StubArena:
-    """Only what the device check reads, so ordinals need no real hardware."""
+def test_host_snapshot_survives_source_mutation_and_rematerialization(
+    dist_ready, monkeypatch
+):
+    _mock_host_allocation_without_cuda(monkeypatch)
+    manager = _Manager()
+    adapter = _adapter(manager)
+    source = torch.arange(12, dtype=torch.float32).reshape(3, 4).t()
+    staged = _stage(adapter, {"w": source}, TrainerStagingMode.COPY_TO_HOST)
+    staged.publish_ready.wait()
+    (served,) = staged.buffer_owner
+    assert served.device.type == "cpu"
+    assert served.is_contiguous()
+    assert torch.equal(served, source.bfloat16())
+    snapshot = served.clone()
+    address = served.data_ptr()
+    source.fill_(-1)
+    assert torch.equal(served, snapshot)
+    for value in (7, 11):
+        next_source = torch.full((4, 3), value, dtype=torch.float32)
+        next_stage = _stage(
+            adapter, {"w": next_source}, TrainerStagingMode.COPY_TO_HOST
+        )
+        next_stage.publish_ready.wait()
+        assert next_stage.manifest is staged.manifest
+        assert served.data_ptr() == address
+        assert torch.equal(served, next_source.bfloat16())
+    assert len(manager.registered) == 1
+    (published,) = unwrap_rendezvous_blob(staged.manifest.data).tensors
+    assert published.shards[0].memory_type == "DRAM"
 
-    def __init__(self, device):
-        self.device = torch.device(device)
 
-
-def test_arena_device_rejects_two_ordinals_of_one_family():
-    arenas = [_StubArena("cuda:0"), _StubArena("cuda:1")]
-
-    with pytest.raises(NotImplementedError, match="cuda:0.*cuda:1"):
-        FSDPTrainerAdapter._arena_device(arenas)
-
-
-def test_arena_device_accepts_one_repeated_ordinal():
-    arenas = [_StubArena("cuda:1"), _StubArena("cuda:1")]
-
-    assert FSDPTrainerAdapter._arena_device(arenas) == torch.device("cuda:1")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA pinned host copies"
+)
+def test_cuda_host_snapshot_fences_nondefault_stream_and_preserves_fp32(dist_ready):
+    manager = _Manager()
+    adapter = FSDPTrainerAdapter(
+        manager=manager,
+        nixl_metadata_endpoint="host:1234",
+        wire_dtype_overrides={"bias": torch.float32},
+    )
+    stream = torch.cuda.Stream()
+    addresses = None
+    for value in (1.000123, 2.000321, 3.001234):
+        with torch.cuda.stream(stream):
+            state = {
+                "w": torch.full(
+                    (128, 256), value, device="cuda", dtype=torch.float32
+                ).t(),
+                "bias": torch.tensor([value], device="cuda", dtype=torch.float32),
+            }
+            staged = _stage(adapter, state, TrainerStagingMode.COPY_TO_HOST)
+        staged.publish_ready.wait()
+        served = {k.split("__", 3)[-1]: v for k, v in manager.registered[0].items()}
+        assert all(t.is_pinned() and t.device.type == "cpu" for t in served.values())
+        assert torch.equal(served["w"], torch.full((256, 128), value).bfloat16())
+        assert torch.equal(served["bias"], torch.tensor([value], dtype=torch.float32))
+        current = {k: t.data_ptr() for k, t in served.items()}
+        if addresses is not None:
+            assert current == addresses
+        addresses = current
+    assert len(manager.registered) == 1

@@ -63,8 +63,9 @@ def _version(
     base=None,
     model_name="test-model",
     state=WeightVersionState.READY,
-):
+) -> WeightVersion:
     return WeightVersion(
+        trainer_mesh_generation=0,
         version_id=uid,
         model_name=model_name,
         payload_format=payload_format,
@@ -73,7 +74,6 @@ def _version(
             storage_type=ObjectStorageType.S3,
             uri=f"s3://weights/{uid}/model.safetensors.index.json",
         ),
-        expected_source_slots=(),
         layout_signature="layout",
         state=state,
         created_at_unix_ms=1,
