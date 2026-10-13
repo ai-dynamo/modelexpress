@@ -451,16 +451,11 @@ require the generation field; decoding parses it as a uint64 without repeating
 creation-time consistency checks. Versions without a trainer mesh, including object-storage
 versions, carry generation zero. A requested version whose recorded mesh
 generation differs from the current trainer mesh fails trainer source resolution.
-The session tries configured source kinds in order, so this failure can fall back
-to a generator peer serving the requested version. Bounded staging applies to
-trainer transfers; peers retain their normal runtime-tensor preparation path.
-An engine left uncertain by a failed installation can recover through a complete
-peer tensor transfer even when the requested version was published as a delta.
-The publication format does not determine the peer's transfer representation;
-failed-handle and undrained-transfer protections still apply.
-Trainer and peer paths check compatibility during plan selection without a
-separate preflight pass. Object-storage replay retains preflight validation of
-every revision before acquiring the chain's leases.
+The session can fall back to a generator peer serving the requested version.
+Peer reads use complete runtime tensors, allowing recovery from an uncertain
+installation even for a version published as a delta. Trainer and peer paths
+check compatibility during plan selection; object-storage replay validates every
+revision before acquiring the chain's leases.
 
 Any trainer mesh update that changes its generation is rejected while a linked
 weight version has an active consumer lease, including additive replicas that
@@ -583,11 +578,6 @@ rebuilds the transfer plan. Content-only digest changes refresh verification
 metadata without rebuilding that plan. Releasing a trainer shard evicts its
 worker-local version entry only after the central service accepts the deletion;
 the service rejects deletion while a version lease is active.
-Trainer source resolution retains per-update results, checksums, and timing in a
-resolution round. Transfer preparation separates connection setup from plan
-selection, and streaming posts batches through a dedicated method. Parsed source
-metadata is frozen by preparation before caching; both staging modes retain the transport's
-read descriptors directly instead of copying them into another descriptor type.
 For S3, `WeightVersion.object_storage` identifies the storage type and global
 `model.safetensors.index.json` URI directly; the server validates only this
 typed location and does not contact S3.
@@ -656,11 +646,6 @@ geometry, and framework orchestration independently replaceable.
 capacity per arena, and `staging_buffers_count` defaults to one. The streaming
 client uses their product as its total staging limit. `staging_device` selects
 CUDA or pinned host receive memory.
-The setting fixes the receiver's staging mode at construction; load-time
-updates use one `prepare()` entry point, which selects full-copy or bounded
-preparation from that fixed configuration. Both modes record planning and cache
-reuse during preparation; streaming transfer bytes and durations are recorded
-when installation exits, including failure paths.
 
 The `stage_weight()` / `apply_weight()` generator APIs hold a version lease
 across metadata preparation and incremental installation. The NIXL receiver
@@ -679,17 +664,14 @@ sources without bounded staging configured, `stage_weight()` transfers a full
 independent copy before installation.
 
 Trainer resolution checks the mesh and requested version under its lease, then
-tries replicas in worker-ID order. `TrainerSourceShard` records the selected
-worker, slot, endpoint, manifest, and digests; `TrainerSourceSnapshot` adds mesh
-identity and geometry. A manifest cache keyed by shard and worker survives
-preparation and replica selection. Unchanged endpoint and manifest digest reuse
-metadata and lazily extracted checksums; a changed manifest refreshes them.
-Checksums and leases remain outside reusable plans.
-Matching structural fingerprints reuse preparation without recomposing the engine
-layout or recompiling transfers. Geometry, addresses, registrations, endpoint, or
-selection changes invalidate preparation. A cached source must still publish the
-requested version. Failed native preparation and manager reset invalidate the plan;
-the client's engine install layout remains available for the next preparation.
+tries replicas in worker-ID order. `TrainerSourceShard` identifies the selected
+worker and buffers; `TrainerSourceSnapshot` adds mesh identity and geometry.
+A shard-and-worker manifest cache reuses metadata and extracted checksums while
+the endpoint and digest match. The selected worker must still publish the
+requested version. Checksums and leases remain outside reusable plans.
+Matching source fingerprints reuse preparation; changes to geometry, addresses,
+registrations, endpoints or replica selection rebuild it. Native preparation
+failure and manager reset invalidate the plan, retaining the client's install layout.
 
 `MX_REFIT_PACK_MODULES` coalesces consecutive owning-module batches up to the
 same staging limit, trading a larger arena residency for fewer of them. It never
@@ -735,14 +717,15 @@ engine-owned post-load workspace, CUDA allocator overhead, and transport metadat
 | `GetWeightVersion` | `GetWeightVersionRequest` | `GetWeightVersionResponse` | Read the version and its lifecycle state |
 | `DeleteWeightVersion` | `DeleteWeightVersionRequest` | `DeleteWeightVersionResponse` | Cancel a `STAGING` version or move a `READY` version to `RELEASING` for retirement |
 | `UpdateWeightVersionState` | `UpdateWeightVersionStateRequest` | `UpdateWeightVersionStateResponse` | Explicitly update lifecycle state, including S3 `STAGING` to `READY` |
-| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker metadata reference for a required logical shard |
+| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker manifest for a required logical shard |
 | `ListWeightVersionShards` | `ListWeightVersionShardsRequest` | `ListWeightVersionShardsResponse` | List the version's physical source publications |
 | `DeleteWeightVersionShard` | `DeleteWeightVersionShardRequest` | `DeleteWeightVersionShardResponse` | Evict one source shard after release when no lease protects the version |
 | `RegisterVersionLease` | `RegisterVersionLeaseRequest` | `RegisterVersionLeaseResponse` | Acquire or renew protection while installing a version |
 | `DeleteVersionLease` | `DeleteVersionLeaseRequest` | `DeleteVersionLeaseResponse` | Release a generator's protection of the version shards |
 
-`RefitWorkerService.GetWeightVersionShardManifest` is a unary manifest RPC; tensor
-bytes remain on the advertised data-plane transport.
+`RefitWorkerService.GetWeightVersionShardManifest` is also unary and returns
+`GetWeightVersionShardManifestResponse`; tensor bytes remain on the advertised
+data-plane transport.
 
 The final missing NIXL source slot atomically changes the version to `READY`.
 For S3, the orchestrator marks the version `READY` after publication completes.
@@ -1796,27 +1779,17 @@ therefore not a total GPU-memory bound. Two arenas can overlap the next READ wit
 installation of the current group; the benefit must be measured on the target
 hardware. Trainer staging mode and receiver arena location are separate choices.
 
-Bounded transfer reuses READ addresses and sizes with the compiled plan. Plan
-changes, failed preparation, incomplete iteration and workspace teardown discard
-cached descriptors. Each batch still creates views, zeroes padding, posts fresh
-READs and completes the existing fences. Source leases, tensor views and
-transport handles remain owned by the update. Private transfer counters report
-hits, misses and builds; descriptor work stays outside the wire timer.
+Bounded transfer reuses READ descriptors with the compiled plan. Plan changes,
+failed preparation, incomplete iteration and workspace teardown discard them.
+Each batch creates views, zeroes padding, posts fresh READs and completes its fences.
+Source leases, tensor views and transport handles remain owned by the update.
 
-Trainer discovery freezes ordinary parsed source and shard rows as immutable
-host metadata. An exact manifest-byte match can reuse the decoded snapshot;
-custom or mutable source rows retain field-by-field validation. The snapshot
-owns no tensors, transport handles, version checksums or source leases, and
-stable rows do not need a second structural key. C's compiled physical plan
-reuse checks the selected source fingerprint and controls bounded descriptor
-reuse. Current source coverage is checked before transfer. Snapshot
-construction is charged to source preparation on a cache miss. Trainer discovery
-accumulates cache, fetch and verification counters across the sources needed
-for each candidate and flushes them before yielding, on failure or on close.
-Manifest RPC time is reported separately within resolution time; waiting for the
-consumer to transfer or install a yielded candidate is excluded. Failed RPCs
-retain elapsed time, while fetch and verification counts record successful
-validation.
+Parsed trainer source rows are immutable host metadata; an exact manifest-byte
+match reuses the decoded snapshot. Custom or mutable rows retain field-by-field
+validation. The snapshot owns no tensors, transport handles, checksums or leases.
+Transfer-plan reuse checks the selected source fingerprint. Discovery metrics
+include metadata fetch and verification, excluding time the consumer spends
+transferring or installing a yielded candidate.
 
 The prepared streaming artifact owns its iterator and remains protected by the
 version lease. An installation failure fences the engine and never falls back
@@ -1834,53 +1807,19 @@ unsupported. The same generic path is used for small-model validation and GLM;
 passing the former does not establish full-model correctness or performance.
 
 
-Full-copy and bounded updates enter one session staging flow. Immutable streaming
-settings bind the mode, placement, buffer count and total budget at runtime
-construction; each transfer retains that configuration for its lifetime. Public
-`staging_buffer_bytes` remains the capacity of each buffer, multiplied by the
-buffer count for the internal total budget. Bounded device compatibility is
-checked before creating its NIXL manager. Streaming installer support is checked
-once during runtime initialization, before allocating transfers. Runtime
-construction selects the trainer method; per-update candidate selection does not
-repeat method-type or streaming-installer checks. Generator peer reads retain a separate
-full-copy transfer borrowing the engine manager. The version lease remains held through
-installation or release. Preparation retry and recovery behavior stays scoped
-to the selected update strategy; failures after a possible write fence the engine.
+Full-copy and bounded updates share one `prepare()` flow with staging settings
+fixed at client construction. A cached update plan retains the logical plan,
+physical source binding, connections and workspace. Matching fingerprints skip
+layout composition, compilation and connection setup; registered arenas remain
+owned by the workspace. Per-update artifacts, checksums and leases remain fresh.
+Coverage and capacity are validated during compilation; debug validation can
+recheck cached coverage. Plans become reusable only after preparation succeeds.
 
-Each transfer owns an immutable update plan containing capture operations
-composed with trainer conversion, the fixed generator layout, immutable trainer
-source rows, and a transfer plan. The transfer plan records logical reads by source slot, tensor
-and shard geometry, and source-relative byte offset; it contains no session or
-absolute source address. A separate physical binding resolves those reads to
-the selected source sessions and addresses for execution. The compiled plan is
-reused when the selected source fingerprint matches, using the same rule for
-full-copy and bounded updates. The cached update plan retains the physical source
-binding and connected transport; these are rebuilt when the fingerprint
-changes and remain separate from the address-independent logical plan. Matching
-snapshots also skip connection setup and streaming arena capacity checks; registered
-arenas remain owned by the workspace. Each update gets fresh preparation wrappers
-and metrics, while transport counters accumulate over the transport lifetime.
-Per-update checksums and leases remain fresh. Matching snapshots skip metadata
-parsing, layout composition, and compilation. The common `prepare()` sequence owns cache
-lookup, layout acquisition, source binding, connections, failure cleanup, and
-publication. Full-copy and bounded helpers retain their respective workspace
-allocation and descriptor setup; compilation remains specific to each mode.
-Prepared plans publish only after setup succeeds. Internal batching
-consumes the fixed validated budget; coverage and capacity checks remain at the
-compilation boundary. Debug validation rechecks cached whole-plan coverage and
-streaming module coverage without reacquiring the layout. Descriptor bindings
-remain lazy and are reused with the compiled plan.
-Preparation and transport READ failures invalidate descriptor caches along with
-the update plan. Invalidating the cache does not recover native connections or
-permit reuse of resources whose outstanding reads have not been safely drained.
-
-The transfer owns cleanup of partial native preparation. Metadata, layout and
-compilation failures leave registered storage and existing connections intact.
-A failed preparation that attempted manager initialization, source connection or
-registration resets an owned manager before releasing its storage; cleanup failure
-remains fatal with its cause retained. Borrowed managers cannot be reset by the
-transfer. Streaming READ drain, retained leases and uncertain-resource quarantine
-keep their existing installation behavior.
+Metadata or planning failures leave existing connections and storage intact.
+Failure during native setup resets an owned manager before releasing its storage;
+borrowed managers cannot be reset. Preparation or READ failure invalidates the
+cached plan and descriptors. Cleanup failure remains fatal, retaining its cause;
+resources with undrained reads remain protected by the installation failure rules.
 
 ## RL refit CI harness
 
