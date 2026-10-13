@@ -45,7 +45,7 @@ jobs:
   test-p2p:
     needs: admission-slots
     concurrency:
-      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      group: ${{ format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
     name: P2P test (${{ matrix.label || matrix.framework }})
@@ -54,7 +54,7 @@ jobs:
     env:
       MX_CI_GPU_POOL: a100a
       MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
-      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:
@@ -248,7 +248,7 @@ jobs:
   test-p2p-mla-model:
     needs: admission-slots
     concurrency:
-      group: ${{ needs.admission-slots.outputs.a100b_count == '1' && 'modelexpress-azure-a100b' || format('modelexpress-gpu-a100b-slot-{0}', fromJSON(needs.admission-slots.outputs.a100b_slots)[matrix.gpu_slot]) }}
+      group: ${{ format('modelexpress-gpu-a100b-slot-{0}', fromJSON(needs.admission-slots.outputs.a100b_slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
     name: P2P MLA model test (${{ matrix.framework }} TP=2)
@@ -258,7 +258,7 @@ jobs:
     env:
       MX_CI_GPU_POOL: a100b
       MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.a100b_count }}
-      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.a100b_count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.a100b_slots)[matrix.gpu_slot]) }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.a100b_slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:
@@ -336,7 +336,7 @@ jobs:
   test-tp:
     needs: admission-slots
     concurrency:
-      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      group: ${{ format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
     name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }} ${{ matrix.topology }})
@@ -345,7 +345,7 @@ jobs:
     env:
       MX_CI_GPU_POOL: a100a
       MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
-      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:
@@ -422,7 +422,7 @@ jobs:
   test-parallel:
     needs: admission-slots
     concurrency:
-      group: ${{ needs.admission-slots.outputs.a100b_count == '1' && 'modelexpress-azure-a100b' || format('modelexpress-gpu-a100b-slot-{0}', fromJSON(needs.admission-slots.outputs.a100b_slots)[matrix.gpu_slot]) }}
+      group: ${{ format('modelexpress-gpu-a100b-slot-{0}', fromJSON(needs.admission-slots.outputs.a100b_slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
     name: P2P ${{ matrix.label }} test (vllm)
@@ -431,7 +431,7 @@ jobs:
     env:
       MX_CI_GPU_POOL: a100b
       MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.a100b_count }}
-      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.a100b_count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.a100b_slots)[matrix.gpu_slot]) }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.a100b_slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:
@@ -521,7 +521,7 @@ jobs:
   test-with-dynamo:
     needs: admission-slots
     concurrency:
-      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      group: ${{ format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
     name: P2P test with Dynamo (${{ matrix.mode }})
@@ -530,7 +530,7 @@ jobs:
     env:
       MX_CI_GPU_POOL: a100a
       MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
-      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:
@@ -604,7 +604,7 @@ jobs:
   test-fleet-scale:
     needs: admission-slots
     concurrency:
-      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[11]) }}
+      group: ${{ format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[11]) }}
       queue: max
       cancel-in-progress: false
     name: P2P Fleet scale test (vLLM, 15 workers)
@@ -613,7 +613,7 @@ jobs:
     env:
       MX_CI_GPU_POOL: a100a
       MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
-      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[11]) }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[11]) }}
     permissions:
       contents: read
     steps:
@@ -668,7 +668,7 @@ jobs:
   test-rolling-update:
     needs: admission-slots
     concurrency:
-      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      group: ${{ format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
     name: P2P Rolling-update test (${{ matrix.framework }}, 5 workers)
@@ -677,7 +677,7 @@ jobs:
     env:
       MX_CI_GPU_POOL: a100a
       MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
-      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:
@@ -748,7 +748,7 @@ jobs:
   test-stale-metadata:
     needs: admission-slots
     concurrency:
-      group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      group: ${{ format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
     name: P2P Stale metadata test (${{ matrix.framework }})
@@ -757,7 +757,7 @@ jobs:
     env:
       MX_CI_GPU_POOL: a100a
       MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
-      MX_CI_GPU_LANE: ${{ needs.admission-slots.outputs.count == '1' && 'all' || format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
     permissions:
       contents: read
     strategy:

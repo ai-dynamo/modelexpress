@@ -54,7 +54,7 @@ jobs:
   refit:
     if: ${{ inputs.suite == 'refit' }}
     concurrency:
-      group: ${{ inputs.gpu_limit == '1' && format('modelexpress-rl-gpu-{0}', vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02') || format('modelexpress-rl-gpu-{0}-slot-{1}', vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', inputs.gpu_slot) }}
+      group: ${{ format('modelexpress-rl-gpu-{0}-slot-{1}', vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', inputs.gpu_slot) }}
       queue: max
       cancel-in-progress: false
     name: "RL generator-only ${{ inputs.scenario }} refit (${{ inputs.model }})"
@@ -62,7 +62,7 @@ jobs:
     timeout-minutes: 120
     env:
       MX_CI_GPU_CONCURRENCY: ${{ inputs.gpu_limit }}
-      MX_CI_GPU_LANE: ${{ inputs.gpu_limit == '1' && 'all' || format('slot-{0}', inputs.gpu_slot) }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', inputs.gpu_slot) }}
       MODEL_PROFILE: ${{ inputs.model }}
       SCENARIO: ${{ inputs.scenario }}
       RUN_ID: ${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -115,7 +115,7 @@ jobs:
   vime:
     if: ${{ inputs.suite == 'vime' }}
     concurrency:
-      group: ${{ inputs.gpu_limit == '1' && format('modelexpress-rl-gpu-{0}', 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02') || format('modelexpress-rl-gpu-{0}-slot-{1}', 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', inputs.gpu_slot) }}
+      group: ${{ format('modelexpress-rl-gpu-{0}-slot-{1}', 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', inputs.gpu_slot) }}
       queue: max
       cancel-in-progress: false
     name: RL Vime delta-refit smoke
@@ -125,7 +125,7 @@ jobs:
       contents: read
     env:
       MX_CI_GPU_CONCURRENCY: ${{ inputs.gpu_limit }}
-      MX_CI_GPU_LANE: ${{ inputs.gpu_limit == '1' && 'all' || format('slot-{0}', inputs.gpu_slot) }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', inputs.gpu_slot) }}
       KUBE_CONTEXT: nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
       NAMESPACE: mx-ci-h100-vime-${{ github.run_id }}-${{ github.run_attempt }}
       WORKER_IMAGE: nvcr.io/0980761089281446/vime-dynamo-mx-worker:${{ github.sha }}

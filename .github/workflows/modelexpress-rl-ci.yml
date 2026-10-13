@@ -100,7 +100,7 @@ jobs:
         id: inputs
         env:
           TEST_SHA: ${{ inputs.sha || needs.authorize.outputs.sha }}
-          MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '8' }}
+          MX_CI_RL_GPU_CONCURRENCY: ${{ vars.MX_CI_RL_GPU_CONCURRENCY || '4' }}
           PR_NUMBER: ${{ inputs.pull_request || github.event.issue.number || 0 }}
           GH_TOKEN: ${{ github.token }}
           MODEL_PROFILE: ${{ inputs.model || needs.authorize.outputs.model }}
@@ -111,9 +111,9 @@ jobs:
           echo "harness_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
           import os
-          count = int(os.environ["MX_CI_GPU_CONCURRENCY"])
+          count = int(os.environ["MX_CI_RL_GPU_CONCURRENCY"])
           if not 1 <= count <= 16:
-              raise SystemExit("MX_CI_GPU_CONCURRENCY must be between 1 and 16")
+              raise SystemExit("MX_CI_RL_GPU_CONCURRENCY must be between 1 and 16")
           number = int(os.environ["PR_NUMBER"]) or int(os.environ["GITHUB_REF"].rsplit("/", 1)[1])
           print(f"gpu_limit={count}")
           print(f"gpu_slot={number % count}")
@@ -250,14 +250,14 @@ jobs:
       - name: Assign GPU slot
         id: slots
         env:
-          MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '8' }}
+          MX_CI_RL_GPU_CONCURRENCY: ${{ vars.MX_CI_RL_GPU_CONCURRENCY || '4' }}
           PR_NUMBER: "0"
         run: |
           python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
           import os
-          count = int(os.environ["MX_CI_GPU_CONCURRENCY"])
+          count = int(os.environ["MX_CI_RL_GPU_CONCURRENCY"])
           if not 1 <= count <= 16:
-              raise SystemExit("MX_CI_GPU_CONCURRENCY must be between 1 and 16")
+              raise SystemExit("MX_CI_RL_GPU_CONCURRENCY must be between 1 and 16")
           number = int(os.environ["PR_NUMBER"]) or int(os.environ["GITHUB_REF"].rsplit("/", 1)[1])
           print(f"gpu_limit={count}")
           print(f"gpu_slot={(number + 1) % count}")

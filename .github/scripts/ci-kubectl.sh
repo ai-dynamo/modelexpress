@@ -81,9 +81,7 @@ wait_for_worker_liveness() {
 # Wait for the previous CI namespaces and physical pods before allocating a new workload.
 wait_for_gpu_pool_cleanup() {
   local pool="$1" deadline=$((SECONDS + 900)) namespaces pods remaining
-  local lane="${MX_CI_GPU_LANE:-all}" concurrency="${MX_CI_GPU_CONCURRENCY:-8}"
-  [[ "$concurrency" =~ ^([1-9]|1[0-6])$ ]] || { echo "MX_CI_GPU_CONCURRENCY must be between 1 and 16" >&2; return 1; }
-  if [ "$concurrency" = 1 ]; then lane=all; fi
+  local lane="${MX_CI_GPU_LANE:-slot-0}"
   local slot_selector="ci.modelexpress.nvidia.com/gpu-lane=$lane"
   # vCluster mirrors namespace labels using SHA256(label key)[:10].
   local host_lane="vcluster.loft.sh/ns-label-${VCLUSTER_NAME:-mx-ci-cluster}-x-9c8bc18f28"

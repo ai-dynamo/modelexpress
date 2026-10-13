@@ -130,14 +130,15 @@ interruptions; they do not establish the cause of the host API resets.
 The parent workflow calls inference GPU tests through a per-PR concurrency group
 that cancels superseded work. A100a defaults to 8 repository-wide test
 slots; A100b is capped at four. `MX_CI_A100B_CONCURRENCY` can lower its cap
-to 1–4, and the common `MX_CI_GPU_CONCURRENCY` limit also applies. Inference cases have distinct indices rotated by PR number and reduced
+to 1–4, and the inference `MX_CI_GPU_CONCURRENCY` limit also applies. Inference cases have distinct indices rotated by PR number and reduced
 modulo the configured limit; RL refit and Vime use PR-based slots per Kubernetes
 context. One complete workload occupies each slot through execution and cleanup.
 Matrices allow up to 8 entries to dispatch concurrently. Builds and independent
 cleanup remain outside these queues. GitHub's `queue: max` retains pending jobs.
 
 `MX_CI_GPU_CONCURRENCY` overrides the default of 8 and accepts integers from 1 to 16; 1
-serializes each pool/context. Eight is an experimental default, not a
+serializes each inference pool through `slot-0`, using the same queue and cleanup
+path as other limits. Eight is an experimental default, not a
 capacity reservation; slot collisions or runner availability may reduce actual
 concurrency. Drain current runs (or cancel and finish cleanup) before changing
 limits, because changing slot assignments does not move already queued or
@@ -201,14 +202,16 @@ including timeouts while reading the response body. GitHub concurrency groups
 remain the queue, with normal cleanup inside test jobs and independent fallback
 cleanup outside per-PR cancellation groups.
 
-RL GPU jobs default to 8 repository-wide slots per Kubernetes context. Refit
+RL GPU jobs default to 4 repository-wide slots per Kubernetes context,
+configured independently with `MX_CI_RL_GPU_CONCURRENCY` (1–16). Refit
 runs choose PR number modulo the configured limit; Vime uses PR number plus one
 modulo that limit. This bounds concurrency across PRs without a reservation
 ledger. One-job mode serializes both workloads. Normal namespace deletion finishes before
 releasing a slot. Independent cleanup remains outside the queues. Refit jobs have
 a two-hour budget including admission, setup, execution and cleanup.
 
-The 8-slot default needs live qualification of CPU, memory, GPU/MIG and RDMA headroom.
+The 8/4/4 defaults for A100a/A100b/RL need live qualification of CPU, memory,
+GPU/MIG and RDMA headroom.
 Lower the limit when scheduling delays or resource contention appear. Source/target,
 artifact, metadata and model assertions remain unchanged. These limits neither
 reserve cluster-wide capacity nor guarantee placement against other workloads.
