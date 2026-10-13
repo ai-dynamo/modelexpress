@@ -598,7 +598,7 @@ jobs:
       group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[11]) }}
       queue: max
       cancel-in-progress: false
-    name: Fleet scale test (vLLM, 15 workers)
+    name: P2P Fleet scale test (vLLM, 15 workers)
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 120
     env:
@@ -662,7 +662,7 @@ jobs:
       group: ${{ needs.admission-slots.outputs.count == '1' && 'modelexpress-azure-a100a' || format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
       queue: max
       cancel-in-progress: false
-    name: Rolling-update test (${{ matrix.framework }}, 5 workers)
+    name: P2P Rolling-update test (${{ matrix.framework }}, 5 workers)
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 120
     env:

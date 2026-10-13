@@ -27,7 +27,7 @@ jobs:
     secrets: inherit
 
   gpu-cleanup:
-    name: GPU test cleanup
+    name: GPU cleanup
     needs: [gpu-tests]
     if: always()
     runs-on: prod-modelexpress-builder-amd-v1

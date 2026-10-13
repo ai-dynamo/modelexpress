@@ -24,7 +24,7 @@ jobs:
     secrets: inherit
 
   rl-tests:
-    name: RL tests
+    name: RL
     uses: ./.github/workflows/modelexpress-rl-ci.yml
     with:
       model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
