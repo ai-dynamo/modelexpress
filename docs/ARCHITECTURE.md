@@ -2037,8 +2037,9 @@ current sessions and addresses without rebuilding geometry.
 
 The replay plan records alias groups and owning modules during capture. Each
 update validates the live owners, load-time inputs and graph-bound storage.
-Per-owner alias views reconnect complete ties during materialization and native
-post-load processing. Finalization validates all captured module paths and
+Per-owner alias views are built once directly from captured tie groups, without
+separate structure-signature caches. They reconnect complete ties during
+materialization and native post-load processing. Finalization validates all captured module paths and
 restores runtime aliases. Changed capture compatibility invalidates the engine
 bindings and replay schedule together; no validation verdict is reused across
 updates. Custom attribute access, setters and parameter-registration hooks retain

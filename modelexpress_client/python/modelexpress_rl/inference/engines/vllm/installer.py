@@ -20,7 +20,6 @@ from collections.abc import Callable, Mapping
 from contextlib import closing
 from dataclasses import dataclass, field, replace
 from functools import cached_property
-from inspect import getattr_static
 from pathlib import Path
 from typing import TYPE_CHECKING
 from weakref import ref
@@ -172,15 +171,10 @@ class _ParameterAliases:
     ties: tuple[tuple[tuple[Module, str], ...], ...]
     writers: tuple[tuple[Module, type], ...]
     attributes: tuple[tuple[type, str], ...]
-    structure: tuple | None = None
-    root_type: type | None = None
-    _owner_plans: dict = field(default_factory=dict, compare=False, repr=False)
 
     @cached_property
     def by_owner(self):
         """Share each complete tie group with every layer that can change it."""
-        if self.edges is None or self.structure is None:
-            return None
         modules = {"": self.root}
         if self.edges is None:
             return None
@@ -188,74 +182,14 @@ class _ParameterAliases:
             modules[edge.path] = edge.child
         owners = iter(self.owners)
         groups_by_owner = {}
-        named_groups = []
-        for index, group in enumerate(self.groups):
+        for group in self.groups:
             named = tuple((next(owners)[0], module, leaf) for module, leaf in group)
-            named_groups.append(named)
             for module in dict.fromkeys(module for module, _ in group):
-                groups_by_owner.setdefault(module, []).append(index)
-        structures = (
-            # Custom owner hashing can change classes between dictionary writes.
-            _alias_structure(named_groups)
-            if _ordinary_owner_hashes(self.writers)
-            else None
-        )
-        result = {}
-        for module, indices in groups_by_owner.items():
-            groups = [named_groups[index] for index in indices]
-            structure = (
-                tuple(structures[index] for index in indices)
-                if structures is not None
-                else _alias_structure(groups)
-            )
-            plan = self._owner_plans.get(structure) if structure is not None else None
-            if plan is None:
-                plan = _compile_parameter_aliases(self.root, groups, modules)
-                if structure is not None:
-                    self._owner_plans[structure] = plan
-            result[module] = plan
-        return result
-
-
-def _ordinary_owner_hashes(writers):
-    checked = set()
-    for module, _captured_class in writers:
-        cls = type(module)
-        if type(cls) is not type:
-            return False
-        if cls not in checked:
-            if (
-                getattr_static(cls, "__hash__") is not object.__hash__
-                or getattr_static(cls, "__eq__") is not object.__eq__
-            ):
-                return False
-            checked.add(cls)
-    return True
-
-
-def _alias_structure(groups):
-    result = []
-    inheritance = {}
-    for group in groups:
-        if len(group) < 2:
-            continue
-        entries = []
-        for path, module, leaf in group:
-            if (
-                type(path) is not str
-                or type(leaf) is not str
-                or type(type(module)) is not type
-            ):
-                return None
-            cls = type(module)
-            bases = cls.__mro__
-            cached = inheritance.get(cls)
-            if cached is None or cached[0] is not bases:
-                cached = (bases, tuple(map(id, bases)))
-                inheritance[cls] = cached
-            entries.append((path, id(module), leaf, cached[1]))
-        result.append(tuple(entries))
-    return tuple(result)
+                groups_by_owner.setdefault(module, []).append(named)
+        return {
+            module: _compile_parameter_aliases(self.root, groups, modules)
+            for module, groups in groups_by_owner.items()
+        }
 
 
 def _compile_parameter_aliases(model, groups, modules) -> _ParameterAliases:
@@ -316,8 +250,6 @@ def _compile_parameter_aliases(model, groups, modules) -> _ParameterAliases:
         tuple(ties),
         tuple(writers.values()),
         tuple(attributes),
-        _alias_structure(groups),
-        type(model),
     )
 
 
@@ -741,7 +673,7 @@ class _VllmInstaller(EngineInstaller):
 
         gen_key = self.capture_generator_fingerprint()
 
-        if not self._is_quantized and self._capture_cache is not None:
+        if self._capture_cache is not None:
             cached_gen_key, cached_manifest, result = self._capture_cache
             if cached_gen_key == gen_key and cached_manifest == tuple(manifest):
                 copies = (
@@ -906,12 +838,11 @@ class _VllmInstaller(EngineInstaller):
                 targets,
                 schedule,
             )
-            if not self._is_quantized:
-                self._capture_cache = (
-                    gen_key,
-                    tuple(manifest),
-                    _CaptureSnapshot.create(copy.deepcopy((capture, param_layout))),
-                )
+            self._capture_cache = (
+                gen_key,
+                tuple(manifest),
+                _CaptureSnapshot.create(copy.deepcopy((capture, param_layout))),
+            )
         return capture, param_layout
 
     def install_tensors(

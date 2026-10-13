@@ -2972,7 +2972,7 @@ def test_streaming_preserves_destructor_boundaries(monkeypatch, owner_kind):
 
 @pytest.mark.parametrize("bounded", [False, True])
 @pytest.mark.parametrize("source_replay", [False, True])
-def test_custom_metaclass_ties_use_whole_alias_fallback(
+def test_custom_metaclass_ties_use_owner_views(
     monkeypatch, bounded, source_replay
 ):
     from tests.test_refit_ordered_installer import _transfer_and_install
@@ -3029,7 +3029,7 @@ def test_custom_metaclass_ties_use_whole_alias_fallback(
         model=model, vllm_config=object(), model_config=object(),
         device=torch.device("cpu"),
     )
-    assert installer._parameter_aliases(model).by_owner is None
+    assert installer._parameter_aliases(model).by_owner is not None
     captured, layout = installer.capture(
         [("first.weight", torch.float32, (2,))], trainer_mesh=("trainer", 1)
     )
