@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from functools import partial
 
 from modelexpress.refit.timing import (
     add_refit_bytes,
@@ -42,6 +41,10 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         transfer: _NixlStagedTransfer,
         capture_layout: Callable,
     ) -> None:
+        if transfer is None:
+            raise ValueError("transfer is required")
+        if not callable(capture_layout):
+            raise TypeError("capture_layout must be callable")
         self._transfer = transfer
         self._capture_layout = capture_layout
         self._active_staged: _StagedNixlWeights | None = None
@@ -67,10 +70,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                 manifests=manifests,
                 trainer_snapshot=source.snapshot,
                 checksums=source.checksums,
-                capture_layout=partial(
-                    self._capture_layout,
-                    trainer_mesh=(source.snapshot.mesh_id, source.snapshot.mesh_generation),
-                ),
+                capture_layout=self._capture_layout,
             )
             counters.update(prepared.metrics)
         set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))
