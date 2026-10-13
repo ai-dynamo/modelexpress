@@ -128,30 +128,28 @@ jobs:
       - name: Build images from the approved revision
         id: images
         env:
-          CACHE_SCOPE: ${{ inputs.pull_request || github.event.issue.number || github.ref_name }}
           TEST_SHA: ${{ needs.validate.outputs.sha }}
           RUNTIME_BASE: ${{ needs.validate.outputs.runtime }}
           NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
         run: |
           set -euo pipefail
           echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
-          cache_tag="buildcache-${CACHE_SCOPE//\//-}"
           repo=nvcr.io/0980761089281446
           server="$repo/mx-bench-server:$TEST_SHA"
           worker="$repo/mx-bench-worker:$TEST_SHA"
           cleanup="$repo/mx-bench-cleanup:$TEST_SHA"
           docker buildx build --platform linux/amd64 -f ci/k8s/server/Dockerfile.server \
-            --cache-from "type=registry,ref=$repo/mx-bench-server:$cache_tag" \
-            --cache-to "type=registry,ref=$repo/mx-bench-server:$cache_tag,mode=max,ignore-error=true" \
+            --cache-from "type=registry,ref=$repo/mx-bench-server:buildcache-shared" \
+            --cache-to "type=registry,ref=$repo/mx-bench-server:buildcache-shared,mode=max,ignore-error=true" \
             -t "$server" --metadata-file server-build.json --push candidate
           docker buildx build --platform linux/amd64 -f ci/bench/Dockerfile \
-            --cache-from "type=registry,ref=$repo/mx-bench-worker:$cache_tag" \
-            --cache-to "type=registry,ref=$repo/mx-bench-worker:$cache_tag,mode=max,ignore-error=true" \
+            --cache-from "type=registry,ref=$repo/mx-bench-worker:buildcache-shared" \
+            --cache-to "type=registry,ref=$repo/mx-bench-worker:buildcache-shared,mode=max,ignore-error=true" \
             --build-arg "RUNTIME_BASE=$RUNTIME_BASE" -t "$worker" \
             --metadata-file worker-build.json --push candidate
           docker buildx build --platform linux/amd64 -f ci/bench/Dockerfile.cleanup \
-            --cache-from "type=registry,ref=$repo/mx-bench-cleanup:$cache_tag" \
-            --cache-to "type=registry,ref=$repo/mx-bench-cleanup:$cache_tag,mode=max,ignore-error=true" \
+            --cache-from "type=registry,ref=$repo/mx-bench-cleanup:buildcache-shared" \
+            --cache-to "type=registry,ref=$repo/mx-bench-cleanup:buildcache-shared,mode=max,ignore-error=true" \
             -t "$cleanup" --metadata-file cleanup-build.json --push candidate
           echo "cleanup=$repo/mx-bench-cleanup@$(jq -r '."containerimage.digest"' cleanup-build.json)" >> "$GITHUB_OUTPUT"
           echo "server=$repo/mx-bench-server@$(jq -r '."containerimage.digest"' server-build.json)" >> "$GITHUB_OUTPUT"
@@ -270,17 +268,23 @@ jobs:
         run: |
           bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 \
             -f examples/rl/vime_dynamo_delta_refit/Dockerfile \
-            --cache-from "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:buildcache-${GITHUB_REF_NAME//\//-}" \
-            --cache-to "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:buildcache-${GITHUB_REF_NAME//\//-},mode=max,ignore-error=true" \
+            --cache-from "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:buildcache-shared" \
+            --cache-to "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:buildcache-shared,mode=max,ignore-error=true" \
             --target trainer --push \
-            -t "${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:${{ github.sha }}" .
+            -t "${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:${{ github.sha }}" . &
+          trainer_pid=$!
+          worker_status=0
           bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 \
             -f examples/rl/vime_dynamo_delta_refit/Dockerfile \
             --build-context dynamo="${RUNNER_TEMP}/dynamo" \
-            --cache-from "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-worker:buildcache-${GITHUB_REF_NAME//\//-}" \
-            --cache-to "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-worker:buildcache-${GITHUB_REF_NAME//\//-},mode=max,ignore-error=true" \
+            --cache-from "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-worker:buildcache-shared" \
+            --cache-to "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-worker:buildcache-shared,mode=max,ignore-error=true" \
             --target worker --push \
-            -t "${MX_IMAGE_REPO}/vime-dynamo-mx-worker:${{ github.sha }}" .
+            -t "${MX_IMAGE_REPO}/vime-dynamo-mx-worker:${{ github.sha }}" . || worker_status=$?
+          trainer_status=0
+          wait "$trainer_pid" || trainer_status=$?
+          if [ "$worker_status" -ne 0 ]; then exit "$worker_status"; fi
+          exit "$trainer_status"
 
   # ---------------------------------------------------------------------------
 

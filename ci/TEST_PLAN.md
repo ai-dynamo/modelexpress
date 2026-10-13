@@ -102,12 +102,18 @@ Ordinary comments do not start RL builds, GPU tests, or Vime jobs.
 ## CI build caches
 
 Image builds import and export registry caches in their existing NVCR image
-repositories. Cache tags are scoped to the PR or branch and image, with separate
-Vime trainer and worker caches. `mode=max` preserves intermediate build layers;
+repositories. Each image exports one `buildcache-shared` tag so a new approved PR
+can reuse matching layers from other PRs. Builds import only that shared cache.
+Concurrent exports replace the shared cache;
+BuildKit still checks input keys before reusing a layer. Vime trainer and worker
+build concurrently on the same runner with separate caches, and both must succeed.
+`mode=max` preserves intermediate build layers;
 cache export failure does not fail an otherwise successful build. The pinned
 Dynamo sidecar builds before copying ModelExpress sources so ModelExpress-only
-edits can reuse that compile layer. The first build for a cache scope is cold;
-subsequent builds can reuse matching layers without changing GPU allocations.
+edits can reuse that compile layer. The first shared-cache build is cold;
+subsequent PRs can reuse matching layers without changing GPU allocations.
+Inference GPU checkouts abort transfers stalled below one byte per second for
+60 seconds, allowing the checkout action's existing fetch retries to recover.
 
 ## vCluster connectivity recovery
 
@@ -150,6 +156,11 @@ do not exceed operating-system command argument limits.
 
 P2P sources and targets, the fleet seed, and every fleet scale wave wait for all
 controller-desired pods to be scheduled before starting their startup deadline.
+P2P jobs allow one replacement when kubelet admission fails because the assigned
+node has no healthy `rdma/ib` device, during scheduling or startup. Kubernetes
+owns the retry; failed attempts remain available for diagnostics and are excluded
+from active-pod selection. A second occurrence exhausts the job retry;
+other admission failures, crashes, and OOMs still fail immediately.
 Scheduling and startup each retain the configured readiness budget; each GPU
 test job also has a two-hour limit. Both MLA framework variants use 900 seconds
 per scheduling/startup phase instead of 3,600 seconds. Source/target topology, fleet size, metadata,
