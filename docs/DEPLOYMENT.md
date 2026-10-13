@@ -441,6 +441,8 @@ Vime coverage as E2E CI, using the exact triggering `main` SHA.
 
 Every job runs on the velonix self-hosted runners. The runner override reaches
 the child workflows' control jobs while GPU jobs keep their dedicated runners.
+Core CI defaults to read-only repository contents; only its coverage job receives
+OIDC token permission.
 Run-specific caller groups prevent one nightly from cancelling another; the
 GPU children retain the repository-wide capacity queues shared with PR tests.
 Nightly GPU slots use the run ID, while PR runs continue using the PR number.
@@ -511,6 +513,8 @@ starting a new one. Staging results and the GitLab handoff are replied on
 that thread; a channel-level message goes out through
 `SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL` once per run, green or red. The single
 job to watch is `nightly-status`.
+Failure messages JSON-escape job names so quotes, backslashes and newlines do
+not break the Slack payload.
 
 Every Slack message mentions `SLACK_MENTION_OPS_SUPPORT` and
 `SLACK_MENTION_DYNAMO_BOT`; a failing run additionally mentions

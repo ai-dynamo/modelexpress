@@ -98,8 +98,7 @@ jobs:
              | (if .conclusion == "cancelled" then ":warning: cancelled: "
                 elif .conclusion == "timed_out" then ":alarm_clock: timed out: "
                 else ":failed: " end) as $mark
-             | $mark + (.name | split(" / ") | if length > 2 then .[0] + " > " + .[-1] else .[-1] end)
-             | . + "\\n"' "$JOBS_JSON")
+             | $mark + (.name | split(" / ") | if length > 2 then .[0] + " > " + .[-1] else .[-1] end)' "$JOBS_JSON")
           echo "$FAILED_JOBS"
           {
             echo "FAILED_JOBS<<EOF"
@@ -139,7 +138,7 @@ jobs:
               - type: "section"
                 text:
                   type: mrkdwn
-                  text: "${{ env.FAILED_JOBS }}"
+                  text: ${{ toJSON(env.FAILED_JOBS) }}
               - type: "section"
                 text:
                   type: mrkdwn

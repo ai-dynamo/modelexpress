@@ -152,8 +152,9 @@ def main() -> int:
 
     stage_version = args.stage_version.strip()
     if stage_version:
-        wm = re.search(r'\[workspace\.package\][^\[]*?\n\s*version\s*=\s*"([^"]+)"',
-                       (root / "Cargo.toml").read_text())
+        wm = re.search(
+            r'(?ms)^\[workspace\.package\](?:(?!^[ \t]*\[).)*?\n[ \t]*version[ \t]*=[ \t]*"([^"]+)"',
+            (root / "Cargo.toml").read_text())
         if not wm:
             print("::error::--stage-version: cannot read [workspace.package].version", file=sys.stderr)
             return 1

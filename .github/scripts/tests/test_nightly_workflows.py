@@ -30,6 +30,37 @@ def execute(script, environment):
 
 
 class NightlyWorkflowTests(unittest.TestCase):
+    def test_only_coverage_receives_oidc_permission(self):
+        core = workflow("modelexpress-core-ci.yml")
+        self.assertEqual(core.get("permissions"), {"contents": "read"})
+        oidc_jobs = [
+            name for name, job in core["jobs"].items()
+            if job.get("permissions", core["permissions"]).get("id-token") == "write"
+        ]
+        self.assertEqual(oidc_jobs, ["code-coverage"])
+
+    def test_slack_failure_payload_preserves_quotes_backslashes_and_newlines(self):
+        steps = workflow("notify-slack.yml")["jobs"]["notify-slack"]["steps"]
+        names = ['Test "quoted" path C:\\models\nanother line', "second lane"]
+        jobs = {"jobs": [{"name": name, "status": "completed", "conclusion": "failure"} for name in names]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "jobs.json").write_text(json.dumps(jobs))
+            script = 'curl() { cat "$JOB_RESPONSE"; }\n' + steps[0]["run"]
+            script = script.replace("${{ github.repository }}", "example/repo").replace("${{ github.run_id }}", "123")
+            result, values = execute(script, {
+                "JOB_RESPONSE": str(root / "jobs.json"), "GITHUB_ENV": str(root / "env"),
+                "GITHUB_TOKEN": "test-token", "IGNORED_JOBS": "", "FORCE_ALERT": "false",
+            })
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(values["has_failures"], "true")
+            failed = (root / "env").read_text().split("FAILED_JOBS<<EOF\n", 1)[1].rsplit("\nEOF\n", 1)[0]
+        payload = steps[1]["with"]["payload"]
+        payload = payload.replace("${{ toJSON(env.FAILED_JOBS) }}", json.dumps(failed))
+        payload = payload.replace("${{ env.FAILED_JOBS }}", failed)
+        parsed = yaml.safe_load(payload)
+        self.assertEqual(parsed["blocks"][2]["text"]["text"], "\n".join(f":failed: {name}" for name in names))
+
     def test_preflight_rejects_forks_and_non_main_refs(self):
         script = workflow("nightly-ci.yml")["jobs"]["preflight"]["steps"][0]["run"]
         for repository, ref, expected in [
