@@ -1,0 +1,118 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+name: ModelExpress RL Vime GPU CI
+
+on:
+  workflow_call:
+    inputs:
+      gpu_limit:
+        type: string
+        required: true
+      gpu_slot:
+        type: string
+        required: true
+    secrets:
+      NGC_API_KEY:
+        required: true
+      HF_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  KUBECONFIG: /teleport/kubeconfig.yaml
+  KUBE_CONTEXT: ${{ vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02' }}
+  NAMESPACE: mx-ci-bench-${{ github.run_id }}-${{ github.run_attempt }}
+  RESULTS_DIR: ${{ github.workspace }}/bench-results
+
+jobs:
+  vime:
+    concurrency:
+      group: ${{ format('modelexpress-rl-gpu-{0}-slot-{1}', 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', inputs.gpu_slot) }}
+      queue: max
+      cancel-in-progress: false
+    name: RL Vime delta-refit smoke
+    runs-on: prod-deploy-tester-v1
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      MX_CI_GPU_CONCURRENCY: ${{ inputs.gpu_limit }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', inputs.gpu_slot) }}
+      KUBE_CONTEXT: nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
+      NAMESPACE: mx-ci-h100-vime-${{ github.run_id }}-${{ github.run_attempt }}
+      WORKER_IMAGE: nvcr.io/0980761089281446/vime-dynamo-mx-worker:${{ github.sha }}
+      TRAINER_IMAGE: nvcr.io/0980761089281446/vime-dynamo-mx-trainer:${{ github.sha }}
+      MODEL_SUBPATH: Qwen/Qwen3-0.6B
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Wait for previous RL GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup rl
+
+      - name: Prepare direct H100 workload
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          kc=(kubectl --kubeconfig=/teleport/kubeconfig.yaml --context="$KUBE_CONTEXT")
+          k=("${kc[@]}" --namespace="$NAMESPACE")
+          "${kc[@]}" config get-contexts "$KUBE_CONTEXT" -o name | grep -qx "$KUBE_CONTEXT"
+          "${kc[@]}" create namespace "$NAMESPACE" --dry-run=client -o yaml \
+            | "${kc[@]}" label --local -f - \
+                ci.modelexpress.nvidia.com/run-id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+                ci.modelexpress.nvidia.com/gpu-lane="$MX_CI_GPU_LANE" \
+                -o yaml \
+            | "${kc[@]}" create -f -
+          "${k[@]}" create quota vime-delta-refit-gpu-budget \
+            --hard=requests.nvidia.com/gpu=3,limits.nvidia.com/gpu=3
+          "${k[@]}" create secret docker-registry nvcr-imagepullsecret \
+            --docker-server=nvcr.io \
+            --docker-username="\$oauthtoken" \
+            --docker-password="$NGC_API_KEY"
+          "${k[@]}" create secret generic mx-s3-creds \
+            --from-literal=AWS_ACCESS_KEY_ID=delta-refit \
+            --from-literal=AWS_SECRET_ACCESS_KEY=delta-refit-smoke
+          "${k[@]}" create secret generic hf-token-secret \
+            --from-literal=HF_TOKEN="$HF_TOKEN"
+          "${k[@]}" wait --for=create persistentvolumeclaim/shared-model-cache --timeout=2m
+          "${k[@]}" wait --for=jsonpath='{.status.phase}'=Bound \
+            persistentvolumeclaim/shared-model-cache --timeout=5m
+          sed "s|WORKER_IMAGE|$WORKER_IMAGE|g" ci/rl/model-download.yaml \
+            | "${k[@]}" create -f -
+          "${k[@]}" wait --for=condition=complete \
+            job/vime-delta-refit-model-download --timeout=20m
+
+      - name: Run Kubernetes Vime delta-refit smoke
+        run: ci/rl/smoke_vime_delta_refit.sh
+
+      - name: Dump direct H100 diagnostics
+        if: failure()
+        run: |
+          k=(kubectl --kubeconfig=/teleport/kubeconfig.yaml \
+            --context="$KUBE_CONTEXT" --namespace="$NAMESPACE")
+          "${k[@]}" get pods,jobs,deployments,services,dynamographdeployments -o wide || true
+          "${k[@]}" describe dynamographdeployment/vime-delta-refit || true
+          "${k[@]}" get events --sort-by='.lastTimestamp' || true
+          for pod in $("${k[@]}" get pods -o name 2>/dev/null); do
+            "${k[@]}" describe "$pod" | tail -60 || true
+            "${k[@]}" logs "$pod" --all-containers --tail=200 || true
+          done
+
+      - name: Reap direct H100 workload
+        if: always()
+        run: |
+          kc=(kubectl --kubeconfig=/teleport/kubeconfig.yaml --context="$KUBE_CONTEXT")
+          owner=$("${kc[@]}" get namespace "$NAMESPACE" --ignore-not-found \
+            -o go-template='{{ index .metadata.labels "ci.modelexpress.nvidia.com/run-id" }}')
+          if [ "$owner" = "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ]; then
+            "${kc[@]}" delete namespace "$NAMESPACE" --wait=true --timeout=180s
+          fi
