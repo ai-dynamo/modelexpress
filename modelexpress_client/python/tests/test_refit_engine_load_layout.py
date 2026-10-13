@@ -11,8 +11,8 @@ from torch import nn
 from tests.test_refit_vllm_installer import _install_fake_vllm
 
 
-@pytest.fixture
-def capture_installer(monkeypatch) -> tuple:
+@pytest.fixture(params=[False, True], ids=["unquantized", "quantized"])
+def capture_installer(monkeypatch, request) -> tuple:
     _install_fake_vllm(monkeypatch, lambda model: None)
     layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
     layerwise._get_original_loader = lambda parameter: None
@@ -37,7 +37,9 @@ def capture_installer(monkeypatch) -> tuple:
     model = Model()
     installer = module._VllmInstaller(
         model=model,
-        vllm_config=object(),
+        vllm_config=SimpleNamespace(
+            quant_config=object() if request.param else None
+        ),
         model_config=object(),
         device=torch.device("cpu"),
     )

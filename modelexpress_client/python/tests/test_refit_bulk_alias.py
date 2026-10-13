@@ -196,35 +196,8 @@ def test_alias_validation_accepts_mixins_and_observes_custom_dictionary():
         installer._validate_alias_owners(aliases)
 
 
-def test_alias_signature_observes_mro_changes_during_iteration():
-    class Base(torch.nn.Module):
-        pass
-
-    class Alternative(torch.nn.Module):
-        pass
-
-    class Owner(Base):
-        pass
-
-    owner = Owner()
-    before = tuple(map(id, Owner.__mro__))
-
-    class ChangingGroup:
-        def __len__(self):
-            return 2
-
-        def __iter__(self):
-            yield ("first", owner, "weight")
-            Owner.__bases__ = (Alternative,)
-            yield ("second", owner, "weight")
-
-    structure = api._alias_structure([ChangingGroup()])
-    assert structure[0][0][-1] == before
-    assert structure[0][1][-1] == tuple(map(id, Owner.__mro__)) != before
-
-
 @pytest.mark.parametrize("custom", ["hash", "equality", "neither"])
-def test_owner_signatures_preserve_custom_hashing_fallback(monkeypatch, custom):
+def test_owner_views_preserve_ties_with_custom_hashing(custom):
     class Owner(torch.nn.Linear):
         pass
 
@@ -238,13 +211,17 @@ def test_owner_signatures_preserve_custom_hashing_fallback(monkeypatch, custom):
     model.other = model.other_alias = Owner(2, 2)
     model.other.weight = model.branch.weight
     aliases = api._VllmInstaller._parameter_aliases(model)
-    assert api._ordinary_owner_hashes(aliases.writers) is (custom == "neither")
-    actual = aliases.by_owner
-    monkeypatch.setattr(api, "_ordinary_owner_hashes", lambda writers: False)
-    expected = api._VllmInstaller._parameter_aliases(model).by_owner
-    assert list(actual) == list(expected)
-    for owner in actual:
-        assert actual[owner] == expected[owner]
+    views = aliases.by_owner
+    assert set(views) == {model.branch, model.other}
+    assert aliases.by_owner is views
+    replacement = torch.nn.Parameter(torch.ones(2, 2))
+    model.branch.weight = replacement
+    installer = api._VllmInstaller(
+        model=model, vllm_config=object(), model_config=object(),
+        device=torch.device("cpu"),
+    )
+    installer._restore_parameter_aliases(views[model.other])
+    assert model.other.weight is model.branch.weight is replacement
 
 
 def _reordered_alias_fixture(*, tie_weight=False):

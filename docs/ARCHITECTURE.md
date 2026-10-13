@@ -1767,7 +1767,8 @@ layout, including buffer geometry and integer routing state. Compatible changes 
 recapture. Trainer rank, source address and shard-placement changes alone do not
 invalidate capture. The cached generation advances only after successful
 validation or recapture; a failed recapture leaves no valid cache entry for the
-attempted generation. Quantized captures retain the existing support guard.
+attempted generation. Quantized and unquantized captures follow the same cache
+policy; the quantized-streaming restriction remains separate.
 Converter and engine loading semantics are fixed for the runtime lifetime;
 changing either requires recreating the whole runtime, including transfer caches.
 This adds no validation in source resolution.
@@ -1812,8 +1813,9 @@ current sessions and addresses without rebuilding geometry.
 
 The replay plan records alias groups and owning modules during capture. Each
 update validates the live owners, load-time inputs and graph-bound storage.
-Per-owner alias views reconnect complete ties during materialization and native
-post-load processing. Finalization validates all captured module paths and
+Per-owner alias views are built once directly from captured tie groups, without
+separate structure-signature caches. They reconnect complete ties during
+materialization and native post-load processing. Finalization validates all captured module paths and
 restores runtime aliases. Changed capture compatibility invalidates the engine
 bindings and replay schedule together; no validation verdict is reused across
 updates. Custom attribute access, setters and parameter-registration hooks retain
