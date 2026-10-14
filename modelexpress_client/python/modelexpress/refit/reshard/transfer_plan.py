@@ -5,25 +5,26 @@
 
 Ties the pieces together: take a ``CaptureResult`` and the published source
 shards, run ``plan_pull`` per captured copy, and collect the byte segments into a
-``TransferPlan``. Any source whose slice can't be expressed as a box
+``LogicalTransferPlan``. Any source whose slice can't be expressed as a box
 (``UnsupportedReshard``), or that has no published shards, or that capture
 already flagged, is recorded in ``fallback`` as unsupported. The current
 receiver rejects such plans before transfer. Descriptor-heavy but otherwise
 supported strided copies use a separate bounded full-source staging path.
 
-``execute_transfer`` turns the planned segments into absolute-address
-``ReadDescriptor``s (destination param ``data_ptr()`` resolved at refit time)
-and hands them to a ``Transport``.
+``bind_transfer`` resolves source and destination buffers into a separate
+``PhysicalTransferPlan``. ``execute_transfer`` submits its exact phase; receivers
+also use its full-pull and conversion phases.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from modelexpress import envs
 from modelexpress.refit.reshard.slice_plan import (
-    PullSegment,
+    LogicalRead,
+    SourceBuffer,
     _row_major_strides,
     plan_pull,
 )
@@ -46,7 +47,7 @@ class SourceInfo:
     shards: list  # list[Shard]
 
 
-@dataclass
+@dataclass(frozen=True)
 class ConvertSource:
     """A source whose SERVED dtype (``src_dtype``) differs from its dest param's
     dtype (e.g. a bf16-served router for an fp32 dest). The geometry is fine - only
@@ -58,10 +59,10 @@ class ConvertSource:
     param_name: str
     dest_shape: tuple
     src_dtype: Any  # served/wire dtype -> the staging buffer's dtype
-    segments: list  # list[PullSegment], into the staging buffer
+    segments: tuple
 
 
-@dataclass
+@dataclass(frozen=True)
 class FullPullSource:
     """Descriptor-heavy source reconstructed once in contiguous staging.
 
@@ -73,12 +74,12 @@ class FullPullSource:
     global_shape: tuple
     dtype: Any
     elsize: int
-    segments: list
-    copies: list
+    segments: tuple
+    copies: tuple
 
 
-@dataclass
-class TransferPlan:
+@dataclass(frozen=True)
+class LogicalTransferPlan:
     """Planned pull: ``segments`` are byte runs READ straight into live params;
     ``converts`` are dtype-mismatched sources to pull into staging then cast;
     ``full_pulls`` bound descriptor-heavy copies through contiguous source
@@ -86,13 +87,15 @@ class TransferPlan:
     sources that cannot be updated. The current receiver fails closed when it is
     non-empty."""
 
-    segments: list = field(default_factory=list)
-    fallback: list = field(default_factory=list)
-    converts: list = field(default_factory=list)  # list[ConvertSource]
-    full_pulls: list = field(default_factory=list)  # list[FullPullSource]
-    unbounded_sources: list = field(default_factory=list)
+    source_buffers: tuple[SourceBuffer, ...] = ()
+    segments: tuple = ()
+    fallback: tuple = ()
+    converts: tuple = ()
+    full_pulls: tuple = ()
+    unbounded_sources: tuple = ()
     exact_descriptor_count: int = 0
     exact_bytes: int = 0
+    verify_full_sources: bool = False
 
     def _all_segments(self):
         """Every planned segment, wherever it lands.
@@ -113,17 +116,6 @@ class TransferPlan:
     def descriptor_count(self) -> int:
         return sum(1 for _ in self._all_segments())
 
-    def sessions(self) -> set:
-        """The transport sessions this plan actually reads from.
-
-        A receiver needs every trainer's shard table to build the plan, because it
-        cannot know which trainers hold the bytes it is missing until the slice
-        arithmetic is done. It does not need to *read* from all of them: with
-        enough ranks on both sides, each receiver ends up pulling from a fraction
-        of the trainers. This is that fraction.
-        """
-        return {segment.session for segment in self._all_segments()}
-
     def descriptor_savings(self) -> int:
         return max(0, self.exact_descriptor_count - self.descriptor_count())
 
@@ -131,7 +123,9 @@ class TransferPlan:
         return max(0, self.bytes_planned() - self.exact_bytes)
 
 
-def _full_pull_segments(src_name: str, source: SourceInfo) -> list:
+def _full_pull_segments(
+    src_name: str, source: SourceInfo, buffer_indices: tuple[int, ...]
+) -> tuple[LogicalRead, ...]:
     """Reconstruct a complete dim-0-sharded tensor in contiguous staging.
 
     Layouts that are not a gap-free dim-0 partition are rejected so the caller
@@ -144,10 +138,13 @@ def _full_pull_segments(src_name: str, source: SourceInfo) -> list:
     for extent in source.global_shape[1:]:
         trailing *= int(extent)
 
-    ordered = sorted(source.shards, key=lambda shard: int(shard.shard_offset[0]))
+    ordered = sorted(
+        zip(buffer_indices, source.shards, strict=True),
+        key=lambda item: int(item[1].shard_offset[0]),
+    )
     segments = []
     next_row = 0
-    for shard in ordered:
+    for buffer_index, shard in ordered:
         if len(shard.shape) != len(source.global_shape) or len(
             shard.shard_offset
         ) != len(source.global_shape):
@@ -171,9 +168,9 @@ def _full_pull_segments(src_name: str, source: SourceInfo) -> list:
             )
         elements = rows * trailing
         segments.append(
-            PullSegment(
-                session=shard.session,
-                src_addr=shard.addr,
+            LogicalRead(
+                source_buffer=buffer_index,
+                src_byte=0,
                 param_name=src_name,
                 dst_byte=start * trailing * source.elsize,
                 nbytes=elements * source.elsize,
@@ -186,7 +183,62 @@ def _full_pull_segments(src_name: str, source: SourceInfo) -> list:
             f"{src_name}: dim-0 shards cover {next_row} of "
             f"{source.global_shape[0]} rows"
         )
-    return segments
+    return tuple(segments)
+
+
+def _plan_verified_transfer(
+    capture, sources, source_buffers, source_indices, max_segments_per_copy
+) -> LogicalTransferPlan:
+    """Reconstruct sources without an identity copy for whole-shard checksums."""
+    copies_by_source = {}
+    for copy in capture.copies:
+        copies_by_source.setdefault(copy.src_name, []).append(copy)
+    segments, converts, full_pulls, unbounded_sources = [], [], [], []
+    fallback = list(dict.fromkeys(capture.unsupported))
+    exact_count = exact_bytes = 0
+    for name, source in sources.items():
+        copies = copies_by_source.pop(name, [])
+        if not copies:
+            continue
+        if any(
+            not copy.op_chain and tuple(copy.dest_shape) == tuple(source.global_shape)
+            for copy in copies
+        ):
+            part = _plan_transfer(
+                CaptureResult(copies=copies), {name: source},
+                source_buffers, source_indices,
+                max_segments_per_copy=max_segments_per_copy,
+            )
+            segments.extend(part.segments)
+            converts.extend(part.converts)
+            full_pulls.extend(part.full_pulls)
+            unbounded_sources.extend(part.unbounded_sources)
+            fallback.extend(item for item in part.fallback if item not in fallback)
+            exact_count += part.exact_descriptor_count
+            exact_bytes += part.exact_bytes
+            continue
+        identity = RecordedCopy(
+            name, (), name, 0, tuple(source.global_shape),
+            tuple(_row_major_strides(source.global_shape)), source.dtype,
+        )
+        reads = plan_pull(
+            identity, source.global_shape, source.dtype, source.elsize,
+            source.shards, buffer_indices=source_indices[name],
+        )
+        full_pulls.append(FullPullSource(
+            name, tuple(source.global_shape), source.dtype, source.elsize,
+            reads, tuple(copies),
+        ))
+        exact_count += len(reads)
+        exact_bytes += sum(read.nbytes for read in reads)
+    fallback.extend(name for name in copies_by_source if name not in fallback)
+    return LogicalTransferPlan(
+        source_buffers=source_buffers, segments=tuple(segments),
+        fallback=tuple(fallback), converts=tuple(converts),
+        full_pulls=tuple(full_pulls), unbounded_sources=tuple(unbounded_sources),
+        exact_descriptor_count=exact_count, exact_bytes=exact_bytes,
+        verify_full_sources=True,
+    )
 
 
 def plan_transfer(
@@ -194,23 +246,88 @@ def plan_transfer(
     sources: dict,
     *,
     max_segments_per_copy: int | None = None,
-) -> TransferPlan:
-    """Build a ``TransferPlan`` from captured copies + published ``sources``
+    source_slots: dict[str, str] | None = None,
+    verify_full_sources: bool = False,
+) -> LogicalTransferPlan:
+    """Build a ``LogicalTransferPlan`` from captured copies + published ``sources``
     (``{src_name: SourceInfo}``). Sources flagged unsupported at capture, missing
-    from ``sources``, or non-box at ``plan_pull`` are marked unsupported."""
-    plan = TransferPlan()
-    fallback_seen: set = set()
-    exact_by_source: dict[str, list[tuple[RecordedCopy, list]]] = {}
-    full_pull_names: set[str] = set()
+    from ``sources``, or non-box at ``plan_pull`` are marked unsupported.
+
+    ``source_slots`` maps transport sessions to logical source slots; omission
+    uses session identity. ``verify_full_sources`` reconstructs sources lacking
+    an identity copy so receivers can verify whole-shard checksums.
+    """
+    source_buffers = []
+    source_indices = {}
+    needed_names = dict.fromkeys(copy.src_name for copy in capture.copies)
+    for name in needed_names:
+        source = sources.get(name)
+        if source is None:
+            continue
+        indices = []
+        for shard in source.shards:
+            indices.append(len(source_buffers))
+            source_buffers.append(SourceBuffer(
+                shard.session if source_slots is None else source_slots[shard.session],
+                name, tuple(shard.shard_offset), tuple(shard.shape),
+            ))
+        source_indices[name] = tuple(indices)
+    source_buffers = tuple(source_buffers)
+    return _plan_transfer(
+        capture, sources, source_buffers, source_indices,
+        max_segments_per_copy=max_segments_per_copy,
+        verify_full_sources=verify_full_sources,
+    )
+
+
+def plan_transfer_groups(
+    captures, sources: dict, complete_plan: LogicalTransferPlan, *,
+    max_segments_per_copy: int | None = None,
+):
+    """Plan subsets of the complete capture using the same source geometry.
+
+    The source-buffer table and one shared index map stay inside the planner.
+    Full-source verification follows the complete plan.
+    """
+    source_indices = {}
+    for index, buffer in enumerate(complete_plan.source_buffers):
+        source_indices.setdefault(buffer.src_name, []).append(index)
+    source_indices = {name: tuple(indices) for name, indices in source_indices.items()}
+    for capture in captures:
+        yield _plan_transfer(
+            capture, sources, complete_plan.source_buffers, source_indices,
+            max_segments_per_copy=max_segments_per_copy,
+            verify_full_sources=complete_plan.verify_full_sources,
+        )
+
+
+def _plan_transfer(
+    capture, sources, source_buffers, source_indices, *,
+    max_segments_per_copy=None, verify_full_sources=False,
+) -> LogicalTransferPlan:
     if max_segments_per_copy is None:
         max_segments_per_copy = envs.MX_RESHARD_MAX_SEGMENTS_PER_COPY
     if max_segments_per_copy < 1:
         raise ValueError("max_segments_per_copy must be at least 1")
+    if verify_full_sources:
+        return _plan_verified_transfer(
+            capture, sources, source_buffers, source_indices, max_segments_per_copy
+        )
+    exact_segments = []
+    fallback = []
+    converts = []
+    full_pulls = []
+    unbounded_sources = []
+    exact_descriptor_count = 0
+    exact_bytes = 0
+    fallback_seen: set = set()
+    exact_by_source: dict[str, list[tuple[RecordedCopy, list]]] = {}
+    full_pull_names: set[str] = set()
 
     def mark_fallback(name: str) -> None:
         if name not in fallback_seen:
             fallback_seen.add(name)
-            plan.fallback.append(name)
+            fallback.append(name)
 
     # Sources whose loader used an unsupported op never made it into copies.
     for name in capture.unsupported:
@@ -234,19 +351,20 @@ def plan_transfer(
                 param_name=copy.param_name,
                 dest_offset=0,
                 dest_shape=copy.dest_shape,
-                dest_stride=_row_major_strides(copy.dest_shape),
+                dest_stride=tuple(_row_major_strides(copy.dest_shape)),
                 dest_dtype=src.dtype,
             )
             try:
                 segments = plan_pull(
-                    staging_copy, src.global_shape, src.dtype, src.elsize, src.shards
+                    staging_copy, src.global_shape, src.dtype, src.elsize, src.shards,
+                    buffer_indices=source_indices[copy.src_name],
                 )
             except UnsupportedReshard:
                 mark_fallback(copy.src_name)
                 continue
-            plan.exact_descriptor_count += len(segments)
-            plan.exact_bytes += sum(segment.nbytes for segment in segments)
-            plan.converts.append(
+            exact_descriptor_count += len(segments)
+            exact_bytes += sum(segment.nbytes for segment in segments)
+            converts.append(
                 ConvertSource(
                     copy.param_name, tuple(copy.dest_shape), src.dtype, segments
                 )
@@ -255,13 +373,14 @@ def plan_transfer(
 
         try:
             segments = plan_pull(
-                copy, src.global_shape, src.dtype, src.elsize, src.shards
+                copy, src.global_shape, src.dtype, src.elsize, src.shards,
+                buffer_indices=source_indices[copy.src_name],
             )
         except UnsupportedReshard:
             mark_fallback(copy.src_name)
             continue
-        plan.exact_descriptor_count += len(segments)
-        plan.exact_bytes += sum(segment.nbytes for segment in segments)
+        exact_descriptor_count += len(segments)
+        exact_bytes += sum(segment.nbytes for segment in segments)
         exact_by_source.setdefault(copy.src_name, []).append((copy, segments))
         if len(segments) > max_segments_per_copy:
             full_pull_names.add(copy.src_name)
@@ -269,70 +388,101 @@ def plan_transfer(
     for src_name, entries in exact_by_source.items():
         if src_name not in full_pull_names:
             for _copy, segments in entries:
-                plan.segments.extend(segments)
+                exact_segments.extend(segments)
             continue
 
         source = sources[src_name]
         try:
-            full_segments = _full_pull_segments(src_name, source)
+            full_segments = _full_pull_segments(src_name, source, source_indices[src_name])
         except UnsupportedReshard:
             # Descriptor bounding is an optimization. Preserve the known-correct
             # exact plan when this source cannot be reconstructed contiguously.
-            plan.unbounded_sources.append(src_name)
+            unbounded_sources.append(src_name)
             for _copy, segments in entries:
-                plan.segments.extend(segments)
+                exact_segments.extend(segments)
             continue
 
-        plan.full_pulls.append(
+        full_pulls.append(
             FullPullSource(
                 src_name=src_name,
                 global_shape=tuple(source.global_shape),
                 dtype=source.dtype,
                 elsize=source.elsize,
                 segments=full_segments,
-                copies=[copy for copy, _segments in entries],
+                copies=tuple(copy for copy, _segments in entries),
             )
         )
 
-    return plan
+    return LogicalTransferPlan(
+        source_buffers=tuple(source_buffers), segments=tuple(exact_segments),
+        fallback=tuple(fallback), converts=tuple(converts), full_pulls=tuple(full_pulls),
+        unbounded_sources=tuple(unbounded_sources),
+        exact_descriptor_count=exact_descriptor_count, exact_bytes=exact_bytes,
+    )
 
 
-def exact_descriptors(
-    plan: TransferPlan,
-    resolve_param_ptr: Callable[[str], int],
-) -> list[ReadDescriptor]:
-    """Absolute-address ``ReadDescriptor``s for the exact-segment phase.
+@dataclass(frozen=True)
+class PhysicalTransferPlan:
+    """An execution binding; its addresses and sessions never enter geometry."""
 
-    Split out from :func:`execute_transfer` so a caller that issues the exact,
-    full-pull and convert phases as one batch can build the descriptors without
-    also performing the read.
-    """
-    return [
-        ReadDescriptor(
-            session=seg.session,
-            src_addr=seg.src_addr,
-            dst_addr=resolve_param_ptr(seg.param_name) + seg.dst_byte,
-            nbytes=seg.nbytes,
+    segments: tuple[ReadDescriptor, ...]
+    full_pulls: tuple[tuple[ReadDescriptor, ...], ...]
+    converts: tuple[tuple[ReadDescriptor, ...], ...]
+    fallback: tuple
+
+    @property
+    def descriptors(self) -> tuple[ReadDescriptor, ...]:
+        return self.segments + tuple(
+            read for phase in (*self.full_pulls, *self.converts) for read in phase
         )
-        for seg in plan.segments
-    ]
 
 
-def execute_transfer(
-    plan: TransferPlan,
-    resolve_param_ptr: Callable[[str], int],
-    transport: Transport,
-) -> dict:
-    """Resolve each planned segment's destination param name to a live
-    ``data_ptr()`` (via ``resolve_param_ptr``), form absolute-address
-    ``ReadDescriptor``s, and execute them on ``transport``.
+def bind_transfer(
+    plan: LogicalTransferPlan,
+    resolve_source: Callable[[SourceBuffer], tuple[str, int]],
+    resolve_destination: Callable[[str, str], int],
+) -> PhysicalTransferPlan:
+    """Resolve each used source buffer and destination once for this execution.
 
-    Returns a small stats dict; ``fallback`` is passed through so the receiver
-    can reject an unsupported plan."""
-    descriptors = exact_descriptors(plan, resolve_param_ptr)
-    transport.read(descriptors)
+    ``resolve_source(buffer)`` returns ``(session, base_address)``.
+    ``resolve_destination(kind, name)`` returns the destination base address;
+    ``kind`` is ``recv``, ``full`` or ``convert``.
+    """
+    sources = {}
+    destinations = {"recv": {}, "full": {}, "convert": {}}
+
+    def bind(reads, kind):
+        result = []
+        targets = destinations[kind]
+        for read in reads:
+            index = read.source_buffer
+            if index < 0 or index >= len(plan.source_buffers):
+                raise ValueError(f"source buffer index out of range: {index}")
+            if index not in sources:
+                sources[index] = resolve_source(plan.source_buffers[index])
+            session, address = sources[index]
+            target = read.param_name
+            if target not in targets:
+                targets[target] = resolve_destination(kind, target)
+            result.append(ReadDescriptor(
+                session=session, src_addr=address + read.src_byte,
+                dst_addr=targets[target] + read.dst_byte, nbytes=read.nbytes,
+            ))
+        return tuple(result)
+
+    return PhysicalTransferPlan(
+        bind(plan.segments, "recv"),
+        tuple(bind(p.segments, "full") for p in plan.full_pulls),
+        tuple(bind(p.segments, "convert") for p in plan.converts),
+        plan.fallback,
+    )
+
+
+def execute_transfer(plan: PhysicalTransferPlan, transport: Transport) -> dict:
+    """Execute the exact phase of a bound plan."""
+    transport.read(list(plan.segments))
     return {
-        "segments": len(descriptors),
-        "bytes": sum(d.nbytes for d in descriptors),
+        "segments": len(plan.segments),
+        "bytes": sum(d.nbytes for d in plan.segments),
         "fallback": list(plan.fallback),
     }

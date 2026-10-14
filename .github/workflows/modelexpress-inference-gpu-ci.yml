@@ -1,0 +1,823 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: ModelExpress Inference GPU CI
+
+on:
+  workflow_call:
+
+env:
+  MX_CI_MODEL: Qwen/Qwen2.5-0.5B
+  VCLUSTER_NAME: mx-ci-cluster
+  VCLUSTER_NAMESPACE: mx-ci
+  MX_IMAGE_REPO: nvcr.io/0980761089281446
+
+jobs:
+  admission-slots:
+    runs-on: ubuntu-latest
+    outputs:
+      slots: ${{ steps.slots.outputs.slots }}
+      count: ${{ steps.slots.outputs.count }}
+      a100b_slots: ${{ steps.slots.outputs.a100b_slots }}
+      a100b_count: ${{ steps.slots.outputs.a100b_count }}
+    steps:
+      - id: slots
+        env:
+          MX_CI_GPU_CONCURRENCY: ${{ vars.MX_CI_GPU_CONCURRENCY || '8' }}
+          MX_CI_A100B_CONCURRENCY: ${{ vars.MX_CI_A100B_CONCURRENCY || '4' }}
+        run: |
+          python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
+          import json, os
+          count = int(os.environ["MX_CI_GPU_CONCURRENCY"])
+          if not 1 <= count <= 16:
+              raise SystemExit("MX_CI_GPU_CONCURRENCY must be between 1 and 16")
+          a100b_count = int(os.environ["MX_CI_A100B_CONCURRENCY"])
+          if not 1 <= a100b_count <= 4:
+              raise SystemExit("MX_CI_A100B_CONCURRENCY must be between 1 and 4")
+          a100b_count = min(count, a100b_count)
+          seed = int(os.environ["GITHUB_REF"].rsplit("/", 1)[1])
+          print(f"count={count}")
+          print("slots=" + json.dumps([(seed + i) % count for i in range(16)]))
+          print(f"a100b_count={a100b_count}")
+          print("a100b_slots=" + json.dumps([(seed + i) % a100b_count for i in range(4)]))
+          PYTHON
+
+  test-p2p:
+    needs: admission-slots
+    concurrency:
+      group: ${{ format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      queue: max
+      cancel-in-progress: false
+    name: P2P test (${{ matrix.label || matrix.framework }})
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 120
+    env:
+      MX_CI_GPU_POOL: a100a
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      # Bound matrix dispatch; the shared pool concurrency group
+      # controls which queued workload can allocate GPUs.
+      max-parallel: 8
+      matrix:
+        include:
+          - framework: vllm
+            gpu_slot: 0
+            namespace: mx-ci-vllm-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8001"
+            worker_port: "8002"
+            expected_artifact_sources: "1"
+            expected_artifact_source_types: "torch_compile_cache"
+          - framework: vllm
+            gpu_slot: 1
+            label: vllm MTP
+            namespace: mx-ci-vllm-mtp-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/vllm/manifest-azure-mtp.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            pytest_args: "--expect-mtp"
+            model: Qwen/Qwen3.5-0.8B
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8031"
+            worker_port: "8032"
+          - framework: sglang
+            gpu_slot: 2
+            namespace: mx-ci-sglang-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/sgl/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8005"
+            worker_port: "8006"
+            expected_artifact_sources: "1"
+          # Same SGLang P2P test as above, but over the Mooncake TransferEngine
+          # transport instead of NIXL. The ModelExpress package loader uses the
+          # same remote_instance command on source and target; the first replica
+          # publishes a TransferEngine session and later replicas pull from it.
+          # The per-rank NIXL agent assertion is skipped via --transport.
+          - framework: sglang-mooncake
+            gpu_slot: 3
+            namespace: mx-ci-sglang-mooncake-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/sgl/manifest-azure-mooncake.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            pytest_args: "--p2p-marker 'SGLang MxModelLoader transfer_engine COMPLETE' --transport transfer_engine"
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8007"
+            worker_port: "8008"
+          # Full tensor-manifest publish path (MX_P2P_METADATA=0): the source
+          # embeds the full tensor manifest in the WorkerMetadata proto it
+          # publishes, instead of serving it on-demand. The mixed-version entry
+          # (client @ this commit vs the last released server) is a proto
+          # backward-compatibility guard — it catches client-side proto changes
+          # that break older servers (e.g. dropping the legacy `tensors`
+          # field). same-version only guards the path against future same-build
+          # breaks.
+          - framework: vllm
+            gpu_slot: 4
+            label: vllm full-manifest same-version
+            namespace: mx-ci-full-manifest-same-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8021"
+            worker_port: "8022"
+            mx_p2p_metadata: "0"
+          - framework: vllm
+            gpu_slot: 5
+            label: vllm full-manifest mixed-version
+            namespace: mx-ci-full-manifest-mixed-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8023"
+            worker_port: "8024"
+            mx_p2p_metadata: "0"
+            # TODO: resolve this dynamically to the latest released
+            # modelexpress-server tag instead of hardcoding, so the guard
+            # tracks "newest client vs latest released server" without a
+            # manual bump each release.
+            server_image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.4.0
+          # Redis backend variants of the full-manifest path: same
+          # MX_P2P_METADATA=0 embedded-metadata publish, but with a Redis
+          # metadata store instead of the default Kubernetes CRD backend. The
+          # source-readiness gate queries mx-server's ListSources (backend-
+          # agnostic), so it works even though Redis publishes no ModelMetadata
+          # CRs.
+          - framework: vllm
+            gpu_slot: 6
+            label: vllm full-manifest redis same-version
+            namespace: mx-ci-full-manifest-redis-same-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8025"
+            worker_port: "8026"
+            mx_p2p_metadata: "0"
+            server_manifest: ci/k8s/server/mx-server-redis.yaml
+          - framework: vllm
+            gpu_slot: 7
+            label: vllm full-manifest redis mixed-version
+            namespace: mx-ci-full-manifest-redis-mixed-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8027"
+            worker_port: "8028"
+            mx_p2p_metadata: "0"
+            server_manifest: ci/k8s/server/mx-server-redis.yaml
+            server_image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.4.0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
+
+      - name: Run P2P RDMA transfer test
+        uses: ./.github/actions/run-mx-p2p-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          # Defaults to this commit's server; matrix.server_image overrides it
+          # (e.g. the mixed-version embedded-metadata entry pins a released tag).
+          server_image: ${{ matrix.server_image || format('{0}/mx-server:{1}', env.MX_IMAGE_REPO, github.sha) }}
+          manifest: ${{ matrix.manifest }}
+          test_script: ${{ matrix.test_script }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ matrix.model || env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          server_manifest: ${{ matrix.server_manifest || 'ci/k8s/server/mx-server.yaml' }}
+          mx_p2p_metadata: ${{ matrix.mx_p2p_metadata || '1' }}
+          source_extra_env: ${{ matrix.source_extra_env }}
+          extra_env: ${{ matrix.extra_env }}
+          source_port: ${{ matrix.source_port }}
+          worker_port: ${{ matrix.worker_port }}
+          pytest_args: ${{ matrix.pytest_args }}
+          expected_artifact_sources: ${{ matrix.expected_artifact_sources || '0' }}
+          expected_artifact_source_types: ${{ matrix.expected_artifact_source_types || '' }}
+
+      - name: Dump vCluster diagnostics on failure
+        # Captures vCluster control-plane state at the moment of failure
+        # (pod status, recent events, syncer logs, controller-identity
+        # overlay) — surfaces infra-side disruption that may be the real
+        # cause rather than the test itself.
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        # connect-vcluster backgrounds a `kubectl port-forward` and exports
+        # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
+        # the next job on this self-hosted runner doesn't inherit an orphan.
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+
+  test-p2p-mla-model:
+    needs: admission-slots
+    concurrency:
+      group: ${{ format('modelexpress-gpu-a100b-slot-{0}', fromJSON(needs.admission-slots.outputs.a100b_slots)[matrix.gpu_slot]) }}
+      queue: max
+      cancel-in-progress: false
+    name: P2P MLA model test (${{ matrix.framework }} TP=2)
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 120
+    # Full-GPU pool is required because VRAM sampling is blocked on MIG slices.
+    env:
+      MX_CI_GPU_POOL: a100b
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.a100b_count }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.a100b_slots)[matrix.gpu_slot]) }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - framework: vllm
+            gpu_slot: 0
+            namespace: mx-ci-vllm-mla-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/vllm/manifest-azure-tp2.yaml
+            source_port: "8001"
+            worker_port: "8002"
+          - framework: sglang
+            gpu_slot: 1
+            namespace: mx-ci-sglang-mla-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/sgl/manifest-azure-tp2.yaml
+            source_port: "8009"
+            worker_port: "8010"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
+
+      - name: Run P2P MLA model test
+        uses: ./.github/actions/run-mx-p2p-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          manifest: ${{ matrix.manifest }}
+          test_script: ci/k8s/client/test_p2p_k8s.py
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: deepseek-ai/DeepSeek-V2-Lite
+          hf_token: ${{ secrets.HF_TOKEN }}
+          source_extra_env: "JOB_NAME=mx-source"
+          extra_env: "JOB_NAME=mx-target"
+          source_port: ${{ matrix.source_port }}
+          worker_port: ${{ matrix.worker_port }}
+          tp_size: "2"
+          pod_ready_timeout_seconds: "900"
+          measure_vram: "true"
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+
+  test-tp:
+    needs: admission-slots
+    concurrency:
+      group: ${{ format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      queue: max
+      cancel-in-progress: false
+    name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }} ${{ matrix.topology }})
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 120
+    env:
+      MX_CI_GPU_POOL: a100a
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Multi-node TP=2 (vLLM). StatefulSet + Ray topology; see the
+          # manifest header for the cross-host pod-pairing rationale.
+          - framework: vllm
+            gpu_slot: 8
+            tp_size: 2
+            topology: multi-node
+            namespace: mx-ci-vllm-multinode-tp2-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/vllm/manifest-azure-multi-node-tp2.yaml
+            source_port: "8001"
+            worker_port: "8002"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
+
+      - name: Run P2P RDMA transfer test (TP > 1)
+        uses: ./.github/actions/run-mx-p2p-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          manifest: ${{ matrix.manifest }}
+          test_script: ci/k8s/client/test_p2p_k8s.py
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          source_extra_env: "JOB_NAME=mx-source"
+          extra_env: "JOB_NAME=mx-target"
+          source_port: ${{ matrix.source_port }}
+          worker_port: ${{ matrix.worker_port }}
+          tp_size: ${{ matrix.tp_size }}
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        # connect-vcluster backgrounds a `kubectl port-forward` and exports
+        # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
+        # the next job on this self-hosted runner doesn't inherit an orphan.
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+
+  test-parallel:
+    needs: admission-slots
+    concurrency:
+      group: ${{ format('modelexpress-gpu-a100b-slot-{0}', fromJSON(needs.admission-slots.outputs.a100b_slots)[matrix.gpu_slot]) }}
+      queue: max
+      cancel-in-progress: false
+    name: P2P ${{ matrix.label }} test (vllm)
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 120
+    env:
+      MX_CI_GPU_POOL: a100b
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.a100b_count }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.a100b_slots)[matrix.gpu_slot]) }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - label: DP=2
+            gpu_slot: 2
+            namespace: mx-ci-vllm-dp2-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/vllm/manifest-azure-dp2.yaml
+            tp_size: "1"
+            dp_size: "2"
+            source_port: "8001"
+            worker_port: "8002"
+          - label: EP=2
+            gpu_slot: 3
+            namespace: mx-ci-vllm-ep2-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/vllm/manifest-azure-ep2.yaml
+            model: deepseek-ai/DeepSeek-V2-Lite
+            tp_size: "2"
+            dp_size: "1"
+            pod_ready_timeout_seconds: "3600"
+            source_port: "8003"
+            worker_port: "8004"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
+
+      - name: Run P2P RDMA transfer test (${{ matrix.label }})
+        uses: ./.github/actions/run-mx-p2p-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          manifest: ${{ matrix.manifest }}
+          test_script: ci/k8s/client/test_p2p_k8s.py
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-vllm:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          # DP uses the default dense CI model; EP overrides to an MoE model.
+          model: ${{ matrix.model || env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          source_extra_env: "JOB_NAME=mx-source"
+          extra_env: "JOB_NAME=mx-target"
+          source_port: ${{ matrix.source_port }}
+          worker_port: ${{ matrix.worker_port }}
+          tp_size: ${{ matrix.tp_size }}
+          dp_size: ${{ matrix.dp_size }}
+          # EP's MoE model is larger; give it the same headroom as the MLA job.
+          pod_ready_timeout_seconds: ${{ matrix.pod_ready_timeout_seconds || '900' }}
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        # connect-vcluster backgrounds a `kubectl port-forward` and exports
+        # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
+        # the next job on this self-hosted runner doesn't inherit an orphan.
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+
+  test-with-dynamo:
+    needs: admission-slots
+    concurrency:
+      group: ${{ format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      queue: max
+      cancel-in-progress: false
+    name: P2P test with Dynamo (${{ matrix.mode }})
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 120
+    env:
+      MX_CI_GPU_POOL: a100a
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: aggregated
+            gpu_slot: 9
+            manifest: ci/k8s/client/vllm/dynamo/manifest-azure-aggregated.yaml
+            namespace: mx-ci-dynamo-agg-${{ github.run_id }}-${{ github.run_attempt }}
+            dgd_name: mx-agg-${{ github.run_id }}-${{ github.run_attempt }}
+          - mode: disaggregated
+            gpu_slot: 10
+            manifest: ci/k8s/client/vllm/dynamo/manifest-azure-disaggregated.yaml
+            namespace: mx-ci-dynamo-disagg-${{ github.run_id }}-${{ github.run_attempt }}
+            dgd_name: mx-disagg-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
+
+      - name: Run Dynamo P2P test
+        uses: ./.github/actions/run-mx-dynamo-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          # DGD name shared with the action input AND the manifest's envsubst
+          # placeholder, so all three (kubectl patch/delete, manifest
+          # metadata.name, derived service refs) stay in sync.
+          namespace: ${{ matrix.namespace }}
+          dgd_name: ${{ matrix.dgd_name }}
+          manifest: ${{ matrix.manifest }}
+          mode: ${{ matrix.mode }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-dynamo-vllm:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # Ten-step TP2 trainer + TP1 Dynamo rollout smoke on three H100s.
+
+  test-fleet-scale:
+    needs: admission-slots
+    concurrency:
+      group: ${{ format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[11]) }}
+      queue: max
+      cancel-in-progress: false
+    name: P2P Fleet scale test (vLLM, 15 workers)
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 120
+    env:
+      MX_CI_GPU_POOL: a100a
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[11]) }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
+
+      - name: Run fleet scale test
+        uses: ./.github/actions/run-mx-fleet-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: mx-ci-fleet-${{ github.run_id }}-${{ github.run_attempt }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-vllm:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          worker_cpu_request: ${{ vars.MX_CI_FLEET_CPU || '2' }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          fleet_size: "15"
+          wave_sizes: "5 10 15"
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+
+  test-rolling-update:
+    needs: admission-slots
+    concurrency:
+      group: ${{ format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      queue: max
+      cancel-in-progress: false
+    name: P2P Rolling-update test (${{ matrix.framework }}, 5 workers)
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 120
+    env:
+      MX_CI_GPU_POOL: a100a
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+            gpu_slot: 12
+            namespace: mx-ci-rolling-vllm-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/vllm/manifest-azure-rolling-update.yaml
+          - framework: sglang
+            gpu_slot: 13
+            namespace: mx-ci-rolling-sglang-${{ github.run_id }}-${{ github.run_attempt }}
+            manifest: ci/k8s/client/sgl/manifest-azure-rolling-update.yaml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
+
+      - name: Run rolling-update test
+        uses: ./.github/actions/run-mx-fleet-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          worker_cpu_request: ${{ vars.MX_CI_FLEET_CPU || '2' }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          manifest: ${{ matrix.manifest }}
+          test_script: ci/k8s/client/test_rolling_update.py
+          fleet_size: "5"
+          wave_sizes: "5"
+          rolling_update: "true"
+          rollout_timeout_seconds: "1200"
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+
+  test-stale-metadata:
+    needs: admission-slots
+    concurrency:
+      group: ${{ format('modelexpress-gpu-a100a-slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+      queue: max
+      cancel-in-progress: false
+    name: P2P Stale metadata test (${{ matrix.framework }})
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 120
+    env:
+      MX_CI_GPU_POOL: a100a
+      MX_CI_GPU_CONCURRENCY: ${{ needs.admission-slots.outputs.count }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', fromJSON(needs.admission-slots.outputs.slots)[matrix.gpu_slot]) }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+            gpu_slot: 14
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            namespace: mx-ci-stale-vllm-${{ github.run_id }}-${{ github.run_attempt }}
+            source_port: "8011"
+          - framework: sglang
+            gpu_slot: 15
+            manifest: ci/k8s/client/sgl/manifest-azure.yaml
+            namespace: mx-ci-stale-sgl-${{ github.run_id }}-${{ github.run_attempt }}
+            source_port: "8012"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Wait for previous GPU workload cleanup
+        run: |
+          source .github/scripts/ci-kubectl.sh
+          wait_for_gpu_pool_cleanup "$MX_CI_GPU_POOL"
+
+      - name: Run stale-metadata test
+        uses: ./.github/actions/run-mx-stale-metadata-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          manifest: ${{ matrix.manifest }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          source_port: ${{ matrix.source_port }}
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
