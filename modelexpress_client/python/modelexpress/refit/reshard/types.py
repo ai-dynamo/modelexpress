@@ -95,3 +95,4 @@ class CaptureResult:
     owner_workspaces: dict = field(default_factory=dict)
     owner_dependencies: tuple = ()
     destination_layouts: dict[str, tuple[tuple, tuple]] = field(default_factory=dict)
+    generator_fingerprint: tuple | None = None

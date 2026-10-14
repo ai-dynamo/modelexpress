@@ -199,7 +199,7 @@ def _transfer_with_resolved_plan(monkeypatch, manifests: list[bytes]) -> tuple:
     resolved = trainer.resolved_metadata
     transfer._weight_update_plan = _WeightUpdatePlan(
         trainer_source_snapshot=trainer,
-        generator_capture_snapshot=CaptureResult(copies=[]),
+        layout_capture_snapshot=CaptureResult(copies=[]),
         parameter_layout=MappingProxyType({}),
         transfer_plan=LogicalTransferPlan(),
         source_binding=_SourceBinding(resolved, {}, ()),

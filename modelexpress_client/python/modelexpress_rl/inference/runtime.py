@@ -54,6 +54,7 @@ class FullTensorEngineCapability:
     # capture_layout transfers ownership of its returned capture and layout
     # to the update plan; it must not mutate them after returning.
     capture_layout: Callable
+    generator_fingerprint: Callable[[], tuple]
     runtime_tensors: dict[str, Any] | None
     source_worker_id: str | None
     unpublish_runtime_tensors: Callable[[], None]
@@ -191,10 +192,11 @@ def _create_load_time_tensor_method(
         device_id=capability.device_id,
         device=capability.device,
         listen_port=None,
+        capture_layout=capability.capture_layout,
+        generator_fingerprint=capability.generator_fingerprint,
     )
     return LoadTimeTensorNixlUpdateMethod(
         transfer=transfer,
-        capture_layout=capability.capture_layout,
     )
 
 
@@ -211,6 +213,8 @@ def _create_runtime_tensor_method(
         device_id=capability.device_id,
         device=capability.device,
         manager=capability.nixl_manager,
+        capture_layout=capability.capture_layout,
+        generator_fingerprint=capability.generator_fingerprint,
     )
     return RuntimeTensorNixlUpdateMethod(
         transfer=transfer,

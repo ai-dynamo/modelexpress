@@ -37,6 +37,7 @@ def _convert(weights):
 
 
 def _fixture(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", "1")
     model = _OverlappingModel()
     installer = _persistent_installer(monkeypatch, model)
     installer._convert_native_to_hf = _convert
