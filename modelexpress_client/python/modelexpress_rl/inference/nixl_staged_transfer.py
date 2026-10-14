@@ -267,6 +267,7 @@ def _bounded_batches(
     complete = complete_plan
     if complete is None:
         complete = plan_transfer(capture, sources, source_slots=source_slots,
+                                 max_staging_bytes=max_staging_bytes,
                                  verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST)
     metrics["bounded_whole_plan_s"] = time.perf_counter() - started
     metrics["bounded_whole_plan_builds"] = int(complete_plan is None)
@@ -803,6 +804,7 @@ class _NixlStagedTransfer:
             slots_by_agent = {agent: slot for slot, agent in binding.agents_by_slot.items()}
             plan = plan_transfer(
                 capture, trainer.resolved_metadata.sources,
+                max_staging_bytes=self._buffer_budget,
                 source_slots={
                     session: slots_by_agent[agent]
                     for session, agent in trainer.resolved_metadata.session_to_agent.items()
@@ -948,6 +950,12 @@ class _NixlStagedTransfer:
                 transfer_plan.transfer_plan
                 if isinstance(transfer_plan, _StreamingSchedule)
                 else transfer_plan
+            )
+            metrics.update(
+                exact_descriptors=plan.exact_descriptor_count,
+                planned_descriptors=plan.descriptor_count(),
+                descriptor_savings=plan.descriptor_savings(),
+                extra_wire_bytes=plan.extra_wire_bytes(),
             )
             if not reusable:
                 trainer = self._retain_needed_sources(trainer, plan)
