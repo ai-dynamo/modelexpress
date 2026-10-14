@@ -1371,6 +1371,12 @@ requires an engine restart.
 
 ### Experimental streamed full refit
 
+Streamed refit requires `runai-model-streamer>=0.17.0` for ranged window reads.
+For S3-compatible storage, configure matching `AWS_ENDPOINT_URL` and
+`AWS_DEFAULT_REGION` on every generator worker. The generator's
+`object_storage_endpoint_url` and `object_storage_region_name` configure the
+`S3Client` index read; shard reads use RunAI's separate configuration.
+
 With `MX_REFIT_FULL_STREAMING=true`, vLLM can stream a new, non-checksummed full
 HF checkpoint directly from indexed S3 shards through its existing graph-safe
 layerwise reload. Workers without a cached seed first use the canonical S3

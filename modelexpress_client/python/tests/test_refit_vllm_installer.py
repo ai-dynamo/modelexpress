@@ -2542,6 +2542,7 @@ def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
     monkeypatch.setenv("MX_MS_DISTRIBUTED", "1")
     monkeypatch.setenv("MX_REFIT_STREAM_WINDOW_LAYERS", window_layers)
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
 
     paths = []
 
@@ -2648,4 +2649,5 @@ def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(
     assert torch.equal(model.weight, torch.tensor([7.0, 8.0]))
     assert stream._writer is None
     assert stream._complete
+    assert installer._live_version == "v2"
     assert paths == ["vllm" if window_layers == "0" else "windowed"]

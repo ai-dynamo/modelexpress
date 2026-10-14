@@ -214,3 +214,46 @@ def test_windowed_weights_reject_windows_that_do_not_cover_checkpoint(monkeypatc
     with pytest.raises(ValueError, match="windows"):
         list(windowed_weights(list(files), [["model.layers.0.w"]], is_distributed=True))
     assert not any(isinstance(e, tuple) and e[0] == "stream" for e in events)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="ModelStreamer requires Linux")
+def test_windowed_weights_real_streamer_across_shards_and_windows(monkeypatch, tmp_path):
+    from safetensors.torch import save_file
+
+    platforms = ModuleType("vllm.platforms")
+    platforms.current_platform = SimpleNamespace(is_cuda_alike=lambda: False)
+    monkeypatch.setitem(sys.modules, "vllm.platforms", platforms)
+    shards = [
+        {
+            "embed.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+            "model.layers.0.weight": torch.tensor([1.0, 2.0]),
+            "model.layers.2.scale": torch.tensor([3.0], dtype=torch.bfloat16),
+        },
+        {
+            "model.layers.0.bias": torch.tensor([4.0]),
+            "model.layers.1.weight": torch.arange(4, dtype=torch.float16),
+            "model.layers.2.weight": torch.tensor([5, 6], dtype=torch.int32),
+        },
+    ]
+    paths = []
+    expected = {}
+    for index, tensors in enumerate(shards):
+        path = tmp_path / f"shard-{index}.safetensors"
+        save_file(tensors, str(path))
+        paths.append(str(path))
+        expected.update(tensors)
+    windows = layer_windows(expected, 1)
+    assert len(windows) == 4
+
+    loaded = list(windowed_weights(paths, windows, is_distributed=False))
+
+    assert len(loaded) == len(expected)
+    assert {name for name, _ in loaded} == set(expected)
+    cursor = 0
+    for window in windows:
+        assert {name for name, _ in loaded[cursor:cursor + len(window)]} == set(window)
+        cursor += len(window)
+    for name, tensor in loaded:
+        assert tensor.device.type == "cpu"
+        assert tensor.dtype == expected[name].dtype
+        assert torch.equal(tensor, expected[name])
