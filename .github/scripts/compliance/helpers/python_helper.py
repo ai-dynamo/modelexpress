@@ -154,8 +154,7 @@ def main():
         print(f"{name}\t{version}\t{spdx}")
 
     count = len(seen)
-    icon = "✅" if count > 0 else "⚠️"
-    print(f"{icon} [python] extracted {count} package(s)", file=sys.stderr)
+    print(f"[python] extracted {count} package(s)", file=sys.stderr)
 
 
 if __name__ == "__main__":

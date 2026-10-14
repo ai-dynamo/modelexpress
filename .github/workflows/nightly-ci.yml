@@ -10,13 +10,16 @@ on:
     inputs:
       release:
         description: >-
-          Stage artifacts internally (NGC nightly tags, Artifactory wheels,
-          GitLab release pipeline). Requires manual-release-approval.
+          Stage the artifacts (NGC, Artifactory) and hand them to GitLab
+          release-automation, which publishes them to NGC and PyPI.
+          Requires manual-release-approval.
         required: false
         type: boolean
         default: false
       run_tests:
-        description: Run the hosted and K8s/GPU e2e test suites.
+        description: >-
+          Run the core, inference and RL test suites. Release runs always run
+          the core suite.
         required: false
         type: boolean
         default: true
@@ -180,8 +183,7 @@ jobs:
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 10
     needs: [preflight]
-    if: >-
-      ${{ !cancelled() && needs.preflight.result == 'success' }}
+    if: ${{ !cancelled() && needs.preflight.outputs.release == 'true' }}
     outputs:
       thread_ts: ${{ steps.post.outputs.thread_ts }}
     steps:
@@ -194,7 +196,6 @@ jobs:
           NIGHTLY_TAG: ${{ needs.preflight.outputs.nightly_tag }}
           WHEEL_VERSION: ${{ needs.preflight.outputs.wheel_version }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          MENTION: ${{ vars.SLACK_MENTION_OPS_SUPPORT }} ${{ vars.SLACK_MENTION_DYNAMO_BOT }}
         run: |
           set -euo pipefail
           PAYLOAD=$(jq -n \
@@ -202,7 +203,6 @@ jobs:
             --arg tag     "${NIGHTLY_TAG}" \
             --arg wheel   "${WHEEL_VERSION}" \
             --arg run_url "${RUN_URL}" \
-            --arg mention "${MENTION}" \
             '{
               channel: $channel,
               text: ("ModelExpress Nightly build started — " + $tag),
@@ -215,7 +215,7 @@ jobs:
                     { type: "mrkdwn", text: ("*Wheel version:*\n`" + $wheel + "`") }
                   ] },
                 { type: "context",
-                  elements: [ { type: "mrkdwn", text: ("<" + $run_url + "|GitHub Actions run> " + $mention) } ] }
+                  elements: [ { type: "mrkdwn", text: ("<" + $run_url + "|GitHub Actions run>") } ] }
               ]
             }')
           RESPONSE=$(curl -fsSL -X POST https://slack.com/api/chat.postMessage \
@@ -231,7 +231,7 @@ jobs:
   core-tests:
     name: Core test suite
     needs: [preflight]
-    if: ${{ needs.preflight.outputs.run_tests == 'true' }}
+    if: ${{ needs.preflight.outputs.run_tests == 'true' || needs.preflight.outputs.release == 'true' }}
     permissions:
       contents: read
       id-token: write
@@ -641,7 +641,6 @@ jobs:
         env:
           NIGHTLY_TAG: ${{ needs.preflight.outputs.nightly_tag }}
           CHART_VERSION: ${{ needs.preflight.outputs.chart_version }}
-          NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
         run: bash .github/scripts/package_helm_chart.sh
 
   stage-helm-ngc:
@@ -678,7 +677,6 @@ jobs:
         env:
           NIGHTLY_TAG: ${{ needs.preflight.outputs.nightly_tag }}
           CHART_VERSION: ${{ needs.preflight.outputs.chart_version }}
-          NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
         run: bash .github/scripts/package_helm_chart.sh
 
       - name: Push chart to NGC helm registry
@@ -855,14 +853,18 @@ jobs:
     name: Trigger GitLab release pipeline
     runs-on:
       group: gitlab_ci_runners
-    needs: [preflight, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc, compliance, notify-slack-start]
+    needs: [preflight, manual-release-approval, core-tests, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc, compliance, notify-slack-start]
     if: >-
       ${{ !cancelled() &&
           needs.preflight.outputs.release == 'true' &&
           inputs.skip_gitlab_pipeline != true &&
+          needs.core-tests.result == 'success' &&
           needs.stage-containers-ngc.result == 'success' &&
           needs.build-wheels.result == 'success' &&
-          needs.compliance.result == 'success' }}
+          needs.compliance.result == 'success' &&
+          ((github.event_name == 'schedule' && github.run_attempt == '1') ||
+           (needs.manual-release-approval.result == 'success' &&
+            needs.manual-release-approval.outputs.approved_attempt == github.run_attempt)) }}
     environment: automated-release
     timeout-minutes: 15
     permissions:
@@ -874,8 +876,6 @@ jobs:
           GITLAB_TRIGGER_URL: ${{ secrets.GITLAB_PIPELINE_URL }}
           GITLAB_TRIGGER_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
           GITLAB_REF: ${{ vars.GITLAB_RELEASE_AUTOMATION_REF || 'main' }}
-          # GitLab publishes nothing while true.
-          DRY_RUN: "true"
           SONAR_BRANCH: ${{ github.ref_name }}
           ARTIFACTORY_PATH: ${{ needs.preflight.outputs.artifactory_path }}
           ARTIFACTORY_WHEEL_REPO: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
@@ -927,7 +927,8 @@ jobs:
             --form "ref=${GITLAB_REF}" \
             --form "variables[PROJECT]=modelexpress" \
             --form "variables[PIPELINE_TYPE]=security" \
-            --form "variables[DRY_RUN]=${DRY_RUN}" \
+            --form "variables[DRY_RUN]=false" \
+            --form "variables[NSPECT_REGISTERED]=false" \
             --form "variables[RELEASE_TYPE]=nightly" \
             --form "variables[ARTIFACTS]=${ARTIFACTS}" \
             --form "variables[SONAR_BRANCH]=${SONAR_BRANCH}" \
@@ -1073,7 +1074,7 @@ jobs:
   notify-slack-failure:
     name: Notify Slack — run status
     needs: [nightly-status]
-    if: always()
+    if: ${{ !cancelled() }}
     uses: ./.github/workflows/notify-slack.yml
     permissions:
       contents: read
@@ -1081,10 +1082,10 @@ jobs:
     with:
       pipeline_name: Nightly
       force_alert: ${{ needs.nightly-status.result != 'success' }}
-      always_post: true
       mention_always: ${{ vars.SLACK_MENTION_OPS_SUPPORT }} ${{ vars.SLACK_MENTION_DYNAMO_BOT }}
       mention_on_failure: ${{ vars.SLACK_MENTION_MX_DEV_TEAM }}
       ignored_jobs: |
         Test Suite (nightly)
+        Test Suite (beta)
         staging status
     secrets: inherit

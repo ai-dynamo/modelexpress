@@ -395,28 +395,23 @@ Without buildx (single arch, matches the host):
 ```bash
 docker build -f docker/Dockerfile.client-wheel --target builder -t mx-wheel-builder .
 docker run --rm -v "$PWD/dist:/out" mx-wheel-builder bash -lc 'cp -r /dist/. /out/'
+```
 
-#### CI uploads to Artifactory
+#### CI builds and nightly uploads
 
-`.github/workflows/build-wheels.yml` runs this Dockerfile on every PR
-(via `copy-pr-bot` mirroring into `pull-request/<pr_id>` branches) and
-every push to `main` / `release/**`, building both archs in parallel on
-velonix self-hosted runners and uploading the artifacts to NV Artifactory.
+`.github/workflows/build-wheels.yml` builds this Dockerfile for both archs
+on velonix self-hosted runners on every PR (via `copy-pr-bot` mirroring
+into `pull-request/<pr_id>` branches) and every push to `main` /
+`release/**`. These runs only build; nothing is uploaded.
 
-Destination layout:
+Only the [Nightly pipeline](#nightly-pipeline) uploads, to NV Artifactory:
 
-| Event | Repository | Subpath |
+| Artifact | Repository | Subpath |
 |---|---|---|
-| `push` to `pull-request/<pr_id>` (copy-pr-bot mirror) | `${ARTIFACTORY_PYPI_REPO_NAME}` | `pr/<pr_id>/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
-| `push` to `main`, `release/**` | `${ARTIFACTORY_PYPI_REPO_NAME}` | `post-merge/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
-| Nightly wheels (`nightly-ci.yml`) | `${ARTIFACTORY_PYPI_REPO_NAME}` | `nightly/<run_id>/` |
-| Nightly crates (`nightly-ci.yml`) | `${ARTIFACTORY_CARGO_REPO_NAME}` | `nightly/<run_id>/` |
+| Nightly wheels + sdist | `${ARTIFACTORY_PYPI_REPO_NAME}` | `nightly/<run_id>/` |
+| Nightly crates (`.crate`) | `${ARTIFACTORY_CARGO_REPO_NAME}` | `nightly/<run_id>/` |
 
-The PR and post-merge paths each contain the 6 artifacts from one arch:
-4 manylinux wheels (cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist.
-The nightly path is shared by both archs and additionally receives the
-packaged Rust crates (`.crate`) — see
-[Nightly pipeline](#nightly-pipeline). The upload step is gated on the
+The upload step is gated on the
 `automated-release` GitHub environment, which holds `ARTIFACTORY_URL`,
 `ARTIFACTORY_TOKEN` (JFrog identity token), and
 `ARTIFACTORY_PYPI_REPO_NAME`. Registry and repository
@@ -428,9 +423,16 @@ run logs: `MX_IMAGE_REPO`, `NGC_PUBLISH_ORG` (repo scope) and `ARTIFACTORY_CARGO
 
 `.github/workflows/nightly-ci.yml` runs daily at 09:00 UTC (01:00 PST)
 against `main`, builds every release artifact from that commit, runs the
-core, inference and RL test suites, and stages the artifacts internally.
-It can also be dispatched manually; a manual run only stages after
-approval through the `manual-release-approval` GitHub environment.
+core, inference and RL test suites, and stages the artifacts. GitLab
+release-automation then scans and publishes them. It can also be
+dispatched manually; a manual run only stages after approval through the
+`manual-release-approval` GitHub environment.
+
+Only the first attempt of a scheduled run stages without approval. Every
+later attempt, and every manual run, stages and triggers GitLab only after
+a devops approval given in that same attempt. "Re-run failed jobs" on a run
+therefore stages nothing; to retry staging, use "Re-run all jobs" or a new
+dispatch from `main`, and approve it.
 
 Scheduled and manual runs require the upstream repository and `refs/heads/main`,
 including runs that only build and test. The nightly calls
@@ -461,12 +463,17 @@ Two runs on the same day can therefore contain different code under the same
 wheel version. Use the run-specific Artifactory path to select an exact build;
 the wheel version alone does not identify its source commit.
 
-The packaged nightly chart is stamped to reference the nightly server
-image, so `helm install` of a nightly chart deploys nightly code — it does
-not fall back to the released image in `helm/values.yaml`.
+GitLab release-automation then publishes the nightly: the image as
+`nvcr.io/nvidia/ai-dynamo/modelexpress-server-nightly:<date>-<sha7>` (and
+`:latest`), the chart as `modelexpress-nightly` in
+`https://helm.ngc.nvidia.com/nvidia/ai-dynamo`, and the wheels on PyPI as
+`modelexpress==<base>.dev<date>`. Crates stay internal.
 
-No ModelExpress artifact is uploaded to GitHub artifact storage; the table
-above is the complete list of places a nightly artifact exists. Compliance
+The packaged nightly chart is stamped to reference the public nightly
+server image (the `repository` in `helm/values.yaml` plus `-nightly`), so
+`helm install` of a nightly chart deploys nightly code.
+
+No ModelExpress artifact is uploaded to GitHub artifact storage. Compliance
 scan results are the only permitted GitHub artifact. `package-helm-chart`
 and `stage-helm-ngc` each build the chart through
 `.github/scripts/package_helm_chart.sh`; keep both on that script so they
@@ -499,36 +506,34 @@ CSV (`.github/scripts/compliance/audit_image.py`): the job fails if the image
 adds a package the CSV lacks, or a file no package owns that is not one of the
 binaries or `NOTICES` copied into `/app`. A new first-party file copied into
 `/app` goes in that script's `FIRST_PARTY_FILES`. release-automation's `nvbug:attach-compliance` and
-`nvbug:attach-license` jobs attach these files on every security nightly;
-when the trigger sends `DRY_RUN=true` they fetch and match the artifacts but
-write nothing to the OSRB bugs. The artifact names and layout are the contract of
-its `nvbug-attach-compliance.py` and `nvbug-attach-license.py`.
+`nvbug:attach-license` jobs attach these files on every security nightly.
+The artifact names and layout are the contract of its
+`nvbug-attach-compliance.py` and `nvbug-attach-license.py`.
 
 After staging, the workflow triggers the internal GitLab
-release-automation pipeline (security scans) and reports to Slack. A
-thread is opened at the start of every run, and its `thread_ts` is
-forwarded to GitLab as `SLACK_THREAD_TS`, so the GitLab pipeline
-continues posting its scan updates onto the same thread instead of
-starting a new one. Staging results and the GitLab handoff are replied on
-that thread; a channel-level message goes out through
-`SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL` once per run, green or red. The single
-job to watch is `nightly-status`.
+release-automation pipeline, which scans and publishes the artifacts. A
+Slack thread is opened at the start of every release run, and its
+`thread_ts` is forwarded to GitLab as `SLACK_THREAD_TS`, so GitLab posts
+its scan, nSpect and publish updates on the same thread. Staging results
+and the GitLab handoff are replied on that thread too. A channel-level
+alert goes out through `SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL` only when a run
+is red. The single job to watch is `nightly-status`.
 Failure messages JSON-escape job names so quotes, backslashes and newlines do
 not break the Slack payload.
 
-Every Slack message mentions `SLACK_MENTION_OPS_SUPPORT` and
-`SLACK_MENTION_DYNAMO_BOT`; a failing run additionally mentions
-`SLACK_MENTION_MX_DEV_TEAM`. All three are repository variables holding
+The alert mentions `SLACK_MENTION_OPS_SUPPORT`, `SLACK_MENTION_DYNAMO_BOT`
+and `SLACK_MENTION_MX_DEV_TEAM`. All three are repository variables holding
 full Slack mention syntax (`<!subteam^ID>` for a user group, `<@ID>` for
 a user or bot), so the IDs stay out of this public repository.
 
-Test failures do **not** block staging (matching the Dynamo nightly): a
-red test lane alerts Slack while the scan-gated staging proceeds.
+Test failures do **not** block staging. Release runs always run the core
+suite, and a failed core suite blocks the GitLab publish handoff, as
+Dynamo's pre-merge suite does. The inference and RL suites never block it.
 
-Additional secrets beyond the `ARTIFACTORY_*` set above, all in the
-`automated-release` environment unless noted: `NGC_PUBLISH_USERNAME`,
-`NGC_PUBLISH_TOKEN`, `GITLAB_PIPELINE_URL`, `GITLAB_TRIGGER_TOKEN`, and
-(repository scope) `SLACK_RELEASE_BOT_TOKEN`, `SLACK_RELEASE_CHANNEL_ID`,
+Additional secrets in the `automated-release` environment, which admits
+only `main` and `release/*`: `NGC_PUBLISH_USERNAME`, `NGC_PUBLISH_TOKEN`,
+`GITLAB_PIPELINE_URL` and `GITLAB_TRIGGER_TOKEN`. Repository scope holds
+`SLACK_RELEASE_BOT_TOKEN`, `SLACK_RELEASE_CHANNEL_ID` and
 `SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL`. The optional repository variable
 `GITLAB_RELEASE_AUTOMATION_REF` overrides the GitLab ref (default `main`).
 

@@ -226,8 +226,7 @@ jobs:
           retention-days: 14
 
   build-vime-delta-refit:
-    needs: validate
-    if: ${{ !cancelled() && needs.validate.result == 'success' && github.event_name != 'issue_comment' }}
+    if: ${{ github.event_name != 'issue_comment' }}
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref_name }}-build-vime-delta-refit-${{ inputs.concurrency_key }}
       cancel-in-progress: ${{ inputs.concurrency_key == '' }}
@@ -244,14 +243,14 @@ jobs:
         id: slots
         env:
           MX_CI_RL_GPU_CONCURRENCY: ${{ vars.MX_CI_RL_GPU_CONCURRENCY || '4' }}
-          GPU_SLOT: ${{ needs.validate.outputs.gpu_slot }}
+          PR_NUMBER: "0"
         run: |
           python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
           import os
           count = int(os.environ["MX_CI_RL_GPU_CONCURRENCY"])
           if not 1 <= count <= 16:
               raise SystemExit("MX_CI_RL_GPU_CONCURRENCY must be between 1 and 16")
-          number = int(os.environ["GPU_SLOT"])
+          number = int(os.environ["PR_NUMBER"]) or int(os.environ["GITHUB_RUN_ID"] if os.environ["GITHUB_EVENT_NAME"] in {"schedule", "workflow_dispatch"} else os.environ["GITHUB_REF"].rsplit("/", 1)[1])
           print(f"gpu_limit={count}")
           print(f"gpu_slot={(number + 1) % count}")
           PYTHON

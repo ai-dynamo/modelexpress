@@ -6,9 +6,16 @@ set -euo pipefail
 
 : "${NIGHTLY_TAG:?NIGHTLY_TAG is required}"
 : "${CHART_VERSION:?CHART_VERSION is required}"
-: "${NGC_STAGING_ORG:?NGC_STAGING_ORG is required}"
 
-NIGHTLY_REPO="nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/modelexpress-server-nightly"
+BASE_REPO=$(sed -n 's/^[[:space:]]*repository:[[:space:]]*//p' helm/values.yaml | head -1 | tr -d "\"'")
+case "${BASE_REPO}" in
+  nvcr.io/?*) ;;
+  *)
+    echo "::error::helm/values.yaml has no nvcr.io image repository (got '${BASE_REPO}')"
+    exit 1
+    ;;
+esac
+NIGHTLY_REPO="${BASE_REPO}-nightly"
 CHART_NAME="modelexpress-nightly"
 
 python3 - "$NIGHTLY_REPO" "$NIGHTLY_TAG" <<'PY'

@@ -4,8 +4,7 @@
 
 """Diff two new-format OSRB dependency CSVs into a change-typed diff CSV.
 
-The OSRB CSV is the cross-ecosystem ``osrb-deps.csv`` written by
-``compliance.generators.common.write_merged_csv`` — columns::
+The OSRB CSV is the cross-ecosystem CSV written by ``osrb.py`` — columns::
 
     ecosystem,name,version,spdx,source_url,notes
 

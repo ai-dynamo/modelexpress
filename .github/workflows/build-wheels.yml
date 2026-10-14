@@ -1,21 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Builds the modelexpress Python client wheels via docker/Dockerfile.client-wheel
-# and uploads the resulting artifacts to NV Artifactory.
+# Builds the modelexpress Python client wheels via docker/Dockerfile.client-wheel.
 #
-# Triggered on:
-#   - push to pull-request/<pr_id> (mirrored from contributor PRs by
-#     copy-pr-bot): lands under pr/<pr_id>/<sha>/<run_id>/<run_attempt>/<arch>/
-#   - push to main and release/**: lands under
-#     post-merge/<sha>/<run_id>/<run_attempt>/<arch>/
-#
-# copy-pr-bot mirrors PRs (including fork PRs) into the pull-request/<pr_id>
-# branch namespace inside this repo, which lets the workflow access
-# environment-scoped secrets that fork PRs can't reach directly.
-#
-# Runs in parallel to (does not gate on) the rest of CI. Upload is
-# environment-gated on `automated-release`.
+# Pushes to pull-request/<pr_id> (copy-pr-bot mirrors), main and release/**
+# only build the wheels. Only the nightly uploads, under its upload_prefix,
+# through the `automated-release` environment.
 
 name: Build & upload client wheels
 
@@ -36,8 +26,8 @@ on:
         default: ''
       upload_prefix:
         description: >-
-          Artifactory subpath overriding the pr/ / post-merge/ computation,
-          used verbatim (e.g. nightly). Wheel filenames are arch-unique; the
+          Artifactory subpath to upload to (e.g. nightly/<run_id>). Empty
+          builds without uploading. Wheel filenames are arch-unique; the
           py3-none-any wheel and sdist are uploaded identically by both arch
           jobs and simply overwrite each other.
         required: false
@@ -66,7 +56,7 @@ jobs:
     # targets their Artifactory. In a fork this queues forever waiting for a
     # runner that never checks in.
     if: github.repository == 'ai-dynamo/modelexpress'
-    environment: ${{ inputs.skip_upload != true && 'automated-release' || '' }}
+    environment: ${{ inputs.upload_prefix != '' && inputs.skip_upload != true && 'automated-release' || '' }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -87,27 +77,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.11.1
-
-      - name: Compute artifactory subpath
-        id: dest
-        env:
-          UPLOAD_PREFIX: ${{ inputs.upload_prefix }}
-        run: |
-          if [ -n "${UPLOAD_PREFIX}" ]; then
-            SUBPATH="${UPLOAD_PREFIX}"
-          else
-            case "${GITHUB_REF_NAME}" in
-              pull-request/*)
-                PR_ID="${GITHUB_REF_NAME#pull-request/}"
-                SUBPATH="pr/${PR_ID}/${{ github.sha }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.arch }}"
-                ;;
-              *)
-                SUBPATH="post-merge/${{ github.sha }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.arch }}"
-                ;;
-            esac
-          fi
-          echo "subpath=${SUBPATH}" >> "$GITHUB_OUTPUT"
-          echo "Destination subpath: ${SUBPATH}"
 
       - name: Apply wheel version override
         if: inputs.wheel_version != ''
@@ -147,23 +116,24 @@ jobs:
           fi
 
       - name: Set up JFrog CLI
-        if: inputs.skip_upload != true
+        if: inputs.upload_prefix != '' && inputs.skip_upload != true
         uses: jfrog/setup-jfrog-cli@279b1f629f43dd5bc658d8361ac4802a7ef8d2d5 # v4.9.1
         env:
           JF_URL: ${{ secrets.ARTIFACTORY_URL }}
           JF_ACCESS_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
 
       - name: Upload to Artifactory
-        if: inputs.skip_upload != true
+        if: inputs.upload_prefix != '' && inputs.skip_upload != true
         env:
           UPLOAD_REPO: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
+          UPLOAD_PREFIX: ${{ inputs.upload_prefix }}
         run: |
           set -euo pipefail
           if [ -z "${UPLOAD_REPO}" ]; then
             echo "::error::ARTIFACTORY_PYPI_REPO_NAME is not set; refusing to upload to an empty repository path"
             exit 1
           fi
-          DEST="${UPLOAD_REPO}/${{ steps.dest.outputs.subpath }}/"
+          DEST="${UPLOAD_REPO}/${UPLOAD_PREFIX}/"
           echo "Uploading to: ${DEST}"
           jf rt upload --flat "dist/*.whl" "${DEST}"
           jf rt upload --flat "dist/*.tar.gz" "${DEST}"

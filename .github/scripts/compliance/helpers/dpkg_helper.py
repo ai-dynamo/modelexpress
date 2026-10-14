@@ -176,8 +176,7 @@ def main():
             print(f"{pkg}\t{version}\t{license_id}")
             count += 1
 
-    icon = "✅" if count > 0 else "⚠️"
-    print(f"{icon} [dpkg] extracted {count} package(s)", file=sys.stderr)
+    print(f"[dpkg] extracted {count} package(s)", file=sys.stderr)
 
 
 if __name__ == "__main__":
