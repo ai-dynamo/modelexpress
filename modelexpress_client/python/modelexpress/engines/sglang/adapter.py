@@ -12,13 +12,13 @@ import os
 import uuid
 from importlib.metadata import version as pkg_version
 from typing import TYPE_CHECKING, Iterator
+from urllib.parse import urlsplit
 
 import torch
 
-from ... import envs
-from ... import p2p_pb2
-from ...adapter import EngineAdapter
+from ... import envs, p2p_pb2
 from ...accelerators import accelerator_backend_for
+from ...adapter import EngineAdapter
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...tensor_utils import (
@@ -26,6 +26,7 @@ from ...tensor_utils import (
     capture_tensor_attrs,
     collect_module_tensors,
 )
+from .draft_weights import draft_weight_adapter_for
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
 
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.runtime_context import ParallelContext
 
 
 class SglangAdapter(EngineAdapter):
@@ -70,9 +72,13 @@ class SglangAdapter(EngineAdapter):
         ):
             return 0
 
-        from sglang.srt import distributed
+        parallel = _get_sglang_parallel_context()
+        if parallel is not None:
+            return int(parallel.world_group.local_rank)
 
-        return int(distributed.get_world_group().local_rank)
+        from sglang.srt.distributed import parallel_state
+
+        return int(parallel_state.get_world_group().local_rank)
 
     def get_device_id(self) -> int:
         gpu_id = getattr(self.device_config, "gpu_id", None)
@@ -107,7 +113,22 @@ class SglangAdapter(EngineAdapter):
         # the same ModelExpress version; mixing old and new manifests fails
         # tensor matching.
         adopt_hidden_tensors(result.model, self.accelerator_backend)
-        return collect_module_tensors(result.model, self.accelerator_backend)
+        tensors = collect_module_tensors(result.model, self.accelerator_backend)
+        if is_sglang_draft_model(self.model_config):
+            selector = draft_weight_adapter_for(
+                type(result.model).__name__, role="draft", model=result.model
+            )
+            if selector is not None:
+                tensors = selector.publishable(result.model, tensors)
+            else:
+                prefixes = _target_shared_draft_prefixes(result.model)
+                if prefixes:
+                    tensors = {
+                        name: tensor
+                        for name, tensor in tensors.items()
+                        if not name.startswith(prefixes)
+                    }
+        return tensors
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
         with capture_tensor_attrs(self.accelerator_backend):
@@ -133,6 +154,10 @@ class SglangAdapter(EngineAdapter):
         if model is None:
             raise RuntimeError("SGLang ModelStreamer loading requires result.model")
 
+        is_draft = is_sglang_draft_model(self.model_config)
+        selector = draft_weight_adapter_for(
+            type(model).__name__, role="draft" if is_draft else "main", model=model
+        )
         from sglang.srt.configs.load_config import LoadFormat
         from sglang.srt.model_loader.loader import RunaiModelStreamerLoader
 
@@ -148,9 +173,22 @@ class SglangAdapter(EngineAdapter):
         stream_model_config = copy.copy(self.model_config)
         _set_load_config_attr(stream_model_config, "model_weights", model_uri)
 
-        loader = RunaiModelStreamerLoader(stream_config)
+        if selector is not None:
+            # Import lazily: the MX SGLang adapter must remain importable when
+            # SGLang is not installed.
+            from .role_aware_streamer import RoleAwareModelStreamerLoader
+
+            loader = RoleAwareModelStreamerLoader(
+                stream_config,
+                model_uri=model_uri,
+                selector=selector,
+                role="draft" if is_draft else "main",
+                rank=self.get_global_rank(),
+            )
+        else:
+            loader = RunaiModelStreamerLoader(stream_config)
         loader.target_device_str = str(self.target_device)
-        return loader._get_all_weights(stream_model_config, model)
+        yield from loader._get_all_weights(stream_model_config, model)
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
         with capture_tensor_attrs(self.accelerator_backend):
@@ -299,6 +337,35 @@ def _call_sglang_post_load_weights(model: torch.nn.Module) -> None:
             post_load_weights()
 
 
+def is_sglang_draft_model(model_config: ModelConfig) -> bool:
+    """True for SGLang's speculative draft ModelRunner load.
+
+    The draft worker builds its ModelConfig with ``is_draft_model=True`` and,
+    unless ``speculative_draft_load_format`` says otherwise, loads through the
+    same ``remote_instance`` path as the target, on the same GPU.
+    """
+    return bool(getattr(model_config, "is_draft_model", False))
+
+
+def _target_shared_draft_prefixes(model) -> tuple[str, ...]:
+    """Tensor-name prefixes SGLang swaps for the target's after an MTP draft loads.
+
+    Same-checkpoint drafts (MTP / NextN) go through the EAGLE worker's
+    non-EAGLE3 branch, which calls ``set_embed_and_head(embed, head)``: the
+    draft's own ``model.embed_tokens.weight`` and ``lm_head.weight`` are
+    deleted and replaced with the target's (the embedding only on a single
+    pipeline stage, where the target provides it). Those draft copies are
+    discarded, so they are neither served nor received over P2P; holding them
+    for NIXL would pin memory SGLang frees right after the load.
+    """
+    if not hasattr(model, "set_embed_and_head"):
+        return ()
+    prefixes = ["lm_head."]
+    if _get_parallel_size("get_pipeline_model_parallel_world_size") == 1:
+        prefixes.insert(0, "model.embed_tokens.")
+    return tuple(prefixes)
+
+
 def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIdentity:
     """Build a ModelExpress SourceIdentity from SGLang model state."""
     try:
@@ -352,46 +419,110 @@ def _get_revision(model_config: ModelConfig) -> str:
     return str(getattr(model_config, "revision", "") or "")
 
 
-def _get_parallel_size(name: str) -> int:
+def _get_sglang_parallel_context() -> ParallelContext | None:
+    """Use the scoped parallel API when provided by SGLang."""
     try:
-        from sglang.srt import distributed
+        from sglang.srt.runtime_context import get_parallel
+    except ModuleNotFoundError as exc:
+        if exc.name != "sglang.srt.runtime_context":
+            raise
+        return None
+    return get_parallel()
 
-        return int(getattr(distributed, name)())
-    except Exception:
+
+def _get_parallel_size(name: str) -> int:
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return 1
+
+    parallel = _get_sglang_parallel_context()
+    if parallel is not None:
+        field = {
+            "get_tensor_model_parallel_world_size": "tp_size",
+            "get_pipeline_model_parallel_world_size": "pp_size",
+            "get_moe_expert_parallel_world_size": "moe_ep_size",
+        }[name]
+        return int(getattr(parallel, field))
+
+    from sglang.srt.distributed import parallel_state
+
+    return int(getattr(parallel_state, name)())
 
 
 def _get_sglang_worker_rank(load_config: LoadConfig) -> int:
     """Return the SGLang model-parallel shard key, excluding DP replicas."""
-    try:
-        from sglang.srt import distributed
-
-        tp_rank = int(distributed.get_tensor_model_parallel_rank())
-        pp_rank = int(distributed.get_pipeline_model_parallel_rank())
-        tp_size = int(distributed.get_tensor_model_parallel_world_size())
-        return pp_rank * tp_size + tp_rank
-    except Exception:
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return int(getattr(load_config, "tp_rank", 0) or 0)
 
+    parallel = _get_sglang_parallel_context()
+    if parallel is not None:
+        return int(parallel.pp_rank) * int(parallel.tp_size) + int(parallel.tp_rank)
 
-def _get_sglang_node_rank(load_config: LoadConfig, global_rank: int) -> int:
+    from sglang.srt.distributed import parallel_state
+
+    tp_rank = int(parallel_state.get_tensor_model_parallel_rank())
+    pp_rank = int(parallel_state.get_pipeline_model_parallel_rank())
+    tp_size = int(parallel_state.get_tensor_model_parallel_world_size())
+    return pp_rank * tp_size + tp_rank
+
+
+def _get_sglang_server_args():
+    """Read native launch settings from current or legacy SGLang runtimes."""
+    try:
+        from sglang.srt.runtime_context import get_server_args
+    except ImportError:
+        try:
+            from sglang.srt.server_args import get_global_server_args as get_server_args
+        except ImportError:
+            return None
+    try:
+        return get_server_args()
+    except ValueError:
+        # SGLang has not published its process-local settings yet.
+        return None
+
+
+def _get_sglang_node_rank(
+    load_config: LoadConfig, global_rank: int, server_args=None,
+) -> int:
     """Return the physical node rank used for node-local artifact routing."""
     configured = getattr(load_config, "node_rank", None)
     if configured is not None:
         return int(configured)
+    native_rank = getattr(server_args, "node_rank", None)
+    if native_rank is not None:
+        return int(native_rank)
 
-    # SGLang's LoadConfig does not currently retain ServerArgs.node_rank.  Use
-    # the launcher-provided equivalents, including LeaderWorkerSet's stable
-    # per-group worker index used by the Kubernetes multi-node deployment.
     for name in ("NODE_RANK", "LWS_WORKER_INDEX", "GROUP_RANK"):
         value = os.getenv(name)
         if value is not None:
-            return int(value)
+            try:
+                rank = int(value)
+                if rank >= 0:
+                    return rank
+            except ValueError:
+                pass
+            logger.warning("Ignoring invalid %s=%r for node rank", name, value)
 
     local_world_size = os.getenv("LOCAL_WORLD_SIZE")
-    if local_world_size and int(local_world_size) > 0:
-        return global_rank // int(local_world_size)
+    if local_world_size is not None:
+        try:
+            size = int(local_world_size)
+            if size > 0:
+                return global_rank // size
+        except ValueError:
+            pass
+        logger.warning("Ignoring invalid LOCAL_WORLD_SIZE=%r", local_world_size)
     return 0
+
+
+def _get_sglang_head_addr(load_config: LoadConfig, server_args) -> str | None:
+    """Extract the native rendezvous host for artifact readiness probes."""
+    address = getattr(load_config, "dist_init_addr", None) or getattr(
+        server_args, "dist_init_addr", None
+    )
+    if address:
+        return urlsplit(address if "://" in address else f"//{address}").hostname
+    return os.getenv("LWS_LEADER_ADDRESS") or os.getenv("MASTER_ADDR")
 
 
 def build_sglang_load_context(
@@ -404,7 +535,8 @@ def build_sglang_load_context(
     adapter = SglangAdapter(load_config, model_config, device_config)
     worker_rank = adapter.get_worker_rank()
     global_rank = adapter.get_global_rank()
-    node_rank = _get_sglang_node_rank(load_config, global_rank)
+    server_args = _get_sglang_server_args()
+    node_rank = _get_sglang_node_rank(load_config, global_rank, server_args)
     server_url = getattr(load_config, "modelexpress_url", None)
     return LoadContext(
         model_config=model_config,
@@ -421,7 +553,7 @@ def build_sglang_load_context(
         ),
         worker_id=uuid.uuid4().hex[:8],
         node_rank=node_rank,
-        head_addr=os.getenv("LWS_LEADER_ADDRESS") or os.getenv("MASTER_ADDR"),
+        head_addr=_get_sglang_head_addr(load_config, server_args),
         adapter=adapter,
         accelerator_backend=adapter.accelerator_backend,
     )

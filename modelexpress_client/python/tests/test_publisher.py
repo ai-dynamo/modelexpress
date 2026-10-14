@@ -231,6 +231,29 @@ class TestPublisherPublishAndReady:
         ready.assert_called_once_with()
         publish.assert_called_once_with()
 
+    def test_publish_failure_can_stop_without_retrying(
+        self, mx_client, nixl_manager, caplog
+    ):
+        publish = MagicMock(side_effect=RuntimeError("put chunk failed"))
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=publish,
+            interval_secs=1,
+            heartbeat_after_publish=False,
+            retry_publish_on_failure=False,
+        )
+
+        with caplog.at_level("ERROR", logger="modelexpress.metadata.publisher"):
+            assert publisher._tick() is None
+            publisher._tick()
+
+        publish.assert_called_once_with()
+        assert publisher._stop_event.is_set()
+        assert "Source publish failed; not retrying" in caplog.text
+
 
 class TestHeartbeatStop:
     def test_stop_marks_stale(self, heartbeat, mx_client):
@@ -601,3 +624,35 @@ class TestSourceLoadPresence:
         )
         publisher._update_status(2)
         assert mx_client.update_status.call_args.kwargs["source_load"] is None
+
+
+class TestPublisherRepublish:
+    def test_republish_runs_publish_fn_again(self, mx_client, nixl_manager):
+        published = iter(["first", "second"])
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=lambda: next(published),
+            interval_secs=1,
+        )
+        publisher._tick()
+        assert publisher.mx_source_id == "first"
+
+        publisher.republish()
+        assert publisher.mx_source_id is None
+        publisher._tick()
+        assert publisher.mx_source_id == "second"
+
+    def test_republish_without_publish_fn_is_noop(self, mx_client, nixl_manager):
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            mx_source_id="fixed",
+            interval_secs=1,
+        )
+        publisher.republish()
+        assert publisher.mx_source_id == "fixed"

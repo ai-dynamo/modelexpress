@@ -5,6 +5,7 @@
 
 import types
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -213,6 +214,33 @@ class TestAdoptHiddenTensors:
         module = nn.Module()
         module.runtime_state = ExplodingDict()
 
+        assert adopt_hidden_tensors(module, backend) == 0
+
+    @pytest.mark.parametrize("container", [dict, list, tuple])
+    @pytest.mark.parametrize("failure_first", [False, True])
+    def test_preserves_siblings_of_failing_container_entries(
+        self, mock_accelerator_backend_cls, container, failure_first,
+    ):
+        class ExplodingDict(dict):
+            def items(self):
+                raise RuntimeError("lazy runtime object")
+
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        tensor = torch.randn(4)
+        entries = [("valid", tensor), ("broken", ExplodingDict())]
+        if failure_first:
+            entries.reverse()
+        state = (
+            dict(entries) if container is dict
+            else container(value for _, value in entries)
+        )
+        module = nn.Module()
+        module.runtime_state = {"nested": state}
+
+        assert adopt_hidden_tensors(module, backend) == 1
+        buffers = list(module.named_buffers())
+        assert len(buffers) == 1
+        assert buffers[0][1] is tensor
         assert adopt_hidden_tensors(module, backend) == 0
 
     def test_cpu_tensors_ignored(self):

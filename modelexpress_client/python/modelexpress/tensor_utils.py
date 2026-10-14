@@ -124,23 +124,33 @@ def _find_hidden_accel_tensors(
             results.append(("t", tensor))
     elif isinstance(obj, (list, tuple)):
         for i, item in enumerate(list(obj)):
-            for path, tensor in _find_hidden_accel_tensors(
-                item,
-                visited,
-                accelerator_backend,
-                depth + 1,
-            ):
+            try:
+                nested = _find_hidden_accel_tensors(
+                    item, visited, accelerator_backend, depth + 1,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Skipping sequence entry %s while scanning for hidden tensors: %s",
+                    i, exc,
+                )
+                continue
+            for path, tensor in nested:
                 results.append((f"{i}_{path}", tensor))
     elif isinstance(obj, dict):
         # snapshot: traversal can trigger lazy attributes that mutate the
         # container we are walking (seen on SGLang's K3 object graph)
         for k, v in list(obj.items()):
-            for path, tensor in _find_hidden_accel_tensors(
-                v,
-                visited,
-                accelerator_backend,
-                depth + 1,
-            ):
+            try:
+                nested = _find_hidden_accel_tensors(
+                    v, visited, accelerator_backend, depth + 1,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Skipping dictionary entry %s while scanning for hidden tensors: %s",
+                    k, exc,
+                )
+                continue
+            for path, tensor in nested:
                 results.append((f"{k}_{path}", tensor))
     elif not isinstance(obj, (type, nn.Module, types.ModuleType)) and _has_own_dict(
         obj
@@ -217,10 +227,8 @@ def adopt_hidden_tensors(
                     accelerator_backend=backend,
                 )
             except Exception as exc:
-                # Hidden-tensor adoption is supplementary to normal parameter
-                # and buffer discovery.  Lazy/proxy runtime objects may reject
-                # introspection; skip only that root instead of disabling the
-                # worker's entire P2P source publication path.
+                # A root can reject enumeration entirely. Nested failures are
+                # isolated per entry by the recursive scanner above.
                 logger.debug(
                     "Skipping hidden tensor scan for %s.%s (%s): %s",
                     _module_name,

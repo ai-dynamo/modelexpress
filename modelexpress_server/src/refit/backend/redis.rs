@@ -130,6 +130,10 @@ where
 }
 
 fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersion> {
+    let trainer_mesh_id = fields
+        .get("trainer_mesh_id")
+        .filter(|mesh_id| !mesh_id.is_empty())
+        .cloned();
     Ok(WeightVersion {
         uid: hash_field(&fields, "uid")?.to_string(),
         model_name: hash_field(&fields, "model_name")?.to_string(),
@@ -149,10 +153,8 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
                 uri: uri.clone(),
                 storage_type: ObjectStorageType::S3.into(),
             }),
-        trainer_mesh_id: fields
-            .get("trainer_mesh_id")
-            .filter(|mesh_id| !mesh_id.is_empty())
-            .cloned(),
+        trainer_mesh_id,
+        trainer_mesh_generation: parse_hash_field(&fields, "trainer_mesh_generation")?,
         version_number: fields
             .get("version_number")
             .filter(|number| !number.is_empty())
@@ -335,6 +337,35 @@ impl RedisRefitBackend {
 
 #[async_trait]
 impl RefitBackend for RedisRefitBackend {
+    async fn validate_trainer_mesh_workers(
+        &self,
+        model_name: &str,
+        workers: &HashMap<String, TrainerTensorsMetadata>,
+    ) -> RefitResult<()> {
+        let members: Vec<_> = workers.iter().collect();
+        let mut pipeline = redis::pipe();
+        for (worker_id, _) in &members {
+            pipeline.hgetall(worker_key(worker_id));
+        }
+        let registrations: Vec<HashMap<String, String>> = pipeline
+            .query_async(&mut self.redis.clone())
+            .await
+            .map_err(redis_error)?;
+        let trainer_role = i32::from(WorkerRole::Trainer).to_string();
+        for ((worker_id, metadata), registration) in members.into_iter().zip(registrations) {
+            if registration.get("worker_id") != Some(worker_id)
+                || registration.get("model_name").map(String::as_str) != Some(model_name)
+                || registration.get("role") != Some(&trainer_role)
+                || registration.get("refit_endpoint") != Some(&metadata.metadata_endpoint)
+            {
+                return Err(RefitBackendError::FailedPrecondition(format!(
+                    "mesh worker {worker_id:?} requires an active trainer registration for the model and binding endpoint"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn find_trainer_mesh_for_request(
         &self,
         request: &CreateTrainerMeshRequest,
@@ -495,7 +526,7 @@ impl RefitBackend for RedisRefitBackend {
                     .to_string(),
             )),
             "VERSION_LEASED" => Err(RefitBackendError::FailedPrecondition(
-                "cannot rebind a worker endpoint while a linked version has an active lease"
+                "cannot change trainer mesh generation while a linked version has an active lease"
                     .to_string(),
             )),
             _ => Err(RefitBackendError::Internal(format!(
@@ -626,6 +657,11 @@ impl RefitBackend for RedisRefitBackend {
             if result == "MESH_MODEL_MISMATCH" {
                 return Err(RefitBackendError::FailedPrecondition(
                     "trainer mesh and weight version model_name differ".to_string(),
+                ));
+            }
+            if result == "MESH_GENERATION_MISSING" {
+                return Err(RefitBackendError::FailedPrecondition(
+                    "trainer mesh is missing a positive generation".to_string(),
                 ));
             }
             if result != "COLLISION" {
@@ -776,6 +812,11 @@ impl RefitBackend for RedisRefitBackend {
             "MESH_NOT_FOUND" => {
                 return Err(RefitBackendError::FailedPrecondition(
                     "trainer mesh is missing".to_string(),
+                ));
+            }
+            "MESH_GENERATION_MISSING" | "MESH_GENERATION_MISMATCH" => {
+                return Err(RefitBackendError::FailedPrecondition(
+                    "weight version trainer_mesh_generation does not match the current mesh; create a new version".to_string(),
                 ));
             }
             "WORKER_NOT_TRAINER" | "WORKER_NOT_IN_MESH" | "WORKER_ENDPOINT_MISMATCH" => {
@@ -1001,6 +1042,52 @@ impl RefitBackend for RedisRefitBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build stored version fields for generation-decoding tests.
+    fn stored_version(mesh_id: &str, generation: Option<&str>) -> HashMap<String, String> {
+        let mut fields = HashMap::from([
+            ("uid".to_string(), "version".to_string()),
+            ("model_name".to_string(), "model".to_string()),
+            ("idempotency_key".to_string(), "request".to_string()),
+            ("payload_format".to_string(), "1".to_string()),
+            ("base_version_id".to_string(), String::new()),
+            ("layout_signature".to_string(), String::new()),
+            ("state".to_string(), "1".to_string()),
+            ("created_at_unix_ms".to_string(), "123".to_string()),
+            ("trainer_mesh_id".to_string(), mesh_id.to_string()),
+        ]);
+        if let Some(generation) = generation {
+            fields.insert(
+                "trainer_mesh_generation".to_string(),
+                generation.to_string(),
+            );
+        }
+        fields
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    /// Reject missing or malformed generations and preserve the full uint64 range.
+    fn stored_versions_require_uint64_generation() {
+        for generation in [None, Some("invalid"), Some("18446744073709551616")] {
+            assert!(matches!(
+                version_from_hash(stored_version("mesh", generation)),
+                Err(RefitBackendError::Internal(_))
+            ));
+        }
+        let version = version_from_hash(stored_version("mesh", Some("18446744073709551615")))
+            .expect("positive generation decodes");
+        assert_eq!(version.trainer_mesh_generation, u64::MAX);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    /// Decode the zero generation written for versions without a trainer mesh.
+    fn stored_nonmesh_versions_have_generation_zero() {
+        let version = version_from_hash(stored_version("", Some("0")))
+            .expect("generation is not applicable without a mesh");
+        assert_eq!(version.trainer_mesh_generation, 0);
+    }
 
     #[test]
     fn version_ids_cannot_collide_with_derived_keys() {

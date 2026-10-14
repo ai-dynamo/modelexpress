@@ -163,6 +163,7 @@ python -m pip install ./modelexpress_client/python
 export MX_SERVER_ADDRESS=modelexpress-server:8001
 export MX_P2P_METADATA=1
 export MX_ARTIFACT_TRANSFER=1
+export MX_ARTIFACT_BACKEND=nixl
 
 vllm serve deepseek-ai/DeepSeek-V4-Pro \
   --load-format modelexpress \
@@ -172,7 +173,15 @@ vllm serve deepseek-ai/DeepSeek-V4-Pro \
 
 Start the first replica with weights available through local storage or `MX_MODEL_URI`. After it becomes healthy, launch the same command on another compatible node: ModelExpress discovers the serving replica and transfers its post-processed weights directly over NIXL P2P RDMA.
 
-JIT artifact transfer requires the P2P metadata path and writable target staging and runtime cache directories. With those prerequisites, `MX_ARTIFACT_TRANSFER=1` installs compatible artifacts into the new replica's filesystem caches. This works with central-coordinator backends (`redis` or `kubernetes`) and with `k8s-service`; the latter discovers an artifact through a Service and then pins the transfer to the selected Pod's direct endpoint.
+`MX_ARTIFACT_TRANSFER=1` enables compatible JIT-cache installation and
+publication. `MX_ARTIFACT_BACKEND` selects exactly one artifact transport and
+defaults to `nixl`. The NIXL backend requires the P2P metadata path and supports
+central coordinators (`redis` or `kubernetes`) and `k8s-service`. With
+`k8s-service`, discovery goes through a Service and the transfer is pinned to
+the selected Pod's direct endpoint. The `mooncake` backend instead uses a
+configured Mooncake distributed store and does not require an MX server or P2P
+metadata. Both backends require writable staging/runtime cache directories and
+a trusted deployment; there is no automatic fallback between them.
 
 See the [Kubernetes P2P example](examples/p2p_transfer_k8s/README.md) for metadata-server and inference-worker manifests.
 
@@ -198,7 +207,7 @@ vllm serve deepseek-ai/DeepSeek-V4-Pro \
   --trust-remote-code
 ```
 
-vLLM 0.23.0 recognizes the load format natively; the ModelExpress Python package must still be installed in the runtime image. The first instance loads from disk, while subsequent instances receive weights via RDMA. Set `MX_ARTIFACT_TRANSFER=1` to transfer compatible JIT caches as well. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Server setup](examples/p2p_transfer_k8s/server/README.md).
+vLLM 0.23.0 recognizes the load format natively; the ModelExpress Python package must still be installed in the runtime image. The first instance loads from disk, while subsequent instances receive weights via RDMA. Set `MX_ARTIFACT_TRANSFER=1` to transfer compatible JIT caches as well, and select `MX_ARTIFACT_BACKEND=nixl` (the default) or `mooncake`. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Server setup](examples/p2p_transfer_k8s/server/README.md).
 
 ### ModelStreamer on Kubernetes
 

@@ -200,9 +200,9 @@ def test_requires_initialized_distributed_engine(monkeypatch):
         _adapter()
 
 
-def test_source_slot_id_requires_binding(dist_ready):
+def test_logical_shard_id_requires_binding(dist_ready):
     with pytest.raises(RuntimeError, match="bind_tensors"):
-        _ = _adapter().source_slot_id
+        _ = _adapter().logical_shard_id
 
 
 def test_bind_tensors_validates_state_dict_and_returns_wire_coverage(dist_ready):
@@ -210,7 +210,7 @@ def test_bind_tensors_validates_state_dict_and_returns_wire_coverage(dist_ready)
 
     binding = adapter.bind_tensors({"w": torch.ones(2, 4)})
     assert len(binding) == 64
-    assert adapter.source_slot_id == binding
+    assert adapter.logical_shard_id == binding
     assert not adapter._manager.registered
     assert adapter._arenas == {}
     assert _adapter().bind_tensors({"w": torch.zeros(2, 4)}) == binding

@@ -62,8 +62,12 @@ if TYPE_CHECKING:
     MX_PUBLISH_TIMEOUT_SECS: int
     MX_MODEL_REVISION: str
     MX_MODEL_URI: Optional[str]
+    MX_PLUGIN_DIR: str
+    MX_LOAD_PLUGIN: Optional[str]
+    MX_LOAD_PLUGIN_BEFORE: str
     MX_LOAD_STRATEGY_CHAIN: str
     MX_P2P_METADATA: str
+    MX_DISABLE_DRAFT_P2P: bool
     MX_RESHARD_FUSED_WIRE: bool
     MX_RESHARD_BATCH_INSTALL: bool
     MX_RESHARD_CACHE_DESCRIPTORS: bool
@@ -90,6 +94,7 @@ if TYPE_CHECKING:
     MX_ARTIFACT_OWNER_DEVICE_ID: int
     # NIXL / transport
     MX_NIXL_BACKEND: str
+    MX_NIXL_METADATA_TIMEOUT: float
     MX_POOL_REG: bool
     NIXL_UCX_TLS: Optional[str]
     UCX_TLS: Optional[str]
@@ -117,6 +122,11 @@ if TYPE_CHECKING:
     MX_ARTIFACT_TRANSFER: bool
     MX_ARTIFACT_BUNDLE_ROOT: Optional[str]
     MX_ARTIFACT_COMPILE_CONFIG_DIGEST: str
+    MX_ARTIFACT_BACKEND: str
+    MX_ARTIFACT_MOONCAKE_NAMESPACE: str
+    MX_ARTIFACT_MOONCAKE_POOL_BYTES: int
+    MX_ARTIFACT_MOONCAKE_DELETE_RETRIES: int
+    MX_ARTIFACT_MOONCAKE_DELETE_RETRY_DELAY_SECS: float
     MX_ARTIFACT_READY_URL: str
     MX_ARTIFACT_READY_TIMEOUT_SECS: int
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
@@ -135,6 +145,10 @@ if TYPE_CHECKING:
     MX_P2P_TOPOLOGY_LEVELS: Optional[str]
     MX_P2P_TOPOLOGY: Optional[str]
     MX_P2P_TOPOLOGY_LOAD_WEIGHT: float
+    # Transfer-domain policy: the topology domain sources must share with this
+    # node, and whether that is required (filter) or preferred (ordering).
+    MX_P2P_TOPOLOGY_DOMAIN: Optional[str]
+    MX_P2P_TOPOLOGY_ENFORCEMENT: Optional[str]
     # Opt-in metrics collector
     MX_METRICS_ENABLED: bool
     MX_METRICS_PORT: Optional[str]
@@ -279,10 +293,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_PUBLISH_TIMEOUT_SECS": lambda: _env_int("MX_PUBLISH_TIMEOUT_SECS", 30 * 60),
     "MX_MODEL_REVISION": lambda: os.environ.get("MX_MODEL_REVISION", ""),
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
+    "MX_PLUGIN_DIR": lambda: os.environ.get("MX_PLUGIN_DIR", "/opt/modelexpress/plugins"),
+    "MX_LOAD_PLUGIN": lambda: os.environ.get("MX_LOAD_PLUGIN"),
+    "MX_LOAD_PLUGIN_BEFORE": lambda: os.environ.get("MX_LOAD_PLUGIN_BEFORE", "server-cache"),
     "MX_LOAD_STRATEGY_CHAIN": lambda: (
         os.environ.get("MX_LOAD_STRATEGY_CHAIN", "INFERENCE").strip().upper()
     ),
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
+    "MX_DISABLE_DRAFT_P2P": lambda: _env_bool("MX_DISABLE_DRAFT_P2P", False),
     "MX_RESHARD_FUSED_WIRE": lambda: _env_bool("MX_RESHARD_FUSED_WIRE", True),
     # Issue the per-view re-slice copies of full-pulled sources as one batched
     # _foreach_copy_ instead of a copy_() per view. On by default: it is the same
@@ -385,6 +403,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_ARTIFACT_OWNER_DEVICE_ID": lambda: _env_int("MX_ARTIFACT_OWNER_DEVICE_ID", 0),
     # ── NIXL / transport ───────────────────────────────────────────────────
     "MX_NIXL_BACKEND": lambda: os.environ.get("MX_NIXL_BACKEND", "UCX").strip().upper(),
+    "MX_NIXL_METADATA_TIMEOUT": lambda: _env_positive_float(
+        "MX_NIXL_METADATA_TIMEOUT", 120.0
+    ),
     "MX_POOL_REG": lambda: os.environ.get("MX_POOL_REG", "0") == "1",
     "NIXL_UCX_TLS": lambda: os.environ.get("NIXL_UCX_TLS"),
     "UCX_TLS": lambda: os.environ.get("UCX_TLS"),
@@ -427,6 +448,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_ARTIFACT_COMPILE_CONFIG_DIGEST": lambda: os.environ.get(
         "MX_ARTIFACT_COMPILE_CONFIG_DIGEST", ""
     ),
+    "MX_ARTIFACT_BACKEND": lambda: os.environ.get("MX_ARTIFACT_BACKEND", "nixl")
+    .strip()
+    .lower(),
+    "MX_ARTIFACT_MOONCAKE_NAMESPACE": lambda: os.environ.get(
+        "MX_ARTIFACT_MOONCAKE_NAMESPACE", "modelexpress/artifacts"
+    ).strip(),
+    "MX_ARTIFACT_MOONCAKE_POOL_BYTES": lambda: _env_int(
+        "MX_ARTIFACT_MOONCAKE_POOL_BYTES", 512 * 1024 * 1024
+    ),
+    "MX_ARTIFACT_MOONCAKE_DELETE_RETRIES": lambda: _env_int(
+        "MX_ARTIFACT_MOONCAKE_DELETE_RETRIES", 10
+    ),
+    "MX_ARTIFACT_MOONCAKE_DELETE_RETRY_DELAY_SECS": lambda: _env_float(
+        "MX_ARTIFACT_MOONCAKE_DELETE_RETRY_DELAY_SECS", 0.7
+    ),
     "MX_ARTIFACT_READY_URL": lambda: os.environ.get("MX_ARTIFACT_READY_URL", ""),
     "MX_ARTIFACT_READY_TIMEOUT_SECS": lambda: _env_int(
         "MX_ARTIFACT_READY_TIMEOUT_SECS", 1800
@@ -454,6 +490,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_P2P_TOPOLOGY_LOAD_WEIGHT": lambda: max(
         0.0, _env_float("MX_P2P_TOPOLOGY_LOAD_WEIGHT", 0.0)
     ),
+    # Raw; topology.resolve_policy validates and applies the "required" default.
+    "MX_P2P_TOPOLOGY_DOMAIN": lambda: os.environ.get("MX_P2P_TOPOLOGY_DOMAIN"),
+    "MX_P2P_TOPOLOGY_ENFORCEMENT": lambda: os.environ.get("MX_P2P_TOPOLOGY_ENFORCEMENT"),
     # ── Opt-in metrics collector ───────────────────────────────────────────
     "MX_METRICS_ENABLED": lambda: (
         os.environ.get("MX_METRICS_ENABLED", "0").strip().lower() in _TRUTHY

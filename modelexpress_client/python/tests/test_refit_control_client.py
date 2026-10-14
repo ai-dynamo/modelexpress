@@ -21,7 +21,9 @@ from modelexpress_rl import (
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
     def __init__(self) -> None:
         self.version = None
-        self.mesh = None
+        self.mesh = refit_pb2.TrainerMesh(
+            mesh_id="mesh-a", model_name="test/model", generation=1
+        )
 
     def CreateTrainerMesh(self, request, _context):
         self.mesh = refit_pb2.TrainerMesh(
@@ -54,7 +56,9 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.mesh = None
         return refit_pb2.DeleteTrainerMeshResponse()
 
-    def CreateWeightVersion(self, request, _context):
+    def CreateWeightVersion(
+        self, request, _context
+    ) -> refit_pb2.CreateWeightVersionResponse:
         self.version = refit_pb2.WeightVersion(
             uid=request.uid if request.HasField("uid") else "version-a",
             model_name=request.model_name,
@@ -69,6 +73,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             self.version.object_storage.CopyFrom(request.object_storage)
         if request.HasField("trainer_mesh_id"):
             self.version.trainer_mesh_id = request.trainer_mesh_id
+            self.version.trainer_mesh_generation = self.mesh.generation
         if request.HasField("version_number"):
             self.version.version_number = request.version_number
         return refit_pb2.CreateWeightVersionResponse(version=self.version)
@@ -98,27 +103,19 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         return refit_pb2.UpdateWeightVersionStateResponse(version=self.version)
 
 
-def test_weight_version_required_fields_precede_optional_fields():
-    from dataclasses import MISSING, fields
-
-    optional_seen = False
-    for field in fields(control_module.WeightVersion):
-        if field.default is MISSING:
-            assert not optional_seen
-        else:
-            optional_seen = True
-    version = control_module.WeightVersion(
-        version_id="version-a",
-        model_name="test/model",
-        payload_format=WeightPayloadFormat.FULL_TENSOR,
-        layout_signature="",
-        state=WeightVersionState.STAGING,
-        created_at_unix_ms=1234,
-    )
-    assert version.base_version_id is None
-    assert version.object_storage is None
-    assert version.trainer_mesh_id is None
-    assert version.version_number is None
+@pytest.mark.parametrize("generation", [True, -1, 0, 2**64])
+def test_weight_version_rejects_invalid_mesh_generation(generation) -> None:
+    with pytest.raises(ValueError, match="generation"):
+        control_module.WeightVersion(
+            version_id="version-a",
+            model_name="test/model",
+            payload_format=WeightPayloadFormat.FULL_TENSOR,
+            layout_signature="",
+            state=WeightVersionState.STAGING,
+            created_at_unix_ms=1234,
+            trainer_mesh_id="mesh-a",
+            trainer_mesh_generation=generation,
+        )
 
 
 def test_control_client_rejects_missing_version_response():
@@ -200,8 +197,10 @@ def test_control_client_links_version_to_trainer_mesh():
     assert fetched == version
 
 
-def test_control_client_owns_global_weight_version_lifecycle():
+@pytest.mark.parametrize("generation", [1, 2**64 - 1])
+def test_control_client_owns_global_weight_version_lifecycle(generation) -> None:
     service = _RefitService()
+    service.mesh.generation = generation
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
     port = server.add_insecure_port("127.0.0.1:0")
@@ -229,6 +228,7 @@ def test_control_client_owns_global_weight_version_lifecycle():
     assert created.ref.version_id == "version-a"
     assert created.payload_format is WeightPayloadFormat.FULL_TENSOR
     assert created.trainer_mesh_id == "mesh-a"
+    assert created.trainer_mesh_generation == generation
     assert created.state is WeightVersionState.STAGING
     assert fetched == created
     assert ready.state is WeightVersionState.READY
