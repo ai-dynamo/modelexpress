@@ -98,8 +98,127 @@ echo '{"items":[{"metadata":{"name":"failed-worker"},"status":{"containerStatuse
 '''
     result = run_shell(tmp_path, 'wait_for_scheduling Source mx-source job-name=mx-source 30', command)
     assert result.returncode != 0
-    assert "pod failed while waiting for scheduling: failed-worker" in result.stderr
+    assert "pod failed: failed-worker" in result.stderr
     assert "did not schedule within" not in result.stderr
+
+
+def test_unhealthy_rdma_admission_retries_one_pod(tmp_path):
+    command = '''echo "$*" >> "$FIXTURE/commands"
+if [[ " $* " == *" get job,statefulset,deployment "* ]]; then
+  echo '{"spec":{"backoffLimit":1}}'; exit 0
+fi
+count=$(cat "$FIXTURE/calls" 2>/dev/null || echo 0)
+count=$((count + 1)); echo "$count" > "$FIXTURE/calls"
+if [ "$count" -gt 1 ]; then
+  echo '{"items":[{"metadata":{"name":"failed-worker"},"status":{"phase":"Failed","reason":"UnexpectedAdmissionError","message":"no healthy devices present rdma/ib"}},{"metadata":{"name":"replacement-worker"},"status":{"conditions":[{"type":"PodScheduled","status":"True"}]}}]}'
+else
+  echo '{"items":[{"metadata":{"name":"failed-worker"},"status":{"phase":"Failed","reason":"UnexpectedAdmissionError","message":"Allocate failed due to no healthy devices present; cannot allocate unhealthy devices rdma/ib, which is unexpected"}}]}'
+fi
+'''
+    result = run_shell(
+        tmp_path,
+        "wait_for_scheduling Target mx-target job-name=mx-target 30",
+        command,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "scheduled (1/1 pods)" in result.stdout
+    commands = (tmp_path / "commands").read_text()
+    assert "delete pod" not in commands
+
+
+def test_unexpected_admission_error_without_rdma_fails_immediately(tmp_path):
+    command = '''echo "$*" >> "$FIXTURE/commands"
+if [[ " $* " == *" get job,statefulset,deployment "* ]]; then
+  echo '{"spec":{"backoffLimit":1}}'; exit 0
+fi
+echo '{"items":[{"metadata":{"name":"failed-worker"},"status":{"phase":"Failed","reason":"UnexpectedAdmissionError","message":"admission rejected invalid security context"}}]}'
+'''
+    result = run_shell(
+        tmp_path,
+        "wait_for_scheduling Target mx-target job-name=mx-target 30",
+        command,
+    )
+    assert result.returncode != 0
+    assert "pod failed: failed-worker" in result.stderr
+    assert "delete pod" not in (tmp_path / "commands").read_text()
+
+
+def test_exhausted_rdma_admission_retry_fails_immediately(tmp_path):
+    command = '''echo "$*" >> "$FIXTURE/commands"
+if [[ " $* " == *" get job,statefulset,deployment "* ]]; then
+  echo '{"spec":{"backoffLimit":1},"status":{"conditions":[{"type":"Failed","status":"True"}]}}'; exit 0
+fi
+echo '{"items":[{"metadata":{"name":"failed-worker"},"status":{"phase":"Failed","reason":"UnexpectedAdmissionError","message":"Allocate failed due to no healthy devices present; cannot allocate unhealthy devices rdma/ib, which is unexpected"}}]}'
+'''
+    result = run_shell(
+        tmp_path,
+        "wait_for_scheduling Target mx-target job-name=mx-target 30",
+        command,
+    )
+    assert result.returncode != 0
+    assert "exhausted its RDMA admission retry" in result.stderr
+    assert "delete pod" not in (tmp_path / "commands").read_text()
+
+
+@pytest.mark.parametrize("phase", ["metadata", "health"])
+@pytest.mark.parametrize("scenario", ["recovery", "exhausted", "other_admission", "crash", "config_error"])
+def test_admission_failure_after_scheduling(tmp_path, phase, scenario):
+    failed = {
+        "metadata": {"name": "failed-worker"},
+        "status": {"phase": "Failed", "reason": "UnexpectedAdmissionError",
+                   "message": "no healthy devices present rdma/ib"},
+    }
+    if scenario == "other_admission":
+        failed["status"]["message"] = "invalid security context"
+    elif scenario == "crash":
+        failed["status"]["reason"] = "Error"
+    elif scenario == "config_error":
+        failed["status"] = {"phase": "Pending", "containerStatuses": [
+            {"state": {"waiting": {"reason": "CreateContainerConfigError"}}},
+        ]}
+    scheduled = {"metadata": {"name": "failed-worker"}, "status": {
+        "phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "True"}],
+    }}
+    replacement = {"metadata": {"name": "replacement-worker"}, "status": {
+        "phase": "Running", "conditions": [{"type": "PodScheduled", "status": "True"}],
+    }}
+    command = f'''echo "$*" >> "$FIXTURE/commands"
+if [[ " $* " == *" get job,statefulset,deployment "* ]]; then
+  if [ "{scenario}" = exhausted ] && [ -f "$FIXTURE/calls" ] && [ "$(cat "$FIXTURE/calls")" -ge 3 ]; then
+    echo '{{"kind":"Job","spec":{{"backoffLimit":1}},"status":{{"failed":2}}}}'
+  else echo '{{"kind":"Job","spec":{{"backoffLimit":1}},"status":{{"failed":1}}}}'; fi
+  exit 0
+fi
+if [[ " $* " == *" exec "* ]]; then
+  [[ " $* " == *" replacement-worker "* ]]; exit $?
+fi
+count=$(cat "$FIXTURE/calls" 2>/dev/null || echo 0)
+count=$((count + 1)); echo "$count" > "$FIXTURE/calls"
+if [ "$count" -eq 1 ]; then echo '{json.dumps({"items": [scheduled]})}'
+elif [ "$count" -eq 2 ]; then echo '{json.dumps({"items": [failed]})}'
+else echo '{json.dumps({"items": [failed, replacement]})}'; fi
+'''
+    body = 'wait_for_scheduling Target mx-target job-name=mx-target 30\n'
+    if phase == "health":
+        body += 'source .github/actions/run-mx-p2p-test/vram-sampling.sh\ntest_pod=\n'
+        body += 'wait_for_health Target job-name=mx-target mx-target 8000 test_pod 30\n'
+        body += 'echo "pod=$test_pod"\n'
+    else:
+        workflow = (ROOT / ".github/actions/run-mx-p2p-test/action.yml").read_text()
+        loop = workflow.split('\n        while [ $SECONDS -lt $deadline ]; do\n', 1)[1]
+        loop = 'while [ $SECONDS -lt $deadline ]; do\n' + loop.split('        # The loop exits', 1)[0]
+        body += 'deadline=$((SECONDS + 30)); MEASURE_VRAM=false; TP_SIZE=1\n'
+        body += 'count_weight_sources() { if [ "$(cat "$FIXTURE/calls")" -ge 3 ]; then echo 1; else echo 0; fi; }\n'
+        body += loop
+    result = run_shell(tmp_path, body, command)
+    if scenario == "recovery":
+        assert result.returncode == 0, result.stderr
+        assert int((tmp_path / "calls").read_text()) == 3
+        assert ("pod=replacement-worker" if phase == "health" else "published 1/1") in result.stdout
+    else:
+        assert result.returncode != 0
+        assert ("exhausted" if scenario == "exhausted" else "pod failed") in result.stderr
+    assert "delete pod" not in (tmp_path / "commands").read_text()
 
 
 @pytest.mark.parametrize("scenario,status,deletes", [

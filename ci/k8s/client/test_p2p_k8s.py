@@ -75,6 +75,7 @@ def _pod_name(namespace: str, job_name: str, ordinal: int | None = None) -> str:
         probe = kubectl(
             "get", "pods",
             "-l", ordinal_selector,
+            "--field-selector=status.phase!=Failed",
             "-o", "name",
             namespace=namespace,
         )
@@ -86,6 +87,7 @@ def _pod_name(namespace: str, job_name: str, ordinal: int | None = None) -> str:
     result = kubectl(
         "get", "pods",
         "-l", f"job-name={job_name}",
+        "--field-selector=status.phase!=Failed",
         "-o", "jsonpath={.items[0].metadata.name}",
         namespace=namespace,
     )
@@ -122,6 +124,7 @@ def _pod_logs_by_pod(namespace: str, job_name: str, container: str) -> dict[str,
     pod_list = kubectl(
         "get", "pods",
         "-l", f"job-name={job_name}",
+        "--field-selector=status.phase!=Failed",
         "-o", "jsonpath={.items[*].metadata.name}",
         namespace=namespace,
     ).stdout.split()

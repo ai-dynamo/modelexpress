@@ -29,7 +29,7 @@ jobs:
   gpu-cleanup:
     name: GPU cleanup
     needs: [gpu-tests]
-    if: ${{ always() && needs.gpu-tests.result != 'success' }}
+    if: ${{ always() && needs.gpu-tests.result != 'skipped' && needs.gpu-tests.result != 'success' }}
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 30
     permissions:
@@ -103,8 +103,8 @@ jobs:
           bash .github/scripts/build-with-registry-retry.sh \
             --platform linux/amd64 \
             -f ci/k8s/server/Dockerfile.server \
-            --cache-from "type=registry,ref=${SERVER_IMAGE%:*}:buildcache-${GITHUB_REF_NAME//\//-}" \
-            --cache-to "type=registry,ref=${SERVER_IMAGE%:*}:buildcache-${GITHUB_REF_NAME//\//-},mode=max,ignore-error=true" \
+            --cache-from "type=registry,ref=${SERVER_IMAGE%:*}:buildcache-shared" \
+            --cache-to "type=registry,ref=${SERVER_IMAGE%:*}:buildcache-shared,mode=max,ignore-error=true" \
             -t "${SERVER_IMAGE}" \
             --push \
             .
@@ -167,8 +167,8 @@ jobs:
           bash .github/scripts/build-with-registry-retry.sh \
             --platform linux/amd64 \
             -f "${{ matrix.dockerfile }}" \
-            --cache-from "type=registry,ref=${WORKER_IMAGE%:*}:buildcache-${GITHUB_REF_NAME//\//-}" \
-            --cache-to "type=registry,ref=${WORKER_IMAGE%:*}:buildcache-${GITHUB_REF_NAME//\//-},mode=max,ignore-error=true" \
+            --cache-from "type=registry,ref=${WORKER_IMAGE%:*}:buildcache-shared" \
+            --cache-to "type=registry,ref=${WORKER_IMAGE%:*}:buildcache-shared,mode=max,ignore-error=true" \
             -t "${WORKER_IMAGE}" \
             --push \
             .
