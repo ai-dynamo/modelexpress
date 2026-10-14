@@ -16,6 +16,11 @@ env:
   VCLUSTER_NAME: mx-ci-cluster
   VCLUSTER_NAMESPACE: mx-ci
   MX_IMAGE_REPO: nvcr.io/0980761089281446
+  GIT_CONFIG_COUNT: "2"
+  GIT_CONFIG_KEY_0: http.lowSpeedLimit
+  GIT_CONFIG_VALUE_0: "1"
+  GIT_CONFIG_KEY_1: http.lowSpeedTime
+  GIT_CONFIG_VALUE_1: "60"
 
 jobs:
   admission-slots:

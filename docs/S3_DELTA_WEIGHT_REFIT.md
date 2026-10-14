@@ -312,6 +312,21 @@ engine is marked uncertain. The next request may reinstall that active version
 or install any target reconstructed from it; either successful installation
 clears the uncertain state.
 
+With `MX_REFIT_DELTA_SURGICAL=true` (default `false`), the vLLM installer skips the whole-checkpoint
+reload when it knows which tensors changed. The prepared checkpoint carries the
+changed names of every delta since its full root, read from the delta indexes in
+the cache, and the installer remembers the version it last installed from a
+checkpoint. It then feeds only the checkpoint tensors of each destination module
+those deltas touched (every expert of a fused MoE, both halves of a packed
+projection) through the same graph-safe layerwise reload. Untouched layers keep
+their kernel tensors. If a fed module is still incomplete, the installer loads
+the rest of the checkpoint in the same reload, which is exactly a full reload.
+Peer installs, bounded tensor streaming, cold start, and failed installs leave the live version unknown,
+so the next checkpoint install is a full reload.
+Delta lineage uses registry version IDs validated during replay. Writer versions
+in cached XOR index metadata may differ from those IDs and do not determine
+surgical reload eligibility.
+
 All ranks sharing one host filesystem can share the same cache. Each host without
 a shared filesystem needs its own cache.
 

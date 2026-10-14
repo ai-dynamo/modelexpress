@@ -18,6 +18,7 @@ sample_peak_vram() {
   if [ -z "${pod}" ]; then
     pod="$(ci_kubectl get pods -n "${NAMESPACE}" \
       -l "${selector}" \
+      --field-selector=status.phase!=Failed \
       -o json | jq -r '.items[0].metadata.name // empty')"
   fi
   if [ -z "${pod}" ]; then
@@ -72,12 +73,11 @@ wait_for_health() {
     measure_vram=true
   fi
 
-  local deadline failed pod
+  local deadline pod
   deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
-    pod="$(ci_kubectl get pods -n "${NAMESPACE}" \
-      -l "${selector}" \
-      -o json | jq -r '.items[0].metadata.name // empty')"
+    pod="$(ci_workload_pods "${label}" "${container}" "${selector}" \
+      | jq -r '.items[0].metadata.name // empty')" || return 1
     printf -v "${pod_var}" '%s' "${pod}"
 
     if [ "${measure_vram}" = "true" ]; then
@@ -88,13 +88,6 @@ wait_for_health() {
          curl -sf -m 5 "http://localhost:${port}/health" >/dev/null; then
       echo "${label} ${pod} /health returned 200."
       break
-    fi
-
-    failed="$(ci_kubectl get pods -n "${NAMESPACE}" -l "${selector}" --no-headers \
-      | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)"
-    if [ -n "${failed}" ]; then
-      echo "ERROR: ${label} pod entered failure state before /health returned 200: ${failed}"
-      exit 1
     fi
 
     echo "${label} /health not ready yet (pod=${pod:-<not-created>})..."
