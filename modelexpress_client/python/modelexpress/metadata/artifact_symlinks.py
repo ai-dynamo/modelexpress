@@ -16,7 +16,8 @@ _MAX_METADATA_BYTES = 4 * 1024 * 1024
 
 def encode_links(source_root: Path, links: list[Path]) -> bytes:
     entries = []
-    reserved_path = source_root.resolve() / METADATA_NAME
+    resolved_source_root = source_root.resolve()
+    reserved_path = resolved_source_root / METADATA_NAME
     for link in links:
         try:
             resolved = link.resolve(strict=False)
@@ -28,8 +29,10 @@ def encode_links(source_root: Path, links: list[Path]) -> bytes:
         # Absolute links within a cache must follow that cache when relocated.
         if os.path.isabs(target):
             normalized = Path(os.path.abspath(target))
-            if normalized.is_relative_to(source_root):
+            if normalized.is_relative_to(resolved_source_root):
                 target = os.path.relpath(normalized, link.parent)
+            elif resolved.is_relative_to(resolved_source_root):
+                target = os.path.relpath(resolved, link.parent.resolve())
         entries.append({"path": link.relative_to(source_root).as_posix(), "target": target})
     payload = json.dumps(
         {"version": 1, "links": entries}, sort_keys=True, separators=(",", ":")

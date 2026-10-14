@@ -88,6 +88,38 @@ def test_absolute_internal_link_does_not_depend_on_source_cache(tmp_path):
     assert (transfer.roots[0].target_root / "header.h").read_text() == "header"
 
 
+def test_absolute_internal_link_through_source_alias_is_relocated(tmp_path):
+    source, transfer = _bundle(tmp_path)
+    source_alias = tmp_path / "source-alias"
+    source_alias.symlink_to(source, target_is_directory=True)
+    (source / "include").symlink_to(source_alias / "headers", target_is_directory=True)
+
+    _install(transfer)
+    installed_link = transfer.roots[0].target_root / "include"
+    assert installed_link.is_symlink()
+    assert installed_link.readlink() == Path("headers")
+
+    source_alias.unlink()
+    source.rename(tmp_path / "retired-source")
+    assert (installed_link / "header.h").read_text() == "header"
+
+
+def test_absolute_internal_link_to_external_symlink_keeps_internal_path(tmp_path):
+    source, transfer = _bundle(tmp_path)
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "header.h").write_text("external header")
+    (source / "external-alias").symlink_to(external, target_is_directory=True)
+    (source / "include").symlink_to(source / "external-alias", target_is_directory=True)
+
+    _install(transfer)
+    installed_link = transfer.roots[0].target_root / "include"
+    assert installed_link.readlink() == Path("external-alias")
+
+    source.rename(tmp_path / "retired-source")
+    assert (installed_link / "header.h").read_text() == "external header"
+
+
 def test_cycle_is_rejected_before_extracting_regular_files(tmp_path):
     source, transfer = _bundle(tmp_path)
     (source / "a").symlink_to("b")
