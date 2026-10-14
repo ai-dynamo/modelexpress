@@ -19,7 +19,8 @@ also use its full-pull and conversion phases.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Any, Callable
 
 from modelexpress import envs
@@ -78,6 +79,9 @@ class FullPullSource:
     elsize: int
     segments: tuple
     copies: tuple
+    copy_indices: tuple = ()
+    exact_descriptor_count: int = 0
+    exact_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -98,6 +102,13 @@ class LogicalTransferPlan:
     exact_descriptor_count: int = 0
     exact_bytes: int = 0
     verify_full_sources: bool = False
+    source_replay: bool = False
+    replay_parameter_names: frozenset[str] = frozenset()
+    replay_last_writes: MappingProxyType = field(default_factory=lambda: MappingProxyType({}))
+    replay_total_copies: int = 0
+    replay_generation: int | None = None
+    installation_owner_peak_bytes: int = 0
+    installation_materialization_peak_bytes: int = 0
 
     def _all_segments(self):
         """Every planned segment, wherever it lands.
@@ -123,6 +134,150 @@ class LogicalTransferPlan:
 
     def extra_wire_bytes(self) -> int:
         return max(0, self.bytes_planned() - self.exact_bytes)
+
+
+def replay_scratch_bytes(full):
+    """Bound simultaneously live local replay outputs, excluding the receive view."""
+    import torch
+
+    peak = 0
+    for copy in full.copies:
+        root = torch.empty(full.global_shape, dtype=full.dtype, device="meta")
+        root_storage = root.untyped_storage()._cdata
+        value = root
+
+        def storages(value, root_storage=root_storage):
+            tensors = value if isinstance(value, (tuple, list)) else (value,)
+            return {
+                tensor.untyped_storage()._cdata: tensor.untyped_storage().nbytes()
+                for tensor in tensors
+                if isinstance(tensor, torch.Tensor)
+                and tensor.untyped_storage()._cdata != root_storage
+            }
+
+        for name, args, frozen in copy.op_chain:
+            previous = storages(value)
+            kwargs = dict(frozen)
+            if name == "to":
+                if args and isinstance(args[0], (str, torch.device)):
+                    args = (torch.device("meta"), *args[1:])
+                    if len(args) >= 4:
+                        args = (*args[:3], True, *args[4:])
+                    else:
+                        kwargs["copy"] = True
+                if kwargs.get("device") is not None:
+                    kwargs["device"] = torch.device("meta")
+                    kwargs["copy"] = True
+            value = (
+                torch.empty_like(value)
+                if name == "zero_"
+                else getattr(value, name)(*args, **kwargs)
+            )
+            peak = max(peak, sum((previous | storages(value)).values()))
+    return peak
+
+
+def _plan_local_replay(copy, source, index, *, buffer_indices):
+    """Read the longest representable source prefix and replay its suffix locally."""
+    import torch
+
+    from modelexpress.refit.reshard.geometry import _SUPPORTED_OPS
+
+    if any(op[0] not in _SUPPORTED_OPS.values() for op in copy.op_chain):
+        raise UnsupportedReshard(f"{copy.src_name}: unsupported replay operation")
+    root = torch.empty(source.global_shape, dtype=source.dtype, device="meta")
+    value = root
+    exact = None
+    for length in range(len(copy.op_chain) + 1):
+        if length:
+            name, args, kwargs = copy.op_chain[length - 1]
+            if name in {"to", "float", "bfloat16", "half", "double", "zero_"}:
+                break
+            value = getattr(value, name)(*args, **dict(kwargs))
+            if not isinstance(value, torch.Tensor):
+                continue
+            if value is not root and value._base is not root:
+                break
+        candidate = replace(
+            copy,
+            op_chain=copy.op_chain[:length],
+            dest_offset=0,
+            dest_shape=tuple(value.shape),
+            dest_stride=tuple(_row_major_strides(value.shape)),
+            dest_dtype=source.dtype,
+        )
+        try:
+            reads = plan_pull(
+                candidate, source.global_shape, source.dtype, source.elsize,
+                source.shards, buffer_indices=buffer_indices,
+            )
+            count, nbytes = len(reads), sum(read.nbytes for read in reads)
+        except UnsupportedReshard:
+            break
+        exact = (length, candidate, count, nbytes)
+    if exact is None:
+        raise UnsupportedReshard(f"{copy.src_name}: no transferable replay prefix")
+    selected = exact
+    prefix, candidate, _, _ = selected
+    segments = plan_pull(
+        candidate, source.global_shape, source.dtype, source.elsize, source.shards,
+        buffer_indices=buffer_indices,
+    )
+    # Tuple keys cannot collide with trainer names, including across packed owners.
+    key = (copy.src_name, copy.param_name, index)
+    return FullPullSource(
+        src_name=key,
+        global_shape=candidate.dest_shape,
+        dtype=source.dtype,
+        elsize=source.elsize,
+        segments=tuple(segment._replace(param_name=key) for segment in segments),
+        copies=(replace(copy, op_chain=copy.op_chain[prefix:]),),
+        copy_indices=(index,),
+        exact_descriptor_count=exact[2],
+        exact_bytes=exact[3],
+    )
+
+
+def source_replay_workspace(capture):
+    """Estimate load-time storage liveness; native quantization scratch is unknown."""
+    spans = {}
+    for index, copy in enumerate(capture.copies):
+        owner = copy.param_name.rpartition(".")[0]
+        spans.setdefault(owner, [index, index])[1] = index
+    parent = {owner: owner for owner in spans}
+
+    def root(owner):
+        while parent[owner] != owner:
+            parent[owner] = parent[parent[owner]]
+            owner = parent[owner]
+        return owner
+
+    for dependencies in capture.owner_dependencies:
+        owners = [owner for owner in dependencies if owner in spans]
+        for owner in owners[1:]:
+            parent[root(owner)] = root(owners[0])
+    groups = {}
+    for owner in spans:
+        groups.setdefault(root(owner), []).append(owner)
+    events = {}
+    for owners in groups.values():
+        first = min(spans[owner][0] for owner in owners)
+        last = max(spans[owner][1] for owner in owners)
+        workspace = [capture.owner_workspaces.get(owner, (0, 0)) for owner in owners]
+        # Upper bound transient materialization regardless of owner traversal order.
+        retained = sum(item[1] for item in workspace)
+        temporary = max((allocated - kept for allocated, kept in workspace), default=0)
+        events.setdefault(first, [[], 0])[0].append((retained, temporary))
+        events.setdefault(last, [[], 0])[1] += retained
+    live = retained_peak = materialization_peak = 0
+    for index in sorted(events):
+        incoming, released = events[index]
+        for retained, temporary in incoming:
+            live += retained
+            retained_peak = max(retained_peak, live)
+            materialization_peak = max(materialization_peak, live + temporary)
+        live -= released
+    return retained_peak, materialization_peak
 
 
 def _full_pull_segments(
@@ -303,6 +458,37 @@ def plan_transfer_groups(
         )
 
 
+def _plan_source_replay(capture, sources, source_buffers, source_indices, *, verify_full_sources):
+    full_pulls = []
+    fallback = list(dict.fromkeys(capture.unsupported))
+    for index, copy in enumerate(capture.copies):
+        source = sources.get(copy.src_name)
+        if source is None:
+            if copy.src_name not in fallback:
+                fallback.append(copy.src_name)
+            continue
+        pull = _plan_local_replay(
+            replace(copy, op_chain=()) if verify_full_sources else copy,
+            source, index, buffer_indices=source_indices[copy.src_name],
+        )
+        if verify_full_sources:
+            pull = replace(pull, copies=(copy,))
+        full_pulls.append(pull)
+    owner_peak, materialization_peak = source_replay_workspace(capture)
+    return LogicalTransferPlan(
+        source_buffers=tuple(source_buffers), full_pulls=tuple(full_pulls),
+        fallback=tuple(fallback), source_replay=True,
+        verify_full_sources=verify_full_sources,
+        replay_parameter_names=frozenset(copy.param_name for copy in capture.copies),
+        replay_last_writes=MappingProxyType({copy.param_name: i for i, copy in enumerate(capture.copies)}),
+        replay_total_copies=len(capture.copies), replay_generation=capture.generation,
+        installation_owner_peak_bytes=owner_peak,
+        installation_materialization_peak_bytes=materialization_peak,
+        exact_descriptor_count=sum(p.exact_descriptor_count for p in full_pulls),
+        exact_bytes=sum(p.exact_bytes for p in full_pulls),
+    )
+
+
 def _plan_transfer(
     capture, sources, source_buffers, source_indices, *,
     max_segments_per_copy=None, verify_full_sources=False,
@@ -311,6 +497,11 @@ def _plan_transfer(
         max_segments_per_copy = envs.MX_RESHARD_MAX_SEGMENTS_PER_COPY
     if max_segments_per_copy < 1:
         raise ValueError("max_segments_per_copy must be at least 1")
+    if capture.source_replay:
+        return _plan_source_replay(
+            capture, sources, source_buffers, source_indices,
+            verify_full_sources=verify_full_sources,
+        )
     if verify_full_sources:
         return _plan_verified_transfer(
             capture, sources, source_buffers, source_indices, max_segments_per_copy

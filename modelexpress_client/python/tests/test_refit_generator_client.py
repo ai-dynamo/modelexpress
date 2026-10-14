@@ -846,7 +846,11 @@ def test_generator_handles_mesh_change_with_configured_peer_fallback(
 
             def prepare(self, **_kwargs) -> SimpleNamespace:
                 return SimpleNamespace(
-                    metrics={}, batches=[SimpleNamespace(layouts=({"weight": None},))]
+                    metrics={},
+                    batches=[SimpleNamespace(
+                        transfer_plan=SimpleNamespace(source_replay=False),
+                        layouts=({"weight": None},),
+                    )],
                 )
 
             def iter_bounded(self, _prepared, _metrics) -> object:
@@ -1891,7 +1895,10 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
             return SimpleNamespace(
                 metrics={},
                 batches=[
-                    SimpleNamespace(layouts=({"a.weight": None, "b.weight": None},))
+                    SimpleNamespace(
+                        transfer_plan=SimpleNamespace(source_replay=False),
+                        layouts=({"a.weight": None, "b.weight": None},),
+                    )
                 ],
             )
 
@@ -2556,6 +2563,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
                 metrics={},
                 batches=[
                     SimpleNamespace(
+                        transfer_plan=SimpleNamespace(source_replay=False),
                         layouts=({f"{index}.weight": ((2, 2), torch.float32)},)
                     )
                     for index in range(2)
@@ -2600,18 +2608,26 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
 
     class Installer(_VllmInstaller):
         def __init__(self):
-            self._model = model
-            self._device = torch.device("cpu")
-            self._vllm_config = SimpleNamespace(quant_config=None)
-            self._model_config = SimpleNamespace(dtype=torch.float32)
-            self._live_version = None
+            super().__init__(
+                model=model,
+                device=torch.device("cpu"),
+                vllm_config=SimpleNamespace(quant_config=None),
+                model_config=SimpleNamespace(dtype=torch.float32),
+            )
             self.copy_count = 0
+
+        def _compile_install_plan(self, aliases):
+            return SimpleNamespace(
+                by_name=dict(model.named_parameters()),
+                replay_metadata=None,
+                bounded=False,
+            )
 
         def _reload(self, load):
             assert_installation_guard()
             load(self._parameter_aliases(self._model))
 
-        def _process_and_commit(self, tensors, **kwargs):
+        def _apply_batch(self, plan, tensors, **kwargs):
             assert_installation_guard()
             self.copy_count += 1
             events.append("copy")
@@ -2760,7 +2776,10 @@ def test_streaming_creates_and_emits_one_timing_cycle(
                 raise ValueError("injected streaming preparation failure")
             return SimpleNamespace(
                 metrics={},
-                batches=[SimpleNamespace(layouts=({"weight": None},))],
+                batches=[SimpleNamespace(
+                    transfer_plan=SimpleNamespace(source_replay=False),
+                    layouts=({"weight": None},),
+                )],
             )
 
         def reset_workspace(self):

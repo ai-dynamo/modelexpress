@@ -19,14 +19,31 @@ _RECORD_FIELDS = (
     "dest_shape",
     "dest_stride",
     "dest_dtype",
+    "owner_offset",
+    "owner_stride",
 )
 _CAPTURE_FIELDS = (
     "copies",
     "unsupported",
     "unattributed",
     "unsupported_reasons",
+    "source_replay",
+    "generation",
+    "owner_workspaces",
+    "owner_dependencies",
+    "destination_layouts",
     "generator_fingerprint",
 )
+_CLASS_DEFAULTS = {
+    CaptureResult: {
+        "unattributed": 0,
+        "generator_fingerprint": None,
+        "source_replay": False,
+        "generation": None,
+        "owner_dependencies": (),
+    },
+    RecordedCopy: {"owner_offset": None, "owner_stride": None},
+}
 _CAPTURE_CLASS = CaptureResult
 _RECORD_CLASS = RecordedCopy
 _COPY_METHODS = (
@@ -109,11 +126,8 @@ def _ordinary_copy_classes() -> bool:
         if any(
             name in namespace
             and not (
-                cls is CaptureResult
-                and (
-                    (name == "unattributed" and type(namespace[name]) is int)
-                    or (name == "generator_fingerprint" and namespace[name] is None)
-                )
+                name in _CLASS_DEFAULTS[cls]
+                and namespace[name] is _CLASS_DEFAULTS[cls][name]
             )
             for name in fields
         ):
@@ -165,6 +179,9 @@ class _CaptureSnapshot:
     records: tuple
     indices: tuple[int, ...]
     layout: tuple
+    metadata: tuple
+    owner_workspaces: tuple
+    destination_layouts: tuple
 
     @classmethod
     def create(cls, result: tuple):
@@ -192,6 +209,24 @@ class _CaptureSnapshot:
             or layout is capture.unsupported_reasons
         ):
             return result
+        metadata = (capture.source_replay, capture.generation, capture.owner_dependencies)
+        mappings = (
+            layout,
+            capture.unsupported_reasons,
+            capture.owner_workspaces,
+            capture.destination_layouts,
+        )
+        if (
+            not all(_immutable(value) for value in metadata)
+            or any(type(mapping) is not dict for mapping in mappings)
+            or len({id(mapping) for mapping in mappings}) != len(mappings)
+            or not all(
+                type(name) is str and _immutable(value)
+                for mapping in mappings
+                for name, value in mapping.items()
+            )
+        ):
+            return result
         records, indices, seen = [], [], {}
         for record in capture.copies:
             if (
@@ -214,13 +249,17 @@ class _CaptureSnapshot:
                     )
                 )
             indices.append(seen[identity])
-        if not all(
-            type(name) is str and _immutable(value) for name, value in layout.items()
-        ):
-            return result
         if not _ordinary_copy_classes():
             return result
-        return cls(result, tuple(records), tuple(indices), tuple(layout.items()))
+        return cls(
+            result,
+            tuple(records),
+            tuple(indices),
+            tuple(layout.items()),
+            metadata,
+            tuple(capture.owner_workspaces.items()),
+            tuple(capture.destination_layouts.items()),
+        )
 
     def clone(self):
         if not _ordinary_copy_classes():
@@ -241,6 +280,16 @@ class _CaptureSnapshot:
             unsupported=[],
             unattributed=0,
             unsupported_reasons={},
+            source_replay=self.metadata[0],
+            generation=self.metadata[1],
+            owner_dependencies=_clone_value(self.metadata[2], memo),
+            owner_workspaces={
+                name: _clone_value(value, memo) for name, value in self.owner_workspaces
+            },
+            destination_layouts={
+                name: _clone_value(value, memo)
+                for name, value in self.destination_layouts
+            },
             generator_fingerprint=self.fallback[0].generator_fingerprint,
         )
         result = (

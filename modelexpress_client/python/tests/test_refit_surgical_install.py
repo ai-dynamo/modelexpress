@@ -75,6 +75,7 @@ def fake_vllm(monkeypatch):
         "vllm.model_executor.model_loader",
         "vllm.model_executor.model_loader.default_loader",
         "vllm.model_executor.model_loader.reload",
+        "vllm.model_executor.model_loader.reload.meta",
         LAYERWISE,
     ]
     modules = {name: ModuleType(name) for name in names}
@@ -90,6 +91,10 @@ def fake_vllm(monkeypatch):
     ].DefaultModelLoader = DefaultModelLoader
     layerwise = modules[LAYERWISE]
     layerwise.LAYERWISE_INFO = {}
+    layerwise._copy_and_restore_kernel_tensors = lambda _layer, _info: None
+    modules["vllm.model_executor.model_loader.reload.meta"].materialize_layer = (
+        lambda _layer, _info: None
+    )
 
     def initialize(_model):
         for layer in state.incomplete:
