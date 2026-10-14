@@ -21,7 +21,7 @@ Pipeline per copy:
   2. ``intersect`` overlaps that needed box with each published shard's box.
   3. ``paired_runs`` walks each overlap into maximal runs that are contiguous in
      BOTH the shard buffer and the destination param, emitting one
-     ``PullSegment`` per run.
+     ``LogicalRead`` per run.
 
 Two properties worth noting:
   * Destination strides come from the ACTUAL captured ``dest_stride`` (read off
@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from modelexpress.refit.reshard.types import (
     OpChain,
@@ -70,14 +70,21 @@ class Shard:
     digest: str | None = None
 
 
-@dataclass
-class PullSegment:
-    """One contiguous run: read ``nbytes`` at ``src_addr`` (absolute, already
-    shard.addr + offset) -> write at ``param.data_ptr() + dst_byte`` for the
-    param resolved by ``param_name`` at refit time."""
+@dataclass(frozen=True)
+class SourceBuffer:
+    """Address-independent identity of one published tensor shard."""
 
-    session: str
-    src_addr: int
+    source_slot_id: str
+    src_name: str
+    shard_offset: tuple
+    shape: tuple
+
+
+class LogicalRead(NamedTuple):
+    """A source-relative byte run into a named destination."""
+
+    source_buffer: int
+    src_byte: int
     param_name: str
     dst_byte: int
     nbytes: int
@@ -309,9 +316,11 @@ def plan_pull(
     src_dtype: Any,
     elsize: int,
     shards: list,
-) -> list:
+    *,
+    buffer_indices: tuple[int, ...],
+) -> tuple[LogicalRead, ...]:
     """For one captured ``copy`` and the published ``shards`` of its source
-    tensor, return the ``PullSegment``s that read exactly the needed slice.
+    tensor, return the ``LogicalRead``s that read exactly the needed slice.
 
     Raises ``UnsupportedReshard`` on dtype mismatch, or an op-chain that isn't
     a pure permuted view (copy / rank increase / dim-merge)."""
@@ -327,7 +336,7 @@ def plan_pull(
     need_origin = [lo for lo, _ in needed]
 
     segments: list = []
-    for sh in shards:
+    for buffer_index, sh in zip(buffer_indices, shards, strict=True):
         shard_box = [(o, o + s) for o, s in zip(sh.shard_offset, sh.shape, strict=True)]
         overlap = intersect(needed, shard_box)
         if overlap is None:
@@ -337,12 +346,12 @@ def plan_pull(
             overlap, sh.shard_offset, src_strides, need_origin, dest_strides
         ):
             segments.append(
-                PullSegment(
-                    session=sh.session,
-                    src_addr=sh.addr + s_off * sh.elsize,
+                LogicalRead(
+                    source_buffer=buffer_index,
+                    src_byte=s_off * sh.elsize,
                     param_name=copy.param_name,
                     dst_byte=(copy.dest_offset + d_off) * elsize,
                     nbytes=n * elsize,
                 )
             )
-    return segments
+    return tuple(segments)

@@ -135,6 +135,9 @@ class TestAllocationScope:
     def test_prepare_scopes_every_registered_buffer_class(self, monkeypatch):
         from tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
 
+        # Binding resolves real shard addresses and has its own tests; this one
+        # only counts the allocation scopes, which all precede it.
+        monkeypatch.setenv("MX_RESHARD_CACHE_DESCRIPTORS", "0")
         receiver, keepalive = _build(_RecordingTransport())
         plan = receiver._plan
         receiver._manager = MagicMock()
@@ -161,7 +164,7 @@ class TestAllocationScope:
         receiver._log_coverage = MagicMock()
         sessions = {"s0": "a0", "s1": "a1", "s2": "a2"}
         sources = {
-            name: SimpleNamespace(dtype=torch.float32, global_shape=(1,))
+            name: SimpleNamespace(dtype=torch.float32, global_shape=(1,), shards=[])
             for name in ("exact", "strided", "router")
         }
         entered = []

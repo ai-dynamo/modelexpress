@@ -18,7 +18,7 @@ import atexit
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -149,6 +149,10 @@ class NixlTransferManager:
         # UCX-backed NIXL agent. Dropping an agent with live GPU registrations
         # can abort inside ucp_worker_destroy during framework teardown.
         self._registered_memory: list[Any] = []
+        self._base_registration_ranges: list[tuple[int, int]] = []
+        # (handle, registered start, registered end) per appended tensor name.
+        # Aliases retain the original range even if its first name is removed.
+        self._appended_registrations: dict[str, tuple[Any, int, int] | None] = {}
         # Remote agents this manager has loaded, so shutdown can disconnect them.
         # Maps agent name -> (ip, port) for agents reached over the P2P socket, or
         # None for agents loaded from a metadata blob.
@@ -419,6 +423,9 @@ class NixlTransferManager:
                 )
             )
             reg_count = len(allocations)
+            self._base_registration_ranges = [
+                (base, base + size) for base, size in allocations
+            ]
         elif registrable_tensors:
             self._registered_memory.append(
                 self._agent.register_memory(
@@ -426,8 +433,12 @@ class NixlTransferManager:
                 )
             )
             reg_count = len(registrable_tensors)
+            self._base_registration_ranges = [
+                (d.addr, d.addr + d.size) for d in registrable_descriptors
+            ]
         else:
             reg_count = 0
+            self._base_registration_ranges = []
         nixl_reg_time = time.perf_counter() - nixl_reg_start
 
         # Phase 3: Get agent metadata blob
@@ -453,6 +464,191 @@ class NixlTransferManager:
         )
 
         return self._metadata
+
+    def register_additional_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:
+        """Append tensors to an already-registered catalog.
+
+        ``register_tensors`` and ``register_arena`` replace the name ->
+        tensor catalog, so a second call would drop the first set from
+        ``tensor_descriptors`` and from receive-side name matching. This
+        adds to it instead: tensors already covered by the main registration
+        reuse it, while uncovered tensors get per-tensor registration (an
+        arena MR range cannot grow without invalidating published rkeys).
+        Refreshed agent metadata covers both sets.
+
+        Used by the speculative draft pass, which shares the main load's
+        agent. Views inside an existing registration reuse its handle.
+
+        Returns:
+            NIXL metadata bytes for this agent, covering every registration.
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+
+        new_tensors: dict[str, torch.Tensor] = {}
+        for name, tensor in tensors.items():
+            existing = self._tensors.get(name)
+            if existing is not None:
+                if existing.data_ptr() == tensor.data_ptr():
+                    continue
+                raise ValueError(
+                    f"Tensor '{name}' is already registered at a different address"
+                )
+            if not tensor.is_contiguous():
+                raise RuntimeError(
+                    f"Tensor '{name}' is not contiguous. "
+                    "Non-contiguous tensors cannot be used for RDMA transfers."
+                )
+            new_tensors[name] = tensor
+        if not new_tensors:
+            return self._metadata
+
+        new_descriptors = [
+            TensorDescriptor(
+                name=name,
+                addr=tensor.data_ptr(),
+                size=tensor.numel() * tensor.element_size(),
+                device_id=self._device_id,
+                dtype=str(tensor.dtype),
+            )
+            for name, tensor in new_tensors.items()
+        ]
+        # A view can be smaller than its already-registered parent. Register
+        # only maximal uncovered ranges, while publishing every tensor name.
+        existing_registrations = [
+            registration
+            for registration in self._appended_registrations.values()
+            if registration is not None
+        ]
+        new_ranges: list[tuple[int, int]] = []
+        registrable: list[torch.Tensor] = []
+        for tensor in sorted(
+            new_tensors.values(),
+            key=lambda t: t.numel() * t.element_size(),
+            reverse=True,
+        ):
+            size = tensor.numel() * tensor.element_size()
+            start, end = tensor.data_ptr(), tensor.data_ptr() + size
+            if (
+                size > 0
+                and not any(
+                    base_start <= start and end <= base_end
+                    for base_start, base_end in self._base_registration_ranges
+                )
+                and not any(
+                    reg_start <= start and end <= reg_end
+                    for _, reg_start, reg_end in existing_registrations
+                )
+                and not any(
+                    reg_start <= start and end <= reg_end
+                    for reg_start, reg_end in new_ranges
+                )
+            ):
+                registrable.append(tensor)
+                new_ranges.append((start, end))
+        reused_registrations: dict[str, tuple[Any, int, int] | None] = {}
+        new_registration_ranges: dict[str, tuple[int, int]] = {}
+        for name, tensor in new_tensors.items():
+            size = tensor.numel() * tensor.element_size()
+            start, end = tensor.data_ptr(), tensor.data_ptr() + size
+            if size == 0 or any(
+                base_start <= start and end <= base_end
+                for base_start, base_end in self._base_registration_ranges
+            ):
+                reused_registrations[name] = None
+                continue
+            existing = next(
+                (
+                    item
+                    for item in existing_registrations
+                    if item[1] <= start and end <= item[2]
+                ),
+                None,
+            )
+            if existing is not None:
+                reused_registrations[name] = existing
+            else:
+                new_registration_ranges[name] = next(
+                    region
+                    for region in new_ranges
+                    if region[0] <= start and end <= region[1]
+                )
+        registration = None
+        if registrable:
+            registration = self._agent.register_memory(
+                registrable, backends=self._backends
+            )
+        try:
+            metadata = self._agent.get_agent_metadata()
+        except BaseException:
+            if registration is not None:
+                try:
+                    self._agent.deregister_memory(registration)
+                except Exception:
+                    # Keep the handle reachable for shutdown even when the
+                    # immediate rollback fails.
+                    self._registered_memory.append(registration)
+                    logger.exception("Failed to roll back appended NIXL memory")
+            raise
+
+        if registration is not None:
+            self._registered_memory.append(registration)
+        self._tensors = {**self._tensors, **new_tensors}
+        self._tensor_descriptors = self._tensor_descriptors + new_descriptors
+        for name in new_tensors:
+            self._appended_registrations[name] = (
+                (registration, *new_registration_ranges[name])
+                if name in new_registration_ranges
+                else reused_registrations[name]
+            )
+        self._metadata = metadata
+        logger.info(
+            "Appended %d tensors (%d regions) to the registered catalog "
+            "(%d tensors total)",
+            len(new_tensors),
+            len(registrable),
+            len(self._tensor_descriptors),
+        )
+        return self._metadata
+
+    def deregister_tensors(self, names: Iterable[str]) -> None:
+        """Release tensors added by :meth:`register_additional_tensors`.
+
+        Drops the names from the catalog and deregisters each backing
+        registration once none of its tensors remain. Names that were not
+        appended (the base catalog) are ignored: their memory is released
+        only by :meth:`shutdown`.
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        removed = {name for name in names if name in self._appended_registrations}
+        if not removed:
+            return
+        handles: list[Any] = []
+        for name in removed:
+            registration = self._appended_registrations.pop(name)
+            handle = registration[0] if registration is not None else None
+            if handle is not None and not any(handle is h for h in handles):
+                handles.append(handle)
+        remaining = [
+            registration[0]
+            for registration in self._appended_registrations.values()
+            if registration is not None
+        ]
+        for handle in handles:
+            if any(handle is h for h in remaining):
+                continue
+            self._agent.deregister_memory(handle)
+            self._registered_memory = [
+                r for r in self._registered_memory if r is not handle
+            ]
+        self._tensors = {
+            name: t for name, t in self._tensors.items() if name not in removed
+        }
+        self._tensor_descriptors = [
+            d for d in self._tensor_descriptors if d.name not in removed
+        ]
+        self._metadata = self._agent.get_agent_metadata()
 
     def register_arena(
         self, arena: VmmArena, tensors: dict[str, torch.Tensor]
@@ -572,6 +768,7 @@ class NixlTransferManager:
                 backends=self._backends,
             )
         )
+        self._base_registration_ranges = [(base, base + used)]
         nixl_reg_time = time.perf_counter() - nixl_reg_start
 
         metadata_start = time.perf_counter()
@@ -1340,6 +1537,8 @@ class NixlTransferManager:
                         exc_info=True,
                     )
         self._registered_memory = []
+        self._base_registration_ranges = []
+        self._appended_registrations = {}
         self._agent = None
         self._metadata = b""
         self._tensor_descriptors = []

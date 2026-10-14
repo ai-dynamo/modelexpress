@@ -444,7 +444,7 @@ def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
     arena = torch.ones(2)
     closed = []
     transfer = SimpleNamespace(arena=arena, close=lambda: closed.append("transfer"))
-    method = LoadTimeTensorNixlUpdateMethod(transfer=transfer, capture_layout=None)
+    method = LoadTimeTensorNixlUpdateMethod(transfer=transfer, capture_layout=lambda manifest: None)
     prepared = PreparedStreamingTensors(lambda: iter(()), frozenset({"weight"}), {})
     prepared.ownership.iterator = iter(({"weight": arena},))
     if failure != "in_progress":

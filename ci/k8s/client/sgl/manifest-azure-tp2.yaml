@@ -126,6 +126,8 @@ spec:
             - --modelexpress-config
             - '{"transport": "nixl"}'
           env:
+            - name: MX_MODEL_URI
+              value: "${MX_CI_MODEL}"
             - name: MX_SERVER_ADDRESS
               value: "mx-server:8000"
             - name: MX_ARTIFACT_TRANSFER
