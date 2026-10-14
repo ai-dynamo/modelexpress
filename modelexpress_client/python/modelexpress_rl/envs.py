@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     MX_REFIT_CHECKPOINT_DIR: str | None
     MX_REFIT_DELTA_BUCKET_BYTES: int
     MX_REFIT_DELTA_SURGICAL: bool
+    MX_REFIT_DEBUG_VALIDATE_PLAN: bool
+    MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT: bool
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
@@ -83,6 +85,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "LOCAL_RANK": lambda: (
         int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else None
+    ),
+    "MX_REFIT_DEBUG_VALIDATE_PLAN": lambda: parse_bool(
+        os.environ.get("MX_REFIT_DEBUG_VALIDATE_PLAN", "false"),
+        "MX_REFIT_DEBUG_VALIDATE_PLAN",
+    ),
+    "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT": lambda: parse_bool(
+        os.environ.get("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", "false"),
+        "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT",
     ),
     "MX_REFIT_METADATA_PORT": lambda: require_positive_int(
         int(os.environ.get("MX_REFIT_METADATA_PORT", "7555")),

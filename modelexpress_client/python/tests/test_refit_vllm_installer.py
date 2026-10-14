@@ -804,7 +804,8 @@ def test_streaming_rejects_aliasing_source_before_any_batch_copy(monkeypatch):
     assert not prepared.ownership.release_blocked
 
 
-def test_streaming_uses_engine_processing_and_defers_attention(monkeypatch):
+@pytest.mark.parametrize("quantized", [False, True])
+def test_streaming_uses_engine_processing_and_defers_attention(monkeypatch, quantized):
     model = nn.Module()
     model.first = nn.Linear(2, 2, bias=False)
     model.attention = nn.Module()
@@ -874,10 +875,11 @@ def test_streaming_uses_engine_processing_and_defers_attention(monkeypatch):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
     installer = _VllmInstaller(
         model=model,
-        vllm_config=object(),
+        vllm_config=SimpleNamespace(quant_config=object() if quantized else None),
         model_config=object(),
         device=torch.device("cpu"),
     )
+    assert PreparedStreamingTensors in installer.capabilities.artifact_types
     for value in (1, 3, 5):
         events.clear()
 
@@ -1865,6 +1867,7 @@ def test_alias_mutation_fails_before_a_later_hook_can_hide_it(
 def test_capture_key_unwraps_reload_loaders_but_guards_original_and_receiver(
     monkeypatch,
 ):
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", "1")
     _install_fake_vllm(monkeypatch, lambda model: None)
     layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
 
@@ -1887,9 +1890,9 @@ def test_capture_key_unwraps_reload_loaders_but_guards_original_and_receiver(
     )
     manifest = [("weight", torch.float32, (2, 2))]
     assert not hasattr(model.weight, "weight_loader")
-    key = installer._capture_key(manifest)
+    key = installer.capture_generator_fingerprint()
     model.weight.weight_loader = default_loader
-    assert installer._capture_key(manifest) == key
+    assert installer.capture_generator_fingerprint() == key
     underlying = model.weight.weight_loader
 
     def wrapped(loader):
@@ -1901,16 +1904,16 @@ def test_capture_key_unwraps_reload_loaders_but_guards_original_and_receiver(
 
     for _ in range(2):
         model.weight.weight_loader = wrapped(wrapped(underlying))
-        assert installer._capture_key(manifest) == key
+        assert installer.capture_generator_fingerprint() == key
     model.weight.weight_loader = wrapped(lambda parameter, value: parameter.add_(value))
-    assert installer._capture_key(manifest) != key
+    assert installer.capture_generator_fingerprint() != key
 
     def ordinary_wrapper(*args, **kwargs):
         return underlying(*args, **kwargs)
 
     ordinary_wrapper.__wrapped__ = underlying
     model.weight.weight_loader = ordinary_wrapper
-    assert installer._capture_key(manifest) != key
+    assert installer.capture_generator_fingerprint() != key
 
     class Loader:
         def load(self, parameter, value):
@@ -1918,21 +1921,22 @@ def test_capture_key_unwraps_reload_loaders_but_guards_original_and_receiver(
 
     first, second = Loader(), Loader()
     model.weight.weight_loader = first.load
-    key = installer._capture_key(manifest)
+    key = installer.capture_generator_fingerprint()
     model.weight.weight_loader = wrapped(first.load)
-    assert installer._capture_key(manifest) == key
+    assert installer.capture_generator_fingerprint() == key
     model.weight.weight_loader = second.load
-    assert installer._capture_key(manifest) != key
+    assert installer.capture_generator_fingerprint() != key
 
-    resolved_key = installer._capture_key(manifest)
+    resolved_key = installer.capture_generator_fingerprint()
     del layerwise._get_original_loader
-    assert installer._capture_key(manifest) == resolved_key
+    assert installer.capture_generator_fingerprint() == resolved_key
 
 
 @pytest.mark.parametrize("missing", ["module", "symbol"])
 def test_capture_key_reports_missing_layerwise_api_before_mutation(
     monkeypatch, missing
 ):
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", "1")
     _install_fake_vllm(monkeypatch, lambda model: None)
     if missing == "module":
         monkeypatch.setitem(
@@ -1951,7 +1955,7 @@ def test_capture_key_reports_missing_layerwise_api_before_mutation(
     with pytest.raises(
         RuntimeError, match="requires vLLM's layerwise reload APIs"
     ) as raised:
-        installer._capture_key([("weight", torch.float32, (2, 2))])
+        installer.capture_generator_fingerprint()
 
     assert isinstance(raised.value.__cause__, ImportError)
     assert model.weight is parameter
@@ -1959,6 +1963,7 @@ def test_capture_key_reports_missing_layerwise_api_before_mutation(
 
 
 def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", "1")
     class Model(nn.Module):
         def __init__(self):
             super().__init__()

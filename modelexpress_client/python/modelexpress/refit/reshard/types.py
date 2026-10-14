@@ -88,3 +88,4 @@ class CaptureResult:
     unsupported: list = field(default_factory=list)
     unattributed: int = 0
     unsupported_reasons: dict = field(default_factory=dict)
+    generator_fingerprint: tuple | None = None

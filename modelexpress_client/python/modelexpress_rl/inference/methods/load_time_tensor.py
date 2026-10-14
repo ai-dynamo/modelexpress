@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 
 from modelexpress.refit.timing import (
@@ -40,14 +40,10 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self,
         *,
         transfer: _NixlStagedTransfer,
-        capture_layout: Callable,
     ) -> None:
         if transfer is None:
             raise ValueError("transfer is required")
-        if not callable(capture_layout):
-            raise TypeError("capture_layout must be callable")
         self._transfer = transfer
-        self._capture_layout = capture_layout
         self._active_staged: _StagedNixlWeights | None = None
         self._active_streamed: PreparedStreamingTensors | None = None
 
@@ -75,7 +71,6 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                 trainer_snapshot=source.snapshot,
                 checksums=source.checksums,
                 prepare_groups=source.prepare_groups,
-                capture_layout=self._capture_layout,
             )
             counters.update(prepared.metrics)
         set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))
