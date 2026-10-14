@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import subprocess
@@ -30,6 +31,7 @@ from .artifact_manifest import (
     artifact_manifest_id,
     build_artifact_manifest,
 )
+from .artifact_symlinks import METADATA_NAME, encode_links, read_links, restore_links
 from .payload import accelerators_compatible
 from .publisher import PublisherThread
 from .publish import _get_worker_host, _publish_metadata_to_server
@@ -200,6 +202,7 @@ class TarredArtifactTransfer(ArtifactTransfer):
         for tar_path in tar_paths:
             tar_path.unlink(missing_ok=True)
 
+        symlink_count = 0
         for tar_name, _ in root_archives:
             tar_path = bundle_path / tar_name
             resolved_source = resolved_sources[tar_name]
@@ -207,9 +210,14 @@ class TarredArtifactTransfer(ArtifactTransfer):
                 with tarfile.open(tar_path, "w"):
                     pass
                 continue
-            entries, skipped = _tar_source_entries(resolved_source)
+            metadata_path = resolved_source / METADATA_NAME
+            if metadata_path.exists() or metadata_path.is_symlink():
+                raise ValueError(f"artifact source uses reserved metadata name: {metadata_path}")
+            entries, links, skipped = _tar_source_entries(resolved_source)
             _log_skipped_entries(tar_name, skipped)
-            _write_tar_from_entries(tar_path, resolved_source, entries)
+            metadata = encode_links(resolved_source, links) if links else None
+            _write_tar_from_entries(tar_path, resolved_source, entries, metadata)
+            symlink_count += len(links)
 
         manifest = build_artifact_manifest(
             bundle_path,
@@ -221,12 +229,13 @@ class TarredArtifactTransfer(ArtifactTransfer):
         total_size = sum(file.size for file in manifest.files)
         logger.info(
             "[TIMING] Artifact prepare complete: name=%s artifact_id=%s "
-            "files=%d chunks=%d size=%.2f MiB elapsed=%.3fs",
+            "files=%d chunks=%d size=%.2f MiB symlinks=%d elapsed=%.3fs",
             self.name,
             artifact_id,
             len(manifest.files),
             len(manifest.chunks),
             _mib(total_size),
+            symlink_count,
             elapsed,
         )
         return ArtifactBundle(
@@ -255,6 +264,7 @@ class TarredArtifactTransfer(ArtifactTransfer):
                 f"{sorted(files_by_name)} != {sorted(expected_names)}"
             )
         installed_targets = []
+        symlink_count = 0
         validate_total = 0.0
         extract_total = 0.0
         for tar_name, root in root_archives:
@@ -269,10 +279,17 @@ class TarredArtifactTransfer(ArtifactTransfer):
             step_start = time.perf_counter()
             with install_metrics.time_artifact_install_step(self.name, root.name, "validate"):
                 _validate_tar_members(tar_file)
+                links = read_links(tar_file, output_path)
             validate_seconds = time.perf_counter() - step_start
             step_start = time.perf_counter()
             with install_metrics.time_artifact_install_step(self.name, root.name, "extract"):
-                _run_tar(["-xf", str(tar_file), "-C", str(output_path)])
+                try:
+                    _run_tar(["-xf", str(tar_file), "-C", str(output_path)])
+                except Exception:
+                    if links is not None:
+                        (output_path / METADATA_NAME).unlink(missing_ok=True)
+                    raise
+                symlink_count += restore_links(output_path, links)
             extract_seconds = time.perf_counter() - step_start
             install_metrics.record_artifact_install_bytes(self.name, root.name, archive_bytes)
             validate_total += validate_seconds
@@ -291,10 +308,11 @@ class TarredArtifactTransfer(ArtifactTransfer):
         elapsed = time.perf_counter() - start
         logger.info(
             "[TIMING] Artifact install complete: artifact_id=%s targets=%s "
-            "size=%.2f MiB validate=%.3fs extract=%.3fs elapsed=%.3fs",
+            "size=%.2f MiB symlinks=%d validate=%.3fs extract=%.3fs elapsed=%.3fs",
             header.artifact_id,
             installed_targets,
             _mib(header.total_size),
+            symlink_count,
             validate_total,
             extract_total,
             elapsed,
@@ -974,27 +992,17 @@ def _close_target_buffers(
             logger.warning("Failed to deregister target artifact buffer", exc_info=True)
 
 
-@dataclass(frozen=True)
-class _SkippedEntry:
-    path: Path
-    kind: str
-    detail: str
-
-
-def _tar_source_entries(source_root: Path) -> tuple[bytes, list[_SkippedEntry]]:
+def _tar_source_entries(source_root: Path) -> tuple[bytes, list[Path], list[Path]]:
     """Enumerate the archive members under source_root for tar --null -T.
 
     Only regular files and directories are listed, which keeps the
     file-or-directory invariant that _validate_tar_members enforces on the
-    receiving side. Anything else is reported back so the caller can log it.
-
-    Symlinks are left out rather than followed or copied verbatim: in the JIT
-    caches this packs they are derived state that the engine rebuilds. Both
-    this walk and tar stop at a symlinked directory, so dropping one costs the
-    link entry alone, never a subtree tar would otherwise have archived.
+    receiving side. Links are recorded separately rather than followed, and
+    unsupported filesystem entries are reported to the caller for logging.
     """
     names: list[str] = []
-    skipped: list[_SkippedEntry] = []
+    skipped: list[Path] = []
+    links: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(source_root, followlinks=False):
         directory = Path(dirpath)
         names.append(_tar_member_name(directory, source_root))
@@ -1002,17 +1010,20 @@ def _tar_source_entries(source_root: Path) -> tuple[bytes, list[_SkippedEntry]]:
         for name in sorted(dirnames):
             path = directory / name
             if path.is_symlink():
-                skipped.append(_classify_skipped_entry(path, source_root))
+                links.append(path)
                 continue
             kept.append(name)
         dirnames[:] = kept
         for name in sorted(filenames):
             path = directory / name
-            if path.is_symlink() or not path.is_file():
-                skipped.append(_classify_skipped_entry(path, source_root))
+            if path.is_symlink():
+                links.append(path)
+                continue
+            if not path.is_file():
+                skipped.append(path)
                 continue
             names.append(_tar_member_name(path, source_root))
-    return b"\0".join(name.encode() for name in names) + b"\0", skipped
+    return b"\0".join(name.encode() for name in names) + b"\0", links, skipped
 
 
 def _tar_member_name(path: Path, source_root: Path) -> str:
@@ -1020,40 +1031,11 @@ def _tar_member_name(path: Path, source_root: Path) -> str:
     return "./" if relative == "." else f"./{relative}"
 
 
-def _classify_skipped_entry(path: Path, source_root: Path) -> _SkippedEntry:
-    if not path.is_symlink():
-        return _SkippedEntry(path=path, kind="not a file or directory", detail="")
-    try:
-        detail = os.readlink(path)
-    except OSError:
-        detail = ""
-    resolved = path.resolve()
-    if not resolved.exists():
-        return _SkippedEntry(path=path, kind="broken symlink", detail=detail)
-    if resolved.is_relative_to(source_root):
-        return _SkippedEntry(path=path, kind="internal symlink", detail=detail)
-    return _SkippedEntry(path=path, kind="external symlink", detail=detail)
-
-
-def _log_skipped_entries(archive_name: str, skipped: list[_SkippedEntry]) -> None:
+def _log_skipped_entries(archive_name: str, skipped: list[Path]) -> None:
     if not skipped:
         return
-    internal = [entry for entry in skipped if entry.kind == "internal symlink"]
-    if internal:
-        logger.debug(
-            "Artifact archive %s skipped %d symlink(s) resolving inside the "
-            "source root; their targets are archived under their real paths",
-            archive_name,
-            len(internal),
-        )
-    notable = [entry for entry in skipped if entry.kind != "internal symlink"]
-    if not notable:
-        return
-    preview = ", ".join(
-        f"{entry.path} ({entry.kind}{f' -> {entry.detail}' if entry.detail else ''})"
-        for entry in notable[:_SKIPPED_ENTRY_PREVIEW]
-    )
-    remaining = len(notable) - _SKIPPED_ENTRY_PREVIEW
+    preview = ", ".join(str(path) for path in skipped[:_SKIPPED_ENTRY_PREVIEW])
+    remaining = len(skipped) - _SKIPPED_ENTRY_PREVIEW
     if remaining > 0:
         preview = f"{preview}, ... {remaining} more"
     logger.warning(
@@ -1061,7 +1043,7 @@ def _log_skipped_entries(archive_name: str, skipped: list[_SkippedEntry]) -> Non
         "carry as a file or directory; engines that need them rebuild them on "
         "demand: %s",
         archive_name,
-        len(notable),
+        len(skipped),
         preview,
     )
 
@@ -1070,6 +1052,7 @@ def _write_tar_from_entries(
     tar_path: Path,
     source_root: Path,
     entries: bytes,
+    metadata: bytes | None = None,
 ) -> None:
     with tempfile.NamedTemporaryFile(
         prefix="mx-artifact-",
@@ -1091,6 +1074,12 @@ def _write_tar_from_entries(
                 str(member_list),
             ]
         )
+        if metadata is not None:
+            with tarfile.open(tar_path, "a") as archive:
+                member = tarfile.TarInfo(METADATA_NAME)
+                member.mode = 0o600
+                member.size = len(metadata)
+                archive.addfile(member, io.BytesIO(metadata))
     finally:
         member_list.unlink(missing_ok=True)
 
