@@ -142,13 +142,20 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
         "_allocate_arena",
         lambda self, size: torch.empty(size, dtype=torch.uint8),
     )
+
+    def capture_layout(manifest):
+        captures.append(manifest)
+        return capture, layout
+
     transfer = module._NixlStagedTransfer(
+        generator_fingerprint=lambda: (),
         agent_name="target",
         device_id=0,
         device=torch.device("cuda:0"),
         listen_port=None,
         manager=Manager() if parameters.get("borrowed_manager") else None,
         streaming=settings,
+        capture_layout=capture_layout,
     )
 
     def manifests():
@@ -178,10 +185,6 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
             )
         ]
 
-    def capture_layout(manifest):
-        captures.append(manifest)
-        return capture, layout
-
     def prepare(*, generation: int = 1) -> module._PreparedBoundedTransfer:
         blobs = manifests()
         snapshot = TrainerSourceSnapshot("mesh", generation, tuple(
@@ -198,7 +201,6 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
         return transfer.prepare(
             trainer_snapshot=snapshot,
             manifests=blobs,
-            capture_layout=capture_layout,
             checksums=MappingProxyType({
                 (name, "source", tensor.data_ptr(), (0, 0), (4, 4)): tensor_digest(tensor)
                 for name, tensor in sources.items()
@@ -494,8 +496,10 @@ def test_logical_plan_lifetime_is_mesh_pair(harness, mesh_id, generation, reuse)
         captures.append(schema)
         return harness.capture, harness.layout
 
+    harness.transfer._capture_layout = capture_layout
     second = harness.transfer.prepare(
-        manifests=[snapshot.shards[0].metadata], trainer_snapshot=snapshot, capture_layout=capture_layout,
+        manifests=[snapshot.shards[0].metadata],
+        trainer_snapshot=snapshot,
     )
     assert len(captures) == int(not reuse)
     metrics, installed = harness.collect(second)
@@ -562,7 +566,6 @@ def test_larger_source_scratch_grows_then_reuses_capacity(harness) -> None:
     blob = snapshot.shards[0].metadata
     larger = harness.transfer.prepare(
         manifests=[blob], trainer_snapshot=snapshot,
-        capture_layout=lambda _: (harness.capture, harness.layout),
     )
     grown, installed = harness.collect(larger)
     _check_values(harness, installed, exact_rows=4)
@@ -614,7 +617,6 @@ def _agent_registration_snapshot(
 def _prepare_agent_registration(harness, snapshot) -> module._PreparedNixlTransfer | module._PreparedBoundedTransfer:
     return harness.transfer.prepare(
         manifests=[shard.metadata for shard in snapshot.shards], trainer_snapshot=snapshot,
-        capture_layout=lambda _: (harness.capture, harness.layout),
     )
 
 
@@ -729,8 +731,8 @@ def test_replica_switch_reuses_matching_group_descriptors(harness, monkeypatch, 
         trainer = snapshot(worker)
         builds.clear()
         prepared = harness.transfer.prepare(
-            manifests=[shard.metadata for shard in trainer.shards], trainer_snapshot=trainer,
-            capture_layout=lambda _: (harness.capture, harness.layout),
+            manifests=[shard.metadata for shard in trainer.shards],
+            trainer_snapshot=trainer,
         )
         plan = harness.transfer._weight_update_plan
         if index == 0:
@@ -767,9 +769,11 @@ def test_replica_switch_reuses_matching_group_descriptors(harness, monkeypatch, 
     harness.transfer.reset_workspace()
     builds.clear()
     trainer = snapshot("a1")
+    harness.transfer._capture_layout = lambda _: pytest.fail(
+        "reset must preserve the logical plan"
+    )
     rebuilt = harness.transfer.prepare(
         manifests=[shard.metadata for shard in trainer.shards], trainer_snapshot=trainer,
-        capture_layout=lambda _: pytest.fail("reset must preserve the logical plan"),
     )
     assert {session for group in builds for session in group} == {"a1", "b1"}
     if harness.streaming is None:

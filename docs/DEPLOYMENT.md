@@ -1625,6 +1625,7 @@ settings are read when the transfer is constructed.
 | Internal environment variable | Default | Purpose |
 | --- | --- | --- |
 | `MX_REFIT_DEBUG_VALIDATE_PLAN` | `0` | Recheck cached whole-model and owning-module transfer coverage. |
+| `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` | `0` | Validate that generator layout hasn't changed. |
 | `MX_REFIT_PACK_MODULES` | `1` | Pack complete owning modules within each bounded staging arena. |
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Descriptor budget before full-source reconstruction. |
 | `MX_REFIT_PREFETCH_REPLICA_METADATA` | `0` | Fetch stable metadata for all replicas in needed logical-shard groups on first preparation. |

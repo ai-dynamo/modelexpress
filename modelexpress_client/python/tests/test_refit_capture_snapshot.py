@@ -270,7 +270,7 @@ def test_real_capture_cache_uses_snapshot_for_slicing_and_retains_invalidation(
     installer, model = capture_installer
     manifest = [("weight", torch.float32, (3, 3))]
     cold, _ = installer.capture(manifest)
-    assert type(installer._capture_cache[1]) is _CaptureSnapshot
+    assert type(installer._capture_cache[2]) is _CaptureSnapshot
     assert cold.copies[0].op_chain[0][0] == "__getitem__"
     original = copy.deepcopy(cold)
     cold.copies[0].dest_offset = 55
@@ -320,7 +320,7 @@ def test_real_capture_cache_preserves_duplicate_record_identity(
     manifest = [("weight", torch.float32, (3, 3))]
     installer.capture(manifest)
     warm, _ = installer.capture(manifest)
-    assert type(installer._capture_cache[1]) is _CaptureSnapshot
+    assert type(installer._capture_cache[2]) is _CaptureSnapshot
     assert warm.copies[0] is warm.copies[1]
 
 
@@ -338,7 +338,7 @@ def test_real_capture_cache_nested_mutable_payload_remains_isolated(
     monkeypatch.setattr(module, "capture_weights", mutable)
     manifest = [("weight", torch.float32, (3, 3))]
     installer.capture(manifest)
-    assert type(installer._capture_cache[1]) is tuple
+    assert type(installer._capture_cache[2]) is tuple
     first, _ = installer.capture(manifest)
     first.copies[0].op_chain[0][1][0][0] = 99
     assert installer.capture(manifest)[0].copies[0].op_chain[0][1][0][0] == 4
@@ -393,7 +393,7 @@ def test_integer_index_payload_deepcopy_remains_isolated(
     monkeypatch.setattr(module, "capture_weights", indexed)
     manifest = [("weight", torch.float32, (3, 3))]
     installer.capture(manifest)
-    assert type(installer._capture_cache[1]) is tuple
+    assert type(installer._capture_cache[2]) is tuple
     index[0] = 1
     first, _ = installer.capture(manifest)
     first_index = first.copies[0].op_chain[0][1][0]
@@ -401,3 +401,12 @@ def test_integer_index_payload_deepcopy_remains_isolated(
     first_index[0] = 0
     second, _ = installer.capture(manifest)
     assert list(second.copies[0].op_chain[0][1][0]) == [2, 0, 2]
+
+
+def test_snapshot_clone_preserves_capture_fingerprint():
+    result = _result()
+    result[0].generator_fingerprint = ("layout", (1, 2))
+    snapshot = _CaptureSnapshot.create(result)
+    assert type(snapshot) is _CaptureSnapshot
+    assert not hasattr(snapshot, "fingerprint")
+    assert snapshot.clone()[0].generator_fingerprint == result[0].generator_fingerprint

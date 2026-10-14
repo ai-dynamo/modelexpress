@@ -412,6 +412,9 @@ class _VllmInstaller(EngineInstaller):
         self._load_buffer_names = frozenset()
         self._persistent_names = frozenset()
         self._tied_input_peak_bytes = 0
+        self._debug_validate_generator_layout = (
+            rl_envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT
+        )
 
     @cached_property
     def _original_loader(self) -> Callable:
@@ -425,7 +428,10 @@ class _VllmInstaller(EngineInstaller):
             ) from error
         return _get_original_loader
 
-    def _capture_key(self, manifest):
+    def capture_generator_fingerprint(self):
+        if not self._debug_validate_generator_layout:
+            return ()
+
         original_loader = self._original_loader
 
         def function_identity(function):
@@ -474,7 +480,6 @@ class _VllmInstaller(EngineInstaller):
             for name, buffer in self._model.named_buffers(remove_duplicate=False)
         )
         return (
-            tuple(manifest),
             parameters,
             modules,
             buffers,
@@ -489,8 +494,8 @@ class _VllmInstaller(EngineInstaller):
                     PreparedEngineTensors,
                     PreparedRuntimeTensors,
                     PreparedCheckpointArtifact,
+                    PreparedStreamingTensors,
                 }
-                | ({PreparedStreamingTensors} if not self._is_quantized else set())
             )
         )
 
@@ -644,10 +649,12 @@ class _VllmInstaller(EngineInstaller):
         afterward without finalizing (finalizing would commit the empty skeletons
         and corrupt the live params).
         """
+
+        gen_key = self.capture_generator_fingerprint()
+
         if self._capture_cache is not None:
-            key, result = self._capture_cache
-            current_key = self._capture_key(manifest)
-            if key == current_key:
+            cached_gen_key, cached_manifest, result = self._capture_cache
+            if cached_gen_key == gen_key and cached_manifest == tuple(manifest):
                 copies = (
                     result.indices
                     if type(result) is _CaptureSnapshot
@@ -787,6 +794,8 @@ class _VllmInstaller(EngineInstaller):
             len(capture.unsupported),
             self._is_quantized,
         )
+        gen_key = self.capture_generator_fingerprint()
+        capture.generator_fingerprint = gen_key
         if not capture.unsupported and not capture.unattributed:
             engine = self.engine_install_plan
             targets = engine.bind_targets(self._load_buffer_names)
@@ -808,7 +817,8 @@ class _VllmInstaller(EngineInstaller):
                 schedule,
             )
             self._capture_cache = (
-                self._capture_key(manifest),
+                gen_key,
+                tuple(manifest),
                 _CaptureSnapshot.create(copy.deepcopy((capture, param_layout))),
             )
         return capture, param_layout
@@ -841,10 +851,6 @@ class _VllmInstaller(EngineInstaller):
     @torch.no_grad()
     def install_streaming(self, prepared: PreparedStreamingTensors) -> None:
         """Copy complete groups into engine-owned storage before arena reuse."""
-        if self._is_quantized:
-            raise IncompleteRefit(
-                "bounded streaming currently requires an unquantized engine"
-            )
         _check_install_dispatch(bounded=True)
         ownership = prepared.ownership
         if ownership.iterator is not None or ownership.release_blocked:

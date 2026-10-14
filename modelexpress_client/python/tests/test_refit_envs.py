@@ -149,10 +149,12 @@ def test_streaming_diagnostics_default_off_and_packing_on(monkeypatch) -> None:
 
     for name in (
         "MX_REFIT_DEBUG_VALIDATE_PLAN",
+        "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT",
         "MX_REFIT_PACK_MODULES",
     ):
         monkeypatch.delenv(name, raising=False)
-    assert refit_envs.MX_REFIT_DEBUG_VALIDATE_PLAN is False
+    assert envs.MX_REFIT_DEBUG_VALIDATE_PLAN is False
+    assert envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT is False
     assert refit_envs.MX_REFIT_PACK_MODULES is True
 
 
@@ -182,3 +184,16 @@ def test_delta_surgical_parses_boolean(monkeypatch):
     monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "maybe")
     with pytest.raises(ValueError, match="MX_REFIT_DELTA_SURGICAL"):
         envs.MX_REFIT_DELTA_SURGICAL
+
+
+@pytest.mark.parametrize(
+    "name", ["MX_REFIT_DEBUG_VALIDATE_PLAN", "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT"]
+)
+def test_debug_flags_use_rl_boolean_parser(monkeypatch, name):
+    monkeypatch.setenv(name, "true")
+    assert getattr(envs, name) is True
+    monkeypatch.setenv(name, "false")
+    assert getattr(envs, name) is False
+    monkeypatch.setenv(name, "invalid")
+    with pytest.raises(ValueError, match=name):
+        getattr(envs, name)

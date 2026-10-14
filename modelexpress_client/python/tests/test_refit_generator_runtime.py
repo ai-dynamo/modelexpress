@@ -91,6 +91,7 @@ def _full_tensor_engine(
         model_name="test/model",
         installer=_Installer(),
         full_tensor=FullTensorEngineCapability(
+            generator_fingerprint=lambda: (),
             device_id=2,
             device="cuda:2",
             worker_rank=3,
@@ -376,7 +377,9 @@ def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
     )
 
     assert transfer_kwargs["listen_port"] is None
-    assert set(method_kwargs) == {"transfer", "capture_layout"}
+    assert set(method_kwargs) == {"transfer"}
+    assert callable(transfer_kwargs["capture_layout"])
+    assert callable(transfer_kwargs["generator_fingerprint"])
     assert runtime.p2p_client is None
     runtime.close()
 
@@ -490,7 +493,7 @@ def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
     arena = torch.ones(2)
     closed = []
     transfer = SimpleNamespace(arena=arena, close=lambda: closed.append("transfer"))
-    method = LoadTimeTensorNixlUpdateMethod(transfer=transfer, capture_layout=lambda manifest: None)
+    method = LoadTimeTensorNixlUpdateMethod(transfer=transfer)
     prepared = PreparedStreamingTensors(lambda: iter(()), frozenset({"weight"}), {})
     prepared.ownership.iterator = iter(({"weight": arena},))
     if failure != "in_progress":

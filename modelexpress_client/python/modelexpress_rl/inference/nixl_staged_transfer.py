@@ -23,6 +23,7 @@ from typing import Any, NamedTuple, cast
 
 import torch
 from modelexpress import envs, p2p_pb2
+from modelexpress_rl import envs as rl_envs
 from modelexpress.metadata.worker_server import (
     TensorReadLease,
     prepare_tensor_read,
@@ -158,7 +159,7 @@ class _DescriptorCache:
 @dataclass(frozen=True)
 class _WeightUpdatePlan:
     trainer_source_snapshot: TrainerSourceSnapshot
-    generator_capture_snapshot: CaptureResult
+    layout_capture_snapshot: CaptureResult
     parameter_layout: Mapping
     transfer_plan: LogicalTransferPlan | _StreamingSchedule
     source_binding: _SourceBinding | None
@@ -517,6 +518,8 @@ class _NixlStagedTransfer:
         *,
         device_id: int,
         device: torch.device,
+        capture_layout: _CaptureLayout,
+        generator_fingerprint: Callable[[], tuple],
         agent_name: str | None = None,
         listen_port: int | None = None,
         timeout_seconds: float | None = None,
@@ -525,6 +528,12 @@ class _NixlStagedTransfer:
     ) -> None:
         if streaming is not None and device.type != "cuda":
             raise ValueError("bounded NIXL staging requires a CUDA device")
+        if not callable(capture_layout):
+            raise TypeError("capture_layout must be callable")
+        if not callable(generator_fingerprint):
+            raise ValueError("generator_fingerprint must be callable")
+        self._capture_layout = capture_layout
+        self._generator_fingerprint = generator_fingerprint
         self._streaming = streaming
         self._buffer_budget = (
             None
@@ -578,7 +587,10 @@ class _NixlStagedTransfer:
         self._staging_device: torch.device | None = None
         self._manager_ready = True
         self._weight_update_plan: _WeightUpdatePlan | None = None
-        self._debug_validate_plan = envs.MX_REFIT_DEBUG_VALIDATE_PLAN
+        self._debug_validate_plan = rl_envs.MX_REFIT_DEBUG_VALIDATE_PLAN
+        self._debug_validate_generator_layout = (
+            rl_envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT
+        )
         self._pack_modules = envs.MX_REFIT_PACK_MODULES
         self._plan_compile_lock = threading.Lock()
 
@@ -726,7 +738,6 @@ class _NixlStagedTransfer:
     def _resolve_layout(
         self,
         manifests: list[bytes],
-        capture_layout: _CaptureLayout,
         metrics: dict[str, float],
         trainer_snapshot: TrainerSourceSnapshot,
     ) -> tuple[TrainerSourceSnapshot, CaptureResult, _StagingLayout]:
@@ -739,7 +750,7 @@ class _NixlStagedTransfer:
         )
         metrics["source_metadata_s"] = time.perf_counter() - started
         started = time.perf_counter()
-        capture, parameter_layout = capture_layout(list(source_schema))
+        capture, parameter_layout = self._capture_layout(list(source_schema))
         metrics["layout_capture_s"] = time.perf_counter() - started
         return trainer, capture, parameter_layout
 
@@ -875,7 +886,6 @@ class _NixlStagedTransfer:
         self,
         *,
         manifests: list[bytes],
-        capture_layout: _CaptureLayout,
         trainer_snapshot: TrainerSourceSnapshot,
         checksums: Mapping[ShardChecksumKey, str] | None = None,
         prepare_groups: Callable[[frozenset[str]], None] | None = None,
@@ -903,12 +913,16 @@ class _NixlStagedTransfer:
                     metrics.update(source_cache_enabled=1, source_cache_hits=1, source_cache_misses=0)
                 else:
                     trainer = self._resolve_trainer(trainer_snapshot, manifests, metrics)
-                capture = previous.generator_capture_snapshot
+                capture = previous.layout_capture_snapshot
                 parameter_layout = previous.parameter_layout
                 transfer_plan = previous.transfer_plan
+                if self._debug_validate_generator_layout:
+                    assert (
+                        self._generator_fingerprint() == capture.generator_fingerprint
+                    ), "generator layout changed since capture"
             else:
                 trainer, capture, parameter_layout = self._resolve_layout(
-                    manifests, capture_layout, metrics, trainer_snapshot
+                    manifests, metrics, trainer_snapshot
                 )
                 transfer_plan = None
 
@@ -1068,7 +1082,7 @@ class _NixlStagedTransfer:
         reusable: bool,
     ) -> _PreparedNixlTransfer:
         plan = cast(LogicalTransferPlan, cached.transfer_plan)
-        capture = cached.generator_capture_snapshot
+        capture = cached.layout_capture_snapshot
         resolved = cached.trainer_source_snapshot.resolved_metadata
         source_binding = cast(_SourceBinding, cached.source_binding)
         if not reusable:

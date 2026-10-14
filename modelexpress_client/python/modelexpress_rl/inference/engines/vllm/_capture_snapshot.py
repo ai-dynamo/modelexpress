@@ -32,10 +32,12 @@ _CAPTURE_FIELDS = (
     "owner_workspaces",
     "owner_dependencies",
     "destination_layouts",
+    "generator_fingerprint",
 )
 _CLASS_DEFAULTS = {
     CaptureResult: {
         "unattributed": 0,
+        "generator_fingerprint": None,
         "source_replay": False,
         "generation": None,
         "owner_dependencies": (),
@@ -285,8 +287,10 @@ class _CaptureSnapshot:
                 name: _clone_value(value, memo) for name, value in self.owner_workspaces
             },
             destination_layouts={
-                name: _clone_value(value, memo) for name, value in self.destination_layouts
+                name: _clone_value(value, memo)
+                for name, value in self.destination_layouts
             },
+            generator_fingerprint=self.fallback[0].generator_fingerprint,
         )
         result = (
             capture,

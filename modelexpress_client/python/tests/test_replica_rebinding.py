@@ -136,10 +136,7 @@ def _assert_replica_values(installed, replica, cycle):
 
 def _setup_method(harness, monkeypatch):
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
-    method = LoadTimeTensorNixlUpdateMethod(
-        transfer=harness.transfer,
-        capture_layout=lambda schema: (harness.captures.append(schema) or (harness.capture, harness.layout)),
-    )
+    method = LoadTimeTensorNixlUpdateMethod(transfer=harness.transfer)
     if not hasattr(method, "prepare_streaming"):
         monkeypatch.setattr(harness.transfer, "_device", torch.device("cpu"))
     return method
