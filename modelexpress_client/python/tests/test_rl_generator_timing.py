@@ -134,7 +134,12 @@ def test_transfer_timing_reports_cache_reuse_and_consumed_bytes(bounded, outcome
         def prepare(self, **_kwargs) -> SimpleNamespace:
             return SimpleNamespace(
                 metrics={"plan_cache_hits": next(self.hits)},
-                batches=[SimpleNamespace(layouts=({"weight": None},))],
+                batches=[
+                    SimpleNamespace(
+                        layouts=({"weight": None},),
+                        transfer_plan=SimpleNamespace(source_replay=False),
+                    )
+                ],
             )
 
         def stage(self, _prepared) -> SimpleNamespace:

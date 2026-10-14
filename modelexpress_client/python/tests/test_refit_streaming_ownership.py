@@ -36,7 +36,12 @@ def setup_method(monkeypatch, *, staging_device="cuda", staging_buffers=1) -> tu
                 raise RuntimeError("preparation failed")
             return SimpleNamespace(
                 metrics={},
-                batches=[SimpleNamespace(layouts=({"weight": None},))],
+                batches=[
+                    SimpleNamespace(
+                        layouts=({"weight": None},),
+                        transfer_plan=SimpleNamespace(source_replay=False),
+                    )
+                ],
             )
 
         def iter_bounded(self, prepared, metrics):
