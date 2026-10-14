@@ -463,12 +463,14 @@ class _CollectiveHalf:
         for misc in self._plan.misc:
             self._remaining()
             spec = self._specs[misc.name]
+            # Recorded before anything is enqueued, as for a reshard, so a
+            # broadcast or hook that raises still leaves the lane drained.
+            self._record_lane(lane)
             with self._stream_context(lane, spec):
                 ctx = spec.enter()
                 self._pending_contexts.append(ctx)
                 _broadcast(lane, ctx.buf, root=0)
                 spec.leave(ctx)
-            self._record_lane(lane)
         # Keep temporary buffers and post hooks alive until the broadcast work
         # has completed, and do not report success for merely enqueued work.
         self._drain_active_lanes()

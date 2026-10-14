@@ -156,15 +156,35 @@ class _RefitClientBase:
             )
         return self._half
 
-    def _abort_round(self) -> None:
-        """Leave a round whose per-group call failed.
+    def _fail_round(self, error: BaseException) -> None:
+        """The one exit for a bound round that failed anywhere after binding.
 
-        Peers may already be inside the collective waiting on this rank, so the
-        lanes are aborted rather than left live, and the round is closed so a
-        later call cannot continue it.
+        Order matters. Peers may already be inside the collective waiting on
+        this rank, so the lanes are aborted first: that is local and cannot
+        hang on the network. The failure is then reported against the bound
+        operation, best effort, which moves the group to a fresh epoch. The
+        round state is reset last and unconditionally, so a later call cannot
+        continue it. Never raises; the caller re-raises ``error``.
         """
-        if self._half is not None:
-            self._half.abort()
+        try:
+            if self._half is not None:
+                self._half.abort()
+        except Exception:  # noqa: BLE001 - the report and reset must still run
+            logger.warning(
+                "aborting the local half after a failed round raised; reporting "
+                "and resetting anyway",
+                exc_info=True,
+            )
+        if self._operation_id is not None:
+            try:
+                self._report(succeeded=False, message=repr(error))
+            except Exception:  # noqa: BLE001 - the original failure is re-raised
+                logger.warning(
+                    "reporting the failed round to the control plane raised; "
+                    "the local half is already aborted so peers are released, "
+                    "and the original failure is re-raised",
+                    exc_info=True,
+                )
         self._reset_round()
 
     def _reset_round(self) -> None:
@@ -484,6 +504,16 @@ class _RefitClientBase:
         return membership
 
     def cleanup(self) -> None:
+        if self._operation_id is not None:
+            # Tearing down mid-round is a failure of that round: peers are
+            # released and the bound operation is told, rather than left
+            # PENDING until its key expires.
+            self._fail_round(
+                RuntimeError(
+                    f"cleanup ran while the round for version {self._version!r} "
+                    "was in flight"
+                )
+            )
         if self._membership is not None:
             self._cache.abort_group(self._membership.group_id)
         self._membership = None
@@ -581,8 +611,8 @@ class RefitClientTrainer(_RefitClientBase):
         try:
             self._publisher.start_new_round(version)
             self._half.start_weight_update(version)
-        except BaseException:
-            self._reset_round()
+        except BaseException as error:
+            self._fail_round(error)
             raise
         self._round_started = True
         self._version = version
@@ -593,8 +623,8 @@ class RefitClientTrainer(_RefitClientBase):
         half = self._require_round(version, "publish_weights")
         try:
             half.publish_weights(layer_group_id)
-        except Exception:
-            self._abort_round()
+        except BaseException as error:
+            self._fail_round(error)
             raise
 
     def finish_weight_update(
@@ -609,18 +639,8 @@ class RefitClientTrainer(_RefitClientBase):
         self._check_operation_alias(operation_id)
         try:
             half.finish_weight_update(self.membership.broadcast_lane.lane_id)
-        except Exception as error:
-            half.abort()
-            try:
-                self._report(succeeded=False, message=repr(error))
-            except Exception:
-                logger.warning(
-                    "reporting the failed round to the control plane raised; "
-                    "the local half is already aborted so peers are released, "
-                    "and the original failure is re-raised below",
-                    exc_info=True,
-                )
-            self._reset_round()
+        except BaseException as error:
+            self._fail_round(error)
             raise
         try:
             self._report(succeeded=True)
@@ -723,17 +743,17 @@ class RefitClientGenerator(_RefitClientBase):
         try:
             self._loader.start_new_round(version)
             self._half.start_weight_update(version)
-        except BaseException:
-            self._reset_round()
+        except BaseException as error:
+            self._fail_round(error)
             raise
         self._unfinished = deque()
         self._pipeline_depth = envs.MX_NCCL_REFIT_PIPELINE_DEPTH
         self._round_started = True
         self._version = version
 
-    def _abort_round(self) -> None:
+    def _reset_round(self) -> None:
         self._unfinished = deque()
-        super()._abort_round()
+        super()._reset_round()
 
     def _install_oldest(self, half: NcclM2nReceiver) -> None:
         layer_group_id = self._unfinished.popleft()
@@ -751,8 +771,8 @@ class RefitClientGenerator(_RefitClientBase):
             self._unfinished.append(layer_group_id)
             while len(self._unfinished) >= self._pipeline_depth:
                 self._install_oldest(half)
-        except Exception:
-            self._abort_round()
+        except BaseException as error:
+            self._fail_round(error)
             raise
 
     def finish_weight_update(
@@ -772,19 +792,8 @@ class RefitClientGenerator(_RefitClientBase):
                 self._install_oldest(half)
             half.finish_weight_update(self.membership.broadcast_lane.lane_id)
             self._loader.finish()
-        except Exception as error:
-            self._unfinished = deque()
-            half.abort()
-            try:
-                self._report(succeeded=False, message=repr(error))
-            except Exception:
-                logger.warning(
-                    "reporting the failed round to the control plane raised; "
-                    "the local half is already aborted so peers are released, "
-                    "and the original failure is re-raised below",
-                    exc_info=True,
-                )
-            self._reset_round()
+        except BaseException as error:
+            self._fail_round(error)
             raise
         try:
             self._report(succeeded=True)

@@ -1265,6 +1265,150 @@ class TestPerGroupFailure:
             client.update_weights("v1")
 
 
+def _generator(rz, engine):
+    client = RefitClientGenerator(
+        rendezvous=rz,
+        model_name="m",
+        trainer_slots=["t0", "t1"],
+        generator_slots=["g0", "g1"],
+        source_partition_count=1,
+        slot_id="g0",
+        worker_id="w9",
+        index_in_role=0,
+    )
+    client.initialize(engine)
+    client.compute_plan()
+    return client
+
+
+class TestOneFailurePath:
+    """Every failure after binding aborts, reports the bound operation, and resets."""
+
+    @staticmethod
+    def _assert_failed_round(client, rz, message, *, method="publish_weights"):
+        assert len(client._cache) == 0
+        assert [r["operation_id"] for r in rz.reports] == ["op1"]
+        assert rz.reports[0]["succeeded"] is False
+        assert message in rz.reports[0]["message"]
+        assert client._operation_id is None
+        assert client._version is None
+        with pytest.raises(RuntimeError, match="start_weight_update must run"):
+            getattr(client, method)("v1")
+
+    def test_a_failed_publish_reports_the_bound_operation(self, fake_nccl, monkeypatch):
+        rz = FakeRendezvous()
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        monkeypatch.setattr(
+            collective_backend, "_reshard", _raises(RuntimeError("enqueue failed"))
+        )
+        with pytest.raises(RuntimeError, match="enqueue failed"):
+            client.publish_weights("v1")
+        self._assert_failed_round(client, rz, "enqueue failed")
+
+    def test_a_failed_publisher_start_reports_the_bound_operation(
+        self, fake_nccl, monkeypatch
+    ):
+        rz = FakeRendezvous()
+        engine = FakeEngine()
+        client = trainer(rz, engine)
+        client.compute_plan()
+        monkeypatch.setattr(
+            engine, "start_new_round", _raises(RuntimeError("prepare failed"))
+        )
+        with pytest.raises(RuntimeError, match="prepare failed"):
+            client.start_weight_update("v1", "op1")
+        self._assert_failed_round(client, rz, "prepare failed")
+        assert "reshard" not in fake_nccl and "broadcast" not in fake_nccl
+
+    def test_a_failed_issue_reports_the_bound_operation(self, fake_nccl, monkeypatch):
+        rz = FakeRendezvous()
+        client = _generator(rz, FakeEngine())
+        client.start_weight_update("v1", "op1")
+        monkeypatch.setattr(
+            collective_backend, "_reshard", _raises(RuntimeError("recv failed"))
+        )
+        with pytest.raises(RuntimeError, match="recv failed"):
+            client.update_weights("v1")
+        self._assert_failed_round(client, rz, "recv failed", method="update_weights")
+        assert not client._unfinished
+
+    def test_a_failed_install_reports_the_bound_operation(self, fake_nccl, monkeypatch):
+        monkeypatch.setenv("MX_NCCL_REFIT_PIPELINE_DEPTH", "1")
+        rz = FakeRendezvous()
+        engine = FakeEngine()
+        client = _generator(rz, engine)
+        client.start_weight_update("v1", "op1")
+        monkeypatch.setattr(engine, "install", _raises(RuntimeError("install failed")))
+        with pytest.raises(RuntimeError, match="install failed"):
+            client.update_weights("v1")
+        self._assert_failed_round(
+            client, rz, "install failed", method="update_weights"
+        )
+
+    def test_an_interrupt_mid_round_still_releases_and_reports(
+        self, fake_nccl, monkeypatch
+    ):
+        rz = FakeRendezvous()
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        monkeypatch.setattr(collective_backend, "_reshard", _raises(KeyboardInterrupt()))
+        with pytest.raises(KeyboardInterrupt):
+            client.publish_weights("v1")
+        self._assert_failed_round(client, rz, "KeyboardInterrupt")
+
+    def test_a_raising_abort_still_reports_and_resets(self, fake_nccl, monkeypatch):
+        rz = FakeRendezvous()
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        monkeypatch.setattr(
+            collective_backend, "_reshard", _raises(RuntimeError("enqueue failed"))
+        )
+        monkeypatch.setattr(client._half, "abort", _raises(RuntimeError("abort broke")))
+        with pytest.raises(RuntimeError, match="enqueue failed"):
+            client.publish_weights("v1")
+        assert rz.reports[0]["succeeded"] is False
+        assert client._operation_id is None
+
+    def test_a_refused_binding_reports_nothing_and_keeps_the_lanes(self, fake_nccl):
+        from modelexpress_rl.collective import TransferBindingError
+
+        rz = FakeRendezvous()
+        rz.bind_error = TransferBindingError("epoch is 0, expected 1")
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        lanes = len(client._cache)
+        with pytest.raises(TransferBindingError):
+            client.start_weight_update("v1", "stale-op")
+        # Nothing ran, so there is nothing to release and no operation to blame.
+        assert rz.reports == []
+        assert len(client._cache) == lanes
+
+    def test_cleanup_mid_round_reports_the_bound_operation(self, fake_nccl):
+        rz = FakeRendezvous()
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        client.cleanup()
+        assert [r["operation_id"] for r in rz.reports] == ["op1"]
+        assert rz.reports[0]["succeeded"] is False
+        assert "cleanup ran" in rz.reports[0]["message"]
+        assert len(client._cache) == 0
+
+    def test_cleanup_after_a_finished_round_reports_nothing_more(self, fake_nccl):
+        rz = FakeRendezvous()
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        client.publish_weights("v1")
+        client.finish_weight_update("v1")
+        client.cleanup()
+        assert [r["succeeded"] for r in rz.reports] == [True]
+
+
 THREE_GROUPS = ReshardPlan(bulk=[entry("a"), entry("b"), entry("c")])
 
 
