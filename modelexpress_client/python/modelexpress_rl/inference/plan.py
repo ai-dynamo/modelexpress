@@ -63,6 +63,7 @@ class EngineCapabilities:
     """Prepared artifacts that one engine installer can commit."""
 
     artifact_types: frozenset[type[PreparedArtifact]]
+    streamed_checkpoints: bool = False
 
 
 @dataclass(frozen=True)
