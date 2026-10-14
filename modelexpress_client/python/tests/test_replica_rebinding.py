@@ -16,24 +16,12 @@ import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 
 from tests.test_refit_bounded_descriptors import harness
 from modelexpress.refit.reshard.rendezvous import (
-    PublishedShard, PublishedTensor, structural_manifest_digest, wrap_rendezvous_blob,
+    PublishedShard, PublishedTensor, wrap_rendezvous_blob,
 )
-from modelexpress_rl.train import WeightPayloadFormat
 from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 
-try:
-    from modelexpress_rl.inference.adapter import TrainerSourceShard
-    from modelexpress_rl.inference.plan import ResolvedTrainerSource, TrainerSourceSnapshot
-except ImportError:
-    TrainerSourceShard = None
-    ResolvedTrainerSource = None
-    TrainerSourceSnapshot = None
-
-if TrainerSourceSnapshot is None:
-    from modelexpress_rl.inference.adapter import (
-        GeneratorSource, GeneratorTransferInputs, NixlGeneratorSource,
-    )
-    from modelexpress_rl.inference.plan import TrainerUpdateSource
+from modelexpress_rl.inference.adapter import TrainerSourceShard
+from modelexpress_rl.inference.plan import ResolvedTrainerSource, TrainerSourceSnapshot
 
 
 def _initialize_replicas(harness):
@@ -55,34 +43,9 @@ def _snapshot(harness, replica, cycle):
                                    shard_offset=(0, 0), shape=(4, 4))],
         ) for name, tensor in tensors.items()],
     )
-    if TrainerSourceSnapshot is None:
-        return TrainerUpdateSource(inputs=GeneratorTransferInputs(
-            version_id=str(cycle),
-            base_version_id=None,
-            layout_signature="replica-rebinding-test-layout",
-            payload_format=WeightPayloadFormat.FULL_TENSOR,
-            sources=(GeneratorSource(
-                source_slot_id="slot",
-                worker_id=replica,
-                manifest_digest=hashlib.sha256(blob).hexdigest(),
-                transport=NixlGeneratorSource(
-                    manifest_endpoint=f"{replica}:19000",
-                    manifest=blob,
-                    structural_digest=structural_manifest_digest(blob),
-                ),
-            ),),
-            trainer_mesh_id="mesh",
-            trainer_mesh_generation=1,
-        ))
-    if "manifest_digest" in TrainerSourceShard.__dataclass_fields__:
-        shard = TrainerSourceShard(
-            "slot", replica, hashlib.sha256(blob).hexdigest(), f"{replica}:19000",
-            blob, structural_manifest_digest(blob),
-        )
-    else:
-        shard = TrainerSourceShard(
-            "slot", replica, hashlib.sha256(blob).hexdigest(), f"{replica}:19000", blob,
-        )
+    shard = TrainerSourceShard(
+        "slot", replica, hashlib.sha256(blob).hexdigest(), f"{replica}:19000", blob,
+    )
     return TrainerSourceSnapshot("mesh", 1, (shard,))
 
 
@@ -106,11 +69,7 @@ def _load_replica(harness, method, replica: str, cycle: int):
     ):
         tensor.copy_(torch.arange(16, dtype=torch.float32).reshape(4, 4) + base + cycle + index)
     raw_source = _snapshot(harness, replica, cycle)
-    source = (
-        ResolvedTrainerSource(raw_source)
-        if ResolvedTrainerSource is not None
-        else raw_source
-    )
+    source = ResolvedTrainerSource(raw_source)
     prepared = _prepare(method, source, cycle)
     try:
         return {name: value.clone() for batch in prepared.batches() for name, value in batch.items()}
