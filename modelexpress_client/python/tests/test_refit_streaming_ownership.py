@@ -69,10 +69,9 @@ def setup_method(monkeypatch, *, staging_device="cuda", staging_buffers=1) -> tu
             TrainerSourceShard(
                 source_slot_id="slot",
                 worker_id="trainer",
-                manifest_digest="digest",
-                structural_digest="structure",
-                manifest_endpoint="trainer:19000",
-                manifest=b"metadata",
+                stable_metadata_digest="digest",
+                metadata_endpoint="trainer:19000",
+                metadata=b"metadata",
             ),
         ),
     )

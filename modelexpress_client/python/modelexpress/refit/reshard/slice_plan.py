@@ -51,7 +51,7 @@ from modelexpress.refit.reshard.types import (
 )
 
 
-@dataclass
+@dataclass(frozen=True)
 class Shard:
     """A published source shard covering full[shard_offset : shard_offset+shape].
 

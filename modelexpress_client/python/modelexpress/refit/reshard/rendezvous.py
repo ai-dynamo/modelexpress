@@ -37,9 +37,11 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import NamedTuple
 
 from modelexpress import envs, p2p_pb2
@@ -224,6 +226,7 @@ def build_sources(tensors: list, *, session_to_memory: dict | None = None) -> tu
     Returns ``(sources, session_to_agent, session_to_device)`` where ``sources``
     is ``{src_name: SourceInfo}`` for ``plan_transfer`` and the two maps drive
     ``NixlReshardTransport``. Each shard's ``session`` is its owning agent name.
+    Returned mappings and source rows are immutable and own their geometry.
     Host-aware callers must supply ``session_to_memory``, populated here with
     the memory type for each session, and forward it to the transport.
     """
@@ -246,8 +249,8 @@ def build_sources(tensors: list, *, session_to_memory: dict | None = None) -> tu
             memory_types[session] = s.memory_type
             shards.append(
                 Shard(
-                    shard_offset=s.shard_offset,
-                    shape=s.shape,
+                    shard_offset=tuple(s.shard_offset),
+                    shape=tuple(s.shape),
                     session=session,
                     addr=s.addr,
                     elsize=t.elsize,
@@ -257,14 +260,18 @@ def build_sources(tensors: list, *, session_to_memory: dict | None = None) -> tu
             session_to_agent[session] = s.agent_name
             session_to_device[session] = s.device_id
         sources[t.name] = SourceInfo(
-            global_shape=t.full_shape,
+            global_shape=tuple(t.full_shape),
             dtype=dtype,
             elsize=t.elsize,
-            shards=shards,
+            shards=tuple(shards),
         )
     if session_to_memory is not None:
         session_to_memory.update(memory_types)
-    return sources, session_to_agent, session_to_device
+    return (
+        MappingProxyType(sources),
+        MappingProxyType(session_to_agent),
+        MappingProxyType(session_to_device),
+    )
 
 
 def merge_shard_tables(tables: list) -> list:
@@ -327,7 +334,6 @@ def wrap_rendezvous_blob(
     agent_name: str,
     metadata_endpoint: str,
     tensors: list,
-    publisher_step: int | None = None,
 ) -> bytes:
     """Pack ``{agent_meta, agent_name, metadata_endpoint, shard_table}`` into one
     JSON blob. ``metadata_endpoint`` (``host:listen_port`` of the trainer's NIXL
@@ -335,18 +341,7 @@ def wrap_rendezvous_blob(
     for the P2P memory-registration handshake (the central agent-metadata blob
     alone does not make the registrations resolvable for RDMA reads).
 
-    ``publisher_step`` stamps the table with the training step whose weights it
-    describes. A receiver otherwise has no way to tell a current table from one
-    published a step ago, and it needs to: the shard table carries the per-shard
-    digests a receiver verifies against, so a table one step behind makes correctly
-    delivered bytes read as corruption. Inferring freshness instead - asking whether
-    any digest changed since planning - holds only when a table is wholly stale or
-    wholly current, and breaks under partial propagation across many publishers,
-    where it reports one lagging publisher's shard as a hard defect. The stamp turns
-    that inference into an observation.
-
-    The key is omitted rather than written as null when absent, so a blob from an
-    unstamped publisher is byte-identical to one an older client would have produced.
+    Counts and byte totals are included in every blob.
     """
     payload = {
         "schema": _schema_for(tensors),
@@ -354,10 +349,14 @@ def wrap_rendezvous_blob(
         "metadata_endpoint": metadata_endpoint,
         "agent_meta_b64": base64.b64encode(agent_metadata).decode("ascii"),
         "tensors": _encode_tensor_entries(tensors),
+        "tensor_count": len(tensors),
+        "total_bytes": sum(
+            math.prod(shard.shape) * tensor.elsize
+            for tensor in tensors
+            for shard in tensor.shards
+        ),
     }
-    if publisher_step is not None:
-        payload["publisher_step"] = int(publisher_step)
-    return json.dumps(payload).encode("utf-8")
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def structural_manifest_digest(blob: bytes) -> str:
@@ -385,7 +384,6 @@ def structural_manifest_digest(blob: bytes) -> str:
             "content-sensitive digest, which disables transfer-plan reuse"
         )
         return hashlib.sha256(blob).hexdigest()
-    payload.pop("publisher_step", None)
     for tensor in payload.get("tensors", ()):
         for shard in tensor.get("shards", ()):
             shard.pop("digest", None)
@@ -396,65 +394,60 @@ def structural_manifest_digest(blob: bytes) -> str:
 class RendezvousPayload(NamedTuple):
     """One trainer rank's unwrapped rendezvous blob.
 
-    A plain tuple until now, which read as ``payload[3]`` at the point where the
-    interesting question is asked - whether this rank published any tensors. Being
-    a tuple subclass, it still indexes as before.
-
-    ``publisher_step`` is ``None`` for a publisher that does not stamp, and that
-    must be read as "unknown", never as step 0: a publisher read as step 0 looks
-    permanently behind, and a consumer that excuses lagging publishers would then
-    excuse all of its shards, going quiet instead of strict. It carries a default
-    so that reading the stamp is a new field rather than a second unwrap function,
-    which is also why unpacking must now name six values. ``tensor_count`` keeps
-    the published table size available when ``with_tensors=False`` deliberately
-    leaves ``tensors`` empty; ``None`` preserves direct and older callers.
+    Named fields retain the existing positional tuple access.
     """
 
     agent_metadata: bytes
     agent_name: str
     metadata_endpoint: str
     tensors: list
-    publisher_step: int | None = None
-    tensor_count: int | None = None
-
-    def entry_count(self) -> int:
-        """How many shard-table entries this rank published.
-
-        Distinct from ``len(self.tensors)`` because a payload unwrapped for a
-        quorum check carries the count without paying to build the table. Asking
-        "did this rank publish anything" must stay answerable on both.
-        """
-        return len(self.tensors) if self.tensor_count is None else self.tensor_count
+    tensor_count: int
+    total_bytes: int
 
 
-def unwrap_rendezvous_blob(
-    blob: bytes, *, with_tensors: bool = True
-) -> RendezvousPayload:
-    """Inverse of ``wrap_rendezvous_blob``.
-
-    ``with_tensors=False`` decodes everything except the shard table, for callers
-    that only need the version stamp. Building the table dominates this function
-    (~97 ms vs ~9 ms per source on Qwen3-30B-A3B's 4922 entries), and a per-step
-    quorum check re-does it for a table that never changes between steps.
-    ``tensor_count`` is still populated, so an empty publisher stays detectable.
-    """
+def unwrap_rendezvous_blob(blob: bytes, *, stable: bool = False) -> RendezvousPayload:
+    """Decode a blob; stable metadata also requires counts and excludes checksums."""
     payload = json.loads(blob.decode("utf-8"))
     if payload.get("schema") not in (_SCHEMA, _HOST_SCHEMA):
         raise ValueError(f"unexpected rendezvous blob schema {payload.get('schema')!r}")
     agent_metadata = base64.b64decode(payload["agent_meta_b64"])
     agent_name = payload["agent_name"]
     metadata_endpoint = payload.get("metadata_endpoint", "")
-    entries = payload["tensors"]
-    tensors = decode_shard_entries(entries) if with_tensors else []
-    raw_step = payload.get("publisher_step")
-    publisher_step = None if raw_step is None else int(raw_step)
+    tensors = decode_shard_entries(payload["tensors"])
+    byte_count = sum(
+        math.prod(shard.shape) * tensor.elsize
+        for tensor in tensors for shard in tensor.shards
+    )
+    tensor_count = payload.get("tensor_count")
+    if tensor_count is None:
+        tensor_count = len(tensors)
+    total_bytes = payload.get("total_bytes")
+    if total_bytes is None:
+        total_bytes = byte_count
+    if stable:
+        if (
+            type(payload["tensor_count"]) is not int or tensor_count <= 0
+            or type(payload["total_bytes"]) is not int or total_bytes <= 0
+            or tensor_count != len(tensors) or total_bytes != byte_count
+            or any("digest" in shard for tensor in payload["tensors"] for shard in tensor["shards"])
+        ):
+            raise ValueError("stable metadata contains version state or invalid counts")
+        if len({tensor.name for tensor in tensors}) != len(tensors):
+            raise ValueError("stable metadata contains duplicate tensor names")
+        for tensor in tensors:
+            identities = {
+                (shard.agent_name, shard.addr, tuple(shard.shard_offset), tuple(shard.shape))
+                for shard in tensor.shards
+            }
+            if len(identities) != len(tensor.shards):
+                raise ValueError("stable metadata contains duplicate physical shards")
     return RendezvousPayload(
         agent_metadata,
         agent_name,
         metadata_endpoint,
         tensors,
-        publisher_step,
-        len(entries),
+        tensor_count,
+        total_bytes,
     )
 
 
@@ -581,18 +574,11 @@ class MxReshardRendezvous:
         expected_trainers: int,
         timeout: float = 1200.0,
         poll_interval: float = 1.0,
-        with_tensors: bool = True,
     ) -> list:
         """Block until ``expected_trainers`` trainer ranks are visible **with a
         non-empty shard table**, then return them.
 
         Returns ``list[RendezvousPayload]``, one per trainer rank.
-
-        ``with_tensors=False`` skips building the shard tables, for a caller that
-        only needs each rank's version stamp. The quorum semantics are unchanged -
-        emptiness is still judged on the published entry count - but a per-step
-        check no longer rebuilds tables that are identical every step. Anything
-        that reads shard geometry must leave this ``True``.
 
         A rank counts toward the quorum only once its published table names at
         least one tensor. A rank that advertises READY with nothing to read has
@@ -633,9 +619,7 @@ class MxReshardRendezvous:
             # The fetch is the dominant term (~4.0 s of ~4.8 s here) and it is
             # server-bound, not client-bound: see ``_fetch_metadata`` for the
             # measurement that ruled out concurrency. Cutting it further means
-            # sending less, which needs ``publisher_step`` carried in the
-            # ``list_sources`` instance record so the quorum costs one small call
-            # instead of one full shard table per rank. That is a protocol change.
+            # sending less through ``list_sources`` would need a protocol change.
             fetch_t0 = time.perf_counter()
             metas = self._fetch_metadata(instances)
             fetch_s += time.perf_counter() - fetch_t0
@@ -643,11 +627,9 @@ class MxReshardRendezvous:
                 if meta is None or not meta.found:
                     continue
                 parse_t0 = time.perf_counter()
-                payload = unwrap_rendezvous_blob(
-                    meta.worker.nixl_metadata, with_tensors=with_tensors
-                )
+                payload = unwrap_rendezvous_blob(meta.worker.nixl_metadata)
                 parse_s += time.perf_counter() - parse_t0
-                if payload.entry_count() == 0:
+                if not payload.tensors:
                     empty += 1
                     continue
                 payloads.append(payload)
@@ -671,11 +653,7 @@ class MxReshardRendezvous:
                     "schema": "mx-discover-cost-v1",
                     "rank": self.rank,
                     "sources": len(payloads),
-                    # entry_count, not len(tensors): the quorum path does not build
-                    # the tables, and this figure is what shows the cost tracks
-                    # source count rather than bytes moved.
-                    "tensors": sum(p.entry_count() for p in payloads),
-                    "tables_built": with_tensors,
+                    "tensors": sum(len(p.tensors) for p in payloads),
                     "grpc_fetch_s": round(fetch_s, 6),
                     "blob_parse_s": round(parse_s, 6),
                     "polls": polls,
