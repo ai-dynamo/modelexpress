@@ -9,7 +9,7 @@ import logging
 
 import torch.nn as nn
 
-from modelexpress import envs as mx_envs
+from modelexpress.rl import envs as mx_envs
 from modelexpress.adapter import StrategyFailed, StrategyRecoveryError
 from modelexpress.load_strategy import execute_load_strategies
 from modelexpress.load_strategy.context import LoadContext, LoadResult
@@ -487,6 +487,16 @@ class RLLoadStrategyChain:
     @staticmethod
     def run(model: nn.Module, ctx: LoadContext) -> nn.Module:
         """Execute the cold-start strategy chain for the agreed version."""
+        from .engines import configure_engine_logging
+
+        from modelexpress import p2p_pb2
+
+        engine = {
+            p2p_pb2.BACKEND_FRAMEWORK_VLLM: "vllm",
+            p2p_pb2.BACKEND_FRAMEWORK_SGLANG: "sglang",
+        }.get(ctx.identity.backend_framework)
+        if engine is not None:
+            configure_engine_logging(engine)
         ctx.desired_version_uid = _agree_desired_version(ctx)
         # A desired UID is a correctness constraint: version-agnostic fallbacks
         # could load different weights and let the worker serve the wrong version.

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from types import FunctionType, GetSetDescriptorType
 
 import torch
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress.rl.refit.reshard.types import CaptureResult, RecordedCopy
 
 _RECORD_FIELDS = (
     "src_name",

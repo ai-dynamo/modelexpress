@@ -234,12 +234,7 @@ See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
 ### Generator refit checkpoint cache
 
-`refit_checkpoint_max_size_gb` defaults to 2000 GB per model. At initialization,
-the generator caps this quota at existing cache bytes plus free disk space and
-logs any reduction. Free space is checked again before known writes and copies,
-including when `null` disables the configured quota. See the
-[S3 refit cache configuration](S3_DELTA_WEIGHT_REFIT.md#refit_checkpoint_dir)
-for setup and eviction behavior.
+See the [RL checkpoint cache reference](rl/CONFIGURATION.md#generator-refit-checkpoint-cache) for quota, capacity, and eviction behavior.
 
 ## ServiceAccount Authentication
 
@@ -553,77 +548,11 @@ dashboard.
 
 ### FSDP refit tensor precision
 
-The FSDP publisher transfers floating tensors in BF16 by default. Frameworks
-whose models require higher precision for selected tensors can provide exact
-state-dict names through the trainer context:
-
-```python
-import torch
-from modelexpress_rl import FSDPTrainerContext, ModelExpressTrainerConfig
-
-config = ModelExpressTrainerConfig(
-    engine_context=FSDPTrainerContext(
-        wire_dtype_overrides={"model.layers.0.mlp.router.selection_bias": torch.float32},
-    ),
-    model_name="my-model",
-    device_id=0,
-    server_url="localhost:8001",
-)
-```
-
-Model-specific name selection belongs to the framework. Overrides accept
-`torch.float16`, `torch.bfloat16`, and `torch.float32`; these are unquantized
-tensor dtypes, not packed FP8/FP4 format support. Other tensors retain the BF16
-default. An unknown name or non-floating tensor is rejected rather than silently
-ignoring a precision exception. Names must match the state dict supplied by that
-trainer, including any wrapper prefixes.
-
-`COPY_TO_HOST` and `COPY_TO_DEVICE` register persistent buffers in each selected
-dtype and copy subsequent versions into those buffers. `IN_PLACE` requires the source dtype to
-match the selected dtype. The adapter copies the override mapping at creation;
-changing the caller's mapping does not change an active adapter. A source dtype
-change after initialization is rejected before writing a new version. Recreate
-the adapter and rebind when the model's precision policy changes.
-
-Manifests describe each served tensor's dtype and element size, and byte totals
-sum their actual sizes. Existing receiver dtype conversion remains available,
-but casting a rounded BF16 value back to FP32 cannot recover source precision.
-Verify installed parameters and generation separately from transfer completion.
+See the [RL FSDP precision guide](rl/CONFIGURATION.md#fsdp-precision-and-trainer-staging) for dtype overrides, supported precisions, and validation.
 
 ### Choosing trainer staging for synchronous refits
 
-Choose an existing `TrainerStagingMode` explicitly for the integration:
-
-| Mode | Recommendation | Lifetime and memory cost |
-|---|---|---|
-| `IN_PLACE` | First choice and lowest staging latency for synchronous integrations. Trainers wait for receivers to finish and retire/delete the version before updating its source bytes. | Registers existing contiguous storage without a second weight copy. Addresses must remain stable across updates; bytes must remain immutable while the version can be read. |
-| `COPY_TO_HOST` | First choice when `IN_PLACE` is unavailable, including trainer-side dtype conversion or moving source storage. | Keeps a persistent wire-format copy in pinned host RAM on CUDA hosts. GPU-to-host staging and host-to-receiver transfer add latency, but avoid a persistent second weight copy in VRAM. |
-| `COPY_TO_DEVICE` | Explicit exception when measured latency justifies the VRAM cost, typically for small models where `IN_PLACE` is unavailable. | Keeps an additional wire-format copy on the trainer device. It is generally faster than host staging but can consume substantial VRAM; budget all rank-local shards, including replicated tensors. |
-
-`IN_PLACE` cannot perform trainer-side conversion: each source must already have
-the selected transfer dtype and representation. A conversion plugin also rules
-out this mode. CPU offload or state-dict rematerialization can invalidate its
-stable-address requirement even when the dtypes match. Do not silently fall back
-to a device copy when these checks fail.
-
-The FSDP adapter supports all three modes for full-tensor payloads. Host staging
-preserves the per-tensor dtype overrides above and registers its persistent CPU
-buffers once. CUDA copy completion is fenced before publication; the served
-snapshot and its registration remain live until version retirement. Conversion
-can still require temporary device workspace; host staging eliminates the
-persistent wire-format device copy, not every transient allocation. Support for
-arbitrary conversion plugins remains adapter-specific.
-
-FP32 trainer shards transferred as BF16 with selected FP32 exceptions require
-conversion, so they cannot use `IN_PLACE`. Use `COPY_TO_HOST` for this precision
-policy unless a measured latency requirement justifies the additional VRAM
-needed by `COPY_TO_DEVICE`.
-
-Trainer `COPY_TO_HOST` is independent of the generator's `staging_device="cpu"`
-setting: the former changes where source snapshots live, while the latter
-changes where receivers land incoming bytes. Host-source manifests use the
-internal `mx.reshard.shard_table.v2` format, so both ends must run a host-aware
-client. Older readers reject this format. Device-only manifests retain v1.
+See the [RL trainer staging guide](rl/CONFIGURATION.md#choosing-trainer-staging-for-synchronous-refits) for mode selection, tensor lifetime, conversion, and memory requirements.
 
 ### Dynamo Model Cache Deployment
 
@@ -635,12 +564,7 @@ kubectl apply -f examples/dynamo_model_cache_k8s/agg.yaml
 
 See [`../examples/dynamo_model_cache_k8s/README.md`](../examples/dynamo_model_cache_k8s/README.md) for the full guide.
 
-For RL cold start and active weight refit, see
-[`../examples/rl/dynamo_vllm_reshard_refit/README.md`](../examples/rl/dynamo_vllm_reshard_refit/README.md).
-Its vLLM startup probe directly reconciles the desired MX UID through vLLM's
-native Control gRPC service. Keep that probe on the restartable vLLM init
-container: Kubernetes does not start the Dynamo sidecar until vLLM reports the
-desired UID, so a failed or mismatched reconciliation cannot admit the worker.
+For RL cold start and active refit, see the [RL Dynamo deployment guide](../examples/rl/dynamo_vllm_reshard_refit/README.md) and [RL architecture](rl/ARCHITECTURE.md#rl-cold-start-deployment).
 
 ## P2P GPU Weight Transfers
 
@@ -698,15 +622,12 @@ Pick based on workload, not operational preference. The choice has structural co
 | Workload shape                                                         | Backend          | Why                                                                                                                                            |
 |------------------------------------------------------------------------|------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
 | Stable-weight inference. Weights fixed at pod startup, no mid-life refit. Simple K8s deployment. | `k8s-service`    | Lowest deployment footprint. No server, no Redis, no CRDs. Matches the homogeneous pool assumption that Service-routing requires.             |
-| Future RL refit workflows (under development). Training updates weights every step and rollout workers need per-worker sources. | `redis` or `kubernetes` | The central store provides the per-worker addressability required by the planned receiver-driven refit workflow. Selecting this backend does not enable end-to-end live refit today. |
-| Future live fine-tune broadcasts (under development). New checkpoints are pushed to running replicas. | `redis` or `kubernetes` | These workflows require the same per-worker addressability. The `k8s-service` backend cannot swap a live pod's `mx_source_id` without restarting the pod. |
+| Live RL refit with per-worker source selection | `redis` or `kubernetes` | The central store provides the required per-worker addressability. See the [RL refit architecture](rl/ARCHITECTURE.md). |
 | Mixed-version fleet. Multiple revisions serving concurrently, callers dispatch by revision. | `redis` or `kubernetes` | Central store indexes by `mx_source_id`, so multiple identities coexist cleanly. k8s-service requires one Service pool per identity.          |
 | Heterogeneous hardware. Some sources on H100, some on B200, callers match on topology. | `redis` or `kubernetes` | Central store carries per-worker metadata including identity fields; k8s-service's pool assumption requires all pods to be interchangeable.   |
 | Multiple checkpoints in parallel (base + LoRA, fp16 + nvfp4, etc.).   | Either           | Different `SourceIdentity` produces different `mx_source_id`. Each identity gets its own Service (k8s-service) or its own source records (central). Both work. |
 
 The central-coordinator backends (`redis`, `kubernetes`) are the default. Reach for `k8s-service` specifically when the deployment meets three criteria: (1) weights stay fixed for each pod's lifetime, (2) every pod behind a given Service serves the exact same checkpoint, and (3) dropping the `modelexpress-server` / Redis / CRD components is a material simplification.
-
-Receiver-driven RL refit and live fine-tune broadcast are under development. The table identifies the metadata backend required by those future workflows; it does not describe a currently supported end-to-end refit path.
 
 See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale, limitations, and the structural reasons these backend families differ.
 
@@ -737,15 +658,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 |----------|---------|-------------|
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client's gRPC server address (recommended; ignored when client uses `k8s-service` backend) |
-| `MX_MODEL_NAME_OVERRIDE` | (unset) | Override vLLM's MX model identity without changing its model-loading path. Set before worker startup and use the same name for RL trainers and WeightVersions. Unset or empty preserves vLLM's configured model path/ID, including rewritten S3 cache paths. See [S3 Delta Weight Refit](S3_DELTA_WEIGHT_REFIT.md). |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
-| `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Initial-load policy. `RL` uses exact desired-version P2P and canonical S3 replay when `MX_REFIT_DESIRED_VERSION_UID` is set; otherwise it tries `MX_MODEL_URI` and then the engine-native loader. vLLM speculative draft models are rejected because the desired UID identifies only the main model. |
-| `MX_LOAD_PLUGIN` | (unset) | Select one external loading strategy by name for the shared `INFERENCE` chain. Unset or empty disables plugin discovery. See [Loading Strategy Plugins](#loading-strategy-plugins). |
-| `MX_LOAD_PLUGIN_BEFORE` | `server-cache` | Insert the selected plugin immediately before this built-in strategy. Ignored when no plugin is selected. See [Loading Strategy Plugins](#loading-strategy-plugins) for valid names. |
-| `MX_PLUGIN_DIR` | `/opt/modelexpress/plugins` | Directory containing `mx_plugin_<name>.py` entries; read only when a plugin is selected. |
-| `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact immutable version required by the RL initial-load policy. When set, startup fails if neither desired-version P2P nor S3 replay succeeds; version-agnostic fallbacks are not allowed. |
-| `MX_GENERATOR_SOURCE_ORDER` | Auto-detected | Ordered RL weight sources. For desired-version cold start, the default is `GENERATOR,OBJECT_STORAGE`; supported entries are `GENERATOR` (P2P) and `OBJECT_STORAGE` (canonical S3 replay). The same order controls active refit. `OBJECT_STORAGE` disables P2P for both paths. `TRAINER` is supported by active refit only and is rejected during desired-version cold start. |
-| `MX_REFIT_CHECKPOINT_DIR` | (unset) | Local cache for RL full checkpoints, deltas, and materialized checkpoints. Required for desired-version S3 replay. Cache persistence and capacity are determined by the mounted volume. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
 | `MX_P2P_SOURCE_SELECTOR` | `random` | P2P source-ordering policy for the RDMA load path. `random` (behavior-preserving default; local-RNG shuffle), `rendezvous_hash` (stateless deterministic spreading via HRW hashing; stable across restarts and minimally disrupted by source-set changes), `load_aware` (biases `rendezvous_hash` away from sources with high `source_load`; collapses to `rendezvous_hash` when load is 0/unset), or `topology_aware` (locality-first: prefer sources in the narrowest shared RDMA domain, rendezvous jitter as tiebreak). Unknown values log a warning and fall back to `random`. Ordering only — the `MAX_SOURCE_RETRIES=3` retry budget is unchanged. On the `kubernetes` metadata backend, `load_aware` needs the `ModelMetadata` CRD shipped with this release (`status.worker.sourceLoad`): the API server prunes fields the installed schema lacks, and Helm does not update `crds/` on upgrade, so reapply the CRD as described under [Distributed backend selection](#distributed-backend-selection) or `source_load` is silently dropped and the policy degrades to `rendezvous_hash`. |
 | `MX_P2P_LOAD_WEIGHT` | `1.0` | Weight of the `source_load` penalty in the `load_aware` selector (`score = unit_hash − w · source_load`). Higher values steer more aggressively away from busy sources; `0` makes `load_aware` behave like `rendezvous_hash`. |
@@ -775,8 +688,6 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_P2P_METADATA` | `1` | Enable P2P metadata exchange (source workers only). Set to `0` to publish full metadata through a central-coordinator backend. This setting is ignored on backends that require P2P metadata, currently `k8s-service`. |
 | `MX_DISABLE_DRAFT_P2P` | `0` | Set to `1` to load the SGLang speculative draft through storage without receiving or publishing draft tensors over NIXL P2P. Main-model P2P and cold-load shard selection are unchanged. The default permits P2P for compatible same-checkpoint MTP drafts; it does not bypass checkpoint identity or compatibility checks, and storage fallback remains available when no compatible READY source is found. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
-| `MX_REFIT_DELTA_SURGICAL` | `false` | Experimental vLLM delta install: reload only the modules whose checkpoint tensors the delta chain changed since the engine's last checkpoint install, instead of the whole prepared checkpoint. Falls back to a full reload when the lineage or live version is unknown, or when a fed module is incomplete. See the S3 delta refit guide. |
-| `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL listen port for an RL generator's refit client; effective port is `MX_REFIT_METADATA_PORT + device_id`, separate from a boot-time loader manager |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses the same artifact lifecycle for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. |
@@ -797,6 +708,8 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_METADATA_NAMESPACE` | `default` | K8s namespace for CRD backend |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms (2 hours for large models) |
 | `VLLM_PLUGINS` | - | For vLLM versions older than 0.23.0, set to `modelexpress` to register the `modelexpress` and `mx` loaders. vLLM 0.23.0 and newer recognize the load format natively. |
+
+RL initial-load, refit, and generator-source settings are listed in the [RL configuration reference](rl/CONFIGURATION.md).
 
 **Restricting P2P to one Availability Zone.** Set `MX_P2P_TOPOLOGY_DOMAIN=zone` (enforcement defaults to `required`). On a Dynamo-managed cluster the zone needs no MX wiring: setting `spec.experimental.kvTransferPolicy` on the DynamoGraphDeployment to `{labelKey: topology.kubernetes.io/zone, domain: zone}` makes the operator copy the node's zone label onto each worker pod and project it to `/etc/dynamo/topology/zone`, which MX reads. Use `enforcement: preferred, preferredWeight: 0` there to get the mount without changing Dynamo's prefill/decode routing. Roll out in this order, because under `required` a source with no published zone is ineligible and the target silently loads from disk:
 
@@ -850,9 +763,9 @@ and only one allocated rail on their NUMA node:
 
 Aggregate with four readers sharing was *lower* than a single reader
 alone (26.1 GB/s), so throughput is destroyed rather than divided.
-Nothing in the refit telemetry dissents: byte counts, descriptor counts
-and coverage are all exact. Pair this with `MX_RESHARD_MIN_GBPS` so a
-collapse is reported rather than inferred.
+A refit can move the exact planned bytes and still run far below the fabric
+limit. RL throughput diagnostics and the `MX_RESHARD_MIN_GBPS` threshold are
+documented in the [RL configuration reference](rl/CONFIGURATION.md).
 
 The probe runs at worker startup, walks PCIe sysfs, and computes a
 **host-wide** GPU-to-NIC assignment — every rank derives the same map from
@@ -862,11 +775,10 @@ Ranking is rail distinctness first, then PCIe depth, then NUMA locality.
 
 The GPU set comes from the PCI listing rather than from
 `torch.cuda.device_count()`, so it is the same in every rank regardless of
-how the workers were launched. That distinction is load-bearing: NeMo-RL
-and prime-RL give each worker its own `CUDA_VISIBLE_DEVICES`, and a map
-built from the visible set would have each rank see one GPU, count from
-zero, and pick the same rail as all of its peers — the convergence the
-probe exists to prevent.
+how the workers were launched. That distinction is load-bearing: Some multi-process workloads give each worker its own `CUDA_VISIBLE_DEVICES`;
+a map built from that visible set would have each rank see one GPU, count from
+zero, and pick the same rail as all of its peers — the convergence the probe
+exists to prevent.
 
 One case it cannot solve alone: if the container is device-isolated so
 that only one GPU appears in the PCI listing too, there is nothing to
@@ -988,17 +900,9 @@ handles.
 
 ### P2P Metadata Exchange
 
-P2P metadata exchange is enabled by default. Source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch tensor manifests or artifact manifests directly from the source worker rather than pulling them through the central store. RL generator-to-generator active refit calls `PrepareTensorRead` while preparing the update, then holds the bounded lease until the staged update is released or the NIXL transfer completes. These donor-timed leases protect the donor's live tensor storage while another generator reads it; the donor drains existing readers before overwriting that storage, and if the drain times out, refit fails before mutation. Completion and ordinary failures release immediately. A pre-transfer retry obtains a fresh lease and revalidates the exact source version and worker instead of reusing the consumed manifest. If the target pod exits without cleanup because of `SIGKILL`, OOM, or node loss, the donor expires the abandoned lease after its bounded lifetime. Ordinary inference loading continues to use `GetTensorManifest` without this RL-specific mutation fence. For file-backed cache artifacts, targets call `PrepareArtifactChunk` and `ReleaseArtifactChunk` while bytes move through NIXL into target-local staging, then install the staged artifact into the runtime cache directory. The division of responsibility depends on which metadata backend is in use:
+P2P metadata exchange is enabled by default. Source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch tensor manifests or artifact manifests directly from the source worker rather than pulling them through the central store. For file-backed cache artifacts, targets call `PrepareArtifactChunk` and `ReleaseArtifactChunk` while bytes move through NIXL into target-local staging, then install the staged artifact into the runtime cache directory. The division of responsibility depends on which metadata backend is in use:
 
-Active refit of a generator that publishes runtime tensors requires this default P2P metadata path. With `MX_P2P_METADATA=0`, ModelExpress cannot account for readers of tensor addresses stored in the central coordinator, so it fails the refit before mutation instead of risking a mixed-version transfer.
-
-Generator-to-generator active refit validates the peer first, then receives
-directly into the target's registered live runtime tensors at the engine safe
-point. It does not allocate a second model-sized GPU buffer. If that direct
-transfer fails after mutation starts, ModelExpress marks the engine state
-uncertain; reset or restart the worker before serving or retrying. Quantized
-models and FP8 KV-cache configurations use canonical object-storage refit because
-their non-tensor derived state cannot currently be refreshed by a direct copy.
+RL generator peer leases and in-place update safety are described in the [RL refit architecture](rl/ARCHITECTURE.md#generator-peer-lease-behavior).
 
 - **Central-coordinator backends (`redis`, `kubernetes`):** the source publishes only a lightweight pointer (its `worker_grpc_endpoint` and NIXL listen address) to the central server, and targets use that pointer to connect directly to the source for the MB-scale data. Set `MX_P2P_METADATA=0` to publish full tensor metadata (NIXL blobs + tensor descriptors) to the central server instead. Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the server's metadata; no configuration is needed on the target side.
 - **`k8s-service` backend:** auto-enabled for tensor metadata. The backend declares itself decentralized (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P tensor path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly. File-backed artifact transfer currently requires a central-coordinator backend (`redis` or `kubernetes`) because `k8s-service` does not yet publish `artifact_source` discovery metadata.
@@ -1136,58 +1040,10 @@ artifact transfer only within a trusted deployment, and network-isolate the MX
 server, worker gRPC endpoints, and Mooncake store from untrusted clients.
 ModelExpress does not currently sign cache artifacts.
 
-RL refit has the same trusted-network requirement. Its trainer-local
-`RefitWorkerService` serves stable trainer metadata and separate version checksum
-records over plaintext gRPC. Metadata digests detect corruption but do not
-authenticate the trainer.
+RL refit also uses plaintext trainer metadata and checksum RPCs; keep its server and worker endpoints on a trusted, isolated network. See [RL security and protocol upgrades](rl/ARCHITECTURE.md#rl-protocol-trust-and-upgrades).
 
-The split worker metadata protocol requires a coordinated upgrade of the MX server,
-trainers, and generators. It replaces `GetWeightVersionShardManifest` and retires the
-old `WeightVersionShard` manifest, endpoint, and count fields; mixed protocol versions
-are unsupported. Retire active refit rounds and their leases before stopping workers.
-Restart workers and remove obsolete refit metadata during the upgrade, preserving
-unrelated Redis and model-cache state.
+Canonical S3 publication, full-checkpoint caching, and the example S3 fixture are described in the [RL refit architecture](rl/ARCHITECTURE.md#canonical-s3-checkpoint-publication-and-cache-operations) and [S3 delta guide](rl/S3_DELTA_WEIGHT_REFIT.md).
 
-Canonical S3 trainers consume Hugging Face tensor buckets produced by the
-training framework. Framework-native bucket settings remain the default.
-Integrations may use `MX_REFIT_DELTA_BUCKET_BYTES` as an explicit override, or
-its 512 MiB default when they have no native setting. `MX_REFIT_DELTA_WORKERS`
-(default `min(32, CPU count)`) controls trainer CPU work;
-`MX_S3_UPLOAD_WORKERS` controls concurrent full-checkpoint batch uploads.
-Framework integrations read the bucket-size setting before constructing the
-stream; ModelExpress preserves the supplied bucket boundaries.
-Full checkpoints are grouped into concurrently uploaded safetensors objects of
-up to `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` tensor bytes (4 GiB by default).
-A single tensor larger than the configured size is uploaded on its own.
-Generators download those objects concurrently through the ModelExpress S3
-client. Each download worker validates one batch and overwrites the matching
-regions in the existing local checkpoint mmaps.
-The receiver marks its local checkpoint `UPDATING` before mutation and `READY`
-only after success. An interrupted update remains unavailable until a fresh
-initialization reseeds it from `seed_checkpoint_path`.
-
-S3 versions normally use `XOR_DELTA`. Integrations may opt into a
-framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish
-native HF safetensor shards, omit `base_version_id`, and become the exact base
-for the next delta. The cadence is disabled by default. Slime exposes
-`--modelexpress-full-hf-checkpoint-interval N`; Vime accepts
-`full_hf_checkpoint_interval` in `--modelexpress-config`. In both cases, `N`
-counts published ModelExpress weight versions.
-
-The `vime_dynamo_delta_refit` and `dynamo_vllm_s3_delta_refit` Kubernetes examples
-use a disposable SeaweedFS 4.48 S3 fixture. Both manifests pin the upstream
-public `docker.io/chrislusf/seaweedfs` image by digest and run `weed mini` with
-S3 on port 9000. The `mx-s3-creds` Secret supplies `AWS_ACCESS_KEY_ID` and
-`AWS_SECRET_ACCESS_KEY` to both SeaweedFS and the S3 clients; Vime CI creates
-this Secret before deploying the stack. The `/healthz` readiness probe checks
-that the S3 listener is serving; it does not validate the backing storage.
-Data stays in an `emptyDir` volume. Volume counts are bounded for the 64 GiB
-Vime and 16 GiB lifecycle fixtures, with 1 GiB SeaweedFS volumes.
-Each storage pod requests 1 GiB of memory and has a 4 GiB limit for concurrent
-trainer multipart uploads. `GOMEMLIMIT=3GiB` leaves headroom below that limit;
-the previous 1 GiB container limit is insufficient for two trainer ranks.
-The Vime CI smoke test consumes the example manifest directly; update both
-manifests together when changing the fixture image.
 
 ### Server-Backed Model Cache (No Shared Storage)
 
@@ -1513,102 +1369,7 @@ kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/co
 
 ### Bounded GPU refit
 
-Framework integrations choose the public staging, installation and memory
-settings. The framework also owns the safe update point and the pause/restart
-policy described below.
-
-| Integration choice | Public setting or operation |
-| --- | --- |
-| Trainer storage | Set `ModelExpressTrainerConfig.staging_mode` explicitly. Prefer `IN_PLACE` when its lifetime and dtype requirements hold; otherwise start with `COPY_TO_HOST`. |
-| Generator installation | Use `stage_weight()` followed by `apply_weight()`, then release the handle. Bounded staging defers batch reads until apply. |
-| Receiver memory | Set `ModelExpressGeneratorConfig.staging_buffer_bytes` per buffer and `staging_buffers_count` for bounded installation. `staging_device` selects host or device receive memory. |
-
-For unquantized vLLM models whose weights leave insufficient memory for a second
-complete weight copy, initialize the generator with
-`source_order=(WeightSource.TRAINER,)` and bounded staging:
-
-```python
-generator = ModelExpressGeneratorClient.initialize(
-    ModelExpressGeneratorConfig(
-        engine_context=engine_context,
-        model_name=model_name,
-        source_order=(WeightSource.TRAINER,),
-        staging_buffer_bytes=4 * 1024**3,
-        staging_buffers_count=2,
-        staging_device="cuda",  # or "cpu" for pinned host staging
-    )
-)
-# Pause generation on every replica before installing live weights.
-staged = generator.stage_weight(version=WeightVersionRef(version_uid))
-try:
-    metrics = generator.apply_weight(staged)
-finally:
-    staged.release()
-# Resume only after every replica completes successfully.
-```
-
-This API interleaves NIXL reads and per-module installation. It supports mixed
-floating-point wire/engine dtypes through the existing conversion planner. The
-per-buffer limit covers receive, conversion, full-pull scratch, and alignment.
-Total arena capacity is `staging_buffer_bytes * staging_buffers_count` per
-generator worker. A module larger than one buffer fails during preparation. Engine
-post-load workspaces and live weights require additional headroom; the limit is
-not a total process-memory cap.
-
-`staging_device` selects where the arenas live. `"cuda"` (default) lands RDMA
-in VRAM and commits with a device copy. `"cpu"` allocates pinned host memory,
-registers it as NIXL DRAM, and commits with a host-to-device copy, so the arena
-costs no VRAM. Host staging adds a host-to-device copy and depends on the
-available host-memory and CPU-to-GPU bandwidth. `staging_buffers_count=2` posts the
-next batch's READ into the other arena before the current batch is committed,
-allowing transfer and installation to overlap. The benefit depends on the
-hardware and the relative transfer and installation times; it does not guarantee
-that the copy is hidden. Host arenas are an option for VRAM-constrained
-deployments. Changing either option between updates is a workspace switch (see
-below).
-
-Any failure requires keeping the deployment paused and restarting its engines.
-Some modules may already contain the new version, so a failed operation cannot
-be treated as a usable old version. The framework owns this pause/restart policy.
-Quantized engines, generator-peer publication, and object-storage delta replay
-are not supported by this API. Trainer-source `stage_weight()` keeps its
-full-copy behavior.
-After releasing an update, callers can switch between full-copy and bounded
-staging on the same trainer-only client. A mode switch disconnects the NIXL
-agent and deregisters its workspace before freeing the old buffers, then
-reinitializes registrations and plans for the new mode. Same-mode updates retain
-their reusable workspace. Never switch while an update handle remains active.
-
-Streaming preparation retries transient RPC, runtime, and manifest-validation
-failures up to `max_transfer_attempts`, keeping the version lease across attempts.
-Failed preparation storage is reset before retrying; a reset failure requires an
-engine restart. Once installation starts, failures are not automatically retried.
-Release errors remain visible to callers, but a locally released update no longer
-holds the client's active slot even when lease deletion fails.
-Metrics include `staging_peak_bytes`, `batches`, `bytes_received`, `wire_s`, and
-`reconstruct_s`. `wire_s` measures READ posting through completion observation;
-`wire_wait_s` measures the blocking completion wait. With two arenas, a READ can
-overlap the previous batch's installation, so wire and installation times must
-not be added as disjoint intervals. GPU validation is required for each target
-model and topology before performance qualification.
-
-Streaming reports independent `streaming_total_s`, `streaming_prepare_s`,
-`streaming_apply_s`, and `streaming_release_s` intervals. Preparation contains
-`source_metadata_s`, `layout_capture_s`, `transfer_planning_s`, and
-`connection_registration_s`; the remaining preparation time includes version
-discovery and lease/control operations. Application contains NIXL `wire_s`,
-`reconstruct_s`, `install_commit_s` (including CUDA completion), `reload_s`, and
-`post_install_sync_s`. In the generic installer, vLLM's post-load processing
-refreshes attention-derived weights within `reload_s`. The ordinary
-`perf/mx_receive_install_time` is not emitted for streaming installation because
-its application interval includes network reads. With refit timing enabled,
-DIRECT updates emit the same stage record as staged updates. The installation
-stage's `materialization_s`, `receive_copy_s`, and `post_load_processing_s`
-metadata report host-call durations inside the native engine lifecycle. They
-exclude subsequent CUDA completion waits and are not standalone GPU latencies.
-Do not sum nested parent and child intervals or maxima from different ranks.
-Preserve raw samples and expose residual/unattributed time against the independent
-total rather than describing the entire streaming operation as wire or install.
+See the [RL bounded GPU refit guide](rl/ARCHITECTURE.md#bounded-gpu-refit-deployment-guidance) for setup, memory limits, update safety, retries, and streaming timings.
 
 ### Reference transfer results
 
@@ -1619,333 +1380,24 @@ total rather than describing the entire streaming operation as wire or install.
 
 ### Internal streaming diagnostics
 
-Source metadata and transfer plans are reused automatically. These internal
-settings are read when the transfer is constructed.
-
-| Internal environment variable | Default | Purpose |
-| --- | --- | --- |
-| `MX_REFIT_DEBUG_VALIDATE_PLAN` | `0` | Recheck cached whole-model and owning-module transfer coverage. |
-| `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` | `0` | Validate that generator layout hasn't changed. |
-| `MX_REFIT_PACK_MODULES` | `1` | Pack complete owning modules within each bounded staging arena. |
-| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Descriptor budget before full-source reconstruction. |
-| `MX_REFIT_PREFETCH_REPLICA_METADATA` | `0` | Fetch stable metadata for all replicas in needed logical-shard groups on first preparation. |
-| `MX_REFIT_DEBUG_VALIDATE_REPLICAS` | `0` | Check that replicas in each logical-shard group have equivalent canonical coverage. |
-
-Replicas are tried in worker-ID order. Metadata prefetch is limited to groups
-needed by the transfer plan; unavailable replicas can be retried later.
-Digest and identity errors fail preparation. Debug validation requires every
-published replica to resolve and compares canonical coverage and geometry,
-ignoring replica-specific physical addresses.
-
-Bounded streaming requires the framework to hold its update guard through
-transfer, installation and verification. Each group is copied from a receive
-arena into engine-owned load-time storage; vLLM performs post-load processing and
-restores live parameter bindings. Partial installation can change the live
-version. Engine-owned temporary tensors and post-load workspaces require VRAM
-beyond the arena cap. Trainer staging is a separate choice. See
-[bounded vLLM streaming installation](ARCHITECTURE.md#bounded-vllm-streaming-installation)
-for the ownership and failure contract.
-
-The unquantized vLLM installer also reuses a successful load-layout capture while
-parameter identities, addresses, shapes, strides, dtypes, devices, original
-loaders, module identities/loaders, routing-buffer versions or contents, and
-the source converter match. Cache results are copied before returning them.
-Quantized and incomplete captures are never retained. Callers must keep model
-configuration and loader behavior fixed while using an installer.
-
-These caches hold layouts and plans, not weight values or readiness. Every
-update still obtains its version and lease and reads fresh tensor values.
-The installer checks live owners, shared parameters and complete module inputs.
-Engine callbacks receive independent storage, so they cannot retain a view into
-the receive arena.
-Logical plans belong to one mesh ID and generation; generation changes rebuild
-them even when capture remains compatible. Replica changes rebind physical
-sources while retaining the logical plan. Workspace reset clears physical
-transport and descriptor state; closing the transfer releases its cached plan.
-Cache counters and lookup/build/validation times accompany preparation metrics.
-Wire-to-engine dtype conversion respects the captured destination slice, strides
-and arena storage offset, including padding surrounding the destination view.
-Bounded staging views are zeroed before each READ so untouched loader padding
-cannot retain bytes from a previous batch or version.
+See the [RL configuration reference](rl/CONFIGURATION.md#rl-environment-settings) for diagnostic settings and the [RL architecture](rl/ARCHITECTURE.md#bounded-streaming-internals-and-diagnostics) for cache and execution behavior.
 
 ## ModelExpress benchmark CI harness
 
-[`ci/bench/`](../ci/bench/) runs native vLLM cold-load and refit checks using
-registered, pinned model profiles. `profiles.json` lists supported profile keys
-and the defaults (`nemotron`, scenario `delta`). Only delta refit is implemented.
-Add a profile to the catalog to extend the harness;
-the trigger and lifecycle scripts do not contain model-specific allowlists.
-
-| Profile | Pinned model | Resources per worker |
-| --- | --- | --- |
-| `nemotron` | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4`, revision `bee7596271d1495f6992ae224aefde4410e816b8` | TP1, 16 CPU, 128 GiB RAM |
-| `kimi` | `moonshotai/Kimi-K2.7-Code`, revision `74797c9c62378b951a1f6fcf5c4631024e9b8bef` | TP8, 64 CPU, 1 TiB RAM |
-
-There has been **no live AWS validation**. Profile support means the model can be
-selected, rendered, and tested; it does not establish GPU/kernel or refit
-compatibility. Kimi requires eight GPUs on one node with sufficient host RAM.
-Its quantized MLA refit path needs qualification; the experimental WNA16 workaround
-is not included or applied. Failures remain failures and stop before resume.
+The RL refit benchmark deployment, experiment contract, validation, timing, and cleanup details have moved to the [RL benchmark CI architecture](rl/ARCHITECTURE.md#modelexpress-benchmark-ci-harness).
 
 ### Trigger benchmark CI with a PR comment
 
-After the workflow lands on the default branch, a repository writer can post:
-
-```text
-/bench
-/bench --model kimi --scenario delta
-/bench --model nemotron --sha <full-40-character-PR-head-SHA>
-```
-
-Bare `/bench` uses the catalog's default profile. `--model` selects a registered
-profile, `--scenario` selects a registered experiment, and `--sha` optionally binds the request to an explicit PR head. Otherwise
-the authorization job resolves the current head once. In both cases that exact
-revision must match copy-pr-bot's `pull-request/<PR-number>` mirror. First use the
-existing `/ok to test <SHA>` approval process if needed, wait for mirroring, then
-post the benchmark comment. The new command does not grant copy-pr-bot approval. Closed
-PRs, edited comments, stale explicit SHAs, unmirrored heads, unknown models/scenarios/options,
-and commenters without write permission are rejected. New revisions need new
-requests. Labels do not trigger this workflow.
-
-The hosted gate checks permission and resolves immutable source/model/scenario outputs.
-`modelexpress-rl-ci.yml` handles both authorized `/bench` comments and reusable
-CI calls. The workflow accepts PR number, exact source SHA,
-model, scenario and digest-pinned runtime inputs. Comment runs repeat the caller
-permission, current-head and mirror checks before privileged builds. Automatic
-runs derive the PR number from the upstream `pull-request/<N>` push and require
-the event SHA to match the current open PR and approved mirror. One trusted harness
-revision is resolved on the hosted runner and reused by build, test and cleanup:
-the approved mirrored SHA for automatic runs, or the default branch for comments.
-Privileged jobs build that approved ModelExpress revision using the selected
-trusted Dockerfiles and harness scripts. Per-model runtime bases are
-configured by digest; built images are also consumed by digest. Harness edits in
-a PR run on GPUs after copy-pr-bot approval in automatic Nemotron CI. Opt-in
-comment runs use the default-branch harness until the edits merge.
-`issue_comment` requires the workflow on the default branch, as documented
-by [GitHub](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#issue_comment).
-
-Both automatic and comment-triggered CI reuse the SeaweedFS Deployment and
-Service from `examples/rl/vime_dynamo_delta_refit/stack.yaml` in the benchmark's
-isolated namespace. The benchmark reserves four CPUs for SeaweedFS to serve
-concurrent model-weight reads. Setup creates per-run credentials, downloads the pinned model
-snapshot on the CPU control pod, verifies uploads, and publishes its snapshot manifest
-before the timed workload starts. Redis runs as an init sidecar with a startup
-probe so it accepts connections before the ModelExpress server starts. The
-separate S3 cleanup pod uses a digest-pinned CPU Python image containing only
-boto3 and its dependencies, with boto3 taken from the client lockfile. It runs
-without vLLM, Torch, Redis, or the server. The benchmark collects
-run evidence once on success or failure; CI collects separately only if the run
-report is missing. Cleanup releases the GPU pods before removing S3 objects
-and records object and Kubernetes cleanup receipts. CI mounts the cluster's
-retained `shared-model-cache` FSx claim only on the control pod and sets
-`HF_HUB_CACHE` to `/model-cache/.cache/mx-rl-refit/hub`. Hugging Face reuses cached
-files for the pinned revision across runs; a cold cache downloads them once.
-Each run still uploads and verifies its isolated S3 seed. GPU workers do not
-mount this cache, and cleanup leaves the shared source files intact.
-Worker checkpoint preparation and delta publication finish before the timed
-engine startup, so reference downloads do not compete with S3 cold loading.
-Installed embedding verification resolves checkpoint names through the model's
-native weight mapper before applying its shard loader and comparing tensor bytes.
-The configured S3 addressing style is applied to both boto3 and Run:ai
-Model Streamer (`RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING=0` for CI's path-style
-endpoint). Worker logs include native Model Streamer warnings and errors.
-Seed uploads use boto3's standard transfer client
-for the custom HTTP endpoint, matching seed downloads. The existing `HF_TOKEN` secret is forwarded for
-model access. Delta objects are verified absent before namespace deletion; SeaweedFS
-and its seed data remain available if cleanup fails. If setup fails before bucket
-creation, an explicit S3 `NoSuchBucket` response also verifies that run objects
-are absent; other storage errors still fail cleanup. This path needs no AWS IAM role
-or pre-populated bucket. The Nemotron profile defaults to digest-pinned vLLM 0.27.1,
-the version documented in the model's deployment recipe, with
-`MX_BENCH_RUNTIME_BASES.nemotron` available as an override.
-
-Optional repository Actions variables configure placement and runtime overrides:
-
-| Variable | Value |
-| --- | --- |
-| `MX_BENCH_KUBE_CONTEXT` | Kubernetes context available in `/teleport/kubeconfig.yaml`; defaults to `nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02` |
-| `MX_BENCH_RUNTIME_BASES` | JSON mapping profile keys to compatible digest-pinned vLLM base images, e.g. `{"nemotron":"registry/runtime@sha256:...","kimi":"registry/kimi-runtime@sha256:..."}` with full digests |
-
-Runtime overrides take precedence over the profile default. Kimi requires an
-override because its profile has no qualified default runtime. Each image must include
-compatible Torch, vLLM, NIXL, NumPy, requests, and safetensors; the build installs
-ModelExpress and verifies imports. Compatibility with each model's quantization
-and refit path still requires hardware qualification. The existing `NGC_API_KEY`
-secret supplies registry access. CI seeds its own S3 store and does not use the
-Vime model directory; its Hugging Face cache has a separate directory on the same
-FSx volume. Test and cleanup jobs provision Python 3.12 before installing
-PyYAML. S3 cold-load qualification requires a streamer completion marker from
-every TP rank and rejects streamer fallback. The harness retains the runtime's
-FlashInfer compatibility checks. The seed-download step reads the snapshot
-manifest and checks downloaded file sizes against S3 object sizes. Manual runs can use external S3
-through their environment configuration.
-
-`ModelExpress RL CI` handles `/bench` comments and reusable workflow calls directly
-for the selected profile and scenario. The GPU job is named
-`RL generator-only delta refit (PROFILE)` for the delta scenario. Every trusted
-PR automatically calls the same workflow for Nemotron, under
-`RL / GPU / RL generator-only delta refit (nemotron)`.
-Workflow callers can pass a profile key or its registered full model name; validation
-resolves it to the profile key for resource names and configuration. The required `CI status check`
-depends on this workflow, including cleanup; seed download, storage or refit failures
-fail the gate. Kimi remains opt-in and requires a runtime override. Automatic runs check out the approved mirrored
-SHA for the harness; comment runs use the default-branch harness. Offline
-contracts run on every PR in the `RL refit harness tests` job. The namespace GPU quota follows the rendered profile's
-TP size (one for Nemotron, eight for Kimi). Image builds have a 60-minute timeout;
-the test job has a 60-minute timeout, its experiment step 45 minutes, and pods a
-55-minute lifetime. Large models may exceed this initial qualification budget;
-a timeout is a failure. Automatic trusted-PR and comment-triggered runs use per-PR,
-per-job concurrency: when a replacement job becomes eligible, it cancels the older
-queued or running job. Matrix entries use separate groups. Cleanup jobs remain
-outside these groups, so newer runs can start while earlier cleanup is running or
-waiting for a runner. Existing `always()` cleanup steps still run after job cancellation.
-Actions runs expose the tested SHA and artifacts; the workflow does not post PR
-comments.
+See the [trigger and authorization guide](rl/ARCHITECTURE.md#trigger-benchmark-ci-with-a-pr-comment).
 
 ### Manual CLI and environments
 
-```bash
-export KUBE_CONTEXT='<aws-context>' NAMESPACE='<existing-run-namespace>'
-export SERVER_IMAGE='<registry/server:full-commit-sha>'
-export WORKER_IMAGE='<registry/runtime:full-commit-sha>'
-export CLEANUP_IMAGE='<registry/cleanup:full-commit-sha>'
-export MX_CI_S3_BUCKET='<snapshot-bucket>' MX_CI_S3_REGION='<aws-region>'
-export RESULTS_DIR=/tmp/mx-bench-unique-run
-python3 ci/bench/scripts/prepare.py kimi "$RESULTS_DIR" \
-  --environment aws-ci --run-id kimi-unique-run
-# Inspect rendered manifests before deploying.
-python3 ci/bench/scripts/lifecycle.py run "$RESULTS_DIR"
-python3 ci/bench/scripts/lifecycle.py collect "$RESULTS_DIR"
-python3 ci/bench/scripts/lifecycle.py cleanup "$RESULTS_DIR"
-```
-
-Manual callers provision their namespace, service account, secrets, and mirror.
-The Python `lifecycle.py` CLI reads the rendered JSON configuration directly.
-Seed download and publication share a two-hour deadline from process startup;
-either process failing stops the run, including during worker readiness.
-The Python `ci.py` entry point manages CI setup, execution, and namespace cleanup.
-
-Use a fresh run ID/output directory; run IDs begin with the selected profile key.
-`KUBECONFIG` overrides `/teleport/kubeconfig.yaml`. CLI overrides take precedence
-over environment variables and environment-file values. Images require full
-commit SHA tags or digests. The AWS preset selects H100 80 GB nodes,
-0.70 GPU memory utilization, `ci-nightly-high-priority`, and `nvcr-imagepullsecret`.
-S3 is the default with no custom endpoint or RDMA device. Profile defaults supply
-TP/CPU/memory and object prefixes.
-
-Use `--environment /path/to/environment.json` for placement/storage changes.
-Fields include worker/control node selectors, tolerations, control resources,
-service account, image-pull secrets, security context, `addressing_style`,
-`pod_env` (including Secret references), `pod_env_from`, and image references.
-Runtime tensor inventories can differ between vLLM versions and kernel layouts.
-An environment may override `expected_tensors_per_rank` and
-`expected_host_scales_per_rank` with a positive integer (or `null` for an
-unqualified count). Keep qualified counts explicit and tied to the recorded image
-digest; do not disable a failed count check merely to pass a run.
-
-CLI options include context, namespace, region, bucket, endpoint URL, service
-account, seed/delta prefixes, TP, CPU, memory, and GPU memory utilization. Literal
-credentials must not enter the environment file: resolved settings are retained
-as evidence. `--endpoint-url ''` clears an inherited endpoint.
-
-Peer coverage remains manual: `--paths both` requires two suitable nodes plus
-explicit `extra_worker_resources`, `worker_env.MX_NIXL_BACKEND`, and
-`peer_transfer_marker`. See the [EFA example](../examples/p2p_transfer_k8s/client/vllm/aws_efa/).
-Setting these fields does not qualify transport. Each worker's TP ranks stay on
-one node. The report rejects peer fallback to S3, ModelStreamer, or InstantTensor
-and requires different donor/peer nodes.
+See [manual CLI and environments](rl/ARCHITECTURE.md#manual-cli-and-environments).
 
 ### Shared RL refit experiment contract
 
-The shared `harness/lifecycle.py` owns Kubernetes deployment, process deadlines, evidence collection
-and cleanup. `harness/runner.py` exposes `RefitRunner`, which owns the shared pause/refit/verify/resume sequence.
-Rendered configuration supplies explicit initial and target versions, sources by
-worker role, publication evidence path and preparation commands. These values
-keep the sequence independent of delta version naming and S3/peer role names.
-
-Runtime code uses the `harness`, `scenarios.delta` and `engines.vllm` Python
-packages. ConfigMap item mappings preserve these paths inside `/opt/benchmark`;
-pods invoke tasks with `python3 -m`. The renderer mounts shared runtime code,
-the selected scenario and the engine adapter, excluding host-only rendering and
-Kubernetes lifecycle code. CLI paths under `scripts/` remain the same.
-
-The `DeltaScenario` class stores its configuration and has four methods: `configure`, `verify_refit`,
-`validate_inventory` and `validate_report`. It prepares the changed checkpoint
-and validates delta-specific evidence while shared validation checks rank
-completeness, source/version, addresses and timing. Reshard can add an experiment
-through this contract later; there is no reshard implementation or CI case in
-this PR. Comment-triggered GPU runs currently exercise delta over S3 only.
+See the [shared experiment contract](rl/ARCHITECTURE.md#shared-rl-refit-experiment-contract).
 
 ### Validation, timing, and cleanup
 
-The benchmark uses vLLM’s default execution mode without forcing eager execution.
-
-The CI-only `RefitWorkerExtension` in `ci/bench/engines/vllm/worker.py` extends
-each vLLM worker with refit timing and weight/checkpoint validation RPC methods.
-
-The driver checks every rank's tensor hashes, reconstructed checkpoint embedding
-and its corresponding installed vocabulary embedding,
-refit source/version, preserved tensor addresses, and resumed inference. Shared
-validation checks GPU/CPU/host scale agreement for profiles with configured scale
-counts. Model-specific scale-change counts and FlashInfer cache invalidation are
-not asserted. A failed rank stops before resume. Native HTTP
-pause/resume is not Dynamo administration. The publisher preserves the selected
-checkpoint tensor's stored dtype and changes low-order bits to produce a delta.
-The configured payload size (64 MiB for Nemotron, 1 GiB for Kimi) is a best-effort
-target; reports include actual bytes, and size differences do not fail validation.
-Peer refit transfers full runtime tensors.
-Each rank verifies the reconstructed checkpoint tensor hash against the publisher's
-expected hash. Runtime tensor inventories must change after refit and match between
-S3 and peer workers when both paths run. Installed embedding validation resolves the engine vocabulary embedding and
-checks each TP rank against the corresponding checkpoint slice, including
-vocabulary padding. Profiles still select a checkpoint tensor;
-its dtype must be supported by the installed safetensors/PyTorch and refit stack.
-
-`report.json` retains model-load seconds, RPC and per-rank stage/install/total
-seconds, failures, image IDs, and restarts. Loading excludes
-scheduling, image pulls, engine warmup, and the separately downloaded reconstruction
-seed. Stage timing covers the stage operation and completion synchronization;
-installation timing covers apply plus CUDA synchronization. Total refit time is
-stage plus installation; logging, pointer verification, hashing, and inference
-are outside these intervals. The separate RPC duration includes those additional
-operations and must not be compared as the same interval.
-The first refit after client initialization may use a full checkpoint install
-even with `MX_REFIT_DELTA_SURGICAL=1`, because the installer has not established
-its live version. Confirm surgical metrics or logs before interpreting an install
-measurement as surgical. GPU/CPU/host scale agreement does not establish that
-untouched scales retained their exact pre-refit values.
-
-The report separates `validation_status` (`PASS`/`FAILED`) from
-`measurement_status` (`VALID`/`INVALID`). Overall `status` passes only when both
-pass. Successful `latency_summary` entries include the model-load time, RPC time,
-each rank's stage/install/total, and the maximum per-rank total. Model-load time
-is the maximum of one timer per TP rank, with individual rank times retained.
-Missing, duplicate, or unidentified rank timers invalidate measurements; untagged
-model-load timers are accepted only for TP1. Every required
-duration must be finite and nonnegative; missing timings invalidate a benchmark.
-Failed runs keep raw measurements as evidence but have an empty summary.
-Malformed `RESULT` log records are retained as parse-error metadata and make
-the report fail, rather than preventing the failure report from being written.
-
-This is one trial per run,
-with no percentiles, baseline comparison, or performance threshold.
-No AWS performance baseline has been established. Do not run assertion-based
-validators with Python `-O`.
-
-CI uploads evidence on success/failure and runs a separate cleanup job. It stops
-publisher/workers, removes objects under the rendered `artifact_prefix`
-(delta-prefix/run-ID for the delta scenario, including partial publications), and deletes the namespace after checking its
-ownership label and verifying S3 deletion. Cleanup logs are retained separately; artifacts expire after
-14 days. Cluster outages or forced workflow stops can still require manual
-exact-run cleanup. S3 version history follows bucket lifecycle policy.
-
-Run resources use the `mx-benchmark` label for selection and cleanup.
-Manual and CI cleanup share exact-run prefix deletion, including incomplete
-publication and retries after partial deletion. Manual cleanup preserves the
-namespace, snapshot and local evidence. CI deletes its owned namespace only after
-object deletion is verified; failures release benchmark GPU pods and retain the
-namespace and service account for a retry. Retry `ci.py cleanup` with the original
-run ID, namespace, GitHub run ID/attempt and image/environment settings. Rerunning
-the whole GitHub workflow uses a new attempt and does not recover an older retained
-namespace. Never delete the shared model prefix or bucket. Every fresh run
-has isolated server/Redis state and empty worker volumes.
+See [validation, timing, and cleanup](rl/ARCHITECTURE.md#validation-timing-and-cleanup).

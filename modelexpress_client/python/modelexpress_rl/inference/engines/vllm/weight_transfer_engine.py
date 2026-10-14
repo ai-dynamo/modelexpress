@@ -18,17 +18,17 @@ from vllm.distributed.weight_transfer.base import (
 )
 
 from modelexpress import envs
-from modelexpress_rl.inference.client import (
+from modelexpress.rl.inference.client import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
     StagedWeightHandle,
 )
-from modelexpress_rl.inference.receiver import (
+from modelexpress.rl.inference.receiver import (
     DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB,
     ObjectStorageGeneratorConfig,
 )
-from modelexpress_rl.object_storage import ObjectStorageType
-from modelexpress_rl.version import WeightVersionRef
+from modelexpress.rl.object_storage import ObjectStorageType
+from modelexpress.rl.version import WeightVersionRef
 
 from .context import VllmGeneratorContext
 
@@ -86,6 +86,9 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
         )
 
     def __init__(self, config, vllm_config, device, model) -> None:
+        from .. import configure_engine_logging
+
+        configure_engine_logging("vllm")
         super().__init__(config, vllm_config, device, model)
         self._engine_context = VllmGeneratorContext(
             model=model,

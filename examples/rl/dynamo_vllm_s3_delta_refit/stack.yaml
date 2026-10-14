@@ -183,7 +183,7 @@ spec:
                 name: mx-s3-refit-desired-version
                 key: desired_version_uid
           - {name: MX_REFIT_CHECKPOINT_DIR, value: /var/cache/modelexpress/refit}
-          - {name: VLLM_PLUGINS, value: modelexpress}
+          - {name: VLLM_PLUGINS, value: modelexpress_rl}
           - {name: AWS_ENDPOINT_URL, value: "http://mx-s3-refit-seaweedfs:9000"}
           - {name: AWS_DEFAULT_REGION, value: us-east-1}
           - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
@@ -204,7 +204,7 @@ spec:
               command:
               - python3
               - -m
-              - modelexpress_rl.inference.engines.vllm.startup_probe
+              - modelexpress.rl.inference.engines.vllm.startup_probe
               - --address
               - 127.0.0.1:50051
             periodSeconds: 5

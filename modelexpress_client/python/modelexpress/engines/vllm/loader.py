@@ -38,6 +38,7 @@ from ...load_strategy import (
     drain_tensor_readers,
     publish_metadata,
     run_load_strategy_chain,
+    validate_load_strategy_chain,
     unpublish_metadata,
 )
 from ...metrics import enable_metrics, metrics
@@ -106,10 +107,7 @@ class MxModelLoader(BaseModelLoader):
         load_start = time.perf_counter()
 
         is_speculative_draft = _is_speculative_draft(vllm_config, model_config)
-        if is_speculative_draft and envs.MX_LOAD_STRATEGY_CHAIN == "RL":
-            raise ValueError(
-                "RL initial loading does not support speculative draft models"
-            )
+        self._validate_load_policy(is_speculative_draft=is_speculative_draft)
 
         ctx = build_vllm_load_context(vllm_config, model_config)
         ctx.p2p_enabled = not is_speculative_draft
@@ -150,7 +148,7 @@ class MxModelLoader(BaseModelLoader):
                             )
 
                     with metrics.time_load_phase("vllm", model_id, "chain"):
-                        model = run_load_strategy_chain(model, ctx)
+                        model = self._run_load_strategy_chain(model, ctx)
 
                     if ctx.p2p_enabled:
                         _loader_registry[ctx.device_id] = self
@@ -175,14 +173,15 @@ class MxModelLoader(BaseModelLoader):
         )
         return model.eval()
 
+    def _validate_load_policy(self, *, is_speculative_draft: bool = False) -> None:
+        validate_load_strategy_chain()
+
+    def _run_load_strategy_chain(self, model: nn.Module, ctx: LoadContext) -> nn.Module:
+        return run_load_strategy_chain(model, ctx)
+
     def download_model(self, model_config: ModelConfig) -> None:
         """Download the model so it can be loaded immediately."""
-        if envs.MX_LOAD_STRATEGY_CHAIN == "RL":
-            logger.info(
-                "RL initial load is selected; leaving weight acquisition to "
-                "the RL strategy chain"
-            )
-            return
+        self._validate_load_policy()
 
         if model_prefetch.is_enabled():
             # Without shared storage this would pull the full weight set from

@@ -8,7 +8,7 @@ from __future__ import annotations
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from modelexpress_rl import envs as rl_envs
+from modelexpress.rl import envs as rl_envs
 
 _MAX_SINGLE_PUT_BYTES = 64 * 1024**2
 _BLOCK_BYTES = 4 * 1024**2

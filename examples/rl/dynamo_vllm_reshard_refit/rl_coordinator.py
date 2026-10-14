@@ -15,7 +15,7 @@ import torch
 import torch.distributed as dist
 from transformers import AutoModelForCausalLM
 
-from modelexpress_rl import (
+from modelexpress.rl import (
     FSDPTrainerContext,
     ModelExpressControlClient,
     ModelExpressTrainerClient,

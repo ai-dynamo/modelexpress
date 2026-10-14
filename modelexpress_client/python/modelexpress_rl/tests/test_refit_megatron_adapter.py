@@ -1,0 +1,317 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import hashlib
+import json
+from concurrent import futures
+from dataclasses import replace
+from types import SimpleNamespace
+
+import grpc
+import pytest
+
+import modelexpress.rl.train.runtime as runtime_module
+from modelexpress.rl.refit.reshard.rendezvous import unwrap_rendezvous_blob
+from modelexpress.rl import (
+    MegatronTrainerContext,
+    ModelExpressTrainerClient,
+    ModelExpressTrainerConfig,
+    TrainerStagingMode,
+    WeightPayloadFormat,
+    WeightVersionRef,
+    refit_pb2,
+    refit_pb2_grpc,
+)
+from modelexpress.rl.train.adapter import TrainerEngineAdapter
+from modelexpress.rl.train.manifest import bound_tensor_manifest
+from modelexpress.rl.train.engines.megatron import (
+    MegatronTensorSpec,
+    MegatronTrainerAdapter,
+)
+from modelexpress.rl.train.manifest import RefitWorkerService
+
+
+class _Tensor:
+    shape = (8, 8)
+    dtype = "torch.bfloat16"
+    device = SimpleNamespace(index=0)
+
+    def is_contiguous(self):
+        return True
+
+    def element_size(self):
+        return 2
+
+    def data_ptr(self):
+        return 0x1234
+
+
+class _Manager:
+    agent_name = "trainer-r3"
+    nixl_metadata = b"agent-metadata"
+    listen_port = 19003
+
+    def __init__(self):
+        self.registered = []
+
+    def register_tensors(self, tensors):
+        self.registered.append(dict(tensors))
+        return self.nixl_metadata
+
+
+class _RefitService(refit_pb2_grpc.RefitServiceServicer):
+    def __init__(self, events):
+        self.events = events
+        self.registration_ttl = None
+        self.shard = None
+
+    def RegisterWorker(self, request, _context):
+        self.events.append("register-worker")
+        self.registration_ttl = request.ttl_seconds
+        return refit_pb2.RegisterWorkerResponse(worker=request.worker)
+
+    def GetWeightVersion(self, request, _context) -> refit_pb2.GetWeightVersionResponse:
+        return refit_pb2.GetWeightVersionResponse(
+            version=refit_pb2.WeightVersion(uid=request.uid, trainer_mesh_id="mesh-a", trainer_mesh_generation=1)
+        )
+
+    def CreateWeightVersionShard(self, request, _context):
+        self.events.append("publish-version-shard")
+        self.shard = request.shard
+        return refit_pb2.CreateWeightVersionShardResponse(
+            shard=request.shard,
+            version=refit_pb2.WeightVersion(
+                uid=request.shard.version_id,
+                state=refit_pb2.WEIGHT_VERSION_STATE_READY,
+            ),
+        )
+
+
+def test_megatron_adapter_requires_initialized_distributed_engine(monkeypatch):
+    monkeypatch.setattr(
+        "modelexpress.rl.train.engines.megatron.adapter.dist.is_initialized",
+        lambda: False,
+    )
+
+    with pytest.raises(RuntimeError, match="distributed process group"):
+        MegatronTrainerAdapter(
+            manager=_Manager(),
+            nixl_metadata_endpoint="10.0.0.3:19003",
+        )
+
+
+def test_megatron_source_slot_groups_replicas_by_logical_partition(monkeypatch):
+    monkeypatch.setattr(
+        "modelexpress.rl.train.engines.megatron.adapter.dist.is_initialized",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "modelexpress.rl.train.engines.megatron.adapter.dist.get_rank",
+        lambda: 3,
+    )
+    tensors = [
+        MegatronTensorSpec(
+            name="column",
+            tensor=_Tensor(),
+            role="column",
+            hf_names=("column",),
+            global_shape=(16, 8),
+            placement_kind="SHARD",
+            shard_axis=0,
+            local_shard_range=(0, 8),
+        )
+    ]
+
+    first = MegatronTrainerAdapter(
+        manager=_Manager(),
+        nixl_metadata_endpoint="10.0.0.3:19003",
+    )
+    second = MegatronTrainerAdapter(
+        manager=_Manager(),
+        nixl_metadata_endpoint="10.0.0.4:19004",
+    )
+    other_partition = MegatronTrainerAdapter(
+        manager=_Manager(),
+        nixl_metadata_endpoint="10.0.0.5:19005",
+    )
+
+    assert first.bind_tensors(tensors) == second.bind_tensors(tensors)
+    assert first.logical_shard_id == second.logical_shard_id
+    assert (
+        other_partition.bind_tensors([replace(tensors[0], local_shard_range=(8, 16))])
+        != first.logical_shard_id
+    )
+
+
+def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
+    monkeypatch.setattr(
+        "modelexpress.rl.train.engines.megatron.aliases.published_digest",
+        lambda _tensor: "tensor-digest",
+    )
+    monkeypatch.setattr(
+        "modelexpress.rl.train.engines.megatron.adapter.dist.is_initialized",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "modelexpress.rl.train.engines.megatron.adapter.dist.get_rank",
+        lambda: 3,
+    )
+    monkeypatch.setenv("MX_WORKER_HOST", "10.0.0.3")
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    events = []
+    refit_service = _RefitService(events)
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    refit_pb2_grpc.add_RefitServiceServicer_to_server(refit_service, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    manifest_service = RefitWorkerService(endpoint=f"127.0.0.1:{port}")
+    refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(manifest_service, server)
+    server.start()
+    resources = SimpleNamespace(
+        manager=_Manager(),
+        manifest_service=manifest_service,
+        worker_endpoint="trainer-3:9000",
+        close=lambda: None,
+    )
+    monkeypatch.setattr(
+        runtime_module._TrainerResources,
+        "initialize",
+        lambda **_kwargs: resources,
+    )
+    adapter = MegatronTrainerAdapter(
+        manager=_Manager(),
+        nixl_metadata_endpoint="10.0.0.3:19003",
+    )
+    tensors = [
+        MegatronTensorSpec(
+            name="column",
+            tensor=_Tensor(),
+            role="column",
+            hf_names=("column",),
+            global_shape=(16, 8),
+            placement_kind="SHARD",
+            shard_axis=0,
+            local_shard_range=(8, 16),
+        )
+    ]
+
+    with pytest.raises(NotImplementedError, match="COPY_TO_DEVICE staging"):
+        adapter.stage_shard(
+            tensors=tensors,
+            staging_mode=TrainerStagingMode.COPY_TO_DEVICE,
+            payload_format=WeightPayloadFormat.FULL_TENSOR,
+        )
+    with pytest.raises(NotImplementedError, match="XOR_DELTA payloads"):
+        adapter.stage_shard(
+            tensors=tensors,
+            staging_mode=TrainerStagingMode.IN_PLACE,
+            payload_format=WeightPayloadFormat.XOR_DELTA,
+        )
+
+    try:
+        refit_client = ModelExpressTrainerClient.initialize(
+            ModelExpressTrainerConfig(
+                engine_context=MegatronTrainerContext(),
+                device_id=3,
+                server_url=f"127.0.0.1:{port}",
+                model_name="model",
+                staging_mode=TrainerStagingMode.IN_PLACE,
+                payload_format=WeightPayloadFormat.FULL_TENSOR,
+                worker_id="worker-3",
+                registration_ttl_seconds=60,
+            )
+        )
+        metadata = refit_client.bind_tensors(tensors)
+        logical_shard_id = refit_client.logical_shard_id
+        selected_adapter = refit_client._runtime.method._adapter
+        refit_client.publish_version(version=WeightVersionRef("version-a"))
+        worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
+            grpc.insecure_channel(refit_service.shard.metadata_endpoint)
+        )
+        fetched = worker_stub.GetTrainerShardMetadata(
+            refit_pb2.GetTrainerShardMetadataRequest(
+                metadata_digest=refit_service.shard.stable_metadata_digest,
+            )
+        )
+        version_metadata = worker_stub.GetWeightVersionShardMetadata(
+            refit_pb2.GetWeightVersionShardMetadataRequest(
+                version_id="version-a", logical_shard_id=metadata.logical_shard_id,
+            )
+        )
+    finally:
+        if "refit_client" in locals():
+            refit_client.close()
+        server.stop(grace=None).wait()
+
+    assert isinstance(adapter, TrainerEngineAdapter)
+    assert isinstance(selected_adapter, MegatronTrainerAdapter)
+    assert events == [
+        "register-worker",
+        "publish-version-shard",
+    ]
+    assert refit_service.registration_ttl == 60
+    assert len(resources.manager.registered) == 1
+    assert refit_service.shard.version_id == "version-a"
+    assert logical_shard_id == metadata.logical_shard_id
+    assert len(metadata.logical_shard_id) == 64
+    assert refit_service.shard.logical_shard_id == metadata.logical_shard_id
+    assert refit_service.shard.worker_id == "worker-3"
+    assert json.loads(fetched.metadata)["tensor_count"] == 1
+    assert json.loads(fetched.metadata)["total_bytes"] == 128
+    assert (
+        refit_service.shard.stable_metadata_digest
+        == hashlib.sha256(fetched.metadata).hexdigest()
+    )
+    assert refit_service.shard.metadata_endpoint == f"127.0.0.1:{port}"
+    assert fetched.metadata_digest == refit_service.shard.stable_metadata_digest
+    assert metadata.logical_shard_id == hashlib.sha256(
+        bound_tensor_manifest(json.loads(fetched.metadata)["tensors"])
+    ).hexdigest()
+    payload = unwrap_rendezvous_blob(fetched.metadata)
+    assert payload.metadata_endpoint == "10.0.0.3:19003"
+    assert payload.tensors[0].shards[0].addr == 0x1234
+    assert payload.tensors[0].shards[0].shard_offset == (8, 0)
+    assert [(row.tensor_name, row.shard_index, row.digest)
+            for row in version_metadata.metadata.checksums] == [("column", 0, "tensor-digest")]
+    assert version_metadata.version_metadata_digest == refit_service.shard.version_metadata_digest
+    assert version_metadata.version_metadata_digest == hashlib.sha256(
+        version_metadata.metadata.SerializeToString(deterministic=True)
+    ).hexdigest()
+
+
+def test_megatron_aliases_are_reused_without_content_verification(monkeypatch):
+    import modelexpress.rl.train.engines.megatron.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    original = adapter_module.build_hf_aliases
+    calls = []
+
+    def count_aliases(*args, **kwargs):
+        calls.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(adapter_module, "build_hf_aliases", count_aliases)
+    adapter = MegatronTrainerAdapter(
+        manager=_Manager(),
+        nixl_metadata_endpoint="10.0.0.3:19003",
+    )
+    tensors = [
+        MegatronTensorSpec(
+            name="column",
+            tensor=_Tensor(),
+            role="column",
+            hf_names=("column",),
+            global_shape=(16, 8),
+            placement_kind="SHARD",
+            shard_axis=0,
+            local_shard_range=(0, 8),
+        )
+    ]
+    adapter.bind_tensors(tensors)
+    for _ in range(2):
+        staged = adapter.stage_shard(
+            tensors=tensors, staging_mode=TrainerStagingMode.IN_PLACE,
+            payload_format=WeightPayloadFormat.FULL_TENSOR,
+        )
+        assert staged.checksums == ()
+    assert len(calls) == 1

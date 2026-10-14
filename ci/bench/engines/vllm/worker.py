@@ -30,16 +30,16 @@ class RefitWorkerExtension:
     def hotload_init(self, initial_version_id, source):
         try:
             from modelexpress.engines.vllm.loader import get_model_loader
-            from modelexpress_rl.inference.client import (
+            from modelexpress.rl.inference.client import (
                 ModelExpressGeneratorClient,
                 ModelExpressGeneratorConfig,
             )
-            from modelexpress_rl.inference.engines.vllm.context import (
+            from modelexpress.rl.inference.engines.vllm.context import (
                 VllmGeneratorContext,
             )
-            from modelexpress_rl.inference.plan import WeightSource
-            from modelexpress_rl.inference.receiver import ObjectStorageGeneratorConfig
-            from modelexpress_rl.object_storage import ObjectStorageType
+            from modelexpress.rl.inference.plan import WeightSource
+            from modelexpress.rl.inference.receiver import ObjectStorageGeneratorConfig
+            from modelexpress.rl.object_storage import ObjectStorageType
 
             config = load_config()
             cfg = copy.copy(self.vllm_config)
@@ -121,7 +121,7 @@ class RefitWorkerExtension:
         version = version_id
         t = time.perf_counter()
         try:
-            from modelexpress_rl.version import WeightVersionRef
+            from modelexpress.rl.version import WeightVersionRef
 
             torch.cuda.synchronize(self.device)
             stage_start = time.perf_counter()
@@ -288,7 +288,7 @@ class RefitWorkerExtension:
                 },
             )
             assert not changed and not extra, {"changed": changed, "extra": extra}
-            from modelexpress_rl.inference.checkpoint_store import LocalCheckpointStore
+            from modelexpress.rl.inference.checkpoint_store import LocalCheckpointStore
             from safetensors import safe_open
 
             checkpoint = LocalCheckpointStore(
@@ -333,7 +333,7 @@ class RefitWorkerExtension:
 
     def verify_runtime_tensor(self, version_id, tensor_name):
         try:
-            from modelexpress_rl.inference.checkpoint_store import LocalCheckpointStore
+            from modelexpress.rl.inference.checkpoint_store import LocalCheckpointStore
             from safetensors import safe_open
             from vllm.model_executor.layers.vocab_parallel_embedding import (
                 VocabParallelEmbedding,

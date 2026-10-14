@@ -11,10 +11,10 @@ from dataclasses import asdict
 from typing import Any
 
 import torch.distributed as dist
-from modelexpress import envs as mx_envs
-from modelexpress.refit.timing import add_refit_metadata, refit_span
+from modelexpress.rl import envs as mx_envs
+from modelexpress.rl.refit.timing import add_refit_metadata, refit_span
 
-from modelexpress_rl.train.adapter import (
+from modelexpress.rl.train.adapter import (
     CompletionFence,
     NixlMetadataProvider,
     StagedWeightVersionShardData,
@@ -23,7 +23,7 @@ from modelexpress_rl.train.adapter import (
     WeightPayloadFormat,
     TrainerShardMetadata,
 )
-from modelexpress_rl.train.manifest import bound_tensor_manifest
+from modelexpress.rl.train.manifest import bound_tensor_manifest
 
 from .aliases import MegatronTensorSpec, build_hf_aliases
 from .publisher import build_megatron_reshard_manifest
