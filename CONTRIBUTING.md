@@ -68,6 +68,7 @@ A devcontainer configuration is provided for VSCode in `.devcontainer/`. It incl
 | `cargo run --bin fallback_test` | Run fallback tests |
 | `./run_integration_tests.sh` | Integration tests (starts server) |
 | `pytest modelexpress_client/python/tests/` | Run Python client tests |
+| `(cd modelexpress_client/python && MX_RUN_CPU_NIXL=1 UCX_TLS=tcp,self UCX_NET_DEVICES=lo CUDA_VISIBLE_DEVICES='' python -m pytest tests/integration/test_refit_nixl_cpu.py tests/integration/test_refit_nixl_quantized.py tests/integration/test_refit_replica_selection.py -v)` | Run CPU NIXL refit integration tests (requires CPU PyTorch, NIXL 1.5.0, and UCX TCP support) |
 | `modelexpress_client/python/generate_proto.sh` | Regenerate Python protobuf stubs |
 | `modelexpress_client/go/generate_proto.sh` | Regenerate Go protobuf and gRPC bindings |
 | `(cd modelexpress_client/go && go test ./...)` | Run Go binding compilation tests |
@@ -97,6 +98,53 @@ The repository uses pre-commit hooks defined in `.pre-commit-config.yaml`:
 Run pre-commit after every code change, even before creating commits. Do not wait until commit time to discover problems.
 
 ### Environment Variables
+
+CPU NIXL refit integration tests are opt-in locally with `MX_RUN_CPU_NIXL=1`.
+CI sets `MX_REQUIRE_CPU_NIXL=1` to require the tests to run instead of skipping
+when CPU NIXL is unavailable. These tests exercise real NIXL transfers over
+UCX TCP using loopback (`UCX_TLS=tcp,self`, `UCX_NET_DEVICES=lo`) and CPU
+PyTorch. They validate CPU transport and refit behavior; they do not qualify
+GPU transport, production RDMA, or a real GPU quantization engine.
+
+On a local host where NIXL can see GPUs, NIXL may reject `UCX_TLS=tcp,self`
+even when `CUDA_VISIBLE_DEVICES` is empty. In that case, set
+`UCX_TLS=tcp,self,cuda_copy` to satisfy NIXL initialization. The test harness
+respects an explicitly set `UCX_TLS`; its default remains `tcp,self`. Test
+payload buffers remain in DRAM and travel over TCP.
+
+For comparisons across existing worktrees, run
+`python tests/integration/run_refit_matrix.py --targets targets.json --output /tmp/refit-results --python /absolute/path/to/test/python`
+from `modelexpress_client/python`. The targets file maps target labels to
+`{"worktree": "/absolute/repository", "commit": "full-commit-hash", "ref": "reference-label"}`.
+Use disposable validation worktrees: the runner copies only the integration tests
+into them, verifies the pinned commits, and creates separate Python environments
+that share the supplied interpreter's dependency directories. It records exact
+commands, dependency versions, per-test JUnit results, and CPU qualification gaps
+in the output directory. Production source files are never overlaid.
+
+The matrix runner stops the entire suite process group on its 300-second timeout
+or interruption, allows one second for shutdown, then kills remaining workers
+and reaps the suite process. The synthetic process-tree cleanup tests run by
+default without NIXL opt-in and also run in dedicated CPU NIXL CI.
+
+The portable suite covers capture, planning, and real transport with synthetic
+floating-point and packed-weight models. Existing installer/runtime component
+tests run separately. Full engine staging, ordered replay, quantization kernels,
+and serving/version coordination still require their supported runtime; a green
+CPU transport suite does not qualify those paths.
+
+Replica selection tests keep two publishers per logical slot alive across
+A→A→B→B→A→B. The production source resolver receives a simulated control-service
+publication list and fetches manifests through real loopback gRPC; payload reads
+use real CPU NIXL. Only the chosen replica publishes the current version. Separate
+cases switch slots independently and recover from a real unknown-peer transfer
+failure. Exact weights and reference outputs detect stale source reads. Logical
+plans are retained where the snapshot supports separate binding; older physical
+planner APIs rebuild the plan. These tests do not exercise CUDA staging caches.
+Set `MX_REPLICA_NIXL_TIMINGS=/tmp/cycles.jsonl` to retain each cycle's observable
+selection/metadata, preparation, binding, transfer and total durations in seconds.
+Correctness checks are outside the measured interval, and no latency threshold is
+asserted. Missing phase splits are recorded as null.
 
 #### Server
 

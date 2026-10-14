@@ -88,6 +88,7 @@ modelexpress = "modelexpress:register_modelexpress"
 [tool.pytest.ini_options]
 markers = [
     "gpu: requires one or more CUDA GPUs",
+    "cpu_nixl: requires CPU NIXL and UCX TCP support",
     "slow: long-running test (real model load + transfer)",
 ]
 

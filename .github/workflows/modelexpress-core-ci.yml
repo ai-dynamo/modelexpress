@@ -252,6 +252,43 @@ jobs:
       run: |
         .venv/bin/python -m pytest tests/ -v
 
+  python-cpu-nixl-refit:
+    name: Python CPU NIXL Refit Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UCX_TLS: tcp,self
+      UCX_NET_DEVICES: lo
+      CUDA_VISIBLE_DEVICES: ""
+      MX_REQUIRE_CPU_NIXL: "1"
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: "3.12"
+
+    - name: Install uv
+      run: pip install uv
+
+    - name: Install CPU PyTorch and test dependencies
+      working-directory: modelexpress_client/python
+      run: |
+        uv venv .venv --python 3.12
+        uv pip install --python .venv/bin/python torch --index-url https://download.pytorch.org/whl/cpu
+        uv pip install --python .venv/bin/python -e ".[dev]" nixl-cu12==1.5.0
+        uv pip install --python .venv/bin/python --no-deps nixl==1.5.0
+
+    - name: Run CPU NIXL refit integration tests
+      working-directory: modelexpress_client/python
+      run: |
+        .venv/bin/python -m pytest tests/integration/test_refit_nixl_cpu.py tests/integration/test_refit_nixl_quantized.py tests/integration/test_refit_matrix.py tests/integration/test_refit_replica_selection.py -v
+
   python-proto-bindings:
     name: Python Generated Bindings
     runs-on: ubuntu-latest
