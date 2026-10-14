@@ -30,7 +30,7 @@ def setup_method(monkeypatch, *, staging_device="cuda", staging_buffers=1) -> tu
             self.arena = arena
             self.settings = kwargs["streaming"]
 
-        def prepare(self, **kwargs) -> SimpleNamespace:
+        def stage(self, **kwargs) -> SimpleNamespace:
             events.append(("prepare", kwargs))
             if self.fail_prepare:
                 raise RuntimeError("preparation failed")
@@ -84,7 +84,7 @@ def setup_method(monkeypatch, *, staging_device="cuda", staging_buffers=1) -> tu
 
 
 def prepare(method, source) -> PreparedStreamingTensors:
-    return method.prepare(
+    return method.stage(
         version=SimpleNamespace(version_id="v:1"),
         source=ResolvedTrainerSource(source),
     )

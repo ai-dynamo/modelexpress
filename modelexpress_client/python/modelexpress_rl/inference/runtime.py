@@ -411,7 +411,6 @@ def initialize_generator_runtime(
                     max_transfer_attempts=max_transfer_attempts,
                 ),
                 start_lease=start_lease,
-                streaming=streaming,
                 resolve_replay_chain=(
                     None
                     if resolve_replay_chain is None

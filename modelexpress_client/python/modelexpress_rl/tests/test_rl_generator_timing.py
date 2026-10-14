@@ -131,7 +131,7 @@ def test_transfer_timing_reports_cache_reuse_and_consumed_bytes(bounded, outcome
         def __init__(self) -> None:
             self.hits = iter((0, 1))
 
-        def prepare(self, **_kwargs) -> SimpleNamespace:
+        def stage(self, **_kwargs) -> SimpleNamespace:
             return SimpleNamespace(
                 metrics={"plan_cache_hits": next(self.hits)},
                 batches=[
@@ -142,7 +142,7 @@ def test_transfer_timing_reports_cache_reuse_and_consumed_bytes(bounded, outcome
                 ],
             )
 
-        def stage(self, _prepared) -> SimpleNamespace:
+        def execute(self, _prepared) -> SimpleNamespace:
             return SimpleNamespace(metrics=dict(STAGED_METRICS))
 
         def iter_bounded(self, _prepared, metrics):
@@ -161,7 +161,7 @@ def test_transfer_timing_reports_cache_reuse_and_consumed_bytes(bounded, outcome
     for label, expected in (("v1", "cold"), ("v2", "warm")):
         recorder = RefitTimingRecorder(backend="rl_generator", version=label, rank=0)
         with use_refit_timing(recorder):
-            prepared = method.prepare(version=version, source=source)
+            prepared = method.stage(version=version, source=source)
             expected_error = (
                 pytest.raises(RuntimeError, match="transfer failed")
                 if outcome == "error" else nullcontext()

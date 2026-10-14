@@ -291,7 +291,7 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
             ),
         )
         try:
-            prepared = method.prepare_chain(
+            prepared = method.stage_chain(
                 tuple(
                     (
                         version,

@@ -64,7 +64,7 @@ class RuntimeTensorNixlUpdateMethod(UpdateMethod):
             artifact_type=PreparedRuntimeTensors,
         )
 
-    def prepare(self, *, version, source: ResolvedSource) -> PreparedArtifact:
+    def stage(self, *, version, source: ResolvedSource) -> PreparedArtifact:
         del version
         if self._active_read is not None:
             raise RuntimeError("release staged weight before staging another version")

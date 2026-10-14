@@ -13,6 +13,7 @@ from modelexpress.rl.inference.plan import StreamingSettings
 import pytest
 import torch
 from modelexpress.rl import envs
+from modelexpress.adapter import StrategyRecoveryError
 from modelexpress import p2p_pb2
 from modelexpress.rl.refit.reshard.rendezvous import (
     PublishedShard,
@@ -318,7 +319,7 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
     method = LoadTimeTensorNixlUpdateMethod(transfer=transfer)
 
     def update(source):
-        prepared = method.prepare(version=None, source=ResolvedTrainerSource(source))
+        prepared = method.stage(version=None, source=ResolvedTrainerSource(source))
         try:
             if harness.streaming:
                 installed = {name: value.clone() for batch in prepared.batches()
@@ -327,7 +328,7 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
                 installed = prepared.staged.tensors
             _check_values(harness, installed, check_padding=harness.streaming is not None)
             with pytest.raises(RuntimeError, match="release"):
-                method.prepare(version=None, source=ResolvedTrainerSource(source))
+                method.stage(version=None, source=ResolvedTrainerSource(source))
         finally:
             method.release(prepared)
 
@@ -347,7 +348,7 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
                 fault.setattr(manager, "register_tensors", fail_register)
                 if failure == "cleanup":
                     fault.setattr(manager, "shutdown", fail_cleanup)
-                error = ValueError if failure == "cleanup" else RuntimeError
+                error = StrategyRecoveryError if failure == "cleanup" else RuntimeError
                 with pytest.raises(error) as raised:
                     update(source)
                 if failure == "cleanup":
@@ -1169,13 +1170,13 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
     try:
         if not budget_fits:
             with pytest.raises(IncompleteRefit, match="255"):
-                transfer.prepare(
+                transfer.stage(
                     trainer_snapshot=snapshot,
                     manifests=[manifest],
                 )
             assert "register_dram" not in events
             return
-        prepared = transfer.prepare(
+        prepared = transfer.stage(
             trainer_snapshot=snapshot,
             manifests=[manifest],
         )
@@ -1390,7 +1391,7 @@ def test_generator_layout_debug_assertion(harness, monkeypatch, enabled):
         transfer=transfer,
     )
     for _ in range(2):
-        prepared = method.prepare(version=None, source=source)
+        prepared = method.stage(version=None, source=source)
         method.release(prepared)
     if enabled:
         assert (
@@ -1400,10 +1401,10 @@ def test_generator_layout_debug_assertion(harness, monkeypatch, enabled):
     fingerprint[0] = 1
     if enabled:
         with pytest.raises(AssertionError, match="generator layout changed"):
-            method.prepare(version=None, source=source)
+            method.stage(version=None, source=source)
         assert transfer._weight_update_plan.source_binding is None
     else:
-        prepared = method.prepare(version=None, source=source)
+        prepared = method.stage(version=None, source=source)
         method.release(prepared)
         assert not calls
     method.close()
@@ -1435,7 +1436,7 @@ def test_changed_agent_metadata_reconnects(harness, monkeypatch):
     )
     monkeypatch.setattr(transfer._manager, "add_remote_agent", lambda _: "source")
     for _ in range(2):
-        prepared = transfer.prepare(
+        prepared = transfer.stage(
             manifests=[shard.metadata for shard in current.shards],
             trainer_snapshot=current,
         )

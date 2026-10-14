@@ -279,7 +279,7 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
         manifests=manifests,
         trainer_snapshot=snapshot,
     )
-    prepared = harness.transfer.prepare(**request)
+    prepared = harness.transfer.stage(**request)
     metrics, installed = harness.collect(prepared)
     expected = torch.cat((first, second))
     assert torch.equal(installed["weight"], expected)
@@ -288,7 +288,7 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
     first.add_(1000)
     second.add_(1000)
     request["trainer_snapshot"] = harness.transfer.cached_trainer_source()
-    prepared = harness.transfer.prepare(**request)
+    prepared = harness.transfer.stage(**request)
     _second_metrics, second_install = harness.collect(prepared)
     assert torch.equal(second_install["weight"], torch.cat((first, second)))
     assert len(capture_calls) == 1

@@ -23,7 +23,7 @@ def test_native_conversion_records_generator_device_for_local_replay(harness, mo
     }
     prepared = h.prepare()
     batches = (
-        (h.transfer.stage(prepared).tensors,)
+        (h.transfer.execute(prepared).tensors,)
         if h.streaming is None else h.transfer.iter_bounded(prepared, {})
     )
     for batch in batches:

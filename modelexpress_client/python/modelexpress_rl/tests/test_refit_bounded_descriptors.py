@@ -198,7 +198,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
             and cached.physical_fingerprint == snapshot.physical_fingerprint
         ):
             snapshot = cached
-        return transfer.prepare(
+        return transfer.stage(
             trainer_snapshot=snapshot,
             manifests=blobs,
             checksums=MappingProxyType({
@@ -299,7 +299,7 @@ def test_full_copy_reuses_workspace_until_reset(harness, monkeypatch) -> None:
     monkeypatch.setattr(harness.transfer, "_device", torch.device("cpu"))
     monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
     first = harness.prepare()
-    harness.transfer.stage(first)
+    harness.transfer.execute(first)
     for values in harness.sources.values():
         values.add_(3)
 
@@ -309,13 +309,13 @@ def test_full_copy_reuses_workspace_until_reset(harness, monkeypatch) -> None:
 
         warm.setattr(harness.transfer, "_ensure_workspace", unexpected_setup)
         second = harness.prepare()
-        installed = harness.transfer.stage(second).tensors
+        installed = harness.transfer.execute(second).tensors
         _check_values(harness, installed, check_padding=False)
         assert second.descriptors is first.descriptors
 
     harness.transfer.reset_workspace()
     third = harness.prepare()
-    installed = harness.transfer.stage(third).tensors
+    installed = harness.transfer.execute(third).tensors
     _check_values(harness, installed, check_padding=False)
     assert third.descriptors is not second.descriptors
 
@@ -328,7 +328,7 @@ def test_native_conversion_composes_with_transfer(harness, native_conversion, pa
     monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
     prepared = harness.prepare()
     if harness.streaming is None:
-        installed = harness.transfer.stage(prepared).tensors
+        installed = harness.transfer.execute(prepared).tensors
     else:
         _, installed = harness.collect(prepared)
     _check_values(harness, installed, source_transposed=native_conversion == "transpose",
@@ -497,7 +497,7 @@ def test_logical_plan_lifetime_is_mesh_pair(harness, mesh_id, generation, reuse)
         return harness.capture, harness.layout
 
     harness.transfer._capture_layout = capture_layout
-    second = harness.transfer.prepare(
+    second = harness.transfer.stage(
         manifests=[snapshot.shards[0].metadata],
         trainer_snapshot=snapshot,
     )
@@ -564,7 +564,7 @@ def test_larger_source_scratch_grows_then_reuses_capacity(harness) -> None:
         tensor.add_(5)
     snapshot, _rows = _larger_source_snapshot(harness)
     blob = snapshot.shards[0].metadata
-    larger = harness.transfer.prepare(
+    larger = harness.transfer.stage(
         manifests=[blob], trainer_snapshot=snapshot,
     )
     grown, installed = harness.collect(larger)
@@ -615,7 +615,7 @@ def _agent_registration_snapshot(
 
 
 def _prepare_agent_registration(harness, snapshot) -> module._PreparedNixlTransfer | module._PreparedBoundedTransfer:
-    return harness.transfer.prepare(
+    return harness.transfer.stage(
         manifests=[shard.metadata for shard in snapshot.shards], trainer_snapshot=snapshot,
     )
 
@@ -624,7 +624,7 @@ def _collect_agent_registration(harness, prepared) -> dict:
     if harness.streaming is not None:
         _, installed = harness.collect(prepared)
         return installed
-    return {name: value.clone() for name, value in harness.transfer.stage(prepared).tensors.items()}
+    return {name: value.clone() for name, value in harness.transfer.execute(prepared).tensors.items()}
 
 
 @pytest.mark.parametrize("harness", [None, StreamingSettings(1024, "cpu")], indirect=True)
@@ -730,7 +730,7 @@ def test_replica_switch_reuses_matching_group_descriptors(harness, monkeypatch, 
             harness.sources[name] = torch.cat((replicas[worker][name], replicas["b1"][name]))
         trainer = snapshot(worker)
         builds.clear()
-        prepared = harness.transfer.prepare(
+        prepared = harness.transfer.stage(
             manifests=[shard.metadata for shard in trainer.shards],
             trainer_snapshot=trainer,
         )
@@ -741,7 +741,7 @@ def test_replica_switch_reuses_matching_group_descriptors(harness, monkeypatch, 
         if harness.streaming is None:
             selected = prepared.descriptors
             assert selected == original(prepared.transfer_plan, source_binding=prepared.source_binding)
-            installed = harness.transfer.stage(prepared).tensors
+            installed = harness.transfer.execute(prepared).tensors
         else:
             selected = tuple(read for reads in prepared.descriptors for read in reads)
             for batch_index, (batch, reads) in enumerate(zip(prepared.batches, prepared.descriptors, strict=True)):
@@ -772,12 +772,12 @@ def test_replica_switch_reuses_matching_group_descriptors(harness, monkeypatch, 
     harness.transfer._capture_layout = lambda _: pytest.fail(
         "reset must preserve the logical plan"
     )
-    rebuilt = harness.transfer.prepare(
+    rebuilt = harness.transfer.stage(
         manifests=[shard.metadata for shard in trainer.shards], trainer_snapshot=trainer,
     )
     assert {session for group in builds for session in group} == {"a1", "b1"}
     if harness.streaming is None:
-        installed = harness.transfer.stage(rebuilt).tensors
+        installed = harness.transfer.execute(rebuilt).tensors
     else:
         _, installed = harness.collect(rebuilt)
     _check_values(harness, installed, check_padding=harness.streaming is not None)

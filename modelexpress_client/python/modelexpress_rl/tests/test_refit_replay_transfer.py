@@ -30,7 +30,7 @@ def test_ordered_sources_survive_warm_reuse(harness, monkeypatch, verify):
             source.add_(1)
         prepared = h.prepare()
         if h.streaming is None:
-            batches = (h.transfer.stage(prepared).tensors,)
+            batches = (h.transfer.execute(prepared).tensors,)
         else:
             batches = h.transfer.iter_bounded(prepared, {})
         seen = []

@@ -290,6 +290,27 @@ storage. Receive-arena views are never passed to engine callbacks. For trainer
 sources without bounded staging configured, `stage_weight()` transfers a full
 independent copy before installation.
 
+`TrainerMeshRef` is an immutable mesh ID and generation pair. `TrainerMesh.ref`
+returns it, and `WeightVersion.mesh_ref` is `None` for object-storage versions.
+Call `generator.prepare(mesh=mesh.ref)` at an engine safe point to compile
+reusable source plans before staging. The client fetches and validates the exact
+mesh identity and generation; trainer preparation resolves logical manifests and
+validates the mesh again before retaining the plan. Preparation acquires no
+version lease and transfers no weights. `stage_weight()` prepares the version's
+mesh automatically and retains its lease through installation or handle release.
+Calling `prepare()` without a mesh prepares only non-trainer sources and preserves
+the trainer cache. Preparation is rejected while an update handle is active.
+Explicit preparation reports errors; automatic preparation allows configured
+source fallback for recoverable failures, while unsafe recovery remains fatal.
+
+The session visits configured source kinds in fallback order. The planner
+selects compatible methods and passes each resolver's `prepare_inputs(**kwargs)`
+result to `UpdateMethod.prepare(inputs)`. Only the trainer resolver requires a
+mesh. `UpdateMethod.stage(version, source)` stages one version, while
+`stage_chain(chain)` handles replay; methods recover their own failed staging
+attempts. `_NixlStagedTransfer.stage(...)` binds physical sources to cached
+logical reads, and `execute(prepared)` performs the transfer.
+
 The generator compiles one logical plan per mesh ID and generation from its
 fixed installation plan and needed shard groups. Each leased update selects
 replicas and binds fresh checksums, sessions, and addresses. A replica switch

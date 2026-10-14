@@ -94,7 +94,7 @@ def _prepare(method, source, cycle):
             max_staging_bytes=1024,
             staging_device="cpu",
         )
-    return method.prepare(version=cycle, source=source)
+    return method.stage(version=cycle, source=source)
 
 
 def _load_replica(harness, method, replica: str, cycle: int):
