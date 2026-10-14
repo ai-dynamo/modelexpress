@@ -125,7 +125,7 @@ spec:
             failureThreshold: 3
           resources:
             requests:
-              cpu: "4"
+              cpu: "${MX_CI_FLEET_CPU}"
               memory: "16Gi"
               nvidia.com/gpu: "1"
             limits:

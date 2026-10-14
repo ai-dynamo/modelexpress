@@ -116,7 +116,7 @@ runs:
         NAMESPACE: ${{ inputs.namespace }}
       run: |
         echo "::group::Create namespace ${NAMESPACE} and install prerequisites"
-        kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+        bash .github/scripts/ci-namespace.sh create "$NAMESPACE" dynamo
 
         # ModelExpress CRDs are cluster-scoped and safe to re-apply. Use the
         # same canonical manifest documented for non-Helm installations.
@@ -209,15 +209,25 @@ runs:
       run: |
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: source_load_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
         echo "::group::Wait for initial workers to publish ${INITIAL_CR_COUNT} ModelMetadata CR(s)"
+        CR_COUNT=0
         deadline=$((SECONDS + TIMEOUT))
         while [ $SECONDS -lt $deadline ]; do
-          CR_COUNT=$(kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"\n"}{end}' 2>/dev/null | awk '$0 == "weights" || $0 == "" { count++ } END { print count + 0 }')
+          if ! METADATA=$(kubectl --request-timeout=10s get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"|\n"}{end}' 2>&1); then
+            printf '%s\n' "$METADATA" >&2
+            if ! printf '%s\n' "$METADATA" | grep -qiE 'connection refused|connection reset by peer|unexpected EOF|context deadline exceeded|Client\.Timeout exceeded|i/o timeout|TLS handshake timeout'; then
+              exit 1
+            fi
+            echo "WARNING: metadata API read failed; retrying within the readiness deadline"
+            sleep 5
+            continue
+          fi
+          CR_COUNT=$(printf '%s\n' "$METADATA" | awk '$0 == "weights|" || $0 == "|" { count++ } END { print count + 0 }')
           if [ "${CR_COUNT}" -ge "${INITIAL_CR_COUNT}" ]; then
             echo "Initial workers published metadata (${CR_COUNT} CR(s))."
             break
           fi
           # Fail fast on pod crashes.
-          FAILED=$(kubectl get pods -n "${NAMESPACE}" -l nvidia.com/dynamo-component-type=worker --no-headers 2>/dev/null \
+          FAILED=$(kubectl get pods -n "${NAMESPACE}" -l nvidia.com/dynamo-component-type=worker --no-headers \
             | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
           if [ -n "${FAILED}" ]; then
             echo "ERROR: a worker failed before publishing metadata: ${FAILED}"
@@ -226,7 +236,7 @@ runs:
           echo "Have ${CR_COUNT}/${INITIAL_CR_COUNT} ModelMetadata CR(s), retrying in 15s..."
           sleep 15
         done
-        FINAL=$(kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"\n"}{end}' 2>/dev/null | awk '$0 == "weights" || $0 == "" { count++ } END { print count + 0 }')
+        FINAL=$CR_COUNT
         if [ "${FINAL}" -lt "${INITIAL_CR_COUNT}" ]; then
           echo "ERROR: only ${FINAL}/${INITIAL_CR_COUNT} ModelMetadata CRs after ${TIMEOUT}s"
           exit 1
@@ -252,18 +262,28 @@ runs:
       run: |
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: p2p_transfer_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
         echo "::group::Wait for ModelMetadata CR count to reach ${FINAL_CR_COUNT} (scaled-up replica's RDMA transfer complete)"
+        CR_COUNT=0
         deadline=$((SECONDS + TIMEOUT))
         # The scaled-up worker publishes its own ModelMetadata CR, so the
         # CR count reaching FINAL_CR_COUNT is the most direct signal that
         # the new replica reached the publish phase (which happens AFTER
         # successful RDMA receive).
         while [ $SECONDS -lt $deadline ]; do
-          CR_COUNT=$(kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"\n"}{end}' 2>/dev/null | awk '$0 == "weights" || $0 == "" { count++ } END { print count + 0 }')
+          if ! METADATA=$(kubectl --request-timeout=10s get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"|\n"}{end}' 2>&1); then
+            printf '%s\n' "$METADATA" >&2
+            if ! printf '%s\n' "$METADATA" | grep -qiE 'connection refused|connection reset by peer|unexpected EOF|context deadline exceeded|Client\.Timeout exceeded|i/o timeout|TLS handshake timeout'; then
+              exit 1
+            fi
+            echo "WARNING: metadata API read failed; retrying within the readiness deadline"
+            sleep 5
+            continue
+          fi
+          CR_COUNT=$(printf '%s\n' "$METADATA" | awk '$0 == "weights|" || $0 == "|" { count++ } END { print count + 0 }')
           if [ "${CR_COUNT}" -ge "${FINAL_CR_COUNT}" ]; then
             echo "All workers have published metadata (${CR_COUNT} CRs)."
             break
           fi
-          FAILED=$(kubectl get pods -n "${NAMESPACE}" -l nvidia.com/dynamo-component-type=worker --no-headers 2>/dev/null \
+          FAILED=$(kubectl get pods -n "${NAMESPACE}" -l nvidia.com/dynamo-component-type=worker --no-headers \
             | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
           if [ -n "${FAILED}" ]; then
             echo "ERROR: a worker pod failed before completing P2P transfer: ${FAILED}"
@@ -272,7 +292,7 @@ runs:
           echo "Have ${CR_COUNT}/${FINAL_CR_COUNT} ModelMetadata CRs, retrying in 15s..."
           sleep 15
         done
-        FINAL=$(kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"\n"}{end}' 2>/dev/null | awk '$0 == "weights" || $0 == "" { count++ } END { print count + 0 }')
+        FINAL=$CR_COUNT
         if [ "${FINAL}" -lt "${FINAL_CR_COUNT}" ]; then
           echo "ERROR: only ${FINAL} ModelMetadata CRs after ${TIMEOUT}s (expected ${FINAL_CR_COUNT})"
           exit 1
@@ -295,32 +315,10 @@ runs:
         # this ensures Frontend's round-robin doesn't route requests to a
         # worker that's still warming up.
         WORKER_SELECTOR="nvidia.com/dynamo-graph-deployment-name=${DGD_NAME},nvidia.com/dynamo-component-type=worker"
-        PODS=$(kubectl get pods -n "${NAMESPACE}" -l "${WORKER_SELECTOR}" \
-          -o jsonpath='{.items[*].metadata.name}')
-        if [ -z "${PODS}" ]; then
-          echo "ERROR: no worker pods found with selector ${WORKER_SELECTOR}"
-          exit 1
-        fi
-        for POD in ${PODS}; do
-          deadline=$((SECONDS + TIMEOUT))
-          while [ $SECONDS -lt $deadline ]; do
-            if kubectl exec -n "${NAMESPACE}" "${POD}" -- \
-                 curl -sf -m 5 http://localhost:9090/live >/dev/null 2>&1; then
-              echo "${POD} /live OK"
-              break
-            fi
-            echo "${POD} /live not ready yet, retrying in 10s..."
-            sleep 10
-          done
-          # Re-probe post-loop to distinguish "broke out on success" from
-          # "deadline elapsed" — without this, a pod that never becomes
-          # ready would silently fall through.
-          if ! kubectl exec -n "${NAMESPACE}" "${POD}" -- \
-               curl -sf -m 5 http://localhost:9090/live >/dev/null 2>&1; then
-            echo "ERROR: ${POD} /live did not return 200 within ${TIMEOUT}s"
-            exit 1
-          fi
-        done
+        source .github/scripts/ci-kubectl.sh
+        DGD=$(ci_kubectl get dgd "$DGD_NAME" -n "$NAMESPACE" -o json)
+        EXPECTED=$(printf '%s\n' "$DGD" | jq '[.spec.services[] | select(.componentType == "worker") | (.replicas // 1)] | add')
+        wait_for_worker_liveness "$WORKER_SELECTOR" "$EXPECTED" "$TIMEOUT"
         echo "::endgroup::"
 
     - name: Set up Python
@@ -398,40 +396,4 @@ runs:
         NAMESPACE: ${{ inputs.namespace }}
         DGD_NAME: ${{ inputs.dgd_name }}
       run: |
-        echo "::group::Delete namespace ${NAMESPACE}"
-        # Delete the DGD first so the operator finalizers run cleanly before
-        # the namespace delete reaps the operator deployment itself.
-        kubectl delete dgd "${DGD_NAME}" -n "${NAMESPACE}" --ignore-not-found --timeout=120s || true
-        # Timeout sized for our slowest realistic case:
-        #   - 3 component pods (Frontend, ModelExpress server, VllmWorker —
-        #     2 of those replicas after the scale-to-2 patch) each with a
-        #     30s graceful-shutdown grace period
-        #   - DGD-controlled PodClique + PodGang teardown
-        #   - ModelMetadata CR finalizers driven by the mx-server controller
-        #   - K8s namespace finalizer clearance after all child resources
-        # 3 min is enough buffer for the legitimate slow path; in practice the
-        # safeguard (force-finalize via kubectl replace --raw) is what
-        # consistently completes the delete because stuck finalizers from
-        # CR controllers / dynamo operator are the common case, not the
-        # exception. The ::warning:: still fires so unhealthy cleanup
-        # conditions are visible in the GHA UI.
-        if ! kubectl delete namespace "${NAMESPACE}" --ignore-not-found --timeout=180s; then
-          echo "::warning::Namespace ${NAMESPACE} did not finalize within 180s; force-clearing finalizers as a safeguard. Investigate the underlying stuck resource."
-          kubectl get ns "${NAMESPACE}" -o json 2>/dev/null \
-            | jq '.spec.finalizers = []' \
-            | kubectl replace --raw "/api/v1/namespaces/${NAMESPACE}/finalize" -f - || true
-          # Verify the namespace actually finalized. If it didn't, that means
-          # the API rejected our force-clear too — there's something deeper
-          # broken (e.g., dead admission webhook, unreachable conversion
-          # service). Fail loud so it gets investigated. If the namespace IS
-          # gone, the safeguard did its job — exit 0 and rely on the
-          # ::warning:: above for visibility.
-          sleep 5
-          if kubectl get ns "${NAMESPACE}" --no-headers 2>/dev/null | grep -q .; then
-            echo "::error::Namespace ${NAMESPACE} still present after force-finalize. Force-clear was rejected; deeper cluster issue."
-            kubectl get ns "${NAMESPACE}" -o yaml 2>&1 | tail -40
-            exit 1
-          fi
-          echo "Namespace ${NAMESPACE} is gone (safeguard cleared finalizers successfully)."
-        fi
-        echo "::endgroup::"
+        bash .github/scripts/ci-namespace.sh cleanup "$NAMESPACE"

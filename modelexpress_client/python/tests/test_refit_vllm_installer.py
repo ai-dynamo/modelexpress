@@ -804,7 +804,8 @@ def test_streaming_rejects_aliasing_source_before_any_batch_copy(monkeypatch):
     assert not prepared.ownership.release_blocked
 
 
-def test_streaming_uses_engine_processing_and_defers_attention(monkeypatch):
+@pytest.mark.parametrize("quantized", [False, True])
+def test_streaming_uses_engine_processing_and_defers_attention(monkeypatch, quantized):
     model = nn.Module()
     model.first = nn.Linear(2, 2, bias=False)
     model.attention = nn.Module()
@@ -874,10 +875,11 @@ def test_streaming_uses_engine_processing_and_defers_attention(monkeypatch):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
     installer = _VllmInstaller(
         model=model,
-        vllm_config=object(),
+        vllm_config=SimpleNamespace(quant_config=object() if quantized else None),
         model_config=object(),
         device=torch.device("cpu"),
     )
+    assert PreparedStreamingTensors in installer.capabilities.artifact_types
     for value in (1, 3, 5):
         events.clear()
 
@@ -2203,7 +2205,13 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
                 ctypes.memmove(d.dst_addr, d.src_addr, d.nbytes)
 
     prepared = transfer_module._PreparedBoundedTransfer(
-        planned, {"w": source}, Transport()
+        planned, {"w": source}, Transport(),
+        transfer_module._SourceBinding(
+            transfer_module._ResolvedSources(
+                {"w": source}, {"source": "source"}, {"source": 0}, {}
+            ),
+            {"source": "source"}, (),
+        ),
     )
     transfer = object.__new__(transfer_module._NixlStagedTransfer)
     transfer._descriptor_cache = None

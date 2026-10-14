@@ -50,7 +50,7 @@ def setup_method(monkeypatch):
 
     monkeypatch.setattr(runtime, "_NixlStagedTransfer", Transfer)
     method = runtime._create_load_time_tensor_method(
-        capability=SimpleNamespace(device_id=0, device="cpu", capture_layout=None),
+        capability=SimpleNamespace(device_id=0, device="cpu", capture_layout=lambda manifest: None),
         worker_id="receiver",
     )
     source = TrainerUpdateSource(
