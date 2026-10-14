@@ -123,7 +123,7 @@ def _prepared(tensor: torch.Tensor, nbytes: int) -> _PreparedNixlTransfer:
         (("slot-trainer", "trainer", source.shards[0].addr),),
     )
     return _PreparedNixlTransfer(
-        plan=LogicalTransferPlan(),
+        transfer_plan=LogicalTransferPlan(),
         capture=CaptureResult(copies=[copy]),
         sources={"weight": source},
         descriptors=(_Descriptor(nbytes),),
