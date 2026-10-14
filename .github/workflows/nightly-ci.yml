@@ -875,7 +875,6 @@ jobs:
         env:
           GITLAB_TRIGGER_URL: ${{ secrets.GITLAB_PIPELINE_URL }}
           GITLAB_TRIGGER_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
-          GITLAB_REF: ${{ vars.GITLAB_RELEASE_AUTOMATION_REF || 'main' }}
           SONAR_BRANCH: ${{ github.ref_name }}
           ARTIFACTORY_PATH: ${{ needs.preflight.outputs.artifactory_path }}
           ARTIFACTORY_WHEEL_REPO: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
@@ -924,7 +923,7 @@ jobs:
 
           RESPONSE=$(curl -fsSL -X POST "${GITLAB_TRIGGER_URL}" \
             --form "token=<${TOKEN_FILE}" \
-            --form "ref=${GITLAB_REF}" \
+            --form "ref=main" \
             --form "variables[PROJECT]=modelexpress" \
             --form "variables[PIPELINE_TYPE]=security" \
             --form "variables[DRY_RUN]=false" \

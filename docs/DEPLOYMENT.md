@@ -534,8 +534,7 @@ Additional secrets in the `automated-release` environment, which admits
 only `main` and `release/*`: `NGC_PUBLISH_USERNAME`, `NGC_PUBLISH_TOKEN`,
 `GITLAB_PIPELINE_URL` and `GITLAB_TRIGGER_TOKEN`. Repository scope holds
 `SLACK_RELEASE_BOT_TOKEN`, `SLACK_RELEASE_CHANNEL_ID` and
-`SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL`. The optional repository variable
-`GITLAB_RELEASE_AUTOMATION_REF` overrides the GitLab ref (default `main`).
+`SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL`.
 
 ### Custom Client Image (P2P Transfers)
 
