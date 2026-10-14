@@ -28,6 +28,7 @@ Run: pytest tests/test_reshard_refit_stage_record.py
 
 import json
 import logging
+from dataclasses import replace
 
 import pytest
 import torch
@@ -196,8 +197,8 @@ def test_a_skipped_stage_is_absent_rather_than_zero(monkeypatch, caplog):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     transport = _RecordingTransport()
     harness, keepalive = _build(transport)
-    harness._plan.converts = []
-    harness._plan.full_pulls = []
+    harness._plan = replace(harness._plan, converts=(), full_pulls=())
+    harness._bind_physical_plan()
 
     with caplog.at_level(logging.WARNING):
         harness.update_weights(step=1)
@@ -233,7 +234,8 @@ def test_an_exact_phase_that_moved_nothing_is_not_timed(monkeypatch, caplog):
     # ones it had to bound into full_pulls, so the count stays nonzero with nothing
     # left to issue. Zeroing it here would describe a plan plan_transfer cannot
     # produce, and would hide a guard that reads the count instead of the segments.
-    harness._plan.segments = []
+    harness._plan = replace(harness._plan, segments=())
+    harness._bind_physical_plan()
 
     with caplog.at_level(logging.WARNING):
         harness.update_weights(step=1)

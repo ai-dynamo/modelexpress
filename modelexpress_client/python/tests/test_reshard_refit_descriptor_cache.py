@@ -32,7 +32,7 @@ import pytest
 import torch
 
 from modelexpress.refit.reshard import receiver as receiver_mod
-from modelexpress.refit.reshard.transfer_plan import TransferPlan
+from modelexpress.refit.reshard.transfer_plan import LogicalTransferPlan
 from modelexpress.refit.reshard.types import CaptureResult
 from tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
 
@@ -94,9 +94,8 @@ def test_rebuilding_the_plan_drops_the_cache(monkeypatch):
     monkeypatch.setenv("MX_RESHARD_CACHE_DESCRIPTORS", "1")
     harness, keepalive = _build(_RecordingTransport())
     _refit(harness, 1)
-    assert harness._cached_descriptors is not None
 
-    new_plan = TransferPlan()
+    new_plan = LogicalTransferPlan()
     monkeypatch.setattr(
         receiver_mod,
         "gather_sources",
@@ -122,7 +121,7 @@ def test_rebuilding_the_plan_drops_the_cache(monkeypatch):
     harness._prepare(timeout=1.0)
 
     assert harness._plan is new_plan
-    assert harness._cached_descriptors is None
+    assert harness._physical_plan.descriptors == ()
     assert keepalive
 
 
@@ -138,12 +137,10 @@ def test_switching_the_wire_arm_rebuilds_the_cache(monkeypatch):
     monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "0")
     harness, keepalive = _build(_RecordingTransport())
     phased_metrics, phased = _refit(harness, 1)
-    assert harness._cached_descriptors[0] is False
 
     monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "1")
     _zero(harness)
     fused_metrics, fused = _refit(harness, 2)
-    assert harness._cached_descriptors[0] is True
 
     for name in phased:
         assert torch.equal(fused[name], phased[name]), name

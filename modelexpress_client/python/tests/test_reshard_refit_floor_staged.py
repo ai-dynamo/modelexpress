@@ -25,12 +25,14 @@ import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress import p2p_pb2
 from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, TransferPlan
+from modelexpress.refit.reshard.transfer_plan import LogicalTransferPlan, SourceInfo
 from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
 from modelexpress.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.nixl_staged_transfer import (
     _NixlStagedTransfer,
     _PreparedNixlTransfer,
+    _ResolvedSources,
+    _SourceBinding,
 )
 
 # The measured incident and the measured healthy run on the same node: 16.64 GB
@@ -109,12 +111,24 @@ def _prepared(tensor: torch.Tensor, nbytes: int) -> _PreparedNixlTransfer:
             )
         ],
     )
+    resolved = _ResolvedSources(
+        {"weight": source},
+        {"trainer": "trainer"},
+        {"trainer": 0},
+        {"trainer": b"metadata"},
+    )
+    source_binding = _SourceBinding(
+        resolved,
+        {"slot-trainer": "trainer"},
+        (("slot-trainer", "trainer", source.shards[0].addr),),
+    )
     return _PreparedNixlTransfer(
-        plan=TransferPlan(),
+        plan=LogicalTransferPlan(),
         capture=CaptureResult(copies=[copy]),
         sources={"weight": source},
         descriptors=(_Descriptor(nbytes),),
         transport=_Transport(),
+        source_binding=source_binding,
     )
 
 
