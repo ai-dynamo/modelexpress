@@ -299,7 +299,8 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
         ),))
 
     source = snapshot()
-    method = LoadTimeTensorNixlUpdateMethod(transfer=transfer, capture_layout=capture_layout)
+    transfer._capture_layout = capture_layout
+    method = LoadTimeTensorNixlUpdateMethod(transfer=transfer)
 
     def update(source):
         prepared = method.prepare(version=None, source=ResolvedTrainerSource(source))
@@ -381,7 +382,12 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
                 update(bad)
             capture_failure = False
             assert sum(len(t.posts) for t in harness.transports) == reads
-            assert {key: value.data_ptr() for key, value in manager.registered.items()} == registrations
+            if failure == "metadata":
+                assert not manager.registered
+            else:
+                assert {
+                    key: value.data_ptr() for key, value in manager.registered.items()
+                } == registrations
         for _ in range(2):
             for value in harness.sources.values():
                 value.add_(1)
@@ -398,6 +404,8 @@ def test_default_transfer_timeout_matches_the_lease_budget(monkeypatch):
     monkeypatch.setenv("MX_TRANSFER_TIMEOUT", "17")
 
     transfer = _NixlStagedTransfer(
+        generator_fingerprint=lambda: (),
+        capture_layout=lambda _: None,
         device_id=0,
         device=torch.device("cpu"),
         manager=object(),
@@ -639,6 +647,8 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
     monkeypatch.setattr(transfer_module, "NixlTransferManager", _Manager)
     with pytest.raises(RuntimeError, match="init failed"):
         _NixlStagedTransfer(
+            generator_fingerprint=lambda: (),
+            capture_layout=lambda _: None,
             agent_name="generator",
             device_id=0,
             device=torch.device("cpu"),
@@ -670,6 +680,8 @@ def test_borrowed_manager_is_not_initialized_or_closed():
             raise AssertionError("borrowed manager is owned by the loader")
 
     transfer = _NixlStagedTransfer(
+        generator_fingerprint=lambda: (),
+        capture_layout=lambda _: None,
         device_id=0,
         device=torch.device("cpu"),
         manager=_Manager(),
@@ -724,6 +736,8 @@ def test_borrowed_manager_survives_peer_receive_and_refuses_a_reset(monkeypatch)
         transfer_module, "prepare_tensor_read", lambda *a, **k: (_Lease(), 0)
     )
     transfer = _NixlStagedTransfer(
+        generator_fingerprint=lambda: (),
+        capture_layout=lambda _: None,
         device_id=0,
         device=torch.device("cpu"),
         manager=_Manager(),
@@ -1115,6 +1129,7 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
         ]
     )
     transfer = _NixlStagedTransfer(
+        generator_fingerprint=lambda: (),
         agent_name="receiver",
         device_id=0,
         device=torch.device("cuda:0"),
@@ -1122,6 +1137,7 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
         streaming=StreamingSettings(
             256 * staging_buffers - int(not budget_fits), "cpu", staging_buffers
         ),
+        capture_layout=lambda m: (capture, layout),
     )
     layout = {"layer.weight": ((4,), torch.float32)}
     snapshot = TrainerSourceSnapshot(
@@ -1138,14 +1154,12 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
                 transfer.prepare(
                     trainer_snapshot=snapshot,
                     manifests=[manifest],
-                    capture_layout=lambda m: (capture, layout),
                 )
             assert "register_dram" not in events
             return
         prepared = transfer.prepare(
             trainer_snapshot=snapshot,
             manifests=[manifest],
-            capture_layout=lambda m: (capture, layout),
         )
         assert events.count("register_dram") == staging_buffers
         assert len(transfer._staging_arenas) == staging_buffers
@@ -1168,6 +1182,8 @@ def test_bounded_device_validation_precedes_manager_creation(monkeypatch) -> Non
     )
     with pytest.raises(ValueError, match="CUDA device"):
         _NixlStagedTransfer(
+            generator_fingerprint=lambda: (),
+            capture_layout=lambda _: None,
             agent_name="receiver",
             device_id=0,
             device=torch.device("cpu"),
@@ -1316,3 +1332,111 @@ def test_bounded_batch_layouts_are_named_however_they_are_built():
     swapped = replace(built, layouts=(recv, convert, {}))
     assert isinstance(swapped.layouts, transfer_module._StagingLayouts)
     assert swapped.layouts.full == {}
+
+
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_generator_layout_debug_assertion(harness, monkeypatch, enabled):
+    if enabled is None:
+        monkeypatch.delenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", raising=False)
+    else:
+        monkeypatch.setenv(
+            "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", str(int(enabled))
+        )
+    fingerprint = [0]
+    calls = []
+
+    def layout_fingerprint():
+        calls.append(True)
+        return tuple(fingerprint)
+
+    def capture_layout(_):
+        capture = replace(
+            harness.capture,
+            generator_fingerprint=layout_fingerprint() if enabled else None,
+        )
+        return capture, harness.layout
+
+    harness.prepare()
+    source = ResolvedTrainerSource(harness.transfer.cached_trainer_source())
+    transfer = _NixlStagedTransfer(
+        agent_name="debug-target",
+        device_id=0,
+        device=torch.device("cuda:0"),
+        streaming=harness.streaming,
+        generator_fingerprint=layout_fingerprint,
+        capture_layout=capture_layout,
+    )
+    method = LoadTimeTensorNixlUpdateMethod(
+        transfer=transfer,
+    )
+    for _ in range(2):
+        prepared = method.prepare(version=None, source=source)
+        method.release(prepared)
+    if enabled:
+        assert (
+            transfer._weight_update_plan.layout_capture_snapshot.generator_fingerprint
+            == (0,)
+        )
+    fingerprint[0] = 1
+    if enabled:
+        with pytest.raises(AssertionError, match="generator layout changed"):
+            method.prepare(version=None, source=source)
+        assert transfer.cached_trainer_source() is None
+    else:
+        prepared = method.prepare(version=None, source=source)
+        method.release(prepared)
+        assert not calls
+    method.close()
+
+
+def test_generator_layout_debug_requires_adapter_callback(harness, monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", "1")
+    harness.prepare()
+    events = list(harness.events)
+    with pytest.raises(ValueError, match="generator_fingerprint"):
+        _NixlStagedTransfer(
+            generator_fingerprint=None,
+            agent_name="debug-target",
+            device_id=0,
+            device=torch.device("cuda:0"),
+            streaming=harness.streaming,
+            capture_layout=lambda _: (harness.capture, harness.layout),
+        )
+    assert harness.events == events
+
+
+def test_changed_agent_metadata_resets_before_retry(harness, monkeypatch):
+    harness.collect(harness.prepare())
+    transfer = harness.transfer
+    old = transfer.cached_trainer_source()
+    shard = old.shards[0]
+    payload = unwrap_rendezvous_blob(shard.manifest)
+    blob = wrap_rendezvous_blob(
+        b"replacement",
+        payload.agent_name,
+        payload.metadata_endpoint,
+        payload.tensors,
+    )
+    current = replace(
+        old,
+        shards=(
+            replace(
+                shard,
+                manifest=blob,
+                manifest_digest=hashlib.sha256(blob).hexdigest(),
+                structural_digest=structural_manifest_digest(blob),
+            ),
+        ),
+    )
+    monkeypatch.setattr(transfer._manager, "add_remote_agent", lambda _: "source")
+
+    def prepare():
+        return transfer.prepare(
+            manifests=[blob],
+            trainer_snapshot=current,
+        )
+
+    with pytest.raises(RuntimeError, match="metadata changed"):
+        prepare()
+    assert not transfer._loaded_agent_metadata
+    harness.collect(prepare())

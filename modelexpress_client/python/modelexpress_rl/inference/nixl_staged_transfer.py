@@ -24,6 +24,7 @@ from typing import Any, NamedTuple, cast
 
 import torch
 from modelexpress import envs, p2p_pb2
+from modelexpress_rl import envs as rl_envs
 from modelexpress.metadata.worker_server import (
     TensorReadLease,
     prepare_tensor_read,
@@ -111,7 +112,7 @@ class _SourceBinding:
 @dataclass(frozen=True)
 class _WeightUpdatePlan:
     trainer_source_snapshot: TrainerSourceSnapshot
-    generator_capture_snapshot: CaptureResult
+    layout_capture_snapshot: CaptureResult
     parameter_layout: MappingProxyType
     transfer_plan: LogicalTransferPlan | _StreamingSchedule
     source_binding: _SourceBinding
@@ -431,6 +432,8 @@ class _NixlStagedTransfer:
         *,
         device_id: int,
         device: torch.device,
+        capture_layout: _CaptureLayout,
+        generator_fingerprint: Callable[[], tuple],
         agent_name: str | None = None,
         listen_port: int | None = None,
         timeout_seconds: float | None = None,
@@ -439,6 +442,12 @@ class _NixlStagedTransfer:
     ) -> None:
         if streaming is not None and device.type != "cuda":
             raise ValueError("bounded NIXL staging requires a CUDA device")
+        if not callable(capture_layout):
+            raise TypeError("capture_layout must be callable")
+        if not callable(generator_fingerprint):
+            raise ValueError("generator_fingerprint must be callable")
+        self._capture_layout = capture_layout
+        self._generator_fingerprint = generator_fingerprint
         self._streaming = streaming
         self._buffer_budget = (
             None
@@ -493,7 +502,10 @@ class _NixlStagedTransfer:
         self._manager_ready = True
         self._weight_update_plan: _WeightUpdatePlan | None = None
         self._full_copy_descriptors: tuple[ReadDescriptor, ...] | None = None
-        self._debug_validate_plan = envs.MX_REFIT_DEBUG_VALIDATE_PLAN
+        self._debug_validate_plan = rl_envs.MX_REFIT_DEBUG_VALIDATE_PLAN
+        self._debug_validate_generator_layout = (
+            rl_envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT
+        )
         self._pack_modules = envs.MX_REFIT_PACK_MODULES
         self._plan_compile_lock = threading.Lock()
         self._descriptor_cache: list[tuple[ReadDescriptor, ...] | None] | None = None
@@ -609,7 +621,6 @@ class _NixlStagedTransfer:
     def _resolve_layout(
         self,
         manifests: list[bytes],
-        capture_layout: _CaptureLayout,
         metrics: dict[str, float],
         trainer_snapshot: TrainerSourceSnapshot,
     ) -> tuple[TrainerSourceSnapshot, CaptureResult, _StagingLayout]:
@@ -622,7 +633,7 @@ class _NixlStagedTransfer:
         )
         metrics["source_metadata_s"] = time.perf_counter() - started
         started = time.perf_counter()
-        capture, parameter_layout = capture_layout(list(source_schema))
+        capture, parameter_layout = self._capture_layout(list(source_schema))
         metrics["layout_capture_s"] = time.perf_counter() - started
         return trainer, capture, parameter_layout
 
@@ -723,13 +734,13 @@ class _NixlStagedTransfer:
         conflicting = sorted(
             agent for agent in changed if agent in self._loaded_agent_metadata
         )
+        if changed:
+            self._native_setup_started = True
         if conflicting:
             raise RuntimeError(
                 "NIXL metadata changed for an already connected source agent: "
                 f"{conflicting[:10]}"
             )
-        if changed:
-            self._native_setup_started = True
         _load_agent_metadata(self._manager, changed)
         self._loaded_agent_metadata.update(changed)
         return NixlReshardTransport(
@@ -771,7 +782,6 @@ class _NixlStagedTransfer:
         self,
         *,
         manifests: list[bytes],
-        capture_layout: _CaptureLayout,
         trainer_snapshot: TrainerSourceSnapshot,
         checksums: Mapping[ShardChecksumKey, str] | None = None,
     ) -> _PreparedNixlTransfer | _PreparedBoundedTransfer:
@@ -796,17 +806,21 @@ class _NixlStagedTransfer:
                 trainer = previous.trainer_source_snapshot
                 if trainer_snapshot.shards != trainer.shards:
                     trainer = replace(trainer_snapshot, resolved_metadata=trainer.resolved_metadata)
-                capture = previous.generator_capture_snapshot
+                capture = previous.layout_capture_snapshot
                 parameter_layout = previous.parameter_layout
                 source_binding = previous.source_binding
                 transfer_plan = previous.transfer_plan
+                if self._debug_validate_generator_layout:
+                    assert (
+                        self._generator_fingerprint() == capture.generator_fingerprint
+                    ), "generator layout changed since capture"
                 if self._debug_validate_plan:
                     self._validate_complete(
                         capture, dict(parameter_layout), transfer_plan, metrics
                     )
             else:
                 trainer, capture, parameter_layout = self._resolve_layout(
-                    manifests, capture_layout, metrics, trainer_snapshot
+                    manifests, metrics, trainer_snapshot
                 )
                 source_binding = self._source_binding(trainer)
                 started = time.perf_counter()
@@ -924,7 +938,7 @@ class _NixlStagedTransfer:
         reusable: bool,
     ) -> _PreparedNixlTransfer:
         plan = cast(LogicalTransferPlan, cached.transfer_plan)
-        capture = cached.generator_capture_snapshot
+        capture = cached.layout_capture_snapshot
         parameter_layout = cached.parameter_layout
         resolved = cached.trainer_source_snapshot.resolved_metadata
         source_binding = cached.source_binding

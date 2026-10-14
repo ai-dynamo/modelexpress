@@ -428,6 +428,7 @@ def _runtime(
             installer=installer,
             full_tensor=(
                 FullTensorEngineCapability(
+                    generator_fingerprint=lambda: (),
                     device_id=0,
                     device="cuda:0",
                     worker_rank=adapter.worker_rank,
@@ -874,7 +875,7 @@ def test_generator_handles_mesh_change_with_configured_peer_fallback(
 
         planner = generator._runtime.session._planner
         planner._methods = (
-            Method(transfer=Transfer(), capture_layout=lambda manifest: None),
+            Method(transfer=Transfer()),
             _TestMethod(adapter),
         )
         planner._installer = Installer()
@@ -1920,7 +1921,6 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
 
     method = LoadTimeTensorNixlUpdateMethod(
         transfer=Transfer(),
-        capture_layout=lambda manifest: None,
     )
     planner = generator._runtime.session._planner
     planner._methods = (method,)
@@ -2629,7 +2629,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
 
     installer = Installer()
     transfer = Transfer()
-    method = Method(transfer=transfer, capture_layout=lambda manifest: None)
+    method = Method(transfer=transfer)
     planner = generator._runtime.session._planner
     planner._methods = (method,)
     planner._installer = installer
@@ -2789,7 +2789,7 @@ def test_streaming_creates_and_emits_one_timing_cycle(
                     assert batch == {"weight": 7}
             return {}
 
-    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer(), capture_layout=lambda manifest: None)
+    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer())
     planner = generator._runtime.session._planner
     planner._methods = (method,)
     planner._installer = Installer()

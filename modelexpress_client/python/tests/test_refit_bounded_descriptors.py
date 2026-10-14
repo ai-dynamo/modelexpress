@@ -140,12 +140,19 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
         "_allocate_arena",
         lambda self, size: torch.empty(size, dtype=torch.uint8),
     )
+
+    def capture_layout(manifest):
+        captures.append(manifest)
+        return capture, layout
+
     transfer = module._NixlStagedTransfer(
+        generator_fingerprint=lambda: (),
         agent_name="target",
         device_id=0,
         device=torch.device("cuda:0"),
         listen_port=None,
         streaming=settings,
+        capture_layout=capture_layout,
     )
 
     def manifests():
@@ -176,10 +183,6 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
             )
         ]
 
-    def capture_layout(manifest):
-        captures.append(manifest)
-        return capture, layout
-
     def prepare(*, generation: int = 1) -> module._PreparedBoundedTransfer:
         blobs = manifests()
         snapshot = TrainerSourceSnapshot("mesh", generation, tuple(
@@ -197,7 +200,6 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
         return transfer.prepare(
             trainer_snapshot=snapshot,
             manifests=blobs,
-            capture_layout=capture_layout,
             checksums=MappingProxyType({
                 (name, "source", tensor.data_ptr(), (0, 0), (4, 4)): tensor_digest(tensor)
                 for name, tensor in sources.items()

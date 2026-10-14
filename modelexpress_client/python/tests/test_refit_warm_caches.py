@@ -146,12 +146,22 @@ def _transfer_with_resolved_plan(monkeypatch, manifests: list[bytes]) -> tuple:
     resolved = transfer._resolve_metadata(manifests, {})
     transfer._weight_update_plan = _WeightUpdatePlan(
         trainer_source_snapshot=TrainerSourceSnapshot(
-            "mesh", 1, tuple(
-                TrainerSourceShard(str(index), str(index), hashlib.sha256(blob).hexdigest(), "source:19000", blob, structural_manifest_digest(blob))
+            "mesh",
+            1,
+            tuple(
+                TrainerSourceShard(
+                    str(index),
+                    str(index),
+                    hashlib.sha256(blob).hexdigest(),
+                    "source:19000",
+                    blob,
+                    structural_manifest_digest(blob),
+                )
                 for index, blob in enumerate(manifests)
-            ), resolved
+            ),
+            resolved,
         ),
-        generator_capture_snapshot=CaptureResult(copies=[]),
+        layout_capture_snapshot=CaptureResult(copies=[]),
         parameter_layout=MappingProxyType({}),
         transfer_plan=LogicalTransferPlan(),
         source_binding=_SourceBinding(resolved, {}, ()),

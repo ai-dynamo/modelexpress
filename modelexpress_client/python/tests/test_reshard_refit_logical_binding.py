@@ -275,10 +275,10 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
             ))
         ),
     )
+    harness.transfer._capture_layout = capture_layout
     request = dict(
         manifests=manifests,
         trainer_snapshot=snapshot,
-        capture_layout=capture_layout,
     )
     prepared = harness.transfer.prepare(**request)
     metrics, installed = harness.collect(prepared)

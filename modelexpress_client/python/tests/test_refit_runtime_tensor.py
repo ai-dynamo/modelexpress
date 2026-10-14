@@ -63,7 +63,6 @@ class _Transfer:
 def test_load_time_and_runtime_methods_have_disjoint_source_contracts():
     load_time = LoadTimeTensorNixlUpdateMethod(
         transfer=_Transfer(),
-        capture_layout=lambda manifest: manifest,
     )
     runtime = RuntimeTensorNixlUpdateMethod(
         transfer=_Transfer(),
@@ -225,18 +224,32 @@ def test_runtime_method_rejects_a_trainer_source():
         raise AssertionError("runtime tensor method accepted a trainer source")
 
 
-@pytest.mark.parametrize(
-    ("transfer", "capture_layout", "error", "message"),
-    [
-        (None, lambda manifest: manifest, ValueError, "transfer is required"),
-        (object(), None, TypeError, "capture_layout must be callable"),
-        (object(), object(), TypeError, "capture_layout must be callable"),
-    ],
-)
-def test_load_time_method_rejects_invalid_dependencies(
-    transfer, capture_layout, error, message
-):
-    with pytest.raises(error, match=message):
-        LoadTimeTensorNixlUpdateMethod(
-            transfer=transfer, capture_layout=capture_layout
+def test_load_time_method_rejects_missing_transfer():
+    with pytest.raises(ValueError, match="transfer is required"):
+        LoadTimeTensorNixlUpdateMethod(transfer=None)
+
+
+@pytest.mark.parametrize("capture_layout", [None, object(), False])
+def test_staged_transfer_rejects_invalid_capture_layout(capture_layout):
+    from modelexpress_rl.inference.nixl_staged_transfer import _NixlStagedTransfer
+
+    with pytest.raises(TypeError, match="capture_layout must be callable"):
+        _NixlStagedTransfer(
+            generator_fingerprint=lambda: (),
+            device_id=0,
+            device=torch.device("cpu"),
+            manager=object(),
+            capture_layout=capture_layout,
+        )
+
+
+def test_staged_transfer_requires_capture_layout():
+    from modelexpress_rl.inference.nixl_staged_transfer import _NixlStagedTransfer
+
+    with pytest.raises(TypeError, match="capture_layout"):
+        _NixlStagedTransfer(
+            generator_fingerprint=lambda: (),
+            device_id=0,
+            device=torch.device("cpu"),
+            manager=object(),
         )
