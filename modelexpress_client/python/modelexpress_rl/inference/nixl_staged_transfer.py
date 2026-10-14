@@ -24,6 +24,7 @@ from typing import Any, NamedTuple, cast
 import torch
 from modelexpress import envs, p2p_pb2
 from modelexpress_rl import envs as rl_envs
+from modelexpress.adapter import StrategyRecoveryError
 from modelexpress.metadata.worker_server import (
     TensorReadLease,
     prepare_tensor_read,
@@ -60,6 +61,7 @@ from modelexpress.types import ManifestMismatchError, TensorDescriptor
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
 from ..train.manifest import ShardChecksumKey
+from ..version import TrainerMeshRef
 from .plan import StreamingSettings
 
 # Named under modelexpress.* (not modelexpress_rl) so the per-update summary surfaces
@@ -163,6 +165,15 @@ class _WeightUpdatePlan:
     source_binding: _SourceBinding | None
     transport: NixlReshardTransport | None
     descriptor_caches: tuple[_DescriptorCache, ...] | None = None
+
+
+@dataclass(frozen=True)
+class _MeshPlan:
+    mesh: TrainerMeshRef
+    sources: dict
+    capture: CaptureResult
+    parameter_layout: Mapping
+    transfer_plan: LogicalTransferPlan | _StreamingSchedule
 
 
 @dataclass(frozen=True)
@@ -476,6 +487,8 @@ def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
 class _NixlStagedTransfer:
     """Own the complete prepare-and-stage lifecycle for one generator rank."""
 
+    _mesh_plan: _MeshPlan | None = None
+
     def __init__(
         self,
         *,
@@ -734,6 +747,47 @@ class _NixlStagedTransfer:
             return None
         return plan.trainer_source_snapshot
 
+    def compile_mesh(self, mesh: TrainerMeshRef, sources: dict) -> _MeshPlan:
+        """Compile geometry without opening transports or creating an update."""
+        if self._closed:
+            raise RuntimeError("NIXL staged transfer is closed")
+        schema = [(name, source.dtype, tuple(source.global_shape))
+                  for name, source in sorted(sources.items())]
+        capture, layout = self._capture_layout(schema)
+        slots = {shard.session: shard.session for source in sources.values() for shard in source.shards}
+        compile_plan = self._compile_full_copy if self._streaming is None else self._compile_streaming
+        plan = compile_plan(sources, capture, layout, {}, slots)
+        return _MeshPlan(mesh, sources, capture, layout, plan)
+
+    @property
+    def prepared_mesh(self) -> TrainerMeshRef | None:
+        return self._mesh_plan.mesh if self._mesh_plan is not None else None
+
+    def retain_mesh_plan(self, plan: _MeshPlan) -> None:
+        self._mesh_plan = plan
+        self._weight_update_plan = None
+        self._active = None
+
+    @staticmethod
+    def _validate_mesh_sources(prepared: _MeshPlan, trainer: TrainerSourceSnapshot) -> None:
+        resolved = trainer.resolved_metadata
+        slots = {agent: shard.source_slot_id for agent, shard in
+                 zip(resolved.manifest_agents, trainer.shards, strict=True)}
+
+        def coverage(sources, slot_for_session):
+            return {
+                (slot_for_session(shard.session), name, tuple(shard.shard_offset), tuple(shard.shape),
+                 tuple(source.global_shape), source.dtype, source.elsize)
+                for name, source in sources.items() for shard in source.shards
+            }
+
+        expected = coverage(prepared.sources, lambda session: session)
+        selected = set(slots.values())
+        expected = {item for item in expected if item[0] in selected}
+        actual = coverage(resolved.sources, lambda session: slots[resolved.session_to_agent[session]])
+        if actual != expected:
+            raise RuntimeError("published trainer coverage differs from the prepared mesh")
+
     def _can_reuse_plan(self, trainer: TrainerSourceSnapshot) -> bool:
         previous = self._weight_update_plan
         return previous is not None and (
@@ -743,11 +797,11 @@ class _NixlStagedTransfer:
 
     def _compile_streaming(
         self,
-        trainer: TrainerSourceSnapshot,
+        sources: dict,
         capture: CaptureResult,
         parameter_layout: Mapping,
         metrics: dict,
-        binding: _SourceBinding,
+        source_slots: dict[str, str],
     ) -> _StreamingSchedule:
         if not self._plan_compile_lock.acquire(blocking=False):
             raise RuntimeError("bounded plan compilation is already in progress")
@@ -763,20 +817,16 @@ class _NixlStagedTransfer:
                 owner_plan_builds=0,
             )
             started = time.perf_counter()
-            slots_by_agent = {agent: slot for slot, agent in binding.agents_by_slot.items()}
             plan = plan_transfer(
-                capture, trainer.resolved_metadata.sources,
-                source_slots={
-                    session: slots_by_agent[agent]
-                    for session, agent in trainer.resolved_metadata.session_to_agent.items()
-                },
+                capture, sources,
+                source_slots=source_slots,
                 verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST,
             )
             metrics["initial_whole_plan_s"] = time.perf_counter() - started
             modules = _bounded_batches(
                 capture,
                 parameter_layout,
-                trainer.resolved_metadata.sources,
+                sources,
                 self._buffer_budget,
                 complete_plan=plan,
                 metrics=metrics,
@@ -838,14 +888,14 @@ class _NixlStagedTransfer:
                     self.reset_workspace()
                 except Exception as cleanup_error:
                     mode = "streaming" if self._streaming is not None else "full-copy"
-                    raise ValueError(
+                    raise StrategyRecoveryError(
                         f"failed to reset {mode} preparation; restart the generator engine"
                     ) from cleanup_error
             raise
         finally:
             self._native_setup_started = False
 
-    def prepare(
+    def stage(
         self,
         *,
         manifests: list[bytes],
@@ -853,20 +903,26 @@ class _NixlStagedTransfer:
         checksums: Mapping[ShardChecksumKey, str] | None = None,
         prepare_groups: Callable[[frozenset[str]], None] | None = None,
     ) -> _PreparedNixlTransfer | _PreparedBoundedTransfer:
-        """Prepare one version-scoped transfer using this instance's staging mode."""
+        """Stage one version-scoped transfer using this instance's staging mode."""
         streaming = self._streaming
         if checksums is None:
             checksums = {}
         self._retire_previous_mesh(trainer_snapshot)
         with self._preparing():
             previous = self._weight_update_plan
+            mesh_plan = self._mesh_plan
+            if mesh_plan is not None and (
+                mesh_plan.mesh.mesh_id != trainer_snapshot.mesh_id
+                or mesh_plan.mesh.generation != trainer_snapshot.mesh_generation
+            ):
+                mesh_plan = None
             metrics = {}
             lookup_started = time.perf_counter()
             reusable = previous is not None and self._can_reuse_binding(previous, trainer_snapshot)
             metrics.update(
                 plan_cache_enabled=1,
-                plan_cache_hits=int(reusable),
-                plan_cache_misses=int(not reusable),
+                plan_cache_hits=int(reusable or mesh_plan is not None),
+                plan_cache_misses=int(not reusable and mesh_plan is None),
                 plan_cache_lookup_s=time.perf_counter() - lookup_started,
                 plan_cache_validate_s=0.0,
             )
@@ -883,6 +939,11 @@ class _NixlStagedTransfer:
                     assert (
                         self._generator_fingerprint() == capture.generator_fingerprint
                     ), "generator layout changed since capture"
+            elif mesh_plan is not None:
+                trainer = self._resolve_trainer(trainer_snapshot, manifests, metrics)
+                capture = mesh_plan.capture
+                parameter_layout = mesh_plan.parameter_layout
+                transfer_plan = mesh_plan.transfer_plan
             else:
                 trainer, capture, parameter_layout = self._resolve_layout(
                     manifests, metrics, trainer_snapshot
@@ -890,16 +951,23 @@ class _NixlStagedTransfer:
                 transfer_plan = None
 
             planning_started = time.perf_counter()
-            if previous is None:
+            if mesh_plan is not None and not reusable:
+                self._validate_mesh_sources(mesh_plan, trainer)
+            if previous is None and mesh_plan is None:
                 source_binding = self._source_binding(trainer)
+                slots_by_agent = {agent: slot for slot, agent in source_binding.agents_by_slot.items()}
+                source_slots = {
+                    session: slots_by_agent[agent]
+                    for session, agent in trainer.resolved_metadata.session_to_agent.items()
+                }
                 if streaming is None:
                     transfer_plan = self._compile_full_copy(
-                        trainer, capture, parameter_layout, metrics, source_binding
+                        trainer.resolved_metadata.sources, capture, parameter_layout, metrics, source_slots
                     )
                 else:
                     assert self._buffer_budget is not None
                     transfer_plan = self._compile_streaming(
-                        trainer, capture, parameter_layout, metrics, source_binding
+                        trainer.resolved_metadata.sources, capture, parameter_layout, metrics, source_slots
                     )
             elif self._debug_validate_plan:
                 self._validate_complete(
@@ -1013,21 +1081,17 @@ class _NixlStagedTransfer:
 
     def _compile_full_copy(
         self,
-        trainer: TrainerSourceSnapshot,
+        sources: dict,
         capture: CaptureResult,
         parameter_layout: Mapping,
         metrics: dict[str, float],
-        binding: _SourceBinding,
+        source_slots: dict[str, str],
     ) -> LogicalTransferPlan:
         started = time.perf_counter()
-        slots_by_agent = {agent: slot for slot, agent in binding.agents_by_slot.items()}
         plan = plan_transfer(
             capture,
-            trainer.resolved_metadata.sources,
-            source_slots={
-                session: slots_by_agent[agent]
-                for session, agent in trainer.resolved_metadata.session_to_agent.items()
-            },
+            sources,
+            source_slots=source_slots,
             verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST,
         )
         metrics["initial_whole_plan_s"] = time.perf_counter() - started
@@ -1395,7 +1459,7 @@ class _NixlStagedTransfer:
             lambda kind, name: buffers[kind][name].data_ptr(),
         ).descriptors
 
-    def stage(self, prepared: _PreparedNixlTransfer) -> _StagedNixlWeights:
+    def execute(self, prepared: _PreparedNixlTransfer) -> _StagedNixlWeights:
         """Pull, reconstruct, convert, and verify without touching live weights."""
         if self._closed:
             raise RuntimeError("NIXL staged transfer is closed")
@@ -1406,7 +1470,12 @@ class _NixlStagedTransfer:
             posted = prepared.transport.post_reads(list(prepared.descriptors))
             return self._complete_stage(prepared, posted, started)
         except BaseException:
-            self._invalidate_cached_transfer()
+            try:
+                self._invalidate_cached_transfer()
+            except Exception as cleanup_error:
+                raise StrategyRecoveryError(
+                    "failed to invalidate staged transfer; restart the generator engine"
+                ) from cleanup_error
             raise
 
     @torch.no_grad()
@@ -1681,6 +1750,7 @@ class _NixlStagedTransfer:
             return
         self._invalidate_descriptors()
         self._weight_update_plan = None
+        self._mesh_plan = None
         self._closed = True
         if self._owns_manager:
             self._release_staging_registrations()

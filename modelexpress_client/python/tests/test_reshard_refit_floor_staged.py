@@ -152,7 +152,7 @@ def _stage(monkeypatch, *, nbytes: int, wire_s: float):
     transfer._convert_buffers = {}
     transfer._full_buffers = {}
     transfer._active = prepared
-    return transfer.stage(prepared)
+    return transfer.execute(prepared)
 
 
 def _peer_receive(monkeypatch, *, nbytes: int, wire_s: float):

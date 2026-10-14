@@ -15,20 +15,21 @@ from typing import Any, Literal
 import grpc
 from modelexpress import auth, envs
 from modelexpress.client import _get_server_url
+from modelexpress.adapter import StrategyRecoveryError
 from modelexpress.refit.timing import RefitTimingRecorder, refit_span
 
 from modelexpress_rl import envs as rl_envs
 from modelexpress_rl import timing
-from modelexpress_rl.version import WeightVersionRef
+from modelexpress_rl.version import TrainerMeshRef, WeightVersionRef
 
 from .. import refit_pb2, refit_pb2_grpc
-from ..control import WeightVersion, WeightVersionState, _weight_version
+from ..control import TrainerMesh, WeightVersion, WeightVersionState, _mesh, _weight_version
 from ..object_storage import ObjectStorageType
 from .adapter import GeneratorEngineContext
 from .plan import StreamingSettings, WeightSource, parse_weight_source_order
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime, initialize_generator_runtime
-from .session import SessionUpdate
+from .session import StagedUpdate
 from .version_chain import resolve_replay_chain
 
 logger = logging.getLogger("modelexpress_rl.inference.client")
@@ -173,7 +174,7 @@ class StagedWeightHandle:
         *,
         client: ModelExpressGeneratorClient,
         version_id: str,
-        update: SessionUpdate | None,
+        update: StagedUpdate | None,
         timing: RefitTimingRecorder | None = None,
     ) -> None:
         self._client = client
@@ -254,6 +255,7 @@ class ModelExpressGeneratorClient:
         self._serving_version_id: str | None = None
         self._has_initial_serving_version = False
         self._engine_state = _EngineState.READY
+        self._fatal_error: StrategyRecoveryError | None = None
         self._runtime: GeneratorRuntime | None = None
         self._streaming: StreamingSettings | None = None
         self._closed = False
@@ -343,8 +345,53 @@ class ModelExpressGeneratorClient:
             raise
         return client
 
+    def prepare(self, mesh: TrainerMeshRef | None = None) -> None:
+        """Prepare reusable plans at an engine-safe point, outside an update.
+
+        A mesh prepares trainer installation and logical transfer plans. With
+        ``None``, reuse object-storage and P2P prerequisites initialized with
+        the runtime. No weight version is leased or transferred by this call.
+        """
+        errors = self._prepare(mesh)
+        if errors:
+            raise next(iter(errors.values()))
+
+    def _check_usable(self) -> None:
+        if self._closed:
+            raise RuntimeError("generator client is closed")
+        if self._fatal_error is not None:
+            raise StrategyRecoveryError(
+                "previous update left unsafe engine state; restart the generator engine"
+            ) from self._fatal_error
+
+    def _prepare(self, mesh: TrainerMeshRef | None) -> dict[WeightSource, Exception]:
+        if mesh is not None and not isinstance(mesh, TrainerMeshRef):
+            raise TypeError("mesh must be a TrainerMeshRef or None")
+        with self._operation_lock:
+            self._check_usable()
+            if self._active_handle is not None:
+                raise RuntimeError("another generator update is still active")
+            session = self._require_runtime().session
+            try:
+                if mesh is None:
+                    return session.prepare(None)
+                try:
+                    with refit_span("control_discovery"):
+                        current = self._fetch_mesh(mesh)
+                except StrategyRecoveryError:
+                    raise
+                except (grpc.RpcError, RuntimeError) as error:
+                    errors = session.prepare(None)
+                    errors[WeightSource.TRAINER] = error
+                    return errors
+                return session.prepare(current, validate_mesh=lambda: self._fetch_mesh(mesh))
+            except StrategyRecoveryError as error:
+                self._fatal_error = error
+                self._engine_state = _EngineState.UNCERTAIN
+                raise
+
     def stage_weight(self, *, version: WeightVersionRef) -> StagedWeightHandle:
-        """Prepare an exact version without installing it into the live engine.
+        """Stage an exact version without installing it into the live engine.
 
         With ``staging_buffer_bytes`` configured, reserve bounded buffers and
         prepare deferred reads. ``apply_weight`` then pipelines read/install.
@@ -355,6 +402,7 @@ class ModelExpressGeneratorClient:
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
         with self._operation_lock:
+            self._check_usable()
             active = self._active_handle
             if active is not None and active._installation_failed:
                 self._release_staged(active)
@@ -364,35 +412,29 @@ class ModelExpressGeneratorClient:
                     return active
                 raise RuntimeError("another generator update is still active")
             runtime = self._require_runtime()
-            if (
-                (
-                    runtime.initial_version_id is not None
-                    or self._has_initial_serving_version
-                )
+            already_serving = (
+                (runtime.initial_version_id is not None or self._has_initial_serving_version)
                 and version.version_id == self._serving_version_id
                 and self._engine_state is _EngineState.READY
-            ):
-                self._fetch_ready_version(
-                    version.version_id,
-                    target_version_id=version.version_id,
-                )
-                self._active_handle = StagedWeightHandle(
-                    client=self,
-                    version_id=version.version_id,
-                    update=None,
-                )
-                return self._active_handle
-            recorder = timing.start_cycle(
+            )
+            recorder = None if already_serving else timing.start_cycle(
                 version_id=version.version_id,
                 rank=rl_envs.LOCAL_RANK,
             )
             try:
                 with timing.active(recorder):
                     with refit_span("control_discovery"):
-                        ready = self._get_ready_version(version.version_id)
-                    update = runtime.session.stage(ready)
-            except BaseException:
-                # Failed preparation has no handle to report the timing later.
+                        ready = self._fetch_ready_version(
+                            version.version_id, target_version_id=version.version_id,
+                        )
+                    preparation_errors = self._prepare(ready.mesh_ref)
+                    update = None if already_serving else runtime.session.stage(
+                        ready, preparation_errors=preparation_errors,
+                    )
+            except BaseException as error:
+                if isinstance(error, StrategyRecoveryError):
+                    self._fatal_error = error
+                    self._engine_state = _EngineState.UNCERTAIN
                 timing.emit(recorder, logger)
                 raise
             self._active_handle = StagedWeightHandle(
@@ -527,11 +569,23 @@ class ModelExpressGeneratorClient:
             return True
         return False
 
-    def _get_ready_version(self, version_id: str) -> WeightVersion:
-        return self._fetch_ready_version(
-            version_id,
-            target_version_id=version_id,
+    def _fetch_mesh(self, mesh: TrainerMeshRef) -> TrainerMesh:
+        response = self._service.GetTrainerMesh(
+            refit_pb2.GetTrainerMeshRequest(mesh_id=mesh.mesh_id),
+            timeout=self._rpc_timeout_seconds,
         )
+        if not response.HasField("mesh"):
+            raise RuntimeError("MX GetTrainerMesh response is missing mesh")
+        current = response.mesh
+        if (current.mesh_id, current.generation, current.model_name) != (
+            mesh.mesh_id, mesh.generation, self.model_name,
+        ):
+            raise RuntimeError(
+                "trainer mesh identity, model, or generation differs from the requested mesh"
+            )
+        if not current.workers:
+            raise RuntimeError("trainer mesh has no workers")
+        return _mesh(current)
 
     def _fetch_ready_version(
         self,

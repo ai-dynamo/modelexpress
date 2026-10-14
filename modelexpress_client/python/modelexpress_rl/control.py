@@ -14,7 +14,7 @@ from modelexpress.client import _get_server_url
 from . import refit_pb2, refit_pb2_grpc
 from .object_storage import ObjectStorageSource, ObjectStorageType
 from .train import WeightPayloadFormat
-from .version import TrainerTensorsMetadata, WeightVersionRef
+from .version import TrainerMeshRef, TrainerTensorsMetadata, WeightVersionRef
 
 
 class WeightVersionState(str, Enum):
@@ -33,6 +33,11 @@ class TrainerMesh:
     model_name: str
     generation: int
     workers: dict[str, TrainerTensorsMetadata]
+
+    @property
+    def ref(self) -> TrainerMeshRef:
+        """Return the reference passed to generator preparation."""
+        return TrainerMeshRef(self.mesh_id, self.generation)
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,13 @@ class WeightVersion:
     def ref(self) -> WeightVersionRef:
         """Return the opaque reference passed to trainer and generator actors."""
         return WeightVersionRef(self.version_id)
+
+    @property
+    def mesh_ref(self) -> TrainerMeshRef | None:
+        """Return the trainer mesh generation associated with this version."""
+        if self.trainer_mesh_id is None:
+            return None
+        return TrainerMeshRef(self.trainer_mesh_id, self.trainer_mesh_generation)
 
 
 def _required(value: str, name: str) -> str:
