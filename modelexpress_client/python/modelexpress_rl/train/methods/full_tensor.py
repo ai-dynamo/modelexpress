@@ -175,10 +175,18 @@ class FullTensorNixlPublicationMethod:
             accumulate_metadata=True,
             duration_key="publication_rpc_s",
         ):
-            self._service().CreateWeightVersionShard(
-                refit_pb2.CreateWeightVersionShardRequest(shard=shard),
-                timeout=self._rpc_timeout_seconds,
-            )
+            try:
+                self._service().CreateWeightVersionShard(
+                    refit_pb2.CreateWeightVersionShardRequest(shard=shard),
+                    timeout=self._rpc_timeout_seconds,
+                )
+            except BaseException:
+                if record is not None and version.version_id not in self.published:
+                    self._manifest_publisher.release_version_metadata(
+                        version_id=version.version_id,
+                        logical_shard_id=logical_shard_id,
+                    )
+                raise
         self.published.setdefault(version.version_id, []).append(staged)
 
     def release(self, *, version: WeightVersionRef) -> None:

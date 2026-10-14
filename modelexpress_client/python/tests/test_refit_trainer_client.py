@@ -732,3 +732,45 @@ def test_failed_metadata_replacement_can_recover_old_or_new_storage(
     )
     assert json.loads(response.metadata)["storage_revision"] == retry_revision
     assert recovered.version_id == "version-b"
+
+
+@pytest.mark.parametrize("already_published", [False, True])
+def test_rejected_registration_releases_only_unpublished_version_metadata(
+    lifecycle_trainer: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+    already_published: bool,
+) -> None:
+    case = lifecycle_trainer
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    version = WeightVersionRef("version-a")
+    request = refit_pb2.GetWeightVersionShardMetadataRequest(
+        version_id=version.version_id, logical_shard_id=case.adapter.logical_shard_id,
+    )
+    if already_published:
+        case.trainer.publish_version(version=version)
+        original = case.worker.GetWeightVersionShardMetadata(request)
+
+    with monkeypatch.context() as rejected:
+        rejected.setattr(case.service, "registrations", {})
+        with pytest.raises(grpc.RpcError) as error:
+            case.trainer.publish_version(version=version)
+        assert error.value.code() is grpc.StatusCode.FAILED_PRECONDITION
+        assert error.value.details() == "worker not registered"
+
+    if already_published:
+        assert case.worker.GetWeightVersionShardMetadata(request) == original
+    else:
+        with pytest.raises(grpc.RpcError) as missing:
+            case.worker.GetWeightVersionShardMetadata(request)
+        assert missing.value.code() is grpc.StatusCode.NOT_FOUND
+
+    case.trainer.release_version(version=version)
+    case.service.mesh_generation = 2
+    case.adapter.metadata_revision = 1
+    case.trainer.publish_version(version=WeightVersionRef("version-b"))
+    recovered = case.service.shards[-1]
+    assert recovered.version_id == "version-b"
+    assert case.worker.GetWeightVersionShardMetadata(
+        refit_pb2.GetWeightVersionShardMetadataRequest(
+            version_id="version-b", logical_shard_id=case.adapter.logical_shard_id,
+        )
+    ).metadata.stable_metadata_digest == recovered.stable_metadata_digest
