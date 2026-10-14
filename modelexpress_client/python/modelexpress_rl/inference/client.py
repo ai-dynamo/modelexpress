@@ -73,7 +73,8 @@ class ModelExpressGeneratorConfig:
     staging_buffer_bytes: int | None = None
     # One arena serializes reads and installs; two allow their overlap.
     staging_buffers_count: int = 1
-    # Receive arenas use CUDA memory or pinned host memory.
+    # Receive arenas use the engine accelerator's memory ("cuda", for CUDA or
+    # XPU) or pinned host memory.
     staging_device: Literal["cuda", "cpu"] = "cuda"
     # Canonical object-storage checkpoint settings.
     object_storage: ObjectStorageGeneratorConfig | None = None

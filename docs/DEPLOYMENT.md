@@ -1548,7 +1548,8 @@ post-load workspaces and live weights require additional headroom; the limit is
 not a total process-memory cap.
 
 `staging_device` selects where the arenas live. `"cuda"` (default) lands RDMA
-in VRAM and commits with a device copy. `"cpu"` allocates pinned host memory,
+in the engine accelerator's device memory, CUDA or XPU,
+and commits with a device copy. `"cpu"` allocates pinned host memory,
 registers it as NIXL DRAM, and commits with a host-to-device copy, so the arena
 costs no VRAM. Host staging adds a host-to-device copy and depends on the
 available host-memory and CPU-to-GPU bandwidth. `staging_buffers_count=2` posts the
@@ -1589,7 +1590,7 @@ Streaming reports independent `streaming_total_s`, `streaming_prepare_s`,
 `source_metadata_s`, `layout_capture_s`, `transfer_planning_s`, and
 `connection_registration_s`; the remaining preparation time includes version
 discovery and lease/control operations. Application contains NIXL `wire_s`,
-`reconstruct_s`, `install_commit_s` (including CUDA completion), `reload_s`, and
+`reconstruct_s`, `install_commit_s` (including device completion), `reload_s`, and
 `post_install_sync_s`. In the generic installer, vLLM's post-load processing
 refreshes attention-derived weights within `reload_s`. The ordinary
 `perf/mx_receive_install_time` is not emitted for streaming installation because
@@ -1597,7 +1598,7 @@ its application interval includes network reads. With refit timing enabled,
 DIRECT updates emit the same stage record as staged updates. The installation
 stage's `materialization_s`, `receive_copy_s`, and `post_load_processing_s`
 metadata report host-call durations inside the native engine lifecycle. They
-exclude subsequent CUDA completion waits and are not standalone GPU latencies.
+exclude subsequent device completion waits and are not standalone GPU latencies.
 Do not sum nested parent and child intervals or maxima from different ranks.
 Preserve raw samples and expose residual/unattributed time against the independent
 total rather than describing the entire streaming operation as wire or install.

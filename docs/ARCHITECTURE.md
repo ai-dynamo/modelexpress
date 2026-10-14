@@ -645,13 +645,15 @@ geometry, and framework orchestration independently replaceable.
 `ModelExpressGeneratorConfig.staging_buffer_bytes` sets bounded-streaming
 capacity per arena, and `staging_buffers_count` defaults to one. The streaming
 client uses their product as its total staging limit. `staging_device` selects
-CUDA or pinned host receive memory.
+accelerator (`"cuda"`, for CUDA or XPU) or pinned host receive memory.
 
 The `stage_weight()` / `apply_weight()` generator APIs hold a version lease
 across metadata preparation and incremental installation. The NIXL receiver
 plans complete owning-module batches and uses
-one or two registered byte arenas (`staging_buffers`) on CUDA or pinned host
-memory (`staging_device`). Receive tensors, wire-dtype conversion buffers,
+one or two registered byte arenas (`staging_buffers`) on the accelerator or pinned
+host memory (`staging_device`). Its owned NIXL agent, registered-buffer allocation
+scope, and completion fences come from the engine device's `AcceleratorBackend`,
+so CUDA and XPU generators share one path. Receive tensors, wire-dtype conversion buffers,
 full-source reconstruction buffers, and alignment all count toward each
 buffer's capacity. With two arenas the READ for batch
 `i + 1` is posted before batch `i` is yielded for commit, allowing asynchronous
@@ -1161,7 +1163,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 |--------|---------|
 | `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `modelexpress` and `mx` loaders with vLLM |
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
-| `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
+| `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled, falls back to generic per-tensor NIXL registration, and requires no classic-allocator pool for registered buffers. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `refit/` | Engine-agnostic live-refit primitives. `RefitTimingRecorder` provides normalized stage timing; `reshard/` provides loader-observed geometry capture, slice/transfer planning, rendezvous, and transport abstractions |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
@@ -1347,6 +1349,35 @@ same publisher lifecycle to stop the heartbeat and best-effort mark the source
 STALE. Long-lived framework integrations still need to call `close()` from
 their lifecycle; SIGKILL and mid-transfer failure recovery remain follow-up
 work.
+
+The receiver's device-specific work goes through `AcceleratorBackend` rather than
+`torch.cuda` directly: per-stage synchronization, the backend handed to
+`NixlTransferManager`, and the allocation scope for its receive and staging
+buffers. `registered_buffer_alloc_scope()` selects that scope from
+`requires_classic_alloc_pool()`, which states a requirement rather than a
+capability. CUDA requires it and XPU does not: CUDA uses the
+classic-`cudaMalloc` pool in `reshard/cuda_pool.py` because its caching allocator
+under `expandable_segments:True` can return VMM ranges that register successfully
+but fail during RDMA WRITE when `nvidia_peermem` cannot pin the underlying pages
+(that module's docstring records the exact failure signature). XPU uses its normal
+allocator because no equivalent hazard is known or has been observed on XPU.
+Successful XPU registration does not prove the WRITE-time hazard absent, so ruling
+it out would take a real RDMA write into an XPU buffer allocated under an
+expandable-segment equivalent. `torch.xpu` does expose `MemPool` and
+`XPUPluggableAllocator`, so an alternate XPU pool could be implemented if that
+test ever says one is needed.
+
+The receiver applies no publisher/target accelerator compatibility policy, and
+this is a known gap rather than a decision that cross-family refit is safe. The
+rendezvous identity deliberately carries no accelerator (the receiver builds it
+to *discover* the trainer, before it knows anything the trainer served) and the
+shard table carries no publisher family, so `accelerators_compatible` has nothing
+to compare on this path. No pairing is rejected on accelerator-family grounds;
+other NIXL, fabric, or model-geometry constraints may still prevent transfer.
+Closing the gap means
+publishing the source family in the shard table and comparing both endpoints
+through that gate; a target-only check would be unable to express the constraint,
+since compatibility is a property of the source-target pair.
 
 `modelexpress_rl/inference/nixl_staged_transfer.py` owns exact-manifest planning,
 trainer staging buffers, direct generator-peer transfer, and verification. The
@@ -1836,7 +1867,7 @@ admission tables or attention-specific weight transformations.
 Receive-arena tensors are never attached to the model or passed to post-load
 callbacks. The copy boundary requires ordinary Tensor storage views and rejects
 custom dispatch modes instead of bypassing their semantics. A callback may retain an engine-owned tensor without preventing arena
-reuse. CUDA completion is still required before the next READ overwrites an
+reuse. Device completion is still required before the next READ overwrites an
 arena. This ownership boundary removes receive-retention scans; it does not
 remove checks that a callback changed another module or a shared parameter.
 
