@@ -19,6 +19,7 @@ import zstandard
 from safetensors.torch import load_file, save_file
 
 from modelexpress import p2p_pb2
+from modelexpress.adapter import StrategyRecoveryError
 from modelexpress_rl import (
     ModelExpressGeneratorClient,
     ObjectStorageGeneratorConfig,
@@ -204,7 +205,7 @@ class _Adapter:
             state=WeightVersionState.READY,
             created_at_unix_ms=0,
         )
-        self._active = self._method.prepare(
+        self._active = self._method.stage(
             version=version,
             source=ObjectStorageUpdateSource(
                 storage=inputs.object_storage,
@@ -236,7 +237,7 @@ class _Adapter:
                     ),
                 )
             )
-        self._active = self._method.prepare_chain(tuple(chain))
+        self._active = self._method.stage_chain(tuple(chain))
         return self._active.checkpoint
 
     def apply_weight(self, staged):
@@ -636,12 +637,10 @@ def test_p2p_startup_s3_bootstrap_retries_without_activating(
     try:
         with pytest.raises(RuntimeError, match="requires a full replay root"):
             adapter.stage_weight(_inputs(None))
-        adapter._method.preparation_failed()
         assert storage.calls == []
         storage.fail_key_once = "s3://weights/test/v2/model-00001-of-00001.safetensors"
         with pytest.raises(RuntimeError, match="full HF checkpoint download failed"):
             adapter.stage_weight(_full_inputs())
-        adapter._method.preparation_failed()
         assert adapter._method.requires_full_root
         assert not store.active_path.exists()
         staged = adapter.stage_weight(_full_inputs())
@@ -2279,7 +2278,7 @@ def test_replay_base_requires_the_same_source_identity(monkeypatch, tmp_path):
     adapter.close()
 
 
-def test_canonical_s3_in_place_delta_failure_requires_recovery(
+def test_canonical_s3_in_place_delta_failure_recovers_checkpoint(
     monkeypatch, tmp_path
 ):
     base = torch.tensor([1.0, 2.0])
@@ -2322,13 +2321,6 @@ def test_canonical_s3_in_place_delta_failure_requires_recovery(
     assert not first_path.exists()
     assert second_path.exists()
     assert adapter._checkpoint.store.active_version() == "target-a"
-    assert (
-        adapter._checkpoint.store.state().status
-        is checkpoint_store_module.CheckpointState.UPDATING
-    )
-
-    adapter._method.preparation_failed()
-
     state = adapter._checkpoint.store.state()
     assert state.status is checkpoint_store_module.CheckpointState.READY
     assert state.version == "base-a"
@@ -2810,7 +2802,7 @@ def test_canonical_s3_requires_exact_full_checkpoint_tensor_set(
         for name, tensor in launch_tensors.items()
     )
     state = json.loads(adapter._checkpoint.store.state_path.read_text())
-    assert state["status"] == "UPDATING"
+    assert state["status"] == "READY"
     adapter.close()
 
 
@@ -2852,7 +2844,7 @@ def test_canonical_s3_rejects_incompatible_full_checkpoint_tensor_metadata(
         local_tensor,
     )
     state = json.loads(adapter._checkpoint.store.state_path.read_text())
-    assert state["status"] == "UPDATING"
+    assert state["status"] == "READY"
     adapter.close()
 
 
@@ -2890,7 +2882,7 @@ def test_canonical_s3_rejects_incompatible_full_checkpoint_byte_size(
     adapter.close()
 
 
-def test_canonical_s3_full_download_failure_leaves_checkpoint_updating(
+def test_canonical_s3_full_download_failure_recovers_for_retry(
     monkeypatch, tmp_path
 ):
     objects = _full_artifact(torch.tensor([7.0, 8.0]))
@@ -2902,7 +2894,7 @@ def test_canonical_s3_full_download_failure_leaves_checkpoint_updating(
         adapter.stage_weight(_full_inputs())
 
     state = json.loads(adapter._checkpoint.store.state_path.read_text())
-    assert state["status"] == "UPDATING"
+    assert state["status"] == "READY"
     assert state["version"] == "base-a"
     assert torch.equal(
         load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")["weight"],
@@ -2910,12 +2902,12 @@ def test_canonical_s3_full_download_failure_leaves_checkpoint_updating(
     )
     assert not (adapter._checkpoint.store.full_cache / "full-a.tmp").exists()
 
-    with pytest.raises(RuntimeError, match="update is incomplete"):
-        adapter.stage_weight(_full_inputs())
+    staged = adapter.stage_weight(_full_inputs())
+    adapter.release_staged_weight(staged)
     adapter.close()
 
 
-def test_canonical_s3_midstream_failure_leaves_cache_failed_closed(
+def test_canonical_s3_midstream_failure_recovers_cache(
     monkeypatch, tmp_path
 ):
     target = {
@@ -2961,13 +2953,13 @@ def test_canonical_s3_midstream_failure_leaves_cache_failed_closed(
         adapter.stage_weight(_full_inputs())
 
     state = json.loads(adapter._checkpoint.store.state_path.read_text())
-    assert state["status"] == "UPDATING"
+    assert state["status"] == "READY"
     assert state["version"] == "base-a"
     checkpoint = load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")
     assert torch.equal(checkpoint["a"], torch.tensor([1.0]))
     assert torch.equal(checkpoint["b"], torch.tensor([2.0]))
     assert not (adapter._checkpoint.store.full_cache / "full-a").exists()
-    with pytest.raises(RuntimeError, match="update is incomplete"):
+    with pytest.raises(RuntimeError, match="full HF checkpoint download failed"):
         adapter.stage_weight(_full_inputs())
     adapter.close()
 
@@ -2992,21 +2984,14 @@ def test_canonical_s3_final_state_failure_leaves_checkpoint_updating(
 
     monkeypatch.setattr(adapter._checkpoint.store, "write_state", fail_ready_state)
 
-    with pytest.raises(OSError, match="state failed"):
+    with pytest.raises(StrategyRecoveryError, match="could not recover.*state failed"):
         adapter.stage_weight(_full_inputs())
 
     state = json.loads(adapter._checkpoint.store.state_path.read_text())
     assert state["status"] == "UPDATING"
     assert state["version"] == "base-a"
-    with pytest.raises(RuntimeError, match="update is incomplete"):
+    with pytest.raises(StrategyRecoveryError, match="could not recover"):
         adapter.stage_weight(_full_inputs())
-    assert torch.equal(
-        load_file(
-            adapter._checkpoint.local_checkpoint
-            / "model-00001-of-00001.safetensors"
-        )["weight"],
-        torch.tensor([7.0, 8.0]),
-    )
     assert not (adapter._checkpoint.store.full_cache / "full-a.tmp").exists()
     adapter.close()
 
@@ -3269,7 +3254,7 @@ def test_reconstructed_checksum_failure_propagates(monkeypatch, tmp_path):
         adapter.stage_weight(_inputs(root))
 
     failed_state = json.loads(adapter._checkpoint.store.state_path.read_text())
-    assert failed_state["status"] == "UPDATING"
+    assert failed_state["status"] == "READY"
     assert failed_state["version"] == "base-a"
 
     recovered, _ = _build(monkeypatch, tmp_path, objects)
@@ -3334,7 +3319,7 @@ def test_malformed_delta_shard_reports_context(
 
     assert filename in str(raised.value)
     state = json.loads(adapter._checkpoint.store.state_path.read_text())
-    assert state["status"] == "UPDATING"
+    assert state["status"] == "READY"
     assert state["version"] == "base-a"
 
 
@@ -3351,7 +3336,7 @@ def test_wrong_base_fails_before_s3_download(monkeypatch, tmp_path):
     assert storage.calls == []
 
 
-def test_child_download_failure_leaves_checkpoint_updating(
+def test_child_download_failure_recovers_for_retry(
     monkeypatch,
     tmp_path,
 ):
@@ -3367,10 +3352,10 @@ def test_child_download_failure_leaves_checkpoint_updating(
         adapter.stage_weight(_inputs(objects[root_key]))
 
     state = json.loads(adapter._checkpoint.store.state_path.read_text())
-    assert state["status"] == "UPDATING"
+    assert state["status"] == "READY"
     assert state["version"] == "base-a"
-    with pytest.raises(RuntimeError, match="update is incomplete"):
-        adapter.stage_weight(_inputs(objects[root_key]))
+    staged = adapter.stage_weight(_inputs(objects[root_key]))
+    adapter.release_staged_weight(staged)
 
 
 def test_corrupt_zstd_fails_before_checkpoint_mutation(monkeypatch, tmp_path):
@@ -3390,7 +3375,7 @@ def test_corrupt_zstd_fails_before_checkpoint_mutation(monkeypatch, tmp_path):
         adapter.stage_weight(_inputs(objects[root_key]))
 
     state = json.loads(adapter._checkpoint.store.state_path.read_text())
-    assert state["status"] == "UPDATING"
+    assert state["status"] == "READY"
     assert state["version"] == "base-a"
 
 

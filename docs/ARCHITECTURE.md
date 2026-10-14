@@ -657,13 +657,51 @@ storage. Receive-arena views are never passed to engine callbacks. For trainer
 sources without bounded staging configured, `stage_weight()` transfers a full
 independent copy before installation.
 
-The logical plan is cached for one mesh ID and generation and contains only the
-shard groups needed by the generator. Groups list all replicas in worker-ID
-order; metadata is fetched lazily when a published replica is selected.
-Changing replicas rebinds physical sources without recompiling logical reads.
-A mesh change rebuilds the logical plan. Native preparation failures discard
-physical state while retaining the logical plan; each update has fresh checksums
-and a lease.
+`TrainerMeshRef` is an immutable reference containing a mesh ID and generation;
+`TrainerMesh.ref` returns that reference, and `WeightVersion.mesh_ref` returns the
+reference recorded by a mesh-backed version or `None` for an object-storage version.
+
+```python
+mesh = control.create_trainer_mesh(...)
+generator.prepare(mesh=mesh.ref)
+```
+
+`generator.prepare(mesh: TrainerMeshRef | None = None) -> None` prepares reusable
+state; `stage_weight()` also calls it for the version's `WeightVersion.mesh_ref`. The client fetches and
+validates the requested mesh identity, model, and exact generation, then passes
+the resolved `TrainerMesh` and a callback that rechecks the reference to session
+preparation. The mesh-aware method invokes that callback again before retaining
+the compiled plan. The planner selects compatible source and method pairs;
+trainer preparation asks the trainer resolver for logical binding manifests through the existing
+`GetTrainerShardMetadata(logical_shard_id digest)` RPC and prepares logical
+layout and transfer plans, including bounded-transfer plans, before weight
+publication. The logical plan is cached by mesh ID and generation and identifies
+the source slots needed by the generator. Manifest discovery tries replicas in
+worker-ID order. Reusing a mesh key reuses its plans after revalidating the mesh;
+changing the mesh key rebuilds them. Preparation does not acquire a version
+lease or transfer weights. Per-staging-version leases, physical metadata,
+checksums, and source binding still happen while staging that version.
+
+The session visits configured source kinds in fallback order, calling
+`planner.prepare(..., source_kind=...)` and collecting recoverable errors.
+The planner selects compatible methods and passes the resolver's
+`prepare_inputs(**kwargs)` result to `UpdateMethod.prepare(inputs)`.
+Only the trainer resolver requires a mesh; it returns
+`TrainerPreparationInputs`. Other resolvers currently return `None`.
+
+Call preparation at an engine safe point: geometry capture temporarily rewires
+live parameters and restores them afterward. An active update handle prevents
+preparation. Explicit preparation surfaces failures; automatic preparation
+allows configured source fallback. Unsafe cleanup errors fence the client.
+Calling `prepare()` without a mesh prepares only non-trainer sources and
+preserves the trainer cache.
+
+`UpdateMethod.stage(version, source)` stages one version, while
+`stage_chain(chain)` handles replay. Methods recover their own failed staging
+attempts; the planner bounds candidate retries. `_NixlStagedTransfer.stage(...)`
+binds physical sources to cached logical reads, and `execute(prepared)`
+performs the full transfer. The resulting `StagedUpdate` owns the version
+leases through apply or release.
 
 `MX_REFIT_PREFETCH_REPLICA_METADATA` fetches all needed replicas up front.
 `MX_REFIT_DEBUG_VALIDATE_REPLICAS` checks equivalent canonical coverage.

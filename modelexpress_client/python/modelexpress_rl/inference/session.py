@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,12 +16,10 @@ from modelexpress.refit.timing import refit_span
 from modelexpress.adapter import StrategyRecoveryError
 from modelexpress.types import ManifestMismatchError
 
-from ..control import WeightVersion
+from ..control import TrainerMesh, WeightVersion
 from .plan import (
     PreparedArtifact,
     PreparedStreamingTensors,
-    StreamingSettings,
-    UpdateMethod,
     WeightSource,
     WeightUpdatePlan,
     WeightUpdatePlanner,
@@ -28,10 +27,12 @@ from .plan import (
 
 logger = logging.getLogger("modelexpress_rl.inference.session")
 
+_RECOVERABLE_ERRORS = (grpc.RpcError, RuntimeError, ManifestMismatchError)
+
 
 @dataclass
-class SessionUpdate:
-    """Active prepared update and its protected version lease."""
+class StagedUpdate:
+    """One staged update and its protected version leases."""
 
     plan: WeightUpdatePlan
     prepared: PreparedArtifact
@@ -63,10 +64,10 @@ class _LeaseGroup:
 class WeightUpdateSession:
     """Coordinate one rank-local generator update across composed modules.
 
-    The session owns the version lease and update lifecycle, but no engine-
-    specific behavior. ``stage`` prepares one target from a selected source.
+    The session owns reusable preparation, version leases, and the update
+    lifecycle, but no engine-specific behavior. ``stage`` stages one target from a selected source.
     Object storage targets are first expanded into an ordered replay chain;
-    other sources retain the planner's candidate retry and fallback behavior.
+    other sources use candidate retries and source fallback.
     During ``apply`` the session installs the prepared artifact at the caller's
     safe point. ``release`` ends update ownership and closes its lease. If
     streaming cleanup is unproven, resources and the lease remain retained
@@ -86,47 +87,64 @@ class WeightUpdateSession:
         *,
         planner: WeightUpdatePlanner,
         start_lease: Callable[[str], Any],
-        streaming: StreamingSettings | None = None,
         resolve_replay_chain: Callable[[WeightVersion], tuple[WeightVersion, ...]]
         | None = None,
     ) -> None:
-        self._streaming = streaming
         self._planner = planner
         self._start_lease = start_lease
         self._resolve_replay_chain = resolve_replay_chain
 
+    def prepare(
+        self,
+        mesh: TrainerMesh | None,
+        validate_mesh: Callable[[], object] | None = None,
+    ) -> dict[WeightSource, Exception]:
+        """Return recoverable source failures; unsafe engine state remains fatal."""
+        errors = {}
+        for source_kind in self._planner.source_order:
+            try:
+                self._planner.prepare(
+                    mesh, source_kind=source_kind, validate_mesh=validate_mesh,
+                )
+            except StrategyRecoveryError:
+                raise
+            except _RECOVERABLE_ERRORS as error:
+                errors[source_kind] = error
+        return errors
+
     def stage(
         self,
         version: WeightVersion,
-    ) -> SessionUpdate:
-        """Prepare one target and retain its leases until apply or release."""
+        *,
+        preparation_errors: dict[WeightSource, Exception] | None = None,
+    ) -> StagedUpdate:
+        """Stage one target and retain its leases until installation or release."""
         source_order = self._planner.source_order
         if not source_order:
             raise RuntimeError("no refit source is configured")
-        for source_kind in source_order[:-1]:
+        for index, source_kind in enumerate(source_order):
             try:
+                if preparation_errors and source_kind in preparation_errors:
+                    raise preparation_errors[source_kind]
                 return self._stage_source(version, source_kind=source_kind)
             except StrategyRecoveryError:
                 raise
-            except (
-                grpc.RpcError,
-                RuntimeError,
-                ManifestMismatchError,
-            ) as error:
+            except _RECOVERABLE_ERRORS as error:
+                if index == len(source_order) - 1:
+                    raise
                 logger.info(
                     "ModelExpress active refit version=%s source=%s unavailable: %s",
                     version.version_id,
                     source_kind.value,
                     error,
                 )
-        return self._stage_source(version, source_kind=source_order[-1])
 
     def _stage_source(
         self,
         version: WeightVersion,
         *,
         source_kind: WeightSource,
-    ) -> SessionUpdate:
+    ) -> StagedUpdate:
         logger.info(
             "ModelExpress active refit version=%s trying source=%s",
             version.version_id,
@@ -150,25 +168,32 @@ class WeightUpdateSession:
         self,
         version: WeightVersion,
         *,
-        source_kind: WeightSource | None = None,
-    ) -> SessionUpdate:
-        with refit_span("setup_registration"):
-            lease = self._start_lease(version.version_id)
+        source_kind: WeightSource,
+    ) -> StagedUpdate:
+        with self._lease_versions((version,)) as lease:
+            plan, prepared = self._stage_candidates(version, source_kind=source_kind)
+            return StagedUpdate(plan=plan, prepared=prepared, lease=lease)
+
+    @contextmanager
+    def _lease_versions(self, versions: tuple[WeightVersion, ...]) -> Iterator[_LeaseGroup]:
+        leases = []
+        group = _LeaseGroup(leases)
         try:
-            plan, prepared = self._prepare_candidates(version, source_kind=source_kind)
-            return SessionUpdate(plan=plan, prepared=prepared, lease=lease)
+            with refit_span("setup_registration"):
+                for version in versions:
+                    leases.append(self._start_lease(version.version_id))
+            yield group
         except BaseException as primary_error:
-            self._close_lease(lease, version.version_id, primary_error)
+            self._close_lease(group, versions[-1].version_id, primary_error)
             raise
 
-    def _prepare_candidates(
+    def _stage_candidates(
         self,
         version: WeightVersion,
         *,
-        source_kind: WeightSource | None,
+        source_kind: WeightSource,
     ) -> tuple[WeightUpdatePlan, PreparedArtifact]:
-        last_error: BaseException | None = None
-        streaming = self._streaming is not None and source_kind is WeightSource.TRAINER
+        last_error: Exception | None = None
         for plan in self._planner.plans(version, source_kind=source_kind):
             logger.info(
                 "ModelExpress weight update version=%s trying source=%s method=%s installer=%s",
@@ -178,15 +203,13 @@ class WeightUpdateSession:
                 type(plan.installer).__name__,
             )
             try:
-                prepared = plan.method.prepare(version=version, source=plan.source)
-            except (grpc.RpcError, RuntimeError, ManifestMismatchError) as error:
-                if not streaming:
-                    if isinstance(error, StrategyRecoveryError):
-                        raise
-                    self._recover_preparation(plan.method, error)
+                prepared = plan.method.stage(version=version, source=plan.source)
+            except StrategyRecoveryError:
+                raise
+            except _RECOVERABLE_ERRORS as error:
                 last_error = error
                 logger.warning(
-                    "ModelExpress weight update version=%s preparation failed source=%s method=%s error=%s",
+                    "ModelExpress weight update version=%s staging failed source=%s method=%s error=%s",
                     version.version_id,
                     plan.source.kind.value,
                     type(plan.method).__name__,
@@ -194,7 +217,7 @@ class WeightUpdateSession:
                 )
                 continue
             logger.info(
-                "ModelExpress weight update version=%s prepared source=%s method=%s",
+                "ModelExpress weight update version=%s staged source=%s method=%s",
                 version.version_id,
                 plan.source.kind.value,
                 type(plan.method).__name__,
@@ -202,8 +225,6 @@ class WeightUpdateSession:
             return plan, prepared
         if last_error is not None:
             raise last_error
-        if streaming:
-            raise RuntimeError("no NIXL trainer plan supports bounded streaming")
         raise RuntimeError(
             f"no usable refit source for weight version {version.version_id!r}"
         )
@@ -211,8 +232,8 @@ class WeightUpdateSession:
     def _stage_replay_chain(
         self,
         versions: tuple[WeightVersion, ...],
-    ) -> SessionUpdate:
-        """Prepare an already-resolved base-to-target chain atomically."""
+    ) -> StagedUpdate:
+        """Stage an already-resolved base-to-target chain atomically."""
         if not versions:
             raise ValueError("version chain is empty")
         if len(versions) == 1:
@@ -220,18 +241,7 @@ class WeightUpdateSession:
                 versions[0],
                 source_kind=WeightSource.OBJECT_STORAGE,
             )
-        leases = []
-        try:
-            with refit_span("setup_registration"):
-                for version in versions:
-                    leases.append(self._start_lease(version.version_id))
-        except BaseException as primary_error:
-            self._close_lease(
-                _LeaseGroup(leases), versions[-1].version_id, primary_error
-            )
-            raise
-        lease_group = _LeaseGroup(leases)
-        try:
+        with self._lease_versions(versions) as lease_group:
             plans = []
             for version in versions:
                 try:
@@ -254,36 +264,16 @@ class WeightUpdateSession:
                 for plan in plans
             ):
                 raise RuntimeError("version replay chain requires one update method")
-            try:
-                prepared = target_plan.method.prepare_chain(
-                    tuple((plan.version, plan.source) for plan in plans)
-                )
-            except BaseException as error:
-                self._recover_preparation(target_plan.method, error)
-                raise
-            return SessionUpdate(
+            prepared = target_plan.method.stage_chain(
+                tuple((plan.version, plan.source) for plan in plans)
+            )
+            return StagedUpdate(
                 plan=target_plan,
                 prepared=prepared,
                 lease=lease_group,
             )
-        except BaseException as primary_error:
-            self._close_lease(lease_group, versions[-1].version_id, primary_error)
-            raise
 
-    @staticmethod
-    def _recover_preparation(
-        method: UpdateMethod,
-        primary_error: BaseException,
-    ) -> None:
-        try:
-            method.preparation_failed()
-        except Exception as recovery_error:
-            raise StrategyRecoveryError(
-                f"{type(method).__name__} could not recover after preparation "
-                f"failed: {primary_error}"
-            ) from recovery_error
-
-    def apply(self, update: SessionUpdate) -> Any:
+    def apply(self, update: StagedUpdate) -> Any:
         if update.released:
             raise RuntimeError("staged weight has already been released")
         if update.applied:
@@ -339,7 +329,7 @@ class WeightUpdateSession:
                     primary_error,
                 )
 
-    def release(self, update: SessionUpdate) -> None:
+    def release(self, update: StagedUpdate) -> None:
         if update.released:
             return
         if (
@@ -386,4 +376,4 @@ class WeightUpdateSession:
             )
 
 
-__all__ = ["SessionUpdate", "WeightUpdateSession"]
+__all__ = ["StagedUpdate", "WeightUpdateSession"]

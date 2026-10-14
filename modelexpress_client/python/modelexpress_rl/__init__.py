@@ -23,7 +23,7 @@ from .train import (
     WeightPayloadFormat,
 )
 from .object_storage import ObjectStorageSource, ObjectStorageType
-from .version import TrainerTensorsMetadata, WeightVersionRef
+from .version import TrainerMeshRef, TrainerTensorsMetadata, WeightVersionRef
 
 __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     # Framework-facing clients.
@@ -47,6 +47,7 @@ __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     "ObjectStorageSource",
     "ObjectStorageType",
     "TrainerMesh",
+    "TrainerMeshRef",
     "TrainerTensorsMetadata",
     "WeightVersion",
     "WeightVersionRef",

@@ -465,7 +465,7 @@ def test_desired_s3_loads_materialized_checkpoint(monkeypatch, tmp_path):
     loaded = LoadResult(value=nn.Linear(1, 1))
     method = MagicMock()
     method.installation_context.return_value = nullcontext()
-    method.prepare_chain.return_value = SimpleNamespace(
+    method.stage_chain.return_value = SimpleNamespace(
         checkpoint=SimpleNamespace(path=Path("/cache/delta"))
     )
     s3 = MagicMock()
@@ -488,11 +488,11 @@ def test_desired_s3_loads_materialized_checkpoint(monkeypatch, tmp_path):
     load_uri.assert_called_once_with(result, ctx, "/cache/delta")
     assert ctx.identity.revision == "delta"
     method.installation_context.assert_called_once_with(
-        method.prepare_chain.return_value,
+        method.stage_chain.return_value,
         activate=False,
     )
-    method.activate.assert_called_once_with(method.prepare_chain.return_value)
-    method.release.assert_called_once_with(method.prepare_chain.return_value)
+    method.activate.assert_called_once_with(method.stage_chain.return_value)
+    method.release.assert_called_once_with(method.stage_chain.return_value)
     method.close.assert_called_once()
     s3.close.assert_called_once()
 
@@ -515,7 +515,7 @@ def test_desired_s3_does_not_activate_until_every_rank_loads(monkeypatch, tmp_pa
     result = LoadResult(value=nn.Linear(1, 1))
     method = MagicMock()
     method.installation_context.return_value = nullcontext()
-    method.prepare_chain.return_value = SimpleNamespace(
+    method.stage_chain.return_value = SimpleNamespace(
         checkpoint=SimpleNamespace(path=Path("/cache/delta"))
     )
 
@@ -525,7 +525,7 @@ def test_desired_s3_does_not_activate_until_every_rank_loads(monkeypatch, tmp_pa
     ), patch.object(
         DesiredVersionS3Strategy,
         "_prepare",
-        return_value=(method, method.prepare_chain.return_value),
+        return_value=(method, method.stage_chain.return_value),
     ), patch.object(
         DesiredVersionS3Strategy,
         "load_uri",
@@ -567,14 +567,14 @@ def test_desired_s3_only_local_leader_activates(monkeypatch, tmp_path):
     result = LoadResult(value=nn.Linear(1, 1))
     method = MagicMock()
     method.installation_context.return_value = nullcontext()
-    method.prepare_chain.return_value = SimpleNamespace(
+    method.stage_chain.return_value = SimpleNamespace(
         checkpoint=SimpleNamespace(path=Path("/cache/delta"))
     )
 
     def prepare(*_args):
         """Record an unexpected follower preparation attempt."""
         events.append("prepare")
-        return method, method.prepare_chain.return_value
+        return method, method.stage_chain.return_value
 
     with patch(
         "modelexpress_rl.inference.load_strategy._resolve_s3_replay_chain",

@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from modelexpress import p2p_pb2
 
-from ..control import WeightVersion
+from ..control import TrainerMesh, WeightVersion
+from ..version import TrainerMeshRef
 from ..object_storage import ObjectStorageSource
 from ..train.manifest import ShardChecksumKey
 from ..train import WeightPayloadFormat
@@ -229,6 +230,8 @@ class PreparedCheckpointArtifact(PreparedArtifact):
 class SourceResolver(ABC):
     """Resolve one class of source without transferring weight bytes."""
 
+    needs_mesh: bool = False
+
     @property
     @abstractmethod
     def kind(self) -> WeightSource:
@@ -242,38 +245,46 @@ class SourceResolver(ABC):
     def payload_format(self, version: WeightVersion) -> WeightPayloadFormat:
         """Return the payload representation produced for this version."""
 
+    def prepare_inputs(self, **kwargs: Any) -> Any:
+        """Resolve source-specific method inputs, or None when none are needed."""
+        return None
+
     @abstractmethod
     def candidates(self, version: WeightVersion) -> Iterator[ResolvedSource]:
         """Yield verified candidates in fallback order."""
 
 
 class UpdateMethod(ABC):
-    """Prepare an update and protect method state while the engine applies it."""
+    """Stage an update and protect method state while the engine applies it."""
 
     @property
     @abstractmethod
     def capabilities(self) -> MethodCapabilities:
         """Return the combinations implemented by this method."""
 
-    def supports(
+    @property
+    def prepared_mesh(self) -> TrainerMeshRef | None:
+        """Return the mesh whose reusable plans are cached."""
+        return None
+
+    def prepare(
         self,
-        *,
-        source: ResolvedSource,
-    ) -> bool:
-        capabilities = self.capabilities
-        return (
-            source.payload_format in capabilities.payload_formats
-            and source.kind in capabilities.sources
-        )
+        preparation: Any = None,
+    ) -> None:
+        """Prepare reusable resources without staging a weight version."""
 
     @abstractmethod
-    def prepare(
+    def stage(
         self,
         *,
         version: WeightVersion,
         source: ResolvedSource,
     ) -> PreparedArtifact:
-        """Prepare and verify one update without changing live weights."""
+        """Stage one update without changing live weights.
+
+        Recover method-owned state before raising a retryable error. Raise
+        StrategyRecoveryError if cleanup cannot establish a safe retry.
+        """
 
     @abstractmethod
     def release(self, prepared: PreparedArtifact) -> None:
@@ -296,20 +307,17 @@ class UpdateMethod(ABC):
         del prepared
         return False
 
-    def prepare_chain(
+    def stage_chain(
         self,
         chain: tuple[tuple[WeightVersion, ResolvedSource], ...],
     ) -> PreparedArtifact:
-        """Prepare an ordered version chain as one installable artifact."""
+        """Stage an ordered version chain as one installable artifact."""
         if len(chain) != 1:
             raise RuntimeError(
                 f"{type(self).__name__} does not support version-chain replay"
             )
         version, source = chain[0]
-        return self.prepare(version=version, source=source)
-
-    def preparation_failed(self) -> None:
-        """Restore method-owned state after preparation fails."""
+        return self.stage(version=version, source=source)
 
     def installation_failed(self, prepared: PreparedArtifact) -> None:
         """Fence method-owned state after an engine installation failure."""
@@ -365,34 +373,75 @@ class WeightUpdatePlanner:
         """Return source kinds in the order configured for fallback."""
         return tuple(resolver.kind for resolver in self._resolvers)
 
+    def _source_resolvers(
+        self, source_kind: WeightSource | None, version: WeightVersion | None = None,
+    ) -> Iterator[SourceResolver]:
+        return (
+            resolver for resolver in self._resolvers
+            if (source_kind is None or resolver.kind is source_kind)
+            and (version is None or resolver.supports(version))
+        )
+
+    def _matching_methods(
+        self,
+        source_kind: WeightSource,
+        payload_format: WeightPayloadFormat | None = None,
+        version: WeightVersion | None = None,
+    ) -> Iterator[UpdateMethod]:
+        for method in self._methods:
+            capabilities = method.capabilities
+            if (
+                source_kind in capabilities.sources
+                and capabilities.artifact_type in self._installer.capabilities.artifact_types
+                and (payload_format is None or payload_format in capabilities.payload_formats)
+                and (version is None or not capabilities.requires_base_version
+                     or version.base_version_id is not None)
+            ):
+                yield method
+
+    def prepare(
+        self,
+        mesh: TrainerMesh | None,
+        *,
+        source_kind: WeightSource,
+        validate_mesh: Callable[[], object] | None = None,
+    ) -> None:
+        """Prepare compatible methods for one source without version leases."""
+        for resolver in self._source_resolvers(source_kind):
+            if resolver.needs_mesh and mesh is None:
+                continue
+            methods = [
+                method for method in self._matching_methods(resolver.kind)
+                if not resolver.needs_mesh or method.prepared_mesh != mesh.ref
+            ]
+            if not methods:
+                continue
+            if resolver.needs_mesh:
+                if validate_mesh is None:
+                    raise ValueError("mesh preparation requires mesh validation")
+                inputs = resolver.prepare_inputs(
+                    mesh=mesh, validate_mesh=validate_mesh,
+                )
+            else:
+                inputs = resolver.prepare_inputs()
+            for method in methods:
+                method.prepare(inputs)
+
     def plans(
         self,
         version: WeightVersion,
         *,
         source_kind: WeightSource | None = None,
     ) -> Iterator[WeightUpdatePlan]:
-        for resolver in self._resolvers:
-            if source_kind is not None and resolver.kind is not source_kind:
-                continue
-            if not resolver.supports(version):
-                continue
+        for resolver in self._source_resolvers(source_kind, version):
             resolved_plans = []
             for attempt, source in enumerate(resolver.candidates(version)):
                 if attempt >= self._max_transfer_attempts:
                     break
-                for method in self._methods:
-                    if not method.supports(source=source):
-                        continue
-                    if (
-                        method.capabilities.requires_base_version
-                        and version.base_version_id is None
-                    ):
-                        continue
-                    if (
-                        method.capabilities.artifact_type
-                        not in self._installer.capabilities.artifact_types
-                    ):
-                        continue
+                method = next(
+                    self._matching_methods(source.kind, source.payload_format, version), None,
+                )
+                if method is not None:
                     plan = WeightUpdatePlan(
                         version=version,
                         source=source,
@@ -401,7 +450,6 @@ class WeightUpdatePlanner:
                     )
                     resolved_plans.append(plan)
                     yield plan
-                    break
             # Trainer and object-storage transfers may fail transiently even
             # when discovery returns only one candidate. Generator discovery
             # already returns independent peers, so retrying the same peer adds
@@ -417,26 +465,10 @@ class WeightUpdatePlanner:
         source_kind: WeightSource | None = None,
     ) -> None:
         """Reject unsupported static combinations before source I/O or leases."""
-        candidates = []
-        for resolver in self._resolvers:
-            if source_kind is not None and resolver.kind is not source_kind:
-                continue
-            if not resolver.supports(version):
-                continue
-            candidates.append((resolver.kind, resolver.payload_format(version)))
-        for method in self._methods:
-            capabilities = method.capabilities
-            if any(
-                payload_format in capabilities.payload_formats
-                and kind in capabilities.sources
-                and capabilities.artifact_type
-                in self._installer.capabilities.artifact_types
-                and (
-                    not capabilities.requires_base_version
-                    or version.base_version_id is not None
-                )
-                for kind, payload_format in candidates
-            ):
+        for resolver in self._source_resolvers(source_kind, version):
+            if next(self._matching_methods(
+                resolver.kind, resolver.payload_format(version), version,
+            ), None) is not None:
                 return
         raise RuntimeError(
             "no legal source, update method, and engine installer composition for "

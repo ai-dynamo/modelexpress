@@ -309,29 +309,37 @@ class _TestMethod(UpdateMethod):
             artifact_type=PreparedEngineTensors,
         )
 
-    def prepare(self, *, version, source: ResolvedSource) -> PreparedArtifact:
-        if isinstance(source, GeneratorPeerUpdateSource):
-            staged = self._adapter.stage_peer_weight(source.worker)
-        else:
-            inputs = SimpleNamespace(
-                version_id=version.version_id,
-                base_version_id=version.base_version_id,
-                layout_signature=version.layout_signature,
-                payload_format=version.payload_format,
-                sources=source.snapshot.shards
-                if isinstance(source, ResolvedTrainerSource)
-                else (),
-                object_storage=source.storage
-                if isinstance(source, ObjectStorageUpdateSource)
-                else None,
-            )
-            staged = self._adapter.stage_weight(inputs)
+    def stage(self, *, version, source: ResolvedSource) -> PreparedArtifact:
+        try:
+            if isinstance(source, GeneratorPeerUpdateSource):
+                staged = self._adapter.stage_peer_weight(source.worker)
+            else:
+                inputs = SimpleNamespace(
+                    version_id=version.version_id,
+                    base_version_id=version.base_version_id,
+                    layout_signature=version.layout_signature,
+                    payload_format=version.payload_format,
+                    sources=source.snapshot.shards
+                    if isinstance(source, ResolvedTrainerSource)
+                    else (),
+                    object_storage=source.storage
+                    if isinstance(source, ObjectStorageUpdateSource)
+                    else None,
+                )
+                staged = self._adapter.stage_weight(inputs)
+        except (grpc.RpcError, RuntimeError, ManifestMismatchError) as error:
+            if self._adapter.preparation_recovery_failure:
+                self._adapter.preparation_failure_calls += 1
+                raise StrategyRecoveryError(
+                    f"{type(self).__name__} could not recover after preparation failed: {error}"
+                ) from error
+            raise
         return PreparedEngineTensors(staged=staged)
 
-    def prepare_chain(self, chain):
+    def stage_chain(self, chain):
         prepared = None
         for version, source in chain:
-            prepared = self.prepare(version=version, source=source)
+            prepared = self.stage(version=version, source=source)
         assert prepared is not None
         return prepared
 
@@ -351,11 +359,6 @@ class _TestMethod(UpdateMethod):
     def mutated_during_installation_context(self, prepared):
         del prepared
         return self._adapter.installation_context_mutated
-
-    def preparation_failed(self):
-        self._adapter.preparation_failure_calls += 1
-        if self._adapter.preparation_recovery_failure:
-            raise RuntimeError("preparation recovery failed")
 
     def close(self):
         self._adapter.close()
@@ -385,7 +388,6 @@ def _runtime(
     max_transfer_attempts,
     rpc_timeout_seconds,
     resolve_replay_chain,
-    streaming=None,
     **_kwargs,
 ) -> GeneratorRuntime:
     if source_order is None:
@@ -453,7 +455,6 @@ def _runtime(
                 max_transfer_attempts=max_transfer_attempts,
             ),
             start_lease=start_lease,
-            streaming=streaming,
             resolve_replay_chain=lambda version: resolve_replay_chain(
                 version.version_id,
                 {
@@ -469,6 +470,9 @@ def _runtime(
             else None
         ),
     )
+    # These tests focus on staging; explicit mesh preparation is covered by
+    # test_generator_prepare*.py.
+    runtime.session.prepare = lambda mesh, validate_mesh=None: {}
     return runtime
 
 
@@ -780,7 +784,7 @@ def test_generator_discovers_mesh_backed_version(monkeypatch):
     generator = _initialize(monkeypatch, endpoint, adapter)
     try:
         staged = generator.stage_weight(version=WeightVersionRef("version-a"))
-        assert service.mesh_calls == 2
+        assert service.mesh_calls == 3
         assert service.list_calls == 1
         assert [source.source_slot_id for source in adapter.stage_calls[0].sources] == [
             "rank:0",
@@ -802,7 +806,7 @@ def test_trainer_source_allows_fallback_when_initial_mesh_lookup_fails(
         service=lambda: generator._service, rpc_timeout_seconds=1
     )
     try:
-        version = generator._get_ready_version("version-a")
+        version = generator._fetch_ready_version("version-a", target_version_id="version-a")
         with caplog.at_level(logging.WARNING):
             assert list(resolver.candidates(version)) == []
         assert service.mesh_calls == 1
@@ -840,11 +844,12 @@ def test_generator_handles_mesh_change_with_configured_peer_fallback(
 
         class Transfer:
             bounded_staging = True
+            prepared_mesh = None
 
             def cached_trainer_source(self) -> None:
                 return None
 
-            def prepare(self, **_kwargs) -> SimpleNamespace:
+            def stage(self, **_kwargs) -> SimpleNamespace:
                 return SimpleNamespace(
                     metrics={}, batches=[SimpleNamespace(layouts=({"weight": None},))]
                 )
@@ -853,11 +858,11 @@ def test_generator_handles_mesh_change_with_configured_peer_fallback(
                 yield {"weight": 2}
 
         class Method(LoadTimeTensorNixlUpdateMethod):
-            def prepare(self, *, version, source) -> PreparedArtifact:
+            def stage(self, *, version, source) -> PreparedArtifact:
                 adapter.stage_calls.append(
                     SimpleNamespace(version_id=version.version_id)
                 )
-                return super().prepare(version=version, source=source)
+                return super().stage(version=version, source=source)
 
         class Installer:
             @property
@@ -885,12 +890,12 @@ def test_generator_handles_mesh_change_with_configured_peer_fallback(
             assert generator.apply_weight(staged) == "installed"
             staged.release()
         else:
-            with pytest.raises(RuntimeError, match="mesh generation"):
+            with pytest.raises(RuntimeError, match="generation differs"):
                 generator.stage_weight(version=WeightVersionRef("version-a"))
         assert adapter.stage_calls == []
         assert len(adapter.peer_stage_calls) == int(peer_fallback)
-        assert service.lease_registrations == service.lease_deletions == 1 + int(
-            peer_fallback
+        assert service.lease_registrations == service.lease_deletions == (
+            int(peer_fallback) + int(mismatch == "post_manifest")
         )
         assert not service.active_leases
         service.version.uid = "version-b"
@@ -904,8 +909,8 @@ def test_generator_handles_mesh_change_with_configured_peer_fallback(
         assert len(adapter.apply_calls) == 1 + int(peer_fallback)
         assert adapter.stage_calls[0].version_id == "version-b"
         assert len(adapter.peer_stage_calls) == int(peer_fallback)
-        assert service.lease_registrations == service.lease_deletions == 2 + int(
-            peer_fallback
+        assert service.lease_registrations == service.lease_deletions == (
+            1 + int(peer_fallback) + int(mismatch == "post_manifest")
         )
         assert not service.active_leases
     finally:
@@ -1049,7 +1054,7 @@ def test_generator_logs_weight_update_lifecycle(monkeypatch, caplog):
         "version=version-a trying source=TRAINER" in message for message in messages
     )
     assert any(
-        "version=version-a prepared source=TRAINER" in message for message in messages
+        "version=version-a staged source=TRAINER" in message for message in messages
     )
     assert any("version=version-a installing" in message for message in messages)
     assert any("version=version-a installed" in message for message in messages)
@@ -1757,6 +1762,54 @@ def test_generator_reports_lease_cleanup_failure_after_success(
         server.stop(grace=None).wait()
 
 
+def test_streaming_fatal_stage_error_is_not_retried_and_fences_client(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        source_order=(WeightSource.TRAINER,),
+        staging_buffer_bytes=512,
+    )
+    prepare_calls = []
+
+    class Transfer:
+        bounded_staging = True
+        prepared_mesh = None
+
+        def cached_trainer_source(self):
+            return None
+
+        def stage(self, **kwargs):
+            assert service.active_leases
+            prepare_calls.append(kwargs)
+            raise StrategyRecoveryError("unsafe stream staging")
+
+        def close(self):
+            pass
+
+    method = LoadTimeTensorNixlUpdateMethod(
+        transfer=Transfer(),
+    )
+    generator._runtime.session._planner._methods = (method,)
+    generator._runtime.methods = (method,)
+
+    try:
+        with pytest.raises(StrategyRecoveryError, match="unsafe stream staging"):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
+        assert len(prepare_calls) == 1
+        assert not service.active_leases
+        assert generator._active_handle is None
+
+        with pytest.raises(StrategyRecoveryError, match="restart"):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
+        assert len(prepare_calls) == 1
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+
 def test_generator_preserves_apply_error_when_lease_cleanup_also_fails(monkeypatch):
     server, endpoint, service = _start_server()
     service.fail_lease_deletion = True
@@ -1857,7 +1910,6 @@ def _stage_and_apply(generator, *, version):
         (1, RuntimeError),
         (1, grpc.RpcError),
         (1, ManifestMismatchError),
-        (1, StrategyRecoveryError),
         (3, RuntimeError),
     ],
 )
@@ -1879,11 +1931,12 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
 
     class Transfer:
         bounded_staging = True
+        prepared_mesh = None
 
         def cached_trainer_source(self) -> None:
             return None
 
-        def prepare(self, **kwargs) -> SimpleNamespace:
+        def stage(self, **kwargs) -> SimpleNamespace:
             assert service.active_leases
             prepare_calls.append(kwargs)
             if len(prepare_calls) <= prepare_failures:
@@ -1943,7 +1996,7 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
 
             endpoint = service.shards[0].metadata_endpoint
             service.shards[0].metadata_endpoint = ""
-            with pytest.raises(RuntimeError, match="no NIXL trainer plan"):
+            with pytest.raises(RuntimeError, match="no usable refit source"):
                 generator.stage_weight(version=WeightVersionRef("version-a"))
             assert failed._update.released
             assert generator._active_handle is None
@@ -2394,7 +2447,7 @@ def test_object_storage_generator_falls_back_from_storage_to_peer(monkeypatch):
         staged = generator.stage_weight(version=WeightVersionRef("version-a"))
         assert len(adapter.stage_calls) == 1
         assert len(adapter.peer_stage_calls) == 1
-        assert adapter.preparation_failure_calls == 1
+        assert adapter.preparation_failure_calls == 0
         staged.release()
     finally:
         generator.close()
@@ -2541,6 +2594,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
 
     class Transfer:
         bounded_staging = True
+        prepared_mesh = None
 
         def cached_trainer_source(self) -> None:
             return None
@@ -2548,7 +2602,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
         def __init__(self):
             self.arena = arena
 
-        def prepare(self, **kwargs) -> SimpleNamespace:
+        def stage(self, **kwargs) -> SimpleNamespace:
             assert service.active_leases
             assert not guard_active
             events.append("prepare")
@@ -2574,8 +2628,8 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
             self.arena = None
 
     class Method(LoadTimeTensorNixlUpdateMethod):
-        def prepare(self, **kwargs):
-            prepared = super().prepare(**kwargs)
+        def stage(self, **kwargs):
+            prepared = super().stage(**kwargs)
             prepared_updates.append(prepared)
             assert events.count("iterator_open") == len(prepared_updates) - 1
             return prepared
@@ -2750,11 +2804,12 @@ def test_streaming_creates_and_emits_one_timing_cycle(
 
     class Transfer:
         bounded_staging = True
+        prepared_mesh = None
 
         def cached_trainer_source(self) -> None:
             return None
 
-        def prepare(self, **kwargs) -> SimpleNamespace:
+        def stage(self, **kwargs) -> SimpleNamespace:
             observe_cycle()
             if prepare_fails:
                 raise ValueError("injected streaming preparation failure")
@@ -2811,7 +2866,7 @@ def test_streaming_creates_and_emits_one_timing_cycle(
         record = records[0]
         assert record["backend"] == "rl_generator"
         assert record["version"] == "version-a"
-        assert record["stages"]["control_discovery"]["count"] == 1
+        assert record["stages"]["control_discovery"]["count"] == 2
         planning = record["stages"]["transfer_planning"]
         assert planning["count"] == 1
         assert planning["status"] == ("error" if prepare_fails else "ok")

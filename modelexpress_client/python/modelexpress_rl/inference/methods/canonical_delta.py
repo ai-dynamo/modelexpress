@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from modelexpress.adapter import StrategyRecoveryError
+
 from ...control import WeightVersion
 from ...object_storage import ObjectStorageType
 from ...s3 import S3Client
@@ -76,15 +78,15 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
             artifact_type=PreparedCheckpointArtifact,
         )
 
-    def prepare(
+    def stage(
         self,
         *,
         version: WeightVersion,
         source: ResolvedSource,
     ) -> PreparedArtifact:
-        return self.prepare_chain(((version, source),))
+        return self.stage_chain(((version, source),))
 
-    def prepare_chain(
+    def stage_chain(
         self,
         chain: tuple[tuple[WeightVersion, ResolvedSource], ...],
     ) -> PreparedArtifact:
@@ -122,8 +124,17 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                 self._checkpoint = checkpoint
                 self._initialized = True
             checkpoint = self._checkpoint.prepare_chain(tuple(versions))
-        except ValueError as error:
-            raise RuntimeError(str(error)) from error
+        except BaseException as error:
+            try:
+                if self._initialized:
+                    self._checkpoint.recover_incomplete_preparation()
+            except Exception as recovery_error:
+                raise StrategyRecoveryError(
+                    f"canonical checkpoint could not recover after staging failed: {error}"
+                ) from recovery_error
+            if isinstance(error, ValueError):
+                raise RuntimeError(str(error)) from error
+            raise
         self._active = PreparedCheckpointArtifact(checkpoint=checkpoint)
         return self._active
 
@@ -162,10 +173,6 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
             prepared.checkpoint,
             activate=activate,
         )
-
-    def preparation_failed(self) -> None:
-        if self._initialized:
-            self._checkpoint.recover_incomplete_preparation()
 
     def activate(self, prepared: PreparedArtifact) -> None:
         """Activate the prepared checkpoint after distributed loading succeeds."""

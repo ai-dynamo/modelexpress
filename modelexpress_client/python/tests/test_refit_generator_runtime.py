@@ -55,7 +55,7 @@ class _Method(UpdateMethod):
             artifact_type=PreparedEngineTensors,
         )
 
-    def prepare(self, *, version, source):
+    def stage(self, *, version, source):
         raise AssertionError("composition test does not stage weights")
 
     def release(self, prepared):

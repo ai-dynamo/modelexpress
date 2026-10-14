@@ -4,7 +4,9 @@
 """Trainer-memory source resolution."""
 
 import hashlib
+import json
 import logging
+from dataclasses import dataclass
 from functools import partial
 from itertools import chain
 from collections import defaultdict
@@ -12,12 +14,15 @@ from collections.abc import Callable, Iterator, Mapping
 from time import perf_counter
 
 import grpc
+import torch
 from modelexpress import envs
+from modelexpress.refit.reshard.slice_plan import Shard
+from modelexpress.refit.reshard.transfer_plan import SourceInfo
 from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress.refit.timing import add_refit_duration, refit_span
 
 from ... import refit_pb2, refit_pb2_grpc
-from ...control import WeightVersion
+from ...control import TrainerMesh, WeightVersion
 from ...train.manifest import ShardChecksumKey, version_metadata_digest
 from ...train import WeightPayloadFormat
 from ..adapter import ReplicaGroup, TrainerSourceShard
@@ -32,6 +37,50 @@ from ..plan import (
 logger = logging.getLogger("modelexpress_rl.inference.source.trainer")
 
 _MAX_MANIFEST_MESSAGE_SIZE_BYTES = 100 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class TrainerPreparationInputs:
+    """Trainer mesh, logical tensor sources, and generation validation."""
+
+    mesh: TrainerMesh
+    sources: dict[str, SourceInfo]
+    validate_mesh: Callable[[], object]
+
+
+def _binding_sources(slot: str, blob: bytes) -> dict[str, SourceInfo]:
+    """Decode address-independent trainer coverage for the logical planner."""
+    try:
+        sources = {}
+        for tensor in json.loads(blob)["tensors"]:
+            name = tensor["name"]
+            shape = tuple(tensor["full_shape"])
+            dtype = getattr(torch, tensor["dtype"].removeprefix("torch."))
+            elsize = tensor["elsize"]
+            if (
+                not isinstance(name, str) or not name or name in sources
+                or not isinstance(dtype, torch.dtype) or dtype.itemsize != elsize
+                or any(type(size) is not int or size < 0 for size in shape)
+            ):
+                raise ValueError("invalid tensor schema")
+            shards = []
+            for shard in tensor["shards"]:
+                offset, local_shape = tuple(shard["shard_offset"]), tuple(shard["shape"])
+                if (
+                    len(offset) != len(shape) or len(local_shape) != len(shape)
+                    or any(type(value) is not int or value < 0 for value in (*offset, *local_shape))
+                    or any(start + size > full for start, size, full in zip(offset, local_shape, shape, strict=True))
+                ):
+                    raise ValueError("invalid shard geometry")
+                shards.append(Shard(offset, local_shape, slot, 0, elsize))
+            if not shards:
+                raise ValueError("tensor has no shards")
+            sources[name] = SourceInfo(shape, dtype, elsize, tuple(shards))
+        if not sources:
+            raise ValueError("manifest has no tensors")
+        return sources
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(f"invalid logical manifest for slot {slot!r}") from error
 
 
 def _coverage_signature(blob: bytes) -> tuple:
@@ -153,6 +202,8 @@ class _ResolutionRound:
 class TrainerSourceResolver(SourceResolver):
     """Resolve trainer metadata and round checksums without compiling a plan."""
 
+    needs_mesh = True
+
     def __init__(
         self,
         *,
@@ -173,6 +224,51 @@ class TrainerSourceResolver(SourceResolver):
 
     def payload_format(self, version: WeightVersion) -> WeightPayloadFormat:
         return version.payload_format
+
+    def prepare_inputs(
+        self, *, mesh: TrainerMesh, validate_mesh: Callable[[], object],
+    ) -> TrainerPreparationInputs:
+        with refit_span("source_preparation", accumulate_metadata=True):
+            return TrainerPreparationInputs(mesh, self.logical_sources(mesh), validate_mesh)
+
+    def logical_sources(self, mesh: TrainerMesh) -> dict[str, SourceInfo]:
+        groups = defaultdict(list)
+        for worker_id, member in sorted(mesh.workers.items()):
+            groups[member.logical_shard_id].append((worker_id, member.metadata_endpoint))
+        sources = {}
+        for slot, replicas in sorted(groups.items()):
+            last_error = None
+            for worker_id, endpoint in replicas:
+                try:
+                    if not slot or not endpoint:
+                        raise RuntimeError("trainer binding is missing its slot or endpoint")
+                    with grpc.insecure_channel(endpoint, options=[
+                        ("grpc.max_receive_message_length", _MAX_MANIFEST_MESSAGE_SIZE_BYTES),
+                    ]) as channel:
+                        response = refit_pb2_grpc.RefitWorkerServiceStub(channel).GetTrainerShardMetadata(
+                            refit_pb2.GetTrainerShardMetadataRequest(metadata_digest=slot),
+                            timeout=self._rpc_timeout_seconds,
+                        )
+                    if response.metadata_digest != slot or hashlib.sha256(response.metadata).hexdigest() != slot:
+                        raise RuntimeError(f"logical manifest digest mismatch for slot {slot!r}")
+                    decoded = _binding_sources(slot, response.metadata)
+                    break
+                except (grpc.RpcError, RuntimeError) as error:
+                    last_error = error
+                    logger.warning("trainer binding %s unavailable: %s", worker_id, error)
+            else:
+                raise RuntimeError(f"no logical manifest available for slot {slot!r}") from last_error
+            for name, source in decoded.items():
+                previous = sources.get(name)
+                if previous is not None:
+                    if (previous.global_shape, previous.dtype, previous.elsize) != (
+                        source.global_shape, source.dtype, source.elsize,
+                    ):
+                        raise RuntimeError(f"trainer bindings disagree on tensor {name!r}")
+                    source = SourceInfo(source.global_shape, source.dtype, source.elsize,
+                                        (*previous.shards, *source.shards))
+                sources[name] = source
+        return sources
 
     def candidates(self, version: WeightVersion) -> Iterator[ResolvedSource]:
         if version.trainer_mesh_id is None:
@@ -571,4 +667,4 @@ class TrainerSourceResolver(SourceResolver):
         return {keys[key]: digest for key, digest in published.items()}
 
 
-__all__ = ["TrainerSourceResolver"]
+__all__ = ["TrainerPreparationInputs", "TrainerSourceResolver"]
