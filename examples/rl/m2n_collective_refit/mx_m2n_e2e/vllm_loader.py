@@ -288,6 +288,7 @@ class MxRefitWorker:
         elapsed = time.perf_counter() - started
 
         self._mx_client = client
+        self._mx_run_id = run_id
         self._mx_loader = loader
         self._mx_groupings = groupings
         return {
@@ -307,7 +308,10 @@ class MxRefitWorker:
         timings: dict[str, float] = {}
 
         started = time.perf_counter()
-        client.start_weight_update(version)
+        operation_id = client.create_operation(
+            version, key_prefix=f"mx-m2n-e2e-{self._mx_run_id}"
+        )
+        client.start_weight_update(version, operation_id)
         timings["start_s"] = time.perf_counter() - started
 
         transfer_start = time.perf_counter()

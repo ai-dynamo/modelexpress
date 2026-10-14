@@ -140,6 +140,21 @@ class EpochChangedError(RendezvousError):
         )
 
 
+class TransferBindingError(RendezvousError):
+    """An operation does not describe the round a worker is about to run.
+
+    Raised before any NCCL work, so a mismatch is caught while the peers are
+    still outside the collective rather than reported against the wrong
+    operation afterwards.
+    """
+
+
+_BINDABLE_TRANSFER_STATES = (
+    pb.COLLECTIVE_TRANSFER_STATE_PENDING,
+    pb.COLLECTIVE_TRANSFER_STATE_RUNNING,
+)
+
+
 @dataclass(frozen=True)
 class LaneMembership:
     """This worker's placement in one lane."""
@@ -580,6 +595,61 @@ class CollectiveRendezvous:
             or transfer.state != pb.COLLECTIVE_TRANSFER_STATE_PENDING
         ):
             raise RendezvousError("MX returned an incorrectly bound transfer")
+        return transfer
+
+    def get_transfer(self, operation_id: str) -> pb.CollectiveTransfer:
+        """Read one transfer back from MX."""
+        return self._stub.GetCollectiveTransfer(
+            pb.GetCollectiveTransferRequest(operation_id=operation_id),
+            timeout=self._rpc_timeout_s,
+        )
+
+    def bind_transfer(
+        self, membership: Membership, operation_id: str, version: str
+    ) -> pb.CollectiveTransfer:
+        """Fetch ``operation_id`` and check it belongs to this round.
+
+        The operation must name the caller's joined group, its admitted epoch,
+        the model it joined for, and ``version``, and must still be open
+        (``PENDING``, or ``RUNNING`` once a peer has reported). A report only
+        carries the operation, group and epoch, so this is the one place a
+        transfer of one version can be stopped from completing an operation
+        created for another.
+        """
+        if not operation_id or not operation_id.strip():
+            raise TransferBindingError(
+                "start_weight_update needs the operation_id CreateCollectiveTransfer "
+                "returned for this version"
+            )
+        spec = self._group_specs.get(membership.group_id)
+        if spec is None:
+            raise RendezvousError(
+                f"this client never joined group {membership.group_id!r}; a "
+                "transfer can only be bound to a group this client joined"
+            )
+        transfer = self.get_transfer(operation_id)
+        mismatches = []
+        for field, actual, expected in (
+            ("operation_id", transfer.operation_id, operation_id),
+            ("group_id", transfer.group_id, membership.group_id),
+            ("epoch", transfer.epoch, membership.epoch),
+            ("version_id", transfer.version_id, version),
+            ("model_name", transfer.model_name, spec.model_name),
+        ):
+            if actual != expected:
+                mismatches.append(f"{field} is {actual!r}, expected {expected!r}")
+        if transfer.state not in _BINDABLE_TRANSFER_STATES:
+            mismatches.append(
+                "state is "
+                + pb.CollectiveTransferState.Name(transfer.state)
+                + ", expected PENDING or RUNNING"
+            )
+        if mismatches:
+            raise TransferBindingError(
+                f"operation {operation_id!r} does not belong to version {version!r} "
+                f"of group {membership.group_id!r} at epoch {membership.epoch}: "
+                + "; ".join(mismatches)
+            )
         return transfer
 
     def publish_bootstrap(

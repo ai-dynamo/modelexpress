@@ -32,6 +32,7 @@ from .rendezvous import (
     LaneMembership,
     Membership,
     RendezvousError,
+    TransferBindingError,
 )
 from .spi import Loader, LocalParamSpec, Publisher, RefitCtx, resolve_specs
 from .types import (
@@ -72,6 +73,7 @@ __all__ = [
     "RendezvousError",
     "ReshardPlan",
     "Role",
+    "TransferBindingError",
     "build_mesh",
     "build_param_plan",
     "default_placements",

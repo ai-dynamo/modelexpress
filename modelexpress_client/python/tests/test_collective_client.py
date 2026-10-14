@@ -95,6 +95,8 @@ class FakeRendezvous:
         self.joins = 0
         self.freshness_reads = []
         self.stale = None
+        self.binds = []
+        self.bind_error = None
 
     def join(self, **kwargs):
         epoch = self._epochs[min(self.joins, len(self._epochs) - 1)]
@@ -141,6 +143,17 @@ class FakeRendezvous:
     def report(self, **kwargs):
         self.reports.append(kwargs)
         return SimpleNamespace(operation_id=kwargs["operation_id"])
+
+    def bind_transfer(self, membership, operation_id, version):
+        self.binds.append((membership.group_id, membership.epoch, operation_id, version))
+        if self.bind_error is not None:
+            raise self.bind_error
+        return SimpleNamespace(
+            operation_id=operation_id,
+            group_id=membership.group_id,
+            epoch=membership.epoch,
+            version_id=version,
+        )
 
 
 class FakeRendezvousPP2(FakeRendezvous):
@@ -286,7 +299,7 @@ class TestSequencing:
     def test_a_transfer_before_compute_plan_is_refused(self):
         client = trainer(FakeRendezvous(), FakeEngine())
         with pytest.raises(RuntimeError, match="compute_plan must run"):
-            client.start_weight_update("v1")
+            client.start_weight_update("v1", "op1")
 
     def test_publish_before_start_is_refused(self, fake_nccl):
         client = trainer(FakeRendezvous(), FakeEngine())
@@ -299,7 +312,7 @@ class TestSequencing:
         # "v1" opened moved v1's tensors under v2's label on every rank.
         client = trainer(FakeRendezvous(), FakeEngine())
         client.compute_plan()
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         with pytest.raises(ValueError, match="round in flight is 'v1'"):
             client.publish_weights("v2")
         with pytest.raises(ValueError, match="round in flight is 'v1'"):
@@ -959,7 +972,7 @@ class TestRefitRound:
         engine = FakeEngine()
         client = trainer(FakeRendezvous(), engine)
         client.compute_plan()
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         client.publish_weights("v1")
         client.finish_weight_update("v1")
         assert fake_nccl == ["reshard", "broadcast"]
@@ -979,7 +992,7 @@ class TestRefitRound:
         )
         client.initialize(engine)
         client.compute_plan()
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         client.update_weights("v1")
         client.finish_weight_update("v1")
         assert ("install", 0) in engine.calls
@@ -1017,9 +1030,9 @@ class TestReporting:
         rz = FakeRendezvous()
         client = trainer(rz, FakeEngine())
         client.compute_plan()
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         client.publish_weights("v1")
-        client.finish_weight_update("v1", operation_id="op1")
+        client.finish_weight_update("v1")
         assert rz.reports[0]["succeeded"]
         assert rz.reports[0]["epoch"] == 1
         assert rz.reports[0]["worker_id"] == "w0"
@@ -1028,14 +1041,14 @@ class TestReporting:
         rz = FakeRendezvous()
         client = trainer(rz, FakeEngine())
         client.compute_plan()
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
 
         def boom(*args, **kwargs):
             raise RuntimeError("nccl timeout")
 
         monkeypatch.setattr(client._half, "finish_weight_update", boom)
         with pytest.raises(RuntimeError, match="nccl timeout"):
-            client.finish_weight_update("v1", operation_id="op1")
+            client.finish_weight_update("v1")
 
         assert rz.reports[0]["succeeded"] is False
         assert "nccl timeout" in rz.reports[0]["message"]
@@ -1043,14 +1056,105 @@ class TestReporting:
         # stay blocked with an error merely attached.
         assert len(client._cache) == 0
 
-    def test_no_operation_id_means_no_report(self, fake_nccl):
+    def test_the_round_reports_against_the_operation_start_bound(self, fake_nccl):
         rz = FakeRendezvous()
         client = trainer(rz, FakeEngine())
         client.compute_plan()
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         client.publish_weights("v1")
         client.finish_weight_update("v1")
+        assert rz.binds == [("g", 1, "op1", "v1")]
+        assert [report["operation_id"] for report in rz.reports] == ["op1"]
+
+    def test_create_operation_replays_against_the_admitted_membership(
+        self, fake_nccl
+    ):
+        rz = FakeRendezvous()
+        created = []
+
+        def create_transfer(membership, version, *, key_prefix):
+            created.append((membership.group_id, membership.epoch, version, key_prefix))
+            return SimpleNamespace(operation_id=f"op-{version}")
+
+        rz.create_transfer = create_transfer
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        operation_id = client.create_operation("v1", key_prefix="run")
+        assert operation_id == "op-v1"
+        assert created == [("g", 1, "v1", "run")]
+        client.start_weight_update("v1", operation_id)
+        assert rz.binds == [("g", 1, "op-v1", "v1")]
+
+    def test_start_requires_an_operation(self, fake_nccl):
+        client = trainer(FakeRendezvous(), FakeEngine())
+        client.compute_plan()
+        with pytest.raises(TypeError):
+            client.start_weight_update("v1")
+
+    def test_a_mismatched_operation_is_refused_before_any_nccl_work(self, fake_nccl):
+        from modelexpress_rl.collective import TransferBindingError
+
+        rz = FakeRendezvous()
+        rz.bind_error = TransferBindingError("version_id is 'v0', expected 'v1'")
+        engine = FakeEngine()
+        client = trainer(rz, engine)
+        client.compute_plan()
+        with pytest.raises(TransferBindingError, match="version_id"):
+            client.start_weight_update("v1", "op-for-v0")
+        # Nothing was prepared, nothing was issued, nothing was reported, and
+        # the round never opened.
+        assert ("start", "v1") not in engine.calls
+        assert fake_nccl == []
         assert rz.reports == []
+        with pytest.raises(RuntimeError, match="start_weight_update must run"):
+            client.publish_weights("v1")
+        # The worker can still start the round once handed the right operation.
+        rz.bind_error = None
+        client.start_weight_update("v1", "op1")
+        client.publish_weights("v1")
+        client.finish_weight_update("v1")
+        assert rz.reports[-1]["operation_id"] == "op1"
+
+    def test_the_finish_alias_must_name_the_bound_operation(self, fake_nccl):
+        rz = FakeRendezvous()
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        client.publish_weights("v1")
+        with pytest.raises(ValueError, match="bound to 'op1'"):
+            client.finish_weight_update("v1", operation_id="op2")
+        client.finish_weight_update("v1", operation_id="op1")
+        assert [report["operation_id"] for report in rz.reports] == ["op1"]
+
+    def test_a_second_round_cannot_open_over_one_in_flight(self, fake_nccl):
+        rz = FakeRendezvous()
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        with pytest.raises(RuntimeError, match="still in flight"):
+            client.start_weight_update("v2", "op2")
+        assert rz.binds == [("g", 1, "op1", "v1")]
+
+    def test_a_generator_binds_and_reports_the_same_operation(self, fake_nccl):
+        rz = FakeRendezvous()
+        client = RefitClientGenerator(
+            rendezvous=rz,
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=1,
+            slot_id="g0",
+            worker_id="w9",
+            index_in_role=0,
+        )
+        client.initialize(FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        client.update_weights("v1")
+        client.finish_weight_update("v1")
+        assert rz.binds == [("g", 1, "op1", "v1")]
+        assert rz.reports[0]["operation_id"] == "op1"
+        assert rz.reports[0]["worker_id"] == "w9"
 
     def test_a_trainer_aborts_even_when_reporting_the_failure_fails(
         self, fake_nccl, monkeypatch
@@ -1069,7 +1173,7 @@ class TestReporting:
         )
         client = trainer(rz, FakeEngine())
         client.compute_plan()
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         assert len(client._cache) > 0, (
             "control: the cache must be populated, or the post-abort "
             "assertion below passes without anything having been aborted"
@@ -1079,7 +1183,7 @@ class TestReporting:
             client._half, "finish_weight_update", _raises(RuntimeError("nccl timeout"))
         )
         with pytest.raises(RuntimeError, match="nccl timeout"):
-            client.finish_weight_update("v1", operation_id="op1")
+            client.finish_weight_update("v1")
 
         assert len(client._cache) == 0
 
@@ -1102,7 +1206,7 @@ class TestReporting:
         )
         client.initialize(FakeEngine())
         client.compute_plan()
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         assert len(client._cache) > 0, (
             "control: the cache must be populated, or the post-abort "
             "assertion below passes without anything having been aborted"
@@ -1112,7 +1216,7 @@ class TestReporting:
             client._half, "finish_weight_update", _raises(RuntimeError("nccl timeout"))
         )
         with pytest.raises(RuntimeError, match="nccl timeout"):
-            client.finish_weight_update("v1", operation_id="op1")
+            client.finish_weight_update("v1")
 
         assert len(client._cache) == 0
 
@@ -1123,7 +1227,7 @@ class TestPerGroupFailure:
     ):
         client = trainer(FakeRendezvous(), FakeEngine())
         client.compute_plan()
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         assert len(client._cache) > 0
         monkeypatch.setattr(
             collective_backend, "_reshard", _raises(RuntimeError("enqueue failed"))
@@ -1152,7 +1256,7 @@ class TestPerGroupFailure:
         )
         client.initialize(engine)
         client.compute_plan()
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         monkeypatch.setattr(engine, "install", _raises(RuntimeError("install failed")))
         with pytest.raises(RuntimeError, match="install failed"):
             client.update_weights("v1")
@@ -1192,7 +1296,7 @@ class TestLayerGroupPipeline:
         monkeypatch.setenv("MX_NCCL_REFIT_PIPELINE_DEPTH", "2")
         engine = FakeEngine(plan=THREE_GROUPS)
         client = pipelined_generator(engine)
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         client.update_weights("v1", 0)
         assert installs(engine) == []
         client.update_weights("v1", 1)
@@ -1210,7 +1314,7 @@ class TestLayerGroupPipeline:
         monkeypatch.setenv("MX_NCCL_REFIT_PIPELINE_DEPTH", "1")
         engine = FakeEngine(plan=THREE_GROUPS)
         client = pipelined_generator(engine)
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         for group in range(3):
             client.update_weights("v1", group)
             assert installs(engine) == list(range(group + 1))
@@ -1223,12 +1327,12 @@ class TestLayerGroupPipeline:
         engine = FakeEngine(plan=THREE_GROUPS)
         client = pipelined_generator(engine)
         rz = client._rendezvous
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         for group in range(3):
             client.update_weights("v1", group)
         monkeypatch.setattr(engine, "install", _raises(RuntimeError("install failed")))
         with pytest.raises(RuntimeError, match="install failed"):
-            client.finish_weight_update("v1", operation_id="op1")
+            client.finish_weight_update("v1")
         assert rz.reports[0]["succeeded"] is False
         assert len(client._cache) == 0
         assert not client._unfinished
@@ -1240,7 +1344,7 @@ class TestLayerGroupContract:
     def test_a_repeated_group_is_refused_and_aborts_the_round(self, fake_nccl):
         client = trainer(FakeRendezvous(), FakeEngine())
         client.compute_plan()
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         client.publish_weights("v1")
         with pytest.raises(RuntimeError, match="already ran in this round"):
             client.publish_weights("v1")
@@ -1250,9 +1354,9 @@ class TestLayerGroupContract:
         rz = FakeRendezvous()
         client = trainer(rz, FakeEngine())
         client.compute_plan()
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         with pytest.raises(RuntimeError, match="before layer group"):
-            client.finish_weight_update("v1", operation_id="op1")
+            client.finish_weight_update("v1")
         assert rz.reports[0]["succeeded"] is False
         assert len(client._cache) == 0
 
@@ -1325,7 +1429,7 @@ class TestFreshnessAtStart:
         rz, engine = FakeRendezvous(epochs=(3,)), FakeEngine()
         client = trainer(rz, engine)
         client.compute_plan()
-        client.start_weight_update("v1")
+        client.start_weight_update("v1", "op1")
         assert rz.freshness_reads == [("g", 3)]
 
     def test_a_moved_group_is_refused_before_the_engine_prepares(self, fake_nccl):
@@ -1334,7 +1438,7 @@ class TestFreshnessAtStart:
         client.compute_plan()
         rz.stale = EpochChangedError("g", 1, 2)
         with pytest.raises(EpochChangedError):
-            client.start_weight_update("v1")
+            client.start_weight_update("v1", "op1")
         assert ("start", "v1") not in engine.calls
         with pytest.raises(RuntimeError, match="start_weight_update must run"):
             client.publish_weights("v1")
@@ -1355,7 +1459,7 @@ class TestFreshnessAtStart:
         client.compute_plan()
         rz.stale = EpochChangedError("g", 1, 2)
         with pytest.raises(EpochChangedError):
-            client.start_weight_update("v1")
+            client.start_weight_update("v1", "op1")
         assert ("start", "v1") not in engine.calls
 
 

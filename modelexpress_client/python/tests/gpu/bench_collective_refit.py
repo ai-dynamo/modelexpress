@@ -323,8 +323,9 @@ def main() -> int:
 
     for round_index in range(ROUNDS):
         label = f"v{round_index}"
+        operation_id = client.create_operation(label, key_prefix=f"bench-{RUN_ID}")
         round_start = time.perf_counter()
-        client.start_weight_update(label)
+        client.start_weight_update(label, operation_id)
         start_s = time.perf_counter() - round_start
 
         publish_start = time.perf_counter()

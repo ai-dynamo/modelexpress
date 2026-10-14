@@ -278,6 +278,84 @@ class TestCreateTransfer:
         assert stub.created == []
 
 
+class TestBindTransfer:
+    """start_weight_update binds the round to an operation read back from MX."""
+
+    @staticmethod
+    def stub(**changes):
+        stub = TestCreateTransfer.stub()
+        stub.fetched = []
+
+        def get(request, timeout=None):
+            stub.fetched.append(request.operation_id)
+            fields = dict(
+                operation_id=request.operation_id,
+                group_id="g1",
+                epoch=1,
+                model_name="m",
+                version_id="2",
+                idempotency_key="test-g1-epoch-1-version-2",
+                state=pb.COLLECTIVE_TRANSFER_STATE_PENDING,
+            )
+            fields.update(changes)
+            return pb.CollectiveTransfer(**fields)
+
+        stub.GetCollectiveTransfer = get
+        return stub
+
+    @pytest.mark.parametrize(
+        "state",
+        [pb.COLLECTIVE_TRANSFER_STATE_PENDING, pb.COLLECTIVE_TRANSFER_STATE_RUNNING],
+    )
+    def test_an_open_operation_for_this_round_binds(self, state):
+        stub = self.stub(state=state)
+        client, joined = TestCreateTransfer.joined(stub)
+        transfer = client.bind_transfer(joined, "op", "2")
+        assert transfer.operation_id == "op"
+        assert stub.fetched == ["op"]
+
+    @pytest.mark.parametrize(
+        ("changes", "named"),
+        [
+            ({"operation_id": "other"}, "operation_id"),
+            ({"group_id": "other"}, "group_id"),
+            ({"epoch": 2}, "epoch"),
+            ({"version_id": "1"}, "version_id"),
+            ({"model_name": "other"}, "model_name"),
+            ({"state": pb.COLLECTIVE_TRANSFER_STATE_COMPLETE}, "COMPLETE"),
+            ({"state": pb.COLLECTIVE_TRANSFER_STATE_FAILED}, "FAILED"),
+            ({"state": pb.COLLECTIVE_TRANSFER_STATE_ABORTED}, "ABORTED"),
+        ],
+    )
+    def test_an_operation_for_another_round_is_refused(self, changes, named):
+        from modelexpress_rl.collective import TransferBindingError
+
+        stub = self.stub(**changes)
+        client, joined = TestCreateTransfer.joined(stub)
+        with pytest.raises(TransferBindingError, match=named):
+            client.bind_transfer(joined, "op", "2")
+
+    @pytest.mark.parametrize("operation_id", ["", "  "])
+    def test_an_empty_operation_is_refused_before_any_rpc(self, operation_id):
+        from modelexpress_rl.collective import TransferBindingError
+
+        stub = self.stub()
+        client, joined = TestCreateTransfer.joined(stub)
+        with pytest.raises(TransferBindingError, match="operation_id"):
+            client.bind_transfer(joined, operation_id, "2")
+        assert stub.fetched == []
+
+    def test_a_group_this_client_never_joined_is_refused(self):
+        stub = self.stub()
+        client = make_rendezvous(stub)
+        foreign = Membership(
+            group_id="other", epoch=1, lanes=(), is_bootstrap_leader=False
+        )
+        with pytest.raises(RendezvousError, match="never joined group 'other'"):
+            client.bind_transfer(foreign, "op", "2")
+        assert stub.fetched == []
+
+
 class TestJoin:
     def test_a_trainer_declares_its_partition_and_takes_the_assigned_rank(self):
         response = pb.CollectiveGroupMembership(

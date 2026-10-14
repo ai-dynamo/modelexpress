@@ -121,6 +121,8 @@ class _RefitClientBase:
         self._groupings: list[list[str]] | None = None
         self._round_started = False
         self._version: str | None = None
+        self._operation_id: str | None = None
+        self._round_membership: Membership | None = None
 
     @property
     def membership(self) -> Membership:
@@ -163,8 +165,66 @@ class _RefitClientBase:
         """
         if self._half is not None:
             self._half.abort()
+        self._reset_round()
+
+    def _reset_round(self) -> None:
         self._round_started = False
         self._version = None
+        self._operation_id = None
+        self._round_membership = None
+
+    def _bind_operation(self, version: str, operation_id: str) -> None:
+        """Bind the round about to open to its control-plane operation.
+
+        Runs before the engine is prepared and before any NCCL work, so an
+        operation created for another version, group or epoch is refused while
+        every peer is still outside the collective. The bound operation is the
+        one the round's outcome is reported against.
+        """
+        if self._round_started:
+            raise RuntimeError(
+                f"the round for version {self._version!r} is still in flight; "
+                "finish it before starting another"
+            )
+        self._check_still_current()
+        membership = self.membership
+        self._rendezvous.bind_transfer(membership, operation_id, version)
+        self._operation_id = operation_id
+        self._round_membership = membership
+
+    def create_operation(self, version: str, *, key_prefix: str) -> str:
+        """Create, or replay, the operation for ``version`` at the current epoch.
+
+        The create is idempotent on ``(key_prefix, group, epoch, version)``, so
+        every participant may call this and gets the same operation id back; a
+        coordinator that already created the operation can hand its id to
+        ``start_weight_update`` instead. Call it before ``start_weight_update``:
+        once a peer has reported, the replay no longer returns a PENDING
+        operation and is refused.
+        """
+        return self._rendezvous.create_transfer(
+            self.membership, version, key_prefix=key_prefix
+        ).operation_id
+
+    def _check_operation_alias(self, operation_id: str | None) -> None:
+        if operation_id is not None and operation_id != self._operation_id:
+            raise ValueError(
+                f"finish_weight_update names operation {operation_id!r}, but the "
+                f"round in flight is bound to {self._operation_id!r}"
+            )
+
+    def _report(self, *, succeeded: bool, message: str = "") -> None:
+        """Report the bound round's outcome against the identity it was admitted with."""
+        if self._operation_id is None or self._round_membership is None:
+            raise RuntimeError("no operation is bound to this round")
+        self._rendezvous.report(
+            operation_id=self._operation_id,
+            group_id=self._round_membership.group_id,
+            epoch=self._round_membership.epoch,
+            worker_id=self._worker_id,
+            succeeded=succeeded,
+            message=message,
+        )
 
     def _check_still_current(self) -> None:
         """One freshness read before a round prepares the engine.
@@ -428,8 +488,7 @@ class _RefitClientBase:
             self._cache.abort_group(self._membership.group_id)
         self._membership = None
         self._half = None
-        self._round_started = False
-        self._version = None
+        self._reset_round()
 
 
 class RefitClientTrainer(_RefitClientBase):
@@ -506,14 +565,25 @@ class RefitClientTrainer(_RefitClientBase):
             raise
         return membership
 
-    def start_weight_update(self, version: str) -> None:
+    def start_weight_update(self, version: str, operation_id: str) -> None:
+        """Open the round for ``version``, bound to ``operation_id``.
+
+        ``operation_id`` is the ``CollectiveTransfer`` created for ``version``
+        against this group's current epoch. It is fetched and checked before
+        the publisher is prepared or any NCCL work is issued, and the round's
+        outcome is reported against it.
+        """
         if self._half is None:
             raise RuntimeError("compute_plan must run before start_weight_update")
         if self._publisher is None:
             raise RuntimeError("initialize must run before start_weight_update")
-        self._check_still_current()
-        self._publisher.start_new_round(version)
-        self._half.start_weight_update(version)
+        self._bind_operation(version, operation_id)
+        try:
+            self._publisher.start_new_round(version)
+            self._half.start_weight_update(version)
+        except BaseException:
+            self._reset_round()
+            raise
         self._round_started = True
         self._version = version
 
@@ -528,15 +598,21 @@ class RefitClientTrainer(_RefitClientBase):
             raise
 
     def finish_weight_update(
-        self, version: str, operation_id: str | None = None
+        self, version: str, *, operation_id: str | None = None
     ) -> None:
+        """Drain the round and report it against the operation it was bound to.
+
+        ``operation_id`` is optional and only checked: the operation is the one
+        ``start_weight_update`` bound.
+        """
         half = self._require_round(version, "finish_weight_update")
+        self._check_operation_alias(operation_id)
         try:
             half.finish_weight_update(self.membership.broadcast_lane.lane_id)
         except Exception as error:
             half.abort()
             try:
-                self._report(operation_id, succeeded=False, message=repr(error))
+                self._report(succeeded=False, message=repr(error))
             except Exception:
                 logger.warning(
                     "reporting the failed round to the control plane raised; "
@@ -544,11 +620,12 @@ class RefitClientTrainer(_RefitClientBase):
                     "and the original failure is re-raised below",
                     exc_info=True,
                 )
+            self._reset_round()
             raise
+        try:
+            self._report(succeeded=True)
         finally:
-            self._round_started = False
-            self._version = None
-        self._report(operation_id, succeeded=True)
+            self._reset_round()
 
     def report_failure(
         self,
@@ -558,20 +635,6 @@ class RefitClientTrainer(_RefitClientBase):
         membership: Membership | None = None,
     ) -> None:
         """Report using the admitted round identity, including after transport cleanup."""
-        self._report(
-            operation_id, succeeded=False, message=repr(error), membership=membership
-        )
-
-    def _report(
-        self,
-        operation_id: str | None,
-        *,
-        succeeded: bool,
-        message: str = "",
-        membership: Membership | None = None,
-    ) -> None:
-        if operation_id is None:
-            return
         admitted = self._membership if membership is None else membership
         if admitted is None:
             raise RendezvousError(
@@ -583,8 +646,8 @@ class RefitClientTrainer(_RefitClientBase):
             group_id=admitted.group_id,
             epoch=admitted.epoch,
             worker_id=self._worker_id,
-            succeeded=succeeded,
-            message=message,
+            succeeded=False,
+            message=repr(error),
         )
 
     def cleanup(self) -> None:
@@ -646,14 +709,23 @@ class RefitClientGenerator(_RefitClientBase):
             raise
         return membership
 
-    def start_weight_update(self, version: str) -> None:
+    def start_weight_update(self, version: str, operation_id: str) -> None:
+        """Open the round for ``version``, bound to ``operation_id``.
+
+        Same contract as the trainer: the operation is fetched and checked
+        before the loader is prepared or any receive is enqueued.
+        """
         if self._half is None:
             raise RuntimeError("compute_plan must run before start_weight_update")
         if self._loader is None:
             raise RuntimeError("initialize must run before start_weight_update")
-        self._check_still_current()
-        self._loader.start_new_round(version)
-        self._half.start_weight_update(version)
+        self._bind_operation(version, operation_id)
+        try:
+            self._loader.start_new_round(version)
+            self._half.start_weight_update(version)
+        except BaseException:
+            self._reset_round()
+            raise
         self._unfinished = deque()
         self._pipeline_depth = envs.MX_NCCL_REFIT_PIPELINE_DEPTH
         self._round_started = True
@@ -684,11 +756,17 @@ class RefitClientGenerator(_RefitClientBase):
             raise
 
     def finish_weight_update(
-        self, version: str, operation_id: str | None = None
+        self, version: str, *, operation_id: str | None = None
     ) -> None:
+        """Install what is outstanding, then report against the bound operation.
+
+        ``operation_id`` is optional and only checked: the operation is the one
+        ``start_weight_update`` bound.
+        """
         half = self._require_round(version, "finish_weight_update")
         if self._loader is None:
             raise RuntimeError("initialize must run before finish_weight_update")
+        self._check_operation_alias(operation_id)
         try:
             while self._unfinished:
                 self._install_oldest(half)
@@ -698,7 +776,7 @@ class RefitClientGenerator(_RefitClientBase):
             self._unfinished = deque()
             half.abort()
             try:
-                self._report(operation_id, succeeded=False, message=repr(error))
+                self._report(succeeded=False, message=repr(error))
             except Exception:
                 logger.warning(
                     "reporting the failed round to the control plane raised; "
@@ -706,25 +784,12 @@ class RefitClientGenerator(_RefitClientBase):
                     "and the original failure is re-raised below",
                     exc_info=True,
                 )
+            self._reset_round()
             raise
+        try:
+            self._report(succeeded=True)
         finally:
-            self._round_started = False
-            self._version = None
-        self._report(operation_id, succeeded=True)
-
-    def _report(
-        self, operation_id: str | None, *, succeeded: bool, message: str = ""
-    ) -> None:
-        if operation_id is None:
-            return
-        self._rendezvous.report(
-            operation_id=operation_id,
-            group_id=self.membership.group_id,
-            epoch=self.membership.epoch,
-            worker_id=self._worker_id,
-            succeeded=succeeded,
-            message=message,
-        )
+            self._reset_round()
 
     def cleanup(self) -> None:
         if self._loader is not None:

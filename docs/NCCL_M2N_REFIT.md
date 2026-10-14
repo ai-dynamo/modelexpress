@@ -90,10 +90,11 @@ flowchart LR
   end
   S --> C[compute_plan]
   C -->|re-run on membership change| C
-  C --> W[start_weight_update]
+  C --> O["CreateCollectiveTransfer<br/>(version)"]
+  O --> W["start_weight_update<br/>(version, operation_id)"]
   W --> U["publish_weights / update_weights<br/>(version, layer_group_id) xN"]
   U --> F[finish_weight_update]
-  F -->|next refit| W
+  F -->|next refit| O
   F --> X[cleanup]
 ```
 
@@ -167,8 +168,20 @@ operation with the group's current epoch, so on first formation the workers come
 first: `compute_plan` on every worker (join, `READY`, communicators), then
 `CreateCollectiveTransfer`, then `start_weight_update`. On later refits the group
 already exists, and the orchestrator creates each operation before invoking
-`start_weight_update`. An operation created before a membership change carries
-the old epoch and is rejected when reported.
+`start_weight_update`.
+
+`start_weight_update(version, operation_id)` takes that operation as a required
+argument. It reads it back with `GetCollectiveTransfer` and refuses it with
+`TransferBindingError`, before the engine is prepared or any NCCL work is
+issued, unless it names this worker's group, its admitted epoch, the joined
+model and `version`, and is still `PENDING` or `RUNNING`. The round keeps the
+operation, and its success or failure is reported against it, so a transfer of
+one version cannot complete an operation created for another, and an operation
+created before a membership change is refused at start rather than at report.
+The create is idempotent on the replay key, which carries the group, epoch and
+version, so instead of distributing the id a coordinator may have every
+participant call `create_operation(version, key_prefix=...)` before
+`start_weight_update`; they all get the same operation back.
 
 ## 5. Control plane
 
@@ -382,9 +395,9 @@ rules are the contract; the right-hand column is what this backend does with the
 | `initialize` | Once per worker; before `setup_layer_groups`; unordered across workers | Publisher/Loader `capture()`; register with MX; `Sender/Receiver.initialize()` records local shard geometry |
 | `setup_layer_groups` | Once per worker; groups must be disjoint and cover the model | Map each `layer_group_id` to its bulk `ParamPlan` subset. The grouping is folded into the plan digest, so it is fixed before `compute_plan` and every participant must supply the same one |
 | `compute_plan` | After all workers finish `initialize`+`setup_layer_groups`; re-run on membership change | **Join the group with the plan digest, wait for READY, create the communicators.** Membership change = new epoch = new communicators |
-| `start_weight_update(version, worker_ids)` | Once per refit; all `compute_plan` done; no overlapping refits | `Publisher.start_new_round(version)`; the backend binds the operation and the admitted destination subset |
+| `start_weight_update(version, operation_id)` | Once per refit, after `CreateCollectiveTransfer`; all `compute_plan` done; no overlapping refits (a second start while a round is open is refused) | `GetCollectiveTransfer`, checked against the version, group, epoch and model before anything else; then `Publisher.start_new_round(version)` / `Loader.start_new_round(version)` |
 | `publish_weights` / `update_weights(version, layer_group_id)` | Multiple per refit; concurrency across affected workers is desirable | The co-called `nccl.m2n.reshard` sequence for that group's bulk params. Every group runs exactly once per refit, in the same order on every participant; that order is the caller's to keep, and the backend refuses a repeated group and a finish that skipped one. On the generator, a group is installed once `MX_NCCL_REFIT_PIPELINE_DEPTH` groups are in flight, so `Loader.install` for group N overlaps the transfer of group N+1; `finish_weight_update` installs whatever is left. A failure aborts the lanes and closes the round |
-| `finish_weight_update(version)` | After all `*_weight_update` calls for this refit | The misc broadcast; `Loader.finish()`; stream sync; `ReportCollectiveTransfer` |
+| `finish_weight_update(version)` | After all `*_weight_update` calls for this refit | The misc broadcast; `Loader.finish()`; stream sync; `ReportCollectiveTransfer` against the operation `start_weight_update` bound. An `operation_id=` keyword is accepted only as a check against that binding |
 | `cleanup` | Terminal | Release buffers, destroy communicators, deregister |
 
 Two invariants the collective imposes on top of the layering doc:
@@ -440,7 +453,7 @@ is exactly what the fused-parameter path already does.
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for one lane's non-blocking `Communicator.init` |
-| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Client-side deadline for the transfer; an overrun aborts the local lanes. It reaches MX as `succeeded=false` (`RUNNING -> FAILED` above, which moves the epoch) only when it surfaces in `finish_weight_update` with an `operation_id`; the abort alone leaves the group at its epoch |
+| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Client-side deadline for the transfer; an overrun aborts the local lanes. It reaches MX as `succeeded=false` (`RUNNING -> FAILED` above, which moves the epoch) only when it surfaces in `finish_weight_update`, against the bound operation; the abort alone leaves the group at its epoch |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
 
 Timing is reported through the existing `RefitTimingRecorder` stage vocabulary so
