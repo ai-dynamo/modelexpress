@@ -610,6 +610,9 @@ class _VllmInstaller(EngineInstaller):
         self._live_version: str | None = None
         self._capture_cache = None
         self._native_parameter_dispatch = _native_parameter_dispatch()
+        self._debug_validate_generator_layout = (
+            rl_envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT
+        )
 
     @cached_property
     def _original_loader(self) -> Callable:
@@ -623,7 +626,10 @@ class _VllmInstaller(EngineInstaller):
             ) from error
         return _get_original_loader
 
-    def _capture_key(self, manifest):
+    def capture_generator_fingerprint(self):
+        if not self._debug_validate_generator_layout:
+            return ()
+
         original_loader = self._original_loader
 
         def function_identity(function):
@@ -665,7 +671,6 @@ class _VllmInstaller(EngineInstaller):
             if not buffer.is_floating_point() and not buffer.is_complex()
         )
         return (
-            tuple(manifest),
             parameters,
             modules,
             routing_buffers,
@@ -846,10 +851,12 @@ class _VllmInstaller(EngineInstaller):
         afterward without finalizing (finalizing would commit the empty skeletons
         and corrupt the live params).
         """
+
+        gen_key = self.capture_generator_fingerprint()
+
         if not self._is_quantized and self._capture_cache is not None:
-            key, result = self._capture_cache
-            current_key = self._capture_key(manifest)
-            if key == current_key:
+            cached_gen_key, cached_manifest, result = self._capture_cache
+            if cached_gen_key == gen_key and cached_manifest == tuple(manifest):
                 copies = (
                     result.indices
                     if type(result) is _CaptureSnapshot
@@ -911,13 +918,16 @@ class _VllmInstaller(EngineInstaller):
             len(capture.unsupported),
             self._is_quantized,
         )
+        gen_key = self.capture_generator_fingerprint()
+        capture.generator_fingerprint = gen_key
         if (
             not self._is_quantized
             and not capture.unsupported
             and not capture.unattributed
         ):
             self._capture_cache = (
-                self._capture_key(manifest),
+                gen_key,
+                tuple(manifest),
                 _CaptureSnapshot.create(copy.deepcopy((capture, param_layout))),
             )
         return capture, param_layout
