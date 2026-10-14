@@ -895,7 +895,7 @@ class _NixlStagedTransfer:
 
         ``max_staging_bytes`` bounds the bounded-mode arenas in total.
         ``staging_device`` places them on ``"cuda"``, meaning the engine's
-        accelerator whatever its family (RDMA lands in VRAM and the commit is a
+        accelerator, CUDA or XPU (RDMA lands in VRAM and the commit is a
         device copy), or ``"cpu"`` (pinned host memory registered as
         NIXL DRAM; the commit is a host-to-device copy). ``staging_buffers`` of
         2 splits the budget across two arenas, allowing the next batch's READ to

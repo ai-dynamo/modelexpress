@@ -645,7 +645,7 @@ geometry, and framework orchestration independently replaceable.
 `ModelExpressGeneratorConfig.staging_buffer_bytes` sets bounded-streaming
 capacity per arena, and `staging_buffers_count` defaults to one. The streaming
 client uses their product as its total staging limit. `staging_device` selects
-accelerator (`"cuda"`, any family) or pinned host receive memory.
+accelerator (`"cuda"`, for CUDA or XPU) or pinned host receive memory.
 
 The `stage_weight()` / `apply_weight()` generator APIs hold a version lease
 across metadata preparation and incremental installation. The NIXL receiver
@@ -1867,7 +1867,7 @@ admission tables or attention-specific weight transformations.
 Receive-arena tensors are never attached to the model or passed to post-load
 callbacks. The copy boundary requires ordinary Tensor storage views and rejects
 custom dispatch modes instead of bypassing their semantics. A callback may retain an engine-owned tensor without preventing arena
-reuse. CUDA completion is still required before the next READ overwrites an
+reuse. Device completion is still required before the next READ overwrites an
 arena. This ownership boundary removes receive-retention scans; it does not
 remove checks that a callback changed another module or a shared parameter.
 
