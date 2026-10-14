@@ -102,6 +102,13 @@ The RL validation job also handles `/bench` authorization with the existing
 writer and approved-mirror checks; comment runs execute only the selected refit profile.
 Ordinary comments do not start RL builds, GPU tests, or Vime jobs.
 
+`nightly-ci.yml` reuses the core, inference and RL workflows on upstream `main`.
+Scheduled and manual runs authorize only their exact event SHA and use the run ID
+for GPU slot selection. Their caller concurrency groups are run-specific, while
+the GPU capacity queues remain shared with PR tests. The nightly status gate
+requires all selected test suites and accepts skipping them only when
+`run_tests=false`. RL evidence uploads are disabled for nightly calls.
+
 ## CI build caches
 
 Image builds import and export registry caches in their existing NVCR image

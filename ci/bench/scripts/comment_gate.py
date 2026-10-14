@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Authorize comments and trusted mirror pushes before privileged CI starts."""
+"""Authorize comments, trusted mirror pushes and main nightlies before privileged CI."""
 
 import argparse
 import json
@@ -88,6 +88,15 @@ def authorize_workflow(environment, get):
     runtime = environment.get("RUNTIME_BASE") or profile.get("runtime", "")
     if not re.fullmatch(r"[a-zA-Z0-9./:_-]+@sha256:[0-9a-f]{64}", runtime):
         raise ValueError("runtime must be digest-pinned")
+    if environment.get("GITHUB_EVENT_NAME") in {"schedule", "workflow_dispatch"}:
+        if (
+            environment["GITHUB_REPOSITORY"] != "ai-dynamo/modelexpress"
+            or environment.get("GITHUB_REF") != "refs/heads/main"
+            or environment.get("GITHUB_SHA") != sha
+            or environment["PR_NUMBER"] != "0"
+        ):
+            raise ValueError("Expected an exact upstream main nightly revision")
+        return {"sha": sha, "model": model, "scenario": scenario, "runtime": runtime}
     if environment.get("GITHUB_EVENT_NAME") == "push":
         match = re.fullmatch(
             r"refs/heads/pull-request/([1-9][0-9]*)", environment.get("GITHUB_REF", "")
