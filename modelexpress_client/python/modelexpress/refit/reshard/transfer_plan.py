@@ -18,12 +18,14 @@ also use its full-pull and conversion phases.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from modelexpress import envs
 from modelexpress.refit.reshard.slice_plan import (
     LogicalRead,
+    Shard,
     SourceBuffer,
     _row_major_strides,
     plan_pull,
@@ -36,7 +38,7 @@ from modelexpress.refit.reshard.types import (
 )
 
 
-@dataclass
+@dataclass(frozen=True)
 class SourceInfo:
     """Everything the planner needs about one full source tensor: its full shape,
     element dtype/size, and the shards the trainer published for it."""
@@ -44,7 +46,7 @@ class SourceInfo:
     global_shape: tuple
     dtype: Any
     elsize: int
-    shards: list  # list[Shard]
+    shards: Sequence[Shard]
 
 
 @dataclass(frozen=True)

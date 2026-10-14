@@ -14,13 +14,15 @@ import grpc
 from modelexpress.refit.timing import refit_span
 
 from ... import refit_pb2, refit_pb2_grpc
+from ..manifest import version_metadata, version_metadata_digest
+from modelexpress import envs as mx_envs
 from ...version import TrainerTensorsMetadata, WeightVersionRef
 from ..adapter import (
     StagedWeightVersionShardData,
     TrainerEngineAdapter,
     TrainerStagingMode,
     WeightPayloadFormat,
-    WeightVersionShardManifestPublisher,
+    TrainerShardMetadataPublisher,
 )
 
 
@@ -33,7 +35,7 @@ class FullTensorNixlPublicationMethod:
         adapter: TrainerEngineAdapter,
         staging_mode: TrainerStagingMode,
         payload_format: WeightPayloadFormat,
-        manifest_publisher: WeightVersionShardManifestPublisher,
+        manifest_publisher: TrainerShardMetadataPublisher,
         service: Callable[[], refit_pb2_grpc.RefitServiceStub],
         worker_id: str,
         rpc_timeout_seconds: float,
@@ -54,6 +56,8 @@ class FullTensorNixlPublicationMethod:
         self._worker_id = worker_id
         self._rpc_timeout_seconds = rpc_timeout_seconds
         self.published: dict[str, list[StagedWeightVersionShardData]] = {}
+        self._metadata_identity: tuple[str, int] | None = None
+        self._metadata_digest: str | None = None
         self._binding: TrainerTensorsMetadata | None = None
 
     @property
@@ -113,40 +117,57 @@ class FullTensorNixlPublicationMethod:
             duration_key="staging_sync_s",
         ):
             staged.publish_ready.wait()
-        if staged.manifest.transport.upper() != "NIXL":
+            stable_digest = staged.metadata.digest
+        if staged.metadata.transport.upper() != "NIXL":
             raise ValueError(
-                f"unsupported shard transport {staged.manifest.transport!r}"
+                f"unsupported shard transport {staged.metadata.transport!r}"
             )
         # A cached property that hashes the whole manifest, so the first read is
         # the digest being computed and every later one is free.
-        with refit_span(
-            "source_preparation",
-            metadata={"manifest_digests": 1},
-            accumulate_metadata=True,
-            duration_key="manifest_digest_s",
-        ):
-            manifest_digest = staged.manifest.digest
+        identity = (
+            version_response.version.trainer_mesh_id,
+            version_response.version.trainer_mesh_generation,
+        )
+        if self._metadata_identity == identity:
+            assert self._metadata_digest == stable_digest
+        if self._metadata_identity != identity and self.published:
+            raise RuntimeError("release published versions before changing trainer metadata")
+        record = (
+            version_metadata(
+                version_id=version.version_id,
+                worker_id=self._worker_id,
+                logical_shard_id=logical_shard_id,
+                stable_metadata_digest=stable_digest,
+                checksums=staged.checksums,
+            ) if mx_envs.MX_RESHARD_PUBLISH_DIGEST else None
+        )
+        content_digest = version_metadata_digest(record) if record is not None else ""
         with refit_span(
             "setup_registration",
             metadata={"manifest_publications": 1},
             accumulate_metadata=True,
             duration_key="manifest_publish_s",
         ):
-            endpoint = self._manifest_publisher.publish_manifest(
-                version_id=version.version_id,
-                logical_shard_id=logical_shard_id,
-                manifest=staged.manifest,
-            )
+            if self._metadata_identity != identity:
+                if self._metadata_identity is not None:
+                    self._manifest_publisher.release_metadata()
+                    self._metadata_identity = None
+                endpoint = self._manifest_publisher.publish_metadata(metadata=staged.metadata)
+                self._metadata_identity = identity
+                self._metadata_digest = stable_digest
+            else:
+                endpoint = self._manifest_publisher.endpoint
+            if record is not None:
+                self._manifest_publisher.publish_version_metadata(record)
         if not endpoint.strip():
-            raise ValueError("manifest_endpoint is required")
+            raise ValueError("metadata_endpoint is required")
         shard = refit_pb2.WeightVersionShard(
             version_id=version.version_id,
             logical_shard_id=logical_shard_id,
             worker_id=self._worker_id,
-            tensor_count=staged.manifest.tensor_count,
-            total_bytes=staged.manifest.total_bytes,
-            manifest_digest=manifest_digest,
-            manifest_endpoint=endpoint,
+            stable_metadata_digest=stable_digest,
+            version_metadata_digest=content_digest,
+            metadata_endpoint=endpoint,
         )
         with refit_span(
             "setup_registration",
@@ -154,10 +175,18 @@ class FullTensorNixlPublicationMethod:
             accumulate_metadata=True,
             duration_key="publication_rpc_s",
         ):
-            self._service().CreateWeightVersionShard(
-                refit_pb2.CreateWeightVersionShardRequest(shard=shard),
-                timeout=self._rpc_timeout_seconds,
-            )
+            try:
+                self._service().CreateWeightVersionShard(
+                    refit_pb2.CreateWeightVersionShardRequest(shard=shard),
+                    timeout=self._rpc_timeout_seconds,
+                )
+            except BaseException:
+                if record is not None and version.version_id not in self.published:
+                    self._manifest_publisher.release_version_metadata(
+                        version_id=version.version_id,
+                        logical_shard_id=logical_shard_id,
+                    )
+                raise
         self.published.setdefault(version.version_id, []).append(staged)
 
     def release(self, *, version: WeightVersionRef) -> None:
@@ -185,7 +214,7 @@ class FullTensorNixlPublicationMethod:
                 ):
                     raise
                 sleep(min(0.05, max(deadline - monotonic(), 0)))
-        self._manifest_publisher.release_manifest(
+        self._manifest_publisher.release_version_metadata(
             version_id=version.version_id,
             logical_shard_id=logical_shard_id,
         )

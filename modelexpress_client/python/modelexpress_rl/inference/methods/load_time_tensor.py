@@ -27,6 +27,7 @@ from ..plan import (
     PreparedStreamingTensors,
     ResolvedSource,
     ResolvedTrainerSource,
+    TrainerSourceSnapshot,
     UpdateMethod,
     WeightSource,
 )
@@ -46,6 +47,9 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self._active_staged: _StagedNixlWeights | None = None
         self._active_streamed: PreparedStreamingTensors | None = None
 
+    def cached_trainer_source(self) -> TrainerSourceSnapshot | None:
+        return self._transfer.cached_trainer_source()
+
     @property
     def capabilities(self) -> MethodCapabilities:
         return MethodCapabilities(
@@ -59,13 +63,14 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             raise RuntimeError("release the active update before preparing another")
         if not isinstance(source, ResolvedTrainerSource):
             raise TypeError("load-time tensor method requires a trainer source")
-        manifests = [item.manifest for item in source.snapshot.shards]
+        manifests = [item.metadata for item in source.snapshot.shards]
         is_streaming = self._transfer.bounded_staging
         with refit_span("transfer_planning", accumulate_metadata=True) as counters:
             prepared = self._transfer.prepare(
                 manifests=manifests,
                 trainer_snapshot=source.snapshot,
                 checksums=source.checksums,
+                prepare_groups=source.prepare_groups,
             )
             counters.update(prepared.metrics)
         set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))

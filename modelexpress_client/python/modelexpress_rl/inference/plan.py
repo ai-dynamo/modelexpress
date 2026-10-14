@@ -19,7 +19,7 @@ from ..control import WeightVersion
 from ..object_storage import ObjectStorageSource
 from ..train.manifest import ShardChecksumKey
 from ..train import WeightPayloadFormat
-from .adapter import TrainerSourceShard
+from .adapter import ReplicaGroup, TrainerSourceShard
 
 if TYPE_CHECKING:
     from .nixl_staged_transfer import _ResolvedSources
@@ -95,6 +95,7 @@ class TrainerSourceSnapshot:
     mesh_id: str
     mesh_generation: int
     shards: tuple[TrainerSourceShard, ...]
+    replica_groups: tuple[ReplicaGroup, ...] = ()
     resolved_metadata: _ResolvedSources | None = field(
         default=None, compare=False, repr=False
     )
@@ -103,6 +104,7 @@ class TrainerSourceSnapshot:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "shards", tuple(self.shards))
+        object.__setattr__(self, "replica_groups", tuple(self.replica_groups))
 
     @property
     def physical_fingerprint(self) -> tuple:
@@ -110,7 +112,7 @@ class TrainerSourceSnapshot:
             self.mesh_id,
             self.mesh_generation,
             tuple(
-                (shard.source_slot_id, shard.worker_id, shard.manifest_endpoint, shard.structural_digest)
+                (shard.source_slot_id, shard.worker_id)
                 for shard in self.shards
             ),
         )
@@ -131,6 +133,9 @@ class ResolvedTrainerSource:
 
     snapshot: TrainerSourceSnapshot
     checksums: Mapping[ShardChecksumKey, str] = field(default_factory=dict)
+    prepare_groups: Callable[[frozenset[str]], None] | None = field(
+        default=None, compare=False, repr=False
+    )
     kind = WeightSource.TRAINER
     payload_format = WeightPayloadFormat.FULL_TENSOR
 
