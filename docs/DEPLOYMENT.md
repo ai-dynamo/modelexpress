@@ -466,8 +466,9 @@ the wheel version alone does not identify its source commit.
 GitLab release-automation then publishes the nightly: the image as
 `nvcr.io/nvidia/ai-dynamo/modelexpress-server-nightly:<date>-<sha7>` (and
 `:latest`), the chart as `modelexpress-nightly` in
-`https://helm.ngc.nvidia.com/nvidia/ai-dynamo`, and the wheels on PyPI as
-`modelexpress==<base>.dev<date>`. Crates stay internal.
+`https://helm.ngc.nvidia.com/nvidia/ai-dynamo`, the wheels on PyPI as
+`modelexpress==<base>.dev<date>`, and the crates on crates.io as
+`<base>-nightly.<date>.g<sha7>`.
 
 The packaged nightly chart is stamped to reference the public nightly
 server image (the `repository` in `helm/values.yaml` plus `-nightly`), so
