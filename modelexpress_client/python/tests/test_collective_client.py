@@ -223,6 +223,7 @@ def fake_nccl(monkeypatch):
 
     m2n = ModuleType("nccl.m2n")
     m2n.reshard = reshard
+    install_fake_m2n_handles(m2n, ops)
     communicator = ModuleType("nccl.core.communicator")
     communicator.NCCLConfig = NCCLConfig
     communicator.Communicator = SimpleNamespace(init=lambda **kw: Comm())
@@ -254,6 +255,38 @@ def fake_nccl(monkeypatch):
         lambda self, timeout_s=None: None,
     )
     return ops
+
+
+def install_fake_m2n_handles(m2n, timeline=None):
+    """Give a stub ``nccl.m2n`` the explicit-handle API, logging its lifecycle.
+
+    ``timeline``, when given, also receives ``"m2n_destroy"`` so a test can
+    order the handle's destruction against communicator aborts.
+    """
+    m2n.events = []
+
+    class Handle:
+        def __init__(self, serial):
+            self.serial = serial
+            self.destroyed = False
+
+        def destroy(self):
+            self.destroyed = True
+            m2n.events.append(("destroy", self.serial))
+            if timeline is not None:
+                timeline.append("m2n_destroy")
+
+    class Config:
+        pass
+
+    def init(config=None):
+        handle = Handle(len([e for e in m2n.events if e[0] == "init"]))
+        m2n.events.append(("init", handle.serial))
+        return handle
+
+    m2n.Config = Config
+    m2n.init = init
+    return m2n
 
 
 def _raises(error):
@@ -1605,6 +1638,80 @@ class TestFreshnessAtStart:
         with pytest.raises(EpochChangedError):
             client.start_weight_update("v1", "op1")
         assert ("start", "v1") not in engine.calls
+
+
+class TestM2nHandleLifecycle:
+    """Each group epoch owns one explicit M2N handle, destroyed before its lanes."""
+
+    @staticmethod
+    def _m2n():
+        return sys.modules["nccl.m2n"]
+
+    def test_one_handle_serves_every_round_of_an_epoch(self, fake_nccl):
+        client = trainer(FakeRendezvous(), FakeEngine())
+        client.compute_plan()
+        for version in ("v1", "v2"):
+            client.start_weight_update(version, f"op-{version}")
+            client.publish_weights(version)
+            client.finish_weight_update(version)
+        assert self._m2n().events == [("init", 0)]
+
+    def test_cleanup_destroys_the_handle_before_any_lane_is_aborted(self, fake_nccl):
+        client = trainer(FakeRendezvous(), FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        client.publish_weights("v1")
+        client.finish_weight_update("v1")
+        fake_nccl.clear()
+        client.cleanup()
+        assert fake_nccl[0] == "m2n_destroy"
+        assert fake_nccl.count("abort") == 2
+        assert self._m2n().events == [("init", 0), ("destroy", 0)]
+
+    def test_an_epoch_move_destroys_the_old_handle_before_its_lanes(self, fake_nccl):
+        client = trainer(FakeRendezvous(epochs=(1, 2)), FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        client.publish_weights("v1")
+        client.finish_weight_update("v1")
+        fake_nccl.clear()
+        membership = client.compute_plan()
+        assert membership.epoch == 2
+        # The stale epoch-1 lanes are dropped only after the handle that cached
+        # resources against them is gone.
+        assert fake_nccl.index("m2n_destroy") < fake_nccl.index("abort")
+        client.start_weight_update("v2", "op2")
+        client.publish_weights("v2")
+        client.finish_weight_update("v2")
+        assert self._m2n().events == [("init", 0), ("destroy", 0), ("init", 1)]
+
+    def test_a_failed_round_destroys_the_handle_before_aborting_lanes(
+        self, fake_nccl, monkeypatch
+    ):
+        rz = FakeRendezvous()
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        monkeypatch.setattr(
+            collective_backend, "_reshard", _raises(RuntimeError("enqueue failed"))
+        )
+        fake_nccl.clear()
+        with pytest.raises(RuntimeError, match="enqueue failed"):
+            client.publish_weights("v1")
+        assert fake_nccl[0] == "m2n_destroy"
+        assert "abort" in fake_nccl
+        assert rz.reports[0]["succeeded"] is False
+
+    def test_compute_plan_mid_round_fails_that_round(self, fake_nccl):
+        rz = FakeRendezvous(epochs=(1, 2))
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        client.compute_plan()
+        assert rz.reports[0]["operation_id"] == "op1"
+        assert rz.reports[0]["succeeded"] is False
+        assert "compute_plan re-ran" in rz.reports[0]["message"]
+        assert self._m2n().events == [("init", 0), ("destroy", 0)]
 
 
 class TestCleanup:

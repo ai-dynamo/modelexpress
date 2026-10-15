@@ -187,6 +187,19 @@ class _RefitClientBase:
                 )
         self._reset_round()
 
+    def _close_half(self) -> None:
+        """Destroy the current half's M2N handle; its lanes are torn down after."""
+        half, self._half = self._half, None
+        if half is None:
+            return
+        try:
+            half.close()
+        except Exception:  # noqa: BLE001 - teardown of the lanes must proceed
+            logger.warning(
+                "closing the collective half raised; tearing its lanes down anyway",
+                exc_info=True,
+            )
+
     def _reset_round(self) -> None:
         self._round_started = False
         self._version = None
@@ -350,6 +363,13 @@ class _RefitClientBase:
         if self._digest is None:
             raise RuntimeError("initialize must run before compute_plan")
         require_nccl_m2n()
+        if self._operation_id is not None:
+            self._fail_round(
+                RuntimeError(
+                    f"compute_plan re-ran while the round for version "
+                    f"{self._version!r} was in flight"
+                )
+            )
 
         declared = self._declared_lanes()
         membership = self._rendezvous.join(
@@ -386,6 +406,9 @@ class _RefitClientBase:
                 f"{membership.broadcast_lane.lane_id}"
             )
 
+        # The previous half's M2N handle holds resources keyed on the lanes
+        # about to be dropped, so it is destroyed before any of them go.
+        self._close_half()
         previous = self._membership
         if previous is not None and previous.group_id != membership.group_id:
             self._cache.abort_group(previous.group_id)
@@ -514,6 +537,7 @@ class _RefitClientBase:
                     "was in flight"
                 )
             )
+        self._close_half()
         if self._membership is not None:
             self._cache.abort_group(self._membership.group_id)
         self._membership = None

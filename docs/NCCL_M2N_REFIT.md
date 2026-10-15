@@ -442,6 +442,33 @@ engine, not an MX-side rollback. A Loader that wants verify-before-activate must
 allocate its own receive buffers in `pre` and commit in `post`/`install()` — which
 is exactly what the fused-parameter path already does.
 
+### 8.1 M2N handle lifetime
+
+Each collective half (one group at one epoch) owns one explicit `nccl.m2n`
+handle, created by `nccl.m2n.init(Config())` at its first `start_weight_update`
+and passed as `handle=` to every `nccl.m2n.reshard`. No call uses M2N's
+process-wide default handle, which nothing could finalize and which would keep
+communicator-keyed windows, device communicators and staging alive past the
+lanes they were built against.
+
+The handle is always destroyed before the lanes it used are torn down:
+
+| Trigger | Order |
+|---|---|
+| `cleanup()` | close the half (destroy the handle), then abort the group's lanes |
+| `compute_plan` at a new epoch | close the previous half, then drop the stale-epoch lanes |
+| A failed round (`_fail_round`) | the half's abort destroys the handle, then aborts every lane of the group; then the report |
+
+Destroying a handle while GPU work may still reference its resources is not
+safe either, so before destroying it the half gives its in-flight lanes a short
+bounded wait (5 s, or what is left of the transfer deadline). Work that does
+not land in that time - a transfer deadline that already expired, a peer that
+is gone - leaves the handle quarantined: kept referenced, never destroyed, and
+logged. The lanes are aborted regardless, because releasing the peers matters
+more than reclaiming the handle; a process restart reclaims a quarantined
+handle. This matches the fail-stop rule of the standalone M2N transport
+(PR #497): retain native state that might still be in use rather than free it.
+
 ## 9. Configuration
 
 | Variable | Default | Purpose |

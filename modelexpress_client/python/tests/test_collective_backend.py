@@ -31,6 +31,7 @@ from modelexpress_rl.collective import (
     ReshardPlan,
     resolve_specs,
 )
+from tests.test_collective_client import install_fake_m2n_handles
 
 
 class Recorder:
@@ -59,6 +60,8 @@ def recorder(monkeypatch):
 
     module = ModuleType("nccl.m2n")
     module.reshard = reshard
+    install_fake_m2n_handles(module)
+    rec.m2n = module
     parent = ModuleType("nccl")
     monkeypatch.setitem(sys.modules, "nccl", parent)
     monkeypatch.setitem(sys.modules, "nccl.m2n", module)
@@ -307,7 +310,11 @@ class TestOpOrdering:
             "src_placements",
             "dst_mesh",
             "dst_placements",
+            "handle",
         }
+        # The half's own handle, never the process-wide default.
+        assert op.kwargs["handle"] is sender.m2n_handle
+        assert op.kwargs["handle"] is not None
         assert isinstance(op.kwargs["src_placements"][0], Shard)
         assert op.kwargs["src_placements"][0].dim == 0
 
@@ -766,6 +773,112 @@ class TestBoundedSynchronizeFallback:
         assert any(op.kind == "sync" for op in recorder.ops), (
             "falling back must still drain the stream, not skip the wait"
         )
+
+
+class TestM2nHandle:
+    """The half's explicit M2N handle: created once, destroyed before its lanes."""
+
+    @staticmethod
+    def _half(recorder):
+        plan = ReshardPlan(bulk=[entry("a"), entry("b")])
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        timeline = recorder.m2n.events
+        for lane_comm in [lane.handle for lane in cache._lanes.values()]:
+            original = lane_comm.abort
+
+            def abort(original=original, name=lane_comm._name):
+                timeline.append(("comm_abort", name))
+                original()
+
+            lane_comm.abort = abort
+        return half, cache
+
+    def test_no_handle_exists_until_a_round_starts(self, recorder):
+        half, _ = self._half(recorder)
+        assert half.m2n_handle is None
+        assert recorder.m2n.events == []
+
+    def test_every_reshard_of_every_round_uses_the_same_handle(self, recorder):
+        half, _ = self._half(recorder)
+        for version in ("v1", "v2"):
+            half.start_weight_update(version)
+            half.publish_weights(0)
+            half.finish_weight_update(broadcast_lane_id=1)
+        handles = {id(op.kwargs["handle"]) for op in recorder.ops if op.kind == "reshard"}
+        assert handles == {id(half.m2n_handle)}
+        assert recorder.m2n.events == [("init", 0)]
+
+    def test_abort_destroys_the_handle_then_aborts_every_lane(self, recorder):
+        half, cache = self._half(recorder)
+        half.start_weight_update("v1")
+        half.publish_weights(0)
+        half.abort()
+        events = recorder.m2n.events
+        assert events[:2] == [("init", 0), ("destroy", 0)]
+        assert sorted(events[2:]) == [("comm_abort", "lane0"), ("comm_abort", "lane1")]
+        assert len(cache) == 0
+        assert half.m2n_handle is None
+
+    def test_a_half_that_was_aborted_refuses_another_round(self, recorder):
+        half, _ = self._half(recorder)
+        half.start_weight_update("v1")
+        half.abort()
+        with pytest.raises(RuntimeError, match="compute_plan must run again"):
+            half.start_weight_update("v2")
+        assert [e for e in recorder.m2n.events if e[0] == "init"] == [("init", 0)]
+
+    def test_a_deadline_overrun_quarantines_the_handle_and_still_aborts(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setattr(backend, "_QUARANTINED_M2N_HANDLES", [])
+        half, cache = self._half(recorder)
+        half.start_weight_update("v1")
+        half.publish_weights(0)
+        handle = half.m2n_handle
+        half._deadline = 0.0  # long past: the work on the lanes is presumed stuck
+        with pytest.raises(TimeoutError, match="did not complete"):
+            half.finish_weight_update(broadcast_lane_id=1)
+        # Destroying a handle GPU work may still reference is unsafe, so it is
+        # kept, never destroyed - and the lanes are torn down anyway.
+        assert backend._QUARANTINED_M2N_HANDLES == [handle]
+        assert not handle.destroyed
+        assert len(cache) == 0
+
+    def test_a_destroy_that_raises_quarantines_and_still_aborts(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setattr(backend, "_QUARANTINED_M2N_HANDLES", [])
+        half, cache = self._half(recorder)
+        half.start_weight_update("v1")
+        handle = half.m2n_handle
+
+        def broken():
+            raise RuntimeError("finalize failed")
+
+        handle.destroy = broken
+        half.abort()
+        assert backend._QUARANTINED_M2N_HANDLES == [handle]
+        assert len(cache) == 0
+
+    def test_close_destroys_the_handle_and_leaves_the_lanes_to_the_caller(
+        self, recorder
+    ):
+        half, cache = self._half(recorder)
+        half.start_weight_update("v1")
+        half.publish_weights(0)
+        half.finish_weight_update(broadcast_lane_id=1)
+        half.close()
+        half.close()
+        assert recorder.m2n.events == [("init", 0), ("destroy", 0)]
+        assert len(cache) == 2
+
+    def test_a_build_without_a_finalizable_handle_is_refused(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setattr(recorder.m2n, "init", lambda config=None: object())
+        half, _ = self._half(recorder)
+        with pytest.raises(backend.NcclUnavailableError, match="destroy"):
+            half.start_weight_update("v1")
 
 
 class TestWaitEventBackoff:

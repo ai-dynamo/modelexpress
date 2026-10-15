@@ -36,6 +36,41 @@ _SLOW_RESHARD_WARN_S = 10.0
 DEFAULT_LAYER_GROUP = 0
 _M2N_CALL_LOCK = threading.Lock()
 
+#: How long an abort waits for this half's in-flight work before deciding
+#: whether its M2N handle can be destroyed.
+_M2N_QUIESCE_S = 5.0
+
+#: Handles that could not be destroyed safely. Held for the life of the process
+#: so nothing ever finalizes them while GPU work may still reference their
+#: resources; a process restart reclaims them.
+_QUARANTINED_M2N_HANDLES: list[Any] = []
+
+
+def _m2n_init() -> Any:
+    """Create one explicit ``nccl.m2n`` handle.
+
+    Bare ``nccl.m2n.reshard`` uses M2N's process-wide default handle, which
+    nothing here could ever finalize, and which would keep communicator-keyed
+    windows, device communicators and staging alive past the lanes they were
+    built against. An explicit handle lets the half destroy them first.
+    """
+    require_nccl_m2n()
+    import nccl.m2n as m2n
+
+    with _M2N_CALL_LOCK:
+        handle = m2n.init(m2n.Config())
+    if not callable(getattr(handle, "destroy", None)):
+        raise NcclUnavailableError(
+            "this nccl-extensions build returns an M2N handle without destroy(); "
+            "the collective refit needs an explicit, finalizable handle"
+        )
+    return handle
+
+
+def _m2n_destroy(handle: Any) -> None:
+    with _M2N_CALL_LOCK:
+        handle.destroy()
+
 
 class _blocked_reshard_watch:
     """Log while one nccl.m2n reshard call still blocks the host.
@@ -148,8 +183,9 @@ def _reshard(
     entry: ParamPlan,
     src: Any,
     dst: Any,
+    handle: Any,
 ) -> None:
-    """Issue one ``nccl.m2n.reshard``.
+    """Issue one ``nccl.m2n.reshard`` on the half's explicit M2N handle.
 
     Co-called: the trainer passes ``dst=None`` and the generator passes
     ``src=None``, and NCCL routes the many-to-many redistribution internally
@@ -160,7 +196,9 @@ def _reshard(
     an MX-brokered deployment and a NeMo-RL-native one issue the identical
     call: tensors and communicator positional, meshes and placements by
     keyword, meshes nested to their shape, placements as real DTensor objects,
-    and ``stream`` passed as a raw handle only when there is one.
+    and ``stream`` passed as a raw handle only when there is one. The M2N
+    ``handle`` is passed by keyword and always, so no call ever lands on the
+    process-wide default handle that nothing finalizes.
     """
     require_nccl_m2n()
     from nccl.m2n import reshard
@@ -170,6 +208,7 @@ def _reshard(
         "src_placements": [p.to_dtensor() for p in entry.src_placements],
         "dst_mesh": entry.dst_mesh.nested(),
         "dst_placements": [p.to_dtensor() for p in entry.dst_placements],
+        "handle": handle,
     }
     stream = comm.stream
     if stream is not None:
@@ -256,6 +295,105 @@ class _CollectiveHalf:
         self._deadline: float | None = None
         self._timeout_s: float | None = None
         self._version: str | None = None
+        # This half's explicit M2N handle. One per half, and a half is one group
+        # at one epoch, so the handle never outlives the lanes it was used on.
+        self._m2n_handle: Any | None = None
+        self._closed = False
+
+    @property
+    def m2n_handle(self) -> Any | None:
+        return self._m2n_handle
+
+    def _ensure_m2n_handle(self) -> Any:
+        if self._closed:
+            raise RuntimeError(
+                f"the collective half for group {self._group_id} at epoch "
+                f"{self._epoch} was aborted or closed; compute_plan must run again"
+            )
+        if self._m2n_handle is None:
+            self._m2n_handle = _m2n_init()
+        return self._m2n_handle
+
+    def _lanes_quiesced(self, quiesce_s: float) -> bool:
+        """Whether every lane with work in flight finished it within ``quiesce_s``."""
+        lanes = list(self._active_lanes.values())
+        for marks, _ in self._in_flight.values():
+            lanes.extend(lane for lane, _ in marks)
+        seen: set[int] = set()
+        for lane in lanes:
+            if id(lane) in seen:
+                continue
+            seen.add(id(lane))
+            if quiesce_s <= 0 or lane.aborted:
+                return False
+            try:
+                lane.synchronize(timeout_s=quiesce_s)
+            except Exception as error:  # noqa: BLE001 - any failure means "not idle"
+                logger.warning(
+                    "lane %s/%s did not quiesce before M2N handle release: %r",
+                    lane.rank,
+                    lane.world_size,
+                    error,
+                )
+                return False
+        return True
+
+    def _release_m2n_handle(self, *, quiesce_s: float) -> None:
+        """Destroy the M2N handle while the communicators it used are still live.
+
+        M2N caches windows, device communicators, streams and staging against
+        each communicator it has seen, so the handle goes first and the lanes
+        after. Destroying it while GPU work may still reference those resources
+        is not safe either, so the half's in-flight work is given ``quiesce_s``
+        to land; when it does not, the handle is quarantined - kept referenced
+        and never destroyed - and the caller tears the lanes down regardless,
+        because releasing peers matters more than reclaiming the handle. A
+        process restart reclaims a quarantined handle.
+        """
+        handle = self._m2n_handle
+        self._m2n_handle = None
+        if handle is None:
+            return
+        if not self._lanes_quiesced(quiesce_s):
+            _QUARANTINED_M2N_HANDLES.append(handle)
+            logger.error(
+                "M2N handle of group %s at epoch %s quarantined: work on its lanes "
+                "may still be in flight, so it is not destroyed (%d quarantined in "
+                "this process; a restart reclaims them)",
+                self._group_id,
+                self._epoch,
+                len(_QUARANTINED_M2N_HANDLES),
+            )
+            return
+        try:
+            _m2n_destroy(handle)
+        except Exception:  # noqa: BLE001 - the lanes must still be torn down
+            _QUARANTINED_M2N_HANDLES.append(handle)
+            logger.exception(
+                "destroying the M2N handle of group %s at epoch %s failed; "
+                "quarantined",
+                self._group_id,
+                self._epoch,
+            )
+
+    def close(self) -> None:
+        """Healthy teardown of this half, before its lanes are torn down.
+
+        Destroys the M2N handle while the lanes are still live. Does not touch
+        the communicators: the caller owns those and tears them down next.
+        Idempotent.
+        """
+        self._release_m2n_handle(quiesce_s=self._quiesce_bound())
+        self._closed = True
+        self._active_lanes.clear()
+        self._pending_contexts.clear()
+        self._in_flight.clear()
+        self._deadline = None
+
+    def _quiesce_bound(self) -> float:
+        if self._deadline is None:
+            return _M2N_QUIESCE_S
+        return max(0.0, min(_M2N_QUIESCE_S, self._deadline - time.monotonic()))
 
     def setup_layer_groups(self, groupings: list[list[str]] | None) -> None:
         """Partition the bulk parameters into layer groups.
@@ -377,8 +515,17 @@ class _CollectiveHalf:
         )
 
     def abort(self) -> None:
-        """Give up on every lane of this group at once."""
-        self._cache.abort_group(self._group_id)
+        """Give up on every lane of this group at once.
+
+        The M2N handle is released first, while the lanes are still live, and
+        the communicators are aborted after it. The half cannot run another
+        round; the group has to re-form at a fresh epoch.
+        """
+        try:
+            self._release_m2n_handle(quiesce_s=self._quiesce_bound())
+        finally:
+            self._closed = True
+            self._cache.abort_group(self._group_id)
         self._active_lanes.clear()
         self._pending_contexts.clear()
         self._in_flight.clear()
@@ -434,7 +581,13 @@ class _CollectiveHalf:
             self._pending_contexts.append(ctx)
             started = time.monotonic()
             with _blocked_reshard_watch(entry, lane, started):
-                _reshard(comm=lane, entry=entry, src=src(ctx), dst=dst(ctx))
+                _reshard(
+                    comm=lane,
+                    entry=entry,
+                    src=src(ctx),
+                    dst=dst(ctx),
+                    handle=self._m2n_handle,
+                )
             elapsed = time.monotonic() - started
             if elapsed >= _SLOW_RESHARD_WARN_S:
                 # nccl.m2n issues host-blocking collectives inside a call
@@ -484,6 +637,7 @@ class NcclM2nSender(_CollectiveHalf):
         super().__init__(active_partition=source_partition, **kwargs)
 
     def start_weight_update(self, version: str) -> None:
+        self._ensure_m2n_handle()
         self._begin_transfer(version)
         logger.debug("collective sender starting version %s", version)
 
@@ -517,6 +671,7 @@ class NcclM2nReceiver(_CollectiveHalf):
     """Generator half: supplies each parameter's destination to the collective."""
 
     def start_weight_update(self, version: str) -> None:
+        self._ensure_m2n_handle()
         self._begin_transfer(version)
         logger.debug("collective receiver starting version %s", version)
 

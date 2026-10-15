@@ -99,11 +99,16 @@ def _rank_main(rank: int, unique_id: bytes, mode: str, results) -> None:
         cols = GLOBAL_SHAPE[1] // len(DST_RANKS)
         dst = torch.full((GLOBAL_SHAPE[0], cols), -1.0, dtype=torch.float32, device=device)
 
+    handle = mx_backend._m2n_init()
     if mode != "skip-reshard":
         with torch.cuda.stream(stream):
-            mx_backend._reshard(comm=lane, entry=plan, src=src, dst=dst)
+            mx_backend._reshard(
+                comm=lane, entry=plan, src=src, dst=dst, handle=handle
+            )
     lane.synchronize()
     torch.cuda.synchronize()
+    # The explicit handle goes before the communicator, as in production.
+    mx_backend._m2n_destroy(handle)
 
     if rank in DST_RANKS:
         cols = GLOBAL_SHAPE[1] // len(DST_RANKS)
