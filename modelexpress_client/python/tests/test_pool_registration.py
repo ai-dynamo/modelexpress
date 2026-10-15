@@ -300,6 +300,33 @@ class TestRawDescriptorMemType:
             backends=["UCX"],
         )
 
+    def test_arena_ignores_empty_tensors_in_containment_check(self):
+        tensor = torch.zeros(1)
+        base = tensor.data_ptr()
+        used = tensor.numel() * tensor.element_size()
+
+        class FakeArena:
+            live_allocation_count = 1
+
+            def registered_range(self):
+                return base, used
+
+        empty = torch.empty(0, dtype=torch.float32)
+        unallocated = torch.empty(1, dtype=torch.float32, device="meta")
+        mgr = self._make_manager()
+        assert (
+            mgr.register_arena(
+                FakeArena(), {"w": tensor, "empty": empty, "meta": unallocated}
+            )
+            == b"metadata"
+        )
+
+        mgr._agent.register_memory.assert_called_once_with(
+            [(base, used, 0, "")],
+            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+            backends=["UCX"],
+        )
+
     def test_arena_registration_falls_back_when_tensor_uncovered(self):
         # A tensor outside [base, base+used) must not be served by the single MR.
         class FakeArena:
@@ -495,6 +522,58 @@ class TestReceiveFromSourceManifestValidation:
             [(0x1000, weight.numel() * weight.element_size(), 0)],
             [(weight.data_ptr(), weight.numel() * weight.element_size(), 0)],
         ]
+
+    def test_null_address_tensor_is_validated_but_not_transferred(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+        weight = torch.ones(4, dtype=torch.float32)
+        unallocated = torch.empty(1, dtype=torch.float32, device="meta")
+        mgr = self._make_manager(
+            monkeypatch,
+            {"weight": weight, "unallocated": unallocated},
+        )
+        mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
+        mgr._agent.make_prepped_xfer.return_value = "handle"
+        mgr._agent.check_xfer_state.return_value = "DONE"
+
+        result = mgr.receive_from_source(
+            source_metadata=b"",
+            source_tensors=[
+                TensorDescriptor("weight", 0x1000, 16, 0, str(weight.dtype)),
+                TensorDescriptor("unallocated", 0, 4, 0, str(unallocated.dtype)),
+            ],
+            remote_agent_name="source",
+        )
+
+        assert result[:2] == (16, 2)
+        assert [
+            entry.kwargs["xfer_list"]
+            for entry in mgr._agent.prep_xfer_dlist.call_args_list
+        ] == [
+            [(0x1000, 16, 0)],
+            [(weight.data_ptr(), 16, 0)],
+        ]
+
+    def test_null_address_nonzero_size_skip_warns(self, monkeypatch, caplog):
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+        unallocated = torch.empty(1, dtype=torch.float32, device="meta")
+        empty = torch.empty(0, dtype=torch.int32)
+        mgr = self._make_manager(
+            monkeypatch, {"unallocated": unallocated, "empty": empty}
+        )
+
+        with caplog.at_level(logging.WARNING, logger="modelexpress.nixl_transfer"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[
+                    TensorDescriptor("unallocated", 0, 4, 0, str(unallocated.dtype)),
+                    TensorDescriptor("empty", 0, 0, 0, str(empty.dtype)),
+                ],
+                remote_agent_name="source",
+            )
+
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any("tensor 'unallocated'" in m for m in messages)
+        assert not any("tensor 'empty'" in m for m in messages)
 
     def test_all_empty_manifest_needs_no_nixl_transfer(self, monkeypatch):
         indices = torch.empty(0, dtype=torch.int32)

@@ -111,6 +111,11 @@ class PostedRead:
     posted_at: float = field(default_factory=time.perf_counter)
 
 
+def _has_memory_range(size: int, addr: int) -> bool:
+    """True when a tensor owns allocated bytes that can be registered and read."""
+    return size > 0 and addr != 0
+
+
 class NixlTransferManager:
     """
     Manages a single NIXL agent and RDMA transfers.
@@ -327,7 +332,7 @@ class NixlTransferManager:
         for name, tensor in tensors.items():
             size = tensor.numel() * tensor.element_size()
             addr = tensor.data_ptr()
-            if size == 0 or addr == 0:
+            if not _has_memory_range(size, addr):
                 tensor_descriptors.append(
                     TensorDescriptor(
                         name=name,
@@ -398,7 +403,7 @@ class NixlTransferManager:
         registrable_descriptors = [
             descriptor
             for descriptor in tensor_descriptors
-            if descriptor.size > 0 and descriptor.addr != 0
+            if _has_memory_range(descriptor.size, descriptor.addr)
         ]
         registrable_names = {descriptor.name for descriptor in registrable_descriptors}
         registrable_tensors = [
@@ -571,7 +576,8 @@ class NixlTransferManager:
         uncovered = [
             d
             for d in tensor_descriptors
-            if d.addr < base or (d.addr + d.size) > (base + used)
+            if _has_memory_range(d.size, d.addr)
+            and (d.addr < base or (d.addr + d.size) > (base + used))
         ]
         if uncovered:
             logger.warning(
@@ -941,7 +947,15 @@ class NixlTransferManager:
                     f"source={src_tensor.dtype!r}, local={local_dtype!r}"
                 )
             matched_tensors += 1
-            if src_tensor.size == 0:
+            if not _has_memory_range(src_tensor.size, src_tensor.addr):
+                if src_tensor.size > 0:
+                    logger.warning(
+                        "Skipping %d bytes of tensor '%s': source published "
+                        "no memory address, so the local tensor keeps its "
+                        "current values",
+                        src_tensor.size,
+                        src_tensor.name,
+                    )
                 continue
             remote_descs.append(
                 (src_tensor.addr, src_tensor.size, src_tensor.device_id)
