@@ -25,13 +25,13 @@ Run: pytest tests/test_reshard_refit_fused_wire.py
 import torch
 
 from modelexpress.refit.reshard.receiver import ReshardReceiver
-from modelexpress.refit.reshard.slice_plan import PullSegment
+from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import (
-    ConvertSource,
-    FullPullSource,
-    TransferPlan,
+    SourceInfo,
+    plan_transfer,
 )
 from modelexpress.refit.reshard.transport import InMemoryReferenceTransport
+from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
 
 EL = 4  # float32 element size
 
@@ -101,64 +101,33 @@ def _build(transport):
     harness._staging = {"router": convert_staging}
     harness._staging_ptr = {"router": convert_staging.data_ptr()}
 
-    plan = TransferPlan(
-        segments=[
-            PullSegment(
-                session="s0",
-                src_addr=exact_src.data_ptr(),
-                dst_byte=0,
-                nbytes=8 * EL,
-                param_name="exact",
-            )
-        ],
-        full_pulls=[
-            FullPullSource(
-                src_name="strided",
-                global_shape=(4, 4),
-                dtype=torch.float32,
-                elsize=EL,
-                segments=[
-                    PullSegment(
-                        session="s1",
-                        src_addr=strided_src.data_ptr(),
-                        dst_byte=0,
-                        nbytes=16 * EL,
-                        param_name="strided",
-                    )
-                ],
-                # Take the first two columns, the shape a tensor-parallel row
-                # split produces and the reason this source is descriptor-heavy.
-                copies=[
-                    _Copy(
-                        param_name="strided",
-                        op_chain=(("narrow", (1, 0, 2), ()),),
-                        dest_shape=(4, 2),
-                        dest_stride=(2, 1),
-                        dest_offset=0,
-                    )
-                ],
-            )
-        ],
-        converts=[
-            ConvertSource(
-                param_name="router",
-                dest_shape=(4,),
-                src_dtype=torch.bfloat16,
-                segments=[
-                    PullSegment(
-                        session="s2",
-                        src_addr=router_src.data_ptr(),
-                        dst_byte=0,
-                        nbytes=4 * 2,
-                        param_name="router",
-                    )
-                ],
-            )
-        ],
-        exact_bytes=8 * EL,
-        exact_descriptor_count=1,
-    )
+    copies = CaptureResult(copies=[
+        RecordedCopy("exact", (), "exact", 0, (8,), (1,), torch.float32),
+        RecordedCopy("strided", (("narrow", (1, 0, 2), ()),), "strided",
+                     0, (4, 2), (2, 1), torch.float32),
+        RecordedCopy("router", (), "router", 0, (4,), (1,), torch.float32),
+    ])
+    sources = {
+        name: SourceInfo(tuple(tensor.shape), tensor.dtype, tensor.element_size(), [Shard(
+            (0,) * tensor.ndim, tuple(tensor.shape), session, tensor.data_ptr(),
+            tensor.element_size(),
+        )])
+        for name, tensor, session in (
+            ("exact", exact_src, "s0"), ("strided", strided_src, "s1"),
+            ("router", router_src, "s2"),
+        )
+    }
+    plan = plan_transfer(copies, sources, verify_full_sources=True)
     harness._plan = plan
+    harness._resolve_source = lambda buffer: (
+        buffer.source_slot_id, sources[buffer.src_name].shards[0].addr
+    )
+    harness._resolve_destination = lambda kind, name: (
+        harness._full_staging_ptr[name] if kind == "full"
+        else harness._staging_ptr[name] if kind == "convert"
+        else harness._recv_buffers[name].data_ptr()
+    )
+    harness._bind_physical_plan()
     keepalive = (exact_src, strided_src, router_src)
     return harness, keepalive
 
@@ -252,8 +221,9 @@ def test_empty_full_pull_and_convert_groups_are_skipped(monkeypatch):
         monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "1" if fused else "0")
         transport = _RecordingTransport()
         harness, keepalive = _build(transport)
-        harness._plan.full_pulls = []
-        harness._plan.converts = []
+        from dataclasses import replace
+        harness._plan = replace(harness._plan, full_pulls=(), converts=())
+        harness._bind_physical_plan()
 
         harness.update_weights(step=1)
 

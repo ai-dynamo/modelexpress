@@ -20,6 +20,7 @@ Run: pytest tests/test_reshard_refit_ceiling.py
 
 import json
 import logging
+from dataclasses import replace
 
 import pytest
 import torch
@@ -227,7 +228,8 @@ def test_a_bounded_plan_still_reaches_the_guard(monkeypatch):
     monkeypatch.delenv("MX_REFIT_STAGE_RECORD", raising=False)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     harness, keepalive = _build(_RecordingTransport())
-    harness._plan.segments = []
+    harness._plan = replace(harness._plan, segments=())
+    harness._bind_physical_plan()
 
     assert harness._plan.exact_descriptor_count, "precondition: a bounded plan"
     with pytest.raises(RuntimeError, match="failed, not fast"):

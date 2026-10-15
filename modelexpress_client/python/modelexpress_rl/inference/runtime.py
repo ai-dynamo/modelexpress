@@ -13,6 +13,7 @@ from typing import Any
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClient
 
+from .. import envs as rl_envs
 from ..control import WeightVersion
 
 from .adapter import GeneratorEngineContext
@@ -24,7 +25,9 @@ from .methods import (
 from .nixl_staged_transfer import _NixlStagedTransfer
 from .plan import (
     EngineInstaller,
+    PreparedStreamingTensors,
     SourceResolver,
+    StreamingSettings,
     UpdateMethod,
     WeightSource,
     WeightUpdatePlanner,
@@ -49,7 +52,10 @@ class FullTensorEngineCapability:
     device: Any
     # Rank in the engine's weight-transfer group; peer selection matches it.
     worker_rank: int
+    # capture_layout transfers ownership of its returned capture and layout
+    # to the update plan; it must not mutate them after returning.
     capture_layout: Callable
+    generator_fingerprint: Callable[[], tuple]
     runtime_tensors: dict[str, Any] | None
     source_worker_id: str | None
     unpublish_runtime_tensors: Callable[[], None]
@@ -179,16 +185,19 @@ def _create_load_time_tensor_method(
     *,
     capability: FullTensorEngineCapability,
     worker_id: str,
+    streaming: StreamingSettings | None = None,
 ) -> LoadTimeTensorNixlUpdateMethod:
     transfer = _NixlStagedTransfer(
         agent_name=f"mx-refit-load-time-{worker_id}",
+        streaming=streaming,
         device_id=capability.device_id,
         device=capability.device,
         listen_port=None,
+        capture_layout=capability.capture_layout,
+        generator_fingerprint=capability.generator_fingerprint,
     )
     return LoadTimeTensorNixlUpdateMethod(
         transfer=transfer,
-        capture_layout=capability.capture_layout,
     )
 
 
@@ -205,6 +214,8 @@ def _create_runtime_tensor_method(
         device_id=capability.device_id,
         device=capability.device,
         manager=capability.nixl_manager,
+        capture_layout=capability.capture_layout,
+        generator_fingerprint=capability.generator_fingerprint,
     )
     return RuntimeTensorNixlUpdateMethod(
         transfer=transfer,
@@ -283,6 +294,7 @@ def initialize_generator_runtime(
     rpc_timeout_seconds: float,
     service: Callable,
     start_lease: Callable[[str], Any],
+    streaming: StreamingSettings | None = None,
     resolve_replay_chain: Callable[[str, bool], tuple[WeightVersion, ...]]
     | None = None,
 ) -> GeneratorRuntime:
@@ -301,6 +313,12 @@ def initialize_generator_runtime(
         object_storage=object_storage,
         source_order=resolved_source_order,
     )
+    if (
+        streaming is not None
+        and WeightSource.TRAINER in resolved_source_order
+        and PreparedStreamingTensors not in engine.installer.capabilities.artifact_types
+    ):
+        raise ValueError("engine does not support bounded streaming installation")
     methods: list[UpdateMethod] = []
     p2p_client = None
     canonical_method = None
@@ -311,6 +329,10 @@ def initialize_generator_runtime(
             canonical_method = CanonicalDeltaUpdateMethod(
                 model_name=engine.model_name,
                 config=object_storage,
+                stream_full_checkpoints=(
+                    rl_envs.MX_REFIT_FULL_STREAMING
+                    and engine.installer.capabilities.streamed_checkpoints
+                ),
             )
             methods.append(canonical_method)
         if any(
@@ -326,6 +348,7 @@ def initialize_generator_runtime(
                         _create_load_time_tensor_method(
                             capability=engine.full_tensor,
                             worker_id=worker_id,
+                            streaming=streaming,
                         )
                     )
                 if WeightSource.GENERATOR in resolved_source_order:
@@ -383,6 +406,7 @@ def initialize_generator_runtime(
                     max_transfer_attempts=max_transfer_attempts,
                 ),
                 start_lease=start_lease,
+                streaming=streaming,
                 resolve_replay_chain=(
                     None
                     if resolve_replay_chain is None

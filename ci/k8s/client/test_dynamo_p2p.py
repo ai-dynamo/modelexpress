@@ -33,7 +33,7 @@ import subprocess
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from kube_utils import kubectl, port_forward
+from kube_utils import completion_response, kubectl, port_forward
 
 
 # Service + label conventions are set by the dynamo operator from the DGD spec:
@@ -175,8 +175,7 @@ def _send_completion(port: int, model: str, index: int) -> str:
     # warm responses complete in seconds. Using the same timeout for every
     # call keeps the code simple — the wall-clock cost is dominated by the
     # cold start either way.
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        body = json.loads(resp.read())
+    body = completion_response(req)
     choices = body.get("choices", [])
     assert choices, f"Request {index}: no choices in response: {body}"
     text = choices[0].get("text", "")

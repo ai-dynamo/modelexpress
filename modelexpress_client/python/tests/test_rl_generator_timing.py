@@ -12,7 +12,10 @@ processing and the copy into kernel storage all charged as one span.
 """
 
 import logging
+from contextlib import nullcontext
 from types import SimpleNamespace
+
+import pytest
 
 from modelexpress.refit import (
     RefitTimingRecorder,
@@ -21,16 +24,11 @@ from modelexpress.refit import (
     use_refit_timing,
 )
 from modelexpress_rl import timing
-from modelexpress_rl.inference.adapter import (
-    GeneratorSource,
-    GeneratorTransferInputs,
-    NixlGeneratorSource,
-)
 from modelexpress_rl.inference.methods.load_time_tensor import (
     LoadTimeTensorNixlUpdateMethod,
     _attribute_transfer,
 )
-from modelexpress_rl.inference.plan import TrainerUpdateSource
+from modelexpress_rl.inference.plan import ResolvedTrainerSource, TrainerSourceSnapshot
 from modelexpress_rl.train import WeightPayloadFormat
 
 STAGED_METRICS = {
@@ -122,60 +120,64 @@ def test_reusing_a_transfer_plan_is_marked_warm(monkeypatch):
     assert recorder.as_dict()["cold_warm"] == "warm"
 
 
-def test_version_digest_refreshes_verification_without_replanning():
+@pytest.mark.parametrize(
+    "bounded, outcome",
+    [(False, "complete"), (True, "complete"), (True, "error"), (True, "close")],
+)
+def test_transfer_timing_reports_cache_reuse_and_consumed_bytes(bounded, outcome) -> None:
     class Transfer:
-        def __init__(self):
-            self.prepare_calls = 0
-            self.refresh_calls = 0
+        bounded_staging = bounded
 
-        def unpublish_peer(self):
-            pass
+        def __init__(self) -> None:
+            self.hits = iter((0, 1))
 
-        def prepare(self, **_kwargs):
-            self.prepare_calls += 1
-            return object()
-
-        def refresh_sources(self, _prepared, _manifests):
-            self.refresh_calls += 1
-
-        def stage(self, _prepared):
-            return SimpleNamespace(metrics={"bytes_received": 0})
-
-    transfer = Transfer()
-    method = LoadTimeTensorNixlUpdateMethod(
-        transfer=transfer,
-        capture_layout=lambda _manifest: None,
-    )
-
-    def source(version, digest):
-        return TrainerUpdateSource(
-            inputs=GeneratorTransferInputs(
-                version_id=version,
-                base_version_id=None,
-                layout_signature="layout",
-                payload_format=WeightPayloadFormat.FULL_TENSOR,
-                sources=(
-                    GeneratorSource(
-                        source_slot_id="rank:0",
-                        worker_id="trainer-0",
-                        manifest_digest=digest,
-                        transport=NixlGeneratorSource(
-                            manifest_endpoint="trainer:9000",
-                            manifest=version.encode(),
-                            structural_digest="stable-structure",
-                        ),
-                    ),
-                ),
+        def prepare(self, **_kwargs) -> SimpleNamespace:
+            return SimpleNamespace(
+                metrics={"plan_cache_hits": next(self.hits)},
+                batches=[SimpleNamespace(layouts=({"weight": None},))],
             )
-        )
 
-    first = method.prepare(version=None, source=source("v1", "digest-1"))
-    method.release(first)
-    second = method.prepare(version=None, source=source("v2", "digest-2"))
-    method.release(second)
+        def stage(self, _prepared) -> SimpleNamespace:
+            return SimpleNamespace(metrics=dict(STAGED_METRICS))
 
-    assert transfer.prepare_calls == 1
-    assert transfer.refresh_calls == 1
+        def iter_bounded(self, _prepared, metrics):
+            metrics.update(STAGED_METRICS)
+            yield {"weight": 7}
+            if outcome == "error":
+                raise RuntimeError("transfer failed")
+
+    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer())
+    source = ResolvedTrainerSource(TrainerSourceSnapshot("mesh", 1, ()))
+    version = SimpleNamespace(
+        base_version_id=None,
+        layout_signature="layout",
+        payload_format=WeightPayloadFormat.FULL_TENSOR,
+    )
+    for label, expected in (("v1", "cold"), ("v2", "warm")):
+        recorder = RefitTimingRecorder(backend="rl_generator", version=label, rank=0)
+        with use_refit_timing(recorder):
+            prepared = method.prepare(version=version, source=source)
+            expected_error = (
+                pytest.raises(RuntimeError, match="transfer failed")
+                if outcome == "error" else nullcontext()
+            )
+            with expected_error, method.installation_context(prepared):
+                if bounded:
+                    assert recorder.as_dict()["bytes"] == 0
+                    batches = prepared.batches()
+                    assert next(batches) == {"weight": 7}
+                    if outcome == "error":
+                        next(batches)
+                    elif outcome == "complete":
+                        assert list(batches) == []
+                    batches.close()
+            method.release(prepared)
+        record = recorder.as_dict()
+        assert record["cold_warm"] == expected
+        assert record["stages"]["transfer_planning"]["count"] == 1
+        assert record["bytes"] == STAGED_METRICS["bytes_received"]
+        assert record["stages"]["wire_transfer"]["duration_ms"] == 1500.0
+        assert record["stages"]["receive_sync"]["duration_ms"] == 250.0
 
 
 def test_the_record_is_emitted_once(monkeypatch, caplog):

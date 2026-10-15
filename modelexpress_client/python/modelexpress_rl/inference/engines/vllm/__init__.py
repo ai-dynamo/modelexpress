@@ -83,6 +83,7 @@ def _create_vllm_engine_runtime(
             publish_runtime_tensors=publish_runtime_tensors,
             build_identity=build_identity,
             nixl_manager=loader.nixl_manager if loader is not None else None,
+            generator_fingerprint=lambda: installer.capture_generator_fingerprint(),
         ),
     )
 

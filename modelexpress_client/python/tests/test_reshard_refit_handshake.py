@@ -17,8 +17,6 @@ receiver-trainer pair.
 """
 
 import logging
-import types
-
 import pytest
 
 from modelexpress import envs
@@ -26,8 +24,10 @@ from modelexpress.refit.reshard.receiver import (
     handshake_endpoints_for_plan,
     handshake_with_peers,
 )
-from modelexpress.refit.reshard.slice_plan import PullSegment
-from modelexpress.refit.reshard.transfer_plan import TransferPlan
+from modelexpress.refit.reshard.slice_plan import LogicalRead, SourceBuffer
+from modelexpress.refit.reshard.transfer_plan import (
+    ConvertSource, FullPullSource, LogicalTransferPlan,
+)
 
 
 class _Manager:
@@ -211,9 +211,18 @@ def test_a_non_finite_bound_falls_back_to_the_default(monkeypatch, raw):
 # --------------------------------------------------- narrowing the peer set
 
 
-def _segment(session):
-    return PullSegment(
-        session=session, src_addr=0, param_name="w", dst_byte=0, nbytes=1024
+def _read(index):
+    return LogicalRead(
+        source_buffer=index, src_byte=0, param_name="w", dst_byte=0, nbytes=1024
+    )
+
+
+def _plan(*sessions, segments=(), converts=(), full_pulls=()):
+    return LogicalTransferPlan(
+        source_buffers=tuple(
+            SourceBuffer(session, "w", (0,), (1,)) for session in sessions
+        ),
+        segments=tuple(segments), converts=tuple(converts), full_pulls=tuple(full_pulls),
     )
 
 
@@ -223,7 +232,7 @@ def _session_to_agent(n):
 
 def test_only_the_trainers_the_plan_reads_from_are_dialed():
     """Four trainers were discovered, the plan reads from two, so two are dialed."""
-    plan = TransferPlan(segments=[_segment("s1"), _segment("s3")])
+    plan = _plan("s1", "s3", segments=(_read(0), _read(1)))
 
     narrowed = handshake_endpoints_for_plan(plan, _session_to_agent(4), _endpoints(4))
 
@@ -231,7 +240,7 @@ def test_only_the_trainers_the_plan_reads_from_are_dialed():
 
 
 def test_the_narrowed_endpoints_keep_their_addresses():
-    plan = TransferPlan(segments=[_segment("s2")])
+    plan = _plan("s2", segments=(_read(0),))
 
     narrowed = handshake_endpoints_for_plan(plan, _session_to_agent(4), _endpoints(4))
 
@@ -243,13 +252,11 @@ def test_reads_are_counted_from_every_phase_of_the_plan():
     dtype-conversion staging, and into full-pull staging. Missing any one of them
     would drop a peer the plan genuinely reads from, and the failure would surface
     later as an unresolvable address in prep_xfer_dlist."""
-    plan = TransferPlan(
-        segments=[_segment("s0")],
-        converts=[types.SimpleNamespace(segments=[_segment("s1")])],
-        full_pulls=[types.SimpleNamespace(segments=[_segment("s2")])],
+    plan = _plan(
+        "s0", "s1", "s2", segments=(_read(0),),
+        converts=(ConvertSource("w", (1,), object, (_read(1),)),),
+        full_pulls=(FullPullSource("w", (1,), object, 4, (_read(2),), ()),),
     )
-
-    assert plan.sessions() == {"s0", "s1", "s2"}
 
     narrowed = handshake_endpoints_for_plan(plan, _session_to_agent(4), _endpoints(4))
 
@@ -259,7 +266,7 @@ def test_reads_are_counted_from_every_phase_of_the_plan():
 def test_a_planned_trainer_with_no_endpoint_fails_closed():
     """Silently skipping it would defer the failure to prep_xfer_dlist, which
     cannot say which peer it was missing metadata for."""
-    plan = TransferPlan(segments=[_segment("s0"), _segment("s3")])
+    plan = _plan("s0", "s3", segments=(_read(0), _read(1)))
     endpoints = {"trainer-r0": "10.0.0.0:9999"}
 
     with pytest.raises(RuntimeError) as excinfo:
@@ -270,7 +277,7 @@ def test_a_planned_trainer_with_no_endpoint_fails_closed():
 
 def test_an_empty_plan_dials_nobody():
     narrowed = handshake_endpoints_for_plan(
-        TransferPlan(), _session_to_agent(4), _endpoints(4)
+        LogicalTransferPlan(), _session_to_agent(4), _endpoints(4)
     )
 
     assert narrowed == {}
