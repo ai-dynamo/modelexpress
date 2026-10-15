@@ -469,6 +469,41 @@ more than reclaiming the handle; a process restart reclaims a quarantined
 handle. This matches the fail-stop rule of the standalone M2N transport
 (PR #497): retain native state that might still be in use rather than free it.
 
+### 8.2 Wedged aborts and the fatal exit contract
+
+Aborting a lane means `ncclCommAbort` on its communicator. That call cannot
+interrupt an M2N kernel that is still running on the stream; the ability to do
+so lands upstream in NCCL v2.33, which is above the floor this path accepts. So
+when a transfer deadline fires while the kernel is in flight - exactly the
+failure case - the abort can block forever, which turns an attributable failure
+back into the hang the deadlines exist to prevent.
+
+Every lane abort is therefore run on a daemon thread bounded by
+`MX_NCCL_REFIT_ABORT_TIMEOUT_S`, not inline:
+
+* the abort returns in time: the existing behaviour is unchanged - the lane is
+  torn down, the group re-forms at a fresh epoch, the worker continues;
+* the abort overruns: the lane is marked *wedged*, the daemon thread is left
+  holding the stuck call (it cannot be killed from Python, and a leaked thread
+  is cheaper than a hung process), every other lane of the group is still
+  aborted so no peer is left blocked, and `CommunicatorWedgedError` is raised.
+
+`CommunicatorWedgedError` is fatal and process-level, not round-level. The
+failing round is still reported FAILED first - so the server moves the epoch
+and the peers re-form without this worker - and then the error propagates out
+of the round call (`publish_weights` / `update_weights` /
+`finish_weight_update`) or out of `cleanup()`.
+
+**Runner contract.** The integration must catch `CommunicatorWedgedError` at
+its top level and terminate the OS process (a non-zero `os._exit`). A wedged
+communicator cannot be recovered in-process; the only recovery is the server's
+epoch bump plus a fresh generator process reclaiming the same slot and
+re-forming the group at the new epoch - which is what the GPU failure test
+exercises end to end. The error carries `group_id`, `epoch`, `version` and the
+wedged `lane_id` for the exit log. `MX_NCCL_REFIT_ABORT_TIMEOUT_S` (default
+10 s) sets the bound; raise it only if a healthy abort on the deployment's
+libnccl legitimately needs longer than ten seconds to return.
+
 ## 9. Configuration
 
 | Variable | Default | Purpose |
@@ -481,6 +516,7 @@ handle. This matches the fail-stop rule of the standalone M2N transport
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for one lane's non-blocking `Communicator.init` |
 | `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Client-side deadline for the transfer; an overrun aborts the local lanes. It reaches MX as `succeeded=false` (`RUNNING -> FAILED` above, which moves the epoch) against the operation `start_weight_update` bound, from whichever round call it surfaces in; the abort alone, when that report cannot be delivered, leaves the group at its epoch |
+| `MX_NCCL_REFIT_ABORT_TIMEOUT_S` | `10` | How long a lane's `ncclCommAbort` may run on its bounded daemon thread before the communicator is declared wedged (section 8.2). An abort that returns under this bound keeps the normal behaviour; one that overruns raises `CommunicatorWedgedError`, which the runner must treat as a fatal process exit. Only relevant on a libnccl below v2.33, where abort cannot interrupt a running M2N kernel |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
 
 Timing is reported through the existing `RefitTimingRecorder` stage vocabulary so

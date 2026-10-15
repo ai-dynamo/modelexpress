@@ -11,7 +11,13 @@ without a GPU. See ``docs/NCCL_M2N_REFIT.md``.
 
 from .backend import DEFAULT_LAYER_GROUP, NcclM2nReceiver, NcclM2nSender
 from .client import RefitClientGenerator, RefitClientTrainer
-from .comm import CommunicatorCache, LaneCommunicator, LaneKey, NcclUnavailableError
+from .comm import (
+    CommunicatorCache,
+    CommunicatorWedgedError,
+    LaneCommunicator,
+    LaneKey,
+    NcclUnavailableError,
+)
 from .plan import (
     PlanCoverageError,
     build_mesh,
@@ -49,6 +55,7 @@ __all__ = [
     "DEFAULT_LAYER_GROUP",
     "CollectiveRendezvous",
     "CommunicatorCache",
+    "CommunicatorWedgedError",
     "EpochChangedError",
     "GroupNotReadyError",
     "LaneCommunicator",

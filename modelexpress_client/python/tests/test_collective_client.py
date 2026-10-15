@@ -1428,6 +1428,32 @@ class TestOneFailurePath:
         assert rz.reports[0]["succeeded"] is False
         assert client._operation_id is None
 
+    def test_a_wedged_abort_reports_failed_then_re_raises_as_fatal(
+        self, fake_nccl, monkeypatch
+    ):
+        # A wedged communicator abort cannot be swallowed like a dirty teardown:
+        # the round is still reported FAILED so peers re-form, but the fatal
+        # CommunicatorWedgedError then surfaces so the runner can exit.
+        from modelexpress_rl.collective import CommunicatorWedgedError
+
+        rz = FakeRendezvous()
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+
+        monkeypatch.setattr(
+            client._half, "finish_weight_update", _raises(TimeoutError("deadline"))
+        )
+        wedge = CommunicatorWedgedError("abort stuck", group_id="g", epoch=1, lane_id=1)
+        monkeypatch.setattr(client._half, "abort", _raises(wedge))
+
+        with pytest.raises(CommunicatorWedgedError) as caught:
+            client.finish_weight_update("v1")
+        assert caught.value is wedge
+        # Reported FAILED before the fatal error surfaced, and the round reset.
+        assert rz.reports[0]["succeeded"] is False
+        assert client._operation_id is None and client._version is None
+
     def test_a_refused_binding_reports_nothing_and_keeps_the_lanes(self, fake_nccl):
         from modelexpress_rl.collective import TransferBindingError
 

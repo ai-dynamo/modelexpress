@@ -30,7 +30,13 @@ from .backend import (
     NcclM2nSender,
     require_nccl_m2n,
 )
-from .comm import CommunicatorCache, LaneCommunicator, LaneKey, new_unique_id
+from .comm import (
+    CommunicatorCache,
+    CommunicatorWedgedError,
+    LaneCommunicator,
+    LaneKey,
+    new_unique_id,
+)
 from .plan import DEFAULT_RECEIVER_PROTOCOL, plan_digest, validate_coverage
 from .rendezvous import (
     CollectiveRendezvous,
@@ -164,11 +170,27 @@ class _RefitClientBase:
         hang on the network. The failure is then reported against the bound
         operation, best effort, which moves the group to a fresh epoch. The
         round state is reset last and unconditionally, so a later call cannot
-        continue it. Never raises; the caller re-raises ``error``.
+        continue it.
+
+        Normally never raises; the caller re-raises ``error``. The one
+        exception is :class:`CommunicatorWedgedError`: if this half's abort
+        cannot tear a communicator down (``ncclCommAbort`` stuck on a running
+        M2N kernel), the failure is still reported so peers re-form without this
+        worker, the round state is still reset, and then the wedge is re-raised.
+        It is fatal and the runner must exit the process on it.
         """
+        wedged: CommunicatorWedgedError | None = None
         try:
             if self._half is not None:
                 self._half.abort()
+        except CommunicatorWedgedError as error_wedged:
+            wedged = error_wedged
+            logger.error(
+                "the local half's communicator abort wedged (%s); it cannot be "
+                "torn down in this process. Reporting the round FAILED so peers "
+                "re-form without this worker, then the process must exit.",
+                error_wedged,
+            )
         except Exception:  # noqa: BLE001 - the report and reset must still run
             logger.warning(
                 "aborting the local half after a failed round raised; reporting "
@@ -186,6 +208,8 @@ class _RefitClientBase:
                     exc_info=True,
                 )
         self._reset_round()
+        if wedged is not None:
+            raise wedged
 
     def _close_half(self) -> None:
         """Destroy the current half's M2N handle; its lanes are torn down after."""

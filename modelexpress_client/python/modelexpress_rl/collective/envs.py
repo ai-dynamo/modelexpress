@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     MX_NCCL_REFIT_POLL_INTERVAL_S: float
     MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S: float
     MX_NCCL_REFIT_TRANSFER_TIMEOUT_S: float
+    MX_NCCL_REFIT_ABORT_TIMEOUT_S: float
     MX_NCCL_REFIT_REGISTRATION_TTL_S: int
     MX_NCCL_REFIT_PIPELINE_DEPTH: int
     MX_NCCL_REFIT_BLOCKING_DATA_PLANE: bool
@@ -66,6 +67,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_NCCL_REFIT_TRANSFER_TIMEOUT_S": lambda: _float(
         "MX_NCCL_REFIT_TRANSFER_TIMEOUT_S", 600.0
+    ),
+    "MX_NCCL_REFIT_ABORT_TIMEOUT_S": lambda: _float(
+        "MX_NCCL_REFIT_ABORT_TIMEOUT_S", 10.0
     ),
     "MX_NCCL_REFIT_BLOCKING_DATA_PLANE": lambda: _flag(
         "MX_NCCL_REFIT_BLOCKING_DATA_PLANE"

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -43,6 +44,71 @@ class NcclUnavailableError(RuntimeError):
     contract stays usable and testable in an environment that will never run
     the transport.
     """
+
+
+class CommunicatorWedgedError(RuntimeError):
+    """A lane communicator's abort did not return within its deadline.
+
+    ``ncclCommAbort`` cannot interrupt an M2N kernel that is still running
+    (fixed upstream in NCCL v2.33; the floor this path accepts is below that).
+    When a transfer deadline fires while that kernel is in flight, the abort it
+    triggers can therefore block forever -- which is the hang this error
+    replaces. The abort is run on a daemon thread bounded by
+    ``MX_NCCL_REFIT_ABORT_TIMEOUT_S``; if it overruns, the communicator is
+    *wedged*: it cannot be torn down in this process, the daemon thread is left
+    holding it, and this fatal error is raised.
+
+    It is a process-level failure, not a round-level one. The integration (the
+    refit runner) must catch it at its top level and exit the OS process: the
+    server's epoch bump then re-forms the group from a fresh process, which is
+    the only recovery for a communicator that cannot be aborted. See
+    ``docs/NCCL_M2N_REFIT.md`` section 8.2. The attributes carry what overran,
+    filled in as the error travels up (lane, then group, then round).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        group_id: str | None = None,
+        epoch: int | None = None,
+        lane_id: int | None = None,
+        version: str | None = None,
+        timeout_s: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.group_id = group_id
+        self.epoch = epoch
+        self.lane_id = lane_id
+        self.version = version
+        self.timeout_s = timeout_s
+
+
+def abort_timeout() -> float:
+    """How long a lane abort may run before the communicator is wedged."""
+    return envs.MX_NCCL_REFIT_ABORT_TIMEOUT_S
+
+
+def _run_bounded(fn: Any, timeout_s: float, *, name: str) -> bool:
+    """Run ``fn`` on a daemon thread, returning whether it finished in time.
+
+    ``fn`` must swallow its own errors: a clean abort that merely raises is a
+    dirty teardown, not a wedge, and is handled by the caller's warning path.
+    Only *not returning* within ``timeout_s`` is the wedge this guards. The
+    thread is a daemon and is never joined past the deadline on purpose -- a
+    wedged ``ncclCommAbort`` holds it forever, and the whole point is to stop
+    it holding the process with it.
+    """
+    done = threading.Event()
+
+    def runner() -> None:
+        try:
+            fn()
+        finally:
+            done.set()
+
+    threading.Thread(target=runner, name=name, daemon=True).start()
+    return done.wait(timeout_s)
 
 
 def _nccl() -> Any:
@@ -111,10 +177,16 @@ class LaneCommunicator:
         self.unique_id = unique_id
         self._control = control
         self._aborted = False
+        self._wedged = False
 
     @property
     def aborted(self) -> bool:
         return self._aborted
+
+    @property
+    def wedged(self) -> bool:
+        """The last abort of this lane overran its deadline and never returned."""
+        return self._wedged
 
     @property
     def handle(self) -> Any:
@@ -128,23 +200,60 @@ class LaneCommunicator:
     def abort(self) -> None:
         """Tear the communicator down after a deadline or a peer failure.
 
-        Marked aborted even if the underlying abort raises: the point is that
-        nothing may use it again, and a communicator whose peers disagree about
-        what already completed is worse than one that is simply gone.
+        Marked aborted even if the underlying abort raises or wedges: the point
+        is that nothing may use it again, and a communicator whose peers
+        disagree about what already completed is worse than one that is simply
+        gone.
+
+        ``ncclCommAbort`` cannot interrupt an M2N kernel still on the stream, so
+        the underlying abort is run on a daemon thread bounded by
+        ``MX_NCCL_REFIT_ABORT_TIMEOUT_S`` rather than called inline. An abort
+        that returns in time keeps the existing behaviour. One that overruns
+        marks the lane *wedged*, leaves the daemon thread holding the stuck
+        call, and raises :class:`CommunicatorWedgedError`: the lane cannot be
+        torn down in this process, and the fatal error is what lets the runner
+        exit it so the group re-forms elsewhere.
         """
         if self._aborted:
             return
         self._aborted = True
+        timeout_s = abort_timeout()
         for comm in (self._comm, self._control):
             abort = getattr(comm, "abort", None)
             if abort is None:
                 continue
-            try:
-                abort()
-            except Exception as error:  # noqa: BLE001 - teardown must not mask the original failure
-                logger.warning(
-                    "aborting the NCCL communicator did not complete cleanly: %r", error
+
+            def _abort(abort=abort) -> None:
+                try:
+                    abort()
+                except Exception as error:  # noqa: BLE001 - teardown must not mask the original failure
+                    logger.warning(
+                        "aborting the NCCL communicator did not complete cleanly: %r",
+                        error,
+                    )
+
+            returned = _run_bounded(
+                _abort, timeout_s, name=f"nccl-abort-{self.rank}-{self.world_size}"
+            )
+            if not returned:
+                self._wedged = True
+                logger.error(
+                    "aborting the NCCL communicator for lane %s/%s did not return "
+                    "within %.1fs; the M2N kernel is presumed still running and the "
+                    "communicator is wedged. The process must exit so the group "
+                    "re-forms without it.",
+                    self.rank,
+                    self.world_size,
+                    timeout_s,
                 )
+        if self._wedged:
+            raise CommunicatorWedgedError(
+                f"aborting the lane communicator for rank {self.rank} of "
+                f"{self.world_size} did not return within {timeout_s:.1f}s "
+                "(MX_NCCL_REFIT_ABORT_TIMEOUT_S); the communicator is wedged and "
+                "this process must exit",
+                timeout_s=timeout_s,
+            )
 
     def synchronize(self, timeout_s: float | None = None) -> None:
         """Wait for work enqueued on this lane's stream.
@@ -481,23 +590,47 @@ class CommunicatorCache:
             for key in self._lanes
             if key.group_id == group_id and key.epoch != epoch
         ]
-        for key in stale:
-            lane = self._lanes.pop(key, None)
-            if lane is not None:
-                lane.abort()
+        wedged = self._abort_keys(stale)
+        if wedged is not None:
+            raise wedged
         return len(stale)
 
     def abort_group(self, group_id: str) -> int:
         """Abort every lane of a group, not just the one that failed.
 
         A partially aborted group leaves peers blocked in the lanes that did
-        not time out, waiting on ranks that have already given up.
+        not time out, waiting on ranks that have already given up. A lane whose
+        abort wedges is still removed and the rest are still aborted; the
+        :class:`CommunicatorWedgedError` is raised only after every lane has
+        been dealt with, so no peer is left blocked on a lane we skipped.
         """
         keys = [key for key in self._lanes if key.group_id == group_id]
-        for key in keys:
-            lane = self._lanes.pop(key)
-            lane.abort()
+        wedged = self._abort_keys(keys)
+        if wedged is not None:
+            raise wedged
         return len(keys)
+
+    def _abort_keys(self, keys: list[LaneKey]) -> CommunicatorWedgedError | None:
+        """Abort and drop every listed lane; return the first wedge, if any.
+
+        Every lane is aborted before any wedge propagates, because leaving a
+        lane un-aborted is exactly the hang this path exists to prevent.
+        """
+        wedged: CommunicatorWedgedError | None = None
+        for key in keys:
+            lane = self._lanes.pop(key, None)
+            if lane is None:
+                continue
+            try:
+                lane.abort()
+            except CommunicatorWedgedError as error:
+                error.group_id = key.group_id
+                error.epoch = key.epoch
+                if error.lane_id is None:
+                    error.lane_id = key.lane_id
+                if wedged is None:
+                    wedged = error
+        return wedged
 
     def __len__(self) -> int:
         return len(self._lanes)

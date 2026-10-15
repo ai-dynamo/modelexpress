@@ -11,13 +11,16 @@ hung communicator rather than an exception.
 
 import math
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from modelexpress_rl.collective import backend
+from modelexpress_rl.collective import comm as collective_comm
 from modelexpress_rl.collective import (
     CommunicatorCache,
+    CommunicatorWedgedError,
     LaneCommunicator,
     LaneKey,
     LocalParamSpec,
@@ -564,6 +567,133 @@ class TestCommunicatorCache:
         entry_lane = LaneCommunicator(Stubborn(), rank=0, world_size=2, stream=None)
         entry_lane.abort()
         assert entry_lane.aborted
+
+
+class BlockingComm:
+    """A communicator whose abort never returns, standing in for ncclCommAbort
+    stuck on an M2N kernel that NCCL below v2.33 cannot interrupt.
+
+    ``release`` lets the test end the leaked daemon thread; the inner wait is
+    bounded so the thread self-terminates even if a test forgets to.
+    """
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def abort(self):
+        self.started.set()
+        self.release.wait(timeout=5.0)
+
+
+class TestBoundedAbort:
+    """A lane abort runs on a bounded daemon thread, not inline.
+
+    ncclCommAbort cannot interrupt an M2N kernel still on the stream, so a plain
+    inline abort after a transfer deadline hangs the process. These cover the
+    bounded path: an abort that returns keeps the old behaviour; one that
+    overruns wedges the lane, leaves the daemon thread holding the stuck call,
+    and raises CommunicatorWedgedError so the runner can exit the process.
+    """
+
+    @staticmethod
+    def _fast_timeout(monkeypatch):
+        monkeypatch.setattr(collective_comm, "abort_timeout", lambda: 0.05)
+
+    def test_abort_timeout_reads_the_env(self, monkeypatch):
+        monkeypatch.delenv("MX_NCCL_REFIT_ABORT_TIMEOUT_S", raising=False)
+        assert collective_comm.abort_timeout() == 10.0
+        monkeypatch.setenv("MX_NCCL_REFIT_ABORT_TIMEOUT_S", "3.5")
+        assert collective_comm.abort_timeout() == 3.5
+        monkeypatch.setenv("MX_NCCL_REFIT_ABORT_TIMEOUT_S", "0")
+        with pytest.raises(ValueError):
+            collective_comm.abort_timeout()
+
+    def test_a_fast_abort_is_not_wedged_and_does_not_raise(self, recorder, monkeypatch):
+        self._fast_timeout(monkeypatch)
+        entry_lane = lane(recorder, "fast")
+        comm = entry_lane.handle
+        entry_lane.abort()
+        assert entry_lane.aborted
+        assert not entry_lane.wedged
+        assert comm.aborted
+
+    def test_an_abort_that_blocks_forever_wedges_and_raises(self, monkeypatch):
+        self._fast_timeout(monkeypatch)
+        comm = BlockingComm()
+        entry_lane = LaneCommunicator(comm, rank=1, world_size=2, stream=None)
+        try:
+            with pytest.raises(CommunicatorWedgedError) as caught:
+                entry_lane.abort()
+            # The abort did start - the daemon thread ran it - but never returned.
+            assert comm.started.wait(timeout=1.0)
+            assert entry_lane.aborted
+            assert entry_lane.wedged
+            # The lane communicator knows its rank, not its cache lane id; the
+            # cache fills lane_id in when it re-raises.
+            assert caught.value.lane_id is None
+            assert "rank 1" in str(caught.value)
+            assert caught.value.timeout_s == pytest.approx(0.05)
+        finally:
+            comm.release.set()
+
+    def test_a_raising_abort_is_not_a_wedge(self, monkeypatch):
+        self._fast_timeout(monkeypatch)
+
+        class Stubborn:
+            def abort(self):
+                raise RuntimeError("nccl refused")
+
+        entry_lane = LaneCommunicator(Stubborn(), rank=0, world_size=2, stream=None)
+        entry_lane.abort()
+        assert entry_lane.aborted
+        assert not entry_lane.wedged
+
+    def test_abort_group_aborts_every_lane_even_when_one_wedges_then_raises(
+        self, recorder, monkeypatch
+    ):
+        self._fast_timeout(monkeypatch)
+        cache = CommunicatorCache()
+        good0 = lane(recorder, "good0")
+        wedger = LaneCommunicator(BlockingComm(), rank=0, world_size=2, stream=None)
+        good1 = lane(recorder, "good1")
+        cache._lanes[LaneKey("g", 1, 0)] = good0
+        cache._lanes[LaneKey("g", 1, 1)] = wedger
+        cache._lanes[LaneKey("g", 1, 2)] = good1
+        try:
+            with pytest.raises(CommunicatorWedgedError) as caught:
+                cache.abort_group("g")
+            # Every lane was still torn down - no peer is left blocked on a lane
+            # the wedge made us skip - and the cache is empty.
+            assert good0.aborted and good1.aborted and wedger.aborted
+            assert len(cache) == 0
+            assert caught.value.group_id == "g"
+            assert caught.value.lane_id == 1
+            assert caught.value.epoch == 1
+        finally:
+            wedger._comm.release.set()
+
+    def test_a_wedged_half_abort_carries_version_and_epoch(self, recorder, monkeypatch):
+        self._fast_timeout(monkeypatch)
+        plan = ReshardPlan(bulk=[entry("a")])
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        half.start_weight_update("v7")
+        half.publish_weights(0)
+        # Swap the live lane's communicator for one whose abort never returns.
+        wedger = BlockingComm()
+        for lane_comm in cache._lanes.values():
+            lane_comm._comm = wedger
+        try:
+            with pytest.raises(CommunicatorWedgedError) as caught:
+                half.abort()
+            assert caught.value.version == "v7"
+            assert caught.value.epoch == 1
+            assert caught.value.group_id is not None
+            # The half is still closed and the group still emptied.
+            assert half._closed
+            assert len(cache) == 0
+        finally:
+            wedger.release.set()
 
 
 class TestTransferDeadline:

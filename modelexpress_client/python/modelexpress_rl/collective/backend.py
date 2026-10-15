@@ -24,7 +24,13 @@ from contextlib import nullcontext
 from typing import Any
 
 from . import envs
-from .comm import CommunicatorCache, LaneCommunicator, LaneKey, NcclUnavailableError
+from .comm import (
+    CommunicatorCache,
+    CommunicatorWedgedError,
+    LaneCommunicator,
+    LaneKey,
+    NcclUnavailableError,
+)
 from .plan import submission_order
 from .spi import LocalParamSpec, RefitCtx, resolve_specs
 from .types import ParamPlan, ReshardPlan
@@ -617,16 +623,33 @@ class _CollectiveHalf:
         The M2N handle is released first, while the lanes are still live, and
         the communicators are aborted after it. The half cannot run another
         round; the group has to re-form at a fresh epoch.
+
+        If a lane's abort wedges (``ncclCommAbort`` cannot interrupt a running
+        M2N kernel), every lane is still aborted and this half is still closed,
+        then :class:`CommunicatorWedgedError` is re-raised with this group's
+        epoch and version attached. That error is fatal: the runner exits the
+        process so the group re-forms without this worker.
         """
+        wedged: CommunicatorWedgedError | None = None
         try:
             self._release_m2n_handle(quiesce_s=self._quiesce_bound())
         finally:
             self._closed = True
-            self._cache.abort_group(self._group_id)
+            try:
+                self._cache.abort_group(self._group_id)
+            except CommunicatorWedgedError as error:
+                error.version = self._version
+                if error.epoch is None:
+                    error.epoch = self._epoch
+                if error.group_id is None:
+                    error.group_id = self._group_id
+                wedged = error
         self._active_lanes.clear()
         self._pending_contexts.clear()
         self._in_flight.clear()
         self._deadline = None
+        if wedged is not None:
+            raise wedged
 
     def _stream_context(self, lane: LaneCommunicator, spec: LocalParamSpec):
         stream = lane.stream
