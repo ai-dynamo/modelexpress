@@ -11,6 +11,7 @@ from modelexpress import envs
 def test_defaults_when_unset(monkeypatch):
     for name in (
         "MX_NIXL_BACKEND",
+        "MX_ARTIFACT_BACKEND",
         "MX_METADATA_PORT",
         "MX_WORKER_GRPC_PORT",
         "MX_GENERATOR_SOURCE_ORDER",
@@ -18,6 +19,10 @@ def test_defaults_when_unset(monkeypatch):
         "MX_VMM_ARENA",
         "MX_MS_DISTRIBUTED",
         "MX_LOAD_STRATEGY_CHAIN",
+        "MX_DISABLE_DRAFT_P2P",
+        "MX_PLUGIN_DIR",
+        "MX_LOAD_PLUGIN",
+        "MX_LOAD_PLUGIN_BEFORE",
         "MX_INSTANT_TENSOR",
         "VLLM_ATTENTION_BACKEND",
         "SGLANG_CACHE_DIR",
@@ -36,6 +41,7 @@ def test_defaults_when_unset(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
     assert envs.MX_NIXL_BACKEND == "UCX"
+    assert envs.MX_ARTIFACT_BACKEND == "nixl"
     assert envs.MX_METADATA_PORT == 5555
     assert envs.MX_WORKER_GRPC_PORT == 6555
     assert envs.MX_GENERATOR_SOURCE_ORDER is None
@@ -43,6 +49,10 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_VMM_ARENA is False
     assert envs.MX_MS_DISTRIBUTED is True
     assert envs.MX_LOAD_STRATEGY_CHAIN == "INFERENCE"
+    assert envs.MX_DISABLE_DRAFT_P2P is False
+    assert envs.MX_PLUGIN_DIR == "/opt/modelexpress/plugins"
+    assert envs.MX_LOAD_PLUGIN is None
+    assert envs.MX_LOAD_PLUGIN_BEFORE == "server-cache"
     assert envs.MX_INSTANT_TENSOR is True
     assert envs.VLLM_ATTENTION_BACKEND == "auto"
     assert envs.SGLANG_CACHE_DIR is None
@@ -57,6 +67,15 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_RESHARD_FUSED_WIRE is True
     assert envs.MX_RESHARD_BATCH_INSTALL is True
     assert envs.MX_RESHARD_CACHE_DESCRIPTORS is True
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("nixl", "nixl"), (" NIXL ", "nixl"), (" MOONCAKE ", "mooncake")],
+)
+def test_artifact_backend_normalization(monkeypatch, value, expected):
+    monkeypatch.setenv("MX_ARTIFACT_BACKEND", value)
+    assert envs.MX_ARTIFACT_BACKEND == expected
 
 
 def test_int_and_float_parsing(monkeypatch):
@@ -79,6 +98,10 @@ def test_invalid_int_falls_back_to_default(monkeypatch):
 
 
 def test_bool_parsing(monkeypatch, caplog):
+    monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", "1")
+    assert envs.MX_DISABLE_DRAFT_P2P is True
+    monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", "0")
+    assert envs.MX_DISABLE_DRAFT_P2P is False
     monkeypatch.setenv("MX_POOL_REG", "1")
     assert envs.MX_POOL_REG is True
     monkeypatch.setenv("MX_POOL_REG", "0")

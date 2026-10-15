@@ -74,12 +74,12 @@ for _, version_id in ipairs(redis.call('SMEMBERS', KEYS[2])) do
   local endpoints = 'mx:refit:version:publication-endpoints:' .. version_id
   local leases = 'mx:refit:version:leases:' .. version_id
   redis.call('ZREMRANGEBYSCORE', leases, '-inf', now)
+  if redis.call('ZCARD', leases) > 0 then
+    return 'VERSION_LEASED'
+  end
   for worker_id, metadata in pairs(removed) do
     local key = string.len(worker_id) .. ':' .. worker_id .. metadata.logical_shard_id
     if redis.call('HEXISTS', shards, key) == 1 then
-      if redis.call('ZCARD', leases) > 0 then
-        return 'VERSION_LEASED'
-      end
       table.insert(retired, {shards, endpoints, key})
     end
   end
@@ -87,9 +87,6 @@ for _, version_id in ipairs(redis.call('SMEMBERS', KEYS[2])) do
     local key = string.len(worker_id) .. ':' .. worker_id .. metadata.logical_shard_id
     if redis.call('HEXISTS', shards, key) == 1
         and redis.call('HGET', endpoints, key) ~= metadata.metadata_endpoint then
-      if redis.call('ZCARD', leases) > 0 then
-        return 'VERSION_LEASED'
-      end
       table.insert(retired, {shards, endpoints, key})
     end
   end

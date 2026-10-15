@@ -121,7 +121,7 @@ runs:
         NAMESPACE: ${{ inputs.namespace }}
       run: |
         echo "::group::Create namespace ${NAMESPACE}"
-        kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+        bash .github/scripts/ci-namespace.sh create "$NAMESPACE" plain
         echo "::endgroup::"
 
     - name: Create worker registry pull secret
@@ -304,11 +304,4 @@ runs:
       env:
         NAMESPACE: ${{ inputs.namespace }}
       run: |
-        echo "::group::Delete namespace ${NAMESPACE}"
-        if ! kubectl delete namespace "${NAMESPACE}" --ignore-not-found --timeout=180s; then
-          echo "::warning::Namespace ${NAMESPACE} did not finalize within 180s; force-clearing finalizers. Investigate the stuck resource."
-          kubectl get ns "${NAMESPACE}" -o json 2>/dev/null \
-            | jq '.spec.finalizers = []' \
-            | kubectl replace --raw "/api/v1/namespaces/${NAMESPACE}/finalize" -f -
-        fi
-        echo "::endgroup::"
+        bash .github/scripts/ci-namespace.sh cleanup "$NAMESPACE"

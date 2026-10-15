@@ -522,6 +522,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gcs")]
     #[test]
     fn test_resolve_model_path_gcs_uses_full_url_layout() {
         let cache_root = Path::new("/tmp/cache");
@@ -538,6 +539,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gcs")]
     #[test]
     fn test_resolve_model_path_gcs_full_url_trailing_slash_normalizes() {
         let cache_root = Path::new("/tmp/cache");
@@ -564,6 +566,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "gcs")]
     #[test]
     fn test_get_cache_stats_supports_hf_and_gcs_layouts() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -620,6 +623,7 @@ mod tests {
         assert!(stats.models.iter().all(|model| model.name != "tmp"));
     }
 
+    #[cfg(feature = "gcs")]
     #[test]
     fn test_clear_model_removes_only_requested_layout() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");

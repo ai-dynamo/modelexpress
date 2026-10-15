@@ -30,7 +30,7 @@ kind: Job
 metadata:
   name: ${JOB_NAME}
 spec:
-  backoffLimit: 0
+  backoffLimit: 1
   template:
     metadata:
       labels:
@@ -117,6 +117,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: MX_MODEL_URI
+              value: "${MX_CI_MODEL}"
             - name: MX_SERVER_ADDRESS
               value: "mx-server:8000"
             - name: MX_P2P_METADATA

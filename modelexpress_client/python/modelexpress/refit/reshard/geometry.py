@@ -96,7 +96,8 @@ _SUPPORTED_OPS: dict[Callable, str] = {
 
 
 def _freeze_kwargs(kwargs: dict[str, Any]) -> tuple:
-    return tuple(sorted(kwargs.items()))
+    return tuple((name, tuple(value) if isinstance(value, list) else value)
+                 for name, value in sorted(kwargs.items()))
 
 
 @dataclass
@@ -204,10 +205,19 @@ class LazyWeight(torch.Tensor):
 
     @classmethod
     def _intercept(cls, self_, func, op_name, args, kwargs):
+        if op_name == "__getitem__":
+            index = args[0]
+            indices = index if isinstance(index, tuple) else (index,)
+            if any(not isinstance(item, (int, slice, type(Ellipsis), type(None)))
+                   for item in indices):
+                raise UnsupportedReshard("advanced indexing is unsupported")
         meta = self_._meta()
         with torch._C.DisableTorchFunctionSubclass():
             meta_result = func(meta, *args, **kwargs)
-        base_op = (op_name, tuple(args), _freeze_kwargs(kwargs))
+        base_op = (
+            op_name, tuple(tuple(arg) if isinstance(arg, list) else arg for arg in args),
+            _freeze_kwargs(kwargs),
+        )
         if isinstance(meta_result, torch.Tensor):
             return self_._child(meta_result.shape, meta_result.dtype, base_op)
         if isinstance(meta_result, (tuple, list)):
