@@ -20,7 +20,13 @@ _RECORD_FIELDS = (
     "dest_stride",
     "dest_dtype",
 )
-_CAPTURE_FIELDS = ("copies", "unsupported", "unattributed", "unsupported_reasons")
+_CAPTURE_FIELDS = (
+    "copies",
+    "unsupported",
+    "unattributed",
+    "unsupported_reasons",
+    "generator_fingerprint",
+)
 _CAPTURE_CLASS = CaptureResult
 _RECORD_CLASS = RecordedCopy
 _COPY_METHODS = (
@@ -104,8 +110,10 @@ def _ordinary_copy_classes() -> bool:
             name in namespace
             and not (
                 cls is CaptureResult
-                and name == "unattributed"
-                and type(namespace[name]) is int
+                and (
+                    (name == "unattributed" and type(namespace[name]) is int)
+                    or (name == "generator_fingerprint" and namespace[name] is None)
+                )
             )
             for name in fields
         ):
@@ -233,6 +241,7 @@ class _CaptureSnapshot:
             unsupported=[],
             unattributed=0,
             unsupported_reasons={},
+            generator_fingerprint=self.fallback[0].generator_fingerprint,
         )
         result = (
             capture,

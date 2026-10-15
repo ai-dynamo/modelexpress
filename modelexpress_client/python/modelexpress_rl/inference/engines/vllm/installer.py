@@ -18,6 +18,7 @@ import logging
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from inspect import getattr_static
@@ -26,6 +27,7 @@ from types import GetSetDescriptorType
 from typing import TYPE_CHECKING
 
 import torch
+from modelexpress import envs
 from modelexpress.accelerators import accelerator_backend_for
 from modelexpress.engines.vllm.host_quantization import (
     refresh_host_quantization_state,
@@ -37,7 +39,16 @@ from modelexpress.refit.reshard.geometry import (
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import refit_span
 
+from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.engines.vllm._capture_snapshot import _CaptureSnapshot
+from modelexpress_rl.inference.engines.vllm.surgical import (
+    changed_since,
+    module_groups,
+)
+from modelexpress_rl.inference.engines.vllm.stream_windows import (
+    layer_windows,
+    windowed_weights,
+)
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -48,13 +59,32 @@ from modelexpress_rl.inference.plan import (
     PreparedStreamingTensors,
 )
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
+from modelexpress_rl.utils import index_checkpoint_tensors
 
 if TYPE_CHECKING:
+    from modelexpress_rl.inference.streaming_checkpoint import StreamedCheckpoint
     from modelexpress.refit.reshard.types import CaptureResult
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
 
 logger = logging.getLogger("modelexpress_rl.inference.engines.vllm.installer")
+_LAYERWISE_LOGGER = "vllm.model_executor.model_loader.reload.layerwise"
+
+
+class _UnloadedLayerFilter(logging.Filter):
+    """Count vLLM's per-layer warning for layers a delta leaves untouched."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.count = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.msg == "%s: Failed to load weights":
+            self.count += 1
+            return False
+        return True
+
+
 _MODULE_GETATTRIBUTE = torch.nn.Module.__getattribute__
 _MODULE_GETATTR = torch.nn.Module.__getattr__
 _MODULE_GET_SUBMODULE = torch.nn.Module.get_submodule
@@ -576,8 +606,13 @@ class _VllmInstaller(EngineInstaller):
         self._device = device
         self._convert_native_to_hf = convert_native_to_hf
         self._runtime_tensors = runtime_tensors
+        # Version whose checkpoint bytes the engine holds; None when unknown.
+        self._live_version: str | None = None
         self._capture_cache = None
         self._native_parameter_dispatch = _native_parameter_dispatch()
+        self._debug_validate_generator_layout = (
+            rl_envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT
+        )
 
     @cached_property
     def _original_loader(self) -> Callable:
@@ -591,7 +626,10 @@ class _VllmInstaller(EngineInstaller):
             ) from error
         return _get_original_loader
 
-    def _capture_key(self, manifest):
+    def capture_generator_fingerprint(self):
+        if not self._debug_validate_generator_layout:
+            return ()
+
         original_loader = self._original_loader
 
         def function_identity(function):
@@ -633,7 +671,6 @@ class _VllmInstaller(EngineInstaller):
             if not buffer.is_floating_point() and not buffer.is_complex()
         )
         return (
-            tuple(manifest),
             parameters,
             modules,
             routing_buffers,
@@ -648,14 +685,24 @@ class _VllmInstaller(EngineInstaller):
                     PreparedEngineTensors,
                     PreparedRuntimeTensors,
                     PreparedCheckpointArtifact,
+                    PreparedStreamingTensors,
                 }
-                | ({PreparedStreamingTensors} if not self._is_quantized else set())
-            )
+            ),
+            streamed_checkpoints=(
+                getattr(
+                    getattr(self._vllm_config, "parallel_config", None),
+                    "tensor_parallel_size",
+                    1,
+                )
+                == 1
+                or envs.MX_MS_DISTRIBUTED
+            ),
         )
 
     def install(self, prepared: PreparedArtifact) -> dict[str, float]:
         started = time.perf_counter()
         metrics = prepared.metrics
+        live_version, self._live_version = self._live_version, None
         if isinstance(prepared, PreparedEngineTensors):
             self.install_tensors(prepared.staged.tensors)
         elif isinstance(prepared, PreparedStreamingTensors):
@@ -670,7 +717,24 @@ class _VllmInstaller(EngineInstaller):
             checkpoint = prepared.checkpoint
             if not isinstance(checkpoint, PreparedCheckpoint):
                 raise TypeError("checkpoint preparation has an invalid value")
-            self.install_checkpoint(checkpoint.path)
+            if checkpoint.streaming is not None:
+                self.install_streamed_checkpoint(checkpoint.streaming)
+                metrics.update(checkpoint.streaming.cache_metrics)
+            else:
+                changed = (
+                    changed_since(
+                        checkpoint.delta_changes,
+                        live_version=live_version,
+                        target_version=checkpoint.target_version,
+                    )
+                    if rl_envs.MX_REFIT_DELTA_SURGICAL
+                    else None
+                )
+                if changed is None:
+                    self.install_checkpoint(checkpoint.path)
+                else:
+                    metrics.update(self.install_changed_tensors(checkpoint.path, changed))
+            self._live_version = checkpoint.target_version
         else:
             raise TypeError(f"unsupported prepared artifact {type(prepared).__name__}")
         if not isinstance(prepared, PreparedStreamingTensors):
@@ -787,10 +851,12 @@ class _VllmInstaller(EngineInstaller):
         afterward without finalizing (finalizing would commit the empty skeletons
         and corrupt the live params).
         """
+
+        gen_key = self.capture_generator_fingerprint()
+
         if not self._is_quantized and self._capture_cache is not None:
-            key, result = self._capture_cache
-            current_key = self._capture_key(manifest)
-            if key == current_key:
+            cached_gen_key, cached_manifest, result = self._capture_cache
+            if cached_gen_key == gen_key and cached_manifest == tuple(manifest):
                 copies = (
                     result.indices
                     if type(result) is _CaptureSnapshot
@@ -852,13 +918,16 @@ class _VllmInstaller(EngineInstaller):
             len(capture.unsupported),
             self._is_quantized,
         )
+        gen_key = self.capture_generator_fingerprint()
+        capture.generator_fingerprint = gen_key
         if (
             not self._is_quantized
             and not capture.unsupported
             and not capture.unattributed
         ):
             self._capture_cache = (
-                self._capture_key(manifest),
+                gen_key,
+                tuple(manifest),
                 _CaptureSnapshot.create(copy.deepcopy((capture, param_layout))),
             )
         return capture, param_layout
@@ -876,10 +945,6 @@ class _VllmInstaller(EngineInstaller):
     @torch.no_grad()
     def install_streaming(self, prepared: PreparedStreamingTensors) -> None:
         """Copy complete groups into engine-owned storage before arena reuse."""
-        if self._is_quantized:
-            raise IncompleteRefit(
-                "bounded streaming currently requires an unquantized engine"
-            )
         ownership = prepared.ownership
         if ownership.iterator is not None or ownership.release_blocked:
             raise IncompleteRefit(
@@ -1022,6 +1087,50 @@ class _VllmInstaller(EngineInstaller):
                     allow_warm=True,
                 )
 
+    def install_streamed_checkpoint(self, checkpoint: StreamedCheckpoint) -> None:
+        """Stream once through graph-safe reload and tee to one writer per node."""
+        from vllm.distributed import get_world_group
+        from vllm.model_executor.model_loader.runai_streamer_loader import (
+            RunaiModelStreamerLoader,
+        )
+        from vllm.model_executor.model_loader.weight_utils import (
+            runai_safetensors_weights_iterator,
+        )
+
+        tp_size = getattr(
+            getattr(self._vllm_config, "parallel_config", None),
+            "tensor_parallel_size",
+            1,
+        )
+        load_config = copy.copy(self._vllm_config.load_config)
+        extra = dict(getattr(load_config, "model_loader_extra_config", None) or {})
+        extra["distributed"] = tp_size > 1 and envs.MX_MS_DISTRIBUTED
+        object.__setattr__(load_config, "model_loader_extra_config", extra)
+        loader = RunaiModelStreamerLoader(load_config)
+        window_layers = rl_envs.MX_REFIT_STREAM_WINDOW_LAYERS
+        if window_layers:
+            weights = windowed_weights(
+                list(checkpoint.shard_uris),
+                layer_windows(checkpoint.tensor_metadata, window_layers),
+                is_distributed=loader._is_distributed,
+            )
+        else:
+            weights = runai_safetensors_weights_iterator(
+                list(checkpoint.shard_uris),
+                load_config.use_tqdm_on_load,
+                is_distributed=loader._is_distributed,
+            )
+        cache = get_world_group().local_rank == 0
+        with (
+            closing(weights),
+            closing(checkpoint.validate(weights, cache=cache)) as verified,
+        ):
+            self._reload(lambda _aliases: self._model.load_weights(verified))
+        if not checkpoint._complete:
+            raise RuntimeError("full checkpoint stream was not completely consumed")
+        with refit_span("post_install"):
+            torch.cuda.synchronize(self._device)
+
     def install_checkpoint(self, path: str | Path) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""
         try:
@@ -1048,6 +1157,94 @@ class _VllmInstaller(EngineInstaller):
         # reports the stage too rather than charging it to the caller's total.
         with refit_span("post_install"):
             torch.cuda.synchronize(self._device)
+
+    def install_changed_tensors(
+        self, path: str | Path, changed: frozenset[str]
+    ) -> dict[str, float]:
+        """Reload only the modules whose checkpoint tensors a delta changed.
+
+        Untouched layers receive no weights, so vLLM's finalize places their
+        existing kernel tensors back. If a fed module is still incomplete, the
+        rest of the checkpoint is streamed through the same reload, which is
+        then exactly a full reload.
+        """
+        from safetensors import safe_open
+        from vllm.model_executor.layers.attention import is_deferred_attention_layer
+        from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
+
+        started = time.perf_counter()
+        _, locations, _ = index_checkpoint_tensors(path)
+        packed: dict[str, list[str]] = {}
+        for module in self._model.modules():
+            packed.update(getattr(module, "packed_modules_mapping", None) or {})
+        names = module_groups(changed, locations, packed)
+        by_file: dict[Path, list[str]] = {}
+        for name in sorted(
+            names, key=lambda n: (str(locations[n][0]), locations[n][1])
+        ):
+            by_file.setdefault(locations[name][0], []).append(name)
+        fallback = False
+
+        def subset():
+            for file, file_names in by_file.items():
+                with safe_open(str(file), framework="pt") as tensors:
+                    for name in file_names:
+                        yield name, tensors.get_tensor(name)
+
+        def load(_aliases: _ParameterAliases) -> None:
+            nonlocal fallback
+            self._model.load_weights(subset())
+            incomplete = [
+                type(layer).__name__
+                for layer, info in LAYERWISE_INFO.items()
+                if info.can_load()
+                and 0 < info.load_numel < info.load_numel_total
+                and not is_deferred_attention_layer(layer)
+            ]
+            if not incomplete:
+                return
+            fallback = True
+            logger.warning(
+                "Surgical checkpoint install left %d modules incomplete (%s); "
+                "loading the rest of the checkpoint",
+                len(incomplete),
+                sorted(set(incomplete))[:5],
+            )
+            load_config = copy.copy(self._vllm_config.load_config)
+            object.__setattr__(load_config, "load_format", "safetensors")
+            model_config = copy.copy(self._model_config)
+            model_config.model = str(path)
+            model_config.revision = None
+            rest = DefaultModelLoader(load_config).get_all_weights(
+                model_config, self._model
+            )
+            self._model.load_weights(
+                (name, tensor) for name, tensor in rest if name not in names
+            )
+
+        unloaded = _UnloadedLayerFilter()
+        layerwise_logger = logging.getLogger(_LAYERWISE_LOGGER)
+        layerwise_logger.addFilter(unloaded)
+        try:
+            self._reload(load)
+        finally:
+            layerwise_logger.removeFilter(unloaded)
+        with refit_span("post_install"):
+            torch.cuda.synchronize(self._device)
+        logger.info(
+            "Surgical checkpoint install changed=%d loaded=%d untouched_layers=%d "
+            "fallback=%s seconds=%.3f",
+            len(changed),
+            len(names),
+            unloaded.count,
+            fallback,
+            time.perf_counter() - started,
+        )
+        return {
+            "perf/mx_receive_surgical_tensors": float(len(names)),
+            "perf/mx_receive_surgical_fallback": float(fallback),
+        }
 
     @torch.no_grad()
     def _process_and_commit(

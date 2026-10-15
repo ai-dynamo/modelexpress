@@ -14,8 +14,8 @@ have reached Running state.  Asserts:
      are loaded and the model is serving correctly on each.
   4. When enabled by the workflow, target peak and final VRAM do not materially
      exceed source VRAM.
-  5. When --expect-mtp is set, the target transfers the main model through P2P
-     before loading the MTP draft model locally, and source/target greedy
+  5. When --expect-mtp is set, every target rank transfers both the main model
+     and the MTP draft through P2P, and source/target greedy
      completions for a small prompt match exactly.
 
 Invoked by the workflow as:
@@ -48,7 +48,7 @@ import urllib.request
 
 import pytest
 
-from kube_utils import kubectl, port_forward
+from kube_utils import completion_response, kubectl, port_forward
 
 
 def _pod_name(namespace: str, job_name: str, ordinal: int | None = None) -> str:
@@ -75,6 +75,7 @@ def _pod_name(namespace: str, job_name: str, ordinal: int | None = None) -> str:
         probe = kubectl(
             "get", "pods",
             "-l", ordinal_selector,
+            "--field-selector=status.phase!=Failed",
             "-o", "name",
             namespace=namespace,
         )
@@ -86,6 +87,7 @@ def _pod_name(namespace: str, job_name: str, ordinal: int | None = None) -> str:
     result = kubectl(
         "get", "pods",
         "-l", f"job-name={job_name}",
+        "--field-selector=status.phase!=Failed",
         "-o", "jsonpath={.items[0].metadata.name}",
         namespace=namespace,
     )
@@ -122,6 +124,7 @@ def _pod_logs_by_pod(namespace: str, job_name: str, container: str) -> dict[str,
     pod_list = kubectl(
         "get", "pods",
         "-l", f"job-name={job_name}",
+        "--field-selector=status.phase!=Failed",
         "-o", "jsonpath={.items[*].metadata.name}",
         namespace=namespace,
     ).stdout.split()
@@ -193,8 +196,7 @@ def _assert_inference(
         # capture + JIT compile) which can exceed 60s, especially when source
         # and target share a node and contend for GPU scheduling.
         # Subsequent requests are sub-second.
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            body = json.loads(resp.read())
+        body = completion_response(req)
     print(f"[{job_name}] response: {json.dumps(body, indent=2)}")
     choices = body.get("choices", [])
     assert choices, f"No choices in response from {job_name}: {body}"
@@ -223,34 +225,72 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
     )
 
 
-def test_mtp_load_phases(namespace: str, expect_mtp: bool) -> None:
-    """MTP must use P2P only for the main model, never for its draft head."""
+def _deduplicate_log_handlers(lines: list[str]) -> list[str]:
+    """Collapse adjacent vLLM/MX renderings of the same worker log record."""
+    vllm_format = re.compile(
+        r"^(.*?)INFO (\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[([^\]]+:\d+)\] (.*)$"
+    )
+    mx_format = re.compile(
+        r"^(.*?)\[\d{4}-(\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] INFO (\S+:\d+): (.*)$"
+    )
+    result = []
+    previous = None
+    for line in lines:
+        match = vllm_format.match(line) or mx_format.match(line)
+        record = (match.groups(), match.re) if match else None
+        # Keep repeats from the same handler or a different process/time/site.
+        # Consume only one cross-format pair, not every equal message in a run.
+        if (
+            record is not None
+            and previous is not None
+            and record[0] == previous[0]
+            and record[1] != previous[1]
+        ):
+            previous = None
+            continue
+        result.append(line)
+        previous = record
+    return result
+
+
+def test_mtp_load_phases(namespace: str, expect_mtp: bool, tp_size: int) -> None:
+    """Every target rank must finish main and draft loads through RDMA."""
     if not expect_mtp:
         pytest.skip("MTP phase assertion not enabled")
 
     logs = _all_pod_logs(namespace, "mx-target", "mx-target")
-    main_marker = "p2p_enabled=True"
     transfer_marker = "RDMA transfer complete"
-    draft_marker = "p2p_enabled=False"
-    main_index = logs.find(main_marker)
-    transfer_index = logs.find(transfer_marker, main_index + 1)
-    draft_index = logs.find(draft_marker, transfer_index + 1)
+    start_marker = "MxModelLoader starting"
+    complete_marker = "MxModelLoader.load_model() COMPLETE"
     phase_lines = [
         line
         for line in logs.splitlines()
-        if any(marker in line for marker in (main_marker, transfer_marker, draft_marker))
+        if any(marker in line for marker in (start_marker, transfer_marker, complete_marker))
     ]
     print("[mx-target] MTP load phases:\n" + "\n".join(phase_lines))
-    assert main_index >= 0, "Target did not start a P2P-enabled main-model load"
-    assert transfer_index > main_index, (
-        "Target did not complete RDMA transfer after starting the main-model load"
-    )
-    assert draft_index > transfer_index, (
-        "Target did not load the MTP draft locally after the main-model transfer"
-    )
-    assert logs.find(transfer_marker, draft_index + 1) < 0, (
-        "Target performed another RDMA transfer while loading the MTP draft"
-    )
+    for rank in range(tp_size):
+        rank_logs = "\n".join(_deduplicate_log_handlers([
+            line for line in logs.splitlines() if f"[Worker {rank}]" in line
+        ]))
+        cursor = 0
+        for role in ("main", "draft"):
+            start = rank_logs.find(start_marker, cursor)
+            assert start >= 0, f"Rank {rank}: missing {role} load"
+            header = rank_logs[start:].splitlines()[0]
+            assert f"p2p_enabled=True, p2p_role={role}" in header, (
+                f"Rank {rank}: expected P2P-enabled {role} load, got {header}"
+            )
+            end = rank_logs.find(complete_marker, start)
+            assert end > start, f"Rank {rank}: incomplete {role} load"
+            phase = rank_logs[start:end]
+            assert phase.count(start_marker) == 1, (
+                f"Rank {rank}: another load started before {role} completed"
+            )
+            assert transfer_marker in phase, f"Rank {rank}: no {role} RDMA transfer"
+            assert "Streaming weights from" not in phase, (
+                f"Rank {rank}: {role} fell back to ModelStreamer"
+            )
+            cursor = end + len(complete_marker)
 
 
 def test_per_rank_source_agents(

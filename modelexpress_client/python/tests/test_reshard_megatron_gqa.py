@@ -285,7 +285,7 @@ def test_sparse_kv_tables_merge_into_a_complete_bounded_plan():
 
     plan = plan_transfer(capture, sources, max_segments_per_copy=1)
 
-    assert plan.fallback == []
+    assert not plan.fallback
     assert {pull.src_name for pull in plan.full_pulls} == set(HF_NAMES)
     assert plan.bytes_planned() == sum(
         tensor.numel() * tensor.element_size()

@@ -119,24 +119,27 @@ def test_dedup_removes_the_redundant_reads_not_just_the_offers():
             dest_stride=(4, 1),
             dest_dtype=source.dtype,
         )
-        return plan_pull(
+        reads = plan_pull(
             copy,
             global_shape=source.global_shape,
             src_dtype=source.dtype,
             elsize=source.elsize,
             shards=source.shards,
+            buffer_indices=tuple(range(len(source.shards))),
         )
+        return reads, [shard.session for shard in source.shards]
 
-    single = segments_for(1)
+    single, single_owners = segments_for(1)
+    assert set(single_owners) == {"dp0"}
     assert len(single) == 2  # one contiguous run per row block
     assert sum(s.nbytes for s in single) == 32 * EL  # the whole 8x4 tensor, once
 
     for replicas in (2, 8):
-        spread = segments_for(replicas)
+        spread, owners = segments_for(replicas)
         assert len(spread) == len(single), replicas
         assert sum(s.nbytes for s in spread) == sum(s.nbytes for s in single), replicas
         # One owner serves the tensor, so one peer needs a handshake.
-        assert len({s.session for s in spread}) == 1, replicas
+        assert {owners[read.source_buffer] for read in spread} == {"dp0"}, replicas
 
 
 def test_default_offset_takes_the_first_publisher():

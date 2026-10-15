@@ -186,6 +186,52 @@ def mirror_environment():
     }
 
 
+@pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
+def test_trusted_main_run_authorizes_its_exact_trigger_sha(event):
+    environment = {
+        **workflow_environment(),
+        "GITHUB_EVENT_NAME": event,
+        "GITHUB_REF": "refs/heads/main",
+        "GITHUB_SHA": SHA,
+        "PR_NUMBER": "0",
+    }
+
+    def unexpected_api_call(path):
+        pytest.fail(f"main authorization must use the immutable event SHA: {path}")
+
+    assert gate.authorize_workflow(environment, unexpected_api_call) == {
+        "sha": SHA,
+        "model": "nemotron",
+        "scenario": "delta",
+        "runtime": environment["RUNTIME_BASE"],
+    }
+
+
+@pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"GITHUB_REPOSITORY": "contributor/modelexpress"},
+        {"GITHUB_REF": "refs/heads/feature"},
+        {"GITHUB_REF": "refs/tags/main"},
+        {"GITHUB_SHA": "b" * 40},
+        {"PR_NUMBER": "42"},
+    ],
+)
+def test_main_run_cannot_bypass_repository_ref_or_sha_checks(event, change):
+    environment = {
+        **workflow_environment(),
+        "GITHUB_EVENT_NAME": event,
+        "GITHUB_REF": "refs/heads/main",
+        "GITHUB_SHA": SHA,
+        "PR_NUMBER": "0",
+        **change,
+    }
+    _, get = request()
+    with pytest.raises(ValueError):
+        gate.authorize_workflow(environment, get)
+
+
 def test_trusted_mirror_push_does_not_require_bot_writer_permission():
     _, get = request(permission="read")
     assert gate.authorize_workflow(mirror_environment(), get) == {

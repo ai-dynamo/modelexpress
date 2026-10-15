@@ -395,26 +395,147 @@ Without buildx (single arch, matches the host):
 ```bash
 docker build -f docker/Dockerfile.client-wheel --target builder -t mx-wheel-builder .
 docker run --rm -v "$PWD/dist:/out" mx-wheel-builder bash -lc 'cp -r /dist/. /out/'
+```
 
-#### CI uploads to Artifactory
+#### CI builds and nightly uploads
 
-`.github/workflows/build-wheels.yml` runs this Dockerfile on every PR
-(via `copy-pr-bot` mirroring into `pull-request/<pr_id>` branches) and
-every push to `main` / `release/**`, building both archs in parallel on
-velonix self-hosted runners and uploading the artifacts to NV Artifactory.
+`.github/workflows/build-wheels.yml` builds this Dockerfile for both archs
+on velonix self-hosted runners on every PR (via `copy-pr-bot` mirroring
+into `pull-request/<pr_id>` branches) and every push to `main` /
+`release/**`. These runs only build; nothing is uploaded.
 
-Destination layout under `${ARTIFACTORY_PYPI_REPO_NAME}`:
+Only the [Nightly pipeline](#nightly-pipeline) uploads, to NV Artifactory:
 
-| Event | Subpath |
-|---|---|
-| `push` to `pull-request/<pr_id>` (copy-pr-bot mirror) | `pr/<pr_id>/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
-| `push` to `main`, `release/**` | `post-merge/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
+| Artifact | Repository | Subpath |
+|---|---|---|
+| Nightly wheels + sdist | `${ARTIFACTORY_PYPI_REPO_NAME}` | `nightly/<run_id>/` |
+| Nightly crates (`.crate`) | `${ARTIFACTORY_CARGO_REPO_NAME}` | `nightly/<run_id>/` |
 
-Each path contains the 6 artifacts from one arch: 4 manylinux wheels
-(cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist. The upload step is
-gated on the `automated-release` GitHub environment, which holds three
-secrets: `ARTIFACTORY_URL`, `ARTIFACTORY_TOKEN` (JFrog identity token),
-and `ARTIFACTORY_PYPI_REPO_NAME`.
+The upload step is gated on the
+`automated-release` GitHub environment, which holds `ARTIFACTORY_URL`,
+`ARTIFACTORY_TOKEN` (JFrog identity token), and
+`ARTIFACTORY_PYPI_REPO_NAME`. Registry and repository
+names are secrets so they stay out of this public repo and are masked in
+run logs: `MX_IMAGE_REPO`, `NGC_PUBLISH_ORG` (repo scope) and `ARTIFACTORY_CARGO_REPO_NAME`
+(`automated-release`).
+
+### Nightly pipeline
+
+`.github/workflows/nightly-ci.yml` runs daily at 09:00 UTC (01:00 PST)
+against `main`, builds every release artifact from that commit, runs the
+core, inference and RL test suites, and stages the artifacts. GitLab
+release-automation then scans and publishes them. It can also be
+dispatched manually; a manual run only stages after approval through the
+`manual-release-approval` GitHub environment.
+
+Only the first attempt of a scheduled run stages without approval. Every
+later attempt, and every manual run, stages and triggers GitLab only after
+a devops approval given in that same attempt. "Re-run failed jobs" on a run
+therefore stages nothing; to retry staging, use "Re-run all jobs" or a new
+dispatch from `main`, and approve it.
+
+Scheduled and manual runs require the upstream repository and `refs/heads/main`,
+including runs that only build and test. The nightly calls
+`modelexpress-core-ci.yml`, `modelexpress-inference-ci.yml` and
+`modelexpress-rl-ci.yml`; `nightly-status` requires all three to succeed when
+`run_tests` is enabled. The RL suite runs the same Nemotron delta-refit and
+Vime coverage as E2E CI, using the exact triggering `main` SHA.
+
+Every job runs on the velonix self-hosted runners. The runner override reaches
+the child workflows' control jobs while GPU jobs keep their dedicated runners.
+Core CI defaults to read-only repository contents; only its coverage job receives
+OIDC token permission.
+Run-specific caller groups prevent one nightly from cancelling another; the
+GPU children retain the repository-wide capacity queues shared with PR tests.
+Nightly GPU slots use the run ID, while PR runs continue using the PR number.
+PR mirror and `/bench` authorization checks remain in place. Nightlies suppress
+RL evidence uploads to preserve the compliance-only GitHub artifact policy.
+
+| Artifact | Version | Destination |
+|---|---|---|
+| Server image (amd64 + arm64) | tag `<date>-<sha7>` | `nvcr.io/${NGC_PUBLISH_ORG}/ai-dynamo/modelexpress-server-nightly` (+ floating `:latest`, and `modelexpress-server:nightly`) |
+| Python wheels + sdist | `<base>.dev<date>` | `${ARTIFACTORY_PYPI_REPO_NAME}/nightly/<run_id>/` |
+| Rust crates (`.crate`) | `<base>-nightly.<date>.g<sha7>` | `${ARTIFACTORY_CARGO_REPO_NAME}/nightly/<run_id>/` |
+| Helm chart `modelexpress-nightly` | `<base>-nightly.<date>.g<sha7>` | `helm.ngc.nvidia.com/${NGC_PUBLISH_ORG}/ai-dynamo` |
+
+Wheel versions deliberately identify the UTC day rather than the commit.
+Two runs on the same day can therefore contain different code under the same
+wheel version. Use the run-specific Artifactory path to select an exact build;
+the wheel version alone does not identify its source commit.
+
+GitLab release-automation then publishes the nightly: the image as
+`nvcr.io/nvidia/ai-dynamo/modelexpress-server-nightly:<date>-<sha7>` (and
+`:latest`), the chart as `modelexpress-nightly` in
+`https://helm.ngc.nvidia.com/nvidia/ai-dynamo`, the wheels on PyPI as
+`modelexpress==<base>.dev<date>`, and the crates on crates.io as
+`<base>-nightly.<date>.g<sha7>`.
+
+The packaged nightly chart is stamped to reference the public nightly
+server image (the `repository` in `helm/values.yaml` plus `-nightly`), so
+`helm install` of a nightly chart deploys nightly code.
+
+No ModelExpress artifact is uploaded to GitHub artifact storage. Compliance
+scan results are the only permitted GitHub artifact. `package-helm-chart`
+and `stage-helm-ngc` each build the chart through
+`.github/scripts/package_helm_chart.sh`; keep both on that script so they
+cannot package different charts.
+
+The `compliance` job uploads the two GitHub artifacts the nightly is allowed
+to produce, both dependency lists for OSRB review. Neither contains a build
+artifact. Both use Dynamo's OSRB CSV columns
+(`ecosystem,name,version,spdx,source_url,notes`).
+
+| Artifact | Contents | OSRB bug |
+|---|---|---|
+| `compliance-<sha>-modelexpress-server` | `linux_<arch>/osrb-modelexpress-server-<arch>-<sha8>.csv`: the dpkg and Python packages the image adds on top of its base image, plus the Rust crates compiled into its binaries. `.diff.csv`: what changed since the previous scheduled nightly, with a `change` column. `baseline/`: the baseline's provenance and CSV. | container |
+| `license-<sha>-modelexpress` | `osrb-modelexpress-deps-<sha8>.csv`: the crate closure of the published crates with all features, and the Python closure of the wheel with its user-facing extras on Python 3.10 to 3.13. `.diff.csv` and `baseline/BASELINE.md` as above. | source and crates |
+
+The diff baseline is the newest earlier scheduled `nightly-ci.yml` run on
+`main` whose GitLab trigger succeeded and that still has the same artifact
+(`.github/scripts/compliance/baseline.py`). Without one, the diff holds a
+single `baseline_unavailable` row; a failed lookup fails the job, and GitLab
+is only triggered when the compliance scan succeeds. Every row needs a valid
+SPDX expression. Add an entry with a source link to
+`.github/scripts/compliance/license_overrides.toml` to set a dpkg or image
+Python license, or to fill one that a crate or wheel dependency's metadata
+lacks.
+
+The image is scanned without running it: `.github/scripts/compliance/Dockerfile.extract`
+bind-mounts each arch's filesystem into an extractor on the runner's own
+platform. A syft scan of each arch's image and base image then cross-checks the
+CSV (`.github/scripts/compliance/audit_image.py`): the job fails if the image
+adds a package the CSV lacks, or a file no package owns that is not one of the
+binaries or `NOTICES` copied into `/app`. A new first-party file copied into
+`/app` goes in that script's `FIRST_PARTY_FILES`. release-automation's `nvbug:attach-compliance` and
+`nvbug:attach-license` jobs attach these files on every security nightly.
+The artifact names and layout are the contract of its
+`nvbug-attach-compliance.py` and `nvbug-attach-license.py`.
+
+After staging, the workflow triggers the internal GitLab
+release-automation pipeline, which scans and publishes the artifacts. A
+Slack thread is opened at the start of every release run, and its
+`thread_ts` is forwarded to GitLab as `SLACK_THREAD_TS`, so GitLab posts
+its scan, nSpect and publish updates on the same thread. Staging results
+and the GitLab handoff are replied on that thread too. A channel-level
+alert goes out through `SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL` only when a run
+is red. The single job to watch is `nightly-status`.
+Failure messages JSON-escape job names so quotes, backslashes and newlines do
+not break the Slack payload.
+
+The alert mentions `SLACK_MENTION_OPS_SUPPORT`, `SLACK_MENTION_DYNAMO_BOT`
+and `SLACK_MENTION_MX_DEV_TEAM`. All three are repository variables holding
+full Slack mention syntax (`<!subteam^ID>` for a user group, `<@ID>` for
+a user or bot), so the IDs stay out of this public repository.
+
+Test failures do **not** block staging. Release runs always run the core
+suite, and a failed core suite blocks the GitLab publish handoff, as
+Dynamo's pre-merge suite does. The inference and RL suites never block it.
+
+Additional secrets in the `automated-release` environment, which admits
+only `main` and `release/*`: `NGC_PUBLISH_USERNAME`, `NGC_PUBLISH_TOKEN`,
+`GITLAB_PIPELINE_URL` and `GITLAB_TRIGGER_TOKEN`. Repository scope holds
+`SLACK_RELEASE_BOT_TOKEN`, `SLACK_RELEASE_CHANNEL_ID` and
+`SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL`.
 
 ### Custom Client Image (P2P Transfers)
 
@@ -710,6 +831,25 @@ Receiver-driven RL refit and live fine-tune broadcast are under development. The
 
 See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale, limitations, and the structural reasons these backend families differ.
 
+### Loading Strategy Plugins
+
+External loading strategies run after RDMA and before ServerCache by default in the shared `INFERENCE` chain. In that order, RDMA success skips the plugin's `load()`; plugin failure follows the existing recovery and fallback lifecycle. RL and SGLang's `transfer_engine` path are unchanged.
+
+Implement `is_available`, `load`, and `rollback` in the [strategy template](../examples/plugins/mx_plugin_example.py) before enabling it. The template raises `NotImplementedError` for each method. Mount the plugin directory read-only into each worker and set:
+
+```bash
+export MX_PLUGIN_DIR=/opt/modelexpress/plugins
+export MX_LOAD_PLUGIN=example
+```
+
+Set `MX_LOAD_PLUGIN_BEFORE` to insert the plugin immediately before a built-in strategy: `rdma`, `server-cache`, `instant_tensor`, `model_streamer`, `gds`, or `default`. The default is `server-cache`. For example, `export MX_LOAD_PLUGIN_BEFORE=rdma` tries the plugin first. Built-in strategies retain their relative order. Unknown or empty target names fail before discovery or weight loading; the setting is ignored when no plugin is selected.
+
+The directory must contain `mx_plugin_example.py`, whose no-argument `register_plugin()` returns a strategy class named `example`. No inference-engine code or `PYTHONPATH` changes are required. Multiple entries may be mounted; all are imported and validated, but only the selected class is instantiated. Entry imports, registration, and construction must not download or load weights.
+
+Unset or empty `MX_LOAD_PLUGIN` disables discovery. An unknown selection, missing plugin directory, invalid entry, or name collision fails before weight loading.
+
+Plugins execute inside the worker without sandboxing. Deploy trusted artifacts and restart workers to activate updates; imported modules are cached for the worker lifetime. See [External Loading Strategies](ARCHITECTURE.md#external-loading-strategies) for the interface and failure contract.
+
 ### P2P Environment Variables
 
 `MX_SERVER_ADDRESS` is the variable ModelExpress is standardizing on for the client's gRPC server address; `MODEL_EXPRESS_URL` is deprecated and will be removed in a future release. During the transition, set both to the same value: some client paths (notably the TRT-LLM live-transfer integration) currently read only `MODEL_EXPRESS_URL`, and when both are set `MODEL_EXPRESS_URL` takes precedence. Do not drop `MODEL_EXPRESS_URL` yet.
@@ -721,6 +861,9 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_MODEL_NAME_OVERRIDE` | (unset) | Override vLLM's MX model identity without changing its model-loading path. Set before worker startup and use the same name for RL trainers and WeightVersions. Unset or empty preserves vLLM's configured model path/ID, including rewritten S3 cache paths. See [S3 Delta Weight Refit](S3_DELTA_WEIGHT_REFIT.md). |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Initial-load policy. `RL` uses exact desired-version P2P and canonical S3 replay when `MX_REFIT_DESIRED_VERSION_UID` is set; otherwise it tries `MX_MODEL_URI` and then the engine-native loader. vLLM speculative draft models are rejected because the desired UID identifies only the main model. |
+| `MX_LOAD_PLUGIN` | (unset) | Select one external loading strategy by name for the shared `INFERENCE` chain. Unset or empty disables plugin discovery. See [Loading Strategy Plugins](#loading-strategy-plugins). |
+| `MX_LOAD_PLUGIN_BEFORE` | `server-cache` | Insert the selected plugin immediately before this built-in strategy. Ignored when no plugin is selected. See [Loading Strategy Plugins](#loading-strategy-plugins) for valid names. |
+| `MX_PLUGIN_DIR` | `/opt/modelexpress/plugins` | Directory containing `mx_plugin_<name>.py` entries; read only when a plugin is selected. |
 | `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact immutable version required by the RL initial-load policy. When set, startup fails if neither desired-version P2P nor S3 replay succeeds; version-agnostic fallbacks are not allowed. |
 | `MX_GENERATOR_SOURCE_ORDER` | Auto-detected | Ordered RL weight sources. For desired-version cold start, the default is `GENERATOR,OBJECT_STORAGE`; supported entries are `GENERATOR` (P2P) and `OBJECT_STORAGE` (canonical S3 replay). The same order controls active refit. `OBJECT_STORAGE` disables P2P for both paths. `TRAINER` is supported by active refit only and is rejected during desired-version cold start. |
 | `MX_REFIT_CHECKPOINT_DIR` | (unset) | Local cache for RL full checkpoints, deltas, and materialized checkpoints. Required for desired-version S3 replay. Cache persistence and capacity are determined by the mounted volume. |
@@ -745,12 +888,17 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_ARENA_SINGLE_MR` | `0` | Keep single-MR arena registration even when the arena spans several `cuMemCreate` handles. Only safe on transports that can register across handles (dmabuf/IB); cuda_ipc cannot, so the default falls back to per-tensor registration. See [VMM Arena](#vmm-arena-single-mr-registration). |
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` on any UCX predating the `cuda_copy_md` length-truncation fix (openucx/ucx#11461). Scoped to the `cuda_copy` transport; it does not affect `cuda_ipc`. |
 | `MX_NIXL_BACKEND` | `UCX` | NIXL backend for GPU-to-GPU RDMA. `UCX` (default) for InfiniBand / RoCE. `LIBFABRIC` for AWS EFA — see [NIXL Backend Selection](#nixl-backend-selection). |
+| `MX_NIXL_METADATA_TIMEOUT` | `120.0` | Timeout in seconds for fetching peer NIXL metadata during RDMA loading, separate from `MX_TRANSFER_TIMEOUT`. Accepts finite positive numbers, including fractions. Invalid values fall back to the default. |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Addresses both openucx/ucx#11259 and rail convergence, the latter measured at 4.45x on an under-provisioned pod. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MX_UCX_DISABLE_MEM_EVENTS` | `0` | Opt-in. `1` sets `UCX_MEM_EVENTS=n` before NIXL agent creation on the UCX backend (no-op on `LIBFABRIC`), which roughly halves NIXL agent creation time by skipping UCX's mem-hook / VM-unmap tracking. Off by default because the effect is process-wide and permanent: `UCX_MEM_EVENTS` backs registration-cache invalidation for every UCP context in the process, not just ModelExpress's, so this is only safe when the process owns UCX exclusively for ModelExpress transfers. Never overrides an operator-set `UCX_MEM_EVENTS`. UCX reads this option in a shared-library constructor, so if UCX was already loaded elsewhere in the process before agent creation, setting it here can be a no-op. |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_P2P_METADATA` | `1` | Enable P2P metadata exchange (source workers only). Set to `0` to publish full metadata through a central-coordinator backend. This setting is ignored on backends that require P2P metadata, currently `k8s-service`. |
+| `MX_DISABLE_DRAFT_P2P` | `0` | Set to `1` to load the SGLang or vLLM speculative draft through storage without receiving or publishing draft tensors over NIXL P2P. Main-model P2P and cold-load shard selection are unchanged. The default permits P2P for compatible same-checkpoint MTP drafts; it does not bypass checkpoint identity or compatibility checks, and storage fallback remains available when no compatible READY source is found. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
+| `MX_REFIT_DELTA_SURGICAL` | `false` | Experimental vLLM delta install: reload only the modules whose checkpoint tensors the delta chain changed since the engine's last checkpoint install, instead of the whole prepared checkpoint. Falls back to a full reload when the lineage or live version is unknown, or when a fed module is incomplete. See the S3 delta refit guide. |
+| `MX_REFIT_FULL_STREAMING` | `false` | Experimental vLLM full-HF refit: use ModelStreamer once and tee tensors to a bounded background disk writer. Requires distributed ModelStreamer for TP greater than one. Requires `runai-model-streamer>=0.17.0`. Checksummed artifacts and delta replay retain canonical preparation. For S3-compatible storage, set matching `AWS_ENDPOINT_URL` and `AWS_DEFAULT_REGION` on all generator workers; `object_storage_endpoint_url` / `object_storage_region_name` configure only the index reader, not streamed shard reads. See the architecture section on streamed full refit. |
+| `MX_REFIT_STREAM_WINDOW_LAYERS` | `2` | Decoder layers per ranged ModelStreamer request during streamed full refit. Bounds GPU memory held by partially loaded layers; `0` streams the whole checkpoint in one request. |
 | `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL listen port for an RL generator's refit client; effective port is `MX_REFIT_METADATA_PORT + device_id`, separate from a boot-time loader manager |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
@@ -764,7 +912,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
-| `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for decentralized backends where no central coordinator tracks versions. |
+| `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; SGLang draft P2P also requires a non-empty revision. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` backend: sleep between retry attempts. |
@@ -1221,7 +1369,24 @@ All storage backends (S3, GCS, Azure) are included as core dependencies — no e
 | `RUNAI_STREAMER_CONCURRENCY` | `8` | Number of concurrent read threads |
 | `RUNAI_STREAMER_MEMORY_LIMIT` | (none) | CPU staging buffer size in bytes. `0` reuses a single-tensor buffer (most memory efficient). See [runai-model-streamer docs](https://github.com/run-ai/runai-model-streamer). |
 
+For SGLang Qwen3.5 MTP P2P, use `--load-format remote_instance`,
+`--remote-instance-weight-loader-backend modelexpress`,
+`--speculative-draft-load-format remote_instance`, and NIXL transport for both
+passes. Use the same immutable checkpoint, exact SGLang build, and ModelExpress
+build on source and target. Set `MX_MODEL_REVISION` to that checkpoint's real
+revision and `MX_MODEL_URI` to its pinned storage location. MX recognizes
+specific SGLang main/draft class pairs with mirrored checkpoint-name rules;
+unrecognized or incompatible layouts use SGLang's storage loader. New model
+classes require validation against the deployed SGLang build and checkpoint.
+For a recognized checkpoint with a valid
+`model.safetensors.index.json`, ModelStreamer selects main and draft shard files
+before each storage read. Mixed shards can still be read in both passes; if the
+index is unavailable or incomplete, SGLang reads the full file list. This
+selection does not affect P2P target transfer.
+
 With vLLM, `MX_MODEL_URI` can also be a Hugging Face model ID. vLLM first downloads the safetensors into its local Hugging Face cache, then ModelStreamer reads those local files; ModelStreamer does not stream directly from the Hub.
+
+For vLLM MTP with a shared checkpoint, configure both the main and speculative draft loads through ModelExpress and use the same pinned checkpoint, revision, vLLM build, and MX build on source and target. One main NIXL listener serves both role-scoped tensor sets; do not allocate a second metadata port for the draft. On cold start, ModelStreamer prefers the model's `is_unused_checkpoint_weight` hook and delegates to a compatible RunAI loader or uses vLLM's local filter and the checkpoint index. Older engines without the hook can use the bounded Qwen3.5, Qwen3-Next, DeepSeek and GLM MTP compatibility paths described in [vLLM Loader](ARCHITECTURE.md#vllm-loader). Other models and unusable optional metadata retain full-file loading. Main models without their own hook also retain full-file loading. Logs identify whether shard selection used the model-owned hook or the legacy compatibility rule. Mixed shards can be read by both passes. With `MX_VMM_ARENA=1`, the main weights use the arena while draft tensors are registered individually; the draft must not replace the live main arena.
 
 **S3 / S3-compatible:**
 
@@ -1569,21 +1734,17 @@ total rather than describing the entire streaming operation as wire or install.
 | DeepSeek-V3 (671B, FP8) | 681 GB (8 GPUs) | ~15 seconds | ~45 Gbps |
 | Llama 3.3 70B | 140 GB (8 GPUs) | ~5 seconds | ~28 Gbps |
 
-### Internal streaming cache controls
+### Internal streaming diagnostics
 
-Benchmarks record the following implementation switches in their experiment
-manifest. They are internal qualification controls, separate from the public
-integration choices above. Integrations should not expose cache algorithms as
-application configuration. This table records the existing controls and defaults;
-it does not establish a stable configuration API.
+Source metadata and transfer plans are reused automatically. These internal
+settings are read when the transfer is constructed.
 
-| Internal environment variable | Default | Qualification purpose |
+| Internal environment variable | Default | Purpose |
 | --- | --- | --- |
-| `MX_REFIT_CACHE_RESOLVED_SOURCES` | `0` | Reuse decoded, merged source tables only when every ordered manifest byte matches. |
-| `MX_REFIT_CACHE_BOUNDED_PLANS` | `0` | Reuse physical plans when manifests, source geometry/addresses, load capture, destination layout, staging configuration, and planning controls match. |
-| `MX_REFIT_REUSE_COMPLETE_PLAN` | `0` | Use the already-built whole-model plan for bounded coverage validation. |
-| `MX_REFIT_COPY_PLAN_KEY_ON_MISS` | `0` | Snapshot callback inputs only on a plan-cache miss; reject overlapping compilation. |
-| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Existing descriptor budget before full-source reconstruction; changing it invalidates cached plans. |
+| `MX_REFIT_DEBUG_VALIDATE_PLAN` | `0` | Recheck cached whole-model and owning-module transfer coverage. |
+| `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` | `0` | Validate that generator layout hasn't changed. |
+| `MX_REFIT_PACK_MODULES` | `1` | Pack complete owning modules within each bounded staging arena. |
+| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Descriptor budget before full-source reconstruction. |
 
 Bounded streaming requires the framework to hold its update guard through
 transfer, installation and verification. Each group is copied from a receive
@@ -1654,8 +1815,8 @@ and commenters without write permission are rejected. New revisions need new
 requests. Labels do not trigger this workflow.
 
 The hosted gate checks permission and resolves immutable source/model/scenario outputs.
-`bench-ci.yml` handles comment authorization and configured runtime selection, then
-calls `rl-refit-ci.yml`. The reusable workflow accepts PR number, exact source SHA,
+`modelexpress-rl-ci.yml` handles both authorized `/bench` comments and reusable
+CI calls. The workflow accepts PR number, exact source SHA,
 model, scenario and digest-pinned runtime inputs. Comment runs repeat the caller
 permission, current-head and mirror checks before privileged builds. Automatic
 runs derive the PR number from the upstream `pull-request/<N>` push and require
@@ -1726,11 +1887,11 @@ FlashInfer compatibility checks. The seed-download step reads the snapshot
 manifest and checks downloaded file sizes against S3 object sizes. Manual runs can use external S3
 through their environment configuration.
 
-The `RL weight refit CI` comment workflow delegates execution to the shared
-`RL refit CI` workflow for the selected profile and scenario. The GPU job is named
-`RL refit / Refit (PROFILE)` for the delta scenario. Every trusted
+`ModelExpress RL CI` handles `/bench` comments and reusable workflow calls directly
+for the selected profile and scenario. The GPU job is named
+`RL generator-only delta refit (PROFILE)` for the delta scenario. Every trusted
 PR automatically calls the same workflow for Nemotron, under
-`RL generator-only delta refit (vllm, s3) / Refit (nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4)`.
+`RL / GPU / RL generator-only delta refit (nemotron)`.
 Workflow callers can pass a profile key or its registered full model name; validation
 resolves it to the profile key for resource names and configuration. The required `CI status check`
 depends on this workflow, including cleanup; seed download, storage or refit failures

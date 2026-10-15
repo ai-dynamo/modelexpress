@@ -25,7 +25,7 @@ kind: Job
 metadata:
   name: ${JOB_NAME}
 spec:
-  backoffLimit: 0
+  backoffLimit: 1
   template:
     metadata:
       labels:
