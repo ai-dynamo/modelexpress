@@ -3,7 +3,7 @@
 
 # Azure single-GPU vLLM MTP template for P2P RDMA CI.
 # Applied once as mx-source and once as mx-target. The target must receive the
-# main-model weights over P2P, then load the small MTP draft head locally.
+# main-model weights and then the MTP draft weights over P2P.
 #
 # Environment variables substituted before each apply:
 #   JOB_NAME        — mx-source or mx-target
