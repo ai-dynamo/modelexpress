@@ -96,6 +96,37 @@ def validate_coverage(plan: ReshardPlan, expected: list[str]) -> None:
 DEFAULT_RECEIVER_PROTOCOL = "mx-nccl-m2n-bootstrap-v1"
 
 
+def reshard_run_key(entry: ParamPlan) -> tuple[int, str, str]:
+    """The run an entry belongs to: its lane, source mesh and destination mesh.
+
+    Entries sharing a key go to the same communicator with the same topology,
+    which is what nccl.m2n can PACK-fuse inside one ``m2n.group()``.
+    """
+    return (entry.partition_id, entry.src_mesh.canonical(), entry.dst_mesh.canonical())
+
+
+def submission_order(entries: list[ParamPlan]) -> list[ParamPlan]:
+    """The order one layer group's reshards are recorded in, on every rank.
+
+    Sorted by run key, then by the entry's canonical form, so runs are
+    contiguous and in ascending lane order. A rank on one lane records a
+    subsequence of the same total order, which is what M2N needs from buckets
+    whose communicator memberships overlap: one common order on every rank.
+    """
+    return sorted(entries, key=lambda entry: (reshard_run_key(entry), entry.canonical()))
+
+
+def reshard_runs(entries: list[ParamPlan]) -> list[list[ParamPlan]]:
+    """Split one layer group, in submission order, into its runs."""
+    runs: list[list[ParamPlan]] = []
+    for entry in submission_order(entries):
+        if runs and reshard_run_key(runs[-1][-1]) == reshard_run_key(entry):
+            runs[-1].append(entry)
+        else:
+            runs.append([entry])
+    return runs
+
+
 def plan_digest(
     plan: ReshardPlan,
     *,
@@ -126,6 +157,12 @@ def plan_digest(
     differently would issue different operations under the same id. Group
     order is hashed; names within a group are not, since the backend issues a
     group in canonical order.
+
+    The run boundaries of every layer group are hashed too: the lane, meshes
+    and length of each run, in submission order. Each layer group is recorded
+    as one ``m2n.group()`` whose per-communicator contents must match on every
+    rank, so peers that would split or order runs differently - a different
+    grouping rule, not only a different grouping - are refused at READY.
     """
     plan.validate()
     hasher = hashlib.sha256()
@@ -157,6 +194,20 @@ def plan_digest(
                 encoded = name.encode()
                 hasher.update(f"{len(encoded)}:".encode())
                 hasher.update(encoded)
+
+    by_name = {entry.name: entry for entry in plan.bulk}
+    groups = (
+        [list(plan.bulk)]
+        if layer_groups is None
+        else [[by_name[name] for name in group if name in by_name] for group in layer_groups]
+    )
+    hasher.update(f"runs\0{len(groups)}\0".encode())
+    for group in groups:
+        runs = reshard_runs(group)
+        hasher.update(f"{len(runs)}\0".encode())
+        for run in runs:
+            lane, src_mesh, dst_mesh = reshard_run_key(run[0])
+            hasher.update(f"{lane}|{src_mesh}|{dst_mesh}|{len(run)}\0".encode())
 
     return hasher.hexdigest()
 

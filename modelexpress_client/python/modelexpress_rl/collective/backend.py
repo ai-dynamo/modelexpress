@@ -25,6 +25,7 @@ from typing import Any
 
 from . import envs
 from .comm import CommunicatorCache, LaneCommunicator, LaneKey, NcclUnavailableError
+from .plan import submission_order
 from .spi import LocalParamSpec, RefitCtx, resolve_specs
 from .types import ParamPlan, ReshardPlan
 
@@ -34,7 +35,9 @@ logger = logging.getLogger("modelexpress_rl.collective.backend")
 _SLOW_RESHARD_WARN_S = 10.0
 
 DEFAULT_LAYER_GROUP = 0
-_M2N_CALL_LOCK = threading.Lock()
+# Reentrant: a group holds it across recording, and each recorded reshard
+# takes it again.
+_M2N_CALL_LOCK = threading.RLock()
 
 #: How long an abort waits for this half's in-flight work before deciding
 #: whether its M2N handle can be destroyed.
@@ -67,6 +70,90 @@ def _m2n_init() -> Any:
     return handle
 
 
+class _StorageRegion:
+    __slots__ = ("name", "lane", "is_destination", "device", "start", "end")
+
+    def __init__(self, name, lane, is_destination, device, start, end):
+        self.name = name
+        self.lane = lane
+        self.is_destination = is_destination
+        self.device = device
+        self.start = start
+        self.end = end
+
+    def overlaps(self, other: _StorageRegion) -> bool:
+        return (
+            self.device == other.device
+            and self.start < other.end
+            and other.start < self.end
+        )
+
+
+def _storage_region(
+    entry: ParamPlan, buf: Any, *, is_destination: bool
+) -> _StorageRegion | None:
+    """The byte span ``buf`` covers, or None for something that is not a tensor."""
+    try:
+        start = int(buf.data_ptr())
+        itemsize = int(buf.element_size())
+        shape = tuple(buf.shape)
+        stride = tuple(buf.stride())
+        device = str(buf.device)
+    except (AttributeError, TypeError):
+        return None
+    if any(extent == 0 for extent in shape):
+        return None
+    span = 1 + sum((extent - 1) * step for extent, step in zip(shape, stride))
+    return _StorageRegion(
+        entry.name,
+        entry.partition_id,
+        is_destination,
+        device,
+        start,
+        start + span * itemsize,
+    )
+
+
+def _check_storage(
+    regions: list[_StorageRegion], entry: ParamPlan, src: Any, dst: Any
+) -> None:
+    """Refuse a call whose storage collides with one already in the group.
+
+    M2N fuses the calls of a group with no ordering between them, so nothing
+    recorded in one group may write storage another call reads or writes. The
+    one overlap accepted is read-only source storage feeding different lanes,
+    which the standalone M2N transport validated (PR #497). The check runs
+    while recording, so a collision discards the group before anything is
+    issued; it is a local refusal, not a fence, because a fence decided from
+    local buffers would differ between ranks and break the per-communicator
+    contract every rank must record identically.
+    """
+    for buf, is_destination in ((src, False), (dst, True)):
+        if buf is None:
+            continue
+        region = _storage_region(entry, buf, is_destination=is_destination)
+        if region is None:
+            continue
+        for other in regions:
+            if not region.overlaps(other):
+                continue
+            if (
+                not region.is_destination
+                and not other.is_destination
+                and region.lane != other.lane
+            ):
+                continue
+            raise RuntimeError(
+                f"nccl.m2n group storage overlap: {entry.name!r} "
+                f"({'destination' if region.is_destination else 'source'}) overlaps "
+                f"{other.name!r} "
+                f"({'destination' if other.is_destination else 'source'}); every "
+                "parameter of one layer group needs its own storage until the "
+                "group's transfer completes"
+            )
+        regions.append(region)
+
+
 def _m2n_destroy(handle: Any) -> None:
     with _M2N_CALL_LOCK:
         handle.destroy()
@@ -80,10 +167,18 @@ class _blocked_reshard_watch:
     this the trainer stays silent for as long as it is stuck.
     """
 
-    def __init__(self, entry: ParamPlan, lane: LaneCommunicator, started: float):
+    def __init__(
+        self,
+        entry: ParamPlan,
+        lane: LaneCommunicator,
+        started: float,
+        *,
+        calls: int = 1,
+    ):
         self._entry = entry
         self._lane = lane
         self._started = started
+        self._calls = calls
         self._done = threading.Event()
         self._thread = threading.Thread(
             target=self._watch, name="mx-reshard-watch", daemon=True
@@ -100,9 +195,11 @@ class _blocked_reshard_watch:
 
     def _watch(self) -> None:
         while not self._done.wait(_SLOW_RESHARD_WARN_S):
+            group = f"group of {self._calls} starting at " if self._calls > 1 else ""
             logger.warning(
-                "nccl.m2n reshard of %r on lane %s (rank %s of %s) still blocks "
+                "nccl.m2n reshard %sof %r on lane %s (rank %s of %s) still blocks "
                 "the host after %.0fs",
+                group,
                 self._entry.name,
                 self._entry.partition_id,
                 self._lane.rank,
@@ -566,45 +663,89 @@ class _CollectiveHalf:
         self._active_lanes.clear()
         self._pending_contexts.clear()
 
-    def _issue_reshard(self, entry: ParamPlan, *, src: Any, dst: Any) -> None:
+    def _submit_layer_group(
+        self, entries: list[ParamPlan], *, src: Any, dst: Any
+    ) -> list[LaneCommunicator]:
+        """Record one layer group's reshards in one ``m2n.group()`` and issue it.
+
+        Entries are recorded in :func:`submission_order`: grouped into runs by
+        lane and source/destination mesh, runs in ascending lane order. M2N
+        buckets the group by handle, communicator and stream and PACK-fuses the
+        calls of a bucket that share a topology, so a run is what it can fuse;
+        every rank records the same per-communicator sequence, and a rank on
+        one lane records a subsequence of the same total order.
+
+        Inside the group ``reshard`` only records, so ``pre`` hooks run while
+        recording (stream-ordered before the issued transfer) and ``post``
+        hooks run only after the group has been issued. A failure while
+        recording discards the whole group: nothing is issued. The transfer
+        deadline is checked before the group opens, never inside it, because
+        the abort it triggers destroys the M2N handle and that is refused while
+        a group is open.
+
+        Returns the lanes the group used, in submission order.
+        """
         self._remaining()
-        lane = self._lane(entry.partition_id)
-        spec = self._specs[entry.name]
-        # Recorded before anything is enqueued, so a hook or reshard that raises
-        # partway still leaves the lane in the drain set.
-        self._record_lane(lane)
-        with self._stream_context(lane, spec):
-            ctx = spec.enter()
-            # Retain staging buffers and hook state until the asynchronous CUDA
-            # work is complete. Relying only on an allocator's stream tracking
-            # is not sufficient for engine-owned or external buffers.
-            self._pending_contexts.append(ctx)
-            started = time.monotonic()
-            with _blocked_reshard_watch(entry, lane, started):
+        ordered = submission_order(entries)
+        if not ordered:
+            return []
+        handle = self._m2n_handle
+        if handle is None:
+            raise RuntimeError("start_weight_update must run before a transfer")
+        lanes: OrderedDict[int, LaneCommunicator] = OrderedDict()
+        for entry in ordered:
+            lane = self._lane(entry.partition_id)
+            lanes[id(lane)] = lane
+            # Recorded before anything is enqueued, so a hook or reshard that
+            # raises partway still leaves the lane in the drain set.
+            self._record_lane(lane)
+
+        import nccl.m2n as m2n
+
+        staged: list[tuple[ParamPlan, LaneCommunicator, LocalParamSpec, RefitCtx]] = []
+        regions: list[_StorageRegion] = []
+        started = time.monotonic()
+        # The native runtime is process-global and not host-thread-safe, and a
+        # group records on the calling thread, so one lock spans the group.
+        with _M2N_CALL_LOCK, _blocked_reshard_watch(
+            ordered[0], next(iter(lanes.values())), started, calls=len(ordered)
+        ), m2n.group():
+            for entry in ordered:
+                lane = self._lane(entry.partition_id)
+                spec = self._specs[entry.name]
+                with self._stream_context(lane, spec):
+                    ctx = spec.enter()
+                # Retain staging buffers and hook state until the asynchronous
+                # CUDA work is complete. Relying only on an allocator's stream
+                # tracking is not sufficient for engine-owned or external buffers.
+                self._pending_contexts.append(ctx)
+                staged.append((entry, lane, spec, ctx))
+                _check_storage(regions, entry, src(ctx), dst(ctx))
                 _reshard(
                     comm=lane,
                     entry=entry,
                     src=src(ctx),
                     dst=dst(ctx),
-                    handle=self._m2n_handle,
+                    handle=handle,
                 )
-            elapsed = time.monotonic() - started
-            if elapsed >= _SLOW_RESHARD_WARN_S:
-                # nccl.m2n issues host-blocking collectives inside a call
-                # (DevComm creation, window registration) that wait for every
-                # lane rank to enter them; a call that blocks this long is a
-                # peer that has not reached the same entry (v14 recorded
-                # nothing between the bootstrap and a 10-minute stall).
-                logger.warning(
-                    "nccl.m2n reshard of %r on lane %s (rank %s of %s) blocked "
-                    "the host for %.1fs",
-                    entry.name,
-                    entry.partition_id,
-                    lane.rank,
-                    lane.world_size,
-                    elapsed,
-                )
-            spec.leave(ctx)
+        elapsed = time.monotonic() - started
+        if elapsed >= _SLOW_RESHARD_WARN_S:
+            # nccl.m2n issues host-blocking collectives while issuing a group
+            # (DevComm creation, window registration) that wait for every lane
+            # rank to enter them; a group that blocks this long is a peer that
+            # has not reached the same submission.
+            logger.warning(
+                "nccl.m2n group of %d reshard(s) starting at %r on lane %s blocked "
+                "the host for %.1fs",
+                len(ordered),
+                ordered[0].name,
+                ordered[0].partition_id,
+                elapsed,
+            )
+        for _, lane, spec, ctx in staged:
+            with self._stream_context(lane, spec):
+                spec.leave(ctx)
+        return list(lanes.values())
 
     def _finish_misc(self, broadcast_lane_id: int) -> None:
         if not self._pending_misc:
@@ -652,8 +793,9 @@ class NcclM2nSender(_CollectiveHalf):
         """
         started = time.monotonic()
         entries = self._claim_group(layer_group_id)
-        for entry in entries:
-            self._issue_reshard(entry, src=lambda ctx: ctx.buf, dst=lambda ctx: None)
+        self._submit_layer_group(
+            entries, src=lambda ctx: ctx.buf, dst=lambda ctx: None
+        )
         logger.info(
             "collective sender issued layer group %s (%d entries) in %.2fs",
             layer_group_id,
@@ -689,13 +831,12 @@ class NcclM2nReceiver(_CollectiveHalf):
         """
         started = time.monotonic()
         first = len(self._pending_contexts)
-        lanes: OrderedDict[int, LaneCommunicator] = OrderedDict()
         entries = self._claim_group(layer_group_id)
-        for entry in entries:
-            lane = self._lane(entry.partition_id)
-            lanes[id(lane)] = lane
-            self._issue_reshard(entry, src=lambda ctx: None, dst=lambda ctx: ctx.buf)
-        marks = [(lane, lane.record_event()) for lane in lanes.values()]
+        lanes = self._submit_layer_group(
+            entries, src=lambda ctx: None, dst=lambda ctx: ctx.buf
+        )
+        # Recorded after the group's post hooks, so a mark covers them too.
+        marks = [(lane, lane.record_event()) for lane in lanes]
         self._in_flight[layer_group_id] = (marks, self._pending_contexts[first:])
         logger.info(
             "collective receiver issued layer group %s (%d entries) in %.2fs",

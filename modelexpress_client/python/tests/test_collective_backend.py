@@ -31,7 +31,7 @@ from modelexpress_rl.collective import (
     ReshardPlan,
     resolve_specs,
 )
-from tests.test_collective_client import install_fake_m2n_handles
+from tests.test_collective_client import handle_events, install_fake_m2n_handles
 
 
 class Recorder:
@@ -55,8 +55,10 @@ def recorder(monkeypatch):
                 kwargs=kwargs,
                 src_mesh=kwargs["src_mesh"],
                 dst_mesh=kwargs["dst_mesh"],
+                group_depth=module.depth,
             )
         )
+        module.events.append(("reshard", getattr(src, "name", src), getattr(dst, "name", dst)))
 
     module = ModuleType("nccl.m2n")
     module.reshard = reshard
@@ -775,6 +777,187 @@ class TestBoundedSynchronizeFallback:
         )
 
 
+class TestGroupedSubmission:
+    """Each layer group is one m2n.group(), recorded in one canonical order."""
+
+    @staticmethod
+    def _plan():
+        # Names chosen so plain canonical (name) order would interleave lanes.
+        return ReshardPlan(
+            bulk=[
+                entry("a", partition=1),
+                entry("b", partition=0),
+                entry("c", partition=1),
+                entry("d", partition=0),
+            ],
+            source_partition_count=2,
+        )
+
+    @staticmethod
+    def _events(recorder, *kinds):
+        return [e for e in recorder.m2n.events if e[0] in kinds]
+
+    def test_a_layer_group_is_recorded_inside_exactly_one_group(self, recorder):
+        receiver, _ = build(
+            recorder, plan=self._plan(), half_cls=NcclM2nReceiver, partitions=2
+        )
+        receiver.setup_layer_groups([["a", "b"], ["c", "d"]])
+        receiver.start_weight_update("v")
+        receiver.update_weights(0)
+        receiver.update_weights(1)
+        reshards = [op for op in recorder.ops if op.kind == "reshard"]
+        assert [op.group_depth for op in reshards] == [1, 1, 1, 1]
+        assert self._events(recorder, "group_start", "group_end", "group_abort") == [
+            ("group_start",),
+            ("group_end",),
+        ] * 2
+
+    def test_runs_are_lane_major_and_a_lane_s_order_matches_on_both_sides(
+        self, recorder
+    ):
+        receiver, _ = build(
+            recorder, plan=self._plan(), half_cls=NcclM2nReceiver, partitions=2
+        )
+        receiver.start_weight_update("v")
+        receiver.update_weights(0)
+        received = [(op.comm._name, op.dst) for op in recorder.ops if op.kind == "reshard"]
+        assert received == [
+            ("lane0", "buf::b"),
+            ("lane0", "buf::d"),
+            ("lane1", "buf::a"),
+            ("lane1", "buf::c"),
+        ]
+        for partition in (0, 1):
+            recorder.ops.clear()
+            sender, _ = build(
+                recorder,
+                plan=self._plan(),
+                half_cls=NcclM2nSender,
+                partitions=2,
+                source_partition=partition,
+            )
+            sender.start_weight_update("v")
+            sender.publish_weights(0)
+            sent = [(op.comm._name, op.src) for op in recorder.ops if op.kind == "reshard"]
+            # A trainer on one lane records exactly that lane's subsequence.
+            assert sent == [
+                (name, buf) for name, buf in received if name == f"lane{partition}"
+            ]
+
+    def test_pre_hooks_run_while_recording_and_post_hooks_after_issue(self, recorder):
+        plan = ReshardPlan(bulk=[entry("a"), entry("b")])
+        receiver, _ = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
+        events = recorder.m2n.events
+
+        def spec(name):
+            def pre(base):
+                events.append(("pre", name))
+                return RefitCtx(buf=f"scratch::{name}")
+
+            def post(ctx):
+                events.append(("post", name))
+
+            return LocalParamSpec(pre=pre, post=post)
+
+        receiver._specs = {"a": spec("a"), "b": spec("b")}
+        receiver.start_weight_update("v")
+        receiver.update_weights(0)
+        assert self._events(
+            recorder, "pre", "post", "reshard", "group_start", "group_end"
+        ) == [
+            ("group_start",),
+            ("pre", "a"),
+            ("reshard", None, "scratch::a"),
+            ("pre", "b"),
+            ("reshard", None, "scratch::b"),
+            ("group_end",),
+            ("post", "a"),
+            ("post", "b"),
+        ]
+
+    def test_a_failure_while_recording_discards_the_whole_group(
+        self, recorder, monkeypatch
+    ):
+        plan = ReshardPlan(bulk=[entry("a"), entry("b")])
+        sender, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        posts = []
+        calls = []
+
+        def reshard(**kwargs):
+            calls.append(kwargs["entry"].name)
+            if len(calls) == 2:
+                raise RuntimeError("descriptor rejected")
+
+        monkeypatch.setattr(backend, "_reshard", reshard)
+        sender._specs["a"] = LocalParamSpec(base="buf::a", post=posts.append)
+        sender.start_weight_update("v")
+        with pytest.raises(RuntimeError, match="descriptor rejected"):
+            sender.publish_weights(0)
+        assert self._events(recorder, "group_start", "group_end", "group_abort") == [
+            ("group_start",),
+            ("group_abort",),
+        ]
+        # Nothing was issued, so nothing may be committed.
+        assert posts == []
+
+    def test_an_expired_deadline_never_opens_a_group(self, recorder):
+        plan = ReshardPlan(bulk=[entry("a")])
+        sender, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        sender.start_weight_update("v")
+        sender._deadline = 0.0
+        with pytest.raises(TimeoutError):
+            sender.publish_weights(0)
+        assert self._events(recorder, "group_start") == []
+
+    def test_overlapping_destinations_are_refused_before_anything_is_issued(
+        self, recorder
+    ):
+        import torch
+
+        plan = ReshardPlan(bulk=[entry("a"), entry("b")])
+        receiver, _ = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
+        shared = torch.zeros(8, 4)
+        receiver._specs = {
+            "a": LocalParamSpec(base=shared),
+            "b": LocalParamSpec(base=shared[2:]),
+        }
+        receiver.start_weight_update("v")
+        with pytest.raises(RuntimeError, match="storage overlap"):
+            receiver.update_weights(0)
+        assert self._events(recorder, "group_end") == []
+
+    def test_disjoint_slices_of_one_tensor_are_accepted(self, recorder):
+        import torch
+
+        plan = ReshardPlan(bulk=[entry("a"), entry("b")])
+        receiver, _ = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
+        fused = torch.zeros(16, 4)
+        receiver._specs = {
+            "a": LocalParamSpec(base=fused[:8]),
+            "b": LocalParamSpec(base=fused[8:]),
+        }
+        receiver.start_weight_update("v")
+        receiver.update_weights(0)
+        assert self._events(recorder, "group_end") == [("group_end",)]
+
+    def test_read_only_sources_may_feed_different_lanes(self, recorder):
+        import torch
+
+        plan = ReshardPlan(
+            bulk=[entry("a", partition=0), entry("b", partition=1)],
+            source_partition_count=2,
+        )
+        sender, _ = build(recorder, plan=plan, half_cls=NcclM2nSender, partitions=2)
+        source = torch.zeros(8, 4)
+        sender._specs = {
+            "a": LocalParamSpec(base=source),
+            "b": LocalParamSpec(base=source),
+        }
+        sender.start_weight_update("v")
+        sender.publish_weights(0)
+        assert self._events(recorder, "group_end") == [("group_end",)]
+
+
 class TestM2nHandle:
     """The half's explicit M2N handle: created once, destroyed before its lanes."""
 
@@ -796,7 +979,7 @@ class TestM2nHandle:
     def test_no_handle_exists_until_a_round_starts(self, recorder):
         half, _ = self._half(recorder)
         assert half.m2n_handle is None
-        assert recorder.m2n.events == []
+        assert handle_events(recorder.m2n) == []
 
     def test_every_reshard_of_every_round_uses_the_same_handle(self, recorder):
         half, _ = self._half(recorder)
@@ -806,14 +989,14 @@ class TestM2nHandle:
             half.finish_weight_update(broadcast_lane_id=1)
         handles = {id(op.kwargs["handle"]) for op in recorder.ops if op.kind == "reshard"}
         assert handles == {id(half.m2n_handle)}
-        assert recorder.m2n.events == [("init", 0)]
+        assert handle_events(recorder.m2n) == [("init", 0)]
 
     def test_abort_destroys_the_handle_then_aborts_every_lane(self, recorder):
         half, cache = self._half(recorder)
         half.start_weight_update("v1")
         half.publish_weights(0)
         half.abort()
-        events = recorder.m2n.events
+        events = handle_events(recorder.m2n)
         assert events[:2] == [("init", 0), ("destroy", 0)]
         assert sorted(events[2:]) == [("comm_abort", "lane0"), ("comm_abort", "lane1")]
         assert len(cache) == 0
@@ -869,7 +1052,7 @@ class TestM2nHandle:
         half.finish_weight_update(broadcast_lane_id=1)
         half.close()
         half.close()
-        assert recorder.m2n.events == [("init", 0), ("destroy", 0)]
+        assert handle_events(recorder.m2n) == [("init", 0), ("destroy", 0)]
         assert len(cache) == 2
 
     def test_a_build_without_a_finalizable_handle_is_refused(

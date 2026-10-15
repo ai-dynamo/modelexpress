@@ -284,9 +284,31 @@ def install_fake_m2n_handles(m2n, timeline=None):
         m2n.events.append(("init", handle.serial))
         return handle
 
+    m2n.depth = 0
+
+    @contextmanager
+    def group():
+        m2n.events.append(("group_start",))
+        m2n.depth += 1
+        try:
+            yield
+        except BaseException:
+            m2n.events.append(("group_abort",))
+            raise
+        else:
+            m2n.events.append(("group_end",))
+        finally:
+            m2n.depth -= 1
+
     m2n.Config = Config
     m2n.init = init
+    m2n.group = group
     return m2n
+
+
+def handle_events(m2n):
+    """The handle lifecycle and communicator aborts, without group bookkeeping."""
+    return [event for event in m2n.events if event[0] in ("init", "destroy", "comm_abort")]
 
 
 def _raises(error):
@@ -1654,7 +1676,7 @@ class TestM2nHandleLifecycle:
             client.start_weight_update(version, f"op-{version}")
             client.publish_weights(version)
             client.finish_weight_update(version)
-        assert self._m2n().events == [("init", 0)]
+        assert handle_events(self._m2n()) == [("init", 0)]
 
     def test_cleanup_destroys_the_handle_before_any_lane_is_aborted(self, fake_nccl):
         client = trainer(FakeRendezvous(), FakeEngine())
@@ -1666,7 +1688,7 @@ class TestM2nHandleLifecycle:
         client.cleanup()
         assert fake_nccl[0] == "m2n_destroy"
         assert fake_nccl.count("abort") == 2
-        assert self._m2n().events == [("init", 0), ("destroy", 0)]
+        assert handle_events(self._m2n()) == [("init", 0), ("destroy", 0)]
 
     def test_an_epoch_move_destroys_the_old_handle_before_its_lanes(self, fake_nccl):
         client = trainer(FakeRendezvous(epochs=(1, 2)), FakeEngine())
@@ -1683,7 +1705,7 @@ class TestM2nHandleLifecycle:
         client.start_weight_update("v2", "op2")
         client.publish_weights("v2")
         client.finish_weight_update("v2")
-        assert self._m2n().events == [("init", 0), ("destroy", 0), ("init", 1)]
+        assert handle_events(self._m2n()) == [("init", 0), ("destroy", 0), ("init", 1)]
 
     def test_a_failed_round_destroys_the_handle_before_aborting_lanes(
         self, fake_nccl, monkeypatch
@@ -1711,7 +1733,7 @@ class TestM2nHandleLifecycle:
         assert rz.reports[0]["operation_id"] == "op1"
         assert rz.reports[0]["succeeded"] is False
         assert "compute_plan re-ran" in rz.reports[0]["message"]
-        assert self._m2n().events == [("init", 0), ("destroy", 0)]
+        assert handle_events(self._m2n()) == [("init", 0), ("destroy", 0)]
 
 
 class TestCleanup:

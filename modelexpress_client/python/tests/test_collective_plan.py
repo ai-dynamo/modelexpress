@@ -192,6 +192,58 @@ class TestCoverage:
             validate_coverage(ReshardPlan(bulk=[param("a")]), ["a", "a"])
 
 
+class TestReshardRuns:
+    """Runs are what one m2n.group() can fuse: same lane, same meshes."""
+
+    @staticmethod
+    def _meshed(name, partition, dst_offset=2):
+        return ParamPlan(
+            name=name,
+            global_shape=(8, 4),
+            dtype="bfloat16",
+            partition_id=partition,
+            src_mesh=MeshSpec(shape=(2,), rank_offset=0),
+            src_placements=(Placement.shard(0),),
+            dst_mesh=MeshSpec(shape=(2,), rank_offset=dst_offset),
+            dst_placements=(Placement.shard(0),),
+        )
+
+    def test_runs_are_contiguous_and_lane_major(self):
+        from modelexpress_rl.collective.plan import reshard_runs
+
+        entries = [
+            self._meshed("a", 1),
+            self._meshed("b", 0),
+            self._meshed("c", 0, dst_offset=4),
+            self._meshed("d", 1),
+            self._meshed("e", 0),
+        ]
+        runs = [[e.name for e in run] for run in reshard_runs(entries)]
+        assert runs == [["b", "e"], ["c"], ["a", "d"]]
+
+    def test_submission_order_ignores_the_caller_s_enumeration(self):
+        from modelexpress_rl.collective.plan import submission_order
+
+        entries = [self._meshed(n, p) for n, p in (("a", 1), ("b", 0), ("c", 1))]
+        assert [e.name for e in submission_order(entries)] == ["b", "a", "c"]
+        assert submission_order(entries) == submission_order(list(reversed(entries)))
+
+    def test_the_digest_pins_the_run_rule(self, monkeypatch):
+        # Peers whose code would split the same plan into different runs must
+        # not reach READY: each run is part of a collective contract.
+        from modelexpress_rl.collective import plan as plan_module
+
+        plan = ReshardPlan(
+            bulk=[self._meshed("a", 0), self._meshed("b", 1)],
+            source_partition_count=2,
+        )
+        before = plan_digest(plan)
+        monkeypatch.setattr(
+            plan_module, "reshard_run_key", lambda entry: (0, "one", "run")
+        )
+        assert plan_digest(plan) != before
+
+
 class TestDigest:
     def test_the_digest_depends_on_bulk_operation_order(self):
         # Admission is ordered even though the backend issues bulk entries in
