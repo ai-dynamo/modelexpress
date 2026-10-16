@@ -215,21 +215,27 @@ where
     })
 }
 
-fn group_state_from_str(text: &str) -> CollectiveGroupState {
+fn group_state_from_str(text: &str) -> CollectiveResult<CollectiveGroupState> {
     match text {
-        "READY" => CollectiveGroupState::Ready,
-        "RELEASING" => CollectiveGroupState::Releasing,
-        _ => CollectiveGroupState::Forming,
+        "FORMING" => Ok(CollectiveGroupState::Forming),
+        "READY" => Ok(CollectiveGroupState::Ready),
+        "RELEASING" => Ok(CollectiveGroupState::Releasing),
+        other => Err(CollectiveBackendError::Internal(format!(
+            "unknown stored collective group state {other}"
+        ))),
     }
 }
 
-fn transfer_state_from_str(text: &str) -> CollectiveTransferState {
+fn transfer_state_from_str(text: &str) -> CollectiveResult<CollectiveTransferState> {
     match text {
-        "RUNNING" => CollectiveTransferState::Running,
-        "COMPLETE" => CollectiveTransferState::Complete,
-        "FAILED" => CollectiveTransferState::Failed,
-        "ABORTED" => CollectiveTransferState::Aborted,
-        _ => CollectiveTransferState::Pending,
+        "PENDING" => Ok(CollectiveTransferState::Pending),
+        "RUNNING" => Ok(CollectiveTransferState::Running),
+        "COMPLETE" => Ok(CollectiveTransferState::Complete),
+        "FAILED" => Ok(CollectiveTransferState::Failed),
+        "ABORTED" => Ok(CollectiveTransferState::Aborted),
+        other => Err(CollectiveBackendError::Internal(format!(
+            "unknown stored collective transfer state {other}"
+        ))),
     }
 }
 
@@ -487,7 +493,7 @@ impl RedisCollectiveBackend {
             group_id: group_id.to_string(),
             model_name: field(&fields, "model_name")?.to_string(),
             epoch,
-            state: group_state_from_str(field(&fields, "state")?).into(),
+            state: group_state_from_str(field(&fields, "state")?)?.into(),
             lanes,
             plan_source,
             plan_digest: group_digest,
@@ -551,7 +557,7 @@ impl RedisCollectiveBackend {
                 .map_err(redis_error)?;
             if !fields.is_empty()
                 && parse_field::<u64>(&fields, "epoch")? == group.epoch
-                && i32::from(group_state_from_str(field(&fields, "state")?)) == group.state
+                && i32::from(group_state_from_str(field(&fields, "state")?)?) == group.state
             {
                 return Ok(group);
             }
@@ -584,7 +590,7 @@ impl RedisCollectiveBackend {
             version_id: field(&fields, "version_id")?.to_string(),
             model_name: field(&fields, "model_name")?.to_string(),
             idempotency_key: field(&fields, "idempotency_key")?.to_string(),
-            state: transfer_state_from_str(field(&fields, "state")?).into(),
+            state: transfer_state_from_str(field(&fields, "state")?)?.into(),
             created_at_unix_ms: parse_field(&fields, "created_at_unix_ms")?,
             reported_worker_ids: reported,
             failure_message: field(&fields, "failure_message")?.to_string(),
@@ -715,7 +721,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             .ok_or_else(|| {
                 CollectiveBackendError::Internal("join returned no epoch".to_string())
             })?;
-        let state = group_state_from_str(parts.next().unwrap_or("FORMING"));
+        let state = group_state_from_str(parts.next().unwrap_or("FORMING"))?;
 
         Ok(CollectiveGroupMembership {
             group_id,
@@ -1135,6 +1141,42 @@ mod tests {
         // A record has exactly four fields; anything longer is refused rather
         // than parsed from a prefix.
         assert!(participant_from_record("x", "w|TRAINER|3|1|7").is_err());
+    }
+
+    #[test]
+    fn stored_states_decode_or_are_refused() {
+        for (text, state) in [
+            ("FORMING", CollectiveGroupState::Forming),
+            ("READY", CollectiveGroupState::Ready),
+            ("RELEASING", CollectiveGroupState::Releasing),
+        ] {
+            assert_eq!(group_state_from_str(text).expect("group state"), state);
+        }
+        for (text, state) in [
+            ("PENDING", CollectiveTransferState::Pending),
+            ("RUNNING", CollectiveTransferState::Running),
+            ("COMPLETE", CollectiveTransferState::Complete),
+            ("FAILED", CollectiveTransferState::Failed),
+            ("ABORTED", CollectiveTransferState::Aborted),
+        ] {
+            assert_eq!(
+                transfer_state_from_str(text).expect("transfer state"),
+                state
+            );
+        }
+        // A corrupt or newer record is an error, not a silent initial state.
+        for text in ["", "forming", "BOGUS"] {
+            assert!(matches!(
+                group_state_from_str(text),
+                Err(CollectiveBackendError::Internal(_))
+            ));
+        }
+        for text in ["", "pending", "BOGUS"] {
+            assert!(matches!(
+                transfer_state_from_str(text),
+                Err(CollectiveBackendError::Internal(_))
+            ));
+        }
     }
 
     #[test]
