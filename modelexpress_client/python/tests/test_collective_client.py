@@ -1771,6 +1771,59 @@ class TestCleanup:
         assert ("cleanup",) in engine.calls
         assert len(client._cache) == 0
 
+    @staticmethod
+    def _generator(engine):
+        client = RefitClientGenerator(
+            rendezvous=FakeRendezvous(),
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=1,
+            slot_id="g0",
+            worker_id="w9",
+            index_in_role=0,
+        )
+        client.initialize(engine)
+        return client
+
+    @pytest.mark.parametrize("role", ["trainer", "generator"])
+    def test_cleanup_releases_lanes_before_the_engine_frees_buffers(
+        self, fake_nccl, role
+    ):
+        # Mid-round, the handle and the lanes may still reference the engine's
+        # buffers: they must be gone before the engine frees them.
+        engine = FakeEngine()
+        engine.cleanup = lambda: fake_nccl.append("engine_cleanup")
+        if role == "trainer":
+            client = trainer(FakeRendezvous(), engine)
+        else:
+            client = self._generator(engine)
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        fake_nccl.clear()
+        client.cleanup()
+        assert fake_nccl[-1] == "engine_cleanup"
+        assert fake_nccl.count("engine_cleanup") == 1
+        assert fake_nccl.index("m2n_destroy") < fake_nccl.index("engine_cleanup")
+        assert fake_nccl.count("abort") == 2
+
+    @pytest.mark.parametrize("role", ["trainer", "generator"])
+    def test_the_engine_is_cleaned_up_even_if_lane_teardown_raises(
+        self, fake_nccl, role, monkeypatch
+    ):
+        engine = FakeEngine()
+        if role == "trainer":
+            client = trainer(FakeRendezvous(), engine)
+        else:
+            client = self._generator(engine)
+        client.compute_plan()
+        monkeypatch.setattr(
+            client._cache, "abort_group", _raises(RuntimeError("abort failed"))
+        )
+        with pytest.raises(RuntimeError, match="abort failed"):
+            client.cleanup()
+        assert ("cleanup",) in engine.calls
+
     def test_cleanup_is_safe_before_initialize(self):
         client = RefitClientTrainer(
             rendezvous=FakeRendezvous(),

@@ -719,10 +719,16 @@ class RefitClientTrainer(_RefitClientBase):
         )
 
     def cleanup(self) -> None:
-        if self._publisher is not None:
-            self._publisher.cleanup()
-        self._publisher = None
-        super().cleanup()
+        # The lanes and the M2N handle may still reference the engine's
+        # buffers, so they are released first; the engine frees its buffers
+        # after, even if that teardown raised. A CommunicatorWedgedError from
+        # the base is the fail-stop boundary: the process must exit on it.
+        publisher, self._publisher = self._publisher, None
+        try:
+            super().cleanup()
+        finally:
+            if publisher is not None:
+                publisher.cleanup()
 
 
 class RefitClientGenerator(_RefitClientBase):
@@ -849,7 +855,13 @@ class RefitClientGenerator(_RefitClientBase):
             self._reset_round()
 
     def cleanup(self) -> None:
-        if self._loader is not None:
-            self._loader.cleanup()
-        self._loader = None
-        super().cleanup()
+        # The lanes and the M2N handle may still reference the engine's
+        # buffers, so they are released first; the engine frees its buffers
+        # after, even if that teardown raised. A CommunicatorWedgedError from
+        # the base is the fail-stop boundary: the process must exit on it.
+        loader, self._loader = self._loader, None
+        try:
+            super().cleanup()
+        finally:
+            if loader is not None:
+                loader.cleanup()
