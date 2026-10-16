@@ -1159,4 +1159,68 @@ mod tests {
         assert!(decode_lanes("0|1|t0|g0|extra").is_err());
         assert!(decode_lanes("notanumber|1|t0|g0").is_err());
     }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
+    async fn forming_group_with_an_active_operation_refreshes() {
+        // KEYS[4] of the refresh script is the active-operations SET. The
+        // bootstrap scan of a FORMING group must start at the lane hashes, or
+        // HGET on that set fails with WRONGTYPE once an operation is active.
+        let redis_url = std::env::var("MX_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let backend = RedisCollectiveBackend::connect(&redis_url)
+            .await
+            .expect("connect");
+        let model = format!("refresh-active-op-test/{}", Uuid::new_v4());
+        let worker_id = Uuid::new_v4().to_string();
+        let mut connection = backend.connection.clone();
+        let () = connection
+            .hset_multiple(
+                worker_key(&worker_id),
+                &[
+                    ("worker_id", worker_id.as_str()),
+                    ("role", "1"),
+                    ("model_name", model.as_str()),
+                ],
+            )
+            .await
+            .expect("register worker");
+        let () = connection
+            .expire(worker_key(&worker_id), 60)
+            .await
+            .expect("expire registration");
+
+        // Two slots expected, one joins: the group stays FORMING.
+        let group_spec = spec(&model, &["t0"], &["g0"], 1);
+        backend
+            .join_group(&JoinCollectiveGroupRequest {
+                spec: Some(group_spec.clone()),
+                slot_id: "t0".to_string(),
+                worker_id: worker_id.clone(),
+                role: CollectiveRole::Trainer.into(),
+                index_in_role: 0,
+                plan_digest: "digest".to_string(),
+                plan_source: None,
+            })
+            .await
+            .expect("join");
+        backend
+            .create_transfer(&CreateCollectiveTransferRequest {
+                spec: Some(group_spec.clone()),
+                version_id: "v1".to_string(),
+                idempotency_key: Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("create transfer");
+
+        let group_id = group_id_for(&group_spec);
+        let active: u64 = connection
+            .scard(active_ops_key(&group_id))
+            .await
+            .expect("scard");
+        assert_eq!(active, 1, "the transfer must be tracked as active");
+
+        let group = backend.get_group(&group_id).await.expect("refresh");
+        assert_eq!(group.state, i32::from(CollectiveGroupState::Forming));
+    }
 }

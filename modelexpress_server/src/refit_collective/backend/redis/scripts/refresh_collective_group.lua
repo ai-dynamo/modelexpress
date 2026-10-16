@@ -58,7 +58,7 @@ local changed = false
 -- rebuild. This script runs on every GetCollectiveGroup poll.
 local membership_change_requires_bump = redis.call('HGET', KEYS[1], 'state') == 'READY'
 if not membership_change_requires_bump then
-  for i = 4, #KEYS do
+  for i = 5, #KEYS do
     local bootstrap_epoch = redis.call('HGET', KEYS[i], 'bootstrap_epoch')
     if bootstrap_epoch and tonumber(bootstrap_epoch) == epoch then
       membership_change_requires_bump = true
