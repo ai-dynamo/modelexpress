@@ -12,6 +12,7 @@ hung communicator rather than an exception.
 import math
 import sys
 import threading
+import time
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -1252,6 +1253,53 @@ class TestM2nHandle:
         half, _ = self._half(recorder)
         with pytest.raises(backend.NcclUnavailableError, match="destroy"):
             half.start_weight_update("v1")
+
+
+
+class TestQuiesceDeadline:
+    """``quiesce_s`` bounds the whole lane quiesce, not each lane in turn."""
+
+    class SlowLane:
+        """A lane whose in-flight work needs ``work_s`` more seconds to finish."""
+
+        def __init__(self, work_s):
+            self.aborted = False
+            self.work_s = work_s
+            self.rank = 0
+            self.world_size = 2
+            self.timeouts = []
+
+        def synchronize(self, timeout_s=None):
+            self.timeouts.append(timeout_s)
+            time.sleep(min(self.work_s, timeout_s))
+            if timeout_s < self.work_s:
+                raise TimeoutError("lane did not finish within its timeout")
+
+    def test_many_slow_lanes_share_one_deadline(self):
+        quiesce_s = 0.2
+        # Each lane alone would finish inside quiesce_s; one after another they
+        # would need 4 x 0.15 s if each got the full wait.
+        lanes = [self.SlowLane(0.15) for _ in range(4)]
+        half = SimpleNamespace(
+            _active_lanes={index: lane for index, lane in enumerate(lanes)},
+            _in_flight={},
+        )
+        started = time.monotonic()
+        quiesced = NcclM2nSender._lanes_quiesced(half, quiesce_s)
+        elapsed = time.monotonic() - started
+        assert not quiesced
+        assert elapsed < quiesce_s + 0.1
+        assert lanes[0].timeouts[0] <= quiesce_s
+        assert lanes[1].timeouts[0] < quiesce_s - 0.1
+        assert lanes[2].timeouts == [] and lanes[3].timeouts == []
+
+    def test_fast_lanes_still_quiesce(self):
+        lanes = [self.SlowLane(0.0) for _ in range(4)]
+        half = SimpleNamespace(
+            _active_lanes={index: lane for index, lane in enumerate(lanes)},
+            _in_flight={},
+        )
+        assert NcclM2nSender._lanes_quiesced(half, 0.2)
 
 
 class TestWaitEventBackoff:

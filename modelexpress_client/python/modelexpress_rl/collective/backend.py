@@ -420,7 +420,12 @@ class _CollectiveHalf:
         return self._m2n_handle
 
     def _lanes_quiesced(self, quiesce_s: float) -> bool:
-        """Whether every lane with work in flight finished it within ``quiesce_s``."""
+        """Whether every lane with work in flight finished it within ``quiesce_s``.
+
+        ``quiesce_s`` bounds the whole wait, not each lane: every lane draws on
+        one shared deadline, so teardown never takes lane_count x quiesce_s.
+        """
+        deadline = time.monotonic() + quiesce_s
         lanes = list(self._active_lanes.values())
         for marks, _ in self._in_flight.values():
             lanes.extend(lane for lane, _ in marks)
@@ -429,10 +434,11 @@ class _CollectiveHalf:
             if id(lane) in seen:
                 continue
             seen.add(id(lane))
-            if quiesce_s <= 0 or lane.aborted:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0 or lane.aborted:
                 return False
             try:
-                lane.synchronize(timeout_s=quiesce_s)
+                lane.synchronize(timeout_s=remaining)
             except Exception as error:  # noqa: BLE001 - any failure means "not idle"
                 logger.warning(
                     "lane %s/%s did not quiesce before M2N handle release: %r",
