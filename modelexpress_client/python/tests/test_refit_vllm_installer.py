@@ -2524,7 +2524,7 @@ def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(
 ):
     from unittest.mock import Mock
     from modelexpress_rl.inference.streaming_checkpoint import StreamedCheckpoint
-    from modelexpress_rl.inference.receiver import _S3Version
+    from modelexpress_rl.inference.receiver import _ObjectStorageVersion
     from modelexpress_rl.train import WeightPayloadFormat
 
     events = []
@@ -2604,7 +2604,7 @@ def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(
 
     model.load_weights = load
     stream = StreamedCheckpoint(
-        version=_S3Version(
+        version=_ObjectStorageVersion(
             "v2",
             None,
             WeightPayloadFormat.FULL_HF_CHECKPOINT,

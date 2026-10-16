@@ -477,7 +477,7 @@ def test_desired_s3_loads_materialized_checkpoint(monkeypatch, tmp_path):
     ), patch(
         "modelexpress_rl.inference.load_strategy.S3Client", return_value=s3
     ), patch(
-        "modelexpress_rl.inference.load_strategy.bootstrap_s3_checkpoint",
+        "modelexpress_rl.inference.load_strategy.bootstrap_object_storage_checkpoint",
         return_value=Path("/cache/root"),
     ), patch(
         "modelexpress_rl.inference.load_strategy.CanonicalDeltaUpdateMethod",
