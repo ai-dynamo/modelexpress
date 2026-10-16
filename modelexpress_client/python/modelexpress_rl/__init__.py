@@ -10,7 +10,36 @@ break the property the collective path is built around: ``import
 modelexpress_rl.collective`` must not pull in NIXL.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # Static types for the lazy exports below. Never executed at runtime, so
+    # importing this package still pulls in neither refit path's dependencies.
+    from .control import (
+        ModelExpressControlClient,
+        WeightVersion,
+        WeightVersionState,
+    )
+    from .inference import (
+        ModelExpressGeneratorClient,
+        ModelExpressGeneratorConfig,
+        ObjectStorageGeneratorConfig,
+        SglangGeneratorContext,
+        VllmGeneratorContext,
+        WeightSource,
+    )
+    from .object_storage import ObjectStorageSource, ObjectStorageType
+    from .train import (
+        FSDPTrainerContext,
+        MegatronTrainerContext,
+        ModelExpressTrainerClient,
+        ModelExpressTrainerConfig,
+        ObjectStorageConfig,
+        TrainerEngineContext,
+        TrainerStagingMode,
+        WeightPayloadFormat,
+    )
+    from .version import WeightVersionRef
 
 _LAZY = {
     # Framework-facing clients.
