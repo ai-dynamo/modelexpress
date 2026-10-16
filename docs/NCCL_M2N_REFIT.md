@@ -703,10 +703,13 @@ healthy abort on the deployment's libnccl needs longer.
 | `MX_NCCL_REFIT_ABORT_TIMEOUT_S` | `10` | How long a lane's `ncclCommAbort` may run on its daemon thread before the communicator is declared wedged (section 8.2). An overrun raises `CommunicatorWedgedError`; the runner must treat it as a fatal process exit. Relevant only on libnccl below v2.33, where abort cannot interrupt a running M2N kernel |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
 
-Timing uses the existing `RefitTimingRecorder` stages, so pull and push refits
-are comparable. *Setup and registration* (mostly `Communicator.init`) is charged
-**once per epoch**; charged per refit, it would make a warm refit look an order
-of magnitude slower.
+Proposed timing contract (not implemented): the collective clients do not
+record `RefitTimingRecorder` stages today, and the collective benchmark
+(`tests/gpu/bench_collective_refit.py`) uses its own `PhaseTimer`. The proposal
+is that the clients emit the existing `RefitTimingRecorder` stages, so pull and
+push refits are comparable. Under it, *setup and registration* (mostly
+`Communicator.init`) is charged **once per epoch**; charged per refit, it would
+make a warm refit look an order of magnitude slower.
 
 ## 10. Dependencies
 
