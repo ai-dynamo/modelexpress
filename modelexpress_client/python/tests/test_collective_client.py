@@ -1880,3 +1880,73 @@ class TestM2nBuildInDigest:
             client = trainer(FakeRendezvous(), FakeEngine(), m2n_abi_version="pinned")
             digests.append(client._digest)
         assert digests[0] == digests[1]
+
+
+class _ReportRpcError(Exception):
+    def __init__(self, code):
+        super().__init__(code.name)
+        self._code = code
+
+    def code(self):
+        return self._code
+
+
+class FlakyReportRendezvous(FakeRendezvous):
+    """Fails the first ``failures`` success reports with ``code``."""
+
+    def __init__(self, failures, code="UNAVAILABLE"):
+        super().__init__()
+        import grpc
+
+        self.failures = failures
+        self.code = getattr(grpc.StatusCode, code)
+
+    def report(self, **kwargs):
+        if kwargs["succeeded"] and self.failures > 0:
+            self.failures -= 1
+            self.reports.append({**kwargs, "lost": True})
+            raise _ReportRpcError(self.code)
+        return super().report(**kwargs)
+
+
+class TestSuccessReportDelivery:
+    @staticmethod
+    def _finish(rz, monkeypatch):
+        monkeypatch.setattr(collective_client.time, "sleep", lambda _s: None)
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        client.publish_weights("v1")
+        return client
+
+    def test_a_transient_failure_is_retried_and_then_released(self, fake_nccl, monkeypatch):
+        rz = FlakyReportRendezvous(failures=1)
+        client = self._finish(rz, monkeypatch)
+        client.finish_weight_update("v1")
+        assert [r.get("lost", False) for r in rz.reports] == [True, False]
+        assert client._operation_id is None
+        client.start_weight_update("v2", "op2")
+
+    def test_an_undelivered_report_keeps_the_binding_for_retry(self, fake_nccl, monkeypatch):
+        rz = FlakyReportRendezvous(failures=3)
+        client = self._finish(rz, monkeypatch)
+        with pytest.raises(_ReportRpcError):
+            client.finish_weight_update("v1")
+        assert len(rz.reports) == 3
+        assert client._operation_id == "op1"
+        with pytest.raises(RuntimeError, match="retry_report"):
+            client.start_weight_update("v2", "op2")
+        client.retry_report()
+        assert rz.reports[-1]["operation_id"] == "op1"
+        assert rz.reports[-1]["succeeded"]
+        assert "lost" not in rz.reports[-1]
+        assert client._operation_id is None
+        client.start_weight_update("v2", "op2")
+
+    def test_a_refusal_is_not_retried(self, fake_nccl, monkeypatch):
+        rz = FlakyReportRendezvous(failures=1, code="FAILED_PRECONDITION")
+        client = self._finish(rz, monkeypatch)
+        with pytest.raises(_ReportRpcError):
+            client.finish_weight_update("v1")
+        assert len(rz.reports) == 1
+        assert client._operation_id is None

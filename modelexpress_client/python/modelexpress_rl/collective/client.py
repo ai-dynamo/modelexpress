@@ -19,6 +19,7 @@ The sequencing is the contract, and two of its rules are load-bearing here:
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from contextlib import nullcontext
 from typing import Any
@@ -49,6 +50,26 @@ from .spi import Loader, Publisher, resolve_specs
 from .types import ReshardPlan, Role
 
 logger = logging.getLogger("modelexpress_rl.collective.client")
+
+#: Delivery attempts for a round's success report before the binding is kept
+#: for ``retry_report``. The report is idempotent server-side (a worker is
+#: recorded once and terminal states are immutable), so resending is safe.
+_SUCCESS_REPORT_ATTEMPTS = 3
+#: Sleep before the second attempt; it doubles for each one after.
+_SUCCESS_REPORT_BACKOFF_S = 0.2
+#: gRPC codes that say nothing about whether the report landed.
+_TRANSIENT_REPORT_CODES = frozenset({"UNAVAILABLE", "DEADLINE_EXCEEDED"})
+
+
+def _is_transient_rpc_error(error: BaseException) -> bool:
+    code = getattr(error, "code", None)
+    if not callable(code):
+        return False
+    try:
+        status = code()
+    except Exception:  # noqa: BLE001 - an unreadable code is not transient
+        return False
+    return getattr(status, "name", None) in _TRANSIENT_REPORT_CODES
 
 
 def _bootstrap_barrier(
@@ -129,6 +150,7 @@ class _RefitClientBase:
         self._half: NcclM2nSender | NcclM2nReceiver | None = None
         self._groupings: list[list[str]] | None = None
         self._round_started = False
+        self._report_pending = False
         self._version: str | None = None
         self._operation_id: str | None = None
         self._round_membership: Membership | None = None
@@ -158,6 +180,12 @@ class _RefitClientBase:
             raise RuntimeError(f"compute_plan must run before {method}")
         if not self._round_started:
             raise RuntimeError(f"start_weight_update must run before {method}")
+        if self._report_pending:
+            raise RuntimeError(
+                f"the round for version {self._version!r} already finished and "
+                f"only its success report is outstanding; call retry_report() "
+                f"instead of {method}"
+            )
         if version != self._version:
             raise ValueError(
                 f"{method} names version {version!r}, but the round in flight is "
@@ -232,6 +260,7 @@ class _RefitClientBase:
         self._version = None
         self._operation_id = None
         self._round_membership = None
+        self._report_pending = False
 
     def _bind_operation(self, version: str, operation_id: str) -> None:
         """Bind the round about to open to its control-plane operation.
@@ -241,6 +270,11 @@ class _RefitClientBase:
         every peer is still outside the collective. The bound operation is the
         one the round's outcome is reported against.
         """
+        if self._report_pending:
+            raise RuntimeError(
+                f"the success report for version {self._version!r} was not "
+                "delivered; call retry_report() before starting another round"
+            )
         if self._round_started:
             raise RuntimeError(
                 f"the round for version {self._version!r} is still in flight; "
@@ -285,6 +319,49 @@ class _RefitClientBase:
             succeeded=succeeded,
             message=message,
         )
+
+    def _report_success(self) -> None:
+        """Report the bound round as succeeded, then release the binding.
+
+        Transient gRPC errors (UNAVAILABLE, DEADLINE_EXCEEDED) are retried a
+        bounded number of times. If they persist, the operation binding and
+        round identity are kept and the error is raised, so ``retry_report``
+        can deliver the report later instead of leaving the operation RUNNING
+        with nothing left to report it. Any other error is the control plane's
+        answer, so the binding is released and the error is raised.
+        """
+        for attempt in range(1, _SUCCESS_REPORT_ATTEMPTS + 1):
+            try:
+                self._report(succeeded=True)
+            except BaseException as error:
+                if not _is_transient_rpc_error(error):
+                    self._reset_round()
+                    raise
+                if attempt == _SUCCESS_REPORT_ATTEMPTS:
+                    self._report_pending = True
+                    logger.warning(
+                        "the success report for operation %s was not delivered "
+                        "after %d attempts; the binding is kept for retry_report()",
+                        self._operation_id,
+                        attempt,
+                    )
+                    raise
+                time.sleep(_SUCCESS_REPORT_BACKOFF_S * 2 ** (attempt - 1))
+            else:
+                self._reset_round()
+                return
+
+    def retry_report(self) -> None:
+        """Deliver a success report that ``finish_weight_update`` could not.
+
+        Only valid after ``finish_weight_update`` raised a transient error from
+        the report. The round's data plane already completed; this resends the
+        report against the same operation and releases the binding once it is
+        acknowledged.
+        """
+        if not self._report_pending:
+            raise RuntimeError("no undelivered success report is pending")
+        self._report_success()
 
     def _check_still_current(self) -> None:
         """One freshness read before a round prepares the engine.
@@ -693,10 +770,7 @@ class RefitClientTrainer(_RefitClientBase):
         except BaseException as error:
             self._fail_round(error)
             raise
-        try:
-            self._report(succeeded=True)
-        finally:
-            self._reset_round()
+        self._report_success()
 
     def report_failure(
         self,
@@ -852,10 +926,7 @@ class RefitClientGenerator(_RefitClientBase):
         except BaseException as error:
             self._fail_round(error)
             raise
-        try:
-            self._report(succeeded=True)
-        finally:
-            self._reset_round()
+        self._report_success()
 
     def cleanup(self) -> None:
         # The lanes and the M2N handle may still reference the engine's
