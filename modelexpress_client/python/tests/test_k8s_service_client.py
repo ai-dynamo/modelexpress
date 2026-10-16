@@ -36,6 +36,18 @@ def _base_identity() -> p2p_pb2.SourceIdentity:
     )
 
 
+def _artifact_identity() -> p2p_pb2.SourceIdentity:
+    return p2p_pb2.SourceIdentity(
+        mx_version="0.5.0",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+        model_name="deepseek-ai/DeepSeek-V3",
+        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
+        cuda_version="12.9",
+        triton_version="3.4.0",
+        gpu_arch="sm90",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Factory selection
 # ---------------------------------------------------------------------------
@@ -233,6 +245,28 @@ def test_default_service_pattern_is_bare_hostname():
             os.environ["MX_K8S_SERVICE_PATTERN"] = saved
 
 
+def test_resolve_artifact_endpoint_uses_node_pattern_and_owner_port(monkeypatch):
+    monkeypatch.setenv("MX_WORKER_GRPC_PORT", "7000")
+    client = MxK8sServiceClient(
+        worker_rank=6,
+        service_pattern="mx-sources",
+        artifact_service_pattern="mx-artifacts-node-{node_rank}",
+        artifact_owner_device_id=2,
+    )
+
+    assert client._resolve_artifact_endpoint(3) == "mx-artifacts-node-3:7002"
+
+
+def test_artifact_pattern_inherits_weight_pattern_when_unset(monkeypatch):
+    monkeypatch.delenv("MX_K8S_ARTIFACT_SERVICE_PATTERN", raising=False)
+    client = MxK8sServiceClient(
+        worker_rank=0,
+        service_pattern="mx-sources-rank-{rank}:6555",
+    )
+
+    assert client._resolve_artifact_endpoint(0) == "mx-sources-rank-0:6555"
+
+
 def test_close_is_safe_noop():
     client = MxK8sServiceClient(worker_rank=0)
     client.close()
@@ -289,12 +323,130 @@ class _FakeWorkerServicer(p2p_pb2_grpc.WorkerServiceServicer):
         )
 
 
+class _FakeArtifactServicer(p2p_pb2_grpc.WorkerServiceServicer):
+    def __init__(
+        self,
+        mx_source_id: str,
+        *,
+        node_rank: int = 0,
+        accelerator: str = "cuda",
+        fail_first_n: int = 0,
+    ):
+        self._mx_source_id = mx_source_id
+        self._node_rank = node_rank
+        self._accelerator = accelerator
+        self._fail_first_n = fail_first_n
+        self._calls = 0
+
+    @property
+    def call_count(self) -> int:
+        return self._calls
+
+    def GetArtifactManifestHeader(self, request, context):
+        self._calls += 1
+        if self._calls <= self._fail_first_n:
+            context.abort(grpc.StatusCode.NOT_FOUND, "artifact not sealed yet")
+        return p2p_pb2.GetArtifactManifestHeaderResponse(
+            mx_source_id=self._mx_source_id,
+            artifact_id="artifact-123",
+            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+            worker_grpc_endpoint="10.0.0.8:6555",
+            accelerator=self._accelerator,
+            worker_id="worker-artifact-1",
+            worker_rank=0,
+            node_rank=self._node_rank,
+        )
+
+
 def _start_fake_server(servicer) -> tuple[grpc.Server, int]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     p2p_pb2_grpc.add_WorkerServiceServicer_to_server(servicer, server)
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
     return server, port
+
+
+def test_discover_artifact_source_resolves_pod_direct_endpoint():
+    identity = _artifact_identity()
+    source_id = compute_mx_source_id(identity)
+    servicer = _FakeArtifactServicer(source_id, node_rank=2)
+    server, port = _start_fake_server(servicer)
+    try:
+        client = MxK8sServiceClient(
+            worker_rank=5,
+            artifact_service_pattern=f"127.0.0.1:{port}",
+            max_retries=0,
+        )
+        source = client.discover_artifact_source(
+            identity,
+            node_rank=2,
+            accelerator="cuda",
+        )
+    finally:
+        server.stop(grace=None)
+
+    assert source.mx_source_id == source_id
+    assert source.artifact_id == "artifact-123"
+    assert source.worker_id == "worker-artifact-1"
+    assert source.worker_grpc_endpoint == "10.0.0.8:6555"
+    assert servicer.call_count == 1
+
+
+def test_discover_artifact_source_retries_not_found_on_fresh_channel():
+    identity = _artifact_identity()
+    source_id = compute_mx_source_id(identity)
+    servicer = _FakeArtifactServicer(source_id, fail_first_n=2)
+    server, port = _start_fake_server(servicer)
+    try:
+        client = MxK8sServiceClient(
+            worker_rank=0,
+            artifact_service_pattern=f"127.0.0.1:{port}",
+            max_retries=3,
+            backoff_seconds=0.0,
+        )
+        source = client.discover_artifact_source(identity, node_rank=0)
+    finally:
+        server.stop(grace=None)
+
+    assert source.worker_grpc_endpoint == "10.0.0.8:6555"
+    assert servicer.call_count == 3
+
+
+def test_discover_artifact_source_reports_absent_artifact_as_lookup_error():
+    identity = _artifact_identity()
+    source_id = compute_mx_source_id(identity)
+    servicer = _FakeArtifactServicer(source_id, fail_first_n=100)
+    server, port = _start_fake_server(servicer)
+    try:
+        client = MxK8sServiceClient(
+            worker_rank=0,
+            artifact_service_pattern=f"127.0.0.1:{port}",
+            max_retries=1,
+            backoff_seconds=0.0,
+        )
+        with pytest.raises(LookupError, match="no ready artifact source"):
+            client.discover_artifact_source(identity, node_rank=0)
+    finally:
+        server.stop(grace=None)
+
+    assert servicer.call_count == 2
+
+
+def test_discover_artifact_source_rejects_node_rank_mismatch():
+    identity = _artifact_identity()
+    source_id = compute_mx_source_id(identity)
+    servicer = _FakeArtifactServicer(source_id, node_rank=3)
+    server, port = _start_fake_server(servicer)
+    try:
+        client = MxK8sServiceClient(
+            worker_rank=0,
+            artifact_service_pattern=f"127.0.0.1:{port}",
+            max_retries=0,
+        )
+        with pytest.raises(RuntimeError, match="node_rank mismatch"):
+            client.discover_artifact_source(identity, node_rank=0)
+    finally:
+        server.stop(grace=None)
 
 
 def test_get_metadata_success_builds_synthetic_response():

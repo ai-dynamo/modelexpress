@@ -914,6 +914,8 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; SGLang draft P2P also requires a non-empty revision. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
+| `MX_K8S_ARTIFACT_SERVICE_PATTERN` | inherits `MX_K8S_SERVICE_PATTERN` | Optional artifact discovery Service template. Supports `{node_rank}` and `{rank}`; use `{node_rank}` for multi-node source pools and route `{rank}` to the artifact owner device. |
+| `MX_ARTIFACT_OWNER_DEVICE_ID` | `0` | Device whose worker publishes pod-scoped artifacts under `k8s-service`. The artifact Service must target `MX_WORKER_GRPC_PORT + MX_ARTIFACT_OWNER_DEVICE_ID`. |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` backend: sleep between retry attempts. |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (Redis backend only) |
@@ -1124,7 +1126,7 @@ models and FP8 KV-cache configurations use canonical object-storage refit becaus
 their non-tensor derived state cannot currently be refreshed by a direct copy.
 
 - **Central-coordinator backends (`redis`, `kubernetes`):** the source publishes only a lightweight pointer (its `worker_grpc_endpoint` and NIXL listen address) to the central server, and targets use that pointer to connect directly to the source for the MB-scale data. Set `MX_P2P_METADATA=0` to publish full tensor metadata (NIXL blobs + tensor descriptors) to the central server instead. Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the server's metadata; no configuration is needed on the target side.
-- **`k8s-service` backend:** auto-enabled for tensor metadata. The backend declares itself decentralized (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P tensor path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly. File-backed artifact transfer currently requires a central-coordinator backend (`redis` or `kubernetes`) because `k8s-service` does not yet publish `artifact_source` discovery metadata.
+- **`k8s-service` backend:** auto-enables P2P metadata. Tensor manifests are fetched through the rank Service. Artifact discovery sends `GetArtifactManifestHeader` through `MX_K8S_ARTIFACT_SERVICE_PATTERN` (or the weight Service when unset), then pins all remaining artifact RPCs to the pod-direct endpoint in the response. The source worker validates `mx_source_id` and `node_rank`; the target also validates the artifact type, accelerator, and response identity.
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
@@ -1138,7 +1140,8 @@ before sealing the artifact.
 
 `MX_ARTIFACT_BACKEND=nixl` is the default. It uses worker discovery,
 manifest/chunk RPC, and NIXL data transfer, and therefore requires
-`MX_P2P_METADATA=1` plus a central metadata backend (`redis` or `kubernetes`).
+the P2P metadata path with `redis`, `kubernetes`, or `k8s-service` discovery.
+The `k8s-service` backend enables P2P metadata automatically.
 
 Unsupported backend values produce a warning and skip artifact transfer.
 
@@ -1231,10 +1234,13 @@ each worker logs.
 In multi-node deployments, the artifact key includes the framework `node_rank`,
 so each target node selects the corresponding source-node artifact without
 making it worker-specific. For NIXL, that rank is carried in artifact metadata;
-artifact discovery requires a central coordinator (`redis` or `kubernetes`),
-and Kubernetes deployments must use the matching `ModelMetadata` CRD containing
-`status.worker.artifactSource.nodeRank`. Mooncake includes the same rank in its
-deterministic object key and needs no MX metadata record.
+discovery supports a central coordinator (`redis` or `kubernetes`) or
+`k8s-service`. Central Kubernetes deployments use the matching `ModelMetadata`
+CRD containing `status.worker.artifactSource.nodeRank`. A `k8s-service`
+deployment uses a Service pattern containing `{node_rank}`. Its pod-scoped
+caches are published by `MX_ARTIFACT_OWNER_DEVICE_ID` (default device 0), so the
+artifact Service must route to that worker's gRPC port. Mooncake includes the
+same rank in its deterministic object key and needs no MX metadata record.
 
 #### Multi-node readiness
 

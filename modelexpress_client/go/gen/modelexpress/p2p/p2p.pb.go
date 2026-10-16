@@ -1468,7 +1468,11 @@ type GetArtifactManifestHeaderRequest struct {
 	// mx_source_id for validation (catches stale discovery)
 	MxSourceId string `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
 	// Optional artifact_id from ArtifactSourceMetadata for validation.
-	ArtifactId    string `protobuf:"bytes,2,opt,name=artifact_id,json=artifactId,proto3" json:"artifact_id,omitempty"`
+	ArtifactId string `protobuf:"bytes,2,opt,name=artifact_id,json=artifactId,proto3" json:"artifact_id,omitempty"`
+	// Optional node rank expected by a decentralized artifact client. Service-
+	// routed discovery validates this on the selected worker before returning a
+	// pod-direct endpoint. Central-coordinator callers may leave it unset.
+	NodeRank      *uint32 `protobuf:"varint,3,opt,name=node_rank,json=nodeRank,proto3,oneof" json:"node_rank,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1517,6 +1521,13 @@ func (x *GetArtifactManifestHeaderRequest) GetArtifactId() string {
 	return ""
 }
 
+func (x *GetArtifactManifestHeaderRequest) GetNodeRank() uint32 {
+	if x != nil && x.NodeRank != nil {
+		return *x.NodeRank
+	}
+	return 0
+}
+
 type GetArtifactManifestHeaderResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Echoed mx_source_id for confirmation.
@@ -1539,7 +1550,17 @@ type GetArtifactManifestHeaderResponse struct {
 	// File metadata is fetched as one table in the header; chunk metadata is
 	// paged separately. Very high file-count artifacts may need a future paged
 	// file-table RPC.
-	Files         []*ArtifactManifestFile `protobuf:"bytes,12,rep,name=files,proto3" json:"files,omitempty"`
+	Files []*ArtifactManifestFile `protobuf:"bytes,12,rep,name=files,proto3" json:"files,omitempty"`
+	// Pod-direct WorkerService endpoint. Decentralized clients first call this
+	// RPC through a Kubernetes Service, then pin all manifest-page and chunk-
+	// lease RPCs to this endpoint so they cannot land on different pods.
+	WorkerGrpcEndpoint string `protobuf:"bytes,13,opt,name=worker_grpc_endpoint,json=workerGrpcEndpoint,proto3" json:"worker_grpc_endpoint,omitempty"`
+	// Runtime accelerator family of the serving worker.
+	Accelerator string `protobuf:"bytes,14,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
+	// Runtime generation of the worker serving this sealed artifact.
+	WorkerId string `protobuf:"bytes,15,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	// Distributed node rank that owns this node-scoped artifact.
+	NodeRank      uint32 `protobuf:"varint,16,opt,name=node_rank,json=nodeRank,proto3" json:"node_rank,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1656,6 +1677,34 @@ func (x *GetArtifactManifestHeaderResponse) GetFiles() []*ArtifactManifestFile {
 		return x.Files
 	}
 	return nil
+}
+
+func (x *GetArtifactManifestHeaderResponse) GetWorkerGrpcEndpoint() string {
+	if x != nil {
+		return x.WorkerGrpcEndpoint
+	}
+	return ""
+}
+
+func (x *GetArtifactManifestHeaderResponse) GetAccelerator() string {
+	if x != nil {
+		return x.Accelerator
+	}
+	return ""
+}
+
+func (x *GetArtifactManifestHeaderResponse) GetWorkerId() string {
+	if x != nil {
+		return x.WorkerId
+	}
+	return ""
+}
+
+func (x *GetArtifactManifestHeaderResponse) GetNodeRank() uint32 {
+	if x != nil {
+		return x.NodeRank
+	}
+	return 0
 }
 
 type GetArtifactManifestChunksRequest struct {
@@ -3020,12 +3069,15 @@ const file_p2p_proto_rawDesc = "" +
 	"\blease_id\x18\x03 \x01(\tR\aleaseIdB\f\n" +
 	"\n" +
 	"_worker_id\"\x1b\n" +
-	"\x19ReleaseTensorReadResponse\"e\n" +
+	"\x19ReleaseTensorReadResponse\"\x95\x01\n" +
 	" GetArtifactManifestHeaderRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
 	"\vartifact_id\x18\x02 \x01(\tR\n" +
-	"artifactId\"\x82\x04\n" +
+	"artifactId\x12 \n" +
+	"\tnode_rank\x18\x03 \x01(\rH\x00R\bnodeRank\x88\x01\x01B\f\n" +
+	"\n" +
+	"_node_rank\"\x90\x05\n" +
 	"!GetArtifactManifestHeaderResponse\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
@@ -3047,7 +3099,11 @@ const file_p2p_proto_rawDesc = "" +
 	" \x01(\tR\tagentName\x12\x1f\n" +
 	"\vworker_rank\x18\v \x01(\rR\n" +
 	"workerRank\x12=\n" +
-	"\x05files\x18\f \x03(\v2'.model_express.p2p.ArtifactManifestFileR\x05files\"\xb0\x01\n" +
+	"\x05files\x18\f \x03(\v2'.model_express.p2p.ArtifactManifestFileR\x05files\x120\n" +
+	"\x14worker_grpc_endpoint\x18\r \x01(\tR\x12workerGrpcEndpoint\x12 \n" +
+	"\vaccelerator\x18\x0e \x01(\tR\vaccelerator\x12\x1b\n" +
+	"\tworker_id\x18\x0f \x01(\tR\bworkerId\x12\x1b\n" +
+	"\tnode_rank\x18\x10 \x01(\rR\bnodeRank\"\xb0\x01\n" +
 	" GetArtifactManifestChunksRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
@@ -3336,6 +3392,7 @@ func file_p2p_proto_init() {
 	file_p2p_proto_msgTypes[9].OneofWrappers = []any{}
 	file_p2p_proto_msgTypes[10].OneofWrappers = []any{}
 	file_p2p_proto_msgTypes[12].OneofWrappers = []any{}
+	file_p2p_proto_msgTypes[14].OneofWrappers = []any{}
 	file_p2p_proto_msgTypes[25].OneofWrappers = []any{}
 	file_p2p_proto_msgTypes[26].OneofWrappers = []any{}
 	file_p2p_proto_msgTypes[30].OneofWrappers = []any{}

@@ -5,6 +5,7 @@
 
 import types
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -182,6 +183,65 @@ class TestAdoptHiddenTensors:
         module = ModuleWithNested()
         count = adopt_hidden_tensors(module, backend)
         assert count == 3  # w1, w2, buffers[0]
+
+    def test_reads_snapshotted_module_values_without_lazy_getattr(
+        self, mock_accelerator_backend_cls
+    ):
+        class LazyAttrModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.runtime_state = {"scale": torch.randn(4)}
+
+            def __getattribute__(self, name):
+                if name == "runtime_state":
+                    raise AssertionError("lazy attribute resolution must not run")
+                return super().__getattribute__(name)
+
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        module = LazyAttrModule()
+
+        assert adopt_hidden_tensors(module, backend) == 1
+        assert any("runtime_state" in name for name, _ in module.named_buffers())
+
+    def test_skips_runtime_objects_that_reject_introspection(
+        self, mock_accelerator_backend_cls
+    ):
+        class ExplodingDict(dict):
+            def items(self):
+                raise RuntimeError("lazy runtime object")
+
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        module = nn.Module()
+        module.runtime_state = ExplodingDict()
+
+        assert adopt_hidden_tensors(module, backend) == 0
+
+    @pytest.mark.parametrize("container", [dict, list, tuple])
+    @pytest.mark.parametrize("failure_first", [False, True])
+    def test_preserves_siblings_of_failing_container_entries(
+        self, mock_accelerator_backend_cls, container, failure_first,
+    ):
+        class ExplodingDict(dict):
+            def items(self):
+                raise RuntimeError("lazy runtime object")
+
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        tensor = torch.randn(4)
+        entries = [("valid", tensor), ("broken", ExplodingDict())]
+        if failure_first:
+            entries.reverse()
+        state = (
+            dict(entries) if container is dict
+            else container(value for _, value in entries)
+        )
+        module = nn.Module()
+        module.runtime_state = {"nested": state}
+
+        assert adopt_hidden_tensors(module, backend) == 1
+        buffers = list(module.named_buffers())
+        assert len(buffers) == 1
+        assert buffers[0][1] is tensor
+        assert adopt_hidden_tensors(module, backend) == 0
 
     def test_cpu_tensors_ignored(self):
         module = ModuleWithQuant()  # CPU tensors by default

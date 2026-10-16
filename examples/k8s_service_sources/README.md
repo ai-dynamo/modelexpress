@@ -10,6 +10,7 @@ This backend is for **stable-weight inference only**. Weights loaded at pod star
 
 ## Files
 
+- [`artifact-transfer-tp1.yaml`](artifact-transfer-tp1.yaml) - Small TP=1 vLLM example with `MX_ARTIFACT_TRANSFER=1`. Start one healthy source, then scale the same Deployment to two replicas to exercise Service discovery followed by pod-pinned artifact transfer.
 - [`sources-tp2-single-pod.yaml`](sources-tp2-single-pod.yaml) - **Multi-GPU-per-pod shape** (primary). One Deployment with 2-GPU pods running `--tensor-parallel-size=2`. ONE Service named `mx-sources` with two named ports (`rank-0: 6555`, `rank-1: 6556`). Client uses the default pattern `mx-sources`; port is auto-computed from rank. This is the topology for production TP inference (NVLink is intra-node-only).
 - [`sources-tp2.yaml`](sources-tp2.yaml) - **1-GPU-per-pod shape**. Two Deployments (one per rank) with rank-labeled pods. Two Services selecting by `mx.rank`. Pattern: `MX_K8S_SERVICE_PATTERN=mx-sources-rank-{rank}:6555`. For per-rank autoscaling or cross-pod setups where TP isn't involved.
 - [`target.yaml`](target.yaml) - Target Deployments that pull weights via the k8s-service backend. Paired with `sources-tp2.yaml` (1-GPU-per-pod). For multi-GPU-per-pod, scale `sources-tp2-single-pod.yaml` directly - new replicas join as both targets and sources.
@@ -31,7 +32,7 @@ graph TD
     T -- "NIXL/RDMA pull" --> PA
 ```
 
-The Service's Endpoints object is the source list, maintained by Kubernetes based on pod readiness. No `modelexpress-server` in this topology; `mx_source_id` is computed client-side and validated on the `GetTensorManifest` response.
+The Service's Endpoints object is the source list, maintained by Kubernetes based on pod readiness. No `modelexpress-server` in this topology; `mx_source_id` is computed client-side and validated on the `GetTensorManifest` response. When `MX_ARTIFACT_TRANSFER=1`, device 0 also publishes pod-scoped cache artifacts. The target discovers a bundle through `mx-sources:6555`, then uses the returned Pod IP endpoint for all stateful chunk-lease RPCs.
 
 ## Prerequisites
 
@@ -69,3 +70,6 @@ kubectl apply -f target.yaml
 | `MX_K8S_SOURCE_BACKOFF_SECONDS`  | `0.5`                           | Sleep between retries (fresh channel per attempt).                             |
 | `MX_MODEL_REVISION`              | unset                           | Override for `SourceIdentity.revision`. Useful for local / non-HF checkpoints. |
 | `MX_WORKER_GRPC_PORT`            | `6555`                          | Base port for the WorkerGrpcServer (bound port is this + `device_id`).         |
+| `MX_K8S_ARTIFACT_SERVICE_PATTERN`| inherits weight Service pattern | Optional node-scoped artifact Service template; supports `{node_rank}` and `{rank}`. |
+| `MX_ARTIFACT_OWNER_DEVICE_ID`    | `0`                             | Worker that publishes pod-scoped artifacts; expose its gRPC port through the artifact Service. |
+| `MX_ARTIFACT_TRANSFER`           | `0`                             | Set to `1` on source and target Pods to transfer compatible JIT caches.        |
