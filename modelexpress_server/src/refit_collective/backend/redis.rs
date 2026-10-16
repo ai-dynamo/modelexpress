@@ -334,7 +334,7 @@ fn participant_from_record(slot_id: &str, record: &str) -> CollectiveResult<Coll
     let index_in_role: u32 = parts.next().unwrap_or_default().parse().map_err(|error| {
         CollectiveBackendError::Internal(format!("invalid participant index: {error}"))
     })?;
-    let _: u64 = parts.next().unwrap_or_default().parse().map_err(|error| {
+    let joined_epoch: u64 = parts.next().unwrap_or_default().parse().map_err(|error| {
         CollectiveBackendError::Internal(format!("invalid participant epoch: {error}"))
     })?;
     if parts.next().is_some() {
@@ -349,6 +349,7 @@ fn participant_from_record(slot_id: &str, record: &str) -> CollectiveResult<Coll
         role: role.into(),
         index_in_role,
         rank_in_lane: 0,
+        joined_epoch,
     })
 }
 
@@ -1133,6 +1134,7 @@ mod tests {
         let trainer = participant_from_record("t0", "w1|TRAINER|3|7").expect("trainer record");
         assert_eq!(trainer.worker_id, "w1");
         assert_eq!(trainer.index_in_role, 3);
+        assert_eq!(trainer.joined_epoch, 7);
 
         let generator = participant_from_record("g0", "w2|GENERATOR|0|7").expect("generator");
         assert_eq!(generator.worker_id, "w2");
@@ -1264,5 +1266,94 @@ mod tests {
 
         let group = backend.get_group(&group_id).await.expect("refresh");
         assert_eq!(group.state, i32::from(CollectiveGroupState::Forming));
+    }
+
+    async fn register_worker(
+        backend: &RedisCollectiveBackend,
+        worker_id: &str,
+        role: CollectiveRole,
+        model: &str,
+    ) {
+        let role_code = if role == CollectiveRole::Trainer { "1" } else { "2" };
+        let mut connection = backend.connection.clone();
+        let () = connection
+            .hset_multiple(
+                worker_key(worker_id),
+                &[
+                    ("worker_id", worker_id),
+                    ("role", role_code),
+                    ("model_name", model),
+                ],
+            )
+            .await
+            .expect("register worker");
+        let () = connection
+            .expire(worker_key(worker_id), 60)
+            .await
+            .expect("expire registration");
+    }
+
+    async fn join(
+        backend: &RedisCollectiveBackend,
+        group_spec: &CollectiveGroupSpec,
+        slot_id: &str,
+        worker_id: &str,
+        role: CollectiveRole,
+        plan_digest: &str,
+    ) {
+        backend
+            .join_group(&JoinCollectiveGroupRequest {
+                spec: Some(group_spec.clone()),
+                slot_id: slot_id.to_string(),
+                worker_id: worker_id.to_string(),
+                role: role.into(),
+                index_in_role: 0,
+                plan_digest: plan_digest.to_string(),
+                plan_source: None,
+            })
+            .await
+            .expect("join");
+    }
+
+    fn test_redis_url() -> String {
+        std::env::var("MX_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
+    async fn participants_report_the_epoch_they_joined_at() {
+        // t0 rejoins with a new plan, which opens epoch 2. g0 is still on its
+        // epoch 1 record, and the group must say so, or a client sees every
+        // slot present and cannot tell who has to rejoin.
+        let backend = RedisCollectiveBackend::connect(&test_redis_url())
+            .await
+            .expect("connect");
+        let model = format!("joined-epoch-test/{}", Uuid::new_v4());
+        let trainer = Uuid::new_v4().to_string();
+        let generator = Uuid::new_v4().to_string();
+        register_worker(&backend, &trainer, CollectiveRole::Trainer, &model).await;
+        register_worker(&backend, &generator, CollectiveRole::Generator, &model).await;
+        let group_spec = spec(&model, &["t0"], &["g0"], 1);
+        join(&backend, &group_spec, "t0", &trainer, CollectiveRole::Trainer, "d1").await;
+        join(&backend, &group_spec, "g0", &generator, CollectiveRole::Generator, "d1").await;
+        join(&backend, &group_spec, "t0", &trainer, CollectiveRole::Trainer, "d2").await;
+
+        let group = backend
+            .get_group(&group_id_for(&group_spec))
+            .await
+            .expect("get group");
+        assert_eq!(group.epoch, 2);
+        let broadcast = group
+            .lanes
+            .iter()
+            .find(|lane| lane.kind == i32::from(LaneKind::Broadcast))
+            .expect("broadcast lane");
+        let joined: HashMap<&str, u64> = broadcast
+            .participants
+            .iter()
+            .map(|p| (p.slot_id.as_str(), p.joined_epoch))
+            .collect();
+        assert_eq!(joined.get("t0"), Some(&2));
+        assert_eq!(joined.get("g0"), Some(&1));
     }
 }

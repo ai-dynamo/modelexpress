@@ -718,6 +718,29 @@ class TestAwaitReady:
         participant.role = pb.COLLECTIVE_ROLE_TRAINER
         assert rz._missing_slots(g) == ["generator slot rank0"]
 
+    def test_a_slot_admitted_at_an_older_epoch_is_reported_as_awaiting_rejoin(self):
+        # t0 restarted and rejoined, which bumped the group to epoch 2; g0 is
+        # still on its epoch 1 record and has to rejoin before readiness.
+        g = pb.CollectiveGroup(
+            group_id="g1",
+            epoch=2,
+            state=pb.COLLECTIVE_GROUP_STATE_FORMING,
+            expected_trainer_slots=["t0"],
+            expected_generator_slots=["g0"],
+        )
+        lane = g.lanes.add()
+        lane.kind = pb.LANE_KIND_BROADCAST
+        lane.bootstrap_epoch = 1
+        lane.participants.add(
+            slot_id="t0", role=pb.COLLECTIVE_ROLE_TRAINER, joined_epoch=2
+        )
+        lane.participants.add(
+            slot_id="g0", role=pb.COLLECTIVE_ROLE_GENERATOR, joined_epoch=1
+        )
+        assert rz._missing_slots(g) == [
+            "generator slot g0 awaiting rejoin (joined at epoch 1)"
+        ]
+
 
 class _FlakyStub(FakeStub):
     """Fails the first `failures` polls with `error`, then behaves."""

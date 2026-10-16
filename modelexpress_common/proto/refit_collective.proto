@@ -90,6 +90,10 @@ message CollectiveParticipant {
   // The slot's position in the lane's declared order (LaneSpec), so trainers
   // occupy the low ranks of a lane and generators follow.
   uint32 rank_in_lane = 5;
+  // The group epoch this slot's current record was admitted at. A slot whose
+  // joined_epoch is behind the group's epoch is present but has not rejoined
+  // since the last membership change, so it does not count toward readiness.
+  uint64 joined_epoch = 6;
 }
 
 message CollectiveLane {

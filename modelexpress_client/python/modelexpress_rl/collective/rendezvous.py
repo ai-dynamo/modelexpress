@@ -850,7 +850,7 @@ class CollectiveRendezvous:
 
 
 def _missing_slots(group: pb.CollectiveGroup) -> list[str]:
-    """Which expected slots have not been admitted yet.
+    """Which expected slots have not been admitted at the current epoch yet.
 
     Read off the broadcast lane if one is declared, since every participant
     joins it, otherwise off the union of all lanes.
@@ -867,10 +867,15 @@ def _missing_slots(group: pb.CollectiveGroup) -> list[str]:
     # The broadcast lane is the one place the full admitted set is visible in
     # a single read, but a caller need not declare one, so fall back to the
     # union across every lane rather than reporting everyone as missing.
-    admitted: set[tuple[int, str]] = set()
+    # A slot whose record predates the current epoch is present but has not
+    # rejoined since the membership changed, and readiness waits on it just as
+    # it would on an absent slot. joined_epoch 0 means the server did not
+    # report it (epochs start at 1), so treat that record as current.
+    admitted: dict[tuple[int, str], int] = {}
     broadcast = [lane for lane in group.lanes if lane.kind == pb.LANE_KIND_BROADCAST]
     for lane in broadcast or group.lanes:
-        admitted |= {(p.role, p.slot_id) for p in lane.participants}
+        for p in lane.participants:
+            admitted[(p.role, p.slot_id)] = p.joined_epoch
 
     expected = [
         (pb.COLLECTIVE_ROLE_TRAINER, slot, f"trainer slot {slot}")
@@ -879,7 +884,15 @@ def _missing_slots(group: pb.CollectiveGroup) -> list[str]:
         (pb.COLLECTIVE_ROLE_GENERATOR, slot, f"generator slot {slot}")
         for slot in group.expected_generator_slots
     ]
-    missing = [label for role, slot, label in expected if (role, slot) not in admitted]
+    missing = []
+    for role, slot, label in expected:
+        joined_epoch = admitted.get((role, slot))
+        if joined_epoch is None:
+            missing.append(label)
+        elif joined_epoch and joined_epoch != group.epoch:
+            missing.append(
+                f"{label} awaiting rejoin (joined at epoch {joined_epoch})"
+            )
     if missing:
         return missing
 
