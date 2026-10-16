@@ -5,9 +5,265 @@ SPDX-License-Identifier: Apache-2.0
 
 # NCCL M2N Refit: collective weight transfer, standalone from NIXL
 
-> **Status: design.** Separate from the NIXL pull path in
+> **Status: implemented in this PR (ai-dynamo/modelexpress #748).** Separate
+> from the NIXL pull path in
 > [`modelexpress/refit/reshard/`](../modelexpress_client/python/modelexpress/refit/README.md);
 > neither path imports the other.
+
+Part 1 is the client API that integrators code against; we intend to keep it
+stable. Part 2 is how MX implements that API and can change without notice.
+
+## Part 1: Client API
+
+### Overview
+
+Package: `modelexpress_rl.collective`. Per side, an integrator:
+
+- implements one engine adapter: `Publisher` on the trainer, `Loader` on the
+  generator;
+- builds one `CollectiveRendezvous` per worker process on a gRPC channel to MX;
+- calls the lifecycle client, `RefitClientTrainer` or `RefitClientGenerator`,
+  from the RL framework's actor RPCs, with the same `version` and
+  `operation_id` on all participants.
+
+This PR ships no Megatron `Publisher` or vLLM `Loader`; the integration provides
+them. NeMo RL's existing builders port directly to the `LocalParamSpec` SPI.
+
+### `CollectiveRendezvous`
+
+```python
+CollectiveRendezvous(
+    channel: grpc.Channel,
+    *,
+    rpc_timeout_s: float = 30.0,
+    registration_ttl_s: int | None = None,
+)
+```
+
+One per worker process. Registers the worker with MX and renews its liveness
+lease on a background thread. `registration_ttl_s=None` reads
+`MX_NCCL_REFIT_REGISTRATION_TTL_S`. `close()` stops renewal; the instance is
+also a context manager. The refit clients do not close it.
+
+### `RefitClientTrainer` and `RefitClientGenerator`
+
+Constructor, the same for both classes (all arguments keyword-only):
+
+```python
+RefitClientTrainer(
+    *,
+    rendezvous: CollectiveRendezvous,
+    model_name: str,
+    trainer_slots: list[str],
+    generator_slots: list[str],
+    source_partition_count: int,
+    slot_id: str,
+    worker_id: str,
+    index_in_role: int,
+    receiver_protocol: str = DEFAULT_RECEIVER_PROTOCOL,  # "mx-nccl-m2n-bootstrap-v1"
+    m2n_abi_version: str = "",
+    device: Any = None,
+    streams: list[Any] | None = None,
+)
+```
+
+- `trainer_slots`, `generator_slots`: all slot ids in the group, in rank
+  order. The same on all participants.
+- `source_partition_count`: number of reshard lanes, typically the trainer PP
+  size. Must divide `len(trainer_slots)`; lane `i` gets the `i`-th contiguous
+  block of trainer slots.
+- `slot_id`: this worker's seat. `index_in_role`: position of `slot_id` in its
+  role's slot list. `worker_id`: this process generation; use a new id after a
+  restart.
+- `receiver_protocol`, `m2n_abi_version`: part of the plan digest; must match
+  on all participants.
+- `device`: CUDA device for the communicators; `None` uses the current device.
+- `streams`: lane `i` runs on `streams[i % len(streams)]`. `None` or empty
+  runs all lanes on the current stream.
+
+Trainer methods, in call order:
+
+```python
+def initialize(self, publisher: Publisher, *, source_partition: int, expected_parameters: list[str] | None = None) -> None
+def setup_layer_groups(self, groupings: list[list[str]] | None) -> None
+def compute_plan(self) -> Membership
+def create_operation(self, version: str, *, key_prefix: str) -> str
+def start_weight_update(self, version: str, operation_id: str) -> None
+def publish_weights(self, version: str, layer_group_id: int = DEFAULT_LAYER_GROUP) -> None
+def finish_weight_update(self, version: str, *, operation_id: str | None = None) -> None
+def report_failure(self, operation_id: str, error: BaseException, *, membership: Membership | None = None) -> None
+def cleanup(self) -> None
+```
+
+Generator methods, in call order:
+
+```python
+def initialize(self, loader: Loader, *, expected_parameters: list[str] | None = None) -> None
+def setup_layer_groups(self, groupings: list[list[str]] | None) -> None
+def compute_plan(self) -> Membership
+def create_operation(self, version: str, *, key_prefix: str) -> str
+def start_weight_update(self, version: str, operation_id: str) -> None
+def update_weights(self, version: str, layer_group_id: int = DEFAULT_LAYER_GROUP) -> None
+def finish_weight_update(self, version: str, *, operation_id: str | None = None) -> None
+def cleanup(self) -> None
+```
+
+Both classes also expose read-only properties `membership: Membership` (after
+`compute_plan`) and `plan: ReshardPlan` (after `initialize`).
+`DEFAULT_LAYER_GROUP` is `0`.
+
+- `initialize`: once per worker. Captures the plan from the engine and checks
+  that it covers `expected_parameters`, or `parameter_names()` when omitted.
+  The trainer's `source_partition` must be the reshard lane that holds
+  `slot_id`.
+- `setup_layer_groups`: optional, before `compute_plan`. `groupings[i]` lists
+  the bulk parameter names of layer group `i`; groups must be disjoint and
+  the same on all participants. Without it all bulk parameters are in group
+  `0`.
+- `compute_plan`: after `initialize` on every worker. Joins the MX group, waits
+  for READY, and creates the communicators. Re-run after any error that moves
+  the epoch.
+- `create_operation`: once per refit, before `start_weight_update`. Returns the
+  `operation_id` for `version` at the current epoch. Idempotent per
+  `(key_prefix, group, epoch, version)`, so each participant can call it and
+  get the same id. A coordinator can instead create the id once and pass it
+  out.
+- `start_weight_update`: opens the round. Checks the operation against this
+  worker's group, epoch, model and `version` before any NCCL work, then calls
+  the engine's `start_new_round(version)`. One open round at a time.
+- `publish_weights` / `update_weights`: once per layer group per round, in the
+  same group order on all participants. The generator installs groups as they
+  arrive, keeping up to `MX_NCCL_REFIT_PIPELINE_DEPTH` in flight.
+- `finish_weight_update`: closes the round. Runs the misc broadcast, installs
+  the remaining groups and calls `Loader.finish()` (generator), and reports
+  success to MX. `operation_id`, if given, must equal the bound one.
+- `report_failure` (trainer only): reports `operation_id` FAILED for a failure
+  outside the client's own round calls. `membership` defaults to the current
+  one.
+- `cleanup`: terminal. Calls the engine's `cleanup()`, fails any open round,
+  and tears down the communicators.
+
+A round call that raises after `start_weight_update` has bound the operation
+has already aborted the group's lanes, reported the operation FAILED (best
+effort) and reset the round. The caller re-runs `compute_plan` before the next
+round.
+
+### Engine SPI
+
+The trainer implements `Publisher`; the generator implements `Loader`. Both are
+`runtime_checkable` `typing.Protocol` classes.
+
+```python
+class Publisher(Protocol):
+    def capture(self) -> ReshardPlan: ...
+    def parameter_names(self) -> list[str]: ...
+    def local_params(self) -> dict[str, LocalParamSpec]: ...
+    def start_new_round(self, version: str) -> None: ...
+    def cleanup(self) -> None: ...
+
+class Loader(Protocol):
+    def capture(self) -> ReshardPlan: ...
+    def parameter_names(self) -> list[str]: ...
+    def local_params(self) -> dict[str, LocalParamSpec]: ...
+    def start_new_round(self, version: str) -> None: ...
+    def install(self, layer_group_id: int) -> None: ...
+    def finish(self) -> None: ...
+    def cleanup(self) -> None: ...
+```
+
+- `capture`: returns the plan: names, global shapes, dtypes, meshes,
+  placements, partitions. Both sides must produce the same plan.
+- `parameter_names`: the complete canonical parameter set the plan must cover.
+- `local_params`: maps each declared name to this rank's storage.
+- `start_new_round`: prepares the engine for one refit; a Publisher may stage
+  weights here.
+- `install` (Loader): commits one layer group's received buffers into the live
+  model.
+- `finish` (Loader): refreshes derived state after all groups are installed.
+- `cleanup`: releases engine-side resources.
+
+`local_params` values are `LocalParamSpec` records; hooks exchange a
+`RefitCtx`:
+
+```python
+@dataclass
+class LocalParamSpec:
+    base: Any = None
+    pre: Callable[[Any], RefitCtx] | None = None
+    post: Callable[[RefitCtx], None] | None = None
+
+@dataclass
+class RefitCtx:
+    buf: Any
+    extra: dict[str, Any] = field(default_factory=dict)
+```
+
+- `base`: the live local tensor, sent from or received into directly.
+- `pre`: called with `base`; returns a `RefitCtx` whose `buf` the wire op uses.
+  Needed when `base` is `None`.
+- `post`: called with that `RefitCtx` after the wire op; commits the bytes.
+- `RefitCtx.extra`: free-form state from `pre` to `post`, such as the fused
+  parameter slice a received tile belongs to.
+
+`pre`, the wire op and `post` run on one CUDA stream. Section 6.1 lists the
+common patterns.
+
+### Call sequence for one refit round
+
+The flowchart in section 2.B shows the same order.
+
+1. Once per worker: `initialize`, then optionally `setup_layer_groups`.
+2. Every worker: `compute_plan`. All workers must return from it before any
+   worker calls `start_weight_update`.
+3. Per refit: `create_operation(version, key_prefix=...)` on each participant,
+   or once by a coordinator that hands out the id.
+4. Every participant: `start_weight_update(version, operation_id)`.
+5. For each layer group, in the same order everywhere: trainer
+   `publish_weights(version, layer_group_id)`, generator
+   `update_weights(version, layer_group_id)`.
+6. Every participant: `finish_weight_update(version)`. Repeat from step 3 for
+   the next refit; repeat from step 2 after an epoch change.
+7. Terminal: `cleanup()`, then `CollectiveRendezvous.close()`.
+
+### Errors a caller must handle
+
+`GroupNotReadyError`, `EpochChangedError` and `TransferBindingError` subclass
+`RendezvousError`.
+
+| Exception | Raised from | Meaning | Caller action |
+|---|---|---|---|
+| `GroupNotReadyError` | `compute_plan` | Group missed READY within `MX_NCCL_REFIT_GROUP_TIMEOUT_S`; `.missing` names the slots still absent | Fix or restart the missing slots, then retry `compute_plan` |
+| `EpochChangedError` | `compute_plan`, `start_weight_update` | Membership or plan digest moved the epoch; `.disagreeing` names slots with a different plan digest | Re-run `compute_plan` (after fixing the plan if `.disagreeing` is set) |
+| `TransferBindingError` | `start_weight_update` | The operation does not match this worker's group, epoch, model or `version`, or is no longer PENDING or RUNNING | Create a new operation at the current epoch |
+| `RendezvousError` | any client call | Other control-plane failure, including a group no longer READY or a superseded slot | Re-run `compute_plan` |
+| `PlanCoverageError` | `initialize`, `compute_plan` | The captured plan does not partition the expected parameter set | Fix the engine adapter |
+| `NcclUnavailableError` | `compute_plan` | `nccl4py` or `nccl-extensions` is missing or too old | Install the dependencies in section 10 |
+| `CommunicatorWedgedError` | `publish_weights`, `update_weights`, `finish_weight_update`, `cleanup` | A lane abort overran `MX_NCCL_REFIT_ABORT_TIMEOUT_S`; the round is already reported FAILED | Exit the process with a non-zero `os._exit` (section 8.2) |
+
+Any other exception from a round call is a transport or timeout failure; the
+round is already aborted and reported, so re-run `compute_plan`.
+
+### Configuration
+
+Defaults and details are in section 9.
+
+- `MX_NCCL_REFIT_NUM_STREAMS`: stream pool size for integrations that build
+  their own `streams`.
+- `MX_NCCL_REFIT_BLOCKING_DATA_PLANE`: run data traffic on a blocking
+  communicator.
+- `MX_NCCL_REFIT_GROUPED_SUBMISSION`: record each layer group's reshards in one
+  `nccl.m2n.group()`.
+- `MX_NCCL_REFIT_PIPELINE_DEPTH`: layer groups the generator keeps in flight.
+- `MX_NCCL_REFIT_GROUP_TIMEOUT_S`: deadline for `FORMING -> READY`.
+- `MX_NCCL_REFIT_POLL_INTERVAL_S`: group poll backoff floor.
+- `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S`: deadline for one lane's communicator
+  init.
+- `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S`: client-side transfer deadline.
+- `MX_NCCL_REFIT_ABORT_TIMEOUT_S`: bound on one lane abort before
+  `CommunicatorWedgedError`.
+- `MX_NCCL_REFIT_REGISTRATION_TTL_S`: worker liveness lease lifetime.
+
+## Part 2: Internal design
 
 ## 1. What this is
 
@@ -436,7 +692,6 @@ healthy abort on the deployment's libnccl needs longer.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MX_REFIT_TRANSPORT` | `nixl` | `nccl_m2n` selects this path. One backend per deployment |
 | `MX_NCCL_REFIT_NUM_STREAMS` | `2` | Size of the stream pool an integration builds when it does not pass its own `streams`. Not read by `RefitClientTrainer`/`RefitClientGenerator` |
 | `MX_NCCL_REFIT_BLOCKING_DATA_PLANE` | `0` | Opt-in. When `1`, each lane is still initialized as a non-blocking communicator bounded by `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S`, and reshard and broadcast traffic runs on a blocking communicator split from it under the same deadline. On the M2N NVLink path a non-blocking communicator costs about 0.4 ms of host time per reshard call, so this cuts a single-node refit of a few hundred parameters several-fold; over the network the per-call cost is already small and this changes little. Abort tears down both communicators. |
 | `MX_NCCL_REFIT_GROUPED_SUBMISSION` | `0` | Opt-in. When `1`, each layer group's reshards are recorded in one `nccl.m2n.group()` so M2N can fuse them; by default each is a separate `nccl.m2n.reshard` call on the same handle and stream. In nccl-extensions 0.1.0 a group of two or more reshards needs GIN (RDMA devices, and `NCCL_GIN_TYPE=2` for proxy GIN) even when every peer is NVLink-only; without it the group end fails on every rank |
@@ -466,22 +721,6 @@ from nccl.m2n import reshard                          # the M-to-N collective
 `nccl.m2n` ships in the separate `nccl-extensions` distribution under the same
 namespace: install `nccl-extensions[cu12]` or `nccl-extensions[cu13]` to match
 the host CUDA toolkit. Reshard needs NCCL 2.30.7 or newer. Without it,
-`modelexpress_rl.collective` raises an actionable error at `initialize()`. The
+`modelexpress_rl.collective` raises `NcclUnavailableError` at `compute_plan()`, before joining. The
 torch-free plan and rendezvous modules import and test without NCCL, CUDA, or
 torch.
-
-## 11. Proposed implementation slices
-
-| Slice | Contents |
-|---|---|
-| 1. Control plane | `refit_collective.proto`; Rust `RefitCollectiveService` + backend trait + Redis backend (atomic join, admission, epoch bump via Lua) |
-| 2. Torch-free client core | Plan records, mesh and placement derivation, bulk/misc split, layer groups, rank-assignment mirror, digest |
-| 3. Rendezvous client | Join, poll to READY, publish/fetch `uniqueId`, communicator cache keyed by `(group_id, epoch)` |
-| 4. Backend | `NcclM2nSender` / `NcclM2nReceiver`: reshard lanes, broadcast lane, stream assignment |
-| 5. Two-sided clients | `RefitClientTrainer` / `RefitClientGenerator` lifecycle + Publisher/Loader SPI + reference implementations |
-| 6. Tests | Torch-free unit tests for slices 1-3 and 5; a GPU end-to-end harness for slice 4 |
-
-The Megatron publisher and vLLM loader are **out of this PR**: per NeMo RL's
-analysis they are the only pieces with new logic, they need real engines to
-validate, and NeMo RL's existing builders port directly to the
-`LocalParamSpec`-compatible SPI.
