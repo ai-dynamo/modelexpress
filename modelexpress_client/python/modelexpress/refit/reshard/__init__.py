@@ -52,6 +52,7 @@ from modelexpress.refit.reshard.transport import (
     ReadDescriptor,
     Transport,
 )
+from modelexpress.refit.reshard.alloc_scope import registered_buffer_alloc_scope
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.receiver import ReshardReceiver
 from modelexpress.refit.reshard.rendezvous import (
@@ -99,6 +100,7 @@ __all__ = [
     "paired_runs",
     "plan_pull",
     "plan_transfer",
+    "registered_buffer_alloc_scope",
     "plan_transfer_groups",
     "shard_region",
     "tensor_digest",
