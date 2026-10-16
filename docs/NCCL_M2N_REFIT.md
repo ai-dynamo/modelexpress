@@ -76,7 +76,9 @@ RefitClientTrainer(
   role's slot list. `worker_id`: this process generation; use a new id after a
   restart.
 - `receiver_protocol`, `m2n_abi_version`: part of the plan digest; must match
-  on all participants.
+  on all participants. An empty `m2n_abi_version` is replaced by the installed
+  distribution that ships `nccl.m2n` (for example `nccl-extensions==X.Y.Z`),
+  so peers on different builds do not agree on a digest by default.
 - `device`: CUDA device for the communicators; `None` uses the current device.
 - `streams`: lane `i` runs on `streams[i % len(streams)]`. `None` or empty
   runs all lanes on the current stream.

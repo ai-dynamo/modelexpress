@@ -1836,3 +1836,47 @@ class TestCleanup:
             index_in_role=0,
         )
         client.cleanup()
+
+
+class TestM2nBuildInDigest:
+    @staticmethod
+    def _install_fake_metadata(monkeypatch, m2n_version):
+        from importlib import metadata
+        from pathlib import PurePosixPath
+
+        dists = {
+            "nccl4py": ("0.1.0", ["nccl/core/__init__.py"]),
+            "nccl-extensions": (m2n_version, ["nccl/m2n/__init__.py"]),
+        }
+
+        def distribution(name):
+            version, files = dists[name]
+            return SimpleNamespace(
+                metadata={"Name": name},
+                version=version,
+                files=[PurePosixPath(f) for f in files],
+            )
+
+        monkeypatch.setattr(
+            metadata, "packages_distributions", lambda: {"nccl": list(dists)}
+        )
+        monkeypatch.setattr(metadata, "distribution", distribution)
+
+    def test_the_build_is_read_from_the_distribution_that_ships_m2n(self, monkeypatch):
+        self._install_fake_metadata(monkeypatch, "0.3.1")
+        assert collective_backend.installed_m2n_build() == "nccl-extensions==0.3.1"
+
+    def test_differing_installed_builds_split_the_digest(self, fake_nccl, monkeypatch):
+        digests = []
+        for version in ("0.3.1", "0.4.0"):
+            self._install_fake_metadata(monkeypatch, version)
+            digests.append(trainer(FakeRendezvous(), FakeEngine())._digest)
+        assert digests[0] != digests[1]
+
+    def test_an_explicit_version_wins_over_the_installed_build(self, fake_nccl, monkeypatch):
+        digests = []
+        for version in ("0.3.1", "0.4.0"):
+            self._install_fake_metadata(monkeypatch, version)
+            client = trainer(FakeRendezvous(), FakeEngine(), m2n_abi_version="pinned")
+            digests.append(client._digest)
+        assert digests[0] == digests[1]

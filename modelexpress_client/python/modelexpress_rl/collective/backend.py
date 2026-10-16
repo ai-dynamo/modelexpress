@@ -247,6 +247,27 @@ def loaded_nccl_version() -> tuple[int, int, int] | None:
     return (value // 10000, (value // 100) % 100, value % 100)
 
 
+def installed_m2n_build() -> str:
+    """Name and version of the installed distribution that ships ``nccl.m2n``.
+
+    Read from package metadata only, so nothing native is loaded. ``nccl`` is
+    a namespace shared with nccl4py, so the distribution is the one whose
+    files include the ``nccl/m2n`` package rather than any ``nccl`` provider.
+    Returns "" when no installed distribution ships it.
+    """
+    from importlib import metadata
+
+    for name in metadata.packages_distributions().get("nccl", []):
+        try:
+            dist = metadata.distribution(name)
+        except metadata.PackageNotFoundError:
+            continue
+        files = dist.files or []
+        if any(tuple(path.parts[:2]) == ("nccl", "m2n") for path in files):
+            return f"{dist.metadata['Name']}=={dist.version}"
+    return ""
+
+
 def require_nccl_m2n() -> None:
     """Fail before rendezvous when the optional M2N runtime is unavailable.
 

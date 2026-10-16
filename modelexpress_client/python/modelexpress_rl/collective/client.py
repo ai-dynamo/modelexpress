@@ -28,6 +28,7 @@ from .backend import (
     DEFAULT_LAYER_GROUP,
     NcclM2nReceiver,
     NcclM2nSender,
+    installed_m2n_build,
     require_nccl_m2n,
 )
 from .comm import (
@@ -112,7 +113,9 @@ class _RefitClientBase:
         self._worker_id = worker_id
         self._index_in_role = index_in_role
         self._receiver_protocol = receiver_protocol
-        self._m2n_abi_version = m2n_abi_version
+        # Peers on different M2N builds must not share a plan digest, so when
+        # the caller does not name one, the installed build stands in for it.
+        self._m2n_abi_version = m2n_abi_version or installed_m2n_build()
         self._device = device
         self._streams = list(streams) if streams else [None]
 
