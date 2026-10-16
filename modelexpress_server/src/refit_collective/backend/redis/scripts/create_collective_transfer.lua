@@ -12,6 +12,7 @@
 --   EXISTING:<operation_id>   another invocation already owns the key
 --   COLLISION                 the generated operation ID already exists
 --   NOGROUP                   no group exists for this membership
+--   BUSY:<operation_id>       another operation is still in flight at this epoch
 --
 -- The idempotency reservation is what makes an orchestrator retry safe: a
 -- create that timed out client-side but committed server-side returns the
@@ -40,6 +41,21 @@ end
 local epoch = redis.call('HGET', KEYS[3], 'epoch')
 if not epoch then
   return 'NOGROUP'
+end
+
+-- At most one nonterminal operation per group epoch. Two operations on one
+-- epoch would ride the same lane communicators, and a split cohort (some
+-- workers bound to each) would enter collectives its peers are not in. A
+-- same-key replay was already answered above, so anything still in flight
+-- here belongs to a different request.
+local active = redis.call('SMEMBERS', KEYS[4])
+for i = 1, #active do
+  local fields = redis.call('HMGET', ARGV[8] .. active[i], 'state', 'epoch')
+  local op_state, op_epoch = fields[1], fields[2]
+  if (op_state == 'PENDING' or op_state == 'RUNNING')
+      and tonumber(op_epoch) == tonumber(epoch) then
+    return 'BUSY:' .. active[i]
+  end
 end
 
 redis.call('HSET', KEYS[1],

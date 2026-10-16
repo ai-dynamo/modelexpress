@@ -403,7 +403,11 @@ Ordering. `CreateCollectiveTransfer` requires an existing group and stamps the
 operation with the group's current epoch. First formation: `compute_plan` on
 every worker (join, `READY`, communicators), then `CreateCollectiveTransfer`,
 then `start_weight_update`. Later refits: create the operation, then
-`start_weight_update`.
+`start_weight_update`. A group epoch has at most one operation in flight
+(PENDING or RUNNING): a create under a different idempotency key is refused
+with FAILED_PRECONDITION naming the operation in flight, while a replay of the
+same key returns that operation. An abandoned operation is cleared by
+reporting it FAILED, or by the next epoch change.
 
 `start_weight_update(version, operation_id)` reads the operation with
 `GetCollectiveTransfer` and raises `TransferBindingError`, before preparing the

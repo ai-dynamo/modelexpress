@@ -870,6 +870,13 @@ impl CollectiveBackend for RedisCollectiveBackend {
             "NOGROUP" => Err(CollectiveBackendError::FailedPrecondition(
                 "no collective group has formed for this membership yet".to_string(),
             )),
+            other if other.starts_with("BUSY:") => {
+                let busy = other.trim_start_matches("BUSY:");
+                Err(CollectiveBackendError::FailedPrecondition(format!(
+                    "collective transfer {busy} is still in flight at this group epoch; \
+                     it must complete, fail or be aborted before another is created"
+                )))
+            }
             other => match other.strip_prefix("EXISTING:") {
                 Some(existing) => {
                     let transfer = self.read_transfer(existing).await?;
@@ -1355,5 +1362,75 @@ mod tests {
             .collect();
         assert_eq!(joined.get("t0"), Some(&2));
         assert_eq!(joined.get("g0"), Some(&1));
+    }
+
+    fn create_request(
+        group_spec: &CollectiveGroupSpec,
+        version: &str,
+        key: &str,
+    ) -> CreateCollectiveTransferRequest {
+        CreateCollectiveTransferRequest {
+            spec: Some(group_spec.clone()),
+            version_id: version.to_string(),
+            idempotency_key: key.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
+    async fn one_transfer_in_flight_per_group_epoch() {
+        let backend = RedisCollectiveBackend::connect(&test_redis_url())
+            .await
+            .expect("connect");
+        let model = format!("one-in-flight-test/{}", Uuid::new_v4());
+        let trainer = Uuid::new_v4().to_string();
+        register_worker(&backend, &trainer, CollectiveRole::Trainer, &model).await;
+        let group_spec = spec(&model, &["t0"], &["g0"], 1);
+        join(&backend, &group_spec, "t0", &trainer, CollectiveRole::Trainer, "d").await;
+
+        // A split cohort: two halves create concurrently under different keys
+        // at the same epoch. Exactly one may own the epoch.
+        let key_a = Uuid::new_v4().to_string();
+        let key_b = Uuid::new_v4().to_string();
+        let request_a = create_request(&group_spec, "v1", &key_a);
+        let request_b = create_request(&group_spec, "v1", &key_b);
+        let (a, b) = tokio::join!(
+            backend.create_transfer(&request_a),
+            backend.create_transfer(&request_b),
+        );
+        let (winner, loser) = match (a, b) {
+            (Ok(op), Err(error)) | (Err(error), Ok(op)) => (op, error),
+            other => panic!("expected exactly one create to succeed, got {other:?}"),
+        };
+        match loser {
+            CollectiveBackendError::FailedPrecondition(message) => {
+                assert!(message.contains(&winner.operation_id), "{message}");
+            }
+            other => panic!("expected FailedPrecondition, got {other:?}"),
+        }
+
+        // A later different-key create is refused too, while the winner's own
+        // key still replays to the same operation.
+        let request_c = create_request(&group_spec, "v2", &Uuid::new_v4().to_string());
+        assert!(matches!(
+            backend.create_transfer(&request_c).await,
+            Err(CollectiveBackendError::FailedPrecondition(_))
+        ));
+        let replay = backend
+            .create_transfer(&create_request(&group_spec, "v1", &winner.idempotency_key))
+            .await
+            .expect("same-key replay");
+        assert_eq!(replay.operation_id, winner.operation_id);
+
+        // Once the winner is terminal the epoch is free again.
+        let mut connection = backend.connection.clone();
+        let () = connection
+            .hset(operation_key(&winner.operation_id), "state", "COMPLETE")
+            .await
+            .expect("mark complete");
+        backend
+            .create_transfer(&request_c)
+            .await
+            .expect("create after the first is terminal");
     }
 }
