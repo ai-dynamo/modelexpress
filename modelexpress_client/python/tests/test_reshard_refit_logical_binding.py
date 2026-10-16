@@ -3,7 +3,6 @@
 
 """Numerical contract tests for logical planning and per-replica binding."""
 
-from modelexpress.refit.reshard.rendezvous import structural_manifest_digest
 import ctypes
 
 import pytest
@@ -267,7 +266,7 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
         "mesh", 1, tuple(
             TrainerSourceShard(
                 slot, f"worker-{index}", structural_manifest_digest(blob),
-                f"{agent}:19000", blob, structural_manifest_digest(blob),
+                f"{agent}:19000", blob,
             )
             for index, (slot, agent, blob) in enumerate((
                 ("slot-z", "agent-z", manifests[0]),
