@@ -497,6 +497,12 @@ class TestEnvironment:
         monkeypatch.setenv("MX_HEARTBEAT_INTERVAL_SECS", "7")
         assert envs.MX_NCCL_REFIT_REGISTRATION_TTL_S == 21
 
+    def test_grouped_submission_is_off_by_default(self, monkeypatch):
+        monkeypatch.delenv("MX_NCCL_REFIT_GROUPED_SUBMISSION", raising=False)
+        assert envs.MX_NCCL_REFIT_GROUPED_SUBMISSION is False
+        monkeypatch.setenv("MX_NCCL_REFIT_GROUPED_SUBMISSION", "1")
+        assert envs.MX_NCCL_REFIT_GROUPED_SUBMISSION is True
+
 
 class TestAgreementMembers:
     """The digest is what readiness compares, so a mismatch on either of these

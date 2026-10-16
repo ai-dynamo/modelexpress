@@ -910,6 +910,10 @@ class TestBoundedSynchronizeFallback:
 class TestGroupedSubmission:
     """Each layer group is one m2n.group(), recorded in one canonical order."""
 
+    @pytest.fixture(autouse=True)
+    def _grouped(self, monkeypatch):
+        monkeypatch.setenv("MX_NCCL_REFIT_GROUPED_SUBMISSION", "1")
+
     @staticmethod
     def _plan():
         # Names chosen so plain canonical (name) order would interleave lanes.
@@ -1086,6 +1090,62 @@ class TestGroupedSubmission:
         sender.start_weight_update("v")
         sender.publish_weights(0)
         assert self._events(recorder, "group_end") == [("group_end",)]
+
+
+class TestGroupedSubmissionFlag:
+    """Grouped submission is opt-in: a group of 2+ reshards needs GIN in
+    nccl-extensions 0.1.0, so by default each entry is its own reshard call."""
+
+    _plan = staticmethod(TestGroupedSubmission._plan)
+    _events = staticmethod(TestGroupedSubmission._events)
+
+    def _run(self, recorder):
+        receiver, _ = build(
+            recorder, plan=self._plan(), half_cls=NcclM2nReceiver, partitions=2
+        )
+        receiver.start_weight_update("v")
+        receiver.update_weights(0)
+        return [op for op in recorder.ops if op.kind == "reshard"]
+
+    def test_off_by_default_issues_one_reshard_per_entry_outside_any_group(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.delenv("MX_NCCL_REFIT_GROUPED_SUBMISSION", raising=False)
+        reshards = self._run(recorder)
+        assert [op.dst for op in reshards] == [
+            "buf::b",
+            "buf::d",
+            "buf::a",
+            "buf::c",
+        ]
+        assert [op.group_depth for op in reshards] == [0, 0, 0, 0]
+        assert self._events(recorder, "group_start", "group_end", "group_abort") == []
+        handles = {id(op.kwargs.get("handle")) for op in reshards}
+        assert len(handles) == 1
+
+    def test_on_enters_one_group_for_the_layer_group(self, recorder, monkeypatch):
+        monkeypatch.setenv("MX_NCCL_REFIT_GROUPED_SUBMISSION", "1")
+        reshards = self._run(recorder)
+        assert [op.group_depth for op in reshards] == [1, 1, 1, 1]
+        assert self._events(recorder, "group_start", "group_end", "group_abort") == [
+            ("group_start",),
+            ("group_end",),
+        ]
+
+    def test_off_still_refuses_overlapping_destinations(self, recorder, monkeypatch):
+        import torch
+
+        monkeypatch.delenv("MX_NCCL_REFIT_GROUPED_SUBMISSION", raising=False)
+        plan = ReshardPlan(bulk=[entry("a"), entry("b")])
+        receiver, _ = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
+        shared = torch.zeros(8, 4)
+        receiver._specs = {
+            "a": LocalParamSpec(base=shared),
+            "b": LocalParamSpec(base=shared[2:]),
+        }
+        receiver.start_weight_update("v")
+        with pytest.raises(RuntimeError, match="storage overlap"):
+            receiver.update_weights(0)
 
 
 class TestM2nHandle:

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     MX_NCCL_REFIT_REGISTRATION_TTL_S: int
     MX_NCCL_REFIT_PIPELINE_DEPTH: int
     MX_NCCL_REFIT_BLOCKING_DATA_PLANE: bool
+    MX_NCCL_REFIT_GROUPED_SUBMISSION: bool
 
 
 def _int(name: str, default: int) -> int:
@@ -73,6 +74,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_NCCL_REFIT_BLOCKING_DATA_PLANE": lambda: _flag(
         "MX_NCCL_REFIT_BLOCKING_DATA_PLANE"
+    ),
+    "MX_NCCL_REFIT_GROUPED_SUBMISSION": lambda: _flag(
+        "MX_NCCL_REFIT_GROUPED_SUBMISSION"
     ),
     "MX_NCCL_REFIT_PIPELINE_DEPTH": lambda: _int("MX_NCCL_REFIT_PIPELINE_DEPTH", 2),
     "MX_NCCL_REFIT_REGISTRATION_TTL_S": lambda: _int(

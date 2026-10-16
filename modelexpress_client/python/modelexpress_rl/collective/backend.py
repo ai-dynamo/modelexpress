@@ -201,7 +201,9 @@ class _blocked_reshard_watch:
 
     def _watch(self) -> None:
         while not self._done.wait(_SLOW_RESHARD_WARN_S):
-            group = f"group of {self._calls} starting at " if self._calls > 1 else ""
+            group = (
+                f"submission of {self._calls} starting at " if self._calls > 1 else ""
+            )
             logger.warning(
                 "nccl.m2n reshard %sof %r on lane %s (rank %s of %s) still blocks "
                 "the host after %.0fs",
@@ -689,7 +691,16 @@ class _CollectiveHalf:
     def _submit_layer_group(
         self, entries: list[ParamPlan], *, src: Any, dst: Any
     ) -> list[LaneCommunicator]:
-        """Record one layer group's reshards in one ``m2n.group()`` and issue it.
+        """Issue one layer group's reshards, fused in one ``m2n.group()`` if opted in.
+
+        By default each entry is issued as its own ``nccl.m2n.reshard`` call
+        (same handle, lane and stream as the grouped path), because
+        nccl-extensions 0.1.0 needs GIN for a group of two or more reshards
+        and fails the group end on every rank without it.
+        ``MX_NCCL_REFIT_GROUPED_SUBMISSION=1`` records them in one
+        ``m2n.group()`` instead; what follows describes that path, and the
+        ordering, storage check, hook placement and deadline check apply to
+        both.
 
         Entries are recorded in :func:`submission_order`: grouped into runs by
         lane and source/destination mesh, runs in ascending lane order. M2N
@@ -727,12 +738,13 @@ class _CollectiveHalf:
 
         staged: list[tuple[ParamPlan, LaneCommunicator, LocalParamSpec, RefitCtx]] = []
         regions: list[_StorageRegion] = []
+        grouped = envs.MX_NCCL_REFIT_GROUPED_SUBMISSION
         started = time.monotonic()
         # The native runtime is process-global and not host-thread-safe, and a
         # group records on the calling thread, so one lock spans the group.
         with _M2N_CALL_LOCK, _blocked_reshard_watch(
             ordered[0], next(iter(lanes.values())), started, calls=len(ordered)
-        ), m2n.group():
+        ), (m2n.group() if grouped else nullcontext()):
             for entry in ordered:
                 lane = self._lane(entry.partition_id)
                 spec = self._specs[entry.name]
@@ -753,13 +765,14 @@ class _CollectiveHalf:
                 )
         elapsed = time.monotonic() - started
         if elapsed >= _SLOW_RESHARD_WARN_S:
-            # nccl.m2n issues host-blocking collectives while issuing a group
-            # (DevComm creation, window registration) that wait for every lane
-            # rank to enter them; a group that blocks this long is a peer that
-            # has not reached the same submission.
+            # nccl.m2n issues host-blocking collectives while issuing a group or
+            # a call (DevComm creation, window registration) that wait for every
+            # lane rank to enter them; a submission that blocks this long is a
+            # peer that has not reached the same submission.
             logger.warning(
-                "nccl.m2n group of %d reshard(s) starting at %r on lane %s blocked "
-                "the host for %.1fs",
+                "nccl.m2n %s submission of %d reshard(s) starting at %r on lane %s "
+                "blocked the host for %.1fs",
+                "grouped" if grouped else "per-call",
                 len(ordered),
                 ordered[0].name,
                 ordered[0].partition_id,

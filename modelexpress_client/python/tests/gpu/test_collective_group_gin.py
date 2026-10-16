@@ -3,8 +3,8 @@
 
 """A layer group of several reshards on a communicator without GIN.
 
-``_submit_layer_group`` records a layer group's reshards inside one
-``nccl.m2n.group()``. A group of two or more calls in one bucket takes M2N's
+With ``MX_NCCL_REFIT_GROUPED_SUBMISSION=1``, ``_submit_layer_group`` records a
+layer group's reshards inside one ``nccl.m2n.group()``. A group of two or more calls in one bucket takes M2N's
 fused staging path, and that path creates its device communicator with GIN
 requirements even when every peer is NVLink-reachable. A communicator whose
 ranks have no GIN backend (a pod with no RDMA devices, or ``NCCL_GIN_ENABLE=0``)
@@ -200,6 +200,10 @@ def test_ungrouped_reshards_move_bytes_without_gin(gin_disabled) -> None:
         "remove this mark once the group path works there"
     ),
 )
-def test_a_grouped_layer_moves_bytes_without_gin(gin_disabled) -> None:
+def test_a_grouped_layer_moves_bytes_without_gin(
+    gin_disabled, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A layer group of several reshards must work where GIN is unavailable."""
+    # Grouped submission is opt-in; force it so this still pins the GIN failure.
+    monkeypatch.setenv("MX_NCCL_REFIT_GROUPED_SUBMISSION", "1")
     assert _run_cohort(grouped=True) == {rank: True for rank in range(RANKS)}
