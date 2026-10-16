@@ -266,7 +266,9 @@ Defaults and details are in section 9.
 - `MX_NCCL_REFIT_POLL_INTERVAL_S`: group poll backoff floor.
 - `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S`: deadline for one lane's communicator
   init.
-- `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S`: client-side transfer deadline.
+- `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S`: client-side transfer deadline. It is
+  checked between submissions, so a submission that blocks the host is not
+  bounded by it (section 8.2).
 - `MX_NCCL_REFIT_ABORT_TIMEOUT_S`: bound on one lane abort before
   `CommunicatorWedgedError`.
 - `MX_NCCL_REFIT_REGISTRATION_TTL_S`: worker liveness lease lifetime.
@@ -700,6 +702,20 @@ The error includes `group_id`, `epoch`, `version` and the wedged `lane_id` for
 the exit log. Raise `MX_NCCL_REFIT_ABORT_TIMEOUT_S` (default 10 s) only if a
 healthy abort on the deployment's libnccl needs longer.
 
+**A submission that blocks the host is outside the transfer deadline.**
+`MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` is checked between submissions: before each
+`nccl.m2n.reshard` call, and before a grouped submission opens, never inside
+it. A reshard call, or the `nccl.m2n.group()` exit that issues a grouped
+submission, can hold the host inside native code. While it does, the deadline
+cannot fire and no abort runs. The client only logs that the call is still
+blocking, every `_SLOW_RESHARD_WARN_S` (10 s). It never interrupts the call.
+The client cannot recover such a process, the same as a wedged abort, so the
+same runner contract applies. The runner must bound each round call from
+outside (a process-level watchdog) and, once that bound passes, terminate the
+OS process with a non-zero `os._exit`. Peers are released when the server moves
+the epoch: the dead worker's registration lease expires, or another participant
+reports the round FAILED.
+
 ## 9. Configuration
 
 | Variable | Default | Purpose |
@@ -711,7 +727,7 @@ healthy abort on the deployment's libnccl needs longer.
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for one lane's non-blocking `Communicator.init` |
-| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Client-side transfer deadline; an overrun aborts the local lanes. It is reported to MX as `succeeded=false` (`RUNNING -> FAILED`, which moves the epoch) against the operation bound by `start_weight_update`, from whichever round call it surfaces in. If that report cannot be delivered, the abort alone leaves the group at its epoch |
+| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Client-side transfer deadline, checked between submissions; a submission that blocks the host is not bounded by it and falls under the runner exit contract of section 8.2. An overrun aborts the local lanes. It is reported to MX as `succeeded=false` (`RUNNING -> FAILED`, which moves the epoch) against the operation bound by `start_weight_update`, from whichever round call it surfaces in. If that report cannot be delivered, the abort alone leaves the group at its epoch |
 | `MX_NCCL_REFIT_ABORT_TIMEOUT_S` | `10` | How long a lane's `ncclCommAbort` may run on its daemon thread before the communicator is declared wedged (section 8.2). An overrun raises `CommunicatorWedgedError`; the runner must treat it as a fatal process exit. Relevant only on libnccl below v2.33, where abort cannot interrupt a running M2N kernel |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
 

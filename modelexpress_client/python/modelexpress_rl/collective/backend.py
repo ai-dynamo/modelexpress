@@ -530,8 +530,14 @@ class _CollectiveHalf:
     def setup_layer_groups(self, groupings: list[list[str]] | None) -> None:
         """Partition the bulk parameters into layer groups.
 
-        Default is one group holding everything. A caller that wants to bound
-        trainer memory splits it, at the cost of more wire operations.
+        Default is one group holding everything. Each group is issued as its
+        own submission, so splitting bounds how much a single submission
+        carries, and on the generator lets ``Loader.install`` of one group
+        overlap the transfer of the next (``MX_NCCL_REFIT_PIPELINE_DEPTH``).
+        It costs more wire operations. It does not bound trainer staging
+        memory: the sender keeps every group's staging contexts until
+        ``finish_weight_update``, so peak trainer staging is the whole refit
+        whether or not the parameters are split.
         """
         self._groups = OrderedDict()
         if groupings is None:
