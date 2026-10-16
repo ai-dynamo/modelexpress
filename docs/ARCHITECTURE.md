@@ -1793,7 +1793,11 @@ Tarred cache artifacts carry regular files and directories only. The source
 side enumerates members explicitly and hands tar that list, so nothing else can
 enter the archive regardless of how a cache directory is laid out; the target
 side enforces the same invariant in `_validate_tar_members` before extraction.
-Symlinks are skipped at packaging time (see [`DEPLOYMENT.md`](DEPLOYMENT.md#p2p-metadata-exchange)).
+Symlinks are represented in a regular `mx.symlink.metadata.v1` sidecar, validated
+before extraction, and restored afterwards. Internal absolute links are made
+relative so they remain valid when the cache root changes. External link
+targets must exist on the receiving worker. This packaging is shared by both
+artifact transports (see [`DEPLOYMENT.md`](DEPLOYMENT.md#p2p-metadata-exchange)).
 
 Cache artifact checksums protect transfer integrity but do not authenticate the
 source or attest the contents. TorchInductor, Triton, DeepGEMM, TileLang, CuTe

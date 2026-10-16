@@ -26,6 +26,7 @@ from modelexpress.metadata.artifact_manifest import (
     artifact_manifest_id,
     build_artifact_manifest,
 )
+from modelexpress.metadata.artifact_symlinks import METADATA_NAME
 from modelexpress.metadata.artifact_transfer import (
     ArtifactTransfer,
     ArtifactBundle,
@@ -831,7 +832,7 @@ def _prepare_and_install(source, target, bundle):
     return transfer
 
 
-def test_tarred_artifact_transfer_skips_internal_symlink(tmp_path):
+def test_tarred_artifact_transfer_relocates_internal_symlink(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     (source / "target.txt").write_text("target")
@@ -841,10 +842,13 @@ def test_tarred_artifact_transfer_skips_internal_symlink(tmp_path):
     _prepare_and_install(source, target, tmp_path / "bundle")
 
     assert (target / "target.txt").read_text() == "target"
-    assert not (target / "link.txt").exists()
+    assert (target / "link.txt").is_symlink()
+    assert (target / "link.txt").readlink() == Path("target.txt")
+    assert (target / "link.txt").resolve() == target / "target.txt"
+    assert not (target / METADATA_NAME).exists()
 
 
-def test_tarred_artifact_transfer_skips_external_symlink(tmp_path, caplog):
+def test_tarred_artifact_transfer_preserves_external_symlink(tmp_path, caplog):
     caplog.set_level(logging.WARNING, logger="modelexpress.metadata.artifact_transfer")
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -858,24 +862,24 @@ def test_tarred_artifact_transfer_skips_external_symlink(tmp_path, caplog):
     _prepare_and_install(source, target, tmp_path / "bundle")
 
     assert (target / "kernel.so").read_bytes() == b"compiled"
-    assert not (target / "include").exists()
+    assert (target / "include").is_symlink()
+    assert (target / "include" / "header.h").read_text() == "outside"
     assert (outside / "header.h").read_text() == "outside"
-    assert "external symlink" in caplog.text
+    assert "skipped" not in caplog.text
 
 
-def test_tarred_artifact_transfer_survives_broken_symlink(tmp_path, caplog):
-    caplog.set_level(logging.WARNING, logger="modelexpress.metadata.artifact_transfer")
+def test_tarred_artifact_transfer_rejects_broken_symlink_before_extract(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     (source / "kernel.so").write_bytes(b"compiled")
     (source / "dangling").symlink_to(tmp_path / "never-created")
     target = tmp_path / "target"
 
-    _prepare_and_install(source, target, tmp_path / "bundle")
+    with pytest.raises(ValueError, match="symlink source missing"):
+        _prepare_and_install(source, target, tmp_path / "bundle")
 
-    assert (target / "kernel.so").read_bytes() == b"compiled"
+    assert not (target / "kernel.so").exists()
     assert not (target / "dangling").is_symlink()
-    assert "broken symlink" in caplog.text
 
 
 def test_tarred_artifact_transfer_archives_awkward_member_names(tmp_path):
@@ -883,16 +887,16 @@ def test_tarred_artifact_transfer_archives_awkward_member_names(tmp_path):
     (source / "gen").mkdir(parents=True)
     (source / "gen" / "config[sm100].inc").write_text("kept")
     (source / "gen" / "new\nline.cu").write_text("also kept")
-    (source / "gen" / "link[sm100]").symlink_to(tmp_path / "never-created")
-    (source / "gen" / "new\nline_link").symlink_to(tmp_path / "never-created")
+    (source / "gen" / "link[sm100]").symlink_to("config[sm100].inc")
+    (source / "gen" / "new\nline_link").symlink_to("new\nline.cu")
     target = tmp_path / "target"
 
     _prepare_and_install(source, target, tmp_path / "bundle")
 
     assert (target / "gen" / "config[sm100].inc").read_text() == "kept"
     assert (target / "gen" / "new\nline.cu").read_text() == "also kept"
-    assert not (target / "gen" / "link[sm100]").is_symlink()
-    assert not (target / "gen" / "new\nline_link").is_symlink()
+    assert (target / "gen" / "link[sm100]").read_text() == "kept"
+    assert (target / "gen" / "new\nline_link").read_text() == "also kept"
 
 
 def test_tarred_artifact_transfer_keeps_empty_directories(tmp_path):
