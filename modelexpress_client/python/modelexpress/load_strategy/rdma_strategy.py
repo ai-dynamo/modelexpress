@@ -23,6 +23,13 @@ from ..source_selection import (
     configured_policy_label,
     get_configured_selector,
 )
+from ..topology import (
+    apply_policy,
+    blocks_selection,
+    count_in_domain,
+    resolve_policy,
+    warn_if_no_domain_match,
+)
 from ..transfer_safety import check_transfer_allowed
 from ..types import TensorDescriptor
 from .base import (
@@ -33,7 +40,7 @@ from .base import (
     clear_exception_tracebacks,
     register_tensors,
 )
-from .context import LoadResult
+from .context import LoadResult, is_draft_tensor_name
 
 logger = logging.getLogger("modelexpress.strategy_rdma")
 
@@ -87,6 +94,11 @@ def _transfer_timeout_seconds() -> float:
     return configured
 
 
+def _is_draft_pass(ctx: LoadContext) -> bool:
+    # getattr: RL and test callers drive these paths with duck-typed contexts.
+    return getattr(ctx, "p2p_role", "main") == "draft"
+
+
 class RdmaStrategy(LoadStrategy):
     """Load weights via RDMA P2P transfer from an existing source.
 
@@ -101,7 +113,12 @@ class RdmaStrategy(LoadStrategy):
     def rollback(self, ctx: LoadContext) -> None:
         """Clean up NIXL state from a failed RDMA target attempt."""
         if ctx.nixl_manager is not None:
-            ctx.nixl_manager.shutdown()
+            if _is_draft_pass(ctx) and ctx.nixl_manager is ctx.shared_nixl_manager:
+                # The agent belongs to the main load, which keeps serving from
+                # it. Release only the draft's own registrations.
+                ctx.nixl_manager.deregister_tensors(ctx.tensors)
+            else:
+                ctx.nixl_manager.shutdown()
         ctx.tensors = {}
         ctx.nixl_manager = None
 
@@ -149,6 +166,14 @@ class RdmaStrategy(LoadStrategy):
         the model, the adapter first replaces the model with a fresh instance.
         """
         result = _as_load_result(result)
+        if _is_draft_pass(ctx) and ctx.shared_nixl_manager is None:
+            logger.info(
+                f"[Worker {ctx.global_rank}] Speculative draft pass has no "
+                "main-load NIXL agent to share, skipping RDMA"
+            )
+            raise StrategyFailed(
+                "No main-load NIXL agent for the draft pass", mutated=False
+            )
         candidates = self._find_source_instances(ctx)
         if not candidates:
             logger.info(
@@ -188,6 +213,14 @@ class RdmaStrategy(LoadStrategy):
                 continue
 
             if not self._accelerator_compatible(ctx, source_worker, worker_id):
+                continue
+
+            if _is_draft_pass(ctx) and not self._may_serve_draft(ctx, source_worker):
+                logger.info(
+                    f"[Worker {ctx.global_rank}] Skipping source worker "
+                    f"{worker_id}: its manifest has no speculative draft tensors"
+                )
+                selection_metrics.record_attempt(policy, "metadata_miss")
                 continue
 
             logger.info(
@@ -285,6 +318,14 @@ class RdmaStrategy(LoadStrategy):
         caller in load(), so the selector controls ordering only.
         """
         policy = configured_policy_label()
+        topology_policy = resolve_policy()
+        if blocks_selection(topology_policy):
+            logger.warning(
+                f"[Worker {ctx.global_rank}] Topology domain "
+                f"{topology_policy.domain!r} is required but unknown for this "
+                f"node, skipping RDMA"
+            )
+            return []
         try:
             list_resp = ctx.mx_client.list_sources(
                 identity=ctx.identity,
@@ -300,7 +341,10 @@ class RdmaStrategy(LoadStrategy):
                 # every one filtered out" was unreachable, so the two looked
                 # identical on a dashboard.
                 selection_metrics.record_list_sources(policy, "empty")
-                for stage in ("listed", "rank_matched", "accelerator_matched"):
+                stages = ["listed", "rank_matched", "accelerator_matched"]
+                if topology_policy is not None:
+                    stages.append("topology_matched")
+                for stage in stages:
                     selection_metrics.observe_candidates(policy, stage, 0)
                 return []
 
@@ -330,7 +374,7 @@ class RdmaStrategy(LoadStrategy):
 
             selector = get_configured_selector()
             select_start = time.perf_counter()
-            ordered = selector.order(candidates, ctx)
+            ordered = apply_policy(selector.order(candidates, ctx), topology_policy)
             select_seconds = time.perf_counter() - select_start
 
             selection_metrics.record_list_sources(selector.name, "ok")
@@ -343,6 +387,14 @@ class RdmaStrategy(LoadStrategy):
             selection_metrics.observe_candidates(
                 selector.name, "accelerator_matched", len(candidates)
             )
+            topology_field = ""
+            if topology_policy is not None:
+                topology_matched = count_in_domain(ordered, topology_policy)
+                selection_metrics.observe_candidates(
+                    selector.name, "topology_matched", topology_matched
+                )
+                topology_field = f" source_candidates_topology_matched={topology_matched}"
+                warn_if_no_domain_match(candidates, topology_policy, ctx.global_rank)
             selection_metrics.observe_selection_seconds(selector.name, select_seconds)
 
             # Surface the source-published load the client saw, so a dashboard can
@@ -356,6 +408,7 @@ class RdmaStrategy(LoadStrategy):
                 f"source_candidates_total={len(list_resp.instances)} "
                 f"source_candidates_rank_matched={len(rank_matched)} "
                 f"source_candidates_accelerator_matched={len(candidates)}"
+                f"{topology_field}"
             )
             if ordered:
                 logger.debug(
@@ -406,6 +459,52 @@ class RdmaStrategy(LoadStrategy):
             f"target={target_accelerator!r}"
         )
         return False
+
+    @staticmethod
+    def _may_serve_draft(
+        ctx: LoadContext, source_worker: p2p_pb2.WorkerMetadata
+    ) -> bool:
+        """False only when a known manifest carries no draft tensors.
+
+        A source that served the target but not a draft (no speculative
+        config, or its draft pass fell back) must not be tried: the draft
+        would receive nothing. An unknown manifest (P2P metadata that was not
+        prefetched) is left to the receive-time coverage check.
+        """
+        descriptors = worker_tensor_descriptors(source_worker)
+        if not descriptors:
+            return True
+        return any(
+            t.name.startswith(ctx.draft_tensor_namespace) for t in descriptors
+        )
+
+    @staticmethod
+    def _scope_source_tensors(
+        ctx: LoadContext,
+        source_tensors: list[TensorDescriptor],
+    ) -> list[TensorDescriptor]:
+        """Restrict a source manifest to this load's namespace.
+
+        One publication carries the main load's tensors and, namespaced
+        under DRAFT_TENSOR_PREFIX, the speculative draft's. The main pass
+        must not see draft entries (they would break exact-match on
+        heterogeneous transfers) and the draft pass takes only its own.
+        """
+        if not _is_draft_pass(ctx):
+            return [t for t in source_tensors if not is_draft_tensor_name(t.name)]
+        scoped = [
+            t for t in source_tensors
+            if t.name.startswith(ctx.draft_tensor_namespace)
+        ]
+        missing = set(ctx.tensors) - {t.name for t in scoped}
+        if missing:
+            # Receiving a partial draft would leave the rest at dummy values;
+            # fail so the chain falls back to storage for the draft.
+            raise RuntimeError(
+                f"source manifest lacks {len(missing)} of {len(ctx.tensors)} "
+                f"draft tensors (first: {sorted(missing)[:5]})"
+            )
+        return scoped
 
     def _fetch_worker_metadata(
         self,
@@ -582,6 +681,7 @@ class RdmaStrategy(LoadStrategy):
                     )
                     for t in tensor_protos
                 ]
+                source_tensors = self._scope_source_tensors(ctx, source_tensors)
                 host, port_str = ep.rsplit(":", 1)
                 # Claimed before the dial so a fetch that fails part-way, leaving
                 # metadata that lands later, is still released.
@@ -598,6 +698,7 @@ class RdmaStrategy(LoadStrategy):
                             remote_agent_name=agent_name,
                             ip=host,
                             port=int(port_str),
+                            timeout_seconds=envs.MX_NIXL_METADATA_TIMEOUT,
                         )
                 except BaseException:
                     ctx.nixl_manager.remove_remote_agent(remote_agent_name)
@@ -618,6 +719,7 @@ class RdmaStrategy(LoadStrategy):
                     )
                     for t in worker_tensor_descriptors(source_worker)
                 ]
+                source_tensors = self._scope_source_tensors(ctx, source_tensors)
                 # Loaded here rather than inside receive_from_source so this method
                 # holds the name it is responsible for releasing.
                 with selection_metrics.time_source_attempt_phase(
@@ -667,6 +769,11 @@ class RdmaStrategy(LoadStrategy):
                             timeout_seconds=_transfer_timeout_seconds(),
                             remote_agent_name=remote_agent_name,
                             require_exact_match=require_exact_match,
+                            # The shared agent's catalog also holds the main
+                            # load's tensors; match only the draft's.
+                            destination_tensors=(
+                                ctx.tensors if _is_draft_pass(ctx) else None
+                            ),
                         )
                 except Exception as e:
                     raise SourceTransferError(f"RDMA receive failed: {e}") from e

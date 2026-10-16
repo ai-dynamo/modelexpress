@@ -347,6 +347,39 @@ class TestOptionalExtension:
         assert 0 not in vmm_runtime._vmm_arenas
 
 
+    def test_draft_pass_never_closes_the_target_arena(self, monkeypatch):
+        """The speculative draft participates in P2P (p2p_enabled=True) but
+        must skip the arena: entering would take the replace-and-close path
+        and unmap the live, already-published target weights."""
+        from modelexpress.vmm import runtime as vmm_runtime
+
+        monkeypatch.setenv("MX_VMM_ARENA", "1")
+
+        class _TargetArena:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        target_arena = _TargetArena()
+        monkeypatch.setattr(vmm_runtime, "_vmm_arenas", {0: target_arena})
+
+        class _Ctx:
+            global_rank = 0
+            device_id = 0
+            accelerator_backend = _StubBackend()
+            p2p_enabled = True
+            p2p_role = "draft"
+            vmm_arena = None
+
+        ctx = _Ctx()
+        with vmm_runtime.maybe_enter_vmm_arena(ctx):
+            pass
+        assert vmm_runtime._vmm_arenas[0] is target_arena
+        assert not target_arena.closed
+        assert ctx.vmm_arena is None
+
+
 # ---------------------------------------------------------------------------
 # Loader lifecycle: publish-after-success, replace warn
 # ---------------------------------------------------------------------------
@@ -497,3 +530,40 @@ class TestLoaderLifecycle:
             "expected replacement WARNING; got: "
             f"{[r.message for r in caplog.records]}"
         )
+
+    def test_draft_pass_keeps_the_target_arena(self, monkeypatch):
+        """Regression for the MTP corruption path: after the target creates
+        its arena, the draft pass on the same device neither creates, enters,
+        nor closes an arena, and _vmm_arenas still holds the same object."""
+        from contextlib import contextmanager
+
+        monkeypatch.setenv("MX_VMM_ARENA", "1")
+        entered: list[object] = []
+
+        @contextmanager
+        def _recording_use_arena(arena, device):
+            entered.append(arena)
+            yield
+
+        vmm_runtime = self._patch_loader_deps(monkeypatch, _recording_use_arena)
+
+        with vmm_runtime.maybe_enter_vmm_arena(_StubCtx()):
+            pass
+        target_arena = vmm_runtime._vmm_arenas[0]
+        assert entered == [target_arena]
+
+        closed: list[bool] = []
+        monkeypatch.setattr(target_arena, "close", lambda: closed.append(True))
+
+        class _DraftCtx(_StubCtx):
+            p2p_role = "draft"
+
+        draft_ctx = _DraftCtx()
+        draft_ctx.vmm_arena = None
+        with vmm_runtime.maybe_enter_vmm_arena(draft_ctx):
+            pass
+
+        assert vmm_runtime._vmm_arenas[0] is target_arena
+        assert closed == []
+        assert entered == [target_arena]
+        assert draft_ctx.vmm_arena is None
