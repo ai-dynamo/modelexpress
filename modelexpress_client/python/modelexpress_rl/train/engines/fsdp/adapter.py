@@ -25,7 +25,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import torch
@@ -291,17 +291,32 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
 
         ``copy_`` casts to the selected wire dtype when the source dtype differs. The arena is
         the served buffer, so point each shard at it.
+
+        The fence covers every accelerator device an arena or source sits on, and
+        records on that device's own current stream through its own device
+        module. A cross-device copy can be enqueued on either side, while the
+        process current device belongs to whichever library set it last, so
+        fencing the process default can complete while the copy is still in
+        flight.
         """
         devices = set()
         for shard in shards:
             arena = self._arenas[shard.name]
             arena.copy_(shard.source_tensor, non_blocking=True)
             shard.staging_tensor = arena
-            devices.update(t.device for t in (arena, shard.source_tensor) if t.is_cuda)
+            devices.update(
+                t.device for t in (arena, shard.source_tensor) if t.device.type != "cpu"
+            )
+        return self._device_fence(devices)
+
+    @staticmethod
+    def _device_fence(devices: Iterable[torch.device]) -> CompletionFence:
+        """Record one event per accelerator device on its current stream."""
         events = []
-        for device in sorted(devices, key=str):
-            done = torch.cuda.Event()
-            done.record(torch.cuda.current_stream(device))
+        for device in sorted(set(devices), key=str):
+            device_module = torch.get_device_module(device)
+            done = device_module.Event()
+            done.record(device_module.current_stream(device))
             events.append(done)
 
         def wait() -> None:

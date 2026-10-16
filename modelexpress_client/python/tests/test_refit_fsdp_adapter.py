@@ -347,6 +347,95 @@ def test_non_dict_tensors_is_rejected(dist_ready):
         _stage(adapter, [torch.ones(2, 4, dtype=torch.bfloat16)])
 
 
+class _FakeEvent:
+    def __init__(self):
+        self.recorded_on = None
+        self.waits = 0
+
+    def record(self, stream):
+        self.recorded_on = stream
+
+    def synchronize(self):
+        self.waits += 1
+
+
+class _FakeDeviceModule:
+    """Stand-in for torch.cuda / torch.xpu that records how it was driven."""
+
+    def __init__(self):
+        self.requested = []
+        self.streams_for = []
+        self.events = []
+
+    def Event(self):
+        event = _FakeEvent()
+        self.events.append(event)
+        return event
+
+    def current_stream(self, device=None):
+        self.streams_for.append(device)
+        return f"stream:{device}"
+
+
+def _unexpected_cuda_call(*args, **kwargs):
+    raise AssertionError("the snapshot fence must not touch the process CUDA device")
+
+
+@pytest.fixture
+def device_module(monkeypatch):
+    module = _FakeDeviceModule()
+
+    def get_device_module(device):
+        module.requested.append(device)
+        return module
+
+    monkeypatch.setattr(f"{ADAPTER}.classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(torch, "get_device_module", get_device_module)
+    return module
+
+
+def test_device_fence_records_on_each_device_stream(device_module):
+    xpu0, xpu1 = torch.device("xpu:0"), torch.device("xpu:1")
+
+    fence = FSDPTrainerAdapter._device_fence([xpu1, xpu0, xpu1])
+
+    # One event per distinct device, each from that device's own module and
+    # recorded on that device's stream rather than the process current stream.
+    assert device_module.requested == [xpu0, xpu1]
+    assert device_module.streams_for == [xpu0, xpu1]
+    assert [e.recorded_on for e in device_module.events] == [
+        "stream:xpu:0",
+        "stream:xpu:1",
+    ]
+
+    assert [e.waits for e in device_module.events] == [0, 0]
+    fence.wait()
+    assert [e.waits for e in device_module.events] == [1, 1]
+
+
+def test_device_fence_ignores_the_process_cuda_device(device_module, monkeypatch):
+    # The fence must come from the device's own module, so a non-CUDA
+    # accelerator never reaches torch.cuda.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_stream", _unexpected_cuda_call)
+    monkeypatch.setattr(torch.cuda, "Event", _unexpected_cuda_call)
+
+    FSDPTrainerAdapter._device_fence([torch.device("xpu:0")]).wait()
+
+    assert device_module.requested == [torch.device("xpu:0")]
+
+
+def test_cpu_snapshot_needs_no_device_fence(dist_ready, device_module):
+    staged = _stage(
+        _adapter(),
+        {"w": torch.ones(2, 4, dtype=torch.bfloat16)},
+        mode=TrainerStagingMode.COPY_TO_DEVICE,
+    )
+    staged.publish_ready.wait()
+
+    assert device_module.requested == []
+
+
 def test_host_staging_without_cuda_rejects_before_allocation(dist_ready, monkeypatch):
     manager = _Manager()
     adapter = _adapter(manager)
