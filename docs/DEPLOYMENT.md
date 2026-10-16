@@ -221,10 +221,14 @@ The CLI client also uses layered configuration: CLI args > env vars > config fil
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | (auto) | Cache path override |
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Use gRPC streaming instead of shared storage |
 | `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `32768` | Transfer chunk size (bytes) |
+| `MODEL_EXPRESS_HF_MAX_RETRIES` | `3` | Retries for transient Hugging Face errors (429, 5xx, dropped connections) per request |
+| `MODEL_EXPRESS_HF_RETRY_BASE_DELAY_MS` | `1000` | Base delay for the exponential backoff between Hugging Face retries (capped at 30s) |
 
 Cache directory resolution for HuggingFace: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CACHE` -> `~/.cache/huggingface/hub`.
 
 Hugging Face token resolution: `HF_TOKEN` -> the token file at `$HF_HOME/token`, default `~/.cache/huggingface/token`. Set `HF_HUB_DISABLE_IMPLICIT_TOKEN` to use `HF_TOKEN` only. `HF_TOKEN_PATH` is not consulted.
+
+Hugging Face downloads retry transient failures (HTTP 408/429/5xx and connection drops) with exponential backoff; partially downloaded files resume instead of restarting. Failures on files that are not needed to run the model (`LICENSE`, `*.md`, and similar) are logged and skipped rather than failing the whole download.
 
 Cache directory resolution for NGC: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `~/.cache/ngc`.
 
