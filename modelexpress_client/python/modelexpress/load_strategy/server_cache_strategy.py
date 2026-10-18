@@ -97,6 +97,10 @@ class ServerCacheStrategy(NativeLoadStrategy):
         ``ModelConfig`` no matter which root this worker would default to. A
         root of None means nothing better than that default is known, which is
         the case for any path that does not follow the cache layout.
+
+        An existing directory with no inventory remains a legacy weight
+        target, not verified metadata. Missing snapshots and known or
+        unreadable inventories still require strict metadata preparation.
         """
         engine_path = getattr(ctx.model_config, "model", None)
         if engine_path:
@@ -104,13 +108,34 @@ class ServerCacheStrategy(NativeLoadStrategy):
             location = model_snapshot.snapshot_location(repo_id, candidate)
             if location is not None:
                 cache_root, commit = location
-                if candidate.is_dir():
-                    return candidate, cache_root
-                # The frontend resolved this path against its own cache; this
-                # node has nothing there yet. Install the commit the directory
-                # names, under the root the path carries -- the default root
-                # would be a snapshot the engine is not going to read.
-                return self._install_metadata(repo_id, commit, cache_root), cache_root
+                inventory_path = model_snapshot.metadata_inventory_path(
+                    candidate.parent.parent, commit
+                )
+                if candidate.is_dir() and not inventory_path.parent.is_symlink():
+                    try:
+                        inventory_path.lstat()
+                    except FileNotFoundError:
+                        logger.debug(
+                            "Using existing snapshot %s for legacy weight loading "
+                            "without a metadata inventory",
+                            candidate,
+                        )
+                        return candidate, cache_root
+                    except OSError as exc:
+                        logger.warning(
+                            "Cannot inspect metadata inventory %s: %s; "
+                            "requiring metadata validation",
+                            inventory_path,
+                            exc,
+                        )
+                prepared = model_prefetch.ensure_resolved_metadata(repo_id, candidate)
+                if prepared is None:
+                    raise StrategyFailed(
+                        f"No local snapshot for {repo_id} and metadata prefetch "
+                        "did not apply",
+                        mutated=False,
+                    )
+                return prepared
             if candidate.is_dir():
                 return candidate, None
 
@@ -147,8 +172,8 @@ class ServerCacheStrategy(NativeLoadStrategy):
 def _repo_id(ctx: LoadContext) -> str | None:
     """Resolve the repo id to ask the server for.
 
-    ``identity.model_name`` is whatever the engine put in ModelConfig, which
-    vLLM overwrites with the resolved local path while parsing engine args.
-    model_prefetch keeps the mapping back to the original repo id.
+    Use the engine's model path because the MX identity may be a logical name.
+    model_prefetch maps resolved cache paths back to their original repo ids.
     """
-    return model_prefetch.repo_id_for(ctx.identity.model_name)
+    model = getattr(ctx.model_config, "model", None) or ctx.identity.model_name
+    return model_prefetch.repo_id_for(model)

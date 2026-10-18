@@ -16,13 +16,28 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    AZURE_STORAGE_ACCOUNT_NAME: str | None
+    AZURE_STORAGE_ACCOUNT_URL: str | None
+    AZURE_STORAGE_CONNECTION_STRING: str | None
+    MX_AZURE_DOWNLOAD_CONCURRENCY: int
+    MX_AZURE_DOWNLOAD_RANGE_BYTES: int
+    MX_AZURE_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
+    MX_AZURE_MAX_POOL_CONNECTIONS: int
+    MX_AZURE_MAX_ATTEMPTS: int
+    MX_AZURE_CONNECTION_TIMEOUT_SECONDS: int
+    MX_AZURE_READ_TIMEOUT_SECONDS: int
     MX_REFIT_CHECKSUM_FORMAT: str
     MX_REFIT_DESIRED_VERSION_UID: str | None
     MX_REFIT_CHECKPOINT_DIR: str | None
     MX_REFIT_DELTA_BUCKET_BYTES: int
+    MX_REFIT_DELTA_SURGICAL: bool
+    MX_REFIT_DEBUG_VALIDATE_PLAN: bool
+    MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT: bool
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
+    MX_REFIT_FULL_STREAMING: bool
+    MX_REFIT_STREAM_WINDOW_LAYERS: int
     MX_REFIT_TIMING: bool
     MX_S3_DOWNLOAD_RANGE_BYTES: int
     MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
@@ -42,8 +57,44 @@ if TYPE_CHECKING:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "AZURE_STORAGE_ACCOUNT_NAME": lambda: (
+        os.environ.get("AZURE_STORAGE_ACCOUNT_NAME", "").strip() or None
+    ),
+    "AZURE_STORAGE_ACCOUNT_URL": lambda: (
+        os.environ.get("AZURE_STORAGE_ACCOUNT_URL", "").strip() or None
+    ),
+    "AZURE_STORAGE_CONNECTION_STRING": lambda: (
+        os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "").strip() or None
+    ),
+    "MX_AZURE_DOWNLOAD_CONCURRENCY": lambda: positive_int_env(
+        "MX_AZURE_DOWNLOAD_CONCURRENCY", 1
+    ),
+    "MX_AZURE_DOWNLOAD_RANGE_BYTES": lambda: positive_int_env(
+        "MX_AZURE_DOWNLOAD_RANGE_BYTES", 4 * 1024**2
+    ),
+    "MX_AZURE_DOWNLOAD_RANGE_THRESHOLD_BYTES": lambda: positive_int_env(
+        "MX_AZURE_DOWNLOAD_RANGE_THRESHOLD_BYTES", 32 * 1024**2
+    ),
+    "MX_AZURE_MAX_POOL_CONNECTIONS": lambda: positive_int_env(
+        "MX_AZURE_MAX_POOL_CONNECTIONS", 32
+    ),
+    "MX_AZURE_MAX_ATTEMPTS": lambda: positive_int_env("MX_AZURE_MAX_ATTEMPTS", 4),
+    "MX_AZURE_CONNECTION_TIMEOUT_SECONDS": lambda: positive_int_env(
+        "MX_AZURE_CONNECTION_TIMEOUT_SECONDS", 20
+    ),
+    "MX_AZURE_READ_TIMEOUT_SECONDS": lambda: positive_int_env(
+        "MX_AZURE_READ_TIMEOUT_SECONDS", 60
+    ),
     "LOCAL_RANK": lambda: (
         int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else None
+    ),
+    "MX_REFIT_DEBUG_VALIDATE_PLAN": lambda: parse_bool(
+        os.environ.get("MX_REFIT_DEBUG_VALIDATE_PLAN", "false"),
+        "MX_REFIT_DEBUG_VALIDATE_PLAN",
+    ),
+    "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT": lambda: parse_bool(
+        os.environ.get("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", "false"),
+        "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT",
     ),
     "MX_REFIT_METADATA_PORT": lambda: require_positive_int(
         int(os.environ.get("MX_REFIT_METADATA_PORT", "7555")),
@@ -137,6 +188,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("MX_S3_TCP_KEEPALIVE", "true"),
         "MX_S3_TCP_KEEPALIVE",
     ),
+    # Install a delta by reloading only the modules it changes.
+    "MX_REFIT_DELTA_SURGICAL": lambda: parse_bool(
+        os.environ.get("MX_REFIT_DELTA_SURGICAL", "false"),
+        "MX_REFIT_DELTA_SURGICAL",
+    ),
+    "MX_REFIT_FULL_STREAMING": lambda: parse_bool(
+        os.environ.get("MX_REFIT_FULL_STREAMING", "false"),
+        "MX_REFIT_FULL_STREAMING",
+    ),
+    # Decoder layers per streamed full-refit request; 0 streams all at once.
+    "MX_REFIT_STREAM_WINDOW_LAYERS": lambda: require_non_negative_int(
+        int(os.environ.get("MX_REFIT_STREAM_WINDOW_LAYERS", 2)),
+        "MX_REFIT_STREAM_WINDOW_LAYERS",
+    ),
     # One normalized timing record per generator refit. On by default: the
     # durations are already being measured on the staging path, so recording
     # them costs a few perf_counter calls and one log line, against a refit
@@ -150,10 +215,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
 }
 
 
+def parse_int(value: str, name: str) -> int:
+    """Parse one integer environment setting."""
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer") from None
+
+
 def require_positive_int(value: int, name: str) -> int:
     """Return ``value`` or raise when it is not positive."""
     if value <= 0:
         raise ValueError(f"{name} must be positive")
+    return value
+
+
+def positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer while retaining its setting name in errors."""
+    return require_positive_int(parse_int(os.environ.get(name, str(default)), name), name)
+
+
+def require_non_negative_int(value: int, name: str) -> int:
+    """Return ``value`` or raise when it is negative."""
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
     return value
 
 

@@ -88,6 +88,8 @@ pub const HF_HUB_OFFLINE: &str = "HF_HUB_OFFLINE";
 /// HuggingFace Hub endpoint override. Read directly by the `hf_hub` crate;
 /// registered here for reference (ModelExpress only sets it in tests).
 pub const HF_ENDPOINT: &str = "HF_ENDPOINT";
+/// Suppresses use of the locally cached HuggingFace token.
+pub const HF_HUB_DISABLE_IMPLICIT_TOKEN: &str = "HF_HUB_DISABLE_IMPLICIT_TOKEN";
 
 // ── NGC ─────────────────────────────────────────────────────────────────────
 /// Base URL for the NGC artifact/download API.
@@ -109,7 +111,9 @@ pub const DEFAULT_NGC_AUTHN_BASE: &str = "https://authn.nvidia.com";
 // ── Redis / metadata backend (server) ───────────────────────────────────────
 /// Selects the metadata backend implementation (`redis`, `kubernetes`, `memory`).
 pub const MX_METADATA_BACKEND: &str = "MX_METADATA_BACKEND";
-/// Full Redis connection URL for the redis metadata backend.
+/// Full Redis connection URL (preferred) for the redis metadata backend.
+pub const MX_REDIS_URL: &str = "MX_REDIS_URL";
+/// Full Redis connection URL alias for charts predating the `MX_` prefix.
 pub const REDIS_URL: &str = "REDIS_URL";
 /// Redis host (preferred) when building the URL from host + port.
 pub const MX_REDIS_HOST: &str = "MX_REDIS_HOST";
@@ -225,6 +229,14 @@ pub fn hf_offline() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the locally cached HuggingFace token must not be used implicitly, via
+/// [`HF_HUB_DISABLE_IMPLICIT_TOKEN`]. Same truthy values as [`hf_offline`].
+pub fn hf_implicit_token_disabled() -> bool {
+    env::var(HF_HUB_DISABLE_IMPLICIT_TOKEN)
+        .map(|v| matches!(v.to_uppercase().as_str(), "1" | "ON" | "YES" | "TRUE"))
+        .unwrap_or(false)
+}
+
 /// NGC API base URL: [`NGC_API_ENDPOINT`] or [`DEFAULT_NGC_API_BASE`].
 pub fn ngc_api_base() -> String {
     env::var(NGC_API_ENDPOINT).unwrap_or_else(|_| DEFAULT_NGC_API_BASE.to_string())
@@ -259,9 +271,9 @@ pub fn metadata_backend() -> String {
     env::var(MX_METADATA_BACKEND).unwrap_or_default()
 }
 
-/// Full Redis URL from [`REDIS_URL`].
+/// Full Redis URL from [`MX_REDIS_URL`], then [`REDIS_URL`].
 pub fn redis_url() -> Option<String> {
-    env::var(REDIS_URL).ok()
+    env::var(MX_REDIS_URL).or_else(|_| env::var(REDIS_URL)).ok()
 }
 
 /// Redis host from [`MX_REDIS_HOST`], then [`REDIS_HOST`].
@@ -368,12 +380,17 @@ mod tests {
         assert_eq!(HF_HUB_CACHE, "HF_HUB_CACHE");
         assert_eq!(HF_HUB_OFFLINE, "HF_HUB_OFFLINE");
         assert_eq!(HF_ENDPOINT, "HF_ENDPOINT");
+        assert_eq!(
+            HF_HUB_DISABLE_IMPLICIT_TOKEN,
+            "HF_HUB_DISABLE_IMPLICIT_TOKEN"
+        );
         assert_eq!(NGC_API_ENDPOINT, "NGC_API_ENDPOINT");
         assert_eq!(NGC_AUTH_ENDPOINT, "NGC_AUTH_ENDPOINT");
         assert_eq!(NGC_API_KEY, "NGC_API_KEY");
         assert_eq!(NGC_CLI_API_KEY, "NGC_CLI_API_KEY");
         assert_eq!(NGC_CLI_HOME, "NGC_CLI_HOME");
         assert_eq!(MX_METADATA_BACKEND, "MX_METADATA_BACKEND");
+        assert_eq!(MX_REDIS_URL, "MX_REDIS_URL");
         assert_eq!(REDIS_URL, "REDIS_URL");
         assert_eq!(MX_REDIS_HOST, "MX_REDIS_HOST");
         assert_eq!(REDIS_HOST, "REDIS_HOST");
@@ -459,6 +476,16 @@ mod tests {
         assert_eq!(redis_host().as_deref(), Some("legacy-host"));
         let _h1 = EnvVarGuard::set(&lock, MX_REDIS_HOST, "mx-host");
         assert_eq!(redis_host().as_deref(), Some("mx-host"));
+
+        let _u1 = EnvVarGuard::remove(&lock, MX_REDIS_URL);
+        let _u2 = EnvVarGuard::set(&lock, REDIS_URL, "redis://legacy:6379/0");
+        assert_eq!(redis_url().as_deref(), Some("redis://legacy:6379/0"));
+        let _u1 = EnvVarGuard::set(&lock, MX_REDIS_URL, "redis://mx:6379/0");
+        assert_eq!(redis_url().as_deref(), Some("redis://mx:6379/0"));
+        let _u2 = EnvVarGuard::remove(&lock, REDIS_URL);
+        assert_eq!(redis_url().as_deref(), Some("redis://mx:6379/0"));
+        let _u1 = EnvVarGuard::remove(&lock, MX_REDIS_URL);
+        assert_eq!(redis_url(), None);
 
         let _n1 = EnvVarGuard::remove(&lock, MX_METADATA_NAMESPACE);
         let _n2 = EnvVarGuard::set(&lock, POD_NAMESPACE, "pod-ns");

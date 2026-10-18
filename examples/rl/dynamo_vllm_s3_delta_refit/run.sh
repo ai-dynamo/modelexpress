@@ -14,7 +14,7 @@ dynamo_frontend_image=${DYNAMO_FRONTEND_IMAGE:?DYNAMO_FRONTEND_IMAGE is required
 k=(kubectl --namespace "$namespace")
 
 echo "Using context $(kubectl config current-context), namespace $namespace"
-"${k[@]}" get secret hf-token-secret mx-minio-creds nvcr-imagepullsecret >/dev/null
+"${k[@]}" get secret hf-token-secret mx-s3-creds nvcr-imagepullsecret >/dev/null
 "${k[@]}" get persistentvolumeclaim shared-model-cache >/dev/null
 
 "${k[@]}" create configmap mx-s3-refit-scripts \
@@ -31,7 +31,7 @@ export WORKER_IMAGE="$worker_image"
 export DYNAMO_FRONTEND_IMAGE="$dynamo_frontend_image"
 
 envsubst < "$here/stack.yaml" | "${k[@]}" apply -f -
-"${k[@]}" rollout status deployment/mx-s3-refit-minio --timeout=5m
+"${k[@]}" rollout status deployment/mx-s3-refit-seaweedfs --timeout=5m
 "${k[@]}" rollout status deployment/mx-s3-refit-server --timeout=5m
 "${k[@]}" wait --for=condition=Ready \
   dynamographdeployment/mx-s3-refit --timeout=20m

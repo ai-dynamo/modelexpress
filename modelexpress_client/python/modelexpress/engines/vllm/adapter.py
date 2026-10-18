@@ -6,13 +6,14 @@
 from __future__ import annotations
 
 import copy
+import gc
+import inspect
 import json
 import logging
 import os
 import tempfile
 import uuid
-from enum import Enum, auto
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Callable, Iterator
 
 import torch
 
@@ -23,6 +24,7 @@ from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...rank_utils import get_global_rank
 from ...tensor_utils import adopt_hidden_tensors, capture_tensor_attrs, collect_module_tensors
+from .host_quantization import refresh_host_quantization_state
 from .source_identity import build_source_identity
 
 logger = logging.getLogger("modelexpress.engines.vllm.adapter")
@@ -40,16 +42,6 @@ _VLLM_POST_RDMA_FINALIZER_NAMES = (
     # hc_attn_fn has received its real weight values.
     "finalize_mhc_broadcast_weights",
 )
-
-# vLLM keeps accelerator-backed attention scales together with host mirrors
-# consumed by backends such as FlashInfer and AITER. Only the accelerator
-# tensors are part of the ModelExpress manifest, so an RDMA target must refresh
-# the mirrors after the received values overwrite its dummy-loaded tensors.
-_VLLM_ATTENTION_SCALE_NAMES: tuple[str, ...] = ("q", "k", "v")
-
-# MTP draft weights live under an "mtp." prefix in the shared checkpoint. The
-# draft's embedding and lm_head come from the target, so these are all it needs.
-_DRAFT_WEIGHT_PREFIXES: tuple[str, ...] = ("mtp.",)
 
 _SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
 
@@ -75,62 +67,113 @@ def _is_speculative_draft(vllm_config, model_config) -> bool:
     return getattr(model_config, "runner_type", None) == "draft"
 
 
-class DraftShardSelection(Enum):
-    """Outcome of picking the draft's own shards out of a checkpoint."""
-
-    SELECTED = auto()
-    NO_DRAFT_WEIGHTS = auto()
-    UNRESOLVED = auto()
-
-
-def _read_local_safetensors_index(directory: str) -> dict | None:
-    """Read model.safetensors.index.json from a local directory."""
-    local_index = os.path.join(directory, _SAFETENSORS_INDEX_NAME)
-    if not os.path.isfile(local_index):
+def _legacy_draft_weight_rule(model) -> Callable[[str], bool] | None:
+    """Bounded compatibility for MTP loaders predating model-owned hooks."""
+    model_type = type(model)
+    module = inspect.getmodule(model_type)
+    if module is None or not module.__name__.startswith("vllm.model_executor.models."):
         return None
-    with open(local_index, encoding="utf-8") as handle:
+    identity = (module.__name__.rsplit(".", 1)[-1], model_type.__name__)
+    if identity in {
+        ("qwen3_5_mtp", "Qwen3_5MTP"),
+        ("qwen3_5_mtp", "Qwen3_5MoeMTP"),
+        ("qwen3_next_mtp", "Qwen3NextMTP"),
+    }:
+        # These legacy load_weights methods also consume the shared embedding/head.
+        return lambda name: not name.startswith("mtp.") and not any(
+            key in name for key in ("embed_tokens", "lm_head")
+        )
+    if identity not in {
+        ("deepseek_mtp", "DeepSeekMTP"),
+        ("glm4_moe_mtp", "Glm4MoeMTP"),
+        ("glm4_moe_lite_mtp", "Glm4MoeLiteMTP"),
+    }:
+        return None
+    # Reuse the installed loader's helper and config, including its draft overrides.
+    select_layer = getattr(module, "get_spec_layer_idx_from_weight_name", None)
+    config = getattr(model, "config", None)
+    layers = getattr(config, "num_nextn_predict_layers", None)
+    base = getattr(config, "num_hidden_layers", None)
+    if (
+        not callable(select_layer)
+        or type(layers) is not int or layers <= 0
+        or type(base) is not int or base < 0
+    ):
+        return None
+    shared = {"lm_head.weight", "model.embed_tokens.weight"} if (
+        model_type.__name__ == "Glm4MoeMTP"
+    ) else set()
+    return lambda name: name not in shared and select_layer(config, name) is None
+
+
+def _target_shared_draft_prefixes(model, vllm_config) -> tuple[str, ...]:
+    """Tensor-name prefixes vLLM swaps for the target's after an MTP draft loads.
+
+    Mirrors the MTP branch of vLLM's proposer ``_maybe_share_embeddings`` /
+    ``_maybe_share_lm_head``: a draft without ``has_own_embed_tokens`` always
+    takes the target's embedding (single pipeline stage), and the base MTP
+    proposer shares the target's ``lm_head`` and each ``shared_head.head``.
+    Step3p5MTP is different: its proposer keeps each layer's own head (older
+    vLLM releases do not mark this with ``has_own_lm_head``). Draft copies
+    replaced by the base proposer are discarded, so they are neither served
+    nor received over P2P; holding them for NIXL
+    would pin memory vLLM frees to size the KV cache. EAGLE drafts carry the
+    ``has_own_*`` attributes and are compared by content, so nothing is
+    dropped for them.
+    """
+    prefixes: list[str] = []
+    parallel = getattr(vllm_config, "parallel_config", None)
+    if (
+        not hasattr(model, "has_own_embed_tokens")
+        and getattr(parallel, "pipeline_parallel_size", 1) == 1
+    ):
+        prefixes.append("model.embed_tokens.")
+    if not hasattr(model, "has_own_lm_head") and type(model).__name__ != "Step3p5MTP":
+        prefixes.append("lm_head.")
+        for name, module in model.named_modules():
+            if name.endswith("shared_head") and hasattr(module, "head"):
+                prefixes.append(f"{name}.head.")
+    return tuple(prefixes)
+
+
+def _read_local_json(directory: str, name: str) -> dict | None:
+    """Read a JSON file by name from a local directory."""
+    path = os.path.join(directory, name)
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
         return json.load(handle)
 
 
-def _read_safetensors_index(model_uri: str) -> dict | None:
-    """Read model.safetensors.index.json from a local dir or object store.
+def _read_json(model_uri: str, name: str) -> dict | None:
+    """Read a JSON file by name from a local dir or object store.
 
-    Returns the parsed index, or None if it cannot be read.
+    Returns the parsed JSON, or None if it cannot be read.
     """
-    index = _read_local_safetensors_index(model_uri)
-    if index is not None:
-        return index
+    local = _read_local_json(model_uri, name)
+    if local is not None:
+        return local
 
     from runai_model_streamer import pull_files
 
     with tempfile.TemporaryDirectory() as tmp:
         # runai's allow_pattern is a glob matched against the full object key,
         # so a bare filename never matches; anchor it with a leading wildcard.
-        pull_files(model_uri, tmp, allow_pattern=[f"*{_SAFETENSORS_INDEX_NAME}"])
+        pull_files(model_uri, tmp, allow_pattern=[f"*{name}"])
         for root, _dirs, files in os.walk(tmp):
-            if _SAFETENSORS_INDEX_NAME in files:
-                with open(
-                    os.path.join(root, _SAFETENSORS_INDEX_NAME), encoding="utf-8"
-                ) as handle:
+            if name in files:
+                with open(os.path.join(root, name), encoding="utf-8") as handle:
                     return json.load(handle)
-    logger.warning(
-        "safetensors index %s not found under %s; draft-shard selection will "
-        "fall back to streaming all shards",
-        _SAFETENSORS_INDEX_NAME,
-        model_uri,
-    )
     return None
 
 
-def _load_safetensors_index(
-    model_uri: str,
-    hf_weights_files: list[str],
+def _read_local_json_near_shards(
+    hf_weights_files: list[str], name: str
 ) -> dict | None:
-    """Read the checkpoint index, preferring the resolved shards' directory.
+    """Read a JSON file from the first resolved shard directory that has it.
 
-    _prepare_weights has already resolved model_uri (which may be an HF repo
-    id) to local shard paths, so the index sits next to them. Fall back to
-    model_uri for shards the streamer hands back as remote object-store paths.
+    _prepare_weights has already resolved model_uri (which may be an HF repo id)
+    to local shard paths, so the index sits next to them.
     """
     seen: set[str] = set()
     for shard in hf_weights_files:
@@ -138,41 +181,98 @@ def _load_safetensors_index(
         if not directory or directory in seen:
             continue
         seen.add(directory)
-        index = _read_local_safetensors_index(directory)
-        if index is not None:
-            return index
-    return _read_safetensors_index(model_uri)
+        found = _read_local_json(directory, name)
+        if found is not None:
+            return found
+    return None
 
 
-def _select_draft_weight_files(
+def _read_safetensors_index(model_uri: str) -> dict | None:
+    """Read model.safetensors.index.json from a local dir or object store."""
+    index = _read_json(model_uri, _SAFETENSORS_INDEX_NAME)
+    if index is None:
+        logger.warning(
+            "safetensors index %s not found under %s; shard selection "
+            "will fall back to streaming all shards",
+            _SAFETENSORS_INDEX_NAME,
+            model_uri,
+        )
+    return index
+
+
+def _load_safetensors_index(
     model_uri: str,
     hf_weights_files: list[str],
-) -> tuple[DraftShardSelection, list[str]]:
-    """Return the shards holding the draft's own weights.
+) -> dict | None:
+    """Read the checkpoint index, preferring the resolved shards' directory,
+    then model_uri for shards the streamer hands back as object-store paths."""
+    local = _read_local_json_near_shards(hf_weights_files, _SAFETENSORS_INDEX_NAME)
+    return local if local is not None else _read_safetensors_index(model_uri)
 
-    Keeps shards whose index tensors carry a draft prefix. Anything other than
-    SELECTED leaves the caller streaming every shard, so a checkpoint without a
-    draft head (or without a readable index) is never truncated to nothing.
+
+def _select_remote_weight_files(
+    model_uri: str,
+    files: list[str],
+    is_unused_weight: Callable[[str], bool],
+) -> list[str]:
+    """Use optional index metadata to skip wholly unused object-store shards.
+
+    A missing, malformed, or incomplete index preserves the original file list.
+    Unknown files are retained. The model-owned predicate is evaluated outside
+    the metadata-error boundary so a broken model rule is never hidden.
     """
     try:
-        index = _load_safetensors_index(model_uri, hf_weights_files)
-        if not index:
-            return DraftShardSelection.UNRESOLVED, []
-        weight_map = index.get("weight_map") or {}
-        wanted = {
-            fname
-            for tname, fname in weight_map.items()
-            if tname.startswith(_DRAFT_WEIGHT_PREFIXES)
-        }
-        if not wanted:
-            return DraftShardSelection.NO_DRAFT_WEIGHTS, []
-        subset = [f for f in hf_weights_files if os.path.basename(f) in wanted]
-        if not subset:
-            return DraftShardSelection.UNRESOLVED, []
-        return DraftShardSelection.SELECTED, subset
+        index = _load_safetensors_index(model_uri, files)
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError("missing weight_map")
+        names = [os.path.basename(path) for path in files]
+        if len(set(names)) != len(names):
+            raise ValueError("ambiguous shard basenames")
+        for tensor_name, shard in weight_map.items():
+            if (
+                not isinstance(tensor_name, str)
+                or not isinstance(shard, str)
+                or not shard
+                or shard != os.path.basename(shard)
+                or shard in (".", "..")
+            ):
+                raise ValueError("invalid index entry")
+        indexed = set(weight_map.values())
+        if not indexed.issubset(names):
+            raise ValueError("index references unresolved shards")
     except Exception as exc:
-        logger.warning("Draft weight-file selection failed: %s", exc)
-        return DraftShardSelection.UNRESOLVED, []
+        logger.warning("Cannot select RunAI shards from checkpoint index: %s", exc)
+        return files
+
+    needed = {
+        shard for name, shard in weight_map.items() if not is_unused_weight(name)
+    }
+    selected = [
+        path
+        for path in files
+        if os.path.basename(path) not in indexed or os.path.basename(path) in needed
+    ]
+    return selected or files
+
+
+def _converge_streamer_files(
+    files: list[str], selected: list[str], distributed: bool
+) -> list[str]:
+    """Distributed RunAI ranks must stream the same union of selected files."""
+    if not distributed or not torch.distributed.is_initialized():
+        return selected
+    from vllm.distributed import get_world_group
+
+    group = get_world_group()
+    selections = [None] * group.world_size
+    torch.distributed.all_gather_object(
+        selections, (files, selected), group=group.cpu_group
+    )
+    if any(original != files for original, _ in selections):
+        return files
+    needed = {path for _, subset in selections for path in subset}
+    return [path for path in files if path in needed]
 
 
 class VllmAdapter(EngineAdapter):
@@ -181,12 +281,17 @@ class VllmAdapter(EngineAdapter):
     def __init__(self, vllm_config, model_config):
         self.vllm_config = vllm_config
         self.model_config = model_config
+        # Resolve the MX name separately from vLLM's model-loading configuration.
+        self._identity_model_config = copy.copy(model_config)
+        self._identity_model_config.model = (
+            envs.MX_MODEL_NAME_OVERRIDE or model_config.model
+        )
         self.load_config = vllm_config.load_config
         self.target_device = self._resolve_target_device()
         self.accelerator_backend = accelerator_backend_for(self.target_device)
 
     def build_identity(self):
-        return build_source_identity(self.vllm_config, self.model_config)
+        return build_source_identity(self.vllm_config, self._identity_model_config)
 
     def get_worker_rank(self) -> int:
         return _get_vllm_worker_rank(self.vllm_config, self.target_device)
@@ -228,7 +333,16 @@ class VllmAdapter(EngineAdapter):
         if result.model is None:
             raise RuntimeError("vLLM tensor discovery requires result.model")
         adopt_hidden_tensors(result.model, self.accelerator_backend)
-        return collect_module_tensors(result.model, self.accelerator_backend)
+        tensors = collect_module_tensors(result.model, self.accelerator_backend)
+        if _is_speculative_draft(self.vllm_config, self.model_config):
+            prefixes = _target_shared_draft_prefixes(result.model, self.vllm_config)
+            if prefixes:
+                tensors = {
+                    name: tensor
+                    for name, tensor in tensors.items()
+                    if not name.startswith(prefixes)
+                }
+        return tensors
 
     def begin_streaming_reload(self, result: LoadResult) -> None:
         if result.model is None:
@@ -285,7 +399,13 @@ class VllmAdapter(EngineAdapter):
         result = self._finalize_model_specific_weights(
             result, _VLLM_POST_RDMA_FINALIZER_NAMES
         )
-        return self._refresh_host_quantization_state(result)
+        result = self._refresh_host_quantization_state(result)
+        # Release idle post-processing storage after the receive is complete,
+        # before later loaders (for example an MTP draft) allocate NCCL buffers.
+        # Live tensors, including registered weight storage, stay allocated.
+        self.accelerator_backend.synchronize()
+        self.accelerator_backend.empty_cache()
+        return result
 
     def apply_weight_iter(
         self,
@@ -315,47 +435,59 @@ class VllmAdapter(EngineAdapter):
         loader = RunaiModelStreamerLoader(load_config)
         revision = getattr(self.model_config, "revision", None)
 
-        if not _is_speculative_draft(self.vllm_config, self.model_config):
+        is_unused_weight = getattr(model, "is_unused_checkpoint_weight", None)
+        rule_source = "vLLM model"
+        if not callable(is_unused_weight) and _is_speculative_draft(
+            self.vllm_config, self.model_config
+        ):
+            is_unused_weight = _legacy_draft_weight_rule(model)
+            rule_source = "legacy vLLM MTP compatibility rule"
+        if not callable(is_unused_weight):
             return loader._get_weights_iterator(model_uri, revision)
 
-        # An MTP draft shares the target's checkpoint but needs only its own
-        # shards. Stream just those so we do not re-read the whole model from
-        # storage for a small head. Fall back to the full set if unrecognized.
+        # Once vLLM's RunAI loader accepts the model-owned rule, delegate the
+        # entire selection path (including distributed agreement) to it.
+        try:
+            supports_rule = "is_unused_weight" in inspect.signature(
+                loader._get_weights_iterator
+            ).parameters
+        except (TypeError, ValueError):
+            supports_rule = False
+        if supports_rule:
+            return loader._get_weights_iterator(
+                model_uri, revision, is_unused_weight
+            )
+
         from vllm.model_executor.model_loader.weight_utils import (
             runai_safetensors_weights_iterator,
         )
+        from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 
-        hf_weights_files = loader._prepare_weights(model_uri, revision)
-        selection, subset = _select_draft_weight_files(model_uri, hf_weights_files)
-        if selection is DraftShardSelection.UNRESOLVED:
-            logger.warning(
-                "[draft] could not resolve draft-only shards from %s for %s; "
-                "streaming all %d shards",
-                _SAFETENSORS_INDEX_NAME,
-                model_uri,
-                len(hf_weights_files),
+        try:
+            from vllm.model_executor.model_loader.weight_utils import (
+                filter_safetensors_files_by_weight_name,
             )
-            return loader._get_weights_iterator(model_uri, revision)
-        if selection is DraftShardSelection.NO_DRAFT_WEIGHTS:
-            logger.info(
-                "[draft] %s for %s contains no mtp. tensors; streaming all "
-                "%d shards",
-                _SAFETENSORS_INDEX_NAME,
-                model_uri,
-                len(hf_weights_files),
-            )
-            return loader._get_weights_iterator(model_uri, revision)
+        except ImportError:
+            filter_safetensors_files_by_weight_name = None
 
+        files = loader._prepare_weights(model_uri, revision)
+        if is_runai_obj_uri(model_uri) or filter_safetensors_files_by_weight_name is None:
+            selected = _select_remote_weight_files(
+                model_uri, files, is_unused_weight
+            )
+        else:
+            selected = filter_safetensors_files_by_weight_name(
+                files, is_unused_weight
+            )
+        selected = _converge_streamer_files(files, selected, loader._is_distributed)
         logger.info(
-            "[draft] streaming %d of %d safetensors shards for draft weights: %s",
-            len(subset),
-            len(hf_weights_files),
-            [os.path.basename(f) for f in subset],
+            "Streaming %d/%d safetensors shards selected by the %s",
+            len(selected),
+            len(files),
+            rule_source,
         )
         return runai_safetensors_weights_iterator(
-            subset,
-            load_config.use_tqdm_on_load,
-            loader._is_distributed,
+            selected, load_config.use_tqdm_on_load, loader._is_distributed
         )
 
     def build_instanttensor_weight_iter(
@@ -404,15 +536,20 @@ class VllmAdapter(EngineAdapter):
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
         from vllm.model_executor.model_loader.utils import initialize_model
 
-        stale_value = result.value
         stale_model = result.model
+        if stale_model is None:
+            raise RuntimeError("vLLM retry reinitialization requires result.model")
         result.value = None
         result.model = None
-        # Unregister before dropping the model: its registrations identify it,
-        # and clearing them frees its parameters before the rebuild allocates.
         self._unregister_model_layers(stale_model)
-        del stale_value
-        del stale_model
+        # Native tensor aliases can retain child modules through weight-loader
+        # callbacks beyond Python GC. Preserve shared parameterless caches,
+        # such as rotary embeddings, while releasing the discarded weights.
+        for module in list(stale_model.modules()):
+            if module is stale_model or module._parameters:
+                module.__dict__.clear()
+        del module, stale_model
+        gc.collect()
         self.accelerator_backend.empty_cache()
         logger.info(
             "[Worker %s] Re-initializing vLLM model after failed strategy",
@@ -442,165 +579,12 @@ class VllmAdapter(EngineAdapter):
             )
         return result
 
-    @torch.no_grad()
     def _refresh_host_quantization_state(self, result: LoadResult) -> LoadResult:
-        """Refresh vLLM host mirrors after RDMA overwrites device scales.
-
-        vLLM's attention PWAL copies ``_q/_k/_v_scale`` into Python floats and,
-        for some backends, CPU tensors whose launch APIs require host scalars.
-        RDMA receives only the registered accelerator tensors, leaving those
-        mirrors at values derived from the target's dummy load. Re-running PWAL
-        is not a safe repair because the incoming model is already in its
-        processed runtime representation; update only the non-transferable
-        mirrors that the selected backend exposes.
-
-        Compressed-tensors may use per-head scales. Match vLLM's own conversion
-        by using their maximum for the scalar host mirror.
-        """
         if result.model is None:
             raise RuntimeError("vLLM RDMA post-load processing requires result.model")
-
-        float_names = tuple(
-            f"_{scale_name}_scale_float"
-            for scale_name in _VLLM_ATTENTION_SCALE_NAMES
+        refresh_host_quantization_state(
+            result.model, self.vllm_config, self.accelerator_backend
         )
-        cpu_names = ("_k_scale_cpu", "_v_scale_cpu")
-        device_names = tuple(
-            f"_{scale_name}_scale" for scale_name in _VLLM_ATTENTION_SCALE_NAMES
-        )
-        required_names = device_names + float_names + ("_o_scale_float",)
-        flashinfer_cache_names = ("bmm1_scale", "bmm2_scale", "o_sf_scale")
-
-        cache_config = getattr(self.vllm_config, "cache_config", None)
-        configured_cache_dtype = getattr(cache_config, "cache_dtype", None)
-        fp8_expected = isinstance(configured_cache_dtype, str) and (
-            configured_cache_dtype.startswith("fp8")
-        )
-
-        # This is a shim over vLLM private attributes, so an upstream scale
-        # contract change must fail the RDMA strategy instead of silently
-        # serving with stale values. Any failure after mutation is recovered by
-        # the outer strategy reinitializing the whole model before fallback.
-        refreshed_values = 0
-        stale_values = 0
-        refreshed_modules = 0
-        for module_name, module in result.model.named_modules():
-            module_label = module_name or type(module).__name__
-            kv_cache_dtype = getattr(module, "kv_cache_dtype", None)
-            if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
-                fp8_expected = True
-
-            host_names = float_names + cpu_names
-            if not any(hasattr(module, name) for name in host_names):
-                continue
-
-            missing_names = [
-                name for name in required_names if not hasattr(module, name)
-            ]
-            if missing_names:
-                raise RuntimeError(
-                    "Incomplete vLLM attention scale contract on "
-                    f"{module_label}: missing {', '.join(missing_names)}"
-                )
-
-            for float_name in float_names:
-                if not isinstance(getattr(module, float_name), float):
-                    raise RuntimeError(
-                        "Invalid vLLM attention host scalar on "
-                        f"{module_label}: {float_name} must be a float"
-                    )
-
-            for cpu_name in cpu_names:
-                if not hasattr(module, cpu_name):
-                    continue
-                cpu_mirror = getattr(module, cpu_name)
-                if (
-                    not isinstance(cpu_mirror, torch.Tensor)
-                    or cpu_mirror.numel() != 1
-                    or not torch.is_floating_point(cpu_mirror)
-                ):
-                    raise RuntimeError(
-                        "Invalid vLLM attention CPU scale on "
-                        f"{module_label}: {cpu_name} must be a floating-point "
-                        "singleton tensor"
-                    )
-
-            impl = getattr(module, "impl", None)
-            initialized_cache_names = []
-            if module._o_scale_float is not None:
-                initialized_cache_names.append("_o_scale_float")
-            initialized_cache_names.extend(
-                cache_name
-                for cache_name in flashinfer_cache_names
-                if hasattr(impl, cache_name) and getattr(impl, cache_name) is not None
-            )
-            if initialized_cache_names:
-                raise RuntimeError(
-                    "vLLM attention host-scale refresh requires a cold-load "
-                    f"state on {module_label}; already initialized: "
-                    f"{', '.join(initialized_cache_names)}"
-                )
-
-            for scale_name, tensor_name in zip(
-                _VLLM_ATTENTION_SCALE_NAMES, device_names, strict=True
-            ):
-                scale = getattr(module, tensor_name)
-                if (
-                    not isinstance(scale, torch.Tensor)
-                    or not self.accelerator_backend.is_accel_tensor(scale)
-                    or scale.numel() == 0
-                    or not torch.is_floating_point(scale)
-                ):
-                    raise RuntimeError(
-                        "Invalid vLLM accelerator attention scale on "
-                        f"{module_label}: {tensor_name} must be a nonempty "
-                        "floating-point accelerator tensor"
-                    )
-
-                scale_float = scale.detach().float()
-                if not bool(torch.isfinite(scale_float).all().item()) or not bool(
-                    (scale_float > 0).all().item()
-                ):
-                    raise RuntimeError(
-                        "Invalid vLLM accelerator attention scale on "
-                        f"{module_label}: {tensor_name} must contain only finite, "
-                        "positive values"
-                    )
-                value = float(scale_float.max().item())
-                float_name = f"_{scale_name}_scale_float"
-                previous = getattr(module, float_name)
-                if previous != value:
-                    stale_values += 1
-                    logger.debug(
-                        "Refreshing vLLM host scale %s.%s: %r -> %r",
-                        module_label,
-                        float_name,
-                        previous,
-                        value,
-                    )
-                setattr(module, float_name, value)
-
-                cpu_mirror = getattr(module, f"_{scale_name}_scale_cpu", None)
-                if isinstance(cpu_mirror, torch.Tensor):
-                    cpu_mirror.fill_(value)
-
-                refreshed_values += 1
-            refreshed_modules += 1
-
-        if fp8_expected and not refreshed_modules:
-            raise RuntimeError(
-                "FP8 KV cache requires recognizable vLLM q/k/v host scale state, "
-                "but no attention module was refreshed"
-            )
-
-        if refreshed_values:
-            logger.info(
-                "Refreshed %d vLLM host attention scales across %d modules "
-                "after RDMA receive (%d stale dummy values replaced)",
-                refreshed_values,
-                refreshed_modules,
-                stale_values,
-            )
         return result
 
     def _finalize_model_specific_weights(

@@ -12,6 +12,7 @@ import pytest
 import torch.nn as nn
 
 from modelexpress.adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
+from modelexpress.engines.vllm.adapter import VllmAdapter
 from modelexpress.load_strategy import LoadResult
 from modelexpress_rl import (
     ObjectStorageSource,
@@ -62,8 +63,9 @@ def _version(
     base=None,
     model_name="test-model",
     state=WeightVersionState.READY,
-):
+) -> WeightVersion:
     return WeightVersion(
+        trainer_mesh_generation=0,
         version_id=uid,
         model_name=model_name,
         payload_format=payload_format,
@@ -72,7 +74,6 @@ def _version(
             storage_type=ObjectStorageType.S3,
             uri=f"s3://weights/{uid}/model.safetensors.index.json",
         ),
-        expected_source_slots=(),
         layout_signature="layout",
         state=state,
         created_at_unix_ms=1,
@@ -270,14 +271,34 @@ def test_desired_p2p_is_skipped_without_desired_version(monkeypatch):
     assert DesiredVersionP2PStrategy().is_available(_context()) is False
 
 
-def test_desired_p2p_uses_exact_revision(monkeypatch):
+def test_desired_p2p_requires_a_tensor_read_lease():
+    assert DesiredVersionP2PStrategy.requires_tensor_read_lease is True
+
+
+@pytest.mark.parametrize("model_name", [None, "mx_model_abc"])
+def test_desired_p2p_uses_exact_revision(monkeypatch, model_name):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
+    if model_name is None:
+        monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
+    else:
+        monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", model_name)
+    model_path = "/root/.cache/vllm/assets/model_streamer/0088a9aa"
     ctx = _context()
+    adapter = VllmAdapter(
+        SimpleNamespace(
+            parallel_config=SimpleNamespace(),
+            load_config=SimpleNamespace(device="cuda:0"),
+        ),
+        SimpleNamespace(model=model_path, dtype="bfloat16", quantization=None),
+    )
+    ctx.identity = adapter.build_identity()
     result = LoadResult(value=nn.Linear(1, 1))
     client = MagicMock()
     client.__enter__.return_value = client
     client.get_weight_version.return_value = _version(
-        "version-7", WeightPayloadFormat.FULL_HF_CHECKPOINT
+        "version-7",
+        WeightPayloadFormat.FULL_HF_CHECKPOINT,
+        model_name=model_name or model_path,
     )
 
     with patch(

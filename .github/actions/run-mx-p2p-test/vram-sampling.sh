@@ -16,9 +16,10 @@ sample_peak_vram() {
   local samples="${!samples_var}"
 
   if [ -z "${pod}" ]; then
-    pod="$(kubectl get pods -n "${NAMESPACE}" \
+    pod="$(ci_kubectl get pods -n "${NAMESPACE}" \
       -l "${selector}" \
-      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+      --field-selector=status.phase!=Failed \
+      -o json | jq -r '.items[0].metadata.name // empty')"
   fi
   if [ -z "${pod}" ]; then
     return 0
@@ -72,12 +73,11 @@ wait_for_health() {
     measure_vram=true
   fi
 
-  local deadline failed pod
+  local deadline pod
   deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
-    pod="$(kubectl get pods -n "${NAMESPACE}" \
-      -l "${selector}" \
-      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    pod="$(ci_workload_pods "${label}" "${container}" "${selector}" \
+      | jq -r '.items[0].metadata.name // empty')" || return 1
     printf -v "${pod_var}" '%s' "${pod}"
 
     if [ "${measure_vram}" = "true" ]; then
@@ -85,16 +85,9 @@ wait_for_health() {
         "${pod_var}" "${peak_var}" "${samples_var}" "${final_var}"
     fi
     if [ -n "${pod}" ] && kubectl exec -n "${NAMESPACE}" "${pod}" -c "${container}" -- \
-         curl -sf -m 5 "http://localhost:${port}/health" >/dev/null 2>&1; then
+         curl -sf -m 5 "http://localhost:${port}/health" >/dev/null; then
       echo "${label} ${pod} /health returned 200."
       break
-    fi
-
-    failed="$(kubectl get pods -n "${NAMESPACE}" -l "${selector}" --no-headers 2>/dev/null \
-      | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)"
-    if [ -n "${failed}" ]; then
-      echo "ERROR: ${label} pod entered failure state before /health returned 200: ${failed}"
-      exit 1
     fi
 
     echo "${label} /health not ready yet (pod=${pod:-<not-created>})..."
@@ -107,7 +100,7 @@ wait_for_health() {
   fi
   pod="${!pod_var}"
   if [ -z "${pod}" ] || ! kubectl exec -n "${NAMESPACE}" "${pod}" -c "${container}" -- \
-       curl -sf -m 5 "http://localhost:${port}/health" >/dev/null 2>&1; then
+       curl -sf -m 5 "http://localhost:${port}/health" >/dev/null; then
     echo "ERROR: ${label} /health did not return 200 within ${timeout}s${timeout_detail}"
     exit 1
   fi

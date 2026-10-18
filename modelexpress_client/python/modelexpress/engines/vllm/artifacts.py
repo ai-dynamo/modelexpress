@@ -19,8 +19,7 @@ from ...load_strategy.context import LoadContext
 from ...metadata import artifact_lifecycle as _artifact_lifecycle
 from ...metadata.artifact_transfer import (
     ArtifactCacheRoot,
-    P2PArtifactTransfer,
-    PublishedArtifactSource,
+    ArtifactTransfer,
     cute_dsl_cache_artifact_transfer,
     deep_gemm_cache_artifact_transfer,
     flashinfer_cache_artifact_transfer,
@@ -28,6 +27,7 @@ from ...metadata.artifact_transfer import (
     triton_cache_artifact_transfer,
     torch_compile_cache_artifact_transfer,
 )
+from ...metadata.artifact_transport import PublicationHandle
 from ...metadata.publisher import PublisherThread
 
 logger = logging.getLogger("modelexpress.engines.vllm.artifacts")
@@ -35,7 +35,7 @@ logger = logging.getLogger("modelexpress.engines.vllm.artifacts")
 _DEFAULT_READY_URL = "http://127.0.0.1:8000/health"
 _CACHE_SETTLE_SECS = _artifact_lifecycle.CACHE_SETTLE_SECS
 
-_published_sources: dict[tuple[int, int], PublishedArtifactSource] = {}
+_published_sources: dict[tuple[int, int], PublicationHandle] = {}
 _scheduled_publishers: dict[tuple[int, int], PublisherThread] = {}
 # torch.compile cache directories created by an install, keyed by device id.
 # Values are POSIX-style paths relative to the torch.compile cache root, at every
@@ -59,10 +59,10 @@ def install_vllm_cache_artifacts(ctx: LoadContext) -> None:
         if _artifact_transfer_enabled()
         else frozenset()
     )
-    transfers: list[tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]] = []
+    transfers: list[tuple[ArtifactTransfer, p2p_pb2.SourceIdentity]] = []
 
     def transfers_factory() -> list[
-        tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]
+        tuple[ArtifactTransfer, p2p_pb2.SourceIdentity]
     ]:
         if not transfers:
             transfers.extend(_vllm_artifact_transfers(ctx))
@@ -89,7 +89,7 @@ def install_vllm_cache_artifacts(ctx: LoadContext) -> None:
 
 
 def _record_vllm_cache_install(
-    transfer: P2PArtifactTransfer,
+    transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
     before: frozenset[str],
 ) -> None:
@@ -103,7 +103,7 @@ def _record_vllm_cache_install(
 
 
 def _compile_cache_install_receipt_path(
-    transfer: P2PArtifactTransfer,
+    transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
 ) -> Path:
     return _artifact_lifecycle.artifact_marker_path(
@@ -112,7 +112,7 @@ def _compile_cache_install_receipt_path(
 
 
 def _read_compile_cache_install_receipt(
-    transfer: P2PArtifactTransfer,
+    transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
 ) -> frozenset[str]:
     try:
@@ -250,10 +250,10 @@ def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
 
 def _install_vllm_cache_artifact_once(
     ctx: LoadContext,
-    transfer: P2PArtifactTransfer,
+    transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
 ):
-    """Compatibility wrapper for the shared install-once operation."""
+    """Install one vLLM cache artifact through the shared lifecycle."""
     return _artifact_lifecycle.install_artifact_once(
         ctx,
         transfer,
@@ -264,10 +264,10 @@ def _install_vllm_cache_artifact_once(
 
 def _publish_vllm_cache_artifact(
     ctx: LoadContext,
-    transfer: P2PArtifactTransfer,
+    transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
-):
-    """Compatibility wrapper for the shared source publication operation."""
+) -> PublicationHandle:
+    """Publish one vLLM cache artifact through the selected transport."""
     if transfer.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE:
         # Runs on the publisher thread, which is gated on engine readiness, so
         # compilation has finished and vLLM's cache_dir is populated. Never let
@@ -297,7 +297,7 @@ def _artifact_transfer_enabled() -> bool:
 
 def _vllm_artifact_transfers(
     ctx: LoadContext,
-) -> list[tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]]:
+) -> list[tuple[ArtifactTransfer, p2p_pb2.SourceIdentity]]:
     bundle_root = _bundle_root(ctx)
     torch_compile_cache_root = _torch_compile_cache_root()
     triton_cache_root = _triton_cache_root()

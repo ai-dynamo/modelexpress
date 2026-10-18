@@ -13,6 +13,7 @@ from typing import Any
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClient
 
+from .. import envs as rl_envs
 from ..control import WeightVersion
 
 from .adapter import GeneratorEngineContext
@@ -24,7 +25,9 @@ from .methods import (
 from .nixl_staged_transfer import _NixlStagedTransfer
 from .plan import (
     EngineInstaller,
+    PreparedStreamingTensors,
     SourceResolver,
+    StreamingSettings,
     UpdateMethod,
     WeightSource,
     WeightUpdatePlanner,
@@ -49,7 +52,10 @@ class FullTensorEngineCapability:
     device: Any
     # Rank in the engine's weight-transfer group; peer selection matches it.
     worker_rank: int
+    # capture_layout transfers ownership of its returned capture and layout
+    # to the update plan; it must not mutate them after returning.
     capture_layout: Callable
+    generator_fingerprint: Callable[[], tuple]
     runtime_tensors: dict[str, Any] | None
     source_worker_id: str | None
     unpublish_runtime_tensors: Callable[[], None]
@@ -100,6 +106,8 @@ class GeneratorRuntime:
         if self._closed:
             return
         for method in self.methods:
+            method.validate_close()
+        for method in self.methods:
             try:
                 method.close()
             except Exception:
@@ -133,7 +141,9 @@ def _resolve_source_order(
                 "inference P2P state is unavailable; using object storage only"
             )
             return tuple(
-                source for source in source_order if source is not WeightSource.GENERATOR
+                source
+                for source in source_order
+                if source is not WeightSource.GENERATOR
             )
         return source_order
     if object_storage is not None:
@@ -167,8 +177,7 @@ def _validate_source_order(
     for source in source_order:
         if source not in supported_sources:
             raise ValueError(
-                f"{type(engine_context).__name__} does not support "
-                f"{source.value} refit"
+                f"{type(engine_context).__name__} does not support {source.value} refit"
             )
 
 
@@ -176,16 +185,19 @@ def _create_load_time_tensor_method(
     *,
     capability: FullTensorEngineCapability,
     worker_id: str,
+    streaming: StreamingSettings | None = None,
 ) -> LoadTimeTensorNixlUpdateMethod:
     transfer = _NixlStagedTransfer(
         agent_name=f"mx-refit-load-time-{worker_id}",
+        streaming=streaming,
         device_id=capability.device_id,
         device=capability.device,
         listen_port=None,
+        capture_layout=capability.capture_layout,
+        generator_fingerprint=capability.generator_fingerprint,
     )
     return LoadTimeTensorNixlUpdateMethod(
         transfer=transfer,
-        capture_layout=capability.capture_layout,
     )
 
 
@@ -202,6 +214,8 @@ def _create_runtime_tensor_method(
         device_id=capability.device_id,
         device=capability.device,
         manager=capability.nixl_manager,
+        capture_layout=capability.capture_layout,
+        generator_fingerprint=capability.generator_fingerprint,
     )
     return RuntimeTensorNixlUpdateMethod(
         transfer=transfer,
@@ -233,7 +247,6 @@ def _create_resolvers(
                     worker_id=capability.source_worker_id,
                     worker_rank=capability.worker_rank,
                     build_identity=capability.build_identity,
-                    rpc_timeout_seconds=rpc_timeout_seconds,
                 )
             )
         elif source is WeightSource.TRAINER:
@@ -281,9 +294,8 @@ def initialize_generator_runtime(
     rpc_timeout_seconds: float,
     service: Callable,
     start_lease: Callable[[str], Any],
-    resolve_replay_chain: Callable[
-        [str, bool], tuple[WeightVersion, ...]
-    ]
+    streaming: StreamingSettings | None = None,
+    resolve_replay_chain: Callable[[str, bool], tuple[WeightVersion, ...]]
     | None = None,
 ) -> GeneratorRuntime:
     """Resolve construction policy and build one rank-local runtime."""
@@ -301,18 +313,28 @@ def initialize_generator_runtime(
         object_storage=object_storage,
         source_order=resolved_source_order,
     )
+    if (
+        streaming is not None
+        and WeightSource.TRAINER in resolved_source_order
+        and PreparedStreamingTensors not in engine.installer.capabilities.artifact_types
+    ):
+        raise ValueError("engine does not support bounded streaming installation")
     methods: list[UpdateMethod] = []
     p2p_client = None
+    canonical_method = None
     try:
         if WeightSource.OBJECT_STORAGE in resolved_source_order:
             if object_storage is None:
                 raise ValueError("object storage source requires configuration")
-            methods.append(
-                CanonicalDeltaUpdateMethod(
-                    model_name=engine.model_name,
-                    config=object_storage,
-                )
+            canonical_method = CanonicalDeltaUpdateMethod(
+                model_name=engine.model_name,
+                config=object_storage,
+                stream_full_checkpoints=(
+                    rl_envs.MX_REFIT_FULL_STREAMING
+                    and engine.installer.capabilities.streamed_checkpoints
+                ),
             )
+            methods.append(canonical_method)
         if any(
             source in {WeightSource.GENERATOR, WeightSource.TRAINER}
             for source in resolved_source_order
@@ -326,6 +348,7 @@ def initialize_generator_runtime(
                         _create_load_time_tensor_method(
                             capability=engine.full_tensor,
                             worker_id=worker_id,
+                            streaming=streaming,
                         )
                     )
                 if WeightSource.GENERATOR in resolved_source_order:
@@ -362,7 +385,7 @@ def initialize_generator_runtime(
                 p2p_client = None
                 resolved_source_order = (WeightSource.OBJECT_STORAGE,)
         method_tuple = tuple(methods)
-        replay_from_full_root = {
+        force_full_root = {
             WeightSource.GENERATOR,
             WeightSource.OBJECT_STORAGE,
         }.issubset(resolved_source_order)
@@ -383,12 +406,17 @@ def initialize_generator_runtime(
                     max_transfer_attempts=max_transfer_attempts,
                 ),
                 start_lease=start_lease,
+                streaming=streaming,
                 resolve_replay_chain=(
                     None
                     if resolve_replay_chain is None
                     else lambda version: resolve_replay_chain(
                         version.version_id,
-                        replay_from_full_root,
+                        force_full_root
+                        or (
+                            canonical_method is not None
+                            and canonical_method.requires_full_root
+                        ),
                     )
                 ),
             ),

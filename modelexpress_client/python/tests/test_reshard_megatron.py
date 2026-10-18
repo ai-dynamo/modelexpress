@@ -104,7 +104,7 @@ def test_megatron_target_lowers_to_destination_owned_bytes(
 
     plan = plan_transfer(capture, sources)
 
-    assert plan.fallback == []
+    assert not plan.fallback
     assert plan.bytes_planned() == expected_bytes
     assert len(plan.segments) == expected_segments
     assert layouts["expert_fc1"][0] == (16 // tp_size, 8)

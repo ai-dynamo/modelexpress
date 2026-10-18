@@ -18,9 +18,12 @@ pull.
 Design notes:
   * Framework-neutral: the caller supplies the model (ideally a disposable
     ``meta`` twin) and the framework's default weight-loader; no engine import.
-  * Per-source isolation: we bake one source tensor at a time, so unsupported
-    geometry is attributed to the specific source before the receiver fails the
-    update. It never produces an incorrect partial plan.
+  * Bulk capture amortizes model-wide loader setup, then retries one source at a
+    time when an unsupported operation interrupts it, so unsupported geometry is
+    still attributed to the specific source before the receiver fails the update.
+    It never produces an incorrect partial plan: the interrupted attempt rolls
+    back every recorder accumulator (``_BakeRecorder.attempt``), so the retry
+    starts from exactly the state the bulk attempt began with.
   * Allowlist of pure view/slice ops; anything else (arithmetic, .to/.float,
     bool-mask indexing) lands in ``__torch_dispatch__`` and raises
     ``UnsupportedReshard`` for that source, not wrong bytes.
@@ -30,7 +33,8 @@ from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -92,7 +96,8 @@ _SUPPORTED_OPS: dict[Callable, str] = {
 
 
 def _freeze_kwargs(kwargs: dict[str, Any]) -> tuple:
-    return tuple(sorted(kwargs.items()))
+    return tuple((name, tuple(value) if isinstance(value, list) else value)
+                 for name, value in sorted(kwargs.items()))
 
 
 @dataclass
@@ -102,6 +107,24 @@ class _BakeRecorder:
     # Set by the loader stamp to the destination param's full name so copy_ can
     # attribute the write.
     current: Any = None
+
+    @contextmanager
+    def attempt(self) -> Iterator[None]:
+        """Run a capture attempt whose records are discarded unless it completes.
+
+        Every mutable accumulator on this recorder must be restored here. A field
+        added to this class without being restored would let an abandoned attempt
+        contribute to the next one.
+        """
+        copies = len(self.copies)
+        unattributed, current = self.unattributed, self.current
+        try:
+            yield
+        except BaseException:
+            del self.copies[copies:]
+            self.unattributed = unattributed
+            self.current = current
+            raise
 
 
 class LazyWeight(torch.Tensor):
@@ -182,10 +205,19 @@ class LazyWeight(torch.Tensor):
 
     @classmethod
     def _intercept(cls, self_, func, op_name, args, kwargs):
+        if op_name == "__getitem__":
+            index = args[0]
+            indices = index if isinstance(index, tuple) else (index,)
+            if any(not isinstance(item, (int, slice, type(Ellipsis), type(None)))
+                   for item in indices):
+                raise UnsupportedReshard("advanced indexing is unsupported")
         meta = self_._meta()
         with torch._C.DisableTorchFunctionSubclass():
             meta_result = func(meta, *args, **kwargs)
-        base_op = (op_name, tuple(args), _freeze_kwargs(kwargs))
+        base_op = (
+            op_name, tuple(tuple(arg) if isinstance(arg, list) else arg for arg in args),
+            _freeze_kwargs(kwargs),
+        )
         if isinstance(meta_result, torch.Tensor):
             return self_._child(meta_result.shape, meta_result.dtype, base_op)
         if isinstance(meta_result, (tuple, list)):
@@ -307,7 +339,7 @@ def capture_weights(
     pre-built ``weights`` against ``model`` (ideally a disposable meta twin).
 
     Args:
-        model: the engine model exposing ``load_weights([(name, tensor)])`` and
+        model: the engine model exposing ``load_weights([(name, tensor), ...])`` and
             per-param ``weight_loader`` hooks. Should be on ``meta`` so no real
             storage is touched.
         weights: ``{name: LazyWeight}`` from :func:`build_lazy_weights` (optionally
@@ -324,18 +356,27 @@ def capture_weights(
     unsupported: list[str] = []
     unsupported_reasons: dict[str, str] = {}
     try:
-        # One source at a time: a single unsupported loader is attributed only
-        # to that tensor, never the whole bake. Fused params (qkv/gate_up) still
-        # resolve - each source writes its own sub-region of the persistent (meta)
-        # dest param across separate calls. A converted lazy's ``_name`` is the
-        # original published source, so that is what an unsupported placement names.
-        for name, tensor in weights.items():
-            source = getattr(tensor, "_name", name)
-            try:
-                model.load_weights([(name, tensor)])
-            except UnsupportedReshard as exc:
-                unsupported.append(source)
-                unsupported_reasons[source] = str(exc)
+        # Large MoE loaders rebuild model-wide parameter/expert maps on entry.
+        # LazyWeights carry their own source identity across one bulk invocation.
+        try:
+            with recorder.attempt():
+                model.load_weights(list(weights.items()))
+        except UnsupportedReshard as bulk_error:
+            # The per-source retry can succeed for every source even when bulk
+            # order trips a loader, which would otherwise leave `unsupported`
+            # empty and hide a bulk-only incompatibility entirely.
+            logger.warning(
+                "reshard capture: bulk load_weights raised, retrying per source; "
+                "bulk cause: %s",
+                bulk_error,
+            )
+            for name, tensor in weights.items():
+                source = getattr(tensor, "_name", name)
+                try:
+                    model.load_weights([(name, tensor)])
+                except UnsupportedReshard as exc:
+                    unsupported.append(source)
+                    unsupported_reasons[source] = str(exc)
     finally:
         _restore_stamps(saved)
 

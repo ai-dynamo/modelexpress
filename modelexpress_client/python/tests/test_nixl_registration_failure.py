@@ -43,6 +43,9 @@ class FakeManager:
     def register_arena(self, arena, tensors):
         raise RuntimeError("NIXL_ERR_BACKEND")
 
+    def register_additional_tensors(self, tensors):
+        raise RuntimeError("NIXL_ERR_BACKEND")
+
     def shutdown(self):
         self.shutdown_calls += 1
         if self.shutdown_raises:
@@ -52,6 +55,8 @@ class FakeManager:
 def _ctx():
     return SimpleNamespace(
         p2p_enabled=True,
+        p2p_role="main",
+        shared_nixl_manager=None,
         global_rank=0,
         worker_rank=0,
         device_id=0,
@@ -134,4 +139,17 @@ def test_shutdown_failure_still_clears_the_manager(patched):
     with patch.object(base, "_init_nixl_manager", return_value=manager):
         base.register_tensors(MagicMock(), ctx, reuse_discovered=True)
 
+    assert ctx.nixl_manager is None
+
+
+def test_failed_draft_registration_keeps_the_shared_manager(patched):
+    """A draft registers into the main load's agent, which it must not shut down."""
+    shared = FakeManager()
+    ctx = _ctx()
+    ctx.p2p_role = "draft"
+    ctx.shared_nixl_manager = shared
+
+    base.register_tensors(MagicMock(), ctx, reuse_discovered=True)
+
+    assert shared.shutdown_calls == 0, "the main load still serves from this agent"
     assert ctx.nixl_manager is None

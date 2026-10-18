@@ -11,7 +11,7 @@ Runs after .github/actions/run-mx-dynamo-test has:
   5. Waited for both workers to publish (i.e. the second one completed RDMA)
 
 Asserts:
-  1. Exactly 2 ModelMetadata CRs exist in the test namespace, covering source
+  1. Exactly 2 weight-source ModelMetadata CRs exist in the test namespace, covering source
      ranks 0 and 1 (matches our existing P2P test plumbing — the worker_rank
      filter is what gates rank pairing in rdma_strategy.py).
   2. The second worker actually pulled weights via NIXL RDMA (not via the
@@ -33,7 +33,7 @@ import subprocess
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from kube_utils import kubectl, port_forward
+from kube_utils import completion_response, kubectl, port_forward
 
 
 # Service + label conventions are set by the dynamo operator from the DGD spec:
@@ -98,10 +98,13 @@ def test_modelmetadata_crs_published(namespace: str, expected_cr_count: int) -> 
     """
     result = kubectl(
         "get", "modelmetadata",
-        "-o", "jsonpath={range .items[*]}{.metadata.name}{\" \"}{.spec.worker_rank}{\"\\n\"}{end}",
+        "-o", "jsonpath={range .items[*]}{.metadata.name}{\" \"}{.spec.worker_rank}{\"|\"}{.spec.sourceType}{\"\\n\"}{end}",
         namespace=namespace,
     )
-    rows = [line for line in result.stdout.splitlines() if line.strip()]
+    rows = [
+        line.rsplit("|", 1)[0] for line in result.stdout.splitlines()
+        if line.strip() and line.rsplit("|", 1)[-1] in ("", "weights")
+    ]
     print(f"[modelmetadata] {len(rows)} CR(s):")
     for row in rows:
         print(f"  {row}")
@@ -172,8 +175,7 @@ def _send_completion(port: int, model: str, index: int) -> str:
     # warm responses complete in seconds. Using the same timeout for every
     # call keeps the code simple — the wall-clock cost is dominated by the
     # cold start either way.
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        body = json.loads(resp.read())
+    body = completion_response(req)
     choices = body.get("choices", [])
     assert choices, f"Request {index}: no choices in response: {body}"
     text = choices[0].get("text", "")
