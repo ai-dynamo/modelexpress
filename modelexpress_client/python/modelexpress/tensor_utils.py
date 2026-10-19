@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import types
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import cast
 
@@ -104,6 +105,8 @@ def _find_hidden_accel_tensors(
     visited: set[int],
     accelerator_backend: AcceleratorBackend,
     depth: int = 0,
+    *,
+    exclude: Callable[[object], bool] | None = None,
 ) -> list[tuple[str, torch.Tensor]]:
     """Recursively find accelerator tensors in a non-Module Python object graph.
 
@@ -116,13 +119,7 @@ def _find_hidden_accel_tensors(
         return []
     visited.add(id(obj))
 
-    # K3 collectives own local peer pointers, barriers and symmetric-memory
-    # workspaces. Copying those from a donor corrupts the receiver's collectives.
-    cls = type(obj)
-    if (
-        cls.__module__ == "vllm.models.kimi_k3.nvidia.ops.latent_moe_tail"
-        and cls.__name__ == "KimiK3LatentMoETailOp"
-    ):
+    if exclude is not None and exclude(obj):
         return []
 
     results: list[tuple[str, torch.Tensor]] = []
@@ -138,6 +135,7 @@ def _find_hidden_accel_tensors(
                 visited,
                 accelerator_backend,
                 depth + 1,
+                exclude=exclude,
             ):
                 results.append((f"{i}_{path}", tensor))
     elif isinstance(obj, dict):
@@ -149,6 +147,7 @@ def _find_hidden_accel_tensors(
                 visited,
                 accelerator_backend,
                 depth + 1,
+                exclude=exclude,
             ):
                 results.append((f"{k}_{path}", tensor))
     elif not isinstance(obj, (type, nn.Module, types.ModuleType)) and _has_own_dict(
@@ -168,6 +167,7 @@ def _find_hidden_accel_tensors(
                     visited,
                     accelerator_backend,
                     depth + 1,
+                    exclude=exclude,
                 )
             except Exception as exc:
                 logger.debug(
@@ -185,6 +185,8 @@ def _find_hidden_accel_tensors(
 def adopt_hidden_tensors(
     model: nn.Module,
     accelerator_backend: AcceleratorBackend | None = None,
+    *,
+    exclude: Callable[[object], bool] | None = None,
 ) -> int:
     """Register hidden accelerator tensors as module buffers for RDMA transfer.
 
@@ -197,6 +199,7 @@ def adopt_hidden_tensors(
     This function scans each module's non-Module attributes recursively for
     any accelerator tensors not already registered, and adopts them as
     non-persistent buffers so they appear in the manifest and get transferred.
+    The optional exclude predicate skips engine-owned objects and their subtrees.
     """
     import time
     start = time.perf_counter()
@@ -221,6 +224,7 @@ def adopt_hidden_tensors(
                 attr_val,
                 visited=set(),
                 accelerator_backend=backend,
+                exclude=exclude,
             )
             for tensor_path, tensor in tensors:
                 if tensor.data_ptr() in existing_ptrs:

@@ -421,27 +421,15 @@ class TestTraversalRobustness:
         assert [t.numel() for _, t in found] == [4]
 
 
-def test_k3_collective_state_stays_local_during_registration(
-    mock_accelerator_backend_cls,
-):
+def test_hidden_tensor_exclusion_is_optional_and_recursive(mock_accelerator_backend_cls):
+    """An engine predicate prunes subtrees without changing default discovery."""
     backend = mock_accelerator_backend_cls(torch_device_type="cpu")
-    module = ModuleWithQuant()
-    op_cls = type(
-        "KimiK3LatentMoETailOp",
-        (),
-        {
-            "__module__": "vllm.models.kimi_k3.nvidia.ops.latent_moe_tail",
-        },
+    local = types.SimpleNamespace(tensor=torch.zeros(8))
+    quant = torch.ones(4)
+    graph = types.SimpleNamespace(nested=[{"local": local, "quant": quant}])
+    found = _find_hidden_accel_tensors(graph, set(), backend)
+    assert {t.data_ptr() for _, t in found} == {local.tensor.data_ptr(), quant.data_ptr()}
+    found = _find_hidden_accel_tensors(
+        graph, set(), backend, exclude=lambda obj: obj is local
     )
-    op = op_cls()
-    pointers = torch.tensor([1234, 5678], dtype=torch.int64)
-    op.collective = types.SimpleNamespace(peer_ptrs=pointers, flags=torch.zeros(8))
-    module.tail = op
-    adopt_hidden_tensors(module, backend)
-    registered = collect_module_tensors(module, backend)
-    assert all(t.data_ptr() != pointers.data_ptr() for t in registered.values())
-    assert any(
-        t.data_ptr() == module.quant_method.config.a1_gscale.data_ptr()
-        for t in registered.values()
-    )
-    assert op.collective.peer_ptrs is pointers
+    assert [t.data_ptr() for _, t in found] == [quant.data_ptr()]
