@@ -39,6 +39,7 @@ def _convert(weights):
 def _fixture(monkeypatch):
     model = _OverlappingModel()
     installer = _persistent_installer(monkeypatch, model)
+    installer._debug_validate_generator_layout = True
     installer._convert_native_to_hf = _convert
     source = torch.arange(6.0).reshape(3, 2)
     manifest = [("trainer.weight", source.dtype, tuple(source.shape))]
@@ -49,7 +50,7 @@ def _fixture(monkeypatch):
 def test_combined_conversion_replay_matches_direct_loader(monkeypatch, bounded):
     model, installer, source, manifest = _fixture(monkeypatch)
     original = [(value, value.data_ptr()) for value in model.buffers()]
-    captured, layout = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    captured, layout = installer.capture(manifest)
     assert [copy.src_name for copy in captured.copies] == ["trainer.weight"] * 2
     assert [copy.param_name for copy in captured.copies] == ["b", "a"]
     assert all(copy.op_chain for copy in captured.copies)
@@ -67,18 +68,14 @@ def test_combined_conversion_replay_matches_direct_loader(monkeypatch, bounded):
 
 def test_combined_capture_reuse_keeps_schedule_and_snapshot(monkeypatch):
     model, installer, _, manifest = _fixture(monkeypatch)
-    captured, layout = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    captured, layout = installer.capture(manifest)
     plan = installer.source_install_plan
     generation = captured.generation
     captured.copies.clear()
     layout.clear()
-    # Same generation must not inspect compatibility metadata at all.
-    original_key = installer._capture_key
-    monkeypatch.setattr(installer, "_capture_key", lambda _: pytest.fail("deep check"))
-    reused, reused_layout = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    reused, reused_layout = installer.capture(manifest)
     assert len(reused.copies) == 2 and set(reused_layout) == {"a", "b"}
-    monkeypatch.setattr(installer, "_capture_key", original_key)
-    compatible, _ = installer.capture(manifest, trainer_mesh=("trainer", 2))
+    compatible, _ = installer.capture(manifest)
     assert compatible.generation == reused.generation == generation
     assert installer.source_install_plan is plan
     assert model.calls == 1
@@ -89,7 +86,7 @@ def test_combined_incompatible_generation_rebuilds_and_rejects_old_batch(
     monkeypatch, change
 ):
     model, installer, source, manifest = _fixture(monkeypatch)
-    old, old_layout = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    old, old_layout = installer.capture(manifest)
     old_plan = installer.source_install_plan
     if change == "converter":
 
@@ -101,7 +98,7 @@ def test_combined_incompatible_generation_rebuilds_and_rejects_old_batch(
     else:
         manifest = [("trainer.weight", torch.float32, (4, 2))]
         # The unchanged converter selects three rows, preserving destinations.
-    new, _ = installer.capture(manifest, trainer_mesh=("trainer", 2))
+    new, _ = installer.capture(manifest)
     assert new.generation != old.generation
     assert installer.source_install_plan is not old_plan
     assert installer.source_install_plan.schedule is not old_plan.schedule
@@ -114,7 +111,7 @@ def test_combined_incompatible_generation_rebuilds_and_rejects_old_batch(
 
 def test_failed_combined_recapture_invalidates_and_retry_rebuilds(monkeypatch):
     model, installer, _, manifest = _fixture(monkeypatch)
-    old, _ = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    old, _ = installer.capture(manifest)
     fail = True
 
     def converter(weights):
@@ -124,12 +121,11 @@ def test_failed_combined_recapture_invalidates_and_retry_rebuilds(monkeypatch):
 
     installer._convert_native_to_hf = converter
     with pytest.raises(RuntimeError, match="conversion failed"):
-        installer.capture(manifest, trainer_mesh=("trainer", 2))
+        installer.capture(manifest)
     assert installer._capture_cache is None
-    assert installer._capture_mesh is None
     assert installer.source_install_plan is None
     fail = False
-    retried, _ = installer.capture(manifest, trainer_mesh=("trainer", 2))
+    retried, _ = installer.capture(manifest)
     assert retried.generation > old.generation
     assert installer.source_install_plan.generation == retried.generation
     assert model.calls == 2
@@ -138,10 +134,10 @@ def test_failed_combined_recapture_invalidates_and_retry_rebuilds(monkeypatch):
 def test_incomplete_combined_capture_returns_without_caching(monkeypatch):
     model, installer, _, manifest = _fixture(monkeypatch)
     model.extra = nn.Parameter(torch.zeros(1), requires_grad=False)
-    captured, layout = installer.capture(manifest, trainer_mesh=("trainer", 1))
+    captured, layout = installer.capture(manifest)
     assert "extra" in layout
     assert "extra" not in {copy.param_name for copy in captured.copies}
     assert installer.source_install_plan is None
     assert installer._capture_cache is None
-    installer.capture(manifest, trainer_mesh=("trainer", 1))
+    installer.capture(manifest)
     assert model.calls == 2

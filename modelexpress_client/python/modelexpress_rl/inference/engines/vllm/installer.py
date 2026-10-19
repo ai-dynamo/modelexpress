@@ -18,7 +18,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from contextlib import closing
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -414,7 +414,6 @@ class _VllmInstaller(EngineInstaller):
         self._debug_validate_generator_layout = (
             rl_envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT
         )
-        self._capture_mesh = None
         self.engine_install_plan = None
         self.source_install_plan = None
         self._standalone_targets = None
@@ -686,7 +685,6 @@ class _VllmInstaller(EngineInstaller):
                     return result.clone()
                 return copy.deepcopy(result)
         self._capture_cache = None
-        self._capture_mesh = None
         self.engine_install_plan = None
         self.source_install_plan = None
         self._standalone_targets = None
@@ -1787,16 +1785,6 @@ class _VllmInstaller(EngineInstaller):
                 f"count={len(meta_parameters)}, names={meta_parameters[:10]}"
             )
 
-    @cached_property
-    def _unsupported_online_fp8(self) -> bool:
-        module_name = "vllm.model_executor.layers.quantization.online.fp8"
-        return any(
-            any(
-                base.__module__ == module_name
-                for base in type(getattr(layer, "quant_method", None)).__mro__
-            )
-            for layer in self._model.modules()
-        )
 
 
 __all__: list[str] = []

@@ -1971,8 +1971,7 @@ bindings; finalization handles attention dependencies after all inputs arrive.
 Native materialization selects its recorded device, while host bookkeeping can
 be recreated on CPU. Bare tensors retained by graph consumers keep their storage.
 MX does not implement model-family admission tables or attention-specific weight
-transformations. Online FP8 reloads that require changes to vLLM internals are
-unsupported.
+transformations.
 
 Receive-arena tensors are never attached to the model or passed to post-load
 callbacks. The copy boundary requires ordinary Tensor storage views and rejects
@@ -2021,8 +2020,7 @@ The combined capture is the reusable capture artifact; ordered replay planning
 consumes it directly and does not separately compose trainer conversion with an
 installer capture. Capture, logical plan and physical binding have distinct
 lifetimes. Same-generation updates cheaply reuse the capture and logical plan;
-after a generation change, compatibility is checked against the combined capture
-before rebuilding the logical plan. Physical session and address bindings remain
+after a generation change, the logical plan and physical binding are rebuilt. Physical session and address bindings remain
 separate and are refreshed as needed. Per-update readiness, checksums, stream
 completeness and resource-safety checks remain in place.
 
@@ -2045,8 +2043,7 @@ bindings and replay schedule together; no validation verdict is reused across
 updates. Custom attribute access, setters and parameter-registration hooks retain
 Python lookup and assignment semantics.
 
-Quantized streaming retains the original guard. Supported quantized full-copy
-refits retain native processing and restoration; capture cleanup also restores
+Supported quantized refits retain native processing and restoration; capture cleanup also restores
 vLLM's TorchAO reload flag on success and failure.
 
 The staging limit bounds registered receive arenas. Replay operations can require

@@ -401,3 +401,12 @@ def test_integer_index_payload_deepcopy_remains_isolated(
     first_index[0] = 0
     second, _ = installer.capture(manifest)
     assert list(second.copies[0].op_chain[0][1][0]) == [2, 0, 2]
+
+
+def test_snapshot_clone_preserves_capture_fingerprint():
+    result = _result()
+    result[0].generator_fingerprint = ("layout", (1, 2))
+    snapshot = _CaptureSnapshot.create(result)
+    assert type(snapshot) is _CaptureSnapshot
+    assert not hasattr(snapshot, "fingerprint")
+    assert snapshot.clone()[0].generator_fingerprint == result[0].generator_fingerprint

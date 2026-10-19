@@ -2673,9 +2673,9 @@ def test_capture_restores_torchao_reload_state(monkeypatch, fail):
     )
     if fail:
         with pytest.raises(RuntimeError, match="trace failed"):
-            installer.capture([("weight", torch.float32, (2,))], trainer_mesh=("trainer", 1))
+            installer.capture([("weight", torch.float32, (2,))])
     else:
-        installer.capture([("weight", torch.float32, (2,))], trainer_mesh=("trainer", 1))
+        installer.capture([("weight", torch.float32, (2,))])
     assert model._do_torchao_reload is True
 
 
@@ -3031,7 +3031,7 @@ def test_custom_metaclass_ties_use_owner_views(
     )
     assert installer._parameter_aliases(model).by_owner is not None
     captured, layout = installer.capture(
-        [("first.weight", torch.float32, (2,))], trainer_mesh=("trainer", 1)
+        [("first.weight", torch.float32, (2,))]
     )
     for value in (3.0, 7.0):
         tensors = {"first.weight": torch.full((2,), value)}
