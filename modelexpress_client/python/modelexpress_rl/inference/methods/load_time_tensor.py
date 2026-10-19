@@ -59,7 +59,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             raise RuntimeError("release the active update before preparing another")
         if not isinstance(source, ResolvedTrainerSource):
             raise TypeError("load-time tensor method requires a trainer source")
-        manifests = [item.manifest for item in source.snapshot.shards]
+        manifests = [item.metadata for item in source.snapshot.shards]
         is_streaming = self._transfer.bounded_staging
         with refit_span("transfer_planning", accumulate_metadata=True) as counters:
             prepared = self._transfer.prepare(

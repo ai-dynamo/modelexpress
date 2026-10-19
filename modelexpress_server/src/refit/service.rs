@@ -511,8 +511,11 @@ impl RefitService for RefitServiceImpl {
         required(&shard.version_id, "shard.version_id")?;
         required(&shard.logical_shard_id, "shard.logical_shard_id")?;
         required(&shard.worker_id, "shard.worker_id")?;
-        required(&shard.manifest_digest, "shard.manifest_digest")?;
-        required(&shard.manifest_endpoint, "shard.manifest_endpoint")?;
+        required(
+            &shard.stable_metadata_digest,
+            "shard.stable_metadata_digest",
+        )?;
+        required(&shard.metadata_endpoint, "shard.metadata_endpoint")?;
 
         info!(
             "Registering shard for version '{}' from worker '{}' (logical shard '{}')",
