@@ -6,21 +6,34 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
 from modelexpress import p2p_pb2
 
 from ..control import WeightVersion
 from ..object_storage import ObjectStorageSource
+from ..train.manifest import ShardChecksumKey
 from ..train import WeightPayloadFormat
-from .adapter import GeneratorTransferInputs
+from ..version import MeshIdentity
+from .adapter import TrainerSourceShard
 
 if TYPE_CHECKING:
+    from .nixl_staged_transfer import _ResolvedSources
     from .receiver import PreparedCheckpoint
+
+
+@dataclass(frozen=True)
+class StreamingSettings:
+    """Fixed receive capacity and placement for one bounded runtime."""
+
+    max_staging_bytes: int
+    staging_device: str = "cuda"
+    staging_buffers: int = 1
 
 
 class WeightSource(str, Enum):
@@ -63,6 +76,7 @@ class EngineCapabilities:
     """Prepared artifacts that one engine installer can commit."""
 
     artifact_types: frozenset[type[PreparedArtifact]]
+    streamed_checkpoints: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,15 +91,31 @@ class GeneratorPeerUpdateSource:
 
 
 @dataclass(frozen=True)
-class TrainerUpdateSource:
-    """Trainer manifests for one complete full-tensor update."""
+class TrainerSourceSnapshot:
+    """Selected trainer shards and the mesh identity they belong to."""
 
-    inputs: GeneratorTransferInputs
+    mesh_identity: MeshIdentity
+    shards: tuple[TrainerSourceShard, ...]
+    resolved_metadata: _ResolvedSources | None = field(
+        default=None, compare=False, repr=False
+    )
     kind = WeightSource.TRAINER
+    payload_format = WeightPayloadFormat.FULL_TENSOR
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "shards", tuple(self.shards))
 
     @property
-    def payload_format(self) -> WeightPayloadFormat:
-        return self.inputs.payload_format
+    def physical_fingerprint(self) -> tuple:
+        """Server-pinned worker/shard digests require a new mesh generation when
+        physical addresses or registrations change."""
+        return (
+            self.mesh_identity,
+            tuple(
+                (shard.source_slot_id, shard.worker_id)
+                for shard in self.shards
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -97,8 +127,21 @@ class ObjectStorageUpdateSource:
     kind = WeightSource.OBJECT_STORAGE
 
 
+@dataclass(frozen=True)
+class ResolvedTrainerSource:
+    """A stable trainer selection and checksums owned by this leased round."""
+
+    snapshot: TrainerSourceSnapshot
+    checksums: Mapping[ShardChecksumKey, str] = field(default_factory=dict)
+    kind = WeightSource.TRAINER
+    payload_format = WeightPayloadFormat.FULL_TENSOR
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "checksums", MappingProxyType(dict(self.checksums)))
+
+
 ResolvedSource = (
-    GeneratorPeerUpdateSource | TrainerUpdateSource | ObjectStorageUpdateSource
+    GeneratorPeerUpdateSource | ResolvedTrainerSource | ObjectStorageUpdateSource
 )
 
 
@@ -410,7 +453,8 @@ __all__ = [
     "PreparedRuntimeTensors",
     "ResolvedSource",
     "StagedEngineTensors",
-    "TrainerUpdateSource",
+    "TrainerSourceSnapshot",
+    "ResolvedTrainerSource",
     "UpdateMethod",
     "WeightSource",
     "SourceResolver",

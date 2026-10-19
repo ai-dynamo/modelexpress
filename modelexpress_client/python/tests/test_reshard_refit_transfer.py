@@ -23,14 +23,11 @@ from modelexpress.refit.reshard.receiver import _replay_ops
 from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import (
     SourceInfo,
-    exact_descriptors,
+    bind_transfer,
     execute_transfer,
     plan_transfer,
 )
-from modelexpress.refit.reshard.transport import (
-    InMemoryReferenceTransport,
-    ReadDescriptor,
-)
+from modelexpress.refit.reshard.transport import InMemoryReferenceTransport
 from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
 
 # Reuse the ToyModel + manifest from the geometry test (same package, same dir).
@@ -50,6 +47,24 @@ class _RecordingTransport(InMemoryReferenceTransport):
     def read(self, descriptors: list) -> None:
         self.sessions.update(d.session for d in descriptors if d.nbytes)
         super().read(descriptors)
+
+
+def _bind(plan, sources, resolve_param_ptr):
+    def resolve_source(buffer):
+        source = sources[buffer.src_name]
+        shard = next(
+            shard for shard in source.shards
+            if shard.session == buffer.source_slot_id
+            and tuple(shard.shard_offset) == buffer.shard_offset
+            and tuple(shard.shape) == buffer.shape
+        )
+        return shard.session, shard.addr
+
+    def resolve_destination(kind, name):
+        assert kind == "recv"
+        return resolve_param_ptr(name)
+
+    return bind_transfer(plan, resolve_source, resolve_destination)
 
 
 def _full_sources():
@@ -106,13 +121,12 @@ def test_reshard_reconstructs_ground_truth():
         )
 
     plan = plan_transfer(capture, sources)
-    assert plan.fallback == []
+    assert plan.fallback == ()
     assert plan.bytes_planned() > 0
 
     stats = execute_transfer(
-        plan,
-        resolve_param_ptr=lambda name: recon_params[name].data_ptr(),
-        transport=InMemoryReferenceTransport(),
+        _bind(plan, sources, lambda name: recon_params[name].data_ptr()),
+        InMemoryReferenceTransport(),
     )
     assert stats["bytes"] == plan.bytes_planned()
 
@@ -161,13 +175,10 @@ def test_strided_source_reconstructs_exactly():
     sources = {"row": SourceInfo(tuple(row_src.shape), torch.float32, EL, [shard])}
 
     plan = plan_transfer(capture, sources)
-    assert plan.fallback == []
+    assert plan.fallback == ()
     execute_transfer(
-        plan,
-        resolve_param_ptr=lambda name: dict(recon_model.named_parameters())[
-            name
-        ].data_ptr(),
-        transport=InMemoryReferenceTransport(),
+        _bind(plan, sources, lambda name: dict(recon_model.named_parameters())[name].data_ptr()),
+        InMemoryReferenceTransport(),
     )
     assert torch.equal(recon_row, truth_row)
     assert row_src.data_ptr()  # keep alive
@@ -196,7 +207,7 @@ def test_descriptor_heavy_slice_full_pulls_then_replays_locally():
         max_segments_per_copy=1,
     )
 
-    assert plan.segments == []
+    assert plan.segments == ()
     assert len(plan.full_pulls) == 1
     assert plan.exact_descriptor_count == 4
     assert plan.descriptor_count() == 1
@@ -206,16 +217,15 @@ def test_descriptor_heavy_slice_full_pulls_then_replays_locally():
 
     staging = torch.zeros_like(row_src)
     full_pull = plan.full_pulls[0]
-    descriptors = [
-        ReadDescriptor(
-            session=segment.session,
-            src_addr=segment.src_addr,
-            dst_addr=staging.data_ptr() + segment.dst_byte,
-            nbytes=segment.nbytes,
-        )
-        for segment in full_pull.segments
-    ]
-    InMemoryReferenceTransport().read(descriptors)
+    physical = bind_transfer(
+        plan,
+        lambda buffer: (
+            buffer.source_slot_id,
+            next(sh.addr for sh in source.shards if sh.session == buffer.source_slot_id),
+        ),
+        lambda kind, name: staging.data_ptr() if kind == "full" else 0,
+    )
+    InMemoryReferenceTransport().read(physical.full_pulls[0])
 
     reconstructed = torch.zeros_like(truth_row)
     copy = full_pull.copies[0]
@@ -256,8 +266,8 @@ def test_non_dim0_source_keeps_exact_descriptors():
         max_segments_per_copy=1,
     )
 
-    assert plan.full_pulls == []
-    assert plan.unbounded_sources == ["row"]
+    assert plan.full_pulls == ()
+    assert plan.unbounded_sources == ("row",)
     assert len(plan.segments) == 4
     assert plan.descriptor_savings() == 0
     assert plan.extra_wire_bytes() == 0
@@ -298,11 +308,7 @@ def test_unsupported_source_is_marked_for_fail_closed():
     recon_ptrs = {n: p.data_ptr() for n, p in recon_model.named_parameters()}
 
     reads = _RecordingTransport()
-    execute_transfer(
-        plan,
-        resolve_param_ptr=lambda name: recon_ptrs[name],
-        transport=reads,
-    )
+    execute_transfer(_bind(plan, sources, lambda name: recon_ptrs[name]), reads)
     assert "bad" not in reads.sessions
     assert reads.sessions  # the supported sources were still fetched
 
@@ -335,11 +341,9 @@ def test_execute_transfer_surfaces_fallback_for_the_receiver_to_reject():
 
     plan = plan_transfer(capture, sources)
     stats = execute_transfer(
-        plan,
-        resolve_param_ptr=lambda name: recon_ptrs[name],
-        transport=InMemoryReferenceTransport(),
+        _bind(plan, sources, lambda name: recon_ptrs[name]), InMemoryReferenceTransport()
     )
-    assert stats["fallback"] == plan.fallback
+    assert stats["fallback"] == list(plan.fallback)
     assert "bad" in stats["fallback"]
     assert all(t.data_ptr() for t in srcs.values())
 
@@ -363,10 +367,7 @@ def test_exact_descriptors_match_what_execute_transfer_reads():
     model = ToyModel()
     params = dict(model.named_parameters())
 
-    def resolve(name):
-        return params[name].data_ptr()
-
-    built = exact_descriptors(plan, resolve)
+    physical = _bind(plan, sources, lambda name: params[name].data_ptr())
 
     recorded = []
 
@@ -374,11 +375,11 @@ def test_exact_descriptors_match_what_execute_transfer_reads():
         def read(self, descriptors):
             recorded.extend(descriptors)
 
-    stats = execute_transfer(plan, resolve_param_ptr=resolve, transport=_Recorder())
+    stats = execute_transfer(physical, _Recorder())
 
-    assert built == recorded
-    assert stats["segments"] == len(built)
-    assert stats["bytes"] == sum(descriptor.nbytes for descriptor in built)
+    assert list(physical.segments) == recorded
+    assert stats["segments"] == len(physical.segments)
+    assert stats["bytes"] == sum(descriptor.nbytes for descriptor in physical.segments)
     assert all(t.data_ptr() for t in srcs.values())
 
 

@@ -9,6 +9,14 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class MeshIdentity:
+    """Identity of one trainer mesh generation."""
+
+    mesh_id: str
+    generation: int
+
+
+@dataclass(frozen=True)
 class TrainerTensorsMetadata:
     """Compact reference to immutable worker-local logical tensor coverage."""
 
@@ -27,4 +35,4 @@ class WeightVersionRef:
             raise ValueError("version.version_id is required")
 
 
-__all__ = ["TrainerTensorsMetadata", "WeightVersionRef"]
+__all__ = ["MeshIdentity", "TrainerTensorsMetadata", "WeightVersionRef"]

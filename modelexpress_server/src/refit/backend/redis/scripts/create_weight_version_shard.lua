@@ -1,4 +1,4 @@
--- Atomically publish one worker manifest and advance version readiness.
+-- Atomically publish one worker metadata and advance version readiness.
 --
 -- KEYS[1]: version hash
 -- KEYS[2]: publishing worker registration hash
@@ -7,7 +7,7 @@
 -- KEYS[4]: trainer mesh hash
 -- KEYS[5]: publication endpoint index, keyed like physical publications
 -- ARGV: publication key, encoded shard, model_name, logical_shard_id, staging_state,
---       ready_state, worker_id, trainer_role, manifest_endpoint
+--       ready_state, worker_id, trainer_role, metadata_endpoint, stable_metadata_digest
 --
 -- Returns OK:<state> for a new or byte-identical repeated publication. Other
 -- named results reject missing, incompatible, or conflicting inputs. The
@@ -61,6 +61,13 @@ if existing and existing ~= ARGV[2] then
   return 'SHARD_CONFLICT'
 end
 
+local pin_field = 'stable_metadata:' .. ARGV[1]
+local pinned = redis.call('HGET', KEYS[4], pin_field)
+if pinned and pinned ~= ARGV[10] then
+  return 'STABLE_METADATA_MISMATCH'
+end
+
+redis.call('HSET', KEYS[4], pin_field, ARGV[10])
 redis.call('HSET', KEYS[3], ARGV[1], ARGV[2])
 redis.call('HSET', KEYS[5], ARGV[1], ARGV[9])
 local present = {}

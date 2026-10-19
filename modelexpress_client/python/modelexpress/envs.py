@@ -62,8 +62,12 @@ if TYPE_CHECKING:
     MX_PUBLISH_TIMEOUT_SECS: int
     MX_MODEL_REVISION: str
     MX_MODEL_URI: Optional[str]
+    MX_PLUGIN_DIR: str
+    MX_LOAD_PLUGIN: Optional[str]
+    MX_LOAD_PLUGIN_BEFORE: str
     MX_LOAD_STRATEGY_CHAIN: str
     MX_P2P_METADATA: str
+    MX_DISABLE_DRAFT_P2P: bool
     MX_RESHARD_FUSED_WIRE: bool
     MX_RESHARD_BATCH_INSTALL: bool
     MX_RESHARD_CACHE_DESCRIPTORS: bool
@@ -74,10 +78,8 @@ if TYPE_CHECKING:
     MX_RESHARD_HANDSHAKE_BACKOFF_S: float
     MX_REFIT_STAGE_RECORD: bool
     MX_REFIT_PACK_MODULES: bool
-    MX_REFIT_REUSE_COMPLETE_PLAN: bool
-    MX_REFIT_CACHE_RESOLVED_SOURCES: bool
-    MX_REFIT_CACHE_BOUNDED_PLANS: bool
-    MX_REFIT_COPY_PLAN_KEY_ON_MISS: bool
+    MX_REFIT_PREFETCH_REPLICA_METADATA: bool
+    MX_REFIT_DEBUG_VALIDATE_REPLICAS: bool
     MX_RESHARD_MAX_SEGMENTS_PER_COPY: int
     MX_RESHARD_MAX_GBPS: float
     MX_RESHARD_MIN_GBPS: float
@@ -88,6 +90,7 @@ if TYPE_CHECKING:
     MX_K8S_SOURCE_BACKOFF_SECONDS: str
     # NIXL / transport
     MX_NIXL_BACKEND: str
+    MX_NIXL_METADATA_TIMEOUT: float
     MX_POOL_REG: bool
     NIXL_UCX_TLS: Optional[str]
     UCX_TLS: Optional[str]
@@ -286,10 +289,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_PUBLISH_TIMEOUT_SECS": lambda: _env_int("MX_PUBLISH_TIMEOUT_SECS", 30 * 60),
     "MX_MODEL_REVISION": lambda: os.environ.get("MX_MODEL_REVISION", ""),
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
+    "MX_PLUGIN_DIR": lambda: os.environ.get("MX_PLUGIN_DIR", "/opt/modelexpress/plugins"),
+    "MX_LOAD_PLUGIN": lambda: os.environ.get("MX_LOAD_PLUGIN"),
+    "MX_LOAD_PLUGIN_BEFORE": lambda: os.environ.get("MX_LOAD_PLUGIN_BEFORE", "server-cache"),
     "MX_LOAD_STRATEGY_CHAIN": lambda: (
         os.environ.get("MX_LOAD_STRATEGY_CHAIN", "INFERENCE").strip().upper()
     ),
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
+    "MX_DISABLE_DRAFT_P2P": lambda: _env_bool("MX_DISABLE_DRAFT_P2P", False),
     "MX_RESHARD_FUSED_WIRE": lambda: _env_bool("MX_RESHARD_FUSED_WIRE", True),
     # Issue the per-view re-slice copies of full-pulled sources as one batched
     # _foreach_copy_ instead of a copy_() per view. On by default: it is the same
@@ -339,25 +346,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # One JSON stage record per refit. On by default: the timings are already
     # computed, and at INFO they were never captured by a benchmark run.
     "MX_REFIT_STAGE_RECORD": lambda: _env_bool("MX_REFIT_STAGE_RECORD", True),
-    "MX_REFIT_REUSE_COMPLETE_PLAN": lambda: _env_bool(
-        "MX_REFIT_REUSE_COMPLETE_PLAN", False
+    "MX_REFIT_PREFETCH_REPLICA_METADATA": lambda: _env_bool(
+        "MX_REFIT_PREFETCH_REPLICA_METADATA", False
     ),
-    "MX_REFIT_CACHE_RESOLVED_SOURCES": lambda: _env_bool(
-        "MX_REFIT_CACHE_RESOLVED_SOURCES", False
-    ),
-    "MX_REFIT_CACHE_BOUNDED_PLANS": lambda: _env_bool(
-        "MX_REFIT_CACHE_BOUNDED_PLANS", False
-    ),
-    "MX_REFIT_COPY_PLAN_KEY_ON_MISS": lambda: _env_bool(
-        "MX_REFIT_COPY_PLAN_KEY_ON_MISS", False
+    "MX_REFIT_DEBUG_VALIDATE_REPLICAS": lambda: _env_bool(
+        "MX_REFIT_DEBUG_VALIDATE_REPLICAS", False
     ),
     "MX_RESHARD_MAX_SEGMENTS_PER_COPY": lambda: int(
         os.environ.get("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "64")
     ),
-    # Coalesce consecutive owning-module batches up to the staging budget. Off by
-    # default: one module per batch is the conservative arena bound, and packing
-    # trades higher per-batch arena residency for fewer batches.
-    "MX_REFIT_PACK_MODULES": lambda: _env_bool("MX_REFIT_PACK_MODULES", False),
+    # Coalesce consecutive owning-module batches up to the staging budget.
+    "MX_REFIT_PACK_MODULES": lambda: _env_bool("MX_REFIT_PACK_MODULES", True),
     # Per-rank fabric ceiling in Gbps used to reject impossible wire rates. Zero
     # disables the check, and is the default because only the operator knows the
     # real per-rank limit for their fabric.
@@ -388,6 +387,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # ── NIXL / transport ───────────────────────────────────────────────────
     "MX_NIXL_BACKEND": lambda: os.environ.get("MX_NIXL_BACKEND", "UCX").strip().upper(),
+    "MX_NIXL_METADATA_TIMEOUT": lambda: _env_positive_float(
+        "MX_NIXL_METADATA_TIMEOUT", 120.0
+    ),
     "MX_POOL_REG": lambda: os.environ.get("MX_POOL_REG", "0") == "1",
     "NIXL_UCX_TLS": lambda: os.environ.get("NIXL_UCX_TLS"),
     "UCX_TLS": lambda: os.environ.get("UCX_TLS"),

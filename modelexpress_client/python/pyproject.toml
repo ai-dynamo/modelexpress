@@ -31,7 +31,7 @@ dependencies = [
     "protobuf>=5.27.2,<7.0.0",
     "pydantic>=2.0.0",
     "torch>=2.6.0",
-    "runai-model-streamer[s3,gcs,azure]; sys_platform == 'linux'",
+    "runai-model-streamer[azure,gcs,s3]>=0.17.0 ; sys_platform == 'linux'",
     "instanttensor>=0.1.9 ; sys_platform == 'linux'",
     # First release with IfNoneMatch on CompleteMultipartUpload.
     "boto3>=1.35.2",
