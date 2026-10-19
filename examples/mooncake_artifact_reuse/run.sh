@@ -12,6 +12,15 @@ fi
 engine=$1
 shift
 
+for arg in "$@"; do
+  case $arg in
+    --port|--port=*)
+      echo "Set the engine port with MX_EXAMPLE_PORT, not --port, so artifact readiness uses the same port." >&2
+      exit 2
+      ;;
+  esac
+done
+
 : "${MX_EXAMPLE_MODEL:?Set MX_EXAMPLE_MODEL to the model path or ID}"
 : "${MX_EXAMPLE_RUN_DIR:?Set MX_EXAMPLE_RUN_DIR to a fresh, writable directory}"
 : "${MX_ARTIFACT_MOONCAKE_NAMESPACE:?Set a namespace shared by cold and hit runs}"

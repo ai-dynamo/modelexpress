@@ -43,8 +43,9 @@ does not fall back to NIXL artifact transfer.
 ## Cold run, then cache-hit run
 
 Use `vllm` or `sglang` for both runs. Engine-specific flags may be appended
-after the engine name (for example `--trust-remote-code`). Launch from an image
-with that engine's executable and matching model dependencies:
+after the engine name (for example `--trust-remote-code`), but set the listening
+port through `MX_EXAMPLE_PORT` rather than an appended `--port` flag. Launch
+from an image with that engine's executable and matching model dependencies:
 
 ```bash
 export MX_EXAMPLE_RUN_DIR=/tmp/mx-mooncake-cold
