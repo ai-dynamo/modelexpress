@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import struct
 import time
 import uuid
 from collections import defaultdict
@@ -28,25 +27,14 @@ import torch
 
 from .accelerators import AcceleratorBackend
 from .gds_transfer import GdsTransferManager, is_gds_available
+from .safetensors_header import (
+    HEADER_LENGTH_BYTES,
+    SAFETENSORS_DTYPE_MAP,
+    header_length,
+    parse_header,
+)
 
 logger = logging.getLogger("modelexpress.gds_loader")
-
-# Complete dtype mapping from the safetensors spec:
-# https://huggingface.co/docs/safetensors/metadata_parsing#accepted-dtypes
-SAFETENSORS_DTYPE_MAP: dict[str, torch.dtype] = {
-    "F64": torch.float64,
-    "F32": torch.float32,
-    "F16": torch.float16,
-    "BF16": torch.bfloat16,
-    "F8_E4M3": torch.float8_e4m3fn,
-    "F8_E5M2": torch.float8_e5m2,
-    "I64": torch.int64,
-    "I32": torch.int32,
-    "I16": torch.int16,
-    "I8": torch.int8,
-    "U8": torch.uint8,
-    "BOOL": torch.bool,
-}
 
 
 class MxGdsLoader:
@@ -250,36 +238,19 @@ class MxGdsLoader:
             {tensor_name: {"file_offset": int, "size": int, "dtype": str, "shape": list}}
         """
         with open(file_path, "rb") as f:
-            raw = f.read(8)
-            if len(raw) < 8:
-                raise RuntimeError(f"Invalid safetensors file: {file_path}")
+            prefix = f.read(HEADER_LENGTH_BYTES)
+            header_bytes = f.read(header_length(prefix, file_path))
 
-            header_size = struct.unpack("<Q", raw)[0]
-
-            if header_size > 100 * 1024 * 1024:
-                raise RuntimeError(
-                    f"Safetensors header too large ({header_size} bytes): {file_path}"
-                )
-
-            header_bytes = f.read(header_size)
-
-        header = json.loads(header_bytes)
-        data_start = 8 + header_size
-
-        result: dict[str, dict] = {}
-        for name, info in header.items():
-            if name == "__metadata__":
-                continue
-
-            offsets = info["data_offsets"]
-            result[name] = {
-                "file_offset": data_start + offsets[0],
-                "size": offsets[1] - offsets[0],
-                "dtype": info["dtype"],
-                "shape": info["shape"],
+        parsed = parse_header(header_bytes, file_path)
+        return {
+            entry.name: {
+                "file_offset": parsed.data_start + entry.begin,
+                "size": entry.nbytes,
+                "dtype": entry.dtype,
+                "shape": list(entry.shape),
             }
-
-        return result
+            for entry in parsed.tensors
+        }
 
     def _load_file_tensors(
         self,

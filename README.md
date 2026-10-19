@@ -52,9 +52,10 @@ At startup, ModelExpress probes the capabilities available in the environment an
 1. **Serving peer → GPU** — Transfer post-processed weights directly from a compatible replica over NIXL P2P RDMA. Each new replica then joins the source pool, turning scale-out into GPU-to-GPU fan-out.
 2. **Server cache → runtime** — In no-shared-storage mode, fetch the snapshot through the ModelExpress server and hand it to the runtime's native loader.
 3. **Local safetensors → GPU** — Use InstantTensor when its package, CUDA-like device, and runtime adapter capability are available.
-4. **Remote or local storage → GPU with ModelStreamer** — Fetch safetensor ranges concurrently through a bounded CPU staging buffer while overlapping reads with GPU placement.
-5. **Local storage → GPU with GDS** — Use GPUDirect Storage when the platform and runtime adapter support it.
-6. **Default loader** — Fall back to the inference engine's native path.
+4. **S3-over-RDMA → GPU with NIXL OBJ** — When enabled, read safetensor ranges from an S3-over-RDMA object store such as MinIO AIStor straight into GPU memory, without a CPU staging buffer.
+5. **Remote or local storage → GPU with ModelStreamer** — Fetch safetensor ranges concurrently through a bounded CPU staging buffer while overlapping reads with GPU placement.
+6. **Local storage → GPU with GDS** — Use GPUDirect Storage when the platform and runtime adapter support it.
+7. **Default loader** — Fall back to the inference engine's native path.
 
 The first applicable strategy runs. If a strategy fails before changing model state, ModelExpress continues to the next one. If weights may already have landed, it reinitializes the model before continuing so a partially loaded model is never served.
 
@@ -65,7 +66,7 @@ The ModelExpress control plane discovers compatible sources through Redis, Kuber
 ## Features
 
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
-- **Capability-driven loading** — Fixed priority chain: P2P RDMA → server cache → InstantTensor → ModelStreamer → GDS → native loader, with safe fallback
+- **Capability-driven loading** — Fixed priority chain: P2P RDMA → server cache → InstantTensor → NIXL OBJ → ModelStreamer → GDS → native loader, with safe fallback
 - **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
 - **P2P GPU transfer** — vLLM `modelexpress` loader, SGLang `remote_instance` loader with the `modelexpress` backend, and TRT-LLM `checkpoint_format="MX"` with NVIDIA NIXL over InfiniBand, RoCE, NVLink, EFA, and other supported fabrics
 - **JIT cache transfer** — Reuse compatible vLLM and SGLang NIXL compilation caches when replicas scale out
@@ -75,6 +76,7 @@ The ModelExpress control plane discovers compatible sources through Redis, Kuber
 - **ModelStreamer integration** — Pipeline concurrent reads from S3, Azure Blob, GCS, or local storage into vLLM and SGLang
 - **Expanded model pull providers**: NGC catalog and Google Cloud Storage in addition to Hugging Face
 - **GDS (GPUDirect Storage)**: load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path
+- **S3-over-RDMA (NIXL OBJ)**: opt in to load weights from an S3-over-RDMA object store such as MinIO AIStor directly into GPU memory; requires a NIXL build with the generic accelerated OBJ engine ([setup](docs/DEPLOYMENT.md#nixl-obj-s3-over-rdma-to-gpu))
 - **Lower NIXL registration overhead** — Opt in to allocation-level pool registration or a single VMM arena registration
 
 ### Integrations
@@ -233,6 +235,7 @@ docker compose -f docker/docker-compose.yml up --build
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_MODEL_URI` | (unset) | Enable ModelStreamer for an object-store URI or absolute local path. |
 | `MX_MS_DISTRIBUTED` | `1` | Divide ModelStreamer reads across tensor-parallel ranks when TP > 1. On by default; set to `0` to disable. |
+| `MX_OBJ_ENABLED` | `0` | Try NIXL OBJ (S3-over-RDMA straight to GPU) before ModelStreamer for an `s3://` `MX_MODEL_URI`. See [NIXL OBJ](docs/DEPLOYMENT.md#nixl-obj-s3-over-rdma-to-gpu). |
 | `MX_POOL_REG` | `0` | Register each underlying CUDA allocation once instead of registering every tensor. |
 | `MX_VMM_ARENA` | `0` | Load into a CUDA VMM arena and register the used range once; alternative to `MX_POOL_REG`. |
 | `MX_P2P_SOURCE_SELECTOR` | `random` | Peer ordering policy; set `rendezvous_hash` for deterministic, minimally disruptive selection. |
@@ -296,6 +299,7 @@ Start with the [ModelExpress documentation hub](docs/README.md).
 ## Known Issues
 
 - **GDS loader does not scale with TP** — Each TP rank reads full checkpoint tensors and vLLM shards them afterward, so GDS/disk reads scale with TP degree. This can reduce or reverse expected GDS speedups versus the default mmap-based disk loader; TP-aware range reads are needed for a full fix. See [GDS Reads Full Checkpoint Tensors Under TP](docs/ARCHITECTURE.md#gds-reads-full-checkpoint-tensors-under-tp).
+- **NIXL OBJ loader does not scale with TP** — Like GDS, each TP rank reads full checkpoint tensors over S3-over-RDMA, so object-store reads scale with TP degree. See [NIXL OBJ Reads Full Checkpoint Tensors Under TP](docs/ARCHITECTURE.md#nixl-obj-reads-full-checkpoint-tensors-under-tp).
 - **P2P source wedges after a reader is torn down (UCX/InfiniBand)** — Once a reader that pulled from a source is removed, the source can stop serving new readers: their RDMA reads stall to the transfer timeout and fall back to disk, while the source keeps advertising `Ready` and serving inference normally. Loading stays correct, but P2P is effectively lost for that source until the source worker pod is restarted. The cause is NIXL retaining queue-pair state for a peer it holds no record of, so it is not fixable from ModelExpress; tracked as nvbug 6519532. Lower `MX_TRANSFER_TIMEOUT` to bound the stall.
 
 ---

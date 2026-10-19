@@ -78,3 +78,6 @@ class XpuAcceleratorBackend:
 
     def supports_gds(self) -> bool:
         return False
+
+    def supports_obj(self) -> bool:
+        return False

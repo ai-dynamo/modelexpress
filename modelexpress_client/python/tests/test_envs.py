@@ -193,3 +193,34 @@ def test_dir_lists_registered_names():
     assert "MX_NIXL_BACKEND" in names
     assert "VLLM_ATTENTION_BACKEND" in names
     assert names == sorted(names)
+
+
+def test_obj_defaults_and_parsing(monkeypatch):
+    for name in (
+        "MX_OBJ_ENABLED",
+        "MX_OBJ_WINDOW_MB",
+        "MX_OBJ_INFLIGHT",
+        "MX_OBJ_THREADS",
+        "MX_OBJ_TIMEOUT",
+        "MX_OBJ_VERIFY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert envs.MX_OBJ_ENABLED is False
+    assert envs.MX_OBJ_WINDOW_MB == 256
+    assert envs.MX_OBJ_INFLIGHT == 8
+    assert envs.MX_OBJ_THREADS == 0
+    assert envs.MX_OBJ_TIMEOUT == pytest.approx(120.0)
+    assert envs.MX_OBJ_VERIFY == "tail"
+
+    monkeypatch.setenv("MX_OBJ_ENABLED", "yes")
+    monkeypatch.setenv("MX_OBJ_WINDOW_MB", "64")
+    monkeypatch.setenv("MX_OBJ_INFLIGHT", "16")
+    monkeypatch.setenv("MX_OBJ_THREADS", "24")
+    monkeypatch.setenv("MX_OBJ_TIMEOUT", "0")
+    monkeypatch.setenv("MX_OBJ_VERIFY", " FULL ")
+    assert envs.MX_OBJ_ENABLED is True
+    assert envs.MX_OBJ_WINDOW_MB == 64
+    assert envs.MX_OBJ_INFLIGHT == 16
+    assert envs.MX_OBJ_THREADS == 24
+    assert envs.MX_OBJ_TIMEOUT == pytest.approx(120.0)
+    assert envs.MX_OBJ_VERIFY == "full"
