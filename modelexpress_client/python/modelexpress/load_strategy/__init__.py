@@ -160,6 +160,8 @@ def execute_load_strategies(
                     f"raised unexpected error, trying next: {e}"
                 )
                 strategy.rollback(ctx)
+                clear_exception_tracebacks(e)
+                result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
 
     raise RuntimeError(
         f"[Worker {ctx.global_rank}] No loading strategy succeeded "

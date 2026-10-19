@@ -1593,7 +1593,7 @@ class TestPublishMetadataErrorHandling:
 class TestLoadStrategyChainRunErrorHandling:
     """Verify LoadStrategyChain.run catches exceptions from strategy.load()."""
 
-    def test_unexpected_strategy_exception_rolls_back_before_next(self):
+    def test_unexpected_strategy_exception_reinitializes_before_next(self):
         from modelexpress.load_strategy import LoadStrategyChain
 
         call_order = []
@@ -1605,11 +1605,16 @@ class TestLoadStrategyChainRunErrorHandling:
         def rollback(self_or_ctx, *args, **kwargs):
             call_order.append("rollback")
 
+        def reinit(result):
+            call_order.append("reinit")
+            return result
+
         def fallback_load(self_or_model, *args, **kwargs):
             call_order.append("fallback")
             return args[0]
 
         ctx = _make_load_context()
+        ctx.adapter.reinit_for_retry = MagicMock(side_effect=reinit)
         model = MagicMock()
 
         with patch(
@@ -1639,7 +1644,7 @@ class TestLoadStrategyChainRunErrorHandling:
         ):
             LoadStrategyChain.run(model, ctx)
 
-        assert call_order == ["exploding", "rollback", "fallback"]
+        assert call_order == ["exploding", "rollback", "reinit", "fallback"]
 
     def test_strategy_failed_runs_rollback_before_next(self):
         from modelexpress.load_strategy import LoadStrategyChain
