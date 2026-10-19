@@ -1403,7 +1403,13 @@ class _VllmInstaller(EngineInstaller):
                 path,
                 module,
                 {
-                    name: (value, _tensor_geometry(value))
+                    name: (
+                        value,
+                        _tensor_geometry(value),
+                        name not in module._non_persistent_buffers_set
+                        if name in module._buffers
+                        else None,
+                    )
                     for name, value in {**module.__dict__, **module._buffers}.items()
                     if isinstance(value, torch.Tensor)
                     and value.device.type == self._device.type
@@ -1524,7 +1530,7 @@ class _VllmInstaller(EngineInstaller):
                     raise IncompleteRefit(
                         f"graph-bound tensor owner {path!r} was replaced"
                     )
-                for name, (graph_tensor, original_geometry) in attributes.items():
+                for name, (graph_tensor, original_geometry, persistent) in attributes.items():
                     current = getattr(module, name, None)
                     if (
                         not isinstance(current, torch.Tensor)
@@ -1539,6 +1545,11 @@ class _VllmInstaller(EngineInstaller):
                     if current is not graph_tensor:
                         graph_tensor.copy_(current)
                     setattr(module, name, graph_tensor)
+                    if persistent is not None:
+                        if persistent:
+                            module._non_persistent_buffers_set.discard(name)
+                        else:
+                            module._non_persistent_buffers_set.add(name)
             for path, reference, layout in runtime_layouts.values():
                 _validate_runtime_tensor_layout(path, reference(), layout)
 

@@ -601,6 +601,8 @@ bare device tensors and registered buffers in its reload plan, then copies updat
 values into the original storage and restores tensor identity after finalization.
 This preserves addresses used by captured graphs and ModelExpress registrations,
 including persistent and nonpersistent buffers and their `state_dict` membership.
+The original buffer persistence setting is restored even if a hook changes it
+or re-registers a buffer without specifying `persistent`.
 
 The ModelExpress vLLM plugin registers one `modelexpress` native weight-transfer
 backend for both paths. An empty initialization payload preserves the existing
