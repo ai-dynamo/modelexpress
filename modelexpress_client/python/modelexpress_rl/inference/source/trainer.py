@@ -250,7 +250,9 @@ class TrainerSourceResolver(SourceResolver):
                                 publication, None, verify=False, counters=counters,
                             )
                         except grpc.RpcError as error:
-                            if debug_validate or error.code() != grpc.StatusCode.UNAVAILABLE:
+                            if debug_validate or error.code() not in (
+                                grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED
+                            ):
                                 raise
                             counters["replica_metadata_prefetch_unavailable"] += 1
                             continue

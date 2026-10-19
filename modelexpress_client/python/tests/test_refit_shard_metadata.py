@@ -472,7 +472,7 @@ def test_resolution_checks_replica_coverage_only_in_debug_mode(
 
 
 @pytest.mark.parametrize("failure", [
-    "unavailable", "debug_unavailable", "digest", "permission_denied",
+    "unavailable", "debug_unavailable", "deadline_exceeded", "debug_deadline_exceeded", "digest", "permission_denied",
 ])
 def test_optional_prefetch_only_tolerates_availability_errors(
     protocol: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, replicas, failure: str,
