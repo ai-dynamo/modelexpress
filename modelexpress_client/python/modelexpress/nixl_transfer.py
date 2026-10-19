@@ -168,6 +168,9 @@ class NixlTransferManager:
         # Last data-plane failure, used by is_healthy(). None means no failure
         # has been observed on a transfer this manager issued.
         self._data_plane_error: str | None = None
+        # Set while a deregister_all() left registrations behind; new
+        # registrations wait until a retry or shutdown() clears it.
+        self._deregistration_pending = False
         self._atexit_registered = False
 
     @property
@@ -377,6 +380,7 @@ class NixlTransferManager:
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
+        self._check_no_pending_deregistration()
 
         tensor_descriptors = self._build_tensor_descriptors(tensors)
         registrable_descriptors = [
@@ -484,6 +488,7 @@ class NixlTransferManager:
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
+        self._check_no_pending_deregistration()
 
         new_tensors: dict[str, torch.Tensor] = {}
         for name, tensor in tensors.items():
@@ -621,6 +626,7 @@ class NixlTransferManager:
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
+        self._check_no_pending_deregistration()
         removed = {name for name in names if name in self._appended_registrations}
         if not removed:
             return
@@ -688,6 +694,7 @@ class NixlTransferManager:
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
+        self._check_no_pending_deregistration()
 
         tensor_descriptors = self._build_tensor_descriptors(tensors)
 
@@ -1530,6 +1537,76 @@ class NixlTransferManager:
         """Last data-plane failure observed on a transfer, or None."""
         return self._data_plane_error
 
+    def _check_no_pending_deregistration(self) -> None:
+        if self._deregistration_pending:
+            raise RuntimeError(
+                "deregister_all() left registrations behind; call it again "
+                "or shutdown() first"
+            )
+
+    def _deregister_tracked_memory(self) -> list[Exception]:
+        """Deregister every tracked registration, newest first.
+
+        Released handles leave the tracking list; handles whose deregistration
+        failed, or was interrupted, stay on it, so a later call retries them.
+        Returns the failures.
+        """
+        remaining = list(self._registered_memory)
+        failed: list[Any] = []
+        errors: list[Exception] = []
+        try:
+            while remaining:
+                registered = remaining[-1]
+                try:
+                    self._agent.deregister_memory(registered)
+                except Exception as exc:  # noqa: BLE001 - returned to the caller
+                    failed.append(registered)
+                    errors.append(exc)
+                remaining.pop()
+        finally:
+            self._registered_memory = remaining + failed[::-1]
+        return errors
+
+    def deregister_all(self) -> list[str]:
+        """Deregister the tensor registrations now and return the errors.
+
+        Covers the memory behind the tensor catalog (``register_tensors``,
+        ``register_arena``, ``register_additional_tensors``); a buffer from
+        ``register_dram_buffer`` is released by its owner through
+        ``deregister_memory``. ``shutdown()`` only logs deregistration failures;
+        a caller that must know its memory is released, for example before
+        handing that memory to another process, calls this first.
+
+        An empty list means every tracked registration was released; the
+        tensor catalog is then cleared and the agent metadata refreshed, so the
+        manager can register tensors again. Otherwise (a failure, or an
+        interrupt) the handles not released stay tracked and the catalog, which
+        keeps their tensors alive, stays as it is; the next call retries them,
+        and registering or ``deregister_tensors`` refuses until a retry
+        succeeds or ``shutdown()`` runs.
+        """
+        if self._agent is None:
+            return []
+        # Set first, so an interrupt leaves the manager refusing to register.
+        self._deregistration_pending = True
+        errors = [
+            f"deregister_memory: {exc!r}"[:300]
+            for exc in self._deregister_tracked_memory()
+        ]
+        if errors:
+            return errors
+        self._deregistration_pending = False
+        self._base_registration_ranges = []
+        self._appended_registrations = {}
+        self._tensors = {}
+        self._tensor_descriptors = []
+        try:
+            self._metadata = self._agent.get_agent_metadata()
+        except Exception as exc:  # noqa: BLE001 - reported to the caller
+            self._metadata = b""
+            errors.append(f"get_agent_metadata: {exc!r}"[:300])
+        return errors
+
     def shutdown(self) -> None:
         """Disconnect remote agents before releasing local NIXL resources."""
         if self._atexit_registered:
@@ -1537,14 +1614,12 @@ class NixlTransferManager:
             self._atexit_registered = False
         disconnected = self.disconnect_remote_agents()
         if self._agent is not None:
-            for registered in reversed(self._registered_memory):
-                try:
-                    self._agent.deregister_memory(registered)
-                except Exception:
-                    logger.warning(
-                        "Failed to deregister NIXL memory during shutdown",
-                        exc_info=True,
-                    )
+            for exc in self._deregister_tracked_memory():
+                logger.warning(
+                    "Failed to deregister NIXL memory during shutdown",
+                    exc_info=exc,
+                )
+        self._deregistration_pending = False
         self._registered_memory = []
         self._base_registration_ranges = []
         self._appended_registrations = {}

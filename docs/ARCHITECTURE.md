@@ -145,6 +145,7 @@ ModelExpress/
 │       ├── __init__.py                 # Package init, vLLM loader auto-registration
 │       ├── client.py                   # MxClient gRPC client
 │       ├── nixl_transfer.py            # NixlTransferManager
+│       ├── prestage.py                 # Source discovery + READ into caller-owned memory (pre-stage helper)
 │       ├── refit/                      # Engine-agnostic live-refit primitives
 │       │   ├── __init__.py             # Public refit exports
 │       │   ├── timing.py               # Structured refit stage timing
@@ -1177,6 +1178,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
+| `prestage.py` | Pre-stage helper API: `discover_source` (the `RdmaStrategy` discovery for one rank, without an engine), `plan_reads`, and `PrestageReceiver`, a receive-only agent over caller-owned CUDA memory. See [Pre-stage Receiver](#pre-stage-receiver) |
 | `refit/` | Engine-agnostic live-refit primitives. `RefitTimingRecorder` provides normalized stage timing; `reshard/` provides loader-observed geometry capture, slice/transfer planning, rendezvous, and transport abstractions |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
@@ -1249,9 +1251,23 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 | `deregister_tensors(names)` | Release tensors added by `register_additional_tensors` (catalog entries and, once unused, their registration handle). Base-catalog names are ignored; `shutdown()` releases those |
 | `fetch_remote_and_wait(agent_name, ip, port)` | P2P: fetch remote NIXL metadata via listen thread (polls until loaded) |
 | `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P) |
+| `deregister_all()` | Deregister the tensor-catalog registrations now and return the errors instead of logging them, for a caller that must know its memory is released before handing it to another process. On success the catalog is cleared so the manager can register again. On a failure or an interrupt the handles not released and the catalog (which keeps their tensors alive) stay; the next call retries them, and registration and `deregister_tensors` are refused until a retry succeeds or `shutdown()` runs. DRAM buffers from `register_dram_buffer` are released by their owner |
 | `shutdown()` | Clean up NIXL agent and resources |
 
 **Optional NIC pinning.** `MX_RDMA_NIC_PIN=auto` probes PCIe topology at agent init and pins `UCX_NET_DEVICES` to a NUMA-local IB NIC per worker. Workaround for [openucx/ucx#11259](https://github.com/openucx/ucx/issues/11259); see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for details.
+
+### Pre-stage Receiver
+
+`prestage.py` lets a process that is not an engine read a READY source's weights into device memory it owns. The intended caller is a helper that runs while a checkpointed engine process is being restored. For example, a vLLM worker checkpointed after a level-2 sleep (`MxModelLoader.on_sleep`) has released its weight memory but kept the virtual-address reservation, and otherwise gets its weights back from `reload_model()` only after the restore. The helper reads the weights during the restore instead, and the restored process then maps that memory back at its original addresses. The hand-over between the two processes is engine-specific and not part of ModelExpress.
+
+| Piece | Purpose |
+|-------|---------|
+| `engines.vllm.source_identity.build_source_identity_from_values(...)` | The `SourceIdentity` a vLLM worker with these settings publishes, from plain values; runs `build_source_identity` itself |
+| `discover_source(client, identity, worker_rank, receiver_id=...)` | `ListSources` -> rank and accelerator filter -> configured selector -> topology policy -> at most three candidates -> `GetMetadata` with the accelerator re-check -> `PrepareTensorRead`, whose manifest's rank and accelerator are checked again (the same authoritative check, so an unknown accelerator is refused for quantized weights). Returns the source with its tensor manifest and read lease; `release()` the lease after the READ. `tensor_read_lease=False` uses `GetTensorManifest` instead, like the default `RdmaStrategy`. Discovery stops before the handshake: after a failed `connect` or `read`, call it again with that worker in `exclude_worker_ids` |
+| `plan_reads(tensors, resolve)` | Maps manifest entries to local addresses through a caller-supplied resolver and returns `execute_read_batch` ranges plus the entries left out |
+| `PrestageReceiver` | Receive-only `NixlTransferManager` (`listen_port=0`) over caller-owned CUDA regions, connected to one source: `register`, `connect`, one batched `read`, and `close()`. `close()` returns every error from releasing the caller's memory (deregistration, agent shutdown) the receiver has seen, on every call, so the caller hands the memory over only when all registrations were released. Disconnecting the source is best effort, as in `RdmaStrategy`: in P2P the source never loads the receiver's metadata, so it cannot reach the caller's memory |
+
+The caller allocates the memory and hands it over. In the vLLM flow above that means the restored worker maps the pre-staged memory instead of calling `reload_model()`, and then registers and publishes itself as a source again; that engine-side step is not part of this module.
 
 ### vLLM Loader
 

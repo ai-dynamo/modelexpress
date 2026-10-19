@@ -75,6 +75,39 @@ def build_source_identity(
     )
 
 
+def build_source_identity_from_values(
+    *,
+    model: str,
+    dtype: str,
+    quantization: str | None,
+    tensor_parallel_size: int,
+    pipeline_parallel_size: int = 1,
+    data_parallel_size: int = 1,
+    enable_expert_parallel: bool = False,
+    prefill_context_parallel_size: int = 1,
+    revision: str | None = None,
+) -> p2p_pb2.SourceIdentity:
+    """The SourceIdentity a vLLM worker with these settings publishes.
+
+    For a process that has no vLLM config objects, such as a pre-stage helper
+    (see ``modelexpress.prestage``). Runs ``build_source_identity`` itself, so
+    the derivation cannot drift from the source side.
+    """
+    from types import SimpleNamespace
+
+    parallel = SimpleNamespace(
+        tensor_parallel_size=int(tensor_parallel_size),
+        pipeline_parallel_size=int(pipeline_parallel_size),
+        data_parallel_size=int(data_parallel_size),
+        enable_expert_parallel=bool(enable_expert_parallel),
+        prefill_context_parallel_size=int(prefill_context_parallel_size),
+    )
+    model_config = SimpleNamespace(
+        model=model, dtype=dtype, quantization=quantization or None, revision=revision
+    )
+    return build_source_identity(SimpleNamespace(parallel_config=parallel), model_config)
+
+
 def _resolve_model_revision(model_config) -> str:
     """Resolve the model revision for content-addressed identity.
 
