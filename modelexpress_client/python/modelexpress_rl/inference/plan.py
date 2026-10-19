@@ -107,6 +107,8 @@ class TrainerSourceSnapshot:
 
     @property
     def physical_fingerprint(self) -> tuple:
+        """Server-pinned worker/shard digests require a new mesh generation when
+        physical addresses or registrations change."""
         return (
             self.mesh_identity,
             tuple(

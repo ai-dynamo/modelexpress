@@ -567,7 +567,7 @@ addresses and registrations by digest. `GetWeightVersionShardMetadata` supplies
 version-specific checksums separately. Generators cache stable metadata by mesh
 generation, shard and worker, but check each version's publication and checksums.
 With checksum verification disabled, the version metadata RPC is skipped.
-Redis pins each worker/shard digest for the generation and rejects changes.
+Redis pins each worker/shard digest per generation; physical registration changes require advancing it.
 
 Trainers publish stable metadata before version checksums and advertisements,
 retaining staged buffer owners before registration and retaining checksums on registration errors.
