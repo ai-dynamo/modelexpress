@@ -21,6 +21,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import queue
 import re
 import statistics
 import time
@@ -43,6 +44,15 @@ def scrape_rdma(endpoints):
 
 
 def worker(device, args, barrier, results):
+    try:
+        results.put(run_loads(device, args, barrier))
+    except BaseException as exc:
+        barrier.abort()
+        results.put({"device": device, "error": repr(exc)})
+        raise
+
+
+def run_loads(device, args, barrier):
     logging.basicConfig(level=args.log_level, format=f"[gpu{device}] %(asctime)s %(name)s %(message)s")
     if args.cufile_template:
         os.environ["CUFILE_ENV_PATH_JSON"] = args.cufile_template.format(device=device)
@@ -64,10 +74,10 @@ def worker(device, args, barrier, results):
         barrier.wait()
         loader = MxObjLoader(CudaAcceleratorBackend(), device, config)
         start = time.perf_counter()
-        plan = loader.prepare(args.uri)
-        prepared = time.perf_counter()
         tensors = 0
         try:
+            plan = loader.prepare(args.uri)
+            prepared = time.perf_counter()
             for _name, _tensor in loader.iter_tensors():
                 tensors += 1
             torch.cuda.synchronize(device)
@@ -87,7 +97,22 @@ def worker(device, args, barrier, results):
                 "end": end,
             }
         )
-    results.put(runs)
+    return runs
+
+
+def collect(procs, barrier, results):
+    """Gather one outcome per worker without hanging if a worker dies unreported."""
+    outcomes = []
+    while len(outcomes) < len(procs):
+        exited = all(proc.exitcode is not None for proc in procs)
+        try:
+            outcomes.append(results.get(timeout=1.0))
+        except queue.Empty:
+            if exited:
+                break
+            if any(proc.exitcode for proc in procs):
+                barrier.abort()
+    return outcomes
 
 
 def main():
@@ -120,11 +145,14 @@ def main():
     procs = [ctx.Process(target=worker, args=(device, args, barrier, results)) for device in devices]
     for proc in procs:
         proc.start()
-    runs = [run for _ in procs for run in results.get()]
+    outcomes = collect(procs, barrier, results)
     for proc in procs:
         proc.join()
-        if proc.exitcode != 0:
-            raise SystemExit(f"worker exited with {proc.exitcode}")
+    errors = [f"gpu{outcome['device']}: {outcome['error']}" for outcome in outcomes if isinstance(outcome, dict)]
+    if errors or any(proc.exitcode for proc in procs):
+        codes = ", ".join(str(proc.exitcode) for proc in procs)
+        raise SystemExit(f"benchmark failed (worker exit codes {codes}): " + "; ".join(errors))
+    runs = [run for outcome in outcomes for run in outcome]
 
     rounds = []
     for index in range(args.repeats):

@@ -670,7 +670,14 @@ class MxObjLoader:
         while True:
             now = time.monotonic()
             for slot, handle in list(self._slot_handle.items()):
-                if self._manager.poll(handle):
+                try:
+                    done = self._manager.poll(handle)
+                except ObjTransferError:
+                    self._manager.release(handle)
+                    del self._slot_handle[slot]
+                    del self._slot_posted[slot]
+                    raise
+                if done:
                     self._manager.release(handle)
                     del self._slot_handle[slot]
                     del self._slot_posted[slot]

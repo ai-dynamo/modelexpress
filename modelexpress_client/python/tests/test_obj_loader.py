@@ -84,6 +84,7 @@ class FakeHandle:
         self.offset = offset
         self.polls = 0
         self.polls_needed = 1
+        self.released = False
 
 
 class FakeObjAgent:
@@ -118,6 +119,7 @@ class FakeObjAgent:
         self.obj_keys: dict[int, str] = {}
         self.slot_regs: dict[int, int] = {}
         self.inflight: set[FakeHandle] = set()
+        self.handles: list[FakeHandle] = []
         self.posted = 0
         self.events: list[tuple] = []
 
@@ -175,7 +177,9 @@ class FakeObjAgent:
         assert length <= self.slot_regs[addr]
         key = self.obj_keys[dev_id]
         assert offset + length <= len(self.store[key])
-        return FakeHandle(self.posted, addr, length, key, offset)
+        handle = FakeHandle(self.posted, addr, length, key, offset)
+        self.handles.append(handle)
+        return handle
 
     def transfer(self, handle):
         self.posted += 1
@@ -203,6 +207,11 @@ class FakeObjAgent:
 
     def release_xfer_handle(self, handle):
         assert handle not in self.inflight, "released a running request"
+        assert not handle.released, "released a request twice"
+        handle.released = True
+
+    def unreleased(self):
+        return [handle for handle in self.handles if not handle.released]
 
 
 def install_fake_nixl(monkeypatch):
@@ -486,6 +495,7 @@ class TestLoad:
         assert agent.backend_params["num_threads"] == "3"
         assert agent.events[-2:] == [("deregister", "VRAM"), ("deregister", "OBJ")]
         assert not agent.slot_regs and not agent.obj_keys
+        assert not agent.unreleased()
         assert backend.set_device_calls[0] == 0
         assert backend.empty_cache_calls == 1
 
@@ -508,6 +518,7 @@ class TestFailures:
             loader.prepare("s3://models/llama")
         loader.release()
         assert not state["agents"][0].slot_regs
+        assert not state["agents"][0].unreleased()
 
     def test_mid_stream_failure_drains_before_free(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
@@ -520,6 +531,7 @@ class TestFailures:
         assert not loader.finished
         assert not state["agents"][0].inflight
         loader.release()
+        assert not state["agents"][0].unreleased()
 
     def test_tail_canary_catches_short_read(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
@@ -590,6 +602,7 @@ class TestFailures:
         assert not loader.finished
         assert not state["agents"][0].inflight
         loader.release()
+        assert not state["agents"][0].unreleased()
 
     def test_object_changed_during_load(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
