@@ -121,6 +121,10 @@ def _read_dynamo_topology_dir() -> dict[str, str]:
     return out
 
 
+def _domain_value(value: object) -> Optional[str]:
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def local_topology(raw: Optional[str] = None) -> dict[str, str]:
     """This node's ``{domain: value}`` topology map.
 
@@ -144,7 +148,7 @@ def local_topology(raw: Optional[str] = None) -> dict[str, str]:
     if not isinstance(parsed, dict):
         logger.warning("MX_P2P_TOPOLOGY is not a JSON object: %r", raw)
         return {}
-    return {str(k): str(v) for k, v in parsed.items() if v is not None}
+    return {k: v for k, v in parsed.items() if _domain_value(v) is not None}
 
 
 TOPOLOGY_ENFORCEMENTS = ("required", "preferred")
@@ -199,10 +203,10 @@ def wait_for_domain(
         timeout = 0.0
     deadline = time.monotonic() + timeout
     topology = local_topology()
-    while domain not in topology and time.monotonic() < deadline:
+    while _domain_value(topology.get(domain)) is None and time.monotonic() < deadline:
         time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.0)))
         topology = local_topology()
-    if domain not in topology:
+    if _domain_value(topology.get(domain)) is None:
         _expired_waits.add(key)
     return topology
 
@@ -232,7 +236,7 @@ def resolve_policy(timeout: Optional[float] = None) -> Optional[TopologyPolicy]:
     if enforcement != "required":
         timeout = 0.0
     start = time.monotonic()
-    local_value = wait_for_domain(domain, timeout=timeout).get(domain)
+    local_value = _domain_value(wait_for_domain(domain, timeout=timeout).get(domain))
     if local_value is None:
         logger.warning(
             "MX_P2P_TOPOLOGY_DOMAIN=%r but this node reports no value for it "
@@ -250,16 +254,20 @@ def blocks_selection(policy: Optional[TopologyPolicy]) -> bool:
     Under ``required`` no source can be proven same-domain, so callers fall back
     without listing sources.
     """
-    return policy is not None and policy.required and policy.local_value is None
+    return (
+        policy is not None
+        and policy.required
+        and _domain_value(policy.local_value) is None
+    )
 
 
 def in_domain(candidate, policy: TopologyPolicy) -> bool:
     """Whether ``candidate`` published this node's value for the policy domain."""
     raw = getattr(candidate, "topology", None)
     return (
-        policy.local_value is not None
+        _domain_value(policy.local_value) is not None
         and bool(raw)
-        and raw.get(policy.domain) == policy.local_value
+        and _domain_value(raw.get(policy.domain)) == policy.local_value
     )
 
 
@@ -285,7 +293,9 @@ def warn_if_no_domain_match(
     if any(in_domain(c, policy) for c in candidates):
         return
     missing = sum(
-        1 for c in candidates if not (getattr(c, "topology", None) or {}).get(policy.domain)
+        1
+        for c in candidates
+        if _domain_value((getattr(c, "topology", None) or {}).get(policy.domain)) is None
     )
     logger.warning(
         "[Worker %s] No P2P source shares %s=%r: %d compatible source(s), %d "
