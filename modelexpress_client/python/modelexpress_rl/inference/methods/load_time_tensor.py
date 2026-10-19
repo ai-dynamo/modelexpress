@@ -27,7 +27,6 @@ from ..plan import (
     PreparedStreamingTensors,
     ResolvedSource,
     ResolvedTrainerSource,
-    TrainerSourceSnapshot,
     UpdateMethod,
     WeightSource,
 )
@@ -46,9 +45,6 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         self._transfer = transfer
         self._active_staged: _StagedNixlWeights | None = None
         self._active_streamed: PreparedStreamingTensors | None = None
-
-    def cached_trainer_source(self) -> TrainerSourceSnapshot | None:
-        return self._transfer.cached_trainer_source()
 
     @property
     def capabilities(self) -> MethodCapabilities:
@@ -70,7 +66,6 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                 manifests=manifests,
                 trainer_snapshot=source.snapshot,
                 checksums=source.checksums,
-                prepare_groups=source.prepare_groups,
             )
             counters.update(prepared.metrics)
         set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))

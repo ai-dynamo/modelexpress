@@ -1958,9 +1958,9 @@ cached replica reuses them. Each batch recreates views, zeroes padding and posts
 fresh READs. Mesh changes and destination teardown clear execution caches;
 failed attempts invalidate the active binding and retain only safe resources.
 
-Trainer discovery selects replicas for needed shard groups and reuses parsed
-metadata. Snapshots hold no tensors, handles, checksums or leases. Coverage and
-capacity are checked during compilation.
+The resolver owns `_TrainerReplicaGroup` objects per logical slot, retaining all mesh members in worker order
+and cached stable metadata until `MeshIdentity` changes. Prefetch fills only group caches; selections get fresh checksums.
+Immutable snapshots hold no tensors, handles, checksums or leases. Compilation checks coverage and capacity.
 
 The prepared streaming artifact owns its iterator and remains protected by the
 version lease. An installation failure fences the engine and never falls back

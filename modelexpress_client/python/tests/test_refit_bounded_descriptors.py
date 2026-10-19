@@ -192,13 +192,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
             TrainerSourceShard("slot", "worker", hashlib.sha256(blob).hexdigest(), "source:19000", blob)
             for blob in blobs
         ))
-        cached = transfer.cached_trainer_source()
-        if (
-            not parameters.get("equivalent_snapshot", False)
-            and cached is not None
-            and cached.physical_fingerprint == snapshot.physical_fingerprint
-        ):
-            snapshot = cached
+        state.snapshot = snapshot
         return transfer.prepare(
             trainer_snapshot=snapshot,
             manifests=blobs,
@@ -263,9 +257,8 @@ def _check_values(
     indirect=True,
 )
 @pytest.mark.parametrize("pack", [False, True])
-@pytest.mark.parametrize("equivalent_snapshot", [False, True])
 def test_warm_descriptors_still_transfer_new_values(
-    harness, monkeypatch, pack, equivalent_snapshot
+    harness, monkeypatch, pack
 ) -> None:
     monkeypatch.setenv("MX_REFIT_PACK_MODULES", str(int(pack)))
     prepare = harness.prepare

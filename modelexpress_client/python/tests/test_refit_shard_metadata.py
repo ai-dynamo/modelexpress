@@ -89,7 +89,7 @@ def protocol(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
     with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
         service = refit_pb2_grpc.RefitServiceStub(channel)
         case = SimpleNamespace(
-            control=control, worker=worker, cached_snapshot=None,
+            control=control, worker=worker,
             version=WeightVersion(
                 version_id="version-a", model_name="test/model",
                 payload_format=WeightPayloadFormat.FULL_TENSOR, layout_signature="layout-a",
@@ -99,7 +99,6 @@ def protocol(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
         )
         case.resolver = TrainerSourceResolver(
             service=lambda: service, rpc_timeout_seconds=2,
-            cached_source=lambda: case.cached_snapshot,
         )
         _advertise(case)
         try:
@@ -219,7 +218,6 @@ def test_new_version_resolves_fresh_checksums_without_refetching_stable_metadata
         protocol.control.shards[0].version_metadata_digest = ""
     with use_refit_timing(discovery_timing.recorder):
         first, = protocol.resolver.candidates(protocol.version)
-        protocol.cached_snapshot = first.snapshot
         second, = protocol.resolver.candidates(_next_version(protocol))
     stage = discovery_timing.recorder.as_dict()["stages"]["source_preparation"]
     assert stage["duration_ms"] == (8000 if verify else 2000)
@@ -233,11 +231,11 @@ def test_new_version_resolves_fresh_checksums_without_refetching_stable_metadata
     )
 
 
-@pytest.mark.parametrize("change", ["replica", "generation"])
-def test_changed_source_resolves_current_storage(protocol, change) -> None:
+@pytest.mark.parametrize("change", ["replica", "generation", "mesh"])
+def test_changed_source_resolves_current_storage(protocol, monkeypatch, change) -> None:
     first, = protocol.resolver.candidates(protocol.version)
-    protocol.cached_snapshot = first.snapshot
-    generation = 2
+    original_group = protocol.resolver._groups["rank:0"]
+    generation = 1 if change == "mesh" else 2
     worker = "trainer-replacement" if change == "replica" else "trainer-0"
     protocol.control.shards[0].worker_id = worker
     protocol.worker.metadata.worker_id = worker
@@ -247,8 +245,22 @@ def test_changed_source_resolves_current_storage(protocol, change) -> None:
     protocol.worker.blob = json.dumps(payload).encode()
     protocol.worker.metadata.stable_metadata_digest = hashlib.sha256(protocol.worker.blob).hexdigest()
     requested = replace(_next_version(protocol), trainer_mesh_generation=generation)
+    if change == "mesh":
+        service = protocol.resolver._service()
+
+        def get_mesh(request, **kwargs):
+            response = service.GetTrainerMesh(refit_pb2.GetTrainerMeshRequest(mesh_id="mesh-a"), **kwargs)
+            response.mesh.mesh_id = request.mesh_id
+            return response
+
+        monkeypatch.setattr(protocol.resolver, "_service", lambda: SimpleNamespace(
+            GetTrainerMesh=get_mesh, ListWeightVersionShards=service.ListWeightVersionShards,
+        ))
+        requested = replace(requested, trainer_mesh_id="mesh-b")
     second, = protocol.resolver.candidates(requested)
-    assert second.snapshot.replica_groups is not first.snapshot.replica_groups
+    assert protocol.resolver._groups["rank:0"] is not original_group
+    assert original_group.sources["trainer-0"] is first.snapshot.shards[0]
+    assert first.snapshot.shards[0].metadata == _STABLE_METADATA
     assert second.snapshot.mesh_identity.generation == generation
     assert second.snapshot.shards[0].worker_id == worker
     assert second.snapshot.shards[0].metadata == protocol.worker.blob
@@ -260,8 +272,7 @@ def test_changed_source_resolves_current_storage(protocol, change) -> None:
 def test_requested_version_generation_mismatch_rejects_cached_selection(
     protocol: SimpleNamespace,
 ) -> None:
-    first, = protocol.resolver.candidates(protocol.version)
-    protocol.cached_snapshot = first.snapshot
+    list(protocol.resolver.candidates(protocol.version))
     protocol.control.mesh_generation_on_recheck = 2
     with pytest.raises(RuntimeError, match="generation"):
         next(protocol.resolver.candidates(_next_version(protocol)))
@@ -358,7 +369,6 @@ def test_prefetched_replica_fallback_resolves_round_checksums(
     ).hexdigest()
     candidates = protocol.resolver.candidates(protocol.version)
     selected = next(candidates)
-    selected.prepare_groups(frozenset({"rank:0"}))
     assert selected.snapshot.shards[0].worker_id == first.worker_id
     assert len(protocol.worker.stable_requests) == 2
     protocol.worker.metadata.CopyFrom(second_metadata)
@@ -370,11 +380,9 @@ def test_prefetched_replica_fallback_resolves_round_checksums(
     candidates.close()
 
 
-def test_replica_groups_include_unpublished_members_in_worker_order(
+def test_resolver_groups_include_unpublished_members_without_mutating_snapshots(
     protocol: SimpleNamespace, replicas,
 ) -> None:
-    expected_members = ["trainer-a", "trainer-b", "trainer-unpublished"]
-    expected_worker = "trainer-a"
     first, second = replicas
     mesh = refit_pb2.TrainerMesh(
         mesh_id="mesh-a", model_name="test/model", generation=1,
@@ -382,7 +390,7 @@ def test_replica_groups_include_unpublished_members_in_worker_order(
             worker_id: refit_pb2.TrainerTensorsMetadata(
                 logical_shard_id="rank:0", metadata_endpoint=first.metadata_endpoint,
             )
-            for worker_id in ("trainer-a", "trainer-b", "trainer-unpublished")
+            for worker_id in ("trainer-b", "trainer-a", "trainer-unpublished")
         },
     )
     service = SimpleNamespace(
@@ -391,57 +399,54 @@ def test_replica_groups_include_unpublished_members_in_worker_order(
             refit_pb2.ListWeightVersionShardsResponse(shards=protocol.control.shards)
         ),
     )
-    protocol.resolver = TrainerSourceResolver(
-        service=lambda: service,
-        rpc_timeout_seconds=2,
-        cached_source=lambda: protocol.cached_snapshot,
-    )
-
+    protocol.resolver = TrainerSourceResolver(service=lambda: service, rpc_timeout_seconds=2)
+    protocol.control.shards.reverse()
     candidates = protocol.resolver.candidates(protocol.version)
     resolved = next(candidates)
+    group = protocol.resolver._groups["rank:0"]
+    assert group.source_slot_id == "rank:0"
+    assert group.worker_ids == ("trainer-a", "trainer-b", "trainer-unpublished")
+    assert tuple(group.sources) == ("trainer-a",)
     retry = next(candidates)
-    assert retry.snapshot.replica_groups is resolved.snapshot.replica_groups
+    assert resolved.snapshot.shards[0].worker_id == "trainer-a"
     assert retry.snapshot.shards[0].worker_id == "trainer-b"
     candidates.close()
+    assert len(protocol.worker.stable_requests) == 2
 
-    assert resolved.snapshot.shards[0].worker_id == expected_worker
-    group, = resolved.snapshot.replica_groups
-    assert group.source_slot_id == "rank:0"
-    assert [replica.worker_id for replica in group.replicas] == expected_members
-    assert [replica.metadata is not None for replica in group.replicas] == [
-        worker_id != "trainer-unpublished" for worker_id in expected_members
-    ]
-
-    protocol.cached_snapshot = resolved.snapshot
     first.version_id = "version-b"
     protocol.control.shards = [first]
     warm = next(protocol.resolver.candidates(replace(protocol.version, version_id="version-b")))
-    assert warm.snapshot.shards[0].worker_id == "trainer-a"
-    assert warm.snapshot.replica_groups is resolved.snapshot.replica_groups
+    assert warm.snapshot.shards[0] is resolved.snapshot.shards[0]
+    assert protocol.resolver._groups["rank:0"] is group
+    assert retry.snapshot.shards[0].worker_id == "trainer-b"
+    assert len(protocol.worker.stable_requests) == 2
+
+    late = refit_pb2.WeightVersionShard()
+    late.CopyFrom(first)
+    late.version_id = "version-c"
+    late.worker_id = "trainer-unpublished"
+    protocol.control.shards = [late]
+    published = next(protocol.resolver.candidates(replace(protocol.version, version_id="version-c")))
+    assert published.snapshot.shards[0].worker_id == late.worker_id
+    assert protocol.resolver._groups["rank:0"] is group
+    assert tuple(group.sources) == group.worker_ids
+    assert len(protocol.worker.stable_requests) == 3
 
 
-def test_prepare_groups_fetches_metadata_only_for_requested_groups(
-    protocol: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, replicas,
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_optional_prefetch_populates_only_stable_metadata(
+    protocol: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, replicas, prefetch: bool,
 ) -> None:
-    monkeypatch.setenv("MX_REFIT_PREFETCH_REPLICA_METADATA", "1")
-    first, second = replicas
-
-    resolved = next(protocol.resolver.candidates(protocol.version))
-    before = len(protocol.worker.stable_requests)
-    assert resolved.prepare_groups is not None
-    group, = resolved.snapshot.replica_groups
-    assert group.replicas[1].metadata is None
-    resolved.prepare_groups(frozenset({"rank:missing"}))
-    assert len(protocol.worker.stable_requests) == before
-    resolved.prepare_groups(frozenset({"rank:0"}))
-    assert group.replicas[1].metadata == protocol.worker.blob
-    assert len(protocol.worker.stable_requests) == before + 1
+    monkeypatch.setenv("MX_REFIT_PREFETCH_REPLICA_METADATA", str(int(prefetch)))
+    first = next(protocol.resolver.candidates(protocol.version))
+    assert first.snapshot.shards[0].worker_id == "trainer-a"
+    assert len(protocol.worker.stable_requests) == (2 if prefetch else 1)
     assert protocol.worker.version_requests == []
 
 
 @pytest.mark.parametrize("difference", ["coverage", "placement"])
 @pytest.mark.parametrize("debug", [False, True])
-def test_prepare_groups_checks_replica_coverage_only_in_debug_mode(
+def test_resolution_checks_replica_coverage_only_in_debug_mode(
     protocol: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, replicas,
     debug: bool, difference: str,
 ) -> None:
@@ -458,23 +463,18 @@ def test_prepare_groups_checks_replica_coverage_only_in_debug_mode(
     second.stable_metadata_digest = hashlib.sha256(alternate_blob).hexdigest()
     protocol.worker.blobs[second.stable_metadata_digest] = alternate_blob
 
-    resolved = next(protocol.resolver.candidates(protocol.version))
-    assert resolved.prepare_groups is not None
-    before = len(protocol.worker.stable_requests)
-    if debug:
-        if difference == "coverage":
-            with pytest.raises(RuntimeError, match="replicas disagree on tensor coverage"):
-                resolved.prepare_groups(frozenset({"rank:0"}))
-        else:
-            resolved.prepare_groups(frozenset({"rank:0"}))
-        assert len(protocol.worker.stable_requests) == before + 1
+    if debug and difference == "coverage":
+        with pytest.raises(RuntimeError, match="replicas disagree on tensor coverage"):
+            next(protocol.resolver.candidates(protocol.version))
     else:
-        resolved.prepare_groups(frozenset({"rank:0"}))
-        assert len(protocol.worker.stable_requests) == before
+        next(protocol.resolver.candidates(protocol.version))
+    assert len(protocol.worker.stable_requests) == (2 if debug else 1)
 
 
-@pytest.mark.parametrize("failure", ["unavailable", "debug_unavailable", "digest", "permission"])
-def test_optional_prefetch_only_tolerates_unavailable_replica(
+@pytest.mark.parametrize("failure", [
+    "unavailable", "debug_unavailable", "digest", "permission_denied",
+])
+def test_optional_prefetch_only_tolerates_availability_errors(
     protocol: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, replicas, failure: str,
 ) -> None:
     monkeypatch.setenv("MX_REFIT_PREFETCH_REPLICA_METADATA", "1")
@@ -484,36 +484,40 @@ def test_optional_prefetch_only_tolerates_unavailable_replica(
     alternate_blob = json.dumps(alternate).encode()
     second.stable_metadata_digest = hashlib.sha256(alternate_blob).hexdigest()
     protocol.worker.blobs[second.stable_metadata_digest] = alternate_blob
-    if failure == "debug_unavailable":
+    if failure.startswith("debug_"):
         monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_REPLICAS", "1")
-    resolved = next(protocol.resolver.candidates(protocol.version))
-    assert resolved.prepare_groups is not None
-    group, = resolved.snapshot.replica_groups
+    original = protocol.resolver._resolve_source
+    injected = False
 
-    if failure in {"unavailable", "debug_unavailable"}:
-        protocol.worker.stable_failures = 1
-    elif failure == "digest":
-        protocol.worker.blobs[second.stable_metadata_digest] = b"wrong metadata"
-    else:
-        protocol.worker.stable_failures = 1
-        protocol.worker.stable_failure_code = grpc.StatusCode.PERMISSION_DENIED
-    if failure == "unavailable":
-        resolved.prepare_groups(frozenset({"rank:0"}))
-        assert group.replicas[1].metadata is None
-        resolved.prepare_groups(frozenset({"rank:0"}))
-        assert group.replicas[1].metadata == alternate_blob
+    def fail_prefetch(publication, *args, **kwargs):
+        nonlocal injected
+        if publication.worker_id == second.worker_id and not injected:
+            injected = True
+            if failure == "digest":
+                protocol.worker.blobs[second.stable_metadata_digest] = b"wrong metadata"
+            else:
+                protocol.worker.stable_failures = 1
+                protocol.worker.stable_failure_code = getattr(grpc.StatusCode, failure.removeprefix("debug_").upper())
+        return original(publication, *args, **kwargs)
+
+    monkeypatch.setattr(protocol.resolver, "_resolve_source", fail_prefetch)
+    candidates = protocol.resolver.candidates(protocol.version)
+    if failure in ("unavailable", "deadline_exceeded"):
+        resolved = next(candidates)
+        fallback = next(candidates)
+        assert fallback.snapshot.shards[0].metadata == alternate_blob
+        assert resolved.snapshot.shards[0].metadata == protocol.worker.blob
     else:
         with pytest.raises((RuntimeError, grpc.RpcError)):
-            resolved.prepare_groups(frozenset({"rank:0"}))
-        assert group.replicas[1].metadata is None
+            next(candidates)
+    candidates.close()
 
 
 def test_warm_resolution_rechecks_mesh_after_listing_without_checksums(
     protocol: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
-    first = next(protocol.resolver.candidates(protocol.version))
-    protocol.cached_snapshot = first.snapshot
+    next(protocol.resolver.candidates(protocol.version))
     version = _next_version(protocol)
     service = protocol.resolver._service()
 

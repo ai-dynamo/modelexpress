@@ -1751,12 +1751,13 @@ settings are read when the transfer is constructed.
 | `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` | `0` | Validate that generator layout hasn't changed. |
 | `MX_REFIT_PACK_MODULES` | `1` | Pack complete owning modules within each bounded staging arena. |
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Descriptor budget before full-source reconstruction. |
-| `MX_REFIT_PREFETCH_REPLICA_METADATA` | `0` | Fetch stable metadata for all replicas in needed logical-shard groups on first preparation. |
+| `MX_REFIT_PREFETCH_REPLICA_METADATA` | `0` | Prefetch stable metadata for published replica groups during source resolution. |
 | `MX_REFIT_DEBUG_VALIDATE_REPLICAS` | `0` | Check that replicas in each logical-shard group have equivalent canonical coverage. |
 
-Replicas are tried in worker-ID order. Metadata prefetch is limited to groups
-needed by the transfer plan; unavailable replicas can be retried later.
-Digest and identity errors fail preparation. Debug validation requires every
+Replicas are tried lazily in worker-ID order by default. Optional prefetch and
+debug validation inspect published groups before transfer-plan pruning;
+unavailable prefetched replicas can be retried later. Digest and identity errors
+fail resolution. Debug validation requires every
 published replica to resolve and compares canonical coverage and geometry,
 ignoring replica-specific physical addresses.
 

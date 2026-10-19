@@ -18,14 +18,6 @@ class GeneratorEngineContext(ABC):
 
 
 @dataclass(frozen=True)
-class ReplicaGroup:
-    """All trainer workers that can serve one logical source slot."""
-
-    source_slot_id: str
-    replicas: list[TrainerSourceShard] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
 class TrainerSourceShard:
     """Immutable manifest and worker selection for one trainer slot."""
 
@@ -43,4 +35,4 @@ class TrainerSourceShard:
             object.__setattr__(self, "checksum_keys", MappingProxyType(dict(self.checksum_keys)))
 
 
-__all__ = ["GeneratorEngineContext", "ReplicaGroup", "TrainerSourceShard"]
+__all__ = ["GeneratorEngineContext", "TrainerSourceShard"]

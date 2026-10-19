@@ -680,7 +680,6 @@ class _NixlStagedTransfer:
         return replace(
             trainer,
             shards=tuple(shard for shard in trainer.shards if shard.source_slot_id in slots),
-            replica_groups=tuple(group for group in trainer.replica_groups if group.source_slot_id in slots),
             resolved_metadata=replace(
                 trainer.resolved_metadata,
                 manifest_agents=tuple(
@@ -727,12 +726,6 @@ class _NixlStagedTransfer:
         return _SourceBinding(
             resolved, dict(zip(slots, agents, strict=True)), trainer.physical_fingerprint
         )
-
-    def cached_trainer_source(self) -> TrainerSourceSnapshot | None:
-        plan = self._weight_update_plan
-        if plan is None or self._closed:
-            return None
-        return plan.trainer_source_snapshot
 
     def _can_reuse_plan(self, trainer: TrainerSourceSnapshot) -> bool:
         previous = self._weight_update_plan
@@ -850,7 +843,6 @@ class _NixlStagedTransfer:
         manifests: list[bytes],
         trainer_snapshot: TrainerSourceSnapshot,
         checksums: Mapping[ShardChecksumKey, str] | None = None,
-        prepare_groups: Callable[[frozenset[str]], None] | None = None,
     ) -> _PreparedNixlTransfer | _PreparedBoundedTransfer:
         """Prepare one version-scoped transfer using this instance's staging mode."""
         streaming = self._streaming
@@ -913,8 +905,6 @@ class _NixlStagedTransfer:
             )
             if not reusable:
                 trainer = self._retain_needed_sources(trainer, plan)
-            if prepare_groups is not None:
-                prepare_groups(frozenset(shard.source_slot_id for shard in trainer.shards))
             source_binding = (
                 previous.source_binding if reusable else self._source_binding(trainer)
             )

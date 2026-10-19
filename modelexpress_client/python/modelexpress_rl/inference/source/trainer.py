@@ -4,11 +4,11 @@
 """Trainer-memory source resolution."""
 
 import hashlib
+import json
 import logging
-from functools import partial
-from itertools import chain
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, field
 from time import perf_counter
 
 import grpc
@@ -18,10 +18,10 @@ from modelexpress.refit.timing import add_refit_duration, refit_span
 
 from ... import refit_pb2, refit_pb2_grpc
 from ...control import WeightVersion
-from ...train.manifest import ShardChecksumKey, version_metadata_digest
+from ...train.manifest import ShardChecksumKey, bound_tensor_manifest, version_metadata_digest
 from ...train import WeightPayloadFormat
 from ...version import MeshIdentity
-from ..adapter import ReplicaGroup, TrainerSourceShard
+from ..adapter import TrainerSourceShard
 from ..plan import (
     ResolvedSource,
     ResolvedTrainerSource,
@@ -35,21 +35,19 @@ logger = logging.getLogger("modelexpress_rl.inference.source.trainer")
 _MAX_MANIFEST_MESSAGE_SIZE_BYTES = 100 * 1024 * 1024
 
 
-def _coverage_signature(blob: bytes) -> tuple:
-    """Describe logical tensor coverage without physical placement or digests."""
-    tensors = unwrap_rendezvous_blob(blob).tensors
-    return tuple(sorted(
-        (
-            tensor.name,
-            str(tensor.dtype),
-            tuple(tensor.full_shape),
-            tuple(sorted(
-                (tuple(shard.shard_offset), tuple(shard.shape))
-                for shard in tensor.shards
-            )),
-        )
-        for tensor in tensors
-    ))
+@dataclass(frozen=True)
+class _TrainerReplicaGroup:
+    """Mesh members and cached stable metadata for one logical source slot."""
+
+    source_slot_id: str
+    worker_ids: tuple[str, ...]
+    sources: dict[str, TrainerSourceShard] = field(default_factory=dict)
+
+    def published(
+        self, publications: list[refit_pb2.WeightVersionShard],
+    ) -> list[refit_pb2.WeightVersionShard]:
+        by_worker = {shard.worker_id: shard for shard in publications}
+        return [by_worker[worker] for worker in self.worker_ids if worker in by_worker]
 
 
 class _SlotReplicas:
@@ -108,9 +106,9 @@ class _SlotReplicas:
 class _ResolutionRound:
     """Per-update source resolution, checksums, and timing."""
 
-    def __init__(self, resolve_source, stable_sources) -> None:
+    def __init__(self, resolve_source, groups) -> None:
         self._resolve_source = resolve_source
-        self._stable_sources = stable_sources
+        self._groups = groups
         self._verify = envs.MX_RESHARD_PUBLISH_DIGEST
         self.sources = {}
         self.checksums = {}
@@ -122,10 +120,11 @@ class _ResolutionRound:
         identity = (shard.logical_shard_id, shard.worker_id)
         if identity in self.sources:
             return self.sources[identity]
+        group = self._groups[shard.logical_shard_id]
         started = perf_counter()
         try:
             source, checksums = self._resolve_source(
-                shard, self._stable_sources.get(identity),
+                shard, group.sources.get(shard.worker_id),
                 verify=self._verify, counters=self._counters,
             )
         except BaseException:
@@ -133,7 +132,7 @@ class _ResolutionRound:
             raise
         finally:
             self._seconds += perf_counter() - started
-        self._stable_sources[identity] = source
+        group.sources[shard.worker_id] = source
         self.sources[identity] = source
         self.checksums[identity] = checksums
         return source
@@ -159,10 +158,10 @@ class TrainerSourceResolver(SourceResolver):
         *,
         service: Callable[[], refit_pb2_grpc.RefitServiceStub],
         rpc_timeout_seconds: float,
-        cached_source: Callable[[], TrainerSourceSnapshot | None] | None = None,
     ) -> None:
         self._service = service
-        self._cached_source = cached_source
+        self._mesh_identity: MeshIdentity | None = None
+        self._groups: dict[str, _TrainerReplicaGroup] = {}
         self._rpc_timeout_seconds = rpc_timeout_seconds
 
     @property
@@ -181,55 +180,49 @@ class TrainerSourceResolver(SourceResolver):
         mesh = self._get_mesh(version)
         if mesh is None:
             return
-        mesh_workers, mesh_slots, mesh_identity = mesh
+        mesh_workers, expected_slots, mesh_identity = mesh
         published = self._list_published_shards(version, mesh_workers)
         if published is None:
             return
 
-        cached = self._cached_source() if self._cached_source is not None else None
-        if cached is not None and cached.mesh_identity != mesh_identity:
-            cached = None
-        groups = cached.replica_groups if cached is not None else ()
-        if not groups:
-            groups = tuple(
-                ReplicaGroup(slot, [
-                    TrainerSourceShard(
-                        source_slot_id=slot, worker_id=worker_id,
-                        metadata_endpoint=member.metadata_endpoint,
-                        stable_metadata_digest=None, metadata=None,
-                    )
-                    for worker_id, member in sorted(mesh_workers.items())
+        if self._mesh_identity != mesh_identity:
+            self._groups = {
+                slot: _TrainerReplicaGroup(slot, tuple(
+                    worker_id for worker_id, member in sorted(mesh_workers.items())
                     if member.logical_shard_id == slot
-                ])
-                for slot in mesh_slots
-            )
-        stable_sources = self._cached_replicas(cached) if cached is not None else {}
-        resolution = _ResolutionRound(self._resolve_source, stable_sources)
+                ))
+                for slot in expected_slots
+            }
+            self._mesh_identity = mesh_identity
+        resolution = _ResolutionRound(self._resolve_source, self._groups)
 
         try:
-            slots = self._published_slots(
-                groups, published, resolution.resolve,
-            )
-            if slots is None:
-                return
+            slots = []
+            for group in self._groups.values():
+                ordered = group.published(published[group.source_slot_id])
+                if not ordered:
+                    logger.warning(
+                        "no trainer source published for required slot %s",
+                        group.source_slot_id,
+                    )
+                    return
+                slots.append(_SlotReplicas(group.source_slot_id, ordered, resolution.resolve))
 
             seen: set[tuple[tuple[str, str], ...]] = set()
             for selected in self._candidate_sets(slots, seen):
                 selection = tuple(
                     (source.source_slot_id, source.worker_id) for source in selected
                 )
+                if not seen:
+                    self._prepare_replicas(published)
                 self._check_current_mesh(mesh_identity)
                 seen.add(selection)
-                for group, source in zip(groups, selected, strict=True):
-                    self._update_replica(group, source)
-                snapshot = TrainerSourceSnapshot(
-                    mesh_identity=mesh_identity,
-                    shards=selected,
-                    replica_groups=groups,
-                )
                 resolution.flush()
                 yield ResolvedTrainerSource(
-                    snapshot=snapshot,
+                    snapshot=TrainerSourceSnapshot(
+                        mesh_identity=mesh_identity,
+                        shards=selected,
+                    ),
                     checksums={
                         key: digest
                         for source in selected
@@ -237,116 +230,37 @@ class TrainerSourceResolver(SourceResolver):
                             (source.source_slot_id, source.worker_id)
                         ].items()
                     },
-                    prepare_groups=partial(
-                        self._prepare_groups, snapshot, published, stable_sources,
-                        resolution.sources, prefetch=envs.MX_REFIT_PREFETCH_REPLICA_METADATA,
-                        debug_validate=envs.MX_REFIT_DEBUG_VALIDATE_REPLICAS,
-                    ),
                 )
         finally:
             resolution.flush()
 
-    @staticmethod
-    def _published_slots(groups, published, resolve) -> list[_SlotReplicas] | None:
-        slots = []
-        for group in groups:
-            publications = {item.worker_id: item for item in published[group.source_slot_id]}
-            ordered = [
-                publications[replica.worker_id] for replica in group.replicas
-                if replica.worker_id in publications
-            ]
-            if not ordered:
-                logger.warning("no trainer source published for required slot %s", group.source_slot_id)
-                return None
-            slots.append(_SlotReplicas(group.source_slot_id, ordered, resolve))
-        return slots
-
-    @staticmethod
-    def _cached_replicas(snapshot: TrainerSourceSnapshot) -> dict:
-        sources = (
-            source for group in snapshot.replica_groups for source in group.replicas
-        )
-        return {
-            (source.source_slot_id, source.worker_id): source
-            for source in chain(sources, snapshot.shards)
-            if source.metadata is not None and source.stable_metadata_digest
-        }
-
-    @staticmethod
-    def _update_replica(group: ReplicaGroup, source: TrainerSourceShard) -> None:
-        for index, replica in enumerate(group.replicas):
-            if replica.worker_id == source.worker_id:
-                group.replicas[index] = source
-                return
-        raise RuntimeError("cached trainer source group is missing a selected replica")
-
-    def _prepare_groups(
-        self, snapshot, published, stable_sources, round_sources, needed_slots,
-        *, prefetch, debug_validate,
-    ) -> None:
-        if not prefetch and not debug_validate:
+    def _prepare_replicas(self, published) -> None:
+        debug_validate = envs.MX_REFIT_DEBUG_VALIDATE_REPLICAS
+        if not envs.MX_REFIT_PREFETCH_REPLICA_METADATA and not debug_validate:
             return
-        started = perf_counter()
         counters: dict[str, int | float] = defaultdict(int)
-        failed = False
-        try:
-            groups = {group.source_slot_id: group for group in snapshot.replica_groups}
-            for slot_id in sorted(needed_slots):
-                group = groups.get(slot_id)
-                if group is not None:
-                    self._prepare_group(
-                        group, published[slot_id], stable_sources, round_sources,
-                        counters, debug_validate,
+        with refit_span("source_preparation", metadata=counters, accumulate_metadata=True):
+            for group in self._groups.values():
+                coverage = set()
+                for publication in group.published(published[group.source_slot_id]):
+                    source = group.sources.get(publication.worker_id)
+                    if source is None:
+                        try:
+                            source, _ = self._resolve_source(
+                                publication, None, verify=False, counters=counters,
+                            )
+                        except grpc.RpcError as error:
+                            if debug_validate or error.code() != grpc.StatusCode.UNAVAILABLE:
+                                raise
+                            counters["replica_metadata_prefetch_unavailable"] += 1
+                            continue
+                        group.sources[publication.worker_id] = source
+                    if debug_validate:
+                        coverage.add(bound_tensor_manifest(json.loads(source.metadata)["tensors"]))
+                if len(coverage) > 1:
+                    raise RuntimeError(
+                        f"trainer replicas disagree on tensor coverage for slot {group.source_slot_id!r}"
                     )
-        except (grpc.RpcError, RuntimeError):
-            failed = True
-            raise
-        finally:
-            if counters:
-                add_refit_duration(
-                    "source_preparation", perf_counter() - started,
-                    status="error" if failed else "ok", metadata=dict(counters),
-                    accumulate_metadata=True,
-                )
-
-    def _prepare_group(
-        self, group, publications, stable_sources, round_sources, counters, debug_validate,
-    ) -> None:
-        publications = {item.worker_id: item for item in publications}
-        metadata = []
-        for index, replica in enumerate(group.replicas):
-            publication = publications.get(replica.worker_id)
-            if publication is None:
-                continue
-            source = self._prefetch_replica(
-                publication, stable_sources, round_sources, counters, debug_validate,
-            )
-            if source is None:
-                continue
-            group.replicas[index] = source
-            metadata.append(source.metadata)
-        if debug_validate and metadata and len({_coverage_signature(blob) for blob in metadata}) != 1:
-            raise RuntimeError(
-                f"trainer replicas disagree on tensor coverage for slot {group.source_slot_id!r}"
-            )
-
-    def _prefetch_replica(
-        self, publication, stable_sources, round_sources, counters, debug_validate,
-    ) -> TrainerSourceShard | None:
-        identity = (publication.logical_shard_id, publication.worker_id)
-        if identity in round_sources:
-            return round_sources[identity]
-        try:
-            source, _ = self._resolve_source(
-                publication, stable_sources.get(identity), verify=False, counters=counters,
-            )
-        except grpc.RpcError as error:
-            if debug_validate or error.code() != grpc.StatusCode.UNAVAILABLE:
-                raise
-            counters["replica_metadata_prefetch_unavailable"] += 1
-            return None
-        stable_sources[identity] = source
-        return source
 
     def _get_mesh(
         self, version: WeightVersion

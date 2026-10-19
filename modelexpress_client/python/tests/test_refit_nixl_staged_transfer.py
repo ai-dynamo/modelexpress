@@ -1377,7 +1377,7 @@ def test_generator_layout_debug_assertion(harness, monkeypatch, enabled):
         return capture, harness.layout
 
     harness.prepare()
-    source = ResolvedTrainerSource(harness.transfer.cached_trainer_source())
+    source = ResolvedTrainerSource(harness.snapshot)
     transfer = _NixlStagedTransfer(
         agent_name="debug-target",
         device_id=0,
