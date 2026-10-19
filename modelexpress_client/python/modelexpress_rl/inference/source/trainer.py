@@ -346,7 +346,6 @@ class TrainerSourceResolver(SourceResolver):
             counters["replica_metadata_prefetch_unavailable"] += 1
             return None
         stable_sources[identity] = source
-        round_sources[identity] = source
         return source
 
     def _get_mesh(

@@ -341,6 +341,35 @@ def replicas(protocol, monkeypatch):
     return first, second
 
 
+@pytest.mark.parametrize("verify", [False, True])
+def test_prefetched_replica_fallback_resolves_round_checksums(
+    protocol, replicas, monkeypatch, verify,
+) -> None:
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", str(int(verify)))
+    monkeypatch.setenv("MX_REFIT_PREFETCH_REPLICA_METADATA", "1")
+    first, second = replicas
+    protocol.worker.metadata.worker_id = first.worker_id
+    _advertise(protocol)
+    second_metadata = refit_pb2.WeightVersionShardMetadata()
+    second_metadata.CopyFrom(protocol.worker.metadata)
+    second_metadata.worker_id = second.worker_id
+    second.version_metadata_digest = hashlib.sha256(
+        second_metadata.SerializeToString(deterministic=True)
+    ).hexdigest()
+    candidates = protocol.resolver.candidates(protocol.version)
+    selected = next(candidates)
+    selected.prepare_groups(frozenset({"rank:0"}))
+    assert selected.snapshot.shards[0].worker_id == first.worker_id
+    assert len(protocol.worker.stable_requests) == 2
+    protocol.worker.metadata.CopyFrom(second_metadata)
+    protocol.worker.response_digest = second.version_metadata_digest
+    fallback = next(candidates)
+    assert fallback.snapshot.shards[0].worker_id == second.worker_id
+    assert list(fallback.checksums.values()) == (["first"] if verify else [])
+    assert len(protocol.worker.stable_requests) == 2
+    candidates.close()
+
+
 def test_replica_groups_include_unpublished_members_in_worker_order(
     protocol: SimpleNamespace, replicas,
 ) -> None:
