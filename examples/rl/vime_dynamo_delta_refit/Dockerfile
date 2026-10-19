@@ -25,7 +25,7 @@ RUN python3 -B -c \
 
 FROM vllm/vime@sha256:5b48444d8e9962b5525ec11aaa012a75c5170544f4500d28451bc0b46a2f7728 AS trainer
 RUN rm -rf /root/vime
-ADD https://github.com/nv-hwoo/vime.git#c1f8530dfc64223972a479335f5ad646a6e3f3cf /root/vime
+ADD https://github.com/nv-hwoo/vime.git#ff2c1a0363d40222b2db398b4bd6876f2756a426 /root/vime
 ENV PYTHONPATH=/root/vime:/root/Megatron-LM
 RUN --mount=type=bind,source=modelexpress_client/python,target=/opt/modelexpress,rw \
     MX_SKIP_EXT=1 python3 -m pip install --no-cache-dir --no-compile --no-deps \
