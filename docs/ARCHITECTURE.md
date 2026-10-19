@@ -569,7 +569,8 @@ generation, shard and worker, but check each version's publication and checksums
 With checksum verification disabled, the version metadata RPC is skipped.
 Redis pins each worker/shard digest for the generation and rejects changes.
 
-Trainers publish stable metadata before version checksums and advertisements.
+Trainers publish stable metadata before version checksums and advertisements,
+retaining staged buffer owners before registration and retaining checksums on registration errors.
 Replacing physical metadata requires all owned versions to retire; version
 checksum records are deleted only after the lease fence. Stable metadata remains
 available for reuse. Mesh creation validates bindings; updates validate changed members.

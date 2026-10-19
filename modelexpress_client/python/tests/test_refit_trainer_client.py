@@ -40,6 +40,8 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.deleted_shards = []
         self.mesh_id = None
         self.mesh_generation = 1
+        self.publication_error = None
+        self.lease_active = False
 
     def GetWeightVersion(self, request, _context) -> refit_pb2.GetWeightVersionResponse:
         version = refit_pb2.WeightVersion(uid=request.uid)
@@ -60,6 +62,8 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         if shard.worker_id not in self.registrations:
             context.abort(grpc.StatusCode.FAILED_PRECONDITION, "worker not registered")
         self.shards.append(shard)
+        if self.publication_error is not None:
+            context.abort(self.publication_error, "response lost")
         return refit_pb2.CreateWeightVersionShardResponse(
             shard=shard,
             version=refit_pb2.WeightVersion(
@@ -69,6 +73,8 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         )
 
     def DeleteWeightVersionShard(self, request, context) -> refit_pb2.DeleteWeightVersionShardResponse:
+        if self.lease_active:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "weight version has an active lease")
         self.deleted_shards.append(request)
         return refit_pb2.DeleteWeightVersionShardResponse(deleted=True)
 
@@ -646,9 +652,10 @@ def lifecycle_trainer(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespa
         try:
             yield case
         finally:
-            for version_id in ("version-a", "version-b", "version-c"):
-                trainer.release_version(version=WeightVersionRef(version_id))
-            trainer.close()
+            if not trainer._closed:
+                for version_id in ("version-a", "version-b", "version-c"):
+                    trainer.release_version(version=WeightVersionRef(version_id))
+                trainer.close()
             server.stop(grace=None).wait()
 
 
@@ -735,7 +742,7 @@ def test_failed_metadata_replacement_can_recover_old_or_new_storage(
 
 
 @pytest.mark.parametrize("already_published", [False, True])
-def test_rejected_registration_releases_only_unpublished_version_metadata(
+def test_registration_failure_retains_version_metadata_until_release(
     lifecycle_trainer: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
     already_published: bool,
 ) -> None:
@@ -758,10 +765,7 @@ def test_rejected_registration_releases_only_unpublished_version_metadata(
 
     if already_published:
         assert case.worker.GetWeightVersionShardMetadata(request) == original
-    else:
-        with pytest.raises(grpc.RpcError) as missing:
-            case.worker.GetWeightVersionShardMetadata(request)
-        assert missing.value.code() is grpc.StatusCode.NOT_FOUND
+    assert case.worker.GetWeightVersionShardMetadata(request).metadata.version_id == version.version_id
 
     case.trainer.release_version(version=version)
     case.service.mesh_generation = 2
@@ -774,3 +778,41 @@ def test_rejected_registration_releases_only_unpublished_version_metadata(
             version_id="version-b", logical_shard_id=case.adapter.logical_shard_id,
         )
     ).metadata.stable_metadata_digest == recovered.stable_metadata_digest
+
+
+@pytest.mark.parametrize("verify", [False, True])
+@pytest.mark.parametrize("cleanup", ["release", "close"])
+def test_lost_publication_response_retains_buffers_until_cleanup(
+    lifecycle_trainer, monkeypatch, verify, cleanup,
+) -> None:
+    case = lifecycle_trainer
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", str(int(verify)))
+    version = WeightVersionRef("version-a")
+    with monkeypatch.context() as lost:
+        lost.setattr(case.service, "publication_error", grpc.StatusCode.DEADLINE_EXCEEDED)
+        with pytest.raises(grpc.RpcError):
+            case.trainer.publish_version(version=version)
+    method = case.trainer._runtime.method
+    assert method.published[version.version_id][0].buffer_owner == "model"
+    request = refit_pb2.GetWeightVersionShardMetadataRequest(
+        version_id=version.version_id, logical_shard_id=case.adapter.logical_shard_id,
+    )
+    if verify:
+        assert case.worker.GetWeightVersionShardMetadata(request).metadata.version_id == version.version_id
+    if cleanup == "close":
+        case.trainer.close()
+        assert case.trainer._closed
+        assert not method.published
+        return
+    with monkeypatch.context() as leased:
+        leased.setattr(case.service, "lease_active", True)
+        with pytest.raises(grpc.RpcError):
+            case.trainer.release_version(version=version)
+    assert method.published[version.version_id]
+    case.trainer.release_version(version=version)
+    assert version.version_id not in method.published
+    if verify:
+        with pytest.raises(grpc.RpcError) as retired:
+            case.worker.GetWeightVersionShardMetadata(request)
+        assert retired.value.code() is grpc.StatusCode.NOT_FOUND
+    case.trainer.publish_version(version=WeightVersionRef("version-b"))
