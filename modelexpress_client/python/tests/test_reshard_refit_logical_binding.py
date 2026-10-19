@@ -16,6 +16,7 @@ from modelexpress.refit.reshard.transfer_plan import (
     plan_transfer_groups,
 )
 from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.version import MeshIdentity
 from tests.test_refit_bounded_descriptors import harness
 
 
@@ -263,7 +264,7 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
     from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
     snapshot = TrainerSourceSnapshot(
-        "mesh", 1, tuple(
+        MeshIdentity("mesh", 1), tuple(
             TrainerSourceShard(
                 slot, f"worker-{index}", structural_manifest_digest(blob),
                 f"{agent}:19000", blob,

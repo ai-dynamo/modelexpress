@@ -20,6 +20,7 @@ from ... import refit_pb2, refit_pb2_grpc
 from ...control import WeightVersion
 from ...train.manifest import ShardChecksumKey, version_metadata_digest
 from ...train import WeightPayloadFormat
+from ...version import MeshIdentity
 from ..adapter import ReplicaGroup, TrainerSourceShard
 from ..plan import (
     ResolvedSource,
@@ -180,16 +181,13 @@ class TrainerSourceResolver(SourceResolver):
         mesh = self._get_mesh(version)
         if mesh is None:
             return
-        mesh_workers, mesh_slots, mesh_generation = mesh
+        mesh_workers, mesh_slots, mesh_identity = mesh
         published = self._list_published_shards(version, mesh_workers)
         if published is None:
             return
 
         cached = self._cached_source() if self._cached_source is not None else None
-        if cached is not None and (
-            cached.mesh_id != version.trainer_mesh_id
-            or cached.mesh_generation != mesh_generation
-        ):
+        if cached is not None and cached.mesh_identity != mesh_identity:
             cached = None
         groups = cached.replica_groups if cached is not None else ()
         if not groups:
@@ -220,13 +218,12 @@ class TrainerSourceResolver(SourceResolver):
                 selection = tuple(
                     (source.source_slot_id, source.worker_id) for source in selected
                 )
-                self._check_current_mesh(version.trainer_mesh_id, mesh_generation)
+                self._check_current_mesh(mesh_identity)
                 seen.add(selection)
                 for group, source in zip(groups, selected, strict=True):
                     self._update_replica(group, source)
                 snapshot = TrainerSourceSnapshot(
-                    mesh_id=version.trainer_mesh_id,
-                    mesh_generation=mesh_generation,
+                    mesh_identity=mesh_identity,
                     shards=selected,
                     replica_groups=groups,
                 )
@@ -354,7 +351,7 @@ class TrainerSourceResolver(SourceResolver):
 
     def _get_mesh(
         self, version: WeightVersion
-    ) -> tuple[Mapping[str, refit_pb2.TrainerTensorsMetadata], tuple[str, ...], int] | None:
+    ) -> tuple[Mapping[str, refit_pb2.TrainerTensorsMetadata], tuple[str, ...], MeshIdentity] | None:
         try:
             response = self._service().GetTrainerMesh(
                 refit_pb2.GetTrainerMeshRequest(mesh_id=version.trainer_mesh_id),
@@ -380,7 +377,7 @@ class TrainerSourceResolver(SourceResolver):
         expected_slots = tuple(sorted({
             metadata.logical_shard_id for metadata in workers.values()
         }))
-        return workers, expected_slots, version.trainer_mesh_generation
+        return workers, expected_slots, MeshIdentity(mesh.mesh_id, mesh.generation)
 
     def _list_published_shards(
         self,
@@ -448,15 +445,14 @@ class TrainerSourceResolver(SourceResolver):
                 return
             offset += 1
 
-    def _check_current_mesh(self, mesh_id: str, generation: int) -> None:
+    def _check_current_mesh(self, identity: MeshIdentity) -> None:
         current = self._service().GetTrainerMesh(
-            refit_pb2.GetTrainerMeshRequest(mesh_id=mesh_id),
+            refit_pb2.GetTrainerMeshRequest(mesh_id=identity.mesh_id),
             timeout=self._rpc_timeout_seconds,
         )
         if (
             not current.HasField("mesh")
-            or current.mesh.mesh_id != mesh_id
-            or current.mesh.generation != generation
+            or MeshIdentity(current.mesh.mesh_id, current.mesh.generation) != identity
         ):
             raise RuntimeError("trainer mesh generation changed during source resolution")
 

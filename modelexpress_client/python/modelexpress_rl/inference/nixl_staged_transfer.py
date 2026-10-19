@@ -737,9 +737,8 @@ class _NixlStagedTransfer:
     def _can_reuse_plan(self, trainer: TrainerSourceSnapshot) -> bool:
         previous = self._weight_update_plan
         return previous is not None and (
-            previous.trainer_source_snapshot.mesh_id,
-            previous.trainer_source_snapshot.mesh_generation,
-        ) == (trainer.mesh_id, trainer.mesh_generation)
+            previous.trainer_source_snapshot.mesh_identity == trainer.mesh_identity
+        )
 
     def _compile_streaming(
         self,

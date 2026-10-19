@@ -22,6 +22,7 @@ from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 
 from modelexpress_rl.inference.adapter import TrainerSourceShard
 from modelexpress_rl.inference.plan import ResolvedTrainerSource, TrainerSourceSnapshot
+from modelexpress_rl.version import MeshIdentity
 
 
 def _initialize_replicas(harness):
@@ -46,7 +47,7 @@ def _snapshot(harness, replica, cycle):
     shard = TrainerSourceShard(
         "slot", replica, hashlib.sha256(blob).hexdigest(), f"{replica}:19000", blob,
     )
-    return TrainerSourceSnapshot("mesh", 1, (shard,))
+    return TrainerSourceSnapshot(MeshIdentity("mesh", 1), (shard,))
 
 
 def _prepare(method, source, cycle):

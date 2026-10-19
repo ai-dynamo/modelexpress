@@ -6,6 +6,7 @@ import json
 import time
 from dataclasses import replace
 from types import MappingProxyType, SimpleNamespace
+from modelexpress_rl.version import MeshIdentity
 
 import pytest
 import torch
@@ -143,8 +144,7 @@ def _bounded_cache_inputs():
 
 def _trainer_snapshot(manifests: list[bytes]) -> TrainerSourceSnapshot:
     return TrainerSourceSnapshot(
-        "mesh",
-        1,
+        MeshIdentity("mesh", 1),
         tuple(
             TrainerSourceShard(
                 str(index),

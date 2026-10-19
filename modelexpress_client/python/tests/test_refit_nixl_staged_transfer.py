@@ -9,6 +9,7 @@ from types import MappingProxyType
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress_rl.inference.plan import StreamingSettings
+from modelexpress_rl.version import MeshIdentity
 
 import pytest
 import torch
@@ -309,7 +310,7 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
                                        shard_offset=(0, 0), shape=(4, 4))],
             ) for name, value in harness.sources.items()],
         )
-        return TrainerSourceSnapshot("mesh", 1, (TrainerSourceShard(
+        return TrainerSourceSnapshot(MeshIdentity("mesh", 1), (TrainerSourceShard(
             "slot", agent, hashlib.sha256(blob).hexdigest(), f"{agent}:19000", blob,
         ),))
 
@@ -385,7 +386,7 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
                     [replace(t, name="renamed." + t.name) for t in payload.tensors]
                     if capture_failure else payload.tensors,
                 )
-            bad = replace(source, mesh_generation=generation, shards=(replace(
+            bad = replace(source, mesh_identity=replace(source.mesh_identity, generation=generation), shards=(replace(
                 source.shards[0], worker_id="replacement" if failure == "metadata" else source.shards[0].worker_id,
                 metadata=blob, stable_metadata_digest=hashlib.sha256(blob).hexdigest(),
             ),))
@@ -1159,8 +1160,7 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
     )
     layout = {"layer.weight": ((4,), torch.float32)}
     snapshot = TrainerSourceSnapshot(
-        "mesh",
-        1,
+        MeshIdentity("mesh", 1),
         (TrainerSourceShard(
             "slot", "worker", hashlib.sha256(manifest).hexdigest(),
             "source:19000", manifest,

@@ -25,6 +25,7 @@ from modelexpress.refit.reshard.rendezvous import (
 )
 from modelexpress.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot
+from modelexpress_rl.version import MeshIdentity
 from modelexpress.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
@@ -187,7 +188,7 @@ def harness(monkeypatch, request) -> Iterator[SimpleNamespace]:
 
     def prepare(*, generation: int = 1) -> module._PreparedBoundedTransfer:
         blobs = manifests()
-        snapshot = TrainerSourceSnapshot("mesh", generation, tuple(
+        snapshot = TrainerSourceSnapshot(MeshIdentity("mesh", generation), tuple(
             TrainerSourceShard("slot", "worker", hashlib.sha256(blob).hexdigest(), "source:19000", blob)
             for blob in blobs
         ))
@@ -488,7 +489,7 @@ def test_logical_plan_lifetime_is_mesh_pair(harness, mesh_id, generation, reuse)
     harness.sources.update({name: value.clone() + 17 for name, value in harness.sources.items()})
     snapshot = replace(
         _agent_registration_snapshot(harness, generation=generation, token=b"replica-b", worker="replacement"),
-        mesh_id=mesh_id,
+        mesh_identity=MeshIdentity(mesh_id, generation),
     )
     captures = []
 
@@ -541,7 +542,7 @@ def _larger_source_snapshot(harness) -> tuple[TrainerSourceSnapshot, list[torch.
             ) for name, tensor in harness.sources.items()
         ],
     )
-    snapshot = TrainerSourceSnapshot("mesh", 2, (TrainerSourceShard(
+    snapshot = TrainerSourceSnapshot(MeshIdentity("mesh", 2), (TrainerSourceShard(
         "slot", "worker", hashlib.sha256(blob).hexdigest(), "source:19000", blob,
     ),))
     return snapshot, rows
@@ -609,7 +610,7 @@ def _agent_registration_snapshot(
             )],
         ) for name, tensor in harness.sources.items()],
     )
-    return TrainerSourceSnapshot("mesh", generation, (TrainerSourceShard(
+    return TrainerSourceSnapshot(MeshIdentity("mesh", generation), (TrainerSourceShard(
         "slot", worker, hashlib.sha256(blob).hexdigest(), f"{agent}:19000", blob,
     ),))
 
@@ -709,7 +710,7 @@ def test_replica_switch_reuses_matching_group_descriptors(harness, monkeypatch, 
                 ) for name, tensor in replicas[worker].items()
             ])
             shards.append(TrainerSourceShard(slot, worker, hashlib.sha256(blob).hexdigest(), f"{worker}:19000", blob))
-        return TrainerSourceSnapshot("mesh", generation, tuple(shards))
+        return TrainerSourceSnapshot(MeshIdentity("mesh", generation), tuple(shards))
 
     builds = []
     original = harness.transfer._descriptors

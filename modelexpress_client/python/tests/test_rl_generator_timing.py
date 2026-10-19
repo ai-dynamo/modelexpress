@@ -23,7 +23,7 @@ from modelexpress.refit import (
     set_refit_cold,
     use_refit_timing,
 )
-from modelexpress_rl import timing
+from modelexpress_rl import MeshIdentity, timing
 from modelexpress_rl.inference.methods.load_time_tensor import (
     LoadTimeTensorNixlUpdateMethod,
     _attribute_transfer,
@@ -147,7 +147,7 @@ def test_transfer_timing_reports_cache_reuse_and_consumed_bytes(bounded, outcome
                 raise RuntimeError("transfer failed")
 
     method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer())
-    source = ResolvedTrainerSource(TrainerSourceSnapshot("mesh", 1, ()))
+    source = ResolvedTrainerSource(TrainerSourceSnapshot(MeshIdentity("mesh", 1), ()))
     version = SimpleNamespace(
         base_version_id=None,
         layout_signature="layout",

@@ -16,7 +16,7 @@ from modelexpress.refit.timing import refit_span
 from ... import refit_pb2, refit_pb2_grpc
 from ..manifest import version_metadata, version_metadata_digest
 from modelexpress import envs as mx_envs
-from ...version import TrainerTensorsMetadata, WeightVersionRef
+from ...version import MeshIdentity, TrainerTensorsMetadata, WeightVersionRef
 from ..adapter import (
     StagedWeightVersionShardData,
     TrainerEngineAdapter,
@@ -56,7 +56,7 @@ class FullTensorNixlPublicationMethod:
         self._worker_id = worker_id
         self._rpc_timeout_seconds = rpc_timeout_seconds
         self.published: dict[str, list[StagedWeightVersionShardData]] = {}
-        self._metadata_identity: tuple[str, int] | None = None
+        self._metadata_identity: MeshIdentity | None = None
         self._metadata_digest: str | None = None
         self._binding: TrainerTensorsMetadata | None = None
 
@@ -124,7 +124,7 @@ class FullTensorNixlPublicationMethod:
             )
         # A cached property that hashes the whole manifest, so the first read is
         # the digest being computed and every later one is free.
-        identity = (
+        identity = MeshIdentity(
             version_response.version.trainer_mesh_id,
             version_response.version.trainer_mesh_generation,
         )

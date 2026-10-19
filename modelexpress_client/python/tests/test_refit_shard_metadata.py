@@ -249,7 +249,7 @@ def test_changed_source_resolves_current_storage(protocol, change) -> None:
     requested = replace(_next_version(protocol), trainer_mesh_generation=generation)
     second, = protocol.resolver.candidates(requested)
     assert second.snapshot.replica_groups is not first.snapshot.replica_groups
-    assert second.snapshot.mesh_generation == generation
+    assert second.snapshot.mesh_identity.generation == generation
     assert second.snapshot.shards[0].worker_id == worker
     assert second.snapshot.shards[0].metadata == protocol.worker.blob
     assert list(second.checksums.values()) == ["second"]

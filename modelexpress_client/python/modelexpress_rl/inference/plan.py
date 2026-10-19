@@ -19,6 +19,7 @@ from ..control import WeightVersion
 from ..object_storage import ObjectStorageSource
 from ..train.manifest import ShardChecksumKey
 from ..train import WeightPayloadFormat
+from ..version import MeshIdentity
 from .adapter import ReplicaGroup, TrainerSourceShard
 
 if TYPE_CHECKING:
@@ -93,8 +94,7 @@ class GeneratorPeerUpdateSource:
 class TrainerSourceSnapshot:
     """Selected trainer shards and the mesh identity they belong to."""
 
-    mesh_id: str
-    mesh_generation: int
+    mesh_identity: MeshIdentity
     shards: tuple[TrainerSourceShard, ...]
     replica_groups: tuple[ReplicaGroup, ...] = ()
     resolved_metadata: _ResolvedSources | None = field(
@@ -110,8 +110,7 @@ class TrainerSourceSnapshot:
     @property
     def physical_fingerprint(self) -> tuple:
         return (
-            self.mesh_id,
-            self.mesh_generation,
+            self.mesh_identity,
             tuple(
                 (shard.source_slot_id, shard.worker_id)
                 for shard in self.shards

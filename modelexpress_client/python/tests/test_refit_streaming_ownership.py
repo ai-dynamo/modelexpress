@@ -16,6 +16,7 @@ from modelexpress_rl.inference.plan import (
     StreamingSettings,
 )
 from modelexpress_rl.train import WeightPayloadFormat
+from modelexpress_rl.version import MeshIdentity
 
 
 def setup_method(monkeypatch, *, staging_device="cuda", staging_buffers=1) -> tuple:
@@ -63,8 +64,7 @@ def setup_method(monkeypatch, *, staging_device="cuda", staging_buffers=1) -> tu
         streaming=StreamingSettings(512, staging_device, staging_buffers),
     )
     source = TrainerSourceSnapshot(
-        mesh_id="mesh",
-        mesh_generation=1,
+        mesh_identity=MeshIdentity("mesh", 1),
         shards=(
             TrainerSourceShard(
                 source_slot_id="slot",
