@@ -60,6 +60,7 @@ from modelexpress.types import ManifestMismatchError, TensorDescriptor
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
 from ..train.manifest import ShardChecksumKey
+from ..version import MeshIdentity
 from .plan import StreamingSettings
 
 # Named under modelexpress.* (not modelexpress_rl) so the per-update summary surfaces
@@ -156,13 +157,10 @@ class _DescriptorCache:
 
 @dataclass(frozen=True)
 class _WeightUpdatePlan:
-    trainer_source_snapshot: TrainerSourceSnapshot
+    mesh_identity: MeshIdentity
     layout_capture_snapshot: CaptureResult
     parameter_layout: Mapping
     transfer_plan: LogicalTransferPlan | _StreamingSchedule
-    source_binding: _SourceBinding | None
-    transport: NixlReshardTransport | None
-    descriptor_caches: tuple[_DescriptorCache, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -550,6 +548,10 @@ class _NixlStagedTransfer:
         self._staging_device: torch.device | None = None
         self._manager_ready = True
         self._weight_update_plan: _WeightUpdatePlan | None = None
+        self._trainer_source_snapshot: TrainerSourceSnapshot | None = None
+        self._binding: _SourceBinding | None = None
+        self._transport: NixlReshardTransport | None = None
+        self._descriptor_caches: tuple[_DescriptorCache, ...] | None = None
         self._debug_validate_plan = rl_envs.MX_REFIT_DEBUG_VALIDATE_PLAN
         self._debug_validate_generator_layout = (
             rl_envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT
@@ -571,17 +573,13 @@ class _NixlStagedTransfer:
         self._staging_arenas = [] if value is None else [value]
 
     def _invalidate_descriptors(self) -> None:
-        if self._weight_update_plan is not None:
-            self._weight_update_plan = replace(
-                self._weight_update_plan, descriptor_caches=None,
-                source_binding=None, transport=None,
-            )
+        self._descriptor_caches = None
+        self._trainer_source_snapshot = None
+        self._invalidate_cached_transfer()
 
     def _invalidate_cached_transfer(self) -> None:
-        if self._weight_update_plan is not None:
-            self._weight_update_plan = replace(
-                self._weight_update_plan, source_binding=None, transport=None
-            )
+        self._binding = None
+        self._transport = None
 
     def _release_staging_registrations(self) -> None:
         self._invalidate_descriptors()
@@ -658,12 +656,9 @@ class _NixlStagedTransfer:
     def _resolve_trainer(
         self, trainer: TrainerSourceSnapshot, manifests: list[bytes], metrics: dict
     ) -> TrainerSourceSnapshot:
-        previous = self._weight_update_plan
-        if (
-            previous is not None
-            and previous.trainer_source_snapshot.physical_fingerprint == trainer.physical_fingerprint
-        ):
-            resolved = previous.trainer_source_snapshot.resolved_metadata
+        previous = self._trainer_source_snapshot
+        if previous is not None and previous.physical_fingerprint == trainer.physical_fingerprint:
+            resolved = previous.resolved_metadata
             metrics.update(source_cache_enabled=1, source_cache_hits=1, source_cache_misses=0)
         else:
             resolved = self._resolve_metadata(manifests, metrics)
@@ -693,9 +688,9 @@ class _NixlStagedTransfer:
 
     def _retire_previous_mesh(self, trainer: TrainerSourceSnapshot) -> None:
         previous = self._weight_update_plan
-        if previous is not None and not self._can_reuse_plan(trainer):
+        if previous is not None and previous.mesh_identity != trainer.mesh_identity:
             self._weight_update_plan = None
-            self._invalidate_cached_transfer()
+            self._invalidate_descriptors()
 
     def _resolve_layout(
         self,
@@ -725,12 +720,6 @@ class _NixlStagedTransfer:
             raise ValueError("source slots must identify each selected replica once")
         return _SourceBinding(
             resolved, dict(zip(slots, agents, strict=True)), trainer.physical_fingerprint
-        )
-
-    def _can_reuse_plan(self, trainer: TrainerSourceSnapshot) -> bool:
-        previous = self._weight_update_plan
-        return previous is not None and (
-            previous.trainer_source_snapshot.mesh_identity == trainer.mesh_identity
         )
 
     def _compile_streaming(
@@ -853,7 +842,10 @@ class _NixlStagedTransfer:
             previous = self._weight_update_plan
             metrics = {}
             lookup_started = time.perf_counter()
-            reusable = previous is not None and self._can_reuse_binding(previous, trainer_snapshot)
+            reusable = (
+                self._binding is not None and self._transport is not None
+                and self._binding.physical_fingerprint == trainer_snapshot.physical_fingerprint
+            )
             metrics.update(
                 plan_cache_enabled=1,
                 plan_cache_hits=int(reusable),
@@ -863,7 +855,7 @@ class _NixlStagedTransfer:
             )
             if previous is not None:
                 if reusable:
-                    trainer = previous.trainer_source_snapshot
+                    trainer = self._trainer_source_snapshot
                     metrics.update(source_cache_enabled=1, source_cache_hits=1, source_cache_misses=0)
                 else:
                     trainer = self._resolve_trainer(trainer_snapshot, manifests, metrics)
@@ -906,10 +898,10 @@ class _NixlStagedTransfer:
             if not reusable:
                 trainer = self._retain_needed_sources(trainer, plan)
             source_binding = (
-                previous.source_binding if reusable else self._source_binding(trainer)
+                self._binding if reusable else self._source_binding(trainer)
             )
             if reusable:
-                transport = previous.transport
+                transport = self._transport
                 if streaming is not None:
                     metrics["connection_registration_s"] = 0.0
             else:
@@ -917,53 +909,30 @@ class _NixlStagedTransfer:
                     trainer, transfer_plan, source_binding, metrics
                 )
 
-            retained = self._weight_update_plan
-            cached = previous if reusable else _WeightUpdatePlan(
-                trainer,
+            cached = previous or _WeightUpdatePlan(
+                trainer.mesh_identity,
                 capture,
                 parameter_layout,
                 transfer_plan,
-                source_binding,
-                transport,
-                descriptor_caches=None if retained is None else retained.descriptor_caches,
             )
-            if cached.descriptor_caches is None:
+            if self._descriptor_caches is None:
                 plans = (
                     (transfer_plan,) if streaming is None
                     else tuple(batch.transfer_plan for batch in transfer_plan.batches)
                 )
-                cached = replace(cached, descriptor_caches=tuple(
+                self._descriptor_caches = tuple(
                     _DescriptorCache.for_plan(plan) for plan in plans
-                ))
-            if streaming is None:
-                prepared = self._prepare_full_copy(
-                    cached,
-                    metrics,
-                    checksums,
-                    reusable,
                 )
-            else:
-                prepared = self._prepare_streaming(
-                    cached,
-                    metrics,
-                    checksums,
-                    reusable,
-                )
+            prepare = self._prepare_full_copy if streaming is None else self._prepare_streaming
+            prepared = prepare(
+                cached, trainer, source_binding, transport, metrics, checksums, reusable
+            )
             self._weight_update_plan = cached
+            self._trainer_source_snapshot = trainer
+            self._binding = source_binding
+            self._transport = transport
             self._active = prepared
             return prepared
-
-    def _can_reuse_binding(
-        self, previous: _WeightUpdatePlan, trainer: TrainerSourceSnapshot
-    ) -> bool:
-        binding = previous.source_binding
-        if (
-            binding is None or previous.transport is None
-            or previous.trainer_source_snapshot.physical_fingerprint
-            != trainer.physical_fingerprint
-        ):
-            return False
-        return True
 
     def _prepare_transport(self, trainer, transfer_plan, source_binding, metrics):
         streaming = self._streaming
@@ -1029,19 +998,21 @@ class _NixlStagedTransfer:
     def _prepare_full_copy(
         self,
         cached: _WeightUpdatePlan,
+        trainer: TrainerSourceSnapshot,
+        source_binding: _SourceBinding,
+        transport: NixlReshardTransport,
         metrics: dict[str, float],
         checksums: Mapping[ShardChecksumKey, str],
         reusable: bool,
     ) -> _PreparedNixlTransfer:
         plan = cast(LogicalTransferPlan, cached.transfer_plan)
         capture = cached.layout_capture_snapshot
-        resolved = cached.trainer_source_snapshot.resolved_metadata
-        source_binding = cast(_SourceBinding, cached.source_binding)
+        resolved = source_binding.resolved
         if not reusable:
             self._ensure_workspace(plan, cached.parameter_layout)
         workers = {shard.source_slot_id: shard.worker_id
-                   for shard in cached.trainer_source_snapshot.shards}
-        descriptors, reused = cached.descriptor_caches[0].bind(
+                   for shard in trainer.shards}
+        descriptors, reused = self._descriptor_caches[0].bind(
             workers, lambda group: self._descriptors(group, source_binding=source_binding)
         )
         metrics["descriptor_builds"] = int(not reused)
@@ -1054,7 +1025,7 @@ class _NixlStagedTransfer:
                 if copy.src_name in resolved.sources
             },
             descriptors=descriptors,
-            transport=cached.transport,
+            transport=transport,
             source_binding=source_binding,
             metrics=metrics,
             checksums=checksums,
@@ -1063,18 +1034,20 @@ class _NixlStagedTransfer:
     def _prepare_streaming(
         self,
         cached: _WeightUpdatePlan,
+        trainer: TrainerSourceSnapshot,
+        source_binding: _SourceBinding,
+        transport: NixlReshardTransport,
         metrics: dict[str, float],
         checksums: Mapping[ShardChecksumKey, str],
         reusable: bool,
     ) -> _PreparedBoundedTransfer:
         compiled = cast(_StreamingSchedule, cached.transfer_plan)
-        source_binding = cast(_SourceBinding, cached.source_binding)
         workers = {shard.source_slot_id: shard.worker_id
-                   for shard in cached.trainer_source_snapshot.shards}
+                   for shard in trainer.shards}
         descriptors = []
         reused = []
         for index, batch in enumerate(compiled.batches):
-            cache = cached.descriptor_caches[index]
+            cache = self._descriptor_caches[index]
             if reusable:
                 reads, hit = cache.last_descriptors, True
             else:
@@ -1091,7 +1064,7 @@ class _NixlStagedTransfer:
         metrics["descriptor_binding_reused"] = int(all(reused))
         metrics["descriptor_builds"] = sum(not hit for hit in reused)
         return _PreparedBoundedTransfer(
-            compiled.batches, source_binding.resolved.sources, cached.transport, source_binding,
+            compiled.batches, source_binding.resolved.sources, transport, source_binding,
             metrics, checksums, tuple(descriptors), tuple(reused),
         )
 

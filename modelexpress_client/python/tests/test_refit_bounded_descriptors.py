@@ -761,6 +761,7 @@ def test_replica_switch_reuses_matching_group_descriptors(harness, monkeypatch, 
 
     # Reset must rebuild both groups even though their mesh and addresses match.
     harness.transfer.reset_workspace()
+    assert harness.transfer._weight_update_plan is plan
     builds.clear()
     trainer = snapshot("a1")
     harness.transfer._capture_layout = lambda _: pytest.fail(

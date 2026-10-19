@@ -1401,7 +1401,7 @@ def test_generator_layout_debug_assertion(harness, monkeypatch, enabled):
     if enabled:
         with pytest.raises(AssertionError, match="generator layout changed"):
             method.prepare(version=None, source=source)
-        assert transfer._weight_update_plan.source_binding is None
+        assert transfer._binding is None
     else:
         prepared = method.prepare(version=None, source=source)
         method.release(prepared)

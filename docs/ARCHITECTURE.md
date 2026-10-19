@@ -1980,10 +1980,8 @@ passing the former does not establish full-model correctness or performance.
 
 Full-copy and bounded updates share `prepare()`. Shared `MeshIdentity(mesh_id, generation)` values
 identify trainer metadata, resolver caches, source snapshots and compiled geometry without changing RPC fields;
-Logical reads use source-relative offsets; physical
-bindings resolve selected replica addresses. Matching bindings reuse transport
-and workspace setup. Coverage and capacity are checked during compilation, with
-optional debug revalidation. Plans are published only after setup succeeds.
+the transfer owns bindings, transport and descriptor caches. Reset preserves geometry;
+binding reuse requires successful setup. Optional debug checks revalidate coverage.
 
 Metadata or planning failures leave existing connections and storage intact.
 Native setup failure resets an owned manager before releasing its storage;

@@ -5,7 +5,7 @@ import hashlib
 import json
 import time
 from dataclasses import replace
-from types import MappingProxyType, SimpleNamespace
+from types import SimpleNamespace
 from modelexpress_rl.version import MeshIdentity
 
 import pytest
@@ -36,7 +36,6 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _SourceBinding,
     _resolve_sources,
     _required_agent_metadata,
-    _WeightUpdatePlan,
 )
 
 from modelexpress_rl.inference.adapter import TrainerSourceShard
@@ -187,35 +186,17 @@ def test_retaining_needed_sources_keeps_agent_alignment_without_copying_metadata
         assert binding.resolve(plan.source_buffers[read.source_buffer]) == ("needed", 200)
 
 
-def _resolve_trainer(transfer: _NixlStagedTransfer, manifests: list[bytes], metrics: dict):
-    resolved = transfer._resolve_trainer(_trainer_snapshot(manifests), manifests, metrics)
-    return resolved.resolved_metadata
-
-
-def _transfer_with_resolved_plan(monkeypatch, manifests: list[bytes]) -> tuple:
-    transfer = object.__new__(_NixlStagedTransfer)
-    transfer._weight_update_plan = None
-    trainer = transfer._resolve_trainer(_trainer_snapshot(manifests), manifests, {})
-    resolved = trainer.resolved_metadata
-    transfer._weight_update_plan = _WeightUpdatePlan(
-        trainer_source_snapshot=trainer,
-        layout_capture_snapshot=CaptureResult(copies=[]),
-        parameter_layout=MappingProxyType({}),
-        transfer_plan=LogicalTransferPlan(),
-        source_binding=_SourceBinding(resolved, {}, ()),
-        transport=None,
-    )
-    return transfer, resolved
-
-
 @pytest.mark.parametrize(
     "defect", ["empty", "malformed", "duplicate", "mutable", "geometry"]
 )
-def test_metadata_rejects_bad_manifests_even_with_a_cached_plan(
+def test_metadata_rejects_bad_manifests_even_with_a_cached_source(
     monkeypatch, defect
 ) -> None:
     manifest = _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100)
-    transfer, _ = _transfer_with_resolved_plan(monkeypatch, [manifest])
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._trainer_source_snapshot = replace(
+        _trainer_snapshot([manifest]), resolved_metadata=_resolve_sources([manifest])
+    )
     if defect == "geometry":
         payload = json.loads(
             _manifest(agent_name="b", endpoint="b:19000", offset=2, address=200)
