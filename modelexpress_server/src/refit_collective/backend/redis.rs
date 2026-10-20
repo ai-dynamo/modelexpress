@@ -728,7 +728,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             group_id,
             epoch,
             assignments: assignments
-                .into_iter()
+                .iter()
                 .map(|a| LaneAssignment {
                     lane_id: a.lane_id,
                     kind: a.kind.into(),

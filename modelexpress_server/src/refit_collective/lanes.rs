@@ -234,10 +234,10 @@ impl LaneLayout {
     }
 
     /// Where this slot sits in every lane that declared it.
-    pub fn assign(&self, slot_id: &str) -> Result<Vec<Assignment>, LaneError> {
+    pub fn assign(&self, slot_id: &str) -> Result<&[Assignment], LaneError> {
         self.by_slot
             .get(slot_id)
-            .cloned()
+            .map(Vec::as_slice)
             .ok_or_else(|| LaneError::UnknownParticipant {
                 slot_id: slot_id.to_string(),
             })
