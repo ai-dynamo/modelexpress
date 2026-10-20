@@ -305,13 +305,7 @@ runs:
               echo "Source published ${count}/${expected} artifact source(s)."
               return 0
             fi
-            local failed
-            failed=$(ci_kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers \
-              | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)
-            if [ -n "${failed}" ]; then
-              echo "ERROR: source pod failed before publishing artifact metadata: ${failed}"
-              return 1
-            fi
+            ci_workload_pods Source mx-source "job-name=mx-source" >/dev/null || return 1
             echo "Have ${count}/${expected} artifact sources, retrying in 5s..."
             sleep 5
           done
@@ -339,6 +333,7 @@ runs:
         SOURCE_VRAM_SAMPLES=0
 
         while [ $SECONDS -lt $deadline ]; do
+          ci_workload_pods Source mx-source "job-name=mx-source" >/dev/null || exit 1
           if [ "${MEASURE_VRAM}" = "true" ]; then
             # Peak often equals final in healthy runs, but it catches transient
             # duplicate/staging allocations that are freed before /health.
@@ -349,12 +344,6 @@ runs:
           if [ "${CR_COUNT}" -ge "${TP_SIZE}" ]; then
             echo "Source published ${CR_COUNT}/${TP_SIZE} weight sources."
             break
-          fi
-          FAILED=$(ci_kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers \
-            | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)
-          if [ -n "${FAILED}" ]; then
-            echo "ERROR: source pod failed before publishing metadata: ${FAILED}"
-            exit 1
           fi
           echo "Have ${CR_COUNT}/${TP_SIZE} weight sources, retrying in 5s..."
           sleep 5

@@ -5,6 +5,15 @@ name: ModelExpress Inference CI
 
 on:
   workflow_call:
+    inputs:
+      runs_on:
+        description: Runner for control jobs; GPU jobs retain their dedicated runners.
+        type: string
+        default: ''
+      concurrency_key:
+        description: Run-specific suffix that keeps nightly callers from cancelling each other.
+        type: string
+        default: ''
 
 env:
   MX_CI_MODEL: Qwen/Qwen2.5-0.5B
@@ -18,18 +27,20 @@ jobs:
   gpu-tests:
     name: GPU
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-azure-gpu-tests
-      cancel-in-progress: true
+      group: ${{ github.workflow }}-${{ github.ref_name }}-azure-gpu-tests-${{ inputs.concurrency_key }}
+      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
       contents: read
     uses: ./.github/workflows/modelexpress-inference-gpu-ci.yml
+    with:
+      runs_on: ${{ inputs.runs_on }}
     secrets: inherit
 
   gpu-cleanup:
     name: GPU cleanup
     needs: [gpu-tests]
-    if: ${{ always() && needs.gpu-tests.result != 'success' }}
+    if: ${{ always() && needs.gpu-tests.result != 'skipped' && needs.gpu-tests.result != 'success' }}
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 30
     permissions:
@@ -68,11 +79,12 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "$VCLUSTER_PF_PID" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   build-server:
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-build-server
-      cancel-in-progress: true
+      group: ${{ github.workflow }}-${{ github.ref_name }}-build-server-${{ inputs.concurrency_key }}
+      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Build server image
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -84,10 +96,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Compute SERVER_IMAGE
+      - name: Compute SERVER_IMAGE and scope docker credentials
         # Persist the tag in $GITHUB_ENV so both the build step and the
         # cleanup step reference the same value without re-templating.
         run: |
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-inference-buildsrv" >> "$GITHUB_ENV"
           echo "SERVER_IMAGE=${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}" >> "$GITHUB_ENV"
 
       - name: Log in to image registry
@@ -103,8 +116,8 @@ jobs:
           bash .github/scripts/build-with-registry-retry.sh \
             --platform linux/amd64 \
             -f ci/k8s/server/Dockerfile.server \
-            --cache-from "type=registry,ref=${SERVER_IMAGE%:*}:buildcache-${GITHUB_REF_NAME//\//-}" \
-            --cache-to "type=registry,ref=${SERVER_IMAGE%:*}:buildcache-${GITHUB_REF_NAME//\//-},mode=max,ignore-error=true" \
+            --cache-from "type=registry,ref=${SERVER_IMAGE%:*}:buildcache-shared" \
+            --cache-to "type=registry,ref=${SERVER_IMAGE%:*}:buildcache-shared,mode=max,ignore-error=true" \
             -t "${SERVER_IMAGE}" \
             --push \
             .
@@ -118,12 +131,13 @@ jobs:
         if: always()
         run: |
           docker image rm -f "${SERVER_IMAGE}" 2>/dev/null || true
+          rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
   # ---------------------------------------------------------------------------
   build-client:
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-build-client-${{ strategy.job-index }}
-      cancel-in-progress: true
+      group: ${{ github.workflow }}-${{ github.ref_name }}-build-client-${{ strategy.job-index }}-${{ inputs.concurrency_key }}
+      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Build worker image (${{ matrix.framework }})
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -147,10 +161,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Compute WORKER_IMAGE
+      - name: Compute WORKER_IMAGE and scope docker credentials
         # Persist the tag in $GITHUB_ENV so both the build step and the
         # cleanup step reference the same value without re-templating.
         run: |
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-inference-buildcli-${{ strategy.job-index }}" >> "$GITHUB_ENV"
           echo "WORKER_IMAGE=${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}" >> "$GITHUB_ENV"
 
       - name: Log in to image registry
@@ -167,8 +182,8 @@ jobs:
           bash .github/scripts/build-with-registry-retry.sh \
             --platform linux/amd64 \
             -f "${{ matrix.dockerfile }}" \
-            --cache-from "type=registry,ref=${WORKER_IMAGE%:*}:buildcache-${GITHUB_REF_NAME//\//-}" \
-            --cache-to "type=registry,ref=${WORKER_IMAGE%:*}:buildcache-${GITHUB_REF_NAME//\//-},mode=max,ignore-error=true" \
+            --cache-from "type=registry,ref=${WORKER_IMAGE%:*}:buildcache-shared" \
+            --cache-to "type=registry,ref=${WORKER_IMAGE%:*}:buildcache-shared,mode=max,ignore-error=true" \
             -t "${WORKER_IMAGE}" \
             --push \
             .
@@ -182,12 +197,13 @@ jobs:
         if: always()
         run: |
           docker image rm -f "${WORKER_IMAGE}" 2>/dev/null || true
+          rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
   # Build the trainer and rollout images used by the Vime delta-refit smoke.
   ensure-vcluster:
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-ensure-vcluster
-      cancel-in-progress: true
+      group: ${{ github.workflow }}-${{ github.ref_name }}-ensure-vcluster-${{ inputs.concurrency_key }}
+      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Ensure vCluster
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -292,12 +308,13 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
   model-streamer:
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-model-streamer-${{ strategy.job-index }}
-      cancel-in-progress: true
+      group: ${{ github.workflow }}-${{ github.ref_name }}-model-streamer-${{ strategy.job-index }}-${{ inputs.concurrency_key }}
+      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Model Streamer ${{ matrix.mode }} test (${{ matrix.framework }}, S3)
     runs-on: prod-modelexpress-tester-amd-gpu-v1
     needs: [build-client]
@@ -321,6 +338,10 @@ jobs:
             test_model_streamer_fallback: 'true'
 
     steps:
+      - name: Scope docker credentials to this job
+        run: |
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-streamer-${{ strategy.job-index }}" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -342,9 +363,13 @@ jobs:
           hf_token: ${{ secrets.HF_TOKEN }}
           test_model_streamer_fallback: ${{ matrix.test_model_streamer_fallback }}
 
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
+
   status-check:
     name: Inference status check
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
     needs: [gpu-tests, gpu-cleanup, build-server, build-client, ensure-vcluster, model-streamer]
     if: always()
     steps:

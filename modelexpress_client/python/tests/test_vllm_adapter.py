@@ -17,15 +17,13 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 
 from modelexpress.engines.vllm.adapter import (
-    DraftShardSelection,
     VllmAdapter,
-    _DRAFT_WEIGHT_PREFIXES,
     _SAFETENSORS_INDEX_NAME,
+    _converge_streamer_files,
     _get_vllm_device_id,
     _get_vllm_worker_rank,
-    _mtp_layer_prefixes,
     _read_safetensors_index,
-    _select_draft_weight_files,
+    _select_remote_weight_files,
     build_vllm_load_context,
 )
 from modelexpress.engines.vllm.host_quantization import refresh_host_quantization_state
@@ -1010,232 +1008,337 @@ class _StandaloneFinalizer(torch.nn.Module):
         )
 
 
-def _union_prefixes(num_hidden_layers, num_nextn_predict_layers):
-    """The prefix set the adapter actually passes to the selector: DeepSeek's
-    "mtp." unioned with GLM's config.json-derived layer names."""
-    config = {
-        "num_hidden_layers": num_hidden_layers,
-        "num_nextn_predict_layers": num_nextn_predict_layers,
-    }
-    return _DRAFT_WEIGHT_PREFIXES + _mtp_layer_prefixes(config)
-
-
-class TestDraftWeightFileSelection:
-    """A draft load streams only its own shards, and falls back to the full set
-    when the checkpoint has no resolvable draft head. The selector matches both
-    real conventions: DeepSeek's "mtp." prefix and GLM's extra decoder layer
-    model.layers.{num_hidden_layers + i}. Fixtures mirror DeepSeek-V4-Pro
-    (base=61, mtp.0.*) and GLM-5.3 (base=78, model.layers.78.*)."""
-
+class TestModelOwnedShardSelection:
     def _write_index(self, tmp_path, weight_map):
-        """Write a safetensors index mapping tensor names to shard files."""
-        (tmp_path / "model.safetensors.index.json").write_text(
+        (tmp_path / _SAFETENSORS_INDEX_NAME).write_text(
             json.dumps({"weight_map": weight_map}), encoding="utf-8"
         )
 
-    def test_selects_glm_extra_layer_shard(self, tmp_path):
-        """GLM extra-layer MTP (base=78): only the model.layers.78 shard is selected."""
+    def test_remote_uses_model_rule_and_keeps_mixed_and_unknown_files(self, tmp_path):
         self._write_index(
             tmp_path,
             {
-                "model.layers.0.self_attn.qkv_proj.weight": "model-00001-of-00002.safetensors",
-                "model.layers.77.mlp.down_proj.weight": "model-00002-of-00002.safetensors",
-                "model.layers.78.eh_proj.weight": "model-mtp.safetensors",
-                "model.layers.78.self_attn.qkv_proj.weight": "model-mtp.safetensors",
+                "main.weight": "main.safetensors",
+                "draft.weight": "draft.safetensors",
+                "main.bias": "mixed.safetensors",
+                "draft.bias": "mixed.safetensors",
             },
         )
         files = [
-            os.path.join(str(tmp_path), name)
+            str(tmp_path / name)
             for name in (
-                "model-00001-of-00002.safetensors",
-                "model-00002-of-00002.safetensors",
-                "model-mtp.safetensors",
+                "main.safetensors", "draft.safetensors",
+                "mixed.safetensors", "unknown.safetensors",
             )
         ]
-        assert _select_draft_weight_files(
-            str(tmp_path), files, _union_prefixes(78, 1)
-        ) == (
-            DraftShardSelection.SELECTED,
-            [os.path.join(str(tmp_path), "model-mtp.safetensors")],
-        )
+        assert _select_remote_weight_files(
+            str(tmp_path), files, lambda name: name.startswith("main.")
+        ) == files[1:]
 
-    def test_selects_deepseek_mtp_prefix_shard(self, tmp_path):
-        """DeepSeek "mtp." prefix resolves the draft shard when the layer-index prefix matches nothing."""
-        self._write_index(
-            tmp_path,
-            {
-                "layers.0.hc_attn_base": "model-00002-of-00003.safetensors",
-                "layers.60.hc_ffn_base": "model-00002-of-00003.safetensors",
-                "mtp.0.hc_head_base": "model-mtp.safetensors",
-                "mtp.0.hc_head_fn": "model-mtp.safetensors",
-            },
-        )
+    def test_remote_missing_index_keeps_full_list(self, tmp_path):
+        files = [str(tmp_path / "main.safetensors")]
+        assert _select_remote_weight_files(
+            str(tmp_path), files, lambda _name: True
+        ) == files
+
+    def test_remote_broken_model_rule_propagates(self, tmp_path):
+        self._write_index(tmp_path, {"draft.weight": "draft.safetensors"})
+        files = [str(tmp_path / "draft.safetensors")]
+
+        def broken_rule(_name):
+            raise ValueError("broken model rule")
+
+        with pytest.raises(ValueError, match="broken model rule"):
+            _select_remote_weight_files(str(tmp_path), files, broken_rule)
+
+    def test_distributed_selection_uses_union_and_rejects_mismatched_paths(
+        self, monkeypatch
+    ):
+        files = ["main.safetensors", "draft.safetensors"]
+        peer_files = files
+        peer_selected = files[1:]
+        group = SimpleNamespace(world_size=2, cpu_group=object())
+        distributed = ModuleType("vllm.distributed")
+        distributed.get_world_group = lambda: group
+        monkeypatch.setitem(sys.modules, "vllm.distributed", distributed)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+        def gather(states, own, group):
+            states[:] = [own, (peer_files, peer_selected)]
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+        assert _converge_streamer_files(files, files[:1], True) == files
+        peer_files = ["other-node/main.safetensors", "other-node/draft.safetensors"]
+        assert _converge_streamer_files(files, files[:1], True) == files
+
+    def test_model_hook_selects_local_shards_before_streaming(
+        self, tmp_path, monkeypatch
+    ):
         files = [
-            os.path.join(str(tmp_path), name)
-            for name in (
-                "model-00002-of-00003.safetensors",
-                "model-mtp.safetensors",
-            )
+            str(tmp_path / "main.safetensors"),
+            str(tmp_path / "draft.safetensors"),
         ]
-        assert _select_draft_weight_files(
-            str(tmp_path), files, _union_prefixes(61, 1)
-        ) == (
-            DraftShardSelection.SELECTED,
-            [os.path.join(str(tmp_path), "model-mtp.safetensors")],
+        streamer_module = MagicMock()
+        streamer = streamer_module.RunaiModelStreamerLoader.return_value
+        streamer._prepare_weights.return_value = files
+        streamer._is_distributed = False
+        weight_utils = MagicMock()
+        weight_utils.filter_safetensors_files_by_weight_name.return_value = files[1:]
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm.model_executor.model_loader.runai_streamer_loader",
+            streamer_module,
+        )
+        monkeypatch.setitem(
+            sys.modules, "vllm.model_executor.model_loader.weight_utils", weight_utils
+        )
+        runai_utils = MagicMock()
+        runai_utils.is_runai_obj_uri.return_value = False
+        monkeypatch.setitem(
+            sys.modules, "vllm.transformers_utils.runai_utils", runai_utils
+        )
+        monkeypatch.setattr(
+            VllmAdapter, "_model_streamer_distributed_enabled", lambda self: False
+        )
+        adapter = VllmAdapter.__new__(VllmAdapter)
+        adapter.load_config = SimpleNamespace(
+            model_loader_extra_config={}, use_tqdm_on_load=False
+        )
+        adapter.model_config = SimpleNamespace(revision="test-revision")
+        adapter.vllm_config = SimpleNamespace()
+        model = SimpleNamespace(
+            is_unused_checkpoint_weight=lambda name: name.startswith("main.")
         )
 
-    def test_selects_draft_shard_for_hf_repo_id(self, tmp_path):
-        """HF repo-id URI: the index is found next to the resolved shard files."""
-        self._write_index(
-            tmp_path,
-            {
-                "model.layers.0.self_attn.qkv_proj.weight": "model-00001-of-00002.safetensors",
-                "model.layers.78.self_attn.qkv_proj.weight": "model-mtp.safetensors",
-            },
+        adapter.build_model_streamer_weight_iter(str(tmp_path), model=model)
+
+        weight_utils.filter_safetensors_files_by_weight_name.assert_called_once_with(
+            files, model.is_unused_checkpoint_weight
         )
-        files = [
-            os.path.join(str(tmp_path), name)
-            for name in (
-                "model-00001-of-00002.safetensors",
-                "model-mtp.safetensors",
-            )
-        ]
-        assert _select_draft_weight_files(
-            "Qwen/Qwen3.5-27B", files, _union_prefixes(78, 1)
-        ) == (
-            DraftShardSelection.SELECTED,
-            [os.path.join(str(tmp_path), "model-mtp.safetensors")],
+        weight_utils.runai_safetensors_weights_iterator.assert_called_once_with(
+            files[1:], False, False
         )
 
-    def test_does_not_match_shorter_layer_index(self, tmp_path):
-        """layers.7 must not match the layers.78 prefix (trailing-dot guard)."""
-        self._write_index(
-            tmp_path,
-            {"model.layers.7.self_attn.qkv_proj.weight": "model-00001-of-00001.safetensors"},
+    def test_missing_model_hook_uses_native_full_stream(self, tmp_path, monkeypatch):
+        streamer_module = MagicMock()
+        streamer = streamer_module.RunaiModelStreamerLoader.return_value
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm.model_executor.model_loader.runai_streamer_loader",
+            streamer_module,
         )
-        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
-        assert _select_draft_weight_files(
-            str(tmp_path), files, _union_prefixes(78, 1)
-        ) == (
-            DraftShardSelection.NO_DRAFT_WEIGHTS,
-            [],
+        monkeypatch.setattr(
+            VllmAdapter, "_model_streamer_distributed_enabled", lambda self: False
         )
+        adapter = VllmAdapter.__new__(VllmAdapter)
+        adapter.load_config = SimpleNamespace(model_loader_extra_config={})
+        adapter.model_config = SimpleNamespace(revision=None)
+        adapter.vllm_config = SimpleNamespace()
 
-    def test_falls_back_without_draft_head(self, tmp_path):
-        self._write_index(
-            tmp_path, {"model.layers.0.self_attn.qkv_proj.weight": "model-00001-of-00001.safetensors"}
+        adapter.build_model_streamer_weight_iter(str(tmp_path), model=SimpleNamespace())
+
+        streamer._get_weights_iterator.assert_called_once_with(str(tmp_path), None)
+        streamer._prepare_weights.assert_not_called()
+
+    def test_new_runai_loader_receives_model_rule_directly(self, tmp_path, monkeypatch):
+        calls = []
+
+        class NativeLoader:
+            def __init__(self, _load_config):
+                pass
+
+            def _get_weights_iterator(
+                self, model_uri, revision, is_unused_weight=None
+            ):
+                calls.append((model_uri, revision, is_unused_weight))
+                return iter(())
+
+        streamer_module = ModuleType("vllm.model_executor.model_loader.runai_streamer_loader")
+        streamer_module.RunaiModelStreamerLoader = NativeLoader
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm.model_executor.model_loader.runai_streamer_loader",
+            streamer_module,
         )
-        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
-        assert _select_draft_weight_files(
-            str(tmp_path), files, _union_prefixes(78, 1)
-        ) == (
-            DraftShardSelection.NO_DRAFT_WEIGHTS,
-            [],
+        monkeypatch.setattr(
+            VllmAdapter, "_model_streamer_distributed_enabled", lambda self: False
         )
+        adapter = VllmAdapter.__new__(VllmAdapter)
+        adapter.load_config = SimpleNamespace(model_loader_extra_config={})
+        adapter.model_config = SimpleNamespace(revision="pinned")
+        adapter.vllm_config = SimpleNamespace()
+        rule = lambda _name: False
 
-    def test_empty_prefixes_reports_no_draft_weights(self, tmp_path):
-        """No prefixes: report no draft weights without reading the index."""
-        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
-        assert _select_draft_weight_files(str(tmp_path), files, ()) == (
-            DraftShardSelection.NO_DRAFT_WEIGHTS,
-            [],
-        )
-
-    def test_corrupt_index_reports_unresolved(self, tmp_path):
-        (tmp_path / "model.safetensors.index.json").write_text(
-            "{not json", encoding="utf-8"
-        )
-        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
-        assert _select_draft_weight_files(
-            "Qwen/Qwen3.5-27B", files, _union_prefixes(78, 1)
-        ) == (
-            DraftShardSelection.UNRESOLVED,
-            [],
-        )
-
-    def test_unreadable_index_reports_unresolved(self, tmp_path):
-        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
-        with patch(
-            "modelexpress.engines.vllm.adapter._read_safetensors_index",
-            return_value=None,
-        ):
-            assert _select_draft_weight_files(
-                "Qwen/Qwen3.5-27B", files, _union_prefixes(78, 1)
-            ) == (
-                DraftShardSelection.UNRESOLVED,
-                [],
-            )
-
-
-class TestMtpLayerPrefixes:
-    """MTP layer prefixes are derived from the checkpoint's config.json
-    (top-level num_hidden_layers + num_nextn_predict_layers), mirroring vLLM's
-    spec-layer indexing. Any other shape falls back to no prefixes so the
-    selector streams all shards rather than truncating to the wrong ones."""
-
-    def test_derives_glm_extra_layer_prefixes(self):
-        """GLM config (base=92, n=1) yields the layer-92 prefix variants."""
-        config = {"num_hidden_layers": 92, "num_nextn_predict_layers": 1}
-        assert _mtp_layer_prefixes(config) == (
-            "model.layers.92.",
-            "layers.92.",
-            "model.language_model.layers.92.",
+        adapter.build_model_streamer_weight_iter(
+            str(tmp_path), model=SimpleNamespace(is_unused_checkpoint_weight=rule)
         )
 
-    def test_multiple_nextn_layers(self):
-        """n>1 yields prefixes for each consecutive extra layer."""
-        config = {"num_hidden_layers": 61, "num_nextn_predict_layers": 2}
-        assert _mtp_layer_prefixes(config) == (
-            "model.layers.61.",
-            "layers.61.",
-            "model.language_model.layers.61.",
-            "model.layers.62.",
-            "layers.62.",
-            "model.language_model.layers.62.",
+        assert calls == [(str(tmp_path), "pinned", rule)]
+
+
+class TestLegacyMtpShardSelection:
+    def _adapter_and_model(self, tmp_path, monkeypatch, module_name, class_name):
+        files = [str(tmp_path / name) for name in (
+            "main.safetensors", "draft.safetensors", "shared.safetensors",
+            "mixed.safetensors", "extra.safetensors",
+        )]
+        model_module = ModuleType("vllm.model_executor.models." + module_name)
+        model_module.get_spec_layer_idx_from_weight_name = (
+            lambda config, name: 61 if name.startswith("model.layers.61.") else None
         )
+        monkeypatch.setitem(sys.modules, model_module.__name__, model_module)
+        model = type(class_name, (), {"__module__": model_module.__name__})()
+        model.config = SimpleNamespace(num_hidden_layers=61, num_nextn_predict_layers=1)
 
-    def test_multimodal_text_config(self):
-        """Multimodal GLM nests the counts under text_config (GLM-5.3-Flash)."""
-        config = {
-            "architectures": ["Glm5NextForConditionalGeneration"],
-            "text_config": {"num_hidden_layers": 45, "num_nextn_predict_layers": 1},
-        }
-        assert _mtp_layer_prefixes(config) == (
-            "model.layers.45.",
-            "layers.45.",
-            "model.language_model.layers.45.",
+        class LegacyLoader:
+            def __init__(self, _config):
+                self._is_distributed = False
+
+            def _prepare_weights(self, _uri, _revision):
+                return files
+
+            def _get_weights_iterator(self, _uri, _revision):
+                return iter(files)
+
+        streamer_module = ModuleType("vllm.model_executor.model_loader.runai_streamer_loader")
+        streamer_module.RunaiModelStreamerLoader = LegacyLoader
+        monkeypatch.setitem(sys.modules, streamer_module.__name__, streamer_module)
+        # Old releases have the streamer iterator but no model-owned file filter.
+        weight_utils = ModuleType("vllm.model_executor.model_loader.weight_utils")
+        weight_utils.runai_safetensors_weights_iterator = (
+            lambda selected, _progress, _distributed: iter(selected)
         )
+        monkeypatch.setitem(sys.modules, weight_utils.__name__, weight_utils)
+        runai_utils = ModuleType("vllm.transformers_utils.runai_utils")
+        runai_utils.is_runai_obj_uri = lambda uri: uri.startswith("s3://")
+        monkeypatch.setitem(sys.modules, runai_utils.__name__, runai_utils)
+        monkeypatch.setattr(
+            VllmAdapter, "_model_streamer_distributed_enabled", lambda self: False
+        )
+        adapter = VllmAdapter.__new__(VllmAdapter)
+        adapter.load_config = SimpleNamespace(
+            model_loader_extra_config={}, use_tqdm_on_load=False
+        )
+        adapter.model_config = SimpleNamespace(revision="pinned", runner_type="draft")
+        adapter.vllm_config = SimpleNamespace(speculative_config=object())
+        return adapter, model, files
 
-    def test_top_level_counts_win_over_text_config(self):
-        """A top-level num_hidden_layers is authoritative; text_config is a fallback."""
-        config = {
-            "num_hidden_layers": 92,
-            "num_nextn_predict_layers": 1,
-            "text_config": {"num_hidden_layers": 45, "num_nextn_predict_layers": 1},
-        }
-        assert _mtp_layer_prefixes(config)[0] == "model.layers.92."
+    @pytest.mark.parametrize("module_name,class_name,draft_name,shared_name", [
+        ("qwen3_5_mtp", "Qwen3_5MTP", "mtp.layers.0.weight", "model.language_model.embed_tokens.weight"),
+        ("qwen3_5_mtp", "Qwen3_5MoeMTP", "mtp.layers.0.weight", "lm_head.weight"),
+        ("qwen3_next_mtp", "Qwen3NextMTP", "mtp.layers.0.weight", "model.embed_tokens.weight"),
+        ("deepseek_mtp", "DeepSeekMTP", "model.layers.61.weight", "model.layers.61.shared_head.head.weight"),
+        ("glm4_moe_mtp", "Glm4MoeMTP", "model.layers.61.weight", "lm_head.weight"),
+        ("glm4_moe_lite_mtp", "Glm4MoeLiteMTP", "model.layers.61.weight", "model.layers.61.embed_tokens.weight"),
+    ])
+    def test_old_engine_selects_draft_shared_mixed_and_unindexed_files(
+        self, tmp_path, monkeypatch, module_name, class_name, draft_name, shared_name
+    ):
+        adapter, model, files = self._adapter_and_model(
+            tmp_path, monkeypatch, module_name, class_name
+        )
+        (tmp_path / _SAFETENSORS_INDEX_NAME).write_text(json.dumps({"weight_map": {
+            "model.layers.0.weight": "main.safetensors",
+            draft_name: "draft.safetensors",
+            shared_name: "shared.safetensors",
+            draft_name + ".scale": "mixed.safetensors",
+            "model.layers.1.weight": "mixed.safetensors",
+        }}))
 
-    def test_no_mtp_layers_returns_empty(self):
-        """num_nextn_predict_layers=0 yields no prefixes."""
-        config = {"num_hidden_layers": 92, "num_nextn_predict_layers": 0}
-        assert _mtp_layer_prefixes(config) == ()
+        assert list(adapter.build_model_streamer_weight_iter(str(tmp_path), model)) == files[1:]
 
-    def test_missing_fields_returns_empty(self):
-        """Missing config fields yield no prefixes."""
-        assert _mtp_layer_prefixes({}) == ()
-        assert _mtp_layer_prefixes(None) == ()
+    def test_model_owned_rule_takes_precedence_over_legacy_names(self, tmp_path, monkeypatch):
+        adapter, model, files = self._adapter_and_model(
+            tmp_path, monkeypatch, "qwen3_5_mtp", "Qwen3_5MTP"
+        )
+        model.is_unused_checkpoint_weight = lambda name: name != "custom.draft.weight"
+        (tmp_path / _SAFETENSORS_INDEX_NAME).write_text(json.dumps({"weight_map": {
+            "custom.draft.weight": "main.safetensors",
+            "mtp.weight": "draft.safetensors",
+            "lm_head.weight": "shared.safetensors",
+            "model.weight": "mixed.safetensors",
+        }}))
 
-    def test_zeroed_base_returns_empty(self):
-        """A post-override num_hidden_layers=0 (MiMo/GLM-Lite) must not derive
-        layer-0 prefixes; that would collide with the ordinary first layer."""
-        config = {"num_hidden_layers": 0, "num_nextn_predict_layers": 1}
-        assert _mtp_layer_prefixes(config) == ()
+        assert list(adapter.build_model_streamer_weight_iter(str(tmp_path), model)) == [files[0], files[4]]
 
-    def test_nested_text_config_without_nextn_returns_empty(self):
-        """A multimodal config whose text_config declares no nextn layers
-        (e.g. a VL model without MTP) derives no prefixes."""
-        config = {"text_config": {"num_hidden_layers": 92}}
-        assert _mtp_layer_prefixes(config) == ()
+    @pytest.mark.parametrize("draft_pass", [False, True])
+    def test_unknown_or_main_model_preserves_full_stream(self, tmp_path, monkeypatch, draft_pass):
+        adapter, model, files = self._adapter_and_model(
+            tmp_path, monkeypatch, "unknown_mtp" if draft_pass else "qwen3_5_mtp",
+            "UnknownMTP" if draft_pass else "Qwen3_5MTP",
+        )
+        adapter.model_config.runner_type = "draft" if draft_pass else "generate"
+        assert list(adapter.build_model_streamer_weight_iter(str(tmp_path), model)) == files
+
+    @pytest.mark.parametrize("config_content", [b"{invalid JSON", b"\xff"])
+    @pytest.mark.parametrize("has_model_rule", [False, True])
+    def test_main_streaming_does_not_parse_checkpoint_config(
+        self, tmp_path, monkeypatch, config_content, has_model_rule
+    ):
+        adapter, model, files = self._adapter_and_model(
+            tmp_path, monkeypatch, "qwen3_5", "Qwen3_5ForCausalLM"
+        )
+        adapter.model_config.runner_type = "generate"
+        (tmp_path / "config.json").write_bytes(config_content)
+        (tmp_path / _SAFETENSORS_INDEX_NAME).write_text(json.dumps({"weight_map": {
+            "model.layers.0.weight": "main.safetensors",
+            "mtp.layers.0.weight": "draft.safetensors",
+            "model.embed_tokens.weight": "shared.safetensors",
+            "model.layers.1.weight": "mixed.safetensors",
+            "mtp.layers.1.weight": "mixed.safetensors",
+        }}))
+        if has_model_rule:
+            model.is_unused_checkpoint_weight = lambda name: name.startswith("mtp.")
+
+        streamed = list(adapter.build_model_streamer_weight_iter(str(tmp_path), model))
+
+        if has_model_rule:
+            assert streamed == [files[0], files[2], files[3], files[4]]
+        else:
+            assert streamed == files
+
+    @pytest.mark.parametrize("config", [None, SimpleNamespace(),
+        SimpleNamespace(num_hidden_layers=61, num_nextn_predict_layers=0),
+        SimpleNamespace(num_hidden_layers=-1, num_nextn_predict_layers=1)])
+    def test_legacy_nextn_without_usable_config_preserves_full_stream(
+        self, tmp_path, monkeypatch, config
+    ):
+        adapter, model, files = self._adapter_and_model(
+            tmp_path, monkeypatch, "deepseek_mtp", "DeepSeekMTP"
+        )
+        model.config = config
+        assert list(adapter.build_model_streamer_weight_iter(str(tmp_path), model)) == files
+
+    def test_legacy_nextn_uses_installed_helper_with_runtime_draft_config(self, tmp_path, monkeypatch):
+        adapter, model, files = self._adapter_and_model(
+            tmp_path, monkeypatch, "glm4_moe_lite_mtp", "Glm4MoeLiteMTP"
+        )
+        model.config.num_hidden_layers = 0
+
+        def select_layer(config, name):
+            assert config is model.config
+            return 0 if name.startswith("layers.0.") else None
+
+        sys.modules[type(model).__module__].get_spec_layer_idx_from_weight_name = select_layer
+        (tmp_path / _SAFETENSORS_INDEX_NAME).write_text(json.dumps({"weight_map": {
+            "model.layers.61.weight": "main.safetensors",
+            "layers.0.weight": "draft.safetensors",
+            "model.norm.weight": "shared.safetensors",
+            "layers.0.bias": "mixed.safetensors",
+        }}))
+        assert list(adapter.build_model_streamer_weight_iter(str(tmp_path), model)) == [files[1], files[3], files[4]]
+
+    @pytest.mark.parametrize("weight_map", [None, {"mtp.weight": "missing.safetensors"},
+        {"model.weight": "main.safetensors"}])
+    def test_legacy_unusable_or_unrecognized_index_keeps_weights(self, tmp_path, monkeypatch, weight_map):
+        adapter, model, files = self._adapter_and_model(
+            tmp_path, monkeypatch, "qwen3_5_mtp", "Qwen3_5MTP"
+        )
+        if weight_map == {"model.weight": "main.safetensors"}:
+            weight_map = {"model.weight." + str(i): os.path.basename(path)
+                          for i, path in enumerate(files)}
+        (tmp_path / _SAFETENSORS_INDEX_NAME).write_text(json.dumps({"weight_map": weight_map}))
+        assert list(adapter.build_model_streamer_weight_iter(str(tmp_path), model)) == files
 
 
 def _stub_runai(monkeypatch, available: dict[str, str]) -> list:
@@ -1289,7 +1392,7 @@ class TestReadSafetensorsIndexObjectStore:
         assert any("not found under" in rec.message for rec in caplog.records)
 
     def test_selects_draft_shard_from_object_store(self, monkeypatch):
-        """Object-store URI: selects only the draft shard via the index read over runai."""
+        """Object-store selection follows the model rule, not MX prefixes."""
         index = {
             "weight_map": {
                 "model.layers.0.self_attn.qkv_proj.weight": "model-00001-of-00002.safetensors",
@@ -1307,9 +1410,93 @@ class TestReadSafetensorsIndexObjectStore:
                 "model-mtp.safetensors",
             )
         ]
-        assert _select_draft_weight_files(
-            "s3://bucket/model", files, _union_prefixes(92, 1)
-        ) == (
-            DraftShardSelection.SELECTED,
-            ["s3://bucket/model/model-mtp.safetensors"],
+        assert _select_remote_weight_files(
+            "s3://bucket/model", files,
+            lambda name: not name.startswith("model.layers.92."),
+        ) == ["s3://bucket/model/model-mtp.safetensors"]
+
+
+class TestTargetSharedDraftPrefixes:
+    def _mtp_model(self):
+        class _SharedHead(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = torch.nn.Linear(2, 2)
+
+        class _Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.shared_head = _SharedHead()
+
+        class _Mtp(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([_Layer()])
+
+        return _Mtp()
+
+    def test_mtp_draft_drops_embed_lm_head_and_shared_heads(self):
+        from types import SimpleNamespace
+
+        from modelexpress.engines.vllm.adapter import _target_shared_draft_prefixes
+
+        config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=1))
+        assert _target_shared_draft_prefixes(self._mtp_model(), config) == (
+            "model.embed_tokens.",
+            "lm_head.",
+            "layers.0.shared_head.head.",
+        )
+
+    def test_draft_owning_its_heads_keeps_everything(self):
+        from types import SimpleNamespace
+
+        from modelexpress.engines.vllm.adapter import _target_shared_draft_prefixes
+
+        model = self._mtp_model()
+        model.has_own_embed_tokens = True
+        model.has_own_lm_head = True
+        config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=1))
+        assert _target_shared_draft_prefixes(model, config) == ()
+
+    def test_pipeline_parallel_keeps_draft_embedding(self):
+        from types import SimpleNamespace
+
+        from modelexpress.engines.vllm.adapter import _target_shared_draft_prefixes
+
+        config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=2))
+        assert "model.embed_tokens." not in _target_shared_draft_prefixes(
+            self._mtp_model(), config
+        )
+
+    def test_step3p5_keeps_its_layer_heads_without_ownership_marker(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from modelexpress.engines.vllm.adapter import _target_shared_draft_prefixes
+
+        class Step3p5MTP(type(self._mtp_model())):
+            pass
+
+        config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=1))
+        model = Step3p5MTP()
+        assert "layers.0.shared_head.head." not in _target_shared_draft_prefixes(
+            model, config
+        )
+        monkeypatch.setattr(
+            "modelexpress.engines.vllm.adapter.adopt_hidden_tensors",
+            lambda *_args: None,
+        )
+        monkeypatch.setattr(
+            "modelexpress.engines.vllm.adapter.collect_module_tensors",
+            lambda *_args: {
+                "layers.0.shared_head.head.weight": model.layers[0].shared_head.head.weight
+            },
+        )
+        adapter = VllmAdapter.__new__(VllmAdapter)
+        adapter.vllm_config = SimpleNamespace(
+            speculative_config=object(), parallel_config=config.parallel_config
+        )
+        adapter.model_config = SimpleNamespace(runner_type="draft")
+        adapter.accelerator_backend = object()
+        assert "layers.0.shared_head.head.weight" in adapter.discover_tensors(
+            LoadResult(value=model, model=model)
         )
