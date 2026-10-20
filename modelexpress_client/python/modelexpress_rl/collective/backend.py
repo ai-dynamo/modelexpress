@@ -19,7 +19,7 @@ import logging
 import math
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import nullcontext
 from typing import Any
 
@@ -163,6 +163,67 @@ def _check_storage(
 def _m2n_destroy(handle: Any) -> None:
     with _M2N_CALL_LOCK:
         handle.destroy()
+
+
+def _scratch_bytes(spec: LocalParamSpec, ctx: RefitCtx) -> int:
+    """Bytes of the buffer ``pre`` allocated for this call, 0 for live storage."""
+    if spec.pre is None or ctx.buf is spec.base:
+        return 0
+    try:
+        return int(ctx.buf.nbytes)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+class _ReceiveWindow:
+    """Bounds the scratch receive buffers one per-call layer group keeps alive.
+
+    Without it a group retains every ``pre`` buffer until the whole group is
+    waited on, so a group holding the full bulk keeps the full bulk's scratch
+    allocated at once. Calls are collected into windows of about half the
+    budget. Closing a window records an event on every lane it used; once two
+    windows are closed the older one is waited on and dropped, so the allocator
+    can hand its buffers to later calls while the newer window is still on the
+    wire. Nothing is dropped before the event covering its receive and its
+    ``post`` hook has completed.
+    """
+
+    def __init__(self, budget_bytes: int):
+        self.chunk_bytes = max(1, budget_bytes // 2)
+        # (lane marks, contexts, scratch storage regions) per closed window.
+        self.closed: deque[
+            tuple[
+                list[tuple[LaneCommunicator, Any]],
+                list[RefitCtx],
+                list[_StorageRegion],
+            ]
+        ] = deque()
+        self._reset()
+
+    def _reset(self) -> None:
+        self._lanes: OrderedDict[int, LaneCommunicator] = OrderedDict()
+        self._contexts: list[RefitCtx] = []
+        self._regions: list[_StorageRegion] = []
+        self._bytes = 0
+
+    def add(
+        self,
+        lane: LaneCommunicator,
+        ctx: RefitCtx,
+        nbytes: int,
+        regions: list[_StorageRegion],
+    ) -> bool:
+        """Account one issued call; True once the open window is full."""
+        self._lanes[id(lane)] = lane
+        self._contexts.append(ctx)
+        self._regions.extend(regions)
+        self._bytes += nbytes
+        return self._bytes >= self.chunk_bytes
+
+    def close(self) -> None:
+        marks = [(lane, lane.record_event()) for lane in self._lanes.values()]
+        self.closed.append((marks, self._contexts, self._regions))
+        self._reset()
 
 
 class _blocked_reshard_watch:
@@ -722,7 +783,12 @@ class _CollectiveHalf:
         self._pending_contexts.clear()
 
     def _submit_layer_group(
-        self, entries: list[ParamPlan], *, src: Any, dst: Any
+        self,
+        entries: list[ParamPlan],
+        *,
+        src: Any,
+        dst: Any,
+        window_bytes: int = 0,
     ) -> list[LaneCommunicator]:
         """Issue one layer group's reshards, fused in one ``m2n.group()`` if opted in.
 
@@ -750,6 +816,15 @@ class _CollectiveHalf:
         the abort it triggers destroys the M2N handle and that is refused while
         a group is open.
 
+        ``window_bytes`` bounds the ``pre`` scratch the per-call path keeps
+        alive (see :class:`_ReceiveWindow`); each ``post`` hook then runs right
+        after its own call instead of after the last one, which is the same
+        stream order. 0 keeps every context until the group is waited on. A
+        grouped submission ignores it: nothing in a group is issued before the
+        group closes, so nothing in it can be released early. The per-call
+        path then takes the call lock per call rather than across the group,
+        so a window wait never holds it.
+
         Returns the lanes the group used, in submission order.
         """
         self._remaining()
@@ -772,10 +847,14 @@ class _CollectiveHalf:
         staged: list[tuple[ParamPlan, LaneCommunicator, LocalParamSpec, RefitCtx]] = []
         regions: list[_StorageRegion] = []
         grouped = envs.MX_NCCL_REFIT_GROUPED_SUBMISSION
+        window = _ReceiveWindow(window_bytes) if window_bytes and not grouped else None
         started = time.monotonic()
         # The native runtime is process-global and not host-thread-safe, and a
         # group records on the calling thread, so one lock spans the group.
-        with _M2N_CALL_LOCK, _blocked_reshard_watch(
+        # Each per-call reshard takes the lock itself, so the windowed path
+        # does not hold it across the window waits.
+        group_lock = _M2N_CALL_LOCK if window is None else nullcontext()
+        with group_lock, _blocked_reshard_watch(
             ordered[0], next(iter(lanes.values())), started, calls=len(ordered)
         ), (m2n.group() if grouped else nullcontext()):
             for entry in ordered:
@@ -787,7 +866,7 @@ class _CollectiveHalf:
                 # CUDA work is complete. Relying only on an allocator's stream
                 # tracking is not sufficient for engine-owned or external buffers.
                 self._pending_contexts.append(ctx)
-                staged.append((entry, lane, spec, ctx))
+                checked = len(regions)
                 _check_storage(regions, entry, src(ctx), dst(ctx))
                 _reshard(
                     comm=lane,
@@ -796,6 +875,22 @@ class _CollectiveHalf:
                     dst=dst(ctx),
                     handle=handle,
                 )
+                if window is None:
+                    staged.append((entry, lane, spec, ctx))
+                    continue
+                with self._stream_context(lane, spec):
+                    spec.leave(ctx)
+                nbytes = _scratch_bytes(spec, ctx)
+                # Only scratch regions are forgotten on release: the allocator
+                # may hand that memory to a later call of this group, which is
+                # then not a collision. Live storage stays checked.
+                full = window.add(
+                    lane, ctx, nbytes, regions[checked:] if nbytes else []
+                )
+                del ctx
+                if full:
+                    window.close()
+                    self._release_windows(window, regions)
         elapsed = time.monotonic() - started
         if elapsed >= _SLOW_RESHARD_WARN_S:
             # nccl.m2n issues host-blocking collectives while issuing a group or
@@ -815,6 +910,34 @@ class _CollectiveHalf:
             with self._stream_context(lane, spec):
                 spec.leave(ctx)
         return list(lanes.values())
+
+    def _wait_marks(self, marks: list[tuple[LaneCommunicator, Any]]) -> None:
+        """Wait for each lane's mark; a lane without an event is drained whole."""
+        for lane, event in marks:
+            remaining = self._remaining()
+            try:
+                if event is None:
+                    lane.synchronize(
+                        timeout_s=None if remaining == math.inf else remaining
+                    )
+                else:
+                    lane.wait_event(event, remaining)
+            except TimeoutError:
+                self._fail_deadline()
+
+    def _release_windows(
+        self, window: _ReceiveWindow, regions: list[_StorageRegion]
+    ) -> None:
+        """Wait for and drop every closed window but the newest."""
+        while len(window.closed) > 1:
+            marks, contexts, released = window.closed.popleft()
+            self._wait_marks(marks)
+            done = {id(ctx) for ctx in contexts}
+            self._pending_contexts = [
+                ctx for ctx in self._pending_contexts if id(ctx) not in done
+            ]
+            gone = {id(region) for region in released}
+            regions[:] = [region for region in regions if id(region) not in gone]
 
     def _finish_misc(self, broadcast_lane_id: int) -> None:
         if not self._pending_misc:
@@ -897,12 +1020,20 @@ class NcclM2nReceiver(_CollectiveHalf):
         Each lane the group used gets an event recorded right after its last
         receive, so wait_weights can wait for this group alone while later
         groups are already queued on the same streams.
+
+        On the per-call path the group's ``pre`` scratch is bounded by
+        ``MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES``: earlier calls of the group are
+        waited on and dropped while it is still being issued, so a large group
+        does not keep all of its receive buffers at once.
         """
         started = time.monotonic()
         first = len(self._pending_contexts)
         entries = self._claim_group(layer_group_id)
         lanes = self._submit_layer_group(
-            entries, src=lambda ctx: None, dst=lambda ctx: ctx.buf
+            entries,
+            src=lambda ctx: None,
+            dst=lambda ctx: ctx.buf,
+            window_bytes=envs.MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES,
         )
         # Recorded after the group's post hooks, so a mark covers them too.
         marks = [(lane, lane.record_event()) for lane in lanes]
@@ -928,17 +1059,7 @@ class NcclM2nReceiver(_CollectiveHalf):
             )
         started = time.monotonic()
         marks, contexts = self._in_flight.pop(layer_group_id)
-        for lane, event in marks:
-            remaining = self._remaining()
-            try:
-                if event is None:
-                    lane.synchronize(
-                        timeout_s=None if remaining == math.inf else remaining
-                    )
-                else:
-                    lane.wait_event(event, remaining)
-            except TimeoutError:
-                self._fail_deadline()
+        self._wait_marks(marks)
         # A lane no later in-flight group uses is now fully drained, so the
         # finish-time drain has nothing left to wait for on it.
         still_used = {

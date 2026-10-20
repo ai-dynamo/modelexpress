@@ -1433,3 +1433,265 @@ class TestBlockedReshardWatch:
             pass
         assert "still blocks" not in caplog.text
         assert not any(t.name == "mx-reshard-watch" for t in threading.enumerate())
+
+
+class _Tracker:
+    """Live scratch bytes, a reusing address pool, and per-lane completion."""
+
+    def __init__(self):
+        self.live = 0
+        self.peak = 0
+        self.issued: dict[str, int] = {}
+        self.completed: dict[str, int] = {}
+        self.violations: list[str] = []
+        self.free_addresses: list[int] = []
+        self.next_address = 0x1000
+
+
+class _Scratch:
+    """A receive buffer with tensor-like storage, freed by refcount."""
+
+    def __init__(self, tracker, name, nbytes):
+        self._tracker = tracker
+        self.name = name
+        self.nbytes = nbytes
+        self.lane = None
+        self.seq = None
+        if tracker.free_addresses:
+            self._address = tracker.free_addresses.pop()
+        else:
+            self._address = tracker.next_address
+            tracker.next_address += 0x10000
+        tracker.live += nbytes
+        tracker.peak = max(tracker.peak, tracker.live)
+
+    def data_ptr(self):
+        return self._address
+
+    def element_size(self):
+        return 1
+
+    @property
+    def shape(self):
+        return (self.nbytes,)
+
+    def stride(self):
+        return (1,)
+
+    device = "cuda:0"
+
+    def __del__(self):
+        tracker = self._tracker
+        tracker.live -= self.nbytes
+        tracker.free_addresses.append(self._address)
+        if self.lane is not None and tracker.completed.get(self.lane, 0) < self.seq:
+            tracker.violations.append(
+                f"{self.name} released before receive {self.seq} on "
+                f"{self.lane} completed"
+            )
+
+
+class _Event:
+    def __init__(self, lane_name, covers):
+        self.lane_name = lane_name
+        self.covers = covers
+
+
+class TestReceiveWindow:
+    """The generator's receive scratch is released per window, after its event."""
+
+    ENTRY_BYTES = 100
+
+    @pytest.fixture
+    def tracker(self, recorder, monkeypatch):
+        tracker = _Tracker()
+
+        def reshard(*, comm, entry, src, dst, handle):
+            name = comm.handle._name
+            tracker.issued[name] = tracker.issued.get(name, 0) + 1
+            if isinstance(dst, _Scratch):
+                dst.lane = name
+                dst.seq = tracker.issued[name]
+
+        monkeypatch.setattr(backend, "_reshard", reshard)
+        return tracker
+
+    def _half(
+        self, recorder, tracker, monkeypatch, *, names, groupings=None, event=True
+    ):
+        plan = ReshardPlan(bulk=[entry(name) for name in names])
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
+        for lane_obj in cache._lanes.values():
+            name = lane_obj.handle._name
+
+            def record_event(name=name):
+                if not event:
+                    return None
+                return _Event(name, tracker.issued.get(name, 0))
+
+            def wait_event(ev, timeout_s, name=name):
+                tracker.completed[name] = max(
+                    tracker.completed.get(name, 0), ev.covers
+                )
+
+            def synchronize(timeout_s=None, name=name):
+                tracker.completed[name] = tracker.issued.get(name, 0)
+
+            monkeypatch.setattr(lane_obj, "record_event", record_event)
+            monkeypatch.setattr(lane_obj, "wait_event", wait_event)
+            monkeypatch.setattr(lane_obj, "synchronize", synchronize)
+
+        def scratch_spec(name):
+            def pre(base):
+                return RefitCtx(
+                    buf=_Scratch(tracker, name, self.ENTRY_BYTES),
+                    extra={"region": base},
+                )
+
+            return LocalParamSpec(base=f"live::{name}", pre=pre, post=lambda ctx: None)
+
+        half._specs = {name: scratch_spec(name) for name in names}
+        if groupings is not None:
+            half.setup_layer_groups(groupings)
+        return half
+
+    def _receive_one_group(self, half):
+        half.start_weight_update("v")
+        half.issue_weights(0)
+        half.wait_weights(0)
+        half.finish_weight_update(broadcast_lane_id=1)
+
+    def test_a_large_group_keeps_at_most_the_window_of_scratch_alive(
+        self, recorder, tracker, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES", "400")
+        names = [f"p{i:02d}" for i in range(16)]
+        half = self._half(recorder, tracker, monkeypatch, names=names)
+        self._receive_one_group(half)
+        assert tracker.peak <= 400 + 2 * self.ENTRY_BYTES
+        assert tracker.peak < len(names) * self.ENTRY_BYTES
+        assert tracker.live == 0
+        assert tracker.violations == []
+
+    def test_without_a_window_the_whole_group_is_retained(
+        self, recorder, tracker, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES", "0")
+        names = [f"p{i:02d}" for i in range(16)]
+        half = self._half(recorder, tracker, monkeypatch, names=names)
+        self._receive_one_group(half)
+        assert tracker.peak == len(names) * self.ENTRY_BYTES
+        assert tracker.live == 0
+        assert tracker.violations == []
+
+    def test_scratch_is_never_released_before_its_event_completes(
+        self, recorder, tracker, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES", "200")
+        names = [f"p{i:02d}" for i in range(12)]
+        half = self._half(recorder, tracker, monkeypatch, names=names)
+        waits = []
+        lane0 = half._lane(0)
+        real_wait = lane0.wait_event
+
+        def wait_event(ev, timeout_s):
+            # Everything still alive and covered by this event is about to
+            # become releasable; nothing it covers may be gone already.
+            waits.append(ev.covers)
+            real_wait(ev, timeout_s)
+
+        monkeypatch.setattr(lane0, "wait_event", wait_event)
+        half.start_weight_update("v")
+        half.issue_weights(0)
+        # Mid-group waits happened, but they only covered earlier calls.
+        assert waits and max(waits) < len(names)
+        assert tracker.live < len(names) * self.ENTRY_BYTES
+        assert tracker.violations == []
+        half.wait_weights(0)
+        half.finish_weight_update(broadcast_lane_id=1)
+        assert tracker.violations == []
+        assert tracker.live == 0
+
+    def test_an_event_that_never_completes_releases_nothing(
+        self, recorder, tracker, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES", "200")
+        monkeypatch.setenv("MX_NCCL_REFIT_TRANSFER_TIMEOUT_S", "5")
+        names = [f"p{i:02d}" for i in range(8)]
+        half = self._half(recorder, tracker, monkeypatch, names=names)
+        lane0 = half._lane(0)
+
+        def wait_event(ev, timeout_s):
+            seen.append(tracker.live)
+            raise TimeoutError("receive never landed")
+
+        seen = []
+        monkeypatch.setattr(lane0, "wait_event", wait_event)
+        half.start_weight_update("v")
+        with pytest.raises(TimeoutError, match="did not complete"):
+            half.issue_weights(0)
+        # A 200-byte budget closes a window per call; the second close waits
+        # on the first. Both were still alive when that wait failed, and the
+        # failure aborted the group before another receive was issued.
+        assert seen == [2 * self.ENTRY_BYTES]
+        assert tracker.peak == 2 * self.ENTRY_BYTES
+        assert tracker.issued["lane0"] == 2
+
+    def test_a_lane_without_events_is_drained_before_release(
+        self, recorder, tracker, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES", "200")
+        names = [f"p{i:02d}" for i in range(10)]
+        half = self._half(recorder, tracker, monkeypatch, names=names, event=False)
+        self._receive_one_group(half)
+        assert tracker.peak <= 200 + 2 * self.ENTRY_BYTES
+        assert tracker.violations == []
+
+    def test_reused_scratch_addresses_are_not_a_storage_collision(
+        self, recorder, tracker, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES", "200")
+        names = [f"p{i:02d}" for i in range(10)]
+        half = self._half(recorder, tracker, monkeypatch, names=names)
+        self._receive_one_group(half)
+        # The address pool handed released blocks to later calls of the group.
+        assert tracker.next_address < 0x1000 + len(names) * 0x10000
+
+    def test_retention_across_groups_is_bounded_by_the_pipeline(
+        self, recorder, tracker, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES", "0")
+        names = [f"p{i:02d}" for i in range(24)]
+        groupings = [names[i : i + 4] for i in range(0, len(names), 4)]
+        half = self._half(
+            recorder, tracker, monkeypatch, names=names, groupings=groupings
+        )
+        half.start_weight_update("v")
+        # Depth 2: group N is waited on once N+1 is issued.
+        half.issue_weights(0)
+        for group in range(1, len(groupings)):
+            half.issue_weights(group)
+            half.wait_weights(group - 1)
+        half.wait_weights(len(groupings) - 1)
+        half.finish_weight_update(broadcast_lane_id=1)
+        assert tracker.peak <= 2 * 4 * self.ENTRY_BYTES
+        assert tracker.live == 0
+        assert tracker.violations == []
+
+    def test_grouped_submission_keeps_the_whole_group(
+        self, recorder, tracker, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES", "200")
+        monkeypatch.setenv("MX_NCCL_REFIT_GROUPED_SUBMISSION", "1")
+        names = [f"p{i:02d}" for i in range(6)]
+        half = self._half(recorder, tracker, monkeypatch, names=names)
+        self._receive_one_group(half)
+        assert tracker.peak == len(names) * self.ENTRY_BYTES
+        assert tracker.violations == []
+
+    def test_the_window_env_rejects_a_negative_budget(self, monkeypatch):
+        from modelexpress_rl.collective import envs
+
+        monkeypatch.setenv("MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES", "-1")
+        with pytest.raises(ValueError, match="must not be negative"):
+            envs.MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES

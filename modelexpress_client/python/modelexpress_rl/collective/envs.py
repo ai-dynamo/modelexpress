@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     MX_NCCL_REFIT_PIPELINE_DEPTH: int
     MX_NCCL_REFIT_BLOCKING_DATA_PLANE: bool
     MX_NCCL_REFIT_GROUPED_SUBMISSION: bool
+    MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES: int
 
 
 def _int(name: str, default: int) -> int:
@@ -37,6 +38,17 @@ def _int(name: str, default: int) -> int:
         raise ValueError(f"invalid {name}: {os.environ.get(name)!r}") from error
     if value <= 0:
         raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _bytes(name: str, default: int) -> int:
+    """A byte budget, where 0 turns the bound off."""
+    try:
+        value = int(os.environ.get(name, default))
+    except ValueError as error:
+        raise ValueError(f"invalid {name}: {os.environ.get(name)!r}") from error
+    if value < 0:
+        raise ValueError(f"{name} must not be negative, got {value}")
     return value
 
 
@@ -79,6 +91,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MX_NCCL_REFIT_GROUPED_SUBMISSION"
     ),
     "MX_NCCL_REFIT_PIPELINE_DEPTH": lambda: _int("MX_NCCL_REFIT_PIPELINE_DEPTH", 2),
+    "MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES": lambda: _bytes(
+        "MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES", 1 << 30
+    ),
     "MX_NCCL_REFIT_REGISTRATION_TTL_S": lambda: _int(
         "MX_NCCL_REFIT_REGISTRATION_TTL_S",
         _int("MX_HEARTBEAT_INTERVAL_SECS", 30) * 3,
