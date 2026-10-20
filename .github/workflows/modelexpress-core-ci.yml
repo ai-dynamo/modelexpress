@@ -486,6 +486,14 @@ jobs:
           --test refit_collective_service_redis \
           -- --include-ignored --test-threads=1
 
+    - name: Run collective Refit Redis backend tests
+      env:
+        MX_TEST_REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
+      run: |
+        cargo test -p modelexpress-server --lib \
+          refit_collective::backend::redis::tests \
+          -- --include-ignored --test-threads=1
+
     - name: Run integration test script
       env:
         MX_METADATA_BACKEND: redis
