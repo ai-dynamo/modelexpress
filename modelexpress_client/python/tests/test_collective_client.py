@@ -911,30 +911,23 @@ class TestBootstrapBarrier:
 
 
 class TestLaneDeclaration:
-    def test_a_trainer_count_the_partition_count_does_not_divide_is_refused(self):
+    @pytest.mark.parametrize(
+        ("trainer_count", "partitions"),
+        [(5, 2), (2, 4)],
+        ids=["count-not-divided", "more-partitions-than-trainers"],
+    )
+    def test_a_partition_count_that_does_not_divide_the_trainers_is_refused(
+        self, trainer_count, partitions
+    ):
         # Floor division would silently leave the last trainers off every
         # reshard lane. Their parameters never move and the peers expecting
         # their ranks block, which is the failure mode with no error in it.
         client = RefitClientTrainer(
             rendezvous=FakeRendezvous(),
             model_name="m",
-            trainer_slots=["t0", "t1", "t2", "t3", "t4"],
+            trainer_slots=[f"t{i}" for i in range(trainer_count)],
             generator_slots=["g0"],
-            source_partition_count=2,
-            slot_id="t0",
-            worker_id="w0",
-            index_in_role=0,
-        )
-        with pytest.raises(ValueError, match="must divide the trainer slot count"):
-            client._declared_lanes()
-
-    def test_more_partitions_than_trainers_is_refused(self):
-        client = RefitClientTrainer(
-            rendezvous=FakeRendezvous(),
-            model_name="m",
-            trainer_slots=["t0", "t1"],
-            generator_slots=["g0"],
-            source_partition_count=4,
+            source_partition_count=partitions,
             slot_id="t0",
             worker_id="w0",
             index_in_role=0,
@@ -1623,13 +1616,19 @@ class TestSourcePartition:
             index_in_role=0,
         )
 
-    def test_a_partition_off_this_slots_lane_is_refused_before_joining(self):
-        with pytest.raises(ValueError, match="does not match the reshard lane"):
-            self._client("t0").initialize(FakeEngine(), source_partition=1)
-
-    def test_a_slot_outside_the_trainer_slots_is_refused(self):
-        with pytest.raises(ValueError, match="not on any reshard lane"):
-            self._client("g0").initialize(FakeEngine(), source_partition=0)
+    @pytest.mark.parametrize(
+        ("slot_id", "partition", "error"),
+        [
+            ("t0", 1, "does not match the reshard lane"),
+            ("g0", 0, "not on any reshard lane"),
+        ],
+        ids=["partition-off-the-slots-lane", "slot-outside-the-trainer-slots"],
+    )
+    def test_a_slot_and_partition_that_disagree_are_refused_before_joining(
+        self, slot_id, partition, error
+    ):
+        with pytest.raises(ValueError, match=error):
+            self._client(slot_id).initialize(FakeEngine(), source_partition=partition)
 
 
 class TestStreams:
