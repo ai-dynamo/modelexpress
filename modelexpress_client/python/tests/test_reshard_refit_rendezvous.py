@@ -46,7 +46,7 @@ def _one_tensor(agent_name="trainer-agent"):
     ]
 
 
-def test_structural_digest_ignores_version_and_content_digest():
+def test_structural_digest_ignores_content_digest():
     first = _one_tensor()
     first[0].shards[0].digest = "version-a"
     second = _one_tensor()
@@ -57,14 +57,12 @@ def test_structural_digest_ignores_version_and_content_digest():
         "trainer-agent",
         "trainer:1234",
         first,
-        publisher_step=1,
     )
     second_blob = wrap_rendezvous_blob(
         b"nixl",
         "trainer-agent",
         "trainer:1234",
         second,
-        publisher_step=2,
     )
 
     assert structural_manifest_digest(first_blob) == structural_manifest_digest(
@@ -117,6 +115,23 @@ def test_host_memory_kind_roundtrips_and_requires_host_aware_reader():
     assert agents == {"trainer-agent": "trainer-agent"}
     assert devices == {"trainer-agent": 0}
     assert sources["weight"].shards[0].addr == 4096
+
+
+@pytest.mark.parametrize("change", ["missing_counts", "null_counts", "checksum"])
+def test_stable_metadata_validation_preserves_legacy_blob_support(change):
+    payload = json.loads(wrap_rendezvous_blob(b"nixl", "a", "a:1", _one_tensor()))
+    if change == "checksum":
+        payload["tensors"][0]["shards"][0]["digest"] = "version-checksum"
+    else:
+        for name in ("tensor_count", "total_bytes"):
+            if change == "missing_counts":
+                del payload[name]
+            else:
+                payload[name] = None
+    blob = json.dumps(payload).encode()
+    assert unwrap_rendezvous_blob(blob).tensor_count == 1
+    with pytest.raises((KeyError, ValueError)):
+        unwrap_rendezvous_blob(blob, stable=True)
 
 
 def test_rejects_unknown_source_memory_type():
@@ -372,9 +387,7 @@ def test_only_the_requested_number_of_ranks_is_returned():
 
 
 def test_a_discovered_payload_reads_by_field_and_by_position():
-    """Named access is the point of the change. Positions are still stable, which is
-    what lets an optional field like the publisher step be appended without moving
-    anything a caller already reads."""
+    """Named access and positional tuple access describe the same payload."""
     client = _DiscoveryClient([_blob("rank-0", _one_tensor())])
 
     (payload,) = _rendezvous(client).discover_trainers(expected_trainers=1, timeout=0)
@@ -386,6 +399,8 @@ def test_a_discovered_payload_reads_by_field_and_by_position():
         payload.tensors,
     )
     assert payload[3] is payload.tensors
+    assert payload.tensor_count == 1
+    assert payload.total_bytes == 32
 
 
 def test_a_partial_ready_set_still_reports_its_shard_tables():
@@ -418,60 +433,6 @@ def test_invalid_heartbeat_period_fails_before_publish(monkeypatch):
 
     with pytest.raises(ValueError, match="must be positive"):
         rendezvous.publish(b"registered")
-
-
-def test_quorum_can_skip_shard_tables_without_losing_emptiness():
-    """The per-step quorum check needs each rank's version stamp, not its shard
-    table, and rebuilding the table dominated the call. Skipping it must not make
-    a rank that published nothing look like a valid member of the quorum, which is
-    the one thing the emptiness rule exists to prevent."""
-    client = _DiscoveryClient(
-        [_blob("empty-rank", []), _blob("real-rank", _one_tensor())]
-    )
-
-    with pytest.raises(TimeoutError) as excinfo:
-        _rendezvous(client).discover_trainers(
-            expected_trainers=2, timeout=0, with_tensors=False
-        )
-
-    message = str(excinfo.value)
-    assert "1 with a non-empty shard table" in message
-    assert "1 empty" in message
-
-
-def test_skipping_shard_tables_still_reports_the_entry_count(caplog):
-    """``entry_count`` is what keeps emptiness decidable, and it is also the figure
-    that showed this cost scales with source count rather than bytes moved."""
-    import json
-    import logging
-
-    client = _DiscoveryClient([_blob("rank-0", _one_tensor() * 3)])
-
-    with caplog.at_level(logging.WARNING):
-        (payload,) = _rendezvous(client).discover_trainers(
-            expected_trainers=1, timeout=0, with_tensors=False
-        )
-
-    assert payload.tensors == []
-    assert payload.entry_count() == 3
-    assert payload.agent_name == "rank-0"
-    record = next(
-        json.loads(message.split("MX_DISCOVER_COST ", 1)[1])
-        for message in caplog.messages
-        if "MX_DISCOVER_COST " in message
-    )
-    assert record["rank"] == 0
-    assert record["tensors"] == 3
-    assert record["tables_built"] is False
-
-
-def test_entry_count_falls_back_to_the_table_when_not_recorded():
-    """Payloads built directly, as tests and older callers do, record no count."""
-    from modelexpress.refit.reshard.rendezvous import RendezvousPayload
-
-    payload = RendezvousPayload(b"", "a", "", _one_tensor())
-    assert payload.tensor_count is None
-    assert payload.entry_count() == 1
 
 
 def test_decoding_parsed_entries_matches_decoding_the_blob():
@@ -682,3 +643,28 @@ def test_a_cross_family_source_is_still_discovered():
 
     assert len(discovered) == 2
     assert {p.accelerator for p in discovered} == {"cuda", "xpu"}
+
+
+def test_built_sources_own_immutable_geometry():
+    published = _one_tensor()
+    published[0].full_shape = [4, 4]
+    published[0].shards[0].shape = [4, 4]
+    published[0].shards[0].shard_offset = [0, 0]
+    sources, agents, devices = build_sources(published)
+    source = sources["weight"]
+    shard = source.shards[0]
+    published[0].full_shape[0] = 8
+    published[0].shards[0].shape[0] = 8
+    published[0].shards[0].shard_offset[0] = 4
+    published[0].shards[0].addr = 8192
+    published[0].shards.clear()
+    assert source.global_shape == shard.shape == (4, 4)
+    assert shard.shard_offset == (0, 0)
+    assert shard.addr == 4096
+    for mapping in (sources, agents, devices):
+        with pytest.raises(TypeError):
+            mapping["other"] = None
+    with pytest.raises(AttributeError):
+        source.shards += (shard,)
+    with pytest.raises(AttributeError):
+        shard.addr = 0

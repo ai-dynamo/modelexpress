@@ -5,6 +5,9 @@ name: ModelExpress RL Refit GPU CI
 on:
   workflow_call:
     inputs:
+      upload_evidence:
+        type: boolean
+        default: true
       gpu_limit:
         type: string
         required: true
@@ -91,7 +94,7 @@ jobs:
         if: ${{ always() && hashFiles('bench-results/report.json') == '' }}
         run: python3 ci/bench/scripts/ci.py collect
       - name: Save evidence
-        if: always()
+        if: ${{ always() && inputs.upload_evidence }}
         uses: actions/upload-artifact@v4
         with:
           name: bench-${{ github.run_id }}-${{ github.run_attempt }}

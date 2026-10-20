@@ -13,6 +13,7 @@ from tests.test_refit_vllm_installer import _install_fake_vllm
 
 @pytest.fixture
 def capture_installer(monkeypatch) -> tuple:
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", "1")
     _install_fake_vllm(monkeypatch, lambda model: None)
     layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
     layerwise._get_original_loader = lambda parameter: None
@@ -48,18 +49,19 @@ def test_unchanged_layout_checks_key_and_reuses_capture(capture_installer, monke
     installer, model = capture_installer
     manifest = [("weight", torch.float32, (3, 3))]
     installer.capture(manifest)
-    original_key = installer._capture_key
+    original_key = installer.capture_generator_fingerprint
     checked = []
 
-    def capture_key(manifest):
-        checked.append(manifest)
-        return original_key(manifest)
+    def capture_key():
+        checked.append(True)
+        return original_key()
 
-    monkeypatch.setattr(installer, "_capture_key", capture_key)
+    monkeypatch.setattr(installer, "capture_generator_fingerprint", capture_key)
     capture, layout = installer.capture(manifest)
-    assert checked == [manifest]
+    assert checked == [True]
     assert capture.copies and layout == {"weight": ((2, 2), torch.float32)}
     assert model.capture_calls == 1
+    assert capture.generator_fingerprint == installer.capture_generator_fingerprint()
 
 
 @pytest.mark.parametrize("failure", ["loader", "restoration"])
@@ -165,7 +167,7 @@ def test_failed_cache_validation_preserves_cache(
 
     with monkeypatch.context() as patch:
         if failure == "key":
-            patch.setattr(installer, "_capture_key", fail)
+            patch.setattr(installer, "capture_generator_fingerprint", fail)
         else:
             patch.setattr(module._CaptureSnapshot, "clone", fail)
         with pytest.raises(RuntimeError, match="validation failed"):
@@ -188,3 +190,12 @@ def test_conversion_and_loader_are_captured_together(capture_installer):
     assert {record.src_name for record in changed.copies} == {"native"}
     assert first.copies[0].op_chain != changed.copies[0].op_chain
     assert model.capture_calls == 2
+
+
+def test_capture_sets_fingerprint_before_caching(capture_installer):
+    installer, _ = capture_installer
+    manifest = [("weight", torch.float32, (3, 3))]
+    capture, _ = installer.capture(manifest)
+    assert capture.generator_fingerprint == installer.capture_generator_fingerprint()
+    cached, _ = installer.capture(manifest)
+    assert cached.generator_fingerprint == capture.generator_fingerprint
