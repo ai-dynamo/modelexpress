@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable
-from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -120,7 +119,6 @@ class TrainerRuntime:
                     process_group=process_group,
                     read_seed_tensor=read_seed_tensor,
                     s3=s3,
-                    clock=lambda: perf_counter(),
                 )
             except Exception:
                 s3.close()
@@ -210,21 +208,23 @@ class TrainerRuntime:
         return slot
 
     def prepare_delta_base(
-        self, *, hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]]
+        self, *, tensor_iter: Iterable[list[tuple[str, torch.Tensor]]]
     ) -> None:
-        self._canonical_delta().prepare_base(hf_tensor_iter=hf_tensor_iter)
+        self._canonical_delta().prepare_base(tensor_iter=tensor_iter)
 
     def stage(
         self,
         *,
         version: WeightVersionRef,
-        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
+        tensors: Any = None,
+        tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None = None,
     ) -> PublicationArtifact:
-        if hf_tensor_iter is None:
-            raise ValueError(
-                "hf_tensor_iter is required for object storage publication"
-            )
-        return self._canonical_delta().stage(version=version, hf_tensor_iter=hf_tensor_iter)
+        method = self._canonical_delta()
+        if (tensor_iter is None) == (tensors is None):
+            raise ValueError("provide either tensor_iter or a tensor bucket")
+        if tensor_iter is not None:
+            return method.stage(version=version, tensor_iter=tensor_iter)
+        return method.stage_bucket(version=version, bucket=tensors)
 
     def publish(
         self, *, version: WeightVersionRef, staged: PublicationArtifact

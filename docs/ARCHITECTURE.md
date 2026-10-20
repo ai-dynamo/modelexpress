@@ -615,7 +615,8 @@ engine integrations.
 - `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
   graph-safe installation through vLLM's layerwise reload and post-load path.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
-  through SGLang's native safetensors loader.
+  through SGLang's native safetensors loader, using `DefaultModelLoader.Source`
+  to retain the engine's source defaults, including weight-file pattern selection.
 
 Canonical preparation requests queue on a separate `.prepare.lock`. Once the
 leader has reconstructed a target, followers verify and attach to that READY
@@ -637,6 +638,44 @@ The corresponding trainer composition is owned by `TrainerRuntime`. Public
 full-tensor NIXL and canonical-checkpoint object-storage publication remain separate
 method implementations. This keeps transport, payload preparation, engine
 geometry, and framework orchestration independently replaceable.
+
+Miles owns `UpdateWeightFromModelExpressDelta` in
+`miles.backends.training_utils.weight_update.protocols.modelexpress`. Its
+`modelexpress` transfer mode uses the shared SDK's staging and publication APIs
+below. The SDK does not depend on Miles.
+
+Canonical S3 publication accepts either `stage_shard(tensor_iter=...)` for a
+complete weight stream or repeated `stage_shard(tensors=bucket)` calls for one
+version. The runtime dispatches these to the canonical method's `stage()` and
+`stage_bucket()` respectively. Both use the same bounded encoding pool for XOR
+deltas and full HF checkpoints. The iterator form finishes staging before returning; bucket calls
+enqueue work, and `publish()` drains it before publishing the complete version.
+Submitting a bucket for a different version before publication is rejected
+without modifying the staged payload.
+
+```python
+# Each publisher has at least one bucket; the first initializes staging.
+for bucket in local_buckets:
+    staged = trainer.stage_shard(version=version, tensors=bucket)
+staged.publish()  # Collective across the configured publication process group.
+```
+
+The Miles adapter creates this process group from sender ranks only. Non-senders
+still join the framework's weight gathers and barriers, but do not create an MX
+trainer or call publication. Full-tensor NIXL publication uses `bind_tensors()`
+and `publish_version(version=...)`.
+
+Bucket staging retains the bucket and its tensors, so their contents must remain
+stable until publication finishes. Callers submit all buckets for one version
+before publishing, and retry failed uploads through the same publication handle.
+The base version advances only after successful publication.
+
+Staging initializes a fresh artifact and encoding pool for each new version;
+successful publication clears that state. Empty buckets initialize ranks with no
+local tensors so they can still participate in collective publication. A failed
+iterator is discarded automatically and can be retried from the beginning. For
+incremental bucket submissions, a worker failure prevents publication. Use
+`trainer.close()` to discard the staged work and close the client.
 
 `ModelExpressGeneratorConfig.staging_buffer_bytes` sets bounded-streaming
 capacity per arena, and `staging_buffers_count` defaults to one. The streaming
@@ -1210,7 +1249,7 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `inference/load_strategy.py` | RL cold-start policy: exact desired-version P2P, canonical S3 replay, and version-agnostic fallback when no desired version is configured |
 | `inference/version_chain.py` | Shared validation and resolution of immutable full-checkpoint and delta lineage |
 | `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable destination buffers, and verification |
-| `inference/engines/sglang/` | SGLang context and native checkpoint installer |
+| `inference/engines/sglang/` | Public SGLang generator factory, context, and native checkpoint installer |
 | `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |
 | `inference/engines/vllm/installer.py` | Private vLLM load-layout capture plus graph-safe tensor or prepared-checkpoint installation |
 | `inference/engines/vllm/weight_transfer_engine.py` | Native vLLM weight-transfer bridge for NIXL full-tensor and canonical S3 checkpoint refit |
@@ -1270,6 +1309,23 @@ flowchart LR
     N -->|main descriptors| PM[Peer main load]
     N -->|draft descriptors| PD[Peer draft load]
 ```
+
+### SGLang Refit Integration
+
+SGLang obtains its rank-local S3 refit client through the public factory:
+
+```python
+from modelexpress_rl.inference.engines.sglang import get_modelexpress_generator
+
+generator = get_modelexpress_generator(model_runner)
+```
+
+The factory reads `model_runner.server_args.modelexpress_config` as JSON or a
+dictionary, resolves the local seed checkpoint when no seed path is supplied,
+and reuses the client cached on `model_runner.modelexpress_generator`. Connection
+settings use `object_storage_endpoint_url` and `object_storage_region_name`,
+matching the vLLM integration. SGLang owns update coordination and closes the
+cached client during scheduler shutdown.
 
 ### vLLM Refit Installation
 
