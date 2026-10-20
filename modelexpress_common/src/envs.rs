@@ -359,15 +359,41 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Largest number of seconds [`env_secs_ceil`] returns. The value ends up as a
+/// Redis `EX` argument, so it has to stay well inside what Redis accepts; one
+/// week is far beyond any real transfer deadline.
+const MAX_ENV_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// Read an environment variable as a number of seconds, accepting either an
 /// integer or a fractional value, rounded up to the nearest whole second.
-/// Falls back to `default` if unset or unparseable.
+///
+/// Like the Python client, only finite values greater than zero are accepted.
+/// Anything else (zero, negative, NaN, infinite, or unparseable) falls back to
+/// `default` with a warning, and values above [`MAX_ENV_SECS`] are capped.
 fn env_secs_ceil(name: &str, default: u64) -> u64 {
-    env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .map(|v| v.max(0.0).ceil() as u64)
-        .unwrap_or(default)
+    let Ok(raw) = env::var(name) else {
+        return default;
+    };
+    let parsed = raw.trim().parse::<f64>().ok();
+    match parsed {
+        Some(value) if value.is_finite() && value > 0.0 => {
+            if value > MAX_ENV_SECS as f64 {
+                tracing::warn!(
+                    "{name}={raw:?} exceeds the maximum of {MAX_ENV_SECS}s; using {MAX_ENV_SECS}s"
+                );
+                MAX_ENV_SECS
+            } else {
+                // In range (0, MAX_ENV_SECS], so the cast cannot truncate.
+                value.ceil() as u64
+            }
+        }
+        _ => {
+            tracing::warn!(
+                "{name}={raw:?} is not a positive finite number of seconds; using the default of {default}s"
+            );
+            default
+        }
+    }
 }
 
 #[cfg(test)]
@@ -540,5 +566,42 @@ mod tests {
 
         let _g = EnvVarGuard::set(&lock, MX_GC_TIMEOUT_SECS, "not-a-number");
         assert_eq!(gc_timeout_secs(), DEFAULT_GC_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn transfer_timeout_accepts_only_positive_finite_seconds() {
+        let lock = acquire_env_mutex();
+        let name = MX_NCCL_REFIT_TRANSFER_TIMEOUT_S;
+        let default = DEFAULT_NCCL_REFIT_TRANSFER_TIMEOUT_SECS;
+
+        let _g = EnvVarGuard::remove(&lock, name);
+        assert_eq!(nccl_refit_transfer_timeout_secs(), default);
+
+        for (raw, expected) in [
+            // Valid values, fractional ones rounded up.
+            ("120", 120),
+            ("0.25", 1),
+            ("90.5", 91),
+            // Not positive: fall back to the default.
+            ("0", default),
+            ("0.0", default),
+            ("-0.0", default),
+            ("-5", default),
+            // Not finite or not a number: fall back to the default.
+            ("NaN", default),
+            ("inf", default),
+            ("-inf", default),
+            ("not-a-number", default),
+            // Huge but finite: capped.
+            ("1e300", MAX_ENV_SECS),
+            ("18446744073709551616", MAX_ENV_SECS),
+        ] {
+            let _g = EnvVarGuard::set(&lock, name, raw);
+            assert_eq!(nccl_refit_transfer_timeout_secs(), expected, "{name}={raw}");
+        }
+
+        let at_cap = MAX_ENV_SECS.to_string();
+        let _g = EnvVarGuard::set(&lock, name, &at_cap);
+        assert_eq!(nccl_refit_transfer_timeout_secs(), MAX_ENV_SECS);
     }
 }
