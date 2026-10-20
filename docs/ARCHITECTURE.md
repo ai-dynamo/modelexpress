@@ -2090,7 +2090,11 @@ there is no separate complete-layer installer. Writes run in captured order,
 and tied owners finish native processing before their runtime tensors are
 restored. Runtime-tensor and checkpoint artifacts use their own installation APIs.
 
-The adapter depends on vLLM's layerwise reload helpers. Runtime compatibility must
+The adapter depends on vLLM's layerwise reload helpers. When the runtime does not
+export `is_deferred_attention_layer`, attention finalization uses the native
+`Attention`/`MLAAttention` class check used by vLLM v0.27.1. Checkpoint reload does
+not require that optional helper. Missing required reload imports are named in
+the reported error before model mutation. Runtime compatibility must
 be qualified with changing weights, shared parameters, graph-bound addresses,
 post-load state and failure cleanup. The same generic path is used for
 small-model validation and GLM;

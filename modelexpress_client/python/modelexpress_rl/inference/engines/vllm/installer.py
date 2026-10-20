@@ -101,6 +101,15 @@ _MODULE_SETATTR = torch.nn.Module.__setattr__
 _MODULE_REGISTER_PARAMETER = torch.nn.Module.register_parameter
 
 
+def _is_deferred_attention_layer(layer):
+    from vllm.model_executor.layers import attention
+
+    predicate = getattr(attention, "is_deferred_attention_layer", None)
+    if predicate is not None:
+        return predicate(layer)
+    return isinstance(layer, (attention.Attention, attention.MLAAttention))
+
+
 def _tensor_geometry(tensor):
     return (
         tuple(tensor.shape),
@@ -1004,7 +1013,6 @@ class _VllmInstaller(EngineInstaller):
         then exactly a full reload.
         """
         from safetensors import safe_open
-        from vllm.model_executor.layers.attention import is_deferred_attention_layer
         from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
         from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
 
@@ -1035,7 +1043,7 @@ class _VllmInstaller(EngineInstaller):
                 for layer, info in LAYERWISE_INFO.items()
                 if info.can_load()
                 and 0 < info.load_numel < info.load_numel_total
-                and not is_deferred_attention_layer(layer)
+                and not _is_deferred_attention_layer(layer)
             ]
             if not incomplete:
                 return
@@ -1351,7 +1359,6 @@ class _VllmInstaller(EngineInstaller):
     def _restore_owner(owner, persistent):
         if persistent:
             return
-        from vllm.model_executor.layers.attention import is_deferred_attention_layer
         from vllm.model_executor.model_loader.reload.layerwise import (
             LAYERWISE_INFO,
             _copy_and_restore_kernel_tensors,
@@ -1361,7 +1368,7 @@ class _VllmInstaller(EngineInstaller):
         info = LAYERWISE_INFO.get(layer)
         if info is not None and info.kernel_tensors is not None:
             _copy_and_restore_kernel_tensors(layer, info)
-        if info is not None and not is_deferred_attention_layer(layer):
+        if info is not None and not _is_deferred_attention_layer(layer):
             info.reset()
 
     @staticmethod
@@ -1441,7 +1448,6 @@ class _VllmInstaller(EngineInstaller):
         """Run one weight loader inside vLLM's graph-safe reload window."""
         try:
             from vllm.config import set_current_vllm_config
-            from vllm.model_executor.layers.attention import is_deferred_attention_layer
             from vllm.model_executor.layers.quantization.base_config import (
                 QuantizeMethodBase,
             )
@@ -1454,13 +1460,12 @@ class _VllmInstaller(EngineInstaller):
             from vllm.model_executor.model_loader.reload.meta import materialize_layer
         except (ImportError, AttributeError) as error:
             raise RuntimeError(
-                "ModelExpress refit requires vLLM's layerwise reload APIs"
+                f"ModelExpress refit requires vLLM's layerwise reload APIs: {error}"
             ) from error
 
         if not all(
             callable(api)
             for api in (
-                is_deferred_attention_layer,
                 QuantizeMethodBase,
                 _copy_and_restore_kernel_tensors,
                 materialize_layer,

@@ -915,10 +915,16 @@ def test_streaming_rejects_aliasing_source_before_any_batch_copy(monkeypatch):
 
 
 @pytest.mark.parametrize("quantized", [False, True])
-def test_streaming_uses_engine_processing_and_defers_attention(monkeypatch, quantized):
+@pytest.mark.parametrize("attention_api", ["helper", "attention", "mla"])
+def test_streaming_uses_engine_processing_and_defers_attention(
+    monkeypatch, quantized, attention_api
+):
+    class DeferredAttention(nn.Module):
+        pass
+
     model = nn.Module()
     model.first = nn.Linear(2, 2, bias=False)
-    model.attention = nn.Module()
+    model.attention = DeferredAttention()
     model.attention.scale = nn.Parameter(torch.zeros(1))
     model.attention.deferred_attention = True
     model.attention.derived = torch.zeros(1)
@@ -947,6 +953,12 @@ def test_streaming_uses_engine_processing_and_defers_attention(monkeypatch, quan
                 )
 
     _install_fake_vllm(monkeypatch, initialize)
+    if attention_api != "helper":
+        attention = sys.modules["vllm.model_executor.layers.attention"]
+        del attention.is_deferred_attention_layer
+        other = type("OtherAttention", (nn.Module,), {})
+        attention.Attention = DeferredAttention if attention_api == "attention" else other
+        attention.MLAAttention = DeferredAttention if attention_api == "mla" else other
     layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
     quant_base = sys.modules[
         "vllm.model_executor.layers.quantization.base_config"
@@ -2075,6 +2087,20 @@ def test_original_loader_reports_missing_layerwise_api_before_mutation(
 
     assert isinstance(raised.value.__cause__, ImportError)
     assert model.weight is parameter
+    assert torch.equal(model.weight, before)
+
+
+def test_reload_reports_the_missing_native_api_before_mutation(monkeypatch):
+    _install_fake_vllm(monkeypatch, lambda model: None)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    del layerwise.initialize_layerwise_reload
+    model = nn.Linear(2, 2, bias=False)
+    before = model.weight.detach().clone()
+
+    with pytest.raises(RuntimeError, match="initialize_layerwise_reload") as raised:
+        _cpu_installer(model)._reload(lambda _aliases: model.weight.data.zero_())
+
+    assert isinstance(raised.value.__cause__, ImportError)
     assert torch.equal(model.weight, before)
 
 
