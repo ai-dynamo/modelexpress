@@ -13,6 +13,7 @@ import pytest
 
 from modelexpress import p2p_pb2
 from modelexpress.source_selection import (
+    UNKNOWN_LOAD_PRIOR,
     RendezvousHashSelector,
     TopologyAwareSelector,
     get_selector,
@@ -207,20 +208,22 @@ def test_registered_and_resolvable(monkeypatch):
 # ---------------------------------------------------------------------------
 # Composition with load-aware (opt-in within-tier blend)
 #
-# source_load is a separate feature's field; the blend reads it defensively via
-# getattr, so these use duck-typed candidates carrying BOTH topology and
-# source_load (the shape once both features are deployed together).
+# These use real SourceInstanceRef messages carrying BOTH topology and
+# source_load, because source_load is optional on the wire and the blend reads
+# its presence: None leaves the field unset.
 # ---------------------------------------------------------------------------
 
 
 def _blend_ref(sid, topology, source_load):
-    return SimpleNamespace(
+    ref = p2p_pb2.SourceInstanceRef(
         mx_source_id=sid,
         worker_id=f"w-{sid}",
         worker_rank=0,
         topology=topology,
-        source_load=source_load,
     )
+    if source_load is not None:
+        ref.source_load = source_load
+    return ref
 
 
 def test_load_blend_off_by_default_is_pure_topology(monkeypatch):
@@ -260,6 +263,26 @@ def test_load_blend_never_overrides_locality(monkeypatch):
     ]
     order = [c.mx_source_id for c in TopologyAwareSelector().order(cands, ctx)]
     assert order[0] == "near"
+
+
+def test_load_blend_unset_source_load_is_unknown_not_idle(monkeypatch):
+    # An unset optional float reads as 0.0. Scoring that as idle would put
+    # sources that published no reading ahead of same-tier sources reporting
+    # real load; like load_aware, unknown must take the neutral prior.
+    _set_topology(monkeypatch, LEVELS, '{"rack":"r3"}')
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_LOAD_WEIGHT", "1.0")
+    ctx = _ctx()
+    sel = TopologyAwareSelector()
+    # Same identity, so only the load term differs between the three.
+    unknown = _blend_ref("s", {"rack": "r3"}, None)
+    idle = _blend_ref("s", {"rack": "r3"}, 0.0)
+    light = _blend_ref("s", {"rack": "r3"}, 0.3)
+    assert not unknown.HasField("source_load")
+    depth, unknown_tiebreak = sel.score(unknown, ctx)
+    idle_depth, idle_tiebreak = sel.score(idle, ctx)
+    assert depth == idle_depth
+    assert idle_tiebreak - unknown_tiebreak == pytest.approx(UNKNOWN_LOAD_PRIOR)
+    assert sel.score(light, ctx) > sel.score(unknown, ctx)
 
 
 def test_negative_load_weight_clamped(monkeypatch):
