@@ -16,7 +16,7 @@ on:
         description: >-
           Runner label for every job (the nightly passes the self-hosted
           builder so nothing lands on GitHub-hosted runners). Empty keeps
-          ubuntu-latest for direct push/pull_request runs.
+          ubuntu-24.04 for direct push/pull_request runs.
         required: false
         type: string
         default: ''
@@ -38,7 +38,7 @@ jobs:
     name: CI connectivity helper tests
     permissions:
       contents: read
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -55,7 +55,7 @@ jobs:
     name: RL refit harness tests
     permissions:
       contents: read
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -69,7 +69,7 @@ jobs:
 
   test:
     name: Test Suite
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 90
     strategy:
       matrix:
@@ -161,7 +161,7 @@ jobs:
 
   tls-feature-matrix:
     name: TLS Feature Matrix
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     strategy:
       matrix:
         features:
@@ -209,7 +209,7 @@ jobs:
 
   tls-no-backend-rejected:
     name: TLS No-Backend Rejected
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
 
     steps:
     - name: Checkout repository
@@ -237,7 +237,7 @@ jobs:
 
   python-test:
     name: Python Tests (protobuf ${{ matrix.protobuf_major }})
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -279,7 +279,7 @@ jobs:
 
   python-proto-bindings:
     name: Python Generated Bindings
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -323,7 +323,7 @@ jobs:
 
   go-test:
     name: Go Bindings
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 20
 
     steps:
@@ -364,7 +364,7 @@ jobs:
 
   artifact-transfer-contract:
     name: Artifact Transfer Contract
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -404,7 +404,7 @@ jobs:
 
   integration-test:
     name: Integration Tests
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 60
     needs: test
 
@@ -491,7 +491,7 @@ jobs:
 
   security-audit:
     name: Security Audit
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 30
 
     steps:
@@ -524,7 +524,7 @@ jobs:
 
   code-coverage:
     name: Code Coverage
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 60
     needs: test
     permissions:
@@ -586,7 +586,7 @@ jobs:
 
   docker-build:
     name: Docker Build
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 45
     needs: test
 
@@ -633,7 +633,7 @@ jobs:
 
   k8s-grpc-test:
     name: Kubernetes gRPC Transfer Test
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 45
     needs: test
 
