@@ -179,7 +179,10 @@ def execute_load_strategies(
                     f"trying next: {e}"
                 )
                 strategy.rollback(ctx)
-                if e.mutated:
+                # A reload writes into the engine's live model, which the next
+                # strategy overwrites in full, and a rebuilt model would never
+                # reach the engine.
+                if e.mutated and not ctx.is_reload:
                     clear_exception_tracebacks(e)
                     result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
                 continue

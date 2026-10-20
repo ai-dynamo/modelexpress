@@ -28,7 +28,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from modelexpress.adapter import StrategyFailed
-from modelexpress.load_strategy import _strategy_phases
+from modelexpress.load_strategy import _strategy_phases, execute_load_strategies
 from modelexpress.load_strategy.base import LoadStrategy
 from modelexpress.load_strategy.context import LoadResult
 
@@ -187,6 +187,35 @@ def test_streaming_abort_failure_is_reported_as_mutated():
         _attempt(_StreamingStrategy(fail=True), ctx)
 
     assert exc.value.mutated is True
+
+
+def test_reload_mutated_load_failure_retries_on_the_same_model():
+    """The engine keeps serving the model it passed in, and every reload
+    strategy overwrites it in full, so a fallback must not rebuild it."""
+    ctx = _ctx(is_reload=True)
+    seen_models = []
+
+    class _Failing(_StreamingStrategy):
+        name = "failing"
+
+        def load(self, result, ctx):
+            seen_models.append(result.model)
+            raise StrategyFailed("transfer dropped", mutated=True)
+
+    class _Succeeding(_StreamingStrategy):
+        name = "succeeding"
+
+        def load(self, result, ctx):
+            seen_models.append(result.model)
+            return result
+
+    model = MagicMock()
+    with patch("modelexpress.load_strategy.publish_source_if_supported"):
+        loaded = execute_load_strategies(model, ctx, [_Failing(), _Succeeding()])
+
+    assert loaded is model
+    assert seen_models == [model, model]
+    ctx.adapter.reinit_for_retry.assert_not_called()
 
 
 def test_layerwise_reload_is_left_even_when_the_attempt_fails():

@@ -869,6 +869,7 @@ def test_load_internal_reinit_is_visible_after_later_metadata_miss():
     )
     ctx = MagicMock(global_rank=0)
     ctx.accelerator_backend.name = ""
+    ctx.is_reload = False
     original_model = MagicMock(name="original-model")
     original_result = LoadResult(value=original_model, model=original_model)
 
@@ -900,6 +901,7 @@ def test_load_internal_reinit_then_clean_failure_stays_clean():
     )
     ctx = MagicMock(global_rank=0)
     ctx.accelerator_backend.name = ""
+    ctx.is_reload = False
     ctx.adapter.reinit_for_retry.return_value = MagicMock(name="retry-result")
 
     with pytest.raises(StrategyFailed, match="clean failure") as exc:
@@ -926,6 +928,26 @@ def test_load_last_candidate_mutated_failure_propagates_mutated():
     ctx.adapter.reinit_for_retry.assert_not_called()
 
 
+def test_load_reload_retries_next_candidate_without_reinit():
+    """A reload target is the engine's live model; the next candidate
+    overwrites it in place instead of on a rebuilt model."""
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=[StrategyFailed("receive failed", mutated=True), "loaded"]
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+    ctx.is_reload = True
+    model = MagicMock(name="live-model")
+    result = LoadResult(value=model, model=model)
+
+    assert strat.load(result, ctx) == "loaded"
+    ctx.adapter.reinit_for_retry.assert_not_called()
+    assert strat._load_as_target.call_args_list[1].args[0].model is model
+
+
 def test_load_reinit_failure_is_unrecoverable():
     strat = RdmaStrategy()
     strat._find_source_instances = MagicMock(return_value=_sources(2))
@@ -935,6 +957,7 @@ def test_load_reinit_failure_is_unrecoverable():
     )
     ctx = MagicMock(global_rank=0)
     ctx.accelerator_backend.name = ""
+    ctx.is_reload = False
     ctx.adapter.reinit_for_retry.side_effect = RuntimeError("reinit failed")
 
     with pytest.raises(StrategyRecoveryError, match="reinit failed") as exc:

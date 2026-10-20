@@ -314,7 +314,9 @@ class RdmaStrategy(LoadStrategy):
                         f"{worker_id} failed: {cleanup_error}",
                         mutated=True,
                     ) from cleanup_error
-                if e.mutated:
+                # A reload target is the engine's live model; the next
+                # candidate overwrites it in place, see execute_load_strategies.
+                if e.mutated and not ctx.is_reload:
                     try:
                         clear_exception_tracebacks(e)
                         reinitialized = ctx.adapter.reinit_for_retry(result)
