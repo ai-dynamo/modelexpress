@@ -1286,6 +1286,7 @@ flowchart LR
 - After a level-2 sleep, `reload_weights()` refreshes weight content in place through `reload_model()` (see below), whose strategy chain registers the tensors and republishes the replica, as on any successful load.
 - `reload_model()` without a preceding sleep first stops serving the same way `on_sleep` does, so peers never read weights while they are overwritten.
 - With `MX_VMM_ARENA=1`, a reload neither replaces nor enters the arena: the weights are written into their existing arena-backed storage, so only transient allocations happen. The reload's context reuses the existing arena so registration again produces a single MR.
+- An RDMA reload skips target-side post-processing and keeps state derived at the original load, so RDMA is only eligible when the reload's `SourceIdentity` matches the identity of the weights the model holds (snapshotted when the reload starts, so it follows refits). Otherwise a streaming strategy reprocesses the weights. The check is as strong as the identity's `revision`: an empty or branch revision only proves the same model name.
 - A strategy that fails mid-reload, or an RDMA candidate that does, is not followed by `reinit_for_retry`: the engine keeps serving the model it passed in, so the next strategy or candidate overwrites that same model in place.
 
 ### vLLM Refit Installation

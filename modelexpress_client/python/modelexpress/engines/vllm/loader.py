@@ -32,7 +32,7 @@ import time
 import torch
 import torch.nn as nn
 
-from ... import configure_vllm_logging, envs, model_prefetch
+from ... import configure_vllm_logging, envs, model_prefetch, p2p_pb2
 from ...load_strategy import (
     LoadContext,
     drain_tensor_readers,
@@ -174,6 +174,10 @@ class MxModelLoader(BaseModelLoader):
         ctx = build_vllm_load_context(vllm_config, model_config)
         ctx.p2p_role = "draft" if is_speculative_draft else "main"
         ctx.is_reload = model is not None
+        if ctx.is_reload and self._ctx is not None:
+            # Snapshot: a refit rewrites the live identity's revision in place.
+            ctx.loaded_identity = p2p_pb2.SourceIdentity()
+            ctx.loaded_identity.CopyFrom(self._ctx.identity)
         draft_gate: DraftPublicationGate | None = None
         if is_speculative_draft:
             main_loader = _loader_registry.get(ctx.device_id)

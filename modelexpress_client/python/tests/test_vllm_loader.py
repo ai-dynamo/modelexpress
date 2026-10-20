@@ -755,6 +755,91 @@ class TestSleepWakeReloadHooks:
         assert loader._last_sleep_level == 2
 
 
+class TestRdmaReloadIdentityGate:
+    """An RDMA reload skips target-side post-processing, so it may only
+    restore the weights the model already holds."""
+
+    @staticmethod
+    def _identity(revision):
+        identity = _make_identity()
+        identity.revision = revision
+        return identity
+
+    @staticmethod
+    def _is_available(ctx):
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+        ctx.accelerator_backend = MagicMock()
+        ctx.accelerator_backend.supports_rdma_p2p.return_value = True
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "server:8001"}), patch(
+            "modelexpress.load_strategy.rdma_strategy.is_nixl_available",
+            return_value=True,
+        ), patch(
+            "modelexpress.load_strategy.rdma_strategy.check_transfer_allowed",
+            return_value=(True, ""),
+        ):
+            return RdmaStrategy().is_available(ctx)
+
+    def test_reload_of_the_loaded_weights_may_use_rdma(self):
+        ctx = _make_load_context(
+            identity=self._identity("abc"),
+            is_reload=True,
+            loaded_identity=self._identity("abc"),
+        )
+        assert self._is_available(ctx) is True
+
+    def test_reload_of_other_weights_skips_rdma(self):
+        ctx = _make_load_context(
+            identity=self._identity("new"),
+            is_reload=True,
+            loaded_identity=self._identity("old"),
+        )
+        assert self._is_available(ctx) is False
+
+    def test_reload_with_unknown_loaded_weights_skips_rdma(self):
+        ctx = _make_load_context(identity=self._identity("abc"), is_reload=True)
+        assert self._is_available(ctx) is False
+
+    def test_cold_load_is_not_gated(self):
+        ctx = _make_load_context(identity=self._identity("abc"))
+        assert self._is_available(ctx) is True
+
+    @pytest.mark.parametrize("reload", [False, True])
+    def test_loader_snapshots_the_loaded_identity_on_reload(self, reload):
+        """A refit rewrites the live identity's revision in place, so the
+        reload must compare against a copy taken when it started."""
+        loader = _make_loader()
+        loaded_identity = self._identity("abc")
+        loader._ctx = _make_load_context(identity=loaded_identity)
+        new_ctx = _make_load_context(identity=self._identity("abc"))
+        captured = []
+
+        def fake_load_model(vllm_config, model_config, prefix, ctx, *rest):
+            captured.append(ctx.loaded_identity)
+            loaded_identity.revision = "refit"
+            return MagicMock()
+
+        with patch(
+            "modelexpress.engines.vllm.loader.build_vllm_load_context",
+            return_value=new_ctx,
+        ), patch(
+            "modelexpress.engines.vllm.loader._is_speculative_draft",
+            return_value=False,
+        ), patch(
+            "modelexpress.engines.vllm.loader.unpublish_metadata"
+        ), patch.object(loader, "_load_model", side_effect=fake_load_model):
+            if reload:
+                loader.reload_model(MagicMock(), MagicMock(), MagicMock())
+            else:
+                loader.load_model(MagicMock(), MagicMock())
+
+        if reload:
+            assert captured[0] == self._identity("abc")
+            assert captured[0] is not loaded_identity
+        else:
+            assert captured == [None]
+
+
 class TestMtpDrafterSecondLoad:
     """vLLM loads MTP in two passes on one worker: the target, then the drafter
     via a second load_model whose draft ModelConfig has runner_type="draft" and

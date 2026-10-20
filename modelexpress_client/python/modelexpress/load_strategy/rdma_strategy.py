@@ -17,6 +17,7 @@ from ..metadata.payload import (
     worker_tensor_count,
     worker_tensor_descriptors,
 )
+from ..metadata.source_id import compute_mx_source_id
 from ..metrics import metrics as selection_metrics
 from ..nixl_transfer import is_nixl_available
 from ..source_selection import (
@@ -97,6 +98,21 @@ def _transfer_timeout_seconds() -> float:
 def _is_draft_pass(ctx: LoadContext) -> bool:
     # getattr: RL and test callers drive these paths with duck-typed contexts.
     return getattr(ctx, "p2p_role", "main") == "draft"
+
+
+def _reload_restores_loaded_weights(ctx: LoadContext) -> bool:
+    """Whether a reload asks for the same weights the model already holds.
+
+    An RDMA reload skips the target-side post-processing and keeps derived
+    state from the original load, which is only valid for those same weights.
+    This compares identities, so it is as strong as the identity's revision:
+    an empty or branch revision only proves the same model name.
+    """
+    if ctx.loaded_identity is None:
+        return False
+    return compute_mx_source_id(ctx.loaded_identity) == compute_mx_source_id(
+        ctx.identity
+    )
 
 
 class RdmaStrategy(LoadStrategy):
@@ -201,6 +217,13 @@ class RdmaStrategy(LoadStrategy):
         allowed, reason = check_transfer_allowed(ctx.model_config)
         if not allowed:
             logger.info(f"[Worker {ctx.global_rank}] RDMA transfer disabled: {reason}")
+            return False
+
+        if ctx.is_reload and not _reload_restores_loaded_weights(ctx):
+            logger.info(
+                f"[Worker {ctx.global_rank}] Reload targets weights other than "
+                "the loaded ones, skipping RDMA"
+            )
             return False
 
         return True
