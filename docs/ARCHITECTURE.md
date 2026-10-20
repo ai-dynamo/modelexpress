@@ -2015,8 +2015,13 @@ the descriptor limit and per-arena staging budget, then locally replays the
 remaining operations. If no such prefix fits, planning retains the exact reads.
 Before each bounded read, the receiver clears the used arena region once,
 preserving zero-filled gaps without a separate clear for each source write.
-Digest verification stages the complete source and checks the current version
-checksums before replay.
+Ordered replay digest verification leaves the normal reads and staging layout
+unchanged. It checks the current version's whole-shard digests only when those
+reads already stage the complete source before local replay. If a replay read
+stages a source-view prefix, enabling verification rejects the plan before
+transfer: a whole-shard digest cannot verify that partial or rearranged view.
+Verification does not substitute a separate full-source transfer plan or claim
+to validate the final installed tensor.
 
 The combined capture is the reusable capture artifact; ordered replay planning
 consumes it directly and does not separately compose trainer conversion with an

@@ -369,8 +369,9 @@ def plan_transfer(
     from ``sources``, or non-box at ``plan_pull`` are marked unsupported.
 
     ``source_slots`` maps transport sessions to logical source slots; omission
-    uses session identity. ``verify_full_sources`` reconstructs sources lacking
-    an identity copy so receivers can verify whole-shard checksums.
+    uses session identity. ``verify_full_sources`` reconstructs legacy sources
+    lacking an identity copy. Source replay instead requires its normal reads
+    to stage complete sources for whole-shard checksum verification.
     ``max_staging_bytes`` limits descriptor coarsening for each replay write.
     """
     source_buffers = []
@@ -429,13 +430,16 @@ def _plan_source_replay(capture, sources, source_buffers, source_indices, *,
                 fallback.append(copy.src_name)
             continue
         pull = _plan_local_replay(
-            replace(copy, op_chain=()) if verify_full_sources else copy,
+            copy,
             source, index, buffer_indices=source_indices[copy.src_name],
             max_segments_per_copy=max_segments_per_copy,
             max_staging_bytes=max_staging_bytes,
         )
-        if verify_full_sources:
-            pull = replace(pull, copies=(copy,))
+        if verify_full_sources and len(pull.copies[0].op_chain) != len(copy.op_chain):
+            raise UnsupportedReshard(
+                f"{copy.src_name}: published whole-shard digests cannot verify "
+                "this replay read without changing its transfer plan"
+            )
         full_pulls.append(pull)
     return LogicalTransferPlan(
         source_buffers=tuple(source_buffers), full_pulls=tuple(full_pulls),

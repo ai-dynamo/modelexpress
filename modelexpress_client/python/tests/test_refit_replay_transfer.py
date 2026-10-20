@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from modelexpress.refit.reshard.types import IncompleteRefit
+from modelexpress.refit.reshard.types import IncompleteRefit, UnsupportedReshard
 import modelexpress_rl.inference.nixl_staged_transfer as module
 from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
 from modelexpress_rl.inference.plan import StreamingSettings
@@ -44,6 +44,49 @@ def test_ordered_sources_survive_warm_reuse(harness, monkeypatch, verify):
         assert seen == [(0, "a.weight"), (1, "b.weight"), (2, "c.weight"), (3, "a.weight")]
         assert prepared.metrics["plan_cache_hits"] == iteration
     assert len(h.captures) == 1
+
+
+@pytest.mark.parametrize("harness", [None, StreamingSettings(512, "cpu", 2)], indirect=True)
+@pytest.mark.parametrize("missing", [False, True])
+def test_replay_digest_verification_rejects_missing_or_stale_digests(
+    harness, monkeypatch, missing
+):
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    h = harness
+    h.transfer._device = torch.device("cpu")
+    h.capture.source_replay = True
+    if missing:
+        monkeypatch.setattr(
+            "tests.test_refit_bounded_descriptors.tensor_digest", lambda _tensor: ""
+        )
+    prepared = h.prepare()
+    if not missing:
+        h.sources["exact"].add_(1)
+
+    message = "did not publish a verification digest" if missing else "digest mismatch"
+    with pytest.raises(RuntimeError, match=message):
+        if h.streaming is None:
+            h.transfer.stage(prepared)
+        else:
+            next(h.transfer.iter_bounded(prepared, {}))
+
+
+@pytest.mark.parametrize("harness", [None, StreamingSettings(512, "cpu", 2)], indirect=True)
+def test_partial_replay_digest_rejection_precedes_native_setup(harness, monkeypatch):
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    h = harness
+    h.capture.source_replay = True
+    h.capture.copies[0] = replace(
+        h.capture.copies[0], op_chain=(("narrow", (0, 0, 2), ()),),
+        dest_shape=(2, 4),
+    )
+    before = list(h.events)
+
+    with pytest.raises(UnsupportedReshard, match="whole-shard digests cannot verify"):
+        h.prepare()
+
+    assert h.events == before
 
 
 @pytest.mark.parametrize("harness", [StreamingSettings(512, "cpu", 2)], indirect=True)
