@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from importlib import import_module
 
 import pytest
@@ -273,6 +274,13 @@ def test_manifest_builder_reuses_registered_tensor_addresses():
     )
 
     payload = unwrap_rendezvous_blob(manifest.blob)
+    stable = json.loads(manifest.blob)
+    assert stable["tensor_count"] == 1
+    assert stable["total_bytes"] == tensor.numel() * tensor.element_size()
+    assert "digest" not in stable["tensors"][0]["shards"][0]
+    assert manifest.blob == json.dumps(
+        stable, sort_keys=True, separators=(",", ":")
+    ).encode()
     assert (payload.agent_metadata, payload.agent_name, payload.metadata_endpoint) == (
         b"agent-metadata",
         "trainer-r3",
@@ -314,6 +322,7 @@ def test_existing_reshard_publisher_remains_compatible():
     assert source_id == "source-id"
     payload = unwrap_rendezvous_blob(client.worker.nixl_metadata)
     assert payload.tensors[0].shards[0].addr == tensor.data_ptr()
+    assert payload.tensors[0].shards[0].digest is None
 
 
 def test_manifest_builder_rejects_duplicate_tensor_names():

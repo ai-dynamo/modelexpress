@@ -395,26 +395,147 @@ Without buildx (single arch, matches the host):
 ```bash
 docker build -f docker/Dockerfile.client-wheel --target builder -t mx-wheel-builder .
 docker run --rm -v "$PWD/dist:/out" mx-wheel-builder bash -lc 'cp -r /dist/. /out/'
+```
 
-#### CI uploads to Artifactory
+#### CI builds and nightly uploads
 
-`.github/workflows/build-wheels.yml` runs this Dockerfile on every PR
-(via `copy-pr-bot` mirroring into `pull-request/<pr_id>` branches) and
-every push to `main` / `release/**`, building both archs in parallel on
-velonix self-hosted runners and uploading the artifacts to NV Artifactory.
+`.github/workflows/build-wheels.yml` builds this Dockerfile for both archs
+on velonix self-hosted runners on every PR (via `copy-pr-bot` mirroring
+into `pull-request/<pr_id>` branches) and every push to `main` /
+`release/**`. These runs only build; nothing is uploaded.
 
-Destination layout under `${ARTIFACTORY_PYPI_REPO_NAME}`:
+Only the [Nightly pipeline](#nightly-pipeline) uploads, to NV Artifactory:
 
-| Event | Subpath |
-|---|---|
-| `push` to `pull-request/<pr_id>` (copy-pr-bot mirror) | `pr/<pr_id>/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
-| `push` to `main`, `release/**` | `post-merge/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
+| Artifact | Repository | Subpath |
+|---|---|---|
+| Nightly wheels + sdist | `${ARTIFACTORY_PYPI_REPO_NAME}` | `nightly/<run_id>/` |
+| Nightly crates (`.crate`) | `${ARTIFACTORY_CARGO_REPO_NAME}` | `nightly/<run_id>/` |
 
-Each path contains the 6 artifacts from one arch: 4 manylinux wheels
-(cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist. The upload step is
-gated on the `automated-release` GitHub environment, which holds three
-secrets: `ARTIFACTORY_URL`, `ARTIFACTORY_TOKEN` (JFrog identity token),
-and `ARTIFACTORY_PYPI_REPO_NAME`.
+The upload step is gated on the
+`automated-release` GitHub environment, which holds `ARTIFACTORY_URL`,
+`ARTIFACTORY_TOKEN` (JFrog identity token), and
+`ARTIFACTORY_PYPI_REPO_NAME`. Registry and repository
+names are secrets so they stay out of this public repo and are masked in
+run logs: `MX_IMAGE_REPO`, `NGC_PUBLISH_ORG` (repo scope) and `ARTIFACTORY_CARGO_REPO_NAME`
+(`automated-release`).
+
+### Nightly pipeline
+
+`.github/workflows/nightly-ci.yml` runs daily at 09:00 UTC (01:00 PST)
+against `main`, builds every release artifact from that commit, runs the
+core, inference and RL test suites, and stages the artifacts. GitLab
+release-automation then scans and publishes them. It can also be
+dispatched manually; a manual run only stages after approval through the
+`manual-release-approval` GitHub environment.
+
+Only the first attempt of a scheduled run stages without approval. Every
+later attempt, and every manual run, stages and triggers GitLab only after
+a devops approval given in that same attempt. "Re-run failed jobs" on a run
+therefore stages nothing; to retry staging, use "Re-run all jobs" or a new
+dispatch from `main`, and approve it.
+
+Scheduled and manual runs require the upstream repository and `refs/heads/main`,
+including runs that only build and test. The nightly calls
+`modelexpress-core-ci.yml`, `modelexpress-inference-ci.yml` and
+`modelexpress-rl-ci.yml`; `nightly-status` requires all three to succeed when
+`run_tests` is enabled. The RL suite runs the same Nemotron delta-refit and
+Vime coverage as E2E CI, using the exact triggering `main` SHA.
+
+Every job runs on the velonix self-hosted runners. The runner override reaches
+the child workflows' control jobs while GPU jobs keep their dedicated runners.
+Core CI defaults to read-only repository contents; only its coverage job receives
+OIDC token permission.
+Run-specific caller groups prevent one nightly from cancelling another; the
+GPU children retain the repository-wide capacity queues shared with PR tests.
+Nightly GPU slots use the run ID, while PR runs continue using the PR number.
+PR mirror and `/bench` authorization checks remain in place. Nightlies suppress
+RL evidence uploads to preserve the compliance-only GitHub artifact policy.
+
+| Artifact | Version | Destination |
+|---|---|---|
+| Server image (amd64 + arm64) | tag `<date>-<sha7>` | `nvcr.io/${NGC_PUBLISH_ORG}/ai-dynamo/modelexpress-server-nightly` (+ floating `:latest`, and `modelexpress-server:nightly`) |
+| Python wheels + sdist | `<base>.dev<date>` | `${ARTIFACTORY_PYPI_REPO_NAME}/nightly/<run_id>/` |
+| Rust crates (`.crate`) | `<base>-nightly.<date>.g<sha7>` | `${ARTIFACTORY_CARGO_REPO_NAME}/nightly/<run_id>/` |
+| Helm chart `modelexpress-nightly` | `<base>-nightly.<date>.g<sha7>` | `helm.ngc.nvidia.com/${NGC_PUBLISH_ORG}/ai-dynamo` |
+
+Wheel versions deliberately identify the UTC day rather than the commit.
+Two runs on the same day can therefore contain different code under the same
+wheel version. Use the run-specific Artifactory path to select an exact build;
+the wheel version alone does not identify its source commit.
+
+GitLab release-automation then publishes the nightly: the image as
+`nvcr.io/nvidia/ai-dynamo/modelexpress-server-nightly:<date>-<sha7>` (and
+`:latest`), the chart as `modelexpress-nightly` in
+`https://helm.ngc.nvidia.com/nvidia/ai-dynamo`, the wheels on PyPI as
+`modelexpress==<base>.dev<date>`, and the crates on crates.io as
+`<base>-nightly.<date>.g<sha7>`.
+
+The packaged nightly chart is stamped to reference the public nightly
+server image (the `repository` in `helm/values.yaml` plus `-nightly`), so
+`helm install` of a nightly chart deploys nightly code.
+
+No ModelExpress artifact is uploaded to GitHub artifact storage. Compliance
+scan results are the only permitted GitHub artifact. `package-helm-chart`
+and `stage-helm-ngc` each build the chart through
+`.github/scripts/package_helm_chart.sh`; keep both on that script so they
+cannot package different charts.
+
+The `compliance` job uploads the two GitHub artifacts the nightly is allowed
+to produce, both dependency lists for OSRB review. Neither contains a build
+artifact. Both use Dynamo's OSRB CSV columns
+(`ecosystem,name,version,spdx,source_url,notes`).
+
+| Artifact | Contents | OSRB bug |
+|---|---|---|
+| `compliance-<sha>-modelexpress-server` | `linux_<arch>/osrb-modelexpress-server-<arch>-<sha8>.csv`: the dpkg and Python packages the image adds on top of its base image, plus the Rust crates compiled into its binaries. `.diff.csv`: what changed since the previous scheduled nightly, with a `change` column. `baseline/`: the baseline's provenance and CSV. | container |
+| `license-<sha>-modelexpress` | `osrb-modelexpress-deps-<sha8>.csv`: the crate closure of the published crates with all features, and the Python closure of the wheel with its user-facing extras on Python 3.10 to 3.13. `.diff.csv` and `baseline/BASELINE.md` as above. | source and crates |
+
+The diff baseline is the newest earlier scheduled `nightly-ci.yml` run on
+`main` whose GitLab trigger succeeded and that still has the same artifact
+(`.github/scripts/compliance/baseline.py`). Without one, the diff holds a
+single `baseline_unavailable` row; a failed lookup fails the job, and GitLab
+is only triggered when the compliance scan succeeds. Every row needs a valid
+SPDX expression. Add an entry with a source link to
+`.github/scripts/compliance/license_overrides.toml` to set a dpkg or image
+Python license, or to fill one that a crate or wheel dependency's metadata
+lacks.
+
+The image is scanned without running it: `.github/scripts/compliance/Dockerfile.extract`
+bind-mounts each arch's filesystem into an extractor on the runner's own
+platform. A syft scan of each arch's image and base image then cross-checks the
+CSV (`.github/scripts/compliance/audit_image.py`): the job fails if the image
+adds a package the CSV lacks, or a file no package owns that is not one of the
+binaries or `NOTICES` copied into `/app`. A new first-party file copied into
+`/app` goes in that script's `FIRST_PARTY_FILES`. release-automation's `nvbug:attach-compliance` and
+`nvbug:attach-license` jobs attach these files on every security nightly.
+The artifact names and layout are the contract of its
+`nvbug-attach-compliance.py` and `nvbug-attach-license.py`.
+
+After staging, the workflow triggers the internal GitLab
+release-automation pipeline, which scans and publishes the artifacts. A
+Slack thread is opened at the start of every release run, and its
+`thread_ts` is forwarded to GitLab as `SLACK_THREAD_TS`, so GitLab posts
+its scan, nSpect and publish updates on the same thread. Staging results
+and the GitLab handoff are replied on that thread too. A channel-level
+alert goes out through `SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL` only when a run
+is red. The single job to watch is `nightly-status`.
+Failure messages JSON-escape job names so quotes, backslashes and newlines do
+not break the Slack payload.
+
+The alert mentions `SLACK_MENTION_OPS_SUPPORT`, `SLACK_MENTION_DYNAMO_BOT`
+and `SLACK_MENTION_MX_DEV_TEAM`. All three are repository variables holding
+full Slack mention syntax (`<!subteam^ID>` for a user group, `<@ID>` for
+a user or bot), so the IDs stay out of this public repository.
+
+Test failures do **not** block staging. Release runs always run the core
+suite, and a failed core suite blocks the GitLab publish handoff, as
+Dynamo's pre-merge suite does. The inference and RL suites never block it.
+
+Additional secrets in the `automated-release` environment, which admits
+only `main` and `release/*`: `NGC_PUBLISH_USERNAME`, `NGC_PUBLISH_TOKEN`,
+`GITLAB_PIPELINE_URL` and `GITLAB_TRIGGER_TOKEN`. Repository scope holds
+`SLACK_RELEASE_BOT_TOKEN`, `SLACK_RELEASE_CHANNEL_ID` and
+`SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL`.
 
 ### Custom Client Image (P2P Transfers)
 
@@ -773,9 +894,11 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_UCX_DISABLE_MEM_EVENTS` | `0` | Opt-in. `1` sets `UCX_MEM_EVENTS=n` before NIXL agent creation on the UCX backend (no-op on `LIBFABRIC`), which roughly halves NIXL agent creation time by skipping UCX's mem-hook / VM-unmap tracking. Off by default because the effect is process-wide and permanent: `UCX_MEM_EVENTS` backs registration-cache invalidation for every UCP context in the process, not just ModelExpress's, so this is only safe when the process owns UCX exclusively for ModelExpress transfers. Never overrides an operator-set `UCX_MEM_EVENTS`. UCX reads this option in a shared-library constructor, so if UCX was already loaded elsewhere in the process before agent creation, setting it here can be a no-op. |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_P2P_METADATA` | `1` | Enable P2P metadata exchange (source workers only). Set to `0` to publish full metadata through a central-coordinator backend. This setting is ignored on backends that require P2P metadata, currently `k8s-service`. |
-| `MX_DISABLE_DRAFT_P2P` | `0` | Set to `1` to load the SGLang speculative draft through storage without receiving or publishing draft tensors over NIXL P2P. Main-model P2P and cold-load shard selection are unchanged. The default permits P2P for compatible same-checkpoint MTP drafts; it does not bypass checkpoint identity or compatibility checks, and storage fallback remains available when no compatible READY source is found. |
+| `MX_DISABLE_DRAFT_P2P` | `0` | Set to `1` to load the SGLang or vLLM speculative draft through storage without receiving or publishing draft tensors over NIXL P2P. Main-model P2P and cold-load shard selection are unchanged. The default permits P2P for compatible same-checkpoint MTP drafts; it does not bypass checkpoint identity or compatibility checks, and storage fallback remains available when no compatible READY source is found. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_REFIT_DELTA_SURGICAL` | `false` | Experimental vLLM delta install: reload only the modules whose checkpoint tensors the delta chain changed since the engine's last checkpoint install, instead of the whole prepared checkpoint. Falls back to a full reload when the lineage or live version is unknown, or when a fed module is incomplete. See the S3 delta refit guide. |
+| `MX_REFIT_FULL_STREAMING` | `false` | Experimental vLLM full-HF refit: use ModelStreamer once and tee tensors to a bounded background disk writer. Requires distributed ModelStreamer for TP greater than one. Requires `runai-model-streamer>=0.17.0`. Checksummed artifacts and delta replay retain canonical preparation. For S3-compatible storage, set matching `AWS_ENDPOINT_URL` and `AWS_DEFAULT_REGION` on all generator workers; `object_storage_endpoint_url` / `object_storage_region_name` configure only the index reader, not streamed shard reads. See the architecture section on streamed full refit. |
+| `MX_REFIT_STREAM_WINDOW_LAYERS` | `2` | Decoder layers per ranged ModelStreamer request during streamed full refit. Bounds GPU memory held by partially loaded layers; `0` streams the whole checkpoint in one request. |
 | `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL listen port for an RL generator's refit client; effective port is `MX_REFIT_METADATA_PORT + device_id`, separate from a boot-time loader manager |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
@@ -1137,8 +1260,16 @@ server, worker gRPC endpoints, and Mooncake store from untrusted clients.
 ModelExpress does not currently sign cache artifacts.
 
 RL refit has the same trusted-network requirement. Its trainer-local
-`RefitWorkerService` serves exact-version manifests over plaintext gRPC; the
-manifest digest detects corruption but does not authenticate the trainer.
+`RefitWorkerService` serves stable trainer metadata and separate version checksum
+records over plaintext gRPC. Metadata digests detect corruption but do not
+authenticate the trainer.
+
+The split worker metadata protocol requires a coordinated upgrade of the MX server,
+trainers, and generators. It replaces `GetWeightVersionShardManifest` and retires the
+old `WeightVersionShard` manifest, endpoint, and count fields; mixed protocol versions
+are unsupported. Retire active refit rounds and their leases before stopping workers.
+Restart workers and remove obsolete refit metadata during the upgrade, preserving
+unrelated Redis and model-cache state.
 
 Canonical S3 trainers consume Hugging Face tensor buckets produced by the
 training framework. Framework-native bucket settings remain the default.
@@ -1210,11 +1341,16 @@ Requirements and limits:
 - ModelExpress Server needs a writable cache directory, egress to Hugging Face, and `HF_TOKEN` for private repositories. The worker needs none of these.
 - The server must be from a release newer than v0.5.0 — the first generation that keys registry entries on the weight mode. The metadata phase claims a metadata-only download; an older server records that claim against the model name alone, which marks the model complete, so the weight phase finds nothing left to fetch and the worker falls through to a native load that an offline pod cannot perform.
 - Mount the cache path as a volume shared by every container that touches it. Without a volume the snapshot lands in the container's writable layer, invisible to other containers and lost on restart.
-- A pinned revision is honoured. The engine's `revision` — a commit hash, a branch, or a tag — is what the server is asked for, and the snapshot is installed so that the engine's own offline lookup finds it: under `snapshots/<commit>/`, plus a `refs/<revision>` entry unless the requested revision is already the commit hash, which resolves by directory name. A pin for anything other than `main` leaves `refs/main` untouched, so it cannot misdirect a later unpinned resolution in this worker or the next one sharing the cache. A server that does not confirm the requested revision fails the install rather than quietly serving its default — one predating pinned-revision support reports no revision at all, and a commit hash that resolves to a different commit is refused outright. This requires `MODEL_EXPRESS_CACHE_DIRECTORY` and `HF_HUB_CACHE` to be the same path, as above.
+- A pinned revision is honoured. On a metadata cache miss, the engine's `revision` — a commit hash, a branch, or a tag — is what the server is asked for, and the snapshot is installed so that the engine's own offline lookup finds it: under `snapshots/<commit>/`, plus a `refs/<revision>` entry unless the requested revision is already the commit hash, which resolves by directory name. A pin for anything other than `main` leaves `refs/main` untouched, so it cannot misdirect a later unpinned resolution in this worker or the next one sharing the cache. A server that does not confirm the requested revision fails the install rather than quietly serving its default — one predating pinned-revision support reports no revision at all, and a commit hash that resolves to a different commit is refused outright. This requires `MODEL_EXPRESS_CACHE_DIRECTORY` and `HF_HUB_CACHE` to be the same path, as above.
+- Successful revision-confirmed metadata installs attempt to persist a private inventory in `models--<org>--<name>/.modelexpress-metadata/<commit>.json`, next to (not inside) `snapshots/`. Preserve this directory when persisting the cache. A lowercase 40-hex commit request can reuse a complete inventory without contacting the server, creating an RPC stub or acquiring the repository lock, even when another process holds that lock for a cold mutable-ref request. The reader rechecks all recorded file sizes and safe cache paths; it does not assume a particular tokenizer file format. Such a hit writes no refs and fetches no weights.
+- Sidecar persistence failures, including reserved-name collisions, symlinks, read-only storage and a full device, emit a warning but do not fail metadata that has already been validated and published or reused. Conflicting directory-name entries and non-regular inventory targets are left untouched. Invalid manifests or incomplete metadata remain errors. Without a valid inventory, repeated prefetch calls may repeat RPCs or streams; a remembered directory is not enough for memo reuse.
+- Branches, tags, uppercase hashes and requests without a revision still use server confirmation in the metadata installer. An inventory-less cache takes its existing RPC path; a confirmed manifest can promote an already complete snapshot without retransmitting it. Missing, partial, dangling or malformed cache entries are not inventoried warm hits, and invalid or unreadable inventories emit diagnostics. An unconfirmed legacy response can still install metadata, but cannot create an inventory that bypasses later pin confirmation.
+- `ServerCacheStrategy` specifically preserves the old weight path for an existing standard snapshot directory with no inventory: it does not introduce a metadata pin RPC before `install_weight_files`. This permits legacy servers that do not confirm a revision, and retains the weight client's pinned-RPC-error fallback and stream commit check. This is a legacy weight target, not a claim of complete metadata. A missing directory, an invalid inventory, or missing metadata covered by an inventory still requires strict metadata recovery; directory existence cannot hide those failures.
 - The weight phase pins to the commit its snapshot is named after, so a server whose default revision has moved past that snapshot serves the snapshot's own weights instead of failing the phase; when the pinned call fails with a `grpc.RpcError` (resolving a pin needs the Hub, and its failure takes this shape) it degrades to the unpinned request — a download failure the server reports through the status stream is raised, not retried. Weights whose commit differs from the local snapshot directory are refused rather than mixed in.
-- The weight phase writes into the snapshot root the engine resolved, not into whichever root this worker would default to. Without shared storage the two are not always the same: a multi-node engine resolves the model on one node and loads weights in an `EngineCore` process on another, which receives a standard snapshot path it has nothing at. That path carries both the cache root and the commit, so the worker installs there rather than producing a complete snapshot under its own root that the engine never opens.
+- The weight phase writes into the snapshot root the engine resolved, not into whichever root this worker would default to. Without shared storage the two are not always the same: a multi-node engine resolves the model on one node and loads weights in an `EngineCore` process on another, which receives a standard snapshot path it has nothing at. That path carries both the cache root and the commit, so the shared metadata helper restores that exact missing snapshot before the server-cache strategy installs weights. Existing inventoried snapshots are revalidated; existing inventory-less directories retain the legacy weight-target behavior described above. Ordinary local and nonstandard paths keep their previous behavior.
+- Inventory validation does not add an earlier engine lifecycle hook. Metadata recovery in the server-cache strategy still runs after a P2P miss; it does not by itself guarantee tokenizer or processor files are present during earlier initialization in an isolated Core or worker filesystem. The existing integration or storage setup must make those files available at the time they are consumed.
 - `MX_MODEL_REVISION` does not pin anything. It labels the worker's P2P source identity and accepts any string, including one that names no Hugging Face revision at all. Pin through the engine's own revision setting instead.
-- Reusing a local snapshot requires the server to name its revision. A server that already holds an unpinned model answers without naming one, so the worker restreams the metadata rather than assume the copy on disk is current. Metadata is small — well under a second — and the stream carries the commit, which makes restreaming the cheap way to stay correct.
+- Outside the inventoried immutable-pin shortcut, reusing a local snapshot requires the server to name its revision. A server that already holds an unpinned model may answer without naming one, so the worker restreams metadata rather than assume the copy on disk is current. A metadata inventory records paths and sizes, not content hashes that detect equal-size modifications.
 - On a cold server the metadata phase waits only for the non-weight files. The weights are downloaded later, and only if P2P found no source. The server keys its registry entry on the weight mode, so the metadata-only request does not mark the model complete.
 - The server dedups the upstream download but not the per-worker stream. Concurrent workers on a cold model all wait on one Hugging Face fetch, then each streams its own copy, so N replicas starting together cost N x model size in server egress. Size the server's network accordingly, or stagger large rollouts.
 - An unreachable server costs about 20 seconds per worker before loading falls through to the next strategy. That is the TCP connect timeout; a shorter deadline would abort legitimate cold-cache downloads, which can take minutes.
@@ -1262,6 +1398,8 @@ index is unavailable or incomplete, SGLang reads the full file list. This
 selection does not affect P2P target transfer.
 
 With vLLM, `MX_MODEL_URI` can also be a Hugging Face model ID. vLLM first downloads the safetensors into its local Hugging Face cache, then ModelStreamer reads those local files; ModelStreamer does not stream directly from the Hub.
+
+For vLLM MTP with a shared checkpoint, configure both the main and speculative draft loads through ModelExpress and use the same pinned checkpoint, revision, vLLM build, and MX build on source and target. One main NIXL listener serves both role-scoped tensor sets; do not allocate a second metadata port for the draft. On cold start, ModelStreamer prefers the model's `is_unused_checkpoint_weight` hook and delegates to a compatible RunAI loader or uses vLLM's local filter and the checkpoint index. Older engines without the hook can use the bounded Qwen3.5, Qwen3-Next, DeepSeek and GLM MTP compatibility paths described in [vLLM Loader](ARCHITECTURE.md#vllm-loader). Other models and unusable optional metadata retain full-file loading. Main models without their own hook also retain full-file loading. Logs identify whether shard selection used the model-owned hook or the legacy compatibility rule. Mixed shards can be read by both passes. With `MX_VMM_ARENA=1`, the main weights use the arena while draft tensors are registered individually; the draft must not replace the live main arena.
 
 **S3 / S3-compatible:**
 
@@ -1609,21 +1747,26 @@ total rather than describing the entire streaming operation as wire or install.
 | DeepSeek-V3 (671B, FP8) | 681 GB (8 GPUs) | ~15 seconds | ~45 Gbps |
 | Llama 3.3 70B | 140 GB (8 GPUs) | ~5 seconds | ~28 Gbps |
 
-### Internal streaming cache controls
+### Internal streaming diagnostics
 
-Benchmarks record the following implementation switches in their experiment
-manifest. They are internal qualification controls, separate from the public
-integration choices above. Integrations should not expose cache algorithms as
-application configuration. This table records the existing controls and defaults;
-it does not establish a stable configuration API.
+Source metadata and transfer plans are reused automatically. These internal
+settings are read when the transfer is constructed.
 
-| Internal environment variable | Default | Qualification purpose |
+| Internal environment variable | Default | Purpose |
 | --- | --- | --- |
-| `MX_REFIT_CACHE_RESOLVED_SOURCES` | `0` | Reuse decoded, merged source tables only when every ordered manifest byte matches. |
-| `MX_REFIT_CACHE_BOUNDED_PLANS` | `0` | Reuse physical plans when manifests, source geometry/addresses, load capture, destination layout, staging configuration, and planning controls match. |
-| `MX_REFIT_REUSE_COMPLETE_PLAN` | `0` | Use the already-built whole-model plan for bounded coverage validation. |
-| `MX_REFIT_COPY_PLAN_KEY_ON_MISS` | `0` | Snapshot callback inputs only on a plan-cache miss; reject overlapping compilation. |
-| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Existing descriptor budget before full-source reconstruction; changing it invalidates cached plans. |
+| `MX_REFIT_DEBUG_VALIDATE_PLAN` | `0` | Recheck cached whole-model and owning-module transfer coverage. |
+| `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` | `0` | Validate that generator layout hasn't changed. |
+| `MX_REFIT_PACK_MODULES` | `1` | Pack complete owning modules within each bounded staging arena. |
+| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Descriptor budget before full-source reconstruction. |
+| `MX_REFIT_PREFETCH_REPLICA_METADATA` | `0` | Prefetch stable metadata for published replica groups during source resolution. |
+| `MX_REFIT_DEBUG_VALIDATE_REPLICAS` | `0` | Check that replicas in each logical-shard group have equivalent canonical coverage. |
+
+Replicas are tried lazily in worker-ID order by default. Optional prefetch and
+debug validation inspect published groups before transfer-plan pruning;
+unavailable prefetched replicas can be retried later. Digest and identity errors
+fail resolution. Debug validation requires every
+published replica to resolve and compares canonical coverage and geometry,
+ignoring replica-specific physical addresses.
 
 Bounded streaming requires the framework to hold its update guard through
 transfer, installation and verification. Each group is copied from a receive
@@ -1642,13 +1785,15 @@ Quantized and incomplete captures are never retained. Callers must keep model
 configuration and loader behavior fixed while using an installer.
 
 These caches hold layouts and plans, not weight values or readiness. Every
-update still obtains its version and lease, reads fresh tensor values, and runs
-coverage validation. The installer checks live owners, shared parameters and
-complete module inputs. Engine callbacks receive independent storage, so they
-cannot retain a view into the receive arena.
-Workspace reset and close discard source and plan caches. Cache counters and
-lookup/build/validation times accompany streaming preparation metrics; a miss
-rebuilds the entry rather than using a stale layout.
+update still obtains its version and lease and reads fresh tensor values.
+The installer checks live owners, shared parameters and complete module inputs.
+Engine callbacks receive independent storage, so they cannot retain a view into
+the receive arena.
+Logical plans belong to one mesh ID and generation; generation changes rebuild
+them even when capture remains compatible. Replica changes rebind physical
+sources while retaining the logical plan. Workspace reset clears physical
+transport and descriptor state; closing the transfer releases its cached plan.
+Cache counters and lookup/build/validation times accompany preparation metrics.
 Wire-to-engine dtype conversion respects the captured destination slice, strides
 and arena storage offset, including padding surrounding the destination view.
 Bounded staging views are zeroed before each READ so untouched loader padding

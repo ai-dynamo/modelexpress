@@ -453,7 +453,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -1056,7 +1056,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
     { name = "requests", marker = "extra == 'dev'", specifier = ">=2.34.2" },
-    { name = "runai-model-streamer", extras = ["s3", "gcs", "azure"], marker = "sys_platform == 'linux'" },
+    { name = "runai-model-streamer", extras = ["azure", "gcs", "s3"], marker = "sys_platform == 'linux'", specifier = ">=0.17.0" },
     { name = "s3transfer", specifier = ">=0.10.0" },
     { name = "safetensors", specifier = ">=0.8.0" },
     { name = "torch", specifier = ">=2.6.0" },
@@ -1829,7 +1829,7 @@ wheels = [
 
 [[package]]
 name = "runai-model-streamer"
-version = "0.15.8"
+version = "0.17.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "humanize" },
@@ -1838,8 +1838,8 @@ dependencies = [
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d3/9c/145479177e73383a6ae76f013aceac732b021d4164e91445cb74ed493709/runai_model_streamer-0.15.8-py3-none-manylinux2014_aarch64.whl", hash = "sha256:9eb7d5d28a84ab9533314812274841f14aa821fb6bd54acaaea3353dddb95297", size = 608124, upload-time = "2026-03-19T17:19:03.413Z" },
-    { url = "https://files.pythonhosted.org/packages/bd/ca/21b5e92b3de94b44fcc416564efe6f63a149e0d898e2b37463f57a6fa6f8/runai_model_streamer-0.15.8-py3-none-manylinux2014_x86_64.whl", hash = "sha256:b64619b124dce64e8fbfd960c6bc9ad12702ece4effc5a012c5b8c67934cd75d", size = 608334, upload-time = "2026-03-19T17:19:05.426Z" },
+    { url = "https://files.pythonhosted.org/packages/b9/12/7fe4ed110506c992a1194983a816f16e0f2410416952207f89c895af7d04/runai_model_streamer-0.17.0-py3-none-manylinux_2_30_aarch64.whl", hash = "sha256:e722bb0338ed9b047c140745d3f5431af01fd2d5d6d809be01423bc6c62d7eb2", size = 745324, upload-time = "2026-10-13T16:09:10.62Z" },
+    { url = "https://files.pythonhosted.org/packages/42/8e/56727805954fc8bc44f4b193d2aca28ff3ff46578474c8ce300b66299692/runai_model_streamer-0.17.0-py3-none-manylinux_2_30_x86_64.whl", hash = "sha256:d7189e8f6963adc39d38eb7423ac79542e69d1a2eac5e76a473c60ae942b8760", size = 767860, upload-time = "2026-10-13T16:09:12.303Z" },
 ]
 
 [package.optional-dependencies]
@@ -1855,40 +1855,40 @@ s3 = [
 
 [[package]]
 name = "runai-model-streamer-azure"
-version = "0.15.8"
+version = "0.17.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "azure-identity" },
     { name = "azure-storage-blob" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fe/5d/67b4bb65e87574c8286edfc03cc0768c6ccc4c969438bf06402ea72f008a/runai_model_streamer_azure-0.15.8-py3-none-manylinux2014_aarch64.whl", hash = "sha256:bc15e926c962939b76ded7e01fbbd79c5a45b0137c07a7eebdc01dc3556f7bb0", size = 5850816, upload-time = "2026-03-19T17:19:24.935Z" },
-    { url = "https://files.pythonhosted.org/packages/f0/cb/0b2d43f8597719618fc3b938fca4d46ebb1a81f23d516ffa5bb44c335b46/runai_model_streamer_azure-0.15.8-py3-none-manylinux2014_x86_64.whl", hash = "sha256:a1126eae4520026e8938b0ab71dd76e7cb54c4e8e77f1e2f1096ffef78dd93ce", size = 5568982, upload-time = "2026-03-19T17:19:26.634Z" },
+    { url = "https://files.pythonhosted.org/packages/ea/de/67913a3cfedd03764ea5b79fdd8b1a36b78daeb56ed399993759e704a861/runai_model_streamer_azure-0.17.0-py3-none-manylinux_2_30_aarch64.whl", hash = "sha256:a258d8c02391e60e9ad9cec3a24ad655dee769cd82b60e912fa866f198f4ea3e", size = 5298945, upload-time = "2026-10-13T16:09:13.684Z" },
+    { url = "https://files.pythonhosted.org/packages/15/b4/17fe77269581f1229dd3588d9844835a9c6281582dc2cc16829c43ab9591/runai_model_streamer_azure-0.17.0-py3-none-manylinux_2_30_x86_64.whl", hash = "sha256:19d89d841001ec93c17855bc57e80c77ddaad02d2a815782352947fa9988257f", size = 5056165, upload-time = "2026-10-13T16:09:15.638Z" },
 ]
 
 [[package]]
 name = "runai-model-streamer-gcs"
-version = "0.15.8"
+version = "0.17.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "google-auth" },
     { name = "google-cloud-storage" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ed/96/bf294335fbc806da0582c33fb9aa7c25ac39e46ddec172b0973f5ebb2334/runai_model_streamer_gcs-0.15.8-py3-none-manylinux2014_aarch64.whl", hash = "sha256:2252c0848868b45f535eacc6aeea3e00c2e5af4dabbcb349e9f9aaa933bcf1ee", size = 4349510, upload-time = "2026-03-19T17:19:19.199Z" },
-    { url = "https://files.pythonhosted.org/packages/16/b0/115c8fcc42ad1492ba7cda60e02def4edae7bc887392bfbe0418a0c1e87f/runai_model_streamer_gcs-0.15.8-py3-none-manylinux2014_x86_64.whl", hash = "sha256:db0d2848b77d4adf7d287034e4201956cdbf935273237c50662db9b006e22703", size = 4420357, upload-time = "2026-03-19T17:19:20.745Z" },
+    { url = "https://files.pythonhosted.org/packages/f8/06/c21ac3bb75d1bd6c22a4c27810e9f43b4593371507e9b81ac2df55116321/runai_model_streamer_gcs-0.17.0-py3-none-manylinux_2_30_aarch64.whl", hash = "sha256:285766335c9787361ead9ec8c087abc9b41ee4a676b2c8d9f028b4421a5ba236", size = 9624394, upload-time = "2026-10-13T16:09:17.712Z" },
+    { url = "https://files.pythonhosted.org/packages/10/d3/4b50d264ab13103de71906e7037a6b5e8e459167822ebc4379dfda03a4f9/runai_model_streamer_gcs-0.17.0-py3-none-manylinux_2_30_x86_64.whl", hash = "sha256:56fe648fb49e879f5678197b6f23b6a6d2210b6d4651536172e8c0da4dcd42ab", size = 10031945, upload-time = "2026-10-13T16:09:20.019Z" },
 ]
 
 [[package]]
 name = "runai-model-streamer-s3"
-version = "0.15.8"
+version = "0.17.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b6/33/58e3e7d29e37e2c5af91b69b70f0b1150721772bfc4eefd36190a88ed823/runai_model_streamer_s3-0.15.8-py3-none-manylinux2014_aarch64.whl", hash = "sha256:f5916bfe44e50426810f697696fda028b5bcf3bcefb2da2af742635fa22e66f2", size = 6178474, upload-time = "2026-03-19T17:19:09.843Z" },
-    { url = "https://files.pythonhosted.org/packages/22/a2/eba6048769702567e2b6df1d2054a53ea5d1313a491e7a01982788ee96d8/runai_model_streamer_s3-0.15.8-py3-none-manylinux2014_x86_64.whl", hash = "sha256:754f2f9fc1ba87b7231196355646589bca6e28cf2e6f53f70c3ef881d7751fc4", size = 5919881, upload-time = "2026-03-19T17:19:12.09Z" },
+    { url = "https://files.pythonhosted.org/packages/2b/51/9ee67ae206da42d76040caeae68e96c30504671632f159dc12876ddd94f4/runai_model_streamer_s3-0.17.0-py3-none-manylinux_2_30_aarch64.whl", hash = "sha256:1090bf836fd5552a4f8fa21a5a12601b64f886721fbac72535187e19589d1647", size = 6035912, upload-time = "2026-10-13T16:09:22.19Z" },
+    { url = "https://files.pythonhosted.org/packages/bb/6a/9e46fa6be1e280deb0f1153d1384ea1737990ab66a86469ff3567109f5cf/runai_model_streamer_s3-0.17.0-py3-none-manylinux_2_30_x86_64.whl", hash = "sha256:87ddb91f0f89959b08657d1d95318a3dfbe7dcc04aa1731a028247ae436d1358", size = 5785929, upload-time = "2026-10-13T16:09:23.923Z" },
 ]
 
 [[package]]

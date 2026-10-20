@@ -6,7 +6,6 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -31,7 +30,6 @@ from modelexpress_rl import (
     WeightVersionRef,
     WeightVersionState,
 )
-from modelexpress_rl.inference.adapter import GeneratorTransferInputs
 from modelexpress_rl.inference import checkpoint_store as checkpoint_store_module
 from modelexpress_rl.inference import receiver as receiver_module
 from modelexpress_rl.inference.methods import (
@@ -39,6 +37,7 @@ from modelexpress_rl.inference.methods import (
     RuntimeTensorNixlUpdateMethod,
 )
 import modelexpress_rl.inference.methods.canonical_delta as canonical_delta_module
+from modelexpress_rl.inference.receiver import PreparedCheckpoint
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -193,7 +192,7 @@ class _Adapter:
     def _checkpoint(self):
         return self._method._checkpoint
 
-    def stage_weight(self, inputs) -> receiver_module.PreparedCheckpoint:
+    def stage_weight(self, inputs) -> PreparedCheckpoint:
         version = WeightVersion(
             trainer_mesh_generation=0,
             version_id=inputs.version_id,
@@ -214,7 +213,7 @@ class _Adapter:
         )
         return self._active.checkpoint
 
-    def stage_chain(self, inputs) -> receiver_module.PreparedCheckpoint:
+    def stage_chain(self, inputs) -> PreparedCheckpoint:
         chain = []
         for item in inputs:
             version = WeightVersion(
@@ -466,10 +465,10 @@ def _inputs(
     version="target-a",
     version_label=1,
     uri=None,
-):
+) -> SimpleNamespace:
     if uri is None:
         uri = f"s3://weights/test/v{version_label}/model.safetensors.index.json"
-    return GeneratorTransferInputs(
+    return SimpleNamespace(
         version_id=version,
         base_version_id=base_version,
         layout_signature="",
@@ -519,15 +518,10 @@ def _full_artifact(tensor, *, version_label=2):
 
 
 def _full_inputs(*, version="full-a", version_label=2):
-    return replace(
-        _inputs(
-            None,
-            version=version,
-            version_label=version_label,
-        ),
-        base_version_id=None,
-        payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
-    )
+    inputs = _inputs(None, version=version, version_label=version_label)
+    inputs.base_version_id = None
+    inputs.payload_format = WeightPayloadFormat.FULL_HF_CHECKPOINT
+    return inputs
 
 
 @pytest.mark.parametrize("reported_size_gb", [None, 600])
@@ -619,11 +613,19 @@ def test_implicit_cached_seed_restores_without_copying(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("explicit_cached_seed", [False, True])
+@pytest.mark.parametrize("stream_full_checkpoints", [False, True])
+@pytest.mark.parametrize("checksums", [False, True])
 def test_p2p_startup_s3_bootstrap_retries_without_activating(
-    monkeypatch, tmp_path, explicit_cached_seed
+    monkeypatch, tmp_path, explicit_cached_seed, stream_full_checkpoints, checksums
 ):
     weights = torch.tensor([7.0, 8.0])
-    storage = _MemoryS3(_full_artifact(weights))
+    objects = _full_artifact(weights)
+    if not checksums:
+        uri = "s3://weights/test/v2/model.safetensors.index.json"
+        index = json.loads(objects[uri])
+        del index["metadata"]["checksum_format"]
+        objects[uri] = json.dumps(index).encode()
+    storage = _MemoryS3(objects)
     monkeypatch.setattr(canonical_delta_module, "S3Client", lambda **_kwargs: storage)
     store = checkpoint_store_module.LocalCheckpointStore(
         root=tmp_path / "cache", model_name="test/model"
@@ -638,6 +640,7 @@ def test_p2p_startup_s3_bootstrap_retries_without_activating(
             ),
             refit_checkpoint_dir=tmp_path / "cache",
         ),
+        stream_full_checkpoints=stream_full_checkpoints,
     )
     try:
         with pytest.raises(RuntimeError, match="requires a full replay root"):
@@ -651,6 +654,7 @@ def test_p2p_startup_s3_bootstrap_retries_without_activating(
         assert adapter._method.requires_full_root
         assert not store.active_path.exists()
         staged = adapter.stage_weight(_full_inputs())
+        assert staged.streaming is None
         assert torch.equal(
             load_file(staged.path / "model-00001-of-00001.safetensors")["weight"],
             weights,
@@ -1123,12 +1127,10 @@ def test_canonical_s3_rejects_non_s3_source_before_storage_access(
     tmp_path,
 ):
     adapter, storage = _build(monkeypatch, tmp_path, {})
-    inputs = replace(
-        _inputs(None),
-        object_storage=ObjectStorageSource(
-            storage_type=ObjectStorageType.GCS,
-            uri="gs://weights/test/v1/model.safetensors.index.json",
-        ),
+    inputs = _inputs(None)
+    inputs.object_storage = ObjectStorageSource(
+        storage_type=ObjectStorageType.GCS,
+        uri="gs://weights/test/v1/model.safetensors.index.json",
     )
 
     with pytest.raises(ValueError, match="requires S3 object storage"):
@@ -2161,9 +2163,7 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
     generator = ModelExpressGeneratorClient()
     generator._serving_version_id = "base-a"
     generator._max_replay_chain_length = 64
-    generator._staging_buffer_bytes = None
-    generator._staging_buffers_count = 1
-    generator._staging_device = "cuda"
+    generator._streaming = None
     monkeypatch.setattr(
         generator,
         "_fetch_ready_version",
