@@ -480,7 +480,7 @@ jobs:
 
     - name: Run collective Refit Redis integration tests
       env:
-        REDIS_URL: redis://localhost:6379
+        REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
       run: |
         cargo test -p model-express-workspace-tests \
           --test refit_collective_service_redis \
