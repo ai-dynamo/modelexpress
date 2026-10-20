@@ -88,7 +88,7 @@ The following table lists the configurable parameters of the ModelExpress chart 
 
 | Parameter                                    | Description                                    | Default |
 |----------------------------------------------|------------------------------------------------|---------|
-| `replicaCount`                               | Number of ModelExpress replicas                | `1`     |
+| `replicaCount`                               | Number of ModelExpress replicas; use `0` to scale down | `1`     |
 | `image.repository`                           | ModelExpress image repository                  | `nvcr.io/nvidia/ai-dynamo/modelexpress-server` |
 | `image.pullPolicy`                           | Image pull policy                              | `IfNotPresent` |
 | `image.tag`                                  | ModelExpress image tag                         | Chart `appVersion` |
@@ -299,3 +299,9 @@ When contributing to this Helm chart, please ensure:
 2. Values are properly documented
 3. Examples are provided for common use cases
 4. Tests are included for the chart
+
+Run the replica-count rendering regression test with Helm 3 installed:
+
+```bash
+bash helm/tests/replica_count_test.sh
+```
