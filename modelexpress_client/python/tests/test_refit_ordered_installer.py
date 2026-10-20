@@ -8,9 +8,13 @@ import pytest
 import torch
 from torch import nn
 from modelexpress.refit.reshard.types import IncompleteRefit
-from modelexpress_rl.inference.engines.vllm.installer import _VllmInstaller
 from modelexpress_rl.inference.plan import PreparedStreamingTensors, SourceReplayBatch
-from tests.test_refit_vllm_installer import _install_fake_vllm
+from tests.test_refit_vllm_installer import (
+    _cpu_installer,
+    _install_fake_vllm,
+    _install_tensors,
+    _streamed_tensors,
+)
 
 
 def _transfer_and_install(installer, sources, captured, layout, bounded):
@@ -45,14 +49,9 @@ def test_missing_replay_api_fails_before_initialization(monkeypatch):
     _install_fake_vllm(monkeypatch, initialized.append)
     del sys.modules["vllm.model_executor.model_loader.reload.meta"].materialize_layer
     model = nn.Linear(2, 2, bias=False)
-    installer = _VllmInstaller(
-        model=model,
-        vllm_config=object(),
-        model_config=object(),
-        device=torch.device("cpu"),
-    )
+    installer = _cpu_installer(model)
     with pytest.raises(RuntimeError, match="layerwise reload APIs"):
-        installer.install_tensors({"weight": torch.ones(2, 2)})
+        _install_tensors(installer, {"weight": torch.ones(2, 2)}, False)
     assert not initialized
 
 
@@ -103,16 +102,12 @@ def test_persistent_only_owner_skips_materialization(monkeypatch, registry):
         "vllm.model_executor.model_loader.reload.meta"
     ].materialize_layer = materialize
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
-    installer = _VllmInstaller(
-        model=model,
-        vllm_config=object(),
-        model_config=object(),
-        device=torch.device("cpu"),
-    )
+    installer = _cpu_installer(model)
     captured, layout = installer.capture([("bias", torch.float32, (2,))])
     assert len(captured.copies) == 1 and set(layout) == {"bias"}
     installer.install_streaming(
-        PreparedStreamingTensors(
+        _streamed_tensors(
+            installer,
             lambda: iter([{"bias": torch.tensor([3.0, 7.0])}]), frozenset(layout), {}
         )
     )
@@ -138,24 +133,13 @@ def test_replaced_pending_slot_fails_before_its_copy(monkeypatch, streaming):
             model.b.weight = replacement
 
     model.a.quant_method = Mutate()
-    installer = _VllmInstaller(
-        model=model,
-        vllm_config=object(),
-        model_config=object(),
-        device=torch.device("cpu"),
-    )
+    installer = _cpu_installer(model)
     tensors = {name: torch.ones_like(value) for name, value in model.named_parameters()}
     with pytest.raises(IncompleteRefit, match="pending.*slot"):
-        if streaming:
-            installer.install_streaming(
-                PreparedStreamingTensors(
-                    lambda: iter([{name: value} for name, value in tensors.items()]),
-                    frozenset(tensors),
-                    {},
-                )
-            )
-        else:
-            installer.install_tensors(tensors)
+        _install_tensors(
+            installer, tensors, streaming,
+            batches=lambda: iter([{name: value} for name, value in tensors.items()]),
+        )
     assert torch.equal(replacement, torch.zeros(2, 2))
 
 
@@ -177,12 +161,7 @@ def _persistent_installer(monkeypatch, model):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
-    return _VllmInstaller(
-        model=model,
-        vllm_config=object(),
-        model_config=object(),
-        device=torch.device("cpu"),
-    )
+    return _cpu_installer(model)
 
 
 @pytest.mark.parametrize("registry", ["parameter", "buffer"])
@@ -482,6 +461,6 @@ def test_replay_rejects_invalid_update(monkeypatch, invalid):
         capture.generation + 1 if invalid == "generation" else capture.generation,
     )
     with pytest.raises(IncompleteRefit, match="recorded order|before every|invalidated"):
-        installer.install_tensors(batch)
+        _install_tensors(installer, batch, False)
     if invalid != "incomplete":
         assert torch.equal(model.weight, torch.zeros(2))

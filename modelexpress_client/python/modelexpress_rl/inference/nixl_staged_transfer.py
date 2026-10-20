@@ -36,6 +36,7 @@ from modelexpress.nixl_transfer import (
 from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.geometry import _validate_physical_destination
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress.refit.reshard.slice_plan import _row_major_strides
 from modelexpress.refit.reshard.rendezvous import (
     build_sources,
     merge_shard_tables,
@@ -209,12 +210,6 @@ class _StreamingBatch:
     layouts: _StagingLayouts
     nbytes: int
 
-    def __post_init__(self) -> None:
-        # Readers reach these views both by name and by position, and
-        # dataclasses.replace or a plain 3-tuple would satisfy only the second.
-        # Coerce so the annotation holds however the batch was built.
-        if not isinstance(self.layouts, _StagingLayouts):
-            object.__setattr__(self, "layouts", _StagingLayouts(*self.layouts))
 
 
 @dataclass(frozen=True)
@@ -232,12 +227,18 @@ class _PreparedBoundedTransfer:
 @dataclass(frozen=True)
 class _StreamingSchedule:
     transfer_plan: LogicalTransferPlan
-    module_batches: tuple[_StreamingBatch, ...]
     batches: tuple[_StreamingBatch, ...]
     arena_bytes: int = field(init=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "arena_bytes", max(batch.nbytes for batch in self.batches))
+
+    @cached_property
+    def replay_scratch_peak_bytes(self) -> int:
+        return max(
+            (replay_scratch_bytes(pull) for pull in self.transfer_plan.full_pulls),
+            default=0,
+        ) if self.transfer_plan.source_replay else 0
 
 
 def _bounded_batches(
@@ -265,7 +266,8 @@ def _bounded_batches(
     complete = complete_plan
     if complete is None:
         complete = plan_transfer(capture, sources, source_slots=source_slots,
-                                 verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST)
+                                 verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST,
+                                 max_staging_bytes=max_staging_bytes)
     metrics["bounded_whole_plan_s"] = time.perf_counter() - started
     metrics["bounded_whole_plan_builds"] = int(complete_plan is None)
     started = time.perf_counter()
@@ -500,11 +502,7 @@ def _load_agent_metadata(
 def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
     value = tensor
     for op_name, args, frozen_kwargs in op_chain:
-        kwargs = dict(frozen_kwargs)
-        if op_name == "__getitem__":
-            value = value.__getitem__(*args)
-        else:
-            value = getattr(value, op_name)(*args, **kwargs)
+        value = getattr(value, op_name)(*args, **dict(frozen_kwargs))
     return value
 
 
@@ -600,15 +598,6 @@ class _NixlStagedTransfer:
     def bounded_staging(self) -> bool:
         return self._streaming is not None
 
-    @property
-    def _bounded_arena(self) -> torch.Tensor | None:
-        return self._staging_arenas[0] if self._staging_arenas else None
-
-    @_bounded_arena.setter
-    def _bounded_arena(self, value: torch.Tensor | None) -> None:
-        self._invalidate_descriptors()
-        self._staging_arenas = [] if value is None else [value]
-
     def _invalidate_descriptors(self) -> None:
         self._descriptor_caches = None
         self._trainer_source_snapshot = None
@@ -686,7 +675,6 @@ class _NixlStagedTransfer:
             source_build_s=0.0,
             source_manifest_bytes=sum(len(blob) for blob in manifests),
         )
-        started = time.perf_counter()
         metrics["source_cache_misses"] = 1
         return _resolve_sources(manifests, metrics=metrics)
 
@@ -789,6 +777,7 @@ class _NixlStagedTransfer:
                     for session, agent in trainer.resolved_metadata.session_to_agent.items()
                 },
                 verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST,
+                max_staging_bytes=self._buffer_budget,
             )
             metrics["initial_whole_plan_s"] = time.perf_counter() - started
             modules = _bounded_batches(
@@ -805,7 +794,7 @@ class _NixlStagedTransfer:
                 _pack_bounded_batches(modules, self._buffer_budget)
                 if self._pack_modules and not plan.source_replay else modules
             )
-            compiled = _StreamingSchedule(plan, modules, batches)
+            compiled = _StreamingSchedule(plan, batches)
             logger.info("compiled bounded transfer plan")
             return compiled
 
@@ -1100,6 +1089,7 @@ class _NixlStagedTransfer:
             reused.append(hit)
         metrics["descriptor_binding_reused"] = int(all(reused))
         metrics["descriptor_builds"] = sum(not hit for hit in reused)
+        metrics["replay_scratch_peak_bytes"] = compiled.replay_scratch_peak_bytes
         return _PreparedBoundedTransfer(
             compiled.batches, source_binding.resolved.sources, transport, source_binding,
             metrics, checksums, tuple(descriptors), tuple(reused),
@@ -1152,9 +1142,7 @@ class _NixlStagedTransfer:
         recv, convert, full = self._carve_bounded(batch, arenas[index % len(arenas)])
         # Captured loaders may leave padding untouched. Reused arenas must
         # reproduce the zero-filled load layout before the NIC writes it.
-        for tensors in (recv, convert, full):
-            for tensor in tensors.values():
-                tensor.zero_()
+        arenas[index % len(arenas)][:batch.nbytes].zero_()
         if arenas[index % len(arenas)].device.type == "cuda":
             torch.cuda.synchronize(self._device)
         sources = {
@@ -1193,10 +1181,7 @@ class _NixlStagedTransfer:
         metrics["staging_buffers"] = len(arenas)
         metrics["batches"] = len(prepared.batches)
         if prepared.batches[0].transfer_plan.source_replay:
-            metrics["replay_scratch_peak_bytes"] = max(
-                replay_scratch_bytes(pull)
-                for batch in prepared.batches for pull in batch.transfer_plan.full_pulls
-            )
+            metrics["replay_scratch_peak_bytes"] = prepared.metrics["replay_scratch_peak_bytes"]
         batches = prepared.batches
         metrics.update(
             descriptor_cache_hits=0, descriptor_cache_misses=0,
@@ -1282,7 +1267,7 @@ class _NixlStagedTransfer:
             if metrics is not None:
                 metrics["bounded_whole_validation_s"] = time.perf_counter() - whole_started
             owner_started = time.perf_counter()
-            for batch in plan.module_batches:
+            for batch in plan.batches:
                 _NixlStagedTransfer._validate_complete(
                     batch.capture,
                     {name: parameter_layout[name] for name in {copy.param_name for copy in batch.capture.copies}}
@@ -1297,21 +1282,16 @@ class _NixlStagedTransfer:
         if plan.source_replay:
             for copy in capture.copies:
                 shape, dtype = parameter_layout.get(copy.param_name, ((), None))
-                strides = []
-                step = 1
-                for size in reversed(shape):
-                    strides.insert(0, step)
-                    step *= size
                 owner_shape, owner_stride = capture.destination_layouts.get(
-                    copy.param_name, (shape, tuple(strides))
+                    copy.param_name, (shape, tuple(_row_major_strides(shape)))
                 )
                 try:
                     if dtype != copy.dest_dtype or tuple(owner_shape) != tuple(shape):
                         raise UnsupportedReshard("recorded destination owner layout differs")
                     _validate_physical_destination(
                         copy.dest_shape,
-                        copy.dest_stride if copy.owner_stride is None else copy.owner_stride,
-                        copy.dest_offset if copy.owner_offset is None else copy.owner_offset,
+                        copy.dest_stride,
+                        copy.dest_offset,
                         owner_shape, owner_stride,
                     )
                 except UnsupportedReshard as error:
@@ -1480,8 +1460,6 @@ class _NixlStagedTransfer:
                     plan.replay_total_copies, plan.replay_generation,
                 ),
                 {
-                    "installation_owner_peak_bytes": plan.installation_owner_peak_bytes,
-                    "installation_materialization_peak_bytes": plan.installation_materialization_peak_bytes,
                     "bytes_received": sum(d.nbytes for d in prepared.descriptors),
                     "segments": len(prepared.descriptors),
                     "wire_s": wire_seconds, "wire_wait_s": wire_wait_seconds,

@@ -35,13 +35,13 @@ class PhysicalViewModel(torch.nn.Module):
                 self.copy_view(self.bias, source)
 
 
-def test_legacy_destination_reconstruction_keeps_canonical_mapping():
+def test_destination_reconstruction_rejects_noncontiguous_owners():
     model = PhysicalViewModel(stamped=True)
     captured = capture_weights(
         model, build_lazy_weights([("weight", torch.float32, (6,))])
     )
     assert captured.unsupported == ["weight"]
-    assert "canonical owner coordinates" in captured.unsupported_reasons["weight"]
+    assert "require ordered source replay" in captured.unsupported_reasons["weight"]
 
 
 @pytest.mark.parametrize("stamped", [False, True])

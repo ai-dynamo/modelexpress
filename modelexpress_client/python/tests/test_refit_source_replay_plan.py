@@ -11,6 +11,44 @@ from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
 from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("max_segments", [64, 512])
+@pytest.mark.parametrize("arena_bytes", [None, 32768])
+def test_replay_bounds_column_reads_without_exceeding_arena(rank, max_segments, arena_bytes):
+    source = torch.arange(8 * 256 * 64, dtype=torch.float32).reshape(8, 256, 64)
+    shards = [
+        Shard((expert, 0, 0), (1, 256, 64), f"s{expert}", source[expert].data_ptr(), 4)
+        for expert in range(8)
+    ]
+    copy = RecordedCopy(
+        "x", (("select", (0, 5), ()), ("narrow", (1, rank * 32, 32), ())),
+        "a.weight", 0, (256, 32), (32, 1), source.dtype,
+    )
+    options = {} if arena_bytes is None else {"max_staging_bytes": arena_bytes}
+    plan = plan_transfer(
+        CaptureResult(copies=[copy], source_replay=True),
+        {"x": SourceInfo(tuple(source.shape), source.dtype, 4, shards)},
+        max_segments_per_copy=max_segments, **options,
+    )
+    pull = plan.full_pulls[0]
+    coarsened = max_segments < 256 and arena_bytes is None
+    assert len(pull.segments) == (1 if coarsened else 256)
+    assert pull.copy_indices == (0,)
+    assert plan.exact_descriptor_count == 256
+    assert plan.exact_bytes == 32768
+    received = torch.empty(pull.global_shape, dtype=pull.dtype)
+    if arena_bytes is not None:
+        assert received.numel() * received.element_size() <= arena_bytes
+    for read in pull.segments:
+        ctypes.memmove(
+            received.data_ptr() + read.dst_byte,
+            shards[read.source_buffer].addr + read.src_byte,
+            read.nbytes,
+        )
+    actual = _replay_ops(received, pull.copies[0].op_chain)
+    torch.testing.assert_close(actual, source[5, :, rank * 32:(rank + 1) * 32], rtol=0, atol=0)
+
+
 def test_replay_materializes_transposed_source_before_flattening():
     source = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     copy = RecordedCopy(
@@ -77,3 +115,14 @@ def test_integer_index_capture_transfer_and_replay(index):
         ctypes.memmove(received.data_ptr() + read.dst_byte,
                        source.data_ptr() + read.src_byte, read.nbytes)
     torch.testing.assert_close(_replay_ops(received, pull.copies[0].op_chain), expected)
+
+
+@pytest.mark.parametrize("nodes", [("a", "b", "c", "d", "solo"), ("solo", "d", "c", "b", "a")])
+def test_owner_groups_preserve_order_across_transitive_and_cyclic_links(nodes):
+    from modelexpress.refit.reshard.types import _connected_groups
+
+    links = (("b", "c"), ("a", "b"), ("d", "c"), ("foreign", "solo"), ("a", "c"))
+    groups = _connected_groups(nodes, links)
+    connected = tuple(node for node in nodes if node != "solo")
+    expected = (("solo",), connected) if nodes[0] == "solo" else (connected, ("solo",))
+    assert groups == expected

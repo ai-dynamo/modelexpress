@@ -1989,12 +1989,11 @@ load-time slots; native post-processing recreates runtime aliases. Missing
 load-time slots still fail restoration, and final runtime identity and storage
 validation remains required.
 
-Warm load-layout capture keeps a private snapshot when records contain only
-ordinary immutable metadata. Each caller receives fresh mutable capture records
-and containers, with duplicate record references preserved. Slice-containing
-operation tuples are copied with a shared memo. Mutable or custom payloads and
-changed copy protocols use whole-result deep copying. The existing model,
-loader, routing and manifest keys still decide whether a capture can be reused.
+Load-layout capture caches a deep copy of the result and returns another deep
+copy on a cache hit, preserving shared references within each result while
+isolating callers' mutations. The existing model, loader, routing and manifest
+keys decide whether capture can be reused. Warm weight updates reuse their
+compiled transfer plan directly and do not copy the capture again.
 
 `modelexpress.refit.reshard.plan_transfer` builds an immutable
 `LogicalTransferPlan` directly from captured geometry. Exact reads, conversions
@@ -2011,17 +2010,24 @@ plans inherit the complete plan's full-source verification policy.
 shared source table and its index map inside the planner. Module batching and
 packing preserve the same read order for legacy captures. Source replay instead
 batches consecutive writes without regrouping by owner; module packing does not
-reorder those writes. Each write stages the exact representable source-view prefix
-and locally replays the remaining operations. Digest verification stages the
-complete source and checks the current version checksums before replay. No
-descriptor coarsening is applied to source replay.
+reorder those writes. Each write prefers the longest source-view prefix within
+the descriptor limit and per-arena staging budget, then locally replays the
+remaining operations. If no such prefix fits, planning retains the exact reads.
+Before each bounded read, the receiver clears the used arena region once,
+preserving zero-filled gaps without a separate clear for each source write.
+Digest verification stages the complete source and checks the current version
+checksums before replay.
 
 The combined capture is the reusable capture artifact; ordered replay planning
 consumes it directly and does not separately compose trainer conversion with an
 installer capture. Capture, logical plan and physical binding have distinct
-lifetimes. Same-generation updates cheaply reuse the capture and logical plan;
-after a generation change, the logical plan and physical binding are rebuilt. Physical session and address bindings remain
-separate and are refreshed as needed. Per-update readiness, checksums, stream
+lifetimes. The installer keeps one cached runtime-binding record and a source
+installation plan containing the targets and completion schedule. Installation
+follows recorded write order; no separate model-order index is retained. Bounded
+schedules retain only the batches that execute, including any module packing.
+Same-generation updates reuse the capture, logical plan and its replay
+scratch-memory estimate. A generation change rebuilds the logical plan and
+physical binding. Physical sessions and addresses are refreshed as needed. Per-update readiness, checksums, stream
 completeness and resource-safety checks remain in place.
 
 `bind_transfer(plan, resolve_source, resolve_destination)` returns a separate
@@ -2047,8 +2053,7 @@ Supported quantized refits retain native processing and restoration; capture cle
 vLLM's TorchAO reload flag on success and failure.
 
 The staging limit bounds registered receive arenas. Replay operations can require
-additional local scratch, reported as `replay_scratch_peak_bytes`. Estimated
-installation owner and materialization peaks are also reported separately.
+additional local scratch, reported as `replay_scratch_peak_bytes`.
 Engine-owned materialized destinations and post-load workspaces consume
 additional memory, as do the live model and runtime state. The staging limit is
 therefore not a total GPU-memory bound. Two arenas can overlap the next READ with
@@ -2073,6 +2078,17 @@ handle, receive workspace and source lease and requires a process restart: CUDA
 synchronization alone cannot prove failed RDMA reads have completed. Simultaneous
 installation and cleanup errors preserve the original exception with the cleanup
 failure chained as its cause. Partial installation has no rollback.
+
+Captured destination offsets and strides are physical coordinates relative to
+the registered owner. Noncontiguous owners require source replay; destination
+reconstruction rejects them before transfer. Capture does not maintain a second
+canonical coordinate representation.
+
+vLLM load-time tensor installation accepts only `SourceReplayBatch`, for both
+staged and bounded updates. Completed layer-tensor dictionaries are rejected;
+there is no separate complete-layer installer. Writes run in captured order,
+and tied owners finish native processing before their runtime tensors are
+restored. Runtime-tensor and checkpoint artifacts use their own installation APIs.
 
 The adapter depends on vLLM's layerwise reload helpers. Runtime compatibility must
 be qualified with changing weights, shared parameters, graph-bound addresses,

@@ -122,7 +122,7 @@ def test_changed_layout_checks_compatibility(capture_installer, change):
 
 
 @pytest.mark.parametrize(
-    "failure", ["converter", "loader", "restoration", "snapshot"]
+    "failure", ["converter", "loader", "restoration", "cache_copy"]
 )
 def test_failed_recapture_retries(capture_installer, monkeypatch, failure):
     installer, model = capture_installer
@@ -147,7 +147,7 @@ def test_failed_recapture_retries(capture_installer, monkeypatch, failure):
                 SimpleNamespace(kernel_tensors=None, reset=fail),
             )
         else:
-            patch.setattr(module._CaptureSnapshot, "create", fail)
+            patch.setattr(module.copy, "deepcopy", fail)
         with pytest.raises(RuntimeError):
             installer.capture(manifest)
 
@@ -155,7 +155,7 @@ def test_failed_recapture_retries(capture_installer, monkeypatch, failure):
     assert installer.capture(manifest)[0].copies
 
 
-@pytest.mark.parametrize("failure", ["key", "clone"])
+@pytest.mark.parametrize("failure", ["key", "copy"])
 def test_failed_cache_validation_preserves_cache(
     capture_installer, monkeypatch, failure
 ):
@@ -171,7 +171,7 @@ def test_failed_cache_validation_preserves_cache(
         if failure == "key":
             patch.setattr(installer, "capture_generator_fingerprint", fail)
         else:
-            patch.setattr(module._CaptureSnapshot, "clone", fail)
+            patch.setattr(module.copy, "deepcopy", fail)
         with pytest.raises(RuntimeError, match="validation failed"):
             installer.capture(manifest)
         assert installer._capture_cache is cache

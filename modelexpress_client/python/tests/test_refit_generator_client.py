@@ -2493,6 +2493,8 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
     monkeypatch, case
 ):
     import torch
+    from modelexpress.refit.reshard.types import RecordedCopy
+    from modelexpress_rl.inference.plan import SourceReplayBatch
     from modelexpress_rl.inference.engines.vllm.installer import _VllmInstaller
 
     server, endpoint, service = _start_server()
@@ -2518,6 +2520,9 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
         assert service.active_leases
         assert guard_active
 
+    names = frozenset(dict(model.named_parameters()))
+    last_writes = {name: index for index, name in enumerate(model.state_dict())}
+
     class Batches:
         index = 0
 
@@ -2531,7 +2536,9 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
                 raise primary
             if self.index > 2:
                 raise StopIteration
-            return {f"{self.index - 1}.weight": arena}
+            name = f"{self.index - 1}.weight"
+            copy = RecordedCopy(name, (), name, 0, (2, 2), (2, 1), torch.float32)
+            return SourceReplayBatch(((self.index - 1, copy, arena),), names, last_writes, 2)
 
         def close(self):
             if not cleanup_allowed:
@@ -2554,7 +2561,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
                 metrics={},
                 batches=[
                     SimpleNamespace(
-                        transfer_plan=SimpleNamespace(source_replay=False),
+                        transfer_plan=SimpleNamespace(source_replay=True, replay_parameter_names=names),
                         layouts=({f"{index}.weight": ((2, 2), torch.float32)},)
                     )
                     for index in range(2)
@@ -2607,10 +2614,11 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
             )
             self.copy_count = 0
 
-        def _compile_install_plan(self, aliases):
+        def _new_install_execution(self):
             return SimpleNamespace(
-                by_name=dict(model.named_parameters()),
+                targets=SimpleNamespace(by_name=dict(model.named_parameters())),
                 replay_metadata=None,
+                installed=set(),
                 bounded=False,
             )
 
@@ -2618,15 +2626,20 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
             assert_installation_guard()
             load(self._parameter_aliases(self._model))
 
-        def _apply_batch(self, plan, tensors, **kwargs):
+        def _apply_source_batch(self, plan, batch):
             assert_installation_guard()
             self.copy_count += 1
             events.append("copy")
             if self.copy_count == 2 and case in {"partial", "drain", "close"}:
                 raise primary
             with torch.no_grad():
-                for name, value in tensors.items():
-                    model.get_parameter(name).copy_(value)
+                for _, copy, value in batch.writes:
+                    model.get_parameter(copy.param_name).copy_(value)
+                    plan.installed.add(copy.param_name)
+            plan.replay_metadata = (batch.parameter_names, batch.last_writes)
+
+        def _finish_source_replay(self, plan):
+            assert plan.installed == names
 
         def _drain_streaming(self):
             assert_installation_guard()

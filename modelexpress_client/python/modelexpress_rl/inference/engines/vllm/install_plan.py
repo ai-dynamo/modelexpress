@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from weakref import ref
 
+from modelexpress.refit.reshard.types import _connected_groups
+
 if TYPE_CHECKING:
     from .installer import _ParameterAliases
 
@@ -34,7 +36,6 @@ class _InputSlot:
 
 @dataclass(frozen=True)
 class _InputOwner:
-    order: int
     path: str
     layer_ref: ref
     slots: tuple[_InputSlot, ...]
@@ -42,7 +43,6 @@ class _InputOwner:
 
 @dataclass(frozen=True, eq=False)
 class _LayerInstallPlan:
-    order: int
     path: str
     layer_ref: ref
     # Full load-layout name, local slot, canonical (possibly tied) name.
@@ -57,8 +57,6 @@ class _LayerInstallPlan:
 class _InstallTargets:
     by_name: dict[str, _LayerInstallPlan]
     owners: tuple[_LayerInstallPlan, ...]
-    buffer_names: frozenset[str]
-    persistent_names: frozenset[str]
 
 
 @dataclass(frozen=True, eq=False)
@@ -67,8 +65,6 @@ class EngineInstallPlan:
 
     runtime: _EngineRuntimeBindings
     inputs: tuple[_InputOwner, ...]
-    input_layout: dict
-    persistent_names: frozenset[str]
 
     def bind_targets(self, buffer_names: frozenset[str]) -> _InstallTargets:
         canonical, by_name, owners = {}, {}, []
@@ -82,18 +78,13 @@ class EngineInstallPlan:
             if not parameters:
                 continue
             layer = _LayerInstallPlan(
-                owner.order, owner.path, owner.layer_ref, tuple(parameters)
+                owner.path, owner.layer_ref, tuple(parameters)
             )
             owners.append(layer)
             for name, _, first in parameters:
                 if name == first:
                     by_name[name] = layer
-        return _InstallTargets(
-            by_name,
-            tuple(owners),
-            buffer_names,
-            self.persistent_names & by_name.keys(),
-        )
+        return _InstallTargets(by_name, tuple(owners))
 
 
 @dataclass(frozen=True, eq=False)
@@ -109,7 +100,6 @@ class _ReplaySchedule:
             owner: max(last_writes[name] for _, _, name in owner.parameters)
             for owner in targets.owners
         }
-        links = {owner: set() for owner in last}
         owners_by_name = {
             name: owner for owner in targets.owners for name, _, _ in owner.parameters
         }
@@ -117,27 +107,12 @@ class _ReplaySchedule:
         for owner in targets.owners:
             for name, _, canonical in owner.parameters:
                 canonical_slots.setdefault(canonical, []).append(name)
-        for names in (*overlap_groups, *canonical_slots.values()):
-            owners = tuple(
-                dict.fromkeys(
-                    owners_by_name[name] for name in names if name in owners_by_name
-                )
-            )
-            for owner in owners[1:]:
-                links[owners[0]].add(owner)
-                links[owner].add(owners[0])
+        links = (
+            (owners_by_name[name] for name in names if name in owners_by_name)
+            for names in (*overlap_groups, *canonical_slots.values())
+        )
         groups, ready = {}, {}
-        remaining = set(links)
-        while remaining:
-            first = remaining.pop()
-            component, pending = {first}, [first]
-            while pending:
-                owner = pending.pop()
-                for neighbor in links[owner] - component:
-                    remaining.discard(neighbor)
-                    component.add(neighbor)
-                    pending.append(neighbor)
-            group = tuple(sorted(component, key=lambda owner: owner.order))
+        for group in _connected_groups(targets.owners, links):
             ready.setdefault(max(last[owner] for owner in group), []).append(group)
             for owner in group:
                 groups[owner] = group
@@ -148,8 +123,6 @@ class _ReplaySchedule:
 class SourceInstallPlan:
     """Captured engine writes and their client-lifetime completion schedule."""
 
-    engine: EngineInstallPlan
-    generation: int
     targets: _InstallTargets
     schedule: _ReplaySchedule
 
@@ -158,10 +131,9 @@ class SourceInstallPlan:
 class _InstallExecution:
     """Mutable progress and borrowed references owned by one weight update."""
 
-    engine: EngineInstallPlan
-    source_plan: SourceInstallPlan | None
+    aliases: _ParameterAliases
     targets: _InstallTargets
-    installed: dict = field(default_factory=dict)
+    installed: set[str] = field(default_factory=set)
     bounded: bool = False
     pending: dict = field(default_factory=dict)
     replay_started: dict = field(default_factory=dict)
@@ -169,31 +141,3 @@ class _InstallExecution:
     replay_metadata: tuple | None = None
     replay_initialized: set = field(default_factory=set)
     schedule: _ReplaySchedule | None = None
-
-    @property
-    def aliases(self):
-        return self.engine.runtime.load_aliases
-
-    @property
-    def owner_aliases(self):
-        return self.aliases.by_owner
-
-    @property
-    def by_name(self):
-        return self.targets.by_name
-
-    @property
-    def owners(self):
-        return self.targets.owners
-
-    @property
-    def replay_total(self):
-        return self.schedule.total_copies if self.schedule is not None else 0
-
-    @property
-    def replay_groups(self):
-        return self.schedule.groups
-
-    @property
-    def replay_ready(self):
-        return self.schedule.ready

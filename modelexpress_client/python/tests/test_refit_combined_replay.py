@@ -127,7 +127,8 @@ def test_failed_combined_recapture_invalidates_and_retry_rebuilds(monkeypatch):
     fail = False
     retried, _ = installer.capture(manifest)
     assert retried.generation > old.generation
-    assert installer.source_install_plan.generation == retried.generation
+    assert installer.source_install_plan is not None
+    assert installer.source_install_plan.schedule.total_copies == len(retried.copies)
     assert model.calls == 2
 
 

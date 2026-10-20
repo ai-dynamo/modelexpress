@@ -39,7 +39,6 @@ from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import refit_span
 
 from modelexpress_rl import envs as rl_envs
-from modelexpress_rl.inference.engines.vllm._capture_snapshot import _CaptureSnapshot
 from modelexpress_rl.inference.engines.vllm.surgical import (
     changed_since,
     module_groups,
@@ -56,7 +55,6 @@ from modelexpress_rl.inference.engines.vllm.install_plan import (
     _InputOwner,
     _InputSlot,
     _InstallExecution,
-    _LayerInstallPlan,
     _ReplaySchedule,
 )
 from modelexpress_rl.inference.plan import (
@@ -362,16 +360,6 @@ def _receive_destination(target: torch.Tensor, *, bounded: bool) -> torch.Tensor
     return destination
 
 
-def _copy_received(
-    target: torch.Tensor, source: torch.Tensor, *, bounded: bool = False
-) -> None:
-    """Keep receive tensors out of parameter-specific copy dispatch."""
-    destination = _receive_destination(target, bounded=bounded)
-    if type(source) is not torch.Tensor:
-        raise IncompleteRefit("weight installation requires an ordinary source tensor")
-    torch.Tensor.copy_(destination, source)
-
-
 def _reserve_runtime_buffer_slots(model: Module, layerwise_info) -> None:
     """Keep late-created kernel buffers registered while PWAL runs again."""
     for layer in model.modules():
@@ -416,7 +404,6 @@ class _VllmInstaller(EngineInstaller):
         )
         self.engine_install_plan = None
         self.source_install_plan = None
-        self._standalone_targets = None
         self._plan_generation = 0
         self._in_reload = False
         self._load_buffer_names = frozenset()
@@ -675,19 +662,13 @@ class _VllmInstaller(EngineInstaller):
         if self._capture_cache is not None:
             cached_gen_key, cached_manifest, result = self._capture_cache
             if cached_gen_key == gen_key and cached_manifest == tuple(manifest):
-                copies = (
-                    result.indices
-                    if type(result) is _CaptureSnapshot
-                    else result[0].copies
+                logger.info(
+                    "reusing cached vLLM load layout (%d copies)", len(result[0].copies)
                 )
-                logger.info("reusing cached vLLM load layout (%d copies)", len(copies))
-                if type(result) is _CaptureSnapshot:
-                    return result.clone()
                 return copy.deepcopy(result)
         self._capture_cache = None
         self.engine_install_plan = None
         self.source_install_plan = None
-        self._standalone_targets = None
         self.__dict__.pop("_reload_plan", None)
         self._load_buffer_names = frozenset()
         self._persistent_names = frozenset()
@@ -709,20 +690,7 @@ class _VllmInstaller(EngineInstaller):
 
         original_loader = self._original_loader
         model = self._model
-        runtime_slots = dict(
-            (
-                *model.named_parameters(remove_duplicate=False),
-                *model.named_buffers(remove_duplicate=False),
-            )
-        )
-        runtime_groups = overlapping_destination_groups(runtime_slots.items())
-        overlapping = {
-            name
-            for group in runtime_groups
-            if len({id(runtime_slots[name]) for name in group}) > 1
-            for name in group
-        }
-        aliases = self._reload_plan[-1]
+        aliases = self._reload_plan.load_aliases
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(model)
             try:
@@ -763,42 +731,6 @@ class _VllmInstaller(EngineInstaller):
                     for name, buffer in model.named_buffers()
                     if name in self._load_buffer_names
                 )
-                capture.owner_dependencies = tuple(
-                    tuple(dict.fromkeys(name.rpartition(".")[0] for name in group))
-                    for group in runtime_groups
-                )
-                for name, tensor in (*model.named_parameters(), *model.named_buffers()):
-                    if name not in param_layout or not tensor.is_meta:
-                        continue
-                    nbytes = (
-                        tensor.element_size()
-                        * (
-                            1
-                            + sum(
-                                (size - 1) * stride
-                                for size, stride in zip(tensor.shape, tensor.stride())
-                            )
-                        )
-                        if tensor.numel()
-                        else 0
-                    )
-                    original = runtime_slots.get(name)
-                    rebound = (
-                        name in overlapping
-                        and original is not None
-                        and (
-                            tensor.shape == original.shape
-                            and tensor.dtype == original.dtype
-                            and tensor.stride() == original.stride()
-                        )
-                    )
-                    owner = name.rpartition(".")[0]
-                    allocated, retained = capture.owner_workspaces.get(owner, (0, 0))
-                    capture.owner_workspaces[owner] = (
-                        allocated + nbytes,
-                        retained + (0 if rebound else nbytes),
-                    )
-
             finally:
                 for layer in model.modules():
                     info = LAYERWISE_INFO.get(layer)
@@ -831,34 +763,25 @@ class _VllmInstaller(EngineInstaller):
                 len(capture.copies),
             )
             self.source_install_plan = SourceInstallPlan(
-                engine,
-                self._plan_generation,
                 targets,
                 schedule,
             )
             self._capture_cache = (
                 gen_key,
                 tuple(manifest),
-                _CaptureSnapshot.create(copy.deepcopy((capture, param_layout))),
+                copy.deepcopy((capture, param_layout)),
             )
         return capture, param_layout
 
-    def install_tensors(
-        self, tensors: dict[str, torch.Tensor] | SourceReplayBatch
-    ) -> None:
-        """Install verified load-layout tensors without changing graph addresses."""
+    def install_tensors(self, tensors: SourceReplayBatch) -> None:
+        """Replay verified source writes without changing graph addresses."""
+        if not isinstance(tensors, SourceReplayBatch):
+            raise IncompleteRefit("vLLM installation requires ordered source replay")
 
         def load(aliases: _ParameterAliases) -> None:
-            plan = self._compile_install_plan(aliases)
-            if isinstance(tensors, SourceReplayBatch):
-                self._apply_source_batch(plan, tensors)
-                self._finish_source_replay(plan)
-                return
-            if tensors.keys() != plan.by_name.keys():
-                raise IncompleteRefit(
-                    "staged parameter coverage differs from the live load layout"
-                )
-            self._apply_batch(plan, tensors, kind="staged")
+            plan = self._new_install_execution()
+            self._apply_source_batch(plan, tensors)
+            self._finish_source_replay(plan)
 
         self._reload(load)
         # Synchronization is paid once per install, separately from per-layer work.
@@ -870,7 +793,7 @@ class _VllmInstaller(EngineInstaller):
 
     @torch.no_grad()
     def install_streaming(self, prepared: PreparedStreamingTensors) -> None:
-        """Copy complete groups into engine-owned storage before arena reuse."""
+        """Replay source writes into engine storage before arena reuse."""
         ownership = prepared.ownership
         if ownership.iterator is not None or ownership.release_blocked:
             raise IncompleteRefit(
@@ -896,14 +819,13 @@ class _VllmInstaller(EngineInstaller):
         def load(initial_aliases: _ParameterAliases) -> None:
             nonlocal load_s, commit_s
             load_started = time.perf_counter()
-            plan = self._compile_install_plan(initial_aliases)
+            plan = self._new_install_execution()
             plan.bounded = True
-            expected = set(plan.by_name)
+            expected = set(plan.targets.by_name)
             if expected != prepared.parameter_names:
                 raise IncompleteRefit(
                     "streaming parameter coverage differs from the live load layout"
                 )
-            installed = set()
             try:
                 ownership.iterator = iter(prepared.batches())
             except BaseException:
@@ -919,13 +841,9 @@ class _VllmInstaller(EngineInstaller):
                     raise
                 if tensors is sentinel:
                     break
-                source_replay = isinstance(tensors, SourceReplayBatch)
-                names = set() if source_replay else set(tensors)
-                if not source_replay and (
-                    not names or names - expected or names & installed
-                ):
+                if not isinstance(tensors, SourceReplayBatch):
                     raise IncompleteRefit(
-                        "invalid or repeated streaming parameter batch"
+                        "vLLM installation requires ordered source replay"
                     )
                 commit_started = time.perf_counter()
                 received_storages = {
@@ -935,21 +853,15 @@ class _VllmInstaller(EngineInstaller):
                     raise IncompleteRefit(
                         "received streaming tensor aliases live storage"
                     )
-                if source_replay:
-                    self._apply_source_batch(plan, tensors)
-                    installed.update(plan.installed)
-                else:
-                    self._apply_batch(plan, tensors, kind="streaming")
-                    installed.update(names)
+                self._apply_source_batch(plan, tensors)
                 drain()
                 commit_s += time.perf_counter() - commit_started
                 del tensors
-            if plan.replay_metadata is not None:
-                self._finish_source_replay(plan)
-            if installed != expected:
+            if plan.replay_metadata is None or plan.installed != expected:
                 raise IncompleteRefit(
                     "streaming transfer ended before every parameter was installed"
                 )
+            self._finish_source_replay(plan)
             load_s = time.perf_counter() - load_started
 
         reload_started = time.perf_counter()
@@ -1172,8 +1084,8 @@ class _VllmInstaller(EngineInstaller):
     def _ensure_engine_install_plan(self):
         if self.engine_install_plan is not None:
             return self.engine_install_plan
-        inputs, layout, persistent = [], {}, set()
-        for order, (path, layer) in enumerate(self._model.named_modules()):
+        inputs = []
+        for path, layer in self._model.named_modules():
             slots = []
             for is_buffer, values in (
                 (False, layer._parameters),
@@ -1184,30 +1096,23 @@ class _VllmInstaller(EngineInstaller):
                         continue
                     name = f"{path}.{leaf}" if path else leaf
                     slots.append(_InputSlot(name, leaf, id(tensor), is_buffer))
-                    layout[name] = (tuple(tensor.shape), tensor.dtype)
-                    if not tensor.is_meta:
-                        persistent.add(name)
-            inputs.append(_InputOwner(order, path, ref(layer), tuple(slots)))
+            inputs.append(_InputOwner(path, ref(layer), tuple(slots)))
         self.engine_install_plan = EngineInstallPlan(
-            _EngineRuntimeBindings(*self._reload_plan),
+            self._reload_plan,
             tuple(inputs),
-            layout,
-            frozenset(persistent),
         )
         return self.engine_install_plan
 
     def _new_install_execution(self):
         engine = self._ensure_engine_install_plan()
         source = self.source_install_plan
-        if source is not None:
-            targets = source.targets
-        else:
-            if self._standalone_targets is None:
-                self._standalone_targets = engine.bind_targets(self._load_buffer_names)
-            targets = self._standalone_targets
+        targets = (
+            source.targets
+            if source is not None
+            else engine.bind_targets(self._load_buffer_names)
+        )
         return _InstallExecution(
-            engine,
-            source,
+            engine.runtime.load_aliases,
             targets,
             pending={
                 name: ref(getattr(entry.layer, leaf))
@@ -1217,16 +1122,7 @@ class _VllmInstaller(EngineInstaller):
             schedule=source.schedule if source is not None else None,
         )
 
-    def _compile_install_plan(self, aliases: _ParameterAliases) -> _InstallExecution:
-        return self._new_install_execution()
-
-    def _validate_layer_inputs(
-        self,
-        plan: _LayerInstallPlan,
-        tensors: Mapping[str, torch.Tensor],
-        installed: Mapping[str, torch.Tensor],
-        kind: str,
-    ) -> None:
+    def _validate_source_owner(self, plan) -> None:
         layer = plan.layer
         if self._model.get_submodule(plan.path) is not layer:
             raise IncompleteRefit(
@@ -1247,48 +1143,10 @@ class _VllmInstaller(EngineInstaller):
         missing = sorted(current - required)
         if required - current:
             raise IncompleteRefit("installed canonical parameter disappeared")
-        for name, leaf, canonical in plan.parameters:
-            if canonical not in tensors and not (
-                canonical != name and installed.get(canonical) is getattr(layer, leaf)
-            ):
-                missing.append(canonical)
         if missing:
             raise IncompleteRefit(
-                f"{kind} batch splits an owning module {plan.path!r}; "
-                f"missing canonical parameters={sorted(missing)}"
+                f"source replay owner {plan.path!r} gained unplanned parameters={missing}"
             )
-
-    @torch.no_grad()
-    def _apply_batch(
-        self,
-        plan: _InstallExecution,
-        tensors: Mapping[str, torch.Tensor],
-        *,
-        kind: str,
-    ) -> None:
-        """Replay complete layers from staged tensors or a bounded receive arena."""
-        layers = sorted(
-            {plan.by_name[name] for name in tensors}, key=lambda layer: layer.order
-        )
-        # Reject incomplete groups before any of this batch's copies run.
-        for layer_plan in layers:
-            self._validate_layer_inputs(layer_plan, tensors, plan.installed, kind)
-        for layer_plan in layers:
-            self._validate_layer_inputs(layer_plan, tensors, plan.installed, kind)
-            for name, leaf, canonical in layer_plan.parameters:
-                current = getattr(layer_plan.layer, leaf)
-                if current is not plan.pending[
-                    name
-                ]() and current is not plan.installed.get(canonical):
-                    raise IncompleteRefit(
-                        f"pending parameter slot {name!r} was replaced before its copy"
-                    )
-            self._replay_layer(layer_plan, plan, tensors)
-            for name, leaf, canonical in layer_plan.parameters:
-                if name in tensors:
-                    current = getattr(layer_plan.layer, leaf, None)
-                    if current is not None:
-                        plan.installed[canonical] = current
 
     @torch.no_grad()
     def _apply_source_batch(
@@ -1306,7 +1164,7 @@ class _VllmInstaller(EngineInstaller):
                 "source replay batch belongs to a different complete plan"
             )
         if plan.replay_metadata is None:
-            if batch.parameter_names != plan.by_name.keys():
+            if batch.parameter_names != plan.targets.by_name.keys():
                 raise IncompleteRefit(
                     "source replay coverage differs from the live load layout"
                 )
@@ -1320,19 +1178,19 @@ class _VllmInstaller(EngineInstaller):
             if batch.last_writes != plan.schedule.last_writes:
                 raise IncompleteRefit("source replay completion schedule differs")
             plan.replay_metadata = (batch.parameter_names, batch.last_writes)
-        if batch.total_copies != plan.replay_total or not batch.writes:
+        if batch.total_copies != plan.schedule.total_copies or not batch.writes:
             raise IncompleteRefit("incompatible or empty source replay batch")
         for index, recorded, source in batch.writes:
-            if index != plan.replay_next or index >= plan.replay_total:
+            if index != plan.replay_next or index >= plan.schedule.total_copies:
                 raise IncompleteRefit("source replay is not in recorded order")
-            owner = plan.by_name[recorded.param_name]
+            owner = plan.targets.by_name[recorded.param_name]
             if owner not in plan.replay_started:
-                for pending_owner in plan.replay_groups[owner]:
+                for pending_owner in plan.schedule.groups[owner]:
                     if pending_owner not in plan.replay_started:
-                        self._begin_source_owner(pending_owner, plan, batch.last_writes)
+                        self._begin_source_owner(pending_owner, plan)
             self._copy_source_write(owner, plan, recorded, source)
             plan.replay_next += 1
-            for ready in plan.replay_ready.get(index, ()):
+            for ready in plan.schedule.ready.get(index, ()):
                 self._finish_source_group(ready, plan)
 
     def _isolate_native_tied_inputs(self, owners, plan):
@@ -1374,21 +1232,19 @@ class _VllmInstaller(EngineInstaller):
     def _finish_source_group(self, owners, plan):
         self._isolate_native_tied_inputs(owners, plan)
         for owner in owners:
-            self._process_source_owner(owner, plan.replay_started[owner][0])
+            self._process_owner(owner, plan.replay_started[owner][0])
         for owner in owners:
-            self._restore_source_owner(owner, plan.replay_started[owner][0])
+            self._restore_owner(owner, plan.replay_started[owner][0])
         for owner in owners:
             aliases = (
                 plan.aliases
-                if plan.owner_aliases is None
-                else plan.owner_aliases.get(owner.layer)
+                if plan.aliases.by_owner is None
+                else plan.aliases.by_owner.get(owner.layer)
             )
             if aliases is not None:
                 self._restore_parameter_aliases(aliases)
             plan.replay_started.pop(owner)
-            for _, leaf, canonical in owner.parameters:
-                # Native quantization can rename a completed load-time slot.
-                plan.installed[canonical] = getattr(owner.layer, leaf, None)
+            plan.installed.update(canonical for _, _, canonical in owner.parameters)
 
     def _copy_source_write(self, owner, plan, recorded, source):
         from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
@@ -1401,36 +1257,28 @@ class _VllmInstaller(EngineInstaller):
             raise IncompleteRefit(
                 f"pending parameter slot {recorded.param_name!r} was replaced"
             )
-        if target.is_meta or target.dtype != recorded.dest_dtype:
+        destination = _receive_destination(target, bounded=plan.bounded)
+        if target.dtype != recorded.dest_dtype:
             raise IncompleteRefit("recorded destination has no compatible live storage")
-        offset = (
-            recorded.dest_offset
-            if recorded.owner_offset is None
-            else recorded.owner_offset
-        )
-        stride = (
-            recorded.dest_stride
-            if recorded.owner_stride is None
-            else recorded.owner_stride
-        )
-        destination = _receive_destination(target, bounded=plan.bounded).as_strided(
-            recorded.dest_shape, stride, target.storage_offset() + offset
+        destination = destination.as_strided(
+            recorded.dest_shape, recorded.dest_stride,
+            target.storage_offset() + recorded.dest_offset,
         )
         value = _replay_ops(source, recorded.op_chain)
         if tuple(value.shape) != tuple(recorded.dest_shape):
             raise IncompleteRefit("recorded source shape differs from its destination")
-        _copy_received(destination, value, bounded=plan.bounded)
+        if type(value) is not torch.Tensor:
+            raise IncompleteRefit("weight installation requires an ordinary source tensor")
+        torch.Tensor.copy_(destination, value)
 
-    def _begin_source_owner(self, owner, plan, names):
+    def _begin_source_owner(self, owner, plan):
         from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
         from vllm.model_executor.model_loader.reload.meta import materialize_layer
 
-        self._validate_layer_inputs(owner, names, plan.installed, "source replay")
+        self._validate_source_owner(owner)
         layer = owner.layer
-        for name, leaf, canonical in owner.parameters:
-            if getattr(layer, leaf) is not plan.pending[name]() and getattr(
-                layer, leaf
-            ) is not plan.installed.get(canonical):
+        for name, leaf, _ in owner.parameters:
+            if getattr(layer, leaf) is not plan.pending[name]():
                 raise IncompleteRefit(
                     f"pending parameter slot {name!r} was replaced before its copy"
                 )
@@ -1445,12 +1293,12 @@ class _VllmInstaller(EngineInstaller):
             materialize_layer(layer, info)
             aliases = (
                 plan.aliases
-                if plan.owner_aliases is None
-                else plan.owner_aliases.get(layer)
+                if plan.aliases.by_owner is None
+                else plan.aliases.by_owner.get(layer)
             )
             if aliases is not None:
                 self._restore_parameter_aliases(aliases)
-                for tied_owner in plan.replay_groups[owner]:
+                for tied_owner in plan.schedule.groups[owner]:
                     for name, leaf, _ in tied_owner.parameters:
                         if any(
                             tied_owner.layer is module and leaf == slot
@@ -1482,7 +1330,7 @@ class _VllmInstaller(EngineInstaller):
                 plan.replay_initialized.add(canonical)
         plan.replay_started[owner] = (persistent, targets)
 
-    def _process_source_owner(self, owner, persistent):
+    def _process_owner(self, owner, persistent):
         if persistent:
             return
         from vllm.model_executor.layers.quantization.base_config import (
@@ -1500,7 +1348,7 @@ class _VllmInstaller(EngineInstaller):
                 update_tp()
 
     @staticmethod
-    def _restore_source_owner(owner, persistent):
+    def _restore_owner(owner, persistent):
         if persistent:
             return
         from vllm.model_executor.layers.attention import is_deferred_attention_layer
@@ -1518,92 +1366,10 @@ class _VllmInstaller(EngineInstaller):
 
     @staticmethod
     def _finish_source_replay(plan):
-        if plan.replay_next != plan.replay_total or plan.replay_started:
+        if plan.replay_next != plan.schedule.total_copies or plan.replay_started:
             raise IncompleteRefit(
                 "source replay ended before every recorded write was installed"
             )
-
-    def _replay_layer(
-        self,
-        layer_plan: _LayerInstallPlan,
-        plan: _InstallExecution,
-        tensors: Mapping[str, torch.Tensor],
-    ) -> None:
-        from vllm.model_executor.layers.attention import is_deferred_attention_layer
-        from vllm.model_executor.layers.quantization.base_config import (
-            QuantizeMethodBase,
-        )
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            LAYERWISE_INFO,
-            _copy_and_restore_kernel_tensors,
-        )
-        from vllm.model_executor.model_loader.reload.meta import materialize_layer
-
-        layer = layer_plan.layer
-        info = LAYERWISE_INFO.get(layer)
-        managed = info is not None and info.kernel_tensors is not None
-        if getattr(info, "loaded_weights", ()):
-            raise IncompleteRefit("engine reload has pending checkpoint-loader calls")
-        aliases = (
-            plan.aliases if plan.owner_aliases is None else plan.owner_aliases.get(layer)
-        )
-        persistent_only = managed and all(
-            name in self._persistent_names and not getattr(layer, leaf).is_meta
-            for name, leaf, _ in layer_plan.parameters
-            if name in tensors
-        )
-        if info is not None and not persistent_only:
-            with refit_span(
-                "installation",
-                duration_key="materialization_s",
-                accumulate_metadata=True,
-            ):
-                materialize_layer(layer, info)
-            if aliases is not None:
-                self._restore_parameter_aliases(aliases)
-        with refit_span(
-            "installation",
-            duration_key="receive_copy_s",
-            accumulate_metadata=True,
-        ):
-            for name, leaf, _canonical in layer_plan.parameters:
-                if name not in tensors:
-                    continue
-                target, source = getattr(layer, leaf), tensors[name]
-                if (
-                    target.is_meta
-                    or target.shape != source.shape
-                    or target.dtype != source.dtype
-                ):
-                    raise IncompleteRefit(
-                        "received parameter has no compatible live storage"
-                    )
-                _copy_received(target, source, bounded=plan.bounded)
-
-        if persistent_only:
-            return
-
-        # Process the already-filled layer directly: no deferred loader
-        # arguments or replay through vLLM's buffered checkpoint-loader shim.
-        if hasattr(layer, "_already_called_process_weights_after_loading"):
-            delattr(layer, "_already_called_process_weights_after_loading")
-        quant_method = getattr(layer, "quant_method", None)
-        with refit_span(
-            "installation",
-            duration_key="post_load_processing_s",
-            accumulate_metadata=True,
-        ):
-            if isinstance(quant_method, QuantizeMethodBase):
-                quant_method.process_weights_after_loading(layer)
-                update_tp = getattr(layer, "update_param_tp_status", None)
-                if update_tp is not None:
-                    update_tp()
-            if managed:
-                _copy_and_restore_kernel_tensors(layer, info)
-            if info is not None and not is_deferred_attention_layer(layer):
-                info.reset()
-        if aliases is not None:
-            self._restore_parameter_aliases(aliases)
 
     @cached_property
     def _reload_plan(self):
@@ -1660,7 +1426,7 @@ class _VllmInstaller(EngineInstaller):
         aliases = self._parameter_aliases(self._model)
         load_aliases = self._load_time_parameter_aliases(aliases, LAYERWISE_INFO)
 
-        return (
+        return _EngineRuntimeBindings(
             owners,
             runtime_layouts,
             bare_tensors,
@@ -1709,7 +1475,7 @@ class _VllmInstaller(EngineInstaller):
         runtime = (
             self.engine_install_plan.runtime
             if self.engine_install_plan is not None
-            else _EngineRuntimeBindings(*self._reload_plan)
+            else self._reload_plan
         )
         owners = runtime.modules
         runtime_layouts = runtime.layouts

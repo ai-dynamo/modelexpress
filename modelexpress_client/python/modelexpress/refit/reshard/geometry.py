@@ -44,6 +44,7 @@ import torch
 
 from modelexpress.refit.reshard.types import (
     CaptureResult,
+    _connected_groups,
     OpChain,
     OpSpec,
     RecordedCopy,
@@ -125,61 +126,6 @@ def _snapshot_index(index):
 def _freeze_kwargs(kwargs: dict[str, Any]) -> tuple:
     return tuple((name, tuple(value) if isinstance(value, list) else value)
                  for name, value in sorted(kwargs.items()))
-
-
-def _canonical_destination(tensor, owner):
-    """Express a physical destination view in contiguous owner coordinates."""
-    from modelexpress.refit.reshard.slice_plan import _row_major_strides
-
-    offset = tensor.storage_offset() - owner.storage_offset()
-    span = 1
-    dimensions = sorted(
-        (stride, size, axis)
-        for axis, (size, stride) in enumerate(zip(owner.shape, owner.stride()))
-        if size > 1
-    )
-    for stride, size, _ in dimensions:
-        if stride < span:
-            raise UnsupportedReshard("overlapping destination layout is unsupported")
-        span += (size - 1) * stride
-    extent = sum(
-        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
-    )
-    if offset < 0 or (tensor.numel() and offset + extent >= span):
-        raise UnsupportedReshard("destination view exceeds registered owner bounds")
-    if owner.is_contiguous():
-        return offset, tuple(tensor.stride())
-
-    coordinates = [0] * owner.ndim
-    remainder = offset
-    for stride, size, axis in reversed(dimensions):
-        coordinates[axis], remainder = divmod(remainder, stride)
-        if coordinates[axis] >= size:
-            raise UnsupportedReshard("destination view exceeds registered owner bounds")
-    if remainder:
-        raise UnsupportedReshard("destination view addresses holes in owner storage")
-    canonical = _row_major_strides(owner.shape)
-    normalized = []
-    limits = list(coordinates)
-    for size, stride in zip(tensor.shape, tensor.stride()):
-        if size <= 1:
-            normalized.append(1)
-            continue
-        candidates = [
-            (axis, stride // step)
-            for step, owner_size, axis in reversed(dimensions)
-            if stride > 0
-            and stride % step == 0
-            and limits[axis] + (size - 1) * (stride // step) < owner_size
-        ]
-        if len(candidates) != 1:
-            raise UnsupportedReshard(
-                "destination view cannot map to canonical owner coordinates"
-            )
-        axis, step = candidates[0]
-        limits[axis] += (size - 1) * step
-        normalized.append(canonical[axis] * step)
-    return sum(a * b for a, b in zip(coordinates, canonical)), tuple(normalized)
 
 
 def _validate_physical_destination(shape, stride, offset, owner_shape, owner_stride):
@@ -283,16 +229,11 @@ def _strided_spans(shape, strides, start, element_size=1):
     yield from runs(0, start)
 
 
-def _destination_spans(tensor, start):
-    """Yield ordered physical byte runs, retaining holes in strided owners."""
-    yield from _strided_spans(
-        tensor.shape, tensor.stride(), start, tensor.element_size()
-    )
-
-
 def _owners_overlap(left, right):
-    left_runs = _destination_spans(left[2], left[0])
-    right_runs = _destination_spans(right[2], right[0])
+    left_runs, right_runs = (
+        _strided_spans(tensor.shape, tensor.stride(), start, tensor.element_size())
+        for start, _, tensor, _ in (left, right)
+    )
     a, b = next(left_runs, None), next(right_runs, None)
     while a is not None and b is not None:
         if a[0] < b[1] and b[0] < a[1]:
@@ -304,15 +245,15 @@ def _owners_overlap(left, right):
     return False
 
 
-def _overlapping_owners(destinations):
+def _destination_overlap_pairs(destinations):
     groups = {}
     for name, tensor in destinations:
         if not tensor.numel():
             continue
         storage = tensor.untyped_storage()
-        key = (tensor.device, storage._cdata if tensor.device.type == "meta" else None)
+        key = (tensor.device, storage._cdata if tensor.is_meta else None)
         start = tensor.storage_offset() * tensor.element_size()
-        if tensor.device.type != "meta":
+        if not tensor.is_meta:
             start += storage.data_ptr()
         end = start + tensor.element_size() * (
             1
@@ -322,55 +263,37 @@ def _overlapping_owners(destinations):
             )
         )
         groups.setdefault(key, []).append((start, end, tensor, name))
-    overlaps = {}
     for group in groups.values():
         active = []
         for current in sorted(group, key=lambda entry: entry[0]):
             active = [entry for entry in active if entry[1] > current[0]]
             for previous in active:
-                if previous[2] is not current[2] and _owners_overlap(previous, current):
-                    overlaps[current[3]] = previous[3]
-                    overlaps[previous[3]] = current[3]
+                if _owners_overlap(previous, current):
+                    yield previous, current
             active.append(current)
-    return overlaps
+
+
+def _overlapping_owners(destinations):
+    return {
+        entry[3]
+        for left, right in _destination_overlap_pairs(destinations)
+        if left[2] is not right[2]
+        for entry in (left, right)
+    }
 
 
 def overlapping_destination_groups(destinations):
     """Connected physical overlap components, excluding disjoint shared slabs."""
-    by_device = {}
-    parent = {}
-
-    def root(name):
-        while parent[name] != name:
-            parent[name] = parent[parent[name]]
-            name = parent[name]
-        return name
-
-    for name, tensor in destinations:
-        if tensor.is_meta or not tensor.numel():
-            continue
-        parent[name] = name
-        start = tensor.data_ptr()
-        end = start + tensor.element_size() * (
-            1
-            + sum(
-                (size - 1) * stride
-                for size, stride in zip(tensor.shape, tensor.stride())
-            )
-        )
-        by_device.setdefault(tensor.device, []).append((start, end, tensor, name))
-    for entries in by_device.values():
-        active = []
-        for current in sorted(entries, key=lambda entry: entry[0]):
-            active = [entry for entry in active if entry[1] > current[0]]
-            for previous in active:
-                if _owners_overlap(previous, current):
-                    parent[root(current[3])] = root(previous[3])
-            active.append(current)
-    groups = {}
-    for name in parent:
-        groups.setdefault(root(name), []).append(name)
-    return tuple(tuple(names) for names in groups.values() if len(names) > 1)
+    destinations = tuple(
+        (name, tensor) for name, tensor in destinations if not tensor.is_meta
+    )
+    links = (
+        (left[3], right[3]) for left, right in _destination_overlap_pairs(destinations)
+    )
+    return tuple(
+        group for group in _connected_groups((name for name, _ in destinations), links)
+        if len(group) > 1
+    )
 
 
 @dataclass
@@ -381,7 +304,7 @@ class _BakeRecorder:
     # attribute the write.
     current: Any = None
     destinations: list = field(default_factory=list)
-    overlapping_owners: dict = field(default_factory=dict)
+    overlapping_owners: set = field(default_factory=set)
     weights: list = field(default_factory=list)
     source_replay: bool = False
 
@@ -392,24 +315,15 @@ class _BakeRecorder:
             )
         physical_offset = tensor.storage_offset() - owner.storage_offset()
         physical_stride = tuple(tensor.stride())
-        if self.source_replay:
-            _validate_physical_destination(
-                tuple(tensor.shape),
-                physical_stride,
-                physical_offset,
-                tuple(owner.shape),
-                tuple(owner.stride()),
+        if not self.source_replay and not owner.is_contiguous():
+            raise UnsupportedReshard(
+                "noncontiguous destinations require ordered source replay"
             )
-            offset, stride = physical_offset, physical_stride
-        else:
-            offset, stride = _canonical_destination(tensor, owner)
-        return (
-            name,
-            offset,
-            stride,
-            physical_offset,
-            physical_stride,
+        _validate_physical_destination(
+            tuple(tensor.shape), physical_stride, physical_offset,
+            tuple(owner.shape), tuple(owner.stride()),
         )
+        return name, physical_offset, physical_stride
 
     def resolve(self, tensor):
         for name, destination in self.destinations:
@@ -433,9 +347,6 @@ class _BakeRecorder:
             except UnsupportedReshard:
                 continue
         if len(matches) == 1:
-            name = matches[0][0]
-            if name in self.overlapping_owners:
-                return self.destination(name, tensor, dict(candidates)[name])
             return matches[0]
         if candidates:
             raise UnsupportedReshard(
@@ -552,8 +463,6 @@ class LazyWeight(torch.Tensor):
                             dest_shape=tuple(dest.shape),
                             dest_stride=destination[2],
                             dest_dtype=dest.dtype,
-                            owner_offset=destination[3],
-                            owner_stride=destination[4],
                         )
                     )
                 elif rec is not None:
