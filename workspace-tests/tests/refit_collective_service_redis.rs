@@ -520,8 +520,9 @@ async fn admission_bootstrap_epoch_and_transfer_fences_hold() {
     let recreated = create_transfer(&mut collective, &group_spec, "version-1", &idem).await;
     assert_ne!(recreated.operation_id, transfer.operation_id);
 
-    let failed_idem = unique_id("failed-operation");
-    let failed = create_transfer(&mut collective, &group_spec, "version-3", &failed_idem).await;
+    // Only one transfer may be in flight per group epoch, so fail the
+    // recreated operation instead of opening a second one beside it.
+    let failed = recreated;
     let failed = collective
         .report_collective_transfer(ReportCollectiveTransferRequest {
             operation_id: failed.operation_id,
