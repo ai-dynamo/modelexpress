@@ -295,6 +295,7 @@ def _accelerator_matches(
 
 
 def _close_lease(tensor_read: Any) -> str | None:
+    """Release a lease and close its channel; returns the error, if any."""
     try:
         tensor_read.close()
     except Exception as exc:  # noqa: BLE001 - reported to the caller
@@ -366,6 +367,7 @@ class PrestageReceiver:
         listen_port: int = 0,
         accelerator_backend: Any = None,
     ):
+        """Create the manager; nothing touches NIXL until ``initialize()``."""
         self.device_id = int(device_id)
         self.manager = NixlTransferManager(
             agent_name,
@@ -379,6 +381,7 @@ class PrestageReceiver:
         self._cleanup_errors: list[str] = []
 
     def initialize(self) -> None:
+        """Create the NIXL agent and its listener on ``device_id``."""
         t0 = time.perf_counter()
         self.manager.initialize()
         self.timings["agent_s"] = round(time.perf_counter() - t0, 4)
@@ -471,9 +474,15 @@ class PrestageReceiver:
         return list(self._cleanup_errors)
 
     def __enter__(self) -> PrestageReceiver:
+        """Return the receiver; ``close()`` runs on exit."""
         return self
 
     def __exit__(self, *exc: Any) -> None:
+        """Close the receiver and log the cleanup errors.
+
+        A caller that hands the memory over should call ``close()`` itself
+        and check its result instead.
+        """
         errors = self.close()
         if errors:
             logger.warning("PrestageReceiver cleanup errors: %s", errors)
@@ -484,6 +493,7 @@ def _raw_u8(ptr: int, nbytes: int, device: str) -> torch.Tensor:
 
     class _CudaArray:
         def __init__(self, p: int, n: int):
+            """Describe ``n`` bytes at device address ``p`` (CUDA Array Interface v3)."""
             self.__cuda_array_interface__ = {
                 "shape": (int(n),),
                 "typestr": "|u1",

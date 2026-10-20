@@ -95,6 +95,7 @@ class FakeClient:
 
 
 def _instance(worker_id, rank, accelerator="cuda", zone=None):
+    """A READY source as ListSources reports it."""
     inst = p2p_pb2.SourceInstanceRef(
         mx_source_id="src", worker_id=worker_id, worker_rank=rank, accelerator=accelerator
     )
@@ -104,6 +105,7 @@ def _instance(worker_id, rank, accelerator="cuda", zone=None):
 
 
 def _worker(agent="agent", grpc="10.0.0.1:6000", md="10.0.0.1:5000", accelerator="cuda"):
+    """The WorkerMetadata fields GetMetadata answers with."""
     return SimpleNamespace(
         agent_name=agent,
         worker_grpc_endpoint=grpc,
@@ -113,6 +115,7 @@ def _worker(agent="agent", grpc="10.0.0.1:6000", md="10.0.0.1:5000", accelerator
 
 
 def _manifest_response(worker_id, rank, accelerator="cuda", agent=None):
+    """A one-tensor manifest as the serving process fills it."""
     response = p2p_pb2.GetTensorManifestResponse(
         tensors=[
             p2p_pb2.TensorDescriptor(
@@ -203,6 +206,7 @@ def manifest(monkeypatch):
 
 
 def _client(manifest, instances, workers):
+    """A client for ``instances``; their ranks also go into the leased manifests."""
     for inst in instances:
         manifest.ranks.setdefault(inst.worker_id, inst.worker_rank)
     return FakeClient(instances, workers)
@@ -492,6 +496,7 @@ class TestReadPlan:
 
 
 def _receiver(agent, accelerator):
+    """A receiver whose manager runs on ``agent`` instead of a NIXL agent."""
     rcv = prestage.PrestageReceiver("helper", device_id=0, accelerator_backend=accelerator)
     rcv.manager._agent = agent
     rcv.manager._metadata = b"md"
@@ -596,6 +601,7 @@ class TestReceiver:
 
 
 def _manager():
+    """A real manager over a mock agent that returns a new handle per registration."""
     mgr = NixlTransferManager(agent_name="m", device_id=0)
     mgr._agent = MagicMock()
     mgr._agent.get_agent_metadata.return_value = b"metadata"

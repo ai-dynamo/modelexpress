@@ -1538,6 +1538,7 @@ class NixlTransferManager:
         return self._data_plane_error
 
     def _check_no_pending_deregistration(self) -> None:
+        """Refuse while a ``deregister_all()`` left registrations behind."""
         if self._deregistration_pending:
             raise RuntimeError(
                 "deregister_all() left registrations behind; call it again "
