@@ -5,16 +5,26 @@ name: ModelExpress Inference GPU CI
 
 on:
   workflow_call:
+    inputs:
+      runs_on:
+        description: Runner for control jobs; GPU jobs retain their dedicated runners.
+        type: string
+        default: ''
 
 env:
   MX_CI_MODEL: Qwen/Qwen2.5-0.5B
   VCLUSTER_NAME: mx-ci-cluster
   VCLUSTER_NAMESPACE: mx-ci
   MX_IMAGE_REPO: nvcr.io/0980761089281446
+  GIT_CONFIG_COUNT: "2"
+  GIT_CONFIG_KEY_0: http.lowSpeedLimit
+  GIT_CONFIG_VALUE_0: "1"
+  GIT_CONFIG_KEY_1: http.lowSpeedTime
+  GIT_CONFIG_VALUE_1: "60"
 
 jobs:
   admission-slots:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
     outputs:
       slots: ${{ steps.slots.outputs.slots }}
       count: ${{ steps.slots.outputs.count }}
@@ -35,7 +45,7 @@ jobs:
           if not 1 <= a100b_count <= 4:
               raise SystemExit("MX_CI_A100B_CONCURRENCY must be between 1 and 4")
           a100b_count = min(count, a100b_count)
-          seed = int(os.environ["GITHUB_REF"].rsplit("/", 1)[1])
+          seed = int(os.environ["GITHUB_RUN_ID"] if os.environ["GITHUB_EVENT_NAME"] in {"schedule", "workflow_dispatch"} else os.environ["GITHUB_REF"].rsplit("/", 1)[1])
           print(f"count={count}")
           print("slots=" + json.dumps([(seed + i) % count for i in range(16)]))
           print(f"a100b_count={a100b_count}")
@@ -243,6 +253,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
 
   test-p2p-mla-model:
@@ -331,6 +342,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
 
   test-tp:
@@ -417,6 +429,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
 
   test-parallel:
@@ -516,6 +529,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
 
   test-with-dynamo:
@@ -598,6 +612,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # Ten-step TP2 trainer + TP1 Dynamo rollout smoke on three H100s.
 
@@ -663,6 +678,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
 
   test-rolling-update:
@@ -743,6 +759,7 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
 
   test-stale-metadata:
@@ -821,3 +838,4 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+          rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"

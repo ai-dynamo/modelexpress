@@ -88,6 +88,9 @@ of the existing Vime/Dynamo E2E smoke and does not enforce performance threshold
 both to succeed. Each child checks all of its test and cleanup results.
 Inference owns image builds, ModelStreamer, and the reusable GPU test workflow.
 RL owns Vime and generator-only refit, including their builds and cleanup.
+One RL `GPU cleanup` fallback job handles both workloads after both tests finish;
+each cleanup path runs only when its test needs it, and Vime cleanup still runs
+if refit cleanup fails. Normal inline cleanup remains in each test job.
 `modelexpress-rl-refit-gpu-ci.yml` and `modelexpress-rl-vime-gpu-ci.yml`
 contain one GPU job each, avoiding skipped jobs for the other suite. Per-PR caller groups
 cancel superseded tests while repository-wide child groups retain GPU slots.
@@ -99,15 +102,28 @@ The RL validation job also handles `/bench` authorization with the existing
 writer and approved-mirror checks; comment runs execute only the selected refit profile.
 Ordinary comments do not start RL builds, GPU tests, or Vime jobs.
 
+`nightly-ci.yml` reuses the core, inference and RL workflows on upstream `main`.
+Scheduled and manual runs authorize only their exact event SHA and use the run ID
+for GPU slot selection. Their caller concurrency groups are run-specific, while
+the GPU capacity queues remain shared with PR tests. The nightly status gate
+requires all selected test suites and accepts skipping them only when
+`run_tests=false`. RL evidence uploads are disabled for nightly calls.
+
 ## CI build caches
 
 Image builds import and export registry caches in their existing NVCR image
-repositories. Cache tags are scoped to the PR or branch and image, with separate
-Vime trainer and worker caches. `mode=max` preserves intermediate build layers;
+repositories. Each image exports one `buildcache-shared` tag so a new approved PR
+can reuse matching layers from other PRs. Builds import only that shared cache.
+Concurrent exports replace the shared cache;
+BuildKit still checks input keys before reusing a layer. Vime trainer and worker
+build concurrently on the same runner with separate caches, and both must succeed.
+`mode=max` preserves intermediate build layers;
 cache export failure does not fail an otherwise successful build. The pinned
 Dynamo sidecar builds before copying ModelExpress sources so ModelExpress-only
-edits can reuse that compile layer. The first build for a cache scope is cold;
-subsequent builds can reuse matching layers without changing GPU allocations.
+edits can reuse that compile layer. The first shared-cache build is cold;
+subsequent PRs can reuse matching layers without changing GPU allocations.
+Inference GPU checkouts abort transfers stalled below one byte per second for
+60 seconds, allowing the checkout action's existing fetch retries to recover.
 
 ## vCluster connectivity recovery
 
@@ -150,6 +166,11 @@ do not exceed operating-system command argument limits.
 
 P2P sources and targets, the fleet seed, and every fleet scale wave wait for all
 controller-desired pods to be scheduled before starting their startup deadline.
+P2P jobs allow one replacement when kubelet admission fails because the assigned
+node has no healthy `rdma/ib` device, during scheduling or startup. Kubernetes
+owns the retry; failed attempts remain available for diagnostics and are excluded
+from active-pod selection. A second occurrence exhausts the job retry;
+other admission failures, crashes, and OOMs still fail immediately.
 Scheduling and startup each retain the configured readiness budget; each GPU
 test job also has a two-hour limit. Both MLA framework variants use 900 seconds
 per scheduling/startup phase instead of 3,600 seconds. Source/target topology, fleet size, metadata,
@@ -168,7 +189,9 @@ waits for the corresponding host pods to disappear. API errors cannot masquerade
 as successful cleanup. Cleanup preserves namespace/metadata finalizers and reports
 stalled finalization. The parent `GPU test cleanup` job independently reconnects
 after the test workflow finishes or is cancelled, retries remaining namespaces
-owned by the attempt, and checks surviving host pods. The umbrella status check
+owned by the attempt, and checks surviving host pods. Fallback cleanup is skipped
+when tests succeeded or were skipped before starting; failed or cancelled tests
+retain it. The umbrella status check
 requires cleanup success. Legacy namespaces without ownership labels are not
 automatically deleted.
 

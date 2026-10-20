@@ -17,6 +17,8 @@ from modelexpress_rl.inference.plan import (
     EngineInstaller,
     MethodCapabilities,
     PreparedEngineTensors,
+    PreparedStreamingTensors,
+    StreamingSettings,
     UpdateMethod,
 )
 from modelexpress_rl.inference.receiver import ObjectStorageGeneratorConfig
@@ -89,6 +91,7 @@ def _full_tensor_engine(
         model_name="test/model",
         installer=_Installer(),
         full_tensor=FullTensorEngineCapability(
+            generator_fingerprint=lambda: (),
             device_id=2,
             device="cuda:2",
             worker_rank=3,
@@ -292,6 +295,51 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
     runtime.close()
 
 
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("supports_streaming", [False, True])
+@pytest.mark.parametrize("source_kind", [WeightSource.TRAINER, WeightSource.GENERATOR])
+def test_runtime_validates_streaming_support_before_allocating_transfers(
+    monkeypatch, bounded, supports_streaming, source_kind
+) -> None:
+    artifacts = {PreparedEngineTensors}
+    if supports_streaming:
+        artifacts.add(PreparedStreamingTensors)
+    installer = Mock(capabilities=EngineCapabilities(frozenset(artifacts)))
+    engine = _full_tensor_engine()
+    monkeypatch.setattr(
+        engines_module,
+        "_create_engine_runtime",
+        lambda _context: EngineRuntime(
+            model_name=engine.model_name,
+            installer=installer,
+            full_tensor=engine.full_tensor,
+        ),
+    )
+    create_transfer = Mock(return_value=Mock())
+    monkeypatch.setattr(runtime_module, "_NixlStagedTransfer", create_transfer)
+    monkeypatch.setattr(runtime_module, "MxClient", _P2P)
+    kwargs = dict(
+        engine_context=GeneratorEngineContext(),
+        worker_id="generator-3",
+        server_url="mx:8000",
+        object_storage=None,
+        source_order=(source_kind,),
+        max_transfer_attempts=3,
+        rpc_timeout_seconds=30,
+        service=lambda: pytest.fail("initialization must not perform source discovery"),
+        start_lease=lambda _version_id: pytest.fail("initialization must not acquire leases"),
+        streaming=StreamingSettings(512) if bounded else None,
+    )
+    if bounded and source_kind is WeightSource.TRAINER and not supports_streaming:
+        with pytest.raises(ValueError, match="does not support bounded streaming"):
+            initialize_generator_runtime(**kwargs)
+        create_transfer.assert_not_called()
+    else:
+        runtime = initialize_generator_runtime(**kwargs)
+        runtime.close()
+        create_transfer.return_value.close.assert_called_once_with()
+
+
 def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
     context = GeneratorEngineContext()
     monkeypatch.setattr(
@@ -304,18 +352,17 @@ def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
         return object()
 
     monkeypatch.setattr(runtime_module, "_NixlStagedTransfer", create_transfer)
-    full_tensor = _Method({WeightSource.GENERATOR, WeightSource.TRAINER})
     method_kwargs = {}
 
-    def create_method(**kwargs):
-        method_kwargs.update(kwargs)
-        return full_tensor
+    class Method(_Method):
+        def __init__(self, **kwargs) -> None:
+            method_kwargs.update(kwargs)
+            super().__init__({WeightSource.GENERATOR, WeightSource.TRAINER})
 
-    monkeypatch.setattr(
-        runtime_module,
-        "LoadTimeTensorNixlUpdateMethod",
-        create_method,
-    )
+        def cached_trainer_source(self) -> None:
+            return None
+
+    monkeypatch.setattr(runtime_module, "LoadTimeTensorNixlUpdateMethod", Method)
 
     runtime = initialize_generator_runtime(
         engine_context=context,
@@ -330,7 +377,9 @@ def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
     )
 
     assert transfer_kwargs["listen_port"] is None
-    assert set(method_kwargs) == {"transfer", "capture_layout"}
+    assert set(method_kwargs) == {"transfer"}
+    assert callable(transfer_kwargs["capture_layout"])
+    assert callable(transfer_kwargs["generator_fingerprint"])
     assert runtime.p2p_client is None
     runtime.close()
 
@@ -444,7 +493,7 @@ def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
     arena = torch.ones(2)
     closed = []
     transfer = SimpleNamespace(arena=arena, close=lambda: closed.append("transfer"))
-    method = LoadTimeTensorNixlUpdateMethod(transfer=transfer, capture_layout=lambda manifest: None)
+    method = LoadTimeTensorNixlUpdateMethod(transfer=transfer)
     prepared = PreparedStreamingTensors(lambda: iter(()), frozenset({"weight"}), {})
     prepared.ownership.iterator = iter(({"weight": arena},))
     if failure != "in_progress":
@@ -470,3 +519,50 @@ def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
         assert method._active_streamed is prepared
         assert prepared.ownership.iterator is not None
         assert transfer.arena is arena
+
+
+@pytest.mark.parametrize(
+    "enabled,supported,expected",
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_streaming_requires_opt_in_and_engine_capability(
+    monkeypatch, tmp_path, enabled, supported, expected
+):
+    from dataclasses import replace
+    from unittest.mock import Mock
+    from modelexpress_rl.inference.plan import PreparedCheckpointArtifact
+
+    monkeypatch.setenv("MX_REFIT_FULL_STREAMING", str(enabled))
+    engine = _full_tensor_engine()
+    installer = Mock(
+        capabilities=EngineCapabilities(
+            artifact_types=frozenset({PreparedCheckpointArtifact}),
+            streamed_checkpoints=supported,
+        )
+    )
+    monkeypatch.setattr(
+        engines_module,
+        "_create_engine_runtime",
+        lambda context: replace(engine, installer=installer),
+    )
+    canonical = _Method({WeightSource.OBJECT_STORAGE})
+    constructor = Mock(return_value=canonical)
+    monkeypatch.setattr(runtime_module, "CanonicalDeltaUpdateMethod", constructor)
+    runtime = initialize_generator_runtime(
+        engine_context=GeneratorEngineContext(),
+        worker_id="generator-0",
+        server_url="mx:8000",
+        object_storage=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="v0",
+            seed_checkpoint_path=tmp_path / "launch",
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        source_order=(WeightSource.OBJECT_STORAGE,),
+        max_transfer_attempts=1,
+        rpc_timeout_seconds=30,
+        service=lambda: object(),
+        start_lease=lambda version: object(),
+    )
+    assert constructor.call_args.kwargs["stream_full_checkpoints"] is expected
+    runtime.close()

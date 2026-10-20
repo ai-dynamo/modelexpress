@@ -27,11 +27,6 @@ class _TensorSnapshot(NamedTuple):
     shards: tuple
 
 
-class _SourceSnapshot(NamedTuple):
-    sources: MappingProxyType
-    structure: tuple
-
-
 _SNAPSHOT_FIELDS = tuple(
     (
         cls,
@@ -39,43 +34,23 @@ _SNAPSHOT_FIELDS = tuple(
         vars(cls),
         tuple((name, vars(cls)[name]) for name in cls._fields),
     )
-    for cls in (_ShardSnapshot, _TensorSnapshot, _SourceSnapshot)
+    for cls in (_ShardSnapshot, _TensorSnapshot)
 )
 _TUPLE_GETATTRIBUTE = tuple.__getattribute__
 _SOURCE_FIELDS = ("global_shape", "dtype", "elsize", "shards")
 _SHARD_FIELDS = ("shard_offset", "shape", "session", "addr", "elsize", "digest")
 
 
-def _source_structure(source) -> tuple:
-    """Fields baked into a physical plan; per-version content digests are separate."""
-    return (
-        source.dtype,
-        tuple(source.global_shape),
-        source.elsize,
-        tuple(
-            (
-                shard.session,
-                shard.addr,
-                shard.elsize,
-                tuple(shard.shard_offset),
-                tuple(shard.shape),
-            )
-            for shard in source.shards
-        ),
-    )
-
-
 def _snapshot_classes_unchanged() -> bool:
     if (
         _ShardSnapshot is not _SNAPSHOT_FIELDS[0][0]
         or _TensorSnapshot is not _SNAPSHOT_FIELDS[1][0]
-        or _SourceSnapshot is not _SNAPSHOT_FIELDS[2][0]
     ):
         return False
     # Reuse live namespace views and avoid allocating iterators between class
     # checks: a cyclic-GC callback could otherwise change an earlier class.
     index = 0
-    while index < 3:
+    while index < len(_SNAPSHOT_FIELDS):
         row = _SNAPSHOT_FIELDS[index]
         cls = row[0]
         if type(cls) is not type or cls.__bases__ is not row[1]:
@@ -98,16 +73,6 @@ def _snapshot_classes_unchanged() -> bool:
             field_index += 1
         index += 1
     return True
-
-
-def _snapshot_structure(resolved, snapshot) -> tuple | None:
-    if (
-        type(snapshot) is _SourceSnapshot
-        and resolved.sources is tuple.__getitem__(snapshot, 0)
-        and _snapshot_classes_unchanged()
-    ):
-        return tuple.__getitem__(snapshot, 1)
-    return None
 
 
 def _ordinary_record_class(cls, fields) -> bool:
@@ -148,7 +113,7 @@ def _shape(value) -> bool:
     return type(value) is tuple and all(type(size) is int for size in value)
 
 
-def _freeze_sources(source_map) -> _SourceSnapshot | None:
+def _freeze_sources(source_map) -> MappingProxyType | None:
     """Own only source rows; retain the resolver's outer metadata schema."""
     if type(source_map) is not dict:
         return None
@@ -160,7 +125,6 @@ def _freeze_sources(source_map) -> _SourceSnapshot | None:
     ):
         return None
     sources = {}
-    structure = []
     for name, source in source_map.items():
         state = _record_state(source, SourceInfo, _SOURCE_FIELDS)
         if type(name) is not str or state is None:
@@ -174,7 +138,6 @@ def _freeze_sources(source_map) -> _SourceSnapshot | None:
         ):
             return None
         frozen_shards = []
-        shard_structure = []
         for shard in tuple(shards):
             state = _record_state(shard, Shard, _SHARD_FIELDS)
             if state is None:
@@ -197,13 +160,9 @@ def _freeze_sources(source_map) -> _SourceSnapshot | None:
                     (offset, shard_shape, session, address, shard_elsize, digest),
                 )
             )
-            shard_structure.append(
-                (session, address, shard_elsize, offset, shard_shape)
-            )
         sources[name] = tuple.__new__(
             _TensorSnapshot, (shape, dtype, elsize, tuple(frozen_shards))
         )
-        structure.append((name, (dtype, shape, elsize, tuple(shard_structure))))
     if not (
         _ordinary_record_class(SourceInfo, _SOURCE_FIELDS)
         and _ordinary_record_class(Shard, _SHARD_FIELDS)
@@ -212,10 +171,4 @@ def _freeze_sources(source_map) -> _SourceSnapshot | None:
         return None
     # No caller retains the backing maps. Tuple rows contain only immutable
     # scalars and tuples, so a byte-identical manifest cannot acquire new fields.
-    return tuple.__new__(
-        _SourceSnapshot,
-        (
-            MappingProxyType(sources),
-            tuple(structure),
-        ),
-    )
+    return MappingProxyType(sources)

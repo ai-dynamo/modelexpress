@@ -35,6 +35,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_S3_MAX_ATTEMPTS == 5
     assert envs.MX_S3_TCP_KEEPALIVE is True
     assert envs.MX_REFIT_DELTA_SURGICAL is False
+    assert envs.MX_REFIT_STREAM_WINDOW_LAYERS == 2
 
 
 def test_values_are_normalized_and_read_live(monkeypatch):
@@ -144,9 +145,44 @@ def test_s3_tcp_keepalive_rejects_invalid_boolean(monkeypatch):
         _ = envs.MX_S3_TCP_KEEPALIVE
 
 
+def test_streaming_diagnostics_default_off_and_packing_on(monkeypatch) -> None:
+    from modelexpress import envs as refit_envs
+
+    for name in (
+        "MX_REFIT_DEBUG_VALIDATE_PLAN",
+        "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT",
+        "MX_REFIT_PACK_MODULES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert envs.MX_REFIT_DEBUG_VALIDATE_PLAN is False
+    assert envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT is False
+    assert refit_envs.MX_REFIT_PACK_MODULES is True
+
+
 def test_delta_surgical_parses_boolean(monkeypatch):
     monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
     assert envs.MX_REFIT_DELTA_SURGICAL is True
     monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "maybe")
     with pytest.raises(ValueError, match="MX_REFIT_DELTA_SURGICAL"):
         envs.MX_REFIT_DELTA_SURGICAL
+
+
+@pytest.mark.parametrize(
+    "name", ["MX_REFIT_DEBUG_VALIDATE_PLAN", "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT"]
+)
+def test_debug_flags_use_rl_boolean_parser(monkeypatch, name):
+    monkeypatch.setenv(name, "true")
+    assert getattr(envs, name) is True
+    monkeypatch.setenv(name, "false")
+    assert getattr(envs, name) is False
+    monkeypatch.setenv(name, "invalid")
+    with pytest.raises(ValueError, match=name):
+        getattr(envs, name)
+
+
+def test_stream_window_layers_accepts_zero_and_rejects_negative(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_STREAM_WINDOW_LAYERS", "0")
+    assert envs.MX_REFIT_STREAM_WINDOW_LAYERS == 0
+    monkeypatch.setenv("MX_REFIT_STREAM_WINDOW_LAYERS", "-1")
+    with pytest.raises(ValueError, match="MX_REFIT_STREAM_WINDOW_LAYERS must be"):
+        envs.MX_REFIT_STREAM_WINDOW_LAYERS
