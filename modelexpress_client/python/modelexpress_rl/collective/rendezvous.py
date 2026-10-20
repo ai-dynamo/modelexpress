@@ -585,16 +585,32 @@ class CollectiveRendezvous:
             ),
             timeout=self._rpc_timeout_s,
         )
-        if (
-            not transfer.operation_id
-            or transfer.group_id != membership.group_id
-            or transfer.epoch != membership.epoch
-            or transfer.version_id != version
-            or transfer.model_name != spec.model_name
-            or transfer.idempotency_key != key
-            or transfer.state != pb.COLLECTIVE_TRANSFER_STATE_PENDING
+        mismatches = []
+        if not transfer.operation_id:
+            mismatches.append("operation_id is empty")
+        for field, actual, expected in (
+            ("group_id", transfer.group_id, membership.group_id),
+            ("epoch", transfer.epoch, membership.epoch),
+            ("version_id", transfer.version_id, version),
+            ("model_name", transfer.model_name, spec.model_name),
+            ("idempotency_key", transfer.idempotency_key, key),
         ):
-            raise RendezvousError("MX returned an incorrectly bound transfer")
+            if actual != expected:
+                mismatches.append(f"{field} is {actual!r}, expected {expected!r}")
+        # Only a fresh operation is handed back. A replay of the same key that a
+        # peer already moved on, for example to RUNNING, is refused by name.
+        if transfer.state != pb.COLLECTIVE_TRANSFER_STATE_PENDING:
+            mismatches.append(
+                "state is "
+                + pb.CollectiveTransferState.Name(transfer.state)
+                + ", expected PENDING"
+            )
+        if mismatches:
+            raise RendezvousError(
+                f"MX returned an incorrectly bound transfer for version {version!r} "
+                f"of group {membership.group_id!r} at epoch {membership.epoch}: "
+                + "; ".join(mismatches)
+            )
         return transfer
 
     def get_transfer(self, operation_id: str) -> pb.CollectiveTransfer:

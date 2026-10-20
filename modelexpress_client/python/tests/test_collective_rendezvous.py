@@ -237,6 +237,44 @@ class TestCreateTransfer:
             client.create_transfer(joined, "2", key_prefix="test")
 
     @pytest.mark.parametrize(
+        ("changes", "named"),
+        [
+            ({"operation_id": ""}, "operation_id is empty"),
+            ({"group_id": "other"}, "group_id is 'other', expected 'g1'"),
+            ({"epoch": 2}, "epoch is 2, expected 1"),
+            ({"model_name": "other"}, "model_name is 'other', expected 'm'"),
+            ({"version_id": "other"}, "version_id is 'other', expected '2'"),
+            (
+                {"idempotency_key": "other"},
+                "idempotency_key is 'other', expected 'test-g1-epoch-1-version-2'",
+            ),
+            (
+                {"state": pb.COLLECTIVE_TRANSFER_STATE_RUNNING},
+                "state is COLLECTIVE_TRANSFER_STATE_RUNNING, expected PENDING",
+            ),
+            (
+                {"state": pb.COLLECTIVE_TRANSFER_STATE_COMPLETE},
+                "state is COLLECTIVE_TRANSFER_STATE_COMPLETE, expected PENDING",
+            ),
+        ],
+    )
+    def test_a_wrongly_bound_transfer_names_what_differed(self, changes, named):
+        stub = self.stub(**changes)
+        client, joined = self.joined(stub)
+        with pytest.raises(RendezvousError) as error:
+            client.create_transfer(joined, "2", key_prefix="test")
+        assert named in str(error.value)
+
+    def test_every_mismatch_is_reported_together(self):
+        stub = self.stub(epoch=2, state=pb.COLLECTIVE_TRANSFER_STATE_RUNNING)
+        client, joined = self.joined(stub)
+        with pytest.raises(RendezvousError) as error:
+            client.create_transfer(joined, "2", key_prefix="test")
+        message = str(error.value)
+        assert "epoch is 2, expected 1" in message
+        assert "state is COLLECTIVE_TRANSFER_STATE_RUNNING" in message
+
+    @pytest.mark.parametrize(
         "changes",
         [
             {"group_id": "other"},
