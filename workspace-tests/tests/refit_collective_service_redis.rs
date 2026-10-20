@@ -143,6 +143,7 @@ async fn register(
                 role: role.into(),
                 model_name: model_name.to_string(),
                 expires_at_unix_ms: 0,
+                refit_endpoint: String::new(),
             }),
             ttl_seconds,
         })

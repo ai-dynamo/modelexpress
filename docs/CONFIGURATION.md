@@ -116,9 +116,9 @@ An eligible strategy can still fail and allow the next strategy to run. If a str
 | MX_SERVER_ADDRESS | unset | Preferred client address; the Python client falls back to localhost:8001 when neither address is set |
 | MODEL_EXPRESS_NO_SHARED_STORAGE | false | Enables server-backed repository-file and weight fetching when an address is configured |
 | MX_P2P_METADATA | 1 | Enables on-demand P2P metadata exchange; set 0 for full metadata through a central coordinator |
-| MX_MODEL_URI | unset | Enables ModelStreamer for s3://, gs://, az://, or absolute local paths |
+| MX_MODEL_URI | unset | Enables ModelStreamer for s3://, gs://, az://, or absolute local paths; object-store URIs also make InstantTensor ineligible |
 | MX_MS_DISTRIBUTED | 1 | Distributes ModelStreamer reads across CUDA TP ranks when TP > 1 |
-| MX_INSTANT_TENSOR | 1 | Enables the InstantTensor eligibility gate |
+| MX_INSTANT_TENSOR | 1 | Enables the InstantTensor eligibility gate when `MX_MODEL_URI` is not an object-store URI |
 | MX_DISABLE_PATCHES | false | Disables ModelExpress runtime compatibility patches |
 | MODEL_EXPRESS_LOG_LEVEL | runtime-dependent | Use DEBUG to inspect Eligible loaders and Trying strategy |
 
@@ -138,7 +138,7 @@ MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; 
 | MX_SOURCE_QUERY_TIMEOUT | 3600 seconds | TRT-LLM source query timeout |
 | MX_TRANSFER_TIMEOUT | 900 seconds for the general client; 300 seconds for RDMA when unset | Transfer timeout used by integrations; the RDMA receive path uses its 300-second fallback until this variable is explicitly set |
 | MX_HEARTBEAT_INTERVAL_SECS | 30 | Source heartbeat interval |
-| MX_PUBLISH_TIMEOUT_SECS | 1800 | Maximum source publication wait |
+| MX_PUBLISH_TIMEOUT_SECS | 1800 | Maximum source publication wait; 0 retries indefinitely |
 | MX_K8S_SERVICE_PATTERN | mx-sources | Service DNS pattern; {rank} is replaced with the worker rank |
 | MX_K8S_SOURCE_RETRIES | 5 | Fresh-channel retries for k8s-service revision mismatches |
 | MX_K8S_SOURCE_BACKOFF_SECONDS | 0.5 | Backoff between k8s-service retries |
@@ -180,14 +180,32 @@ ModelStreamer credentials are third-party settings. See [Load from object storag
 
 | Environment variable | Default | Effect |
 |---|---|---|
-| MX_ARTIFACT_TRANSFER | false | Transfer compatible file-backed JIT artifacts on the NIXL path |
+| MX_ARTIFACT_TRANSFER | false | Enable compatible file-backed JIT artifact installation and publication |
+| MX_ARTIFACT_BACKEND | nixl | Artifact transport: `nixl` or `mooncake`; exactly one is selected and there is no fallback |
 | MX_ARTIFACT_BUNDLE_ROOT | $TMPDIR/modelexpress-artifacts | Local staging root for artifact bundles |
 | MX_ARTIFACT_COMPILE_CONFIG_DIGEST | empty | Partitions torch compile artifact sources by compile configuration |
+| MX_ARTIFACT_MOONCAKE_NAMESPACE | modelexpress/artifacts | Key prefix used by the Mooncake artifact backend |
+| MX_ARTIFACT_MOONCAKE_POOL_BYTES | 536870912 bytes | Local buffer-pool size for the process-local Mooncake artifact client; a config-file `local_buffer_size` takes precedence |
+| MX_ARTIFACT_MOONCAKE_DELETE_RETRIES | 10 | Additional attempts when stale-object or repair-marker removal reports an active lease |
+| MX_ARTIFACT_MOONCAKE_DELETE_RETRY_DELAY_SECS | 0.7 | Delay in seconds between Mooncake removal attempts |
+| MX_MOONCAKE_CONFIG_PATH | unset | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback |
+| MX_MC_* | unset | Artifact-store Mooncake settings promoted temporarily to the corresponding native `MC_*` names |
+| MX_ETCD_* | unset | Artifact-store etcd settings promoted temporarily to the corresponding native `ETCD_*` names |
 | MX_ARTIFACT_READY_URL | framework default | Readiness endpoint checked before publication |
 | MX_ARTIFACT_READY_TIMEOUT_SECS | 1800 | Readiness/publication timeout |
 | MX_ARTIFACT_TRANSFER_CHUNK_SIZE | 67108864 bytes | Artifact transfer chunk size; maximum is 4 GiB |
 
-Artifact transfer requires MX_P2P_METADATA=1, a central coordinator, writable target cache directories, and a trusted deployment. It transfers file-backed caches; it does not replace model weights.
+The default `p2p` backend requires `MX_P2P_METADATA=1`, a central coordinator,
+and NIXL. The `mooncake` backend requires a Python package exposing
+`mooncake.store`, plus `MX_MC_METADATA_ADDR` and `MX_MC_MASTER_SERVER` (or the
+equivalent JSON/native configuration); it does not use the MX server or
+`MX_P2P_METADATA`. Prefixed settings are restored after each artifact-store
+operation, allowing a separately initialized Mooncake client such as a KV
+cache to keep its own account and configuration.
+
+Both backends require writable target cache directories and a trusted
+deployment. Artifact transfer moves file-backed caches; it does not replace
+model-weight transfer.
 
 ## Client metrics
 

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     # importing this package still pulls in neither refit path's dependencies.
     from .control import (
         ModelExpressControlClient,
+        TrainerMesh,
         WeightVersion,
         WeightVersionState,
     )
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
         TrainerStagingMode,
         WeightPayloadFormat,
     )
-    from .version import WeightVersionRef
+    from .version import MeshIdentity, TrainerTensorsMetadata, WeightVersionRef
 
 _LAZY = {
     # Framework-facing clients.
@@ -60,8 +61,11 @@ _LAZY = {
     "WeightSource": ".inference",
     "VllmGeneratorContext": ".inference",
     # Version values shared across the control, trainer, and generator clients.
+    "MeshIdentity": ".version",
     "ObjectStorageSource": ".object_storage",
     "ObjectStorageType": ".object_storage",
+    "TrainerMesh": ".control",
+    "TrainerTensorsMetadata": ".version",
     "WeightVersion": ".control",
     "WeightVersionRef": ".version",
     "WeightVersionState": ".control",
@@ -86,8 +90,11 @@ __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     "WeightSource",
     "VllmGeneratorContext",
     # Version values shared across the control, trainer, and generator clients.
+    "MeshIdentity",
     "ObjectStorageSource",
     "ObjectStorageType",
+    "TrainerMesh",
+    "TrainerTensorsMetadata",
     "WeightVersion",
     "WeightVersionRef",
     "WeightVersionState",

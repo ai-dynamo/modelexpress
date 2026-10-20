@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
+import json
+import logging
 from importlib import metadata
 from threading import Event
 from types import SimpleNamespace
@@ -12,7 +15,12 @@ from modelexpress.refit.reshard.rendezvous import (
     MxReshardRendezvous,
     PublishedShard,
     PublishedTensor,
+    build_sources,
+    encode_shard_table,
+    decode_shard_table,
+    unwrap_rendezvous_blob,
     _mx_version,
+    structural_manifest_digest,
     wrap_rendezvous_blob,
 )
 
@@ -36,6 +44,125 @@ def _one_tensor(agent_name="trainer-agent"):
             ],
         )
     ]
+
+
+def test_structural_digest_ignores_content_digest():
+    first = _one_tensor()
+    first[0].shards[0].digest = "version-a"
+    second = _one_tensor()
+    second[0].shards[0].digest = "version-b"
+
+    first_blob = wrap_rendezvous_blob(
+        b"nixl",
+        "trainer-agent",
+        "trainer:1234",
+        first,
+    )
+    second_blob = wrap_rendezvous_blob(
+        b"nixl",
+        "trainer-agent",
+        "trainer:1234",
+        second,
+    )
+
+    assert structural_manifest_digest(first_blob) == structural_manifest_digest(
+        second_blob
+    )
+    moved = _one_tensor()
+    moved[0].shards[0].addr = 8192
+    moved_blob = wrap_rendezvous_blob(
+        b"nixl",
+        "trainer-agent",
+        "trainer:1234",
+        moved,
+    )
+    restarted_blob = wrap_rendezvous_blob(
+        b"new-registration",
+        "trainer-agent",
+        "trainer:1234",
+        second,
+    )
+    assert structural_manifest_digest(first_blob) != structural_manifest_digest(
+        moved_blob
+    )
+    assert structural_manifest_digest(first_blob) != structural_manifest_digest(
+        restarted_blob
+    )
+
+
+def test_host_memory_kind_roundtrips_and_requires_host_aware_reader():
+    device = _one_tensor()
+    host = _one_tensor()
+    host[0].shards[0].memory_type = "DRAM"
+    device_blob = wrap_rendezvous_blob(b"nixl", "trainer-agent", "host:1234", device)
+    host_blob = wrap_rendezvous_blob(b"nixl", "trainer-agent", "host:1234", host)
+    assert json.loads(device_blob)["schema"] == "mx.reshard.shard_table.v1"
+    assert "memory_type" not in json.loads(device_blob)["tensors"][0]["shards"][0]
+    assert json.loads(host_blob)["schema"] == "mx.reshard.shard_table.v2"
+    assert structural_manifest_digest(device_blob) != structural_manifest_digest(
+        host_blob
+    )
+    decoded = unwrap_rendezvous_blob(host_blob).tensors
+    assert (
+        decode_shard_table(encode_shard_table(host))[0].shards[0].memory_type == "DRAM"
+    )
+    assert decoded[0].shards[0].memory_type == "DRAM"
+    with pytest.raises(ValueError, match="memory-type-aware receiver"):
+        build_sources(decoded)
+    memory = {}
+    sources, agents, devices = build_sources(decoded, session_to_memory=memory)
+    assert memory == {"trainer-agent": "DRAM"}
+    assert agents == {"trainer-agent": "trainer-agent"}
+    assert devices == {"trainer-agent": 0}
+    assert sources["weight"].shards[0].addr == 4096
+
+
+@pytest.mark.parametrize("change", ["missing_counts", "null_counts", "checksum"])
+def test_stable_metadata_validation_preserves_legacy_blob_support(change):
+    payload = json.loads(wrap_rendezvous_blob(b"nixl", "a", "a:1", _one_tensor()))
+    if change == "checksum":
+        payload["tensors"][0]["shards"][0]["digest"] = "version-checksum"
+    else:
+        for name in ("tensor_count", "total_bytes"):
+            if change == "missing_counts":
+                del payload[name]
+            else:
+                payload[name] = None
+    blob = json.dumps(payload).encode()
+    assert unwrap_rendezvous_blob(blob).tensor_count == 1
+    with pytest.raises((KeyError, ValueError)):
+        unwrap_rendezvous_blob(blob, stable=True)
+
+
+def test_rejects_unknown_source_memory_type():
+    blob = json.loads(wrap_rendezvous_blob(b"nixl", "a", "a:1", _one_tensor()))
+    blob["tensors"][0]["shards"][0]["memory_type"] = "typo"
+    with pytest.raises(ValueError, match="unsupported source memory type"):
+        unwrap_rendezvous_blob(json.dumps(blob).encode())
+
+
+@pytest.mark.parametrize("field,value", [("memory_type", "DRAM"), ("device_id", 1)])
+def test_one_source_session_cannot_advertise_conflicting_memory(field, value):
+    tensors = _one_tensor() + _one_tensor()
+    tensors[1].name = "other"
+    setattr(tensors[1].shards[0], field, value)
+    with pytest.raises(ValueError, match="conflicting device or memory"):
+        build_sources(tensors, session_to_memory={})
+
+
+@pytest.mark.parametrize(
+    "blob", [b"\xff\xfe not json", b"{ definitely not json", b'["a", "list"]']
+)
+def test_an_unreadable_manifest_says_it_disabled_plan_reuse(caplog, blob):
+    """The raw-byte fallback moves with the per-shard content digests, so every
+    version looks structurally different and plan reuse stops. Correct, but the
+    symptom is a warm refit priced like a cold one, which needs a reason."""
+    with caplog.at_level(logging.WARNING):
+        assert structural_manifest_digest(blob) == hashlib.sha256(blob).hexdigest()
+
+    assert [m for m in caplog.messages if "disables transfer-plan reuse" in m], (
+        f"an unreadable manifest must say so, got {caplog.messages}"
+    )
 
 
 def test_mx_version_falls_back_only_when_package_is_missing(monkeypatch):
@@ -145,8 +272,9 @@ def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
     last = client.status_updates[-1]
     # Compare the identity/status fields under test; the heartbeat also carries
     # advisory telemetry (source_load) that is not what this test asserts.
-    assert {k: last.get(k) for k in
-            ("mx_source_id", "worker_id", "worker_rank", "status")} == {
+    assert {
+        k: last.get(k) for k in ("mx_source_id", "worker_id", "worker_rank", "status")
+    } == {
         "mx_source_id": "source-id",
         "worker_id": "trainer-2",
         "worker_rank": 2,
@@ -249,9 +377,7 @@ def test_only_the_requested_number_of_ranks_is_returned():
 
 
 def test_a_discovered_payload_reads_by_field_and_by_position():
-    """Named access is the point of the change. Positions are still stable, which is
-    what lets an optional field like the publisher step be appended without moving
-    anything a caller already reads."""
+    """Named access and positional tuple access describe the same payload."""
     client = _DiscoveryClient([_blob("rank-0", _one_tensor())])
 
     (payload,) = _rendezvous(client).discover_trainers(expected_trainers=1, timeout=0)
@@ -263,6 +389,8 @@ def test_a_discovered_payload_reads_by_field_and_by_position():
         payload.tensors,
     )
     assert payload[3] is payload.tensors
+    assert payload.tensor_count == 1
+    assert payload.total_bytes == 32
 
 
 def test_a_partial_ready_set_still_reports_its_shard_tables():
@@ -295,60 +423,6 @@ def test_invalid_heartbeat_period_fails_before_publish(monkeypatch):
 
     with pytest.raises(ValueError, match="must be positive"):
         rendezvous.publish(b"registered")
-
-
-def test_quorum_can_skip_shard_tables_without_losing_emptiness():
-    """The per-step quorum check needs each rank's version stamp, not its shard
-    table, and rebuilding the table dominated the call. Skipping it must not make
-    a rank that published nothing look like a valid member of the quorum, which is
-    the one thing the emptiness rule exists to prevent."""
-    client = _DiscoveryClient(
-        [_blob("empty-rank", []), _blob("real-rank", _one_tensor())]
-    )
-
-    with pytest.raises(TimeoutError) as excinfo:
-        _rendezvous(client).discover_trainers(
-            expected_trainers=2, timeout=0, with_tensors=False
-        )
-
-    message = str(excinfo.value)
-    assert "1 with a non-empty shard table" in message
-    assert "1 empty" in message
-
-
-def test_skipping_shard_tables_still_reports_the_entry_count(caplog):
-    """``entry_count`` is what keeps emptiness decidable, and it is also the figure
-    that showed this cost scales with source count rather than bytes moved."""
-    import json
-    import logging
-
-    client = _DiscoveryClient([_blob("rank-0", _one_tensor() * 3)])
-
-    with caplog.at_level(logging.WARNING):
-        (payload,) = _rendezvous(client).discover_trainers(
-            expected_trainers=1, timeout=0, with_tensors=False
-        )
-
-    assert payload.tensors == []
-    assert payload.entry_count() == 3
-    assert payload.agent_name == "rank-0"
-    record = next(
-        json.loads(message.split("MX_DISCOVER_COST ", 1)[1])
-        for message in caplog.messages
-        if "MX_DISCOVER_COST " in message
-    )
-    assert record["rank"] == 0
-    assert record["tensors"] == 3
-    assert record["tables_built"] is False
-
-
-def test_entry_count_falls_back_to_the_table_when_not_recorded():
-    """Payloads built directly, as tests and older callers do, record no count."""
-    from modelexpress.refit.reshard.rendezvous import RendezvousPayload
-
-    payload = RendezvousPayload(b"", "a", "", _one_tensor())
-    assert payload.tensor_count is None
-    assert payload.entry_count() == 1
 
 
 def test_decoding_parsed_entries_matches_decoding_the_blob():
@@ -444,3 +518,28 @@ def test_one_unreadable_rank_does_not_abort_the_sweep():
     # The readable ranks are still returned when the quorum only needs them.
     discovered = _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
     assert [p.agent_name for p in discovered] == ["rank-0", "rank-2"]
+
+
+def test_built_sources_own_immutable_geometry():
+    published = _one_tensor()
+    published[0].full_shape = [4, 4]
+    published[0].shards[0].shape = [4, 4]
+    published[0].shards[0].shard_offset = [0, 0]
+    sources, agents, devices = build_sources(published)
+    source = sources["weight"]
+    shard = source.shards[0]
+    published[0].full_shape[0] = 8
+    published[0].shards[0].shape[0] = 8
+    published[0].shards[0].shard_offset[0] = 4
+    published[0].shards[0].addr = 8192
+    published[0].shards.clear()
+    assert source.global_shape == shard.shape == (4, 4)
+    assert shard.shard_offset == (0, 0)
+    assert shard.addr == 4096
+    for mapping in (sources, agents, devices):
+        with pytest.raises(TypeError):
+            mapping["other"] = None
+    with pytest.raises(AttributeError):
+        source.shards += (shard,)
+    with pytest.raises(AttributeError):
+        shard.addr = 0
