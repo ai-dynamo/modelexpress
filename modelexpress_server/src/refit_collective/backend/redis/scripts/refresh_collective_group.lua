@@ -7,40 +7,10 @@
 -- KEYS[4]: group active-operations set
 -- KEYS[5..]: every lane hash
 -- ARGV[1]: operation_key_prefix
+--
+-- The helpers come from common.lua, which redis.rs prepends.
 
-local function parse_participant(record)
-  if not record then
-    return nil
-  end
-  return string.match(record, '^([^|]*)|([^|]*)|([^|]*)|([^|]*)$')
-end
-
-local function registration_matches(worker_id, role, model_name)
-  local key = 'mx:refit:worker:' .. worker_id
-  if redis.call('EXISTS', key) ~= 1 then
-    return false
-  end
-  local expected_role = role == 'TRAINER' and '1' or '2'
-  return redis.call('HGET', key, 'worker_id') == worker_id
-    and redis.call('HGET', key, 'role') == expected_role
-    and redis.call('HGET', key, 'model_name') == model_name
-end
-
--- A group churn that invalidates the current epoch's in-flight communicator
--- also strands any transfer op still riding it. Abort every non-terminal op
--- this group knows about before the epoch moves out from under it.
-local function abort_stale_ops(ops_set_key, op_key_prefix)
-  local op_ids = redis.call('SMEMBERS', ops_set_key)
-  for i = 1, #op_ids do
-    local op_key = op_key_prefix .. op_ids[i]
-    local op_state = redis.call('HGET', op_key, 'state')
-    if op_state == 'PENDING' or op_state == 'RUNNING' then
-      redis.call('HSET', op_key, 'state', 'ABORTED',
-        'failure_message', 'group epoch advanced before the transfer completed')
-    end
-    redis.call('SREM', ops_set_key, op_ids[i])
-  end
-end
+local lane_keys = key_range(5, #KEYS)
 
 local epoch = tonumber(redis.call('HGET', KEYS[1], 'epoch'))
 if not epoch then
@@ -56,16 +26,7 @@ local changed = false
 -- clean FORMING epoch a lapse just removes the participant, so waiters keep
 -- their epoch and time out naming the missing slot instead of being told to
 -- rebuild. This script runs on every GetCollectiveGroup poll.
-local membership_change_requires_bump = redis.call('HGET', KEYS[1], 'state') == 'READY'
-if not membership_change_requires_bump then
-  for i = 5, #KEYS do
-    local bootstrap_epoch = redis.call('HGET', KEYS[i], 'bootstrap_epoch')
-    if bootstrap_epoch and tonumber(bootstrap_epoch) == epoch then
-      membership_change_requires_bump = true
-      break
-    end
-  end
-end
+local membership_change_requires_bump = needs_epoch_bump(KEYS[1], lane_keys, epoch)
 
 local records = redis.call('HGETALL', KEYS[2])
 for i = 1, #records, 2 do
@@ -101,47 +62,12 @@ if changed then
   abort_stale_ops(KEYS[4], ARGV[1])
 end
 
-local expected = tonumber(redis.call('HGET', KEYS[1], 'expected_total'))
-local admitted = redis.call('HLEN', KEYS[2])
-local ready = expected ~= nil and admitted == expected
-
 -- The sweep above already dropped every participant whose registration lapsed,
--- and nothing runs between it and here, so only the epoch is checked again.
-if ready then
-  local participants = redis.call('HVALS', KEYS[2])
-  for i = 1, #participants do
-    local worker_id, _, _, joined_epoch = parse_participant(participants[i])
-    if not worker_id or tonumber(joined_epoch) ~= epoch then
-      ready = false
-      break
-    end
-  end
-end
-
-if ready then
-  for i = 5, #KEYS do
-    local stamped = redis.call('HGET', KEYS[i], 'bootstrap_epoch')
-    if not stamped or tonumber(stamped) ~= epoch then
-      ready = false
-      break
-    end
-  end
-end
-
-if ready then
-  local digest = redis.call('HGET', KEYS[1], 'plan_digest')
-  local reported = redis.call('HVALS', KEYS[3])
-  if #reported ~= expected then
-    ready = false
-  else
-    for i = 1, #reported do
-      if reported[i] ~= digest then
-        ready = false
-        break
-      end
-    end
-  end
-end
+-- and nothing runs between it and here, so only the epoch is checked again:
+-- no model_name, so evaluate_readiness skips the registration lookups.
+local expected = tonumber(redis.call('HGET', KEYS[1], 'expected_total'))
+local ready = evaluate_readiness(
+  KEYS[1], KEYS[2], KEYS[3], lane_keys, expected, epoch, nil)
 
 local state = ready and 'READY' or 'FORMING'
 redis.call('HSET', KEYS[1], 'state', state)

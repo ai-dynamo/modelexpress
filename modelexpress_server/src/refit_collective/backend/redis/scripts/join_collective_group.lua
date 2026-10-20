@@ -23,6 +23,8 @@
 -- ARGV[14]: expected_generator_slots, newline separated
 -- ARGV[15]: created_at_unix_ms
 -- ARGV[16]: operation_key_prefix
+--
+-- The shared helpers come from common.lua, which redis.rs prepends.
 
 local function contains_slot(list, target)
   for slot in string.gmatch(list .. '\n', '([^\n]*)\n') do
@@ -33,45 +35,8 @@ local function contains_slot(list, target)
   return false
 end
 
-local function parse_participant(record)
-  if not record then
-    return nil
-  end
-  return string.match(record, '^([^|]*)|([^|]*)|([^|]*)|([^|]*)$')
-end
-
-local function registration_key(worker_id)
-  return 'mx:refit:worker:' .. worker_id
-end
-
-local function registration_matches(worker_id, role, model_name, key)
-  key = key or registration_key(worker_id)
-  if redis.call('EXISTS', key) ~= 1 then
-    return false
-  end
-  local expected_role = role == 'TRAINER' and '1' or '2'
-  return redis.call('HGET', key, 'worker_id') == worker_id
-    and redis.call('HGET', key, 'role') == expected_role
-    and redis.call('HGET', key, 'model_name') == model_name
-end
-
--- A group churn that invalidates the current epoch's in-flight communicator
--- also strands any transfer op still riding it. Abort every non-terminal op
--- this group knows about before the epoch moves out from under it.
-local function abort_stale_ops(ops_set_key, op_key_prefix)
-  local op_ids = redis.call('SMEMBERS', ops_set_key)
-  for i = 1, #op_ids do
-    local op_key = op_key_prefix .. op_ids[i]
-    local op_state = redis.call('HGET', op_key, 'state')
-    if op_state == 'PENDING' or op_state == 'RUNNING' then
-      redis.call('HSET', op_key, 'state', 'ABORTED',
-        'failure_message', 'group epoch advanced before the transfer completed')
-    end
-    redis.call('SREM', ops_set_key, op_ids[i])
-  end
-end
-
 local lane_count = #KEYS - 5
+local lane_keys = key_range(6, 5 + lane_count)
 local expected_slots = ARGV[7] == 'TRAINER' and ARGV[13] or ARGV[14]
 if not contains_slot(expected_slots, ARGV[5]) then
   return 'UNEXPECTED_SLOT'
@@ -121,16 +86,7 @@ else
   -- epoch only acknowledge it; otherwise a full-cohort restart would bump once
   -- per slot and no worker could share an epoch. Once any lane has published a
   -- current-epoch bootstrap, another membership change must invalidate it.
-  membership_change_requires_bump = redis.call('HGET', KEYS[1], 'state') == 'READY'
-  if not membership_change_requires_bump then
-    for i = 1, lane_count do
-      local bootstrap_epoch = redis.call('HGET', KEYS[5 + i], 'bootstrap_epoch')
-      if bootstrap_epoch and tonumber(bootstrap_epoch) == epoch then
-        membership_change_requires_bump = true
-        break
-      end
-    end
-  end
+  membership_change_requires_bump = needs_epoch_bump(KEYS[1], lane_keys, epoch)
 
   -- Expired registrations are no longer admitted. Removing them advances the
   -- epoch whenever this membership could already have communicator state.
@@ -231,47 +187,8 @@ if ARGV[10] ~= '' then
     'plan_source_digest', ARGV[12])
 end
 
--- READY means every exact slot/rank is live and has acknowledged this epoch,
--- every lane is bootstrapped for it, and every digest agrees.
-local admitted = redis.call('HLEN', KEYS[2])
-local ready = admitted == tonumber(ARGV[4])
-
-if ready then
-  local records = redis.call('HVALS', KEYS[2])
-  for i = 1, #records do
-    local worker_id, role, index, joined_epoch = parse_participant(records[i])
-    if not worker_id or tonumber(joined_epoch) ~= epoch
-        or not registration_matches(worker_id, role, ARGV[2]) then
-      ready = false
-      break
-    end
-  end
-end
-
-if ready then
-  for i = 1, lane_count do
-    local stamped = redis.call('HGET', KEYS[5 + i], 'bootstrap_epoch')
-    if not stamped or tonumber(stamped) ~= epoch then
-      ready = false
-      break
-    end
-  end
-end
-
-if ready then
-  local digests = redis.call('HVALS', KEYS[3])
-  local digest = redis.call('HGET', KEYS[1], 'plan_digest')
-  if #digests ~= tonumber(ARGV[4]) then
-    ready = false
-  else
-    for i = 1, #digests do
-      if digests[i] ~= digest then
-        ready = false
-        break
-      end
-    end
-  end
-end
+local ready = evaluate_readiness(
+  KEYS[1], KEYS[2], KEYS[3], lane_keys, tonumber(ARGV[4]), epoch, ARGV[2])
 
 local state = ready and 'READY' or 'FORMING'
 redis.call('HSET', KEYS[1], 'state', state)

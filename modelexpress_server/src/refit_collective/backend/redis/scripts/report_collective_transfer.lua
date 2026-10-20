@@ -7,13 +7,8 @@
 -- KEYS[5]: group active-operations set
 -- KEYS[6..]: every lane hash, cleared if the collective fails
 -- ARGV: operation_id, group_id, epoch, worker_id, succeeded ('1'/'0'), message
-
-local function parse_participant(record)
-  if not record then
-    return nil
-  end
-  return string.match(record, '^([^|]*)|([^|]*)|([^|]*)|([^|]*)$')
-end
+--
+-- The helpers come from common.lua, which redis.rs prepends.
 
 local state = redis.call('HGET', KEYS[1], 'state')
 if not state then

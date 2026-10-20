@@ -31,11 +31,23 @@ use uuid::Uuid;
 use super::{CollectiveBackend, CollectiveBackendError, CollectiveResult};
 use crate::refit_collective::lanes::{Lane, LaneLayout};
 
-const JOIN_GROUP_LUA: &str = include_str!("redis/scripts/join_collective_group.lua");
-const PUBLISH_BOOTSTRAP_LUA: &str = include_str!("redis/scripts/publish_group_bootstrap.lua");
+// EVAL has no `require`, so the helpers the group scripts share live in one
+// chunk that is prepended to each of them here, at compile time.
+macro_rules! with_common_lua {
+    ($script:literal) => {
+        concat!(
+            include_str!("redis/scripts/common.lua"),
+            "\n",
+            include_str!($script)
+        )
+    };
+}
+
+const JOIN_GROUP_LUA: &str = with_common_lua!("redis/scripts/join_collective_group.lua");
+const PUBLISH_BOOTSTRAP_LUA: &str = with_common_lua!("redis/scripts/publish_group_bootstrap.lua");
 const CREATE_TRANSFER_LUA: &str = include_str!("redis/scripts/create_collective_transfer.lua");
-const REPORT_TRANSFER_LUA: &str = include_str!("redis/scripts/report_collective_transfer.lua");
-const REFRESH_GROUP_LUA: &str = include_str!("redis/scripts/refresh_collective_group.lua");
+const REPORT_TRANSFER_LUA: &str = with_common_lua!("redis/scripts/report_collective_transfer.lua");
+const REFRESH_GROUP_LUA: &str = with_common_lua!("redis/scripts/refresh_collective_group.lua");
 const DELETE_TRANSFER_LUA: &str = include_str!("redis/scripts/delete_collective_transfer.lua");
 
 // `Script::new` hashes and copies the source, and the scripts never change,
@@ -1048,6 +1060,61 @@ mod tests {
             expected_trainer_slots: trainer_slots,
             expected_generator_slots: generator_slots,
             lanes,
+        }
+    }
+
+    /// The `local function` names one Lua chunk defines.
+    fn lua_function_names(source: &str) -> Vec<&str> {
+        source
+            .lines()
+            .filter_map(|line| line.strip_prefix("local function "))
+            .filter_map(|rest| rest.split('(').next())
+            .collect()
+    }
+
+    #[test]
+    fn group_scripts_share_one_copy_of_the_common_helpers() {
+        // Two drift bugs came from these helpers being copied per script. Each
+        // script that uses them gets common.lua prepended and must not carry
+        // its own definition of any of them again.
+        let common = include_str!("redis/scripts/common.lua");
+        let shared = lua_function_names(common);
+        assert!(shared.contains(&"parse_participant"));
+        assert!(shared.contains(&"registration_matches"));
+        assert!(shared.contains(&"evaluate_readiness"));
+        for (name, built, own) in [
+            (
+                "join",
+                JOIN_GROUP_LUA,
+                include_str!("redis/scripts/join_collective_group.lua"),
+            ),
+            (
+                "publish",
+                PUBLISH_BOOTSTRAP_LUA,
+                include_str!("redis/scripts/publish_group_bootstrap.lua"),
+            ),
+            (
+                "report",
+                REPORT_TRANSFER_LUA,
+                include_str!("redis/scripts/report_collective_transfer.lua"),
+            ),
+            (
+                "refresh",
+                REFRESH_GROUP_LUA,
+                include_str!("redis/scripts/refresh_collective_group.lua"),
+            ),
+        ] {
+            assert!(
+                built.starts_with(common),
+                "{name} is built without common.lua"
+            );
+            assert!(built.ends_with(own), "{name} is built without its own body");
+            for function in lua_function_names(own) {
+                assert!(
+                    !shared.contains(&function),
+                    "{name} redefines the shared helper {function}"
+                );
+            }
         }
     }
 
