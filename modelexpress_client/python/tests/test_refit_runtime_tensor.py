@@ -5,7 +5,7 @@ import pytest
 import torch
 from modelexpress import p2p_pb2
 
-from modelexpress_rl import WeightPayloadFormat
+from modelexpress_rl import MeshIdentity, WeightPayloadFormat
 from modelexpress_rl.inference.methods import (
     LoadTimeTensorNixlUpdateMethod,
     RuntimeTensorNixlUpdateMethod,
@@ -214,7 +214,7 @@ def test_runtime_method_rejects_a_trainer_source():
         transfer=_Transfer(),
         runtime_tensors={},
     )
-    source = TrainerSourceSnapshot(mesh_id="mesh", mesh_generation=1, shards=())
+    source = TrainerSourceSnapshot(mesh_identity=MeshIdentity("mesh", 1), shards=())
 
     try:
         method.prepare(version=object(), source=source)

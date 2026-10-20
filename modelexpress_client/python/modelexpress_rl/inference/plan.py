@@ -19,6 +19,7 @@ from ..control import WeightVersion
 from ..object_storage import ObjectStorageSource
 from ..train.manifest import ShardChecksumKey
 from ..train import WeightPayloadFormat
+from ..version import MeshIdentity
 from .adapter import TrainerSourceShard
 
 if TYPE_CHECKING:
@@ -93,8 +94,7 @@ class GeneratorPeerUpdateSource:
 class TrainerSourceSnapshot:
     """Selected trainer shards and the mesh identity they belong to."""
 
-    mesh_id: str
-    mesh_generation: int
+    mesh_identity: MeshIdentity
     shards: tuple[TrainerSourceShard, ...]
     resolved_metadata: _ResolvedSources | None = field(
         default=None, compare=False, repr=False
@@ -107,11 +107,12 @@ class TrainerSourceSnapshot:
 
     @property
     def physical_fingerprint(self) -> tuple:
+        """Server-pinned worker/shard digests require a new mesh generation when
+        physical addresses or registrations change."""
         return (
-            self.mesh_id,
-            self.mesh_generation,
+            self.mesh_identity,
             tuple(
-                (shard.source_slot_id, shard.worker_id, shard.manifest_endpoint, shard.structural_digest)
+                (shard.source_slot_id, shard.worker_id)
                 for shard in self.shards
             ),
         )

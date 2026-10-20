@@ -95,6 +95,11 @@ for _, publication in ipairs(retired) do
   redis.call('HDEL', publication[1], publication[3])
   redis.call('HDEL', publication[2], publication[3])
 end
+for _, field in ipairs(redis.call('HKEYS', KEYS[1])) do
+  if string.sub(field, 1, 16) == 'stable_metadata:' then
+    redis.call('HDEL', KEYS[1], field)
+  end
+end
 redis.call('HSET', KEYS[1],
   'workers', ARGV[2],
   'generation', tonumber(ARGV[1]) + 1)

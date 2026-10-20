@@ -3,7 +3,6 @@
 
 """Numerical contract tests for logical planning and per-replica binding."""
 
-from modelexpress.refit.reshard.rendezvous import structural_manifest_digest
 import ctypes
 
 import pytest
@@ -17,6 +16,7 @@ from modelexpress.refit.reshard.transfer_plan import (
     plan_transfer_groups,
 )
 from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.version import MeshIdentity
 from tests.test_refit_bounded_descriptors import harness
 
 
@@ -264,10 +264,10 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
     from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
     snapshot = TrainerSourceSnapshot(
-        "mesh", 1, tuple(
+        MeshIdentity("mesh", 1), tuple(
             TrainerSourceShard(
                 slot, f"worker-{index}", structural_manifest_digest(blob),
-                f"{agent}:19000", blob, structural_manifest_digest(blob),
+                f"{agent}:19000", blob,
             )
             for index, (slot, agent, blob) in enumerate((
                 ("slot-z", "agent-z", manifests[0]),
@@ -288,7 +288,6 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
 
     first.add_(1000)
     second.add_(1000)
-    request["trainer_snapshot"] = harness.transfer.cached_trainer_source()
     prepared = harness.transfer.prepare(**request)
     _second_metrics, second_install = harness.collect(prepared)
     assert torch.equal(second_install["weight"], torch.cat((first, second)))
