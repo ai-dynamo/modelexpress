@@ -695,6 +695,65 @@ class TestSleepWakeReloadHooks:
             loader.on_wake_up(None)
         mock_pub.assert_not_called()
 
+    def test_reload_model_stops_serving_before_loading(self):
+        """Without a prior sleep() the replica is still serving, so peers
+        must be cut off before the weights are overwritten."""
+        loader = _make_loader()
+        mock_manager = MagicMock()
+        loader._ctx = _make_load_context(nixl_manager=mock_manager)
+        events = []
+        mock_manager.shutdown.side_effect = lambda: events.append("shutdown")
+
+        def fake_reload(*args):
+            events.append("reload")
+            loader._ctx = _make_load_context(nixl_manager=MagicMock())
+            return args[-1]
+
+        model = MagicMock()
+        with patch("modelexpress.engines.vllm.loader.unpublish_metadata") as mock_unpub, \
+             patch.object(loader, "_load_or_reload_model", side_effect=fake_reload):
+            assert loader.reload_model(MagicMock(), MagicMock(), model) is model
+        mock_unpub.assert_called_once()
+        assert events == ["shutdown", "reload"]
+
+    @pytest.mark.parametrize("last_sleep_level", [1, 2])
+    def test_reload_model_does_not_stop_serving_again_after_sleep(
+        self, last_sleep_level
+    ):
+        loader = _make_loader()
+        loader._ctx = _make_load_context(nixl_manager=MagicMock())
+        loader._last_sleep_level = last_sleep_level
+        with patch("modelexpress.engines.vllm.loader.unpublish_metadata") as mock_unpub, \
+             patch.object(loader, "_load_or_reload_model", return_value=MagicMock()):
+            loader.reload_model(MagicMock(), MagicMock(), MagicMock())
+        mock_unpub.assert_not_called()
+
+    @pytest.mark.parametrize("last_sleep_level", [None, 1, 2])
+    def test_reload_model_leaves_sleep_level_untouched(self, last_sleep_level):
+        loader = _make_loader()
+        loader._last_sleep_level = last_sleep_level
+        model = MagicMock()
+        with patch.object(loader, "_load_or_reload_model", return_value=model):
+            assert loader.reload_model(MagicMock(), MagicMock(), model) is model
+        assert loader._last_sleep_level == last_sleep_level
+
+    @pytest.mark.parametrize("last_sleep_level", [1, 2])
+    def test_on_wake_up_clears_sleep_level_when_weights_woken(self, last_sleep_level):
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        loader._last_sleep_level = last_sleep_level
+        with patch("modelexpress.engines.vllm.loader.publish_metadata"), \
+             patch("modelexpress.engines.vllm.loader.register_tensors"):
+            loader.on_wake_up(None)
+        assert loader._last_sleep_level is None
+
+    def test_on_wake_up_keeps_sleep_level_when_weights_not_woken(self):
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        loader._last_sleep_level = 2
+        loader.on_wake_up(["kv_cache"])
+        assert loader._last_sleep_level == 2
+
 
 class TestMtpDrafterSecondLoad:
     """vLLM loads MTP in two passes on one worker: the target, then the drafter

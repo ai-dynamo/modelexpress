@@ -141,7 +141,13 @@ class MxModelLoader(BaseModelLoader):
         `initialize_layerwise_reload`/`finalize_layerwise_reload` to avoid
         transient double-materialization, while RDMA writes into the existing
         buffers and must not have them deferred to meta.
+
+        Peers must not read weights while they are being overwritten, so P2P
+        source-serving stops first unless a prior sleep() already stopped it.
+        The strategy chain registers and republishes the reloaded tensors.
         """
+        if self._last_sleep_level is None:
+            self._stop_serving()
         return self._load_or_reload_model(vllm_config, model_config, prefix, model)
 
     def _load_or_reload_model(
@@ -334,13 +340,7 @@ class MxModelLoader(BaseModelLoader):
         invalid memory.
         """
         self._last_sleep_level = level
-        if self._ctx is None:
-            return
-
-        unpublish_metadata(self._ctx)
-        if self._ctx.nixl_manager is not None:
-            self._ctx.nixl_manager.shutdown()
-            self._ctx.nixl_manager = None
+        self._stop_serving()
 
     def on_wake_up(self, tags: list[str] | None) -> None:
         """Resume P2P source-serving once vLLM's wake_up() has restored
@@ -351,18 +351,30 @@ class MxModelLoader(BaseModelLoader):
         valid again once reload_weights() actually repopulates them, and
         reload_model() registers and republishes the replica itself.
         wake_up() doesn't carry the sleep level itself, so this reads it back
-        from what on_sleep() recorded.
+        from what on_sleep() recorded, and clears it once weights are awake.
         """
-        if self._ctx is None:
+        wake_weights = tags is None or "weights" in tags
+        if not wake_weights:
             return
 
-        wake_weights = tags is None or "weights" in tags
-        if self._last_sleep_level != 1 or not wake_weights:
+        last_sleep_level = self._last_sleep_level
+        self._last_sleep_level = None
+        if self._ctx is None or last_sleep_level != 1:
             return
 
         if self._ctx.nixl_manager is None:
             register_tensors(None, self._ctx, reuse_discovered=True)
         publish_metadata(self._ctx)
+
+    def _stop_serving(self) -> None:
+        """Withdraw the publication and release the NIXL agent, if serving."""
+        if self._ctx is None:
+            return
+
+        unpublish_metadata(self._ctx)
+        if self._ctx.nixl_manager is not None:
+            self._ctx.nixl_manager.shutdown()
+            self._ctx.nixl_manager = None
 
     @property
     def nixl_manager(self) -> NixlTransferManager | None:
