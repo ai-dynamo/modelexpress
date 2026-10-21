@@ -35,6 +35,26 @@ class IncompleteRefit(RuntimeError):
     ``RuntimeError``, so a caller that catches only that is unaffected."""
 
 
+def _connected_groups(nodes, links):
+    """Group linked owners, retaining their input order within each component."""
+    parent = {node: node for node in nodes}
+
+    def root(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for link in links:
+        members = [node for node in link if node in parent]
+        for node in members[1:]:
+            parent[root(node)] = root(members[0])
+    groups = {}
+    for node in parent:
+        groups.setdefault(root(node), []).append(node)
+    return tuple(tuple(group) for group in groups.values())
+
+
 def summarize_unsupported(
     reasons: dict, limit: int | None = 3
 ) -> list[tuple[str, int]]:
@@ -58,8 +78,8 @@ def summarize_unsupported(
 class RecordedCopy:
     """One recorded scatter: read ``src_name`` sliced by ``op_chain`` and write it
     into ``param_name`` at ``as_strided(dest_shape, dest_stride, dest_offset)``.
-    Offsets/shapes/strides are read off the (meta) destination view, so no real
-    storage is needed. ``dest_dtype`` vs the source dtype decides raw-copy vs
+    Destination coordinates are physical and relative to the registered owner.
+    No real storage is needed. ``dest_dtype`` vs the source dtype decides raw-copy vs
     convert-via-staging downstream."""
 
     src_name: str
@@ -69,7 +89,6 @@ class RecordedCopy:
     dest_shape: tuple
     dest_stride: tuple
     dest_dtype: Any
-
 
 @dataclass
 class CaptureResult:
@@ -89,3 +108,6 @@ class CaptureResult:
     unattributed: int = 0
     unsupported_reasons: dict = field(default_factory=dict)
     generator_fingerprint: tuple | None = None
+    source_replay: bool = False
+    generation: int | None = None
+    destination_layouts: dict[str, tuple[tuple, tuple]] = field(default_factory=dict)
