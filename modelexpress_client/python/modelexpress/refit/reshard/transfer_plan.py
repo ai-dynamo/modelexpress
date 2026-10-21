@@ -19,7 +19,9 @@ also use its full-pull and conversion phases.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from math import prod
+from types import MappingProxyType
 from typing import Any, Callable
 
 from modelexpress import envs
@@ -78,6 +80,9 @@ class FullPullSource:
     elsize: int
     segments: tuple
     copies: tuple
+    copy_indices: tuple = ()
+    exact_descriptor_count: int = 0
+    exact_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -98,6 +103,11 @@ class LogicalTransferPlan:
     exact_descriptor_count: int = 0
     exact_bytes: int = 0
     verify_full_sources: bool = False
+    source_replay: bool = False
+    replay_parameter_names: frozenset[str] = frozenset()
+    replay_last_writes: MappingProxyType = field(default_factory=lambda: MappingProxyType({}))
+    replay_total_copies: int = 0
+    replay_generation: int | None = None
 
     def _all_segments(self):
         """Every planned segment, wherever it lands.
@@ -123,6 +133,108 @@ class LogicalTransferPlan:
 
     def extra_wire_bytes(self) -> int:
         return max(0, self.bytes_planned() - self.exact_bytes)
+
+
+def replay_scratch_bytes(full):
+    """Bound simultaneously live local replay outputs, excluding the receive view."""
+    import torch
+
+    peak = 0
+    for copy in full.copies:
+        root = torch.empty(full.global_shape, dtype=full.dtype, device="meta")
+        root_storage = root.untyped_storage()._cdata
+        value = root
+
+        previous = {}
+        for name, args, frozen in copy.op_chain:
+            kwargs = dict(frozen)
+            if name == "to":
+                if args and isinstance(args[0], (str, torch.device)):
+                    args = (torch.device("meta"), *args[1:])
+                    if len(args) >= 4:
+                        args = (*args[:3], True, *args[4:])
+                    else:
+                        kwargs["copy"] = True
+                if kwargs.get("device") is not None:
+                    kwargs["device"] = torch.device("meta")
+                    kwargs["copy"] = True
+            value = (
+                torch.empty_like(value)
+                if name == "zero_"
+                else getattr(value, name)(*args, **kwargs)
+            )
+            tensors = value if isinstance(value, (tuple, list)) else (value,)
+            current = {
+                tensor.untyped_storage()._cdata: tensor.untyped_storage().nbytes()
+                for tensor in tensors
+                if isinstance(tensor, torch.Tensor)
+                and tensor.untyped_storage()._cdata != root_storage
+            }
+            peak = max(peak, sum((previous | current).values()))
+            previous = current
+    return peak
+
+
+def _plan_local_replay(copy, source, index, *, buffer_indices,
+                       max_segments_per_copy, max_staging_bytes):
+    """Prefer a descriptor-bounded source prefix and replay its suffix locally."""
+    import torch
+
+    from modelexpress.refit.reshard.geometry import _SUPPORTED_OPS
+
+    if any(op[0] not in _SUPPORTED_OPS.values() for op in copy.op_chain):
+        raise UnsupportedReshard(f"{copy.src_name}: unsupported replay operation")
+    root = torch.empty(source.global_shape, dtype=source.dtype, device="meta")
+    value = root
+    exact = None
+    bounded = None
+    for length in range(len(copy.op_chain) + 1):
+        if length:
+            name, args, kwargs = copy.op_chain[length - 1]
+            if name in {"to", "float", "bfloat16", "half", "double", "zero_"}:
+                break
+            value = getattr(value, name)(*args, **dict(kwargs))
+            if not isinstance(value, torch.Tensor):
+                continue
+            if value is not root and value._base is not root:
+                break
+        candidate = replace(
+            copy,
+            op_chain=copy.op_chain[:length],
+            dest_offset=0,
+            dest_shape=tuple(value.shape),
+            dest_stride=tuple(_row_major_strides(value.shape)),
+            dest_dtype=source.dtype,
+        )
+        try:
+            reads = plan_pull(
+                candidate, source.global_shape, source.dtype, source.elsize,
+                source.shards, buffer_indices=buffer_indices,
+            )
+        except UnsupportedReshard:
+            break
+        exact = (length, candidate, reads)
+        staging_bytes = ((prod(candidate.dest_shape) * source.elsize + 255) // 256) * 256
+        if len(reads) <= max_segments_per_copy and (
+            max_staging_bytes is None or staging_bytes <= max_staging_bytes
+        ):
+            bounded = exact
+    if exact is None:
+        raise UnsupportedReshard(f"{copy.src_name}: no transferable replay prefix")
+    prefix, candidate, segments = bounded or exact
+    # Tuple keys cannot collide with trainer names, including across packed owners.
+    key = (copy.src_name, copy.param_name, index)
+    return FullPullSource(
+        src_name=key,
+        global_shape=candidate.dest_shape,
+        dtype=source.dtype,
+        elsize=source.elsize,
+        segments=tuple(segment._replace(param_name=key) for segment in segments),
+        copies=(replace(copy, op_chain=copy.op_chain[prefix:]),),
+        copy_indices=(index,),
+        exact_descriptor_count=len(exact[2]),
+        exact_bytes=sum(read.nbytes for read in exact[2]),
+    )
 
 
 def _full_pull_segments(
@@ -250,14 +362,17 @@ def plan_transfer(
     max_segments_per_copy: int | None = None,
     source_slots: dict[str, str] | None = None,
     verify_full_sources: bool = False,
+    max_staging_bytes: int | None = None,
 ) -> LogicalTransferPlan:
     """Build a ``LogicalTransferPlan`` from captured copies + published ``sources``
     (``{src_name: SourceInfo}``). Sources flagged unsupported at capture, missing
     from ``sources``, or non-box at ``plan_pull`` are marked unsupported.
 
     ``source_slots`` maps transport sessions to logical source slots; omission
-    uses session identity. ``verify_full_sources`` reconstructs sources lacking
-    an identity copy so receivers can verify whole-shard checksums.
+    uses session identity. ``verify_full_sources`` reconstructs legacy sources
+    lacking an identity copy. Source replay instead requires its normal reads
+    to stage complete sources for whole-shard checksum verification.
+    ``max_staging_bytes`` limits descriptor coarsening for each replay write.
     """
     source_buffers = []
     source_indices = {}
@@ -279,6 +394,7 @@ def plan_transfer(
         capture, sources, source_buffers, source_indices,
         max_segments_per_copy=max_segments_per_copy,
         verify_full_sources=verify_full_sources,
+        max_staging_bytes=max_staging_bytes,
     )
 
 
@@ -303,14 +419,55 @@ def plan_transfer_groups(
         )
 
 
+def _plan_source_replay(capture, sources, source_buffers, source_indices, *,
+                        verify_full_sources, max_segments_per_copy, max_staging_bytes):
+    full_pulls = []
+    fallback = list(dict.fromkeys(capture.unsupported))
+    for index, copy in enumerate(capture.copies):
+        source = sources.get(copy.src_name)
+        if source is None:
+            if copy.src_name not in fallback:
+                fallback.append(copy.src_name)
+            continue
+        pull = _plan_local_replay(
+            copy,
+            source, index, buffer_indices=source_indices[copy.src_name],
+            max_segments_per_copy=max_segments_per_copy,
+            max_staging_bytes=max_staging_bytes,
+        )
+        if verify_full_sources and len(pull.copies[0].op_chain) != len(copy.op_chain):
+            raise UnsupportedReshard(
+                f"{copy.src_name}: published whole-shard digests cannot verify "
+                "this replay read without changing its transfer plan"
+            )
+        full_pulls.append(pull)
+    return LogicalTransferPlan(
+        source_buffers=tuple(source_buffers), full_pulls=tuple(full_pulls),
+        fallback=tuple(fallback), source_replay=True,
+        verify_full_sources=verify_full_sources,
+        replay_parameter_names=frozenset(copy.param_name for copy in capture.copies),
+        replay_last_writes=MappingProxyType({copy.param_name: i for i, copy in enumerate(capture.copies)}),
+        replay_total_copies=len(capture.copies), replay_generation=capture.generation,
+        exact_descriptor_count=sum(p.exact_descriptor_count for p in full_pulls),
+        exact_bytes=sum(p.exact_bytes for p in full_pulls),
+    )
+
+
 def _plan_transfer(
     capture, sources, source_buffers, source_indices, *,
-    max_segments_per_copy=None, verify_full_sources=False,
+    max_segments_per_copy=None, verify_full_sources=False, max_staging_bytes=None,
 ) -> LogicalTransferPlan:
     if max_segments_per_copy is None:
         max_segments_per_copy = envs.MX_RESHARD_MAX_SEGMENTS_PER_COPY
     if max_segments_per_copy < 1:
         raise ValueError("max_segments_per_copy must be at least 1")
+    if capture.source_replay:
+        return _plan_source_replay(
+            capture, sources, source_buffers, source_indices,
+            verify_full_sources=verify_full_sources,
+            max_segments_per_copy=max_segments_per_copy,
+            max_staging_bytes=max_staging_bytes,
+        )
     if verify_full_sources:
         return _plan_verified_transfer(
             capture, sources, source_buffers, source_indices, max_segments_per_copy
