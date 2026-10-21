@@ -35,7 +35,8 @@ def register_plugin_weight_transfer_engine() -> None:
         logger.debug("vLLM does not expose the weight-transfer engine factory")
         return
 
-    WeightTransferEngineFactory._registry.pop(_WEIGHT_TRANSFER_BACKEND, None)
+    if _WEIGHT_TRANSFER_BACKEND in WeightTransferEngineFactory._registry:
+        return
     WeightTransferEngineFactory.register_engine(
         _WEIGHT_TRANSFER_BACKEND,
         "modelexpress_rl.inference.engines.vllm.weight_transfer_engine",

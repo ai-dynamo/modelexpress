@@ -3,7 +3,6 @@
 
 """RL policy selection for the shared vLLM loader."""
 
-import importlib
 import logging
 from unittest.mock import MagicMock, patch
 
@@ -117,11 +116,8 @@ def test_plugin_registers_rl_loader_only_for_rl_policy(monkeypatch, policy, uses
         ("vllm.distributed.weight_transfer.native", "NativeEngine"),
     ],
 )
-def test_plugin_replaces_weight_transfer_entry_and_is_idempotent(monkeypatch, old_entry):
+def test_plugin_preserves_weight_transfer_entry_and_is_idempotent(monkeypatch, old_entry):
     from modelexpress_rl.inference.engines.vllm import registration
-    from modelexpress_rl.inference.engines.vllm.weight_transfer_engine import (
-        ModelExpressWeightTransferEngine,
-    )
     from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
 
     registry = {
@@ -136,7 +132,16 @@ def test_plugin_replaces_weight_transfer_entry_and_is_idempotent(monkeypatch, ol
     registration.register()
     registration.register()
 
-    module_path, class_name = registry["modelexpress"]
-    assert module_path.startswith("modelexpress_rl.")
-    assert getattr(importlib.import_module(module_path), class_name) is ModelExpressWeightTransferEngine
+    assert registry["modelexpress"] is old_entry
     assert registry["other"] == ("other.engine", "OtherEngine")
+
+
+def test_plugin_registers_missing_weight_transfer_entry_once(monkeypatch):
+    from modelexpress_rl.inference.engines.vllm import registration
+    from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
+
+    monkeypatch.setattr(WeightTransferEngineFactory, "_registry", {})
+    registration.register_plugin_weight_transfer_engine()
+    entry = WeightTransferEngineFactory._registry["modelexpress"]
+    registration.register_plugin_weight_transfer_engine()
+    assert WeightTransferEngineFactory._registry["modelexpress"] is entry

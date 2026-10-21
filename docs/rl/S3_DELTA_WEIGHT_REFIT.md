@@ -174,7 +174,7 @@ Backend-specific environment variables:
 |---|---|---|
 | `MX_MODEL_NAME_OVERRIDE` | unset | Logical MX model name used by vLLM at startup and during refit. Use the same name for trainer clients and published WeightVersions. Without it, vLLM's configured model path or ID is used. |
 | `VLLM_SERVER_DEV_MODE` | unset | Set to `1` to enable vLLM's weight-update HTTP routes. Network-isolate these routes. |
-| `VLLM_PLUGINS` | unset | Set to `modelexpress` to load the ModelExpress vLLM plugin. |
+| `VLLM_PLUGINS` | unset | Set to `modelexpress_rl` to load the RL plugin and its weight-transfer backend. |
 
 ### Start vLLM
 
@@ -183,14 +183,14 @@ Install the `modelexpress` Python package in the same environment used to run
 
 ```toml
 [project.entry-points."vllm.general_plugins"]
-modelexpress = "modelexpress:register_modelexpress"
+modelexpress_rl = "modelexpress_rl.inference.engines.vllm.registration:register"
 ```
 
-`VLLM_PLUGINS=modelexpress` selects that installed plugin. Then start vLLM:
+`VLLM_PLUGINS=modelexpress_rl` selects that installed plugin. Then start vLLM:
 
 ```bash
 export VLLM_SERVER_DEV_MODE=1
-export VLLM_PLUGINS=modelexpress
+export VLLM_PLUGINS=modelexpress_rl
 export MX_SERVER_ADDRESS=modelexpress:8001
 export MX_MODEL_NAME_OVERRIDE=Qwen/Qwen3-30B-A3B
 
