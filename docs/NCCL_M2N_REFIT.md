@@ -258,7 +258,7 @@ Defaults and details are in section 9.
 - `MX_NCCL_REFIT_NUM_STREAMS`: stream pool size for integrations that build
   their own `streams`.
 - `MX_NCCL_REFIT_BLOCKING_DATA_PLANE`: run data traffic on a blocking
-  communicator.
+  communicator (on by default).
 - `MX_NCCL_REFIT_GROUPED_SUBMISSION`: record each layer group's reshards in one
   `nccl.m2n.group()`.
 - `MX_NCCL_REFIT_PIPELINE_DEPTH`: layer groups the generator keeps in flight.
@@ -725,7 +725,7 @@ reports the round FAILED.
 | Variable | Default | Purpose |
 |---|---|---|
 | `MX_NCCL_REFIT_NUM_STREAMS` | `2` | Size of the stream pool an integration builds when it does not pass its own `streams`. Not read by `RefitClientTrainer`/`RefitClientGenerator` |
-| `MX_NCCL_REFIT_BLOCKING_DATA_PLANE` | `0` | Opt-in. When `1`, each lane is still initialized as a non-blocking communicator bounded by `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S`, and reshard and broadcast traffic runs on a blocking communicator split from it under the same deadline. On the M2N NVLink path a non-blocking communicator costs about 0.4 ms of host time per reshard call, so this cuts a single-node refit of a few hundred parameters several-fold; over the network the per-call cost is already small and this changes little. Abort tears down both communicators. |
+| `MX_NCCL_REFIT_BLOCKING_DATA_PLANE` | `1` | On by default; set `0` to run data traffic on the non-blocking communicator instead. When on, each lane is still initialized as a non-blocking communicator bounded by `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S`, and reshard and broadcast traffic runs on a blocking communicator split from it under the same deadline. On the M2N NVLink path a non-blocking communicator costs about 0.4 ms of host time per reshard call, so this cuts a single-node refit of a few hundred parameters several-fold; over the network the per-call cost is already small and this changes little. Abort tears down both communicators. With it off, a rank whose peer dies in the middle of a refit can block past `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` instead of raising. |
 | `MX_NCCL_REFIT_GROUPED_SUBMISSION` | `0` | Opt-in. When `1`, each layer group's reshards are recorded in one `nccl.m2n.group()` so M2N can fuse them; by default each is a separate `nccl.m2n.reshard` call on the same handle and stream. In nccl-extensions 0.1.0 a group of two or more reshards needs GIN (RDMA devices, and `NCCL_GIN_TYPE=2` for proxy GIN) even when every peer is NVLink-only; without it the group end fails on every rank |
 | `MX_NCCL_REFIT_PIPELINE_DEPTH` | `2` | Layer groups the generator keeps in flight before installing the oldest; `1` installs each group before `update_weights` returns. All groups are installed before `finish_weight_update` returns |
 | `MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES` | `1073741824` | Generator, per-call path only: `pre` scratch one layer group keeps alive. Each `post` runs right after its call; calls are closed into half-budget windows, and once two are closed the older is waited on through its lane events and dropped. `0` retains every buffer until the group is waited on. Ignored by grouped submission |

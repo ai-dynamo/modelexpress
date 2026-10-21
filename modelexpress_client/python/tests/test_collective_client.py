@@ -17,6 +17,7 @@ import pytest
 
 import modelexpress_rl.collective.backend as collective_backend
 import modelexpress_rl.collective.client as collective_client
+import modelexpress_rl.collective.envs as envs
 from modelexpress_rl.collective import (
     CommunicatorCache,
     LaneCommunicator,
@@ -195,6 +196,9 @@ class FakeRendezvousPP2(FakeRendezvous):
 
 @pytest.fixture
 def fake_nccl(monkeypatch):
+    # The fake communicators below have no split(), so these tests run the
+    # non-blocking data plane; tests of the blocking one set the flag to "1".
+    monkeypatch.setenv("MX_NCCL_REFIT_BLOCKING_DATA_PLANE", "0")
     ops = []
 
     def reshard(src, dst, comm, **kwargs):
@@ -575,10 +579,10 @@ class TestCommunicatorBootstrap:
         lane.abort()
         assert made == {**made, "child_aborted": True, "parent_aborted": True}
 
-    def test_without_the_flag_the_data_plane_is_the_nonblocking_comm(
+    def test_with_the_flag_off_the_data_plane_is_the_nonblocking_comm(
         self, fake_nccl, monkeypatch
     ):
-        monkeypatch.delenv("MX_NCCL_REFIT_BLOCKING_DATA_PLANE", raising=False)
+        monkeypatch.setenv("MX_NCCL_REFIT_BLOCKING_DATA_PLANE", "0")
         communicator = sys.modules["nccl.core.communicator"]
 
         class Parent:
@@ -1949,3 +1953,17 @@ class TestSuccessReportDelivery:
             client.finish_weight_update("v1")
         assert len(rz.reports) == 1
         assert client._operation_id is None
+
+
+class TestBlockingDataPlaneDefault:
+    def test_unset_means_blocking(self, monkeypatch):
+        monkeypatch.delenv("MX_NCCL_REFIT_BLOCKING_DATA_PLANE", raising=False)
+        assert envs.MX_NCCL_REFIT_BLOCKING_DATA_PLANE is True
+
+    def test_zero_turns_it_off(self, monkeypatch):
+        monkeypatch.setenv("MX_NCCL_REFIT_BLOCKING_DATA_PLANE", "0")
+        assert envs.MX_NCCL_REFIT_BLOCKING_DATA_PLANE is False
+
+    def test_other_flags_stay_off_when_unset(self, monkeypatch):
+        monkeypatch.delenv("MX_NCCL_REFIT_GROUPED_SUBMISSION", raising=False)
+        assert envs.MX_NCCL_REFIT_GROUPED_SUBMISSION is False

@@ -53,9 +53,11 @@ def _bytes(name: str, default: int) -> int:
     return value
 
 
-def _flag(name: str) -> bool:
-    value = os.environ.get(name, "0").strip().lower()
-    if value in ("", "0", "false", "no", "off"):
+def _flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if value == "":
+        return default
+    if value in ("0", "false", "no", "off"):
         return False
     if value in ("1", "true", "yes", "on"):
         return True
@@ -86,7 +88,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MX_NCCL_REFIT_ABORT_TIMEOUT_S", 10.0
     ),
     "MX_NCCL_REFIT_BLOCKING_DATA_PLANE": lambda: _flag(
-        "MX_NCCL_REFIT_BLOCKING_DATA_PLANE"
+        "MX_NCCL_REFIT_BLOCKING_DATA_PLANE", default=True
     ),
     "MX_NCCL_REFIT_GROUPED_SUBMISSION": lambda: _flag(
         "MX_NCCL_REFIT_GROUPED_SUBMISSION"
