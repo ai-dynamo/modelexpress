@@ -9,7 +9,7 @@ from types import ModuleType
 import pytest
 import torch.nn as nn
 
-from modelexpress.tests.test_sglang_loader import (
+from tests.test_sglang_loader import (
     _device_config,
     _load_config,
     _model_config,

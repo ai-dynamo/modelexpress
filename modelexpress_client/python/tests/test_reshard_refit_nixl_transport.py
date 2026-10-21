@@ -9,7 +9,7 @@ groups descriptors per session into one batch, resolves session -> remote agent
 posts every peer's batch before waiting on any of them. The actual RDMA is
 exercised by the on-cluster smoke harness.
 
-Run: pytest modelexpress_rl/tests/test_reshard_refit_nixl_transport.py
+Run: pytest tests/test_reshard_refit_nixl_transport.py
 """
 
 from dataclasses import dataclass

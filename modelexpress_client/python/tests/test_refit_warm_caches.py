@@ -41,7 +41,7 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
 from modelexpress_rl.inference.adapter import TrainerSourceShard
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
-from modelexpress_rl.tests.test_refit_bounded_descriptors import harness, _check_values
+from tests.test_refit_bounded_descriptors import harness, _check_values
 
 
 def _manifest(

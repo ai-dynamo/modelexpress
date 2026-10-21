@@ -9,7 +9,7 @@ reference. Covers: contiguous column-block, strided column-slice (multi-run),
 fused per-shard dest offset, multi-shard fan-in, disjoint shard skip, and
 UnsupportedReshard detection (non-box op, dtype mismatch).
 
-Run: pytest modelexpress_rl/tests/test_reshard_refit_slice_plan.py
+Run: pytest tests/test_reshard_refit_slice_plan.py
 """
 
 import pytest

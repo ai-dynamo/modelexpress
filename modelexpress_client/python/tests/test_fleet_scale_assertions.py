@@ -13,7 +13,7 @@ import pytest
 @pytest.fixture
 def fleet_test(monkeypatch):
     monkeypatch.syspath_prepend(
-        str(Path(__file__).resolve().parents[4] / "ci/k8s/client")
+        str(Path(__file__).resolve().parents[3] / "ci/k8s/client")
     )
     return importlib.import_module("test_fleet_scale")
 

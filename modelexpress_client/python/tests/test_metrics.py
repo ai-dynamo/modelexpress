@@ -75,7 +75,7 @@ _RECORDERS = [
     ("record_artifact_install_bytes", ("torch_compile_cache", "primary", 4096)),
 ]
 
-_PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _fresh_collector(monkeypatch, **env):
@@ -1320,7 +1320,7 @@ def test_load_buckets_match_the_rust_xslow_band():
     two bands are pinned to each other here rather than trusted to stay in step.
     """
     rust = (
-        Path(__file__).resolve().parents[4]
+        Path(__file__).resolve().parents[3]
         / "modelexpress_server"
         / "src"
         / "metrics"

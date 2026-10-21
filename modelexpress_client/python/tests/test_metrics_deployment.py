@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[4]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 _HELM = _REPO_ROOT / "helm"
 
 _VALUES_FILES = [

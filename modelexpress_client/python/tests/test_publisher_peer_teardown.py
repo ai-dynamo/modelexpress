@@ -13,7 +13,7 @@ Two related lifecycle behaviours are covered:
    Skipping the heartbeat only stops refreshing ``updated_at``, so the entry keeps
    its last status and stays selectable until the server's reaper times it out.
 
-Run: pytest modelexpress/tests/test_publisher_peer_teardown.py
+Run: pytest tests/test_publisher_peer_teardown.py
 """
 
 import time

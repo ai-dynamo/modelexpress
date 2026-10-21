@@ -17,7 +17,7 @@ from modelexpress_rl.refit.reshard.transfer_plan import (
 )
 from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
 from modelexpress_rl.version import MeshIdentity
-from modelexpress_rl.tests.test_refit_bounded_descriptors import harness
+from tests.test_refit_bounded_descriptors import harness
 
 
 def _source(tensor, session="physical-0"):

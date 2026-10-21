@@ -4,7 +4,7 @@
 from pathlib import Path
 
 
-_REPO_ROOT = Path(__file__).parents[4]
+_REPO_ROOT = Path(__file__).parents[3]
 _TRTLLM_EXAMPLE = (
     _REPO_ROOT / "examples" / "p2p_transfer_k8s" / "client" / "trtllm"
 )

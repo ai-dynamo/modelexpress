@@ -17,7 +17,7 @@ The tests that matter are the ones that would catch a wrong merge:
     every source - collapsing that would silently drop half the model;
   * the default is the previous first-writer-wins choice.
 
-Run: pytest modelexpress_rl/tests/test_reshard_refit_replica_merge.py
+Run: pytest tests/test_reshard_refit_replica_merge.py
 """
 
 import pytest

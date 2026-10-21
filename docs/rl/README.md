@@ -53,4 +53,4 @@ TensorRT-LLM support in the base package covers initial checkpoint P2P loading. 
 
 The RL package supports the explicitly implemented trainer and generator integrations documented in the architecture guide. vLLM and SGLang use automatic runtime entry points; the shared initial-load path and TensorRT-LLM P2P support remain in the base package.
 
-RL Python tests live under `modelexpress_client/python/modelexpress_rl/tests`; base Python tests live under `modelexpress_client/python/modelexpress/tests`. This boundary matches the installed `modelexpress_rl` and `modelexpress` namespaces.
+Base and RL Python tests remain under `modelexpress_client/python/tests`. Run both suites with `python -m pytest tests/`.

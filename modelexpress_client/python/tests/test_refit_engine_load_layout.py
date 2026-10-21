@@ -8,7 +8,7 @@ import pytest
 import torch
 from modelexpress_rl.inference.engines.vllm import installer as module
 from torch import nn
-from modelexpress_rl.tests.test_refit_vllm_installer import _install_fake_vllm
+from tests.test_refit_vllm_installer import _install_fake_vllm
 
 
 @pytest.fixture(params=[False, True], ids=["unquantized", "quantized"])
