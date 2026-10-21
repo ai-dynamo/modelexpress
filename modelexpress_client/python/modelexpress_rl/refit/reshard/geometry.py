@@ -41,8 +41,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_leaves
 
-from modelexpress.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     _connected_groups,
     OpChain,
@@ -655,6 +657,33 @@ def _shared_recorder(weights: dict) -> _BakeRecorder:
     return next(iter(recorders.values()))
 
 
+class _CaptureMutationGuard(TorchDispatchMode):
+    def __init__(self, destinations):
+        super().__init__()
+        self._storages = {
+            tensor.untyped_storage()._cdata
+            for _, tensor in destinations
+            if not tensor.is_meta
+        }
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        for index, argument in enumerate(func._schema.arguments):
+            if argument.alias_info is None or not argument.alias_info.is_write:
+                continue
+            value = args[index] if index < len(args) else kwargs.get(argument.name)
+            for tensor in tree_leaves(value):
+                if (
+                    isinstance(tensor, torch.Tensor)
+                    and not isinstance(tensor, LazyWeight)
+                    and tensor.untyped_storage()._cdata in self._storages
+                ):
+                    raise UnsupportedReshard(
+                        f"live destination mutation during capture: {func}"
+                    )
+        return func(*args, **kwargs)
+
+
 def capture_weights(
     model: torch.nn.Module,
     weights: dict[str, Any],
@@ -698,25 +727,26 @@ def capture_weights(
     try:
         # Large MoE loaders rebuild model-wide parameter/expert maps on entry.
         # LazyWeights carry their own source identity across one bulk invocation.
-        try:
-            with recorder.attempt():
-                model.load_weights(sorted(weights.items()))
-        except UnsupportedReshard as bulk_error:
-            # The per-source retry can succeed for every source even when bulk
-            # order trips a loader, which would otherwise leave `unsupported`
-            # empty and hide a bulk-only incompatibility entirely.
-            logger.warning(
-                "reshard capture: bulk load_weights raised, retrying per source; "
-                "bulk cause: %s",
-                bulk_error,
-            )
-            for name, tensor in sorted(weights.items()):
-                source = getattr(tensor, "_name", name)
-                try:
-                    model.load_weights([(name, tensor)])
-                except UnsupportedReshard as exc:
-                    unsupported.append(source)
-                    unsupported_reasons[source] = str(exc)
+        with _CaptureMutationGuard(recorder.destinations):
+            try:
+                with recorder.attempt():
+                    model.load_weights(sorted(weights.items()))
+            except UnsupportedReshard as bulk_error:
+                # The per-source retry can succeed for every source even when bulk
+                # order trips a loader, which would otherwise leave `unsupported`
+                # empty and hide a bulk-only incompatibility entirely.
+                logger.warning(
+                    "reshard capture: bulk load_weights raised, retrying per source; "
+                    "bulk cause: %s",
+                    bulk_error,
+                )
+                for name, tensor in sorted(weights.items()):
+                    source = getattr(tensor, "_name", name)
+                    try:
+                        model.load_weights([(name, tensor)])
+                    except UnsupportedReshard as exc:
+                        unsupported.append(source)
+                        unsupported_reasons[source] = str(exc)
     finally:
         _restore_stamps(saved)
         recorder.destinations.clear()

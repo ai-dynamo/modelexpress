@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from modelexpress.refit.reshard.types import IncompleteRefit
+from modelexpress_rl.refit.reshard.types import IncompleteRefit
 from modelexpress_rl.inference.plan import PreparedStreamingTensors, SourceReplayBatch
 from tests.test_refit_vllm_installer import (
     _cpu_installer,
@@ -116,7 +116,7 @@ def test_persistent_only_owner_skips_materialization(monkeypatch, registry):
 
 @pytest.mark.parametrize("streaming", [False, True])
 def test_replaced_pending_slot_fails_before_its_copy(monkeypatch, streaming):
-    from modelexpress.refit.reshard.types import IncompleteRefit
+    from modelexpress_rl.refit.reshard.types import IncompleteRefit
 
     _install_fake_vllm(monkeypatch, lambda model: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
@@ -143,7 +143,7 @@ def test_replaced_pending_slot_fails_before_its_copy(monkeypatch, streaming):
     assert torch.equal(replacement, torch.zeros(2, 2))
 
 
-def _persistent_installer(monkeypatch, model):
+def _persistent_installer(monkeypatch, model, *, quantized=False):
     from contextlib import nullcontext
     from types import ModuleType
 
@@ -161,7 +161,10 @@ def _persistent_installer(monkeypatch, model):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
-    return _cpu_installer(model)
+    return _cpu_installer(
+        model,
+        vllm_config=SimpleNamespace(quant_config=object()) if quantized else None,
+    )
 
 
 @pytest.mark.parametrize("registry", ["parameter", "buffer"])
@@ -464,3 +467,201 @@ def test_replay_rejects_invalid_update(monkeypatch, invalid):
         _install_tensors(installer, batch, False)
     if invalid != "incomplete":
         assert torch.equal(model.weight, torch.zeros(2))
+
+
+def test_online_fp8_streaming_keeps_live_storage(monkeypatch):
+    class OnlineFp8:
+        pass
+
+    OnlineFp8.__module__ = "vllm.model_executor.layers.quantization.online.fp8"
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+            self.quant_method = OnlineFp8()
+
+        def load_weights(self, weights):
+            for _, value in weights:
+                self.weight.copy_(value)
+
+    model = Model()
+    original = model.weight
+    installer = _persistent_installer(monkeypatch, model, quantized=True)
+    assert PreparedStreamingTensors in installer.capabilities.artifact_types
+    prepared = _streamed_tensors(
+        installer, lambda: iter([{"weight": torch.ones(2, 2)}]),
+        frozenset({"weight"}), {},
+    )
+    installer.install_streaming(prepared)
+    assert model.weight is original
+    assert torch.equal(model.weight, torch.ones(2, 2))
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("cast", [False, True])
+def test_quantized_replay_reuses_capture_and_restores_renamed_storage(monkeypatch, cast, bounded):
+    from types import ModuleType
+
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    sources = {
+        f"layer{i}.weight": torch.linspace(0.1, 2.0, 256).reshape(16, 16) + i
+        for i in range(6)
+    }
+
+    class Model(nn.Module):
+        capture_calls = 0
+
+        def load_weights(self, weights):
+            self.capture_calls += 1
+            for name, tensor in weights:
+                target = self.get_submodule(name.rpartition(".")[0]).weight
+                target.copy_(tensor.bfloat16().float() if cast else tensor)
+
+    model = Model()
+    originals = {}
+    for name in sources:
+        owner = nn.Module()
+        owner.packed = nn.Parameter(torch.zeros(16, 16), requires_grad=False)
+        model.add_module(name.split(".")[0], owner)
+        originals[owner] = owner.packed
+
+    class Info:
+        loaded_weights = ()
+
+        def __init__(self, tensor):
+            self.kernel_tensors = ({"packed": tensor}, {})
+
+        def reset(self):
+            self.kernel_tensors = None
+
+    def initialize(target):
+        for owner in target.children():
+            layerwise.LAYERWISE_INFO[owner] = Info(originals[owner])
+            del owner.packed
+            owner.weight = nn.Parameter(torch.empty(16, 16, device="meta"))
+
+    _install_fake_vllm(monkeypatch, initialize)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    layerwise._get_original_loader = lambda tensor: getattr(
+        tensor, "weight_loader", None
+    )
+
+    def place(owner, info):
+        del owner.weight
+        owner.packed = info.kernel_tensors[0]["packed"]
+
+    layerwise._place_kernel_tensors = place
+    utils = ModuleType("vllm.model_executor.model_loader.weight_utils")
+    utils.default_weight_loader = lambda target, value: target.copy_(value)
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    quant_base = sys.modules[
+        "vllm.model_executor.layers.quantization.base_config"
+    ].QuantizeMethodBase
+
+    class Quant(quant_base):
+        def process_weights_after_loading(self, owner):
+            owner.packed = nn.Parameter(owner.weight * 2, requires_grad=False)
+            del owner.weight
+
+    def restore(owner, info):
+        original = info.kernel_tensors[0]["packed"]
+        original.copy_(owner.packed)
+        owner.packed = original
+
+    layerwise._copy_and_restore_kernel_tensors = restore
+    for owner in model.children():
+        owner.quant_method = Quant()
+    manifest = [
+        (name, tensor.dtype, tuple(tensor.shape)) for name, tensor in sources.items()
+    ]
+    installer = _cpu_installer(
+        model, vllm_config=SimpleNamespace(quant_config=object()),
+    )
+    captured, layout = installer.capture(manifest)
+    assert model.capture_calls == 1
+    assert set(layout) == set(sources)
+    assert all(owner.packed is originals[owner] for owner in model.children())
+    assert PreparedStreamingTensors in installer.capabilities.artifact_types
+    pointer_by_owner = {owner: tensor.data_ptr() for owner, tensor in originals.items()}
+    for update in range(2):
+        if update:
+            for source in sources.values():
+                source.add_(3)
+        captured_again, layout_again = installer.capture(manifest)
+        assert model.capture_calls == 1
+        assert captured_again == captured and layout_again == layout
+        _transfer_and_install(installer, sources, captured_again, layout_again, bounded)
+        for name, source in sources.items():
+            owner = getattr(model, name.split(".")[0])
+            expected = source.bfloat16().float() if cast else source
+            assert not hasattr(owner, "weight")
+            assert owner.packed is originals[owner]
+            assert owner.packed.data_ptr() == pointer_by_owner[owner]
+            assert torch.equal(owner.packed, expected * 2)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["zero", "fill", "copy", "view", "data", "out", "foreach"]
+)
+@pytest.mark.parametrize("registry", ["parameter", "buffer"])
+def test_capture_rejects_live_destination_mutation_before_changing_values(
+    monkeypatch, mutation, registry
+):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            value = torch.full((4,), 7.0)
+            if registry == "parameter":
+                self.weight = nn.Parameter(value, requires_grad=False)
+            else:
+                self.register_buffer("weight", value)
+
+        def load_weights(self, weights):
+            if mutation == "zero":
+                self.weight.zero_()
+            elif mutation == "fill":
+                self.weight.fill_(3)
+            elif mutation == "copy":
+                self.weight.copy_(torch.zeros(4))
+            elif mutation == "view":
+                self.weight[1:].add_(3)
+            elif mutation == "data":
+                self.weight.data.zero_()
+            elif mutation == "out":
+                torch.add(self.weight, 3, out=self.weight)
+            else:
+                torch._foreach_add_([self.weight], 3)
+            for _, source in weights:
+                self.weight[:2].copy_(source)
+
+    model = Model()
+    installer = _persistent_installer(monkeypatch, model)
+    captured, _ = installer.capture([("weight", torch.float32, (2,))])
+    assert torch.equal(model.weight, torch.full((4,), 7.0))
+    assert captured.unsupported == ["weight"]
+    assert "live destination mutation" in captured.unsupported_reasons["weight"]
+
+
+def test_capture_allows_scratch_mutation_and_releases_live_storage_guard(monkeypatch):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", torch.full((4,), 7.0))
+
+        def load_weights(self, weights):
+            scratch = self.weight.clone()
+            scratch.zero_()
+            scratch.add_(3)
+            for _, source in weights:
+                self.weight.copy_(source)
+
+    model = Model()
+    installer = _persistent_installer(monkeypatch, model)
+    captured, _ = installer.capture([("weight", torch.float32, (4,))])
+    assert not captured.unsupported
+    assert len(captured.copies) == 1
+    assert torch.equal(model.weight, torch.full((4,), 7.0))
+    model.weight.add_(1)
+    assert torch.equal(model.weight, torch.full((4,), 8.0))

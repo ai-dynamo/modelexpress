@@ -189,7 +189,7 @@ def published_digest(tensor) -> str | None:
     Read live rather than captured at import so a publisher can be switched without
     reimporting, and so the tests do not have to reload this module.
     """
-    from modelexpress import envs
+    from modelexpress_rl import envs
 
     if not envs.MX_RESHARD_PUBLISH_DIGEST:
         return None

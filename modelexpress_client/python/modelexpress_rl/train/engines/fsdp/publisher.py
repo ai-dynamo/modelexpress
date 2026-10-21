@@ -30,7 +30,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from modelexpress.nixl_transfer import NIXL_DRAM_MEM_TYPE, NIXL_VRAM_MEM_TYPE
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     wrap_rendezvous_blob,

@@ -1,16 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-"""The throughput floor on the staged FSDP receiver.
-
-There are two receivers over one transport. ``test_reshard_refit_floor`` covers
-the Megatron one; this file covers the staged one, which is what the FSDP
-trainers refit over and what the collapse that motivated the floor was actually
-measured on. The floor first shipped covering only the Megatron receiver, so an
-operator could set ``MX_RESHARD_MIN_GBPS`` on an FSDP job, breach it by 20x, and
-get silence - the guard was configurable but unreachable. These tests exist so
-that cannot come back.
-"""
+"""Throughput-floor diagnostics for staged RL weight transfers."""
 
 from __future__ import annotations
 
@@ -23,11 +14,11 @@ import torch
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress import p2p_pb2
-from modelexpress.refit.reshard import throughput
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import LogicalTransferPlan, SourceInfo
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
-from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.refit.reshard import throughput
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import LogicalTransferPlan, SourceInfo
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.nixl_staged_transfer import (
     _NixlStagedTransfer,
     _PreparedNixlTransfer,
@@ -276,8 +267,7 @@ def test_the_healthy_fsdp_pull_is_silent(monkeypatch, caplog):
 
 
 def test_the_floor_is_off_unless_configured(monkeypatch, caplog):
-    """Only the operator knows what their fabric should deliver, so absent config
-    the staged path stays out of the way exactly as the Megatron one does."""
+    """Leave the throughput floor disabled unless the operator configures it."""
     _floor(monkeypatch, None)
     with caplog.at_level(logging.WARNING):
         _stage(monkeypatch, nbytes=SLOW_BYTES, wire_s=SLOW_WIRE_S)
@@ -306,30 +296,18 @@ def test_a_healthy_peer_pull_is_silent(monkeypatch, caplog):
     assert not _records(caplog)
 
 
-def test_both_receivers_report_the_same_marker_and_schema(monkeypatch, caplog):
-    """The anti-drift test.
-
-    A CI gate greps one marker string. If the two receivers each carried their own
-    copy of this record, the same regression could fail one path and pass the
-    other, and the gate would read green for the wrong reason. Both must come from
-    the shared implementation.
-    """
+def test_trainer_and_peer_pulls_report_the_same_marker_and_schema(monkeypatch, caplog):
+    """Keep trainer and peer throughput records compatible with the CI gate."""
     _floor(monkeypatch, FLOOR_GBPS)
-    from modelexpress.refit.reshard import receiver
-
-    class _Rig:
-        _global_rank = 3
-
     with caplog.at_level(logging.WARNING):
-        _stage(monkeypatch, nbytes=SLOW_BYTES, wire_s=SLOW_WIRE_S)
+        with monkeypatch.context() as stage_patch:
+            _stage(stage_patch, nbytes=SLOW_BYTES, wire_s=SLOW_WIRE_S)
         staged_payload = _record(caplog)
         caplog.clear()
-        receiver.ReshardReceiver._check_throughput_floor(
-            _Rig(), 1, SLOW_BYTES, {"wire_fused_s": SLOW_WIRE_S}
-        )
-        megatron_payload = _record(caplog)
+        _peer_receive(monkeypatch, nbytes=SLOW_BYTES, wire_s=SLOW_WIRE_S)
+        peer_payload = _record(caplog)
 
-    assert staged_payload["schema"] == megatron_payload["schema"]
+    assert staged_payload["schema"] == peer_payload["schema"]
     # The quantitative fields a gate would threshold on must be named identically
     # on both paths, or a gate written against one silently ignores the other.
     shared = {
@@ -341,6 +319,6 @@ def test_both_receivers_report_the_same_marker_and_schema(monkeypatch, caplog):
         "shortfall_x",
     }
     assert shared <= set(staged_payload)
-    assert shared <= set(megatron_payload)
+    assert shared <= set(peer_payload)
     for key in shared:
-        assert staged_payload[key] == megatron_payload[key]
+        assert staged_payload[key] == peer_payload[key]

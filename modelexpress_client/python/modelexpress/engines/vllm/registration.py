@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 
 _PLUGIN_LOAD_FORMATS = ("modelexpress", "mx")
-_WEIGHT_TRANSFER_BACKEND = "modelexpress"
 
 
 def register_plugin_model_loader() -> None:
@@ -29,26 +28,3 @@ def register_plugin_model_loader() -> None:
             )
             continue
         register_model_loader(load_format)(MxModelLoader)
-
-
-def register_plugin_weight_transfer_engine() -> None:
-    """Register the ModelExpress backend when vLLM exposes weight transfer."""
-    try:
-        from vllm.distributed.weight_transfer.factory import (
-            WeightTransferEngineFactory,
-        )
-    except ImportError:
-        logger.debug("vLLM does not expose the weight-transfer engine factory")
-        return
-
-    if _WEIGHT_TRANSFER_BACKEND in WeightTransferEngineFactory._registry:
-        logger.debug(
-            "vLLM already provides '%s' weight-transfer registration",
-            _WEIGHT_TRANSFER_BACKEND,
-        )
-        return
-    WeightTransferEngineFactory.register_engine(
-        _WEIGHT_TRANSFER_BACKEND,
-        "modelexpress_rl.inference.engines.vllm.weight_transfer_engine",
-        "ModelExpressWeightTransferEngine",
-    )

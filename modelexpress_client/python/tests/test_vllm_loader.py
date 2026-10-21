@@ -233,31 +233,14 @@ def test_initial_load_uses_inference_chain_by_default(monkeypatch):
     inference_run.assert_called_once_with(model, ctx)
 
 
-def test_initial_load_uses_dedicated_rl_chain(monkeypatch):
-    from modelexpress.load_strategy import run_load_strategy_chain
-
-    monkeypatch.setenv("MX_LOAD_STRATEGY_CHAIN", "RL")
-    model = MagicMock()
-    ctx = _make_load_context()
-
-    with patch(
-        "modelexpress.load_strategy.LoadStrategyChain.run"
-    ) as inference_run, patch(
-        "modelexpress_rl.inference.load_strategy.RLLoadStrategyChain.run",
-        return_value=model,
-    ) as rl_run:
-        assert run_load_strategy_chain(model, ctx) is model
-
-    inference_run.assert_not_called()
-    rl_run.assert_called_once_with(model, ctx)
 
 
-def test_initial_load_rejects_unknown_chain(monkeypatch):
+def test_initial_load_rejects_unsupported_policy(monkeypatch):
     from modelexpress.load_strategy import run_load_strategy_chain
 
     monkeypatch.setenv("MX_LOAD_STRATEGY_CHAIN", "unknown")
 
-    with pytest.raises(ValueError, match="MX_LOAD_STRATEGY_CHAIN"):
+    with pytest.raises(ValueError, match="requires its engine integration plugin"):
         run_load_strategy_chain(MagicMock(), _make_load_context())
 
 
@@ -393,13 +376,6 @@ class TestAbstractMethodCompleteness:
                 loader.download_model(cfg)
                 mock_cls.return_value.download_model.assert_not_called()
 
-    def test_download_model_defers_to_rl_initial_load(self):
-        loader = _make_loader()
-        cfg = MagicMock()
-        with patch.dict("os.environ", {"MX_LOAD_STRATEGY_CHAIN": "RL"}, clear=True):
-            with patch("modelexpress.engines.vllm.loader.DefaultModelLoader") as mock_cls:
-                loader.download_model(cfg)
-                mock_cls.return_value.download_model.assert_not_called()
 
     def test_load_weights_delegates(self):
         loader = _make_loader()
@@ -1065,31 +1041,6 @@ class TestMtpDrafterSecondLoad:
             loader_mod._nixl_managers.pop(0, None)
             loader_mod._loader_registry.pop(0, None)
 
-    def test_rl_drafter_is_rejected_before_initialization(self):
-        """RL has no version contract for speculative draft weights."""
-        loader = _make_loader()
-        vllm_config = MagicMock()
-        model_config = MagicMock(dtype=torch.float32, runner_type="draft")
-
-        with patch.dict(
-            os.environ,
-            {
-                "MX_LOAD_STRATEGY_CHAIN": "RL",
-                "MX_REFIT_DESIRED_VERSION_UID": "main-version",
-            },
-            clear=True,
-        ), patch(
-            "modelexpress.engines.vllm.loader.build_vllm_load_context"
-        ) as build_context, patch(
-            "modelexpress.engines.vllm.loader.initialize_model"
-        ) as initialize, pytest.raises(
-            ValueError,
-            match="RL initial loading does not support speculative draft models",
-        ):
-            loader.load_model(vllm_config, model_config)
-
-        build_context.assert_not_called()
-        initialize.assert_not_called()
 
     def test_is_speculative_draft(self):
         from modelexpress.engines.vllm.loader import _is_speculative_draft
@@ -2883,10 +2834,9 @@ class TestConfigureVllmLogging:
 
     def _reset_mx_logger(self):
         """Clear any handlers/level from the modelexpress root logger."""
-        for name in ("modelexpress", "modelexpress_rl"):
-            mx_root = logging.getLogger(name)
-            mx_root.handlers.clear()
-            mx_root.setLevel(logging.NOTSET)
+        mx_root = logging.getLogger("modelexpress")
+        mx_root.handlers.clear()
+        mx_root.setLevel(logging.NOTSET)
 
     def _simulate_vllm_enginecore_logging(self):
         """Reproduce vLLM 0.19.0 EngineCore: only "vllm" gets a handler."""
@@ -2929,21 +2879,6 @@ class TestConfigureVllmLogging:
         finally:
             self._cleanup(vllm_logger)
 
-    def test_rl_child_loggers_visible_after_configure(self):
-        from modelexpress import configure_vllm_logging
-
-        vllm_logger, handler = self._simulate_vllm_enginecore_logging()
-        try:
-            configure_vllm_logging()
-
-            rl_root = logging.getLogger("modelexpress_rl")
-            assert len(rl_root.handlers) == 1
-            assert rl_root.handlers[0] is handler
-            assert logging.getLogger(
-                "modelexpress_rl.inference.session"
-            ).getEffectiveLevel() == logging.DEBUG
-        finally:
-            self._cleanup(vllm_logger)
 
     def test_no_duplicate_handlers_on_repeated_calls(self):
         from modelexpress import configure_vllm_logging

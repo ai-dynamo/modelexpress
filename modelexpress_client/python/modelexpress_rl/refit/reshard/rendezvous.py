@@ -1,35 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-"""Shard-geometry rendezvous for the reshard weight broadcast.
-
-TEMPORARY / NEXT STEP - add typed shard fields to the proto. This whole module
-works around ``TensorDescriptor`` carrying only ``name/addr/size/device_id/dtype``
-and no per-dim shard geometry. Until the proto has those fields, the trainer packs
-the resharding side-table (per source tensor: full shape + each shard's per-dim
-offset/shape + owning NIXL agent/device/base address) into a self-describing JSON
-blob that rides alongside the NIXL agent metadata; the inference side decodes it
-into the ``modelexpress.refit.reshard`` planning inputs (a ``SourceInfo`` per source +
-the shard -> owning-agent/device maps). When the proto gains those fields, delete
-the encode/decode here and build the same maps from typed descriptors -
-``NixlReshardTransport`` and the slice-plan / pull core are untouched.
-
-RENDEZVOUS IDENTITY: trainer and inference must compute the SAME
-``SourceIdentity`` for a role (inference builds the ``role="trainer"`` identity to
-DISCOVER it), so the identity may contain only fields both sides derive
-identically. They differ in ``tp/pp/ep`` (FSDP vs vLLM tp) and framework, so we
-cannot reuse ``build_source_identity`` wholesale; instead we derive the two shared
-values faithfully - ``model_name`` (the single ``[model] name`` both configs
-inherit) and ``mx_version`` (the ``modelexpress`` package version) - with a fixed
-framework as the only other hash key. The served dtype is deliberately NOT in the
-identity (the receiver builds it before discovering anything the trainer served);
-the real dtype rides in the shard table (``PublishedTensor.dtype``, from the
-publisher). See :meth:`_identity`.
-
-Encode/decode are dependency-free; only ``build_sources`` touches torch, to map
-the dtype label back to a ``torch.dtype`` for the dtype-match check (a raw RDMA
-copy is byte-for-byte, so source and dest dtypes must agree).
-"""
+"""Encode trainer shard metadata and build source geometry for RL refit."""
 
 from __future__ import annotations
 
@@ -38,40 +10,22 @@ import hashlib
 import json
 import logging
 import math
-import time
-import uuid
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import NamedTuple
 
-from modelexpress import envs, p2p_pb2
-from modelexpress.client import MxClient
-from modelexpress.metadata.publisher import PublisherThread
 from modelexpress.nixl_transfer import (
     NIXL_DRAM_MEM_TYPE,
     NIXL_MEM_TYPES,
     NIXL_VRAM_MEM_TYPE,
 )
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo
 
-logger = logging.getLogger("modelexpress.refit.reshard.rendezvous")
+logger = logging.getLogger("modelexpress_rl.refit.reshard.rendezvous")
 
 _SCHEMA = "mx.reshard.shard_table.v1"
 _HOST_SCHEMA = "mx.reshard.shard_table.v2"
-
-
-def _mx_version() -> str:
-    """The ``modelexpress`` package version, folded into the SourceIdentity hash
-    so trainer and inference on the same MX build resolve the same mx_source_id.
-    Derived (not a literal) so it tracks the real build."""
-    from importlib.metadata import PackageNotFoundError
-    from importlib.metadata import version as pkg_version
-
-    try:
-        return pkg_version("modelexpress")
-    except PackageNotFoundError:
-        return "0.0.0"
 
 
 @dataclass
@@ -80,7 +34,7 @@ class PublishedShard:
     to READ it from (owning agent / device / base address).
 
     ``digest`` is a position-sensitive digest over the shard's bytes, from
-    :func:`modelexpress.refit.reshard.verify.tensor_digest`. ``None`` means the
+    :func:`modelexpress_rl.refit.reshard.verify.tensor_digest`. ``None`` means the
     publisher did not compute one, which a checker must read as *unchecked* rather
     than as agreement.
     """
@@ -449,248 +403,3 @@ def unwrap_rendezvous_blob(blob: bytes, *, stable: bool = False) -> RendezvousPa
         tensor_count,
         total_bytes,
     )
-
-
-class MxReshardRendezvous:
-    """Thin rendezvous over ``MxClient`` for the reshard broadcast.
-
-    Trainer ranks ``publish`` their (agent metadata + shard table) blob under a
-    role-stamped identity; inference workers ``discover_trainers`` all trainer
-    ranks and merge their shard tables. Delegates all gRPC to ``MxClient`` and
-    distinguishes roles via ``SourceIdentity.extra_parameters['role']`` so they
-    hash to different ``mx_source_id``s.
-    """
-
-    def __init__(
-        self,
-        client: MxClient,
-        role: str,
-        rank: int,
-        model_name: str,
-        worker_id: str = "",
-    ) -> None:
-        self.client = client
-        self.role = role
-        self.rank = rank
-        # The served model name (the single ``[model] name`` both trainer and
-        # inference inherit) - a shared identity field both sides derive equally.
-        self.model_name = model_name
-        self.worker_id = worker_id or str(uuid.uuid4())
-        self._mx_source_id: str | None = None
-        self._publisher: PublisherThread | None = None
-
-    def _identity(self, role: str) -> p2p_pb2.SourceIdentity:
-        # Only fields BOTH sides derive identically (see module docstring): the
-        # shared model_name + mx_version + a fixed framework, with the role in
-        # extra_parameters. No dtype here - the receiver builds this identity to
-        # DISCOVER the trainer (before it knows anything the trainer served), so
-        # the served dtype can't be a hash input; it rides in the shard table
-        # (``PublishedTensor.dtype``, from the publisher) instead.
-        return p2p_pb2.SourceIdentity(
-            mx_version=_mx_version(),
-            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
-            model_name=self.model_name,
-            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
-            extra_parameters={"role": role},
-        )
-
-    def publish(self, blob: bytes) -> str:
-        """Publish a complete rendezvous blob as immediately discoverable.
-
-        Callers build ``blob`` only after the NIXL agent and source buffers are
-        registered, so publication is the readiness boundary for this minimal
-        rendezvous API. Re-publishing refreshes the worker record for the same
-        ``worker_id``.
-        """
-        heartbeat_period = envs.MX_HEARTBEAT_INTERVAL_SECS
-        if heartbeat_period <= 0:
-            raise ValueError(
-                f"MX_HEARTBEAT_INTERVAL_SECS must be positive, got {heartbeat_period}"
-            )
-        if self._publisher is not None:
-            # Stop the old status heartbeat before replacing the publication.
-            # Stopping it afterwards would mark the replacement STALE when the
-            # identity and worker ID resolve to the same source.
-            self._publisher.stop()
-            self._publisher = None
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=self.rank,
-            nixl_metadata=blob,
-            status=p2p_pb2.SOURCE_STATUS_READY,
-        )
-        self._mx_source_id = self.client.publish_metadata(
-            self._identity(self.role), worker, self.worker_id
-        )
-        self._publisher = PublisherThread(
-            mx_client=self.client,
-            mx_source_id=self._mx_source_id,
-            worker_id=self.worker_id,
-            worker_rank=self.rank,
-            interval_secs=heartbeat_period,
-        )
-        self._publisher.start()
-        return self._mx_source_id
-
-    def close(self) -> None:
-        """Stop heartbeats and best-effort mark the published source STALE."""
-        if self._publisher is not None:
-            self._publisher.stop()
-            self._publisher = None
-        self._mx_source_id = None
-
-    def _fetch_metadata(self, instances: list) -> list:
-        """Fetch each instance's metadata, in order.
-
-        Returns one entry per instance, ``None`` where the fetch raised. A single
-        rank's transport error must not abort the sweep: the poll loop's job is to
-        report how many ranks are actually readable, and one raised exception would
-        instead surface as a discovery failure with no count at all.
-
-        Serial on purpose, which is the opposite of what the shape of the problem
-        suggests. Issuing these round-trips from a thread pool was tried and made
-        it **worse**: the fetch went from 4.02 s to ~6.9 s median on 16 sources.
-        The contention is not in this process. Every receiver rank runs this loop,
-        so 16 ranks x 16 sources put 256 requests and ~358 MB of shard table
-        in flight against one metadata server, and queueing there costs more than
-        the serial round-trips saved. Making this concurrent requires reducing what
-        the server has to serve first - see the note in ``discover_trainers``.
-        """
-        return [self._get_metadata_or_none(inst) for inst in instances]
-
-    def _get_metadata_or_none(self, inst):
-        try:
-            return self.client.get_metadata(inst.mx_source_id, inst.worker_id)
-        except Exception as exc:  # noqa: BLE001 - one bad rank must not end the sweep
-            logger.warning(
-                "[reshard] get_metadata failed for source %s worker %s: %s",
-                inst.mx_source_id,
-                inst.worker_id,
-                exc,
-            )
-            return None
-
-    def discover_trainers(
-        self,
-        expected_trainers: int,
-        timeout: float = 1200.0,
-        poll_interval: float = 1.0,
-    ) -> list:
-        """Block until ``expected_trainers`` trainer ranks are visible **with a
-        non-empty shard table**, then return them.
-
-        Returns ``list[RendezvousPayload]``, one per trainer rank.
-
-        A rank counts toward the quorum only once its published table names at
-        least one tensor. A rank that advertises READY with nothing to read has
-        registered no memory, so satisfying the quorum with it makes the receiver
-        stop waiting for the ranks that do have bytes and then stall in the P2P
-        handshake instead - a timeout attributed to the wrong component.
-
-        Exactly ``expected_trainers`` ranks are returned. A stale source from an
-        earlier run can still be READY, and every extra rank returned here becomes
-        an extra peer to handshake and an extra set of shards competing to describe
-        the same tensor names.
-        """
-        trainer_id = self._identity("trainer")
-        deadline = time.monotonic() + timeout
-        # Cost split, kept because this call dominates a MoE refit: measured at
-        # 51% of a 10.25 s refit on Qwen3-30B-A3B, 2.7x the weight transfer it
-        # precedes. On the cluster the fetch is ~4.0 s of that and the parse ~0.8 s.
-        # The round-trips stay serial; see ``_fetch_metadata`` for the measurement
-        # that ruled out a thread pool. ``fetch_s`` includes both ``list_sources``
-        # and the metadata sweep.
-        fetch_s = 0.0
-        parse_s = 0.0
-        polls = 0
-        while True:
-            list_t0 = time.perf_counter()
-            resp = self.client.list_sources(
-                trainer_id,
-                status_filter=p2p_pb2.SOURCE_STATUS_READY,
-            )
-            instances = list(resp.instances)
-            fetch_s += time.perf_counter() - list_t0
-            payloads, empty = [], 0
-            # Every visible READY source is inspected, whatever the count: with
-            # fewer sources than expected the shard-table state is exactly what a
-            # timeout here has to report, and reaching the quorum on instances
-            # alone says nothing about whether any of them published bytes.
-            #
-            # The fetch is the dominant term (~4.0 s of ~4.8 s here) and it is
-            # server-bound, not client-bound: see ``_fetch_metadata`` for the
-            # measurement that ruled out concurrency. Cutting it further means
-            # sending less through ``list_sources`` would need a protocol change.
-            fetch_t0 = time.perf_counter()
-            metas = self._fetch_metadata(instances)
-            fetch_s += time.perf_counter() - fetch_t0
-            for meta in metas:
-                if meta is None or not meta.found:
-                    continue
-                parse_t0 = time.perf_counter()
-                payload = unwrap_rendezvous_blob(meta.worker.nixl_metadata)
-                parse_s += time.perf_counter() - parse_t0
-                if not payload.tensors:
-                    empty += 1
-                    continue
-                payloads.append(payload)
-                if len(payloads) >= expected_trainers:
-                    break
-            polls += 1
-            if len(payloads) >= expected_trainers:
-                break
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"timed out after {timeout}s waiting for {expected_trainers} "
-                    f"trainer ranks (saw {len(instances)} READY source(s), "
-                    f"{len(payloads)} with a non-empty shard table, {empty} empty)"
-                )
-            time.sleep(poll_interval)
-
-        logger.warning(
-            "MX_DISCOVER_COST %s",
-            json.dumps(
-                {
-                    "schema": "mx-discover-cost-v1",
-                    "rank": self.rank,
-                    "sources": len(payloads),
-                    "tensors": sum(len(p.tensors) for p in payloads),
-                    "grpc_fetch_s": round(fetch_s, 6),
-                    "blob_parse_s": round(parse_s, 6),
-                    "polls": polls,
-                }
-            ),
-        )
-        logger.info(
-            "[reshard] discovered %d trainer rank(s)%s: %s",
-            len(payloads),
-            f" ({empty} skipped as empty)" if empty else "",
-            ", ".join(
-                f"{p.agent_name}@{p.metadata_endpoint}[{len(p.tensors)}]"
-                for p in payloads
-            ),
-        )
-        return payloads
-
-
-def gather_sources(
-    client: MxClient,
-    expected_trainers: int,
-    model_name: str,
-    role: str = "inference",
-    rank: int = 0,
-    timeout: float = 1200.0,
-) -> tuple:
-    """One-call inference helper: discover all trainer ranks, merge their shard
-    tables, and build the planning inputs (per-source ``SourceInfo`` + the
-    shard -> owning-agent/device maps).
-
-    Returns ``(sources, session_to_agent, session_to_device, agent_endpoints)``
-    where ``agent_endpoints`` is ``{agent_name: metadata_endpoint}`` for the
-    caller to ``fetch_remote_and_wait`` (P2P) before pulling."""
-    rdv = MxReshardRendezvous(client, role=role, rank=rank, model_name=model_name)
-    payloads = rdv.discover_trainers(expected_trainers, timeout=timeout)
-    tables = [p.tensors for p in payloads]
-    agent_endpoints = {p.agent_name: p.metadata_endpoint for p in payloads}
-    merged = merge_shard_tables(tables)
-    sources, session_to_agent, session_to_device = build_sources(merged)
-    return sources, session_to_agent, session_to_device, agent_endpoints

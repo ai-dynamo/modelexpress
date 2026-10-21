@@ -279,18 +279,6 @@ def test_fatal_errors_do_not_reach_fallback(registry, monkeypatch, tmp_path, sta
     fallback.load.assert_not_called()
 
 
-def test_rl_bypasses_selected_plugin(monkeypatch, tmp_path):
-    write_plugin(tmp_path, prefix="raise RuntimeError('must not import')\n")
-    monkeypatch.setenv("MX_PLUGIN_DIR", str(tmp_path))
-    monkeypatch.setenv("MX_LOAD_PLUGIN", "example")
-    monkeypatch.setenv("MX_LOAD_STRATEGY_CHAIN", "RL")
-    monkeypatch.setenv("MX_LOAD_PLUGIN_BEFORE", "invalid")
-    from modelexpress_rl.inference.load_strategy import RLLoadStrategyChain
-    run = Mock(return_value="rl")
-    monkeypatch.setattr(RLLoadStrategyChain, "run", run)
-    assert chain.run_load_strategy_chain(nn.Linear(1, 1), None) == "rl"
-
-
 def test_example_requires_method_implementation(registry, monkeypatch):
     root = Path(__file__).resolve().parents[3]
     monkeypatch.setenv("MX_PLUGIN_DIR", str(root / "examples" / "plugins"))

@@ -8,12 +8,12 @@
 ``nixl`` is the production NIXL/RDMA backend. The receiver depends only on the
 ``Transport`` protocol, so a non-NIXL backend is a new module here."""
 
-from modelexpress.refit.reshard.transport.base import (
+from modelexpress_rl.refit.reshard.transport.base import (
     InMemoryReferenceTransport,
     ReadDescriptor,
     Transport,
 )
-from modelexpress.refit.reshard.transport.nixl import NixlReshardTransport
+from modelexpress_rl.refit.reshard.transport.nixl import NixlReshardTransport
 
 __all__ = [
     "InMemoryReferenceTransport",

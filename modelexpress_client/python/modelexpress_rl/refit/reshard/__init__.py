@@ -16,7 +16,7 @@ raises ``UnsupportedReshard``. The receiver fails the update before transfer
 because a general fallback path is not implemented.
 """
 
-from modelexpress.refit.reshard.geometry import (
+from modelexpress_rl.refit.reshard.geometry import (
     LazyWeight,
     OpChain,
     RecordedCopy,
@@ -26,8 +26,8 @@ from modelexpress.refit.reshard.geometry import (
     capture_weights,
     convert_source_weights,
 )
-from modelexpress.refit.reshard.types import IncompleteRefit
-from modelexpress.refit.reshard.transfer_plan import (
+from modelexpress_rl.refit.reshard.types import IncompleteRefit
+from modelexpress_rl.refit.reshard.transfer_plan import (
     FullPullSource,
     LogicalTransferPlan,
     PhysicalTransferPlan,
@@ -37,7 +37,7 @@ from modelexpress.refit.reshard.transfer_plan import (
     plan_transfer,
     plan_transfer_groups,
 )
-from modelexpress.refit.reshard.slice_plan import (
+from modelexpress_rl.refit.reshard.slice_plan import (
     LogicalRead,
     Shard,
     SourceBuffer,
@@ -46,30 +46,26 @@ from modelexpress.refit.reshard.slice_plan import (
     paired_runs,
     plan_pull,
 )
-from modelexpress.refit.reshard.transport import (
+from modelexpress_rl.refit.reshard.transport import (
     InMemoryReferenceTransport,
     NixlReshardTransport,
     ReadDescriptor,
     Transport,
 )
-from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
-from modelexpress.refit.reshard.receiver import ReshardReceiver
-from modelexpress.refit.reshard.rendezvous import (
-    MxReshardRendezvous,
+from modelexpress_rl.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     RendezvousPayload,
-    gather_sources,
     wrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.verify import shard_region, tensor_digest
+from modelexpress_rl.refit.reshard.verify import shard_region, tensor_digest
 
 __all__ = [
     "InMemoryReferenceTransport",
     "FullPullSource",
     "IncompleteRefit",
     "LazyWeight",
-    "MxReshardRendezvous",
     "NixlReshardTransport",
     "OpChain",
     "PublishedShard",
@@ -78,7 +74,6 @@ __all__ = [
     "LogicalRead",
     "ReadDescriptor",
     "RecordedCopy",
-    "ReshardReceiver",
     "Shard",
     "SourceBuffer",
     "SourceInfo",
@@ -93,7 +88,6 @@ __all__ = [
     "convert_source_weights",
     "classic_cuda_alloc",
     "execute_transfer",
-    "gather_sources",
     "intersect",
     "op_chain_to_box",
     "paired_runs",

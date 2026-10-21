@@ -33,31 +33,31 @@ from modelexpress.nixl_transfer import (
     NIXL_VRAM_MEM_TYPE,
     NixlTransferManager,
 )
-from modelexpress.refit.reshard import throughput
-from modelexpress.refit.reshard.geometry import _validate_physical_destination
-from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
-from modelexpress.refit.reshard.slice_plan import _row_major_strides
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard import throughput
+from modelexpress_rl.refit.reshard.geometry import _validate_physical_destination
+from modelexpress_rl.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress_rl.refit.reshard.slice_plan import _row_major_strides
+from modelexpress_rl.refit.reshard.rendezvous import (
     build_sources,
     merge_shard_tables,
     unwrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.transfer_plan import (
+from modelexpress_rl.refit.reshard.transfer_plan import (
     LogicalTransferPlan,
     bind_transfer,
     plan_transfer_groups,
     plan_transfer,
     replay_scratch_bytes,
 )
-from modelexpress.refit.reshard.transport import ReadDescriptor
-from modelexpress.refit.reshard.transport.nixl import NixlReshardTransport
-from modelexpress.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.transport import ReadDescriptor
+from modelexpress_rl.refit.reshard.transport.nixl import NixlReshardTransport
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     UnsupportedReshard,
     summarize_unsupported,
 )
-from modelexpress.refit.reshard.verify import shard_region, tensor_digest
+from modelexpress_rl.refit.reshard.verify import shard_region, tensor_digest
 from modelexpress.types import ManifestMismatchError, TensorDescriptor
 
 from modelexpress_rl.inference.plan import SourceReplayBatch, TrainerSourceSnapshot
@@ -266,7 +266,7 @@ def _bounded_batches(
     complete = complete_plan
     if complete is None:
         complete = plan_transfer(capture, sources, source_slots=source_slots,
-                                 verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST,
+                                 verify_full_sources=rl_envs.MX_RESHARD_PUBLISH_DIGEST,
                                  max_staging_bytes=max_staging_bytes)
     metrics["bounded_whole_plan_s"] = time.perf_counter() - started
     metrics["bounded_whole_plan_builds"] = int(complete_plan is None)
@@ -591,7 +591,7 @@ class _NixlStagedTransfer:
         self._debug_validate_generator_layout = (
             rl_envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT
         )
-        self._pack_modules = envs.MX_REFIT_PACK_MODULES
+        self._pack_modules = rl_envs.MX_REFIT_PACK_MODULES
         self._plan_compile_lock = threading.Lock()
 
     @property
@@ -776,7 +776,7 @@ class _NixlStagedTransfer:
                     session: slots_by_agent[agent]
                     for session, agent in trainer.resolved_metadata.session_to_agent.items()
                 },
-                verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST,
+                verify_full_sources=rl_envs.MX_RESHARD_PUBLISH_DIGEST,
                 max_staging_bytes=self._buffer_budget,
             )
             metrics["initial_whole_plan_s"] = time.perf_counter() - started
@@ -1018,7 +1018,7 @@ class _NixlStagedTransfer:
                 session: slots_by_agent[agent]
                 for session, agent in trainer.resolved_metadata.session_to_agent.items()
             },
-            verify_full_sources=envs.MX_RESHARD_PUBLISH_DIGEST,
+            verify_full_sources=rl_envs.MX_RESHARD_PUBLISH_DIGEST,
         )
         metrics["initial_whole_plan_s"] = time.perf_counter() - started
         validation_started = time.perf_counter()
@@ -1503,7 +1503,7 @@ class _NixlStagedTransfer:
         torch.cuda.synchronize(self._device)
         reconstruct_seconds = time.perf_counter() - reconstruct_started
         # Only digest mode has complete tensors and stamped digests to check.
-        if envs.MX_RESHARD_PUBLISH_DIGEST:
+        if rl_envs.MX_RESHARD_PUBLISH_DIGEST:
             self._verify(prepared)
 
         bytes_received = sum(d.nbytes for d in prepared.descriptors)
