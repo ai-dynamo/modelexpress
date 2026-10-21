@@ -184,7 +184,7 @@ def test_failure_rolls_back_and_reinitializes_before_fallback(registry, monkeypa
         assert result.model is old
         events.append("reinit")
         return LoadResult(value=restored, model=restored)
-    ctx = SimpleNamespace(global_rank=0, identity=SimpleNamespace(model_name="test"), events=events, adapter=SimpleNamespace(reinit_for_retry=reinit))
+    ctx = SimpleNamespace(global_rank=0, is_reload=False, p2p_enabled=False, identity=SimpleNamespace(model_name="test"), events=events, adapter=SimpleNamespace(reinit_for_retry=reinit))
     class Fallback(LoadStrategy):
         name = "fallback"
         def load(self, result, ctx):
@@ -201,7 +201,7 @@ def test_failure_rolls_back_and_reinitializes_before_fallback(registry, monkeypa
 def test_availability_delegated_and_rdma_success_skips_plugin_load(registry, monkeypatch, tmp_path):
     write_plugin(tmp_path, body="raise AssertionError('load should be skipped')", extra="    def is_available(self, ctx):\n        ctx.events.append('available')\n        return ctx.enabled\n")
     model = nn.Linear(1, 1)
-    ctx = SimpleNamespace(global_rank=0, identity=SimpleNamespace(model_name="test"), events=[], enabled=True)
+    ctx = SimpleNamespace(global_rank=0, is_reload=False, p2p_enabled=False, identity=SimpleNamespace(model_name="test"), events=[], enabled=True)
     class Rdma(LoadStrategy):
         name = "rdma"
         def load(self, result, ctx):
@@ -219,7 +219,7 @@ def test_recovery_error_aborts_and_rolls_back(registry, monkeypatch, tmp_path):
     write_plugin(tmp_path, body="raise StrategyRecoveryError('recovery')", extra="    def rollback(self, ctx):\n        ctx.events.append('rollback')\n")
     fallback = Mock()
     fallback.name = "fallback"
-    ctx = SimpleNamespace(global_rank=0, identity=SimpleNamespace(model_name="test"), events=[])
+    ctx = SimpleNamespace(global_rank=0, is_reload=False, p2p_enabled=False, identity=SimpleNamespace(model_name="test"), events=[])
     with pytest.raises(StrategyRecoveryError):
         chain.execute_load_strategies(nn.Linear(1, 1), ctx, [load_plugin(registry, "example"), fallback])
     assert ctx.events == ["rollback"]
@@ -233,7 +233,7 @@ def test_plugin_success_publishes_once(registry, monkeypatch, tmp_path):
     fallback.name = "fallback"
     publish = Mock()
     monkeypatch.setattr(chain, "publish_source_if_supported", publish)
-    ctx = SimpleNamespace(global_rank=0, identity=SimpleNamespace(model_name="test"))
+    ctx = SimpleNamespace(global_rank=0, is_reload=False, p2p_enabled=False, identity=SimpleNamespace(model_name="test"))
     assert chain.execute_load_strategies(model, ctx, [load_plugin(registry, "example"), fallback]) is model
     publish.assert_called_once()
     fallback.load.assert_not_called()
@@ -271,7 +271,7 @@ def test_fatal_errors_do_not_reach_fallback(registry, monkeypatch, tmp_path, sta
     write_plugin(tmp_path, body="raise StrategyFailed('dirty', mutated=True)", extra=extras[stage])
     def reinit(result):
         raise RuntimeError("fatal")
-    ctx = SimpleNamespace(global_rank=0, identity=SimpleNamespace(model_name="test"), adapter=SimpleNamespace(reinit_for_retry=reinit))
+    ctx = SimpleNamespace(global_rank=0, is_reload=False, p2p_enabled=False, identity=SimpleNamespace(model_name="test"), adapter=SimpleNamespace(reinit_for_retry=reinit))
     fallback = Mock()
     fallback.name = "fallback"
     with pytest.raises(RuntimeError, match="fatal"):

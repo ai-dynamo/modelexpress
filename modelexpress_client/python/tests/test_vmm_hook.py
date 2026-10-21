@@ -289,6 +289,7 @@ class TestOptionalExtension:
             device_id = 0
             accelerator_backend = _StubBackend()
             p2p_enabled = True
+            is_reload = False
 
         with caplog.at_level("WARNING", logger=vmm_runtime.logger.name):
             # Entering the context manager must not raise; the body must
@@ -402,6 +403,7 @@ class _StubCtx:
     vmm_arena = None
     accelerator_backend = _StubBackend()
     p2p_enabled = True
+    is_reload = False
 
 
 class _StubCudaVmmBackend:
@@ -567,3 +569,55 @@ class TestLoaderLifecycle:
         assert closed == []
         assert entered == [target_arena]
         assert draft_ctx.vmm_arena is None
+
+    def test_reload_reuses_the_existing_arena(self, monkeypatch):
+        """A reload writes into the live model's tensors, which the arena
+        backs. It must neither close nor enter that arena, and must hand it
+        to registration on the reload's fresh ctx."""
+        from contextlib import contextmanager
+
+        monkeypatch.setenv("MX_VMM_ARENA", "1")
+        entered: list[object] = []
+
+        @contextmanager
+        def _recording_use_arena(arena, device):
+            entered.append(arena)
+            yield
+
+        vmm_runtime = self._patch_loader_deps(monkeypatch, _recording_use_arena)
+
+        with vmm_runtime.maybe_enter_vmm_arena(_StubCtx()):
+            pass
+        arena = vmm_runtime._vmm_arenas[0]
+
+        closed: list[bool] = []
+        monkeypatch.setattr(arena, "close", lambda: closed.append(True))
+
+        class _ReloadCtx(_StubCtx):
+            is_reload = True
+
+        reload_ctx = _ReloadCtx()
+        reload_ctx.vmm_arena = None
+        with vmm_runtime.maybe_enter_vmm_arena(reload_ctx):
+            pass
+
+        assert vmm_runtime._vmm_arenas[0] is arena
+        assert closed == []
+        assert entered == [arena]
+        assert reload_ctx.vmm_arena is arena
+
+    def test_reload_without_existing_arena_does_not_create_one(self, monkeypatch):
+        """If the initial load ran outside an arena, the weights live in
+        ordinary allocations; a reload must not start an arena now."""
+        monkeypatch.setenv("MX_VMM_ARENA", "1")
+        vmm_runtime = self._patch_loader_deps(monkeypatch)
+
+        class _ReloadCtx(_StubCtx):
+            is_reload = True
+
+        reload_ctx = _ReloadCtx()
+        with vmm_runtime.maybe_enter_vmm_arena(reload_ctx):
+            pass
+
+        assert vmm_runtime._vmm_arenas == {}
+        assert reload_ctx.vmm_arena is None

@@ -1310,6 +1310,14 @@ flowchart LR
     N -->|draft descriptors| PD[Peer draft load]
 ```
 
+**Sleep/wake lifecycle hooks.** `MxModelLoader` implements vLLM's optional `BaseModelLoader.on_sleep(level)` / `on_wake_up(tags)` hooks so a sleeping replica stops advertising itself as a P2P source before `sleep()` unmaps its GPU memory.
+- `on_sleep` calls `unpublish_metadata` (gates discovery) and `nixl_manager.shutdown()` (stops receiving new requests from peers).
+- `on_wake_up` recreates the NIXL agent and calls `publish_metadata` to mark the replica ready for new incoming P2P connections. It does so only after a level-1 sleep: level 2 discards the weights, so this has to happen on `reload_weights()` instead. Waking the weights clears the recorded sleep level after either level.
+- After a level-2 sleep, `reload_weights()` refreshes weight content in place through `reload_model()` (see below), whose strategy chain registers the tensors and republishes the replica, as on any successful load.
+- `reload_model()` without a preceding sleep first stops serving the same way `on_sleep` does, so peers never read weights while they are overwritten.
+- With `MX_VMM_ARENA=1`, a reload neither replaces nor enters the arena: the weights are written into their existing arena-backed storage, so only transient allocations happen. The reload's context reuses the existing arena so registration again produces a single MR.
+- An RDMA reload skips target-side post-processing and keeps state derived at the original load, so RDMA is only eligible when the reload's `SourceIdentity` matches the identity of the weights the model holds (snapshotted when the reload starts, so it follows refits). Otherwise a streaming strategy reprocesses the weights. The check is as strong as the identity's `revision`: an empty or branch revision only proves the same model name.
+- A strategy that fails mid-reload, or an RDMA candidate that does, is not followed by `reinit_for_retry`: the engine keeps serving the model it passed in, so the next strategy or candidate overwrites that same model in place.
 ### SGLang Refit Integration
 
 SGLang obtains its rank-local S3 refit client through the public factory:
@@ -1638,12 +1646,13 @@ Plugins reuse the interfaces exported by `modelexpress.load_strategy`:
 |-----------|----------|
 | `requires` | Declare required `EngineAdapter` capabilities. |
 | `is_available(ctx)` | Check suitability without downloading artifacts or mutating the model. |
-| `load(result, ctx)` | Complete weight loading and engine post-processing, then return `LoadResult`. Preparing files alone is not success. Use `register_tensors` for results that can serve as transfer sources; the executor owns publication. |
+| `load(result, ctx)` | Complete weight loading, then return `LoadResult`. Preparing files alone is not success. A plain `LoadStrategy` subclass runs engine post-processing itself; one that loads through `apply_weight_iter` or `load_via_native` can subclass `WeightsIteratorLoadStrategy` or `NativeLoadStrategy` from `modelexpress.load_strategy.base` and leave it to `finalize`. The executor owns publication. |
+| `prepare` / `finalize` / `abort` | Optional phase hooks the executor runs around `load`. The defaults enter and leave the engine's layerwise reload when `ctx.is_reload`. On a cold load, `finalize` runs `post_process` and registers publishable results with NIXL. |
 | `rollback(ctx)` | Release strategy-owned resources. Model reinitialization belongs to the executor. |
 | `StrategyFailed` | A clean miss uses `mutated=False`; a failure requiring model recovery uses `mutated=True`. |
 | `StrategyRecoveryError` | Abort loading rather than attempt another strategy. |
 
-A private strategy wrapper delegates availability and cleanup to the plugin. Unknown load exceptions and invalid results become mutated failures, so the existing executor rolls back and attempts model reinitialization before fallback. Availability, cleanup, and recovery errors abort loading. Built-in exception behavior is unchanged. Import and construction must not load weights.
+A private strategy wrapper delegates availability, the phase hooks, and cleanup to the plugin. Unknown load or phase exceptions and invalid results become mutated failures, so the existing executor rolls back and attempts model reinitialization before fallback. Availability, cleanup, and recovery errors abort loading. Built-in exception behavior is unchanged. Import and construction must not load weights.
 
 `LoadContext` provides model identity, ranks, target device, and engine capabilities. Plugins must not change identity or publish sources themselves. Internal context fields are not a cross-version compatibility guarantee; validate plugins against the target client and adapter. Distributed plugins must coordinate their ranks and agree on availability.
 

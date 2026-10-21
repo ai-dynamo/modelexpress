@@ -16,7 +16,7 @@ import logging
 
 from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
-from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
+from .base import LoadContext, WeightsIteratorLoadStrategy, _as_load_result
 from .context import LoadResult
 
 logger = logging.getLogger("modelexpress.strategy_instant_tensor")
@@ -30,7 +30,7 @@ def _has_object_store_model_uri() -> bool:
     return model_uri.startswith(_OBJECT_STORE_URI_PREFIXES)
 
 
-class InstantTensorStrategy(LoadStrategy):
+class InstantTensorStrategy(WeightsIteratorLoadStrategy):
     """Load weights from local safetensors via the instanttensor library.
 
     Runs right after the RDMA (P2P) strategy: when no peer source is serving,
@@ -45,8 +45,7 @@ class InstantTensorStrategy(LoadStrategy):
     """
 
     name = "instant_tensor"
-    requires = (
-        EngineAdapter.apply_weight_iter,
+    requires = WeightsIteratorLoadStrategy.requires + (
         EngineAdapter.build_instanttensor_weight_iter,
     )
 
@@ -90,13 +89,11 @@ class InstantTensorStrategy(LoadStrategy):
 
         try:
             result = ctx.adapter.apply_weight_iter(result, weights_iter)
-            logger.info(f"[Worker {ctx.global_rank}] InstantTensor weight loading complete")
-            result = ctx.adapter.after_weight_iter_load(result)
         except Exception as e:
             logger.warning(
                 f"[Worker {ctx.global_rank}] InstantTensor loading failed, falling through: {e}"
             )
             raise StrategyFailed(str(e), mutated=True) from e
 
-        register_tensors(result, ctx)
+        logger.info(f"[Worker {ctx.global_rank}] InstantTensor weight loading complete")
         return result

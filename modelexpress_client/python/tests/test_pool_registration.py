@@ -791,7 +791,9 @@ class TestReceiveFromSourceManifestValidation:
                 remote_agent_name="dummy",
             )
         assert any(
-            "1 local-only, 1 source-only" in rec.getMessage() for rec in caplog.records
+            "1 local-only (first: ['x']), 1 source-only (first: ['w'])"
+            in rec.getMessage()
+            for rec in caplog.records
         )
 
     def test_hetero_name_mismatch_raises(self, monkeypatch):
