@@ -35,7 +35,7 @@ jobs:
 
   ci-status-check:
     name: CI status check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [inference-tests, rl-tests]
     if: always()
     steps:
