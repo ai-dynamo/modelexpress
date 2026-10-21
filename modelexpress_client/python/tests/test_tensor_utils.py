@@ -5,6 +5,8 @@
 
 import types
 
+import pytest
+
 import torch
 import torch.nn as nn
 
@@ -143,6 +145,43 @@ class TestFindHiddenAccelTensors:
 
 
 class TestAdoptHiddenTensors:
+    @pytest.mark.parametrize("module_name", [
+        "torch.distributed", "torch.distributed.distributed_c10d",
+        "sglang.srt.distributed.parallel_state",
+        "sglang.srt.distributed.device_communicators.custom_all_reduce_v2",
+        "vllm.distributed.parallel_state",
+    ])
+    @pytest.mark.parametrize("subclass", [False, True])
+    def test_transfer_preserves_communicator_state(
+        self, mock_accelerator_backend_cls, module_name, subclass
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        group_type = type("Group", (), {"__module__": module_name})
+        if subclass:
+            group_type = type("CustomGroup", (group_type,), {})
+        models = []
+        for value in (7, 0):
+            model = ModuleWithQuant()
+            group = group_type()
+            group.ca_comm = types.SimpleNamespace(
+                _push_counter=torch.full((2,), value),
+                _symm_tensor=torch.full((4,), value),
+                graph_params=torch.full((2,), value),
+            )
+            model.tp_group = group
+            model.nested_group = {"groups": [group]}
+            assert adopt_hidden_tensors(model, backend) == 2
+            models.append(model)
+        source, target = [collect_module_tensors(m, backend) for m in models]
+        assert source.keys() == target.keys()
+        with torch.no_grad():
+            for name in source:
+                target[name].copy_(source[name])
+        for tensor in vars(models[1].tp_group.ca_comm).values():
+            assert torch.count_nonzero(tensor) == 0
+        assert torch.equal(models[0].quant_method.config.a1_gscale,
+                           models[1].quant_method.config.a1_gscale)
+
     def test_no_hidden_tensors(self):
         model = SimpleModule()
         # Default CUDA backend: CPU tensors must be ignored.

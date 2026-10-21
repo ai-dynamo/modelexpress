@@ -116,6 +116,15 @@ def _find_hidden_accel_tensors(
         return []
     visited.add(id(obj))
 
+    # Communicator buffers contain process-local pointers and synchronization state.
+    if any(
+        (cls.__module__ + ".").startswith((
+            "torch.distributed.", "sglang.srt.distributed.", "vllm.distributed."
+        ))
+        for cls in type(obj).__mro__
+    ):
+        return []
+
     results: list[tuple[str, torch.Tensor]] = []
 
     if isinstance(obj, torch.Tensor):
