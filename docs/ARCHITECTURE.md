@@ -145,6 +145,7 @@ ModelExpress/
 │       ├── __init__.py                 # Package init, vLLM loader auto-registration
 │       ├── client.py                   # MxClient gRPC client
 │       ├── nixl_transfer.py            # NixlTransferManager
+│       ├── prestage.py                 # Source discovery + READ into caller-owned memory (pre-stage helper)
 │       ├── refit/                      # Engine-agnostic live-refit primitives
 │       │   ├── __init__.py             # Public refit exports
 │       │   ├── timing.py               # Structured refit stage timing
@@ -1207,6 +1208,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
+| `prestage.py` | Pre-stage helper API: `discover_source` (the `RdmaStrategy` discovery for one rank, without an engine), `plan_reads`, and `PrestageReceiver`, a receive-only agent over caller-owned CUDA memory. See [Pre-stage Receiver](#pre-stage-receiver) |
 | `refit/` | Engine-agnostic live-refit primitives. `RefitTimingRecorder` provides normalized stage timing; `reshard/` provides loader-observed geometry capture, slice/transfer planning, rendezvous, and transport abstractions |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
@@ -1279,9 +1281,23 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 | `deregister_tensors(names)` | Release tensors added by `register_additional_tensors` (catalog entries and, once unused, their registration handle). Base-catalog names are ignored; `shutdown()` releases those |
 | `fetch_remote_and_wait(agent_name, ip, port)` | P2P: fetch remote NIXL metadata via listen thread (polls until loaded) |
 | `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P) |
+| `deregister_all()` | Deregister the tensor-catalog registrations now and return the errors instead of logging them, for a caller that must know its memory is released before handing it to another process. On success the catalog is cleared so the manager can register again. On a failure or an interrupt the handles not released and the catalog (which keeps their tensors alive) stay; the next call retries them, and registration and `deregister_tensors` are refused until a retry succeeds or `shutdown()` runs. DRAM buffers from `register_dram_buffer` are released by their owner |
 | `shutdown()` | Clean up NIXL agent and resources |
 
 **Optional NIC pinning.** `MX_RDMA_NIC_PIN=auto` probes PCIe topology at agent init and pins `UCX_NET_DEVICES` to a NUMA-local IB NIC per worker. Workaround for [openucx/ucx#11259](https://github.com/openucx/ucx/issues/11259); see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for details.
+
+### Pre-stage Receiver
+
+`prestage.py` lets a process that is not an engine read a READY source's weights into device memory it owns. The intended caller is a helper that runs while a checkpointed engine process is being restored. For example, a vLLM worker checkpointed after a level-2 sleep (`MxModelLoader.on_sleep`) has released its weight memory but kept the virtual-address reservation, and otherwise gets its weights back from `reload_model()` only after the restore. The helper reads the weights during the restore instead, and the restored process then maps that memory back at its original addresses. The hand-over between the two processes is engine-specific and not part of ModelExpress.
+
+| Piece | Purpose |
+|-------|---------|
+| `engines.vllm.source_identity.build_source_identity_from_values(...)` | The `SourceIdentity` a vLLM worker with these settings publishes, from plain values; runs `build_source_identity` itself |
+| `discover_source(client, identity, worker_rank, receiver_id=...)` | `ListSources` -> rank and accelerator filter -> configured selector -> topology policy -> at most three candidates -> `GetMetadata` with the accelerator re-check -> `PrepareTensorRead`, whose manifest's rank and accelerator are checked again (the same authoritative check, so an unknown accelerator is refused for quantized weights). Returns the source with its tensor manifest and read lease; `release()` the lease after the READ. `tensor_read_lease=False` uses `GetTensorManifest` instead, like the default `RdmaStrategy`. Discovery stops before the handshake: after a failed `connect` or `read`, call it again with that worker in `exclude_worker_ids` |
+| `plan_reads(tensors, resolve)` | Maps manifest entries to local addresses through a caller-supplied resolver and returns `execute_read_batch` ranges plus the entries left out |
+| `PrestageReceiver` | Receive-only `NixlTransferManager` (`listen_port=0`) over caller-owned CUDA regions, connected to one source: `register`, `connect`, one batched `read`, and `close()`. `close()` returns every error from releasing the caller's memory (deregistration, agent shutdown) the receiver has seen, on every call, so the caller hands the memory over only when all registrations were released. Disconnecting the source is best effort, as in `RdmaStrategy`: in P2P the source never loads the receiver's metadata, so it cannot reach the caller's memory |
+
+The caller allocates the memory and hands it over. In the vLLM flow above that means the restored worker maps the pre-staged memory instead of calling `reload_model()`, and then registers and publishes itself as a source again; that engine-side step is not part of this module.
 
 ### vLLM Loader
 
@@ -1309,6 +1325,15 @@ flowchart LR
     N -->|main descriptors| PM[Peer main load]
     N -->|draft descriptors| PD[Peer draft load]
 ```
+
+**Sleep/wake lifecycle hooks.** `MxModelLoader` implements vLLM's optional `BaseModelLoader.on_sleep(level)` / `on_wake_up(tags)` hooks so a sleeping replica stops advertising itself as a P2P source before `sleep()` unmaps its GPU memory.
+- `on_sleep` calls `unpublish_metadata` (gates discovery) and `nixl_manager.shutdown()` (stops receiving new requests from peers).
+- `on_wake_up` recreates the NIXL agent and calls `publish_metadata` to mark the replica ready for new incoming P2P connections. It does so only after a level-1 sleep: level 2 discards the weights, so this has to happen on `reload_weights()` instead. Waking the weights clears the recorded sleep level after either level.
+- After a level-2 sleep, `reload_weights()` refreshes weight content in place through `reload_model()` (see below), whose strategy chain registers the tensors and republishes the replica, as on any successful load.
+- `reload_model()` without a preceding sleep first stops serving the same way `on_sleep` does, so peers never read weights while they are overwritten.
+- With `MX_VMM_ARENA=1`, a reload neither replaces nor enters the arena: the weights are written into their existing arena-backed storage, so only transient allocations happen. The reload's context reuses the existing arena so registration again produces a single MR.
+- An RDMA reload skips target-side post-processing and keeps state derived at the original load, so RDMA is only eligible when the reload's `SourceIdentity` matches the identity of the weights the model holds (snapshotted when the reload starts, so it follows refits). Otherwise a streaming strategy reprocesses the weights. The check is as strong as the identity's `revision`: an empty or branch revision only proves the same model name.
+- A strategy that fails mid-reload, or an RDMA candidate that does, is not followed by `reinit_for_retry`: the engine keeps serving the model it passed in, so the next strategy or candidate overwrites that same model in place.
 
 ### SGLang Refit Integration
 
@@ -1638,12 +1663,13 @@ Plugins reuse the interfaces exported by `modelexpress.load_strategy`:
 |-----------|----------|
 | `requires` | Declare required `EngineAdapter` capabilities. |
 | `is_available(ctx)` | Check suitability without downloading artifacts or mutating the model. |
-| `load(result, ctx)` | Complete weight loading and engine post-processing, then return `LoadResult`. Preparing files alone is not success. Use `register_tensors` for results that can serve as transfer sources; the executor owns publication. |
+| `load(result, ctx)` | Complete weight loading, then return `LoadResult`. Preparing files alone is not success. A plain `LoadStrategy` subclass runs engine post-processing itself; one that loads through `apply_weight_iter` or `load_via_native` can subclass `WeightsIteratorLoadStrategy` or `NativeLoadStrategy` from `modelexpress.load_strategy.base` and leave it to `finalize`. The executor owns publication. |
+| `prepare` / `finalize` / `abort` | Optional phase hooks the executor runs around `load`. The defaults enter and leave the engine's layerwise reload when `ctx.is_reload`. On a cold load, `finalize` runs `post_process` and registers publishable results with NIXL. |
 | `rollback(ctx)` | Release strategy-owned resources. Model reinitialization belongs to the executor. |
 | `StrategyFailed` | A clean miss uses `mutated=False`; a failure requiring model recovery uses `mutated=True`. |
 | `StrategyRecoveryError` | Abort loading rather than attempt another strategy. |
 
-A private strategy wrapper delegates availability and cleanup to the plugin. Unknown load exceptions and invalid results become mutated failures, so the existing executor rolls back and attempts model reinitialization before fallback. Availability, cleanup, and recovery errors abort loading. Built-in exception behavior is unchanged. Import and construction must not load weights.
+A private strategy wrapper delegates availability, the phase hooks, and cleanup to the plugin. Unknown load or phase exceptions and invalid results become mutated failures, so the existing executor rolls back and attempts model reinitialization before fallback. Availability, cleanup, and recovery errors abort loading. Built-in exception behavior is unchanged. Import and construction must not load weights.
 
 `LoadContext` provides model identity, ranks, target device, and engine capabilities. Plugins must not change identity or publish sources themselves. Internal context fields are not a cross-version compatibility guarantee; validate plugins against the target client and adapter. Distributed plugins must coordinate their ranks and agree on availability.
 

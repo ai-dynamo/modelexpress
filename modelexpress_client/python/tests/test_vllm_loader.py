@@ -15,6 +15,7 @@ import torch.nn as nn
 
 from modelexpress import p2p_pb2
 from modelexpress.adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
+from modelexpress.load_strategy import _strategy_phases
 from modelexpress.load_strategy.context import LoadResult
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.types import TensorDescriptor
@@ -584,6 +585,261 @@ class TestAbstractMethodCompleteness:
         assert registered["mx"] is MxModelLoader
 
 
+class TestSleepWakeReloadHooks:
+    """Verify MxModelLoader.on_sleep/on_wake_up.
+
+    These back vLLM's optional BaseModelLoader hooks, called from
+    Worker.sleep/wake_up/reload_weights so a sleeping replica stops
+    advertising itself as a P2P source before its GPU memory becomes
+    invalid, and resumes once it's valid again.
+    """
+
+    def test_on_sleep_unpublishes_regardless_of_level(self):
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        with patch("modelexpress.engines.vllm.loader.unpublish_metadata") as mock_unpub:
+            loader.on_sleep(1)
+            loader.on_sleep(2)
+        assert mock_unpub.call_count == 2
+        mock_unpub.assert_called_with(loader._ctx)
+
+    def test_on_sleep_shuts_down_nixl_manager_when_present(self):
+        """unpublish_metadata alone only stops new discovery -- it does
+        nothing for a peer that already has a connection/manifest.
+        nixl_manager.shutdown() additionally stops accepting new
+        connections from such a peer."""
+        loader = _make_loader()
+        mock_manager = MagicMock()
+        loader._ctx = _make_load_context(nixl_manager=mock_manager)
+        with patch("modelexpress.engines.vllm.loader.unpublish_metadata"):
+            loader.on_sleep(1)
+        mock_manager.shutdown.assert_called_once()
+        assert loader._ctx.nixl_manager is None
+
+    def test_on_sleep_records_level_for_on_wake_up(self):
+        """wake_up(tags) doesn't carry the sleep level itself, so on_sleep
+        must remember it for on_wake_up to read back later."""
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        with patch("modelexpress.engines.vllm.loader.unpublish_metadata"):
+            loader.on_sleep(2)
+        assert loader._last_sleep_level == 2
+
+    def test_on_sleep_noop_without_ctx(self):
+        loader = _make_loader()
+        assert loader._ctx is None
+        with patch("modelexpress.engines.vllm.loader.unpublish_metadata") as mock_unpub:
+            loader.on_sleep(1)
+        mock_unpub.assert_not_called()
+
+    @pytest.mark.parametrize("tags", [None, ["weights"]])
+    def test_on_wake_up_publishes_for_level_1_when_weights_woken(self, tags):
+        """tags=None means every pool (including weights) was restored."""
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        loader._last_sleep_level = 1
+        with patch("modelexpress.engines.vllm.loader.publish_metadata") as mock_pub, \
+             patch("modelexpress.engines.vllm.loader.register_tensors") as mock_reg:
+            loader.on_wake_up(tags)
+        mock_pub.assert_called_once_with(loader._ctx)
+        mock_reg.assert_called_once()
+
+    def test_on_wake_up_recreates_nixl_manager_when_torn_down(self):
+        """on_sleep() tears the agent down, so nixl_manager is None here --
+        must be recreated before republishing."""
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        loader._last_sleep_level = 1
+        assert loader._ctx.nixl_manager is None
+        with patch("modelexpress.engines.vllm.loader.publish_metadata"), \
+             patch("modelexpress.engines.vllm.loader.register_tensors") as mock_reg:
+            loader.on_wake_up(None)
+        mock_reg.assert_called_once_with(None, loader._ctx, reuse_discovered=True)
+
+    def test_on_wake_up_skips_recreation_when_nixl_manager_present(self):
+        loader = _make_loader()
+        loader._ctx = _make_load_context(nixl_manager=MagicMock())
+        loader._last_sleep_level = 1
+        with patch("modelexpress.engines.vllm.loader.publish_metadata"), \
+             patch("modelexpress.engines.vllm.loader.register_tensors") as mock_reg:
+            loader.on_wake_up(None)
+        mock_reg.assert_not_called()
+
+    def test_on_wake_up_skips_when_weights_not_in_tags(self):
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        loader._last_sleep_level = 1
+        with patch("modelexpress.engines.vllm.loader.publish_metadata") as mock_pub, \
+             patch("modelexpress.engines.vllm.loader.register_tensors") as mock_reg:
+            loader.on_wake_up(["kv_cache"])
+        mock_pub.assert_not_called()
+        mock_reg.assert_not_called()
+
+    @pytest.mark.parametrize("last_sleep_level", [None, 2])
+    def test_on_wake_up_skips_for_non_level_1_sleep(self, last_sleep_level):
+        """Level 2 discards weights with no CPU backup, so content isn't
+        valid when wake_up() returns. None covers wake_up() called with no
+        prior on_sleep() at all."""
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        loader._last_sleep_level = last_sleep_level
+        with patch("modelexpress.engines.vllm.loader.publish_metadata") as mock_pub, \
+             patch("modelexpress.engines.vllm.loader.register_tensors") as mock_reg:
+            loader.on_wake_up(None)
+        mock_pub.assert_not_called()
+        mock_reg.assert_not_called()
+
+    def test_on_wake_up_noop_without_ctx(self):
+        loader = _make_loader()
+        with patch("modelexpress.engines.vllm.loader.publish_metadata") as mock_pub:
+            loader.on_wake_up(None)
+        mock_pub.assert_not_called()
+
+    def test_reload_model_stops_serving_before_loading(self):
+        """Without a prior sleep() the replica is still serving, so peers
+        must be cut off before the weights are overwritten."""
+        loader = _make_loader()
+        mock_manager = MagicMock()
+        loader._ctx = _make_load_context(nixl_manager=mock_manager)
+        events = []
+        mock_manager.shutdown.side_effect = lambda: events.append("shutdown")
+
+        def fake_reload(*args):
+            events.append("reload")
+            loader._ctx = _make_load_context(nixl_manager=MagicMock())
+            return args[-1]
+
+        model = MagicMock()
+        with patch("modelexpress.engines.vllm.loader.unpublish_metadata") as mock_unpub, \
+             patch.object(loader, "_load_or_reload_model", side_effect=fake_reload):
+            assert loader.reload_model(MagicMock(), MagicMock(), model) is model
+        mock_unpub.assert_called_once()
+        assert events == ["shutdown", "reload"]
+
+    @pytest.mark.parametrize("last_sleep_level", [1, 2])
+    def test_reload_model_does_not_stop_serving_again_after_sleep(
+        self, last_sleep_level
+    ):
+        loader = _make_loader()
+        loader._ctx = _make_load_context(nixl_manager=MagicMock())
+        loader._last_sleep_level = last_sleep_level
+        with patch("modelexpress.engines.vllm.loader.unpublish_metadata") as mock_unpub, \
+             patch.object(loader, "_load_or_reload_model", return_value=MagicMock()):
+            loader.reload_model(MagicMock(), MagicMock(), MagicMock())
+        mock_unpub.assert_not_called()
+
+    @pytest.mark.parametrize("last_sleep_level", [None, 1, 2])
+    def test_reload_model_leaves_sleep_level_untouched(self, last_sleep_level):
+        loader = _make_loader()
+        loader._last_sleep_level = last_sleep_level
+        model = MagicMock()
+        with patch.object(loader, "_load_or_reload_model", return_value=model):
+            assert loader.reload_model(MagicMock(), MagicMock(), model) is model
+        assert loader._last_sleep_level == last_sleep_level
+
+    @pytest.mark.parametrize("last_sleep_level", [1, 2])
+    def test_on_wake_up_clears_sleep_level_when_weights_woken(self, last_sleep_level):
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        loader._last_sleep_level = last_sleep_level
+        with patch("modelexpress.engines.vllm.loader.publish_metadata"), \
+             patch("modelexpress.engines.vllm.loader.register_tensors"):
+            loader.on_wake_up(None)
+        assert loader._last_sleep_level is None
+
+    def test_on_wake_up_keeps_sleep_level_when_weights_not_woken(self):
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        loader._last_sleep_level = 2
+        loader.on_wake_up(["kv_cache"])
+        assert loader._last_sleep_level == 2
+
+
+class TestRdmaReloadIdentityGate:
+    """An RDMA reload skips target-side post-processing, so it may only
+    restore the weights the model already holds."""
+
+    @staticmethod
+    def _identity(revision):
+        identity = _make_identity()
+        identity.revision = revision
+        return identity
+
+    @staticmethod
+    def _is_available(ctx):
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+        ctx.accelerator_backend = MagicMock()
+        ctx.accelerator_backend.supports_rdma_p2p.return_value = True
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "server:8001"}), patch(
+            "modelexpress.load_strategy.rdma_strategy.is_nixl_available",
+            return_value=True,
+        ), patch(
+            "modelexpress.load_strategy.rdma_strategy.check_transfer_allowed",
+            return_value=(True, ""),
+        ):
+            return RdmaStrategy().is_available(ctx)
+
+    def test_reload_of_the_loaded_weights_may_use_rdma(self):
+        ctx = _make_load_context(
+            identity=self._identity("abc"),
+            is_reload=True,
+            loaded_identity=self._identity("abc"),
+        )
+        assert self._is_available(ctx) is True
+
+    def test_reload_of_other_weights_skips_rdma(self):
+        ctx = _make_load_context(
+            identity=self._identity("new"),
+            is_reload=True,
+            loaded_identity=self._identity("old"),
+        )
+        assert self._is_available(ctx) is False
+
+    def test_reload_with_unknown_loaded_weights_skips_rdma(self):
+        ctx = _make_load_context(identity=self._identity("abc"), is_reload=True)
+        assert self._is_available(ctx) is False
+
+    def test_cold_load_is_not_gated(self):
+        ctx = _make_load_context(identity=self._identity("abc"))
+        assert self._is_available(ctx) is True
+
+    @pytest.mark.parametrize("reload", [False, True])
+    def test_loader_snapshots_the_loaded_identity_on_reload(self, reload):
+        """A refit rewrites the live identity's revision in place, so the
+        reload must compare against a copy taken when it started."""
+        loader = _make_loader()
+        loaded_identity = self._identity("abc")
+        loader._ctx = _make_load_context(identity=loaded_identity)
+        new_ctx = _make_load_context(identity=self._identity("abc"))
+        captured = []
+
+        def fake_load_model(vllm_config, model_config, prefix, ctx, *rest):
+            captured.append(ctx.loaded_identity)
+            loaded_identity.revision = "refit"
+            return MagicMock()
+
+        with patch(
+            "modelexpress.engines.vllm.loader.build_vllm_load_context",
+            return_value=new_ctx,
+        ), patch(
+            "modelexpress.engines.vllm.loader._is_speculative_draft",
+            return_value=False,
+        ), patch(
+            "modelexpress.engines.vllm.loader.unpublish_metadata"
+        ), patch.object(loader, "_load_model", side_effect=fake_load_model):
+            if reload:
+                loader.reload_model(MagicMock(), MagicMock(), MagicMock())
+            else:
+                loader.load_model(MagicMock(), MagicMock())
+
+        if reload:
+            assert captured[0] == self._identity("abc")
+            assert captured[0] is not loaded_identity
+        else:
+            assert captured == [None]
+
+
 class TestMtpDrafterSecondLoad:
     """vLLM loads MTP in two passes on one worker: the target, then the drafter
     via a second load_model whose draft ModelConfig has runner_type="draft" and
@@ -1060,7 +1316,7 @@ class TestMtpDrafterSecondLoad:
         ), patch.object(RdmaStrategy, "is_available", return_value=True), patch.object(
             ModelStreamerStrategy, "is_available", return_value=True
         ), patch(
-            "modelexpress.load_strategy.model_streamer_strategy.register_tensors"
+            "modelexpress.load_strategy.base.register_tensors"
         ):
             loaded = execute_load_strategies(model, ctx, [rdma, streamer])
 
@@ -1843,18 +2099,20 @@ class TestLoadStrategyChainRunErrorHandling:
 
 
 class TestDefaultStrategy:
-    @patch("modelexpress.load_strategy.default_strategy.register_tensors")
-    def test_after_native_load_failure_is_mutated(self, mock_register):
+    def test_after_native_load_failure_is_mutated(self):
         from modelexpress.load_strategy.default_strategy import DefaultStrategy
 
         ctx = _make_load_context()
         ctx.adapter.after_native_load = MagicMock(side_effect=RuntimeError("post load"))
 
+        model = MagicMock()
+        strategy = DefaultStrategy()
+        result = LoadResult(value=model, model=model)
         with pytest.raises(StrategyFailed, match="post load") as exc:
-            DefaultStrategy().load(MagicMock(), ctx)
+            with _strategy_phases(strategy, result, ctx):
+                strategy.load(result, ctx)
 
         assert exc.value.mutated is True
-        mock_register.assert_not_called()
 
 
 class TestRdmaStrategyAvailability:
@@ -2159,13 +2417,16 @@ class TestRdmaStrategyLoad:
         assert isinstance(result, LoadResult)
         assert attempts == ["w-1"]
 
-    def test_load_as_target_marks_post_prepare_failure_as_mutated(self):
+    def test_prepare_phase_failure_is_mutated(self):
+        """Preparing the target dummy-allocates and reshapes, so a failure
+        leaves a dirty model -- and nothing is received into it."""
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
         ctx = _make_load_context()
+        ctx.is_reload = False
         result = LoadResult(value=MagicMock(), model=MagicMock())
         strategy = RdmaStrategy()
-        source_worker = _make_worker()
+        strategy._receive_from_peer = MagicMock()
 
         ctx.adapter.prepare_rdma_target = MagicMock(side_effect=lambda result: result)
         ctx.adapter.before_rdma_receive = MagicMock(
@@ -2173,9 +2434,71 @@ class TestRdmaStrategyLoad:
         )
 
         with pytest.raises(StrategyFailed, match="post-prepare failure") as exc:
-            strategy._load_as_target(result, ctx, source_worker, "src", "worker")
+            strategy._load_as_target(result, ctx, MagicMock(), "mx-source", "w-1")
 
         assert exc.value.mutated is True
+        strategy._receive_from_peer.assert_not_called()
+
+    def test_no_source_leaves_the_model_untouched(self):
+        """Without a source, the next strategy must get the model as it was.
+
+        Preparing the target rewrites it into the source's processed layout,
+        which a strategy streaming raw checkpoint weights cannot load into --
+        and a miss reports itself as not mutated, so nothing would rebuild it.
+        """
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+        ctx = _make_load_context()
+        ctx.is_reload = False
+        result = LoadResult(value=MagicMock(), model=MagicMock())
+        strategy = RdmaStrategy()
+        strategy._find_source_instances = MagicMock(return_value=[])
+        ctx.adapter.prepare_rdma_target = MagicMock()
+        ctx.adapter.before_rdma_receive = MagicMock()
+
+        with pytest.raises(StrategyFailed, match="No RDMA source") as exc:
+            with _strategy_phases(strategy, result, ctx):
+                strategy.load(result, ctx)
+
+        assert exc.value.mutated is False
+        ctx.adapter.prepare_rdma_target.assert_not_called()
+        ctx.adapter.before_rdma_receive.assert_not_called()
+
+    def test_each_candidate_prepares_the_target_it_receives_into(self):
+        """A failed candidate leaves a reinitialized model, so the next one
+        has to prepare it again."""
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+        ctx = _make_load_context()
+        ctx.is_reload = False
+        strategy = RdmaStrategy()
+        strategy._find_source_instances = MagicMock(
+            return_value=[
+                _make_instance_ref(worker_id="w-1"),
+                _make_instance_ref(worker_id="w-2"),
+            ]
+        )
+        strategy._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+        strategy._accelerator_compatible = MagicMock(return_value=True)
+        strategy._receive_from_peer = MagicMock(
+            side_effect=[RuntimeError("READ timed out"), None]
+        )
+        ctx.adapter.prepare_rdma_target = MagicMock(side_effect=lambda r: r)
+        ctx.adapter.before_rdma_receive = MagicMock(side_effect=lambda r: r)
+        model = MagicMock()
+        ctx.adapter.reinit_for_retry = MagicMock(
+            return_value=LoadResult(value=model, model=model)
+        )
+
+        with patch(
+            "modelexpress.load_strategy.rdma_strategy.get_configured_selector",
+            return_value=_IdentitySelector(),
+        ):
+            strategy.load(LoadResult(value=MagicMock(), model=MagicMock()), ctx)
+
+        assert ctx.adapter.prepare_rdma_target.call_count == 2
+        assert ctx.adapter.before_rdma_receive.call_count == 2
+        ctx.adapter.reinit_for_retry.assert_called_once()
 
     def test_rollback_shuts_down_nixl_manager(self):
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy

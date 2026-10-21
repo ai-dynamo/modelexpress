@@ -12,7 +12,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from modelexpress import p2p_pb2
-from modelexpress.adapter import StrategyFailed
+from modelexpress.adapter import EngineAdapter, StrategyFailed
 from modelexpress.load_strategy import LoadContext, LoadResult, LoadStrategyChain
 
 
@@ -37,6 +37,7 @@ def _ctx():
         identity=p2p_pb2.SourceIdentity(model_name="test/model"),
         mx_client=MagicMock(),
         worker_id="w",
+        adapter=EngineAdapter(),
     )
 
 
