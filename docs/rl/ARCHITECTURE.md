@@ -654,15 +654,10 @@ can trip a loader that per-source order does not. Unexpected engine errors
 propagate, and parameter loader hooks are restored on every exit. This optimizes
 the first capture without caching layouts across model or source changes.
 
-The minimal rendezvous publisher is called only after its NIXL agent and source
-buffers are registered, so `publish()` stores the worker as READY and repeated
-publication replaces that worker record. The shared `PublisherThread` sends a
-READY status heartbeat every `MX_HEARTBEAT_INTERVAL_SECS` seconds (30 by
-default), keeping the record fresh for READY-only discovery. `close()` uses the
-same publisher lifecycle to stop the heartbeat and best-effort mark the source
-STALE. Long-lived framework integrations still need to call `close()` from
-their lifecycle; SIGKILL and mid-transfer failure recovery remain follow-up
-work.
+Trainer adapters encode registered shard geometry in stable worker manifests.
+The refit control plane owns worker registration, immutable version publication,
+and version leases; receivers resolve those manifests before planning transfers.
+Megatron and FSDP use this shared lifecycle.
 
 `modelexpress_rl/inference/nixl_staged_transfer.py` owns exact-manifest planning,
 trainer staging buffers, direct generator-peer transfer, and verification. The

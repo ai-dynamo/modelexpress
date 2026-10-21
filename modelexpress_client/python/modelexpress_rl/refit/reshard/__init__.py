@@ -53,13 +53,10 @@ from modelexpress_rl.refit.reshard.transport import (
     Transport,
 )
 from modelexpress_rl.refit.reshard.cuda_pool import classic_cuda_alloc
-from modelexpress_rl.refit.reshard.receiver import ReshardReceiver
 from modelexpress_rl.refit.reshard.rendezvous import (
-    MxReshardRendezvous,
     PublishedShard,
     PublishedTensor,
     RendezvousPayload,
-    gather_sources,
     wrap_rendezvous_blob,
 )
 from modelexpress_rl.refit.reshard.verify import shard_region, tensor_digest
@@ -69,7 +66,6 @@ __all__ = [
     "FullPullSource",
     "IncompleteRefit",
     "LazyWeight",
-    "MxReshardRendezvous",
     "NixlReshardTransport",
     "OpChain",
     "PublishedShard",
@@ -78,7 +74,6 @@ __all__ = [
     "LogicalRead",
     "ReadDescriptor",
     "RecordedCopy",
-    "ReshardReceiver",
     "Shard",
     "SourceBuffer",
     "SourceInfo",
@@ -93,7 +88,6 @@ __all__ = [
     "convert_source_weights",
     "classic_cuda_alloc",
     "execute_transfer",
-    "gather_sources",
     "intersect",
     "op_chain_to_box",
     "paired_runs",

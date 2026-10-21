@@ -25,21 +25,12 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES == 4 * 1024**3
     assert envs.MX_REDIS_URL == "redis://localhost:6379"
     assert envs.MX_GENERATOR_SOURCE_ORDER is None
-    assert envs.MX_RESHARD_FUSED_WIRE is True
-    assert envs.MX_RESHARD_BATCH_INSTALL is True
-    assert envs.MX_RESHARD_CACHE_DESCRIPTORS is True
-    assert envs.MX_RESHARD_REQUIRE_FULL_COVERAGE is False
-    assert envs.MX_RESHARD_COVERAGE_FLOOR == pytest.approx(0.995)
-    assert envs.MX_RESHARD_HANDSHAKE_TIMEOUT_S == 900.0
-    assert envs.MX_RESHARD_HANDSHAKE_ATTEMPT_S == 20.0
-    assert envs.MX_RESHARD_HANDSHAKE_BACKOFF_S == 2.0
     assert envs.MX_REFIT_STAGE_RECORD is True
     assert envs.MX_REFIT_DEBUG_VALIDATE_PLAN is False
     assert envs.MX_REFIT_PACK_MODULES is True
     assert envs.MX_REFIT_PREFETCH_REPLICA_METADATA is False
     assert envs.MX_REFIT_DEBUG_VALIDATE_REPLICAS is False
     assert envs.MX_RESHARD_MAX_SEGMENTS_PER_COPY == 64
-    assert envs.MX_RESHARD_MAX_GBPS == 0.0
     assert envs.MX_RESHARD_MIN_GBPS == 0.0
     assert envs.MX_RESHARD_PUBLISH_DIGEST is False
     assert envs.MX_S3_MULTIPART_THRESHOLD_BYTES == 100 * 1024**2
@@ -229,9 +220,6 @@ def test_stream_window_layers_accepts_zero_and_rejects_negative(monkeypatch):
 
 def test_moved_reshard_settings_keep_model_express_boolean_parsing(monkeypatch, caplog):
     for name, falsy, truthy, default in (
-        ("MX_RESHARD_FUSED_WIRE", "off", "yes", True),
-        ("MX_RESHARD_BATCH_INSTALL", "0", "on", True),
-        ("MX_RESHARD_CACHE_DESCRIPTORS", "false", "1", True),
         ("MX_REFIT_STAGE_RECORD", "no", "true", True),
         ("MX_REFIT_PACK_MODULES", "0", "yes", True),
         ("MX_RESHARD_PUBLISH_DIGEST", "off", "on", False),

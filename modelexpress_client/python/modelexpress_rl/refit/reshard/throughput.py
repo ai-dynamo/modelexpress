@@ -1,19 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-"""The refit throughput floor, shared by every receiver that moves weights.
-
-There are two receivers, they use the same transport, and they were reached by
-different framework paths: ``refit.reshard.receiver`` builds its own plan for the
-Megatron path, while ``modelexpress_rl.inference.nixl_staged_transfer`` stages for
-the FSDP path. A floor that lives in one of them protects one framework and
-silently does nothing for the other, which is the failure this module exists to
-prevent - the incident that motivated the floor was measured on the FSDP path.
-
-One implementation also means one schema. A CI gate keys on the marker string, so
-two copies free to drift would let the same regression fail one path and pass the
-other, and the gate would look green for the wrong reason.
-"""
+"""Throughput-floor diagnostics for staged RL weight transfers."""
 
 from __future__ import annotations
 
@@ -74,19 +62,8 @@ def warn_if_below_floor(
 ) -> None:
     """Report a wire rate far below what the fabric should deliver.
 
-    ``MX_RESHARD_MAX_GBPS`` catches a transfer that did not happen. Nothing
-    caught one that happened 20x too slowly: four concurrent receivers on a node
-    collapsed from ~26 GB/s to ~1.5 GB/s each with byte counts exact, descriptor
-    counts exact, coverage complete and fallback zero. Every signal available
-    said the refit was healthy, because a rate is only interpretable against a
-    bound and only the upper one existed.
-
-    Warns rather than raising, which is deliberately the opposite of the ceiling.
-    An impossible rate means the payload never moved so the buffers cannot be
-    trusted; a slow rate is still a correct refit, and killing a training run
-    over throughput would be worse than the throughput. The record is structured
-    so a CI gate can fail on its presence, which is where enforcement belongs: a
-    perf regression should block a merge, not a production refit.
+    Warn rather than abort a correct refit. The structured record lets CI gate
+    throughput regressions without interrupting a running training job.
 
     ``context`` is merged into the record so each receiver can name whoever saw
     it. The incident had one fast rank and three slow ones in the same run, so a
