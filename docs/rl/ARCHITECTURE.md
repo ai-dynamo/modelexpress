@@ -792,6 +792,12 @@ load-time slots; native post-processing recreates runtime aliases. Missing
 load-time slots still fail restoration, and final runtime identity and storage
 validation remains required.
 
+During geometry capture, writes to live registered parameter or buffer storage,
+including views and detached aliases, are rejected before execution and reported
+as unsupported sources. Lazy-source copies remain record-only, and independent
+scratch tensors may still be mutated. The guard ends when capture exits; it does
+not change installation or native post-load processing.
+
 Load-layout capture caches a deep copy of the result and returns another deep
 copy on a cache hit, preserving shared references within each result while
 isolating callers' mutations. The existing model, loader, routing and manifest

@@ -602,14 +602,21 @@ def test_quantized_replay_reuses_capture_and_restores_renamed_storage(monkeypatc
             assert torch.equal(owner.packed, expected * 2)
 
 
-@pytest.mark.parametrize("mutation", ["zero", "fill", "copy", "view"])
+@pytest.mark.parametrize(
+    "mutation", ["zero", "fill", "copy", "view", "data", "out", "foreach"]
+)
+@pytest.mark.parametrize("registry", ["parameter", "buffer"])
 def test_capture_rejects_live_destination_mutation_before_changing_values(
-    monkeypatch, mutation
+    monkeypatch, mutation, registry
 ):
     class Model(nn.Module):
         def __init__(self):
             super().__init__()
-            self.register_buffer("weight", torch.full((4,), 7.0))
+            value = torch.full((4,), 7.0)
+            if registry == "parameter":
+                self.weight = nn.Parameter(value, requires_grad=False)
+            else:
+                self.register_buffer("weight", value)
 
         def load_weights(self, weights):
             if mutation == "zero":
@@ -618,8 +625,14 @@ def test_capture_rejects_live_destination_mutation_before_changing_values(
                 self.weight.fill_(3)
             elif mutation == "copy":
                 self.weight.copy_(torch.zeros(4))
-            else:
+            elif mutation == "view":
                 self.weight[1:].add_(3)
+            elif mutation == "data":
+                self.weight.data.zero_()
+            elif mutation == "out":
+                torch.add(self.weight, 3, out=self.weight)
+            else:
+                torch._foreach_add_([self.weight], 3)
             for _, source in weights:
                 self.weight[:2].copy_(source)
 
@@ -629,3 +642,26 @@ def test_capture_rejects_live_destination_mutation_before_changing_values(
     assert torch.equal(model.weight, torch.full((4,), 7.0))
     assert captured.unsupported == ["weight"]
     assert "live destination mutation" in captured.unsupported_reasons["weight"]
+
+
+def test_capture_allows_scratch_mutation_and_releases_live_storage_guard(monkeypatch):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", torch.full((4,), 7.0))
+
+        def load_weights(self, weights):
+            scratch = self.weight.clone()
+            scratch.zero_()
+            scratch.add_(3)
+            for _, source in weights:
+                self.weight.copy_(source)
+
+    model = Model()
+    installer = _persistent_installer(monkeypatch, model)
+    captured, _ = installer.capture([("weight", torch.float32, (4,))])
+    assert not captured.unsupported
+    assert len(captured.copies) == 1
+    assert torch.equal(model.weight, torch.full((4,), 7.0))
+    model.weight.add_(1)
+    assert torch.equal(model.weight, torch.full((4,), 8.0))
