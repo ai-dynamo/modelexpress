@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from modelexpress_rl.refit.reshard.types import IncompleteRefit
 from modelexpress_rl.inference.plan import PreparedStreamingTensors, SourceReplayBatch
-from tests.test_refit_vllm_installer import (
+from modelexpress_rl.tests.test_refit_vllm_installer import (
     _cpu_installer,
     _install_fake_vllm,
     _install_tensors,

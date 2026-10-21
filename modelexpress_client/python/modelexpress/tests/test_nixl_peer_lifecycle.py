@@ -15,7 +15,7 @@ up in ``remoteBackends_``, which on the source has no entry for a reader it neve
 loaded. The source therefore cannot invalidate its readers, and a reader that exits
 without disconnecting leaves it holding a QP nothing can clean up.
 
-Run: pytest tests/test_nixl_peer_lifecycle.py
+Run: pytest modelexpress/tests/test_nixl_peer_lifecycle.py
 """
 
 import time

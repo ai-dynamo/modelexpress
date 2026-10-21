@@ -44,7 +44,7 @@ dependencies = [
 dev = [
     "opentelemetry-api>=1.41.1",
     "opentelemetry-sdk>=1.41.1",
-    # tests/test_metrics.py builds the real collectors and forks real ranks, so
+    # modelexpress/tests/test_metrics.py builds the real collectors and forks real ranks, so
     # the test extra needs what the metrics extra installs. CI installs only
     # [dev]; without this the metrics tests would error out on import rather
     # than run.
@@ -90,6 +90,7 @@ modelexpress_rl = "modelexpress_rl.inference.engines.vllm.registration:register"
 modelexpress_rl = "modelexpress_rl.inference.engines.sglang.registration:register"
 
 [tool.pytest.ini_options]
+testpaths = ["modelexpress/tests", "modelexpress_rl/tests"]
 markers = [
     "gpu: requires one or more CUDA GPUs",
     "slow: long-running test (real model load + transfer)",
@@ -98,6 +99,7 @@ markers = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["modelexpress*"]
+exclude = ["modelexpress.tests", "modelexpress.tests.*", "modelexpress_rl.tests", "modelexpress_rl.tests.*"]
 
 [tool.setuptools.package-data]
 modelexpress = ["py.typed"]

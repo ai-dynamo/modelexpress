@@ -12,7 +12,7 @@ from safetensors.torch import load_file, save_file
 from modelexpress_rl import envs
 from modelexpress_rl.inference import receiver
 from modelexpress_rl.inference.methods import canonical_delta
-from tests.test_refit_s3_receiver import (
+from modelexpress_rl.tests.test_refit_s3_receiver import (
     _Adapter,
     _MemoryS3,
     _artifact,
