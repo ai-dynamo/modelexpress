@@ -36,7 +36,8 @@ service RefitService {
 // Internal worker-to-worker API. The generator fetches the small transfer
 // manifest here; tensor bytes remain on the advertised data-plane transport.
 service RefitWorkerService {
-  rpc GetWeightVersionShardManifest(GetWeightVersionShardManifestRequest) returns (GetWeightVersionShardManifestResponse);
+  rpc GetTrainerShardMetadata(GetTrainerShardMetadataRequest) returns (GetTrainerShardMetadataResponse);
+  rpc GetWeightVersionShardMetadata(GetWeightVersionShardMetadataRequest) returns (GetWeightVersionShardMetadataResponse);
 }
 
 enum WorkerRole {
@@ -221,10 +222,10 @@ message WeightVersionShard {
   string logical_shard_id = 2;
   // Together with version_id and logical_shard_id, identifies this publication.
   string worker_id = 3;
-  uint64 tensor_count = 4;
-  uint64 total_bytes = 5;
-  string manifest_digest = 6;
-  string manifest_endpoint = 7;
+  string stable_metadata_digest = 6;
+  string metadata_endpoint = 7;
+  // Empty when content verification is disabled.
+  string version_metadata_digest = 8;
 }
 
 message ObjectStorageSource {
@@ -249,16 +250,40 @@ message ListWeightVersionShardsResponse {
   repeated WeightVersionShard shards = 1;
 }
 
-message GetWeightVersionShardManifestRequest {
-  // Empty for immutable bound coverage used during trainer mesh admission.
-  // Otherwise identifies the versioned source-buffer manifest.
+message GetTrainerShardMetadataRequest {
+  // Identifies immutable bound coverage or registered physical source metadata.
+  string metadata_digest = 1;
+}
+
+message GetTrainerShardMetadataResponse {
+  bytes metadata = 1;
+  string metadata_digest = 2;
+}
+
+message ShardChecksum {
+  string tensor_name = 1;
+  uint32 shard_index = 2;
+  string digest = 3;
+}
+
+message WeightVersionShardMetadata {
+  string version_id = 1;
+  string worker_id = 2;
+  string logical_shard_id = 3;
+  string stable_metadata_digest = 4;
+  // Canonical order is (tensor_name, shard_index), with no duplicate keys.
+  repeated ShardChecksum checksums = 5;
+}
+
+message GetWeightVersionShardMetadataRequest {
   string version_id = 1;
   string logical_shard_id = 2;
 }
 
-message GetWeightVersionShardManifestResponse {
-  bytes manifest = 1;
-  string manifest_digest = 2;
+message GetWeightVersionShardMetadataResponse {
+  WeightVersionShardMetadata metadata = 1;
+  // SHA-256 of the deterministically serialized canonical metadata message.
+  string version_metadata_digest = 2;
 }
 
 message DeleteWeightVersionShardRequest {

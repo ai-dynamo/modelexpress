@@ -728,10 +728,15 @@ class RefitWorkerServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.GetWeightVersionShardManifest = channel.unary_unary(
-                '/model_express.refit.RefitWorkerService/GetWeightVersionShardManifest',
-                request_serializer=refit__pb2.GetWeightVersionShardManifestRequest.SerializeToString,
-                response_deserializer=refit__pb2.GetWeightVersionShardManifestResponse.FromString,
+        self.GetTrainerShardMetadata = channel.unary_unary(
+                '/model_express.refit.RefitWorkerService/GetTrainerShardMetadata',
+                request_serializer=refit__pb2.GetTrainerShardMetadataRequest.SerializeToString,
+                response_deserializer=refit__pb2.GetTrainerShardMetadataResponse.FromString,
+                _registered_method=True)
+        self.GetWeightVersionShardMetadata = channel.unary_unary(
+                '/model_express.refit.RefitWorkerService/GetWeightVersionShardMetadata',
+                request_serializer=refit__pb2.GetWeightVersionShardMetadataRequest.SerializeToString,
+                response_deserializer=refit__pb2.GetWeightVersionShardMetadataResponse.FromString,
                 _registered_method=True)
 
 
@@ -740,7 +745,13 @@ class RefitWorkerServiceServicer(object):
     manifest here; tensor bytes remain on the advertised data-plane transport.
     """
 
-    def GetWeightVersionShardManifest(self, request, context):
+    def GetTrainerShardMetadata(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetWeightVersionShardMetadata(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -749,10 +760,15 @@ class RefitWorkerServiceServicer(object):
 
 def add_RefitWorkerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'GetWeightVersionShardManifest': grpc.unary_unary_rpc_method_handler(
-                    servicer.GetWeightVersionShardManifest,
-                    request_deserializer=refit__pb2.GetWeightVersionShardManifestRequest.FromString,
-                    response_serializer=refit__pb2.GetWeightVersionShardManifestResponse.SerializeToString,
+            'GetTrainerShardMetadata': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetTrainerShardMetadata,
+                    request_deserializer=refit__pb2.GetTrainerShardMetadataRequest.FromString,
+                    response_serializer=refit__pb2.GetTrainerShardMetadataResponse.SerializeToString,
+            ),
+            'GetWeightVersionShardMetadata': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetWeightVersionShardMetadata,
+                    request_deserializer=refit__pb2.GetWeightVersionShardMetadataRequest.FromString,
+                    response_serializer=refit__pb2.GetWeightVersionShardMetadataResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -768,7 +784,7 @@ class RefitWorkerService(object):
     """
 
     @staticmethod
-    def GetWeightVersionShardManifest(request,
+    def GetTrainerShardMetadata(request,
             target,
             options=(),
             channel_credentials=None,
@@ -781,9 +797,36 @@ class RefitWorkerService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/model_express.refit.RefitWorkerService/GetWeightVersionShardManifest',
-            refit__pb2.GetWeightVersionShardManifestRequest.SerializeToString,
-            refit__pb2.GetWeightVersionShardManifestResponse.FromString,
+            '/model_express.refit.RefitWorkerService/GetTrainerShardMetadata',
+            refit__pb2.GetTrainerShardMetadataRequest.SerializeToString,
+            refit__pb2.GetTrainerShardMetadataResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetWeightVersionShardMetadata(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.refit.RefitWorkerService/GetWeightVersionShardMetadata',
+            refit__pb2.GetWeightVersionShardMetadataRequest.SerializeToString,
+            refit__pb2.GetWeightVersionShardMetadataResponse.FromString,
             options,
             channel_credentials,
             insecure,
