@@ -2024,9 +2024,8 @@ plans inherit the complete plan's full-source verification policy.
 shared source table and its index map inside the planner. Module batching and
 packing preserve the same read order for legacy captures. Source replay instead
 batches consecutive writes without regrouping by owner; module packing does not
-reorder those writes. Each write prefers the longest source-view prefix within
-the descriptor limit and per-arena staging budget, then locally replays the
-remaining operations. If no such prefix fits, planning retains the exact reads.
+reorder those writes. Each write stages a representable source-view prefix, then
+locally replays the remaining operations.
 Before each bounded read, the receiver clears the used arena region once,
 preserving zero-filled gaps without a separate clear for each source write.
 Ordered replay digest verification leaves the normal reads and staging layout
@@ -2036,6 +2035,15 @@ stages a source-view prefix, enabling verification rejects the plan before
 transfer: a whole-shard digest cannot verify that partial or rearranged view.
 Verification does not substitute a separate full-source transfer plan or claim
 to validate the final installed tensor.
+When an exact prefix exceeds `MX_RESHARD_MAX_SEGMENTS_PER_COPY`, the planner
+considers representable earlier prefixes within the aligned per-arena capacity,
+including noncontiguous views that can be staged with fewer descriptors.
+It chooses the least wire overhead that meets the descriptor target, or the
+greatest available reduction when fragmentation prevents meeting it. Arithmetic
+cost counting avoids constructing discarded descriptor lists. Preparation reports
+exact and planned descriptor counts, descriptor savings and extra wire bytes,
+including on warm updates. If no eligible prefix reduces descriptors, exact
+reads remain.
 
 The combined capture is the reusable capture artifact; ordered replay planning
 consumes it directly and does not separately compose trainer conversion with an

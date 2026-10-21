@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from math import prod
 from types import MappingProxyType
 from typing import Any, Callable
@@ -31,6 +32,7 @@ from modelexpress.refit.reshard.slice_plan import (
     SourceBuffer,
     _row_major_strides,
     plan_pull,
+    pull_metrics,
 )
 from modelexpress.refit.reshard.transport import ReadDescriptor, Transport
 from modelexpress.refit.reshard.types import (
@@ -122,11 +124,19 @@ class LogicalTransferPlan:
         for full_pull in self.full_pulls:
             yield from full_pull.segments
 
+    @cached_property
+    def _read_cost(self) -> tuple[int, int]:
+        count = nbytes = 0
+        for segment in self._all_segments():
+            count += 1
+            nbytes += segment.nbytes
+        return count, nbytes
+
     def bytes_planned(self) -> int:
-        return sum(segment.nbytes for segment in self._all_segments())
+        return self._read_cost[1]
 
     def descriptor_count(self) -> int:
-        return sum(1 for _ in self._all_segments())
+        return self._read_cost[0]
 
     def descriptor_savings(self) -> int:
         return max(0, self.exact_descriptor_count - self.descriptor_count())
@@ -175,9 +185,10 @@ def replay_scratch_bytes(full):
     return peak
 
 
-def _plan_local_replay(copy, source, index, *, buffer_indices,
-                       max_segments_per_copy, max_staging_bytes):
-    """Prefer a descriptor-bounded source prefix and replay its suffix locally."""
+def _plan_local_replay(
+    copy, source, index, *, buffer_indices, max_segments_per_copy, max_staging_bytes=None
+):
+    """Choose a capacity-safe source prefix, then replay remaining operations locally."""
     import torch
 
     from modelexpress.refit.reshard.geometry import _SUPPORTED_OPS
@@ -187,7 +198,7 @@ def _plan_local_replay(copy, source, index, *, buffer_indices,
     root = torch.empty(source.global_shape, dtype=source.dtype, device="meta")
     value = root
     exact = None
-    bounded = None
+    candidates = []
     for length in range(len(copy.op_chain) + 1):
         if length:
             name, args, kwargs = copy.op_chain[length - 1]
@@ -207,21 +218,39 @@ def _plan_local_replay(copy, source, index, *, buffer_indices,
             dest_dtype=source.dtype,
         )
         try:
-            reads = plan_pull(
+            count, nbytes = pull_metrics(
                 candidate, source.global_shape, source.dtype, source.elsize,
-                source.shards, buffer_indices=buffer_indices,
+                source.shards,
             )
         except UnsupportedReshard:
             break
-        exact = (length, candidate, reads)
-        staging_bytes = ((prod(candidate.dest_shape) * source.elsize + 255) // 256) * 256
-        if len(reads) <= max_segments_per_copy and (
-            max_staging_bytes is None or staging_bytes <= max_staging_bytes
-        ):
-            bounded = exact
+        exact = (length, candidate, count, nbytes)
+        candidates.append(exact)
     if exact is None:
         raise UnsupportedReshard(f"{copy.src_name}: no transferable replay prefix")
-    prefix, candidate, segments = bounded or exact
+    selected = exact
+    if exact[2] > max_segments_per_copy:
+        eligible = (
+            item for item in candidates
+            if item[2] < exact[2]
+            and (
+                max_staging_bytes is None
+                or ((prod(item[1].dest_shape) * source.elsize + 255) // 256) * 256
+                <= max_staging_bytes
+            )
+        )
+        selected = min(
+            eligible,
+            key=lambda item: (
+                max(0, item[2] - max_segments_per_copy), item[3], -item[0]
+            ),
+            default=exact,
+        )
+    prefix, candidate, _, _ = selected
+    segments = plan_pull(
+        candidate, source.global_shape, source.dtype, source.elsize, source.shards,
+        buffer_indices=buffer_indices,
+    )
     # Tuple keys cannot collide with trainer names, including across packed owners.
     key = (copy.src_name, copy.param_name, index)
     return FullPullSource(
@@ -232,8 +261,8 @@ def _plan_local_replay(copy, source, index, *, buffer_indices,
         segments=tuple(segment._replace(param_name=key) for segment in segments),
         copies=(replace(copy, op_chain=copy.op_chain[prefix:]),),
         copy_indices=(index,),
-        exact_descriptor_count=len(exact[2]),
-        exact_bytes=sum(read.nbytes for read in exact[2]),
+        exact_descriptor_count=exact[2],
+        exact_bytes=exact[3],
     )
 
 
@@ -419,8 +448,10 @@ def plan_transfer_groups(
         )
 
 
-def _plan_source_replay(capture, sources, source_buffers, source_indices, *,
-                        verify_full_sources, max_segments_per_copy, max_staging_bytes):
+def _plan_source_replay(
+    capture, sources, source_buffers, source_indices, *, verify_full_sources,
+    max_segments_per_copy, max_staging_bytes,
+):
     full_pulls = []
     fallback = list(dict.fromkeys(capture.unsupported))
     for index, copy in enumerate(capture.copies):
