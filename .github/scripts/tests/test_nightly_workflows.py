@@ -12,6 +12,7 @@ from pathlib import Path
 import yaml
 
 WORKFLOWS = Path(__file__).resolve().parents[2] / "workflows"
+ROOT = WORKFLOWS.parents[1]
 
 
 def workflow(name):
@@ -184,6 +185,8 @@ class NightlyWorkflowTests(unittest.TestCase):
                 self.assertIn(case["kind"], {"p2p", "fleet", "dynamo", "stale"})
         large = [case for cases in partitions.values() for case in cases if case.get("large")]
         self.assertEqual(sorted(case["fleet_size"] for case in large if case["kind"] == "fleet"), ["15", "5", "5"])
+        sglang_mla = next(case for case in partitions["sglang"] if case.get("measure_vram"))
+        self.assertEqual(sglang_mla["pytest_args"], "--expected-max-total-tokens 131072")
         self.assertEqual(
             {case["name"] for case in large if case["kind"] != "fleet"},
             {
@@ -195,6 +198,26 @@ class NightlyWorkflowTests(unittest.TestCase):
         # fall through to the A100a array under expression truthiness rules.
         lane = test["env"]["MX_CI_GPU_LANE"]
         self.assertIn("a100b_slots) || fromJSON(needs.admission-slots.outputs.slots))[matrix.gpu_slot]", lane)
+
+    def test_sglang_mla_uses_fixed_token_pool_and_strict_vram_parity(self):
+        manifest = yaml.load(
+            (ROOT / "ci/k8s/client/sgl/manifest-azure-tp2.yaml").read_text(),
+            Loader=yaml.BaseLoader,
+        )
+        args = manifest["spec"]["template"]["spec"]["containers"][0]["args"]
+        cap_index = args.index("--max-total-tokens")
+        self.assertEqual(args[cap_index + 1], "131072")
+
+        action = yaml.load(
+            (ROOT / ".github/actions/run-mx-p2p-test/action.yml").read_text(),
+            Loader=yaml.BaseLoader,
+        )
+        wait = next(
+            step
+            for step in action["runs"]["steps"]
+            if step.get("name") == "Wait for target /health to return 200"
+        )
+        self.assertIn('\n    "0.5"\n', wait["run"])
 
     def test_inference_status_rejects_missing_or_failed_frameworks(self):
         status = workflow("modelexpress-inference-ci.yml")["jobs"]["status-check"]

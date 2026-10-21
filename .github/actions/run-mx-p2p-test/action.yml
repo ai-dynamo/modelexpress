@@ -448,7 +448,7 @@ runs:
           write_vram_measurements "${VRAM_MEASUREMENTS_PATH}" \
             "${SOURCE_PEAK_VRAM_MIB}" "${SOURCE_FINAL_VRAM_MIB}" \
             "${TARGET_PEAK_VRAM_MIB}" "${TARGET_FINAL_VRAM_MIB}" \
-            "1.0"
+            "0.5"
           echo "MX_VRAM_MEASUREMENTS_PATH=${VRAM_MEASUREMENTS_PATH}" >> "$GITHUB_ENV"
           echo "VRAM measurements written to ${VRAM_MEASUREMENTS_PATH}:"
           cat "${VRAM_MEASUREMENTS_PATH}"

@@ -146,7 +146,7 @@ jobs:
                 {
                   "framework": "sglang", "gpu_slot": 1, "namespace": "mx-ci-sglang-mla", "manifest": "ci/k8s/client/sgl/manifest-azure-tp2.yaml",
                   "source_port": "8009", "worker_port": "8010", "pool": "a100b", "kind": "p2p", "name": "P2P MLA model test (sglang TP=2)", "tp_size": "2",
-                  "model": "deepseek-ai/DeepSeek-V2-Lite", "measure_vram": "true", "test_script": "ci/k8s/client/test_p2p_k8s.py",
+                  "model": "deepseek-ai/DeepSeek-V2-Lite", "measure_vram": "true", "test_script": "ci/k8s/client/test_p2p_k8s.py", "pytest_args": "--expected-max-total-tokens 131072",
                   "source_extra_env": "JOB_NAME=mx-source", "extra_env": "JOB_NAME=mx-target"
                 },
                 {

@@ -14,7 +14,8 @@ have reached Running state.  Asserts:
      are loaded and the model is serving correctly on each.
   4. When enabled by the workflow, target peak and final VRAM do not materially
      exceed source VRAM.
-  5. When --expect-mtp is set, every target rank transfers both the main model
+  5. When configured, source and target report the expected token-pool capacity.
+  6. When --expect-mtp is set, every target rank transfers both the main model
      and the MTP draft through P2P, and source/target greedy
      completions for a small prompt match exactly.
 
@@ -27,6 +28,7 @@ Invoked by the workflow as:
       --tp-size $TP_SIZE \
       [--dp-size $DP_SIZE] \
       [--p2p-marker "framework-specific transfer complete string"] \
+      [--expected-max-total-tokens N] \
       [--expect-mtp]
 
 --p2p-marker defaults:
@@ -537,6 +539,26 @@ def test_mtp_source_target_outputs_match(
         "MTP source/target completions differ for the deterministic prompt: "
         f"source={source_text!r}, target={target_text!r}"
     )
+
+
+def test_configured_token_pool_capacity(
+    namespace: str,
+    expected_max_total_tokens: int,
+) -> None:
+    """Source and target must use the configured SGLang token-pool cap."""
+    if expected_max_total_tokens == 0:
+        pytest.skip("Token-pool capacity assertion not enabled")
+
+    for job_name in ("mx-source", "mx-target"):
+        logs = _all_pod_logs(namespace, job_name, job_name)
+        capacities = {
+            int(value)
+            for value in re.findall(r"\bmax_total_num_tokens=(\d+)\b", logs)
+        }
+        assert capacities == {expected_max_total_tokens}, (
+            f"{job_name} reported token-pool capacities {sorted(capacities)}, "
+            f"expected only {expected_max_total_tokens}"
+        )
 
 
 def _assert_target_vram_matches_source(
