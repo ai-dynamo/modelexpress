@@ -198,7 +198,7 @@ def _plan_local_replay(
     root = torch.empty(source.global_shape, dtype=source.dtype, device="meta")
     value = root
     exact = None
-    contiguous = []
+    candidates = []
     for length in range(len(copy.op_chain) + 1):
         if length:
             name, args, kwargs = copy.op_chain[length - 1]
@@ -225,21 +225,20 @@ def _plan_local_replay(
         except UnsupportedReshard:
             break
         exact = (length, candidate, count, nbytes)
-        if value.is_contiguous():
-            contiguous.append(exact)
+        candidates.append(exact)
     if exact is None:
         raise UnsupportedReshard(f"{copy.src_name}: no transferable replay prefix")
     selected = exact
     if exact[2] > max_segments_per_copy:
-        eligible = [
-            item for item in contiguous
+        eligible = (
+            item for item in candidates
             if item[2] < exact[2]
             and (
                 max_staging_bytes is None
                 or ((prod(item[1].dest_shape) * source.elsize + 255) // 256) * 256
                 <= max_staging_bytes
             )
-        ]
+        )
         selected = min(
             eligible,
             key=lambda item: (

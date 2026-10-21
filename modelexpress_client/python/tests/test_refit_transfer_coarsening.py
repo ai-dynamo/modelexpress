@@ -6,10 +6,9 @@ import ctypes
 import pytest
 import torch
 from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
-from modelexpress.refit.reshard.transfer_plan import plan_transfer as _plan_staged_transfer
 
 from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo
+from modelexpress.refit.reshard.transfer_plan import SourceInfo, plan_transfer
 from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy, UnsupportedReshard
 
 
@@ -84,7 +83,7 @@ def test_source_replay_coarsens_excessive_descriptors(operation):
     else:
         ops, expected, exact_count = (("narrow", (1, 0, 64), ()),), source[:, :64], 128
     capture, table = _inputs(source, ops, expected)
-    plan = _plan_staged_transfer(capture, table)
+    plan = plan_transfer(capture, table)
 
     assert plan.descriptor_count() == 1
     assert plan.bytes_planned() == source.numel() * 4
@@ -106,7 +105,7 @@ def test_coarsening_keeps_small_contiguous_prefix_and_cast_suffix(monkeypatch):
     )
     expected = source[17:33, 3:67].bfloat16().float()
     capture, table = _inputs(source, ops, expected)
-    plan = _plan_staged_transfer(capture, table)
+    plan = plan_transfer(capture, table)
 
     assert plan.descriptor_count() == 1
     assert plan.bytes_planned() == 16 * 128 * 4
@@ -120,7 +119,7 @@ def test_descriptor_threshold_preserves_efficient_exact_slices(
     monkeypatch.setenv("MX_RESHARD_MAX_SEGMENTS_PER_COPY", str(limit))
     source = torch.arange(128 * 128, dtype=torch.float32).reshape(128, 128)
     capture, table = _inputs(source, (("narrow", (1, 0, 64), ()),), source[:, :64])
-    plan = _plan_staged_transfer(capture, table)
+    plan = plan_transfer(capture, table)
     assert plan.descriptor_count() == descriptors
     assert torch.equal(_replay(plan, table)[0], source[:, :64])
 
@@ -129,7 +128,7 @@ def test_later_contiguous_prefix_avoids_unnecessary_overread():
     source = torch.arange(128 * 128, dtype=torch.float32).reshape(128, 128)
     ops = (("t", (), ()), ("t", (), ()), ("narrow", (0, 17, 2), ()))
     capture, table = _inputs(source, ops, source[17:19])
-    plan = _plan_staged_transfer(capture, table)
+    plan = plan_transfer(capture, table)
     assert plan.descriptor_count() == 1
     assert plan.bytes_planned() == 2 * 128 * 4
     assert torch.equal(_replay(plan, table)[0], source[17:19])
@@ -140,7 +139,7 @@ def test_bounded_coarsening_respects_arena_capacity(budget, descriptors):
     source = torch.arange(128 * 128, dtype=torch.float32).reshape(128, 128)
     expected = source[:, :64]
     capture, table = _inputs(source, (("narrow", (1, 0, 64), ()),), expected)
-    plan = _plan_staged_transfer(capture, table, max_staging_bytes=budget)
+    plan = plan_transfer(capture, table, max_staging_bytes=budget)
     assert plan.descriptor_count() == descriptors
     assert torch.equal(_replay(plan, table)[0], expected)
 
@@ -149,7 +148,7 @@ def test_coarsening_keeps_tuple_selection_and_shard_offsets():
     source = torch.arange(3 * 128 * 128, dtype=torch.float32).reshape(3, 128, 128)
     ops = (("unbind", (0,), ()), ("__getitem__", (1,), ()), ("t", (), ()))
     capture, table = _inputs(source, ops, source[1].t())
-    plan = _plan_staged_transfer(capture, table)
+    plan = plan_transfer(capture, table)
     assert plan.descriptor_count() == 1
     assert plan.bytes_planned() == 128 * 128 * 4
     assert torch.equal(_replay(plan, table)[0], source[1].t())
@@ -165,7 +164,7 @@ def test_coarsening_does_not_add_bytes_without_reducing_descriptors(monkeypatch)
     capture, table = _inputs(
         source, (("narrow", (1, 0, 8), ()),), source[:, :8], shards
     )
-    plan = _plan_staged_transfer(capture, table)
+    plan = plan_transfer(capture, table)
     assert plan.descriptor_count() == 8
     assert plan.bytes_planned() == 8 * 8 * 4
     assert torch.equal(_replay(plan, table)[0], source[:, :8])
@@ -180,7 +179,7 @@ def test_coarsening_reads_contiguous_runs_from_each_source_shard():
     expected = source[:, 7:71].t()
     ops = (("narrow", (1, 7, 64), ()), ("t", (), ()))
     capture, table = _inputs(source, ops, expected, shards)
-    plan = _plan_staged_transfer(capture, table)
+    plan = plan_transfer(capture, table)
     assert plan.descriptor_count() == 2
     assert torch.equal(_replay(plan, table)[0], expected)
 
@@ -191,9 +190,7 @@ def test_source_replay_rejects_invalid_descriptor_threshold(monkeypatch, limit):
     source = torch.ones(4)
     capture, table = _inputs(source, (), source)
     with pytest.raises(ValueError, match="max_segments_per_copy must be at least 1"):
-        _plan_staged_transfer(capture, table)
-
-
+        plan_transfer(capture, table)
 
 
 def test_fragmented_shards_get_best_reduction_when_threshold_cannot_be_met():
@@ -203,7 +200,7 @@ def test_fragmented_shards_get_best_reduction_when_threshold_cannot_be_met():
         for row in range(8)
     ]
     capture, table = _inputs(source, (("t", (), ()),), source.t(), shards)
-    plan = _plan_staged_transfer(capture, table, max_segments_per_copy=1)
+    plan = plan_transfer(capture, table, max_segments_per_copy=1)
     assert plan.descriptor_count() == 8
     assert plan.exact_descriptor_count == 128
     assert plan.extra_wire_bytes() == 0
@@ -214,10 +211,29 @@ def test_whole_source_verification_preserves_all_bytes_under_coarsening():
     source = torch.arange(128 * 128, dtype=torch.float32).reshape(128, 128)
     capture, table = _inputs(source, (("narrow", (1, 0, 64), ()),), source[:, :64])
     with pytest.raises(UnsupportedReshard, match="whole-shard digests cannot verify"):
-        _plan_staged_transfer(capture, table, verify_full_sources=True,
-                              max_staging_bytes=32768)
-    plan = _plan_staged_transfer(capture, table, verify_full_sources=True,
-                                max_staging_bytes=65536)
+        plan_transfer(
+            capture, table, verify_full_sources=True, max_staging_bytes=32768
+        )
+    plan = plan_transfer(
+        capture, table, verify_full_sources=True, max_staging_bytes=65536
+    )
     assert plan.verify_full_sources
     assert plan.bytes_planned() == 65536
     torch.testing.assert_close(_replay(plan, table)[0], source[:, :64])
+
+
+@pytest.mark.parametrize("limit", [64, 128])
+def test_bounded_coarsening_keeps_noncontiguous_prefix(limit):
+    source = torch.arange(128 * 128, dtype=torch.float32).reshape(128, 128)
+    expected = source[:, :64].t()
+    ops = (("narrow", (1, 0, 64), ()), ("t", (), ()))
+    capture, table = _inputs(source, ops, expected)
+    plan = plan_transfer(
+        capture, table, max_segments_per_copy=limit, max_staging_bytes=32768
+    )
+
+    assert plan.descriptor_count() == 128
+    assert plan.exact_descriptor_count == 8192
+    assert plan.bytes_planned() == 32768
+    assert plan.extra_wire_bytes() == 0
+    torch.testing.assert_close(_replay(plan, table)[0], expected)
