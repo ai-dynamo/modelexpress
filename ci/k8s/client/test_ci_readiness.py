@@ -102,6 +102,29 @@ echo '{"items":[{"metadata":{"name":"failed-worker"},"status":{"containerStatuse
     assert "did not schedule within" not in result.stderr
 
 
+@pytest.mark.parametrize("reason", ["ErrImagePull", "ImagePullBackOff"])
+def test_image_pull_error_can_recover_before_scheduling_deadline(tmp_path, reason):
+    command = f'''if [[ " $* " == *" job,statefulset,deployment "* ]]; then
+  echo '{{"spec":{{"replicas":1}}}}'; exit 0
+fi
+count=$(cat "$FIXTURE/calls" 2>/dev/null || echo 0)
+count=$((count + 1)); echo "$count" > "$FIXTURE/calls"
+if [ "$count" -eq 1 ]; then
+  echo '{{"items":[{{"metadata":{{"name":"worker"}},"status":{{"containerStatuses":[{{"state":{{"waiting":{{"reason":"{reason}"}}}}}}]}}}}]}}'
+else
+  echo '{{"items":[{{"metadata":{{"name":"worker"}},"status":{{"conditions":[{{"type":"PodScheduled","status":"True"}}]}}}}]}}'
+fi
+'''
+    result = run_shell(
+        tmp_path,
+        "wait_for_scheduling Source mx-source job-name=mx-source 30",
+        command,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "scheduled (1/1 pods)" in result.stdout
+    assert int((tmp_path / "calls").read_text()) == 2
+
+
 def test_unhealthy_rdma_admission_retries_one_pod(tmp_path):
     command = '''echo "$*" >> "$FIXTURE/commands"
 if [[ " $* " == *" get job,statefulset,deployment "* ]]; then

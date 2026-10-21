@@ -226,7 +226,7 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
 
 
 def _deduplicate_log_handlers(lines: list[str]) -> list[str]:
-    """Collapse adjacent vLLM/MX renderings of the same worker log record."""
+    """Collapse paired vLLM/MX renderings, even when handlers interleave."""
     vllm_format = re.compile(
         r"^(.*?)INFO (\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[([^\]]+:\d+)\] (.*)$"
     )
@@ -234,22 +234,19 @@ def _deduplicate_log_handlers(lines: list[str]) -> list[str]:
         r"^(.*?)\[\d{4}-(\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] INFO (\S+:\d+): (.*)$"
     )
     result = []
-    previous = None
+    unpaired = {}
     for line in lines:
         match = vllm_format.match(line) or mx_format.match(line)
-        record = (match.groups(), match.re) if match else None
-        # Keep repeats from the same handler or a different process/time/site.
-        # Consume only one cross-format pair, not every equal message in a run.
-        if (
-            record is not None
-            and previous is not None
-            and record[0] == previous[0]
-            and record[1] != previous[1]
-        ):
-            previous = None
-            continue
+        if match:
+            record = (match.groups(), match.re)
+            other_format = mx_format if match.re == vllm_format else vllm_format
+            counterpart = (match.groups(), other_format)
+            # Consume one cross-handler pair; preserve real repeated records.
+            if unpaired.get(counterpart, 0):
+                unpaired[counterpart] -= 1
+                continue
+            unpaired[record] = unpaired.get(record, 0) + 1
         result.append(line)
-        previous = record
     return result
 
 
