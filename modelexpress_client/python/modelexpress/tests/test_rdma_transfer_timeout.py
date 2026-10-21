@@ -13,7 +13,7 @@ The subtlety these tests pin: MX_TRANSFER_TIMEOUT *defaults to 900*. Wiring it
 naively would have tripled this path's budget for everyone who never set it, making
 the reported stall three times worse. So it is honoured only when explicitly set.
 
-Run: pytest tests/test_rdma_transfer_timeout.py
+Run: pytest modelexpress/tests/test_rdma_transfer_timeout.py
 """
 
 import pytest

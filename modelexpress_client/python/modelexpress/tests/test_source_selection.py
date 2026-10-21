@@ -1069,7 +1069,7 @@ def test_load_records_success_metrics(monkeypatch):
     # MX_METRICS_SOURCE_ID_LABEL=1, because it is a per-process uuid whose label
     # domain grows with process count rather than with cluster size. That the
     # label really is absent by default is asserted on the exposition itself in
-    # tests/test_metrics.py.
+    # modelexpress/tests/test_metrics.py.
     m.record_selection.assert_called_once_with("random", cands[0].worker_id)
     m.record_attempt.assert_any_call("random", "success")
     assert m.observe_transfer_seconds.call_args.args[:2] == ("random", "success")

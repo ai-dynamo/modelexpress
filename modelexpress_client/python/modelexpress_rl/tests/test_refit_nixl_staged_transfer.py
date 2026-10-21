@@ -44,7 +44,7 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _ResolvedSources,
 )
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot, ResolvedTrainerSource
-from tests.test_refit_bounded_descriptors import harness, _check_values
+from modelexpress_rl.tests.test_refit_bounded_descriptors import harness, _check_values
 
 
 def _bind_test_execution(transfer, prepared) -> None:
@@ -1402,7 +1402,7 @@ def test_generator_layout_debug_requires_adapter_callback(harness, monkeypatch):
 
 
 def test_changed_agent_metadata_reconnects(harness, monkeypatch):
-    from tests.test_refit_bounded_descriptors import _agent_registration_snapshot
+    from modelexpress_rl.tests.test_refit_bounded_descriptors import _agent_registration_snapshot
 
     harness.collect(harness.prepare())
     transfer = harness.transfer

@@ -17,7 +17,7 @@ import modelexpress_rl.inference.source.trainer as trainer_source_module
 from modelexpress_rl import WeightPayloadFormat, refit_pb2, refit_pb2_grpc
 from modelexpress_rl.control import WeightVersion, WeightVersionState
 from modelexpress_rl.inference.source import TrainerSourceResolver
-from tests.test_refit_generator_client import _RefitService, _STABLE_METADATA
+from modelexpress_rl.tests.test_refit_generator_client import _RefitService, _STABLE_METADATA
 
 
 class _Worker(refit_pb2_grpc.RefitWorkerServiceServicer):

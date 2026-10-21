@@ -2365,7 +2365,7 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
     transfer._staging_arenas = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
-    from tests.test_refit_nixl_staged_transfer import _bind_test_execution
+    from modelexpress_rl.tests.test_refit_nixl_staged_transfer import _bind_test_execution
     _bind_test_execution(transfer, prepared)
 
     class Owner(nn.Module):
@@ -3029,7 +3029,7 @@ def test_streaming_preserves_destructor_boundaries(monkeypatch, owner_kind):
 def test_custom_metaclass_ties_use_owner_views(
     monkeypatch, bounded, source_replay
 ):
-    from tests.test_refit_ordered_installer import _transfer_and_install
+    from modelexpress_rl.tests.test_refit_ordered_installer import _transfer_and_install
 
     class Meta(type):
         pass

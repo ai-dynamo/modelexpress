@@ -7,7 +7,7 @@ A tiny model with column-parallel, row-parallel, fused (qkv-style), unsharded,
 and one UNSUPPORTED-op weight_loader. Exercises: contiguous/strided/fused-offset
 op-chain capture, full copies, and per-source unsupported attribution (an
 unsupported op is identified without producing an incorrect copy). Runs in any
-torch env: pytest tests/test_reshard_refit_geometry.py
+torch env: pytest modelexpress_rl/tests/test_reshard_refit_geometry.py
 """
 
 import logging

@@ -280,7 +280,7 @@ def test_fatal_errors_do_not_reach_fallback(registry, monkeypatch, tmp_path, sta
 
 
 def test_example_requires_method_implementation(registry, monkeypatch):
-    root = Path(__file__).resolve().parents[3]
+    root = Path(__file__).resolve().parents[4]
     monkeypatch.setenv("MX_PLUGIN_DIR", str(root / "examples" / "plugins"))
     registry.initialize_plugins()
     strategy = registry.plugins["example"]()
