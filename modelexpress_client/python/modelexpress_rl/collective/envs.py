@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     MX_NCCL_REFIT_BLOCKING_DATA_PLANE: bool
     MX_NCCL_REFIT_GROUPED_SUBMISSION: bool
     MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES: int
+    MX_NCCL_REFIT_SEND_WINDOW_BYTES: int
 
 
 def _int(name: str, default: int) -> int:
@@ -93,6 +94,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_NCCL_REFIT_PIPELINE_DEPTH": lambda: _int("MX_NCCL_REFIT_PIPELINE_DEPTH", 2),
     "MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES": lambda: _bytes(
         "MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES", 1 << 30
+    ),
+    "MX_NCCL_REFIT_SEND_WINDOW_BYTES": lambda: _bytes(
+        "MX_NCCL_REFIT_SEND_WINDOW_BYTES", 1 << 30
     ),
     "MX_NCCL_REFIT_REGISTRATION_TTL_S": lambda: _int(
         "MX_NCCL_REFIT_REGISTRATION_TTL_S",

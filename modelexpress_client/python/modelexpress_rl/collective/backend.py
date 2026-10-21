@@ -175,12 +175,15 @@ def _scratch_bytes(spec: LocalParamSpec, ctx: RefitCtx) -> int:
         return 0
 
 
-class _ReceiveWindow:
-    """Bounds the scratch receive buffers one per-call layer group keeps alive.
+class _ScratchWindow:
+    """Bounds the ``pre`` scratch buffers one per-call layer group keeps alive.
 
-    Without it a group retains every ``pre`` buffer until the whole group is
-    waited on, so a group holding the full bulk keeps the full bulk's scratch
-    allocated at once. Calls are collected into windows of about half the
+    Used on both halves: the generator's receive buffers and the trainer's
+    send buffers (a ``pre`` that stacks grouped experts builds a fresh one per
+    call). Without it a group retains every ``pre`` buffer until the whole
+    group is waited on, so a group holding the full bulk keeps the full bulk's
+    scratch allocated at once, and a caller that empties the allocator cache
+    between rounds pays for allocating and freeing all of it every round. Calls are collected into windows of about half the
     budget. Closing a window records an event on every lane it used; once two
     windows are closed the older one is waited on and dropped, so the allocator
     can hand its buffers to later calls while the newer window is still on the
@@ -817,7 +820,7 @@ class _CollectiveHalf:
         a group is open.
 
         ``window_bytes`` bounds the ``pre`` scratch the per-call path keeps
-        alive (see :class:`_ReceiveWindow`); each ``post`` hook then runs right
+        alive (see :class:`_ScratchWindow`); each ``post`` hook then runs right
         after its own call instead of after the last one, which is the same
         stream order. 0 keeps every context until the group is waited on. A
         grouped submission ignores it: nothing in a group is issued before the
@@ -847,7 +850,7 @@ class _CollectiveHalf:
         staged: list[tuple[ParamPlan, LaneCommunicator, LocalParamSpec, RefitCtx]] = []
         regions: list[_StorageRegion] = []
         grouped = envs.MX_NCCL_REFIT_GROUPED_SUBMISSION
-        window = _ReceiveWindow(window_bytes) if window_bytes and not grouped else None
+        window = _ScratchWindow(window_bytes) if window_bytes and not grouped else None
         started = time.monotonic()
         # The native runtime is process-global and not host-thread-safe, and a
         # group records on the calling thread, so one lock spans the group.
@@ -926,7 +929,7 @@ class _CollectiveHalf:
                 self._fail_deadline()
 
     def _release_windows(
-        self, window: _ReceiveWindow, regions: list[_StorageRegion]
+        self, window: _ScratchWindow, regions: list[_StorageRegion]
     ) -> None:
         """Wait for and drop every closed window but the newest."""
         while len(window.closed) > 1:
@@ -982,11 +985,20 @@ class NcclM2nSender(_CollectiveHalf):
         another layer group is still resharding is two overlapping
         communicators with operations in flight in different orders, which is
         the case that deadlocks.
+
+        On the per-call path the ``pre`` scratch this group keeps alive (for
+        example grouped experts stacked into a fresh buffer per call) is
+        bounded by ``MX_NCCL_REFIT_SEND_WINDOW_BYTES``: earlier calls are waited
+        on and dropped while the group is still being issued, as on the
+        receive side.
         """
         started = time.monotonic()
         entries = self._claim_group(layer_group_id)
         self._submit_layer_group(
-            entries, src=lambda ctx: ctx.buf, dst=lambda ctx: None
+            entries,
+            src=lambda ctx: ctx.buf,
+            dst=lambda ctx: None,
+            window_bytes=envs.MX_NCCL_REFIT_SEND_WINDOW_BYTES,
         )
         logger.info(
             "collective sender issued layer group %s (%d entries) in %.2fs",

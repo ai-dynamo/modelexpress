@@ -1695,3 +1695,159 @@ class TestReceiveWindow:
         monkeypatch.setenv("MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES", "-1")
         with pytest.raises(ValueError, match="must not be negative"):
             envs.MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES
+
+
+class TestSendWindow:
+    """The trainer's send scratch (what ``pre`` builds) is released per window.
+
+    A trainer whose ``pre`` stacks grouped experts into a fresh buffer per call
+    would otherwise keep every stacked buffer of the group alive until the
+    finish-time drain, which on a large MoE is the whole local expert set
+    allocated once per refit and freed again by the caller.
+    """
+
+    ENTRY_BYTES = 100
+
+    @pytest.fixture
+    def tracker(self, recorder, monkeypatch):
+        tracker = _Tracker()
+
+        def reshard(*, comm, entry, src, dst, handle):
+            name = comm.handle._name
+            tracker.issued[name] = tracker.issued.get(name, 0) + 1
+            if isinstance(src, _Scratch):
+                src.lane = name
+                src.seq = tracker.issued[name]
+
+        monkeypatch.setattr(backend, "_reshard", reshard)
+        return tracker
+
+    def _sender(self, recorder, tracker, monkeypatch, *, names, groupings=None):
+        plan = ReshardPlan(bulk=[entry(name) for name in names])
+        half, cache = build(
+            recorder, plan=plan, half_cls=NcclM2nSender, source_partition=0
+        )
+        for lane_obj in cache._lanes.values():
+            name = lane_obj.handle._name
+
+            def record_event(name=name):
+                return _Event(name, tracker.issued.get(name, 0))
+
+            def wait_event(ev, timeout_s, name=name):
+                tracker.completed[name] = max(
+                    tracker.completed.get(name, 0), ev.covers
+                )
+
+            def synchronize(timeout_s=None, name=name):
+                tracker.completed[name] = tracker.issued.get(name, 0)
+
+            monkeypatch.setattr(lane_obj, "record_event", record_event)
+            monkeypatch.setattr(lane_obj, "wait_event", wait_event)
+            monkeypatch.setattr(lane_obj, "synchronize", synchronize)
+
+        def stacked_spec(name):
+            # base=None and a fresh buffer per call: the grouped-expert shape.
+            def pre(base):
+                return RefitCtx(buf=_Scratch(tracker, name, self.ENTRY_BYTES))
+
+            return LocalParamSpec(base=None, pre=pre)
+
+        half._specs = {name: stacked_spec(name) for name in names}
+        if groupings is not None:
+            half.setup_layer_groups(groupings)
+        return half
+
+    def _send_one_group(self, half):
+        half.start_weight_update("v")
+        half.publish_weights(0)
+        half.finish_weight_update(broadcast_lane_id=1)
+
+    def test_a_large_group_keeps_at_most_the_window_of_scratch_alive(
+        self, recorder, tracker, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_SEND_WINDOW_BYTES", "400")
+        names = [f"p{i:02d}" for i in range(16)]
+        half = self._sender(recorder, tracker, monkeypatch, names=names)
+        self._send_one_group(half)
+        assert tracker.peak <= 400 + 2 * self.ENTRY_BYTES
+        assert tracker.peak < len(names) * self.ENTRY_BYTES
+        assert tracker.live == 0
+        assert tracker.violations == []
+
+    def test_the_default_budget_bounds_the_sender(
+        self, recorder, tracker, monkeypatch
+    ):
+        monkeypatch.delenv("MX_NCCL_REFIT_SEND_WINDOW_BYTES", raising=False)
+        from modelexpress_rl.collective import envs
+
+        assert envs.MX_NCCL_REFIT_SEND_WINDOW_BYTES == 1 << 30
+        names = [f"p{i:02d}" for i in range(16)]
+        half = self._sender(recorder, tracker, monkeypatch, names=names)
+        # Each call accounts as 256 MiB of scratch (the fake buffers stay
+        # small so their fake addresses never overlap).
+        monkeypatch.setattr(backend, "_scratch_bytes", lambda spec, ctx: 1 << 28)
+        self._send_one_group(half)
+        # 16 x 256 MiB against a 1 GiB budget: at most the budget plus two
+        # calls alive, never the whole group.
+        alive = tracker.peak // self.ENTRY_BYTES
+        assert alive <= (1 << 30) // (1 << 28) + 2
+        assert alive < len(names)
+        assert tracker.violations == []
+
+    def test_without_a_window_the_whole_group_is_retained(
+        self, recorder, tracker, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_SEND_WINDOW_BYTES", "0")
+        names = [f"p{i:02d}" for i in range(16)]
+        half = self._sender(recorder, tracker, monkeypatch, names=names)
+        self._send_one_group(half)
+        assert tracker.peak == len(names) * self.ENTRY_BYTES
+        assert tracker.live == 0
+        assert tracker.violations == []
+
+    def test_scratch_is_never_released_before_its_send_completes(
+        self, recorder, tracker, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_SEND_WINDOW_BYTES", "200")
+        names = [f"p{i:02d}" for i in range(12)]
+        half = self._sender(recorder, tracker, monkeypatch, names=names)
+        waits = []
+        lane0 = half._lane(0)
+        real_wait = lane0.wait_event
+
+        def wait_event(ev, timeout_s):
+            waits.append(ev.covers)
+            real_wait(ev, timeout_s)
+
+        monkeypatch.setattr(lane0, "wait_event", wait_event)
+        half.start_weight_update("v")
+        half.publish_weights(0)
+        assert waits and max(waits) < len(names)
+        assert tracker.live < len(names) * self.ENTRY_BYTES
+        assert tracker.violations == []
+        half.finish_weight_update(broadcast_lane_id=1)
+        assert tracker.violations == []
+        assert tracker.live == 0
+
+    def test_live_parameters_never_fill_the_window(
+        self, recorder, tracker, monkeypatch
+    ):
+        monkeypatch.setenv("MX_NCCL_REFIT_SEND_WINDOW_BYTES", "200")
+        names = [f"p{i:02d}" for i in range(8)]
+        half = self._sender(recorder, tracker, monkeypatch, names=names)
+        half._specs = {name: LocalParamSpec(base=f"live::{name}") for name in names}
+        waits = []
+        lane0 = half._lane(0)
+        monkeypatch.setattr(
+            lane0, "wait_event", lambda ev, timeout_s: waits.append(ev.covers)
+        )
+        self._send_one_group(half)
+        # Live shards are not scratch: nothing to release, so nothing waits.
+        assert waits == []
+
+    def test_the_send_window_env_rejects_a_negative_budget(self, monkeypatch):
+        from modelexpress_rl.collective import envs
+
+        monkeypatch.setenv("MX_NCCL_REFIT_SEND_WINDOW_BYTES", "-1")
+        with pytest.raises(ValueError, match="must not be negative"):
+            envs.MX_NCCL_REFIT_SEND_WINDOW_BYTES

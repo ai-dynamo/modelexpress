@@ -264,6 +264,8 @@ Defaults and details are in section 9.
 - `MX_NCCL_REFIT_PIPELINE_DEPTH`: layer groups the generator keeps in flight.
 - `MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES`: bound on the receive scratch one layer
   group keeps alive on the per-call path.
+- `MX_NCCL_REFIT_SEND_WINDOW_BYTES`: the same bound on the trainer's send
+  scratch (buffers a `pre` hook builds, such as stacked grouped experts).
 - `MX_NCCL_REFIT_GROUP_TIMEOUT_S`: deadline for `FORMING -> READY`.
 - `MX_NCCL_REFIT_POLL_INTERVAL_S`: group poll backoff floor.
 - `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S`: deadline for one lane's communicator
@@ -727,6 +729,7 @@ reports the round FAILED.
 | `MX_NCCL_REFIT_GROUPED_SUBMISSION` | `0` | Opt-in. When `1`, each layer group's reshards are recorded in one `nccl.m2n.group()` so M2N can fuse them; by default each is a separate `nccl.m2n.reshard` call on the same handle and stream. In nccl-extensions 0.1.0 a group of two or more reshards needs GIN (RDMA devices, and `NCCL_GIN_TYPE=2` for proxy GIN) even when every peer is NVLink-only; without it the group end fails on every rank |
 | `MX_NCCL_REFIT_PIPELINE_DEPTH` | `2` | Layer groups the generator keeps in flight before installing the oldest; `1` installs each group before `update_weights` returns. All groups are installed before `finish_weight_update` returns |
 | `MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES` | `1073741824` | Generator, per-call path only: `pre` scratch one layer group keeps alive. Each `post` runs right after its call; calls are closed into half-budget windows, and once two are closed the older is waited on through its lane events and dropped. `0` retains every buffer until the group is waited on. Ignored by grouped submission |
+| `MX_NCCL_REFIT_SEND_WINDOW_BYTES` | `1073741824` | Trainer, per-call path only: the same window over the `pre` scratch one layer group keeps alive on the send side (a `pre` that stacks grouped experts builds a new buffer per call). `0` retains every buffer until the finish-time drain. Ignored by grouped submission |
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for one lane's non-blocking `Communicator.init` |
