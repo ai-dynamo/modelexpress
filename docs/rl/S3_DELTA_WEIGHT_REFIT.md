@@ -323,14 +323,15 @@ By default, with full-tensor engine support, active refit uses this order:
 Set `MX_GENERATOR_SOURCE_ORDER=OBJECT_STORAGE` to use S3 directly.
 
 Post-load generator P2P requires registered runtime tensors and an initialized
-loader-owned NIXL manager. Quantized models and FP8 KV caches can select this
-path in either eager or graph mode. The peer transfer copies the registered
-runtime representation without rerunning post-load processing. Eager
+loader-owned NIXL manager. Peer selection does not gate model quantization, FP8
+KV-cache dtype, or eager versus graph execution. The peer transfer copies the
+registered runtime representation without rerunning post-load processing. Eager
 installation then refreshes q/k/v host
 scale mirrors and invalidates FlashInfer launch-scale caches for recomputation
 on the next forward. Graph-mode refits retain direct-copy behavior without
-this refresh; captured scalar updates are not handled here. This does not clear
-stored KV entries; retaining quantized KV entries across a change to their
+this refresh; captured scalar updates are not handled here. Configurations
+requiring those scale updates must use canonical object-storage refit. This does
+not clear stored KV entries; retaining quantized KV entries across a change to their
 K/V scales remains unsupported.
 
 A successful peer install does not trigger checkpoint reconstruction. If a

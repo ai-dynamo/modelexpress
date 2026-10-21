@@ -994,7 +994,7 @@ desired UID, so a failed or mismatched reconciliation cannot admit the worker.
 
 ## Generator peer lease behavior
 
-RL generator-to-generator active refit calls `PrepareTensorRead` while preparing the update, then holds the bounded lease until the staged update is released or the NIXL transfer completes. These donor-timed leases protect the donor's live tensor storage while another generator reads it; the donor drains existing readers before overwriting that storage, and if the drain times out, refit fails before mutation. Completion and ordinary failures release immediately. A pre-transfer retry obtains a fresh lease and revalidates the exact source version and worker instead of reusing the consumed manifest. If the target pod exits without cleanup because of `SIGKILL`, OOM, or node loss, the donor expires the abandoned lease after its bounded lifetime. Ordinary inference loading continues to use `GetTensorManifest` without this RL-specific mutation fence. For file-backed cache artifacts, targets call `PrepareArtifactChunk` and `ReleaseArtifactChunk` while bytes move through NIXL into target-local staging, then install the staged artifact into the runtime cache directory. The division of responsibility depends on which metadata backend is in use:
+RL generator-to-generator active refit calls `PrepareTensorRead` while preparing the update, then holds the bounded lease until the staged update is released or the NIXL transfer completes. These donor-timed leases protect the donor's live tensor storage while another generator reads it; the donor drains existing readers before overwriting that storage, and if the drain times out, refit fails before mutation. Completion and ordinary failures release immediately. A pre-transfer retry obtains a fresh lease and revalidates the exact source version and worker instead of reusing the consumed manifest. If the target pod exits without cleanup because of `SIGKILL`, OOM, or node loss, the donor expires the abandoned lease after its bounded lifetime. Ordinary inference loading continues to use `GetTensorManifest` without this RL-specific mutation fence. For file-backed cache artifacts, targets call `PrepareArtifactChunk` and `ReleaseArtifactChunk` while bytes move through NIXL into target-local staging, then install the staged artifact into the runtime cache directory.
 
 Active refit of a generator that publishes runtime tensors requires this default P2P metadata path. With `MX_P2P_METADATA=0`, ModelExpress cannot account for readers of tensor addresses stored in the central coordinator, so it fails the refit before mutation instead of risking a mixed-version transfer.
 
@@ -1002,9 +1002,12 @@ Generator-to-generator active refit validates the peer first, then receives
 directly into the target's registered live runtime tensors at the engine safe
 point. It does not allocate a second model-sized GPU buffer. If that direct
 transfer fails after mutation starts, ModelExpress marks the engine state
-uncertain; reset or restart the worker before serving or retrying. Quantized
-models and FP8 KV-cache configurations use canonical object-storage refit because
-their non-tensor derived state cannot currently be refreshed by a direct copy.
+uncertain; reset or restart the worker before serving or retrying. For vLLM
+eager execution, peer refit refreshes the recognized host-scale state and
+invalidates attention launch-scale caches as described above. Graph-mode peer refit copies
+runtime tensors without refreshing captured scalars; configurations requiring
+scale changes must use canonical object-storage refit. Neither path makes
+retaining quantized KV entries across changed K/V scales safe.
 
 
 ## RL protocol trust and upgrades
