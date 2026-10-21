@@ -47,8 +47,6 @@ With engine plugin autoload enabled, no manual registration call is needed. If p
 
 Deployments that previously used only `VLLM_PLUGINS=modelexpress` for refit must include `modelexpress_rl`. For manual RL registration, call `modelexpress_rl.inference.engines.vllm.registration.register()` instead of the base `register_modelexpress_loaders()`. Set `MX_LOAD_STRATEGY_CHAIN` before registration. Existing native or custom weight-transfer registrations are preserved.
 
-The public `modelexpress.refit`, `modelexpress.refit_timing`, and `modelexpress.refit.reshard` import paths remain available as compatibility exports. They share implementations, classes, and timing state with `modelexpress_rl.refit`; ordinary base inference loading does not import these compatibility modules.
-
 TensorRT-LLM support in the base package covers initial checkpoint P2P loading. It does not include RL refit or trainer/generator update APIs, and the RL-only settings are rejected by that integration.
 
 ## Support and tests

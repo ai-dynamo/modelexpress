@@ -1,46 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib
 import subprocess
 import sys
-
-import pytest
-
-
-@pytest.mark.parametrize(
-    "suffix",
-    [
-        "timing", "reshard", "reshard.geometry", "reshard.types",
-        "reshard.slice_plan", "reshard.transfer_plan", "reshard.receiver",
-        "reshard.rendezvous", "reshard.verify", "reshard.throughput",
-        "reshard.cuda_pool", "reshard.transport", "reshard.transport.base",
-        "reshard.transport.nixl",
-    ],
-)
-def test_legacy_refit_modules_share_rl_implementation(suffix):
-    legacy = importlib.import_module(f"modelexpress.refit.{suffix}")
-    current = importlib.import_module(f"modelexpress_rl.refit.{suffix}")
-    assert legacy is current
-
-
-def test_legacy_refit_exports_share_timing_state():
-    import modelexpress.refit as legacy
-    import modelexpress.refit_timing as old_timing
-    from modelexpress_rl.refit import timing
-
-    assert old_timing is timing
-    assert legacy.RefitTimingRecorder is timing.RefitTimingRecorder
-    recorder = legacy.RefitTimingRecorder(backend="test", version="version-a")
-    with legacy.use_refit_timing(recorder):
-        assert timing.current_refit_timing() is recorder
-
-
-@pytest.mark.parametrize("name", ["aliases", "publisher"])
-def test_legacy_megatron_modules_share_rl_implementation(name):
-    legacy = importlib.import_module(f"modelexpress.refit.reshard.megatron_{name}")
-    current = importlib.import_module(f"modelexpress_rl.train.engines.megatron.{name}")
-    assert legacy is current
 
 
 def test_full_tensor_package_import_does_not_require_delta_compression():

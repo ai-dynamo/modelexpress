@@ -636,7 +636,6 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `model_snapshot.py` | Hugging Face cache layout: path validation, atomic snapshot publication, revision refs, metadata inventories |
 | `model_prefetch.py` | Pre-engine metadata prefetch and repo-id resolution for server-backed loading |
 | `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map initial-load strategy hooks to vLLM loader APIs |
-| `refit/`, `refit_timing.py` | Legacy import compatibility for the RL-owned timing and reshard modules; forwarding imports share RL classes and state and are not used by base inference loading |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` map strategy hooks to SGLang's `remote_instance` backend; `draft_weights.py` owns model-specific role rules and `checkpoint_selection.py` filters complete safetensors shards before ModelStreamer reads them |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
