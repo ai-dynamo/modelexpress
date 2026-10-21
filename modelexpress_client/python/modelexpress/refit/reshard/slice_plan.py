@@ -41,6 +41,7 @@ or a dim-merging reshape - plus src/dst dtype mismatch - raises
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -272,23 +273,9 @@ def intersect(box_a: list, box_b: list):
     return out
 
 
-def paired_runs(overlap: list, src_origin, src_strides, dst_origin, dst_strides):
-    """Decompose ``overlap`` (full-tensor coords) into runs contiguous in BOTH
-    the source shard buffer (``src_origin``/``src_strides``) and the destination
-    param region (``dst_origin``/``dst_strides``), yielding
-    ``(src_elem_off, dst_elem_off, run_len_elems)``.
-
-    Coalesces a trailing block of dims only while it is unit-packed in both
-    layouts, so a strided source (e.g. a column-slice) yields many runs and a
-    fully-contiguous overlap yields one. Works for arbitrary (possibly
-    non-row-major) ``dst_strides`` - the captured real destination strides."""
+def _paired_run_shape(overlap, src_strides, dst_strides):
     ndim = len(overlap)
     sizes = [hi - lo for lo, hi in overlap]
-    src_start = [lo - o for (lo, _), o in zip(overlap, src_origin, strict=True)]
-    dst_start = [lo - o for (lo, _), o in zip(overlap, dst_origin, strict=True)]
-
-    # Grow the coalesced trailing block while dim d is exactly unit-packed
-    # (stride == running run length) in both src and dst.
     run_len = 1
     p = ndim
     while (
@@ -296,6 +283,15 @@ def paired_runs(overlap: list, src_origin, src_strides, dst_origin, dst_strides)
     ):
         run_len *= sizes[p - 1]
         p -= 1
+    return sizes, p, run_len
+
+
+def paired_runs(overlap: list, src_origin, src_strides, dst_origin, dst_strides):
+    """Yield runs contiguous in both source and destination, in element units."""
+    sizes, p, run_len = _paired_run_shape(overlap, src_strides, dst_strides)
+    ndim = len(overlap)
+    src_start = [lo - o for (lo, _), o in zip(overlap, src_origin, strict=True)]
+    dst_start = [lo - o for (lo, _), o in zip(overlap, dst_origin, strict=True)]
 
     src_base = sum(src_start[d] * src_strides[d] for d in range(ndim))
     dst_base = sum(dst_start[d] * dst_strides[d] for d in range(ndim))
@@ -308,6 +304,41 @@ def paired_runs(overlap: list, src_origin, src_strides, dst_origin, dst_strides)
         s_off = src_base + sum(idx[d] * src_strides[d] for d in range(p))
         d_off = dst_base + sum(idx[d] * dst_strides[d] for d in range(p))
         yield s_off, d_off, run_len
+
+
+def _pull_regions(copy, global_shape, src_dtype, shards):
+    if src_dtype != copy.dest_dtype:
+        raise UnsupportedReshard(
+            f"{copy.param_name}: source dtype {src_dtype} != dest dtype {copy.dest_dtype} "
+            "-> conversion required, not a raw byte copy"
+        )
+
+    # Resolve the op-chain (box or transpose/permute) to the source index box +
+    # the dest strides reindexed into source-dim order.
+    needed, dest_strides = resolve_slice(copy, global_shape)
+    need_origin = [lo for lo, _ in needed]
+
+    for shard_index, sh in enumerate(shards):
+        shard_box = [(o, o + s) for o, s in zip(sh.shard_offset, sh.shape, strict=True)]
+        overlap = intersect(needed, shard_box)
+        if overlap is None:
+            continue
+        yield shard_index, sh, overlap, need_origin, dest_strides
+
+
+def pull_metrics(copy, global_shape, src_dtype, elsize, shards) -> tuple[int, int]:
+    """Count exact descriptors and bytes without expanding individual runs."""
+    descriptors = nbytes = 0
+    for _, sh, overlap, _, dest_strides in _pull_regions(
+        copy, global_shape, src_dtype, shards
+    ):
+        sizes, p, run_len = _paired_run_shape(
+            overlap, _row_major_strides(sh.shape), dest_strides
+        )
+        count = math.prod(sizes[:p])
+        descriptors += count
+        nbytes += count * run_len * elsize
+    return descriptors, nbytes
 
 
 def plan_pull(
@@ -324,23 +355,13 @@ def plan_pull(
 
     Raises ``UnsupportedReshard`` on dtype mismatch, or an op-chain that isn't
     a pure permuted view (copy / rank increase / dim-merge)."""
-    if src_dtype != copy.dest_dtype:
-        raise UnsupportedReshard(
-            f"{copy.param_name}: source dtype {src_dtype} != dest dtype {copy.dest_dtype} "
-            "-> conversion required, not a raw byte copy"
-        )
-
-    # Resolve the op-chain (box or transpose/permute) to the source index box +
-    # the dest strides reindexed into source-dim order.
-    needed, dest_strides = resolve_slice(copy, global_shape)
-    need_origin = [lo for lo, _ in needed]
-
+    if len(buffer_indices) != len(shards):
+        raise ValueError("source buffer indices must match source shards")
     segments: list = []
-    for buffer_index, sh in zip(buffer_indices, shards, strict=True):
-        shard_box = [(o, o + s) for o, s in zip(sh.shard_offset, sh.shape, strict=True)]
-        overlap = intersect(needed, shard_box)
-        if overlap is None:
-            continue
+    for shard_index, sh, overlap, need_origin, dest_strides in _pull_regions(
+        copy, global_shape, src_dtype, shards
+    ):
+        buffer_index = buffer_indices[shard_index]
         src_strides = _row_major_strides(sh.shape)
         for s_off, d_off, n in paired_runs(
             overlap, sh.shard_offset, src_strides, need_origin, dest_strides

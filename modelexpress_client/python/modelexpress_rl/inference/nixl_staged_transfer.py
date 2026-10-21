@@ -921,6 +921,12 @@ class _NixlStagedTransfer:
                 if isinstance(transfer_plan, _StreamingSchedule)
                 else transfer_plan
             )
+            metrics.update(
+                exact_descriptors=plan.exact_descriptor_count,
+                planned_descriptors=plan.descriptor_count(),
+                descriptor_savings=plan.descriptor_savings(),
+                extra_wire_bytes=plan.extra_wire_bytes(),
+            )
             if not reusable:
                 trainer = self._retain_needed_sources(trainer, plan)
             source_binding = (
