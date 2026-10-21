@@ -232,12 +232,21 @@ GCS uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DI
 
 See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
+### Generator refit connection settings
+
+vLLM's `init_info` and SGLang's `--modelexpress-config` use
+`object_storage_endpoint_url` and `object_storage_region_name`. These map to the
+SDK's `ObjectStorageGeneratorConfig.endpoint_url` and `.region_name`. Omit the
+endpoint to use the provider default. Miles uses `object_storage_uri_prefix`
+for trainer publication. See the [backend setup examples](S3_DELTA_WEIGHT_REFIT.md).
+
 ### Generator refit checkpoint cache
 
-`refit_checkpoint_max_size_gb` defaults to 2000 GB per model. At initialization,
-the generator caps this quota at existing cache bytes plus free disk space and
-logs any reduction. Free space is checked again before known writes and copies,
-including when `null` disables the configured quota. See the
+`refit_checkpoint_max_size_gb` defaults to 2000 GB per model in the SDK, vLLM,
+and SGLang. At initialization, the generator caps this quota at existing
+cache bytes plus free disk space and logs any reduction. Free space is checked
+again before known writes and copies, including when `null` disables the
+configured quota. See the
 [S3 refit cache configuration](S3_DELTA_WEIGHT_REFIT.md#refit_checkpoint_dir)
 for setup and eviction behavior.
 
@@ -1260,8 +1269,16 @@ server, worker gRPC endpoints, and Mooncake store from untrusted clients.
 ModelExpress does not currently sign cache artifacts.
 
 RL refit has the same trusted-network requirement. Its trainer-local
-`RefitWorkerService` serves exact-version manifests over plaintext gRPC; the
-manifest digest detects corruption but does not authenticate the trainer.
+`RefitWorkerService` serves stable trainer metadata and separate version checksum
+records over plaintext gRPC. Metadata digests detect corruption but do not
+authenticate the trainer.
+
+The split worker metadata protocol requires a coordinated upgrade of the MX server,
+trainers, and generators. It replaces `GetWeightVersionShardManifest` and retires the
+old `WeightVersionShard` manifest, endpoint, and count fields; mixed protocol versions
+are unsupported. Retire active refit rounds and their leases before stopping workers.
+Restart workers and remove obsolete refit metadata during the upgrade, preserving
+unrelated Redis and model-cache state.
 
 Canonical S3 trainers consume Hugging Face tensor buckets produced by the
 training framework. Framework-native bucket settings remain the default.
@@ -1750,6 +1767,15 @@ settings are read when the transfer is constructed.
 | `MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT` | `0` | Validate that generator layout hasn't changed. |
 | `MX_REFIT_PACK_MODULES` | `1` | Pack complete owning modules within each bounded staging arena. |
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Descriptor budget before full-source reconstruction. |
+| `MX_REFIT_PREFETCH_REPLICA_METADATA` | `0` | Prefetch stable metadata for published replica groups during source resolution. |
+| `MX_REFIT_DEBUG_VALIDATE_REPLICAS` | `0` | Check that replicas in each logical-shard group have equivalent canonical coverage. |
+
+Replicas are tried lazily in worker-ID order by default. Optional prefetch and
+debug validation inspect published groups before transfer-plan pruning;
+unavailable prefetched replicas can be retried later. Digest and identity errors
+fail resolution. Debug validation requires every
+published replica to resolve and compares canonical coverage and geometry,
+ignoring replica-specific physical addresses.
 
 Bounded streaming requires the framework to hold its update guard through
 transfer, installation and verification. Each group is copied from a receive
@@ -1768,13 +1794,15 @@ Quantized and incomplete captures are never retained. Callers must keep model
 configuration and loader behavior fixed while using an installer.
 
 These caches hold layouts and plans, not weight values or readiness. Every
-update still obtains its version and lease, reads fresh tensor values, and runs
-coverage validation. The installer checks live owners, shared parameters and
-complete module inputs. Engine callbacks receive independent storage, so they
-cannot retain a view into the receive arena.
-Workspace reset and close discard source and plan caches. Cache counters and
-lookup/build/validation times accompany streaming preparation metrics; a miss
-rebuilds the entry rather than using a stale layout.
+update still obtains its version and lease and reads fresh tensor values.
+The installer checks live owners, shared parameters and complete module inputs.
+Engine callbacks receive independent storage, so they cannot retain a view into
+the receive arena.
+Logical plans belong to one mesh ID and generation; generation changes rebuild
+them even when capture remains compatible. Replica changes rebind physical
+sources while retaining the logical plan. Workspace reset clears physical
+transport and descriptor state; closing the transfer releases its cached plan.
+Cache counters and lookup/build/validation times accompany preparation metrics.
 Wire-to-engine dtype conversion respects the captured destination slice, strides
 and arena storage offset, including padding surrounding the destination view.
 Bounded staging views are zeroed before each READ so untouched loader padding

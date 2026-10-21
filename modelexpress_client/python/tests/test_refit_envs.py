@@ -159,6 +159,26 @@ def test_streaming_diagnostics_default_off_and_packing_on(monkeypatch) -> None:
     assert refit_envs.MX_REFIT_PACK_MODULES is True
 
 
+def test_refit_replica_settings_default_and_normalization(monkeypatch) -> None:
+    from modelexpress import envs as refit_envs
+
+    names = (
+        "MX_REFIT_PREFETCH_REPLICA_METADATA",
+        "MX_REFIT_DEBUG_VALIDATE_REPLICAS",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+
+    assert refit_envs.MX_REFIT_PREFETCH_REPLICA_METADATA is False
+    assert refit_envs.MX_REFIT_DEBUG_VALIDATE_REPLICAS is False
+
+    monkeypatch.setenv("MX_REFIT_PREFETCH_REPLICA_METADATA", "yes")
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_REPLICAS", "on")
+
+    assert refit_envs.MX_REFIT_PREFETCH_REPLICA_METADATA is True
+    assert refit_envs.MX_REFIT_DEBUG_VALIDATE_REPLICAS is True
+
+
 def test_delta_surgical_parses_boolean(monkeypatch):
     monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
     assert envs.MX_REFIT_DELTA_SURGICAL is True

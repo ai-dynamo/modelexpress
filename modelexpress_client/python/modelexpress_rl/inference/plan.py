@@ -19,6 +19,7 @@ from ..control import WeightVersion
 from ..object_storage import ObjectStorageSource
 from ..train.manifest import ShardChecksumKey
 from ..train import WeightPayloadFormat
+from ..version import MeshIdentity
 from .adapter import TrainerSourceShard
 
 if TYPE_CHECKING:
@@ -93,8 +94,7 @@ class GeneratorPeerUpdateSource:
 class TrainerSourceSnapshot:
     """Selected trainer shards and the mesh identity they belong to."""
 
-    mesh_id: str
-    mesh_generation: int
+    mesh_identity: MeshIdentity
     shards: tuple[TrainerSourceShard, ...]
     resolved_metadata: _ResolvedSources | None = field(
         default=None, compare=False, repr=False
@@ -107,11 +107,12 @@ class TrainerSourceSnapshot:
 
     @property
     def physical_fingerprint(self) -> tuple:
+        """Server-pinned worker/shard digests require a new mesh generation when
+        physical addresses or registrations change."""
         return (
-            self.mesh_id,
-            self.mesh_generation,
+            self.mesh_identity,
             tuple(
-                (shard.source_slot_id, shard.worker_id, shard.manifest_endpoint, shard.structural_digest)
+                (shard.source_slot_id, shard.worker_id)
                 for shard in self.shards
             ),
         )
@@ -147,8 +148,26 @@ ResolvedSource = (
 class StagedEngineTensors(Protocol):
     """Tensor staging payload required by engine installers."""
 
-    tensors: dict[str, Any]
+    tensors: dict[str, Any] | SourceReplayBatch
     metrics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SourceReplayBatch:
+    """Independent source views plus their globally ordered destination writes.
+
+    Source views are borrowed until the caller advances the bounded iterator.
+    The complete last-write table contains metadata only, never staged values.
+    """
+
+    writes: tuple
+    parameter_names: frozenset[str]
+    last_writes: dict[str, int]
+    total_copies: int
+    generation: int | None = None
+
+    def values(self):
+        return (source for _, _, source in self.writes)
 
 
 class PreparedArtifact(ABC):
@@ -173,7 +192,7 @@ class PreparedEngineTensors(PreparedArtifact):
 class _StreamingOwnership:
     """Retain receive resources until both GPU work and transport are drained."""
 
-    iterator: Iterator[dict[str, Any]] | None = None
+    iterator: Iterator[dict[str, Any] | SourceReplayBatch] | None = None
     drain_failed: bool = False
     close_failed: bool = False
     source_failed: bool = False
@@ -192,7 +211,7 @@ class _StreamingOwnership:
 class PreparedStreamingTensors(PreparedArtifact):
     """Deferred bounded transfer; payload is read only during installation."""
 
-    batches: Callable[[], Iterator[dict[str, Any]]]
+    batches: Callable[[], Iterator[dict[str, Any] | SourceReplayBatch]]
     parameter_names: frozenset[str]
     transfer_metrics: dict[str, float]
     ownership: _StreamingOwnership = field(default_factory=_StreamingOwnership)
