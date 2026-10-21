@@ -1841,10 +1841,15 @@ graph TD
 7. **Target becomes source**: After receiving weights or installing a cache artifact, publishes own metadata and starts its own heartbeat
 8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; `ListSources(READY)` also applies this heartbeat freshness check at query time so expired READY records are not returned while waiting for the next reaper pass. GC deletes STALE workers after 1 hour
 
-Zero-byte tensors remain in manifests and participate in exact name, size, and
-dtype validation. They count as matched tensors but are omitted from NIXL
-descriptor lists because they have no registered memory range. A manifest made
-entirely of empty tensors completes as a successful no-op transfer.
+Zero-byte and unallocated (null-address) tensors remain in manifests and
+participate in exact name, size, and dtype validation. On the sender they stay
+in the published manifest but are excluded from NIXL registration; on the
+receiver they count as matched tensors but are omitted from NIXL descriptor
+lists because they have no registered memory range; a nonzero-size tensor
+skipped this way logs a warning, since the local tensor keeps its current
+values. Arena registration ignores such tensors in its containment check. Both
+sides share one predicate for this. A manifest made entirely of empty tensors completes as a
+successful no-op transfer.
 
 Tarred cache artifacts carry regular files and directories only. The source
 side enumerates members explicitly and hands tar that list, so nothing else can
