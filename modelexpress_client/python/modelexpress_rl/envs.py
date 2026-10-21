@@ -185,7 +185,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "MX_REFIT_DOWNLOAD_WORKERS",
         )
         if "MX_REFIT_DOWNLOAD_WORKERS" in os.environ
-        else environment_variables["MX_S3_DOWNLOAD_WORKERS"]()
+        else require_positive_int(
+            int(os.environ.get("MX_S3_DOWNLOAD_WORKERS", 16)),
+            "MX_S3_DOWNLOAD_WORKERS",
+        )
     ),
     "MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES": lambda: require_positive_int(
         int(
@@ -229,10 +232,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ.get("MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS", 16)),
         "MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS",
     ),
-    "MX_S3_DOWNLOAD_WORKERS": lambda: require_positive_int(
-        int(os.environ.get("MX_S3_DOWNLOAD_WORKERS", 16)),
-        "MX_S3_DOWNLOAD_WORKERS",
-    ),
+    "MX_S3_DOWNLOAD_WORKERS": lambda: environment_variables["MX_REFIT_DOWNLOAD_WORKERS"](),
     "MX_S3_MAX_POOL_CONNECTIONS": lambda: require_positive_int(
         int(os.environ.get("MX_S3_MAX_POOL_CONNECTIONS", 32)),
         "MX_S3_MAX_POOL_CONNECTIONS",

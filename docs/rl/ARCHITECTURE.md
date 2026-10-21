@@ -82,8 +82,10 @@ DIRECT installation and pipelined worker streaming are
 not implemented by this control-plane slice.
 NIXL manifest endpoints belong to their physical worker shards; a typed object
 storage source belongs directly to its durable `WeightVersion`. The protocol
-can identify S3, Azure Blob Storage, or GCS, while this initial implementation
-accepts only S3. On the NIXL path, weight bytes and full tensor manifests remain
+can identify S3, Azure Blob Storage, or GCS. The Refit service and trainer
+publication currently accept only S3. Generator checkpoint preparation accepts
+S3 and Azure Blob Storage; exact desired-version startup remains S3-only.
+On the NIXL path, weight bytes and full tensor manifests remain
 on trainer workers. On the S3 path, rank zero uploads the version's global index
 after every trainer rank has uploaded its owned shard. `XOR_DELTA` versions use
 compressed XOR shards; `FULL_HF_CHECKPOINT` versions use native Hugging Face
@@ -207,7 +209,7 @@ design; they are not provided by this implementation.
 
 `GeneratorRuntime` composes three independent seams. Source resolvers discover
 candidate locations without moving bytes; update methods prepare a typed update;
-the engine installer commits it at the caller's safe point. Trainer and S3
+the engine installer commits it at the caller's safe point. Trainer and object-storage
 methods transfer or reconstruct private artifacts during preparation. The
 generator-peer method instead validates the peer and exact runtime tensor catalog
 during preparation, then transfers directly into live storage at the safe point.
@@ -219,13 +221,23 @@ engine integrations.
 - `inference/checkpoint_store.py` owns the host-local immutable lineage layout,
   locking, temporary-directory promotion, atomic JSON persistence, artifact
   fingerprints, and activation state.
-- `inference/receiver.py` owns canonical S3 downloads, safetensors validation,
+- `inference/receiver.py` owns canonical S3 and Azure downloads, safetensors validation,
   and XOR reconstruction into derived checkpoints.
+- `object_storage_reader.py` defines the shared checkpoint-reader interface
+  implemented by `S3Client` and `AzureBlobReader`.
 - `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
   graph-safe installation through vLLM's layerwise reload and post-load path.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
   through SGLang's native safetensors loader, using `DefaultModelLoader.Source`
   to retain the engine's source defaults, including weight-file pattern selection.
+
+Canonical checkpoint preparation selects `S3Client` or `AzureBlobReader` from
+`ObjectStorageGeneratorConfig.storage_type`. Both implement `ObjectStorageReader`
+and share full-checkpoint validation, XOR delta replay, cache promotion, and
+activation. Every source in a replay chain must match the configured provider;
+a mismatch fails before downloads begin. Azure full checkpoints download to disk
+before installation. The optional full-checkpoint streaming path remains S3-only.
+Azure publication and exact desired-version startup require separate support.
 
 Canonical preparation requests queue on a separate `.prepare.lock`. Once the
 leader has reconstructed a target, followers verify and attach to that READY
@@ -581,6 +593,19 @@ end-to-end backend slice implementing the same transaction boundaries.
 
 ## Python engine integration
 
+### SGLang refit integration
+
+SGLang obtains its rank-local object-storage refit client through
+`modelexpress_rl.inference.engines.sglang.get_modelexpress_generator(model_runner)`.
+The factory reads `model_runner.server_args.modelexpress_config` as JSON or a
+dictionary, resolves the local seed checkpoint when no seed path is supplied,
+and reuses the client cached on `model_runner.modelexpress_generator`.
+`object_storage_type` selects `S3` (the default) or `AZURE`. S3 connection settings
+use `object_storage_endpoint_url` and `object_storage_region_name`, matching the
+vLLM integration. Azure rejects these S3-only settings and uses the Azure SDK
+authentication configuration. SGLang owns update coordination and closes the
+cached client during scheduler shutdown.
+
 ### vLLM Refit Installation
 
 The vLLM integration exposes engine installation and tensor geometry to
@@ -609,9 +634,9 @@ backend for both paths. An empty initialization payload preserves the existing
 NIXL path. The payload can override the logical ModelExpress model name when it
 differs from vLLM's model path. Supplying `object_storage_type` with the READY
 seed-base version ID, seed checkpoint path, and refit checkpoint directory
-selects the object-storage path; the initial implementation accepts only `S3`. The payload
+selects the object-storage path, which accepts `S3` or `AZURE`. The payload
 can also override the MX server through `server_url` and the storage connection
-through `object_storage_endpoint_url` and `object_storage_region_name`. Each
+for S3 through `object_storage_endpoint_url` and `object_storage_region_name`. Each
 update carries the opaque MX `version_id`.
 `start_weight_update()` opens the update window, `receive_weights()` stages and
 applies the version through `ModelExpressGeneratorClient`, and

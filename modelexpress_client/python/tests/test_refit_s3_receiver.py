@@ -337,7 +337,7 @@ def test_s3_client_uses_transfer_connection_and_retry_settings(monkeypatch):
         transfer = s3._download_manager.config
         assert transfer.multipart_threshold == 4096
         assert transfer.multipart_chunksize == 1024
-        assert transfer.max_request_concurrency == 3
+        assert transfer.max_request_concurrency == 11
         assert transfer.io_chunksize == 512
         assert transfer.max_io_queue_size == 7
         assert transfer.max_in_memory_download_chunks == 7

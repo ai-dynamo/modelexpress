@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 def get_modelexpress_generator(model_runner: Any) -> ModelExpressGeneratorClient:
-    """Create or reuse the runner's S3 refit client from modelexpress_config.
+    """Create or reuse the runner's object-storage refit client from modelexpress_config.
 
     The client is cached on model_runner.modelexpress_generator; SGLang closes
     it during scheduler shutdown.
@@ -37,6 +37,7 @@ def get_modelexpress_generator(model_runner: Any) -> ModelExpressGeneratorClient
     if isinstance(config, str):
         config = json.loads(config)
     config = config or {}
+    storage_type = ObjectStorageType(config.get("object_storage_type", "S3"))
     checkpoint = config.get("seed_checkpoint_path")
     if not checkpoint:
         checkpoint, _, _ = model_runner.loader._prepare_weights(
@@ -55,7 +56,7 @@ def get_modelexpress_generator(model_runner: Any) -> ModelExpressGeneratorClient
             max_replay_chain_length=config.get("max_replay_chain_length", 64),
             rpc_timeout_seconds=config.get("rpc_timeout_seconds", 30.0),
             object_storage=ObjectStorageGeneratorConfig(
-                storage_type=ObjectStorageType.S3,
+                storage_type=storage_type,
                 initial_base_version_id=config["initial_base_version_id"],
                 seed_checkpoint_path=checkpoint,
                 refit_checkpoint_dir=config["refit_checkpoint_dir"],

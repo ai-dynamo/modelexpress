@@ -234,11 +234,9 @@ See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
 ### Generator refit connection settings
 
-vLLM's `init_info` and SGLang's `--modelexpress-config` use
-`object_storage_endpoint_url` and `object_storage_region_name`. These map to the
-SDK's `ObjectStorageGeneratorConfig.endpoint_url` and `.region_name`. Omit the
-endpoint to use the provider default. Miles uses `object_storage_uri_prefix`
-for trainer publication. See the [backend setup examples](S3_DELTA_WEIGHT_REFIT.md).
+See the [RL generator connection settings](rl/CONFIGURATION.md#generator-refit-connection-settings)
+for S3 and Azure readers, and [RL environment settings](rl/CONFIGURATION.md#rl-environment-settings)
+for download concurrency and provider connection pools.
 
 ### Generator refit checkpoint cache
 

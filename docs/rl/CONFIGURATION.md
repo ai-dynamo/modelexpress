@@ -26,6 +26,8 @@ RL-specific settings are registered in `modelexpress_rl/envs.py` and imported th
 | `MX_MODEL_NAME_OVERRIDE` | (unset) | Override vLLM's MX model identity without changing its model-loading path. Set before worker startup and use the same name for RL trainers and WeightVersions. Unset or empty preserves vLLM's configured model path/ID, including rewritten S3 cache paths. |
 | `MX_REFIT_DELTA_BUCKET_BYTES` | `536870912` (512 MiB) | Optional framework integration override for canonical delta tensor-bucket size; native framework bucket settings take precedence. |
 | `MX_REFIT_DELTA_WORKERS` | `min(32, CPU count)` | CPU worker pool for XOR delta computation and application. |
+| `MX_REFIT_DOWNLOAD_WORKERS` | `MX_S3_DOWNLOAD_WORKERS`, then `16` | Concurrent shard downloads for S3 and Azure; also sets S3 transfer-manager request concurrency. |
+| `MX_S3_DOWNLOAD_WORKERS` | `16` | Legacy fallback when `MX_REFIT_DOWNLOAD_WORKERS` is unset. |
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum format written by canonical S3 trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object; oversized tensors occupy a separate object. |
 | `MX_REFIT_DELTA_SURGICAL` | `false` | Experimental vLLM delta install: reload only the destination modules touched by the delta chain instead of the whole prepared checkpoint. Falls back to a full reload when lineage or the live version is unknown, or when a fed module is incomplete. See the [S3 delta refit guide](S3_DELTA_WEIGHT_REFIT.md). |
@@ -35,6 +37,31 @@ RL-specific settings are registered in `modelexpress_rl/envs.py` and imported th
 | `MX_REFIT_DEBUG_VALIDATE_REPLICAS` | `0` | Check that replicas in each logical-shard group have equivalent canonical coverage. |
 | `MX_REFIT_FULL_STREAMING` | `false` | Experimental vLLM full-HF refit: use ModelStreamer once and tee tensors to a bounded background disk writer. Requires distributed ModelStreamer for TP greater than one. Requires `runai-model-streamer>=0.17.0`. Checksummed artifacts and delta replay retain canonical preparation. For S3-compatible storage, set matching `AWS_ENDPOINT_URL` and `AWS_DEFAULT_REGION` on all generator workers; `object_storage_endpoint_url` / `object_storage_region_name` configure only the index reader, not streamed shard reads. See the architecture section on streamed full refit. |
 | `MX_REFIT_STREAM_WINDOW_LAYERS` | `2` | Decoder layers per ranged ModelStreamer request during streamed full refit. Bounds GPU memory held by partially loaded layers; `0` streams the whole checkpoint in one request. |
+
+The selected download worker count must be a positive integer. An invalid
+`MX_REFIT_DOWNLOAD_WORKERS` value fails validation without falling back.
+`MX_S3_MAX_POOL_CONNECTIONS` separately controls the Botocore HTTP connection pool.
+Azure's per-blob concurrency and connection pool remain controlled by
+`MX_AZURE_DOWNLOAD_CONCURRENCY` and `MX_AZURE_MAX_POOL_CONNECTIONS`.
+
+## Generator refit connection settings
+
+vLLM's `init_info` and SGLang's `--modelexpress-config` select the checkpoint
+reader with `object_storage_type`: `S3` or `AZURE`. SGLang defaults to `S3` when
+the field is omitted. For S3, `object_storage_endpoint_url` and
+`object_storage_region_name` map to the SDK's
+`ObjectStorageGeneratorConfig.endpoint_url` and `.region_name`. Omit the endpoint
+to use the S3 default. Miles uses `object_storage_uri_prefix` for trainer
+publication. See the [backend setup examples](S3_DELTA_WEIGHT_REFIT.md).
+
+Azure generator reads require the Python `azure` extra and `az://container/blob`
+sources. Authentication uses `AZURE_STORAGE_CONNECTION_STRING` first. Otherwise,
+set `AZURE_STORAGE_ACCOUNT_URL` or `AZURE_STORAGE_ACCOUNT_NAME` and use
+`DefaultAzureCredential`, including managed identity or AKS workload identity.
+Azure rejects `object_storage_endpoint_url` and `object_storage_region_name`.
+The generator supports full checkpoints and XOR delta replay. The server still
+rejects Azure publications, and exact desired-version startup remains S3-only.
+Azure generator configuration does not yet provide a complete publication workflow.
 
 ## Staging, streaming, and verification
 

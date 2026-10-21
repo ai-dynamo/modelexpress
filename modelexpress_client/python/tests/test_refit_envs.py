@@ -89,7 +89,7 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     assert envs.MX_S3_DOWNLOAD_RANGE_BYTES == 1024
     assert envs.MX_S3_DOWNLOAD_IO_CHUNK_BYTES == 512
     assert envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS == 6
-    assert envs.MX_S3_DOWNLOAD_WORKERS == 5
+    assert envs.MX_S3_DOWNLOAD_WORKERS == 9
     assert envs.MX_S3_MAX_POOL_CONNECTIONS == 6
     assert envs.MX_S3_MAX_ATTEMPTS == 7
     assert envs.MX_S3_TCP_KEEPALIVE is False
@@ -129,6 +129,7 @@ def test_refit_download_workers_precedence(monkeypatch, neutral, legacy, expecte
     if neutral is not None:
         monkeypatch.setenv("MX_REFIT_DOWNLOAD_WORKERS", neutral)
     assert envs.MX_REFIT_DOWNLOAD_WORKERS == expected
+    assert envs.MX_S3_DOWNLOAD_WORKERS == expected
 
 
 @pytest.mark.parametrize(
@@ -146,8 +147,9 @@ def test_invalid_refit_download_workers_names_setting_without_fallback(
 ):
     monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", "3")
     monkeypatch.setenv("MX_REFIT_DOWNLOAD_WORKERS", value)
-    with pytest.raises(ValueError, match=f"MX_REFIT_DOWNLOAD_WORKERS {message}"):
-        _ = envs.MX_REFIT_DOWNLOAD_WORKERS
+    for name in ("MX_REFIT_DOWNLOAD_WORKERS", "MX_S3_DOWNLOAD_WORKERS"):
+        with pytest.raises(ValueError, match=f"MX_REFIT_DOWNLOAD_WORKERS {message}"):
+            getattr(envs, name)
 
 
 @pytest.mark.parametrize(
