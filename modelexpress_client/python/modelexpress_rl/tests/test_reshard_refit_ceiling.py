@@ -25,7 +25,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from modelexpress.rl.tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
+from modelexpress_rl.tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
 
 # The observed record, verbatim.
 OBSERVED_BYTES = 40_611_246_080
@@ -46,7 +46,7 @@ def _receiver(monkeypatch, ceiling):
         monkeypatch.delenv("MX_RESHARD_MAX_GBPS", raising=False)
     else:
         monkeypatch.setenv("MX_RESHARD_MAX_GBPS", str(ceiling))
-    from modelexpress.rl.refit.reshard import receiver
+    from modelexpress_rl.refit.reshard import receiver
 
     return receiver
 

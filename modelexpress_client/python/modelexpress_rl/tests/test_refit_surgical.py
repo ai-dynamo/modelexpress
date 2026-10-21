@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
-from modelexpress.rl.inference.engines.vllm.surgical import (
+from modelexpress_rl.inference.engines.vllm.surgical import (
     changed_since,
     module_groups,
 )
-from modelexpress.rl.inference.receiver import DeltaChange
+from modelexpress_rl.inference.receiver import DeltaChange
 
 PREFIX = "language_model.model.layers"
 CHECKPOINT = [

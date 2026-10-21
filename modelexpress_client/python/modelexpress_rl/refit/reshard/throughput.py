@@ -5,7 +5,7 @@
 
 There are two receivers, they use the same transport, and they were reached by
 different framework paths: ``refit.reshard.receiver`` builds its own plan for the
-Megatron path, while ``modelexpress.rl.inference.nixl_staged_transfer`` stages for
+Megatron path, while ``modelexpress_rl.inference.nixl_staged_transfer`` stages for
 the FSDP path. A floor that lives in one of them protects one framework and
 silently does nothing for the other, which is the failure this module exists to
 prevent - the incident that motivated the floor was measured on the FSDP path.
@@ -21,7 +21,7 @@ import json
 import logging
 import math
 
-from modelexpress.rl import envs
+from modelexpress_rl import envs
 
 # Grepped by the CI perf gate, so it is named once rather than spelled at each
 # call site.

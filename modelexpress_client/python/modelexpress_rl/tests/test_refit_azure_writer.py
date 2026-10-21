@@ -17,8 +17,8 @@ from azure.storage.blob import BlobServiceClient
 import requests
 from urllib3.response import HTTPResponse
 
-import modelexpress.rl.azure as azure_module
-from modelexpress.rl.azure import AzureBlobClient, ImmutableAzureConflict
+import modelexpress_rl.azure as azure_module
+from modelexpress_rl.azure import AzureBlobClient, ImmutableAzureConflict
 
 
 class _BlobHTTP:

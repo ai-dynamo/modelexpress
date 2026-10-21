@@ -6,9 +6,9 @@ from contextlib import nullcontext
 import pytest
 import torch
 
-import modelexpress.rl.inference.nixl_staged_transfer as module
-from modelexpress.rl.inference.plan import StreamingSettings
-from modelexpress.rl.tests.test_refit_bounded_descriptors import harness
+import modelexpress_rl.inference.nixl_staged_transfer as module
+from modelexpress_rl.inference.plan import StreamingSettings
+from modelexpress_rl.tests.test_refit_bounded_descriptors import harness
 
 
 @pytest.mark.parametrize("harness", [None, StreamingSettings(512, "cpu", 2)], indirect=True)

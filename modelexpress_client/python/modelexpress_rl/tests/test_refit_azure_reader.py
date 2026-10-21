@@ -19,7 +19,7 @@ import azure.storage.blob
 from azure.storage.blob import BlobServiceClient
 import requests
 from urllib3.response import HTTPResponse
-from modelexpress.rl.azure import AzureBlobReader
+from modelexpress_rl.azure import AzureBlobReader
 
 
 class _BlobService:

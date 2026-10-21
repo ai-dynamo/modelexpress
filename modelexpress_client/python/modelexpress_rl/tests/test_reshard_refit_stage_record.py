@@ -33,7 +33,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from modelexpress.rl.tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
+from modelexpress_rl.tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
 
 
 def _run(monkeypatch, caplog, *, fused=True, enabled=True):

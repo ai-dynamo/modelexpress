@@ -15,11 +15,11 @@ from typing import Any, Literal
 import grpc
 from modelexpress import auth, envs
 from modelexpress.client import _get_server_url
-from modelexpress.rl.refit.timing import RefitTimingRecorder, refit_span
+from modelexpress_rl.refit.timing import RefitTimingRecorder, refit_span
 
-from modelexpress.rl import envs as rl_envs
-from modelexpress.rl import timing
-from modelexpress.rl.version import WeightVersionRef
+from modelexpress_rl import envs as rl_envs
+from modelexpress_rl import timing
+from modelexpress_rl.version import WeightVersionRef
 
 from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
@@ -31,7 +31,7 @@ from .runtime import GeneratorRuntime, initialize_generator_runtime
 from .session import SessionUpdate
 from .version_chain import resolve_replay_chain
 
-logger = logging.getLogger("modelexpress.rl.inference.client")
+logger = logging.getLogger("modelexpress_rl.inference.client")
 
 
 class _EngineState(str, Enum):

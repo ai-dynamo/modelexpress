@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from io import BytesIO
 from urllib.parse import urlsplit
 
-from modelexpress.rl import envs as rl_envs
+from modelexpress_rl import envs as rl_envs
 
 
 _MIN_MULTIPART_PART_BYTES = 5 * 1024**2

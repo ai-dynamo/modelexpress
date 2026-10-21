@@ -8,7 +8,7 @@ from types import ModuleType
 
 import pytest
 import torch
-from modelexpress.rl.inference.engines.vllm import installer as module
+from modelexpress_rl.inference.engines.vllm import installer as module
 from torch import nn
 
 

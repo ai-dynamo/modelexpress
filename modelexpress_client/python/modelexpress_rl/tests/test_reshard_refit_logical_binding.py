@@ -8,16 +8,16 @@ import ctypes
 import pytest
 import torch
 
-from modelexpress.rl.refit.reshard.slice_plan import Shard
-from modelexpress.rl.refit.reshard.transfer_plan import (
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import (
     SourceInfo,
     bind_transfer,
     plan_transfer,
     plan_transfer_groups,
 )
-from modelexpress.rl.refit.reshard.types import CaptureResult, RecordedCopy
-from modelexpress.rl.version import MeshIdentity
-from modelexpress.rl.tests.test_refit_bounded_descriptors import harness
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.version import MeshIdentity
+from modelexpress_rl.tests.test_refit_bounded_descriptors import harness
 
 
 def _source(tensor, session="physical-0"):
@@ -130,7 +130,7 @@ def test_binding_failure_does_not_return_a_partial_descriptor_plan():
 
 @pytest.mark.parametrize("keyword", [False, True])
 def test_recorded_operation_arguments_are_snapshotted_before_binding(keyword):
-    from modelexpress.rl.refit.reshard.geometry import capture_geometry
+    from modelexpress_rl.refit.reshard.geometry import capture_geometry
 
     dims = [1, 0]
 
@@ -226,7 +226,7 @@ def test_full_pull_replay_preserves_source_order_after_capture_reordering(groupe
 
 
 def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
-    from modelexpress.rl.refit.reshard.rendezvous import (
+    from modelexpress_rl.refit.reshard.rendezvous import (
         PublishedShard, PublishedTensor, structural_manifest_digest,
         wrap_rendezvous_blob,
     )
@@ -260,8 +260,8 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
         capture_calls.append(_schema)
         return capture, layout
 
-    from modelexpress.rl.inference.adapter import TrainerSourceShard
-    from modelexpress.rl.inference.plan import TrainerSourceSnapshot
+    from modelexpress_rl.inference.adapter import TrainerSourceShard
+    from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
     snapshot = TrainerSourceSnapshot(
         MeshIdentity("mesh", 1), tuple(

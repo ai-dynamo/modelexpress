@@ -5,7 +5,7 @@
 
 import pytest
 import torch
-from modelexpress.rl.inference.engines.vllm import installer as api
+from modelexpress_rl.inference.engines.vllm import installer as api
 
 
 def _fixture():

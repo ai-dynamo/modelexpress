@@ -18,18 +18,18 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from modelexpress.rl import envs as rl_envs
-from modelexpress.rl.inference.checkpoint_store import (
+from modelexpress_rl import envs as rl_envs
+from modelexpress_rl.inference.checkpoint_store import (
     CheckpointCacheCapacityError,
     CheckpointRecord,
     CheckpointState,
     LocalCheckpointStore,
     checkpoint_files_state,
 )
-from modelexpress.rl.object_storage import ObjectStorageType
-from modelexpress.rl.s3 import S3Client
-from modelexpress.rl.train import WeightPayloadFormat
-from modelexpress.rl.utils import (
+from modelexpress_rl.object_storage import ObjectStorageType
+from modelexpress_rl.s3 import S3Client
+from modelexpress_rl.train import WeightPayloadFormat
+from modelexpress_rl.utils import (
     checksum_factory,
     index_checkpoint_tensors,
     read_safetensors_header,

@@ -26,7 +26,7 @@ def test_quantized_mla_checkpoint_refit():
             from vllm.model_executor.layers.quantization.utils.quant_utils import (
                 get_and_maybe_dequant_weights,
             )
-            from modelexpress.rl.inference.engines.vllm.installer import _VllmInstaller
+            from modelexpress_rl.inference.engines.vllm.installer import _VllmInstaller
 
             assert torch.cuda.is_available(), "a CUDA GPU is required"
             llm = LLM(

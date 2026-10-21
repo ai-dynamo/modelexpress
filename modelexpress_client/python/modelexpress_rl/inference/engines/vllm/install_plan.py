@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from weakref import ref
 
-from modelexpress.rl.refit.reshard.types import _connected_groups
+from modelexpress_rl.refit.reshard.types import _connected_groups
 
 if TYPE_CHECKING:
     from .installer import _ParameterAliases

@@ -40,7 +40,7 @@ from .source import (
     TrainerSourceResolver,
 )
 
-logger = logging.getLogger("modelexpress.rl.inference.runtime")
+logger = logging.getLogger("modelexpress_rl.inference.runtime")
 
 
 @dataclass(frozen=True)

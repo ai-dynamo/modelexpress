@@ -15,7 +15,7 @@ from botocore.exceptions import ClientError
 from huggingface_hub import snapshot_download
 from transformers import AutoModelForCausalLM
 
-from modelexpress.rl import (
+from modelexpress_rl import (
     ModelExpressControlClient,
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,

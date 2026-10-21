@@ -7,7 +7,7 @@ import grpc
 import pytest
 from google.protobuf import empty_pb2, wrappers_pb2
 
-from modelexpress.rl.inference.engines.vllm.startup_probe import (
+from modelexpress_rl.inference.engines.vllm.startup_probe import (
     reconcile_serving_version,
 )
 

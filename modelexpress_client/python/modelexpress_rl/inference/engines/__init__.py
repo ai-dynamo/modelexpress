@@ -31,4 +31,4 @@ def configure_engine_logging(engine: str) -> None:
     """Retry attaching engine handlers when worker logging becomes available."""
     from modelexpress import _configure_engine_logging
 
-    _configure_engine_logging(engine)
+    _configure_engine_logging(engine, ("modelexpress", "modelexpress_rl"))

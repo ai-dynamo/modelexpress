@@ -5,11 +5,11 @@ import ctypes
 
 import pytest
 import torch
-from modelexpress.rl.inference.nixl_staged_transfer import _replay_ops
+from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
 
-from modelexpress.rl.refit.reshard.slice_plan import Shard
-from modelexpress.rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
-from modelexpress.rl.refit.reshard.types import CaptureResult, RecordedCopy, UnsupportedReshard
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy, UnsupportedReshard
 
 
 @pytest.fixture(autouse=True)

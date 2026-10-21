@@ -30,14 +30,14 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from modelexpress.nixl_transfer import NIXL_DRAM_MEM_TYPE, NIXL_VRAM_MEM_TYPE
-from modelexpress.rl.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     wrap_rendezvous_blob,
 )
-from modelexpress.rl.train.adapter import NixlMetadataProvider
+from modelexpress_rl.train.adapter import NixlMetadataProvider
 
-logger = logging.getLogger("modelexpress.rl.train.engines.fsdp.publisher")
+logger = logging.getLogger("modelexpress_rl.train.engines.fsdp.publisher")
 
 # Default transfer dtype; FSDPTrainerContext can override it per tensor.
 WIRE_DTYPE = torch.bfloat16

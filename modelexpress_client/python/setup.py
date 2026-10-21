@@ -3,8 +3,9 @@
 
 """Build script for ModelExpress C++ extensions.
 
-Project metadata lives in pyproject.toml. This setup.py discovers the mapped
-RL packages and adds the optional C++ extension. Setuptools merges the two.
+Project metadata lives in pyproject.toml. This setup.py only adds the
+ext_modules entry that pyproject.toml can't express. Setuptools merges
+the two when both are present.
 
 Pure setuptools build, no CUDA or PyTorch dependency in the extension
 itself: the shim only uses the Python C API and dispatches to Python
@@ -21,7 +22,7 @@ import os
 import sys
 import warnings
 
-from setuptools import Extension, find_packages, setup
+from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 from distutils.errors import CCompilerError, DistutilsExecError, DistutilsPlatformError
 
@@ -90,17 +91,6 @@ def _ext_modules():
 
 
 setup(
-    packages=[
-        *find_packages(
-            include=["modelexpress", "modelexpress.*"],
-            exclude=["modelexpress.tests", "modelexpress.tests.*"],
-        ),
-        "modelexpress.rl",
-        *(
-            f"modelexpress.rl.{name}"
-            for name in find_packages("modelexpress_rl", exclude=["tests", "tests.*"])
-        ),
-    ],
     ext_modules=_ext_modules(),
     cmdclass={"build_ext": BuildExtension},
 )

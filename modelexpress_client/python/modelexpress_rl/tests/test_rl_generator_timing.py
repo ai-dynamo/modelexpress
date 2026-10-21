@@ -17,19 +17,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from modelexpress.rl.refit import (
+from modelexpress_rl.refit import (
     RefitTimingRecorder,
     current_refit_timing,
     set_refit_cold,
     use_refit_timing,
 )
-from modelexpress.rl import MeshIdentity, timing
-from modelexpress.rl.inference.methods.load_time_tensor import (
+from modelexpress_rl import MeshIdentity, timing
+from modelexpress_rl.inference.methods.load_time_tensor import (
     LoadTimeTensorNixlUpdateMethod,
     _attribute_transfer,
 )
-from modelexpress.rl.inference.plan import ResolvedTrainerSource, TrainerSourceSnapshot
-from modelexpress.rl.train import WeightPayloadFormat
+from modelexpress_rl.inference.plan import ResolvedTrainerSource, TrainerSourceSnapshot
+from modelexpress_rl.train import WeightPayloadFormat
 
 STAGED_METRICS = {
     "bytes_received": 4_000_000_000,

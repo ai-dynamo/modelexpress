@@ -5,19 +5,19 @@ import json
 
 import pytest
 import torch
-from modelexpress.rl.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     MxReshardRendezvous,
     unwrap_rendezvous_blob,
 )
-from modelexpress.rl.refit.reshard.slice_plan import Shard
-from modelexpress.rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
-from modelexpress.rl.inference.reshard.megatron import (
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
+from modelexpress_rl.inference.reshard.megatron import (
     MegatronReshardReceiver,
     MegatronTargetLayout,
     MegatronTargetSpec,
     lower_megatron_target,
 )
-from modelexpress.rl.train.engines.megatron import (
+from modelexpress_rl.train.engines.megatron import (
     MegatronAliasInput,
     MegatronPublishedTensorSpec,
     MegatronTensorSpec,

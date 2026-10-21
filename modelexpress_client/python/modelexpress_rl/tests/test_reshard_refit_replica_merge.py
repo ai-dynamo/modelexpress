@@ -22,14 +22,14 @@ Run: pytest modelexpress_rl/tests/test_reshard_refit_replica_merge.py
 
 import pytest
 
-from modelexpress.rl.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     build_sources,
     merge_shard_tables,
 )
-from modelexpress.rl.refit.reshard.slice_plan import plan_pull
-from modelexpress.rl.refit.reshard.types import RecordedCopy
+from modelexpress_rl.refit.reshard.slice_plan import plan_pull
+from modelexpress_rl.refit.reshard.types import RecordedCopy
 
 EL = 2  # bytes per bfloat16 element
 

@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # ModelExpress RL package
 
-The optional RL APIs add trainer publication, exact-version generator startup, and live weight updates to the ModelExpress Python distribution. Install the existing `modelexpress` distribution, including its runtime dependencies, then import RL APIs from `modelexpress.rl`. The source package remains `modelexpress_rl`; this source name is not the installed import namespace.
+The optional RL APIs add trainer publication, exact-version generator startup, and live weight updates to the ModelExpress Python distribution. Install the existing `modelexpress` distribution, including its runtime dependencies, then import RL APIs from `modelexpress_rl`. The source and installed package both retain the existing `modelexpress_rl` namespace.
 
 ```bash
 pip install modelexpress
@@ -18,7 +18,7 @@ The RL APIs and base client are shipped by the same distribution. The RL package
 A trainer publishes through the rank-local client after the framework has created a version and declared its source slots. The orchestrator and trainer responsibilities are described in the [S3 delta refit guide](S3_DELTA_WEIGHT_REFIT.md) and [trainer publication example](S3_DELTA_WEIGHT_REFIT.md#initialization).
 
 ```python
-from modelexpress.rl import (
+from modelexpress_rl import (
     MegatronTrainerContext,
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
@@ -40,8 +40,8 @@ The distribution installs these automatic plugin entry points:
 
 | Runtime | Entry-point group | Name | Target |
 |---|---|---|---|
-| vLLM | `vllm.general_plugins` | `modelexpress_rl` | `modelexpress.rl.inference.engines.vllm.registration:register` |
-| SGLang | `sglang.srt.plugins` | `modelexpress_rl` | `modelexpress.rl.inference.engines.sglang.registration:register` |
+| vLLM | `vllm.general_plugins` | `modelexpress_rl` | `modelexpress_rl.inference.engines.vllm.registration:register` |
+| SGLang | `sglang.srt.plugins` | `modelexpress_rl` | `modelexpress_rl.inference.engines.sglang.registration:register` |
 
 With engine plugin autoload enabled, no manual registration call is needed. If plugin loading is filtered, include `modelexpress_rl` in `VLLM_PLUGINS` or `SGLANG_PLUGINS` as appropriate. For vLLM, the plugin exposes the `modelexpress` native weight-transfer backend; the regular base inference loader remains available independently.
 
@@ -51,4 +51,4 @@ TensorRT-LLM support in the base package covers initial checkpoint P2P loading. 
 
 The RL package supports the explicitly implemented trainer and generator integrations documented in the architecture guide. vLLM and SGLang use automatic runtime entry points; the shared initial-load path and TensorRT-LLM P2P support remain in the base package.
 
-RL Python tests live under `modelexpress_client/python/modelexpress_rl/tests`; base Python tests live under `modelexpress_client/python/modelexpress/tests`. This boundary matches the installed `modelexpress.rl` and `modelexpress` namespaces.
+RL Python tests live under `modelexpress_client/python/modelexpress_rl/tests`; base Python tests live under `modelexpress_client/python/modelexpress/tests`. This boundary matches the installed `modelexpress_rl` and `modelexpress` namespaces.

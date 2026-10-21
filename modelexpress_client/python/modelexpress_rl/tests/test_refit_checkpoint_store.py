@@ -9,8 +9,8 @@ import sys
 from types import SimpleNamespace
 
 import pytest
-from modelexpress.rl.inference import checkpoint_store as store_module
-from modelexpress.rl.inference.checkpoint_store import (
+from modelexpress_rl.inference import checkpoint_store as store_module
+from modelexpress_rl.inference.checkpoint_store import (
     CheckpointCacheCapacityError,
     CheckpointState,
     LocalCheckpointStore,
@@ -435,7 +435,7 @@ def test_store_rejects_write_larger_than_filesystem_free_space(
     store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
     store.initialize()
     monkeypatch.setattr(
-        "modelexpress.rl.inference.checkpoint_store.shutil.disk_usage",
+        "modelexpress_rl.inference.checkpoint_store.shutil.disk_usage",
         lambda _path: SimpleNamespace(free=3),
     )
 
@@ -451,7 +451,7 @@ def test_store_caps_quota_to_disk_space_and_logs(
 ):
     gb = 1_000_000_000
     monkeypatch.setattr(
-        "modelexpress.rl.inference.checkpoint_store.shutil.disk_usage",
+        "modelexpress_rl.inference.checkpoint_store.shutil.disk_usage",
         lambda _path: SimpleNamespace(free=300 * gb),
     )
     store = LocalCheckpointStore(
@@ -477,7 +477,7 @@ def test_store_disk_cap_accounts_for_existing_cache(monkeypatch, tmp_path):
     active.mkdir()
     (active / "weights").write_bytes(b"x" * 100)
     monkeypatch.setattr(
-        "modelexpress.rl.inference.checkpoint_store.shutil.disk_usage",
+        "modelexpress_rl.inference.checkpoint_store.shutil.disk_usage",
         lambda _path: SimpleNamespace(free=300),
     )
     resumed = LocalCheckpointStore(
@@ -498,7 +498,7 @@ def test_store_caps_quota_to_all_available_disk_space(
     monkeypatch, tmp_path, free_bytes
 ):
     monkeypatch.setattr(
-        "modelexpress.rl.inference.checkpoint_store.shutil.disk_usage",
+        "modelexpress_rl.inference.checkpoint_store.shutil.disk_usage",
         lambda _path: SimpleNamespace(total=1000, free=free_bytes),
     )
     store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
@@ -522,7 +522,7 @@ def test_store_evicts_stale_checkpoint_to_free_disk_space(monkeypatch, tmp_path)
     stale.mkdir()
     (stale / "weights").write_bytes(b"x" * 40)
     monkeypatch.setattr(
-        "modelexpress.rl.inference.checkpoint_store.shutil.disk_usage",
+        "modelexpress_rl.inference.checkpoint_store.shutil.disk_usage",
         lambda _path: SimpleNamespace(free=20 if stale.exists() else 60),
     )
 

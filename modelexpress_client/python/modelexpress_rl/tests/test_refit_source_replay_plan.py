@@ -5,10 +5,10 @@ import ctypes
 import pytest
 
 import torch
-from modelexpress.rl.refit.reshard.slice_plan import Shard
-from modelexpress.rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
-from modelexpress.rl.refit.reshard.types import CaptureResult, RecordedCopy, UnsupportedReshard
-from modelexpress.rl.inference.nixl_staged_transfer import _replay_ops
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy, UnsupportedReshard
+from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
 
 
 def test_digest_mode_does_not_replace_partial_replay_reads_with_full_sources():
@@ -125,7 +125,7 @@ def test_replay_materializes_transposed_source_before_flattening():
     [], [-1, 0],
 ])
 def test_integer_index_capture_transfer_and_replay(index):
-    from modelexpress.rl.refit.reshard.geometry import build_lazy_weights, capture_weights
+    from modelexpress_rl.refit.reshard.geometry import build_lazy_weights, capture_weights
 
     source = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     expected = source[index].clone()
@@ -165,7 +165,7 @@ def test_integer_index_capture_transfer_and_replay(index):
 
 @pytest.mark.parametrize("nodes", [("a", "b", "c", "d", "solo"), ("solo", "d", "c", "b", "a")])
 def test_owner_groups_preserve_order_across_transitive_and_cyclic_links(nodes):
-    from modelexpress.rl.refit.reshard.types import _connected_groups
+    from modelexpress_rl.refit.reshard.types import _connected_groups
 
     links = (("b", "c"), ("a", "b"), ("d", "c"), ("foreign", "solo"), ("a", "c"))
     groups = _connected_groups(nodes, links)

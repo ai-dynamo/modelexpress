@@ -204,7 +204,7 @@ spec:
               command:
               - python3
               - -m
-              - modelexpress.rl.inference.engines.vllm.startup_probe
+              - modelexpress_rl.inference.engines.vllm.startup_probe
               - --address
               - 127.0.0.1:50051
             periodSeconds: 5

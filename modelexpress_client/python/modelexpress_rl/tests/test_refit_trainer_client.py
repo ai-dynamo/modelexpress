@@ -10,10 +10,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import grpc
-import modelexpress.rl.train.client as client_module
-import modelexpress.rl.train.runtime as runtime_module
+import modelexpress_rl.train.client as client_module
+import modelexpress_rl.train.runtime as runtime_module
 import pytest
-from modelexpress.rl import (
+from modelexpress_rl import (
     FSDPTrainerContext,
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
@@ -23,13 +23,13 @@ from modelexpress.rl import (
     refit_pb2,
     refit_pb2_grpc,
 )
-from modelexpress.rl.train.adapter import (
+from modelexpress_rl.train.adapter import (
     CompletionFence,
     StagedWeightVersionShardData,
     TrainerEngineAdapter,
     TrainerShardMetadata,
 )
-from modelexpress.rl.train.manifest import RefitWorkerService, bound_tensor_manifest
+from modelexpress_rl.train.manifest import RefitWorkerService, bound_tensor_manifest
 
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):

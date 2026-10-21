@@ -12,17 +12,17 @@ import hashlib
 
 import pytest
 import torch
-import modelexpress.rl.inference.nixl_staged_transfer as transfer_module
+import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 
-from modelexpress.rl.tests.test_refit_bounded_descriptors import harness
-from modelexpress.rl.refit.reshard.rendezvous import (
+from modelexpress_rl.tests.test_refit_bounded_descriptors import harness
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard, PublishedTensor, wrap_rendezvous_blob,
 )
-from modelexpress.rl.inference.methods import LoadTimeTensorNixlUpdateMethod
+from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 
-from modelexpress.rl.inference.adapter import TrainerSourceShard
-from modelexpress.rl.inference.plan import ResolvedTrainerSource, TrainerSourceSnapshot
-from modelexpress.rl.version import MeshIdentity
+from modelexpress_rl.inference.adapter import TrainerSourceShard
+from modelexpress_rl.inference.plan import ResolvedTrainerSource, TrainerSourceSnapshot
+from modelexpress_rl.version import MeshIdentity
 
 
 def _initialize_replicas(harness):

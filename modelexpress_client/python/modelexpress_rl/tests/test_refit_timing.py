@@ -5,7 +5,7 @@ import json
 import logging
 
 import pytest
-from modelexpress.rl.refit import (
+from modelexpress_rl.refit import (
     MX_REFIT_TIMING_PREFIX,
     REFIT_TIMING_STAGES,
     RefitTimingRecorder,

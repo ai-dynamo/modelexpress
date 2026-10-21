@@ -85,7 +85,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # _foreach_copy_ instead of a copy_() per view. On by default: it is the same
     # set of copies, and one launch per view means thousands of launches whose
     # Python and launch overhead can rival the RDMA itself. Set to 0 to fall back
-    # to the per-view loop. See modelexpress.rl.refit.reshard.receiver.
+    # to the per-view loop. See modelexpress_rl.refit.reshard.receiver.
     "MX_RESHARD_BATCH_INSTALL": lambda: _env_bool("MX_RESHARD_BATCH_INSTALL", True),
     # Build the RDMA read descriptor lists once per plan instead of once per step.
     # The descriptors are a pure function of the cached plan and the registered
@@ -93,7 +93,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # every refit re-derives an identical list of hundreds of thousands of objects
     # in Python. On by default; set to 0 to rebuild per step for an A/B. The cache
     # is dropped whenever the plan is rebuilt. See
-    # modelexpress.rl.refit.reshard.receiver.
+    # modelexpress_rl.refit.reshard.receiver.
     "MX_RESHARD_CACHE_DESCRIPTORS": lambda: _env_bool(
         "MX_RESHARD_CACHE_DESCRIPTORS", True
     ),
@@ -101,14 +101,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bytes; ReshardReceiver validates its range at the point of use. What a
     # complete refit scores is engine- and model-specific, so the default is set
     # loose enough to pass any complete refit and still catch a gross hole; see
-    # modelexpress.rl.refit.reshard.receiver._coverage_floor.
+    # modelexpress_rl.refit.reshard.receiver._coverage_floor.
     "MX_RESHARD_REQUIRE_FULL_COVERAGE": lambda: (
         os.environ.get("MX_RESHARD_REQUIRE_FULL_COVERAGE", "").strip().lower()
         in _TRUTHY
     ),
     "MX_RESHARD_COVERAGE_FLOOR": lambda: _env_float("MX_RESHARD_COVERAGE_FLOOR", 0.995),
     # Bounds for the reshard peer handshake; see
-    # modelexpress.rl.refit.reshard.receiver.handshake_with_peers.
+    # modelexpress_rl.refit.reshard.receiver.handshake_with_peers.
     #
     # TIMEOUT_S is the budget across every peer and every retry. A refit timeout is
     # the wrong bound, since it lets one unreachable peer consume the whole refit,
@@ -158,7 +158,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # something to compare against. Off by default: it costs a reduction over every
     # published tensor, which is a large relative cost against a ~1.5 s wire, so it
     # belongs in a qualification run rather than a throughput measurement. See
-    # modelexpress.rl.refit.reshard.verify.
+    # modelexpress_rl.refit.reshard.verify.
     "MX_RESHARD_PUBLISH_DIGEST": lambda: _env_bool("MX_RESHARD_PUBLISH_DIGEST", False),
     # ── Trainer pull (live weight sync from a running trainer) ─────────────
     "MX_REDIS_URL": lambda: os.environ.get("MX_REDIS_URL", "redis://localhost:6379"),

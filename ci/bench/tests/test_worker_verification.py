@@ -89,7 +89,7 @@ def test_runtime_tensor_uses_engine_sharding_without_mutating_weight(
     )
     monkeypatch.setitem(
         sys.modules,
-        "modelexpress.rl.inference.checkpoint_store",
+        "modelexpress_rl.inference.checkpoint_store",
         SimpleNamespace(LocalCheckpointStore=CheckpointStore),
     )
     monkeypatch.setitem(

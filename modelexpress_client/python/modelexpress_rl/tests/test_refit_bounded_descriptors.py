@@ -10,23 +10,23 @@ from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace, MappingProxyType
 
-import modelexpress.rl.inference.nixl_staged_transfer as module
-from modelexpress.rl.inference.adapter import TrainerSourceShard
-from modelexpress.rl.inference.plan import StreamingSettings
+import modelexpress_rl.inference.nixl_staged_transfer as module
+from modelexpress_rl.inference.adapter import TrainerSourceShard
+from modelexpress_rl.inference.plan import StreamingSettings
 
 import pytest
 import torch
-from modelexpress.rl import envs
+from modelexpress_rl import envs
 from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
-from modelexpress.rl.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     wrap_rendezvous_blob,
 )
-from modelexpress.rl.refit.reshard.verify import tensor_digest
-from modelexpress.rl.inference.plan import TrainerSourceSnapshot
-from modelexpress.rl.version import MeshIdentity
-from modelexpress.rl.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.verify import tensor_digest
+from modelexpress_rl.inference.plan import TrainerSourceSnapshot
+from modelexpress_rl.version import MeshIdentity
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     RecordedCopy,

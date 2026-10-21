@@ -622,21 +622,21 @@ line in deterministic key order. `perf/mx_receive_stage_weight_time` covers the
 complete `ModelExpressGeneratorClient.stage_weight()` wall-clock call.
 
 The active vLLM refit installer lives in
-`modelexpress.rl.inference.engines.vllm.installer`. It captures canonical
+`modelexpress_rl.inference.engines.vllm.installer`. It captures canonical
 load-time destinations and aliases once for the generator client's lifetime,
 then installs updates into the live model. Checkpoint reloads use vLLM's
 layerwise loader and post-load processing so quantized and graph-bound weights
 retain their engine-owned behavior. Replacing the engine or changing its loader
 semantics requires a new client.
 
-RL refit timing and transfer planning live under `modelexpress.rl.refit`.
+RL refit timing and transfer planning live under `modelexpress_rl.refit`.
 The RL-specific `MX_REFIT_*` and `MX_RESHARD_*` settings are registered in
-`modelexpress.rl.envs`; shared client configuration remains in
+`modelexpress_rl.envs`; shared client configuration remains in
 `modelexpress.envs`.
 
 ### No-gather Refit Resharding
 
-`modelexpress.rl.refit.reshard` captures the slices and destination views selected
+`modelexpress_rl.refit.reshard` captures the slices and destination views selected
 by an engine's own weight loader, intersects them with trainer-published
 shards, and compiles one-sided read descriptors without materializing a full
 trainer tensor. Geometry, slice planning, transfer planning, and the transport
@@ -804,7 +804,7 @@ isolating callers' mutations. The existing model, loader, routing and manifest
 keys decide whether capture can be reused. Warm weight updates reuse their
 compiled transfer plan directly and do not copy the capture again.
 
-`modelexpress.rl.refit.reshard.plan_transfer` builds an immutable
+`modelexpress_rl.refit.reshard.plan_transfer` builds an immutable
 `LogicalTransferPlan` directly from captured geometry. Exact reads, conversions
 and full-source pulls index a shared source-buffer table and carry shard-relative
 byte offsets. The table identifies logical source slots and tensor shards; it

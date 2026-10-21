@@ -7,12 +7,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
-from modelexpress.rl.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     MxReshardRendezvous,
     PublishedTensor,
     wrap_rendezvous_blob,
 )
-from modelexpress.rl.train.adapter import NixlMetadataProvider
+from modelexpress_rl.train.adapter import NixlMetadataProvider
 
 from .aliases import MegatronTensorSpec, build_hf_aliases
 

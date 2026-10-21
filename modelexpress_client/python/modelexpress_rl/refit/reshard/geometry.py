@@ -44,7 +44,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
 
-from modelexpress.rl.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     _connected_groups,
     OpChain,

@@ -16,8 +16,8 @@ from azure.core.exceptions import HttpResponseError
 from azure.core.pipeline.transport import HttpTransport
 from urllib3.response import HTTPResponse
 
-from modelexpress.rl import envs
-from modelexpress.rl.azure import AzureBlobReader
+from modelexpress_rl import envs
+from modelexpress_rl.azure import AzureBlobReader
 
 
 DEFAULTS = {
