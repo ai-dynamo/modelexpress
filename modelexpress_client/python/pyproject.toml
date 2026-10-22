@@ -84,6 +84,10 @@ Documentation = "https://github.com/ai-dynamo/modelexpress/tree/main/docs"
 
 [project.entry-points."vllm.general_plugins"]
 modelexpress = "modelexpress:register_modelexpress"
+modelexpress_rl = "modelexpress_rl.inference.engines.vllm.registration:register"
+
+[project.entry-points."sglang.srt.plugins"]
+modelexpress_rl = "modelexpress_rl.inference.engines.sglang.registration:register"
 
 [tool.pytest.ini_options]
 markers = [

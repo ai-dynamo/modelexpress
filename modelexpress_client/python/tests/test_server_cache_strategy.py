@@ -231,8 +231,7 @@ class TestLoad:
         ctx = _make_context("org/logical-name", model_path=str(snapshot))
 
         assert ServerCacheStrategy().is_available(ctx)
-        with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
-            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+        ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
 
         assert [
             call for client in FakeClient.instances for call in client.calls
@@ -243,15 +242,13 @@ class TestLoad:
         ctx = _make_context(REPO, adapter=adapter, model_path=str(snapshot))
         result = LoadResult(value=MagicMock(), model=MagicMock())
 
-        with patch(
-            "modelexpress.load_strategy.server_cache_strategy.register_tensors"
-        ) as register:
-            out = ServerCacheStrategy().load(result, ctx)
+        strategy = ServerCacheStrategy()
+        out = strategy.load(result, ctx)
+        strategy.finalize(out, ctx)
 
         assert FakeClient.instances[-1].calls == [(REPO, snapshot)]
         assert adapter.native_calls == 1
         assert adapter.post_calls == 1
-        assert register.call_count == 1
         assert out is result
 
     def test_uses_the_snapshot_the_engine_resolved(self, enabled, snapshot, fake_client):
@@ -259,8 +256,7 @@ class TestLoad:
         model_prefetch._snapshot_to_repo_id[str(snapshot)] = REPO
         ctx = _make_context(str(snapshot), model_path=str(snapshot))
 
-        with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
-            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+        ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
 
         assert FakeClient.instances[-1].calls == [(REPO, snapshot)]
 
@@ -268,8 +264,7 @@ class TestLoad:
         ctx = _make_context(REPO, model_path=None)
 
         with patch.object(model_prefetch, "ensure_metadata", return_value=snapshot) as ensure:
-            with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
-                ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
 
         assert ensure.call_count == 1
         assert FakeClient.instances[-1].calls == [(REPO, snapshot)]
@@ -302,8 +297,7 @@ class TestLoad:
 
         monkeypatch.setattr(model_prefetch, "_ensure_metadata_snapshot", install_metadata)
         monkeypatch.setattr(FakeClient, "install_weight_files", install_weights)
-        with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
-            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+        ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
 
         assert events == ["metadata", "weights"]
 
@@ -352,8 +346,7 @@ class TestCacheRoot:
     """
 
     def _run(self, ctx):
-        with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
-            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+        ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
 
     def test_existing_snapshot_pins_the_client_to_its_own_root(
         self, enabled, snapshot, fake_client, monkeypatch, tmp_path
@@ -478,8 +471,8 @@ class TestLegacySnapshotCompatibility:
         adapter = _FakeAdapter()
         ctx = _make_context(REPO, adapter=adapter, model_path=str(legacy_snapshot))
 
-        with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
-            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+        strategy = ServerCacheStrategy()
+        strategy.finalize(strategy.load(LoadResult(value=MagicMock()), ctx), ctx)
 
         assert (legacy_snapshot / "model.safetensors").read_bytes() == b"weights"
         assert (legacy_snapshot / "config.json").read_bytes() == b"{}"
@@ -517,8 +510,7 @@ class TestLegacySnapshotCompatibility:
         adapter = _FakeAdapter()
         ctx = _make_context(REPO, adapter=adapter, model_path=str(legacy_snapshot))
 
-        with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
-            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+        ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
 
         assert (legacy_snapshot / "model.safetensors").read_bytes() == b"weights"
         assert adapter.native_calls == 1

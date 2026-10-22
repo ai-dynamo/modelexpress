@@ -11,6 +11,7 @@ import logging
 import sys
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 
@@ -118,6 +119,29 @@ class _PluginStrategy(LoadStrategy):
 
     def is_available(self, ctx: LoadContext) -> bool:
         return self._strategy.is_available(ctx)
+
+    def prepare(self, result: LoadResult, ctx: LoadContext) -> None:
+        with self._phase():
+            self._strategy.prepare(result, ctx)
+
+    def finalize(self, result: LoadResult, ctx: LoadContext) -> None:
+        with self._phase():
+            self._strategy.finalize(result, ctx)
+
+    def abort(self, result: LoadResult, ctx: LoadContext) -> None:
+        with self._phase():
+            self._strategy.abort(result, ctx)
+
+    @contextmanager
+    def _phase(self):
+        try:
+            yield
+        except (StrategyFailed, StrategyRecoveryError):
+            raise
+        except Exception as exc:
+            raise StrategyFailed(
+                f"Plugin {self.name!r} failed: {exc}", mutated=True
+            ) from exc
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         try:

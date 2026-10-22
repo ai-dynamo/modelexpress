@@ -15,7 +15,7 @@ from typing import Any, Literal
 import grpc
 from modelexpress import auth, envs
 from modelexpress.client import _get_server_url
-from modelexpress.refit.timing import RefitTimingRecorder, refit_span
+from modelexpress_rl.refit.timing import RefitTimingRecorder, refit_span
 
 from modelexpress_rl import envs as rl_envs
 from modelexpress_rl import timing
@@ -88,7 +88,7 @@ class ModelExpressGeneratorConfig:
             and not self.initial_serving_version_id.strip()
         ):
             raise ValueError("initial_serving_version_id must not be empty")
-        source_order_env = envs.MX_GENERATOR_SOURCE_ORDER
+        source_order_env = rl_envs.MX_GENERATOR_SOURCE_ORDER
         if self.source_order is None and source_order_env is not None:
             object.__setattr__(
                 self,

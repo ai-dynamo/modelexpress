@@ -63,7 +63,7 @@ jobs:
       group: ${{ github.workflow }}-${{ inputs.pull_request || github.event.issue.number || github.ref_name }}-rl-refit-validate-${{ inputs.concurrency_key }}
       cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: RL generator-only refit validation
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -344,7 +344,7 @@ jobs:
 
   status-check:
     name: RL status check
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     needs: [validate, build, test, cleanup, build-vime-delta-refit, test-vime-delta-refit]
     if: ${{ always() && (github.event_name != 'issue_comment' || needs.validate.result != 'skipped') }}
     steps:

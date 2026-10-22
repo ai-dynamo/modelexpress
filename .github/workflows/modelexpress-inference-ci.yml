@@ -369,7 +369,7 @@ jobs:
 
   status-check:
     name: Inference status check
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     needs: [gpu-tests, gpu-cleanup, build-server, build-client, ensure-vcluster, model-streamer]
     if: always()
     steps:
