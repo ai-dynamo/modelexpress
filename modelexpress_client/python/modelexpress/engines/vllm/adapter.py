@@ -329,10 +329,24 @@ class VllmAdapter(EngineAdapter):
 
         return get_world_group().broadcast_object(state, src=0)
 
+    @staticmethod
+    def _exclude_hidden_tensor_object(obj: object) -> bool:
+        """Keep K3 peer pointers, barriers, and collective workspaces local."""
+        cls = type(obj)
+        return (
+            cls.__module__ == "vllm.models.kimi_k3.nvidia.ops.latent_moe_tail"
+            and cls.__name__ == "KimiK3LatentMoETailOp"
+        )
+
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
+        """Collect transferable tensors while preserving process-local state."""
         if result.model is None:
             raise RuntimeError("vLLM tensor discovery requires result.model")
-        adopt_hidden_tensors(result.model, self.accelerator_backend)
+        adopt_hidden_tensors(
+            result.model,
+            self.accelerator_backend,
+            exclude=self._exclude_hidden_tensor_object,
+        )
         tensors = collect_module_tensors(result.model, self.accelerator_backend)
         if _is_speculative_draft(self.vllm_config, self.model_config):
             prefixes = _target_shared_draft_prefixes(result.model, self.vllm_config)
