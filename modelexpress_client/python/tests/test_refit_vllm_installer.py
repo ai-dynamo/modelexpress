@@ -2954,7 +2954,7 @@ def test_update_boundary_validates_completed_runtime_slots(
             batches=lambda: ({name: value} for name, value in tensors.items()),
         )
 
-    if repair:
+    if repair or (slot == "cache" and mutation == "replace"):
         install()
         assert getattr(model.first, slot) is original
         assert original.data_ptr() == pointer
@@ -2962,7 +2962,8 @@ def test_update_boundary_validates_completed_runtime_slots(
         assert torch.equal(model.first.weight, tensors["first.weight"])
         assert torch.equal(model.first.cache, torch.ones(2, 2))
     else:
-        with pytest.raises(IncompleteRefit, match=f"runtime tensor first.{slot}"):
+        kind = "graph-bound" if slot == "cache" else "runtime"
+        with pytest.raises(IncompleteRefit, match=f"{kind} tensor first.{slot}"):
             install()
     assert events == ["mutate", "repair"]
 
@@ -3112,3 +3113,31 @@ def test_completed_tensor_installation_is_rejected(monkeypatch, streaming):
         else:
             installer.install_tensors(tensors)
     assert torch.equal(model.weight, original)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("hook_persistent", [None, False, True])
+def test_reload_preserves_registered_buffer_storage_after_deferred_hook(
+    monkeypatch, persistent, hook_persistent
+):
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    model = nn.Module()
+    model.register_buffer("scale_inv", torch.ones(1), persistent=persistent)
+    registered = model.scale_inv
+    pointer = registered.data_ptr()
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+
+    def finalize(target, _config):
+        kwargs = {} if hook_persistent is None else {"persistent": hook_persistent}
+        target.register_buffer("scale_inv", torch.full((1,), value), **kwargs)
+
+    layerwise.finalize_layerwise_reload = finalize
+    installer = _VllmInstaller(
+        model=model, vllm_config=object(), model_config=object(), device=torch.device("cpu")
+    )
+    for value in (4.0, 7.0):
+        installer._reload(lambda _aliases: None)
+        assert model.scale_inv is registered
+        assert model.scale_inv.data_ptr() == pointer
+        assert registered.item() == value
+        assert ("scale_inv" in model.state_dict()) is persistent

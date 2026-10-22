@@ -1382,8 +1382,8 @@ class _VllmInstaller(EngineInstaller):
     def _reload_plan(self):
         from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
 
-        # Layerwise reload does not save bare device tensors referenced by
-        # captured graphs. Host bookkeeping follows the native reload lifecycle.
+        # Deferred post-load hooks can replace bare tensors and registered buffers.
+        # Preserve both for graph consumers and ModelExpress tensor registrations.
         owners = tuple(
             (path, ref(module))
             for path, module in self._model.named_modules(remove_duplicate=False)
@@ -1403,8 +1403,14 @@ class _VllmInstaller(EngineInstaller):
                 path,
                 module,
                 {
-                    name: (value, _tensor_geometry(value))
-                    for name, value in module.__dict__.items()
+                    name: (
+                        value,
+                        _tensor_geometry(value),
+                        name not in module._non_persistent_buffers_set
+                        if name in module._buffers
+                        else None,
+                    )
+                    for name, value in {**module.__dict__, **module._buffers}.items()
                     if isinstance(value, torch.Tensor)
                     and value.device.type == self._device.type
                     and (
@@ -1524,8 +1530,8 @@ class _VllmInstaller(EngineInstaller):
                     raise IncompleteRefit(
                         f"graph-bound tensor owner {path!r} was replaced"
                     )
-                for name, (graph_tensor, original_geometry) in attributes.items():
-                    current = module.__dict__.get(name)
+                for name, (graph_tensor, original_geometry, persistent) in attributes.items():
+                    current = getattr(module, name, None)
                     if (
                         not isinstance(current, torch.Tensor)
                         or _tensor_geometry(graph_tensor) != original_geometry
@@ -1539,6 +1545,11 @@ class _VllmInstaller(EngineInstaller):
                     if current is not graph_tensor:
                         graph_tensor.copy_(current)
                     setattr(module, name, graph_tensor)
+                    if persistent is not None:
+                        if persistent:
+                            module._non_persistent_buffers_set.discard(name)
+                        else:
+                            module._non_persistent_buffers_set.add(name)
             for path, reference, layout in runtime_layouts.values():
                 _validate_runtime_tensor_layout(path, reference(), layout)
 
