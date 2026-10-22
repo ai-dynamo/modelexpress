@@ -154,6 +154,7 @@ jobs:
             --build-arg "RUNTIME_BASE=$RUNTIME_BASE" -t "$worker" \
             --metadata-file worker-build.json --push candidate
           docker buildx build --platform linux/amd64 -f ci/bench/Dockerfile.cleanup \
+            --provenance=false \
             --cache-from "type=registry,ref=$repo/mx-bench-cleanup:buildcache-shared" \
             --cache-to "type=registry,ref=$repo/mx-bench-cleanup:buildcache-shared,mode=max,ignore-error=true" \
             -t "$cleanup" --metadata-file cleanup-build.json --push candidate
