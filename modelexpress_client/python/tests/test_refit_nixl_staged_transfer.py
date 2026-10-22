@@ -5,7 +5,7 @@ import hashlib
 import ctypes
 from contextlib import nullcontext
 from dataclasses import replace
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress_rl.inference.plan import StreamingSettings
@@ -13,22 +13,22 @@ from modelexpress_rl.version import MeshIdentity
 
 import pytest
 import torch
-from modelexpress import envs
+from modelexpress_rl import envs
 from modelexpress import p2p_pb2
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     unwrap_rendezvous_blob,
     wrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.slice_plan import LogicalRead, SourceBuffer, Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, LogicalTransferPlan, plan_transfer
-from modelexpress.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.slice_plan import LogicalRead, SourceBuffer, Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, LogicalTransferPlan, plan_transfer
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     RecordedCopy,
 )
-from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.adapter import TrainerSourceShard
 from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 from modelexpress_rl.inference.nixl_staged_transfer import (
@@ -233,9 +233,8 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, pack, pad
     transfer._active = prepared
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
-    transfer._bounded_arena = torch.empty(arena_bytes, dtype=torch.uint8)
-    transfer._bounded_arena.fill_(255)
-    transfer._staging_arenas = [transfer._bounded_arena]
+    arena = torch.full((arena_bytes,), 255, dtype=torch.uint8)
+    transfer._staging_arenas = [arena]
     _bind_test_execution(transfer, prepared)
     metrics = {}
     installed = {}
@@ -243,7 +242,7 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, pack, pad
     for tensors in transfer.iter_bounded(prepared, metrics):
         addresses.append(next(iter(tensors.values())).data_ptr())
         installed.update({name: value.clone() for name, value in tensors.items()})
-    assert set(addresses) == {transfer._bounded_arena.data_ptr()}
+    assert set(addresses) == {arena.data_ptr()}
     for name, (_, dtype) in layout.items():
         expected = source_tensor.to(dtype)
         if padded:
@@ -292,7 +291,9 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
     transfer = harness.transfer
     manager = transfer._manager
     monkeypatch.setattr(transfer, "_device", torch.device("cpu"))
-    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        transfer_module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     capture_failure = False
 
     def capture_layout(schema):
@@ -882,7 +883,9 @@ def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch):
 
 
 def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch):
-    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        transfer_module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._weight_update_plan = None
     transfer._device = torch.device("cpu")
@@ -1053,7 +1056,7 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
     source_tensor = torch.arange(4, dtype=torch.float32)
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
 
     class Manager:
         def __init__(self, **kwargs):
@@ -1198,7 +1201,7 @@ def test_bounded_device_validation_precedes_manager_creation(monkeypatch) -> Non
     monkeypatch.setattr(
         transfer_module, "NixlTransferManager", lambda **kwargs: events.append(kwargs)
     )
-    with pytest.raises(ValueError, match="CUDA device"):
+    with pytest.raises(ValueError, match="accelerator device"):
         _NixlStagedTransfer(
             generator_fingerprint=lambda: (),
             capture_layout=lambda _: None,
@@ -1331,27 +1334,195 @@ def test_failed_prefetch_drain_does_not_mask_a_caller_error(monkeypatch):
         iterator.throw(RuntimeError("the install failed"))
 
 
-def test_bounded_batch_layouts_are_named_however_they_are_built():
-    """Readers use both `.full` and `[0]`, so construction style must not matter.
+def _unexpected_cuda_call(*_args, **_kwargs):
+    raise AssertionError("generator staging must not reach torch.cuda on XPU")
 
-    The annotation alone does not enforce this: a plain 3-tuple or a
-    dataclasses.replace satisfies positional access and breaks attribute
-    access, which fails at only one of the two call sites.
-    """
-    recv = {"a.weight": ((4,), torch.float32)}
-    convert: dict = {}
-    full = {"w": ((4,), torch.float32)}
 
-    built = transfer_module._StreamingBatch(
-        CaptureResult(copies=[]), LogicalTransferPlan(), (recv, convert, full), 256
+@pytest.fixture
+def xpu_backend(monkeypatch, mock_accelerator_backend_cls):
+    backend = mock_accelerator_backend_cls(name="xpu", torch_device_type="xpu")
+    requested = []
+
+    def backend_for(device):
+        requested.append(device)
+        return backend
+
+    monkeypatch.setattr(transfer_module, "accelerator_backend_for", backend_for)
+    monkeypatch.setattr(torch.cuda, "synchronize", _unexpected_cuda_call)
+    backend.requested = requested
+    return backend
+
+
+def test_owned_manager_uses_the_engine_device_backend(monkeypatch, xpu_backend):
+    created = []
+
+    class _Manager:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        def initialize(self):
+            pass
+
+    monkeypatch.setattr(transfer_module, "NixlTransferManager", _Manager)
+    _NixlStagedTransfer(
+        agent_name="generator",
+        device_id=1,
+        device=torch.device("xpu", 1),
+        listen_port=None,
+        capture_layout=lambda _: pytest.fail("layout capture is not reached"),
+        generator_fingerprint=lambda: (),
     )
-    assert isinstance(built.layouts, transfer_module._StagingLayouts)
-    assert built.layouts.recv is built.layouts[0] is recv
-    assert built.layouts.full is built.layouts[2] is full
 
-    swapped = replace(built, layouts=(recv, convert, {}))
-    assert isinstance(swapped.layouts, transfer_module._StagingLayouts)
-    assert swapped.layouts.full == {}
+    (kwargs,) = created
+    assert kwargs["accelerator_backend"] is xpu_backend
+
+
+def test_staging_synchronizes_and_allocates_through_the_device_backend(
+    monkeypatch, xpu_backend
+):
+    scopes = []
+    monkeypatch.setattr(
+        transfer_module,
+        "registered_buffer_alloc_scope",
+        lambda backend: scopes.append(backend) or nullcontext(),
+    )
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._device = torch.device("xpu", 1)
+
+    transfer._synchronize()
+    with transfer._registered_alloc_scope():
+        pass
+
+    assert xpu_backend.synchronize_calls == [1]
+    assert scopes == [xpu_backend]
+
+
+def test_host_device_staging_needs_no_backend(monkeypatch, xpu_backend):
+    monkeypatch.setattr(
+        transfer_module, "registered_buffer_alloc_scope", _unexpected_cuda_call
+    )
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._device = torch.device("cpu")
+
+    transfer._synchronize()
+    with transfer._registered_alloc_scope():
+        pass
+
+    assert xpu_backend.requested == []
+
+
+@pytest.mark.parametrize("staging_device", [None, "xpu", "cpu"])
+def test_bounded_staging_accepts_an_xpu_engine_device(
+    monkeypatch, xpu_backend, staging_device
+):
+    monkeypatch.setattr(
+        transfer_module,
+        "NixlTransferManager",
+        lambda **_: SimpleNamespace(initialize=lambda: None),
+    )
+    streaming = StreamingSettings(256, staging_device)
+    transfer = _NixlStagedTransfer(
+        agent_name="generator",
+        device_id=1,
+        device=torch.device("xpu", 1),
+        streaming=streaming,
+        capture_layout=lambda _: pytest.fail("layout capture is not reached"),
+        generator_fingerprint=lambda: (),
+    )
+
+    assert transfer._streaming == streaming
+
+
+def test_bounded_staging_rejects_another_device_type_before_manager_creation(
+    monkeypatch, xpu_backend
+):
+    events = []
+    monkeypatch.setattr(
+        transfer_module, "NixlTransferManager", lambda **kwargs: events.append(kwargs)
+    )
+    with pytest.raises(ValueError, match="'cuda' does not match the engine device xpu:1"):
+        _NixlStagedTransfer(
+            agent_name="generator",
+            device_id=1,
+            device=torch.device("xpu", 1),
+            streaming=StreamingSettings(256, "cuda"),
+            capture_layout=lambda _: pytest.fail("layout capture is not reached"),
+            generator_fingerprint=lambda: (),
+        )
+
+    assert events == []
+
+
+class _DeviceArena:
+    """An arena on a device this host does not have; zero-fill is a no-op."""
+
+    def __init__(self, device):
+        self.device = device
+
+    def __getitem__(self, _index):
+        return self
+
+    def zero_(self):
+        return self
+
+
+@pytest.mark.parametrize(
+    ("arena_device", "expected"),
+    [(torch.device("xpu", 1), [1]), (torch.device("cpu"), [])],
+)
+def test_bounded_post_fences_the_zero_fill_through_the_backend(
+    xpu_backend, arena_device, expected
+):
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._device = torch.device("xpu", 1)
+    transfer._staging_arenas = [_DeviceArena(arena_device)]
+    transfer._carve_bounded = lambda _batch, _arena: ({}, {}, {})
+    fenced_before_post = []
+    prepared = SimpleNamespace(
+        batches=[
+            SimpleNamespace(
+                nbytes=0, transfer_plan=None, capture=SimpleNamespace(copies=[])
+            )
+        ],
+        descriptors=[()],
+        descriptors_reused=[False],
+        sources={},
+        transport=SimpleNamespace(
+            post_reads=lambda _descriptors: fenced_before_post.extend(
+                xpu_backend.synchronize_calls
+            )
+        ),
+        source_binding=None,
+        checksums={},
+    )
+
+    transfer._post_bounded(
+        prepared, 0, {"descriptor_cache_hits": 0, "descriptor_cache_misses": 0}
+    )
+
+    assert fenced_before_post == expected
+
+
+def test_source_replay_fences_the_zero_fill_through_the_backend(xpu_backend):
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._closed = False
+    transfer._device = torch.device("xpu", 1)
+    transfer._full_buffers = {"w": SimpleNamespace(zero_=lambda: None)}
+    fenced_before_post = []
+    prepared = SimpleNamespace(
+        transfer_plan=SimpleNamespace(source_replay=True),
+        descriptors=(),
+        transport=SimpleNamespace(
+            post_reads=lambda _descriptors: fenced_before_post.extend(
+                xpu_backend.synchronize_calls
+            )
+        ),
+    )
+    transfer._active = prepared
+    transfer._complete_stage = lambda *_args: "staged"
+
+    assert transfer.stage(prepared) == "staged"
+    assert fenced_before_post == [1]
 
 
 @pytest.mark.parametrize("enabled", [None, False, True])

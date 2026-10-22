@@ -285,7 +285,10 @@ Start with the [ModelExpress documentation hub](docs/README.md).
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Symptom-driven diagnostics |
 | [Architecture](docs/ARCHITECTURE.md) | Components, gRPC, NIXL, FP8 |
 | [Benchmarks](docs/BENCHMARKS.md) | Loading paths, NIXL registration, and artifact-transfer results |
-| [RL weight refit](modelexpress_client/python/modelexpress/refit/README.md) | Receiver-driven trainer-to-rollout resharding design and implementation status |
+| [RL package](docs/rl/README.md) | Quickstart, imports, runtime plugins, and support boundaries |
+| [RL architecture](docs/rl/ARCHITECTURE.md) | Weight versions, stage_weight, staged transfer, caching, and failure recovery |
+| [RL configuration](docs/rl/CONFIGURATION.md) | RL staging, streaming, checksum, and diagnostics settings |
+| [S3 delta refit](docs/rl/S3_DELTA_WEIGHT_REFIT.md) | Trainer-to-generator S3 delta workflow |
 | [CLI](docs/CLI.md) | Full CLI reference |
 | [Metrics](docs/METRICS.md) | Prometheus exposition for the server and the client |
 | [Metadata](docs/metadata.md) | Redis keys, K8s CRD schema |
@@ -305,7 +308,7 @@ Start with the [ModelExpress documentation hub](docs/README.md).
 ### Priorities Under Development
 
 - **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high-speed NVMe.
-- **[RL post-training refit](modelexpress_client/python/modelexpress/refit/README.md)**: Make updates receiver-driven—trainer ranks publish the shards they own, rollout workers discover and plan against their target layout, then pull, convert, reshard, and load directly over NIXL.
+- **[RL post-training refit](docs/rl/README.md)**: Trainer ranks publish their owned shards; rollout workers plan against their target layout, then pull, convert, reshard, and load directly over NIXL.
 - **Earlier weight availability**: Bring weights to prefill earlier; identify prefill workers that can act as strong source nodes.
 - **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
 - **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.

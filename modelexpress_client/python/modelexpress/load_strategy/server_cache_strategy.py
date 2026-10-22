@@ -15,18 +15,17 @@ import logging
 from pathlib import Path
 
 from .. import model_prefetch, model_snapshot
-from ..adapter import EngineAdapter, StrategyFailed
-from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
+from ..adapter import StrategyFailed
+from .base import LoadContext, NativeLoadStrategy, _as_load_result
 from .context import LoadResult
 
 logger = logging.getLogger("modelexpress.strategy_server_cache")
 
 
-class ServerCacheStrategy(LoadStrategy):
+class ServerCacheStrategy(NativeLoadStrategy):
     """Install weights from the server, then load them with the engine's loader."""
 
     name = "server-cache"
-    requires = (EngineAdapter.load_via_native,)
 
     def is_available(self, ctx: LoadContext) -> bool:
         """Return whether the server can supply weights for this model.
@@ -82,11 +81,9 @@ class ServerCacheStrategy(LoadStrategy):
 
         try:
             result = ctx.adapter.load_via_native(result)
-            result = ctx.adapter.after_native_load(result)
         except Exception as exc:
             raise StrategyFailed(str(exc), mutated=True) from exc
 
-        register_tensors(result, ctx)
         return result
 
     def _snapshot_path(

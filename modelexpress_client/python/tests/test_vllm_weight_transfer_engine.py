@@ -413,7 +413,7 @@ def test_weight_transfer_engine_rejects_invalid_version_id(version_id):
 def test_vllm_plugin_registers_weight_transfer_engine(monkeypatch):
     from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
 
-    from modelexpress.engines.vllm import registration
+    from modelexpress_rl.inference.engines.vllm import registration
 
     calls = []
     monkeypatch.setattr(WeightTransferEngineFactory, "_registry", {})
