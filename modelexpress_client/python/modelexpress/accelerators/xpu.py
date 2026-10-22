@@ -83,6 +83,6 @@ class XpuAcceleratorBackend:
         # The classic pool works around a CUDA-specific interaction between
         # expandable-segment allocations and nvidia_peermem pinning; no equivalent
         # hazard is known or has been observed on XPU. Not a proof of absence -
-        # refit/reshard/cuda_pool.py has the failure signature and
-        # docs/ARCHITECTURE.md what would settle it.
+        # modelexpress_rl/refit/reshard/cuda_pool.py has the failure signature and
+        # docs/rl/ARCHITECTURE.md what would settle it.
         return False

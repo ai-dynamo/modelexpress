@@ -344,8 +344,8 @@ class TestAcceleratorCapabilityGates:
         self,
         mock_accelerator_backend_cls,
     ):
-        from modelexpress.refit.reshard import cuda_pool
-        from modelexpress.refit.reshard.alloc_scope import (
+        from modelexpress_rl.refit.reshard import cuda_pool
+        from modelexpress_rl.refit.reshard.alloc_scope import (
             registered_buffer_alloc_scope,
         )
 
@@ -365,8 +365,8 @@ class TestAcceleratorCapabilityGates:
         self,
         mock_accelerator_backend_cls,
     ):
-        from modelexpress.refit.reshard import cuda_pool
-        from modelexpress.refit.reshard.alloc_scope import (
+        from modelexpress_rl.refit.reshard import cuda_pool
+        from modelexpress_rl.refit.reshard.alloc_scope import (
             registered_buffer_alloc_scope,
         )
 
@@ -392,8 +392,8 @@ class TestAcceleratorCapabilityGates:
         self,
         mock_accelerator_backend_cls,
     ):
-        from modelexpress.refit.reshard import cuda_pool
-        from modelexpress.refit.reshard.alloc_scope import (
+        from modelexpress_rl.refit.reshard import cuda_pool
+        from modelexpress_rl.refit.reshard.alloc_scope import (
             registered_buffer_alloc_scope,
         )
 
@@ -424,6 +424,7 @@ class TestAcceleratorCapabilityGates:
             device_id = 0
             target_device = nullcontext()
             p2p_enabled = True
+            is_reload = False
 
         ctx = Ctx()
         ctx.accelerator_backend = mock_accelerator_backend_cls(vmm=False)

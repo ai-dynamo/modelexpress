@@ -24,7 +24,7 @@ env:
 
 jobs:
   admission-slots:
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     outputs:
       slots: ${{ steps.slots.outputs.slots }}
       count: ${{ steps.slots.outputs.count }}

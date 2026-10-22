@@ -1483,7 +1483,7 @@ class TestTargetSharedDraftPrefixes:
         )
         monkeypatch.setattr(
             "modelexpress.engines.vllm.adapter.adopt_hidden_tensors",
-            lambda *_args: None,
+            lambda *_args, **_kwargs: None,
         )
         monkeypatch.setattr(
             "modelexpress.engines.vllm.adapter.collect_module_tensors",
@@ -1500,3 +1500,36 @@ class TestTargetSharedDraftPrefixes:
         assert "layers.0.shared_head.head.weight" in adapter.discover_tensors(
             LoadResult(value=model, model=model)
         )
+
+
+@pytest.mark.parametrize(
+    "class_module,class_name,excluded",
+    [
+        ("vllm.models.kimi_k3.nvidia.ops.latent_moe_tail", "KimiK3LatentMoETailOp", True),
+        ("other_engine", "KimiK3LatentMoETailOp", False),
+        ("vllm.models.kimi_k3.nvidia.ops.latent_moe_tail", "OtherOp", False),
+    ],
+)
+def test_discovery_keeps_exact_k3_collective_state_local(
+    mock_accelerator_backend_cls, class_module, class_name, excluded,
+):
+    """Only the exact K3 operator is excluded; hidden quant tensors still transfer."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    model = nn.Module()
+    model.quant = SimpleNamespace(scale=torch.ones(4))
+    op_cls = type(class_name, (), {"__module__": class_module})
+    op = op_cls()
+    pointers = torch.tensor([1234, 5678], dtype=torch.int64)
+    flags = torch.zeros(8)
+    workspace = torch.zeros(16)
+    op.collective = SimpleNamespace(peer_ptrs=pointers, flags=flags, workspace=workspace)
+    model.tail = {"nested": [op]}
+    registered = adapter.discover_tensors(LoadResult(value=model, model=model))
+    registered_ptrs = {t.data_ptr() for t in registered.values()}
+    assert model.quant.scale.data_ptr() in registered_ptrs
+    for tensor in (pointers, flags, workspace):
+        assert (tensor.data_ptr() in registered_ptrs) is not excluded
+    assert op.collective.peer_ptrs is pointers
+    assert op.collective.flags is flags
+    assert op.collective.workspace is workspace

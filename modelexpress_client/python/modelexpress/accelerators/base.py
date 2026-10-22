@@ -78,7 +78,7 @@ class AcceleratorBackend(Protocol):
         A requirement, not a capability: True where this backend's default torch
         allocator can hand out a range the HCA cannot pin, so registered buffers
         have to be scoped into a classic-allocation pool instead (see
-        ``refit/reshard/cuda_pool.py`` for the hazard and the CUDA
+        ``modelexpress_rl/refit/reshard/cuda_pool.py`` for the hazard and the CUDA
         implementation). False means the default allocator is already suitable.
         """
         ...

@@ -111,6 +111,11 @@ class PostedRead:
     posted_at: float = field(default_factory=time.perf_counter)
 
 
+def _has_memory_range(size: int, addr: int) -> bool:
+    """True when a tensor owns allocated bytes that can be registered and read."""
+    return size > 0 and addr != 0
+
+
 class NixlTransferManager:
     """
     Manages a single NIXL agent and RDMA transfers.
@@ -315,14 +320,34 @@ class NixlTransferManager:
         param.data in vLLM. Do NOT call .contiguous() here - that would
         create copies and RDMA writes would land in the wrong memory.
 
+        We keep a descriptor and a ``self._tensors`` entry for every tensor,
+        including zero-byte or unallocated ones, so the published manifest and
+        the receiver's name match see the same name set. Those tensors are
+        excluded only from NIXL memory registration because they carry no RDMA
+        payload.
+
         We take a shallow copy of the caller's dict (``dict(tensors)``)
-        so ``shutdown()``'s cleanup cannot mutate the caller's
-        container. The tensor VALUES are the same objects as
-        ``param.data``; only the dict container is owned by the manager.
+        so ``shutdown()``'s cleanup cannot mutate the caller's container.
+        The tensor VALUES are the same objects as ``param.data``; only the
+        dict container is owned by the manager.
         """
         self._tensors = dict(tensors)
         tensor_descriptors = []
         for name, tensor in tensors.items():
+            size = tensor.numel() * tensor.element_size()
+            addr = tensor.data_ptr()
+            if not _has_memory_range(size, addr):
+                tensor_descriptors.append(
+                    TensorDescriptor(
+                        name=name,
+                        addr=addr,
+                        size=size,
+                        device_id=self._device_id,
+                        dtype=str(tensor.dtype),
+                    )
+                )
+                continue
+
             if not tensor.is_contiguous():
                 raise RuntimeError(
                     f"Tensor '{name}' is not contiguous. "
@@ -331,8 +356,8 @@ class NixlTransferManager:
             tensor_descriptors.append(
                 TensorDescriptor(
                     name=name,
-                    addr=tensor.data_ptr(),
-                    size=tensor.numel() * tensor.element_size(),
+                    addr=addr,
+                    size=size,
                     device_id=self._device_id,
                     dtype=str(tensor.dtype),
                 )
@@ -380,10 +405,15 @@ class NixlTransferManager:
 
         tensor_descriptors = self._build_tensor_descriptors(tensors)
         registrable_descriptors = [
-            descriptor for descriptor in tensor_descriptors if descriptor.size > 0
+            descriptor
+            for descriptor in tensor_descriptors
+            if _has_memory_range(descriptor.size, descriptor.addr)
         ]
+        registrable_names = {descriptor.name for descriptor in registrable_descriptors}
         registrable_tensors = [
-            tensor for tensor in tensors.values() if tensor.numel() > 0
+            tensor
+            for name, tensor in self._tensors.items()
+            if name in registrable_names
         ]
 
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
@@ -391,6 +421,7 @@ class NixlTransferManager:
         if (
             _pool_reg_enabled()
             and not force_per_tensor
+            and registrable_tensors
             and all(t.is_cuda for t in registrable_tensors)
         ):
             if self._accelerator_backend.supports_pool_reg():
@@ -741,7 +772,8 @@ class NixlTransferManager:
         uncovered = [
             d
             for d in tensor_descriptors
-            if d.addr < base or (d.addr + d.size) > (base + used)
+            if _has_memory_range(d.size, d.addr)
+            and (d.addr < base or (d.addr + d.size) > (base + used))
         ]
         if uncovered:
             logger.warning(
@@ -1112,7 +1144,15 @@ class NixlTransferManager:
                     f"source={src_tensor.dtype!r}, local={local_dtype!r}"
                 )
             matched_tensors += 1
-            if src_tensor.size == 0:
+            if not _has_memory_range(src_tensor.size, src_tensor.addr):
+                if src_tensor.size > 0:
+                    logger.warning(
+                        "Skipping %d bytes of tensor '%s': source published "
+                        "no memory address, so the local tensor keeps its "
+                        "current values",
+                        src_tensor.size,
+                        src_tensor.name,
+                    )
                 continue
             remote_descs.append(
                 (src_tensor.addr, src_tensor.size, src_tensor.device_id)
@@ -1157,11 +1197,20 @@ class NixlTransferManager:
             # recording now: this path falls through to the same return as a
             # clean transfer, and recording here would count the receive twice.
             receive_result = "partial"
+            # Names, not just counts. A local-only tensor keeps its dummy value
+            # while the transfer still reports success, so this line is the only
+            # thing between a partial load and silently wrong output -- and a
+            # count cannot distinguish "48 harmless empty buffers" from "48
+            # weights that never arrived". The strict branch above already
+            # reports names for exactly this reason.
             logger.warning(
                 "Tensor name mismatch between source manifest and local "
-                "registration: %d local-only, %d source-only",
+                "registration: %d local-only (first: %s), "
+                "%d source-only (first: %s)",
                 len(local_only),
+                local_only[:10],
                 len(source_only),
+                source_only[:10],
             )
 
         if matched_tensors == 0:

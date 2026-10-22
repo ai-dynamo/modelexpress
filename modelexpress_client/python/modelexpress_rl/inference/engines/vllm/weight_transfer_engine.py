@@ -86,6 +86,9 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
         )
 
     def __init__(self, config, vllm_config, device, model) -> None:
+        from .. import configure_engine_logging
+
+        configure_engine_logging("vllm")
         super().__init__(config, vllm_config, device, model)
         self._engine_context = VllmGeneratorContext(
             model=model,

@@ -15,7 +15,7 @@ import torch
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 
 from tests.test_refit_bounded_descriptors import harness
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard, PublishedTensor, wrap_rendezvous_blob,
 )
 from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
@@ -96,9 +96,7 @@ def _assert_replica_values(installed, replica, cycle):
 
 def _setup_method(harness, monkeypatch):
     monkeypatch.setattr(
-        transfer_module,
-        "registered_buffer_alloc_scope",
-        lambda _backend: nullcontext(),
+        transfer_module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
     )
     method = LoadTimeTensorNixlUpdateMethod(transfer=harness.transfer)
     if not hasattr(method, "prepare_streaming"):

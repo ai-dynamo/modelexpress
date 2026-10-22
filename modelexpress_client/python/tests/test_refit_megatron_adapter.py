@@ -11,7 +11,7 @@ import grpc
 import pytest
 
 import modelexpress_rl.train.runtime as runtime_module
-from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
+from modelexpress_rl.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress_rl import (
     MegatronTrainerContext,
     ModelExpressTrainerClient,

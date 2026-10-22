@@ -12,7 +12,7 @@ from typing import Any
 import torch
 from modelexpress import p2p_pb2
 from modelexpress.metadata.worker_server import TensorReadLease
-from modelexpress.refit.timing import add_refit_bytes, add_refit_duration
+from modelexpress_rl.refit.timing import add_refit_bytes, add_refit_duration
 
 from ...train import WeightPayloadFormat
 from ..nixl_staged_transfer import _NixlStagedTransfer
