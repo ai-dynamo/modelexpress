@@ -189,6 +189,24 @@ class EngineAdapter:
         """Return whether RDMA must cover every source and target tensor."""
         return False
 
+    def begin_streaming_reload(self, result: LoadResult) -> None:
+        """Enter the engine's layerwise reload before a streaming reload.
+
+        Entered by a strategy whose weights reach the engine through its own
+        load_weights() callbacks, and only when reloading an initialized
+        model. Engines without deferred materialization leave this a no-op.
+        """
+        return None
+
+    def end_streaming_reload(self, result: LoadResult) -> None:
+        """Leave the engine's layerwise reload.
+
+        Always paired with begin_streaming_reload(): from the strategy's
+        finalize() on success and its abort() on failure, so a fallback never
+        starts against a model left half-materialized.
+        """
+        return None
+
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         """Prepare target-side model storage before receiving RDMA weights."""
         return result

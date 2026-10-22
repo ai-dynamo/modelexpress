@@ -886,6 +886,8 @@ impl RegistryBackend for KubernetesRegistryBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kube::CustomResourceExt;
+    use std::collections::BTreeSet;
 
     #[test]
     fn lease_expires_only_after_unchanged_heartbeat_duration() {
@@ -1030,5 +1032,126 @@ mod tests {
     fn sanitize_trims_leading_trailing_dashes() {
         assert!(sanitize_registry_name("-model-").starts_with("model-"));
         assert!(sanitize_registry_name(".model.").starts_with("model-"));
+    }
+
+    #[allow(clippy::expect_used)]
+    /// Variant names of a unit-variant enum, read from its derived `Deserialize` impl.
+    ///
+    /// The derive hands the deserializer the complete variant list, so a new variant shows up
+    /// here without anyone having to extend a hand-written list.
+    fn serde_variant_names<'de, T: serde::Deserialize<'de>>() -> &'static [&'static str] {
+        struct VariantCapture(Option<&'static [&'static str]>);
+
+        impl<'de> serde::Deserializer<'de> for &mut VariantCapture {
+            type Error = serde::de::value::Error;
+
+            fn deserialize_any<V: serde::de::Visitor<'de>>(
+                self,
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(serde::de::Error::custom("not an enum"))
+            }
+
+            fn deserialize_enum<V: serde::de::Visitor<'de>>(
+                self,
+                _name: &'static str,
+                variants: &'static [&'static str],
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                self.0 = Some(variants);
+                Err(serde::de::Error::custom("variants captured"))
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                bytes byte_buf option unit unit_struct newtype_struct seq tuple
+                tuple_struct map struct identifier ignored_any
+            }
+        }
+
+        let mut capture = VariantCapture(None);
+        let _ = T::deserialize(&mut capture);
+        capture
+            .0
+            .expect("type should deserialize as an enum and report its variants")
+    }
+
+    #[allow(clippy::expect_used)]
+    fn crd_string_enum(pointer: &str) -> BTreeSet<String> {
+        let crd = serde_json::to_value(ModelCacheEntry::crd()).expect("CRD should serialize");
+        let schema = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties")
+            .expect("CRD should carry an openAPIV3Schema");
+        schema
+            .pointer(pointer)
+            .and_then(|values| values.as_array())
+            .unwrap_or_else(|| panic!("CRD schema should list an enum at {pointer}"))
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("CRD enum values should be strings")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn crd_provider_enum_matches_every_model_provider() {
+        let variants = serde_variant_names::<ModelProvider>();
+        let providers: Vec<ModelProvider> = variants
+            .iter()
+            .map(|name| {
+                serde_json::from_value(json!(name)).expect("variant name should deserialize")
+            })
+            .collect();
+
+        for provider in &providers {
+            let stored = KubernetesRegistryBackend::provider_str(*provider);
+            assert_eq!(
+                KubernetesRegistryBackend::provider_from_str(stored)
+                    .expect("stored provider string should parse back"),
+                *provider,
+                "provider_from_str does not round-trip {stored:?}"
+            );
+            assert!(
+                ALL_PROVIDERS.contains(provider),
+                "ALL_PROVIDERS is missing {provider:?}"
+            );
+        }
+        assert_eq!(ALL_PROVIDERS.len(), providers.len());
+
+        let written: BTreeSet<String> = providers
+            .iter()
+            .map(|p| KubernetesRegistryBackend::provider_str(*p).to_string())
+            .collect();
+        assert_eq!(
+            written,
+            crd_string_enum("/spec/properties/provider/enum"),
+            "the CRD's spec.provider enum must accept exactly the provider strings the backend writes"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn crd_phase_enum_matches_every_model_status() {
+        let mut written = BTreeSet::from([String::new()]);
+        for name in serde_variant_names::<ModelStatus>() {
+            let status: ModelStatus =
+                serde_json::from_value(json!(name)).expect("variant name should deserialize");
+            let phase = KubernetesRegistryBackend::phase_from_status(status);
+            assert_eq!(
+                KubernetesRegistryBackend::status_from_phase(phase),
+                status,
+                "status_from_phase does not round-trip {phase:?}"
+            );
+            written.insert(phase.to_string());
+        }
+        assert_eq!(
+            written,
+            crd_string_enum("/status/properties/phase/enum"),
+            "the CRD's status.phase enum must accept exactly the phases the backend writes, plus the empty initial phase"
+        );
     }
 }

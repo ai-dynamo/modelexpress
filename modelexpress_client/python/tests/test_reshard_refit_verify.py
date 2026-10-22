@@ -22,8 +22,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from modelexpress import envs  # noqa: E402
-from modelexpress.refit.reshard.rendezvous import (  # noqa: E402
+from modelexpress_rl import envs  # noqa: E402
+from modelexpress_rl.refit.reshard.rendezvous import (  # noqa: E402
     PublishedShard,
     PublishedTensor,
     build_sources,
@@ -32,7 +32,7 @@ from modelexpress.refit.reshard.rendezvous import (  # noqa: E402
     unwrap_rendezvous_blob,
     wrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.verify import (  # noqa: E402
+from modelexpress_rl.refit.reshard.verify import (  # noqa: E402
     published_digest,
     shard_region,
     tensor_digest,

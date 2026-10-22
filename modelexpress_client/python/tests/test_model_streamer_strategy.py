@@ -13,6 +13,7 @@ import torch
 from modelexpress import p2p_pb2
 from modelexpress.adapter import EngineAdapter
 from modelexpress.adapter import StrategyFailed
+from modelexpress.load_strategy import _strategy_phases
 from modelexpress.load_strategy.context import LoadResult
 
 
@@ -143,8 +144,7 @@ class TestModelStreamerLoad:
         model_config.model = model
         return _make_load_context(model_config=model_config)
 
-    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_success_path_s3(self, mock_register):
+    def test_success_path_s3(self):
         model = MagicMock()
         ctx = self._make_ctx_with_uri(model_weights="s3://bucket/model")
         strategy = self._make_strategy()
@@ -163,10 +163,8 @@ class TestModelStreamerLoad:
         assert result.model is model
         mock_stream.assert_called_once_with("s3://bucket/model", ctx, model)
         model.load_weights.assert_called_once()
-        mock_register.assert_called_once_with(result, ctx)
 
-    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_success_path_local_falls_back_to_model(self, mock_register):
+    def test_success_path_local_falls_back_to_model(self):
         """When model_weights is unset, the URI comes from model_config.model."""
         model = MagicMock()
         ctx = self._make_ctx_with_uri(model_weights=None, model="/models/llama")
@@ -184,8 +182,7 @@ class TestModelStreamerLoad:
         assert isinstance(result, LoadResult)
         mock_stream.assert_called_once_with("/models/llama", ctx, model)
 
-    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_success_path_sglang_model_path_without_model(self, mock_register):
+    def test_success_path_sglang_model_path_without_model(self):
         """SGLang ModelConfig exposes model_path, not model."""
         model = MagicMock()
         model_config = SimpleNamespace(
@@ -207,8 +204,7 @@ class TestModelStreamerLoad:
         assert isinstance(result, LoadResult)
         mock_stream.assert_called_once_with("/models/deepseek", ctx, model)
 
-    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_uri_from_env_with_hf_model_as_fallback(self, mock_register):
+    def test_uri_from_env_with_hf_model_as_fallback(self):
         model = MagicMock()
         ctx = self._make_ctx_with_uri(
             model_weights=None, model="Qwen/Qwen2.5-0.5B"
@@ -226,8 +222,7 @@ class TestModelStreamerLoad:
 
         mock_stream.assert_called_once_with("s3://other/path-in-env", ctx, model)
 
-    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_raises_strategy_failed_on_error(self, mock_register):
+    def test_raises_strategy_failed_on_error(self):
         model = MagicMock()
         ctx = self._make_ctx_with_uri(model_weights="s3://bucket/model")
         strategy = self._make_strategy()
@@ -241,10 +236,8 @@ class TestModelStreamerLoad:
                 strategy.load(model, ctx)
 
         assert exc.value.mutated is False
-        mock_register.assert_not_called()
 
-    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_apply_weight_iter_failure_is_mutated(self, mock_register):
+    def test_apply_weight_iter_failure_is_mutated(self):
         model = MagicMock()
         adapter = _FakeAdapter()
         adapter.apply_weight_iter = MagicMock(side_effect=RuntimeError("partial load"))
@@ -261,10 +254,8 @@ class TestModelStreamerLoad:
                     strategy.load(model, ctx)
 
         assert exc.value.mutated is True
-        mock_register.assert_not_called()
 
-    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_after_weight_iter_failure_is_mutated(self, mock_register):
+    def test_after_weight_iter_failure_is_mutated(self):
         model = MagicMock()
         adapter = _FakeAdapter()
         adapter.after_weight_iter_load = MagicMock(side_effect=RuntimeError("post load"))
@@ -277,11 +268,12 @@ class TestModelStreamerLoad:
                 "ModelStreamerStrategy._stream_weights",
                 return_value=iter([("layer.0.weight", torch.randn(4, 4))]),
             ):
+                result = LoadResult(value=model, model=model)
                 with pytest.raises(StrategyFailed, match="post load") as exc:
-                    strategy.load(model, ctx)
+                    with _strategy_phases(strategy, result, ctx):
+                        strategy.load(result, ctx)
 
         assert exc.value.mutated is True
-        mock_register.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@
 #![allow(clippy::result_large_err)] // Match tonic service validation helpers.
 
 use modelexpress_common::grpc::refit::{
-    GetWeightVersionShardManifestRequest, TrainerTensorsMetadata,
+    GetTrainerShardMetadataRequest, TrainerTensorsMetadata,
     refit_worker_service_client::RefitWorkerServiceClient,
 };
 use serde::{Deserialize, Serialize};
@@ -51,28 +51,27 @@ fn volume(shape: &[u64]) -> Result<u64, Status> {
 pub(super) async fn validate_binding(metadata: &TrainerTensorsMetadata) -> Result<(), Status> {
     let endpoint =
         tonic::transport::Endpoint::from_shared(format!("http://{}", metadata.metadata_endpoint))
-            .map_err(|_| invalid("invalid manifest endpoint"))?
+            .map_err(|_| invalid("invalid metadata endpoint"))?
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30));
     let channel = endpoint
         .connect()
         .await
-        .map_err(|_| Status::unavailable("could not connect to binding manifest endpoint"))?;
+        .map_err(|_| Status::unavailable("could not connect to binding metadata endpoint"))?;
     let response = RefitWorkerServiceClient::new(channel)
         .max_decoding_message_size(100 * 1024 * 1024)
-        .get_weight_version_shard_manifest(GetWeightVersionShardManifestRequest {
-            version_id: String::new(),
-            logical_shard_id: metadata.logical_shard_id.clone(),
+        .get_trainer_shard_metadata(GetTrainerShardMetadataRequest {
+            metadata_digest: metadata.logical_shard_id.clone(),
         })
         .await?
         .into_inner();
-    if response.manifest_digest != metadata.logical_shard_id
-        || format!("{:x}", Sha256::digest(&response.manifest)) != metadata.logical_shard_id
+    if response.metadata_digest != metadata.logical_shard_id
+        || format!("{:x}", Sha256::digest(&response.metadata)) != metadata.logical_shard_id
     {
-        return Err(invalid("binding manifest digest does not match"));
+        return Err(invalid("binding metadata digest does not match"));
     }
-    let mut manifest: BoundManifest = serde_json::from_slice(&response.manifest)
-        .map_err(|_| invalid("invalid binding tensor manifest"))?;
+    let mut manifest: BoundManifest = serde_json::from_slice(&response.metadata)
+        .map_err(|_| invalid("invalid binding tensor metadata"))?;
     manifest.tensors.sort_by(|a, b| a.name.cmp(&b.name));
     let mut total_bytes = 0_u64;
     for tensor in &mut manifest.tensors {

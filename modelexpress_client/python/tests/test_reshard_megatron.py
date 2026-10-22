@@ -1,251 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from importlib import import_module
+import json
 
 import pytest
 import torch
-from modelexpress.refit.reshard.rendezvous import (
-    MxReshardRendezvous,
+from modelexpress_rl.refit.reshard.rendezvous import (
     unwrap_rendezvous_blob,
-)
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, plan_transfer
-from modelexpress_rl.inference.reshard.megatron import (
-    MegatronReshardReceiver,
-    MegatronTargetLayout,
-    MegatronTargetSpec,
-    lower_megatron_target,
 )
 from modelexpress_rl.train.engines.megatron import (
     MegatronAliasInput,
-    MegatronPublishedTensorSpec,
     MegatronTensorSpec,
     build_hf_aliases,
     build_megatron_reshard_manifest,
-    publish_megatron_reshard_view,
-    publish_registered_shard_table,
 )
-
-
-def _bf16_sources() -> tuple[dict[str, SourceInfo], list[torch.Tensor]]:
-    tensors = [
-        torch.zeros((8, 8), dtype=torch.bfloat16),
-        torch.zeros((8, 8), dtype=torch.bfloat16),
-        torch.zeros((8, 8), dtype=torch.bfloat16),
-        torch.zeros((8, 8), dtype=torch.bfloat16),
-        torch.zeros((8,), dtype=torch.bfloat16),
-    ]
-    sources = {
-        "expert_fc1": SourceInfo(
-            (16, 8),
-            torch.bfloat16,
-            2,
-            [
-                Shard((0, 0), (8, 8), "tp0", tensors[0].data_ptr(), 2),
-                Shard((8, 0), (8, 8), "tp1", tensors[1].data_ptr(), 2),
-            ],
-        ),
-        "expert_fc2": SourceInfo(
-            (8, 16),
-            torch.bfloat16,
-            2,
-            [
-                Shard((0, 0), (8, 8), "tp0", tensors[2].data_ptr(), 2),
-                Shard((0, 8), (8, 8), "tp1", tensors[3].data_ptr(), 2),
-            ],
-        ),
-        "norm": SourceInfo(
-            (8,),
-            torch.bfloat16,
-            2,
-            [Shard((0,), (8,), "tp0", tensors[4].data_ptr(), 2)],
-        ),
-    }
-    return sources, tensors
-
-
-def _specs() -> list[MegatronTargetSpec]:
-    return [
-        MegatronTargetSpec(
-            "expert_fc1",
-            "expert_column",
-            (16, 8),
-            torch.bfloat16,
-            shard_axis=0,
-            descriptor_extras={"expert_layout": "grouped"},
-        ),
-        MegatronTargetSpec(
-            "expert_fc2",
-            "expert_row",
-            (8, 16),
-            torch.bfloat16,
-            shard_axis=1,
-            descriptor_extras={"expert_layout": "grouped"},
-        ),
-        MegatronTargetSpec("norm", "replicated", (8,), torch.bfloat16),
-    ]
-
-
-@pytest.mark.parametrize(
-    ("tp_size", "tp_rank", "expected_bytes", "expected_segments"),
-    [(2, 1, 272, 3), (4, 2, 144, 10)],
-)
-def test_megatron_target_lowers_to_destination_owned_bytes(
-    tp_size: int,
-    tp_rank: int,
-    expected_bytes: int,
-    expected_segments: int,
-):
-    sources, keepalive = _bf16_sources()
-    capture, layouts = lower_megatron_target(
-        _specs(), MegatronTargetLayout(tp_size=tp_size, tp_rank=tp_rank)
-    )
-
-    plan = plan_transfer(capture, sources)
-
-    assert not plan.fallback
-    assert plan.bytes_planned() == expected_bytes
-    assert len(plan.segments) == expected_segments
-    assert layouts["expert_fc1"][0] == (16 // tp_size, 8)
-    assert layouts["expert_fc2"][0] == (8, 16 // tp_size)
-    assert layouts["norm"][0] == (8,)
-    assert all(tensor.data_ptr() for tensor in keepalive)
-
-
-def test_leading_axis_experts_preserve_expert_dimension():
-    capture, layouts = lower_megatron_target(
-        [
-            MegatronTargetSpec(
-                "fc1",
-                "expert_column",
-                (4, 16, 8),
-                torch.bfloat16,
-                descriptor_extras={"expert_layout": "leading_axis"},
-            ),
-            MegatronTargetSpec(
-                "fc2",
-                "expert_row",
-                (4, 8, 16),
-                torch.bfloat16,
-                descriptor_extras={"expert_layout": "leading_axis"},
-            ),
-        ],
-        MegatronTargetLayout(tp_size=4, tp_rank=3),
-    )
-
-    assert layouts == {
-        "fc1": ((4, 4, 8), torch.bfloat16),
-        "fc2": ((4, 8, 4), torch.bfloat16),
-    }
-    assert capture.copies[0].op_chain == (("narrow", (1, 12, 4), ()),)
-    assert capture.copies[1].op_chain == (("narrow", (2, 12, 4), ()),)
-
-
-def test_non_divisible_target_geometry_fails_closed():
-    with pytest.raises(ValueError, match="not divisible"):
-        lower_megatron_target(
-            [
-                MegatronTargetSpec(
-                    "column",
-                    "column",
-                    (10, 8),
-                    torch.bfloat16,
-                )
-            ],
-            MegatronTargetLayout(tp_size=4, tp_rank=0),
-        )
-
-
-@pytest.mark.parametrize("extent", [4.5, True])
-def test_target_spec_rejects_non_integral_global_shape(extent):
-    with pytest.raises(ValueError, match="positive integer extents"):
-        MegatronTargetSpec("column", "column", (extent, 8), torch.bfloat16)
-
-
-@pytest.mark.parametrize(
-    ("tp_size", "tp_rank", "message"),
-    [
-        (2.5, 0, "tp_size must be an integer"),
-        (True, 0, "tp_size must be an integer"),
-        (2, 0.5, "tp_rank must be an integer"),
-        (2, False, "tp_rank must be an integer"),
-    ],
-)
-def test_target_layout_rejects_non_integral_geometry(tp_size, tp_rank, message):
-    with pytest.raises(ValueError, match=message):
-        MegatronTargetLayout(tp_size=tp_size, tp_rank=tp_rank)
-
-
-def test_legacy_megatron_publisher_imports_remain_available():
-    legacy_aliases = import_module(
-        "modelexpress.refit.reshard.megatron_aliases"
-    )
-    legacy_publisher = import_module(
-        "modelexpress.refit.reshard.megatron_publisher"
-    )
-
-    assert legacy_aliases.MegatronAliasInput is MegatronAliasInput
-    assert legacy_aliases.build_hf_aliases is build_hf_aliases
-    assert (
-        legacy_publisher.publish_registered_shard_table
-        is publish_registered_shard_table
-    )
-
-
-def test_receiver_seam_validates_manifest_and_invokes_installer():
-    installed = []
-    receiver = object.__new__(MegatronReshardReceiver)
-    receiver._target_specs = _specs()
-    receiver._target_layout = MegatronTargetLayout(tp_size=4, tp_rank=0)
-    receiver._install_native = installed.append
-    manifest = [
-        ("expert_fc1", torch.bfloat16, (16, 8)),
-        ("expert_fc2", torch.bfloat16, (8, 16)),
-        ("norm", torch.bfloat16, (8,)),
-    ]
-
-    capture, layouts = receiver._capture(manifest)
-    buffers = {
-        name: torch.empty(shape, dtype=dtype)
-        for name, (shape, dtype) in layouts.items()
-    }
-    receiver._install(buffers)
-
-    assert len(capture.copies) == 3
-    assert installed == [buffers]
-
-
-def test_receiver_seam_rejects_stale_manifest_geometry():
-    receiver = object.__new__(MegatronReshardReceiver)
-    receiver._target_specs = _specs()
-    receiver._target_layout = MegatronTargetLayout(tp_size=2, tp_rank=0)
-
-    with pytest.raises(RuntimeError, match="disagrees"):
-        receiver._capture(
-            [
-                ("expert_fc1", torch.bfloat16, (8, 8)),
-                ("expert_fc2", torch.bfloat16, (8, 16)),
-                ("norm", torch.bfloat16, (8,)),
-            ]
-        )
 
 
 class _Manager:
     agent_name = "trainer-r3"
     nixl_metadata = b"agent-metadata"
-
-
-class _PublishClient:
-    def __init__(self):
-        self.worker = None
-
-    def publish_metadata(self, _identity, worker, _worker_id):
-        self.worker = worker
-        return "source-id"
-
-    def update_status(self, **_kwargs):
-        return True
 
 
 def test_manifest_builder_reuses_registered_tensor_addresses():
@@ -273,6 +46,13 @@ def test_manifest_builder_reuses_registered_tensor_addresses():
     )
 
     payload = unwrap_rendezvous_blob(manifest.blob)
+    stable = json.loads(manifest.blob)
+    assert stable["tensor_count"] == 1
+    assert stable["total_bytes"] == tensor.numel() * tensor.element_size()
+    assert "digest" not in stable["tensors"][0]["shards"][0]
+    assert manifest.blob == json.dumps(
+        stable, sort_keys=True, separators=(",", ":")
+    ).encode()
     assert (payload.agent_metadata, payload.agent_name, payload.metadata_endpoint) == (
         b"agent-metadata",
         "trainer-r3",
@@ -280,40 +60,6 @@ def test_manifest_builder_reuses_registered_tensor_addresses():
     )
     assert payload.tensors[0].shards[0].addr == tensor.data_ptr()
     assert payload.tensors[0].shards[0].shard_offset == (8, 0)
-
-
-def test_existing_reshard_publisher_remains_compatible():
-    client = _PublishClient()
-    rendezvous = MxReshardRendezvous(
-        client,
-        role="trainer",
-        rank=3,
-        model_name="model",
-        worker_id="worker-3",
-    )
-    tensor = torch.zeros((8, 8), dtype=torch.bfloat16)
-
-    try:
-        source_id = publish_megatron_reshard_view(
-            manager=_Manager(),
-            rendezvous=rendezvous,
-            tensors={"column": tensor},
-            specs=[
-                MegatronPublishedTensorSpec(
-                    name="column",
-                    global_shape=(16, 8),
-                    shard_axis=0,
-                    local_shard_range=(8, 16),
-                )
-            ],
-            metadata_endpoint="10.0.0.3:19003",
-        )
-    finally:
-        rendezvous.close()
-
-    assert source_id == "source-id"
-    payload = unwrap_rendezvous_blob(client.worker.nixl_metadata)
-    assert payload.tensors[0].shards[0].addr == tensor.data_ptr()
 
 
 def test_manifest_builder_rejects_duplicate_tensor_names():

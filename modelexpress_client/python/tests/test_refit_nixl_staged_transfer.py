@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from modelexpress.refit.reshard.rendezvous import structural_manifest_digest
 import hashlib
 import ctypes
 from contextlib import nullcontext
@@ -10,25 +9,26 @@ from types import MappingProxyType
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress_rl.inference.plan import StreamingSettings
+from modelexpress_rl.version import MeshIdentity
 
 import pytest
 import torch
-from modelexpress import envs
+from modelexpress_rl import envs
 from modelexpress import p2p_pb2
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     unwrap_rendezvous_blob,
     wrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.slice_plan import LogicalRead, SourceBuffer, Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, LogicalTransferPlan, plan_transfer
-from modelexpress.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.slice_plan import LogicalRead, SourceBuffer, Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, LogicalTransferPlan, plan_transfer
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     RecordedCopy,
 )
-from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.adapter import TrainerSourceShard
 from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 from modelexpress_rl.inference.nixl_staged_transfer import (
@@ -45,6 +45,20 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
 )
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot, ResolvedTrainerSource
 from tests.test_refit_bounded_descriptors import harness, _check_values
+
+
+def _bind_test_execution(transfer, prepared) -> None:
+    transfer._weight_update_plan = None
+    descriptors = []
+    for index, batch in enumerate(prepared.batches):
+        recv, convert, full = transfer._carve_bounded(
+            batch, transfer._staging_arenas[index % len(transfer._staging_arenas)]
+        )
+        descriptors.append(tuple(transfer._descriptors(
+            batch.transfer_plan, recv, full, convert, source_binding=prepared.source_binding
+        )))
+    object.__setattr__(prepared, "descriptors", tuple(descriptors))
+    object.__setattr__(prepared, "descriptors_reused", (False,) * len(descriptors))
 
 
 def _bind_plan(plan, sources) -> tuple[LogicalTransferPlan, _SourceBinding]:
@@ -214,20 +228,21 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, pack, pad
 
     prepared = _prepared_bounded(batches, {"w": source}, Transport())
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
+    transfer._weight_update_plan = None
     transfer._closed = False
     transfer._active = prepared
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
-    transfer._bounded_arena = torch.empty(arena_bytes, dtype=torch.uint8)
-    transfer._bounded_arena.fill_(255)
+    arena = torch.full((arena_bytes,), 255, dtype=torch.uint8)
+    transfer._staging_arenas = [arena]
+    _bind_test_execution(transfer, prepared)
     metrics = {}
     installed = {}
     addresses = []
     for tensors in transfer.iter_bounded(prepared, metrics):
         addresses.append(next(iter(tensors.values())).data_ptr())
         installed.update({name: value.clone() for name, value in tensors.items()})
-    assert set(addresses) == {transfer._bounded_arena.data_ptr()}
+    assert set(addresses) == {arena.data_ptr()}
     for name, (_, dtype) in layout.items():
         expected = source_tensor.to(dtype)
         if padded:
@@ -268,7 +283,7 @@ def _manifest(
 
 
 @pytest.mark.parametrize(
-    "failure", [None, "registration", "cleanup", "metadata", "capture", "malformed", "post", "await", "replica"]
+    "failure", [None, "registration", "cleanup", "metadata", "capture", "malformed", "post", "await", "replica", "post_replica", "await_replica"]
 )
 @pytest.mark.parametrize("harness", [None, StreamingSettings(1024)], indirect=True)
 @pytest.mark.parametrize("diagnostic", [None, "plan"])
@@ -294,8 +309,8 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
                                        shard_offset=(0, 0), shape=(4, 4))],
             ) for name, value in harness.sources.items()],
         )
-        return TrainerSourceSnapshot("mesh", 1, (TrainerSourceShard(
-            "slot", agent, hashlib.sha256(blob).hexdigest(), f"{agent}:19000", blob, structural_manifest_digest(blob),
+        return TrainerSourceSnapshot(MeshIdentity("mesh", 1), (TrainerSourceShard(
+            "slot", agent, hashlib.sha256(blob).hexdigest(), f"{agent}:19000", blob,
         ),))
 
     source = snapshot()
@@ -342,8 +357,8 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
                 assert not manager.registered
         update(source)
         setup_calls = [harness.events.count(event) for event in ("register", "connect:source")]
-        if failure in ("post", "await"):
-            operation = "post_reads" if failure == "post" else "await_reads"
+        if failure in ("post", "await", "post_replica", "await_replica"):
+            operation = "post_reads" if failure.startswith("post") else "await_reads"
 
             def fail_read(*_args):
                 raise RuntimeError("read failed")
@@ -352,11 +367,11 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
                 fault.setattr(type(harness.transports[-1]), operation, fail_read)
                 with pytest.raises(RuntimeError, match="read failed"):
                     update(source)
-        if failure == "replica":
+        if failure in ("replica", "post_replica", "await_replica"):
             harness.sources.update({name: value.clone() + 10 for name, value in harness.sources.items()})
             source = snapshot("replica")
         if failure in ("metadata", "capture", "malformed"):
-            blob = source.shards[0].manifest
+            blob = source.shards[0].metadata
             generation = 2
             if failure == "malformed":
                 blob = b"malformed"
@@ -370,10 +385,9 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
                     [replace(t, name="renamed." + t.name) for t in payload.tensors]
                     if capture_failure else payload.tensors,
                 )
-            bad = replace(source, mesh_generation=generation, shards=(replace(
+            bad = replace(source, mesh_identity=replace(source.mesh_identity, generation=generation), shards=(replace(
                 source.shards[0], worker_id="replacement" if failure == "metadata" else source.shards[0].worker_id,
-                manifest=blob, manifest_digest=hashlib.sha256(blob).hexdigest(),
-                structural_digest=structural_manifest_digest(blob) if failure != "malformed" else "invalid",
+                metadata=blob, stable_metadata_digest=hashlib.sha256(blob).hexdigest(),
             ),))
             reads = sum(len(t.posts) for t in harness.transports)
             registrations = {key: value.data_ptr() for key, value in manager.registered.items()}
@@ -392,8 +406,10 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
             for value in harness.sources.values():
                 value.add_(1)
             update(source)
+        if failure in (None, "post", "await", "replica", "post_replica", "await_replica"):
+            assert len(harness.captures) == 1
+            assert len(harness.transports) == (1 if failure is None else 2)
         if failure is None:
-            assert len(harness.captures) == len(harness.transports) == 1
             assert [harness.events.count(event) for event in ("register", "connect:source")] == setup_calls
     finally:
         method.close()
@@ -608,7 +624,7 @@ def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer
 def test_staged_verification_rejects_missing_or_mismatched_digest():
     tensor = torch.arange(64, dtype=torch.int32)
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
+    transfer._weight_update_plan = None
     transfer._recv_buffers = {"weight": tensor}
     transfer._convert_buffers = {}
     transfer._full_buffers = {}
@@ -657,7 +673,7 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
     assert calls == ["initialize", "shutdown"]
 
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
+    transfer._weight_update_plan = None
     transfer._manager = _Manager()
     transfer._owns_manager = True
     transfer._closed = False
@@ -815,7 +831,7 @@ def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch):
             calls.append(("remove", agent_name))
 
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
+    transfer._weight_update_plan = None
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
     transfer._timeout = 30.0
@@ -867,7 +883,7 @@ def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch):
 def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch):
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
+    transfer._weight_update_plan = None
     transfer._device = torch.device("cpu")
     buffers = {}
     layout = {"weight": ((4,), torch.float32)}
@@ -929,13 +945,14 @@ def test_double_buffered_iteration_alternates_arenas_and_prefetches(monkeypatch)
 
     prepared = _prepared_bounded(batches, {"w": source}, Transport())
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
+    transfer._weight_update_plan = None
     transfer._closed = False
     transfer._active = prepared
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
     arenas = [torch.empty(256, dtype=torch.uint8) for _ in range(2)]
     transfer._staging_arenas = arenas
+    _bind_test_execution(transfer, prepared)
     transfer._staging_registrations = []
     metrics = {}
     addresses = []
@@ -1008,12 +1025,13 @@ def test_abandoned_double_buffered_iteration_drains_the_prefetched_read(monkeypa
 
     prepared = _prepared_bounded(batches, {"w": source}, Transport())
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
+    transfer._weight_update_plan = None
     transfer._closed = False
     transfer._active = prepared
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
     transfer._staging_arenas = [torch.empty(256, dtype=torch.uint8) for _ in range(2)]
+    _bind_test_execution(transfer, prepared)
     transfer._staging_registrations = []
     iterator = transfer.iter_bounded(prepared, {})
     next(iterator)
@@ -1141,11 +1159,10 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
     )
     layout = {"layer.weight": ((4,), torch.float32)}
     snapshot = TrainerSourceSnapshot(
-        "mesh",
-        1,
+        MeshIdentity("mesh", 1),
         (TrainerSourceShard(
             "slot", "worker", hashlib.sha256(manifest).hexdigest(),
-            "source:19000", manifest, structural_manifest_digest(manifest),
+            "source:19000", manifest,
         ),),
     )
     try:
@@ -1242,13 +1259,14 @@ def test_failed_prefetch_drain_is_reported_not_swallowed(monkeypatch):
     drained = []
     prepared = _prepared_bounded(batches, {"w": source}, Transport())
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
+    transfer._weight_update_plan = None
     transfer._closed = False
     transfer._active = prepared
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
     # Two arenas, so batch 1's READ is posted before batch 0 is yielded.
     transfer._staging_arenas = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
+    _bind_test_execution(transfer, prepared)
 
     iterator = transfer.iter_bounded(prepared, {})
     next(iterator)
@@ -1298,40 +1316,18 @@ def test_failed_prefetch_drain_does_not_mask_a_caller_error(monkeypatch):
 
     prepared = _prepared_bounded(batches, {"w": source}, Transport())
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._descriptor_cache = None
+    transfer._weight_update_plan = None
     transfer._closed = False
     transfer._active = prepared
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
     transfer._staging_arenas = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
+    _bind_test_execution(transfer, prepared)
 
     iterator = transfer.iter_bounded(prepared, {})
     next(iterator)
     with pytest.raises(RuntimeError, match="the install failed"):
         iterator.throw(RuntimeError("the install failed"))
-
-
-def test_bounded_batch_layouts_are_named_however_they_are_built():
-    """Readers use both `.full` and `[0]`, so construction style must not matter.
-
-    The annotation alone does not enforce this: a plain 3-tuple or a
-    dataclasses.replace satisfies positional access and breaks attribute
-    access, which fails at only one of the two call sites.
-    """
-    recv = {"a.weight": ((4,), torch.float32)}
-    convert: dict = {}
-    full = {"w": ((4,), torch.float32)}
-
-    built = transfer_module._StreamingBatch(
-        CaptureResult(copies=[]), LogicalTransferPlan(), (recv, convert, full), 256
-    )
-    assert isinstance(built.layouts, transfer_module._StagingLayouts)
-    assert built.layouts.recv is built.layouts[0] is recv
-    assert built.layouts.full is built.layouts[2] is full
-
-    swapped = replace(built, layouts=(recv, convert, {}))
-    assert isinstance(swapped.layouts, transfer_module._StagingLayouts)
-    assert swapped.layouts.full == {}
 
 
 @pytest.mark.parametrize("enabled", [None, False, True])
@@ -1357,7 +1353,7 @@ def test_generator_layout_debug_assertion(harness, monkeypatch, enabled):
         return capture, harness.layout
 
     harness.prepare()
-    source = ResolvedTrainerSource(harness.transfer.cached_trainer_source())
+    source = ResolvedTrainerSource(harness.snapshot)
     transfer = _NixlStagedTransfer(
         agent_name="debug-target",
         device_id=0,
@@ -1381,7 +1377,7 @@ def test_generator_layout_debug_assertion(harness, monkeypatch, enabled):
     if enabled:
         with pytest.raises(AssertionError, match="generator layout changed"):
             method.prepare(version=None, source=source)
-        assert transfer.cached_trainer_source() is None
+        assert transfer._binding is None
     else:
         prepared = method.prepare(version=None, source=source)
         method.release(prepared)
@@ -1405,38 +1401,20 @@ def test_generator_layout_debug_requires_adapter_callback(harness, monkeypatch):
     assert harness.events == events
 
 
-def test_changed_agent_metadata_resets_before_retry(harness, monkeypatch):
+def test_changed_agent_metadata_reconnects(harness, monkeypatch):
+    from tests.test_refit_bounded_descriptors import _agent_registration_snapshot
+
     harness.collect(harness.prepare())
     transfer = harness.transfer
-    old = transfer.cached_trainer_source()
-    shard = old.shards[0]
-    payload = unwrap_rendezvous_blob(shard.manifest)
-    blob = wrap_rendezvous_blob(
-        b"replacement",
-        payload.agent_name,
-        payload.metadata_endpoint,
-        payload.tensors,
-    )
-    current = replace(
-        old,
-        shards=(
-            replace(
-                shard,
-                manifest=blob,
-                manifest_digest=hashlib.sha256(blob).hexdigest(),
-                structural_digest=structural_manifest_digest(blob),
-            ),
-        ),
+    current = _agent_registration_snapshot(
+        harness, generation=2, token=b"source:replacement"
     )
     monkeypatch.setattr(transfer._manager, "add_remote_agent", lambda _: "source")
-
-    def prepare():
-        return transfer.prepare(
-            manifests=[blob],
+    for _ in range(2):
+        prepared = transfer.prepare(
+            manifests=[shard.metadata for shard in current.shards],
             trainer_snapshot=current,
         )
-
-    with pytest.raises(RuntimeError, match="metadata changed"):
-        prepare()
-    assert not transfer._loaded_agent_metadata
-    harness.collect(prepare())
+        harness.collect(prepared)
+    assert transfer._loaded_agent_metadata["source"] == b"source:replacement"
+    assert len(harness.captures) == 2

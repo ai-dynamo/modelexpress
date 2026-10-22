@@ -359,9 +359,6 @@ def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
             method_kwargs.update(kwargs)
             super().__init__({WeightSource.GENERATOR, WeightSource.TRAINER})
 
-        def cached_trainer_source(self) -> None:
-            return None
-
     monkeypatch.setattr(runtime_module, "LoadTimeTensorNixlUpdateMethod", Method)
 
     runtime = initialize_generator_runtime(
