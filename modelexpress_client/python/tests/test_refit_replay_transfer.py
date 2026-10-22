@@ -19,7 +19,7 @@ from tests.test_refit_bounded_descriptors import harness
 def test_ordered_sources_survive_warm_reuse(harness, monkeypatch, verify):
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", str(int(verify)))
     monkeypatch.setattr(
-        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+        module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
     )
     h = harness
     h.transfer._device = torch.device("cpu")
@@ -55,7 +55,7 @@ def test_replay_digest_verification_rejects_missing_or_stale_digests(
 ):
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
     monkeypatch.setattr(
-        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+        module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
     )
     h = harness
     h.transfer._device = torch.device("cpu")
@@ -98,7 +98,7 @@ def test_replay_scratch_analysis_is_reused_until_generation_changes(harness, mon
     from unittest.mock import Mock
 
     monkeypatch.setattr(
-        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+        module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
     )
     h = harness
     h.capture.source_replay = True
@@ -152,7 +152,7 @@ def test_replay_abandonment_drains_prefetched_read(harness):
 @pytest.mark.parametrize("replay", [False, True])
 def test_bounded_receive_clears_used_arena_once_per_batch(harness, monkeypatch, replay):
     monkeypatch.setattr(
-        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+        module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
     )
     h = harness
     h.capture.source_replay = replay

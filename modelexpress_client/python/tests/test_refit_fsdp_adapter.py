@@ -454,7 +454,7 @@ def test_arena_alloc_scope_follows_the_arena_device(monkeypatch):
     xpu1 = torch.device("xpu:1")
     assert FSDPTrainerAdapter._registered_alloc_scope(xpu1) is scope
     backend_for.assert_called_once_with(xpu1)
-    scope_for.assert_called_once_with(backend)
+    scope_for.assert_called_once_with(backend, device=xpu1)
 
 
 def test_device_arenas_are_allocated_inside_their_alloc_scope(dist_ready, monkeypatch):
@@ -513,6 +513,35 @@ def test_xpu_device_snapshot_is_fenced_on_the_arena_device(dist_ready):
             assert served.data_ptr() == addresses
         addresses = served.data_ptr()
     assert len(manager.registered) == 1
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="requires two CUDA devices",
+)
+def test_cuda_arena_uses_classic_pool_when_another_device_is_current(dist_ready):
+    from modelexpress_rl.refit.reshard import cuda_pool
+
+    manager = _Manager()
+    arena_device = torch.device("cuda", 0)
+    previous = torch.cuda.current_device()
+    torch.cuda.set_device(1)
+    try:
+        state = {"w": torch.ones(64, 64, device=arena_device)}
+        _stage(_adapter(manager), state, TrainerStagingMode.COPY_TO_DEVICE).publish_ready.wait()
+    finally:
+        torch.cuda.set_device(previous)
+
+    (served,) = manager.registered[0].values()
+    assert served.device == arena_device
+    pools = [
+        segment.get("segment_pool_id")
+        for segment in torch.cuda.memory_snapshot()
+        if segment["address"]
+        <= served.data_ptr()
+        < segment["address"] + segment["total_size"]
+    ]
+    assert pools == [tuple(cuda_pool._get_pool().id)]
 
 
 def test_host_staging_without_cuda_rejects_before_allocation(dist_ready, monkeypatch):

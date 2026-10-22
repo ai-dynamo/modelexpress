@@ -378,15 +378,20 @@ class TestAcceleratorCapabilityGates:
 
         @contextmanager
         def fake_use_mem_pool(pool, device=None):
-            entered.append(pool)
+            entered.append((pool, device))
             yield
 
+        cuda1 = torch.device("cuda", 1)
         with patch.object(cuda_pool, "_get_pool", return_value="pool"):
             with patch.object(torch.cuda, "use_mem_pool", fake_use_mem_pool):
                 with registered_buffer_alloc_scope(backend):
                     pass
+                with registered_buffer_alloc_scope(backend, device=cuda1):
+                    pass
 
-        assert entered == ["pool"]
+        # The pool applies to one device: the buffer's device when given,
+        # otherwise the current one.
+        assert entered == [("pool", None), ("pool", cuda1)]
 
     def test_registered_buffer_scope_rejects_an_unimplemented_backend_pool(
         self,

@@ -317,7 +317,10 @@ does not: CUDA uses the classic-`cudaMalloc` pool in
 `modelexpress_rl/refit/reshard/cuda_pool.py` because its caching allocator under
 `expandable_segments:True` can return VMM ranges that register successfully but
 fail during RDMA WRITE when `nvidia_peermem` cannot pin the underlying pages (that
-module's docstring records the exact failure signature). XPU uses its normal
+module's docstring records the exact failure signature). A CUDA pool scope
+applies to one device, so callers pass the device the buffers are allocated on;
+without it the scope covers only the current device, and an allocation on any
+other device silently comes from the default caching allocator. XPU uses its normal
 allocator because no equivalent hazard is known or has been observed on XPU.
 Successful XPU registration does not prove the WRITE-time hazard absent, so ruling
 it out would take a real RDMA write into an XPU buffer allocated under an

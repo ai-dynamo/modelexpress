@@ -161,7 +161,7 @@ def _persistent_installer(monkeypatch, model, *, quantized=False):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(
-        transfer_module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+        transfer_module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
     )
     return _cpu_installer(
         model,

@@ -622,7 +622,7 @@ class _NixlStagedTransfer:
         backend = self._backend
         if backend is None:
             return nullcontext()
-        return registered_buffer_alloc_scope(backend)
+        return registered_buffer_alloc_scope(backend, device=self._device)
 
     def _invalidate_descriptors(self) -> None:
         self._descriptor_caches = None

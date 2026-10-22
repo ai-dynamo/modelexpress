@@ -112,12 +112,11 @@ preserves the per-tensor dtype overrides above and registers its persistent CPU
 buffers once. Copy completion is fenced before publication on every accelerator
 device the snapshot touches, using that device's own current stream rather than
 the process current device. `COPY_TO_DEVICE` allocates each arena in the
-registered-buffer scope selected by its own device's `AcceleratorBackend`: the
-classic-allocation pool on CUDA and the default allocator on XPU. The CUDA pool
-applies only to the current CUDA device, so keep each trainer rank's current
-device set to the device holding its shards; an arena allocated on another CUDA
-device falls back to the default caching allocator. The served snapshot and its
-registration remain live until version retirement. Conversion can still require temporary device workspace; host staging eliminates the
+registered-buffer scope of its own device, selected by that device's
+`AcceleratorBackend`: the classic-allocation pool on CUDA and the default
+allocator on XPU. The scope applies to the arena's device even when another
+device is current. The served snapshot and its registration remain live until
+version retirement. Conversion can still require temporary device workspace; host staging eliminates the
 persistent wire-format device copy, not every transient allocation. Support for
 arbitrary conversion plugins remains adapter-specific.
 

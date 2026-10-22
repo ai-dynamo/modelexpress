@@ -99,11 +99,18 @@ def _get_pool() -> "torch.cuda.MemPool":
 
 
 @contextmanager
-def classic_cuda_alloc() -> Iterator[None]:
-    """Scope CUDA allocations into the classic-``cudaMalloc`` MemPool.
+def classic_cuda_alloc(
+    device: "torch.device | str | int | None" = None,
+) -> Iterator[None]:
+    """Scope CUDA allocations on ``device`` into the classic-``cudaMalloc`` MemPool.
 
     Use when the resulting tensor's address must be a contiguous ``cudaMalloc``
-    block - required for NIXL-registered buffers (see module docstring)."""
+    block - required for NIXL-registered buffers (see module docstring).
+
+    The pool applies only to allocations on ``device``; ``None`` means the
+    current CUDA device. Pass the device the buffer is allocated on whenever it
+    may differ from the current one, or the allocation silently falls back to
+    the default caching allocator."""
     pool = _get_pool()
-    with torch.cuda.use_mem_pool(pool):
+    with torch.cuda.use_mem_pool(pool, device=device):
         yield

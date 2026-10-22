@@ -16,11 +16,15 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, ContextManager
 
 if TYPE_CHECKING:
+    import torch
+
     from modelexpress.accelerators import AcceleratorBackend
 
 
 def registered_buffer_alloc_scope(
     backend: "AcceleratorBackend",
+    *,
+    device: "torch.device | None" = None,
 ) -> ContextManager[None]:
     """Return the allocation scope ``backend`` needs for NIXL-registered buffers.
 
@@ -30,6 +34,10 @@ def registered_buffer_alloc_scope(
     here rather than a fallback. CUDA is the only dedicated pool implementation;
     fail clearly if another backend requests one instead of silently using CUDA
     code.
+
+    ``device`` is the device the buffers are allocated on. A pool scope applies
+    to one device, so pass it whenever it may differ from the backend's current
+    device; ``None`` means the current device.
     """
     if backend.requires_classic_alloc_pool():
         if backend.name != "cuda":
@@ -44,7 +52,7 @@ def registered_buffer_alloc_scope(
         # so importing anything under refit.reshard loads that module anyway.
         from modelexpress_rl.refit.reshard.cuda_pool import classic_cuda_alloc
 
-        return classic_cuda_alloc()
+        return classic_cuda_alloc(device)
     return nullcontext()
 
 

@@ -292,7 +292,7 @@ def test_warm_descriptors_still_transfer_new_values(
 def test_full_copy_reuses_workspace_until_reset(harness, monkeypatch) -> None:
     monkeypatch.setattr(harness.transfer, "_device", torch.device("cpu"))
     monkeypatch.setattr(
-        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+        module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
     )
     first = harness.prepare()
     harness.transfer.stage(first)
@@ -322,7 +322,7 @@ def test_full_copy_reuses_workspace_until_reset(harness, monkeypatch) -> None:
 def test_native_conversion_composes_with_transfer(harness, native_conversion, pack, monkeypatch):
     monkeypatch.setattr(harness.transfer, "_device", torch.device("cpu"))
     monkeypatch.setattr(
-        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+        module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
     )
     prepared = harness.prepare()
     if harness.streaming is None:
@@ -629,7 +629,7 @@ def _collect_agent_registration(harness, prepared) -> dict:
 def test_next_generation_replaces_agent_registration_before_read(harness, monkeypatch) -> None:
     monkeypatch.setattr(harness.transfer, "_device", torch.device("cpu"))
     monkeypatch.setattr(
-        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+        module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
     )
     first = _agent_registration_snapshot(harness, generation=1)
     _check_values(harness, _collect_agent_registration(harness, _prepare_agent_registration(harness, first)), check_padding=harness.streaming is not None)
@@ -691,7 +691,7 @@ def test_native_replacement_failure_cleans_up_and_retries(harness, monkeypatch, 
 def test_replica_switch_reuses_matching_group_descriptors(harness, monkeypatch, pack):
     monkeypatch.setattr(harness.transfer, "_device", torch.device("cpu"))
     monkeypatch.setattr(
-        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+        module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
     )
     replicas = {
         worker: {name: tensor[start:start + 2].clone() + delta for name, tensor in harness.sources.items()}

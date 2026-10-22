@@ -178,10 +178,9 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
     ) -> None:
         """Allocate one persistent arena per shard in its selected wire dtype.
 
-        Each arena is allocated in the registered-buffer scope selected by its
-        own device's backend rather than by whichever accelerator the process
-        happens to use. The CUDA classic pool still applies only to the current
-        CUDA device, so a CUDA arena on another device misses it.
+        Each arena is allocated in the registered-buffer scope of its own device,
+        selected by that device's backend, rather than by whichever device the
+        process happens to have current.
         """
         host = staging_mode is TrainerStagingMode.COPY_TO_HOST
         if host and not torch.cuda.is_available():
@@ -216,9 +215,12 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         device: torch.device | str,
     ) -> contextlib.AbstractContextManager[None]:
         """Return the allocation scope a registered arena on ``device`` needs."""
-        if torch.device(device).type == "cpu":
+        device = torch.device(device)
+        if device.type == "cpu":
             return contextlib.nullcontext()
-        return registered_buffer_alloc_scope(accelerator_backend_for(device))
+        return registered_buffer_alloc_scope(
+            accelerator_backend_for(device), device=device
+        )
 
     def _register_sources_in_place(self, shards: list[LocalTensorShard]) -> None:
         """Register the live local storage as the served buffer (no copy)."""

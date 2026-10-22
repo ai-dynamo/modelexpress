@@ -96,7 +96,7 @@ def _assert_replica_values(installed, replica, cycle):
 
 def _setup_method(harness, monkeypatch):
     monkeypatch.setattr(
-        transfer_module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+        transfer_module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
     )
     method = LoadTimeTensorNixlUpdateMethod(transfer=harness.transfer)
     if not hasattr(method, "prepare_streaming"):
