@@ -150,7 +150,7 @@ class NightlyWorkflowTests(unittest.TestCase):
         }
         self.assertEqual(set(large["needs"]), small | prerequisites)
         self.assertIn("!cancelled()", large["if"])
-        for job in prerequisites:
+        for job in small | prerequisites:
             self.assertIn(f"needs.{job}.result == 'success'", large["if"])
         self.assertEqual(large["with"]["framework"], "large")
         self.assertIn("gpu-tests-large", jobs["gpu-cleanup"]["needs"])

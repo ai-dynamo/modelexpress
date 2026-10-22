@@ -90,6 +90,10 @@ jobs:
         && needs.build-client-vllm.result == 'success'
         && needs.build-client-sglang.result == 'success'
         && needs.build-client-dynamo-vllm.result == 'success'
+        && needs.gpu-tests-vllm.result == 'success'
+        && needs.gpu-tests-sglang.result == 'success'
+        && needs.gpu-tests-sglang-mooncake.result == 'success'
+        && needs.gpu-tests-dynamo-vllm.result == 'success'
       }}
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref_name }}-gpu-tests-large-${{ inputs.concurrency_key }}
