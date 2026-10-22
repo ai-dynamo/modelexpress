@@ -10,10 +10,6 @@ on:
         description: Runner for control jobs; GPU jobs retain their dedicated runners.
         type: string
         default: ''
-      concurrency_key:
-        description: Run-specific suffix that keeps nightly callers from cancelling each other.
-        type: string
-        default: ''
 
 env:
   MX_CI_MODEL: Qwen/Qwen2.5-0.5B
@@ -26,9 +22,6 @@ env:
 jobs:
   gpu-tests-vllm:
     name: GPU (vllm)
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-gpu-tests-vllm-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     needs: [build-client-vllm, build-server, ensure-vcluster]
     permissions:
       contents: read
@@ -40,9 +33,6 @@ jobs:
 
   gpu-tests-sglang:
     name: GPU (sglang)
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-gpu-tests-sglang-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     needs: [build-client-sglang, build-server, ensure-vcluster]
     permissions:
       contents: read
@@ -54,9 +44,6 @@ jobs:
 
   gpu-tests-sglang-mooncake:
     name: GPU (sglang-mooncake)
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-gpu-tests-sglang-mooncake-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     needs: [build-client-sglang-mooncake, build-server, ensure-vcluster]
     permissions:
       contents: read
@@ -68,9 +55,6 @@ jobs:
 
   gpu-tests-dynamo-vllm:
     name: GPU (dynamo-vllm)
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-gpu-tests-dynamo-vllm-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     needs: [build-client-dynamo-vllm, build-server, ensure-vcluster]
     permissions:
       contents: read
@@ -82,22 +66,6 @@ jobs:
 
   gpu-tests-large:
     name: GPU (large)
-    if: >-
-      ${{
-        !cancelled()
-        && needs.build-server.result == 'success'
-        && needs.ensure-vcluster.result == 'success'
-        && needs.build-client-vllm.result == 'success'
-        && needs.build-client-sglang.result == 'success'
-        && needs.build-client-dynamo-vllm.result == 'success'
-        && needs.gpu-tests-vllm.result == 'success'
-        && needs.gpu-tests-sglang.result == 'success'
-        && needs.gpu-tests-sglang-mooncake.result == 'success'
-        && needs.gpu-tests-dynamo-vllm.result == 'success'
-      }}
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-gpu-tests-large-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     needs:
       - build-server
       - ensure-vcluster
@@ -161,9 +129,6 @@ jobs:
           rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   build-server:
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-build-server-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Build server image
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -204,7 +169,7 @@ jobs:
       - name: Cleanup local image
         # buildx with --push typically doesn't materialize a local image,
         # but reap defensively in case the buildx driver was switched.
-        # `if: always()` survives failure + cancel-in-progress so the
+        # `if: always()` survives failure and workflow cancellation so the
         # self-hosted builder runner's Docker daemon doesn't accumulate
         # stale images across runs.
         if: always()
@@ -214,9 +179,6 @@ jobs:
 
   # ---------------------------------------------------------------------------
   build-client-vllm:
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-build-client-vllm-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Build worker image (vllm)
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -260,7 +222,7 @@ jobs:
       - name: Cleanup local image
         # buildx with --push typically doesn't materialize a local image,
         # but reap defensively in case the buildx driver was switched.
-        # `if: always()` survives failure + cancel-in-progress so the
+        # `if: always()` survives failure and workflow cancellation so the
         # self-hosted builder runner's Docker daemon doesn't accumulate
         # stale images across runs (each matrix entry adds a multi-GB image).
         if: always()
@@ -269,9 +231,6 @@ jobs:
           rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
   build-client-sglang:
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-build-client-sglang-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Build worker image (sglang)
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -282,9 +241,6 @@ jobs:
     steps: *build-worker-steps
 
   build-client-sglang-mooncake:
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-build-client-sglang-mooncake-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Build worker image (sglang-mooncake)
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -295,9 +251,6 @@ jobs:
     steps: *build-worker-steps
 
   build-client-dynamo-vllm:
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-build-client-dynamo-vllm-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Build worker image (dynamo-vllm)
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -309,9 +262,6 @@ jobs:
 
   # Build the trainer and rollout images used by the Vime delta-refit smoke.
   ensure-vcluster:
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-ensure-vcluster-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Ensure vCluster
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -420,9 +370,6 @@ jobs:
 
   # ---------------------------------------------------------------------------
   model-streamer-vllm:
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-model-streamer-vllm-${{ strategy.job-index }}-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Model Streamer ${{ matrix.mode }} test (vllm, S3)
     runs-on: prod-modelexpress-tester-amd-gpu-v1
     needs: [build-client-vllm]
@@ -469,9 +416,6 @@ jobs:
         run: rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
   model-streamer-sglang:
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-model-streamer-sglang-${{ strategy.job-index }}-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Model Streamer ${{ matrix.mode }} test (sglang, S3)
     runs-on: prod-modelexpress-tester-amd-gpu-v1
     needs: [build-client-sglang]

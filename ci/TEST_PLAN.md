@@ -92,9 +92,10 @@ One RL `GPU cleanup` fallback job handles both workloads after both tests finish
 each cleanup path runs only when its test needs it, and Vime cleanup still runs
 if refit cleanup fails. Normal inline cleanup remains in each test job.
 `modelexpress-rl-refit-gpu-ci.yml` and `modelexpress-rl-vime-gpu-ci.yml`
-contain one GPU job each, avoiding skipped jobs for the other suite. Per-PR caller groups
-cancel superseded tests while repository-wide child groups retain GPU slots.
-Independent fallback cleanup stays outside the cancellation queues. Inference
+contain one GPU job each, avoiding skipped jobs for the other suite. One
+workflow-level group in `modelexpress-e2e-ci.yml` cancels superseded PR runs
+while repository-wide child groups retain GPU slots. Cleanup jobs use `always()`
+so cancellation still runs independent fallback cleanup. Inference
 and RL skip it when the GPU tests and their inline cleanup succeed; failures and
 cancellations retain fallback cleanup. Status checks accept a skipped fallback
 only when its corresponding tests succeeded.
@@ -104,8 +105,8 @@ Ordinary comments do not start RL builds, GPU tests, or Vime jobs.
 
 `nightly-ci.yml` reuses the core, inference and RL workflows on upstream `main`.
 Scheduled and manual runs authorize only their exact event SHA and use the run ID
-for GPU slot selection. Their caller concurrency groups are run-specific, while
-the GPU capacity queues remain shared with PR tests. The nightly status gate
+for GPU slot selection. They remain outside PR supersession, while the GPU
+capacity queues are shared with PR tests. The nightly status gate
 requires all selected test suites and accepts skipping them only when
 `run_tests=false`. RL evidence uploads are disabled for nightly calls.
 
@@ -159,12 +160,12 @@ with shared setup, diagnostics and GPU queues; no unrelated test jobs are create
 One fallback cleanup waits for all framework calls; the final status check requires
 every framework build and test to succeed.
 
-Replacement GPU tests become eligible after their image builds and setup finish;
-native per-PR concurrency then cancels superseded GPU work. Fallback cleanup stays
-outside these cancellation groups. Nightly calls retain separate run-specific keys.
+Replacement GPU tests become eligible after their image builds and setup finish.
+The E2E caller cancels a superseded PR run as one unit; its `always()` cleanup
+jobs continue after cancellation. Nightly calls are not superseded.
 
-The parent workflow calls inference GPU tests through per-framework, per-PR
-concurrency groups that cancel superseded work. A100a defaults to 8 repository-wide test
+The parent workflow calls inference GPU tests per framework without additional
+supersession groups. A100a defaults to 8 repository-wide test
 slots; A100b defaults to one concurrent test requiring four full GPUs at peak.
 `MX_CI_A100B_CONCURRENCY` can override its limit to 1–4, and the inference `MX_CI_GPU_CONCURRENCY` limit also applies. Inference cases have distinct indices rotated by PR number and reduced
 modulo the configured limit; RL refit and Vime use PR-based slots per Kubernetes
@@ -247,9 +248,9 @@ Reads use server-side label selectors and the host namespace instead of listing
 all cluster pods. RL namespace finalization already covers its directly hosted
 pods. Other slots, unlabeled legacy workloads, and previous concurrency modes
 are left to Kubernetes scheduling. API errors fail closed after bounded retries,
-including timeouts while reading the response body. GitHub concurrency groups
-remain the queue, with normal cleanup inside test jobs and independent fallback
-cleanup outside per-PR cancellation groups.
+including timeouts while reading the response body. GitHub capacity concurrency
+groups remain the queue. Normal cleanup stays inside test jobs, and `always()`
+fallback cleanup continues when a PR workflow is cancelled.
 
 RL GPU jobs default to 4 repository-wide slots per Kubernetes context,
 configured independently with `MX_CI_RL_GPU_CONCURRENCY` (1–16). Refit

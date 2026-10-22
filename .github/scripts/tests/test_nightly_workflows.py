@@ -125,18 +125,30 @@ class NightlyWorkflowTests(unittest.TestCase):
             for framework in ["vllm", "sglang", "sglang-mooncake", "dynamo-vllm", "large"]
         })
 
-    def test_gpu_cancellation_preserves_independent_cleanup(self):
-        jobs = workflow("modelexpress-inference-ci.yml")["jobs"]
-        for framework in ["vllm", "sglang", "sglang-mooncake", "dynamo-vllm", "large"]:
-            target = f"gpu-tests-{framework}"
-            self.assertEqual(jobs[target]["concurrency"], {
-                "group": "${{ github.workflow }}-${{ github.ref_name }}-"
-                         + target + "-${{ inputs.concurrency_key }}",
-                "cancel-in-progress": "${{ inputs.concurrency_key == '' }}",
-            })
-        cleanup = jobs["gpu-cleanup"]
-        self.assertNotIn("concurrency", cleanup)
-        self.assertIn("always()", cleanup["if"])
+    def test_workflow_level_supersession_preserves_cleanup(self):
+        e2e = workflow("modelexpress-e2e-ci.yml")
+        self.assertEqual(e2e["concurrency"], {
+            "group": "${{ github.workflow }}-${{ github.ref }}",
+            "cancel-in-progress": "true",
+        })
+
+        inference = workflow("modelexpress-inference-ci.yml")
+        rl = workflow("modelexpress-rl-ci.yml")
+        for child in [inference, rl]:
+            self.assertNotIn("concurrency_key", child["on"]["workflow_call"]["inputs"])
+            for job in child["jobs"].values():
+                self.assertNotIn("concurrency", job)
+
+        self.assertIn("always()", inference["jobs"]["gpu-cleanup"]["if"])
+        self.assertIn("always()", rl["jobs"]["cleanup"]["if"])
+        self.assertEqual(rl["concurrency"], {
+            "group": "${{ github.workflow }}-${{ github.event.issue.number || github.run_id }}",
+            "cancel-in-progress": "${{ github.event_name == 'issue_comment' }}",
+        })
+
+        nightly = workflow("nightly-ci.yml")["jobs"]
+        self.assertNotIn("concurrency_key", nightly["inference-tests"]["with"])
+        self.assertNotIn("concurrency_key", nightly["rl-tests"]["with"])
 
     def test_large_gpu_tests_wait_for_all_small_tests(self):
         jobs = workflow("modelexpress-inference-ci.yml")["jobs"]
@@ -149,9 +161,7 @@ class NightlyWorkflowTests(unittest.TestCase):
             "build-client-sglang", "build-client-dynamo-vllm",
         }
         self.assertEqual(set(large["needs"]), small | prerequisites)
-        self.assertIn("!cancelled()", large["if"])
-        for job in small | prerequisites:
-            self.assertIn(f"needs.{job}.result == 'success'", large["if"])
+        self.assertNotIn("if", large)
         self.assertEqual(large["with"]["framework"], "large")
         self.assertIn("gpu-tests-large", jobs["gpu-cleanup"]["needs"])
         self.assertIn("gpu-tests-large", jobs["status-check"]["needs"])
