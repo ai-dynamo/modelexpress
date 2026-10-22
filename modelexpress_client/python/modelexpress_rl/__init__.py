@@ -23,7 +23,7 @@ from .train import (
     WeightPayloadFormat,
 )
 from .object_storage import ObjectStorageSource, ObjectStorageType
-from .version import TrainerTensorsMetadata, WeightVersionRef
+from .version import MeshIdentity, TrainerTensorsMetadata, WeightVersionRef
 
 __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     # Framework-facing clients.
@@ -44,6 +44,7 @@ __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     "WeightSource",
     "VllmGeneratorContext",
     # Version values shared across the control, trainer, and generator clients.
+    "MeshIdentity",
     "ObjectStorageSource",
     "ObjectStorageType",
     "TrainerMesh",

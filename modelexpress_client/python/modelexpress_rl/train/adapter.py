@@ -13,6 +13,8 @@ from enum import Enum
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Protocol
 
+from .. import refit_pb2
+
 if TYPE_CHECKING:
     import torch
 
@@ -83,7 +85,7 @@ class CompletionFence:
 
 
 @dataclass(frozen=True)
-class WeightVersionShardManifest:
+class TrainerShardMetadata:
     """Engine-neutral description of one trainer process's source buffers."""
 
     data: bytes
@@ -92,8 +94,9 @@ class WeightVersionShardManifest:
     transport: str
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "data", bytes(self.data))
         if not self.data:
-            raise ValueError("manifest data must not be empty")
+            raise ValueError("metadata data must not be empty")
         if self.tensor_count <= 0:
             raise ValueError("tensor_count must be positive")
         if self.total_bytes <= 0:
@@ -111,9 +114,13 @@ class WeightVersionShardManifest:
 class StagedWeightVersionShardData:
     """Adapter-owned immutable buffers and their transfer manifest."""
 
-    manifest: WeightVersionShardManifest
+    metadata: TrainerShardMetadata
     publish_ready: CompletionFence
     buffer_owner: object | None = None
+    checksums: tuple[tuple[str, int, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "checksums", tuple(tuple(row) for row in self.checksums))
 
 
 class TrainerEngineAdapter(ABC):
@@ -159,7 +166,7 @@ class TrainerEngineAdapter(ABC):
         """Capture one immutable, rank-local version shard."""
 
 
-class WeightVersionShardManifestPublisher(Protocol):
+class TrainerShardMetadataPublisher(Protocol):
     """Worker endpoint that makes a manifest retrievable before advertisement."""
 
     @property
@@ -168,17 +175,19 @@ class WeightVersionShardManifestPublisher(Protocol):
     def publish_binding(self, manifest: bytes) -> None:
         """Serve immutable tensor coverage before joining a trainer mesh."""
 
-    def publish_manifest(
-        self,
-        *,
-        version_id: str,
-        logical_shard_id: str,
-        manifest: WeightVersionShardManifest,
-    ) -> str:
-        """Publish ``manifest`` and return its ready, worker-local endpoint."""
+    def publish_metadata(self, *, metadata: TrainerShardMetadata) -> str:
+        """Publish stable metadata and return its ready worker-local endpoint."""
 
-    def release_manifest(self, *, version_id: str, logical_shard_id: str) -> None:
-        """Stop serving a released version's manifest."""
+    def release_metadata(self) -> None:
+        """Stop serving the current physical metadata after publication retirement."""
+
+    def publish_version_metadata(
+        self, metadata: refit_pb2.WeightVersionShardMetadata
+    ) -> None:
+        """Publish immutable version checksums referencing already served metadata."""
+
+    def release_version_metadata(self, *, version_id: str, logical_shard_id: str) -> None:
+        """Stop serving a released version's checksums."""
 
 
 __all__ = [
@@ -188,6 +197,6 @@ __all__ = [
     "TrainerEngineAdapter",
     "TrainerStagingMode",
     "WeightPayloadFormat",
-    "WeightVersionShardManifest",
-    "WeightVersionShardManifestPublisher",
+    "TrainerShardMetadata",
+    "TrainerShardMetadataPublisher",
 ]

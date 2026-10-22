@@ -23,6 +23,16 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_REFIT_DELTA_BUCKET_BYTES == 512 * 1024**2
     assert envs.MX_REFIT_DELTA_WORKERS == min(32, os.cpu_count() or 8)
     assert envs.MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES == 4 * 1024**3
+    assert envs.MX_REDIS_URL == "redis://localhost:6379"
+    assert envs.MX_GENERATOR_SOURCE_ORDER is None
+    assert envs.MX_REFIT_STAGE_RECORD is True
+    assert envs.MX_REFIT_DEBUG_VALIDATE_PLAN is False
+    assert envs.MX_REFIT_PACK_MODULES is True
+    assert envs.MX_REFIT_PREFETCH_REPLICA_METADATA is False
+    assert envs.MX_REFIT_DEBUG_VALIDATE_REPLICAS is False
+    assert envs.MX_RESHARD_MAX_SEGMENTS_PER_COPY == 64
+    assert envs.MX_RESHARD_MIN_GBPS == 0.0
+    assert envs.MX_RESHARD_PUBLISH_DIGEST is False
     assert envs.MX_S3_MULTIPART_THRESHOLD_BYTES == 100 * 1024**2
     assert envs.MX_S3_UPLOAD_PART_BYTES == 16 * 1024**2
     assert envs.MX_S3_UPLOAD_WORKERS == 8
@@ -146,7 +156,7 @@ def test_s3_tcp_keepalive_rejects_invalid_boolean(monkeypatch):
 
 
 def test_streaming_diagnostics_default_off_and_packing_on(monkeypatch) -> None:
-    from modelexpress import envs as refit_envs
+    from modelexpress_rl import envs as refit_envs
 
     for name in (
         "MX_REFIT_DEBUG_VALIDATE_PLAN",
@@ -157,6 +167,26 @@ def test_streaming_diagnostics_default_off_and_packing_on(monkeypatch) -> None:
     assert envs.MX_REFIT_DEBUG_VALIDATE_PLAN is False
     assert envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT is False
     assert refit_envs.MX_REFIT_PACK_MODULES is True
+
+
+def test_refit_replica_settings_default_and_normalization(monkeypatch) -> None:
+    from modelexpress_rl import envs as refit_envs
+
+    names = (
+        "MX_REFIT_PREFETCH_REPLICA_METADATA",
+        "MX_REFIT_DEBUG_VALIDATE_REPLICAS",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+
+    assert refit_envs.MX_REFIT_PREFETCH_REPLICA_METADATA is False
+    assert refit_envs.MX_REFIT_DEBUG_VALIDATE_REPLICAS is False
+
+    monkeypatch.setenv("MX_REFIT_PREFETCH_REPLICA_METADATA", "yes")
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_REPLICAS", "on")
+
+    assert refit_envs.MX_REFIT_PREFETCH_REPLICA_METADATA is True
+    assert refit_envs.MX_REFIT_DEBUG_VALIDATE_REPLICAS is True
 
 
 def test_delta_surgical_parses_boolean(monkeypatch):
@@ -186,3 +216,26 @@ def test_stream_window_layers_accepts_zero_and_rejects_negative(monkeypatch):
     monkeypatch.setenv("MX_REFIT_STREAM_WINDOW_LAYERS", "-1")
     with pytest.raises(ValueError, match="MX_REFIT_STREAM_WINDOW_LAYERS must be"):
         envs.MX_REFIT_STREAM_WINDOW_LAYERS
+
+
+def test_moved_reshard_settings_keep_model_express_boolean_parsing(monkeypatch, caplog):
+    for name, falsy, truthy, default in (
+        ("MX_REFIT_STAGE_RECORD", "no", "true", True),
+        ("MX_REFIT_PACK_MODULES", "0", "yes", True),
+        ("MX_RESHARD_PUBLISH_DIGEST", "off", "on", False),
+    ):
+        monkeypatch.setenv(name, falsy)
+        assert getattr(envs, name) is False
+        monkeypatch.setenv(name, truthy)
+        assert getattr(envs, name) is True
+        monkeypatch.setenv(name, "invalid")
+        with caplog.at_level("WARNING", logger="modelexpress_rl.envs"):
+            assert getattr(envs, name) is default
+        assert f"Invalid {name}=" in caplog.text
+
+
+def test_generator_source_order_and_redis_url_keep_raw_defaults(monkeypatch):
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "TRAINER,GENERATOR")
+    monkeypatch.setenv("MX_REDIS_URL", "redis://redis:6379")
+    assert envs.MX_GENERATOR_SOURCE_ORDER == "TRAINER,GENERATOR"
+    assert envs.MX_REDIS_URL == "redis://redis:6379"
