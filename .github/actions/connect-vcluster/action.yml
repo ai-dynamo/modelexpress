@@ -68,10 +68,18 @@ runs:
         echo "VCLUSTER_PF_PID=${PF_PID}" >> "$GITHUB_ENV"
         echo "VCLUSTER_PF_LOG=${PF_LOG}" >> "$GITHUB_ENV"
 
-        vcluster connect ${VCLUSTER_NAME} \
+        deadline=$((SECONDS + 300))
+        until vcluster connect ${VCLUSTER_NAME} \
           --namespace ${NAMESPACE} \
           --server=https://127.0.0.1:${LOCAL_PORT} \
-          --print > ${{ github.workspace }}/.kubeconfig-vcluster
+          --print > ${{ github.workspace }}/.kubeconfig-vcluster; do
+          if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "ERROR: could not generate the vCluster kubeconfig within 300s"
+            exit 1
+          fi
+          echo "Retrying vCluster discovery in 5s"
+          sleep 5
+        done
         # kubectl warns on world/group-readable kubeconfigs. The file
         # already had restrictive content (server URL + cert + token) so
         # tighten the mode to match.

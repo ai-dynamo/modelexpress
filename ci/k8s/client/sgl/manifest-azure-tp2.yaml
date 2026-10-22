@@ -18,11 +18,10 @@
 # Differences vs sgl/manifest-azure.yaml (TP=1, Qwen):
 #   - nvidia.com/gpu / rdma/ib: 2 each (one IB device per GPU)
 #   - --tp 2
-#   - --context-length 1024 + --mem-fraction-static 0.6: keep the KV pool small
+#   - --context-length 1024 + --max-total-tokens 131072: keep the KV pool small
 #     and fixed. SGLang has no direct byte cap like vLLM's
-#     --kv-cache-memory-bytes; a low static fraction on a full 80GiB A100 caps
-#     the pool well below the weight footprint so VRAM parity tracks weight
-#     residency, not autosized cache growth.
+#     --kv-cache-memory-bytes, so the explicit token cap prevents available
+#     memory differences from changing source/target cache capacity.
 #   - --trust-remote-code: DeepSeek-V2 ships custom modeling code.
 #   - cpu/memory bumped to accommodate 2 GPUs of orchestration.
 #
@@ -113,9 +112,11 @@ spec:
             - --tp
             - "2"
             # Keep KV fixed and small so VRAM parity stays sensitive to weight
-            # residency instead of the engine auto-sizing cache around leaks.
+            # residency instead of available-memory-dependent cache sizing.
             - --context-length
             - "1024"
+            - --max-total-tokens
+            - "131072"
             - --mem-fraction-static
             - "0.6"
             - --trust-remote-code
