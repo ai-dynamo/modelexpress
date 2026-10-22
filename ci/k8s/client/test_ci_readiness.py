@@ -360,6 +360,63 @@ def test_admission_does_not_treat_api_failure_as_free_capacity(tmp_path):
     assert "Forbidden" in result.stderr
 
 
+def test_large_workload_admission_reclaims_stale_namespace(tmp_path):
+    owner = "123-2"
+    metadata = {"name": "mx-ci-fleet-old", "labels": {
+        "ci.modelexpress.nvidia.com/run-id": owner,
+        "ci.modelexpress.nvidia.com/gpu-lane": "large-workload",
+        "ci.modelexpress.nvidia.com/gpu-pool": "a100a",
+    }}
+    namespace = json.dumps({"metadata": metadata})
+    namespaces = json.dumps({"items": [{"metadata": metadata}]})
+    command = f'''echo "$*" >> "$FIXTURE/commands"
+if [[ " $* " == *" get namespaces "* ]]; then
+  if [ -f "$FIXTURE/deleted" ]; then echo '{{"items":[]}}'; else echo '{namespaces}'; fi
+  exit 0
+fi
+if [[ " $* " == *" get namespace mx-ci-fleet-old "* ]]; then
+  if [ -f "$FIXTURE/deleted" ]; then exit 0; else echo '{namespace}'; fi
+  exit 0
+fi
+if [[ " $* " == *" delete namespace mx-ci-fleet-old "* ]]; then
+  echo "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" > "$FIXTURE/cleanup-owner"
+  touch "$FIXTURE/deleted"
+  exit 0
+fi
+if [[ " $* " == *" delete deployment,statefulset,job "* ]]; then exit 0; fi
+echo '{{"items":[]}}'
+'''
+    body = (
+        f'export GITHUB_WORKSPACE="{tmp_path}" MX_CI_GPU_LANE=large-workload\n'
+        'touch "$GITHUB_WORKSPACE/.kubeconfig-host"\n'
+        'wait_for_gpu_pool_cleanup a100a'
+    )
+    result = run_shell(tmp_path, body, command)
+    assert result.returncode == 0, result.stderr
+    assert "Reclaiming stale namespace mx-ci-fleet-old from run 123-2" in result.stdout
+    assert (tmp_path / "cleanup-owner").read_text().strip() == owner
+    assert "delete namespace mx-ci-fleet-old" in (tmp_path / "commands").read_text()
+
+
+def test_large_workload_admission_refuses_invalid_owner(tmp_path):
+    namespaces = json.dumps({"items": [{"metadata": {
+        "name": "mx-ci-fleet-old",
+        "labels": {
+            "ci.modelexpress.nvidia.com/gpu-lane": "large-workload",
+            "ci.modelexpress.nvidia.com/gpu-pool": "a100a",
+        },
+    }}]})
+    command = f'''if [[ " $* " == *" get namespaces "* ]]; then echo '{namespaces}'; else echo '{{"items":[]}}'; fi
+'''
+    result = run_shell(
+        tmp_path,
+        'export GITHUB_WORKSPACE=. MX_CI_GPU_LANE=large-workload\nwait_for_gpu_pool_cleanup a100a',
+        command,
+    )
+    assert result.returncode != 0
+    assert "invalid run owner" in result.stderr
+
+
 @pytest.mark.parametrize("lane,pool,status", [
     ("slot-0", "a100a", 1),
     ("slot-1", "a100a", 0),
