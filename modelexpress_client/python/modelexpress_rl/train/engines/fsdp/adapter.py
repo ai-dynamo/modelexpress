@@ -14,7 +14,7 @@ the client passes each stage, so a trainer that re-materializes its state_dict
   and already match the wire dtype; trainer-side conversion is incompatible.
 - COPY_TO_HOST (recommended when IN_PLACE is unavailable): allocates persistent
   pinned CPU buffers in the wire dtype and registers them once. Each stage copies
-  the current shards into those buffers; publish_ready fences CUDA copies.
+  the current shards into those buffers; publish_ready fences accelerator copies.
 - COPY_TO_DEVICE: retains an additional wire-format copy on the source device.
   This can reduce latency compared with host staging, but its VRAM cost makes it
   an explicit choice for exceptional cases such as small models.
@@ -31,8 +31,9 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from modelexpress.accelerators import accelerator_backend_for
 from modelexpress_rl import envs as mx_envs
-from modelexpress_rl.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress_rl.refit.reshard.alloc_scope import registered_buffer_alloc_scope
 from modelexpress_rl.refit.timing import (
     add_refit_duration,
     add_refit_metadata,
@@ -175,7 +176,13 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
     def _allocate_and_register_arenas(
         self, shards: list[LocalTensorShard], staging_mode: TrainerStagingMode
     ) -> None:
-        """Allocate one persistent arena per shard in its selected wire dtype."""
+        """Allocate one persistent arena per shard in its selected wire dtype.
+
+        Each arena is allocated in the registered-buffer scope selected by its
+        own device's backend rather than by whichever accelerator the process
+        happens to use. The CUDA classic pool still applies only to the current
+        CUDA device, so a CUDA arena on another device misses it.
+        """
         host = staging_mode is TrainerStagingMode.COPY_TO_HOST
         if host and not torch.cuda.is_available():
             # Arenas are allocated pinned so the non_blocking snapshot copy is an
@@ -183,16 +190,17 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
             # pins the pages regardless. torch cannot pin without CUDA, and a
             # trainer without CUDA has no device shards to stage from.
             raise RuntimeError("COPY_TO_HOST staging requires CUDA for pinned memory")
-        with contextlib.nullcontext() if host else classic_cuda_alloc():
-            self._arenas = {
-                s.name: torch.empty(
+        arenas = {}
+        for s in shards:
+            device = "cpu" if host else s.source_tensor.device
+            with self._registered_alloc_scope(device):
+                arenas[s.name] = torch.empty(
                     s.local_shape,
                     dtype=self._wire_dtype(s),
-                    device="cpu" if host else s.source_tensor.device,
+                    device=device,
                     pin_memory=host,
                 )
-                for s in shards
-            }
+        self._arenas = arenas
         self._manager.register_tensors(
             {
                 self._register_key(i, s.name): self._arenas[s.name]
@@ -202,6 +210,15 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         self._registered_addrs = {
             name: arena.data_ptr() for name, arena in self._arenas.items()
         }
+
+    @staticmethod
+    def _registered_alloc_scope(
+        device: torch.device | str,
+    ) -> contextlib.AbstractContextManager[None]:
+        """Return the allocation scope a registered arena on ``device`` needs."""
+        if torch.device(device).type == "cpu":
+            return contextlib.nullcontext()
+        return registered_buffer_alloc_scope(accelerator_backend_for(device))
 
     def _register_sources_in_place(self, shards: list[LocalTensorShard]) -> None:
         """Register the live local storage as the served buffer (no copy)."""
