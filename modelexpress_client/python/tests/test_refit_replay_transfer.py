@@ -18,7 +18,9 @@ from tests.test_refit_bounded_descriptors import harness
 @pytest.mark.parametrize("verify", [False, True])
 def test_ordered_sources_survive_warm_reuse(harness, monkeypatch, verify):
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", str(int(verify)))
-    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
+    )
     h = harness
     h.transfer._device = torch.device("cpu")
     h.capture.source_replay = True
@@ -52,7 +54,9 @@ def test_replay_digest_verification_rejects_missing_or_stale_digests(
     harness, monkeypatch, missing
 ):
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
-    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
+    )
     h = harness
     h.transfer._device = torch.device("cpu")
     h.capture.source_replay = True
@@ -93,7 +97,9 @@ def test_partial_replay_digest_rejection_precedes_native_setup(harness, monkeypa
 def test_replay_scratch_analysis_is_reused_until_generation_changes(harness, monkeypatch):
     from unittest.mock import Mock
 
-    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
+    )
     h = harness
     h.capture.source_replay = True
     analyze = Mock(wraps=module.replay_scratch_bytes)
@@ -145,7 +151,9 @@ def test_replay_abandonment_drains_prefetched_read(harness):
 @pytest.mark.parametrize("harness", [StreamingSettings(2048, "cpu", 2)], indirect=True)
 @pytest.mark.parametrize("replay", [False, True])
 def test_bounded_receive_clears_used_arena_once_per_batch(harness, monkeypatch, replay):
-    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
+    )
     h = harness
     h.capture.source_replay = replay
     prepared = h.prepare()

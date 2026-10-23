@@ -136,9 +136,14 @@ to a device copy when these checks fail.
 
 The FSDP adapter supports all three modes for full-tensor payloads. Host staging
 preserves the per-tensor dtype overrides above and registers its persistent CPU
-buffers once. CUDA copy completion is fenced before publication; the served
-snapshot and its registration remain live until version retirement. Conversion
-can still require temporary device workspace; host staging eliminates the
+buffers once. Copy completion is fenced before publication on every accelerator
+device the snapshot touches, using that device's own current stream rather than
+the process current device. `COPY_TO_DEVICE` allocates each arena in the
+registered-buffer scope of its own device, selected by that device's
+`AcceleratorBackend`: the classic-allocation pool on CUDA and the default
+allocator on XPU. The scope applies to the arena's device even when another
+device is current. The served snapshot and its registration remain live until
+version retirement. Conversion can still require temporary device workspace; host staging eliminates the
 persistent wire-format device copy, not every transient allocation. Support for
 arbitrary conversion plugins remains adapter-specific.
 
