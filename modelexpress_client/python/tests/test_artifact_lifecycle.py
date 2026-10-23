@@ -219,6 +219,51 @@ def test_artifact_miss_reports_an_empty_digest_distinguishably(
     assert "compile_config_digest=''" in caplog.text
 
 
+def test_nixl_cross_domain_miss_returns_for_local_rebuild(
+    artifact_transfer_enabled, monkeypatch, tmp_path, caplog
+):
+    import modelexpress.metadata.nixl_artifact_transport as nixl_transport
+
+    monkeypatch.setenv("MX_ARTIFACT_BACKEND", "nixl")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "site")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_ENFORCEMENT", "required")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", '{"site":"site-a"}')
+    monkeypatch.setattr(artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path))
+    client = MagicMock()
+    client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=[
+        p2p_pb2.SourceInstanceRef(
+            mx_source_id="artifact-source", worker_id="cross-domain",
+            topology={"site": "site-b"},
+        )
+    ])
+    transport = nixl_transport.NixlArtifactTransport(
+        mx_client=client, nixl_manager=object()
+    )
+    monkeypatch.setattr(
+        artifact_lifecycle, "_create_artifact_transport", lambda *a, **k: transport
+    )
+    transfer_worker = MagicMock()
+    monkeypatch.setattr(nixl_transport, "transfer_artifact_from_worker", transfer_worker)
+    cache = tmp_path / "cache"
+    transfer = SimpleNamespace(
+        name="torch_compile_cache",
+        roots=(ArtifactCacheRoot("primary", cache, cache),),
+        target_file_paths=lambda: [],
+        install=MagicMock(),
+    )
+    ctx = SimpleNamespace(
+        global_rank=0, node_rank=0, accelerator_backend=SimpleNamespace(name="cuda")
+    )
+    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+        artifact_lifecycle.install_artifacts(
+            ctx, lambda: [(transfer, _identity())], engine_label="vLLM"
+        )
+    assert "the engine will rebuild this cache locally" in caplog.text
+    client.get_metadata.assert_not_called()
+    transfer_worker.assert_not_called()
+    transfer.install.assert_not_called()
+
+
 def test_stale_artifact_is_logged_once_at_warning(
     artifact_transfer_enabled,
     caplog,
@@ -1167,9 +1212,59 @@ def _publish_context():
     )
 
 
+def test_nixl_publish_retries_unknown_domain_without_preparing_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("MX_ARTIFACT_BACKEND", "nixl")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "site")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_ENFORCEMENT", "required")
+    monkeypatch.delenv("MX_P2P_TOPOLOGY", raising=False)
+    monkeypatch.setenv("DYN_TOPOLOGY_MOUNT_PATH", str(tmp_path))
+    bundle = SimpleNamespace(artifact_id="artifact", manifest=SimpleNamespace(files=[]))
+    transfer = SimpleNamespace(
+        name="cache",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+        roots=(),
+        prepare_source=MagicMock(return_value=bundle),
+    )
+    handle = SimpleNamespace(identifier="published", transport="nixl", stop=MagicMock())
+    transport = artifact_lifecycle.NixlArtifactTransport()
+    monkeypatch.setattr(transport, "publish", MagicMock(return_value=handle))
+    monkeypatch.setattr(artifact_lifecycle, "_get_worker_server", lambda _device: object())
+    monkeypatch.setattr(artifact_lifecycle, "_create_artifact_transport", lambda *a, **k: transport)
+    ctx = _publish_context()
+    published_sources = {}
+    publisher = artifact_lifecycle.PublisherThread(
+        mx_client=ctx.mx_client,
+        worker_id=ctx.worker_id,
+        worker_rank=ctx.worker_rank,
+        publish_fn=lambda: artifact_lifecycle.publish_artifact(
+            ctx, transfer, _identity(), engine_label="SGLang", accelerator="cuda",
+            published_sources=published_sources,
+        ).identifier,
+        heartbeat_after_publish=False,
+        retry_publish_on_failure=transport.retry_publish_on_failure,
+    )
+
+    for _ in range(2):
+        assert not publisher._try_publish()
+    transfer.prepare_source.assert_not_called()
+    transport.publish.assert_not_called()
+    assert not publisher._stop_event.is_set()
+
+    (tmp_path / "site").write_text("site-a")
+    assert publisher._try_publish()
+    transfer.prepare_source.assert_called_once_with()
+    transport.publish.assert_called_once()
+    assert published_sources[(ctx.device_id, transfer.mx_source_type)] is handle
+
+
 @pytest.mark.parametrize("backend", ["nixl", "mooncake"])
 def test_publish_artifact_uses_selected_transport(monkeypatch, tmp_path, backend):
     monkeypatch.setenv("MX_ARTIFACT_BACKEND", backend)
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "site")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", "{}")
+    monkeypatch.setenv(
+        "MX_P2P_TOPOLOGY_ENFORCEMENT", "preferred" if backend == "nixl" else "required"
+    )
     bundle = SimpleNamespace(
         artifact_id="artifact",
         manifest=SimpleNamespace(files=[]),
@@ -1183,7 +1278,12 @@ def test_publish_artifact_uses_selected_transport(monkeypatch, tmp_path, backend
     handle = SimpleNamespace(
         identifier="published", transport=backend, stop=MagicMock()
     )
-    transport = SimpleNamespace(publish=MagicMock(return_value=handle))
+    transport = (
+        artifact_lifecycle.NixlArtifactTransport()
+        if backend == "nixl"
+        else MooncakeArtifactTransport()
+    )
+    monkeypatch.setattr(transport, "publish", MagicMock(return_value=handle))
     factory = MagicMock(return_value=transport)
     worker_server = object()
     get_worker_server = MagicMock(return_value=worker_server)

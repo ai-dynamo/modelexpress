@@ -357,6 +357,7 @@ def publish_artifact(
             f"{required_roots}"
         )
 
+    transport.check_publishable()
     start = time.perf_counter()
     bundle = transfer.prepare_source()
     key = (ctx.device_id, transfer.mx_source_type)
