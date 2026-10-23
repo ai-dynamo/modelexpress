@@ -1374,7 +1374,11 @@ mod tests {
         role: CollectiveRole,
         model: &str,
     ) {
-        let role_code = if role == CollectiveRole::Trainer { "1" } else { "2" };
+        let role_code = if role == CollectiveRole::Trainer {
+            "1"
+        } else {
+            "2"
+        };
         let mut connection = backend.connection.clone();
         let () = connection
             .hset_multiple(
@@ -1434,9 +1438,33 @@ mod tests {
         register_worker(&backend, &trainer, CollectiveRole::Trainer, &model).await;
         register_worker(&backend, &generator, CollectiveRole::Generator, &model).await;
         let group_spec = spec(&model, &["t0"], &["g0"], 1);
-        join(&backend, &group_spec, "t0", &trainer, CollectiveRole::Trainer, "d1").await;
-        join(&backend, &group_spec, "g0", &generator, CollectiveRole::Generator, "d1").await;
-        join(&backend, &group_spec, "t0", &trainer, CollectiveRole::Trainer, "d2").await;
+        join(
+            &backend,
+            &group_spec,
+            "t0",
+            &trainer,
+            CollectiveRole::Trainer,
+            "d1",
+        )
+        .await;
+        join(
+            &backend,
+            &group_spec,
+            "g0",
+            &generator,
+            CollectiveRole::Generator,
+            "d1",
+        )
+        .await;
+        join(
+            &backend,
+            &group_spec,
+            "t0",
+            &trainer,
+            CollectiveRole::Trainer,
+            "d2",
+        )
+        .await;
 
         let group = backend
             .get_group(&group_id_for(&group_spec))

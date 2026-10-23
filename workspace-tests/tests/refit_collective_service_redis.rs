@@ -991,8 +991,24 @@ async fn join_triggered_epoch_bump_aborts_and_releases_stranded_transfer() {
         join_request(&group_spec, "g0", &worker_g0, CollectiveRole::Generator, 0),
     )
     .await;
-    publish(&mut collective, &t0.group_id, 1, RESHARD_LANE, &worker_t0, 5).await;
-    let ready = publish(&mut collective, &t0.group_id, 1, BROADCAST_LANE, &worker_t0, 6).await;
+    publish(
+        &mut collective,
+        &t0.group_id,
+        1,
+        RESHARD_LANE,
+        &worker_t0,
+        5,
+    )
+    .await;
+    let ready = publish(
+        &mut collective,
+        &t0.group_id,
+        1,
+        BROADCAST_LANE,
+        &worker_t0,
+        6,
+    )
+    .await;
     assert_eq!(ready.state, i32::from(CollectiveGroupState::Ready));
 
     let transfer = create_transfer(
@@ -1080,7 +1096,15 @@ async fn refresh_triggered_epoch_bump_aborts_and_releases_stranded_transfer() {
         join_request(&group_spec, "g0", &generator, CollectiveRole::Generator, 0),
     )
     .await;
-    publish(&mut collective, &membership.group_id, 1, RESHARD_LANE, &trainer, 5).await;
+    publish(
+        &mut collective,
+        &membership.group_id,
+        1,
+        RESHARD_LANE,
+        &trainer,
+        5,
+    )
+    .await;
     let ready = publish(
         &mut collective,
         &membership.group_id,
