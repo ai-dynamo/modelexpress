@@ -4,6 +4,7 @@
 """Tests for the dedicated RL cold-start loading policy."""
 
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -24,9 +25,9 @@ from modelexpress_rl import (
 from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.load_strategy import (
     DesiredVersionP2PStrategy,
-    DesiredVersionS3Strategy,
+    DesiredVersionObjectStorageStrategy,
     RLLoadStrategyChain,
-    _resolve_s3_replay_chain,
+    _resolve_object_storage_replay_chain,
 )
 
 
@@ -86,7 +87,9 @@ def _version(
     base=None,
     model_name="test-model",
     state=WeightVersionState.READY,
+    storage_type=ObjectStorageType.S3,
 ) -> WeightVersion:
+    scheme = "az" if storage_type is ObjectStorageType.AZURE else "s3"
     return WeightVersion(
         trainer_mesh_generation=0,
         version_id=uid,
@@ -94,8 +97,8 @@ def _version(
         payload_format=payload_format,
         base_version_id=base,
         object_storage=ObjectStorageSource(
-            storage_type=ObjectStorageType.S3,
-            uri=f"s3://weights/{uid}/model.safetensors.index.json",
+            storage_type=storage_type,
+            uri=f"{scheme}://weights/{uid}/model.safetensors.index.json",
         ),
         layout_signature="layout",
         state=state,
@@ -109,8 +112,8 @@ def test_desired_version_does_not_use_version_agnostic_fallbacks(monkeypatch):
     ctx = _context()
     unavailable_p2p = MagicMock(name="desired_version_p2p")
     unavailable_p2p.is_available.return_value = False
-    unavailable_s3 = MagicMock(name="desired_version_s3")
-    unavailable_s3.is_available.return_value = False
+    unavailable_object_storage = MagicMock(name="desired_version_object_storage")
+    unavailable_object_storage.is_available.return_value = False
     fallback = MagicMock(name="default")
     fallback.is_available.return_value = True
     fallback.load.return_value = LoadResult(value=model, model=model)
@@ -119,8 +122,8 @@ def test_desired_version_does_not_use_version_agnostic_fallbacks(monkeypatch):
         "modelexpress_rl.inference.load_strategy.DesiredVersionP2PStrategy",
         return_value=unavailable_p2p,
     ), patch(
-        "modelexpress_rl.inference.load_strategy.DesiredVersionS3Strategy",
-        return_value=unavailable_s3,
+        "modelexpress_rl.inference.load_strategy.DesiredVersionObjectStorageStrategy",
+        return_value=unavailable_object_storage,
     ), patch(
         "modelexpress_rl.inference.load_strategy.ModelStreamerStrategy",
         return_value=fallback,
@@ -136,11 +139,11 @@ def test_desired_version_does_not_use_version_agnostic_fallbacks(monkeypatch):
 @pytest.mark.parametrize(
     ("configured", "expected"),
     [
-        (None, [DesiredVersionP2PStrategy, DesiredVersionS3Strategy]),
-        ("OBJECT_STORAGE", [DesiredVersionS3Strategy]),
+        (None, [DesiredVersionP2PStrategy, DesiredVersionObjectStorageStrategy]),
+        ("OBJECT_STORAGE", [DesiredVersionObjectStorageStrategy]),
         (
             "OBJECT_STORAGE,GENERATOR",
-            [DesiredVersionS3Strategy, DesiredVersionP2PStrategy],
+            [DesiredVersionObjectStorageStrategy, DesiredVersionP2PStrategy],
         ),
         ("GENERATOR", [DesiredVersionP2PStrategy]),
     ],
@@ -298,8 +301,15 @@ def test_desired_p2p_requires_a_tensor_read_lease():
     assert DesiredVersionP2PStrategy.requires_tensor_read_lease is True
 
 
-@pytest.mark.parametrize("model_name", [None, "mx_model_abc"])
-def test_desired_p2p_uses_exact_revision(monkeypatch, model_name):
+@pytest.mark.parametrize(
+    ("model_name", "storage_type"),
+    [
+        (None, ObjectStorageType.S3),
+        ("mx_model_abc", ObjectStorageType.S3),
+        (None, ObjectStorageType.AZURE),
+    ],
+)
+def test_desired_p2p_uses_exact_revision(monkeypatch, model_name, storage_type):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
     if model_name is None:
         monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
@@ -322,6 +332,7 @@ def test_desired_p2p_uses_exact_revision(monkeypatch, model_name):
         "version-7",
         WeightPayloadFormat.FULL_HF_CHECKPOINT,
         model_name=model_name or model_path,
+        storage_type=storage_type,
     )
 
     with patch(
@@ -425,7 +436,7 @@ def test_missing_optional_sources_reaches_engine_default(monkeypatch, caplog):
         "modelexpress_rl.inference.load_strategy.DesiredVersionP2PStrategy",
         return_value=unavailable,
     ), patch(
-        "modelexpress_rl.inference.load_strategy.DesiredVersionS3Strategy",
+        "modelexpress_rl.inference.load_strategy.DesiredVersionObjectStorageStrategy",
         return_value=unavailable,
     ), patch(
         "modelexpress_rl.inference.load_strategy.ModelStreamerStrategy",
@@ -440,15 +451,20 @@ def test_missing_optional_sources_reaches_engine_default(monkeypatch, caplog):
     assert "RL initial load has no desired version" in caplog.text
 
 
-def test_desired_s3_is_skipped_without_cache_directory(monkeypatch):
+def test_desired_object_storage_is_skipped_without_cache_directory(monkeypatch):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
     monkeypatch.delenv("MX_REFIT_CHECKPOINT_DIR", raising=False)
-    assert DesiredVersionS3Strategy().is_available(_context()) is False
+    assert DesiredVersionObjectStorageStrategy().is_available(_context()) is False
 
 
-def test_resolve_s3_chain_returns_full_root_then_deltas():
-    root = _version("root", WeightPayloadFormat.FULL_HF_CHECKPOINT)
-    delta = _version("delta", WeightPayloadFormat.XOR_DELTA, base="root")
+@pytest.mark.parametrize("storage_type", [ObjectStorageType.S3, ObjectStorageType.AZURE])
+def test_resolve_object_storage_chain_returns_full_root_then_deltas(storage_type):
+    root = _version(
+        "root", WeightPayloadFormat.FULL_HF_CHECKPOINT, storage_type=storage_type
+    )
+    delta = _version(
+        "delta", WeightPayloadFormat.XOR_DELTA, base="root", storage_type=storage_type
+    )
     client = MagicMock()
     client.__enter__.return_value = client
     client.get_weight_version.side_effect = [delta, root]
@@ -457,10 +473,10 @@ def test_resolve_s3_chain_returns_full_root_then_deltas():
         "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
         return_value=client,
     ):
-        assert _resolve_s3_replay_chain(_context(), "delta") == (root, delta)
+        assert _resolve_object_storage_replay_chain(_context(), "delta") == (root, delta)
 
 
-def test_resolve_s3_chain_rejects_mismatched_returned_uid():
+def test_resolve_object_storage_chain_rejects_mismatched_returned_uid():
     client = MagicMock()
     client.__enter__.return_value = client
     client.get_weight_version.return_value = _version(
@@ -474,7 +490,34 @@ def test_resolve_s3_chain_rejects_mismatched_returned_uid():
         RuntimeError,
         match="requested revision 'desired' but MX returned 'other'",
     ):
-        _resolve_s3_replay_chain(_context(), "desired")
+        _resolve_object_storage_replay_chain(_context(), "desired")
+
+
+@pytest.mark.parametrize(
+    ("storage", "message"),
+    [
+        (None, "has no object-storage source"),
+        (
+            ObjectStorageSource(ObjectStorageType.GCS, "gs://weights/private"),
+            "unsupported object-storage provider GCS",
+        ),
+    ],
+)
+def test_resolve_object_storage_chain_rejects_unusable_source(storage, message):
+    version = replace(
+        _version("desired", WeightPayloadFormat.FULL_HF_CHECKPOINT),
+        object_storage=storage,
+    )
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.get_weight_version.return_value = version
+    with patch(
+        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
+        return_value=client,
+    ), pytest.raises(RuntimeError, match=message) as error:
+        _resolve_object_storage_replay_chain(_context(), "desired")
+    if storage is not None:
+        assert storage.uri not in str(error.value)
 
 
 def test_desired_s3_loads_materialized_checkpoint(monkeypatch, tmp_path):
@@ -492,10 +535,10 @@ def test_desired_s3_loads_materialized_checkpoint(monkeypatch, tmp_path):
         checkpoint=SimpleNamespace(path=Path("/cache/delta"))
     )
     s3 = MagicMock()
-    strategy = DesiredVersionS3Strategy()
+    strategy = DesiredVersionObjectStorageStrategy()
 
     with patch(
-        "modelexpress_rl.inference.load_strategy._resolve_s3_replay_chain",
+        "modelexpress_rl.inference.load_strategy._resolve_object_storage_replay_chain",
         return_value=(root, delta),
     ), patch(
         "modelexpress_rl.inference.load_strategy.S3Client", return_value=s3
@@ -520,7 +563,10 @@ def test_desired_s3_loads_materialized_checkpoint(monkeypatch, tmp_path):
     s3.close.assert_called_once()
 
 
-def test_desired_s3_does_not_activate_until_every_rank_loads(monkeypatch, tmp_path):
+@pytest.mark.parametrize("storage_type", [ObjectStorageType.S3, ObjectStorageType.AZURE])
+def test_desired_object_storage_waits_for_every_rank_to_load(
+    monkeypatch, tmp_path, storage_type
+):
     """Do not activate a checkpoint when another rank fails engine loading."""
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "delta")
     monkeypatch.setenv("MX_REFIT_CHECKPOINT_DIR", str(tmp_path))
@@ -529,12 +575,16 @@ def test_desired_s3_does_not_activate_until_every_rank_loads(monkeypatch, tmp_pa
     def gather(state):
         """Inject a peer engine-load failure into gathered phase state."""
         phase, desired, configured, result = state
-        peer_result = False if phase == "s3_engine_loaded" else result
+        peer_result = False if phase == "object_storage_engine_loaded" else result
         return state, (phase, desired, configured, peer_result)
 
     ctx.adapter = _DistributedAdapter(gather)
-    root = _version("root", WeightPayloadFormat.FULL_HF_CHECKPOINT)
-    delta = _version("delta", WeightPayloadFormat.XOR_DELTA, base="root")
+    root = _version(
+        "root", WeightPayloadFormat.FULL_HF_CHECKPOINT, storage_type=storage_type
+    )
+    delta = _version(
+        "delta", WeightPayloadFormat.XOR_DELTA, base="root", storage_type=storage_type
+    )
     result = LoadResult(value=nn.Linear(1, 1))
     method = MagicMock()
     method.installation_context.return_value = nullcontext()
@@ -543,21 +593,21 @@ def test_desired_s3_does_not_activate_until_every_rank_loads(monkeypatch, tmp_pa
     )
 
     with patch(
-        "modelexpress_rl.inference.load_strategy._resolve_s3_replay_chain",
+        "modelexpress_rl.inference.load_strategy._resolve_object_storage_replay_chain",
         return_value=(root, delta),
     ), patch.object(
-        DesiredVersionS3Strategy,
+        DesiredVersionObjectStorageStrategy,
         "_prepare",
         return_value=(method, method.prepare_chain.return_value),
     ), patch.object(
-        DesiredVersionS3Strategy,
+        DesiredVersionObjectStorageStrategy,
         "load_uri",
         return_value=result,
     ), pytest.raises(
         StrategyRecoveryError,
         match="at least one rank failed to load",
     ):
-        DesiredVersionS3Strategy().load(result, ctx)
+        DesiredVersionObjectStorageStrategy().load(result, ctx)
 
     method.activate.assert_not_called()
 
@@ -576,8 +626,8 @@ def test_desired_s3_only_local_leader_activates(monkeypatch, tmp_path):
         peer_result = (
             (True, True)
             if phase in {
-                "s3_local_leader_prepared",
-                "s3_checkpoint_activated",
+                "object_storage_local_leader_prepared",
+                "object_storage_checkpoint_activated",
             }
             else result
         )
@@ -600,18 +650,20 @@ def test_desired_s3_only_local_leader_activates(monkeypatch, tmp_path):
         return method, method.prepare_chain.return_value
 
     with patch(
-        "modelexpress_rl.inference.load_strategy._resolve_s3_replay_chain",
+        "modelexpress_rl.inference.load_strategy._resolve_object_storage_replay_chain",
         return_value=(root, delta),
     ), patch.object(
-        DesiredVersionS3Strategy,
+        DesiredVersionObjectStorageStrategy,
         "_prepare",
         side_effect=prepare,
     ), patch.object(
-        DesiredVersionS3Strategy,
+        DesiredVersionObjectStorageStrategy,
         "load_uri",
         return_value=result,
     ):
-        assert DesiredVersionS3Strategy().load(result, ctx) is result
+        assert DesiredVersionObjectStorageStrategy().load(result, ctx) is result
 
     method.activate.assert_not_called()
-    assert events.index("s3_local_leader_prepared") < events.index("prepare")
+    assert (
+        events.index("object_storage_local_leader_prepared") < events.index("prepare")
+    )
