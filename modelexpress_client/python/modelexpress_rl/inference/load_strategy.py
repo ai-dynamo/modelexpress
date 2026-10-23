@@ -18,6 +18,7 @@ from modelexpress.load_strategy.model_streamer_strategy import ModelStreamerStra
 from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
 from .. import envs
+from ..azure import AzureBlobReader
 from ..control import ModelExpressControlClient, WeightVersion, WeightVersionState
 from ..object_storage import ObjectStorageType
 from ..s3 import S3Client
@@ -139,7 +140,7 @@ def _fetch_ready_version(
     ctx: LoadContext,
     version_uid: str,
     *,
-    require_s3: bool,
+    require_object_storage: bool,
 ) -> WeightVersion:
     """Validate the control-plane record required by a load strategy."""
     version = client.get_weight_version(version_uid)
@@ -154,11 +155,15 @@ def _fetch_ready_version(
         raise RuntimeError(
             f"revision {version_uid!r} model_name does not match the worker"
         )
-    if require_s3 and (
-        version.object_storage is None
-        or version.object_storage.storage_type is not ObjectStorageType.S3
-    ):
-        raise RuntimeError(f"revision {version_uid!r} has no S3 source")
+    if require_object_storage:
+        storage = version.object_storage
+        if storage is None:
+            raise RuntimeError(f"revision {version_uid!r} has no object-storage source")
+        if storage.storage_type not in {ObjectStorageType.S3, ObjectStorageType.AZURE}:
+            raise RuntimeError(
+                f"revision {version_uid!r} has unsupported object-storage provider "
+                f"{storage.storage_type.value}"
+            )
     return version
 
 
@@ -198,7 +203,7 @@ class DesiredVersionP2PStrategy(RdmaStrategy):
                     client,
                     ctx,
                     desired_version_uid,
-                    require_s3=False,
+                    require_object_storage=False,
                 )
             original_revision = ctx.identity.revision
             ctx.identity.revision = desired_version_uid
@@ -235,13 +240,13 @@ class DesiredVersionP2PStrategy(RdmaStrategy):
         return loaded
 
 
-class DesiredVersionS3Strategy(ModelStreamerStrategy):
+class DesiredVersionObjectStorageStrategy(ModelStreamerStrategy):
     """Reconstruct the desired full-plus-delta chain and load it locally."""
 
-    name = "desired_version_s3"
+    name = "desired_version_object_storage"
 
     def is_available(self, ctx: LoadContext) -> bool:
-        """Report S3 availability only when every rank can use it."""
+        """Report object-storage availability only when every rank can use it."""
         desired_version_uid = ctx.desired_version_uid
         if desired_version_uid is None:
             return False
@@ -250,11 +255,13 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
         )
         results = _gather_phase(
             ctx,
-            phase="s3_available",
+            phase="object_storage_available",
             desired_version_uid=desired_version_uid,
             result=available,
         )
-        return bool(_require_uniform_result(results, phase="S3 availability"))
+        return bool(
+            _require_uniform_result(results, phase="object-storage availability")
+        )
 
     @staticmethod
     def _prepare(
@@ -265,7 +272,15 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
         """Materialize a replay chain without activating its checkpoint."""
         root = chain[0]
         assert root.object_storage is not None
-        s3 = S3Client()
+        storage_type = root.object_storage.storage_type
+        if storage_type is ObjectStorageType.S3:
+            reader = S3Client()
+        elif storage_type is ObjectStorageType.AZURE:
+            reader = AzureBlobReader()
+        else:
+            raise ValueError(
+                f"unsupported object-storage provider {storage_type.value}"
+            )
         try:
             seed_path = bootstrap_object_storage_checkpoint(
                 model_name=ctx.identity.model_name,
@@ -276,15 +291,15 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
                     uri=root.object_storage.uri,
                 ),
                 refit_checkpoint_dir=checkpoint_dir,
-                reader=s3,
+                reader=reader,
             )
         finally:
-            s3.close()
+            reader.close()
 
         method = CanonicalDeltaUpdateMethod(
             model_name=ctx.identity.model_name,
             config=ObjectStorageGeneratorConfig(
-                storage_type=ObjectStorageType.S3,
+                storage_type=storage_type,
                 initial_base_version_id=root.version_id,
                 seed_checkpoint_path=seed_path,
                 refit_checkpoint_dir=checkpoint_dir,
@@ -325,7 +340,7 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
             chain = None
             chain_error = None
             try:
-                chain = _resolve_s3_replay_chain(ctx, desired_version_uid)
+                chain = _resolve_object_storage_replay_chain(ctx, desired_version_uid)
             except BaseException as error:
                 chain_error = error
             chain_result = (
@@ -335,17 +350,18 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
             )
             chain_results = _gather_phase(
                 ctx,
-                phase="s3_chain",
+                phase="object_storage_chain",
                 desired_version_uid=desired_version_uid,
                 result=chain_result,
             )
             agreed_chain = _require_uniform_result(
                 chain_results,
-                phase="S3 replay-chain resolution",
+                phase="object-storage replay-chain resolution",
             )
             if agreed_chain[0] != "ready":
                 raise StrategyRecoveryError(
-                    "at least one rank failed to resolve the S3 replay chain"
+                    "at least one rank failed to resolve the "
+                    "object-storage replay chain"
                 ) from chain_error
             assert chain is not None
 
@@ -358,7 +374,7 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
                     leader_error = error
             leader_results = _gather_phase(
                 ctx,
-                phase="s3_local_leader_prepared",
+                phase="object_storage_local_leader_prepared",
                 desired_version_uid=desired_version_uid,
                 result=(is_local_leader, leader_error is None),
             )
@@ -366,7 +382,7 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
                 is_leader and not succeeded for is_leader, succeeded in leader_results
             ):
                 raise StrategyRecoveryError(
-                    "a local leader failed to prepare the S3 checkpoint"
+                    "a local leader failed to prepare the object-storage checkpoint"
                 ) from leader_error
 
             follower_error = None
@@ -377,13 +393,14 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
                     follower_error = error
             prepared_results = _gather_phase(
                 ctx,
-                phase="s3_all_prepared",
+                phase="object_storage_all_prepared",
                 desired_version_uid=desired_version_uid,
                 result=leader_error is None and follower_error is None,
             )
             if not all(prepared_results):
                 raise StrategyRecoveryError(
-                    "at least one rank failed to attach to the S3 checkpoint"
+                    "at least one rank failed to attach to the "
+                    "object-storage checkpoint"
                 ) from follower_error
             assert method is not None and prepared is not None
 
@@ -400,13 +417,14 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
                 load_error = error
             load_results = _gather_phase(
                 ctx,
-                phase="s3_engine_loaded",
+                phase="object_storage_engine_loaded",
                 desired_version_uid=desired_version_uid,
                 result=load_error is None,
             )
             if not all(load_results):
                 raise StrategyRecoveryError(
-                    "at least one rank failed to load the prepared S3 checkpoint"
+                    "at least one rank failed to load the prepared "
+                    "object-storage checkpoint"
                 ) from load_error
 
             activation_error = None
@@ -417,7 +435,7 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
                     activation_error = error
             activation_results = _gather_phase(
                 ctx,
-                phase="s3_checkpoint_activated",
+                phase="object_storage_checkpoint_activated",
                 desired_version_uid=desired_version_uid,
                 result=(is_local_leader, activation_error is None),
             )
@@ -426,7 +444,7 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
                 for is_leader, succeeded in activation_results
             ):
                 raise StrategyRecoveryError(
-                    "a local leader failed to activate the S3 checkpoint"
+                    "a local leader failed to activate the object-storage checkpoint"
                 ) from activation_error
 
             ctx.identity.revision = desired_version_uid
@@ -460,7 +478,7 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
                     )
 
 
-def _resolve_s3_replay_chain(
+def _resolve_object_storage_replay_chain(
     ctx: LoadContext,
     target_version_uid: str,
 ) -> tuple[WeightVersion, ...]:
@@ -471,14 +489,20 @@ def _resolve_s3_replay_chain(
                 client,
                 ctx,
                 version_uid,
-                require_s3=True,
+                require_object_storage=True,
             )
 
-        return resolve_replay_chain(
+        chain = resolve_replay_chain(
             target_version_id=target_version_uid,
             fetch_ready_version=fetch_ready_version,
             max_chain_length=_MAX_REPLAY_CHAIN_LENGTH,
         )
+        if len({version.object_storage.storage_type for version in chain}) != 1:
+            raise RuntimeError(
+                f"target {target_version_uid!r}: replay chain spans multiple "
+                "object-storage providers"
+            )
+        return chain
 
 
 class RLLoadStrategyChain:
@@ -509,7 +533,7 @@ class RLLoadStrategyChain:
                 (
                     DesiredVersionP2PStrategy()
                     if source is WeightSource.GENERATOR
-                    else DesiredVersionS3Strategy()
+                    else DesiredVersionObjectStorageStrategy()
                 )
                 for source in source_order
             ]
@@ -532,6 +556,6 @@ class RLLoadStrategyChain:
 
 __all__ = [
     "DesiredVersionP2PStrategy",
-    "DesiredVersionS3Strategy",
+    "DesiredVersionObjectStorageStrategy",
     "RLLoadStrategyChain",
 ]
