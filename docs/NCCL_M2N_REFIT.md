@@ -93,6 +93,7 @@ def create_operation(self, version: str, *, key_prefix: str) -> str
 def start_weight_update(self, version: str, operation_id: str) -> None
 def publish_weights(self, version: str, layer_group_id: int = DEFAULT_LAYER_GROUP) -> None
 def finish_weight_update(self, version: str, *, operation_id: str | None = None) -> None
+def retry_report(self) -> None
 def report_failure(self, operation_id: str, error: BaseException, *, membership: Membership | None = None) -> None
 def cleanup(self) -> None
 ```
@@ -107,6 +108,7 @@ def create_operation(self, version: str, *, key_prefix: str) -> str
 def start_weight_update(self, version: str, operation_id: str) -> None
 def update_weights(self, version: str, layer_group_id: int = DEFAULT_LAYER_GROUP) -> None
 def finish_weight_update(self, version: str, *, operation_id: str | None = None) -> None
+def retry_report(self) -> None
 def cleanup(self) -> None
 ```
 
@@ -621,6 +623,7 @@ host synchronize.
 | `start_weight_update(version, operation_id)` | Once per refit, after `CreateCollectiveTransfer`; all `compute_plan` done; no overlapping refits (a second start during an open round is rejected) | `GetCollectiveTransfer`, checked first against version, group, epoch and model; then `Publisher.start_new_round(version)` / `Loader.start_new_round(version)` |
 | `publish_weights` / `update_weights(version, layer_group_id)` | Multiple per refit; concurrency across affected workers is desirable | The co-called `nccl.m2n.reshard` calls for that group's bulk params, on the half's handle; one call each by default, or with `MX_NCCL_REFIT_GROUPED_SUBMISSION=1` recorded in one `nccl.m2n.group()` and issued at its close so M2N can PACK-fuse them (GIN requirement: section 9). Canonical order on every rank: runs of entries sharing a lane, source mesh and destination mesh, in ascending lane order; a single-lane trainer records that lane's subsequence. Run boundaries are part of the plan digest. `pre` hooks run while recording, `post` hooks after issue. Two calls in one group with overlapping storage (except read-only sources feeding different lanes) are rejected before issue; no fence, because one derived from local buffers would differ between ranks. Each group runs exactly once per refit, in the same caller-maintained order on every participant; the backend rejects a repeated group and a finish that skipped one. The generator installs a group once `MX_NCCL_REFIT_PIPELINE_DEPTH` groups are in flight, so `Loader.install` for group N overlaps the transfer of N+1; `finish_weight_update` installs the rest. A failure here, in `start_weight_update` after binding, in `finish_weight_update`, or `cleanup()` during an open round: abort every lane of the group, report the bound operation failed (best effort), reset the round |
 | `finish_weight_update(version)` | After all `*_weight_update` calls for this refit | The misc broadcast; `Loader.finish()`; stream sync; `ReportCollectiveTransfer` against the operation bound by `start_weight_update`, retried on transient errors and kept bound for `retry_report()` if it never lands. An `operation_id=` keyword is accepted only as a check against that binding |
+| `retry_report()` | Only after `finish_weight_update` raised from an undelivered success report | Resends `ReportCollectiveTransfer` against the still-bound operation, then releases the binding |
 | `cleanup` | Terminal | Release buffers, destroy communicators, deregister |
 
 Two more invariants:

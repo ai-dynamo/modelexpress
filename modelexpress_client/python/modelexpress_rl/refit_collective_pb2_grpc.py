@@ -401,9 +401,10 @@ class RefitCollectiveService(object):
 
 
 class RefitCollectiveWorkerServiceStub(object):
-    """Worker-to-worker. The trainer that MX ranks first in the group serves the
-    reshard plan; every other participant fetches it and verifies the digest MX
-    advertised before issuing any wire operation.
+    """Worker-to-worker, reserved. No in-tree client serves or calls it yet: the
+    stock clients capture the plan from their own engine and agree on it through
+    the readiness digest. It is kept so a trainer can later serve the plan and
+    advertise itself as the group's `plan_source`.
     """
 
     def __init__(self, channel):
@@ -420,9 +421,10 @@ class RefitCollectiveWorkerServiceStub(object):
 
 
 class RefitCollectiveWorkerServiceServicer(object):
-    """Worker-to-worker. The trainer that MX ranks first in the group serves the
-    reshard plan; every other participant fetches it and verifies the digest MX
-    advertised before issuing any wire operation.
+    """Worker-to-worker, reserved. No in-tree client serves or calls it yet: the
+    stock clients capture the plan from their own engine and agree on it through
+    the readiness digest. It is kept so a trainer can later serve the plan and
+    advertise itself as the group's `plan_source`.
     """
 
     def GetReshardPlan(self, request, context):
@@ -448,9 +450,10 @@ def add_RefitCollectiveWorkerServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class RefitCollectiveWorkerService(object):
-    """Worker-to-worker. The trainer that MX ranks first in the group serves the
-    reshard plan; every other participant fetches it and verifies the digest MX
-    advertised before issuing any wire operation.
+    """Worker-to-worker, reserved. No in-tree client serves or calls it yet: the
+    stock clients capture the plan from their own engine and agree on it through
+    the readiness digest. It is kept so a trainer can later serve the plan and
+    advertise itself as the group's `plan_source`.
     """
 
     @staticmethod

@@ -63,7 +63,10 @@ enum CollectiveGroupState {
   COLLECTIVE_GROUP_STATE_UNSPECIFIED = 0;
   COLLECTIVE_GROUP_STATE_FORMING = 1;
   COLLECTIVE_GROUP_STATE_READY = 2;
-  COLLECTIVE_GROUP_STATE_RELEASING = 3;
+  // A RELEASING state was declared but never set by the server; the number
+  // and name stay reserved so a future state cannot reuse them on the wire.
+  reserved 3;
+  reserved "COLLECTIVE_GROUP_STATE_RELEASING";
 }
 
 enum CollectiveTransferState {

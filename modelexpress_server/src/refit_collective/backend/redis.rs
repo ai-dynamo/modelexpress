@@ -231,7 +231,6 @@ fn group_state_from_str(text: &str) -> CollectiveResult<CollectiveGroupState> {
     match text {
         "FORMING" => Ok(CollectiveGroupState::Forming),
         "READY" => Ok(CollectiveGroupState::Ready),
-        "RELEASING" => Ok(CollectiveGroupState::Releasing),
         other => Err(CollectiveBackendError::Internal(format!(
             "unknown stored collective group state {other}"
         ))),
@@ -1224,7 +1223,6 @@ mod tests {
         for (text, state) in [
             ("FORMING", CollectiveGroupState::Forming),
             ("READY", CollectiveGroupState::Ready),
-            ("RELEASING", CollectiveGroupState::Releasing),
         ] {
             assert_eq!(group_state_from_str(text).expect("group state"), state);
         }
@@ -1241,7 +1239,8 @@ mod tests {
             );
         }
         // A corrupt or newer record is an error, not a silent initial state.
-        for text in ["", "forming", "BOGUS"] {
+        // RELEASING was never written and is no longer a group state.
+        for text in ["", "forming", "BOGUS", "RELEASING"] {
             assert!(matches!(
                 group_state_from_str(text),
                 Err(CollectiveBackendError::Internal(_))

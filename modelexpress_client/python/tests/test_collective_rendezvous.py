@@ -720,14 +720,6 @@ class TestAwaitReady:
                 group_id="g1", epoch=1, timeout_s=value, poll_interval_s=0.01
             )
 
-    def test_a_releasing_group_fails_without_polling_until_timeout(self):
-        stub = FakeStub(groups=[group(state=pb.COLLECTIVE_GROUP_STATE_RELEASING)])
-        with pytest.raises(RendezvousError, match="releasing"):
-            make_rendezvous(stub).await_ready(
-                group_id="g1", epoch=1, timeout_s=5, poll_interval_s=0.001
-            )
-        assert stub.get_calls == 1
-
     def test_an_rpc_deadline_at_the_group_deadline_becomes_not_ready(self, monkeypatch):
         class DeadlineExceeded(grpc.RpcError):
             def code(self):

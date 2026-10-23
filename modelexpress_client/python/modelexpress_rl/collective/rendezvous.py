@@ -816,10 +816,6 @@ class CollectiveRendezvous:
                 )
             if group.state == pb.COLLECTIVE_GROUP_STATE_READY:
                 return group
-            if group.state == pb.COLLECTIVE_GROUP_STATE_RELEASING:
-                raise RendezvousError(
-                    f"collective group {group_id} is releasing and cannot become READY"
-                )
             now = time.monotonic()
             if now >= next_progress_log:
                 # A stalled join is otherwise silent until the deadline (600s
