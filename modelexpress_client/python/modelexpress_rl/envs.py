@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
+    MX_MAX_REPLAY_CHAIN_LENGTH: int
     MX_REFIT_FULL_STREAMING: bool
     MX_REFIT_STREAM_WINDOW_LAYERS: int
     MX_REFIT_TIMING: bool
@@ -135,6 +136,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "LOCAL_RANK": lambda: (
         int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else None
+    ),
+    "MX_MAX_REPLAY_CHAIN_LENGTH": lambda: positive_int_env(
+        "MX_MAX_REPLAY_CHAIN_LENGTH", 64
     ),
     "MX_REFIT_DEBUG_VALIDATE_PLAN": lambda: parse_bool(
         os.environ.get("MX_REFIT_DEBUG_VALIDATE_PLAN", "false"),
