@@ -239,8 +239,8 @@ spec:
                   --tensor-parallel-size 2 \
                   --distributed-executor-backend ray \
                   --max-model-len 1024 \
-                  --kv-cache-memory-bytes 1073741824 \
-                  --compilation-config '{"cache_dir":"/root/.cache/vllm/torch_compile_cache/mx-ci"}' \
+                  --kv-cache-memory-bytes 1073741824 --max-num-seqs 16 \
+                  --compilation-config '{"cache_dir":"/root/.cache/vllm/torch_compile_cache/mx-ci","cudagraph_capture_sizes":[1,2,4,8,16]}' \
                   --trust-remote-code \
                   --port "${WORKER_PORT}"
               else

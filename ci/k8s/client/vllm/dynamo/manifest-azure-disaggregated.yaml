@@ -9,7 +9,7 @@
 #   VllmDecodeWorker  — generates tokens after receiving KV from prefill
 #
 # Modeled on examples/dynamo_p2p_transfer_k8s/vllm/vllm-single-node-disaggregated.yaml
-# but scaled to CI sizes (Qwen2.5-0.5B, TP=1, 1 GPU/IB device per worker).
+# but scaled to CI sizes (Qwen3.5-0.8B, TP=1, 1 GPU/IB device per worker).
 #
 # Initial topology: 1 prefill + 1 decode (2 ModelMetadata CRs).
 # Test scales VllmDecodeWorker to replicas=2 (3 CRs total). This exercises
@@ -91,7 +91,7 @@ spec:
         imagePullSecrets:
           - name: worker-registry
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.1.1
+          image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.5.1
           command:
             - python3
             - -m
@@ -182,8 +182,8 @@ spec:
               add: [IPC_LOCK]
           command:
             - python3
-            - -m
-            - dynamo.vllm
+            - /opt/mx-ci/launch_dynamo.py
+            - vllm
           args:
             - --model
             - "${MX_CI_MODEL}"
@@ -285,8 +285,8 @@ spec:
               add: [IPC_LOCK]
           command:
             - python3
-            - -m
-            - dynamo.vllm
+            - /opt/mx-ci/launch_dynamo.py
+            - vllm
           args:
             - --model
             - "${MX_CI_MODEL}"

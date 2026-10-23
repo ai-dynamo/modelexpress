@@ -109,12 +109,16 @@ spec:
             # auto-generated cache key includes runtime-resolved factors that
             # differ across these two pods. Pin the directory so this test
             # exercises reuse of the transferred cache, not just installation.
+            - --max-num-seqs
+            - "16"
             - --compilation-config
-            - '{"cache_dir":"/root/.cache/vllm/torch_compile_cache/mx-ci"}'
+            - '{"cache_dir":"/root/.cache/vllm/torch_compile_cache/mx-ci","cudagraph_capture_sizes":[1,2,4,8,16]}'
             - --trust-remote-code
             - --port
             - "${WORKER_PORT}"
           env:
+            - name: MX_CI_WEIGHT_DIGESTS
+              value: "1"
             - name: POD_NAME
               valueFrom:
                 fieldRef:

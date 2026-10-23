@@ -26,6 +26,9 @@ cargo build --bin modelexpress-cli
 
 The compiled binary will be available at `target/debug/modelexpress-cli` (or `target/release/modelexpress-cli` for release builds).
 
+The separate `test_client` binary defaults to `Qwen/Qwen3.5-0.8B`; use
+`cargo run --bin test_client -- --test-model <MODEL>` to select another model.
+
 ## Usage
 
 ### Global Options

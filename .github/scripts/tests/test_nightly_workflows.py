@@ -98,8 +98,8 @@ class NightlyWorkflowTests(unittest.TestCase):
                 }
                 result, values = execute(inference, environment)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads(values["slots"]), [(seed + i) % 8 for i in range(16)])
-                self.assertEqual(json.loads(values["a100b_slots"]), [(seed + i) % 4 for i in range(4)])
+                self.assertEqual(json.loads(values["slots"]), [(seed + i) % 8 for i in range(20)])
+                self.assertEqual(json.loads(values["a100b_slots"]), [(seed + i) % 4 for i in range(6)])
                 result, values = execute(validate, environment)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(values["gpu_slot"], str(seed % 4))
@@ -109,7 +109,7 @@ class NightlyWorkflowTests(unittest.TestCase):
 
     def test_inference_tests_wait_only_for_their_worker_image(self):
         jobs = workflow("modelexpress-inference-ci.yml")["jobs"]
-        for framework in ["vllm", "sglang", "sglang-mooncake", "dynamo-vllm"]:
+        for framework in ["vllm", "sglang", "sglang-mooncake", "dynamo-vllm", "dynamo-sglang"]:
             with self.subTest(framework=framework):
                 gpu = jobs[f"gpu-tests-{framework}"]
                 self.assertEqual(set(gpu["needs"]), {
@@ -122,7 +122,7 @@ class NightlyWorkflowTests(unittest.TestCase):
             self.assertEqual(len(streamer["strategy"]["matrix"]["include"]), 2)
         self.assertEqual(set(jobs["gpu-cleanup"]["needs"]), {
             f"gpu-tests-{framework}"
-            for framework in ["vllm", "sglang", "sglang-mooncake", "dynamo-vllm", "large"]
+            for framework in ["vllm", "sglang", "sglang-mooncake", "dynamo-vllm", "dynamo-sglang", "large"]
         })
 
     def test_workflow_level_supersession_preserves_cleanup(self):
@@ -154,11 +154,11 @@ class NightlyWorkflowTests(unittest.TestCase):
         jobs = workflow("modelexpress-inference-ci.yml")["jobs"]
         large = jobs["gpu-tests-large"]
         small = {f"gpu-tests-{framework}" for framework in [
-            "vllm", "sglang", "sglang-mooncake", "dynamo-vllm",
+            "vllm", "sglang", "sglang-mooncake", "dynamo-vllm", "dynamo-sglang",
         ]}
         prerequisites = {
             "build-server", "ensure-vcluster", "build-client-vllm",
-            "build-client-sglang", "build-client-dynamo-vllm",
+            "build-client-sglang", "build-client-dynamo-vllm", "build-client-dynamo-sglang",
         }
         self.assertEqual(set(large["needs"]), small | prerequisites)
         self.assertNotIn("if", large)
@@ -178,7 +178,7 @@ class NightlyWorkflowTests(unittest.TestCase):
         match = re.search(r"fromJSON\('((?:''|[^'])*)'\)", include)
         partitions = json.loads(match[1].replace("''", "'"))
         self.assertEqual({key: len(rows) for key, rows in partitions.items()}, {
-            "vllm": 10, "sglang": 3, "sglang-mooncake": 1, "dynamo-vllm": 1, "large": 5,
+            "vllm": 10, "sglang": 6, "sglang-mooncake": 1, "dynamo-vllm": 1, "dynamo-sglang": 1, "large": 7,
         })
         namespaces = set()
         for framework, cases in partitions.items():
@@ -193,6 +193,10 @@ class NightlyWorkflowTests(unittest.TestCase):
                 self.assertNotIn(case["namespace"], namespaces)
                 namespaces.add(case["namespace"])
                 self.assertIn(case["kind"], {"p2p", "fleet", "dynamo", "stale"})
+                if case["kind"] == "dynamo":
+                    suffix = "-39868265163-10"
+                    grove_label = f"{case['namespace']}{suffix}-{case['dgd_name']}{suffix}"
+                    self.assertLessEqual(len(grove_label), 63, grove_label)
         large = [case for cases in partitions.values() for case in cases if case.get("large")]
         self.assertEqual(sorted(case["fleet_size"] for case in large if case["kind"] == "fleet"), ["15", "5", "5"])
         sglang_mla = next(case for case in partitions["sglang"] if case.get("measure_vram"))
@@ -201,6 +205,8 @@ class NightlyWorkflowTests(unittest.TestCase):
             {case["name"] for case in large if case["kind"] != "fleet"},
             {
                 "P2P TP test (vllm TP=2 multi-node)",
+                "P2P TP test (sglang TP=2 multi-node)",
+                "P2P test with Dynamo (sglang disaggregated)",
                 "P2P test with Dynamo (disaggregated)",
             },
         )

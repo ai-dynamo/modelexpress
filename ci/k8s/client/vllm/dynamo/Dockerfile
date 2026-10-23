@@ -10,13 +10,16 @@
 #
 # Built and pushed by the `build-client` job in .github/workflows/modelexpress-inference-ci.yml
 # under tag <MX_IMAGE_REPO>/mx-worker-vllm-dynamo:<sha>.
-FROM nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
+FROM nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.5.1
 
 # Layer the ModelExpress Python client on top. Build context is the repo root
 # (matches the existing build job's build context), so the COPY path is
 # unambiguous.
+USER root
 COPY --chown=dynamo:dynamo modelexpress_client/python /opt/modelexpress/client
 WORKDIR /opt/modelexpress/client
-RUN uv pip install .
+RUN uv pip install --system --no-deps --reinstall .
+COPY ci/k8s/client/launch_dynamo.py /opt/mx-ci/launch_dynamo.py
 
+USER dynamo
 WORKDIR /workspace

@@ -37,7 +37,9 @@ def _port(value: str) -> int:
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--namespace", default=os.environ.get("NAMESPACE", ""))
-    parser.addoption("--model", default=os.environ.get("MX_CI_MODEL", "Qwen/Qwen2.5-0.5B"))
+    parser.addoption("--model", default=os.environ.get("MX_CI_MODEL", "Qwen/Qwen3.5-0.8B"))
+    parser.addoption("--capture-source-baseline", action="store_true")
+    parser.addoption("--accuracy-pilot", action="store_true", help="Measure 64/128 MMLU samples and native-repeat score variation")
     parser.addoption("--source-port", default=_port(os.environ.get("SOURCE_PORT", "8001")), type=_port)
     parser.addoption("--worker-port", default=_port(os.environ.get("WORKER_PORT", "8002")), type=_port)
     parser.addoption(
@@ -150,6 +152,11 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 @pytest.fixture(scope="session")
+def capture_source_baseline(request: pytest.FixtureRequest) -> bool:
+    return request.config.getoption("--capture-source-baseline")
+
+
+@pytest.fixture(scope="session")
 def namespace(request: pytest.FixtureRequest) -> str:
     ns = request.config.getoption("--namespace")
     assert ns, "Pass --namespace or set NAMESPACE env var"
@@ -159,6 +166,11 @@ def namespace(request: pytest.FixtureRequest) -> str:
 @pytest.fixture(scope="session")
 def model(request: pytest.FixtureRequest) -> str:
     return request.config.getoption("--model")
+
+
+@pytest.fixture(scope="session")
+def accuracy_pilot(request: pytest.FixtureRequest) -> bool:
+    return request.config.getoption("--accuracy-pilot")
 
 
 @pytest.fixture(scope="session")

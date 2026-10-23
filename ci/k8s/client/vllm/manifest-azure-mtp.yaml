@@ -74,14 +74,20 @@ spec:
             - "1024"
             - --kv-cache-memory-bytes
             - "1073741824"
+            - --gpu-memory-utilization
+            - "0.85"
+            - --max-num-seqs
+            - "16"
             - --compilation-config
-            - '{"cache_dir":"/root/.cache/vllm/torch_compile_cache/mx-ci-mtp"}'
+            - '{"cache_dir":"/root/.cache/vllm/torch_compile_cache/mx-ci-mtp","cudagraph_capture_sizes":[1,2,4,8,16]}'
             - --speculative-config
             - '{"method":"mtp","num_speculative_tokens":1}'
             - --trust-remote-code
             - --port
             - "${WORKER_PORT}"
           env:
+            - name: MX_CI_WEIGHT_DIGESTS
+              value: "1"
             - name: POD_NAME
               valueFrom:
                 fieldRef:

@@ -378,11 +378,10 @@ mod tests {
 
     #[test]
     fn test_model_metadata_spec_defaults_missing_source_type() {
-        let spec: ModelMetadataSpec =
-            serde_json::from_str(r#"{"modelName":"Qwen/Qwen2.5-0.5B-Instruct"}"#)
-                .expect("spec should deserialize without sourceType");
+        let spec: ModelMetadataSpec = serde_json::from_str(r#"{"modelName":"Qwen/Qwen3.5-0.8B"}"#)
+            .expect("spec should deserialize without sourceType");
 
-        assert_eq!(spec.model_name, "Qwen/Qwen2.5-0.5B-Instruct");
+        assert_eq!(spec.model_name, "Qwen/Qwen3.5-0.8B");
         assert_eq!(spec.source_type, "unknown");
     }
 
