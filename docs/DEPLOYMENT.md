@@ -1057,7 +1057,7 @@ returns actual worker endpoints and currently published artifact types. Missing
 optional caches are skipped immediately. Keep the engine head address reachable
 for instance-local registration and allow Pod-direct worker/NIXL traffic. See the
 [single-Service recipe](../examples/k8s_service_sources/README.md#leader-discovery)
-for lifecycle semantics and the one-port Service manifest.
+for worker configuration and lifecycle semantics.
 
 ### Artifact Transfer Backends
 

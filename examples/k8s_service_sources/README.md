@@ -10,8 +10,6 @@ This backend is for **stable-weight inference only**. Weights loaded at pod star
 
 ## Files
 
-- [`leader-discovery-service.yaml`](leader-discovery-service.yaml) - One discovery Service and one port for a whole multi-node engine. See [Leader discovery](#leader-discovery) for worker configuration and readiness behavior.
-- [`artifact-transfer-tp1.yaml`](artifact-transfer-tp1.yaml) - Small TP=1 vLLM example with `MX_ARTIFACT_TRANSFER=1`. Start one healthy source, then scale the same Deployment to two replicas to exercise Service discovery followed by pod-pinned artifact transfer.
 - [`sources-tp2-single-pod.yaml`](sources-tp2-single-pod.yaml) - **Multi-GPU-per-pod shape** (primary). One Deployment with 2-GPU pods running `--tensor-parallel-size=2`. ONE Service named `mx-sources` with two named ports (`rank-0: 6555`, `rank-1: 6556`). Client uses the default pattern `mx-sources`; port is auto-computed from rank. This is the topology for production TP inference (NVLink is intra-node-only).
 - [`sources-tp2.yaml`](sources-tp2.yaml) - **1-GPU-per-pod shape**. Two Deployments (one per rank) with rank-labeled pods. Two Services selecting by `mx.rank`. Pattern: `MX_K8S_SERVICE_PATTERN=mx-sources-rank-{rank}:6555`. For per-rank autoscaling or cross-pod setups where TP isn't involved.
 - [`target.yaml`](target.yaml) - Target Deployments that pull weights via the k8s-service backend. Paired with `sources-tp2.yaml` (1-GPU-per-pod). For multi-GPU-per-pod, scale `sources-tp2-single-pod.yaml` directly - new replicas join as both targets and sources.
@@ -84,9 +82,10 @@ Service patterns continue to work. All workers must use the new protocol; this
 mode does not fall back to rank Services when a leader lacks the metadata RPC.
 
 The Service selects only healthy instance leaders (global rank 0, local device
-0), with a single port targeting that worker's gRPC port. Apply
-[`leader-discovery-service.yaml`](leader-discovery-service.yaml) alongside your
-existing LWS/engine manifests. Keep the engine's normal rendezvous networking;
+0), with a single Service port `6555` targeting that worker's gRPC port.
+For LeaderWorkerSet, combine your model's application label with
+`leaderworkerset.sigs.k8s.io/worker-index: "0"` in the Service selector.
+Keep the engine's normal rendezvous networking;
 no extra per-rank or per-node **MX discovery** Services are needed. Changing from
 two nodes with eight GPUs each to another supported TP/PP topology does not
 change the discovery Service.
@@ -143,58 +142,3 @@ carry topology into weight source selection. Artifact headers recheck the domain
 before creating target files, so a changed source location cannot bypass the
 policy through a cached directory. Legacy artifact Services validate the same
 header fields and fail closed when required topology is absent.
-
-## GPU validation
-
-On October 23, 2026, the leader discovery implementation was tested on
-`nebius-2` with NVIDIA H200 GPUs, vLLM 0.26.0, PyTorch 2.11.0+cu130,
-ModelExpress 0.8.0 and NIXL 1.3.1 (UCX). The model was `Qwen/Qwen3-0.6B`,
-pinned to revision `c1899de289a04d12100db370d81485cdf75e47ca`. The image was
-`nvcr.io/nvidian/dynamo-dev/zhongdongmin@sha256:2ea256bced645fe5614ca28c7056a29ad2dd35f37797d67f6db51297e8bac252`.
-
-| Case | Source / target layout | Verified result |
-| --- | --- | --- |
-| TP1, eager | One GPU per Pod, source and target on different hosts | 339 tensors / 1.20 GB transferred by RDMA; Triton and FlashInfer installed; one directory lookup; matching inference |
-| TP2 | Two GPUs per Pod, source and target on different hosts | Both ranks transferred about 0.61 GB each; 47.97 MiB torch.compile cache installed; both ranks directly loaded AOT functions; matching inference |
-| PP2 / TP1 | Each instance spans two hosts, one GPU per Pod | Ranks 0/1 transferred 170/171 tensors, about 0.76 GB each; both node-specific markers matched; both Pods reused their installed AOT cache; matching inference |
-
-These three passing cases used the image above, before integrating main at
-`3fe38ae9`. The merged image
-`nvcr.io/nvidian/dynamo-dev/zhongdongmin@sha256:02818c1f8067d7d101a6a3048341c051a102e5de7189847700fab527d06e3853`
-was also exercised with distributed PP2/TP1 and required same-zone topology.
-Both ranks completed RDMA and reused the installed AOT cache, but the generated
-completion differed between source and target. That run failed the inference
-comparison and is not counted as passing; the cause remains under investigation.
-
-Every case used one MX discovery Service with one port. Target workers fetched
-one directory each. TP1 skipped four absent optional artifact types within the
-same logged second, without per-type backoff. Real worker RPC checks also
-confirmed that withdrawn membership is rejected, READY restores discovery, and
-old worker IDs are rejected. All three test namespaces were deleted afterwards.
-
-The distributed PP2 run used four Pods interleaved across two physical hosts:
-source node 0 shared a host with target node 1, and source node 1 with target
-node 0. Each corresponding rank's weights and artifacts crossed hosts. Other
-idle nodes carried reservation taints and were not used. This run does not
-qualify a two-node-by-eight-GPU topology or provide a startup-latency benchmark.
-
-The reproducible runner is
-[`ci/k8s/client/leader_discovery_gpu.py`](../../ci/k8s/client/leader_discovery_gpu.py).
-It saves directory responses, Pod placement, per-Pod logs, inference responses
-and `result.json` before cleanup. For example, from the repository root:
-
-```bash
-python ci/k8s/client/leader_discovery_gpu.py \
-  --context nebius-2 --namespace mx-leader-my-test \
-  --image nvcr.io/nvidian/dynamo-dev/zhongdongmin@sha256:2ea256bced645fe5614ca28c7056a29ad2dd35f37797d67f6db51297e8bac252 \
-  --revision c1899de289a04d12100db370d81485cdf75e47ca \
-  --tp 1 --pp 2 --nodes 2 \
-  --pull-secret-namespace YOUR_NAMESPACE --pull-secret nvcr-secret \
-  --output /tmp/mx-leader-gpu-results
-```
-
-The namespace must be new. For an explicitly retained test namespace, `--resume`
-requires the runner's ownership label and matching image. The two instance
-groups need separate engine rendezvous Services in addition to the single MX
-discovery Service. To rebuild the validation image, use
-[`Dockerfile.leader-test`](Dockerfile.leader-test) from the repository root.

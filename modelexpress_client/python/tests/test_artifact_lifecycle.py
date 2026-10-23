@@ -720,8 +720,7 @@ def test_unavailable_mooncake_backend_skips_install_and_publish(
     assert scheduled_publishers == {}
 
 
-@pytest.mark.parametrize("service_routed", [False, True])
-def test_every_device_participates_in_mooncake_lifecycle(monkeypatch, service_routed):
+def test_every_device_participates_in_mooncake_lifecycle(monkeypatch):
     monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
     monkeypatch.setenv("MX_ARTIFACT_BACKEND", "mooncake")
     monkeypatch.setattr(
@@ -734,7 +733,6 @@ def test_every_device_participates_in_mooncake_lifecycle(monkeypatch, service_ro
         worker_rank=1,
         device_id=1,
         accelerator_backend=SimpleNamespace(name="cuda"),
-        mx_client=SimpleNamespace(SERVICE_ROUTED_ARTIFACTS=service_routed),
     )
     transfers_factory = MagicMock(return_value=[])
     scheduled_publishers = {}
