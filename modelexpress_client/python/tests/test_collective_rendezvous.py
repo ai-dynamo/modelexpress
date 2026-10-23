@@ -648,6 +648,35 @@ class TestJoin:
         assert client._registration_stop.is_set()
         assert threads[0].joined
 
+    def test_a_closed_rendezvous_refuses_to_join_again(self):
+        # A worker whose communicator bootstrap failed closes its rendezvous;
+        # it must not renew its lease or rejoin the epoch it just aborted.
+        stub = FakeStub(
+            membership=membership(
+                assignments=[
+                    (0, pb.LANE_KIND_RESHARD, 1, 2),
+                    (1, pb.LANE_KIND_BROADCAST, 1, 2),
+                ]
+            )
+        )
+        client = make_rendezvous(stub)
+        kwargs = dict(
+            model_name="m",
+            trainer_slots=["t0"],
+            generator_slots=["g0"],
+            lanes=lanes_for(["t0"], ["g0"]),
+            slot_id="g0",
+            worker_id="w1",
+            role=Role.GENERATOR,
+            index_in_role=0,
+            plan_digest="d",
+        )
+        client.join(**kwargs)
+        client.close()
+        with pytest.raises(RendezvousError, match="closed"):
+            client.join(**kwargs)
+        assert stub.events == ["register", "join"]
+
 
 class TestAwaitReady:
     def test_it_returns_once_the_group_is_ready(self):

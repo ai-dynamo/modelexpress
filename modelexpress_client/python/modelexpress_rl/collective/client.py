@@ -646,12 +646,36 @@ class _RefitClientBase:
                     )
                 _bootstrap_barrier(broadcast, self._device)
         except BaseException:
-            self._cache.abort_group(membership.group_id)
-            self._membership = None
+            # Fatal for this worker. Its lease would otherwise keep the group
+            # READY at this epoch with the bootstrap ids just aborted, and a
+            # retry in this process would re-enter them. Closing the
+            # rendezvous stops the lease renewal so its TTL moves the epoch,
+            # and refuses any further join here: the worker must restart.
+            try:
+                self._cache.abort_group(membership.group_id)
+            finally:
+                self._membership = None
+                self._close_rendezvous_after_failed_bootstrap(membership)
             raise
 
         self._membership = membership
         return membership
+
+    def _close_rendezvous_after_failed_bootstrap(self, membership: Membership) -> None:
+        logger.error(
+            "communicator bootstrap of group %s at epoch %s failed; closing the "
+            "rendezvous so this worker's lease expires and the epoch moves. "
+            "This worker must be restarted to rejoin.",
+            membership.group_id,
+            membership.epoch,
+        )
+        try:
+            self._rendezvous.close()
+        except Exception:  # noqa: BLE001 - the bootstrap failure is re-raised
+            logger.warning(
+                "closing the rendezvous after a failed bootstrap raised",
+                exc_info=True,
+            )
 
     def cleanup(self) -> None:
         if self._wedged is not None:

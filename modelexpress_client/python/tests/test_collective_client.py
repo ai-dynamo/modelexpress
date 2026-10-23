@@ -397,6 +397,46 @@ class TestBootstrap:
         trainer(rz, FakeEngine()).compute_plan()
         assert rz.published == []
 
+    def test_a_failed_bootstrap_closes_the_rendezvous_so_the_epoch_is_not_reused(
+        self, fake_nccl, monkeypatch
+    ):
+        # The local communicators of this epoch were just aborted. A renewed
+        # registration would keep the group READY at the same epoch with the
+        # same bootstrap ids, so a same-process retry would re-enter them.
+        # Bootstrap failure is fatal for the worker: the lease stops renewing,
+        # its TTL moves the epoch, and a restarted worker joins the new one.
+        class ClosingRendezvous(FakeRendezvous):
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+            def join(self, **kwargs):
+                # As CollectiveRendezvous: a closed rendezvous refuses to join.
+                if self.closed:
+                    raise RendezvousError("the collective rendezvous is closed")
+                return super().join(**kwargs)
+
+        rz = ClosingRendezvous()
+        client = trainer(rz, FakeEngine())
+        monkeypatch.setattr(
+            collective_client,
+            "_bootstrap_barrier",
+            _raises(RuntimeError("barrier failed")),
+        )
+        with pytest.raises(RuntimeError, match="barrier failed"):
+            client.compute_plan()
+        assert rz.closed, "the lease kept renewing after the bootstrap failed"
+        assert len(client._cache) == 0
+
+        monkeypatch.setattr(
+            collective_client, "_bootstrap_barrier", lambda lane, device: None
+        )
+        with pytest.raises(RendezvousError, match="closed"):
+            client.compute_plan()
+        assert rz.joins == 1, "the failed epoch was joined again"
+        assert len(client._cache) == 0
+
     def test_every_worker_barriers_between_global_pp_lane_initializations(
         self, fake_nccl, monkeypatch
     ):

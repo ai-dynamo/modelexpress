@@ -253,6 +253,13 @@ The flowchart in section 2.B shows the same order.
 Any other exception from a round call is a transport or timeout failure; the
 round is already aborted and reported, so re-run `compute_plan`.
 
+A failure while `compute_plan` bootstraps the communicators (lane init, the
+post-init settle, or the bootstrap barrier) is fatal for the worker instead.
+The local communicators are aborted and the rendezvous is closed: the worker's
+lease stops renewing, so its TTL moves the epoch off the bootstrap ids just
+aborted, and any later `compute_plan` on that client raises `RendezvousError`
+rather than rejoin it. Restart the worker process; it joins the next epoch.
+
 ### Configuration
 
 Defaults and details are in section 9.
