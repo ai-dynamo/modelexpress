@@ -527,21 +527,24 @@ def test_cuda_arena_uses_classic_pool_when_another_device_is_current(dist_ready)
     previous = torch.cuda.current_device()
     torch.cuda.set_device(1)
     try:
-        state = {"w": torch.ones(64, 64, device=arena_device)}
+        # Several shards: each arena re-enters the pool scope on the arena device.
+        state = {
+            name: torch.ones(64, 64, device=arena_device) for name in ("a", "b", "c")
+        }
         _stage(_adapter(manager), state, TrainerStagingMode.COPY_TO_DEVICE).publish_ready.wait()
     finally:
         torch.cuda.set_device(previous)
 
-    (served,) = manager.registered[0].values()
-    assert served.device == arena_device
+    served = list(manager.registered[0].values())
+    assert [t.device for t in served] == [arena_device] * 3
+    segments = torch.cuda.memory_snapshot()
     pools = [
         segment.get("segment_pool_id")
-        for segment in torch.cuda.memory_snapshot()
-        if segment["address"]
-        <= served.data_ptr()
-        < segment["address"] + segment["total_size"]
+        for t in served
+        for segment in segments
+        if segment["address"] <= t.data_ptr() < segment["address"] + segment["total_size"]
     ]
-    assert pools == [tuple(cuda_pool._get_pool().id)]
+    assert pools == [tuple(cuda_pool._get_pool(0).id)] * 3
 
 
 def test_host_staging_without_cuda_rejects_before_allocation(dist_ready, monkeypatch):

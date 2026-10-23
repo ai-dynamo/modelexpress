@@ -75,14 +75,14 @@ void mx_classic_free(void* ptr, ptrdiff_t size, int device, void* stream) {
 }
 """
 
-_pool: "torch.cuda.MemPool | None" = None
+_pools: "dict[int, torch.cuda.MemPool]" = {}
 _allocator_wrapper: "torch.cuda.memory.CUDAPluggableAllocator | None" = None
 
 
-def _get_pool() -> "torch.cuda.MemPool":
-    global _pool, _allocator_wrapper
-    if _pool is not None:
-        return _pool
+def _get_allocator() -> "torch.cuda.memory.CUDAPluggableAllocator":
+    global _allocator_wrapper
+    if _allocator_wrapper is not None:
+        return _allocator_wrapper
     module = load_inline(
         name="mx_classic_cuda_alloc",
         cpp_sources=[_SOURCE],
@@ -94,8 +94,32 @@ def _get_pool() -> "torch.cuda.MemPool":
     _allocator_wrapper = torch.cuda.memory.CUDAPluggableAllocator(
         str(so_path), "mx_classic_alloc", "mx_classic_free"
     )
-    _pool = torch.cuda.MemPool(_allocator_wrapper.allocator())
-    return _pool
+    return _allocator_wrapper
+
+
+def _get_pool(device_index: int) -> "torch.cuda.MemPool":
+    """Return the classic pool for ``device_index``, creating it on first use.
+
+    A MemPool registers with the device current at construction and can only be
+    reused there: entering it repeatedly on any other device trips the caching
+    allocator's pool use-count assertion. So each device gets its own pool,
+    constructed with that device current.
+    """
+    pool = _pools.get(device_index)
+    if pool is None:
+        allocator = _get_allocator()
+        with torch.cuda.device(device_index):
+            pool = torch.cuda.MemPool(allocator.allocator())
+        _pools[device_index] = pool
+    return pool
+
+
+def _device_index(device: "torch.device | str | int | None") -> int:
+    """Resolve ``device`` to the CUDA device index an allocation on it lands on."""
+    if isinstance(device, int):
+        return device
+    index = None if device is None else torch.device(device).index
+    return torch.cuda.current_device() if index is None else index
 
 
 @contextmanager
@@ -107,10 +131,11 @@ def classic_cuda_alloc(
     Use when the resulting tensor's address must be a contiguous ``cudaMalloc``
     block - required for NIXL-registered buffers (see module docstring).
 
-    The pool applies only to allocations on ``device``; ``None`` means the
-    current CUDA device. Pass the device the buffer is allocated on whenever it
+    The pool applies only to allocations on ``device``; ``None`` or a device
+    without an index means the current CUDA device, which is where such a
+    device allocates. Pass the device the buffer is allocated on whenever it
     may differ from the current one, or the allocation silently falls back to
     the default caching allocator."""
-    pool = _get_pool()
-    with torch.cuda.use_mem_pool(pool, device=device):
+    device_index = _device_index(device)
+    with torch.cuda.use_mem_pool(_get_pool(device_index), device=device_index):
         yield

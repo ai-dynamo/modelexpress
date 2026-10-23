@@ -37,7 +37,7 @@ def registered_buffer_alloc_scope(
 
     ``device`` is the device the buffers are allocated on. A pool scope applies
     to one device, so pass it whenever it may differ from the backend's current
-    device; ``None`` means the current device.
+    device; ``None`` or a device without an index means the current device.
     """
     if backend.requires_classic_alloc_pool():
         if backend.name != "cuda":
