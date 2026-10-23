@@ -128,6 +128,15 @@ pub const MX_METADATA_NAMESPACE: &str = "MX_METADATA_NAMESPACE";
 /// Kubernetes namespace injected via the downward API for in-cluster pods.
 pub const POD_NAMESPACE: &str = "POD_NAMESPACE";
 
+// ── Refit collective (server) ───────────────────────────────────────────────
+/// Deadline (seconds) for a collective-refit weight transfer, armed per
+/// weight version once the group reports READY. Shared with the Python NCCL
+/// client, which stores it as a float; also reused server-side as the TTL on
+/// a newly created transfer op's idempotency key, so a worker that dies
+/// between create and the next group-epoch bump does not leak the key
+/// forever.
+pub const MX_NCCL_REFIT_TRANSFER_TIMEOUT_S: &str = "MX_NCCL_REFIT_TRANSFER_TIMEOUT_S";
+
 // ── Reaper (server) ─────────────────────────────────────────────────────────
 /// Interval (seconds) between reaper scans for stale/GC worker sweeps.
 pub const MX_REAPER_SCAN_INTERVAL_SECS: &str = "MX_REAPER_SCAN_INTERVAL_SECS";
@@ -171,6 +180,9 @@ const DEFAULT_REAPER_SCAN_INTERVAL_SECS: u64 = 30;
 const DEFAULT_REGISTRY_STATS_INTERVAL_SECS: u64 = 60;
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_GC_TIMEOUT_SECS: u64 = 3600;
+/// Default collective-refit transfer timeout, matching the Python client's
+/// `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` default of 600.0 seconds.
+const DEFAULT_NCCL_REFIT_TRANSFER_TIMEOUT_SECS: u64 = 600;
 
 // ── Getters ───────────────────────────────────────────────────────────────
 
@@ -328,12 +340,60 @@ pub fn gc_timeout_secs() -> u64 {
     env_u64(MX_GC_TIMEOUT_SECS, DEFAULT_GC_TIMEOUT_SECS)
 }
 
+/// Collective-refit transfer timeout in seconds
+/// ([`MX_NCCL_REFIT_TRANSFER_TIMEOUT_S`], default 600). Accepts either an
+/// integer or a fractional value, rounded up, since the Python client stores
+/// this as a float.
+pub fn nccl_refit_transfer_timeout_secs() -> u64 {
+    env_secs_ceil(
+        MX_NCCL_REFIT_TRANSFER_TIMEOUT_S,
+        DEFAULT_NCCL_REFIT_TRANSFER_TIMEOUT_SECS,
+    )
+}
+
 /// Read an environment variable as `u64`, falling back to `default`.
 fn env_u64(name: &str, default: u64) -> u64 {
     env::var(name)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Largest number of seconds [`env_secs_ceil`] returns. The value ends up as a
+/// Redis `EX` argument, so it has to stay well inside what Redis accepts; one
+/// week is far beyond any real transfer deadline.
+const MAX_ENV_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Read an environment variable as a number of seconds, accepting either an
+/// integer or a fractional value, rounded up to the nearest whole second.
+///
+/// Like the Python client, only finite values greater than zero are accepted.
+/// Anything else (zero, negative, NaN, infinite, or unparseable) falls back to
+/// `default` with a warning, and values above [`MAX_ENV_SECS`] are capped.
+fn env_secs_ceil(name: &str, default: u64) -> u64 {
+    let Ok(raw) = env::var(name) else {
+        return default;
+    };
+    let parsed = raw.trim().parse::<f64>().ok();
+    match parsed {
+        Some(value) if value.is_finite() && value > 0.0 => {
+            if value > MAX_ENV_SECS as f64 {
+                tracing::warn!(
+                    "{name}={raw:?} exceeds the maximum of {MAX_ENV_SECS}s; using {MAX_ENV_SECS}s"
+                );
+                MAX_ENV_SECS
+            } else {
+                // In range (0, MAX_ENV_SECS], so the cast cannot truncate.
+                value.ceil() as u64
+            }
+        }
+        _ => {
+            tracing::warn!(
+                "{name}={raw:?} is not a positive finite number of seconds; using the default of {default}s"
+            );
+            default
+        }
+    }
 }
 
 #[cfg(test)]
@@ -506,5 +566,42 @@ mod tests {
 
         let _g = EnvVarGuard::set(&lock, MX_GC_TIMEOUT_SECS, "not-a-number");
         assert_eq!(gc_timeout_secs(), DEFAULT_GC_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn transfer_timeout_accepts_only_positive_finite_seconds() {
+        let lock = acquire_env_mutex();
+        let name = MX_NCCL_REFIT_TRANSFER_TIMEOUT_S;
+        let default = DEFAULT_NCCL_REFIT_TRANSFER_TIMEOUT_SECS;
+
+        let _g = EnvVarGuard::remove(&lock, name);
+        assert_eq!(nccl_refit_transfer_timeout_secs(), default);
+
+        for (raw, expected) in [
+            // Valid values, fractional ones rounded up.
+            ("120", 120),
+            ("0.25", 1),
+            ("90.5", 91),
+            // Not positive: fall back to the default.
+            ("0", default),
+            ("0.0", default),
+            ("-0.0", default),
+            ("-5", default),
+            // Not finite or not a number: fall back to the default.
+            ("NaN", default),
+            ("inf", default),
+            ("-inf", default),
+            ("not-a-number", default),
+            // Huge but finite: capped.
+            ("1e300", MAX_ENV_SECS),
+            ("18446744073709551616", MAX_ENV_SECS),
+        ] {
+            let _g = EnvVarGuard::set(&lock, name, raw);
+            assert_eq!(nccl_refit_transfer_timeout_secs(), expected, "{name}={raw}");
+        }
+
+        let at_cap = MAX_ENV_SECS.to_string();
+        let _g = EnvVarGuard::set(&lock, name, &at_cap);
+        assert_eq!(nccl_refit_transfer_timeout_secs(), MAX_ENV_SECS);
     }
 }
