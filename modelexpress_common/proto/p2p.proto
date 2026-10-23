@@ -352,6 +352,7 @@ message InstanceWorkerMetadata {
   // Currently sealed/published artifacts. Absence is an immediate cache miss,
   // not a promise that this worker can never publish that type in the future.
   repeated InstanceArtifact artifacts = 3;
+  map<string, string> topology = 4;
 }
 
 message RegisterInstanceWorkerRequest {
@@ -504,6 +505,8 @@ message GetArtifactManifestHeaderResponse {
 
   // Distributed node rank that owns this node-scoped artifact.
   uint32 node_rank = 16;
+  // Published worker location for transfer-domain validation on direct fetch.
+  map<string, string> topology = 17;
 }
 
 message GetArtifactManifestChunksRequest {

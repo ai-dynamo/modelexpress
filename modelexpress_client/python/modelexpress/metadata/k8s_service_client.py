@@ -53,6 +53,7 @@ from .. import p2p_pb2, p2p_pb2_grpc
 from ..client import MxClientBase
 from .payload import accelerators_compatible, tensor_source_metadata
 from .source_id import compute_mx_source_id
+from ..topology import blocks_selection, in_domain, resolve_policy
 
 logger = logging.getLogger("modelexpress.metadata.k8s_service_client")
 
@@ -212,6 +213,7 @@ class MxK8sServiceClient(MxClientBase):
                     worker_rank=entry.worker.worker_rank,
                     model_name=identity.model_name,
                     accelerator=entry.accelerator,
+                    topology=entry.topology,
                 )
                 for entry in metadata.workers if entry.worker.worker_rank == self._worker_rank
             ])
@@ -381,8 +383,11 @@ class MxK8sServiceClient(MxClientBase):
         from .artifact_transfer import ArtifactSourceEndpoint
 
         requested_node_rank = 0 if node_rank is None else node_rank
+        policy = resolve_policy()
+        if blocks_selection(policy):
+            raise LookupError("required artifact source topology is unknown")
         if self._leader is not None:
-            return self._leader.artifact_source(identity, requested_node_rank, artifact_id, accelerator)
+            return self._leader.artifact_source(identity, requested_node_rank, artifact_id, accelerator, policy)
         mx_source_id = compute_mx_source_id(identity)
         service_endpoint = self._resolve_artifact_endpoint(requested_node_rank)
         last_error: Exception | None = None
@@ -404,6 +409,8 @@ class MxK8sServiceClient(MxClientBase):
                         "artifact mx_source_id mismatch: expected "
                         f"{mx_source_id!r}, got {response.mx_source_id!r}"
                     )
+                elif policy is not None and policy.required and not in_domain(response, policy):
+                    mismatch_reason = "artifact source is outside the required topology"
                 elif response.mx_source_type != identity.mx_source_type:
                     mismatch_reason = (
                         "artifact source type mismatch: expected "

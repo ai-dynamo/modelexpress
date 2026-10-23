@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import grpc
+import json
 import pytest
 import torch
 
@@ -21,6 +22,7 @@ from modelexpress.metadata.artifact_manifest import (
 )
 from modelexpress.metadata.artifact_transfer import transfer_artifact_from_worker
 from modelexpress.metadata.artifact_transport import ArtifactTransportContext
+from modelexpress.metadata.artifact_transport import ArtifactTransportUnavailable
 from modelexpress.metadata.instance_metadata import grpc_endpoint
 from modelexpress.metadata.k8s_service_client import MxK8sServiceClient
 from modelexpress.metadata.nixl_artifact_transport import NixlArtifactTransport
@@ -95,6 +97,7 @@ class Pool:
             SimpleNamespace(
                 identity=self.identity,
                 global_rank=rank,
+                worker_rank=rank,
                 node_rank=rank // self.per_node,
                 device_id=rank % self.per_node,
                 head_addr="127.0.0.1",
@@ -548,6 +551,7 @@ def test_runtime_head_and_framework_health_probe(monkeypatch, framework, port, t
         SimpleNamespace(
             identity=weights,
             global_rank=8,
+            worker_rank=8,
             node_rank=1,
             device_id=0,
             head_addr="engine-leader",
@@ -567,3 +571,108 @@ def test_runtime_head_and_framework_health_probe(monkeypatch, framework, port, t
 )
 def test_direct_endpoints_support_ipv6(host, expected):
     assert grpc_endpoint(host, 6555) == expected
+
+
+@pytest.mark.parametrize(
+    "source_zone,enforcement,accepted",
+    [
+        ("a", "required", True),
+        ("b", "required", False),
+        ("", "required", False),
+        ("b", "preferred", True),
+    ],
+)
+def test_leader_directory_enforces_transfer_domain(
+    pool_factory, monkeypatch, source_zone, enforcement, accepted
+):
+    pool = pool_factory()
+    monkeypatch.setattr(
+        "modelexpress.metadata.worker_server.local_topology",
+        lambda: {"zone": source_zone},
+    )
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "zone")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", json.dumps({"zone": "a"}))
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_ENFORCEMENT", enforcement)
+    target = pool.client()
+    if not accepted:
+        with pytest.raises(ValueError, match="required topology"):
+            target.list_sources(pool.identity)
+        return
+    ref = target.list_sources(pool.identity).instances[0]
+    assert ref.topology["zone"] == source_zone
+    assert (
+        target.get_metadata(ref.mx_source_id, ref.worker_id).worker.topology["zone"]
+        == source_zone
+    )
+
+
+def test_unknown_required_domain_blocks_directory_rpc(pool_factory, monkeypatch):
+    pool = pool_factory()
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "zone")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", "{}")
+    monkeypatch.setattr("modelexpress.topology.DOMAIN_WAIT_TIMEOUT_S", 0)
+    directory = pool.servers[0]._servicer._instance_directory
+    directory.metadata = Mock(wraps=directory.metadata)
+    with pytest.raises(LookupError, match="topology is unknown"):
+        pool.client().list_sources(pool.identity)
+    directory.metadata.assert_not_called()
+
+
+def test_artifact_topology_drift_rejected_before_creating_files(
+    pool_factory, monkeypatch, tmp_path
+):
+    pool = pool_factory()
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_file = source_dir / "cache.bin"
+    source_file.write_bytes(b"compiled-cache")
+    artifact_identity, _ = pool.publish_artifact(1, source_file)
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "zone")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", json.dumps({"zone": "a"}))
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_ENFORCEMENT", "required")
+    monkeypatch.setattr(
+        "modelexpress.metadata.worker_server.local_topology", lambda: {"zone": "a"}
+    )
+    target = pool.client()
+    target.discover_artifact_source(artifact_identity, node_rank=1)
+    monkeypatch.setattr(
+        "modelexpress.metadata.worker_server.local_topology", lambda: {"zone": "b"}
+    )
+    destination = tmp_path / "must-not-exist"
+    with pytest.raises(ArtifactTransportUnavailable, match="required topology"):
+        NixlArtifactTransport(mx_client=target, nixl_manager=object()).fetch(
+            SimpleNamespace(name="triton", target_file_paths=lambda: [destination]),
+            artifact_identity,
+            ArtifactTransportContext(node_rank=1, accelerator="cuda"),
+        )
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    "source_zone,accepted", [("a", True), ("b", False), ("", False)]
+)
+def test_legacy_artifact_header_enforces_transfer_domain(
+    pool_factory, monkeypatch, tmp_path, source_zone, accepted
+):
+    pool = pool_factory(1, 1)
+    path = tmp_path / "cache.bin"
+    path.write_bytes(b"compiled-cache")
+    artifact_identity, _ = pool.publish_artifact(0, path)
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "zone")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", json.dumps({"zone": "a"}))
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_ENFORCEMENT", "required")
+    monkeypatch.setattr(
+        "modelexpress.metadata.worker_server.local_topology",
+        lambda: {"zone": source_zone},
+    )
+    client = MxK8sServiceClient(
+        artifact_service_pattern=pool.endpoint, leader_service="", max_retries=0
+    )
+    if accepted:
+        assert (
+            client.discover_artifact_source(artifact_identity).worker_id
+            == "generation-0"
+        )
+    else:
+        with pytest.raises(RuntimeError, match="required topology"):
+            client.discover_artifact_source(artifact_identity)

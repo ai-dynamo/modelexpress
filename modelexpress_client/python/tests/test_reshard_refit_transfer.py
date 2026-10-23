@@ -18,17 +18,17 @@ Run: pytest tests/test_reshard_refit_transfer.py
 
 import torch
 
-from modelexpress.refit.reshard.geometry import capture_geometry
-from modelexpress.refit.reshard.receiver import _replay_ops
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import (
+from modelexpress_rl.refit.reshard.geometry import capture_geometry
+from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import (
     SourceInfo,
     bind_transfer,
     execute_transfer,
     plan_transfer,
 )
-from modelexpress.refit.reshard.transport import InMemoryReferenceTransport
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.refit.reshard.transport import InMemoryReferenceTransport
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
 
 # Reuse the ToyModel + manifest from the geometry test (same package, same dir).
 from tests.test_reshard_refit_geometry import ToyModel, _manifest
@@ -298,7 +298,7 @@ def test_unsupported_source_is_marked_for_fail_closed():
     # Fail-closed means the unsupported source is never fetched. `plan_transfer`
     # records it and plans nothing for it; the refusal itself is the receiver's
     # policy, not this layer's - see the `if plan.fallback:` guard in
-    # `ReshardReceiver._prepare`, which raises UnsupportedReshard before any
+    # `_NixlStagedTransfer.prepare`, which raises UnsupportedReshard before any
     # transport call rather than serving stale weights for `bad`.
     assert "bad" not in planned_params
 

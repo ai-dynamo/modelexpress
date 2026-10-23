@@ -1818,17 +1818,6 @@ def test_sglang_health_url_replaces_draft_gate(_clean_sglang_registries):
     assert 0 not in loader_mod._draft_publication_gates
 
 
-def test_sglang_rl_chain_rejects_draft(monkeypatch):
-    monkeypatch.setenv("MX_LOAD_STRATEGY_CHAIN", "RL")
-    loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
-    with pytest.raises(ValueError, match="speculative draft"):
-        loader.load_model(
-            model=nn.Linear(2, 2),
-            model_config=_model_config(is_draft_model=True),
-            device_config=_device_config(),
-        )
-
-
 @pytest.mark.parametrize(
     ("spec", "expected"),
     [

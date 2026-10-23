@@ -188,6 +188,12 @@ exec vllm serve "$TEST_MODEL" --revision "$MX_MODEL_REVISION" \\
         }
         if group == "source":
             env.update(MX_K8S_SOURCE_RETRIES="2", MX_K8S_SOURCE_BACKOFF_SECONDS="0.1")
+        if a.topology_zone:
+            env.update(
+                MX_P2P_TOPOLOGY_DOMAIN="zone",
+                MX_P2P_TOPOLOGY_ENFORCEMENT="required",
+                MX_P2P_TOPOLOGY=json.dumps({"zone": a.topology_zone}),
+            )
         container = {
             "name": "vllm",
             "image": a.image,
@@ -535,6 +541,7 @@ print(json.dumps(checks))
                 "tp": a.tp,
                 "pp": a.pp,
                 "nodes_per_instance": a.nodes,
+                "topology_zone": a.topology_zone,
                 "placements": placements,
                 "rdma_ranks": sorted(ranks),
                 "directory_requests": selections,
@@ -570,6 +577,9 @@ def main():
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--keep-namespace", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--topology-zone", help="Exercise required same-zone topology enforcement"
+    )
     args = parser.parse_args()
     if args.tp < 1 or args.pp < 1 or args.nodes < 1 or args.tp * args.pp % args.nodes:
         parser.error("positive TP * PP must be divisible by nodes")

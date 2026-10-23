@@ -137,6 +137,13 @@ instances behind the Service; there is no target-wide donor-affinity collective.
 Live expert placement/EPLB updates are outside this protocol. Central backends
 and legacy rank/node discovery retain their existing behavior.
 
+Transfer-domain enforcement also applies to leader discovery. Required policies
+reject unknown local domains and nonmatching worker locations; directory entries
+carry topology into weight source selection. Artifact headers recheck the domain
+before creating target files, so a changed source location cannot bypass the
+policy through a cached directory. Legacy artifact Services validate the same
+header fields and fail closed when required topology is absent.
+
 ## GPU validation
 
 On October 23, 2026, the leader discovery implementation was tested on

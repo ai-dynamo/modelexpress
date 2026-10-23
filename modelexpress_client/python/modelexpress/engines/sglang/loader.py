@@ -16,7 +16,11 @@ import torch
 import torch.nn as nn
 
 from ... import envs, p2p_pb2
-from ...load_strategy import LoadContext, run_load_strategy_chain
+from ...load_strategy import (
+    LoadContext,
+    run_load_strategy_chain,
+    validate_load_strategy_chain,
+)
 from ...load_strategy.base import clear_exception_tracebacks
 from ...load_strategy.context import LoadResult
 from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
@@ -160,6 +164,7 @@ class MxModelLoader:
     ) -> nn.Module:
         """Load model weights through the shared ModelExpress strategy chain."""
         transport = getattr(self.load_config, "modelexpress_transport", "nixl")
+        self._validate_load_policy(transport)
         # L0 wraps the dispatcher rather than each transport, so the
         # transfer_engine path -- which never touches the strategy chain -- still
         # reports a load duration. Instrumenting only the chain would leave that
@@ -195,6 +200,12 @@ class MxModelLoader:
                 f"modelexpress transports 'nixl' and 'transfer_engine', "
                 f"got {transport!r}."
             )
+
+    def _validate_load_policy(self, transport: str) -> None:
+        validate_load_strategy_chain()
+
+    def _run_load_strategy_chain(self, model: nn.Module, ctx: LoadContext) -> nn.Module:
+        return run_load_strategy_chain(model, ctx)
 
     def _load_model_via_nixl(
         self,
@@ -317,7 +328,7 @@ class MxModelLoader:
         with selection_metrics.time_load_phase(
             "sglang", ctx.identity.model_name, "chain"
         ):
-            model = run_load_strategy_chain(model, ctx)
+            model = self._run_load_strategy_chain(model, ctx)
 
         if not is_main:
             if ctx.p2p_enabled and ctx.nixl_manager is not None:

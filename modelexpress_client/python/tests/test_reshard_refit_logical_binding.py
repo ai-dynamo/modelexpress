@@ -8,14 +8,15 @@ import ctypes
 import pytest
 import torch
 
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import (
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import (
     SourceInfo,
     bind_transfer,
     plan_transfer,
     plan_transfer_groups,
 )
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.version import MeshIdentity
 from tests.test_refit_bounded_descriptors import harness
 
 
@@ -129,7 +130,7 @@ def test_binding_failure_does_not_return_a_partial_descriptor_plan():
 
 @pytest.mark.parametrize("keyword", [False, True])
 def test_recorded_operation_arguments_are_snapshotted_before_binding(keyword):
-    from modelexpress.refit.reshard.geometry import capture_geometry
+    from modelexpress_rl.refit.reshard.geometry import capture_geometry
 
     dims = [1, 0]
 
@@ -224,17 +225,11 @@ def test_full_pull_replay_preserves_source_order_after_capture_reordering(groupe
     assert torch.equal(destination, b.transpose(0, 1))
 
 
-@pytest.mark.parametrize("cache_bounded", [False, True])
-@pytest.mark.parametrize("reuse_complete", [False, True])
-def test_staged_prepare_binds_split_sources_from_reordered_manifests(
-    monkeypatch, harness, cache_bounded, reuse_complete
-):
-    from modelexpress.refit.reshard.rendezvous import (
+def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
+    from modelexpress_rl.refit.reshard.rendezvous import (
         PublishedShard, PublishedTensor, structural_manifest_digest,
         wrap_rendezvous_blob,
     )
-    monkeypatch.setenv("MX_REFIT_CACHE_BOUNDED_PLANS", str(int(cache_bounded)))
-    monkeypatch.setenv("MX_REFIT_REUSE_COMPLETE_PLAN", str(int(reuse_complete)))
 
     first = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     second = torch.arange(100, 108, dtype=torch.float32).reshape(2, 4)
@@ -265,14 +260,25 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(
         capture_calls.append(_schema)
         return capture, layout
 
-    fingerprints = tuple(structural_manifest_digest(m) for m in manifests)
+    from modelexpress_rl.inference.adapter import TrainerSourceShard
+    from modelexpress_rl.inference.plan import TrainerSourceSnapshot
+
+    snapshot = TrainerSourceSnapshot(
+        MeshIdentity("mesh", 1), tuple(
+            TrainerSourceShard(
+                slot, f"worker-{index}", structural_manifest_digest(blob),
+                f"{agent}:19000", blob,
+            )
+            for index, (slot, agent, blob) in enumerate((
+                ("slot-z", "agent-z", manifests[0]),
+                ("slot-a", "agent-a", manifests[1]),
+            ))
+        ),
+    )
+    harness.transfer._capture_layout = capture_layout
     request = dict(
         manifests=manifests,
-        source_fingerprints=fingerprints,
-        capture_layout=capture_layout,
-        max_staging_bytes=512,
-        staging_device="cpu",
-        source_slot_ids=("slot-z", "slot-a"),
+        trainer_snapshot=snapshot,
     )
     prepared = harness.transfer.prepare(**request)
     metrics, installed = harness.collect(prepared)
@@ -285,4 +291,4 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(
     prepared = harness.transfer.prepare(**request)
     _second_metrics, second_install = harness.collect(prepared)
     assert torch.equal(second_install["weight"], torch.cat((first, second)))
-    assert len(capture_calls) == 2
+    assert len(capture_calls) == 1

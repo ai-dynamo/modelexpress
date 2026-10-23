@@ -27,19 +27,47 @@ ci_kubectl() {
   done
 }
 
+ci_workload_pods() {
+  local label="$1" workload="$2" selector="$3" pods failed controllers
+  pods=$(ci_kubectl get pods -n "$NAMESPACE" -l "$selector" -o json) || return 1
+  pods=$(printf '%s\n' "$pods" | jq '
+      def transient_rdma_admission:
+        .status.phase == "Failed" and
+        .status.reason == "UnexpectedAdmissionError" and
+        ((.status.message // "") | test("no healthy devices present.*rdma/ib"; "i"));
+      {failed: [.items[] | select(
+        (.status.phase == "Failed" and (transient_rdma_admission | not)) or
+        any(.status.containerStatuses[]?, .status.initContainerStatuses[]?;
+          ((.state.waiting.reason // .state.terminated.reason // "") |
+            test("Error|CrashLoopBackOff|OOMKilled")))
+      ) | .metadata.name],
+       retryable: any(.items[]; transient_rdma_admission),
+       items: [.items[] | select(.status.phase != "Failed" and .metadata.deletionTimestamp == null)]}') || return 1
+  failed=$(printf '%s\n' "$pods" | jq -r '.failed[]')
+  if [ -n "$failed" ]; then
+    echo "ERROR: $label pod failed: $failed" >&2
+    return 1
+  fi
+  if [ "$(printf '%s\n' "$pods" | jq '.retryable')" = true ]; then
+    controllers=$(ci_kubectl get job,statefulset,deployment "$workload" -n "$NAMESPACE" --ignore-not-found -o json) || return 1
+    if printf '%s\n' "$controllers" | jq -e '(.items // [.]) | any(.[];
+      (.kind == "Job" and (.status.failed // 0) > (.spec.backoffLimit // 0)) or
+      any(.status.conditions[]?; (.type == "Failed" or .type == "FailureTarget") and .status == "True"))' >/dev/null; then
+      echo "ERROR: $label workload exhausted its RDMA admission retry" >&2
+      return 1
+    fi
+  fi
+  printf '%s\n' "$pods" | jq '{items}'
+}
+
 wait_for_scheduling() {
   local label="$1" workload="$2" selector="$3" timeout="$4"
-  local deadline=$((SECONDS + timeout)) controllers expected pods scheduled failed
+  local deadline=$((SECONDS + timeout)) controllers expected pods scheduled
   while [ "$SECONDS" -lt "$deadline" ]; do
     controllers=$(ci_kubectl get job,statefulset,deployment "$workload" -n "$NAMESPACE" --ignore-not-found -o json) || return 1
     expected=$(printf '%s\n' "$controllers" | jq '(.items // [.]) | map(.spec.replicas // .spec.parallelism // 1) | add // 0')
-    pods=$(ci_kubectl get pods -n "$NAMESPACE" -l "$selector" -o json) || return 1
-    failed=$(printf '%s\n' "$pods" | jq -r '.items[] | select(.status.phase == "Failed" or any(.status.containerStatuses[]?, .status.initContainerStatuses[]?; .state.waiting.reason == "CrashLoopBackOff" or .state.terminated.reason == "OOMKilled" or .state.terminated.reason == "Error")) | .metadata.name')
-    if [ -n "$failed" ]; then
-      echo "ERROR: $label pod failed while waiting for scheduling: $failed" >&2
-      return 1
-    fi
-    scheduled=$(printf '%s\n' "$pods" | jq '[.items[] | select(.metadata.deletionTimestamp == null) | select(any(.status.conditions[]?; .type == "PodScheduled" and .status == "True"))] | length')
+    pods=$(ci_workload_pods "$label" "$workload" "$selector") || return 1
+    scheduled=$(printf '%s\n' "$pods" | jq '[.items[] | select(any(.status.conditions[]?; .type == "PodScheduled" and .status == "True"))] | length')
     if [ "$expected" -gt 0 ] && [ "$scheduled" -ge "$expected" ]; then
       echo "$label scheduled (${scheduled}/${expected} pods); starting the startup deadline"
       return 0
@@ -78,9 +106,9 @@ wait_for_worker_liveness() {
 }
 
 # GitHub releases a cancelled job's queue slot before independent cleanup finishes.
-# Wait for the previous CI namespaces and physical pods before allocating a new workload.
+# Wait for previous CI resources; the exclusive large lane reclaims stale namespaces.
 wait_for_gpu_pool_cleanup() {
-  local pool="$1" deadline=$((SECONDS + 900)) namespaces pods remaining
+  local pool="$1" deadline=$((SECONDS + 900)) namespaces pods remaining cleanup_targets namespace owner
   local lane="${MX_CI_GPU_LANE:-slot-0}"
   local slot_selector="ci.modelexpress.nvidia.com/gpu-lane=$lane"
   # vCluster mirrors namespace labels using SHA256(label key)[:10].
@@ -106,6 +134,26 @@ wait_for_gpu_pool_cleanup() {
     if [ "$remaining" -eq 0 ]; then
       echo "GPU pool $pool lane $lane has no previous CI workload awaiting cleanup"
       return 0
+    fi
+    if [[ "$pool" == a100* && "$lane" = large-workload ]]; then
+      cleanup_targets=$(printf '%s\n' "$namespaces" | jq -r \
+        --arg pool "$pool" --arg lane "$lane" '
+        .items[] |
+        select(.metadata.name | startswith("mx-ci-")) |
+        select(.metadata.labels["ci.modelexpress.nvidia.com/gpu-lane"] == $lane) |
+        select(.metadata.labels["ci.modelexpress.nvidia.com/gpu-pool"] == $pool) |
+        [.metadata.name, (.metadata.labels["ci.modelexpress.nvidia.com/run-id"] // "")] | @tsv') || return 1
+      while IFS=$'\t' read -r namespace owner; do
+        [ -n "$namespace" ] || continue
+        if [[ ! "$owner" =~ ^[0-9]+-[0-9]+$ ]]; then
+          echo "ERROR: refusing stale namespace $namespace with invalid run owner '$owner'" >&2
+          return 1
+        fi
+        echo "Reclaiming stale namespace $namespace from run $owner"
+        GITHUB_RUN_ID="${owner%-*}" GITHUB_RUN_ATTEMPT="${owner##*-}" \
+          bash .github/scripts/ci-namespace.sh cleanup "$namespace" || return 1
+      done <<< "$cleanup_targets"
+      [ -z "$cleanup_targets" ] || continue
     fi
     echo "Waiting for GPU pool $pool lane $lane cleanup ($remaining namespaces/pods remain)"
     sleep 10

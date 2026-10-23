@@ -21,6 +21,7 @@ import pytest
 
 from modelexpress import p2p_pb2
 from modelexpress.adapter import StrategyFailed, StrategyRecoveryError
+from modelexpress.load_strategy import _strategy_phases
 from modelexpress.load_strategy.base import LoadResult, clear_exception_tracebacks
 from modelexpress.load_strategy.rdma_strategy import MAX_SOURCE_RETRIES, RdmaStrategy
 from modelexpress.source_selection import (
@@ -660,6 +661,7 @@ def test_load_metadata_miss_tries_next_candidate():
     strat._fetch_worker_metadata = MagicMock(side_effect=[None, worker])
     strat._load_as_target = MagicMock(return_value="loaded")
     ctx = MagicMock(global_rank=0)
+    ctx.is_reload = False
     ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
     with pytest.MonkeyPatch.context() as mp:
@@ -801,6 +803,7 @@ def test_load_transfer_failure_reinitializes_and_tries_next_source():
         metadata={"retry": True},
     )
     ctx = MagicMock(global_rank=0)
+    ctx.is_reload = False
     ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
     ctx.adapter.reinit_for_retry.return_value = retry_result
 
@@ -866,6 +869,7 @@ def test_load_internal_reinit_is_visible_after_later_metadata_miss():
     )
     ctx = MagicMock(global_rank=0)
     ctx.accelerator_backend.name = ""
+    ctx.is_reload = False
     original_model = MagicMock(name="original-model")
     original_result = LoadResult(value=original_model, model=original_model)
 
@@ -897,6 +901,7 @@ def test_load_internal_reinit_then_clean_failure_stays_clean():
     )
     ctx = MagicMock(global_rank=0)
     ctx.accelerator_backend.name = ""
+    ctx.is_reload = False
     ctx.adapter.reinit_for_retry.return_value = MagicMock(name="retry-result")
 
     with pytest.raises(StrategyFailed, match="clean failure") as exc:
@@ -923,6 +928,26 @@ def test_load_last_candidate_mutated_failure_propagates_mutated():
     ctx.adapter.reinit_for_retry.assert_not_called()
 
 
+def test_load_reload_retries_next_candidate_without_reinit():
+    """A reload target is the engine's live model; the next candidate
+    overwrites it in place instead of on a rebuilt model."""
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=[StrategyFailed("receive failed", mutated=True), "loaded"]
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+    ctx.is_reload = True
+    model = MagicMock(name="live-model")
+    result = LoadResult(value=model, model=model)
+
+    assert strat.load(result, ctx) == "loaded"
+    ctx.adapter.reinit_for_retry.assert_not_called()
+    assert strat._load_as_target.call_args_list[1].args[0].model is model
+
+
 def test_load_reinit_failure_is_unrecoverable():
     strat = RdmaStrategy()
     strat._find_source_instances = MagicMock(return_value=_sources(2))
@@ -932,6 +957,7 @@ def test_load_reinit_failure_is_unrecoverable():
     )
     ctx = MagicMock(global_rank=0)
     ctx.accelerator_backend.name = ""
+    ctx.is_reload = False
     ctx.adapter.reinit_for_retry.side_effect = RuntimeError("reinit failed")
 
     with pytest.raises(StrategyRecoveryError, match="reinit failed") as exc:
@@ -1035,6 +1061,7 @@ def test_load_records_success_metrics(monkeypatch):
     strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
     strat._load_as_target = MagicMock(return_value="loaded")
     ctx = MagicMock(global_rank=0)
+    ctx.is_reload = False
     ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
     assert strat.load(MagicMock(), ctx) == "loaded"
@@ -1057,6 +1084,7 @@ def test_load_records_transfer_fallback_metrics(monkeypatch):
         side_effect=StrategyFailed("receive failed", mutated=True)
     )
     ctx = MagicMock(global_rank=0)
+    ctx.is_reload = False
     ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
     with pytest.raises(StrategyFailed):
@@ -1335,6 +1363,7 @@ def _phase_series(collector):
 def _receiving_ctx():
     """A context whose adapter and NIXL manager accept everything."""
     ctx = MagicMock(global_rank=0)
+    ctx.is_reload = False
     ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
     ctx.nixl_manager.receive_from_source.return_value = (0, 0, 0.0)
     ctx.nixl_manager.add_remote_agent.return_value = "peer"
@@ -1368,7 +1397,10 @@ def test_a_successful_attempt_records_every_phase_once_and_they_nest_in_the_tran
     strat._fetch_worker_metadata = MagicMock(return_value=_centralized_source())
     ctx = _receiving_ctx()
 
-    strat.load(MagicMock(), ctx)
+    model = MagicMock()
+    result = LoadResult(value=model, model=model)
+    with _strategy_phases(strat, result, ctx):
+        strat.load(result, ctx)
 
     phases, transfer = _phase_series(collector)
     assert {p for p, _ in phases} == {
@@ -1376,7 +1408,10 @@ def test_a_successful_attempt_records_every_phase_once_and_they_nest_in_the_tran
     }, phases
     assert all(outcome == "ok" for _, outcome in phases), phases
     assert all(count == 1.0 for count, _ in phases.values()), phases
-    inside = sum(s for (p, _), (_, s) in phases.items() if p != "metadata")
+    # prepare and finalize are run by the chain around the strategy, so unlike
+    # the rest they sit outside the transfer span rather than nested in it.
+    outside = {"metadata", "prepare", "finalize"}
+    inside = sum(s for (p, _), (_, s) in phases.items() if p not in outside)
     assert inside <= transfer, (
         f"phases inside the transfer summed to {inside:.6f}s but the transfer took "
         f"{transfer:.6f}s; a phase is recorded outside the span or from two sites"
@@ -1398,8 +1433,11 @@ def test_a_receive_that_raises_is_recorded_as_an_error_in_that_phase(monkeypatch
     ctx = _receiving_ctx()
     ctx.nixl_manager.receive_from_source.side_effect = RuntimeError("READ timed out")
 
+    model = MagicMock()
+    result = LoadResult(value=model, model=model)
     with pytest.raises(StrategyFailed):
-        strat.load(MagicMock(), ctx)
+        with _strategy_phases(strat, result, ctx):
+            strat.load(result, ctx)
 
     phases, _ = _phase_series(collector)
     by_phase = {p: outcome for p, outcome in phases}
@@ -1471,9 +1509,18 @@ def test_required_zone_all_sources_cross_domain_falls_through_chain(monkeypatch)
         def is_available(self, ctx):
             return True
 
+        def prepare(self, result, ctx):
+            pass
+
         def load(self, result, ctx):
             self.calls.append(result.model)
             return result
+
+        def finalize(self, result, ctx):
+            pass
+
+        def abort(self, result, ctx):
+            pass
 
         def rollback(self, ctx):
             pass

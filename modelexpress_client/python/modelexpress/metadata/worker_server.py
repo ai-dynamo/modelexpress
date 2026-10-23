@@ -27,6 +27,7 @@ from typing import Any
 import grpc
 
 from .. import envs, p2p_pb2, p2p_pb2_grpc
+from ..topology import local_topology
 
 logger = logging.getLogger("modelexpress.metadata.worker_server")
 
@@ -182,6 +183,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             worker=self._instance_worker,
             accelerator=self._accelerator,
             artifacts=artifacts,
+            topology=local_topology(),
         )
 
     def register_artifact_source(
@@ -430,6 +432,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             accelerator=self._accelerator,
             worker_id=self._worker_id,
             node_rank=artifact_source.node_rank,
+            topology=local_topology(),
         )
         logger.info(
             f"GetArtifactManifestHeader served: {len(manifest.files)} files, "

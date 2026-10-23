@@ -13,6 +13,7 @@ import grpc
 import torch
 
 from .. import envs, p2p_pb2, p2p_pb2_grpc
+from ..topology import apply_policy, blocks_selection, in_domain, resolve_policy
 from .instance_metadata import InstanceDirectory, grpc_endpoint
 from .payload import accelerators_compatible, tensor_source_metadata
 from .source_id import compute_mx_source_id
@@ -52,6 +53,7 @@ class LeaderDiscovery:
         self._identity.CopyFrom(ctx.identity)
         self._snapshots.clear()
         self._global_rank = ctx.global_rank
+        self._worker_rank = ctx.worker_rank
         self._node_rank = ctx.node_rank
         self._world_size = (
             torch.distributed.get_world_size()
@@ -149,6 +151,9 @@ class LeaderDiscovery:
         if self._identity is None:
             raise ValueError("leader discovery requires a configured weight identity")
         source_id = compute_mx_source_id(self._identity)
+        policy = resolve_policy()
+        if blocks_selection(policy):
+            raise LookupError("required instance topology is unknown")
         with self._lock:
             cached = self._snapshots.get(source_id)
             if isinstance(cached, Exception):
@@ -166,6 +171,19 @@ class LeaderDiscovery:
                             timeout=10,
                         )
                     self._validate(response, source_id)
+                    if policy is not None and policy.required:
+                        selected = next(
+                            (
+                                w
+                                for w in response.workers
+                                if w.worker.worker_rank == self._worker_rank
+                            ),
+                            None,
+                        )
+                        if selected is None or not in_domain(selected, policy):
+                            raise ValueError(
+                                "selected instance worker is outside the required topology"
+                            )
                     self._snapshots[source_id] = response
                     logger.info(
                         "Selected instance through %s: leader=%s workers=%d published_artifacts=%d",
@@ -274,18 +292,23 @@ class LeaderDiscovery:
                 status=p2p_pb2.SOURCE_STATUS_READY,
                 worker_grpc_endpoint=selected.worker_grpc_endpoint,
                 accelerator=response.accelerator,
+                topology=next(
+                    entry.topology
+                    for entry in metadata.workers
+                    if entry.worker == selected
+                ),
             ),
         )
 
     def artifact_source(
-        self, identity, node_rank: int, artifact_id: str, accelerator: str
+        self, identity, node_rank: int, artifact_id: str, accelerator: str, policy=None
     ):
         from .artifact_transfer import ArtifactSourceEndpoint
 
         source_id = compute_mx_source_id(identity)
         matches = [
             (entry, artifact)
-            for entry in self.metadata().workers
+            for entry in apply_policy(list(self.metadata().workers), policy)
             if entry.worker.node_rank == node_rank
             for artifact in entry.artifacts
             if artifact.mx_source_id == source_id

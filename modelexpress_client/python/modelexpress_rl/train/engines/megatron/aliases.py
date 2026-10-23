@@ -8,8 +8,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from modelexpress.refit.reshard.rendezvous import PublishedShard, PublishedTensor
-from modelexpress.refit.reshard.verify import published_digest
+from modelexpress_rl.refit.reshard.rendezvous import PublishedShard, PublishedTensor
+from modelexpress_rl.refit.reshard.verify import published_digest
 
 
 @dataclass(frozen=True)

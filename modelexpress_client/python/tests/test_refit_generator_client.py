@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import json
 import logging
 import time
 from concurrent import futures
@@ -28,7 +29,6 @@ from modelexpress_rl import (
     refit_pb2,
     refit_pb2_grpc,
 )
-from modelexpress_rl.inference.adapter import GeneratorTransferInputs
 from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
@@ -36,10 +36,11 @@ from modelexpress_rl.inference.plan import (
     GeneratorPeerUpdateSource,
     MethodCapabilities,
     ObjectStorageUpdateSource,
+    PreparedArtifact,
     PreparedEngineTensors,
     PreparedStreamingTensors,
     ResolvedSource,
-    TrainerUpdateSource,
+    ResolvedTrainerSource,
     UpdateMethod,
     WeightUpdatePlanner,
 )
@@ -56,8 +57,22 @@ from modelexpress_rl.inference.source import (
 )
 
 
+_STABLE_METADATA = json.dumps({
+    "schema": "mx.reshard.shard_table.v1",
+    "agent_name": "trainer", "agent_meta_b64": "",
+    "metadata_endpoint": "trainer:19000", "tensor_count": 1, "total_bytes": 8,
+    "tensors": [{
+        "name": "weight", "dtype": "torch.bfloat16", "elsize": 2,
+        "full_shape": [4], "shards": [{
+            "agent_name": "trainer", "device_id": 0, "addr": 4096,
+            "shard_offset": [0], "shape": [4],
+        }],
+    }],
+}).encode()
+
+
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
-    def __init__(self, *, endpoint: str, state=None, manifest_digest=None) -> None:
+    def __init__(self, *, endpoint: str, state=None, stable_metadata_digest=None) -> None:
         self.registrations = {}
         self.active_leases = set()
         self.lease_registrations = 0
@@ -72,11 +87,11 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.omit_base_version = False
         self.additional_versions = {}
         self.version = refit_pb2.WeightVersion(
-            trainer_mesh_generation=1,
             uid="version-a",
             model_name="test/model",
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR,
             trainer_mesh_id="mesh-a",
+            trainer_mesh_generation=1,
             layout_signature="layout-a",
             state=state or refit_pb2.WEIGHT_VERSION_STATE_READY,
         )
@@ -86,16 +101,14 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR,
             state=refit_pb2.WEIGHT_VERSION_STATE_READY,
         )
-        digest = manifest_digest or hashlib.sha256(b"manifest").hexdigest()
+        digest = stable_metadata_digest or hashlib.sha256(_STABLE_METADATA).hexdigest()
         self.shards = [
             refit_pb2.WeightVersionShard(
                 version_id="version-a",
                 logical_shard_id=slot,
                 worker_id=f"trainer-{rank}",
-                tensor_count=2,
-                total_bytes=128,
-                manifest_digest=digest,
-                manifest_endpoint=endpoint,
+                stable_metadata_digest=digest,
+                metadata_endpoint=endpoint,
             )
             for rank, slot in enumerate(("rank:0", "rank:1"))
         ]
@@ -141,7 +154,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
                 workers={
                     shard.worker_id: refit_pb2.TrainerTensorsMetadata(
                         logical_shard_id=shard.logical_shard_id,
-                        metadata_endpoint=shard.manifest_endpoint,
+                        metadata_endpoint=shard.metadata_endpoint,
                     )
                     for shard in self.shards
                 },
@@ -178,15 +191,15 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
 
 
 class _WorkerService(refit_pb2_grpc.RefitWorkerServiceServicer):
-    def __init__(self, manifest=b"manifest"):
+    def __init__(self, manifest=_STABLE_METADATA) -> None:
         self.manifest = manifest
         self.requests = []
 
-    def GetWeightVersionShardManifest(self, request, _context):
+    def GetTrainerShardMetadata(self, request, _context) -> refit_pb2.GetTrainerShardMetadataResponse:
         self.requests.append(request)
-        return refit_pb2.GetWeightVersionShardManifestResponse(
-            manifest=self.manifest,
-            manifest_digest=hashlib.sha256(self.manifest).hexdigest(),
+        return refit_pb2.GetTrainerShardMetadataResponse(
+            metadata=self.manifest,
+            metadata_digest=hashlib.sha256(self.manifest).hexdigest(),
         )
 
 
@@ -210,8 +223,6 @@ class _P2pService(p2p_pb2_grpc.P2pServiceServicer):
 class _Adapter:
     def __init__(self, service):
         self.service = service
-        self.create_calls = []
-        self.validate_calls = []
         self.stage_calls = []
         self.peer_stage_calls = []
         self.apply_calls = []
@@ -258,14 +269,6 @@ class _Adapter:
     def _publish_runtime_tensors(self, version_id):
         self.publish_weight_version(version_id=version_id)
 
-    def create_transfer_plan(self, inputs):
-        self.create_calls.append(inputs)
-        return {"inputs": inputs}
-
-    def validate_transfer_plan(self, plan, inputs):
-        self.validate_calls.append((plan, inputs))
-        return True
-
     def stage_weight(self, inputs):
         assert self.service.active_leases
         self.stage_calls.append(inputs)
@@ -291,8 +294,6 @@ class _Adapter:
 class _TestMethod(UpdateMethod):
     def __init__(self, adapter):
         self._adapter = adapter
-        self._cached_plan = None
-        self._cached_fingerprint = None
 
     @property
     def capabilities(self):
@@ -308,31 +309,22 @@ class _TestMethod(UpdateMethod):
             artifact_type=PreparedEngineTensors,
         )
 
-    def prepare(self, *, version, source: ResolvedSource):
+    def prepare(self, *, version, source: ResolvedSource) -> PreparedArtifact:
         if isinstance(source, GeneratorPeerUpdateSource):
             staged = self._adapter.stage_peer_weight(source.worker)
         else:
-            if isinstance(source, ObjectStorageUpdateSource):
-                inputs = GeneratorTransferInputs(
-                    version_id=version.version_id,
-                    base_version_id=version.base_version_id,
-                    layout_signature=version.layout_signature,
-                    payload_format=version.payload_format,
-                    sources=(),
-                    object_storage=source.storage,
-                )
-            elif isinstance(source, TrainerUpdateSource):
-                inputs = source.inputs
-            else:
-                raise TypeError("unsupported test source")
-            reusable = (
-                self._cached_plan is not None
-                and self._cached_fingerprint == inputs.physical_fingerprint
-                and self._adapter.validate_transfer_plan(self._cached_plan, inputs)
+            inputs = SimpleNamespace(
+                version_id=version.version_id,
+                base_version_id=version.base_version_id,
+                layout_signature=version.layout_signature,
+                payload_format=version.payload_format,
+                sources=source.snapshot.shards
+                if isinstance(source, ResolvedTrainerSource)
+                else (),
+                object_storage=source.storage
+                if isinstance(source, ObjectStorageUpdateSource)
+                else None,
             )
-            if not reusable:
-                self._cached_plan = self._adapter.create_transfer_plan(inputs)
-                self._cached_fingerprint = inputs.physical_fingerprint
             staged = self._adapter.stage_weight(inputs)
         return PreparedEngineTensors(staged=staged)
 
@@ -393,8 +385,9 @@ def _runtime(
     max_transfer_attempts,
     rpc_timeout_seconds,
     resolve_replay_chain,
+    streaming=None,
     **_kwargs,
-):
+) -> GeneratorRuntime:
     if source_order is None:
         source_order = (
             (WeightSource.OBJECT_STORAGE,)
@@ -435,6 +428,7 @@ def _runtime(
             installer=installer,
             full_tensor=(
                 FullTensorEngineCapability(
+                    generator_fingerprint=lambda: (),
                     device_id=0,
                     device="cuda:0",
                     worker_rank=adapter.worker_rank,
@@ -459,6 +453,7 @@ def _runtime(
                 max_transfer_attempts=max_transfer_attempts,
             ),
             start_lease=start_lease,
+            streaming=streaming,
             resolve_replay_chain=lambda version: resolve_replay_chain(
                 version.version_id,
                 {
@@ -477,14 +472,16 @@ def _runtime(
     return runtime
 
 
-def _start_server(*, state=None, manifest=b"manifest", manifest_digest=None):
+def _start_server(*, state=None, manifest=_STABLE_METADATA, stable_metadata_digest=None) -> tuple:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     port = server.add_insecure_port("127.0.0.1:0")
     endpoint = f"127.0.0.1:{port}"
     service = _RefitService(
         endpoint=endpoint,
         state=state,
-        manifest_digest=manifest_digest or hashlib.sha256(manifest).hexdigest(),
+        stable_metadata_digest=(
+            stable_metadata_digest or hashlib.sha256(manifest).hexdigest()
+        ),
     )
     refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
     service.worker = _WorkerService(manifest)
@@ -502,6 +499,7 @@ def _initialize(
     adapter,
     *,
     object_storage=False,
+    storage_type=ObjectStorageType.S3,
     max_transfer_attempts=3,
     max_replay_chain_length=64,
     source_order=None,
@@ -530,7 +528,7 @@ def _initialize(
             lease_ttl_seconds=lease_ttl_seconds,
             object_storage=(
                 ObjectStorageGeneratorConfig(
-                    storage_type=ObjectStorageType.S3,
+                    storage_type=storage_type,
                     initial_base_version_id="base-a",
                     seed_checkpoint_path="unused-launch",
                     refit_checkpoint_dir="unused-cache",
@@ -673,7 +671,7 @@ def test_generator_rejects_unsupported_object_storage_before_adapter_creation(
         lambda **_kwargs: pytest.fail("runtime must not be created"),
     )
 
-    with pytest.raises(ValueError, match="only S3 object storage"):
+    with pytest.raises(ValueError, match="only S3 and Azure object storage"):
         ModelExpressGeneratorClient.initialize(
             ModelExpressGeneratorConfig(
                 engine_context=VllmGeneratorContext(
@@ -736,7 +734,7 @@ def test_generator_uses_source_order_from_env(monkeypatch):
         server.stop(grace=None).wait()
 
 
-def test_generator_stages_applies_releases_and_reuses_valid_plan(monkeypatch):
+def test_generator_stages_applies_and_releases_across_versions(monkeypatch) -> None:
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter)
@@ -756,29 +754,24 @@ def test_generator_stages_applies_releases_and_reuses_valid_plan(monkeypatch):
         second = generator.stage_weight(version=WeightVersionRef("version-a"))
         second.release()
 
-        service.shards[0].worker_id = "replacement-trainer-0"
-        replacement = generator.stage_weight(version=WeightVersionRef("version-a"))
-        replacement.release()
     finally:
         generator.close()
         server.stop(grace=None).wait()
 
     assert service.registrations["generator-0"].role == refit_pb2.WORKER_ROLE_GENERATOR
-    assert service.lease_registrations == 3
-    assert service.lease_deletions == 3
-    assert len(adapter.create_calls) == 2
-    assert len(adapter.validate_calls) == 1
-    assert len(adapter.stage_calls) == 3
+    assert service.lease_registrations == 4
+    assert service.lease_deletions == 4
+    assert len(adapter.stage_calls) == 2
     assert len(adapter.apply_calls) == 1
     assert len(adapter.publish_calls) == 1
-    assert len(adapter.release_calls) == 3
+    assert len(adapter.release_calls) == 2
     assert adapter.close_calls == 1
-    assert len(service.worker.requests) == 3
-    assert [source.source_slot_id for source in adapter.create_calls[0].sources] == [
+    assert len(service.worker.requests) == 2
+    assert [source.source_slot_id for source in adapter.stage_calls[0].sources] == [
         "rank:0",
         "rank:1",
     ]
-    assert adapter.create_calls[0].payload_format is WeightPayloadFormat.FULL_TENSOR
+    assert adapter.stage_calls[0].payload_format is WeightPayloadFormat.FULL_TENSOR
 
 
 def test_generator_discovers_mesh_backed_version(monkeypatch):
@@ -790,7 +783,7 @@ def test_generator_discovers_mesh_backed_version(monkeypatch):
         staged = generator.stage_weight(version=WeightVersionRef("version-a"))
         assert service.mesh_calls == 2
         assert service.list_calls == 1
-        assert [source.source_slot_id for source in adapter.create_calls[0].sources] == [
+        assert [source.source_slot_id for source in adapter.stage_calls[0].sources] == [
             "rank:0",
             "rank:1",
         ]
@@ -821,16 +814,101 @@ def test_trainer_source_allows_fallback_when_initial_mesh_lookup_fails(
         server.stop(grace=None).wait()
 
 
-def test_generator_rejects_mesh_change_during_source_resolution(monkeypatch):
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("mismatch", ["initial", "post_manifest"])
+@pytest.mark.parametrize("peer_fallback", [False, True])
+def test_generator_handles_mesh_change_with_configured_peer_fallback(
+    monkeypatch, mismatch, bounded, peer_fallback
+) -> None:
     server, endpoint, service = _start_server()
     service.version.trainer_mesh_id = "mesh-a"
+    if mismatch == "initial":
+        service.version.trainer_mesh_generation = 2
     service.mesh_generation_on_recheck = 2
+    if peer_fallback:
+        _add_generator_peer(service)
     adapter = _Adapter(service)
-    generator = _initialize(monkeypatch, endpoint, adapter)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        source_order=(WeightSource.TRAINER, WeightSource.GENERATOR)
+        if peer_fallback
+        else (WeightSource.TRAINER,),
+        staging_buffer_bytes=512 if bounded else None,
+    )
+    if bounded:
+
+        class Transfer:
+            bounded_staging = True
+
+            def prepare(self, **_kwargs) -> SimpleNamespace:
+                return SimpleNamespace(
+                    metrics={},
+                    batches=[SimpleNamespace(
+                        transfer_plan=SimpleNamespace(source_replay=False),
+                        layouts=({"weight": None},),
+                    )],
+                )
+
+            def iter_bounded(self, _prepared, _metrics) -> object:
+                yield {"weight": 2}
+
+        class Method(LoadTimeTensorNixlUpdateMethod):
+            def prepare(self, *, version, source) -> PreparedArtifact:
+                adapter.stage_calls.append(
+                    SimpleNamespace(version_id=version.version_id)
+                )
+                return super().prepare(version=version, source=source)
+
+        class Installer:
+            @property
+            def capabilities(self) -> EngineCapabilities:
+                return EngineCapabilities(
+                    frozenset({PreparedEngineTensors, PreparedStreamingTensors})
+                )
+
+            def install(self, prepared) -> str:
+                if isinstance(prepared, PreparedEngineTensors):
+                    return adapter.apply_weight(prepared.staged)
+                assert [batch["weight"] for batch in prepared.batches()] == [2]
+                adapter.apply_calls.append(prepared)
+                return "installed"
+
+        planner = generator._runtime.session._planner
+        planner._methods = (
+            Method(transfer=Transfer()),
+            _TestMethod(adapter),
+        )
+        planner._installer = Installer()
     try:
-        with pytest.raises(RuntimeError, match="trainer mesh generation changed"):
-            generator.stage_weight(version=WeightVersionRef("version-a"))
-        assert adapter.create_calls == []
+        if peer_fallback:
+            staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+            assert generator.apply_weight(staged) == "installed"
+            staged.release()
+        else:
+            with pytest.raises(RuntimeError, match="mesh generation"):
+                generator.stage_weight(version=WeightVersionRef("version-a"))
+        assert adapter.stage_calls == []
+        assert len(adapter.peer_stage_calls) == int(peer_fallback)
+        assert service.lease_registrations == service.lease_deletions == 1 + int(
+            peer_fallback
+        )
+        assert not service.active_leases
+        service.version.uid = "version-b"
+        service.version.trainer_mesh_generation = 2
+        for shard in service.shards:
+            shard.version_id = "version-b"
+        staged = generator.stage_weight(version=WeightVersionRef("version-b"))
+        assert generator.apply_weight(staged) == "installed"
+        staged.release()
+        assert len(adapter.stage_calls) == 1
+        assert len(adapter.apply_calls) == 1 + int(peer_fallback)
+        assert adapter.stage_calls[0].version_id == "version-b"
+        assert len(adapter.peer_stage_calls) == int(peer_fallback)
+        assert service.lease_registrations == service.lease_deletions == 2 + int(
+            peer_fallback
+        )
         assert not service.active_leases
     finally:
         generator.close()
@@ -999,7 +1077,7 @@ def test_generator_does_not_retry_peer_publication(monkeypatch):
 
 
 def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
-    server, endpoint, service = _start_server(manifest_digest="bad-digest")
+    server, endpoint, service = _start_server(stable_metadata_digest="bad-digest")
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter)
 
@@ -1011,13 +1089,15 @@ def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
         server.stop(grace=None).wait()
 
     assert not service.active_leases
-    assert service.lease_registrations == 1
-    assert service.lease_deletions == 1
+    assert service.lease_registrations == 2
+    assert service.lease_deletions == 2
     assert adapter.stage_calls == []
 
 
 def test_generator_fetches_trainer_manifest_larger_than_grpc_default(monkeypatch):
-    manifest = b"x" * (4 * 1024 * 1024 + 1)
+    manifest = json.dumps({
+        **json.loads(_STABLE_METADATA), "padding": "x" * (4 * 1024 * 1024 + 1),
+    }).encode()
     server, endpoint, service = _start_server(manifest=manifest)
     adapter = _Adapter(service)
     generator = _initialize(
@@ -1034,10 +1114,7 @@ def test_generator_fetches_trainer_manifest_larger_than_grpc_default(monkeypatch
         generator.close()
         server.stop(grace=None).wait()
 
-    assert all(
-        source.transport.manifest == manifest
-        for source in adapter.stage_calls[0].sources
-    )
+    assert all(source.metadata == manifest for source in adapter.stage_calls[0].sources)
 
 
 def test_generator_reports_timing_for_a_refit_that_never_staged(monkeypatch, caplog):
@@ -1045,7 +1122,7 @@ def test_generator_reports_timing_for_a_refit_that_never_staged(monkeypatch, cap
     it is the one path where nothing downstream can report it: the recorder is
     handed on through the staged handle, and there is no handle yet."""
     monkeypatch.delenv("MX_REFIT_TIMING", raising=False)
-    server, endpoint, service = _start_server(manifest_digest="bad-digest")
+    server, endpoint, service = _start_server(stable_metadata_digest="bad-digest")
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter)
 
@@ -1062,9 +1139,9 @@ def test_generator_reports_timing_for_a_refit_that_never_staged(monkeypatch, cap
     assert "MX_REFIT_TIMING" in caplog.text
 
 
-def test_generator_reports_missing_trainer_manifest_digest(monkeypatch, caplog):
+def test_generator_reports_missing_trainer_stable_metadata_digest(monkeypatch, caplog) -> None:
     server, endpoint, service = _start_server()
-    service.shards[0].manifest_digest = ""
+    service.shards[0].stable_metadata_digest = ""
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter)
 
@@ -1078,7 +1155,7 @@ def test_generator_reports_missing_trainer_manifest_digest(monkeypatch, caplog):
         generator.close()
         server.stop(grace=None).wait()
 
-    assert "source is missing its manifest digest" in caplog.text
+    assert "source is missing its stable metadata digest" in caplog.text
     assert adapter.stage_calls == []
 
 
@@ -1262,15 +1339,24 @@ def _add_generator_peer(service):
     )
 
 
-def test_generator_resolves_and_stages_target_replay_chain(monkeypatch):
+@pytest.mark.parametrize("provider", [ObjectStorageType.S3, ObjectStorageType.AZURE])
+def test_generator_resolves_and_stages_target_replay_chain(monkeypatch, provider):
     server, endpoint, service = _start_server()
     service.version.CopyFrom(_canonical_version("version-c", "version-b"))
     service.additional_versions = {
         "version-a": _canonical_version("version-a", "base-a"),
         "version-b": _canonical_version("version-b", "version-a"),
     }
+    if provider is ObjectStorageType.AZURE:
+        for version in [service.version, *service.additional_versions.values()]:
+            version.object_storage.storage_type = refit_pb2.OBJECT_STORAGE_TYPE_AZURE
+            version.object_storage.uri = version.object_storage.uri.replace(
+                "s3://", "az://", 1
+            )
     adapter = _Adapter(service)
-    generator = _initialize(monkeypatch, endpoint, adapter, object_storage=True)
+    generator = _initialize(
+        monkeypatch, endpoint, adapter, object_storage=True, storage_type=provider
+    )
 
     try:
         staged = generator.stage_weight(version=WeightVersionRef("version-c"))
@@ -1337,16 +1423,26 @@ def test_generator_rejects_excessive_replay_chain_before_leasing(monkeypatch):
     assert adapter.stage_calls == []
 
 
+@pytest.mark.parametrize(
+    ("storage_type", "proto_type", "scheme"),
+    [
+        (ObjectStorageType.S3, refit_pb2.OBJECT_STORAGE_TYPE_S3, "s3"),
+        (ObjectStorageType.AZURE, refit_pb2.OBJECT_STORAGE_TYPE_AZURE, "az"),
+    ],
+)
 def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
     monkeypatch,
+    storage_type,
+    proto_type,
+    scheme,
 ):
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
     service.version.ClearField("base_version_id")
     service.version.object_storage.CopyFrom(
         refit_pb2.ObjectStorageSource(
-            storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
-            uri="s3://weights/model.safetensors.index.json",
+            storage_type=proto_type,
+            uri=f"{scheme}://weights/model.safetensors.index.json",
         )
     )
     adapter = _Adapter(service)
@@ -1355,6 +1451,7 @@ def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
         endpoint,
         adapter,
         object_storage=True,
+        storage_type=storage_type,
     )
 
     try:
@@ -1362,6 +1459,7 @@ def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
         inputs = adapter.stage_calls[0]
         assert inputs.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
         assert inputs.base_version_id is None
+        assert inputs.object_storage.storage_type is storage_type
         assert service.list_calls == 0
         staged.release()
     finally:
@@ -1426,7 +1524,7 @@ def test_generator_rejects_missing_object_storage_before_adapter_mutation(
     assert service.lease_deletions == 0
 
 
-def test_generator_skips_non_s3_object_storage_before_adapter_mutation(
+def test_generator_skips_unsupported_storage_payload_before_adapter_mutation(
     monkeypatch,
 ):
     server, endpoint, service = _start_server()
@@ -1533,7 +1631,9 @@ def test_generator_retries_complete_staged_transfer_under_one_lease(monkeypatch)
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
     adapter.stage_failures = 1
-    generator = _initialize(monkeypatch, endpoint, adapter)
+    generator = _initialize(
+        monkeypatch, endpoint, adapter, source_order=(WeightSource.TRAINER,)
+    )
 
     try:
         staged = generator.stage_weight(version=WeightVersionRef("version-a"))
@@ -1564,7 +1664,7 @@ def test_generator_retries_with_redundant_worker_for_same_slot(monkeypatch):
         generator.close()
         server.stop(grace=None).wait()
 
-    assert [call.sources[0].worker_id for call in adapter.create_calls] == [
+    assert [call.sources[0].worker_id for call in adapter.stage_calls] == [
         "trainer-0",
         "trainer-replica",
     ]
@@ -1584,12 +1684,12 @@ def test_generator_assembles_healthy_replicas_from_different_offsets(monkeypatch
     broken_first_slot = refit_pb2.WeightVersionShard()
     broken_first_slot.CopyFrom(service.shards[0])
     broken_first_slot.worker_id = "trainer-a1"
-    broken_first_slot.manifest_digest = unusable
+    broken_first_slot.stable_metadata_digest = unusable
     # rank:1 is the mirror image: its first replica is the broken one.
     healthy_second_slot = refit_pb2.WeightVersionShard()
     healthy_second_slot.CopyFrom(service.shards[1])
     healthy_second_slot.worker_id = "trainer-b1"
-    service.shards[1].manifest_digest = unusable
+    service.shards[1].stable_metadata_digest = unusable
     service.shards.extend([broken_first_slot, healthy_second_slot])
     adapter = _Adapter(service)
     generator = _initialize(
@@ -1627,7 +1727,7 @@ def test_generator_fetches_fallback_manifest_only_after_primary_failure(monkeypa
         generator.close()
         server.stop(grace=None).wait()
 
-    assert len(service.worker.requests) == 2
+    assert len(service.worker.requests) == len(service.shards) - 1
 
 
 def test_generator_preserves_transfer_error_when_lease_cleanup_also_fails(
@@ -1774,19 +1874,19 @@ def _stage_and_apply(generator, *, version):
 
 @pytest.mark.parametrize("fail_second", [False, True])
 @pytest.mark.parametrize(
-    "prepare_failures,prepare_error,reset_failure",
+    "prepare_failures,prepare_error",
     [
-        (0, RuntimeError, False),
-        (1, RuntimeError, False),
-        (1, grpc.RpcError, False),
-        (1, ManifestMismatchError, False),
-        (3, RuntimeError, False),
-        (1, RuntimeError, True),
+        (0, RuntimeError),
+        (1, RuntimeError),
+        (1, grpc.RpcError),
+        (1, ManifestMismatchError),
+        (1, StrategyRecoveryError),
+        (3, RuntimeError),
     ],
 )
 def test_streaming_client_holds_lease_and_fences_partial_install(
-    monkeypatch, fail_second, prepare_failures, prepare_error, reset_failure
-):
+    monkeypatch, fail_second, prepare_failures, prepare_error
+) -> None:
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
     generator = _initialize(
@@ -1801,15 +1901,9 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
     recovered = False
 
     class Transfer:
-        def reset_workspace(self):
-            assert service.active_leases
-            if reset_failure:
-                raise RuntimeError("cleanup failure")
+        bounded_staging = True
 
-        def prepare(self, **kwargs):
-            assert kwargs["max_staging_bytes"] == 512
-            assert kwargs["staging_device"] == "cuda"
-            assert kwargs["staging_buffers"] == 1
+        def prepare(self, **kwargs) -> SimpleNamespace:
             assert service.active_leases
             prepare_calls.append(kwargs)
             if len(prepare_calls) <= prepare_failures:
@@ -1817,7 +1911,10 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
             return SimpleNamespace(
                 metrics={},
                 batches=[
-                    SimpleNamespace(layouts=({"a.weight": None, "b.weight": None},))
+                    SimpleNamespace(
+                        transfer_plan=SimpleNamespace(source_replay=False),
+                        layouts=({"a.weight": None, "b.weight": None},),
+                    )
                 ],
             )
 
@@ -1847,17 +1944,12 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
 
     method = LoadTimeTensorNixlUpdateMethod(
         transfer=Transfer(),
-        capture_layout=lambda manifest: None,
     )
     planner = generator._runtime.session._planner
     planner._methods = (method,)
     planner._installer = Installer()
     try:
-        if reset_failure:
-            with pytest.raises(ValueError, match="restart the generator engine"):
-                _stage_and_apply(generator, version=WeightVersionRef("version-a"))
-            assert installed == []
-        elif prepare_failures == 3:
+        if prepare_failures == 3:
             with pytest.raises(prepare_error, match="preparation failure"):
                 _stage_and_apply(generator, version=WeightVersionRef("version-a"))
             assert installed == []
@@ -1872,9 +1964,9 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
                 generator.apply_weight(failed)
             assert installed == ["a.weight"]
 
-            endpoint = service.shards[0].manifest_endpoint
-            service.shards[0].manifest_endpoint = ""
-            with pytest.raises(ValueError, match="no NIXL trainer plan"):
+            endpoint = service.shards[0].metadata_endpoint
+            service.shards[0].metadata_endpoint = ""
+            with pytest.raises(RuntimeError, match="no NIXL trainer plan"):
                 generator.stage_weight(version=WeightVersionRef("version-a"))
             assert failed._update.released
             assert generator._active_handle is None
@@ -1882,7 +1974,7 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
             assert generator._engine_state.value == "UNCERTAIN"
             assert installed == ["a.weight"]
 
-            service.shards[0].manifest_endpoint = endpoint
+            service.shards[0].metadata_endpoint = endpoint
             fail_second = False
             recovery = generator.stage_weight(version=WeightVersionRef("version-a"))
             assert recovery is not failed
@@ -1903,10 +1995,51 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
         assert not service.active_leases
         assert generator._active_handle is None
         assert method._active_streamed is None
-        assert len(prepare_calls) == (
-            (1 if reset_failure else min(prepare_failures + 1, 3)) + int(recovered)
-        )
+        assert len(prepare_calls) == (min(prepare_failures + 1, 3) + int(recovered))
         assert service.lease_registrations == (3 if recovered else 1)
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+
+@pytest.mark.parametrize(
+    "payload_format",
+    [WeightPayloadFormat.XOR_DELTA, WeightPayloadFormat.FULL_HF_CHECKPOINT],
+)
+def test_uncertain_streaming_client_recovers_from_complete_peer_tensors(
+    monkeypatch, payload_format
+) -> None:
+    server, endpoint, service = _start_server()
+    _add_generator_peer(service)
+    adapter = _Adapter(service)
+    adapter.apply_failure = True
+    generator = _initialize(
+        monkeypatch, endpoint, adapter,
+        source_order=(WeightSource.GENERATOR,), staging_buffer_bytes=512,
+    )
+    try:
+        failed = generator.stage_weight(version=WeightVersionRef("version-a"))
+        with pytest.raises(RuntimeError, match="apply failed"):
+            generator.apply_weight(failed)
+        assert not service.active_leases
+        with pytest.raises(RuntimeError, match="fresh transaction"):
+            generator.apply_weight(failed)
+
+        service.version.uid = "version-b"
+        service.version.payload_format = getattr(refit_pb2, f"WEIGHT_PAYLOAD_FORMAT_{payload_format.value}")
+        service.version.base_version_id = (
+            "base-a" if payload_format is WeightPayloadFormat.XOR_DELTA else ""
+        )
+        adapter.apply_failure = False
+        recovered = generator.stage_weight(version=WeightVersionRef("version-b"))
+        assert service.active_leases
+        assert generator.apply_weight(recovered) == "installed"
+        assert recovered.applied
+        recovered.release()
+        assert len(adapter.peer_stage_calls) == 2
+        assert service.p2p.requests[-1].identity.revision == "version-b"
+        assert not adapter.stage_calls
+        assert not service.active_leases
     finally:
         generator.close()
         server.stop(grace=None).wait()
@@ -1991,8 +2124,8 @@ def test_generator_rejects_unsupported_payload_after_peer_miss(monkeypatch):
         generator.close()
         server.stop(grace=None).wait()
 
-    assert service.lease_registrations == 1
-    assert service.lease_deletions == 1
+    assert service.lease_registrations == 2
+    assert service.lease_deletions == 2
 
 
 def test_generator_falls_back_when_peer_identity_is_unavailable(monkeypatch):
@@ -2060,7 +2193,7 @@ def test_generator_discovers_rank_matched_p2p_peer(monkeypatch):
     assert service.lease_registrations == 1
     assert service.lease_deletions == 1
     assert len(adapter.peer_stage_calls) == 1
-    assert adapter.create_calls == []
+    assert adapter.stage_calls == []
 
 
 def test_generator_tries_next_peer_after_manifest_mismatch(monkeypatch):
@@ -2124,7 +2257,7 @@ def test_generator_tries_next_peer_after_manifest_mismatch(monkeypatch):
         "bad-agent",
         "good-agent",
     ]
-    assert adapter.create_calls == []
+    assert adapter.stage_calls == []
 
 
 def test_generator_randomizes_and_limits_peers_before_trainer_fallback(monkeypatch):
@@ -2175,7 +2308,7 @@ def test_generator_randomizes_and_limits_peers_before_trainer_fallback(monkeypat
         "peer-agent-2",
         "peer-agent-1",
     ]
-    assert len(adapter.create_calls) == 1
+    assert len(adapter.stage_calls) == 1
 
 
 def test_object_storage_generator_uses_peer_without_fetching_s3(monkeypatch):
@@ -2366,65 +2499,6 @@ def test_streaming_rejects_invalid_staging_options_before_leasing(kwargs, match)
         )
 
 
-@pytest.mark.parametrize("buffer_bytes,count", [(512, 1), (1024, 2)])
-def test_streaming_forwards_staging_options_to_the_method(
-    monkeypatch, buffer_bytes, count
-):
-    server, endpoint, service = _start_server()
-    adapter = _Adapter(service)
-    generator = _initialize(
-        monkeypatch,
-        endpoint,
-        adapter,
-        source_order=(WeightSource.TRAINER,),
-        staging_buffer_bytes=buffer_bytes,
-        staging_buffers_count=count,
-        staging_device="cpu",
-    )
-    prepare_calls = []
-
-    class Transfer:
-        def prepare(self, **kwargs):
-            prepare_calls.append(kwargs)
-            return SimpleNamespace(
-                metrics={},
-                batches=[SimpleNamespace(layouts=({"a.weight": None},))],
-            )
-
-        def iter_bounded(self, prepared, metrics):
-            yield {"a.weight": 1}
-
-    class Installer:
-        @property
-        def capabilities(self):
-            return EngineCapabilities(
-                frozenset({PreparedEngineTensors, PreparedStreamingTensors})
-            )
-
-        def install(self, prepared):
-            for _tensors in prepared.batches():
-                pass
-            return {}
-
-    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer(), capture_layout=lambda manifest: None)
-    planner = generator._runtime.session._planner
-    planner._methods = (method,)
-    planner._installer = Installer()
-    try:
-        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
-        assert not staged.applied
-        assert service.active_leases
-        assert adapter.apply_calls == []
-        generator.apply_weight(staged)
-        staged.release()
-        assert prepare_calls[-1]["staging_device"] == "cpu"
-        assert prepare_calls[-1]["staging_buffers"] == count
-        assert prepare_calls[-1]["max_staging_bytes"] == buffer_bytes * count
-    finally:
-        generator.close()
-        server.stop(grace=None).wait()
-
-
 @pytest.mark.parametrize(
     "case",
     [
@@ -2441,6 +2515,8 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
     monkeypatch, case
 ):
     import torch
+    from modelexpress_rl.refit.reshard.types import RecordedCopy
+    from modelexpress_rl.inference.plan import SourceReplayBatch
     from modelexpress_rl.inference.engines.vllm.installer import _VllmInstaller
 
     server, endpoint, service = _start_server()
@@ -2466,6 +2542,9 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
         assert service.active_leases
         assert guard_active
 
+    names = frozenset(dict(model.named_parameters()))
+    last_writes = {name: index for index, name in enumerate(model.state_dict())}
+
     class Batches:
         index = 0
 
@@ -2479,7 +2558,9 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
                 raise primary
             if self.index > 2:
                 raise StopIteration
-            return {f"{self.index - 1}.weight": arena}
+            name = f"{self.index - 1}.weight"
+            copy = RecordedCopy(name, (), name, 0, (2, 2), (2, 1), torch.float32)
+            return SourceReplayBatch(((self.index - 1, copy, arena),), names, last_writes, 2)
 
         def close(self):
             if not cleanup_allowed:
@@ -2489,10 +2570,12 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
                 raise cleanup_error
 
     class Transfer:
+        bounded_staging = True
+
         def __init__(self):
             self.arena = arena
 
-        def prepare(self, **kwargs):
+        def prepare(self, **kwargs) -> SimpleNamespace:
             assert service.active_leases
             assert not guard_active
             events.append("prepare")
@@ -2500,6 +2583,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
                 metrics={},
                 batches=[
                     SimpleNamespace(
+                        transfer_plan=SimpleNamespace(source_replay=True, replay_parameter_names=names),
                         layouts=({f"{index}.weight": ((2, 2), torch.float32)},)
                     )
                     for index in range(2)
@@ -2518,8 +2602,8 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
             self.arena = None
 
     class Method(LoadTimeTensorNixlUpdateMethod):
-        def prepare_streaming(self, **kwargs):
-            prepared = super().prepare_streaming(**kwargs)
+        def prepare(self, **kwargs):
+            prepared = super().prepare(**kwargs)
             prepared_updates.append(prepared)
             assert events.count("iterator_open") == len(prepared_updates) - 1
             return prepared
@@ -2544,26 +2628,40 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
 
     class Installer(_VllmInstaller):
         def __init__(self):
-            self._model = model
-            self._device = torch.device("cpu")
-            self._vllm_config = SimpleNamespace(quant_config=None)
-            self._model_config = SimpleNamespace(dtype=torch.float32)
-            self._live_version = None
+            super().__init__(
+                model=model,
+                device=torch.device("cpu"),
+                vllm_config=SimpleNamespace(quant_config=None),
+                model_config=SimpleNamespace(dtype=torch.float32),
+            )
             self.copy_count = 0
+
+        def _new_install_execution(self):
+            return SimpleNamespace(
+                targets=SimpleNamespace(by_name=dict(model.named_parameters())),
+                replay_metadata=None,
+                installed=set(),
+                bounded=False,
+            )
 
         def _reload(self, load):
             assert_installation_guard()
             load(self._parameter_aliases(self._model))
 
-        def _process_and_commit(self, tensors, **kwargs):
+        def _apply_source_batch(self, plan, batch):
             assert_installation_guard()
             self.copy_count += 1
             events.append("copy")
             if self.copy_count == 2 and case in {"partial", "drain", "close"}:
                 raise primary
             with torch.no_grad():
-                for name, value in tensors.items():
-                    model.get_parameter(name).copy_(value)
+                for _, copy, value in batch.writes:
+                    model.get_parameter(copy.param_name).copy_(value)
+                    plan.installed.add(copy.param_name)
+            plan.replay_metadata = (batch.parameter_names, batch.last_writes)
+
+        def _finish_source_replay(self, plan):
+            assert plan.installed == names
 
         def _drain_streaming(self):
             assert_installation_guard()
@@ -2573,7 +2671,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
 
     installer = Installer()
     transfer = Transfer()
-    method = Method(transfer=transfer, capture_layout=lambda manifest: None)
+    method = Method(transfer=transfer)
     planner = generator._runtime.session._planner
     planner._methods = (method,)
     planner._installer = installer
@@ -2670,7 +2768,7 @@ def test_streaming_creates_and_emits_one_timing_cycle(
 ):
     import json
 
-    from modelexpress.refit.timing import (
+    from modelexpress_rl.refit.timing import (
         RefitTimingRecorder,
         current_refit_timing,
         refit_span,
@@ -2693,15 +2791,19 @@ def test_streaming_creates_and_emits_one_timing_cycle(
         observed.append(recorder)
 
     class Transfer:
-        def prepare(self, **kwargs):
+        bounded_staging = True
+
+        def prepare(self, **kwargs) -> SimpleNamespace:
             observe_cycle()
-            with refit_span("transfer_planning"):
-                if prepare_fails:
-                    raise ValueError("injected streaming preparation failure")
-                return SimpleNamespace(
-                    metrics={},
-                    batches=[SimpleNamespace(layouts=({"weight": None},))],
-                )
+            if prepare_fails:
+                raise ValueError("injected streaming preparation failure")
+            return SimpleNamespace(
+                metrics={},
+                batches=[SimpleNamespace(
+                    transfer_plan=SimpleNamespace(source_replay=False),
+                    layouts=({"weight": None},),
+                )],
+            )
 
         def reset_workspace(self):
             observe_cycle()
@@ -2729,7 +2831,7 @@ def test_streaming_creates_and_emits_one_timing_cycle(
                     assert batch == {"weight": 7}
             return {}
 
-    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer(), capture_layout=lambda manifest: None)
+    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer())
     planner = generator._runtime.session._planner
     planner._methods = (method,)
     planner._installer = Installer()

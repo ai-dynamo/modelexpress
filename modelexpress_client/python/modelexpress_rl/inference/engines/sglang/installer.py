@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import time
-from types import SimpleNamespace
 
 import torch
 
@@ -61,7 +60,7 @@ class _SglangInstaller(EngineInstaller):
             if not isinstance(loader, DefaultModelLoader):
                 raise TypeError("ModelExpress requires DefaultModelLoader")
             weights = loader._get_weights_iterator(
-                SimpleNamespace(
+                DefaultModelLoader.Source(
                     model_or_path=str(prepared.path),
                     revision=None,
                     prefix="",

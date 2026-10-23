@@ -8,7 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
+from modelexpress_rl.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress_rl.train.adapter import TrainerStagingMode, WeightPayloadFormat
 from modelexpress_rl.train.context import FSDPTrainerContext
 from modelexpress_rl.train.engines import _create_trainer_adapter
@@ -62,8 +62,8 @@ def test_copy_preserves_per_tensor_dtype_and_warm_buffers(
     assert torch.equal(served["bias"], bias)
     assert served["weights"].dtype == torch.bfloat16
     assert torch.equal(served["weights"], weights.bfloat16())
-    assert first.manifest.total_bytes == bias.numel() * 4 + weights.numel() * 2
-    published = {t.name: t for t in unwrap_rendezvous_blob(first.manifest.data).tensors}
+    assert first.metadata.total_bytes == bias.numel() * 4 + weights.numel() * 2
+    published = {t.name: t for t in unwrap_rendezvous_blob(first.metadata.data).tensors}
     assert (published["bias"].dtype, published["bias"].elsize) == ("torch.float32", 4)
     assert (published["weights"].dtype, published["weights"].elsize) == (
         "torch.bfloat16",
@@ -75,7 +75,7 @@ def test_copy_preserves_per_tensor_dtype_and_warm_buffers(
     second = _stage(adapter, state, mode)
     second.publish_ready.wait()
     assert torch.equal(served["bias"], bias)
-    assert second.manifest.total_bytes == first.manifest.total_bytes
+    assert second.metadata.total_bytes == first.metadata.total_bytes
     assert {name: value.data_ptr() for name, value in served.items()} == addresses
     assert len(manager.registered) == 1
 
@@ -90,7 +90,7 @@ def test_in_place_accepts_fp32_override(dist_ready):
         adapter,
         {"bias": torch.tensor([1.000123]), "w": torch.ones(2, dtype=torch.bfloat16)},
     )
-    assert staged.manifest.total_bytes == 8
+    assert staged.metadata.total_bytes == 8
 
 
 def test_multiple_dtype_overrides_include_fp16_and_scalar(dist_ready, monkeypatch):
@@ -113,7 +113,7 @@ def test_multiple_dtype_overrides_include_fp16_and_scalar(dist_ready, monkeypatc
     assert served["projection"].dtype == torch.float16
     assert served["weights"].dtype == torch.bfloat16
     assert torch.equal(served["scale"], state["scale"])
-    assert staged.manifest.total_bytes == 6 * 2 + 4 + 4 * 2
+    assert staged.metadata.total_bytes == 6 * 2 + 4 + 4 * 2
 
 
 def test_copy_rejects_source_dtype_change_before_writing(dist_ready, monkeypatch):
@@ -223,7 +223,7 @@ def test_bind_tensors_validates_state_dict_and_returns_wire_coverage(dist_ready)
 
     staged = _stage(adapter, {"w": torch.ones(2, 4, dtype=torch.bfloat16)})
     assert binding == hashlib.sha256(
-        bound_tensor_manifest(json.loads(staged.manifest.data)["tensors"])
+        bound_tensor_manifest(json.loads(staged.metadata.data)["tensors"])
     ).hexdigest()
 
 
@@ -234,9 +234,9 @@ def test_in_place_stage_registers_once(dist_ready):
 
     staged = _stage(adapter, state_dict)
 
-    assert staged.manifest.tensor_count == 1
-    assert staged.manifest.total_bytes == 2 * 4 * 2  # bf16 elsize
-    assert staged.manifest.transport == "NIXL"
+    assert staged.metadata.tensor_count == 1
+    assert staged.metadata.total_bytes == 2 * 4 * 2  # bf16 elsize
+    assert staged.metadata.transport == "NIXL"
     staged.publish_ready.wait()  # IN_PLACE performs no copy: no-op
 
     # Re-staging the same weights must not re-register (setup is one-time).
@@ -253,10 +253,11 @@ def test_warm_stage_reuses_structural_manifest(dist_ready, monkeypatch):
     state_dict["w"].fill_(2)
     second = _stage(adapter, state_dict)
 
-    assert second.manifest is first.manifest
+    assert second.metadata.data == first.metadata.data
+    assert second.metadata.total_bytes == first.metadata.total_bytes
 
 
-def test_digest_mode_rebuilds_version_manifest(dist_ready, monkeypatch):
+def test_digest_mode_refreshes_checksums_with_stable_metadata(dist_ready, monkeypatch) -> None:
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
     adapter = _adapter()
     state_dict = {"w": torch.ones(2, 4, dtype=torch.bfloat16)}
@@ -265,7 +266,9 @@ def test_digest_mode_rebuilds_version_manifest(dist_ready, monkeypatch):
     state_dict["w"].fill_(2)
     second = _stage(adapter, state_dict)
 
-    assert second.manifest.data != first.manifest.data
+    assert second.metadata.data == first.metadata.data
+    assert second.checksums != first.checksums
+    assert second.metadata.total_bytes == first.metadata.total_bytes
 
 
 def test_in_place_rejects_a_moved_source(dist_ready):
@@ -385,11 +388,11 @@ def test_host_snapshot_survives_source_mutation_and_rematerialization(
             adapter, {"w": next_source}, TrainerStagingMode.COPY_TO_HOST
         )
         next_stage.publish_ready.wait()
-        assert next_stage.manifest is staged.manifest
+        assert next_stage.metadata.data == staged.metadata.data
         assert served.data_ptr() == address
         assert torch.equal(served, next_source.bfloat16())
     assert len(manager.registered) == 1
-    (published,) = unwrap_rendezvous_blob(staged.manifest.data).tensors
+    (published,) = unwrap_rendezvous_blob(staged.metadata.data).tensors
     assert published.shards[0].memory_type == "DRAM"
 
 

@@ -24,6 +24,14 @@ import torch
 from .. import p2p_pb2
 from ..metrics import metrics as install_metrics
 from ..nixl_transfer import NIXL_DRAM_MEM_TYPE, NixlTransferManager
+from ..topology import (
+    apply_policy,
+    blocks_selection,
+    in_domain,
+    local_topology,
+    resolve_policy,
+    warn_if_no_domain_match,
+)
 from .artifact_manifest import (
     _crc32c_hex,
     artifact_source_metadata,
@@ -490,16 +498,15 @@ def publish_artifact_source(
             f"source type: {bundle.manifest.mx_source_type} != {transfer.mx_source_type}"
         )
 
+    policy = resolve_policy(timeout=0)
+    if blocks_selection(policy):
+        raise LookupError("required artifact publish topology is unknown")
+    topology = local_topology()
     worker_host = host or _get_worker_host()
     metadata_endpoint = _nixl_metadata_endpoint(worker_host, nixl_manager)
     if worker_grpc_server.port is None:
         raise RuntimeError("worker gRPC server must be started before artifact publish")
     worker_grpc_endpoint = f"{worker_host}:{worker_grpc_server.port}"
-    artifact_chunk_manager = NixlArtifactChunkManager(
-        nixl_manager,
-        max_buffers=max_inflight_chunks,
-    )
-
     worker = p2p_pb2.WorkerMetadata(
         worker_rank=worker_rank,
         metadata_endpoint=metadata_endpoint,
@@ -507,6 +514,13 @@ def publish_artifact_source(
         worker_grpc_endpoint=worker_grpc_endpoint,
         artifact_source=artifact_source_metadata(bundle.manifest, node_rank=node_rank),
         accelerator=accelerator,
+        topology=topology,
+    )
+    if policy is not None and policy.required and not in_domain(worker, policy):
+        raise LookupError("required artifact publish topology changed during resolution")
+    artifact_chunk_manager = NixlArtifactChunkManager(
+        nixl_manager,
+        max_buffers=max_inflight_chunks,
     )
     try:
         mx_source_id = _publish_metadata_to_server(
@@ -585,7 +599,12 @@ def discover_artifact_source(
     accelerator-specific, so a cache bundle from a different accelerator family
     must not be installed. Empty means unknown and is accepted for backward
     compatibility, matching RDMA tensor source selection.
+    Transfer-domain policy filters source refs before fetching metadata and
+    rechecks required domains on the fetched worker.
     """
+    policy = resolve_policy()
+    if blocks_selection(policy):
+        raise LookupError("required artifact source topology is unknown")
     service_resolver = getattr(mx_client, "discover_artifact_source", None)
     if (
         getattr(mx_client, "SERVICE_ROUTED_ARTIFACTS", False) is True
@@ -603,22 +622,24 @@ def discover_artifact_source(
         identity=identity,
         status_filter=p2p_pb2.SOURCE_STATUS_READY,
     )
-    for source in sources.instances:
-        if worker_rank is not None and source.worker_rank != worker_rank:
-            continue
-        # Drop accelerator-incompatible sources before GetMetadata using the
-        # lightweight SourceInstanceRef.accelerator; the post-fetch re-check
-        # below covers empty refs on old servers and metadata drift.
-        if not accelerators_compatible(
+    candidates = [
+        source
+        for source in sources.instances
+        if (worker_rank is None or source.worker_rank == worker_rank)
+        and accelerators_compatible(
             accelerator,
             source.accelerator,
             mx_source_type=identity.mx_source_type,
-        ):
-            continue
+        )
+    ]
+    warn_if_no_domain_match(candidates, policy, worker_rank)
+    for source in apply_policy(candidates, policy):
         metadata = mx_client.get_metadata(source.mx_source_id, source.worker_id)
         if not metadata.found:
             continue
         worker = metadata.worker
+        if policy is not None and policy.required and not in_domain(worker, policy):
+            continue
         if worker.WhichOneof("source_payload") != "artifact_source":
             continue
         if not accelerators_compatible(
@@ -819,6 +840,7 @@ def transfer_artifact_from_worker(
     expected_node_rank: int | None = None,
     expected_source_type: int | None = None,
     expected_accelerator: str = "",
+    expected_topology: dict[str, str] | None = None,
 ) -> p2p_pb2.GetArtifactManifestHeaderResponse:
     """Transfer all files in an artifact from one source worker via NIXL."""
     start = time.perf_counter()
@@ -829,6 +851,8 @@ def transfer_artifact_from_worker(
         mx_source_id=mx_source_id,
         artifact_id=artifact_id,
     )
+    if expected_topology and any(header.topology.get(k) != value for k, value in expected_topology.items()):
+        raise ValueError("artifact header is outside the required topology")
     if expected_worker_id:
         if header.worker_id != expected_worker_id or header.mx_source_id != mx_source_id:
             raise ValueError("artifact header does not match the selected worker generation")

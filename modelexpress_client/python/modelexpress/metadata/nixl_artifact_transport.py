@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .. import p2p_pb2
+from ..topology import blocks_selection, resolve_policy
 from .artifact_transfer import (
     ArtifactBundle,
     ArtifactTransfer,
@@ -75,6 +76,11 @@ class NixlArtifactTransport(ArtifactTransport):
         """A live NIXL source is published after either a hit or a miss."""
         return True
 
+    def check_publishable(self) -> None:
+        """Reject an unknown required domain before cache preparation."""
+        if blocks_selection(resolve_policy(timeout=0)):
+            raise LookupError("required artifact publish topology is unknown")
+
     def __init__(
         self,
         *,
@@ -119,6 +125,12 @@ class NixlArtifactTransport(ArtifactTransport):
                     "expected_source_type": identity.mx_source_type,
                     "expected_accelerator": context.accelerator,
                 }
+            if getattr(self._mx_client, "SERVICE_ROUTED_ARTIFACTS", False) is True:
+                policy = resolve_policy()
+                if blocks_selection(policy):
+                    raise LookupError("required artifact source topology is unknown")
+                if policy is not None and policy.required:
+                    validation["expected_topology"] = {policy.domain: policy.local_value}
             header = transfer_artifact_from_worker(
                 source.worker_grpc_endpoint,
                 source.mx_source_id,
