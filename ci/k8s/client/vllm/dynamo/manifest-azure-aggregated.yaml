@@ -236,4 +236,14 @@ spec:
             - modelexpress
             - --tensor-parallel-size
             - "1"
+            - --max-model-len
+            - "1024"
+            - --max-num-batched-tokens
+            - "1024"
+            - --max-num-seqs
+            - "16"
+            - --gpu-memory-utilization
+            - "0.85"
+            - --kv-cache-memory-bytes
+            - "1073741824"
             - --trust-remote-code
