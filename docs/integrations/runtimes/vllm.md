@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # vLLM
 
-vLLM uses the `modelexpress` load format. The loader can use P2P, server cache, InstantTensor, ModelStreamer, GDS, or vLLM's native loader according to the fixed strategy chain.
+vLLM uses the `modelexpress` load format. The loader can use P2P, server cache, InstantTensor, NIXL OBJ, ModelStreamer, GDS, or vLLM's native loader according to the fixed strategy chain.
 
 For vLLM `0.23.0` and newer, install the ModelExpress Python client and run:
 

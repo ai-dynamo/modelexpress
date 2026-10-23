@@ -70,3 +70,7 @@ class AcceleratorBackend(Protocol):
     def supports_gds(self) -> bool:
         """Return whether GPUDirect Storage loading is supported."""
         ...
+
+    def supports_obj(self) -> bool:
+        """Return whether NIXL OBJ (S3-over-RDMA) loading into device memory is supported."""
+        ...

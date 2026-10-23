@@ -87,6 +87,13 @@ if TYPE_CHECKING:
     MX_GDS_MAX_CHUNK_KB: Optional[str]
     MX_GDS_THREADS: int
     MX_GDS_TIMEOUT: float
+    # NIXL OBJ (S3-over-RDMA to GPU)
+    MX_OBJ_ENABLED: bool
+    MX_OBJ_WINDOW_MB: int
+    MX_OBJ_INFLIGHT: int
+    MX_OBJ_THREADS: int
+    MX_OBJ_TIMEOUT: float
+    MX_OBJ_VERIFY: str
     # Model streamer
     MX_MS_DISTRIBUTED: bool
     # InstantTensor loader
@@ -304,6 +311,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_GDS_MAX_CHUNK_KB": lambda: os.environ.get("MX_GDS_MAX_CHUNK_KB"),
     "MX_GDS_THREADS": lambda: _env_int("MX_GDS_THREADS", 8),
     "MX_GDS_TIMEOUT": lambda: _env_float("MX_GDS_TIMEOUT", 120.0),
+    # ── NIXL OBJ (S3-over-RDMA to GPU) ─────────────────────────────────────
+    # Opt-in: requires a NIXL build with the generic accelerated OBJ engine and
+    # an S3-over-RDMA endpoint (MinIO AIStor). Range checks live in
+    # obj_loader.ObjLoadConfig. MX_OBJ_THREADS=0 means "same as inflight".
+    "MX_OBJ_ENABLED": lambda: _env_bool("MX_OBJ_ENABLED", False),
+    "MX_OBJ_WINDOW_MB": lambda: _env_int("MX_OBJ_WINDOW_MB", 256),
+    "MX_OBJ_INFLIGHT": lambda: _env_int("MX_OBJ_INFLIGHT", 8),
+    "MX_OBJ_THREADS": lambda: _env_int("MX_OBJ_THREADS", 0),
+    "MX_OBJ_TIMEOUT": lambda: _env_positive_float("MX_OBJ_TIMEOUT", 120.0),
+    "MX_OBJ_VERIFY": lambda: os.environ.get("MX_OBJ_VERIFY", "tail").strip().lower(),
     # ── Model streamer ─────────────────────────────────────────────────────
     "MX_MS_DISTRIBUTED": lambda: (
         os.environ.get("MX_MS_DISTRIBUTED", "1").lower() in ("1", "true")
