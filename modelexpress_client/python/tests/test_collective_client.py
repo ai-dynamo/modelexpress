@@ -1827,6 +1827,78 @@ class TestCleanup:
             client.cleanup()
         assert ("cleanup",) in engine.calls
 
+    @pytest.mark.parametrize("where", ["cleanup", "round"])
+    @pytest.mark.parametrize("role", ["trainer", "generator"])
+    def test_a_wedged_abort_keeps_the_buffers_gpu_work_may_still_use(
+        self, fake_nccl, role, where, monkeypatch
+    ):
+        # In-flight work does not quiesce (the handle is quarantined) and the
+        # communicator abort wedges: the M2N kernel may still be reading or
+        # writing the pending buffers, so neither the half's pending contexts
+        # nor the engine's buffers may be freed before the process exits.
+        import gc
+        import threading
+        import weakref
+
+        import modelexpress_rl.collective.comm as collective_comm
+        from modelexpress_rl.collective import CommunicatorWedgedError
+
+        engine = FakeEngine()
+        if role == "trainer":
+            client = trainer(FakeRendezvous(), engine)
+        else:
+            client = self._generator(engine)
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        if role == "trainer":
+            client.publish_weights("v1")
+        else:
+            client.update_weights("v1")
+        half = client._half
+        pending = [weakref.ref(ctx) for ctx in half._pending_contexts]
+        assert pending, "the round left nothing in flight to protect"
+
+        def never_quiesces(self, timeout_s=None):
+            raise TimeoutError("the M2N kernel is still running")
+
+        monkeypatch.setattr(
+            "modelexpress_rl.collective.comm.LaneCommunicator.synchronize",
+            never_quiesces,
+        )
+        monkeypatch.setattr(collective_comm, "abort_timeout", lambda: 0.05)
+        release = threading.Event()
+
+        class Stuck:
+            def abort(self):
+                release.wait(timeout=5.0)
+
+        for lane_comm in client._cache._lanes.values():
+            lane_comm._comm = Stuck()
+        fake_nccl.clear()
+        try:
+            with pytest.raises(CommunicatorWedgedError):
+                if where == "cleanup":
+                    client.cleanup()
+                else:
+                    monkeypatch.setattr(
+                        half, "finish_weight_update", _raises(TimeoutError("late"))
+                    )
+                    client.finish_weight_update("v1")
+            if where == "round":
+                # A runner that cleans up on the way out must not free them
+                # either: the wedge was already raised.
+                with pytest.raises(CommunicatorWedgedError):
+                    client.cleanup()
+            del half
+            gc.collect()
+            assert "m2n_destroy" not in fake_nccl
+            assert all(ref() is not None for ref in pending), (
+                "pending buffers were dropped while GPU work may still use them"
+            )
+            assert ("cleanup",) not in engine.calls
+        finally:
+            release.set()
+
     def test_cleanup_is_safe_before_initialize(self):
         client = RefitClientTrainer(
             rendezvous=FakeRendezvous(),

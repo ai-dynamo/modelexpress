@@ -699,7 +699,12 @@ forever. Every lane abort therefore runs on a daemon thread bounded by
 `CommunicatorWedgedError` is fatal to the process. The round is first reported
 FAILED, so the server moves the epoch and the peers re-form without this worker;
 then the error propagates out of the round call (`publish_weights` /
-`update_weights` / `finish_weight_update`) or `cleanup()`.
+`update_weights` / `finish_weight_update`) or `cleanup()`. Since the kernel the
+abort could not stop may still read or write the round's buffers, nothing it
+might use is freed: the half's pending buffers are quarantined with its M2N
+handle, and `cleanup()` (including any later call) re-raises the error without
+letting the publisher or loader free its buffers. Any other failure in
+`cleanup()` still frees them.
 
 **Runner contract.** Catch `CommunicatorWedgedError` at top level and terminate
 the OS process (non-zero `os._exit`); a wedged communicator cannot be recovered

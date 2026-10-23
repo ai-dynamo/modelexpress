@@ -26,6 +26,7 @@ from typing import Any
 
 from . import envs
 from .backend import (
+    _QUARANTINED_REFIT_BUFFERS,
     DEFAULT_LAYER_GROUP,
     NcclM2nReceiver,
     NcclM2nSender,
@@ -154,6 +155,9 @@ class _RefitClientBase:
         self._version: str | None = None
         self._operation_id: str | None = None
         self._round_membership: Membership | None = None
+        # Set once a communicator abort wedged. Fatal for the process: nothing
+        # the wedged kernel may still use is released after it.
+        self._wedged: CommunicatorWedgedError | None = None
 
     @property
     def membership(self) -> Membership:
@@ -239,7 +243,10 @@ class _RefitClientBase:
                     exc_info=True,
                 )
         self._reset_round()
+        if wedged is None and isinstance(error, CommunicatorWedgedError):
+            wedged = error
         if wedged is not None:
+            self._wedged = wedged
             raise wedged
 
     def _close_half(self) -> None:
@@ -254,6 +261,22 @@ class _RefitClientBase:
                 "closing the collective half raised; tearing its lanes down anyway",
                 exc_info=True,
             )
+
+    def _release_engine(self, engine: Publisher | Loader) -> None:
+        """Let the engine free its buffers, unless a communicator abort wedged.
+
+        After a wedge the M2N kernel may still read or write those buffers, so
+        the engine is quarantined for the life of the process instead; the
+        process must exit on the wedge. Every other failure frees them.
+        """
+        if self._wedged is None:
+            engine.cleanup()
+            return
+        _QUARANTINED_REFIT_BUFFERS.append(engine)
+        logger.error(
+            "a communicator abort wedged; the engine's buffers are kept, not "
+            "freed, until the process exits"
+        )
 
     def _reset_round(self) -> None:
         self._round_started = False
@@ -631,6 +654,10 @@ class _RefitClientBase:
         return membership
 
     def cleanup(self) -> None:
+        if self._wedged is not None:
+            # A wedged abort already tore down what could be torn down; what
+            # is left may still be in use by the kernel it could not stop.
+            raise self._wedged
         if self._operation_id is not None:
             # Tearing down mid-round is a failure of that round: peers are
             # released and the bound operation is told, rather than left
@@ -643,7 +670,11 @@ class _RefitClientBase:
             )
         self._close_half()
         if self._membership is not None:
-            self._cache.abort_group(self._membership.group_id)
+            try:
+                self._cache.abort_group(self._membership.group_id)
+            except CommunicatorWedgedError as error:
+                self._wedged = error
+                raise
         self._membership = None
         self._half = None
         self._reset_round()
@@ -798,14 +829,14 @@ class RefitClientTrainer(_RefitClientBase):
     def cleanup(self) -> None:
         # The lanes and the M2N handle may still reference the engine's
         # buffers, so they are released first; the engine frees its buffers
-        # after, even if that teardown raised. A CommunicatorWedgedError from
-        # the base is the fail-stop boundary: the process must exit on it.
+        # after, even if that teardown raised, unless a communicator abort
+        # wedged: then they are kept and the process must exit.
         publisher, self._publisher = self._publisher, None
         try:
             super().cleanup()
         finally:
             if publisher is not None:
-                publisher.cleanup()
+                self._release_engine(publisher)
 
 
 class RefitClientGenerator(_RefitClientBase):
@@ -931,11 +962,11 @@ class RefitClientGenerator(_RefitClientBase):
     def cleanup(self) -> None:
         # The lanes and the M2N handle may still reference the engine's
         # buffers, so they are released first; the engine frees its buffers
-        # after, even if that teardown raised. A CommunicatorWedgedError from
-        # the base is the fail-stop boundary: the process must exit on it.
+        # after, even if that teardown raised, unless a communicator abort
+        # wedged: then they are kept and the process must exit.
         loader, self._loader = self._loader, None
         try:
             super().cleanup()
         finally:
             if loader is not None:
-                loader.cleanup()
+                self._release_engine(loader)

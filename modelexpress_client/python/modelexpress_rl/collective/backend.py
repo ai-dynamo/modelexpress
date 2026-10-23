@@ -54,6 +54,12 @@ _M2N_QUIESCE_S = 5.0
 #: resources; a process restart reclaims them.
 _QUARANTINED_M2N_HANDLES: list[Any] = []
 
+#: Buffers a wedged communicator's M2N kernel may still read or write: a
+#: half's pending contexts and in-flight groups, and the engine that owns the
+#: buffers. Held for the life of the process for the same reason as the
+#: handles above; the process must exit on the wedge anyway.
+_QUARANTINED_REFIT_BUFFERS: list[Any] = []
+
 
 def _m2n_init() -> Any:
     """Create one explicit ``nccl.m2n`` handle.
@@ -727,7 +733,9 @@ class _CollectiveHalf:
         M2N kernel), every lane is still aborted and this half is still closed,
         then :class:`CommunicatorWedgedError` is re-raised with this group's
         epoch and version attached. That error is fatal: the runner exits the
-        process so the group re-forms without this worker.
+        process so the group re-forms without this worker. The half's pending
+        buffers are then quarantined for the life of the process rather than
+        dropped, since the kernel the abort could not stop may still use them.
         """
         wedged: CommunicatorWedgedError | None = None
         try:
@@ -743,6 +751,14 @@ class _CollectiveHalf:
                 if error.group_id is None:
                     error.group_id = self._group_id
                 wedged = error
+        if wedged is not None:
+            # The kernel the abort could not stop may still use these buffers,
+            # so they are quarantined, never freed; new containers replace them.
+            _QUARANTINED_REFIT_BUFFERS.append(
+                (self._pending_contexts, self._in_flight)
+            )
+            self._pending_contexts = []
+            self._in_flight = OrderedDict()
         self._active_lanes.clear()
         self._pending_contexts.clear()
         self._in_flight.clear()
