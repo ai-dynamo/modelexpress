@@ -13,10 +13,10 @@ RL-specific settings are registered in `modelexpress_rl/envs.py` and imported th
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Select the engine-neutral initial-load policy. With `RL`, a configured desired UID permits only desired-version P2P and S3 replay; without one, loading falls back through `MX_MODEL_URI` and then the engine default. vLLM speculative draft models are rejected in `RL` mode. |
-| `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact version required when `MX_LOAD_STRATEGY_CHAIN=RL`; startup fails rather than using a version-agnostic fallback when neither P2P nor S3 can load it |
+| `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Select the engine-neutral initial-load policy. With `RL`, a configured desired UID permits only desired-version P2P and object-storage replay; without one, loading falls back through `MX_MODEL_URI` and then the engine default. vLLM speculative draft models are rejected in `RL` mode. |
+| `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact version required when `MX_LOAD_STRATEGY_CHAIN=RL`; startup fails rather than using a version-agnostic fallback when neither P2P nor object storage can load it |
 | `MX_GENERATOR_SOURCE_ORDER` | Auto-detected | Ordered RL weight sources. Desired-version cold start defaults to `GENERATOR,OBJECT_STORAGE`; `OBJECT_STORAGE` disables P2P for both cold start and active refit. `TRAINER` applies only to active refit and is rejected for desired-version cold start. |
-| `MX_REFIT_CHECKPOINT_DIR` | (unset) | Host-local cache for RL S3 full checkpoints, deltas, and materialized checkpoints; the S3 strategy skips when it is unset |
+| `MX_REFIT_CHECKPOINT_DIR` | (unset) | Host-local cache for RL full checkpoints, deltas, and materialized checkpoints from S3 or Azure; the object-storage startup strategy skips when it is unset |
 | `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL metadata-listener port for RL generator refit; each rank adds its local device ID. Kept separate from `MX_METADATA_PORT`, which may remain owned by the boot-time loader |
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Maximum exact descriptors for one no-gather refit copy before a compatible dim-0-sharded source is pulled once into contiguous staging and sliced locally |
 | `MX_REFIT_STAGE_RECORD` | `1` | Emit one `refit-stage-v2` JSON record per refit, giving a benchmark harness the per-stage timings without parsing logs. Set to `0` to silence it |
@@ -59,9 +59,26 @@ sources. Authentication uses `AZURE_STORAGE_CONNECTION_STRING` first. Otherwise,
 set `AZURE_STORAGE_ACCOUNT_URL` or `AZURE_STORAGE_ACCOUNT_NAME` and use
 `DefaultAzureCredential`, including managed identity or AKS workload identity.
 Azure rejects `object_storage_endpoint_url` and `object_storage_region_name`.
-The generator supports full checkpoints and XOR delta replay. The server still
-rejects Azure publications, and exact desired-version startup remains S3-only.
-Azure generator configuration does not yet provide a complete publication workflow.
+The server accepts Azure publications, and generators support full checkpoints
+and XOR delta replay during live updates and exact desired-version startup.
+The trainer SDK still publishes only to S3. An external producer must upload
+Azure artifacts before marking the registered version `READY`.
+
+Upgrade every serving ModelExpress server replica before publishing Azure
+versions. Older replicas read object-storage records as S3. Existing records
+without a provider remain S3; this change does not repair earlier Azure records
+that were stored with the wrong provider.
+
+Exact-version startup selects the reader from the registered version's storage
+provider. All versions in a replay chain must use the same provider: S3 or Azure.
+Set `MX_REFIT_CHECKPOINT_DIR` for local reconstruction. The generator verifies
+cached artifacts before reuse and downloads missing or damaged artifacts before
+engine loading. Only successful loading on all ranks permits activation.
+
+The startup strategy name in telemetry is now `desired_version_object_storage`
+(previously `desired_version_s3`). Its collective phase labels now use the
+`object_storage_` prefix. Use the same client build on all ranks; mixed old and
+new labels cause a startup phase disagreement.
 
 ## Staging, streaming, and verification
 
