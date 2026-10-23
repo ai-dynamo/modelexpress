@@ -70,6 +70,7 @@ A devcontainer configuration is provided for VSCode in `.devcontainer/`. It incl
 | `python3 -m unittest discover -s .github/scripts/tests -v` | CI version-stamping and nightly workflow tests (requires PyYAML, bash and jq) |
 | `./test_grpc_transfer_k8s.sh` | gRPC transfer tests on kind (requires Docker, kubectl and Helm) |
 | `pytest modelexpress_client/python/tests/` | Run Python client tests |
+| `pytest ci/k8s/client/test_inference_parity.py` | Check inference comparison failures and Dynamo target coverage without GPUs |
 | `modelexpress_client/python/generate_proto.sh` | Regenerate Python protobuf stubs |
 | `modelexpress_client/go/generate_proto.sh` | Regenerate Go protobuf and gRPC bindings |
 | `(cd modelexpress_client/go && go test ./...)` | Run Go binding compilation tests |

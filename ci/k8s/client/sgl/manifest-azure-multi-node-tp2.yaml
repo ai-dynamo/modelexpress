@@ -1,0 +1,145 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Native SGLang TP=2 across two pods per replica. Cross-paired placement
+# keeps both TP collectives and same-rank source/target transfers cross-host.
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${JOB_NAME}
+  labels:
+    app: mx-p2p-worker
+    job-name: ${JOB_NAME}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    job-name: ${JOB_NAME}
+  ports:
+    - name: dist-init
+      port: 29500
+      targetPort: 29500
+    - name: http
+      port: ${WORKER_PORT}
+      targetPort: ${WORKER_PORT}
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ${JOB_NAME}
+spec:
+  serviceName: ${JOB_NAME}
+  podManagementPolicy: Parallel
+  replicas: 2
+  selector:
+    matchLabels:
+      job-name: ${JOB_NAME}
+  template:
+    metadata:
+      labels:
+        app: mx-p2p-worker
+        job-name: ${JOB_NAME}
+    spec:
+      restartPolicy: Always
+      imagePullSecrets:
+        - name: worker-registry
+      nodeSelector:
+        agentpool: a100a
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  job-name: ${JOB_NAME}
+              topologyKey: kubernetes.io/hostname
+
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              matchLabelKeys:
+                - apps.kubernetes.io/pod-index
+              topologyKey: kubernetes.io/hostname
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: agentpool
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: no-datadog
+          operator: Exists
+          effect: NoExecute
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: ${JOB_NAME}
+          image: ${WORKER_IMAGE}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: ${WORKER_PORT}
+              name: http
+            - containerPort: 29500
+              name: dist-init
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MX_MODEL_URI
+              value: "${MX_CI_MODEL}"
+            - name: MX_SERVER_ADDRESS
+              value: "mx-server:8000"
+            - name: MX_ARTIFACT_TRANSFER
+              value: "1"
+            - name: MX_ARTIFACT_READY_URL
+              value: "http://${JOB_NAME}-0.${JOB_NAME}:${WORKER_PORT}/health"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              ORDINAL="${POD_NAME##*-}"
+              STS_NAME="${POD_NAME%-*}"
+              exec python3 -m sglang.launch_server \
+                --model-path "${MX_CI_MODEL}" \
+                --host 0.0.0.0 --port "${WORKER_PORT}" \
+                --tp 2 --nnodes 2 --node-rank "$ORDINAL" \
+                --dist-init-addr "${STS_NAME}-0.${STS_NAME}:29500" \
+                --context-length 1024 --mem-fraction-static 0.6 \
+                --trust-remote-code --load-format remote_instance \
+                --remote-instance-weight-loader-backend modelexpress \
+                --modelexpress-config '{"transport":"nixl"}'
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]

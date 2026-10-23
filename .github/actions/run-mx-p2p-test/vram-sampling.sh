@@ -74,6 +74,7 @@ wait_for_health() {
   fi
 
   local deadline pod
+  local healthy=false
   deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
     pod="$(ci_workload_pods "${label}" "${container}" "${selector}" \
@@ -87,6 +88,7 @@ wait_for_health() {
     if [ -n "${pod}" ] && kubectl exec -n "${NAMESPACE}" "${pod}" -c "${container}" -- \
          curl -sf -m 5 "http://localhost:${port}/health" >/dev/null; then
       echo "${label} ${pod} /health returned 200."
+      healthy=true
       break
     fi
 
@@ -98,9 +100,7 @@ wait_for_health() {
     sample_peak_vram "${label}" "${selector}" "${container}" \
       "${pod_var}" "${peak_var}" "${samples_var}" "${final_var}"
   fi
-  pod="${!pod_var}"
-  if [ -z "${pod}" ] || ! kubectl exec -n "${NAMESPACE}" "${pod}" -c "${container}" -- \
-       curl -sf -m 5 "http://localhost:${port}/health" >/dev/null; then
+  if [ "${healthy}" != "true" ]; then
     echo "ERROR: ${label} /health did not return 200 within ${timeout}s${timeout_detail}"
     exit 1
   fi

@@ -1,0 +1,161 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# SGLang aggregated serving with MX weight transfer and MMLU score comparison.
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: ${DGD_NAME}
+spec:
+  backendFramework: sglang
+  services:
+    ModelExpress:
+      componentType: frontend
+      replicas: 1
+      livenessProbe:
+        tcpSocket:
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      readinessProbe:
+        tcpSocket:
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      extraPodSpec:
+        serviceAccountName: modelexpress
+        imagePullSecrets:
+        - name: worker-registry
+        mainContainer:
+          image: ${MX_SERVER_IMAGE}
+          command:
+          - /bin/sh
+          - -c
+          args:
+          - exec /app/modelexpress-server --port 8000
+          env:
+          - name: MX_METADATA_BACKEND
+            value: kubernetes
+          - name: MX_METADATA_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+        limits:
+          cpu: '2'
+          memory: 4Gi
+      extraPodSpec:
+        imagePullSecrets:
+        - name: worker-registry
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.5.1
+          command:
+          - python3
+          - -m
+          - dynamo.frontend
+          args:
+          - --router-mode
+          - round-robin
+          - --http-port
+          - '8000'
+    SglangWorker:
+      envFromSecret: hf-token-secret
+      componentType: worker
+      replicas: 1
+      sharedMemory:
+        size: 64Gi
+      resources:
+        requests:
+          cpu: '4'
+          memory: 16Gi
+          gpu: '1'
+          custom:
+            rdma/ib: '1'
+        limits:
+          gpu: '1'
+          custom:
+            rdma/ib: '1'
+      envs:
+      - name: POD_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+      - name: POD_UID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.uid
+      - name: POD_NAMESPACE
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.namespace
+      - name: MX_SERVER_ADDRESS
+        value: ${DGD_NAME}-modelexpress:8000
+      - name: MX_ARTIFACT_TRANSFER
+        value: '1'
+      - name: MX_ARTIFACT_READY_URL
+        value: http://127.0.0.1:9090/health
+      - name: MX_RDMA_NIC_PIN
+        value: auto
+      - name: UCX_RNDV_SCHEME
+        value: get_zcopy
+      - name: UCX_RNDV_THRESH
+        value: '0'
+      - name: MX_MODEL_URI
+        value: ${MX_CI_MODEL}
+      extraPodSpec:
+        imagePullSecrets:
+        - name: worker-registry
+        nodeSelector:
+          agentpool: a100a
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  nvidia.com/dynamo-graph-deployment-name: ${DGD_NAME}
+                  nvidia.com/dynamo-component-type: worker
+          podAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: agentpool
+              labelSelector:
+                matchLabels:
+                  nvidia.com/dynamo-graph-deployment-name: ${DGD_NAME}
+                  nvidia.com/dynamo-component-type: worker
+        mainContainer:
+          image: ${WORKER_IMAGE}
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+          command:
+          - python3
+          - /opt/mx-ci/launch_dynamo.py
+          - sglang
+          args:
+          - --model-path
+          - ${MX_CI_MODEL}
+          - --served-model-name
+          - ${MX_CI_MODEL}
+          - --load-format
+          - remote_instance
+          - --remote-instance-weight-loader-backend
+          - modelexpress
+          - --modelexpress-config
+          - '{"transport":"nixl"}'
+          - --tp
+          - '1'
+          - --context-length
+          - '1024'
+          - --mem-fraction-static
+          - '0.6'
+          - --trust-remote-code
+          - --skip-tokenizer-init
+          - --host
+          - 0.0.0.0

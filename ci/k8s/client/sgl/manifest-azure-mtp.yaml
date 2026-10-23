@@ -1,0 +1,141 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# SGLang EAGLE speculative decoding using the Qwen3.5 MTP head.
+# Applied separately for mx-source and mx-target on different hosts in the a100a pool.
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: mx-p2p-worker
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: worker-registry
+      nodeSelector:
+        agentpool: a100a
+      affinity:
+        # Source and target on different hosts so we exercise true cross-host
+        # RDMA over IB, not intra-node loopback through the same NIC.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: kubernetes.io/hostname
+        # Pin source + target to the SAME node pool. The test cluster splits GPU
+        # nodes across InfiniBand partitions (different pkeys), and pods on
+        # different pkeys can't talk RDMA (UCX "local pkey differs from remote
+        # pkey", NIXL_ERR_BACKEND on receive). Combined with the hostname
+        # anti-affinity, this forces source/target onto different hosts WITHIN
+        # the same IB partition.
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: agentpool
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: no-datadog
+          operator: Exists
+          effect: NoExecute
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: ${JOB_NAME}
+          image: ${WORKER_IMAGE}
+          # Force re-pull on every pod creation so CI/dev iterations on the same
+          # tag pick up freshly pushed images instead of the node's cached copy.
+          imagePullPolicy: Always
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            - --model-path
+            - "${MX_CI_MODEL}"
+            - --revision
+            - "2fc06364715b967f1860aea9cf38778875588b17"
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "${WORKER_PORT}"
+            - --tp
+            - "1"
+            - --disable-radix-cache
+            - --speculative-algorithm
+            - EAGLE
+            - --speculative-draft-model-path
+            - "${MX_CI_MODEL}"
+            - --speculative-draft-model-revision
+            - "2fc06364715b967f1860aea9cf38778875588b17"
+            - --speculative-draft-load-format
+            - remote_instance
+            - --speculative-num-steps
+            - "1"
+            - --speculative-eagle-topk
+            - "1"
+            - --speculative-num-draft-tokens
+            - "2"
+            # Keep KV fixed and small so VRAM parity stays sensitive to weight
+            # residency instead of the engine auto-sizing cache around leaks.
+            - --context-length
+            - "1024"
+            - --mem-fraction-static
+            - "0.6"
+            - --trust-remote-code
+            - --load-format
+            - remote_instance
+            - --remote-instance-weight-loader-backend
+            - modelexpress
+            - --modelexpress-config
+            - '{"transport": "nixl"}'
+          env:
+            - name: MX_MODEL_URI
+              value: "${MX_CI_MODEL}"
+            - name: MX_MODEL_REVISION
+              value: "2fc06364715b967f1860aea9cf38778875588b17"
+            - name: MX_SERVER_ADDRESS
+              value: "mx-server:8000"
+            - name: MX_ARTIFACT_TRANSFER
+              value: "1"
+            - name: MX_ARTIFACT_READY_URL
+              value: "http://127.0.0.1:${WORKER_PORT}/health"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - containerPort: ${WORKER_PORT}
+          resources:
+            requests:
+              cpu: "8"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]

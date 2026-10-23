@@ -48,7 +48,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: python3 -m pip install pytest pyyaml
-      - run: python3 -m pytest ci/k8s/client/test_kube_utils.py ci/k8s/client/test_ci_readiness.py -q
+      - run: python3 -m pytest ci/k8s/client/test_kube_utils.py ci/k8s/client/test_ci_readiness.py ci/k8s/client/test_inference_parity.py ci/k8s/client/test_sglang_scenarios.py -q
       - run: python3 -m unittest discover -s .github/scripts/tests -v
 
   benchmark:

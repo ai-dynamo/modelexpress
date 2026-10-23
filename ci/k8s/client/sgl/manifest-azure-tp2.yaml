@@ -22,7 +22,7 @@
 #     and fixed. SGLang has no direct byte cap like vLLM's
 #     --kv-cache-memory-bytes, so the explicit token cap prevents available
 #     memory differences from changing source/target cache capacity.
-#   - --trust-remote-code: DeepSeek-V2 ships custom modeling code.
+#   - --trust-remote-code: allow model-provided configuration code when needed.
 #   - cpu/memory bumped to accommodate 2 GPUs of orchestration.
 #
 # CLUSTER REQUIREMENT — MUST RUN ON NON-MIG GPU NODES (agentpool: a100b).

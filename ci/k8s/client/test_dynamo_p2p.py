@@ -17,9 +17,9 @@ Asserts:
   2. The second worker actually pulled weights via NIXL RDMA (not via the
      HF disk-fallback path). Detected by scanning all worker pod logs for a
      remote source agent loaded through either central or P2P metadata.
-  3. The Dynamo Frontend serves /v1/completions end-to-end with a non-empty
-     response. Proves the frontend → worker routing path works, separate
-     from the P2P transfer itself.
+  3. AIPerf scores from the source captured before scaling do not significantly
+     regress on the explicitly routed target. Raw response metadata proves
+     the intended decode worker served every request.
 
 Invoked by the workflow as:
   pytest ci/k8s/client/test_dynamo_p2p.py -v \\
@@ -30,10 +30,12 @@ Invoked by the workflow as:
 import json
 import re
 import subprocess
+import time
+import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from kube_utils import completion_response, kubectl, port_forward
+from inference_parity import artifact_dir, compare, profile, read_responses
 
 
 # Service + label conventions are set by the dynamo operator from the DGD spec:
@@ -144,75 +146,78 @@ def test_second_replica_used_rdma(namespace: str, dgd_name: str) -> None:
     )
 
 
-# Number of /v1/completions requests sent through the Frontend in the inference
-# test. Sized at >= 2x post-scale worker count (aggregated: 2 workers;
-# disaggregated: 2 decode workers serving + 1 prefill) so round-robin must
-# dispatch to every serving worker at least once with high probability —
-# catches the failure mode where the scaled-up replica's P2P-loaded weights
-# load fine but produce 5xx / empty text on inference.
-INFERENCE_REQUEST_COUNT = 6
-
-
-def _send_completion(port: int, model: str, index: int) -> str:
-    """POST one /v1/completions request and return the completion text.
-
-    Asserts non-empty text inside the worker thread so the failure shows up
-    with the offending request index — `future.result()` re-raises in the
-    main test thread and pytest captures it normally.
-    """
+def _probe_worker(port: int, model: str, worker_id: int | None = None) -> int:
+    nvext = {"extra_fields": ["worker_id"]}
+    if worker_id is not None:
+        nvext.update(backend_instance_id=worker_id, decode_worker_id=worker_id)
     payload = json.dumps({
-        "model": model,
-        "prompt": "The capital of France is",
-        "max_tokens": 8,
+        "model": model, "messages": [{"role": "user", "content": "Reply with A."}],
+        "max_tokens": 8, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False},
+        "nvext": nvext,
     }).encode()
     req = urllib.request.Request(
-        f"http://localhost:{port}/v1/completions",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        f"http://localhost:{port}/v1/chat/completions", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
     )
-    # Cold-start budget per request (vLLM CUDA-graph capture, model warmup);
-    # warm responses complete in seconds. Using the same timeout for every
-    # call keeps the code simple — the wall-clock cost is dominated by the
-    # cold start either way.
     body = completion_response(req)
-    choices = body.get("choices", [])
-    assert choices, f"Request {index}: no choices in response: {body}"
-    text = choices[0].get("text", "")
-    assert text, f"Request {index}: empty completion text: {body}"
-    return text
+    actual = body["nvext"]["worker_id"]["decode_worker_id"]
+    assert isinstance(actual, int), f"Missing serving worker ID: {body}"
+    assert worker_id is None or actual == worker_id, f"Routed to worker {actual}, expected {worker_id}"
+    return actual
 
 
-def test_frontend_inference(namespace: str, model: str, dgd_name: str) -> None:
-    """Dynamo Frontend's /v1/completions returns valid responses across
-    multiple concurrent requests.
+def _wait_for_worker_route(port: int, model: str, worker_id: int) -> None:
+    for attempt in range(90):
+        try:
+            _probe_worker(port, model, worker_id)
+            return
+        except urllib.error.HTTPError as error:
+            message = error.read().decode()
+            if error.code != 400 or f"nvext.decode_worker_id={worker_id} does not identify a known worker" not in message:
+                raise
+            assert attempt < 89, f"Worker {worker_id} was discovered but never became routable: {message}"
+            time.sleep(2)
 
-    Validates end-to-end: HTTP request → Frontend → round-robin to a worker →
-    inference using P2P-loaded weights → response back. We can't address
-    individual workers directly (`python3 -m dynamo.vllm` doesn't expose
-    /v1/completions on the worker pod, only the Frontend does), so we fire N
-    requests concurrently and rely on round-robin to spread them across every
-    worker. As long as all N return non-empty text, the scaled-up replica's
-    P2P-loaded weights are intact enough to serve. Concurrent rather than
-    sequential because real serving sees concurrent load, and concurrency
-    forces the Frontend to actually distribute — sequential round-robin can
-    degenerate to "same worker handles all" if it always responds before the
-    next request arrives.
 
-    The completion text may be nonsensical (Qwen2.5-0.5B + non-zero
-    temperature), but every response must have non-empty text — we're
-    testing the routing + serving path, not model correctness.
-    """
+def _discovered_worker_ids(port: int) -> set[int]:
+    request = urllib.request.Request(f"http://localhost:{port}/health")
+    body = completion_response(request)
+    return {
+        instance["instance_id"] for instance in body["instances"]
+        if instance["endpoint"] == "generate"
+    }
+
+
+def test_frontend_inference(
+    namespace: str, model: str, dgd_name: str, capture_source_baseline: bool,
+) -> None:
+    """Capture the source before scale-up, then explicitly route to each target."""
+    directory = artifact_dir(namespace)
     frontend_svc = f"{dgd_name}-frontend"
     with port_forward(namespace, f"svc/{frontend_svc}", local_port=18000, remote_port=FRONTEND_PORT) as port:
-        with ThreadPoolExecutor(max_workers=INFERENCE_REQUEST_COUNT) as pool:
-            futures = {
-                pool.submit(_send_completion, port, model, i): i
-                for i in range(INFERENCE_REQUEST_COUNT)
-            }
-            for future in as_completed(futures):
-                i = futures[future]
-                # future.result() re-raises any AssertionError /
-                # urllib.error.URLError from inside the worker thread.
-                text = future.result()
-                print(f"[frontend req {i}] completion: {text!r}")
+        url = f"http://localhost:{port}"
+        if capture_source_baseline:
+            source_id = _probe_worker(port, model)
+            profile(url, model, directory / "source", worker_id=source_id)
+            initial_ids = _discovered_worker_ids(port)
+            assert source_id in initial_ids, "Serving source missing from frontend discovery"
+            (directory / "source-worker.json").write_text(json.dumps(source_id) + "\n")
+            (directory / "initial-workers.json").write_text(json.dumps(sorted(initial_ids)) + "\n")
+            return
+
+        source_id = json.loads((directory / "source-worker.json").read_text())
+        source = read_responses(directory / "source", worker_id=source_id)
+        initial_ids = set(json.loads((directory / "initial-workers.json").read_text()))
+        for _ in range(20):
+            serving_ids = _discovered_worker_ids(port)
+            if initial_ids <= serving_ids and len(serving_ids - initial_ids) == 1:
+                break
+            time.sleep(2)
+        assert initial_ids <= serving_ids and len(serving_ids - initial_ids) == 1, (
+            f"Expected original workers {initial_ids} and one target, observed {serving_ids}"
+        )
+        (directory / "serving-workers.json").write_text(json.dumps(sorted(serving_ids)) + "\n")
+        for target_id in sorted(serving_ids - initial_ids):
+            _wait_for_worker_route(port, model, target_id)
+            target = profile(url, model, directory / f"target-{target_id}", worker_id=target_id)
+            compare(source, target, directory / f"comparison-{target_id}.json")

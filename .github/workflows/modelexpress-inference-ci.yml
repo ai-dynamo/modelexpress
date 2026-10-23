@@ -12,7 +12,7 @@ on:
         default: ''
 
 env:
-  MX_CI_MODEL: Qwen/Qwen2.5-0.5B
+  MX_CI_MODEL: Qwen/Qwen3.5-0.8B
   VCLUSTER_NAME: mx-ci-cluster
   VCLUSTER_NAMESPACE: mx-ci
   MX_CI_S3_BUCKET: ai-dynamo-modelexpress-ci
@@ -64,6 +64,17 @@ jobs:
       framework: dynamo-vllm
     secrets: inherit
 
+  gpu-tests-dynamo-sglang:
+    name: GPU (dynamo-sglang)
+    needs: [build-client-dynamo-sglang, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/modelexpress-inference-gpu-ci.yml
+    with:
+      runs_on: ${{ inputs.runs_on }}
+      framework: dynamo-sglang
+    secrets: inherit
+
   gpu-tests-large:
     name: GPU (large)
     needs:
@@ -72,10 +83,12 @@ jobs:
       - build-client-vllm
       - build-client-sglang
       - build-client-dynamo-vllm
+      - build-client-dynamo-sglang
       - gpu-tests-vllm
       - gpu-tests-sglang
       - gpu-tests-sglang-mooncake
       - gpu-tests-dynamo-vllm
+      - gpu-tests-dynamo-sglang
     permissions:
       contents: read
     uses: ./.github/workflows/modelexpress-inference-gpu-ci.yml
@@ -86,7 +99,7 @@ jobs:
 
   gpu-cleanup:
     name: GPU cleanup
-    needs: [gpu-tests-vllm, gpu-tests-sglang, gpu-tests-sglang-mooncake, gpu-tests-dynamo-vllm, gpu-tests-large]
+    needs: [gpu-tests-vllm, gpu-tests-sglang, gpu-tests-sglang-mooncake, gpu-tests-dynamo-vllm, gpu-tests-dynamo-sglang, gpu-tests-large]
     if: ${{ always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 30
@@ -258,6 +271,16 @@ jobs:
     env:
       FRAMEWORK: dynamo-vllm
       DOCKERFILE: ci/k8s/client/vllm/dynamo/Dockerfile
+    steps: *build-worker-steps
+
+  build-client-dynamo-sglang:
+    name: Build worker image (dynamo-sglang)
+    runs-on: prod-modelexpress-builder-amd-v1
+    permissions:
+      contents: read
+    env:
+      FRAMEWORK: dynamo-sglang
+      DOCKERFILE: ci/k8s/client/sgl/dynamo/Dockerfile
     steps: *build-worker-steps
 
   # Build the trainer and rollout images used by the Vime delta-refit smoke.
@@ -441,6 +464,7 @@ jobs:
       - gpu-tests-sglang
       - gpu-tests-sglang-mooncake
       - gpu-tests-dynamo-vllm
+      - gpu-tests-dynamo-sglang
       - gpu-tests-large
       - gpu-cleanup
       - build-server
@@ -448,6 +472,7 @@ jobs:
       - build-client-sglang
       - build-client-sglang-mooncake
       - build-client-dynamo-vllm
+      - build-client-dynamo-sglang
       - ensure-vcluster
       - model-streamer-vllm
       - model-streamer-sglang

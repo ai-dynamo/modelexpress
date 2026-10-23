@@ -6,7 +6,7 @@
 #
 # REQUIRES AN MoE MODEL. --enable-expert-parallel only does anything for
 # mixture-of-experts models; the test-ep job pairs this manifest with
-# deepseek-ai/DeepSeek-V2-Lite (MLA + MoE). Do not reuse it with the default
+# zai-org/GLM-4.7-Flash (MLA + MoE). Do not reuse it with the default
 # dense CI model.
 #
 # EP vs TP — what this exercises beyond the TP=2 test:
