@@ -29,6 +29,7 @@ from .draft_weights import draft_weight_adapter_for
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
 
 if TYPE_CHECKING:
+    from ...types import TensorDescriptor
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
@@ -128,10 +129,31 @@ class SglangAdapter(EngineAdapter):
                     }
         return tensors
 
+    def requires_exact_tensor_catalog(self) -> bool:
+        # A partial runtime catalog can leave quantization state inconsistent.
+        return True
+
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
         with capture_tensor_attrs(self.accelerator_backend):
             result = self._post_load_weights(result)
             return self._process_weights_after_loading(result)
+
+    def prepare_rdma_target_from_manifest(
+        self, result: LoadResult, source_tensors: list[TensorDescriptor]
+    ) -> None:
+        from .runtime_state import prepare_runtime_tensors
+
+        if result.model is None:
+            raise RuntimeError("SGLang runtime preparation requires result.model")
+        prepare_runtime_tensors(result.model, source_tensors)
+
+    def after_rdma_receive(self, result: LoadResult) -> LoadResult:
+        from .runtime_state import finalize_runtime_state
+
+        if result.model is None:
+            raise RuntimeError("SGLang runtime finalization requires result.model")
+        finalize_runtime_state(result.model)
+        return result
 
     def apply_weight_iter(
         self,

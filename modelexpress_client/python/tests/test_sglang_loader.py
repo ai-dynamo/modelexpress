@@ -1792,3 +1792,16 @@ def test_sglang_target_discovery_keeps_embed_and_head():
 
     assert "model.embed_tokens.weight" in tensors
     assert "lm_head.weight" in tensors
+
+
+def test_transfer_engine_rejects_source_only_runtime_tensor():
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    transfer_engine = MagicMock()
+    source = p2p_pb2.WorkerMetadata(
+        transfer_engine_session_id="source",
+        tensors=[p2p_pb2.TensorDescriptor(name="proj.weight_scale_inv_swizzled", size=2048)],
+    )
+    with pytest.raises(RuntimeError, match="source-only tensors"):
+        loader._receive_via_transfer_engine({}, transfer_engine, source,
+                                            SimpleNamespace(global_rank=0))
+    transfer_engine.batch_transfer_sync_read.assert_not_called()
