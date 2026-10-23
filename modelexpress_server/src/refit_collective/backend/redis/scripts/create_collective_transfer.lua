@@ -5,13 +5,15 @@
 -- KEYS[3]: group hash
 -- KEYS[4]: group active-operations set
 -- ARGV: operation_id, group_id, version_id, model_name, idempotency_key,
---       state, created_at_unix_ms, operation_key_prefix, idempotency_ttl_secs
+--       state, created_at_unix_ms, operation_key_prefix, idempotency_ttl_secs,
+--       expected_epoch
 --
 -- Returns:
 --   CREATED
 --   EXISTING:<operation_id>   another invocation already owns the key
 --   COLLISION                 the generated operation ID already exists
 --   NOGROUP                   no group exists for this membership
+--   NOTREADY:<epoch>:<state>  the group is not READY at the expected epoch
 --   BUSY:<operation_id>       another operation is still in flight at this epoch
 --
 -- The idempotency reservation is what makes an orchestrator retry safe: a
@@ -41,6 +43,15 @@ end
 local epoch = redis.call('HGET', KEYS[3], 'epoch')
 if not epoch then
   return 'NOGROUP'
+end
+
+-- READY admission and epoch binding are one decision. The caller names the
+-- READY epoch it checked; if the group has since moved on (or never got
+-- there), nothing is written: no operation that would block the next create,
+-- and no reservation that would replay this refusal's key.
+local group_state = redis.call('HGET', KEYS[3], 'state') or ''
+if group_state ~= 'READY' or tonumber(epoch) ~= tonumber(ARGV[10]) then
+  return 'NOTREADY:' .. epoch .. ':' .. group_state
 end
 
 -- At most one nonterminal operation per group epoch. Two operations on one

@@ -144,6 +144,11 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
         validate_spec(request.spec.as_ref())?;
         required(&request.version_id, "version_id")?;
         required(&request.idempotency_key, "idempotency_key")?;
+        if request.expected_epoch == 0 {
+            return Err(Status::invalid_argument(
+                "expected_epoch is required: name the READY group epoch to transfer at",
+            ));
+        }
 
         self.backend
             .create_transfer(&request)

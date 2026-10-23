@@ -581,7 +581,13 @@ class CollectiveRendezvous:
         )
         transfer = self._stub.CreateCollectiveTransfer(
             pb.CreateCollectiveTransferRequest(
-                spec=spec, version_id=version, idempotency_key=key
+                spec=spec,
+                version_id=version,
+                idempotency_key=key,
+                # The server re-checks READY at exactly this epoch atomically
+                # with opening the operation, closing the gap since the check
+                # above.
+                expected_epoch=membership.epoch,
             ),
             timeout=self._rpc_timeout_s,
         )

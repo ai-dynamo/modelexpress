@@ -414,8 +414,11 @@ state the trainer can observe.
 
 ![Timing waterfall of group formation: the orchestrator fans out actor RPCs, every worker joins, the lane leader publishes the NCCL unique id, MX flips the group to READY, all ranks pay the one-time Communicator.init cost, and only then does the orchestrator create the transfer for the first refit](images/nccl-m2n-group-formation.png)
 
-Ordering. `CreateCollectiveTransfer` requires an existing group and stamps the
-operation with the group's current epoch. First formation: `compute_plan` on
+Ordering. `CreateCollectiveTransfer` carries the `expected_epoch` the caller
+saw `READY` (0 is rejected as INVALID_ARGUMENT) and is admitted only if, in the
+same atomic step that opens the operation, the group is still `READY` at
+exactly that epoch; otherwise it fails with FAILED_PRECONDITION and leaves no
+operation and no idempotency reservation behind. First formation: `compute_plan` on
 every worker (join, `READY`, communicators), then `CreateCollectiveTransfer`,
 then `start_weight_update`. Later refits: create the operation, then
 `start_weight_update`. A group epoch has at most one operation in flight

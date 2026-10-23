@@ -844,6 +844,11 @@ impl CollectiveBackend for RedisCollectiveBackend {
             CollectiveBackendError::InvalidArgument("spec is required".to_string())
         })?;
         Self::layout_for(spec)?;
+        if request.expected_epoch == 0 {
+            return Err(CollectiveBackendError::InvalidArgument(
+                "expected_epoch is required: name the READY group epoch to transfer at".to_string(),
+            ));
+        }
         let group_id = group_id_for(spec);
         let operation_id = Uuid::new_v4().simple().to_string();
 
@@ -869,12 +874,23 @@ impl CollectiveBackend for RedisCollectiveBackend {
             .arg(now_unix_ms()?)
             .arg(OPERATION_KEY_PREFIX)
             .arg(envs::nccl_refit_transfer_timeout_secs())
+            .arg(request.expected_epoch)
             .invoke_async(&mut self.connection.clone())
             .await
             .map_err(redis_error)?;
 
         match outcome.as_str() {
             "CREATED" => self.read_transfer(&operation_id).await,
+            other if other.starts_with("NOTREADY:") => {
+                let mut parts = other.trim_start_matches("NOTREADY:").splitn(2, ':');
+                let epoch = parts.next().unwrap_or_default();
+                let state = parts.next().unwrap_or_default();
+                Err(CollectiveBackendError::FailedPrecondition(format!(
+                    "collective group {group_id} is {state} at epoch {epoch}, not READY at \
+                     the expected epoch {}; no transfer was created",
+                    request.expected_epoch
+                )))
+            }
             "COLLISION" => Err(CollectiveBackendError::Internal(
                 "generated operation id already exists".to_string(),
             )),
@@ -1321,16 +1337,27 @@ mod tests {
             })
             .await
             .expect("join");
-        backend
-            .create_transfer(&CreateCollectiveTransferRequest {
-                spec: Some(group_spec.clone()),
-                version_id: "v1".to_string(),
-                idempotency_key: Uuid::new_v4().to_string(),
-            })
-            .await
-            .expect("create transfer");
 
+        // A FORMING group refuses a create, so seed the in-flight operation
+        // the way an epoch-1 create on a since-demoted group would leave it.
         let group_id = group_id_for(&group_spec);
+        let operation_id = Uuid::new_v4().simple().to_string();
+        let () = connection
+            .hset_multiple(
+                operation_key(&operation_id),
+                &[
+                    ("operation_id", operation_id.as_str()),
+                    ("group_id", group_id.as_str()),
+                    ("epoch", "1"),
+                    ("state", "PENDING"),
+                ],
+            )
+            .await
+            .expect("seed operation");
+        let () = connection
+            .sadd(active_ops_key(&group_id), &operation_id)
+            .await
+            .expect("seed active operation");
         let active: u64 = connection
             .scard(active_ops_key(&group_id))
             .await
@@ -1435,11 +1462,149 @@ mod tests {
         version: &str,
         key: &str,
     ) -> CreateCollectiveTransferRequest {
+        create_request_at(group_spec, version, key, 1)
+    }
+
+    fn create_request_at(
+        group_spec: &CollectiveGroupSpec,
+        version: &str,
+        key: &str,
+        expected_epoch: u64,
+    ) -> CreateCollectiveTransferRequest {
         CreateCollectiveTransferRequest {
             spec: Some(group_spec.clone()),
             version_id: version.to_string(),
             idempotency_key: key.to_string(),
+            expected_epoch,
         }
+    }
+
+    /// Join t0 and g0 and publish both lanes' bootstraps: READY at epoch 1.
+    async fn ready_group(backend: &RedisCollectiveBackend, test: &str) -> CollectiveGroupSpec {
+        let model = format!("{test}/{}", Uuid::new_v4());
+        let trainer = Uuid::new_v4().to_string();
+        let generator = Uuid::new_v4().to_string();
+        register_worker(backend, &trainer, CollectiveRole::Trainer, &model).await;
+        register_worker(backend, &generator, CollectiveRole::Generator, &model).await;
+        let group_spec = spec(&model, &["t0"], &["g0"], 1);
+        join(
+            backend,
+            &group_spec,
+            "t0",
+            &trainer,
+            CollectiveRole::Trainer,
+            "d",
+        )
+        .await;
+        join(
+            backend,
+            &group_spec,
+            "g0",
+            &generator,
+            CollectiveRole::Generator,
+            "d",
+        )
+        .await;
+        let group_id = group_id_for(&group_spec);
+        for (lane_id, fill) in [(0, 1u8), (1, 2u8)] {
+            backend
+                .publish_bootstrap(&PublishGroupBootstrapRequest {
+                    group_id: group_id.clone(),
+                    epoch: 1,
+                    lane_id,
+                    worker_id: trainer.clone(),
+                    nccl_unique_id: vec![fill; 128],
+                })
+                .await
+                .expect("publish lane bootstrap");
+        }
+        let group = backend.get_group(&group_id).await.expect("get group");
+        assert_eq!(group.state, i32::from(CollectiveGroupState::Ready));
+        assert_eq!(group.epoch, 1);
+        group_spec
+    }
+
+    /// Assert a refused create left neither an operation nor a reservation.
+    async fn assert_nothing_admitted(
+        backend: &RedisCollectiveBackend,
+        group_spec: &CollectiveGroupSpec,
+        key: &str,
+    ) {
+        let mut connection = backend.connection.clone();
+        let active: u64 = connection
+            .scard(active_ops_key(&group_id_for(group_spec)))
+            .await
+            .expect("scard");
+        assert_eq!(active, 0, "a refused create must not leave an operation");
+        let reserved: bool = connection
+            .exists(operation_idempotency_key(&group_spec.model_name, key))
+            .await
+            .expect("exists");
+        assert!(!reserved, "a refused create must not leave a reservation");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
+    async fn create_is_admitted_only_at_the_ready_epoch_it_names() {
+        let backend = RedisCollectiveBackend::connect(&test_redis_url())
+            .await
+            .expect("connect");
+
+        // FORMING: one of two slots joined. Even the current epoch is refused.
+        let model = format!("create-forming-test/{}", Uuid::new_v4());
+        let trainer = Uuid::new_v4().to_string();
+        register_worker(&backend, &trainer, CollectiveRole::Trainer, &model).await;
+        let forming = spec(&model, &["t0"], &["g0"], 1);
+        join(
+            &backend,
+            &forming,
+            "t0",
+            &trainer,
+            CollectiveRole::Trainer,
+            "d",
+        )
+        .await;
+        let key = Uuid::new_v4().to_string();
+        match backend
+            .create_transfer(&create_request_at(&forming, "v1", &key, 1))
+            .await
+        {
+            Err(CollectiveBackendError::FailedPrecondition(_)) => {}
+            other => panic!("expected FailedPrecondition while FORMING, got {other:?}"),
+        }
+        assert_nothing_admitted(&backend, &forming, &key).await;
+
+        // READY at epoch 1, but the caller names another epoch.
+        let group_spec = ready_group(&backend, "create-epoch-test").await;
+        for stale in [2, 7] {
+            let key = Uuid::new_v4().to_string();
+            match backend
+                .create_transfer(&create_request_at(&group_spec, "v1", &key, stale))
+                .await
+            {
+                Err(CollectiveBackendError::FailedPrecondition(_)) => {}
+                other => panic!("expected FailedPrecondition at epoch {stale}, got {other:?}"),
+            }
+            assert_nothing_admitted(&backend, &group_spec, &key).await;
+        }
+
+        // No epoch at all is an invalid request, not a guess at the current one.
+        let key = Uuid::new_v4().to_string();
+        match backend
+            .create_transfer(&create_request_at(&group_spec, "v1", &key, 0))
+            .await
+        {
+            Err(CollectiveBackendError::InvalidArgument(_)) => {}
+            other => panic!("expected InvalidArgument without an epoch, got {other:?}"),
+        }
+        assert_nothing_admitted(&backend, &group_spec, &key).await;
+
+        // The READY epoch itself is admitted.
+        let created = backend
+            .create_transfer(&create_request_at(&group_spec, "v1", &key, 1))
+            .await
+            .expect("create at the READY epoch");
+        assert_eq!(created.epoch, 1);
     }
 
     #[tokio::test]
@@ -1448,11 +1613,7 @@ mod tests {
         let backend = RedisCollectiveBackend::connect(&test_redis_url())
             .await
             .expect("connect");
-        let model = format!("one-in-flight-test/{}", Uuid::new_v4());
-        let trainer = Uuid::new_v4().to_string();
-        register_worker(&backend, &trainer, CollectiveRole::Trainer, &model).await;
-        let group_spec = spec(&model, &["t0"], &["g0"], 1);
-        join(&backend, &group_spec, "t0", &trainer, CollectiveRole::Trainer, "d").await;
+        let group_spec = ready_group(&backend, "one-in-flight-test").await;
 
         // A split cohort: two halves create concurrently under different keys
         // at the same epoch. Exactly one may own the epoch.

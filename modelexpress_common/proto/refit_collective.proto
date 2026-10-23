@@ -235,6 +235,12 @@ message CreateCollectiveTransferRequest {
   CollectiveGroupSpec spec = 1;
   string version_id = 2;
   string idempotency_key = 3;
+  // The READY group epoch the caller checked and means to transfer at.
+  // Required (0 is rejected): the create is admitted only if the group is
+  // still READY at exactly this epoch when the operation is opened, so a group
+  // that moved to a new epoch in between leaves no operation and no
+  // idempotency reservation behind.
+  uint64 expected_epoch = 4;
 }
 
 message GetCollectiveTransferRequest {

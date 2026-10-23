@@ -206,12 +206,14 @@ async fn create_transfer(
     spec: &CollectiveGroupSpec,
     version_id: &str,
     idempotency_key: &str,
+    expected_epoch: u64,
 ) -> CollectiveTransfer {
     client
         .create_collective_transfer(CreateCollectiveTransferRequest {
             spec: Some(spec.clone()),
             version_id: version_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
+            expected_epoch,
         })
         .await
         .expect("create collective transfer")
@@ -303,25 +305,23 @@ async fn admission_bootstrap_epoch_and_transfer_fences_hold() {
     )
     .await;
 
-    let pending = create_transfer(
-        &mut collective,
-        &group_spec,
-        "pending-version",
-        &unique_id("pending-operation"),
-    )
-    .await;
-    let premature_report = collective
-        .report_collective_transfer(ReportCollectiveTransferRequest {
-            operation_id: pending.operation_id,
-            group_id: pending.group_id,
-            epoch: pending.epoch,
-            worker_id: worker_t0.clone(),
-            succeeded: true,
-            message: String::new(),
-        })
-        .await
-        .expect_err("PENDING cannot advance until the group is READY");
-    assert_eq!(premature_report.code(), tonic::Code::FailedPrecondition);
+    // A FORMING group admits no transfer, even at its current epoch, and a
+    // create that names no epoch is malformed.
+    for (expected_epoch, code) in [
+        (1, tonic::Code::FailedPrecondition),
+        (0, tonic::Code::InvalidArgument),
+    ] {
+        let premature_create = collective
+            .create_collective_transfer(CreateCollectiveTransferRequest {
+                spec: Some(group_spec.clone()),
+                version_id: "pending-version".to_string(),
+                idempotency_key: unique_id("pending-operation"),
+                expected_epoch,
+            })
+            .await
+            .expect_err("a transfer cannot be created until the group is READY");
+        assert_eq!(premature_create.code(), code);
+    }
 
     let non_leader = collective
         .publish_group_bootstrap(PublishGroupBootstrapRequest {
@@ -443,8 +443,22 @@ async fn admission_bootstrap_epoch_and_transfer_fences_hold() {
     assert_eq!(epoch_two.state, i32::from(CollectiveGroupState::Ready));
 
     let idem = unique_id("operation");
-    let transfer = create_transfer(&mut collective, &group_spec, "version-1", &idem).await;
-    let replay = create_transfer(&mut collective, &group_spec, "version-1", &idem).await;
+    let transfer = create_transfer(
+        &mut collective,
+        &group_spec,
+        "version-1",
+        &idem,
+        epoch_two.epoch,
+    )
+    .await;
+    let replay = create_transfer(
+        &mut collective,
+        &group_spec,
+        "version-1",
+        &idem,
+        epoch_two.epoch,
+    )
+    .await;
     assert_eq!(replay.operation_id, transfer.operation_id);
 
     let conflicting_replay = collective
@@ -452,6 +466,7 @@ async fn admission_bootstrap_epoch_and_transfer_fences_hold() {
             spec: Some(group_spec.clone()),
             version_id: "version-2".to_string(),
             idempotency_key: idem.clone(),
+            expected_epoch: epoch_two.epoch,
         })
         .await
         .expect_err("idempotency replay with a different payload must fail");
@@ -517,7 +532,14 @@ async fn admission_bootstrap_epoch_and_transfer_fences_hold() {
         })
         .await
         .expect("delete terminal transfer");
-    let recreated = create_transfer(&mut collective, &group_spec, "version-1", &idem).await;
+    let recreated = create_transfer(
+        &mut collective,
+        &group_spec,
+        "version-1",
+        &idem,
+        epoch_two.epoch,
+    )
+    .await;
     assert_ne!(recreated.operation_id, transfer.operation_id);
 
     // Only one transfer may be in flight per group epoch, so fail the
@@ -978,6 +1000,7 @@ async fn join_triggered_epoch_bump_aborts_and_releases_stranded_transfer() {
         &group_spec,
         "version-1",
         &unique_id("join-abort-operation"),
+        1,
     )
     .await;
     assert_eq!(transfer.state, i32::from(CollectiveTransferState::Pending));
@@ -1074,6 +1097,7 @@ async fn refresh_triggered_epoch_bump_aborts_and_releases_stranded_transfer() {
         &group_spec,
         "version-1",
         &unique_id("refresh-abort-operation"),
+        1,
     )
     .await;
     assert_eq!(transfer.state, i32::from(CollectiveTransferState::Pending));

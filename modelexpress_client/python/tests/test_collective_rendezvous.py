@@ -210,6 +210,16 @@ class TestCreateTransfer:
         assert stub.created[0].idempotency_key == "test-g1-epoch-1-version-2"
         assert stub.get_timeouts == [5.0, 5.0]
 
+    def test_creation_names_the_ready_epoch_it_checked(self):
+        # The server admits the create only if the group is still READY at
+        # exactly this epoch, so a group that moved on in between leaves no
+        # operation behind for the client to reject.
+        stub = self.stub()
+        client, joined = self.joined(stub)
+        client.create_transfer(joined, "2", key_prefix="test")
+        assert joined.epoch == 1
+        assert stub.created[0].expected_epoch == joined.epoch
+
     def test_the_replay_key_carries_the_callers_namespace(self):
         stub = self.stub()
         client, joined = self.joined(stub)
