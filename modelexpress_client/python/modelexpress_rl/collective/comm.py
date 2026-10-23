@@ -197,7 +197,7 @@ class LaneCommunicator:
             )
         return self._comm
 
-    def abort(self) -> None:
+    def abort(self, deadline: float | None = None) -> None:
         """Tear the communicator down after a deadline or a peer failure.
 
         Marked aborted even if the underlying abort raises or wedges: the point
@@ -213,15 +213,36 @@ class LaneCommunicator:
         call, and raises :class:`CommunicatorWedgedError`: the lane cannot be
         torn down in this process, and the fatal error is what lets the runner
         exit it so the group re-forms elsewhere.
+
+        ``deadline`` is an absolute ``time.monotonic()`` instant shared by every
+        lane of a group teardown, so the data and control communicators of all
+        lanes together get one ``MX_NCCL_REFIT_ABORT_TIMEOUT_S`` budget rather
+        than one each. Once it has passed no further abort is launched: the
+        remaining handles are left untouched (never aborted concurrently with a
+        stuck one) and the lane is reported wedged.
         """
         if self._aborted:
             return
         self._aborted = True
         timeout_s = abort_timeout()
+        if deadline is None:
+            deadline = time.monotonic() + timeout_s
         for comm in (self._comm, self._control):
             abort = getattr(comm, "abort", None)
             if abort is None:
                 continue
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                self._wedged = True
+                logger.error(
+                    "the shared %.1fs teardown budget was spent before the NCCL "
+                    "communicator for lane %s/%s could be aborted; it is left as "
+                    "is and the process must exit so the group re-forms without it.",
+                    timeout_s,
+                    self.rank,
+                    self.world_size,
+                )
+                break
 
             def _abort(abort=abort) -> None:
                 try:
@@ -233,19 +254,20 @@ class LaneCommunicator:
                     )
 
             returned = _run_bounded(
-                _abort, timeout_s, name=f"nccl-abort-{self.rank}-{self.world_size}"
+                _abort, remaining_s, name=f"nccl-abort-{self.rank}-{self.world_size}"
             )
             if not returned:
                 self._wedged = True
                 logger.error(
                     "aborting the NCCL communicator for lane %s/%s did not return "
-                    "within %.1fs; the M2N kernel is presumed still running and the "
-                    "communicator is wedged. The process must exit so the group "
-                    "re-forms without it.",
+                    "within the %.1fs teardown budget; the M2N kernel is presumed "
+                    "still running and the communicator is wedged. The process must "
+                    "exit so the group re-forms without it.",
                     self.rank,
                     self.world_size,
                     timeout_s,
                 )
+                break
         if self._wedged:
             raise CommunicatorWedgedError(
                 f"aborting the lane communicator for rank {self.rank} of "
@@ -600,9 +622,11 @@ class CommunicatorCache:
 
         A partially aborted group leaves peers blocked in the lanes that did
         not time out, waiting on ranks that have already given up. A lane whose
-        abort wedges is still removed and the rest are still aborted; the
-        :class:`CommunicatorWedgedError` is raised only after every lane has
-        been dealt with, so no peer is left blocked on a lane we skipped.
+        abort wedges is still removed, and every remaining lane is dropped too
+        (aborted while the shared teardown budget lasts, marked wedged once it
+        is spent); the :class:`CommunicatorWedgedError` is raised only after
+        every lane has been dealt with, and the process exit it forces is what
+        releases any lane left un-aborted.
         """
         keys = [key for key in self._lanes if key.group_id == group_id]
         wedged = self._abort_keys(keys)
@@ -614,15 +638,20 @@ class CommunicatorCache:
         """Abort and drop every listed lane; return the first wedge, if any.
 
         Every lane is aborted before any wedge propagates, because leaving a
-        lane un-aborted is exactly the hang this path exists to prevent.
+        lane un-aborted is exactly the hang this path exists to prevent. All of
+        them share one ``MX_NCCL_REFIT_ABORT_TIMEOUT_S`` deadline: once it has
+        passed, the remaining lanes are dropped and marked wedged without
+        launching another abort, so a wedged teardown delays the fatal report
+        by at most one budget, not one per lane and handle.
         """
         wedged: CommunicatorWedgedError | None = None
+        deadline = time.monotonic() + abort_timeout() if keys else None
         for key in keys:
             lane = self._lanes.pop(key, None)
             if lane is None:
                 continue
             try:
-                lane.abort()
+                lane.abort(deadline=deadline)
             except CommunicatorWedgedError as error:
                 error.group_id = key.group_id
                 error.epoch = key.epoch

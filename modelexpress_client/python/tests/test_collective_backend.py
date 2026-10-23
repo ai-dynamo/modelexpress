@@ -664,8 +664,9 @@ class TestBoundedAbort:
         try:
             with pytest.raises(CommunicatorWedgedError) as caught:
                 cache.abort_group("g")
-            # Every lane was still torn down - no peer is left blocked on a lane
-            # the wedge made us skip - and the cache is empty.
+            # Every lane is marked aborted and dropped (good1 after the wedge
+            # spent the shared budget, without launching its abort), and the
+            # cache is empty.
             assert good0.aborted and good1.aborted and wedger.aborted
             assert len(cache) == 0
             assert caught.value.group_id == "g"
@@ -673,6 +674,43 @@ class TestBoundedAbort:
             assert caught.value.epoch == 1
         finally:
             wedger._comm.release.set()
+
+    def test_abort_group_shares_one_teardown_budget_across_lanes_and_handles(
+        self, monkeypatch
+    ):
+        # Every lane has a data and a control communicator whose aborts wedge.
+        # Per-handle budgets would delay the fatal report by about
+        # 2 x lanes x timeout; the group gets one budget, and once it is spent
+        # no further abort is launched (they are never run concurrently).
+        timeout_s = 0.2
+        monkeypatch.setattr(collective_comm, "abort_timeout", lambda: timeout_s)
+        cache = CommunicatorCache()
+        comms = []
+        lanes = []
+        for lane_id in range(3):
+            data, control = BlockingComm(), BlockingComm()
+            comms += [data, control]
+            entry_lane = LaneCommunicator(
+                data, rank=0, world_size=2, stream=None, control=control
+            )
+            lanes.append(entry_lane)
+            cache._lanes[LaneKey("g", 1, lane_id)] = entry_lane
+        try:
+            started = time.monotonic()
+            with pytest.raises(CommunicatorWedgedError) as caught:
+                cache.abort_group("g")
+            elapsed = time.monotonic() - started
+            assert elapsed < timeout_s * 1.75, elapsed
+            assert caught.value.lane_id == 0
+            # Only the first abort was ever launched; the rest were dropped
+            # without starting another thread against a spent budget.
+            assert [c.started.is_set() for c in comms] == [True] + [False] * 5
+            assert all(entry_lane.aborted for entry_lane in lanes)
+            assert all(entry_lane.wedged for entry_lane in lanes)
+            assert len(cache) == 0
+        finally:
+            for c in comms:
+                c.release.set()
 
     def test_a_wedged_half_abort_carries_version_and_epoch(self, recorder, monkeypatch):
         self._fast_timeout(monkeypatch)
