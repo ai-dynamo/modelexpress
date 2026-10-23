@@ -292,7 +292,9 @@ def test_installer_loads_prepared_checkpoint_inside_vllm_config(monkeypatch, tmp
         "vllm.model_executor.model_loader.default_loader"
     ].DefaultModelLoader = DefaultModelLoader
     synchronized = []
-    monkeypatch.setattr(torch.cuda, "synchronize", synchronized.append)
+    monkeypatch.setattr(
+        _VllmInstaller, "_synchronize", lambda self: synchronized.append(self._device)
+    )
 
     model = nn.Linear(1, 1, bias=False)
     model_config = SimpleNamespace(model="/launch", revision="main")
@@ -633,7 +635,9 @@ def test_installer_preserves_engine_derived_storage(
         "vllm.model_executor.model_loader.default_loader"
     ].DefaultModelLoader = DefaultModelLoader
     synchronized = []
-    monkeypatch.setattr(torch.cuda, "synchronize", synchronized.append)
+    monkeypatch.setattr(
+        _VllmInstaller, "_synchronize", lambda self: synchronized.append(self._device)
+    )
     installer = _VllmInstaller(
         model=model,
         vllm_config=SimpleNamespace(
@@ -2511,6 +2515,30 @@ def test_load_time_alias_restoration_does_not_ignore_missing_ties(recorded):
         installer._restore_parameter_aliases(aliases)
 
 
+@pytest.mark.parametrize(
+    ("device", "expected"), [(torch.device("xpu", 1), [1]), (torch.device("cpu"), [])]
+)
+def test_installer_synchronizes_through_the_device_backend(
+    monkeypatch, mock_accelerator_backend_cls, device, expected
+):
+    backend = mock_accelerator_backend_cls(name="xpu", torch_device_type="xpu")
+    monkeypatch.setattr(
+        "modelexpress_rl.inference.engines.vllm.installer.accelerator_backend_for",
+        lambda _device: backend,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda *_args: pytest.fail("the installer must not reach torch.cuda"),
+    )
+    installer = object.__new__(_VllmInstaller)
+    installer._device = device
+
+    installer._synchronize()
+
+    assert backend.synchronize_calls == expected
+
+
 @pytest.mark.parametrize("window_layers", ["0", "2"])
 def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(
     monkeypatch, window_layers
@@ -2534,7 +2562,9 @@ def test_streamed_checkpoint_uses_graph_safe_reload_and_closes_iterator(
     monkeypatch.setitem(
         sys.modules, "vllm.model_executor.model_loader.weight_utils", weight_utils
     )
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
+    monkeypatch.setattr(
+        _VllmInstaller, "_synchronize", lambda self: events.append("sync")
+    )
     monkeypatch.setenv("MX_MS_DISTRIBUTED", "1")
     monkeypatch.setenv("MX_REFIT_STREAM_WINDOW_LAYERS", window_layers)
     monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")

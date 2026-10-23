@@ -160,7 +160,9 @@ def _persistent_installer(monkeypatch, model, *, quantized=False):
     monkeypatch.setitem(sys.modules, utils.__name__, utils)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
-    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        transfer_module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     return _cpu_installer(
         model,
         vllm_config=SimpleNamespace(quant_config=object()) if quantized else None,
