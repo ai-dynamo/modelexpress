@@ -127,9 +127,10 @@ spec:
             # avoids target-0 (also pod-index=0), and source-1 avoids
             # target-1, but source-0 may share a host with target-1.
             #
-            # Combined with Rule 1, this lets the test exercise full cross-
-            # host RDMA on a 2-node pool (Node A: source-0 + target-1,
-            # Node B: source-1 + target-0) instead of needing 4 nodes.
+            # Combined with Rule 1, this permits source-0 + target-1 and
+            # source-1 + target-0 to share hosts. The current pool advertises
+            # one exclusive rdma/ib resource per host, however, so all four
+            # pods still require separate hosts there.
             #
             # Requires K8s ≥ 1.29 (matchLabelKeys is beta then, stable in
             # 1.31) and ≥ 1.28 for the auto-applied
@@ -249,7 +250,7 @@ spec:
               fi
           resources:
             requests:
-              cpu: "4"
+              cpu: "2"
               memory: "16Gi"
               nvidia.com/gpu: "1"
               rdma/ib: "1"

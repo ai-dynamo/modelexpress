@@ -14,7 +14,8 @@ have reached Running state.  Asserts:
      are loaded and the model is serving correctly on each.
   4. When enabled by the workflow, target peak and final VRAM do not materially
      exceed source VRAM.
-  5. When --expect-mtp is set, every target rank transfers both the main model
+  5. When configured, source and target report the expected token-pool capacity.
+  6. When --expect-mtp is set, every target rank transfers both the main model
      and the MTP draft through P2P, and source/target greedy
      completions for a small prompt match exactly.
 
@@ -27,6 +28,7 @@ Invoked by the workflow as:
       --tp-size $TP_SIZE \
       [--dp-size $DP_SIZE] \
       [--p2p-marker "framework-specific transfer complete string"] \
+      [--expected-max-total-tokens N] \
       [--expect-mtp]
 
 --p2p-marker defaults:
@@ -226,7 +228,7 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
 
 
 def _deduplicate_log_handlers(lines: list[str]) -> list[str]:
-    """Collapse adjacent vLLM/MX renderings of the same worker log record."""
+    """Collapse paired vLLM/MX renderings, even when handlers interleave."""
     vllm_format = re.compile(
         r"^(.*?)INFO (\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[([^\]]+:\d+)\] (.*)$"
     )
@@ -234,22 +236,19 @@ def _deduplicate_log_handlers(lines: list[str]) -> list[str]:
         r"^(.*?)\[\d{4}-(\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] INFO (\S+:\d+): (.*)$"
     )
     result = []
-    previous = None
+    unpaired = {}
     for line in lines:
         match = vllm_format.match(line) or mx_format.match(line)
-        record = (match.groups(), match.re) if match else None
-        # Keep repeats from the same handler or a different process/time/site.
-        # Consume only one cross-format pair, not every equal message in a run.
-        if (
-            record is not None
-            and previous is not None
-            and record[0] == previous[0]
-            and record[1] != previous[1]
-        ):
-            previous = None
-            continue
+        if match:
+            record = (match.groups(), match.re)
+            other_format = mx_format if match.re == vllm_format else vllm_format
+            counterpart = (match.groups(), other_format)
+            # Consume one cross-handler pair; preserve real repeated records.
+            if unpaired.get(counterpart, 0):
+                unpaired[counterpart] -= 1
+                continue
+            unpaired[record] = unpaired.get(record, 0) + 1
         result.append(line)
-        previous = record
     return result
 
 
@@ -540,6 +539,26 @@ def test_mtp_source_target_outputs_match(
         "MTP source/target completions differ for the deterministic prompt: "
         f"source={source_text!r}, target={target_text!r}"
     )
+
+
+def test_configured_token_pool_capacity(
+    namespace: str,
+    expected_max_total_tokens: int,
+) -> None:
+    """Source and target must use the configured SGLang token-pool cap."""
+    if expected_max_total_tokens == 0:
+        pytest.skip("Token-pool capacity assertion not enabled")
+
+    for job_name in ("mx-source", "mx-target"):
+        logs = _all_pod_logs(namespace, job_name, job_name)
+        capacities = {
+            int(value)
+            for value in re.findall(r"\bmax_total_num_tokens=(\d+)\b", logs)
+        }
+        assert capacities == {expected_max_total_tokens}, (
+            f"{job_name} reported token-pool capacities {sorted(capacities)}, "
+            f"expected only {expected_max_total_tokens}"
+        )
 
 
 def _assert_target_vram_matches_source(

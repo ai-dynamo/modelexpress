@@ -116,7 +116,7 @@ spec:
         size: 64Gi
       resources:
         requests:
-          cpu: "4"
+          cpu: "2"
           memory: "16Gi"
           gpu: "1"
           custom:
@@ -191,6 +191,16 @@ spec:
             - modelexpress
             - --tensor-parallel-size
             - "1"
+            - --max-model-len
+            - "1024"
+            - --max-num-batched-tokens
+            - "1024"
+            - --max-num-seqs
+            - "16"
+            - --gpu-memory-utilization
+            - "0.85"
+            - --kv-cache-memory-bytes
+            - "1073741824"
             - --trust-remote-code
             - --disaggregation-mode
             - prefill
@@ -212,7 +222,7 @@ spec:
         size: 64Gi
       resources:
         requests:
-          cpu: "4"
+          cpu: "2"
           memory: "16Gi"
           gpu: "1"
           custom:
@@ -284,6 +294,16 @@ spec:
             - modelexpress
             - --tensor-parallel-size
             - "1"
+            - --max-model-len
+            - "1024"
+            - --max-num-batched-tokens
+            - "1024"
+            - --max-num-seqs
+            - "16"
+            - --gpu-memory-utilization
+            - "0.85"
+            - --kv-cache-memory-bytes
+            - "1073741824"
             - --trust-remote-code
             - --disaggregation-mode
             - decode

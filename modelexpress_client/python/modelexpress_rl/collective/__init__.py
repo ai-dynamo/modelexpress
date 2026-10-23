@@ -3,7 +3,7 @@
 
 """NCCL M2N collective refit: the client-side control plane.
 
-A sibling of the NIXL pull path in ``modelexpress.refit.reshard``, not a mode
+A sibling of the NIXL pull path in ``modelexpress_rl.refit.reshard``, not a mode
 of it. Nothing here imports NIXL, and nothing here imports torch, NCCL or CUDA
 either -- the plan contract and the rendezvous are deliberately testable
 without a GPU. See ``docs/NCCL_M2N_REFIT.md``.

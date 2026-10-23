@@ -3,7 +3,7 @@
 
 """Refit cycle ownership for the RL generator path.
 
-:mod:`modelexpress.refit.timing` owns the record, the stage vocabulary and the
+:mod:`modelexpress_rl.refit.timing` owns the record, the stage vocabulary and the
 recording helpers. This module owns only the thing that was missing on this
 path: a cycle. The recorder is populated while one is active, so with nothing
 activating it the RL client produced no stages at all, and a framework asking
@@ -23,7 +23,7 @@ staging through install, including the caller's pause, which is why the stage
 durations are what to read for transport cost.
 
 Layers contributing stages inside a cycle should reach for
-:func:`modelexpress.refit.timing.refit_span` directly rather than anything here.
+:func:`modelexpress_rl.refit.timing.refit_span` directly rather than anything here.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ import logging
 from collections.abc import Iterator
 from typing import Any
 
-from modelexpress.refit.timing import (
+from modelexpress_rl.refit.timing import (
     RefitTimingRecorder,
     current_refit_timing,
     use_refit_timing,

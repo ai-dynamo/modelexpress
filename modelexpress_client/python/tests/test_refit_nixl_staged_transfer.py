@@ -13,22 +13,22 @@ from modelexpress_rl.version import MeshIdentity
 
 import pytest
 import torch
-from modelexpress import envs
+from modelexpress_rl import envs
 from modelexpress import p2p_pb2
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     unwrap_rendezvous_blob,
     wrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.slice_plan import LogicalRead, SourceBuffer, Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, LogicalTransferPlan, plan_transfer
-from modelexpress.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.slice_plan import LogicalRead, SourceBuffer, Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, LogicalTransferPlan, plan_transfer
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     RecordedCopy,
 )
-from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.adapter import TrainerSourceShard
 from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 from modelexpress_rl.inference.nixl_staged_transfer import (
@@ -233,9 +233,8 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, pack, pad
     transfer._active = prepared
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
-    transfer._bounded_arena = torch.empty(arena_bytes, dtype=torch.uint8)
-    transfer._bounded_arena.fill_(255)
-    transfer._staging_arenas = [transfer._bounded_arena]
+    arena = torch.full((arena_bytes,), 255, dtype=torch.uint8)
+    transfer._staging_arenas = [arena]
     _bind_test_execution(transfer, prepared)
     metrics = {}
     installed = {}
@@ -243,7 +242,7 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, pack, pad
     for tensors in transfer.iter_bounded(prepared, metrics):
         addresses.append(next(iter(tensors.values())).data_ptr())
         installed.update({name: value.clone() for name, value in tensors.items()})
-    assert set(addresses) == {transfer._bounded_arena.data_ptr()}
+    assert set(addresses) == {arena.data_ptr()}
     for name, (_, dtype) in layout.items():
         expected = source_tensor.to(dtype)
         if padded:
@@ -1329,29 +1328,6 @@ def test_failed_prefetch_drain_does_not_mask_a_caller_error(monkeypatch):
     next(iterator)
     with pytest.raises(RuntimeError, match="the install failed"):
         iterator.throw(RuntimeError("the install failed"))
-
-
-def test_bounded_batch_layouts_are_named_however_they_are_built():
-    """Readers use both `.full` and `[0]`, so construction style must not matter.
-
-    The annotation alone does not enforce this: a plain 3-tuple or a
-    dataclasses.replace satisfies positional access and breaks attribute
-    access, which fails at only one of the two call sites.
-    """
-    recv = {"a.weight": ((4,), torch.float32)}
-    convert: dict = {}
-    full = {"w": ((4,), torch.float32)}
-
-    built = transfer_module._StreamingBatch(
-        CaptureResult(copies=[]), LogicalTransferPlan(), (recv, convert, full), 256
-    )
-    assert isinstance(built.layouts, transfer_module._StagingLayouts)
-    assert built.layouts.recv is built.layouts[0] is recv
-    assert built.layouts.full is built.layouts[2] is full
-
-    swapped = replace(built, layouts=(recv, convert, {}))
-    assert isinstance(swapped.layouts, transfer_module._StagingLayouts)
-    assert swapped.layouts.full == {}
 
 
 @pytest.mark.parametrize("enabled", [None, False, True])

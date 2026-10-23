@@ -102,6 +102,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         ),
     )
     parser.addoption(
+        "--expected-max-total-tokens",
+        default=_nonnegative_int(os.environ.get("EXPECTED_MAX_TOTAL_TOKENS", "0")),
+        type=_nonnegative_int,
+        help="Expected SGLang max_total_num_tokens value; zero disables the assertion.",
+    )
+    parser.addoption(
         "--dgd-name",
         default=os.environ.get("DGD_NAME", "mx-dynamo-vllm"),
         help=(
@@ -204,6 +210,11 @@ def expected_artifact_sources(request: pytest.FixtureRequest) -> int:
 def expected_artifact_source_types(request: pytest.FixtureRequest) -> set[str]:
     raw = request.config.getoption("--expected-artifact-source-types")
     return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+@pytest.fixture(scope="session")
+def expected_max_total_tokens(request: pytest.FixtureRequest) -> int:
+    return request.config.getoption("--expected-max-total-tokens")
 
 
 @pytest.fixture(scope="session")

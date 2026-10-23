@@ -10,12 +10,26 @@ endpoints are derived from the initialized engine.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from modelexpress.envs import _env_bool, _env_float
+
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
+    MX_REFIT_STAGE_RECORD: bool
+    MX_REFIT_PACK_MODULES: bool
+    MX_REFIT_PREFETCH_REPLICA_METADATA: bool
+    MX_REFIT_DEBUG_VALIDATE_REPLICAS: bool
+    MX_RESHARD_MAX_SEGMENTS_PER_COPY: int
+    MX_RESHARD_MIN_GBPS: float
+    MX_RESHARD_PUBLISH_DIGEST: bool
+    MX_REDIS_URL: str
+    MX_GENERATOR_SOURCE_ORDER: str | None
     AZURE_STORAGE_ACCOUNT_NAME: str | None
     AZURE_STORAGE_ACCOUNT_URL: str | None
     AZURE_STORAGE_CONNECTION_STRING: str | None
@@ -34,6 +48,7 @@ if TYPE_CHECKING:
     MX_REFIT_DEBUG_VALIDATE_PLAN: bool
     MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT: bool
     MX_REFIT_DELTA_WORKERS: int
+    MX_REFIT_DOWNLOAD_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
     MX_REFIT_FULL_STREAMING: bool
@@ -57,6 +72,40 @@ if TYPE_CHECKING:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # One JSON stage record per refit. On by default: the timings are already
+    # computed, and at INFO they were never captured by a benchmark run.
+    "MX_REFIT_STAGE_RECORD": lambda: _env_bool("MX_REFIT_STAGE_RECORD", True),
+    "MX_REFIT_PREFETCH_REPLICA_METADATA": lambda: _env_bool(
+        "MX_REFIT_PREFETCH_REPLICA_METADATA", False
+    ),
+    "MX_REFIT_DEBUG_VALIDATE_REPLICAS": lambda: _env_bool(
+        "MX_REFIT_DEBUG_VALIDATE_REPLICAS", False
+    ),
+    "MX_RESHARD_MAX_SEGMENTS_PER_COPY": lambda: int(
+        os.environ.get("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "64")
+    ),
+    # Coalesce consecutive owning-module batches up to the staging budget.
+    "MX_REFIT_PACK_MODULES": lambda: _env_bool("MX_REFIT_PACK_MODULES", True),
+    # Per-rank floor in Gbps below which a refit is reported as degraded. Zero
+    # disables it, and is the default for the same reason as the ceiling.
+    #
+    # The ceiling catches transfers that did not happen. Nothing caught a transfer
+    # that happened 20x too slowly: four concurrent receivers collapsed from
+    # ~26 GB/s to ~1.5 GB/s with no error, no warning, byte counts exact,
+    # descriptor counts exact, coverage 100% and fallback 0. Every signal we had
+    # said the refit was healthy. A rate is only interpretable against a bound,
+    # and we only ever had the upper one.
+    "MX_RESHARD_MIN_GBPS": lambda: _env_float("MX_RESHARD_MIN_GBPS", 0.0),
+    # Have publishers digest each shard they advertise, so a receiver-side check has
+    # something to compare against. Off by default: it costs a reduction over every
+    # published tensor, which is a large relative cost against a ~1.5 s wire, so it
+    # belongs in a qualification run rather than a throughput measurement. See
+    # modelexpress_rl.refit.reshard.verify.
+    "MX_RESHARD_PUBLISH_DIGEST": lambda: _env_bool("MX_RESHARD_PUBLISH_DIGEST", False),
+    # ── Trainer pull (live weight sync from a running trainer) ─────────────
+    "MX_REDIS_URL": lambda: os.environ.get("MX_REDIS_URL", "redis://localhost:6379"),
+    # ── Generator weight sync ──────────────────────────────────────────────
+    "MX_GENERATOR_SOURCE_ORDER": lambda: os.environ.get("MX_GENERATOR_SOURCE_ORDER"),
     "AZURE_STORAGE_ACCOUNT_NAME": lambda: (
         os.environ.get("AZURE_STORAGE_ACCOUNT_NAME", "").strip() or None
     ),
@@ -115,7 +164,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_CHECKPOINT_DIR": lambda: (
         os.environ.get("MX_REFIT_CHECKPOINT_DIR", "").strip() or None
     ),
-    # Framework integrations read this while constructing ``hf_tensor_iter``;
+    # Framework integrations read this while constructing ``tensor_iter``;
     # ModelExpress preserves the supplied framework bucket boundaries.
     "MX_REFIT_DELTA_BUCKET_BYTES": lambda: require_positive_int(
         int(os.environ.get("MX_REFIT_DELTA_BUCKET_BYTES", 512 * 1024**2)),
@@ -129,6 +178,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
             )
         ),
         "MX_REFIT_DELTA_WORKERS",
+    ),
+    "MX_REFIT_DOWNLOAD_WORKERS": lambda: (
+        require_positive_int(
+            parse_int(os.environ["MX_REFIT_DOWNLOAD_WORKERS"], "MX_REFIT_DOWNLOAD_WORKERS"),
+            "MX_REFIT_DOWNLOAD_WORKERS",
+        )
+        if "MX_REFIT_DOWNLOAD_WORKERS" in os.environ
+        else require_positive_int(
+            int(os.environ.get("MX_S3_DOWNLOAD_WORKERS", 16)),
+            "MX_S3_DOWNLOAD_WORKERS",
+        )
     ),
     "MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES": lambda: require_positive_int(
         int(
@@ -172,10 +232,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ.get("MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS", 16)),
         "MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS",
     ),
-    "MX_S3_DOWNLOAD_WORKERS": lambda: require_positive_int(
-        int(os.environ.get("MX_S3_DOWNLOAD_WORKERS", 16)),
-        "MX_S3_DOWNLOAD_WORKERS",
-    ),
+    "MX_S3_DOWNLOAD_WORKERS": lambda: environment_variables["MX_REFIT_DOWNLOAD_WORKERS"](),
     "MX_S3_MAX_POOL_CONNECTIONS": lambda: require_positive_int(
         int(os.environ.get("MX_S3_MAX_POOL_CONNECTIONS", 32)),
         "MX_S3_MAX_POOL_CONNECTIONS",

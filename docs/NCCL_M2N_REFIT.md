@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 > **Status: implemented in this PR (ai-dynamo/modelexpress #748).** Separate
 > from the NIXL pull path in
-> [`modelexpress/refit/reshard/`](../modelexpress_client/python/modelexpress/refit/README.md);
+> [`modelexpress_rl/refit/reshard/`](rl/ARCHITECTURE.md#no-gather-refit-resharding);
 > neither path imports the other.
 
 Part 1 is the client API that integrators code against; we intend to keep it

@@ -20,6 +20,7 @@ Two rules here exist because their absence turns a failure into a hang:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -27,7 +28,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
-from .. import envs as rl_envs
 from . import envs
 
 logger = logging.getLogger("modelexpress_rl.collective.comm")
@@ -385,10 +385,12 @@ class LaneCommunicator:
 
 
 def _resolve_timeout_s(timeout_s: float | None) -> float:
-    return rl_envs.require_positive_float(
-        timeout_s if timeout_s is not None else envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S,
-        "timeout_s",
-    )
+    # Validated locally: modelexpress_rl.envs imports modelexpress.envs, which
+    # loads the NIXL-side modelexpress package this path must not pull in.
+    value = timeout_s if timeout_s is not None else envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("timeout_s must be finite and positive")
+    return value
 
 
 def _wait_until_initialized(comm: Any, bindings: Any, timeout_s: float) -> None:

@@ -42,6 +42,22 @@ def test_mtp_accepts_dual_handler_logs(monkeypatch, reverse, tp_size):
     _check(monkeypatch, _dual_handler_logs(lines, reverse=reverse), tp_size)
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mtp_accepts_delayed_main_completion_log(monkeypatch, reverse):
+    main = _phase(0, "main")
+    draft = _phase(0, "draft")
+    first, second = ("mx", "vllm") if reverse else ("vllm", "mx")
+    lines = _dual_handler_logs(main[:2], reverse=reverse)
+    lines += [
+        _format_log(main[2], style=first),
+        _format_log(draft[0], style=first),
+        _format_log(main[2], style=second),
+        _format_log(draft[0], style=second),
+    ]
+    lines += _dual_handler_logs(draft[1:], reverse=reverse)
+    _check(monkeypatch, lines)
+
+
 @pytest.mark.parametrize("duplicate", ["same_handler", "later_time", "other_process"])
 def test_mtp_rejects_distinct_repeated_start(monkeypatch, duplicate):
     main = [_format_log(line) for line in _phase(0, "main")]

@@ -10,20 +10,20 @@ from modelexpress_rl.version import MeshIdentity
 
 import pytest
 import torch
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     unwrap_rendezvous_blob,
     wrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import (
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import (
     ConvertSource,
     SourceInfo,
     LogicalTransferPlan,
     plan_transfer,
 )
-from modelexpress.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     RecordedCopy,

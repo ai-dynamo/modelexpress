@@ -499,6 +499,7 @@ def _initialize(
     adapter,
     *,
     object_storage=False,
+    storage_type=ObjectStorageType.S3,
     max_transfer_attempts=3,
     max_replay_chain_length=64,
     source_order=None,
@@ -527,7 +528,7 @@ def _initialize(
             lease_ttl_seconds=lease_ttl_seconds,
             object_storage=(
                 ObjectStorageGeneratorConfig(
-                    storage_type=ObjectStorageType.S3,
+                    storage_type=storage_type,
                     initial_base_version_id="base-a",
                     seed_checkpoint_path="unused-launch",
                     refit_checkpoint_dir="unused-cache",
@@ -670,7 +671,7 @@ def test_generator_rejects_unsupported_object_storage_before_adapter_creation(
         lambda **_kwargs: pytest.fail("runtime must not be created"),
     )
 
-    with pytest.raises(ValueError, match="only S3 object storage"):
+    with pytest.raises(ValueError, match="only S3 and Azure object storage"):
         ModelExpressGeneratorClient.initialize(
             ModelExpressGeneratorConfig(
                 engine_context=VllmGeneratorContext(
@@ -843,7 +844,11 @@ def test_generator_handles_mesh_change_with_configured_peer_fallback(
 
             def prepare(self, **_kwargs) -> SimpleNamespace:
                 return SimpleNamespace(
-                    metrics={}, batches=[SimpleNamespace(layouts=({"weight": None},))]
+                    metrics={},
+                    batches=[SimpleNamespace(
+                        transfer_plan=SimpleNamespace(source_replay=False),
+                        layouts=({"weight": None},),
+                    )],
                 )
 
             def iter_bounded(self, _prepared, _metrics) -> object:
@@ -1334,15 +1339,24 @@ def _add_generator_peer(service):
     )
 
 
-def test_generator_resolves_and_stages_target_replay_chain(monkeypatch):
+@pytest.mark.parametrize("provider", [ObjectStorageType.S3, ObjectStorageType.AZURE])
+def test_generator_resolves_and_stages_target_replay_chain(monkeypatch, provider):
     server, endpoint, service = _start_server()
     service.version.CopyFrom(_canonical_version("version-c", "version-b"))
     service.additional_versions = {
         "version-a": _canonical_version("version-a", "base-a"),
         "version-b": _canonical_version("version-b", "version-a"),
     }
+    if provider is ObjectStorageType.AZURE:
+        for version in [service.version, *service.additional_versions.values()]:
+            version.object_storage.storage_type = refit_pb2.OBJECT_STORAGE_TYPE_AZURE
+            version.object_storage.uri = version.object_storage.uri.replace(
+                "s3://", "az://", 1
+            )
     adapter = _Adapter(service)
-    generator = _initialize(monkeypatch, endpoint, adapter, object_storage=True)
+    generator = _initialize(
+        monkeypatch, endpoint, adapter, object_storage=True, storage_type=provider
+    )
 
     try:
         staged = generator.stage_weight(version=WeightVersionRef("version-c"))
@@ -1409,16 +1423,26 @@ def test_generator_rejects_excessive_replay_chain_before_leasing(monkeypatch):
     assert adapter.stage_calls == []
 
 
+@pytest.mark.parametrize(
+    ("storage_type", "proto_type", "scheme"),
+    [
+        (ObjectStorageType.S3, refit_pb2.OBJECT_STORAGE_TYPE_S3, "s3"),
+        (ObjectStorageType.AZURE, refit_pb2.OBJECT_STORAGE_TYPE_AZURE, "az"),
+    ],
+)
 def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
     monkeypatch,
+    storage_type,
+    proto_type,
+    scheme,
 ):
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
     service.version.ClearField("base_version_id")
     service.version.object_storage.CopyFrom(
         refit_pb2.ObjectStorageSource(
-            storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
-            uri="s3://weights/model.safetensors.index.json",
+            storage_type=proto_type,
+            uri=f"{scheme}://weights/model.safetensors.index.json",
         )
     )
     adapter = _Adapter(service)
@@ -1427,6 +1451,7 @@ def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
         endpoint,
         adapter,
         object_storage=True,
+        storage_type=storage_type,
     )
 
     try:
@@ -1434,6 +1459,7 @@ def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
         inputs = adapter.stage_calls[0]
         assert inputs.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
         assert inputs.base_version_id is None
+        assert inputs.object_storage.storage_type is storage_type
         assert service.list_calls == 0
         staged.release()
     finally:
@@ -1498,7 +1524,7 @@ def test_generator_rejects_missing_object_storage_before_adapter_mutation(
     assert service.lease_deletions == 0
 
 
-def test_generator_skips_non_s3_object_storage_before_adapter_mutation(
+def test_generator_skips_unsupported_storage_payload_before_adapter_mutation(
     monkeypatch,
 ):
     server, endpoint, service = _start_server()
@@ -1885,7 +1911,10 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
             return SimpleNamespace(
                 metrics={},
                 batches=[
-                    SimpleNamespace(layouts=({"a.weight": None, "b.weight": None},))
+                    SimpleNamespace(
+                        transfer_plan=SimpleNamespace(source_replay=False),
+                        layouts=({"a.weight": None, "b.weight": None},),
+                    )
                 ],
             )
 
@@ -2486,6 +2515,8 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
     monkeypatch, case
 ):
     import torch
+    from modelexpress_rl.refit.reshard.types import RecordedCopy
+    from modelexpress_rl.inference.plan import SourceReplayBatch
     from modelexpress_rl.inference.engines.vllm.installer import _VllmInstaller
 
     server, endpoint, service = _start_server()
@@ -2511,6 +2542,9 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
         assert service.active_leases
         assert guard_active
 
+    names = frozenset(dict(model.named_parameters()))
+    last_writes = {name: index for index, name in enumerate(model.state_dict())}
+
     class Batches:
         index = 0
 
@@ -2524,7 +2558,9 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
                 raise primary
             if self.index > 2:
                 raise StopIteration
-            return {f"{self.index - 1}.weight": arena}
+            name = f"{self.index - 1}.weight"
+            copy = RecordedCopy(name, (), name, 0, (2, 2), (2, 1), torch.float32)
+            return SourceReplayBatch(((self.index - 1, copy, arena),), names, last_writes, 2)
 
         def close(self):
             if not cleanup_allowed:
@@ -2547,6 +2583,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
                 metrics={},
                 batches=[
                     SimpleNamespace(
+                        transfer_plan=SimpleNamespace(source_replay=True, replay_parameter_names=names),
                         layouts=({f"{index}.weight": ((2, 2), torch.float32)},)
                     )
                     for index in range(2)
@@ -2591,26 +2628,40 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
 
     class Installer(_VllmInstaller):
         def __init__(self):
-            self._model = model
-            self._device = torch.device("cpu")
-            self._vllm_config = SimpleNamespace(quant_config=None)
-            self._model_config = SimpleNamespace(dtype=torch.float32)
-            self._live_version = None
+            super().__init__(
+                model=model,
+                device=torch.device("cpu"),
+                vllm_config=SimpleNamespace(quant_config=None),
+                model_config=SimpleNamespace(dtype=torch.float32),
+            )
             self.copy_count = 0
+
+        def _new_install_execution(self):
+            return SimpleNamespace(
+                targets=SimpleNamespace(by_name=dict(model.named_parameters())),
+                replay_metadata=None,
+                installed=set(),
+                bounded=False,
+            )
 
         def _reload(self, load):
             assert_installation_guard()
             load(self._parameter_aliases(self._model))
 
-        def _process_and_commit(self, tensors, **kwargs):
+        def _apply_source_batch(self, plan, batch):
             assert_installation_guard()
             self.copy_count += 1
             events.append("copy")
             if self.copy_count == 2 and case in {"partial", "drain", "close"}:
                 raise primary
             with torch.no_grad():
-                for name, value in tensors.items():
-                    model.get_parameter(name).copy_(value)
+                for _, copy, value in batch.writes:
+                    model.get_parameter(copy.param_name).copy_(value)
+                    plan.installed.add(copy.param_name)
+            plan.replay_metadata = (batch.parameter_names, batch.last_writes)
+
+        def _finish_source_replay(self, plan):
+            assert plan.installed == names
 
         def _drain_streaming(self):
             assert_installation_guard()
@@ -2717,7 +2768,7 @@ def test_streaming_creates_and_emits_one_timing_cycle(
 ):
     import json
 
-    from modelexpress.refit.timing import (
+    from modelexpress_rl.refit.timing import (
         RefitTimingRecorder,
         current_refit_timing,
         refit_span,
@@ -2748,7 +2799,10 @@ def test_streaming_creates_and_emits_one_timing_cycle(
                 raise ValueError("injected streaming preparation failure")
             return SimpleNamespace(
                 metrics={},
-                batches=[SimpleNamespace(layouts=({"weight": None},))],
+                batches=[SimpleNamespace(
+                    transfer_plan=SimpleNamespace(source_replay=False),
+                    layouts=({"weight": None},),
+                )],
             )
 
         def reset_workspace(self):
