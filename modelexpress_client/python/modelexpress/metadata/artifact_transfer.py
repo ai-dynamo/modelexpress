@@ -825,77 +825,84 @@ def transfer_artifact_from_worker(
     start = time.perf_counter()
     if max_inflight_chunks <= 0:
         raise ValueError("max_inflight_chunks must be positive")
-    header, _ = fetch_artifact_manifest_header(
-        endpoint,
-        mx_source_id=mx_source_id,
-        artifact_id=artifact_id,
-    )
-    chunks = _fetch_all_chunks(
-        endpoint,
-        mx_source_id,
-        header.artifact_id,
-        expected_chunk_count=header.chunk_count,
-    )
-    _validate_fetched_artifact_manifest(header, chunks, artifact_id)
-    target_header = _header_with_target_file_paths(header, target_file_paths)
-    target_files = target_header.files
-    _prepare_target_files(target_files)
-    if not chunks:
-        elapsed = time.perf_counter() - start
-        logger.info(
-            "[TIMING] Artifact transfer complete: artifact_id=%s source=%s "
-            "files=%d chunks=0 size=%.2f MiB elapsed=%.3fs throughput=%.2f Gbps",
-            header.artifact_id,
+    # One channel for the whole transfer: the per-chunk prepare/release RPCs
+    # below would otherwise each open a fresh TCP connection to the source.
+    with grpc.insecure_channel(endpoint) as channel:
+        header, _ = fetch_artifact_manifest_header(
             endpoint,
-            header.file_count,
-            _mib(header.total_size),
-            elapsed,
-            _gbps(header.total_size, elapsed),
+            mx_source_id=mx_source_id,
+            artifact_id=artifact_id,
+            channel=channel,
         )
-        return target_header
-
-    target_slots = _register_target_buffers(
-        nixl_manager,
-        buffer_size=max(int(chunk.length) for chunk in chunks),
-        buffer_count=min(max_inflight_chunks, len(chunks)),
-    )
-    remote_agent_name = ""
-    try:
-        next_chunk = 0
-        while next_chunk < len(chunks):
-            batch = chunks[next_chunk : next_chunk + max_inflight_chunks]
-            prepared = _prepare_chunk_batch(
-                endpoint,
-                mx_source_id,
+        chunks = _fetch_all_chunks(
+            endpoint,
+            mx_source_id,
+            header.artifact_id,
+            expected_chunk_count=header.chunk_count,
+            channel=channel,
+        )
+        _validate_fetched_artifact_manifest(header, chunks, artifact_id)
+        target_header = _header_with_target_file_paths(header, target_file_paths)
+        target_files = target_header.files
+        _prepare_target_files(target_files)
+        if not chunks:
+            elapsed = time.perf_counter() - start
+            logger.info(
+                "[TIMING] Artifact transfer complete: artifact_id=%s source=%s "
+                "files=%d chunks=0 size=%.2f MiB elapsed=%.3fs throughput=%.2f Gbps",
                 header.artifact_id,
-                batch,
+                endpoint,
+                header.file_count,
+                _mib(header.total_size),
+                elapsed,
+                _gbps(header.total_size, elapsed),
             )
-            try:
-                if not remote_agent_name:
-                    remote_agent_name = nixl_manager.add_remote_agent(
-                        prepared[-1].source_metadata
-                    )
-                _transfer_prepared_batch(
-                    nixl_manager,
-                    remote_agent_name,
-                    target_files,
-                    prepared,
-                    target_slots,
-                    timeout,
-                )
-            finally:
-                _release_prepared_chunks(
+            return target_header
+
+        target_slots = _register_target_buffers(
+            nixl_manager,
+            buffer_size=max(int(chunk.length) for chunk in chunks),
+            buffer_count=min(max_inflight_chunks, len(chunks)),
+        )
+        remote_agent_name = ""
+        try:
+            next_chunk = 0
+            while next_chunk < len(chunks):
+                batch = chunks[next_chunk : next_chunk + max_inflight_chunks]
+                prepared = _prepare_chunk_batch(
                     endpoint,
                     mx_source_id,
                     header.artifact_id,
-                    prepared,
+                    batch,
+                    channel=channel,
                 )
-            next_chunk += len(prepared)
-    except Exception:
-        _cleanup_target_files(target_files)
-        raise
-    finally:
-        _close_target_buffers(nixl_manager, target_slots)
+                try:
+                    if not remote_agent_name:
+                        remote_agent_name = nixl_manager.add_remote_agent(
+                            prepared[-1].source_metadata
+                        )
+                    _transfer_prepared_batch(
+                        nixl_manager,
+                        remote_agent_name,
+                        target_files,
+                        prepared,
+                        target_slots,
+                        timeout,
+                    )
+                finally:
+                    _release_prepared_chunks(
+                        endpoint,
+                        mx_source_id,
+                        header.artifact_id,
+                        prepared,
+                        channel=channel,
+                    )
+                next_chunk += len(prepared)
+        except Exception:
+            _cleanup_target_files(target_files)
+            raise
+        finally:
+            _close_target_buffers(nixl_manager, target_slots)
 
     elapsed = time.perf_counter() - start
     logger.info(
@@ -1188,6 +1195,7 @@ def _prepare_chunk_batch(
     mx_source_id: str,
     artifact_id: str,
     chunks: list[p2p_pb2.ArtifactManifestChunk],
+    channel: grpc.Channel | None = None,
 ) -> list[p2p_pb2.PrepareArtifactChunkResponse]:
     prepared: list[p2p_pb2.PrepareArtifactChunkResponse] = []
     resource_exhausted_attempts = 0
@@ -1199,6 +1207,7 @@ def _prepare_chunk_batch(
                 mx_source_id=mx_source_id,
                 artifact_id=artifact_id,
                 chunk_index=chunk.chunk_index,
+                channel=channel,
             )
             prepared.append(response)
             resource_exhausted_attempts = 0
@@ -1211,7 +1220,9 @@ def _prepare_chunk_batch(
                     raise
                 time.sleep(_RESOURCE_EXHAUSTED_PREPARE_DELAY_SECONDS)
                 continue
-            _release_prepared_chunks(endpoint, mx_source_id, artifact_id, prepared)
+            _release_prepared_chunks(
+                endpoint, mx_source_id, artifact_id, prepared, channel=channel
+            )
             raise
     return prepared
 
@@ -1228,6 +1239,7 @@ def _release_prepared_chunks(
     mx_source_id: str,
     artifact_id: str,
     prepared: list[p2p_pb2.PrepareArtifactChunkResponse],
+    channel: grpc.Channel | None = None,
 ) -> None:
     for response in prepared:
         try:
@@ -1236,6 +1248,7 @@ def _release_prepared_chunks(
                 mx_source_id=mx_source_id,
                 artifact_id=artifact_id,
                 lease_id=response.lease_id,
+                channel=channel,
             )
         except Exception:
             logger.warning(
@@ -1261,6 +1274,7 @@ def _fetch_all_chunks(
     artifact_id: str,
     *,
     expected_chunk_count: int,
+    channel: grpc.Channel | None = None,
 ) -> list[p2p_pb2.ArtifactManifestChunk]:
     if expected_chunk_count == 0:
         return []
@@ -1272,6 +1286,7 @@ def _fetch_all_chunks(
             mx_source_id=mx_source_id,
             artifact_id=artifact_id,
             start_chunk_index=start,
+            channel=channel,
         )
         chunks.extend(response.chunks)
         if len(chunks) > expected_chunk_count:
