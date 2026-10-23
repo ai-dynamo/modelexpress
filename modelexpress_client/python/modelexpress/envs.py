@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     MX_RESHARD_PUBLISH_DIGEST: bool
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
+    MX_K8S_LEADER_SERVICE: str
     MX_K8S_ARTIFACT_SERVICE_PATTERN: str
     MX_K8S_SOURCE_RETRIES: str
     MX_K8S_SOURCE_BACKOFF_SECONDS: str
@@ -393,6 +394,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get(
         "MX_K8S_SERVICE_PATTERN", "mx-sources"
     ),
+    "MX_K8S_LEADER_SERVICE": lambda: os.environ.get("MX_K8S_LEADER_SERVICE", ""),
     "MX_K8S_ARTIFACT_SERVICE_PATTERN": lambda: os.environ.get(
         "MX_K8S_ARTIFACT_SERVICE_PATTERN", ""
     ).strip(),

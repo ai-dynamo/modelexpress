@@ -83,6 +83,7 @@ class MxK8sServiceClient(MxClientBase):
         artifact_owner_device_id: int | None = None,
         max_retries: int | None = None,
         backoff_seconds: float | None = None,
+        leader_service: str | None = None,
     ):
         self._worker_rank = worker_rank
         self._service_pattern = service_pattern or envs.MX_K8S_SERVICE_PATTERN
@@ -109,6 +110,28 @@ class MxK8sServiceClient(MxClientBase):
             else float(env_backoff) if env_backoff
             else _DEFAULT_BACKOFF_SECONDS
         )
+        configured_leader = (
+            envs.MX_K8S_LEADER_SERVICE if leader_service is None else leader_service
+        ).strip()
+        self._leader = None
+        if configured_leader:
+            from .leader_discovery import LeaderDiscovery
+
+            self._leader = LeaderDiscovery(
+                configured_leader, self._max_retries, self._backoff_seconds,
+            )
+
+    @property
+    def LEADER_DISCOVERY(self) -> bool:
+        return self._leader is not None
+
+    def configure_load_context(self, ctx) -> None:
+        if self._leader is not None:
+            self._leader.configure(ctx)
+
+    def attach_worker_server(self, server, worker, worker_id: str) -> None:
+        if self._leader is not None:
+            self._leader.attach(server, worker, worker_id)
 
     # -- connection management ------------------------------------------------
 
@@ -117,6 +140,8 @@ class MxK8sServiceClient(MxClientBase):
 
     def worker_rpc_retry_policy(self) -> tuple[int, float]:
         """Retry worker RPCs because each channel may select a new pod."""
+        if self._leader is not None:
+            return 0, 0.0
         return self._max_retries, self._backoff_seconds
 
     # -- RPC wrappers (MxClient duck-type) -----------------------------------
@@ -141,6 +166,8 @@ class MxK8sServiceClient(MxClientBase):
         """
         self._worker_rank = worker.worker_rank
         source_id = compute_mx_source_id(identity)
+        if self._leader is not None and identity.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_WEIGHTS:
+            self._leader.register(True)
         logger.info(
             "MxK8sServiceClient.publish_metadata: "
             "computed mx_source_id=%s for worker_rank=%d",
@@ -174,6 +201,20 @@ class MxK8sServiceClient(MxClientBase):
                 "first"
             )
         source_id = compute_mx_source_id(identity)
+        if self._leader is not None:
+            metadata = self._leader.metadata()
+            if source_id != metadata.mx_source_id:
+                raise ValueError("requested weights differ from the configured instance identity")
+            return p2p_pb2.ListSourcesResponse(instances=[
+                p2p_pb2.SourceInstanceRef(
+                    mx_source_id=source_id,
+                    worker_id=entry.worker.worker_id,
+                    worker_rank=entry.worker.worker_rank,
+                    model_name=identity.model_name,
+                    accelerator=entry.accelerator,
+                )
+                for entry in metadata.workers if entry.worker.worker_rank == self._worker_rank
+            ])
         # worker_id is intentionally empty. This backend has no per-pod
         # addressability (kube-proxy picks the backend at connection
         # time); get_metadata ignores worker_id and routes through the
@@ -204,6 +245,8 @@ class MxK8sServiceClient(MxClientBase):
                 "worker_rank; call publish_metadata first or set it "
                 "at construction time"
             )
+        if self._leader is not None:
+            return self._leader.tensor_metadata(mx_source_id, worker_id, self._worker_rank)
         endpoint = self._resolve_endpoint()
         last_error: Exception | None = None
 
@@ -313,7 +356,9 @@ class MxK8sServiceClient(MxClientBase):
         status: "p2p_pb2.SourceStatus",
         source_load: float = 0.0,
     ) -> bool:
-        """No-op: K8s readiness probes supersede central liveness tracking."""
+        """Refresh instance membership in leader mode; otherwise use Pod readiness."""
+        if self._leader is not None:
+            self._leader.update_status(mx_source_id, status)
         return True
 
     def discover_artifact_source(
@@ -336,6 +381,8 @@ class MxK8sServiceClient(MxClientBase):
         from .artifact_transfer import ArtifactSourceEndpoint
 
         requested_node_rank = 0 if node_rank is None else node_rank
+        if self._leader is not None:
+            return self._leader.artifact_source(identity, requested_node_rank, artifact_id, accelerator)
         mx_source_id = compute_mx_source_id(identity)
         service_endpoint = self._resolve_artifact_endpoint(requested_node_rank)
         last_error: Exception | None = None

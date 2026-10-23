@@ -140,6 +140,9 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         self._tensor_read_leases = _TensorReadLeases()
         self._tensor_read_lease_timeout = _tensor_read_lease_timeout_seconds()
         self._artifact_sources: dict[str, _ArtifactSource] = {}
+        self._instance_worker = None
+        self._instance_directory = None
+        self._instance_ready = False
         self._artifact_lock = Lock()
         if artifact_manifests and mx_source_id:
             self._artifact_sources[mx_source_id] = _ArtifactSource(
@@ -149,6 +152,37 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
 
     def set_mx_source_id(self, mx_source_id: str) -> None:
         self._mx_source_id = mx_source_id
+
+    def RegisterInstanceWorker(self, request, context):
+        if self._instance_directory is None:
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "worker is not an instance leader")
+        return self._instance_directory.register(request, context)
+
+    def GetInstanceMetadata(self, request, context):
+        if self._instance_directory is None:
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "worker is not an instance leader")
+        return self._instance_directory.metadata(request, context, self.GetWorkerInventory)
+
+    def GetWorkerInventory(self, request, context):
+        self._validate_tensor_source(request.mx_source_id, request.worker_id, context)
+        if self._instance_worker is None or not self._instance_ready:
+            context.abort(grpc.StatusCode.UNAVAILABLE, "instance worker is not ready")
+        with self._artifact_lock:
+            artifacts = [
+                p2p_pb2.InstanceArtifact(
+                    mx_source_id=source_id,
+                    mx_source_type=manifest.mx_source_type,
+                    artifact_id=artifact_id,
+                )
+                for source_id, source in sorted(self._artifact_sources.items())
+                for artifact_id, manifest in sorted(source.manifests.items())
+                if source.node_rank == self._instance_worker.node_rank
+            ]
+        return p2p_pb2.InstanceWorkerMetadata(
+            worker=self._instance_worker,
+            accelerator=self._accelerator,
+            artifacts=artifacts,
+        )
 
     def register_artifact_source(
         self,
@@ -557,6 +591,16 @@ class WorkerGrpcServer:
     @property
     def port(self) -> int | None:
         return self._port
+
+    def configure_instance(self, worker, directory=None) -> None:
+        if self._servicer is None:
+            raise RuntimeError("server must be started before configuring instance metadata")
+        self._servicer._instance_worker = worker
+        self._servicer._instance_directory = directory
+
+    def set_instance_ready(self, ready: bool) -> None:
+        if self._servicer is not None:
+            self._servicer._instance_ready = ready
 
     def set_mx_source_id(self, mx_source_id: str) -> None:
         if self._servicer is None:

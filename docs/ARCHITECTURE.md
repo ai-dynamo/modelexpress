@@ -1041,6 +1041,42 @@ The decentralized `k8s-service` backend lives in the Python client as `MxK8sServ
 
 See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for design rationale, limitations, and backend-selection guidance.
 
+#### Single leader metadata discovery
+
+`MX_K8S_LEADER_SERVICE=mx-sources:6555` enables a second discovery contract in
+`MxK8sServiceClient`. A single Service selects healthy rank-zero instance leaders.
+`metadata/instance_metadata.py` implements the leader-local registration table;
+`metadata/leader_discovery.py` handles bootstrap, per-load snapshot caching and
+direct worker selection. These modules extend the existing Python worker gRPC
+service; they do not add a central metadata server.
+
+| RPC | Purpose |
+| --- | --- |
+| `RegisterInstanceWorker` | Register/refresh/withdraw a worker generation at its own engine head, using the weight identity and expected distributed world size |
+| `GetInstanceMetadata` | Validate leader health and all rank registrations, then return each worker's actual endpoint and current sealed artifact inventory |
+| `GetWorkerInventory` | Read a generation-validated lightweight inventory directly from a registered worker |
+
+Worker endpoints carry global rank, model-shard rank and framework node rank
+separately. The actual gRPC port uses the local device ordinal, so global rank 8
+on node 1 can advertise that node's port 6555 without Service port translation.
+Registrations follow READY/STALE weight heartbeats and expire after three
+heartbeat intervals (minimum 15 seconds). Concurrent discovery reads the leader's
+own inventory locally and bounds remote inventory fanout to five seconds total.
+Changed registrations or unavailable worker generations invalidate discovery.
+
+Targets cache one directory or discovery failure per client/load. Missing
+artifact types become immediate misses; published artifacts use the matching
+node's owner endpoint for manifest/chunk RPCs and NIXL. Direct tensor requests
+carry the selected worker generation. Artifact headers are checked against the
+selected generation, identity, node, type and accelerator before target files
+are created. Runtime health does not imply all optional caches have been sealed:
+each snapshot lists only currently published artifacts.
+
+This contract supports stable-weight TP/PP instances with unique shard ranks.
+Each target worker selects independently; it does not introduce target-wide
+instance affinity or live EPLB placement updates. With the new setting unset,
+existing rank/node Service discovery remains in effect.
+
 ### ModelDownloadTracker
 
 Global singleton (`LazyLock<ModelDownloadTracker>`) that coordinates concurrent downloads. Uses `try_claim_for_download()` for race-free model claiming and tokio channels for streaming status updates to multiple waiting clients.
@@ -1750,6 +1786,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Feeds the torch compile cache `SourceIdentity`, adding compile configuration as a partitioning dimension for artifact discovery. Unset leaves the field empty, which drops it from the `mx_source_id` input, so workers whose other identity fields match — model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch — share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](DEPLOYMENT.md#pairing-workers-by-compile-configuration) |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
+| `MX_K8S_LEADER_SERVICE` | unset | Opt in to one leader Service/port for all ranks and node-local artifacts, e.g. `mx-sources:6555`. Supersedes both Service patterns; direct endpoints and published artifacts come from the instance directory. |
 | `MX_K8S_ARTIFACT_SERVICE_PATTERN` | inherits `MX_K8S_SERVICE_PATTERN` | Optional node-scoped artifact discovery Service template. Supports `{node_rank}` and `{rank}`; `{rank}` is the artifact owner device ID. Use an explicit port for one-port artifact Services. |
 | `MX_ARTIFACT_OWNER_DEVICE_ID` | `0` | Device whose worker publishes pod-scoped artifacts for `k8s-service`. Other devices skip duplicate publication. The artifact Service must route to this device's worker gRPC port. |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |

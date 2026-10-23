@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG BASE_IMAGE=nvcr.io/nvidian/dynamo-dev/zhongdongmin@sha256:a52e795de6e0ac4fcfc4d4b7e5bfb6fbb2892ddd2ded6232d92a8cf4419cc4f5
+FROM ${BASE_IMAGE}
+COPY modelexpress_client/python /opt/modelexpress/client
+RUN python3 -m pip install --no-deps --no-build-isolation /opt/modelexpress/client

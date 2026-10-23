@@ -197,11 +197,9 @@ def test_identity_name_is_resolved_once_without_changing_loader_config(
 
     model = nn.Linear(2, 2)
     loader = MagicMock()
-    monkeypatch.setattr(
-        sys.modules["vllm.model_executor.model_loader.default_loader"],
-        "DefaultModelLoader",
-        loader,
-    )
+    loader_module = ModuleType("vllm.model_executor.model_loader.default_loader")
+    loader_module.DefaultModelLoader = loader
+    monkeypatch.setitem(sys.modules, loader_module.__name__, loader_module)
     adapter.load_via_native(LoadResult(value=model, model=model))
 
     loader.return_value.load_weights.assert_called_once_with(model, model_config)
@@ -213,7 +211,7 @@ def test_build_vllm_load_context_uses_current_platform_for_bare_cuda(monkeypatch
     """Resolve a bare CUDA device through vLLM's current platform."""
     _stub_vllm_current_device(monkeypatch, current_device=2)
     _stub_metadata_client(monkeypatch)
-    sys.modules["vllm.distributed"].get_world_group.return_value.local_rank = 2
+    _stub_vllm_world_group(monkeypatch, local_rank=2)
     vllm_config = _context_config(load_device=None)
 
     ctx = build_vllm_load_context(vllm_config, _model_config())
@@ -228,7 +226,7 @@ def test_build_vllm_load_context_keeps_explicit_cuda_index(monkeypatch):
     """Preserve an explicitly configured CUDA device index."""
     _stub_vllm_current_device(monkeypatch, current_device=2)
     _stub_metadata_client(monkeypatch)
-    sys.modules["vllm.distributed"].get_world_group.return_value.local_rank = 3
+    _stub_vllm_world_group(monkeypatch, local_rank=3)
     vllm_config = _context_config(load_device="cuda:3")
 
     ctx = build_vllm_load_context(vllm_config, _model_config())
@@ -242,7 +240,7 @@ def test_build_vllm_load_context_keeps_explicit_cuda_index(monkeypatch):
 def test_build_vllm_load_context_uses_node_rank_as_node_rank(monkeypatch):
     """Populate node rank from vLLM's parallel configuration."""
     _stub_metadata_client(monkeypatch)
-    sys.modules["vllm.distributed"].get_world_group.return_value.local_rank = 0
+    _stub_vllm_world_group(monkeypatch, local_rank=0)
     vllm_config = _context_config(load_device="cuda:0")
     vllm_config.parallel_config.node_rank = 1
 
@@ -815,6 +813,12 @@ def test_after_weight_iter_load_does_not_rerun_model_specific_finalizers(monkeyp
 
     assert result.model is model
     assert events == [("process", torch.device("cpu"))]
+
+
+def _stub_vllm_world_group(monkeypatch, *, local_rank: int) -> None:
+    distributed = ModuleType("vllm.distributed")
+    distributed.get_world_group = lambda: SimpleNamespace(local_rank=local_rank)
+    monkeypatch.setitem(sys.modules, distributed.__name__, distributed)
 
 
 def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:

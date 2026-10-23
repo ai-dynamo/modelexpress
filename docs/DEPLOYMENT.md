@@ -791,6 +791,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; SGLang draft P2P also requires a non-empty revision. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
+| `MX_K8S_LEADER_SERVICE` | unset | Opt in to single-leader discovery, e.g. `mx-sources:6555`. Set on all sources/targets. The Service selects only global-rank-zero leaders and exposes one worker port; both rank/node Service patterns are bypassed. Workers register with their own engine head, and targets fetch a directory of Pod-direct endpoints and published artifacts. See the [deployment recipe](../examples/k8s_service_sources/README.md#leader-discovery). |
 | `MX_K8S_ARTIFACT_SERVICE_PATTERN` | inherits `MX_K8S_SERVICE_PATTERN` | Optional artifact discovery Service template. Supports `{node_rank}` and `{rank}`; use `{node_rank}` for multi-node source pools and route `{rank}` to the artifact owner device. |
 | `MX_ARTIFACT_OWNER_DEVICE_ID` | `0` | Device whose worker publishes pod-scoped artifacts under `k8s-service`. The artifact Service must target `MX_WORKER_GRPC_PORT + MX_ARTIFACT_OWNER_DEVICE_ID`. |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
@@ -1006,6 +1007,15 @@ their non-tensor derived state cannot currently be refreshed by a direct copy.
 - **`k8s-service` backend:** auto-enables P2P metadata. Tensor manifests are fetched through the rank Service. Artifact discovery sends `GetArtifactManifestHeader` through `MX_K8S_ARTIFACT_SERVICE_PATTERN` (or the weight Service when unset), then pins all remaining artifact RPCs to the pod-direct endpoint in the response. The source worker validates `mx_source_id` and `node_rank`; the target also validates the artifact type, accelerator, and response identity.
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
+
+For a single discovery Service across a multi-node engine, set
+`MX_K8S_LEADER_SERVICE=mx-sources:6555` on all workers and make that Service select
+only ready instance leaders. This bypasses the rank/node patterns: the leader
+returns actual worker endpoints and currently published artifact types. Missing
+optional caches are skipped immediately. Keep the engine head address reachable
+for instance-local registration and allow Pod-direct worker/NIXL traffic. See the
+[single-Service recipe](../examples/k8s_service_sources/README.md#leader-discovery)
+for lifecycle semantics and the one-port Service manifest.
 
 ### Artifact Transfer Backends
 

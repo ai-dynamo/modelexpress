@@ -260,6 +260,9 @@ var P2PService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
+	WorkerService_RegisterInstanceWorker_FullMethodName    = "/model_express.p2p.WorkerService/RegisterInstanceWorker"
+	WorkerService_GetInstanceMetadata_FullMethodName       = "/model_express.p2p.WorkerService/GetInstanceMetadata"
+	WorkerService_GetWorkerInventory_FullMethodName        = "/model_express.p2p.WorkerService/GetWorkerInventory"
 	WorkerService_GetTensorManifest_FullMethodName         = "/model_express.p2p.WorkerService/GetTensorManifest"
 	WorkerService_PrepareTensorRead_FullMethodName         = "/model_express.p2p.WorkerService/PrepareTensorRead"
 	WorkerService_ReleaseTensorRead_FullMethodName         = "/model_express.p2p.WorkerService/ReleaseTensorRead"
@@ -279,6 +282,11 @@ const (
 // Artifact bytes move through NIXL; PrepareArtifactChunk only creates a
 // source-side registered DRAM range and returns its transfer descriptor.
 type WorkerServiceClient interface {
+	// One leader Service bootstraps an entire model instance. Workers register
+	// only with their own engine's head, never through the load-balanced Service.
+	RegisterInstanceWorker(ctx context.Context, in *RegisterInstanceWorkerRequest, opts ...grpc.CallOption) (*RegisterInstanceWorkerResponse, error)
+	GetInstanceMetadata(ctx context.Context, in *GetInstanceMetadataRequest, opts ...grpc.CallOption) (*GetInstanceMetadataResponse, error)
+	GetWorkerInventory(ctx context.Context, in *GetWorkerInventoryRequest, opts ...grpc.CallOption) (*InstanceWorkerMetadata, error)
 	GetTensorManifest(ctx context.Context, in *GetTensorManifestRequest, opts ...grpc.CallOption) (*GetTensorManifestResponse, error)
 	// Prepare/Release protect a mutable RL generator's live tensor storage while
 	// another generator reads it during active-refit P2P transfer.
@@ -296,6 +304,36 @@ type workerServiceClient struct {
 
 func NewWorkerServiceClient(cc grpc.ClientConnInterface) WorkerServiceClient {
 	return &workerServiceClient{cc}
+}
+
+func (c *workerServiceClient) RegisterInstanceWorker(ctx context.Context, in *RegisterInstanceWorkerRequest, opts ...grpc.CallOption) (*RegisterInstanceWorkerResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RegisterInstanceWorkerResponse)
+	err := c.cc.Invoke(ctx, WorkerService_RegisterInstanceWorker_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerServiceClient) GetInstanceMetadata(ctx context.Context, in *GetInstanceMetadataRequest, opts ...grpc.CallOption) (*GetInstanceMetadataResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetInstanceMetadataResponse)
+	err := c.cc.Invoke(ctx, WorkerService_GetInstanceMetadata_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerServiceClient) GetWorkerInventory(ctx context.Context, in *GetWorkerInventoryRequest, opts ...grpc.CallOption) (*InstanceWorkerMetadata, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(InstanceWorkerMetadata)
+	err := c.cc.Invoke(ctx, WorkerService_GetWorkerInventory_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *workerServiceClient) GetTensorManifest(ctx context.Context, in *GetTensorManifestRequest, opts ...grpc.CallOption) (*GetTensorManifestResponse, error) {
@@ -378,6 +416,11 @@ func (c *workerServiceClient) ReleaseArtifactChunk(ctx context.Context, in *Rele
 // Artifact bytes move through NIXL; PrepareArtifactChunk only creates a
 // source-side registered DRAM range and returns its transfer descriptor.
 type WorkerServiceServer interface {
+	// One leader Service bootstraps an entire model instance. Workers register
+	// only with their own engine's head, never through the load-balanced Service.
+	RegisterInstanceWorker(context.Context, *RegisterInstanceWorkerRequest) (*RegisterInstanceWorkerResponse, error)
+	GetInstanceMetadata(context.Context, *GetInstanceMetadataRequest) (*GetInstanceMetadataResponse, error)
+	GetWorkerInventory(context.Context, *GetWorkerInventoryRequest) (*InstanceWorkerMetadata, error)
 	GetTensorManifest(context.Context, *GetTensorManifestRequest) (*GetTensorManifestResponse, error)
 	// Prepare/Release protect a mutable RL generator's live tensor storage while
 	// another generator reads it during active-refit P2P transfer.
@@ -397,6 +440,15 @@ type WorkerServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedWorkerServiceServer struct{}
 
+func (UnimplementedWorkerServiceServer) RegisterInstanceWorker(context.Context, *RegisterInstanceWorkerRequest) (*RegisterInstanceWorkerResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RegisterInstanceWorker not implemented")
+}
+func (UnimplementedWorkerServiceServer) GetInstanceMetadata(context.Context, *GetInstanceMetadataRequest) (*GetInstanceMetadataResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetInstanceMetadata not implemented")
+}
+func (UnimplementedWorkerServiceServer) GetWorkerInventory(context.Context, *GetWorkerInventoryRequest) (*InstanceWorkerMetadata, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetWorkerInventory not implemented")
+}
 func (UnimplementedWorkerServiceServer) GetTensorManifest(context.Context, *GetTensorManifestRequest) (*GetTensorManifestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetTensorManifest not implemented")
 }
@@ -437,6 +489,60 @@ func RegisterWorkerServiceServer(s grpc.ServiceRegistrar, srv WorkerServiceServe
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&WorkerService_ServiceDesc, srv)
+}
+
+func _WorkerService_RegisterInstanceWorker_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterInstanceWorkerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).RegisterInstanceWorker(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_RegisterInstanceWorker_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).RegisterInstanceWorker(ctx, req.(*RegisterInstanceWorkerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerService_GetInstanceMetadata_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetInstanceMetadataRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).GetInstanceMetadata(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_GetInstanceMetadata_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).GetInstanceMetadata(ctx, req.(*GetInstanceMetadataRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerService_GetWorkerInventory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetWorkerInventoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).GetWorkerInventory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_GetWorkerInventory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).GetWorkerInventory(ctx, req.(*GetWorkerInventoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _WorkerService_GetTensorManifest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -572,6 +678,18 @@ var WorkerService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "model_express.p2p.WorkerService",
 	HandlerType: (*WorkerServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "RegisterInstanceWorker",
+			Handler:    _WorkerService_RegisterInstanceWorker_Handler,
+		},
+		{
+			MethodName: "GetInstanceMetadata",
+			Handler:    _WorkerService_GetInstanceMetadata_Handler,
+		},
+		{
+			MethodName: "GetWorkerInventory",
+			Handler:    _WorkerService_GetWorkerInventory_Handler,
+		},
 		{
 			MethodName: "GetTensorManifest",
 			Handler:    _WorkerService_GetTensorManifest_Handler,

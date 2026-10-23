@@ -314,6 +314,11 @@ message WorkerMetadata {
 // Artifact bytes move through NIXL; PrepareArtifactChunk only creates a
 // source-side registered DRAM range and returns its transfer descriptor.
 service WorkerService {
+  // One leader Service bootstraps an entire model instance. Workers register
+  // only with their own engine's head, never through the load-balanced Service.
+  rpc RegisterInstanceWorker(RegisterInstanceWorkerRequest) returns (RegisterInstanceWorkerResponse);
+  rpc GetInstanceMetadata(GetInstanceMetadataRequest) returns (GetInstanceMetadataResponse);
+  rpc GetWorkerInventory(GetWorkerInventoryRequest) returns (InstanceWorkerMetadata);
   rpc GetTensorManifest(GetTensorManifestRequest) returns (GetTensorManifestResponse);
   // Prepare/Release protect a mutable RL generator's live tensor storage while
   // another generator reads it during active-refit P2P transfer.
@@ -323,6 +328,57 @@ service WorkerService {
   rpc GetArtifactManifestChunks(GetArtifactManifestChunksRequest) returns (GetArtifactManifestChunksResponse);
   rpc PrepareArtifactChunk(PrepareArtifactChunkRequest) returns (PrepareArtifactChunkResponse);
   rpc ReleaseArtifactChunk(ReleaseArtifactChunkRequest) returns (ReleaseArtifactChunkResponse);
+}
+
+// Addresses use the actual bound port (local device ordinal), independent of
+// the global/model-shard ranks. These records never contain tensor manifests.
+message InstanceWorkerEndpoint {
+  uint32 global_rank = 1;
+  uint32 worker_rank = 2;
+  uint32 node_rank = 3;
+  string worker_id = 4;
+  string worker_grpc_endpoint = 5;
+}
+
+message InstanceArtifact {
+  string mx_source_id = 1;
+  MxSourceType mx_source_type = 2;
+  string artifact_id = 3;
+}
+
+message InstanceWorkerMetadata {
+  InstanceWorkerEndpoint worker = 1;
+  string accelerator = 2;
+  // Currently sealed/published artifacts. Absence is an immediate cache miss,
+  // not a promise that this worker can never publish that type in the future.
+  repeated InstanceArtifact artifacts = 3;
+}
+
+message RegisterInstanceWorkerRequest {
+  string mx_source_id = 1; // The instance's weight identity.
+  uint32 world_size = 2;
+  InstanceWorkerEndpoint worker = 3;
+  bool ready = 4;
+}
+
+message RegisterInstanceWorkerResponse {
+  string leader_worker_id = 1;
+}
+
+message GetInstanceMetadataRequest {
+  string mx_source_id = 1; // The instance's weight identity.
+}
+
+message GetInstanceMetadataResponse {
+  string mx_source_id = 1;
+  string leader_worker_id = 2;
+  uint32 world_size = 3;
+  repeated InstanceWorkerMetadata workers = 4;
+}
+
+message GetWorkerInventoryRequest {
+  string mx_source_id = 1;
+  string worker_id = 2;
 }
 
 message GetTensorManifestRequest {

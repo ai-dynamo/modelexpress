@@ -115,3 +115,7 @@ class LoadContext:
     # cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr, collapsing
     # O(plugin_calls) MRs to 1.
     vmm_arena: VmmArena | None = None
+
+    def __post_init__(self) -> None:
+        if getattr(self.mx_client, "LEADER_DISCOVERY", False) is True:
+            self.mx_client.configure_load_context(self)
