@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     MX_REFIT_DEBUG_VALIDATE_PLAN: bool
     MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT: bool
     MX_REFIT_DELTA_WORKERS: int
+    MX_REFIT_DOWNLOAD_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
     MX_REFIT_FULL_STREAMING: bool
@@ -178,6 +179,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         "MX_REFIT_DELTA_WORKERS",
     ),
+    "MX_REFIT_DOWNLOAD_WORKERS": lambda: (
+        require_positive_int(
+            parse_int(os.environ["MX_REFIT_DOWNLOAD_WORKERS"], "MX_REFIT_DOWNLOAD_WORKERS"),
+            "MX_REFIT_DOWNLOAD_WORKERS",
+        )
+        if "MX_REFIT_DOWNLOAD_WORKERS" in os.environ
+        else require_positive_int(
+            int(os.environ.get("MX_S3_DOWNLOAD_WORKERS", 16)),
+            "MX_S3_DOWNLOAD_WORKERS",
+        )
+    ),
     "MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES": lambda: require_positive_int(
         int(
             os.environ.get(
@@ -220,10 +232,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ.get("MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS", 16)),
         "MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS",
     ),
-    "MX_S3_DOWNLOAD_WORKERS": lambda: require_positive_int(
-        int(os.environ.get("MX_S3_DOWNLOAD_WORKERS", 16)),
-        "MX_S3_DOWNLOAD_WORKERS",
-    ),
+    "MX_S3_DOWNLOAD_WORKERS": lambda: environment_variables["MX_REFIT_DOWNLOAD_WORKERS"](),
     "MX_S3_MAX_POOL_CONNECTIONS": lambda: require_positive_int(
         int(os.environ.get("MX_S3_MAX_POOL_CONNECTIONS", 32)),
         "MX_S3_MAX_POOL_CONNECTIONS",
