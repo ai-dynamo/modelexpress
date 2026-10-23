@@ -772,6 +772,35 @@ class TestTransferDeadline:
         ]
         assert not any(lane.aborted for lane in cache._lanes.values())
 
+    def test_no_per_call_reshard_is_dispatched_after_the_deadline(
+        self, recorder, clock, short_deadline, monkeypatch
+    ):
+        """The ungrouped path re-checks the budget before every call.
+
+        Each call is independent, so once the budget is spent the next one
+        must not launch: the group is aborted and the overrun reported instead.
+        """
+        monkeypatch.delenv("MX_NCCL_REFIT_GROUPED_SUBMISSION", raising=False)
+        dispatched = []
+
+        def slow_reshard(*, comm, entry, src, dst, handle):
+            dispatched.append((entry.name, clock.now))
+            clock.advance(20.0)
+
+        monkeypatch.setattr(backend, "_reshard", slow_reshard)
+        plan = ReshardPlan(bulk=[entry("a"), entry("b"), entry("c")])
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        half.start_weight_update("v7")
+        deadline = half._deadline
+
+        with pytest.raises(TimeoutError, match="did not complete"):
+            half.publish_weights(0)
+
+        late = [(name, at) for name, at in dispatched if at >= deadline]
+        assert not late, f"reshards launched after the deadline: {late}"
+        assert [name for name, _ in dispatched] == ["a", "b"]
+        assert all(lane.aborted for lane in cache._lanes.values())
+
     def test_the_deadline_is_rearmed_per_version_not_per_client(
         self, recorder, clock, short_deadline
     ):

@@ -861,6 +861,11 @@ class _CollectiveHalf:
             ordered[0], next(iter(lanes.values())), started, calls=len(ordered)
         ), (m2n.group() if grouped else nullcontext()):
             for entry in ordered:
+                if not grouped:
+                    # Each per-call reshard is issued on its own, so the
+                    # budget is re-checked before every one; a group only
+                    # records here and was checked before it opened.
+                    self._remaining()
                 lane = self._lane(entry.partition_id)
                 spec = self._specs[entry.name]
                 with self._stream_context(lane, spec):
