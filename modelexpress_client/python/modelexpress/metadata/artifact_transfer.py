@@ -539,6 +539,8 @@ def publish_artifact_source(
             bundle.artifact_id,
             bundle.manifest,
             artifact_chunk_manager,
+            node_rank=node_rank,
+            worker_grpc_endpoint=worker_grpc_endpoint,
         )
     except Exception:
         artifact_chunk_manager.close()
@@ -603,6 +605,19 @@ def discover_artifact_source(
     policy = resolve_policy()
     if blocks_selection(policy):
         raise LookupError("required artifact source topology is unknown")
+    service_resolver = getattr(mx_client, "discover_artifact_source", None)
+    if (
+        getattr(mx_client, "SERVICE_ROUTED_ARTIFACTS", False) is True
+        and callable(service_resolver)
+    ):
+        return service_resolver(
+            identity,
+            worker_rank=worker_rank,
+            node_rank=node_rank,
+            artifact_id=artifact_id,
+            accelerator=accelerator,
+        )
+
     sources = mx_client.list_sources(
         identity=identity,
         status_filter=p2p_pb2.SOURCE_STATUS_READY,
@@ -820,6 +835,12 @@ def transfer_artifact_from_worker(
     timeout: float = 120.0,
     max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
     target_file_paths: list[str | Path] | None = None,
+    *,
+    expected_worker_id: str = "",
+    expected_node_rank: int | None = None,
+    expected_source_type: int | None = None,
+    expected_accelerator: str = "",
+    expected_topology: dict[str, str] | None = None,
 ) -> p2p_pb2.GetArtifactManifestHeaderResponse:
     """Transfer all files in an artifact from one source worker via NIXL."""
     start = time.perf_counter()
@@ -830,6 +851,19 @@ def transfer_artifact_from_worker(
         mx_source_id=mx_source_id,
         artifact_id=artifact_id,
     )
+    if expected_topology and any(header.topology.get(k) != value for k, value in expected_topology.items()):
+        raise ValueError("artifact header is outside the required topology")
+    if expected_worker_id:
+        if header.worker_id != expected_worker_id or header.mx_source_id != mx_source_id:
+            raise ValueError("artifact header does not match the selected worker generation")
+        if expected_node_rank is not None and header.node_rank != expected_node_rank:
+            raise ValueError("artifact header does not match the selected node")
+        if expected_source_type is not None and header.mx_source_type != expected_source_type:
+            raise ValueError("artifact header does not match the requested source type")
+        if not accelerators_compatible(
+            expected_accelerator, header.accelerator, mx_source_type=header.mx_source_type,
+        ):
+            raise ValueError("artifact header has an incompatible accelerator")
     chunks = _fetch_all_chunks(
         endpoint,
         mx_source_id,

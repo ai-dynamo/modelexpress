@@ -123,3 +123,7 @@ class LoadContext:
     # when unknown. RDMA reloads skip the target-side post-processing, so they
     # are only correct when restoring these same weights.
     loaded_identity: p2p_pb2.SourceIdentity | None = None
+
+    def __post_init__(self) -> None:
+        if getattr(self.mx_client, "LEADER_DISCOVERY", False) is True:
+            self.mx_client.configure_load_context(self)
