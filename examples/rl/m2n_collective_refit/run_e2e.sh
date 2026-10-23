@@ -17,6 +17,20 @@ RUN=${RUN:-e2e-$(date +%s)}
 OUT=${OUT:-/work/out/$RUN}
 TRAINER=${TRAINER:-fsdp2}
 DST=${DST:-replicate}
+# Process-level bound, in seconds, on each trainer and generator process; 0
+# (the default) leaves them unbounded. MX_NCCL_REFIT_TRANSFER_TIMEOUT_S cannot
+# interrupt a reshard or grouped submission that blocks the host in native
+# code, so this is the bound that does: on expiry the process is sent SIGTERM,
+# then SIGKILL 30 s later, and its .rc file reads 124 (or 137).
+PROC_TIMEOUT_S=${PROC_TIMEOUT_S:-0}
+
+bounded() {
+  if [ "$PROC_TIMEOUT_S" != 0 ]; then
+    timeout --kill-after=30 "$PROC_TIMEOUT_S" "$@"
+  else
+    "$@"
+  fi
+}
 
 export PYTHONPATH=${PYTHONPATH:-$(cd "$(dirname "$0")" && pwd)}
 export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-WARNING}
@@ -25,7 +39,7 @@ mkdir -p "$OUT"
 echo "run=$RUN model=$MODEL trainer=$TRAINER dst=$DST trainers=$T generators=$G rounds=$ROUNDS out=$OUT"
 
 ( CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((G-1))) \
-  python3 -m mx_m2n_e2e.generator --model-dir "$MODEL" --endpoint "$MX_ENDPOINT" \
+  bounded python3 -m mx_m2n_e2e.generator --model-dir "$MODEL" --endpoint "$MX_ENDPOINT" \
     --model-name "$RUN" --run-id "$RUN" --trainers "$T" --generators "$G" \
     --rounds "$ROUNDS" --dst-layout "$DST" ${DIFF:+--diff-checkpoint} --out "$OUT" > "$OUT/generator.log" 2>&1
   echo $? > "$OUT/generator.rc" ) &
@@ -37,7 +51,7 @@ for rank in $(seq 0 $((T-1))); do
   ( CUDA_VISIBLE_DEVICES=$((G+rank)) LOCAL_DEVICE=0 RANK=$rank \
     LOCAL_RANK=0 WORLD_SIZE=$T \
     MASTER_ADDR=127.0.0.1 MASTER_PORT=${MASTER_PORT:-29555} \
-    python3 -m mx_m2n_e2e.trainer --model-dir "$MODEL" --endpoint "$MX_ENDPOINT" \
+    bounded python3 -m mx_m2n_e2e.trainer --model-dir "$MODEL" --endpoint "$MX_ENDPOINT" \
       --model-name "$RUN" --run-id "$RUN" --trainers "$T" --generators "$G" \
       --rounds "$ROUNDS" --backend "$TRAINER" --dst-layout "$DST" \
       --out "$OUT" > "$OUT/trainer$rank.log" 2>&1

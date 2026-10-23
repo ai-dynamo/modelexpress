@@ -49,6 +49,7 @@ DIFF=1 ./run_e2e.sh
 | `TRAINER` | `fsdp2` | `fsdp2` or `deepspeed` |
 | `DST` | `replicate` | `replicate` or `sharded` |
 | `DIFF` | unset | `1` turns on the per-parameter comparison |
+| `PROC_TIMEOUT_S` | `0` (off) | per-process bound in seconds: SIGTERM on expiry, SIGKILL 30 s later, `.rc` file reads 124. Set it for unattended runs: `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` cannot interrupt a reshard blocked in native code |
 
 The run needs `T + G` GPUs on one node, a reachable ModelExpress server, and
 NCCL 2.30.7 or newer mapped into the process. `torch.cuda.nccl.version()`
