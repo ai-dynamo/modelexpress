@@ -158,6 +158,14 @@ pinned to revision `c1899de289a04d12100db370d81485cdf75e47ca`. The image was
 | TP2 | Two GPUs per Pod, source and target on different hosts | Both ranks transferred about 0.61 GB each; 47.97 MiB torch.compile cache installed; both ranks directly loaded AOT functions; matching inference |
 | PP2 / TP1 | Each instance spans two hosts, one GPU per Pod | Ranks 0/1 transferred 170/171 tensors, about 0.76 GB each; both node-specific markers matched; both Pods reused their installed AOT cache; matching inference |
 
+These three passing cases used the image above, before integrating main at
+`3fe38ae9`. The merged image
+`nvcr.io/nvidian/dynamo-dev/zhongdongmin@sha256:02818c1f8067d7d101a6a3048341c051a102e5de7189847700fab527d06e3853`
+was also exercised with distributed PP2/TP1 and required same-zone topology.
+Both ranks completed RDMA and reused the installed AOT cache, but the generated
+completion differed between source and target. That run failed the inference
+comparison and is not counted as passing; the cause remains under investigation.
+
 Every case used one MX discovery Service with one port. Target workers fetched
 one directory each. TP1 skipped four absent optional artifact types within the
 same logged second, without per-type backoff. Real worker RPC checks also
