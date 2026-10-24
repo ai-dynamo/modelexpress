@@ -80,6 +80,53 @@ publication instead. Not every cache type is produced by every model, so a
 missing optional artifact is not necessarily a failure. Keep the namespace
 stable only for compatible runs; use a new one for independent experiments.
 
+## Kubernetes example
+
+The [vLLM](k8s/vllm-single-node.yaml) and
+[SGLang](k8s/sglang-single-node.yaml) manifests follow the other
+single-node examples: each contains a Service and a one-replica Deployment.
+Choose **one** manifest for a cold/hit pair. Before applying it, replace the
+image with one containing the engine, ModelExpress, and `mooncake.store`;
+replace the `model-cache` PVC and `/models/model` path with your model's
+location; and choose a fresh `MX_ARTIFACT_MOONCAKE_NAMESPACE`. The SGLang
+image also needs the ModelExpress delegation hook and NIXL. The example uses
+one GPU (`TP=1`); adjust the GPU resource count and engine TP flag together
+for a larger model. If your cluster exposes RDMA through an extended resource
+such as `rdma/ib`, add its requests/limits for the Mooncake network.
+
+Create the Mooncake configuration Secret in the same Kubernetes namespace as
+the Deployment. Keep credentials out of the manifest and version control:
+
+```bash
+kubectl create secret generic mooncake-config \
+  --from-file=config.json=/secure/path/to/mooncake.json
+kubectl apply -f examples/mooncake_artifact_reuse/k8s/vllm-single-node.yaml
+```
+
+For SGLang, apply `k8s/sglang-single-node.yaml` instead. Both manifests mount
+model weights read-only from the PVC and put JIT caches and artifact bundles
+on a per-Pod `emptyDir`. They set `MX_P2P_METADATA=0` and do not require a
+ModelExpress metadata server for artifacts. Weights load from the model
+volume; Mooncake does not accelerate weight loading in this example. The
+readiness probe and `MX_ARTIFACT_READY_URL` both use port 8000; change the
+engine, Service/probe, and readiness URL ports together if needed.
+
+Wait for `/health` and `artifact publish complete` in the first Pod's logs,
+then restart the Deployment. Its `Recreate` strategy stops the old Pod before
+creating a new one. The replacement Pod has a fresh local cache while keeping
+the same Mooncake namespace and model PVC:
+
+```bash
+kubectl logs deployment/mx-mooncake-vllm > cold.log
+kubectl rollout restart deployment/mx-mooncake-vllm
+kubectl rollout status deployment/mx-mooncake-vllm
+kubectl logs deployment/mx-mooncake-vllm > hit.log
+```
+
+For SGLang, substitute `mx-mooncake-sglang` in those commands. In `hit.log`,
+look for `Mooncake artifact fetch complete` and `artifact install complete`.
+This is a single-node Pod example; it does not set up multi-node model loading.
+
 See [configuration](../../docs/CONFIGURATION.md#artifact-transfer) for store
 settings and [deployment guidance](../../docs/DEPLOYMENT.md#artifact-transfer-backends)
 for the supported cache roots.
