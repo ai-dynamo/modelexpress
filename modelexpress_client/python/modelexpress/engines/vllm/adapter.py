@@ -55,6 +55,23 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+def _local_runtime_tensors(model: torch.nn.Module) -> list[torch.Tensor]:
+    """Identify the instance-owned FlashInfer MLA counter without importing vLLM."""
+    tensors = []
+    for module in model.modules():
+        for owner in (module, vars(module).get("impl")):
+            if owner is None or not any(
+                cls.__module__ == "vllm.v1.attention.backends.mla.flashinfer_mla"
+                and cls.__name__ == "FlashInferMLAImpl"
+                for cls in type(owner).__mro__
+            ):
+                continue
+            counter = getattr(owner, "_multi_ctas_kv_counter_buffer", None)
+            if isinstance(counter, torch.Tensor):
+                tensors.append(counter)
+    return tensors
+
+
 def _is_speculative_draft(vllm_config, model_config) -> bool:
     """True for the draft pass of a speculative load.
 
@@ -347,7 +364,11 @@ class VllmAdapter(EngineAdapter):
             self.accelerator_backend,
             exclude=self._exclude_hidden_tensor_object,
         )
-        tensors = collect_module_tensors(result.model, self.accelerator_backend)
+        tensors = collect_module_tensors(
+            result.model,
+            self.accelerator_backend,
+            preserve_local=_local_runtime_tensors(result.model),
+        )
         if _is_speculative_draft(self.vllm_config, self.model_config):
             prefixes = _target_shared_draft_prefixes(result.model, self.vllm_config)
             if prefixes:
