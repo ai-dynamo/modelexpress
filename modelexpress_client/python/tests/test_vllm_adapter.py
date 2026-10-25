@@ -1487,7 +1487,7 @@ class TestTargetSharedDraftPrefixes:
         )
         monkeypatch.setattr(
             "modelexpress.engines.vllm.adapter.collect_module_tensors",
-            lambda *_args: {
+            lambda *_args, **_kwargs: {
                 "layers.0.shared_head.head.weight": model.layers[0].shared_head.head.weight
             },
         )

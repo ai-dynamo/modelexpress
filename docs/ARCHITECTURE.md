@@ -1041,6 +1041,15 @@ The solution: both source and target run `process_weights_after_loading()` first
 
 The vLLM adapter passes an exclusion predicate to engine-agnostic hidden-tensor discovery, skipping the exact `vllm.models.kimi_k3.nvidia.ops.latent_moe_tail.KimiK3LatentMoETailOp` class. Its GPU peer-pointer arrays, barriers, and multicast workspaces are process-local collective state and must retain the receiver's allocations and contents. Transferring donor collective state can cause CUDA illegal-address errors during receiver warmup. Hidden quantization tensors outside this operator remain eligible for adoption and RDMA transfer.
 
+The vLLM tensor catalog preserves the instance-owned FlashInfer MLA
+`_multi_ctas_kv_counter_buffer` on recognized `FlashInferMLAImpl` objects attached
+as attention `impl` or registered modules. Collection omits buffer aliases
+within that counter's byte range, including previously adopted buffers, while
+retaining unrelated hidden derived tensors. Parameters and widened storage
+transfers that overlap local state raise a classification error. This bounded
+compatibility rule does not classify arbitrary runtime buffers; versions using
+a module-global counter need no instance-field exclusion.
+
 ```mermaid
 graph TD
     subgraph Source
