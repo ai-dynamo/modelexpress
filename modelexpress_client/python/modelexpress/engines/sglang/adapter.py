@@ -10,7 +10,7 @@ import gc
 import logging
 import uuid
 from importlib.metadata import version as pkg_version
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Callable, Iterator
 
 import torch
 
@@ -28,6 +28,35 @@ from .draft_weights import draft_weight_adapter_for
 from .runtime_state import finalize_runtime_state, prepare_runtime_tensors
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
+
+# Live comm buffers, not weights: created lazily on the first forward, so only
+# warm/restored engines have them and adopting them breaks manifest matching.
+# Matched by type name so this imports on SGLang builds without them.
+_RUNTIME_COMM_TYPES = frozenset({"MultimemAllGatherer", "MultimemAllGatherState"})
+
+# Layout scratch, not weights: restore clears its _cache_permute_indices, so only
+# warm donors have the entries. Other methods (Mxfp4MoEMethod) still need theirs.
+_LAYOUT_SCRATCH_TYPES = frozenset({"UnquantizedFusedMoEMethod"})
+
+
+def _runtime_state_filter(model: torch.nn.Module) -> Callable[[object], bool]:
+    """Build the ``exclude`` predicate for adopt_hidden_tensors.
+
+    The scan only offers attribute values to the predicate, never their owner,
+    and the MoE method is itself an nn.Module. So the scratch dicts are matched
+    by identity, found through their owning module.
+    """
+    scratch_ids = {
+        id(cache)
+        for module in model.modules()
+        if type(module).__name__ in _LAYOUT_SCRATCH_TYPES
+        and isinstance(cache := vars(module).get("_cache_permute_indices"), dict)
+    }
+
+    def exclude(obj: object) -> bool:
+        return type(obj).__name__ in _RUNTIME_COMM_TYPES or id(obj) in scratch_ids
+
+    return exclude
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -52,6 +81,7 @@ class SglangAdapter(EngineAdapter):
         self.device_config = device_config
         self.target_device = torch.device(device_config.device)
         self.accelerator_backend = accelerator_backend_for(self.target_device)
+        self.is_reload = False
 
     def build_identity(self) -> p2p_pb2.SourceIdentity:
         return build_sglang_source_identity(
@@ -113,7 +143,11 @@ class SglangAdapter(EngineAdapter):
         # This adds _mx_* names to the manifest, so source and target must run
         # the same ModelExpress version; mixing old and new manifests fails
         # tensor matching.
-        adopt_hidden_tensors(result.model, self.accelerator_backend)
+        adopt_hidden_tensors(
+            result.model,
+            self.accelerator_backend,
+            exclude=_runtime_state_filter(result.model),
+        )
         tensors = collect_module_tensors(result.model, self.accelerator_backend)
         if is_sglang_draft_model(self.model_config):
             selector = draft_weight_adapter_for(
@@ -226,10 +260,34 @@ class SglangAdapter(EngineAdapter):
         # Same capture as the target path so the source publishes the derived
         # MLA tensors under matching buffer names (symmetric manifest).
         with capture_tensor_attrs(self.accelerator_backend):
-            DefaultModelLoader.load_weights_and_postprocess(
-                result.model, weights_iter, self.target_device,
-            )
+            if self.is_reload:
+                DefaultModelLoader.load_weights_only(
+                    result.model, weights_iter, self.target_device,
+                )
+            else:
+                DefaultModelLoader.load_weights_and_postprocess(
+                    result.model, weights_iter, self.target_device,
+                )
         return result
+
+    def begin_streaming_reload(self, result: LoadResult) -> None:
+        """Restore checkpoint-format weights in place."""
+        if result.model is None:
+            raise RuntimeError("SGLang streaming reload requires result.model")
+        from sglang.srt.model_loader.loader import DefaultModelLoader
+
+        DefaultModelLoader.restore_weights_before_loading(
+            result.model, self.target_device
+        )
+
+    def end_streaming_reload(self, result: LoadResult) -> None:
+        """Re-run quantization post-processing on the reloaded weights."""
+        if result.model is None:
+            raise RuntimeError("SGLang streaming reload requires result.model")
+        from sglang.srt.model_loader.loader import DefaultModelLoader
+
+        with capture_tensor_attrs(self.accelerator_backend):
+            DefaultModelLoader.postprocess_weights(result.model, self.target_device)
 
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
         from sglang.srt.model_loader.loader import (

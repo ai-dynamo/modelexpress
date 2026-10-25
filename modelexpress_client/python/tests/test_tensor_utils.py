@@ -459,3 +459,31 @@ def test_hidden_tensor_exclusion_is_optional_and_recursive(mock_accelerator_back
         graph, set(), backend, exclude=lambda obj: obj is local
     )
     assert [t.data_ptr() for _, t in found] == [quant.data_ptr()]
+
+
+def test_sglang_adapter_skips_bf16_moe_layout_cache(mock_accelerator_backend_cls):
+    """Warm donor and restored target must publish the same MoE tensor set."""
+    from modelexpress.engines.sglang.adapter import _runtime_state_filter
+
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+
+    # The real MoE methods are nn.Modules (BaseFusedOp), so the scan reaches
+    # their cache dict as a plain attribute and never offers the owner.
+    class UnquantizedFusedMoEMethod(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._cache_permute_indices = {("w2", 128): torch.zeros(4)}
+
+    class Mxfp4MoEMethod(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._cache_permute_indices = {("w2", 128): torch.zeros(4)}
+
+    def adopted(method):
+        model = nn.Module()
+        model.quant_method = method
+        adopt_hidden_tensors(model, backend, exclude=_runtime_state_filter(model))
+        return [n for n, _ in model.named_buffers()]
+
+    assert adopted(UnquantizedFusedMoEMethod()) == []
+    assert len(adopted(Mxfp4MoEMethod())) == 1
