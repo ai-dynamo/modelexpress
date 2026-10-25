@@ -52,6 +52,7 @@ class SglangAdapter(EngineAdapter):
         self.device_config = device_config
         self.target_device = torch.device(device_config.device)
         self.accelerator_backend = accelerator_backend_for(self.target_device)
+        self.is_reload = False
 
     def build_identity(self) -> p2p_pb2.SourceIdentity:
         return build_sglang_source_identity(
@@ -109,6 +110,22 @@ class SglangAdapter(EngineAdapter):
             )
         )
 
+    @staticmethod
+    def _unquantized_moe_permute_cache_ids(model: torch.nn.Module) -> set[int]:
+        """Ids of UnquantizedFusedMoEMethod._cache_permute_indices dicts.
+
+        Permute-index cache, not weights: restore clears them, so only warm donors
+        have entries. Other methods (Mxfp4MoEMethod) still need theirs. The scan
+        offers only attribute values to the exclude predicate, never their
+        owner, so the dicts are matched by identity through their owning module.
+        """
+        return {
+            id(cache)
+            for module in model.modules()
+            if type(module).__name__ == "UnquantizedFusedMoEMethod"
+            and isinstance(cache := vars(module).get("_cache_permute_indices"), dict)
+        }
+
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         """Collect transferable tensors while preserving process-local state."""
         if result.model is None:
@@ -126,10 +143,15 @@ class SglangAdapter(EngineAdapter):
         # This adds _mx_* names to the manifest, so source and target must run
         # the same ModelExpress version; mixing old and new manifests fails
         # tensor matching.
+        permute_cache_ids = self._unquantized_moe_permute_cache_ids(result.model)
+
+        def exclude(obj: object) -> bool:
+            return id(obj) in permute_cache_ids or self._exclude_hidden_tensor_object(obj)
+
         adopt_hidden_tensors(
             result.model,
             self.accelerator_backend,
-            exclude=self._exclude_hidden_tensor_object,
+            exclude=exclude,
         )
         tensors = collect_module_tensors(result.model, self.accelerator_backend)
         if is_sglang_draft_model(self.model_config):
@@ -243,10 +265,34 @@ class SglangAdapter(EngineAdapter):
         # Same capture as the target path so the source publishes the derived
         # MLA tensors under matching buffer names (symmetric manifest).
         with capture_tensor_attrs(self.accelerator_backend):
-            DefaultModelLoader.load_weights_and_postprocess(
-                result.model, weights_iter, self.target_device,
-            )
+            if self.is_reload:
+                DefaultModelLoader.load_weights_only(
+                    result.model, weights_iter, self.target_device,
+                )
+            else:
+                DefaultModelLoader.load_weights_and_postprocess(
+                    result.model, weights_iter, self.target_device,
+                )
         return result
+
+    def begin_streaming_reload(self, result: LoadResult) -> None:
+        """Restore checkpoint-format weights in place."""
+        if result.model is None:
+            raise RuntimeError("SGLang streaming reload requires result.model")
+        from sglang.srt.model_loader.loader import DefaultModelLoader
+
+        DefaultModelLoader.restore_weights_before_loading(
+            result.model, self.target_device
+        )
+
+    def end_streaming_reload(self, result: LoadResult) -> None:
+        """Re-run quantization post-processing on the reloaded weights."""
+        if result.model is None:
+            raise RuntimeError("SGLang streaming reload requires result.model")
+        from sglang.srt.model_loader.loader import DefaultModelLoader
+
+        with capture_tensor_attrs(self.accelerator_backend):
+            DefaultModelLoader.postprocess_weights(result.model, self.target_device)
 
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
         from sglang.srt.model_loader.loader import (
