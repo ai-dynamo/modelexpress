@@ -852,7 +852,10 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_UCX_DISABLE_MEM_EVENTS` | `0` | Opt-in. `1` sets `UCX_MEM_EVENTS=n` before NIXL agent creation on the UCX backend (no-op on `LIBFABRIC`), which roughly halves NIXL agent creation time by skipping UCX's mem-hook / VM-unmap tracking. Off by default because the effect is process-wide and permanent: `UCX_MEM_EVENTS` backs registration-cache invalidation for every UCP context in the process, not just ModelExpress's, so this is only safe when the process owns UCX exclusively for ModelExpress transfers. Never overrides an operator-set `UCX_MEM_EVENTS`. UCX reads this option in a shared-library constructor, so if UCX was already loaded elsewhere in the process before agent creation, setting it here can be a no-op. |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_P2P_METADATA` | `1` | Enable P2P metadata exchange (source workers only). Set to `0` to publish full metadata through a central-coordinator backend. This setting is ignored on backends that require P2P metadata, currently `k8s-service`. |
-| `MX_DISABLE_DRAFT_P2P` | `0` | Set to `1` to load the SGLang or vLLM speculative draft through storage without receiving or publishing draft tensors over NIXL P2P. Main-model P2P and cold-load shard selection are unchanged. The default permits P2P for compatible same-checkpoint MTP drafts; it does not bypass checkpoint identity or compatibility checks, and storage fallback remains available when no compatible READY source is found. |
+| `MX_DISABLE_DRAFT_P2P` | `0` | Set to `1` to load speculative drafts through storage without P2P receive/publication. SGLang applies this to independent NIXL draft sessions; vLLM applies it to its shared NIXL draft path. SGLang NIXL drafts, including standalone and unknown model classes, otherwise use independent source identities and the normal P2P/fallback flow. TransferEngine drafts remain storage-only. |
+| `MX_DRAFT_MODEL_URI` | (conditional main override, then draft config) | SGLang draft ModelStreamer URI. When unset, inherits `MX_MODEL_URI` if the resolved startup main/draft paths and checkpoint revisions match; otherwise uses the draft's own configuration. Explicit draft values take precedence. |
+| `MX_DRAFT_MODEL_REVISION` | (conditional main override, then draft config) | SGLang draft identity revision override. When unset, inherits `MX_MODEL_REVISION` for a confirmed shared checkpoint unless an explicit draft URI differs from the main's effective URI; otherwise uses the draft's configured revision. This labels identity only; pin actual weights through SGLang's revision setting or immutable storage. |
+| `MX_DRAFT_PORT_OFFSET` | `10000` | SGLang NIXL draft port stride. Draft index `i` adds `(i + 1) * stride` to both NIXL metadata and worker gRPC ports, before adding the local device ordinal. Reserve/expose these ports for every draft; configure the same stride on peers. Ranges must not overlap and ports must fit in 1–65535. Ignored by TransferEngine. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
@@ -866,8 +869,8 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
-| `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; SGLang draft P2P also requires a non-empty revision. |
-| `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
+| `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; central-server SGLang draft sessions do not impose an additional revision requirement. |
+| `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). SGLang draft clients then add their draft port offset in either case; the Service must expose the corresponding ports. |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` backend: sleep between retry attempts. |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (Redis backend only) |
@@ -1362,31 +1365,67 @@ InstantTensor also honors its own `INSTANTTENSOR_BACKEND` environment variable (
 
 ModelStreamer reads safetensor ranges concurrently through a bounded CPU staging buffer and pipelines completed tensors into the inference engine while later reads continue. It supports S3, GCS, Azure Blob Storage, and local filesystem (PVC) paths. This storage-loading path does not require P2P by itself. If the same deployment also enables ModelExpress P2P metadata and RDMA resources, later replicas can receive weights from an already-loaded source instead of streaming from storage again.
 
-All storage backends (S3, GCS, Azure) are included as core dependencies — no extra install step needed. The strategy activates when `MX_MODEL_URI` is set. See [`../examples/model_streamer_k8s/`](../examples/model_streamer_k8s/) for Kubernetes examples, including the Azure Blob recipe.
+All storage backends (S3, GCS, Azure) are included as core dependencies — no extra install step needed. For main loads, the strategy activates when `MX_MODEL_URI` is set. SGLang draft sessions resolve their own URI from draft settings or model configuration. See [`../examples/model_streamer_k8s/`](../examples/model_streamer_k8s/) for Kubernetes examples, including the Azure Blob recipe.
 
 **General configuration:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_MODEL_URI` | (none) | Model location. Must be set to enable ModelStreamer. Accepts a remote URI (`s3://bucket/model`, `gs://...`, `az://...`) or absolute local path (`/models/deepseek-ai/DeepSeek-V4-Pro`). |
+| `MX_MODEL_URI` | (none) | Main model location. Enables ModelStreamer for main loads. Accepts a remote URI (`s3://bucket/model`, `gs://...`, `az://...`) or absolute local path (`/models/deepseek-ai/DeepSeek-V4-Pro`). |
 | `MX_MS_DISTRIBUTED` | `1` | Divide ModelStreamer reads across tensor-parallel ranks and share the results instead of having every rank read the full checkpoint. Requires tensor parallelism > 1 and a CUDA-capable platform; a no-op at TP1. On by default. Set to `0` to disable. |
 | `RUNAI_STREAMER_CONCURRENCY` | `8` | Number of concurrent read threads |
 | `RUNAI_STREAMER_MEMORY_LIMIT` | (none) | CPU staging buffer size in bytes. `0` reuses a single-tensor buffer (most memory efficient). See [runai-model-streamer docs](https://github.com/run-ai/runai-model-streamer). |
 
-For SGLang Qwen3.5 MTP P2P, use `--load-format remote_instance`,
-`--remote-instance-weight-loader-backend modelexpress`,
-`--speculative-draft-load-format remote_instance`, and NIXL transport for both
-passes. Use the same immutable checkpoint, exact SGLang build, and ModelExpress
-build on source and target. Set `MX_MODEL_REVISION` to that checkpoint's real
-revision and `MX_MODEL_URI` to its pinned storage location. MX recognizes
-specific SGLang main/draft class pairs with mirrored checkpoint-name rules;
-unrecognized or incompatible layouts use SGLang's storage loader. New model
-classes require validation against the deployed SGLang build and checkpoint.
-For a recognized checkpoint with a valid
-`model.safetensors.index.json`, ModelStreamer selects main and draft shard files
-before each storage read. Mixed shards can still be read in both passes; if the
-index is unavailable or incomplete, SGLang reads the full file list. This
-selection does not affect P2P target transfer.
+For SGLang draft P2P, use `--load-format remote_instance`,
+`--remote-instance-weight-loader-backend modelexpress`, and
+`--speculative-draft-load-format remote_instance`. Standalone drafts can use a
+separate `--speculative-draft-model-path`; `transport=nixl` uses
+independent draft identities and publication. Use the same pinned draft
+checkpoint, SGLang build, and ModelExpress build on source and target. Set
+`MX_DRAFT_MODEL_URI` when the draft has its own object-store location, and
+`MX_DRAFT_MODEL_REVISION` when overriding its identity revision. These settings
+apply to the draft, while `MX_MODEL_URI`/`MX_MODEL_REVISION` describe the main.
+For same-checkpoint MTP, an unset `MX_DRAFT_MODEL_URI` inherits `MX_MODEL_URI`
+when SGLang's resolved startup main/draft paths and checkpoint revisions match.
+An omitted draft path or revision uses the main default. Different paths,
+revisions, or an unavailable resolved configuration API keep the draft's own
+configuration; no main loader needs to initialize first. Explicit draft URI
+overrides take precedence. An unset `MX_DRAFT_MODEL_REVISION` likewise inherits
+`MX_MODEL_REVISION` for a shared checkpoint, unless an explicit draft URI differs
+from the main's effective URI. If inheritance does not apply or the main revision
+override is unset, the draft uses its configured revision. An explicit draft
+revision always takes precedence. Main and draft keep independent P2P identities
+and publication resources when sharing storage.
+`MX_DRAFT_MODEL_URI` applies to ModelStreamer. TransferEngine drafts still load
+natively using SGLang's model configuration.
+An unrecognized model class or PP>1 does not disable MX draft P2P;
+SGLang's algorithm/model topology restrictions still apply.
+
+NIXL discovers draft tensors before SGLang binds shared weights.
+Recognized models use their existing selector's `publishable()` rules; models
+without a selector retain their complete per-rank catalog. Source selection
+uses the draft identity. NIXL requires exact source and target tensor catalogs,
+including tensor names, byte sizes, and dtypes. Use compatible source/target builds and
+keep storage fallback available during a mixed-version rollout. A health
+gate publishes the saved pre-binding catalog.
+For unrecognized models, replaced embedding/head storage stays alive for peer
+transfers, so allow for its retained GPU memory when sizing KV cache.
+Validate the selected model and topology against the existing sharing rules;
+this change does not add runtime algorithm or PP checks to `publishable()`.
+
+For NIXL on device 0, the default main metadata/gRPC ports are 5555/6555;
+draft index 0 uses 15555/16555 and index 1 uses 25555/26555. Add the local device
+ordinal for other devices. Expose the draft ports in containers, network policy,
+and K8s Services. The `k8s-service` backend adds the draft offset even when
+`MX_K8S_SERVICE_PATTERN` specifies an explicit port. Its existing per-rank
+Service routing must also route to the matching PP shard. TransferEngine drafts continue to load natively without P2P publication.
+
+On a cold miss, recognized checkpoint rules and a valid
+`model.safetensors.index.json` let ModelStreamer select main/draft shard files
+before reading. Unknown rules or unusable indexes retain the full file list;
+this optimization does not determine P2P eligibility. Mixed shards can still
+be read by both passes. Standalone draft tensor catalogs include their own
+embedding/head; EAGLE sharing follows the active worker's behavior.
 
 With vLLM, `MX_MODEL_URI` can also be a Hugging Face model ID. vLLM first downloads the safetensors into its local Hugging Face cache, then ModelStreamer reads those local files; ModelStreamer does not stream directly from the Hub.
 

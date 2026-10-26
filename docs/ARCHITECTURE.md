@@ -755,7 +755,7 @@ selection and source discovery remain inside the ModelExpress package.
 existence depends on checkpoint values. After placeholder post-processing and
 before registering destination memory, the receive strategy calls
 `prepare_rdma_target_from_manifest` with model-relative tensor names (stripping
-the draft namespace for the adapter). SGLang's `runtime_state.py` uses the
+legacy shared-draft namespaces for the adapter). SGLang's `runtime_state.py` uses the
 presence of `weight_scale_inv_swizzled` to recover the donor's block-FP8 MXFP8
 decision for FlashInfer CuTeDSL/CUTLASS. It allocates the engine-defined scale
 layout without priming floating scales or reshuffling weights. The existing
@@ -772,45 +772,75 @@ This does not add optimized support for Hopper's optional BF16 weight cache or
 ROCm MXFP8 layouts; mismatches remain failures. Warm reloads skip cold-load
 preparation and retain their existing same-identity restrictions.
 
-**Speculative draft pass.** SGLang's EAGLE worker builds a second ModelRunner
-for the draft on the same GPU. Its `ModelConfig` has `is_draft_model=True` and,
-unless `speculative_draft_load_format` names another format, it loads through the
-same `remote_instance` backend. The generic MX draft path recognizes that
-second pass, reuses the main load's NIXL agent instead of binding the same
-metadata port again, and gives draft tensors a separate manifest namespace.
-Cold-load shard selection is separate from P2P compatibility. MX recognizes
-exact SGLang main and draft model classes and mirrors their unconditional
-checkpoint-name exclusions in `DraftSelection` rules. For example, Qwen3.5
-text-only mains skip vision and MTP tensors, whereas conditional-generation
-mains retain vision tensors; their draft reads MTP tensors and its required
-embedding. Qwen4-Exp conditional-generation mains also honor SGLang's
-`language_model_only` flag: a text-only instance omits vision-only shards,
-while a shard mixed with text weights remains selected. DeepSeek/GLM NextN
-rules use the configured base-layer count to
-separate the appended prediction layer. DeepSeek V4's DSpark draft instead
-reads `mtp.<stage>.*` weights and pairs with the DeepSeek V4 main; it does
-not use the single-layer NextN rule. Compatible class pairs are explicit,
-and draft manifests are scoped by the class, engine version, checkpoint
-identity, and role-specific layout parameters. Rules are shared only where
-SGLang uses the same loading branch. These are pre-read file-selection rules,
-not a replacement for SGLang's tensor mapping, quantization, conditional
-parameter checks, or `load_weights`. When SGLang exposes a stable model-owned
-selection hook, MX can consume it instead of maintaining these temporary
-mirrors. The checkpoint's `model.safetensors.index.json` maps tensor names to shard files;
-it does not by itself define which tensors belong to every architecture's draft.
+**Speculative draft sessions with NIXL.** SGLang loads each draft through the same
+`remote_instance` ModelExpress backend as the target. In
+`engines/sglang/adapter.py`, `build_sglang_load_context()` and
+`build_sglang_source_identity()` create independent sessions for each
+`(worker rank, draft_model_idx)`. Worker rank is `pp_rank * tp_size + tp_rank`.
+Each session owns its SourceIdentity, NIXL agent, metadata listener, tensor
+catalog, publisher, and heartbeat. Main
+and draft can become READY independently, and draft retries or cleanup cannot
+unpublish the main. An explicitly configured health URL still gates publication.
 
-- A recognized draft may use P2P only when it shares the main `SourceIdentity`,
-  their exact model rules are compatible, pipeline parallelism is one, and
-  the source identity includes an explicit revision and SGLang package version.
-  A hash of these inputs and the model URI scopes its draft tensor names. The
-  receiver accepts only that namespace and verifies complete descriptor
-  coverage. Unknown or incompatible drafts fall back to SGLang's storage load.
-- After the main and draft loads, only draft-owned tensors are appended to the
-  main NIXL registration and metadata publication; target-shared embedding and
-  head storage is excluded using SGLang's `get_embed_and_head`, independent of
-  parameter names. The source's publication gate does not open for a recognized
-  draft until that extension succeeds. If a health URL is configured,
-  both draft publication and engine health must be ready.
+- Standalone, EAGLE/EAGLE3, MTP/NextN, and unrecognized model classes use the
+  normal P2P lookup, receive, and storage fallback paths. No main/draft class
+  pairing, same-checkpoint requirement, or PP=1 gate applies. SGLang must still
+  support the requested model, algorithm, and parallel topology.
+- Draft identity uses the normal ModelExpress version, source type, model
+  name/revision, framework, TP/PP/EP sizes, dtype, and quantization fields.
+  Its additional parameters are only `model_role="draft"` and
+  `draft_model_idx`. Main identity is unchanged. Checkpoint pinning and
+  compatible SGLang/ModelExpress builds remain deployment responsibilities;
+  an empty revision is not an additional draft-specific rejection.
+- NIXL follows the main SGLang model's exact catalog policy: source and target
+  tensor names, byte sizes, and dtypes must match.
+  Discovery collects the per-rank loader layout before SGLang binds draft
+  weights to the target.
+  Recognized draft models use their existing selector's `publishable()` rule;
+  those model-specific sharing assumptions are unchanged. Without a selector,
+  the complete catalog is retained, including embedding and head, with ordinary
+  tensor/storage deduplication. No tensor-name prefix or setter-presence
+  fallback removes weights from an unrecognized model. Main discovery keeps
+  its complete catalog. After loading, SGLang performs its normal binding and
+  initialization steps.
+- NIXL's session-scoped tensor and manager registries retain the collected
+  tensor views while the session serves peers, independently of the loader
+  object's lifetime. Replacing a model parameter or its `.data` does not
+  replace the published view. A health gate delays advertisement of the saved
+  catalog; it must not rescan the model after binding. For unrecognized models,
+  keeping replaced embedding/head storage increases retained GPU memory and
+  transfer bytes, without cloning the whole model. Revoke publication and finish
+  transfers before deregistering or releasing this storage. This is a cold-load contract,
+  not an immutable copy protecting against in-place weight updates.
+- For NIXL, metadata and worker gRPC ports add
+  `(draft_model_idx + 1) * MX_DRAFT_PORT_OFFSET` to their usual base plus local
+  device ordinal. The default offset is 10000. Publication registries use a
+  separate draft namespace; tensor names need no draft prefix. K8s-Service
+  discovery applies the same offset to the resolved service port. TransferEngine
+  drafts still load natively without P2P publication.
+- `MX_DRAFT_MODEL_URI` overrides the draft's ModelStreamer URI;
+  when unset, it inherits `MX_MODEL_URI` if SGLang's resolved startup main/draft
+  paths and checkpoint revisions match. An omitted draft path or revision uses
+  the main default, as in SGLang's ModelConfig construction. If those settings
+  differ or the resolved configuration API is unavailable, the draft uses its
+  own model configuration. This comparison needs no main loader or publication
+  state; sharing storage still uses independent identities and sessions.
+  `MX_DRAFT_MODEL_REVISION` overrides only the draft identity revision; when
+  unset, it inherits `MX_MODEL_REVISION` under the same checkpoint condition,
+  unless an explicit draft URI differs from the main's effective URI. Otherwise,
+  or when no main revision override is set, it uses the draft's configured
+  revision. Pin the actual weights through engine configuration or immutable
+  storage.
+  `MX_DISABLE_DRAFT_P2P=1` disables draft receive/publication. The RL load chain
+  continues to reject speculative drafts. vLLM's shared-agent draft path is
+  unchanged.
+- Checkpoint shard selection is an optional cold-load optimization, separate
+  from P2P eligibility. `DraftSelection` rules mirror known SGLang checkpoint
+  exclusions: Qwen3.5 text mains skip vision/MTP weights while vision mains
+  retain vision weights; NextN uses configured extra-layer indices, and DSpark
+  reads its own MTP stages. Rules do not replace SGLang's tensor mapping,
+  quantization, or `load_weights`. Unknown classes remain eligible for P2P and
+  use the original full-file loader on a cold miss.
 - On a cold source using ModelStreamer, a recognized model rule selects
   **files** separately for the main and draft passes. The generic tensor-name
   to index to shard algorithm is the same for every rule. MX first lets SGLang's
@@ -839,10 +869,6 @@ it does not by itself define which tensors belong to every architecture's draft.
   `model.safetensors.index.json` only and removes it after parsing; the
   selected weight shards still flow through SGLang's ModelStreamer. This does
   not change the warm target's role-scoped GPU P2P path.
-- On `transport=transfer_engine`, the draft loads natively and never publishes.
-  A second TransferEngine source would advertise the head under the target's
-  identity and replace the target's heartbeat, and its same-named tensors would
-  match the target's manifest. `MX_LOAD_STRATEGY_CHAIN=RL` rejects a draft.
 
 ```mermaid
 flowchart LR
@@ -852,9 +878,10 @@ flowchart LR
     S -->|main shard subset| M[SGLang ModelStreamer<br/>main load_weights]
     S -->|draft shard subset| D[SGLang ModelStreamer<br/>draft load_weights]
     S -. unsupported or incomplete .-> F[SGLang full-shard fallback]
-    M --> P[One NIXL agent<br/>one READY source]
-    D -->|append draft-namespaced tensors| P
-    P -->|one manifest, two role-scoped tensor sets| T[New replica<br/>main and draft P2P]
+    M --> P[Main session<br/>own agent and READY source]
+    D --> Q[Draft session<br/>own agent and READY source]
+    P -->|matching main identity and rank| T[New replica main]
+    Q -->|matching draft identity and rank| U[New replica draft]
 ```
 
 **LoadStrategyChain** (`load_strategy/`):
@@ -866,7 +893,7 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 | p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank` and runtime `accelerator`, order the survivors via the configured `SourceSelector` (`MX_P2P_SOURCE_SELECTOR`: `random` default, `rendezvous_hash`, `load_aware`, or `topology_aware`), then try candidates (max 3). Filtering before the retry slice prevents incompatible sources from exhausting the retry budget; a post-`GetMetadata` accelerator check remains as defense-in-depth. Before preparing target tensors, P2P sources must serve a manifest for the selected runtime `worker_id`; generation mismatches and transfer failures retry the next candidate, reinitializing the target first when it may have been mutated. |
 | p1 | `ServerCacheStrategy` | `MODEL_EXPRESS_NO_SHARED_STORAGE` enabled + server address configured + adapter implements `load_via_native` | Stream the model's weight files from ModelExpress Server into the snapshot the engine already resolved, then hand off to the engine's native loader. The cold-miss path for workers with no route to Hugging Face: the server downloads and caches the model once, and every later worker is served from that cache. Non-weight files arrive earlier, before the engine starts — see [Server-Backed Model Cache](#server-backed-model-cache). Falls through on failure. |
 | p2 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + no object-store `MX_MODEL_URI` + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves and (if needed) downloads the weight files. An `s3://`, `gs://`, or `az://` `MX_MODEL_URI` skips this strategy and proceeds to ModelStreamer. Falls through on other failures. |
-| p3 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
+| p3 | `ModelStreamerStrategy` | `MX_MODEL_URI` or a per-model session URI + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
 | p4 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
 | p5 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
 

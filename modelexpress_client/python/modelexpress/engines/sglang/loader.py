@@ -6,10 +6,7 @@
 from __future__ import annotations
 
 import logging
-import threading
 import time
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as pkg_version
 from typing import TYPE_CHECKING
 
 import torch
@@ -24,7 +21,7 @@ from ...load_strategy import (
 from ...load_strategy.base import clear_exception_tracebacks
 from ...load_strategy.context import LoadResult
 from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
-from ...metadata.publish import _heartbeat_threads
+from ...metadata.publish import PublicationKey, _heartbeat_threads, publication_key
 from ...metadata.publisher import PublisherThread
 from ...metrics import enable_metrics
 from ...metrics import metrics as selection_metrics
@@ -47,7 +44,6 @@ from .artifacts import (
     install_sglang_cache_artifacts,
     schedule_sglang_cache_artifact_publish,
 )
-from .draft_weights import draft_tensor_namespace, draft_weight_adapter_for
 
 logger = logging.getLogger("modelexpress.engines.sglang.loader")
 
@@ -57,83 +53,8 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 
-class _DraftPublicationGate:
-    """Keep a main load undiscoverable until its draft joins the manifest."""
-
-    def __init__(self, grace_secs: float | None):
-        self._released = threading.Event()
-        self._grace_secs = grace_secs
-        self._deadline: float | None = None
-        self._expired_logged = False
-
-    def arm(self) -> None:
-        if self._grace_secs is not None:
-            self._deadline = time.monotonic() + self._grace_secs
-
-    def release(self) -> None:
-        self._released.set()
-
-    def is_open(self) -> bool:
-        if self._released.is_set():
-            return True
-        if self._deadline is None or time.monotonic() < self._deadline:
-            return False
-        if not self._expired_logged:
-            self._expired_logged = True
-            logger.warning(
-                "Speculative draft pass did not reach the ModelExpress loader "
-                "within %.0fs of the target load; publishing the target without "
-                "draft tensors",
-                self._grace_secs,
-            )
-        return True
-
-
-_tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
-_nixl_managers: dict[int, NixlTransferManager] = {}
-_loader_registry: dict[int, MxModelLoader] = {}
-# Main-pass publication gates awaiting this device's speculative draft pass.
-_draft_publication_gates: dict[int, _DraftPublicationGate] = {}
-
-
-def _sglang_version() -> str:
-    try:
-        return pkg_version("sglang")
-    except PackageNotFoundError:
-        return ""
-
-
-def _speculative_server_args():
-    """Return SGLang's speculative settings for this process, if available."""
-    try:
-        from sglang.srt.runtime_context import get_spec
-
-        return get_spec()
-    except Exception:
-        pass
-    try:
-        from sglang.srt.server_args import get_global_server_args
-
-        return get_global_server_args()
-    except Exception:
-        return None
-
-
-def _expects_draft_pass() -> bool:
-    """True when SGLang will run a draft ModelRunner load through this loader.
-
-    NGRAM speculation has no draft model, and a draft with its own
-    ``speculative_draft_load_format`` never reaches the remote_instance
-    backend.
-    """
-    spec = _speculative_server_args()
-    algorithm = getattr(spec, "speculative_algorithm", None)
-    algorithm = str(getattr(algorithm, "name", algorithm) or "").upper()
-    if algorithm in ("", "NONE", "NGRAM"):
-        return False
-    draft_format = getattr(spec, "speculative_draft_load_format", None)
-    draft_format = getattr(draft_format, "value", draft_format)
-    return draft_format is None or str(draft_format) == "remote_instance"
+_tensor_registry: dict[PublicationKey, dict[str, torch.Tensor]] = {}
+_nixl_managers: dict[PublicationKey, NixlTransferManager] = {}
 
 
 class MxModelLoader:
@@ -152,8 +73,6 @@ class MxModelLoader:
         # prove it came up. No-op unless enabled; never raises.
         enable_metrics()
         self._ctx: LoadContext | None = None
-        self._strict_draft_publication = False
-        self._draft_weight_adapter = None
 
     def load_model(
         self,
@@ -220,73 +139,9 @@ class MxModelLoader:
             model_config,
             device_config,
         )
-        is_draft = is_sglang_draft_model(model_config)
-        ctx.p2p_role = "draft" if is_draft else "main"
-        draft_gate: _DraftPublicationGate | None = None
-        strict_draft = False
-        if is_draft:
-            main_loader = _loader_registry.get(ctx.device_id)
-            main_ctx = main_loader._ctx if main_loader is not None else None
-            draft_adapter = draft_weight_adapter_for(
-                type(model).__name__, role="draft", model=model
-            )
-            same_checkpoint = main_ctx is not None and main_ctx.identity == ctx.identity
-            compatible_adapter = (
-                same_checkpoint
-                and draft_adapter is not None
-                and main_loader._draft_weight_adapter is not None
-                and draft_adapter.compatible_main(main_loader._draft_weight_adapter)
-            )
-            namespace = (
-                draft_tensor_namespace(
-                    ctx.identity,
-                    main_loader._draft_weight_adapter,
-                    draft_adapter,
-                    type(model).__name__,
-                    _sglang_version(),
-                    envs.MX_MODEL_URI or ctx.identity.model_name,
-                )
-                if compatible_adapter and ctx.identity.pipeline_parallel_size == 1
-                else None
-            )
-            if namespace is not None and not envs.MX_DISABLE_DRAFT_P2P:
-                # Same checkpoint (MTP / NextN): join the main load's
-                # publication through its NIXL agent instead of binding
-                # MX_METADATA_PORT + device_id a second time.
-                ctx.shared_nixl_manager = _nixl_managers.get(ctx.device_id)
-                ctx.draft_tensor_namespace = namespace
-                strict_draft = main_loader._strict_draft_publication
-            else:
-                # Unknown layouts, an unpinned checkpoint or a different
-                # draft identity fall back to SGLang's storage loader.
-                ctx.p2p_enabled = False
-            draft_gate = _draft_publication_gates.pop(ctx.device_id, None)
-        elif _expects_draft_pass():
-            self._draft_weight_adapter = draft_weight_adapter_for(
-                type(model).__name__, role="main", model=model
-            )
-            self._strict_draft_publication = (
-                self._draft_weight_adapter is not None and not envs.MX_DISABLE_DRAFT_P2P
-            )
-            if self._strict_draft_publication or not envs.MX_ARTIFACT_READY_URL.strip():
-                main_gate = _DraftPublicationGate(
-                    grace_secs=None if self._strict_draft_publication else 600.0
-                )
-                _draft_publication_gates[ctx.device_id] = main_gate
-                if envs.MX_ARTIFACT_READY_URL.strip():
-                    ctx.source_ready_fn = (
-                        lambda: main_gate.is_open() and _sglang_health_ready(ctx)
-                    )
-                else:
-                    ctx.source_ready_fn = main_gate.is_open
-        elif not is_draft:
-            self._draft_weight_adapter = draft_weight_adapter_for(
-                type(model).__name__, role="main", model=model
-            )
-        if not is_draft and ctx.source_ready_fn is None and envs.MX_ARTIFACT_READY_URL.strip():
+        if envs.MX_ARTIFACT_READY_URL.strip():
             ctx.source_ready_fn = lambda: _sglang_health_ready(ctx)
-        if not is_draft:
-            self._ctx = ctx
+        self._ctx = ctx
 
         logger.info(
             "[Worker %s] SGLang MxModelLoader starting (model=%s, "
@@ -296,16 +151,7 @@ class MxModelLoader:
             ctx.p2p_enabled,
             ctx.p2p_role,
         )
-        try:
-            model = self._run_nixl_load(model, ctx)
-        finally:
-            if draft_gate is not None and (
-                not strict_draft or ctx.draft_published
-            ):
-                draft_gate.release()
-            main_gate_pending = _draft_publication_gates.get(ctx.device_id)
-            if not is_draft and main_gate_pending is not None:
-                main_gate_pending.arm()
+        model = self._run_nixl_load(model, ctx)
 
         total_time = time.perf_counter() - load_start
         logger.info(
@@ -330,25 +176,17 @@ class MxModelLoader:
         ):
             model = self._run_load_strategy_chain(model, ctx)
 
-        if not is_main:
-            if ctx.p2p_enabled and ctx.nixl_manager is not None:
-                # Same checkpoint, same SourceIdentity: extend the main load's
-                # manifest instead of registering a second source under a
-                # colliding mx_source_id.
-                _tensor_registry.setdefault(ctx.device_id, {}).update(ctx.tensors)
-            return model
-
-        _loader_registry[ctx.device_id] = self
-        _tensor_registry[ctx.device_id] = ctx.tensors
+        key = publication_key(ctx.device_id, ctx.publication_namespace)
+        _tensor_registry[key] = ctx.tensors
         if ctx.nixl_manager is not None:
-            _nixl_managers[ctx.device_id] = ctx.nixl_manager
+            _nixl_managers[key] = ctx.nixl_manager
         else:
-            _nixl_managers.pop(ctx.device_id, None)
-
-        with selection_metrics.time_load_phase(
-            "sglang", ctx.identity.model_name, "publish"
-        ):
-            schedule_sglang_cache_artifact_publish(ctx)
+            _nixl_managers.pop(key, None)
+        if is_main:
+            with selection_metrics.time_load_phase(
+                "sglang", ctx.identity.model_name, "publish"
+            ):
+                schedule_sglang_cache_artifact_publish(ctx)
         return model
 
     def _load_model_via_transfer_engine(

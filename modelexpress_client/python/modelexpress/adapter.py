@@ -186,6 +186,10 @@ class EngineAdapter:
         """Return whether this engine is running on a CUDA-like platform."""
         return False
 
+    def uses_main_checkpoint(self) -> bool:
+        """Return whether a draft can inherit the main ModelStreamer URI."""
+        return False
+
     def requires_exact_tensor_catalog(self) -> bool:
         """Return whether RDMA must cover every source and target tensor."""
         return False

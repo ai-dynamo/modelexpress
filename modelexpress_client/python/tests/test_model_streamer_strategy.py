@@ -128,6 +128,63 @@ class TestModelStreamerIsAvailable:
                 assert strategy.is_available(ctx) is False
 
 
+@pytest.mark.parametrize(
+    "role,namespace,main_uri,draft_uri,weights,path,expected_uri,available",
+    [
+        ("draft", "sglang-draft-0", None, "s3://draft", None, "/draft",
+         "s3://draft", True),
+        ("draft", "sglang-draft-0", "s3://main", "s3://draft", "/weights", "/draft",
+         "s3://draft", True),
+        ("draft", "sglang-draft-0", "s3://main", None, "/weights", "/draft",
+         "/weights", True),
+        ("draft", "sglang-draft-0", "s3://main", None, None, "/draft",
+         "/draft", True),
+        ("draft", "sglang-draft-0", None, None, None, "/draft", "/draft", True),
+        ("draft", "sglang-draft-0", "s3://main", None, None, None, "", False),
+        ("main", "", None, "s3://draft", None, "/main", "/main", False),
+        ("main", "", "s3://main", "s3://draft", None, "/main", "s3://main", True),
+        ("draft", "", "s3://main", "s3://draft", None, "/shared", "s3://main", True),
+        ("draft", "", None, "s3://draft", None, "/shared", "/shared", False),
+    ],
+)
+def test_role_uri_selection_matches_streamer_availability_and_loading(
+    role, namespace, main_uri, draft_uri, weights, path, expected_uri, available,
+    monkeypatch,
+):
+    from modelexpress.load_strategy.model_streamer_strategy import (
+        ModelStreamerStrategy,
+        _resolve_model_uri,
+    )
+
+    for name, value in (("MX_MODEL_URI", main_uri), ("MX_DRAFT_MODEL_URI", draft_uri)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    ctx = _make_load_context(
+        p2p_role=role,
+        publication_namespace=namespace,
+        model_config=SimpleNamespace(model_weights=weights, model_path=path),
+    )
+    strategy = ModelStreamerStrategy()
+    assert _resolve_model_uri(ctx) == expected_uri
+    with (
+        patch("importlib.util.find_spec", return_value=MagicMock()),
+        patch.object(
+            ctx.adapter, "build_model_streamer_weight_iter", return_value=iter(())
+        ) as stream,
+    ):
+        assert strategy.is_available(ctx) is available
+        if available:
+            model = MagicMock()
+            model.load_weights.side_effect = list
+            result = strategy.load(LoadResult(model, model), ctx)
+            assert result.model is model
+            stream.assert_called_once_with(expected_uri, model=model)
+        else:
+            stream.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # TestModelStreamerLoad
 # ---------------------------------------------------------------------------

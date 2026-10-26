@@ -19,6 +19,9 @@ def test_defaults_when_unset(monkeypatch):
         "MX_MS_DISTRIBUTED",
         "MX_LOAD_STRATEGY_CHAIN",
         "MX_DISABLE_DRAFT_P2P",
+        "MX_DRAFT_MODEL_URI",
+        "MX_DRAFT_MODEL_REVISION",
+        "MX_DRAFT_PORT_OFFSET",
         "MX_PLUGIN_DIR",
         "MX_LOAD_PLUGIN",
         "MX_LOAD_PLUGIN_BEFORE",
@@ -40,6 +43,9 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_ARTIFACT_BACKEND == "nixl"
     assert envs.MX_METADATA_PORT == 5555
     assert envs.MX_WORKER_GRPC_PORT == 6555
+    assert envs.MX_DRAFT_PORT_OFFSET == 10000
+    assert envs.MX_DRAFT_MODEL_URI is None
+    assert envs.MX_DRAFT_MODEL_REVISION == ""
     assert envs.MX_POOL_REG is False
     assert envs.MX_VMM_ARENA is False
     assert envs.MX_MS_DISTRIBUTED is True
@@ -71,6 +77,8 @@ def test_artifact_backend_normalization(monkeypatch, value, expected):
 
 
 def test_int_and_float_parsing(monkeypatch):
+    monkeypatch.setenv("MX_DRAFT_PORT_OFFSET", "2000")
+    assert envs.MX_DRAFT_PORT_OFFSET == 2000
     monkeypatch.setenv("MX_METADATA_PORT", "1234")
     monkeypatch.setenv("MX_GDS_TIMEOUT", "1.5")
     monkeypatch.setenv("MX_SOURCE_QUERY_TIMEOUT", "42")
@@ -137,6 +145,10 @@ def test_normalization(monkeypatch):
 
 
 def test_raw_optional_passthrough(monkeypatch, tmp_path):
+    monkeypatch.setenv("MX_DRAFT_MODEL_URI", "s3://bucket/draft")
+    monkeypatch.setenv("MX_DRAFT_MODEL_REVISION", "draft-sha")
+    assert envs.MX_DRAFT_MODEL_URI == "s3://bucket/draft"
+    assert envs.MX_DRAFT_MODEL_REVISION == "draft-sha"
     monkeypatch.delenv("MX_MODEL_URI", raising=False)
     assert envs.MX_MODEL_URI is None
     monkeypatch.setenv("MX_MODEL_URI", "s3://bucket/model")
