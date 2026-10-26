@@ -178,26 +178,43 @@ Shared client settings are registered in `modelexpress.envs`. RL settings are li
 ### Canonical S3 Transfer Tuning
 
 Objects below the configured thresholds use one PUT or GET. Larger uploads use
-multipart parts, and larger downloads use ranged GETs through one persistent
-`s3transfer.TransferManager` per `S3Client`. The receiver's file-level pool and
-the manager's global request concurrency use the same worker setting, so all
-whole-object and ranged data GETs share one 16-request budget. HEAD requests use
-the manager's separate submission executor. Downloads target a seekable
-`BytesIO`, so the complete downloaded object remains resident; the I/O settings
-below bound queued chunks, not the final object size.
+multipart parts. Downloads default to one persistent `s3transfer.TransferManager`
+per `S3Client`. Set `MX_S3_DOWNLOAD_BACKEND=ranged` to opt in to parallel GETs
+into a preallocated buffer.
+This affects canonical S3 artifact downloads for refit and recovery; the normal
+ModelStreamer loading path has its own downloader.
+
+The ranged backend starts with HEAD for size and ETag. Below the range threshold,
+it performs one whole-object GET; otherwise it issues parallel ranges. All data
+GETs, including the first range and body-read retries, share one per-client pool
+limited by `MX_REFIT_DOWNLOAD_WORKERS` (falling back to `MX_S3_DOWNLOAD_WORKERS`,
+then 16). HEAD requests are outside this data-GET budget. Every GET is pinned to
+the HEAD ETag with `IfMatch`; an object change or an invalid range response fails
+without retrying. Endpoints must support HEAD, conditional GET, and byte ranges.
+Select `transfer_manager` explicitly to return to the default implementation;
+there is no automatic backend switch on an error.
+
+Ranges write directly into a preallocated `BytesIO` buffer. Exported views are
+released before returning immutable `bytes`, avoiding a second full-object
+allocation on CPython. Older SDK bodies without `readinto` use bounded read
+chunks. The complete object remains resident, and concurrent file downloads and
+retained delta shards add to peak memory; this is not a bounded-memory model
+streamer. Validate peak RSS and throughput on your target endpoint and runtime
+before enabling it for large models.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `MX_S3_DOWNLOAD_BACKEND` | `transfer_manager` | `transfer_manager` or opt-in `ranged` |
 | `MX_S3_MULTIPART_THRESHOLD_BYTES` | `104857600` (100 MiB) | Minimum object size for multipart upload |
 | `MX_S3_UPLOAD_PART_BYTES` | `16777216` (16 MiB) | Multipart upload part size |
 | `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart part uploads |
 | `MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES` | `104857600` (100 MiB) | Minimum object size for parallel ranged download |
 | `MX_S3_DOWNLOAD_RANGE_BYTES` | `8388608` (8 MiB) | Byte-range size for parallel downloads |
-| `MX_S3_DOWNLOAD_WORKERS` | `16` | Receiver file-worker limit and shared whole/ranged data GET concurrency budget |
-| `MX_S3_DOWNLOAD_IO_CHUNK_BYTES` | `1048576` (1 MiB) | TransferManager I/O queue chunk size |
-| `MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS` | `16` | Sets `max_io_queue_size` and the non-seekable-output chunk limit. For the seekable `BytesIO` target, the default bounds queued I/O to about 16 MiB but does not cap the full downloaded object |
+| `MX_S3_DOWNLOAD_WORKERS` | `16` | Legacy fallback for `MX_REFIT_DOWNLOAD_WORKERS`; sets file-worker and per-client data GET limits for either backend |
+| `MX_S3_DOWNLOAD_IO_CHUNK_BYTES` | `1048576` (1 MiB) | TransferManager I/O queue chunk size; ranged-backend read chunk limit for SDK bodies without `readinto` |
+| `MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS` | `16` | TransferManager only: sets `max_io_queue_size` and the non-seekable-output chunk limit. For the seekable `BytesIO` target, the default bounds queued I/O to about 16 MiB but does not cap the full downloaded object |
 | `MX_S3_MAX_POOL_CONNECTIONS` | `32` | Botocore HTTP connection-pool size |
-| `MX_S3_MAX_ATTEMPTS` | `5` | Botocore total request attempts and TransferManager post-200 streaming-download attempts |
+| `MX_S3_MAX_ATTEMPTS` | `5` | Botocore total request attempts and per-download (TransferManager) or per-range (ranged backend) body-read attempts |
 | `MX_S3_TCP_KEEPALIVE` | `true` | Enable TCP keepalive for S3 connections |
 
 ### UCX/NIXL Tuning

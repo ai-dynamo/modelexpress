@@ -58,6 +58,7 @@ class S3Client:
         from botocore.config import Config as BotoConfig
         from s3transfer.manager import TransferConfig, TransferManager
 
+        backend = rl_envs.MX_S3_DOWNLOAD_BACKEND
         self._multipart_threshold_bytes = rl_envs.MX_S3_MULTIPART_THRESHOLD_BYTES
         self._upload_part_bytes = rl_envs.MX_S3_UPLOAD_PART_BYTES
         if not (
@@ -83,20 +84,32 @@ class S3Client:
             max_workers=rl_envs.MX_S3_UPLOAD_WORKERS,
             thread_name_prefix="modelexpress-s3-upload",
         )
-        self._download_manager = TransferManager(
-            self._client,
-            config=TransferConfig(
-                multipart_threshold=rl_envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES,
-                multipart_chunksize=rl_envs.MX_S3_DOWNLOAD_RANGE_BYTES,
-                max_request_concurrency=rl_envs.MX_S3_DOWNLOAD_WORKERS,
-                io_chunksize=rl_envs.MX_S3_DOWNLOAD_IO_CHUNK_BYTES,
-                max_io_queue_size=(rl_envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS),
-                max_in_memory_download_chunks=(
-                    rl_envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS
+        self._download_manager = None
+        self._download_pool = None
+        if backend == "ranged":
+            self._range_bytes = rl_envs.MX_S3_DOWNLOAD_RANGE_BYTES
+            self._range_threshold_bytes = rl_envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES
+            self._max_attempts = rl_envs.MX_S3_MAX_ATTEMPTS
+            self._io_chunk_bytes = rl_envs.MX_S3_DOWNLOAD_IO_CHUNK_BYTES
+            self._download_pool = ThreadPoolExecutor(
+                max_workers=rl_envs.MX_S3_DOWNLOAD_WORKERS,
+                thread_name_prefix="modelexpress-s3-range",
+            )
+        else:
+            self._download_manager = TransferManager(
+                self._client,
+                config=TransferConfig(
+                    multipart_threshold=rl_envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES,
+                    multipart_chunksize=rl_envs.MX_S3_DOWNLOAD_RANGE_BYTES,
+                    max_request_concurrency=rl_envs.MX_S3_DOWNLOAD_WORKERS,
+                    io_chunksize=rl_envs.MX_S3_DOWNLOAD_IO_CHUNK_BYTES,
+                    max_io_queue_size=(rl_envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS),
+                    max_in_memory_download_chunks=(
+                        rl_envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS
+                    ),
+                    num_download_attempts=rl_envs.MX_S3_MAX_ATTEMPTS,
                 ),
-                num_download_attempts=rl_envs.MX_S3_MAX_ATTEMPTS,
-            ),
-        )
+            )
 
     def put(self, *, uri: str, data: bytes) -> None:
         """Create an immutable object, accepting an identical retry."""
@@ -186,9 +199,117 @@ class S3Client:
     def get(self, uri: str) -> bytes:
         """Read one S3 object."""
         bucket, key = _parse_uri(uri)
-        target = BytesIO()
-        self._download_manager.download(bucket, key, target).result()
-        return target.getvalue()
+        if self._download_manager is not None:
+            target = BytesIO()
+            self._download_manager.download(bucket, key, target).result()
+            return target.getvalue()
+        return self._get_ranged(bucket, key)
+
+    def _get_ranged(self, bucket: str, key: str) -> bytes:
+        metadata = self._client.head_object(Bucket=bucket, Key=key)
+        total = int(metadata["ContentLength"])
+        etag = metadata["ETag"]
+        if total == 0:
+            return b""
+        step = self._range_bytes if total >= self._range_threshold_bytes else total
+        with BytesIO() as target:
+            target.seek(total - 1)
+            target.write(b"\0")
+            with target.getbuffer() as view:
+                futures = []
+                try:
+                    for start in range(0, total, step):
+                        futures.append(
+                            self._download_pool.submit(
+                                self._read_range,
+                                bucket,
+                                key,
+                                etag,
+                                total,
+                                start,
+                                min(start + step, total),
+                                view,
+                                total >= self._range_threshold_bytes,
+                            )
+                        )
+                    for future in futures:
+                        future.result()
+                except Exception:
+                    for future in futures:
+                        future.cancel()
+                    wait(futures)
+                    raise
+            # Release exported views before BytesIO exposes its immutable backing.
+            return target.getvalue()
+
+    def _read_range(
+        self,
+        bucket: str,
+        key: str,
+        etag: str,
+        total: int,
+        start: int,
+        end: int,
+        view: memoryview,
+        ranged: bool,
+    ) -> None:
+        from botocore.exceptions import (
+            ConnectionClosedError,
+            IncompleteReadError,
+            ReadTimeoutError,
+            ResponseStreamingError,
+        )
+
+        request = {"Bucket": bucket, "Key": key, "IfMatch": etag}
+        if ranged:
+            request["Range"] = f"bytes={start}-{end - 1}"
+        for attempt in range(self._max_attempts):
+            # Botocore handles request retries; only body reads are retried here.
+            response = self._client.get_object(**request)
+            body = response["Body"]
+            try:
+                if response.get("ETag") != etag:
+                    raise ValueError(
+                        f"S3 object changed during download: {bucket}/{key}"
+                    )
+                if (
+                    ranged
+                    and response.get("ContentRange")
+                    != f"bytes {start}-{end - 1}/{total}"
+                ):
+                    raise ValueError(f"invalid S3 ContentRange for {bucket}/{key}")
+                if int(response["ContentLength"]) != end - start:
+                    raise ValueError(f"invalid S3 ContentLength for {bucket}/{key}")
+                with view[start:end] as part:
+                    offset = 0
+                    while offset < len(part):
+                        with part[offset:] as remaining:
+                            readinto = getattr(body, "readinto", None)
+                            if readinto is not None:
+                                count = readinto(remaining)
+                            else:
+                                chunk = body.read(
+                                    min(len(remaining), self._io_chunk_bytes)
+                                )
+                                count = len(chunk)
+                                remaining[:count] = chunk
+                        if not count:
+                            raise OSError(f"short S3 range read for {bucket}/{key}")
+                        offset += count
+                if body.read(1):
+                    raise OSError(f"long S3 range read for {bucket}/{key}")
+                return
+            except (
+                OSError,
+                ConnectionClosedError,
+                IncompleteReadError,
+                ReadTimeoutError,
+                ResponseStreamingError,
+            ):
+                if attempt == self._max_attempts - 1:
+                    raise
+            finally:
+                body.close()
 
     def size(self, uri: str) -> int:
         """Return one S3 object's byte size without downloading its payload."""
@@ -198,7 +319,10 @@ class S3Client:
     def close(self) -> None:
         """Close the underlying SDK client when supported."""
         self._upload_pool.shutdown()
-        self._download_manager.shutdown()
+        if self._download_manager is not None:
+            self._download_manager.shutdown()
+        if self._download_pool is not None:
+            self._download_pool.shutdown()
         close = getattr(self._client, "close", None)
         if close is not None:
             close()

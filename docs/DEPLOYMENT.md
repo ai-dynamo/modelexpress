@@ -11,6 +11,11 @@ For RL generator checkpoint-cache capacity and
 `MX_REFIT_CHECKPOINT_MAX_SIZE_GB`, see the
 [RL checkpoint-cache configuration](rl/CONFIGURATION.md#generator-refit-checkpoint-cache).
 
+For canonical S3 refit and recovery downloads, `MX_S3_DOWNLOAD_BACKEND=ranged`
+opts in to parallel reads into a preallocated buffer. TransferManager remains
+the default. See [S3 transfer tuning](../modelexpress_client/python/README.md#canonical-s3-transfer-tuning)
+for concurrency, endpoint compatibility, and memory sizing.
+
 ## Server Configuration
 
 ModelExpress uses a layered configuration system. Sources are applied in order of precedence:

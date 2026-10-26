@@ -27,7 +27,8 @@ RL-specific settings are registered in `modelexpress_rl/envs.py` and imported th
 | `MX_MODEL_NAME_OVERRIDE` | (unset) | Override vLLM's MX model identity without changing its model-loading path. Set before worker startup and use the same name for RL trainers and WeightVersions. Unset or empty preserves vLLM's configured model path/ID, including rewritten S3 cache paths. |
 | `MX_REFIT_DELTA_BUCKET_BYTES` | `536870912` (512 MiB) | Optional framework integration override for canonical delta tensor-bucket size; native framework bucket settings take precedence. |
 | `MX_REFIT_DELTA_WORKERS` | `min(32, CPU count)` | CPU worker pool for XOR delta computation and application. |
-| `MX_REFIT_DOWNLOAD_WORKERS` | `MX_S3_DOWNLOAD_WORKERS`, then `16` | Concurrent shard downloads for S3 and Azure; also sets S3 transfer-manager request concurrency. |
+| `MX_REFIT_DOWNLOAD_WORKERS` | `MX_S3_DOWNLOAD_BACKEND` | `transfer_manager` | Canonical S3 artifact downloader: `transfer_manager` or opt-in `ranged`. See [transfer tuning](../../modelexpress_client/python/README.md#canonical-s3-transfer-tuning) for compatibility and memory requirements. |
+| `MX_S3_DOWNLOAD_WORKERS`, then `16` | Concurrent shard downloads for S3 and Azure; also sets the per-client S3 data GET concurrency for either backend. |
 | `MX_S3_DOWNLOAD_WORKERS` | `16` | Legacy fallback when `MX_REFIT_DOWNLOAD_WORKERS` is unset. |
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum format written by canonical S3 trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object; oversized tensors occupy a separate object. |

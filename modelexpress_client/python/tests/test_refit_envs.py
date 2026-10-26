@@ -36,6 +36,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_RESHARD_PUBLISH_DIGEST is False
     assert envs.MX_S3_MULTIPART_THRESHOLD_BYTES == 100 * 1024**2
     assert envs.MX_S3_UPLOAD_PART_BYTES == 16 * 1024**2
+    assert envs.MX_S3_DOWNLOAD_BACKEND == "transfer_manager"
     assert envs.MX_S3_UPLOAD_WORKERS == 8
     assert envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES == 100 * 1024**2
     assert envs.MX_S3_DOWNLOAD_RANGE_BYTES == 8 * 1024**2
@@ -292,3 +293,16 @@ def test_generator_source_order_and_redis_url_keep_raw_defaults(monkeypatch):
     monkeypatch.setenv("MX_REDIS_URL", "redis://redis:6379")
     assert envs.MX_GENERATOR_SOURCE_ORDER == "TRAINER,GENERATOR"
     assert envs.MX_REDIS_URL == "redis://redis:6379"
+
+
+@pytest.mark.parametrize("value", ["ranged", " RANGED ", "transfer_manager"])
+def test_s3_download_backend_selection(monkeypatch, value):
+    monkeypatch.setenv("MX_S3_DOWNLOAD_BACKEND", value)
+    assert envs.MX_S3_DOWNLOAD_BACKEND == value.strip().lower()
+
+
+@pytest.mark.parametrize("value", ["", "auto", "true"])
+def test_s3_download_backend_rejects_unknown_values(monkeypatch, value):
+    monkeypatch.setenv("MX_S3_DOWNLOAD_BACKEND", value)
+    with pytest.raises(ValueError, match="MX_S3_DOWNLOAD_BACKEND"):
+        _ = envs.MX_S3_DOWNLOAD_BACKEND
