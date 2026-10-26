@@ -31,6 +31,10 @@ fn required(value: &str, field: &str) -> Result<(), Status> {
     }
 }
 
+/// Characters a slot id may not contain: the Redis records and lane encodings
+/// split on them. Shared by the expected-slot and incoming-slot checks.
+const SLOT_DELIMITERS: &[char] = &['\0', '\n', '\r', '|', ','];
+
 fn delimiter_free(value: &str, field: &str, delimiters: &[char]) -> Result<(), Status> {
     if let Some(delimiter) = delimiters
         .iter()
@@ -102,7 +106,7 @@ fn validate_spec(spec: Option<&CollectiveGroupSpec>) -> Result<&CollectiveGroupS
             required(slot, field)?;
             // `,` is the slot separator inside the stored lane set
             // (`encode_lanes`); a slot carrying one would decode as two.
-            delimiter_free(slot, field, &['\0', '\n', '\r', '|', ','])?;
+            delimiter_free(slot, field, SLOT_DELIMITERS)?;
         }
     }
     if spec
@@ -192,7 +196,7 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
         required(&request.slot_id, "slot_id")?;
         required(&request.worker_id, "worker_id")?;
         required(&request.plan_digest, "plan_digest")?;
-        delimiter_free(&request.slot_id, "slot_id", &['\0', '\n', '\r', '|', ','])?;
+        delimiter_free(&request.slot_id, "slot_id", SLOT_DELIMITERS)?;
         delimiter_free(&request.worker_id, "worker_id", &['\0', '|'])?;
 
         let role = CollectiveRole::try_from(request.role).unwrap_or(CollectiveRole::Unspecified);
