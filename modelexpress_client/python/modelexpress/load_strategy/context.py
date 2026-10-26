@@ -90,21 +90,23 @@ class LoadContext:
     accelerator_backend: AcceleratorBackend = field(
         default_factory=CudaAcceleratorBackend
     )
-    # "main" for the primary load; "draft" for the speculative second pass
-    # on the same worker. The draft shares the main load's NIXL agent,
-    # metadata port and SourceIdentity rather than publishing its own.
+    # "main" for the primary load; "draft" for a speculative model load.
     p2p_role: str = "main"
     # A separate draft is advertised within its main model's publication.
     p2p_source_identity: p2p_pb2.SourceIdentity | None = None
     # Independent drafts must not inherit the main checkpoint's MX_MODEL_URI.
     model_streamer_uri: str | None = None
+    # Independent models on the same rank own separate serving resources.
+    # Empty retains the primary/legacy shared-draft publication.
+    publication_namespace: str = ""
+    port_offset: int = 0
     # Draft manifests can refine this to a compatibility-digested namespace.
     draft_tensor_namespace: str = DRAFT_TENSOR_PREFIX
     # False keeps a load out of P2P entirely (no registration, no RDMA).
     p2p_enabled: bool = True
     # Replica-wide cold-start fallback skips peer reads but still publishes.
     skip_rdma: bool = False
-    # Draft pass only: the main load's already-initialized NIXL manager. The
+    # Legacy shared draft only: the main load's initialized NIXL manager. The
     # draft registers into it instead of binding MX_METADATA_PORT + device_id
     # a second time.
     shared_nixl_manager: NixlTransferManager | None = None
@@ -135,3 +137,7 @@ class LoadContext:
     # Reload only: refuse a peer catalog that does not name every target
     # tensor before any write, instead of warning and refilling a subset.
     require_exact_tensor_catalog: bool = False
+
+    @property
+    def shares_main_publication(self) -> bool:
+        return self.p2p_role == "draft" and not self.publication_namespace

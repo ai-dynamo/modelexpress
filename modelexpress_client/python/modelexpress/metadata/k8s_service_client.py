@@ -75,8 +75,10 @@ class MxK8sServiceClient(MxClientBase):
         service_pattern: str | None = None,
         max_retries: int | None = None,
         backoff_seconds: float | None = None,
+        port_offset: int = 0,
     ):
         self._worker_rank = worker_rank
+        self._port_offset = port_offset
         self._service_pattern = service_pattern or envs.MX_K8S_SERVICE_PATTERN
         env_retries = envs.MX_K8S_SOURCE_RETRIES
         self._max_retries = (
@@ -303,13 +305,17 @@ class MxK8sServiceClient(MxClientBase):
         """Substitute ``{rank}`` into the pattern; auto-append port if absent.
 
         If the pattern resolves to a string containing ``:`` (explicit
-        ``host:port``), it is used verbatim. If the pattern is a bare
+        ``host:port``), that port is used as the base. If the pattern is a bare
         hostname, the client appends ``:{MX_WORKER_GRPC_PORT + rank}`` so
         the multi-GPU-per-pod Shape-2 topology (one Service with N named
         ports) works without any explicit port encoding in the pattern.
+        Independent model sessions add their port offset in either case.
         """
         resolved = self._service_pattern.format(rank=self._worker_rank)
         if ":" in resolved:
-            return resolved
-        base_port = envs.MX_WORKER_GRPC_PORT
+            if not self._port_offset:
+                return resolved
+            host, port = resolved.rsplit(":", 1)
+            return f"{host}:{int(port) + self._port_offset}"
+        base_port = envs.MX_WORKER_GRPC_PORT + self._port_offset
         return f"{resolved}:{base_port + self._worker_rank}"
