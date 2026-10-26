@@ -52,11 +52,15 @@ object-store-reqwest = { package = "reqwest", version = "0.13", default-features
 prometheus-client = { version = "0.25", default-features = false }
 prost = "0.13"
 rustls = { version = "0.23.46", default-features = false }
+rustls-native-certs = "0.8.3"
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 mockall = "0.14.0"
 tempfile = "3.20"
 tokio = { version = "1.46", features = ["full"] }
+tokio-openssl = "0.6.5"
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["tls12"] }
 tokio-stream = "0.1"
 tonic = "0.13"
 tonic-build = "0.13"
@@ -68,6 +72,7 @@ uuid = { version = "1.17", features = ["v4", "serde"] }
 thiserror = "2.0"
 tower = { version = "0.5.3", features = ["util"] }
 http = "1.4.1"
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 moka = { version = "0.12.15", features = ["future"] }
 secrecy = "0.10.3"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
