@@ -537,6 +537,9 @@ class VllmAdapter(EngineAdapter):
             disk_config.load_format = "auto"
         except AttributeError:
             object.__setattr__(disk_config, "load_format", "auto")
+        # DefaultModelLoader rejects streamer-only keys such as distributed and
+        # memory_limit, so the native fallback loads without extra config.
+        _set_load_config_extra_config(disk_config, {})
 
         DefaultModelLoader(disk_config).load_weights(result.model, self.model_config)
         return result
