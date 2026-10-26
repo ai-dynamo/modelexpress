@@ -20,7 +20,7 @@ use kube::{
     Client,
     api::{Api, ListParams, Patch, PatchParams, PostParams},
 };
-use modelexpress_common::digest::DigestError;
+use modelexpress_common::digest::{DigestError, sha256_hex};
 use modelexpress_common::models::{ModelProvider, ModelStatus};
 use serde_json::json;
 use std::{
@@ -129,7 +129,7 @@ fn sanitize_registry_name(model_name: &str) -> Result<String, DigestError> {
         }
     }
     let trimmed = out.trim_matches(|c: char| c == '-' || c == '.');
-    let hash = hex_sha256(model_name)?;
+    let hash = sha256_hex(model_name.as_bytes())?;
     let hash_suffix = &hash[..HASH_SUFFIX_LEN];
     if trimmed.is_empty() {
         // Degenerate input ("", "///", "---"): emit just the hash.
@@ -140,10 +140,6 @@ fn sanitize_registry_name(model_name: &str) -> Result<String, DigestError> {
     let prefix_len = trimmed.len().min(max_prefix);
     let prefix = &trimmed[..prefix_len];
     Ok(format!("{prefix}-{hash_suffix}"))
-}
-
-fn hex_sha256(s: &str) -> Result<String, DigestError> {
-    modelexpress_common::digest::sha256_hex(s.as_bytes())
 }
 
 pub struct KubernetesRegistryBackend {

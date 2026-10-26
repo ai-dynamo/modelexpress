@@ -10,7 +10,7 @@
 pub struct DigestError(String);
 
 #[cfg(feature = "tls-native")]
-pub fn sha256(bytes: &[u8]) -> Result<[u8; 32], DigestError> {
+fn sha256(bytes: &[u8]) -> Result<[u8; 32], DigestError> {
     sha256_in(None, bytes).map_err(|err| DigestError(err.to_string()))
 }
 
@@ -29,7 +29,7 @@ fn sha256_in(
 }
 
 #[cfg(not(feature = "tls-native"))]
-pub fn sha256(bytes: &[u8]) -> Result<[u8; 32], DigestError> {
+fn sha256(bytes: &[u8]) -> Result<[u8; 32], DigestError> {
     use sha2::{Digest, Sha256};
     Ok(Sha256::digest(bytes).into())
 }

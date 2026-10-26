@@ -4,11 +4,10 @@
 //! Redis implementation of the Refit control-plane backend.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use modelexpress_common::digest::sha256;
+use modelexpress_common::digest::sha256_hex;
 use modelexpress_common::grpc::refit::{
     CreateTrainerMeshRequest, CreateWeightVersionRequest, DeleteVersionLeaseRequest,
     DeleteWeightVersionShardRequest, ObjectStorageSource, ObjectStorageType,
@@ -80,13 +79,9 @@ fn idempotency_key(model_name: &str, request_key: &str) -> String {
 }
 
 fn lease_id(version_id: &str, worker_id: &str) -> RefitResult<String> {
-    let digest = sha256(format!("{version_id}\0{worker_id}").as_bytes())
+    let digest = sha256_hex(format!("{version_id}\0{worker_id}").as_bytes())
         .map_err(|error| RefitBackendError::Internal(error.to_string()))?;
-    let mut id = String::with_capacity(8);
-    for byte in &digest[..4] {
-        let _ = write!(id, "{byte:02x}");
-    }
-    Ok(id)
+    Ok(digest[..8].to_string())
 }
 
 fn now_unix_ms() -> RefitResult<u64> {

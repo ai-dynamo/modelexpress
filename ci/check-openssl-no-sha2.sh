@@ -2,12 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# The openssl build hashes through OpenSSL (modelexpress_common::digest), so the
-# pure-Rust sha2 crate must not be a runtime dependency of that build. A direct
-# `use sha2::...` in a crate built with --features openssl re-adds it; use
-# modelexpress_common::digest::{sha256, sha256_hex} instead.
-#
-# Usage: ci/check-openssl-no-sha2.sh
+# The openssl build hashes with OpenSSL, so sha2 must not be a runtime dependency of it.
+# A direct `use sha2::...` re-adds it; call modelexpress_common::digest::sha256_hex instead.
 
 set -euo pipefail
 
