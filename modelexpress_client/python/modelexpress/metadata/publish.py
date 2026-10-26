@@ -33,12 +33,18 @@ PUBLISH_METADATA_RETRYABLE_STATUS_CODES = {
     grpc.StatusCode.DEADLINE_EXCEEDED,
 }
 
-# Global storage for heartbeat threads and worker servers, keyed by device_id.
-_heartbeat_threads: dict[int, PublisherThread] = {}
-_worker_servers: dict[int, "WorkerGrpcServer"] = {}  # P2P mode only
+# Heartbeats use worker rank, servers/manifests use local device ordinal.
+# Independent sessions add a namespace; main/legacy callers retain integer keys.
+PublicationKey = int | tuple[int, str]
+_heartbeat_threads: dict[PublicationKey, PublisherThread] = {}
+_worker_servers: dict[PublicationKey, "WorkerGrpcServer"] = {}  # P2P mode only
 # Centralized mode only: the tensor manifest each device's publisher sends,
 # kept extendable so a speculative draft pass can join the publication.
-_central_manifests: dict[int, "_CentralManifest"] = {}
+_central_manifests: dict[PublicationKey, "_CentralManifest"] = {}
+
+
+def publication_key(index: int, namespace: str = "") -> PublicationKey:
+    return (index, namespace) if namespace else index
 
 
 class _CentralManifest:
@@ -52,8 +58,8 @@ class _CentralManifest:
         self.tensor_protos = [*self.tensor_protos, *tensor_protos]
 
 
-def _get_worker_server(device_id: int) -> "WorkerGrpcServer | None":
-    return _worker_servers.get(device_id)
+def _get_worker_server(device_id: int, namespace: str = "") -> "WorkerGrpcServer | None":
+    return _worker_servers.get(publication_key(device_id, namespace))
 
 
 def build_tensor_protos(
@@ -94,6 +100,8 @@ def publish_metadata_and_ready(
     worker_id: str,
     accelerator: str = "cuda",
     ready_fn: Callable[[], bool] | None = None,
+    publication_namespace: str = "",
+    port_offset: int = 0,
     *,
     accelerator_backend: AcceleratorBackend | None = None,
 ) -> None:
@@ -114,6 +122,8 @@ def publish_metadata_and_ready(
         worker_rank,
         accelerator_backend=accelerator_backend or nixl_manager.accelerator_backend,
     )
+    device_key = publication_key(device_id, publication_namespace)
+    worker_key = publication_key(worker_rank, publication_namespace)
 
     # This node's RDMA-fabric location, published once so the topology_aware
     # selector can rank sources by locality. Empty when unconfigured. With a
@@ -138,7 +148,7 @@ def publish_metadata_and_ready(
         host = _get_worker_host()
 
         base_port = envs.MX_WORKER_GRPC_PORT
-        worker_grpc_port = base_port + device_id
+        worker_grpc_port = base_port + port_offset + device_id
 
         grpc_server = WorkerGrpcServer(
             tensor_protos=tensor_protos,
@@ -153,15 +163,16 @@ def publish_metadata_and_ready(
         try:
             actual_port = grpc_server.start()
         except RuntimeError as e:
+            offset_term = f" + port_offset ({port_offset})" if port_offset else ""
             raise RuntimeError(
                 f"Cannot listen on worker gRPC port {worker_grpc_port} = "
-                f"MX_WORKER_GRPC_PORT ({base_port}) + device_id ({device_id}); "
+                f"MX_WORKER_GRPC_PORT ({base_port}){offset_term} + device_id ({device_id}); "
                 "it may collide with another service on this host. Choose an "
-                "MX_WORKER_GRPC_PORT whose range base..base+num_local_devices-1 "
-                f"is free: {e}"
+                "MX_WORKER_GRPC_PORT with a free port range for all local "
+                f"devices in each session: {e}"
             ) from e
-        _worker_servers[device_id] = grpc_server
-        _central_manifests.pop(device_id, None)
+        _worker_servers[device_key] = grpc_server
+        _central_manifests.pop(device_key, None)
 
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=worker_rank,
@@ -188,12 +199,12 @@ def publish_metadata_and_ready(
             return mx_source_id
 
         def cleanup_fn() -> None:
-            if _worker_servers.get(device_id) is grpc_server:
-                _worker_servers.pop(device_id, None)
+            if _worker_servers.get(device_key) is grpc_server:
+                _worker_servers.pop(device_key, None)
             grpc_server.stop()
     else:
         manifest = _CentralManifest(tensor_protos)
-        _central_manifests[device_id] = manifest
+        _central_manifests[device_key] = manifest
 
         def publish_fn() -> str:
             # Built at publish time, not here: a speculative draft pass may
@@ -244,7 +255,7 @@ def publish_metadata_and_ready(
         source_load_provider=make_source_load_provider(device_id),
     )
     publisher.start()
-    _heartbeat_threads[worker_rank] = publisher
+    _heartbeat_threads[worker_key] = publisher
 
 
 def extend_published_tensors(
