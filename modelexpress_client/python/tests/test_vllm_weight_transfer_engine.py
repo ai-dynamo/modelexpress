@@ -88,6 +88,7 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(
     monkeypatch, seed_info
 ):
     """Parse VIME object-storage metadata into generator initialization."""
+    monkeypatch.delenv("MX_REFIT_CHECKPOINT_MAX_SIZE_GB", raising=False)
     client = MagicMock()
     initialize = MagicMock(return_value=client)
     monkeypatch.setattr(
