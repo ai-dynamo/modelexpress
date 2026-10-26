@@ -719,6 +719,7 @@ class MxModelLoader:
                     addr=addr,
                     size=self._byte_size(numel, element_size),
                     device_id=ctx.device_id,
+                    dtype=str(ctx.tensors[name].dtype),
                 )
                 for name, (addr, numel, element_size) in weight_info.items()
             ]

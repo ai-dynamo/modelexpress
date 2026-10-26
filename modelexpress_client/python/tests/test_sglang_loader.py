@@ -1046,6 +1046,7 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat(
         worker_rank=3,
         worker_id="worker-id",
         device_id=1,
+        tensors={"weight": torch.zeros(4, dtype=torch.float16)},
         identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
         mx_client=SimpleNamespace(),
         accelerator_backend=SimpleNamespace(name="cuda"),
@@ -1108,6 +1109,7 @@ def test_transfer_engine_publish_failure_is_deferred_to_publisher():
         worker_rank=3,
         worker_id="worker-id",
         device_id=1,
+        tensors={"weight": torch.zeros(4, dtype=torch.float16)},
         identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
         accelerator_backend=SimpleNamespace(name="cuda"),
         mx_client=SimpleNamespace(

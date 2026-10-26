@@ -26,7 +26,8 @@ def prepare_runtime_tensors(
     For SGLang's block-FP8 CuTeDSL/CUTLASS path, the swizzled tensor's presence
     is the donor's MXFP8 decision. Its layout is defined by SGLang, not by an
     untrusted size from the manifest. Other value-dependent layouts fail the
-    exact catalog check or are rejected here rather than guessed.
+    exact catalog check or are rejected here rather than guessed. Older manifests
+    without a derived scale dtype are rejected so the loader falls back natively.
     """
     source = {tensor.name: tensor for tensor in source_tensors}
     if len(source) != len(source_tensors):
@@ -108,6 +109,8 @@ def finalize_runtime_state(model: torch.nn.Module) -> None:
             if not hasattr(layer, host_name):
                 continue
             scale = getattr(layer, f"{kind}_scale", None)
+            if scale is None:
+                continue
             if not isinstance(scale, torch.Tensor) or scale.numel() != 1:
                 raise ManifestMismatchError(f"Invalid SGLang KV scale at {name}.{kind}")
             value = float(scale.item())

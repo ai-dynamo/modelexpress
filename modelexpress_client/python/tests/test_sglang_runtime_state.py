@@ -100,7 +100,7 @@ def test_received_scales_must_agree_with_manifest(encode, derived):
         finalize_runtime_state(model)
 
 
-@pytest.mark.parametrize("field,value", [("dtype", "torch.float32"), ("size", 1)])
+@pytest.mark.parametrize("field,value", [("dtype", "torch.float32"), ("dtype", ""), ("size", 1)])
 def test_malformed_derived_descriptor_rejected(field, value):
     model = _model()
     source = _manifest()
@@ -154,3 +154,58 @@ def test_invalid_kv_host_scale_rejected(value):
     model.k_scale = torch.tensor(value)
     with pytest.raises(ManifestMismatchError, match="KV scale"):
         finalize_runtime_state(model)
+
+
+def test_unquantized_kv_scales_are_absent():
+    model = torch.nn.Module()
+    model.k_scale = model.v_scale = None
+    model.k_scale_float = model.v_scale_float = None
+    finalize_runtime_state(model)
+    assert model.k_scale_float is None
+    assert model.v_scale_float is None
+
+
+@pytest.mark.parametrize("scale", [1.0, torch.ones(2)])
+def test_malformed_kv_scale_rejected(scale):
+    model = torch.nn.Module()
+    model.k_scale_float = None
+    model.k_scale = scale
+    with pytest.raises(ManifestMismatchError, match="KV scale"):
+        finalize_runtime_state(model)
+
+
+def test_transfer_engine_published_manifest_prepares_mxfp8_receiver(monkeypatch):
+    from modelexpress.engines.sglang.loader import MxModelLoader
+    from modelexpress.metadata.payload import worker_tensor_descriptors
+    from modelexpress import p2p_pb2
+
+    donor = _model()
+    prepare_runtime_tensors(donor, _manifest())
+    tensors = dict(donor.named_parameters())
+    publisher = Mock()
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.loader.PublisherThread", publisher
+    )
+    ctx = SimpleNamespace(
+        tensors=tensors, device_id=0, worker_rank=0, global_rank=0,
+        worker_id="donor", identity=p2p_pb2.SourceIdentity(model_name="test"),
+        accelerator_backend=SimpleNamespace(name="cuda"), mx_client=Mock(),
+    )
+    loader = MxModelLoader(SimpleNamespace(modelexpress_transport="transfer_engine"))
+    weight_info = {
+        name: (tensor.data_ptr(), tensor.numel(), tensor.element_size())
+        for name, tensor in tensors.items()
+    }
+    assert loader._publish_transfer_engine_source(
+        ctx=ctx, session_id="donor-session", weight_info=weight_info
+    )
+    publisher.call_args.kwargs["publish_fn"]()
+    worker = ctx.mx_client.publish_metadata.call_args.args[1]
+    manifest = list(worker_tensor_descriptors(worker))
+    assert {t.name: t.dtype for t in manifest} == {
+        name: str(tensor.dtype) for name, tensor in tensors.items()
+    }
+    receiver = _model()
+    prepare_runtime_tensors(receiver, manifest)
+    assert receiver.proj.weight_scale_inv_swizzled.shape == donor.proj.weight_scale_inv_swizzled.shape
+    assert receiver.proj.weight_scale_inv_swizzled.dtype == torch.uint8
