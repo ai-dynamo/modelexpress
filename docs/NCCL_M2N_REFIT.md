@@ -79,6 +79,10 @@ RefitClientTrainer(
   on all participants. An empty `m2n_abi_version` is replaced by the installed
   distribution that ships `nccl.m2n` (for example `nccl-extensions==X.Y.Z`),
   so peers on different builds do not agree on a digest by default.
+- `MX_NCCL_REFIT_BLOCKING_DATA_PLANE`, `MX_NCCL_REFIT_GROUPED_SUBMISSION`:
+  read once when the client is constructed and part of the plan digest, since
+  both change what a rank does inside native collectives. The client runs the
+  values it hashed, so changing the environment afterwards has no effect.
 - `device`: CUDA device for the communicators; `None` uses the current device.
 - `streams`: lane `i` runs on `streams[i % len(streams)]`. `None` or empty
   runs all lanes on the current stream.
