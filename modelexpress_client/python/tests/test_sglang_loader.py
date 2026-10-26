@@ -817,7 +817,11 @@ def test_mx_model_loader_delegates_transfer_engine_transport_in_mx_package():
     )
 
 
-def test_transfer_engine_receive_failure_reinitializes_before_native_fallback():
+@pytest.mark.parametrize("draft", [False, True])
+def test_transfer_engine_receive_failure_reinitializes_before_native_fallback(
+    draft, monkeypatch
+):
+    monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", "0")
     transfer_engine = MagicMock()
     transfer_engine.register_memory.return_value = 0
     transfer_engine.batch_transfer_sync_read.return_value = -1
@@ -844,7 +848,8 @@ def test_transfer_engine_receive_failure_reinitializes_before_native_fallback():
     ]
     adapter.reinit_for_retry.return_value = fresh_result
     adapter.load_via_native.return_value = native_result
-    ctx = build_sglang_load_context(load_config, _model_config(), _device_config())
+    model_config = _model_config(is_draft_model=draft)
+    ctx = build_sglang_load_context(load_config, model_config, _device_config())
     ctx.adapter = adapter
     source_worker = p2p_pb2.WorkerMetadata(
         transfer_engine_session_id="source-session",
@@ -871,24 +876,29 @@ def test_transfer_engine_receive_failure_reinitializes_before_native_fallback():
     ) as publish:
         loaded = loader._load_model_via_transfer_engine(
             model=initial_model,
-            model_config=_model_config(),
+            model_config=model_config,
             device_config=_device_config(),
         )
 
     assert loaded is native_model
+    assert ctx.p2p_role == ("draft" if draft else "main")
     transfer_engine.unregister_memory.assert_called_once_with(
         target_tensor.data_ptr()
     )
     adapter.reinit_for_retry.assert_called_once_with(prepared_result)
     adapter.load_via_native.assert_called_once_with(fresh_result)
-    publish.assert_called_once()
-    assert publish.call_args.kwargs["weight_info"] == {
-        "native": (
-            native_tensor.data_ptr(),
-            native_tensor.numel(),
-            native_tensor.element_size(),
-        )
-    }
+    adapter.after_rdma_receive.assert_not_called()
+    publish.assert_called_once_with(
+        ctx=ctx,
+        session_id="target-session",
+        weight_info={
+            "native": (
+                native_tensor.data_ptr(),
+                native_tensor.numel(),
+                native_tensor.element_size(),
+            )
+        },
+    )
 
 
 def test_transfer_engine_source_registration_failure_keeps_native_model():
@@ -1348,33 +1358,6 @@ def test_te_find_source_records_the_funnel_on_success(monkeypatch):
         call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list
     }
     assert observed["listed"] == 2
-
-
-def test_sglang_transfer_engine_draft_loads_natively_without_publishing():
-    model = nn.Linear(2, 2)
-    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
-    adapter = MagicMock()
-    adapter.load_via_native.side_effect = lambda result: result
-    ctx = SimpleNamespace(global_rank=0, adapter=adapter, tensors={"stale": 1})
-
-    with patch(
-        "modelexpress.engines.sglang.loader.build_sglang_load_context",
-        return_value=ctx,
-    ), patch.object(loader, "_find_transfer_engine_source") as find, patch.object(
-        loader, "_publish_transfer_engine_source"
-    ) as publish:
-        loaded = loader._load_model_via_transfer_engine(
-            model=model,
-            model_config=_model_config(is_draft_model=True),
-            device_config=_device_config(),
-        )
-
-    assert loaded is model
-    adapter.load_via_native.assert_called_once()
-    find.assert_not_called()
-    publish.assert_not_called()
-    assert ctx.tensors == {}
-    assert loader._ctx is None
 
 
 def test_transfer_engine_rejects_source_only_runtime_tensor():

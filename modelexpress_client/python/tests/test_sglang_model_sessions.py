@@ -20,6 +20,7 @@ from modelexpress.engines.sglang import loader as loader_mod
 from modelexpress.load_strategy.base import (
     publish_metadata,
     register_tensors,
+    unpublish_metadata,
 )
 from modelexpress.load_strategy.context import LoadResult
 from modelexpress.load_strategy.model_streamer_strategy import (
@@ -405,7 +406,7 @@ def test_draft_failure_does_not_hide_or_shutdown_main():
     assert main.source_ready_fn is None
 
 
-@pytest.mark.parametrize("transport", ["nixl"])
+@pytest.mark.parametrize("transport", ["nixl", "transfer_engine"])
 def test_explicit_disable_keeps_draft_out_of_p2p(transport, monkeypatch):
     monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", "1")
     ctx = make_context(modelexpress_transport=transport)
@@ -540,7 +541,7 @@ def test_known_draft_uses_existing_publishable_rules(
     assert set(main.adapter.discover_tensors(result)) == all_names
 
 
-@pytest.mark.parametrize("transport", ["nixl"])
+@pytest.mark.parametrize("transport", ["nixl", "transfer_engine"])
 @pytest.mark.parametrize("binding", ["parameter", "data"])
 @pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize("ready_url", ["", "http://localhost:30000/health"])
@@ -660,6 +661,234 @@ def test_publication_keeps_tensor_views_after_loader_collection(
     gc.collect()
     assert ctx_ref() is None
     assert all(view() is None for view in views.values())
+
+
+@pytest.mark.parametrize("from_peer", [False, True])
+@pytest.mark.parametrize("model_cls", [DraftWithHead, NoopSetterDraft, PackedDraft])
+@pytest.mark.parametrize(
+    "index,metadata_port,grpc_port,port_offset",
+    [
+        (0, 5555, 6555, "10000"),
+        (0, 55000, 56000, "10000"),
+        (0, 5555, 6555, "0"),
+        (6, 5555, 6555, "10000"),
+        (0, 5555, 6555, "invalid"),
+    ],
+)
+def test_transfer_engine_loads_complete_unknown_draft_before_binding(
+    from_peer, model_cls, index, metadata_port, grpc_port, port_offset, monkeypatch,
+):
+    monkeypatch.setenv("MX_METADATA_PORT", str(metadata_port))
+    monkeypatch.setenv("MX_WORKER_GRPC_PORT", str(grpc_port))
+    monkeypatch.setenv("MX_DRAFT_PORT_OFFSET", port_offset)
+    source, target = model_cls(), model_cls()
+    with torch.no_grad():
+        for param in target.parameters():
+            param.zero_()
+    source_tensors = dict(source.named_parameters())
+    worker = p2p_pb2.WorkerMetadata(
+        transfer_engine_session_id="seed-draft",
+        tensors=publication.build_tensor_protos(source_tensors, 0, 3),
+    )
+    engine = MagicMock()
+    engine.register_memory.return_value = 0
+
+    def read(session, local, remote, sizes):
+        assert session == "seed-draft"
+        for dst, src, size in zip(local, remote, sizes):
+            ctypes.memmove(dst, src, size)
+        return 0
+
+    engine.batch_transfer_sync_read.side_effect = read
+    ctx = make_context(
+        index=index,
+        modelexpress_transport="transfer_engine",
+        remote_instance_weight_loader_transfer_engine=engine,
+        remote_instance_weight_loader_transfer_engine_session_id="draft-session",
+    )
+    ctx.mx_client = MagicMock()
+    loader = loader_mod.MxModelLoader(ctx.load_config)
+
+    def native(result):
+        result.model.load_state_dict(source.state_dict())
+        return result
+
+    with (
+        patch.object(loader_mod, "build_sglang_load_context", return_value=ctx),
+        patch.object(
+            loader,
+            "_find_transfer_engine_source",
+            return_value=worker if from_peer else None,
+        ),
+        patch.object(ctx.adapter, "load_via_native", side_effect=native) as load,
+        patch.object(
+            ctx.adapter, "before_rdma_receive", side_effect=lambda result: result
+        ),
+        patch.object(loader_mod, "PublisherThread") as heartbeat,
+    ):
+        loaded = loader._load_model_via_transfer_engine(
+            model=target,
+            model_config=ctx.model_config,
+            device_config=ctx.adapter.device_config,
+        )
+        heartbeat.call_args.kwargs["publish_fn"]()
+
+    assert loaded is target
+    assert load.call_count == (0 if from_peer else 1)
+    for name, tensor in target.state_dict().items():
+        torch.testing.assert_close(tensor, source.state_dict()[name])
+    published = ctx.mx_client.publish_metadata.call_args.args[1]
+    assert published.transfer_engine_session_id == "draft-session"
+    assert {t.name for t in worker_tensor_descriptors(published)} == set(source_tensors)
+    assert ctx.port_offset == 0
+    assert set(publication._heartbeat_threads) == {(3, f"sglang-draft-{index}")}
+
+
+@pytest.mark.parametrize("draft_first", [False, True])
+def test_transfer_engine_publication_discovery_and_cleanup_are_session_scoped(
+    draft_first, monkeypatch
+):
+    monkeypatch.setattr(publication.PublisherThread, "start", lambda self: None)
+    monkeypatch.setattr(loader_mod, "resolve_policy", lambda: None)
+    sources, statuses = {}, {}
+    client = MagicMock()
+
+    def publish(identity, worker, worker_id):
+        source_id = compute_mx_source_id(identity)
+        sources[source_id] = (worker_id, worker)
+        return source_id
+
+    def update_status(mx_source_id, worker_id, worker_rank, status, **kwargs):
+        published_worker_id, worker = sources[mx_source_id]
+        assert worker_id == published_worker_id
+        assert worker_rank == worker.worker_rank
+        statuses[mx_source_id] = status
+        return True
+
+    def list_sources(identity, status_filter):
+        source_id = compute_mx_source_id(identity)
+        return p2p_pb2.ListSourcesResponse(instances=[
+            p2p_pb2.SourceInstanceRef(
+                mx_source_id=sid, worker_id=worker_id, worker_rank=worker.worker_rank,
+            )
+            for sid, (worker_id, worker) in sources.items()
+            if sid == source_id and statuses.get(sid) == status_filter
+        ])
+
+    def get_metadata(mx_source_id, worker_id):
+        published_worker_id, worker = sources[mx_source_id]
+        assert worker_id == published_worker_id
+        return p2p_pb2.GetMetadataResponse(found=True, worker=worker)
+
+    client.publish_metadata.side_effect = publish
+    client.update_status.side_effect = update_status
+    client.list_sources.side_effect = list_sources
+    client.get_metadata.side_effect = get_metadata
+    main = make_context(draft=False, path="org/model")
+    draft = make_context(path="org/model")
+    loader = loader_mod.MxModelLoader(main.load_config)
+    order = (draft, main) if draft_first else (main, draft)
+    for ctx in order:
+        ctx.mx_client = client
+        ctx.tensors = {"weight": torch.ones(2)}
+        weight = ctx.tensors["weight"]
+        assert loader._publish_transfer_engine_source(
+            ctx=ctx,
+            session_id=f"{ctx.p2p_role}-session",
+            weight_info={
+                "weight": (weight.data_ptr(), weight.numel(), weight.element_size()),
+            },
+        )
+        key = 3 if ctx is main else (3, "sglang-draft-0")
+        publication._heartbeat_threads[key]._tick()
+
+    assert len(sources) == 2
+    assert set(publication._heartbeat_threads) == {3, (3, "sglang-draft-0")}
+    main_publisher = publication._heartbeat_threads[3]
+    draft_publisher = publication._heartbeat_threads[(3, "sglang-draft-0")]
+    assert main_publisher is not draft_publisher
+    for ctx in (main, draft):
+        worker = loader._find_transfer_engine_source(ctx)
+        assert worker.transfer_engine_session_id == f"{ctx.p2p_role}-session"
+        assert worker_tensor_descriptors(worker)[0].addr == (
+            ctx.tensors["weight"].data_ptr()
+        )
+        client.list_sources.assert_called_with(
+            identity=ctx.identity, status_filter=p2p_pb2.SOURCE_STATUS_READY,
+        )
+
+    client.update_status.reset_mock()
+    unpublish_metadata(draft)
+    client.update_status.assert_called_once_with(
+        mx_source_id=compute_mx_source_id(draft.identity),
+        worker_id=draft.worker_id,
+        worker_rank=draft.worker_rank,
+        status=p2p_pb2.SOURCE_STATUS_STALE,
+        source_load=None,
+    )
+    assert set(publication._heartbeat_threads) == {3}
+    assert draft_publisher._stop_event.is_set()
+    assert not main_publisher._stop_event.is_set()
+    main_publisher._tick()
+    assert statuses[compute_mx_source_id(main.identity)] == (
+        p2p_pb2.SOURCE_STATUS_READY
+    )
+    assert loader._find_transfer_engine_source(draft) is None
+    remaining = loader._find_transfer_engine_source(main)
+    assert remaining.transfer_engine_session_id == "main-session"
+    unpublish_metadata(main)
+
+
+@pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("mismatch", ["missing", "size", "extra"])
+def test_transfer_engine_rejects_catalog_mismatch_before_read(draft, mismatch):
+    ctx = make_context(draft=draft)
+    tensors = {"weight": torch.ones(2)}
+    descriptors = publication.build_tensor_protos(tensors, 0, 3)
+    if mismatch == "missing":
+        descriptors = []
+    elif mismatch == "size":
+        descriptors[0].size += 1
+    else:
+        descriptors.append(p2p_pb2.TensorDescriptor(name="extra", size=4))
+    worker = p2p_pb2.WorkerMetadata(tensors=descriptors)
+    engine = MagicMock()
+    with pytest.raises(RuntimeError, match="missing tensor|size mismatch|source-only tensors"):
+        loader_mod.MxModelLoader(ctx.load_config)._receive_via_transfer_engine(
+            tensors, engine, worker, ctx
+        )
+    engine.batch_transfer_sync_read.assert_not_called()
+
+
+@pytest.mark.parametrize("draft", [False, True])
+def test_transfer_engine_uses_target_names_and_sizes(draft):
+    ctx = make_context(draft=draft)
+    source = torch.tensor([1.0, 2.0])
+    target = torch.zeros_like(source)
+    descriptors = publication.build_tensor_protos({"weight": source}, 0, 3)
+    descriptors[0].dtype = "torch.int32"
+    worker = p2p_pb2.WorkerMetadata(
+        transfer_engine_session_id="seed-session", tensors=descriptors
+    )
+    engine = MagicMock()
+
+    def read(session, local, remote, sizes):
+        for dst, src, size in zip(local, remote, sizes):
+            ctypes.memmove(dst, src, size)
+        return 0
+
+    engine.batch_transfer_sync_read.side_effect = read
+    loader_mod.MxModelLoader(ctx.load_config)._receive_via_transfer_engine(
+        {"weight": target}, engine, worker, ctx
+    )
+
+    engine.batch_transfer_sync_read.assert_called_once_with(
+        "seed-session",
+        [target.data_ptr()],
+        [source.data_ptr()],
+        [target.numel() * target.element_size()],
+    )
+    torch.testing.assert_close(target, source)
 
 
 def test_nixl_draft_receives_with_exact_catalog_policy_and_own_manager():

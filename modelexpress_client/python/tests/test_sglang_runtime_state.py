@@ -206,6 +206,7 @@ def test_transfer_engine_published_manifest_receives_and_finalizes_mxfp8(monkeyp
         worker_rank=0,
         global_rank=0,
         worker_id="donor",
+        publication_namespace="",
         identity=p2p_pb2.SourceIdentity(model_name="test"),
         accelerator_backend=SimpleNamespace(name="cuda"),
         mx_client=Mock(),

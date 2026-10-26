@@ -203,22 +203,8 @@ class MxModelLoader:
             model_config,
             device_config,
         )
-        if is_sglang_draft_model(model_config):
-            # TransferEngine publishes a separate source per load, so a draft
-            # would advertise its head under the target's SourceIdentity (same
-            # checkpoint) and replace the target's heartbeat, and its
-            # same-named tensors would match the target's manifest. SGLang's
-            # own transfer_engine backend likewise never publishes the draft.
-            # Load it natively; the nixl transport serves drafts over P2P.
-            logger.info(
-                "[Worker %s] Speculative draft on the transfer_engine "
-                "transport; loading natively without source publication",
-                ctx.global_rank,
-            )
-            result = ctx.adapter.load_via_native(
-                LoadResult(value=model, model=model)
-            )
-            ctx.tensors = {}
+        if not ctx.p2p_enabled:
+            result = ctx.adapter.load_via_native(LoadResult(value=model, model=model))
             self.remote_instance_transfer_engine_weight_info = {}
             return result.model.eval()
         self._ctx = ctx
@@ -606,7 +592,8 @@ class MxModelLoader:
                 ),
             )
             heartbeat.start()
-            _heartbeat_threads[ctx.worker_rank] = heartbeat
+            key = publication_key(ctx.worker_rank, ctx.publication_namespace)
+            _heartbeat_threads[key] = heartbeat
         except Exception:
             logger.exception(
                 "[Worker %s] TransferEngine heartbeat startup failed "

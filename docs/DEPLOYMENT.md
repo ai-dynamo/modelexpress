@@ -852,7 +852,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_UCX_DISABLE_MEM_EVENTS` | `0` | Opt-in. `1` sets `UCX_MEM_EVENTS=n` before NIXL agent creation on the UCX backend (no-op on `LIBFABRIC`), which roughly halves NIXL agent creation time by skipping UCX's mem-hook / VM-unmap tracking. Off by default because the effect is process-wide and permanent: `UCX_MEM_EVENTS` backs registration-cache invalidation for every UCP context in the process, not just ModelExpress's, so this is only safe when the process owns UCX exclusively for ModelExpress transfers. Never overrides an operator-set `UCX_MEM_EVENTS`. UCX reads this option in a shared-library constructor, so if UCX was already loaded elsewhere in the process before agent creation, setting it here can be a no-op. |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_P2P_METADATA` | `1` | Enable P2P metadata exchange (source workers only). Set to `0` to publish full metadata through a central-coordinator backend. This setting is ignored on backends that require P2P metadata, currently `k8s-service`. |
-| `MX_DISABLE_DRAFT_P2P` | `0` | Set to `1` to load speculative drafts through storage without P2P receive/publication. SGLang applies this to independent NIXL draft sessions; vLLM applies it to its shared NIXL draft path. SGLang NIXL drafts, including standalone and unknown model classes, otherwise use independent source identities and the normal P2P/fallback flow. TransferEngine drafts remain storage-only. |
+| `MX_DISABLE_DRAFT_P2P` | `0` | Set to `1` to load speculative drafts through storage without P2P receive/publication. SGLang applies this to independent NIXL and TransferEngine draft sessions; vLLM applies it to its shared NIXL draft path. SGLang drafts, including standalone and unknown model classes, otherwise use independent source identities and the normal P2P/fallback flow. |
 | `MX_DRAFT_MODEL_URI` | (conditional main override, then draft config) | SGLang draft ModelStreamer URI. When unset, inherits `MX_MODEL_URI` if the resolved startup main/draft paths and checkpoint revisions match; otherwise uses the draft's own configuration. Explicit draft values take precedence. |
 | `MX_DRAFT_MODEL_REVISION` | (conditional main override, then draft config) | SGLang draft identity revision override. When unset, inherits `MX_MODEL_REVISION` for a confirmed shared checkpoint unless an explicit draft URI differs from the main's effective URI; otherwise uses the draft's configured revision. This labels identity only; pin actual weights through SGLang's revision setting or immutable storage. |
 | `MX_DRAFT_PORT_OFFSET` | `10000` | SGLang NIXL draft port stride. Draft index `i` adds `(i + 1) * stride` to both NIXL metadata and worker gRPC ports, before adding the local device ordinal. Reserve/expose these ports for every draft; configure the same stride on peers. Ranges must not overlap and ports must fit in 1–65535. Ignored by TransferEngine. |
@@ -1379,7 +1379,7 @@ All storage backends (S3, GCS, Azure) are included as core dependencies — no e
 For SGLang draft P2P, use `--load-format remote_instance`,
 `--remote-instance-weight-loader-backend modelexpress`, and
 `--speculative-draft-load-format remote_instance`. Standalone drafts can use a
-separate `--speculative-draft-model-path`; `transport=nixl` uses
+separate `--speculative-draft-model-path`; both NIXL and TransferEngine use
 independent draft identities and publication. Use the same pinned draft
 checkpoint, SGLang build, and ModelExpress build on source and target. Set
 `MX_DRAFT_MODEL_URI` when the draft has its own object-store location, and
@@ -1396,18 +1396,20 @@ from the main's effective URI. If inheritance does not apply or the main revisio
 override is unset, the draft uses its configured revision. An explicit draft
 revision always takes precedence. Main and draft keep independent P2P identities
 and publication resources when sharing storage.
-`MX_DRAFT_MODEL_URI` applies to ModelStreamer. TransferEngine drafts still load
-natively using SGLang's model configuration.
+`MX_DRAFT_MODEL_URI` applies to ModelStreamer; TransferEngine's native storage
+fallback continues to use SGLang's model configuration.
 An unrecognized model class or PP>1 does not disable MX draft P2P;
 SGLang's algorithm/model topology restrictions still apply.
 
-NIXL discovers draft tensors before SGLang binds shared weights.
+Both transports discover draft tensors before SGLang binds shared weights.
 Recognized models use their existing selector's `publishable()` rules; models
 without a selector retain their complete per-rank catalog. Source selection
 uses the draft identity. NIXL requires exact source and target tensor catalogs,
-including tensor names, byte sizes, and dtypes. Use compatible source/target builds and
-keep storage fallback available during a mixed-version rollout. A health
-gate publishes the saved pre-binding catalog.
+including tensor names, byte sizes, and dtypes. TransferEngine requires
+identical source and target tensor names and equal byte sizes. It does not
+compare per-tensor dtype metadata; model dtype is still part of SourceIdentity.
+Use compatible source/target builds and keep storage fallback available during
+a mixed-version rollout. A health gate publishes the saved pre-binding catalog.
 For unrecognized models, replaced embedding/head storage stays alive for peer
 transfers, so allow for its retained GPU memory when sizing KV cache.
 Validate the selected model and topology against the existing sharing rules;
@@ -1418,7 +1420,9 @@ draft index 0 uses 15555/16555 and index 1 uses 25555/26555. Add the local devic
 ordinal for other devices. Expose the draft ports in containers, network policy,
 and K8s Services. The `k8s-service` backend adds the draft offset even when
 `MX_K8S_SERVICE_PATTERN` specifies an explicit port. Its existing per-rank
-Service routing must also route to the matching PP shard. TransferEngine drafts continue to load natively without P2P publication.
+Service routing must also route to the matching PP shard. TransferEngine uses
+the draft ModelRunner's own engine and negotiated session endpoint;
+`MX_DRAFT_PORT_OFFSET` does not apply to this transport.
 
 On a cold miss, recognized checkpoint rules and a valid
 `model.safetensors.index.json` let ModelStreamer select main/draft shard files
