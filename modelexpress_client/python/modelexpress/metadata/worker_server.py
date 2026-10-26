@@ -585,10 +585,20 @@ class WorkerGrpcServer:
         )
         p2p_pb2_grpc.add_WorkerServiceServicer_to_server(self._servicer, self._server)
 
-        if self._requested_port:
-            self._port = self._server.add_insecure_port(f"[::]:{self._requested_port}")
-        else:
-            self._port = self._server.add_insecure_port("[::]:0")
+        address = f"[::]:{self._requested_port or 0}"
+        bind_error: Exception | None = None
+        try:
+            port = self._server.add_insecure_port(address)
+        except RuntimeError as e:
+            port, bind_error = 0, e
+        if port == 0 or (self._requested_port and port != self._requested_port):
+            self._server = None
+            self._servicer = None
+            raise RuntimeError(
+                f"WorkerGrpcServer failed to bind {address} (got port {port}); "
+                "another process may already be listening on it"
+            ) from bind_error
+        self._port = port
 
         self._server.start()
         logger.info(

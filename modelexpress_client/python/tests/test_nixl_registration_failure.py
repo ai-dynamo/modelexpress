@@ -153,3 +153,19 @@ def test_failed_draft_registration_keeps_the_shared_manager(patched):
 
     assert shared.shutdown_calls == 0, "the main load still serves from this agent"
     assert ctx.nixl_manager is None
+
+
+def test_listener_failure_names_the_port_setting(patched, monkeypatch):
+    monkeypatch.setenv("MX_METADATA_PORT", "5555")
+    ctx = _ctx()
+    ctx.device_id = 2
+
+    with patch.object(
+        base, "_init_nixl_manager", side_effect=RuntimeError("Address already in use")
+    ), patch.object(base.logger, "warning") as warning:
+        base.register_tensors(MagicMock(), ctx, reuse_discovered=True)
+
+    message = warning.call_args.args[0]
+    assert "5557 = MX_METADATA_PORT (5555) + device_id (2)" in message
+    assert "Address already in use" in message
+    assert ctx.nixl_manager is None
