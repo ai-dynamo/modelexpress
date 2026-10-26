@@ -932,6 +932,7 @@ def test_transfer_engine_ticket_runtime_requirement_is_receive_only(has_source):
         global_rank=0,
         identity=SimpleNamespace(model_name="model"),
         adapter=adapter,
+        p2p_enabled=True,
     )
     with patch(
         "modelexpress.engines.sglang.loader.build_sglang_load_context", return_value=ctx
@@ -1003,10 +1004,14 @@ def test_transfer_engine_pending_warnings_are_periodic(
     assert ticket.drained
 
 
+@pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize(
     "failure", ["drained_failure", "later_batch", "submission_exception", "drain_exception", "interrupted", "validation"]
 )
-def test_transfer_engine_receive_failure_waits_for_safe_fallback(failure):
+def test_transfer_engine_receive_failure_waits_for_safe_fallback(
+    failure, draft, monkeypatch
+):
+    monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", "0")
     transfer_engine = MagicMock()
     transfer_engine.register_memory.return_value = 0
 
@@ -1051,8 +1056,10 @@ def test_transfer_engine_receive_failure_waits_for_safe_fallback(failure):
     ]
     adapter.reinit_for_retry.return_value = fresh_result
     adapter.load_via_native.return_value = native_result
-    ctx = build_sglang_load_context(load_config, _model_config(), _device_config())
+    model_config = _model_config(is_draft_model=draft)
+    ctx = build_sglang_load_context(load_config, model_config, _device_config())
     ctx.adapter = adapter
+    assert ctx.p2p_role == ("draft" if draft else "main")
     source_worker = p2p_pb2.WorkerMetadata(
         transfer_engine_session_id="source-session",
         tensors=[
@@ -1088,7 +1095,7 @@ def test_transfer_engine_receive_failure_waits_for_safe_fallback(failure):
             with pytest.raises(error):
                 loader._load_model_via_transfer_engine(
                     model=initial_model,
-                    model_config=_model_config(),
+                    model_config=model_config,
                     device_config=_device_config(),
                 )
             assert list(sglang_loader._pending_transfer_engine_receives.values()) == [
@@ -1102,7 +1109,7 @@ def test_transfer_engine_receive_failure_waits_for_safe_fallback(failure):
             return
         loaded = loader._load_model_via_transfer_engine(
             model=initial_model,
-            model_config=_model_config(),
+            model_config=model_config,
             device_config=_device_config(),
         )
         assert not sglang_loader._pending_transfer_engine_receives
@@ -1116,13 +1123,23 @@ def test_transfer_engine_receive_failure_waits_for_safe_fallback(failure):
         assert failed_ticket.drained
         assert failed_ticket.drain.call_count == 2
     assert loaded is native_model
-    transfer_engine.unregister_memory.assert_called_once_with(target_tensor.data_ptr())
+    transfer_engine.unregister_memory.assert_called_once_with(
+        target_tensor.data_ptr()
+    )
     adapter.reinit_for_retry.assert_called_once_with(prepared_result)
     adapter.load_via_native.assert_called_once_with(fresh_result)
-    publish.assert_called_once()
-    assert publish.call_args.kwargs["weight_info"] == {
-        "native": (native_tensor.data_ptr(), native_tensor.numel(), native_tensor.element_size())
-    }
+    adapter.after_rdma_receive.assert_not_called()
+    publish.assert_called_once_with(
+        ctx=ctx,
+        session_id="target-session",
+        weight_info={
+            "native": (
+                native_tensor.data_ptr(),
+                native_tensor.numel(),
+                native_tensor.element_size(),
+            )
+        },
+    )
 
 
 def test_transfer_engine_source_registration_failure_keeps_native_model():
@@ -1676,33 +1693,6 @@ def test_te_find_source_records_the_funnel_on_success(monkeypatch):
         call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list
     }
     assert observed["listed"] == 2
-
-
-def test_sglang_transfer_engine_draft_loads_natively_without_publishing():
-    model = nn.Linear(2, 2)
-    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
-    adapter = MagicMock()
-    adapter.load_via_native.side_effect = lambda result: result
-    ctx = SimpleNamespace(global_rank=0, adapter=adapter, tensors={"stale": 1})
-
-    with patch(
-        "modelexpress.engines.sglang.loader.build_sglang_load_context",
-        return_value=ctx,
-    ), patch.object(loader, "_find_transfer_engine_source") as find, patch.object(
-        loader, "_publish_transfer_engine_source"
-    ) as publish:
-        loaded = loader._load_model_via_transfer_engine(
-            model=model,
-            model_config=_model_config(is_draft_model=True),
-            device_config=_device_config(),
-        )
-
-    assert loaded is model
-    adapter.load_via_native.assert_called_once()
-    find.assert_not_called()
-    publish.assert_not_called()
-    assert ctx.tensors == {}
-    assert loader._ctx is None
 
 
 def test_transfer_engine_rejects_source_only_runtime_tensor():
