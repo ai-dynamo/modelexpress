@@ -645,6 +645,10 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 
 RL trainers and generators use the optional `modelexpress_rl` namespace from the same Python distribution. See the [RL package guide](rl/README.md) and [RL refit architecture](rl/ARCHITECTURE.md).
 
+Trainer NIXL refit stages ordered source replay batches for engine installation.
+Direct generator-peer refit owns its donor leases and reads in the runtime-tensor
+update method, borrowing the inference NIXL manager independently of trainer staging.
+
 ### MxClient
 
 gRPC client wrapping the P2P service stubs:
@@ -1179,7 +1183,10 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering serv
 
 ## RL staged transfer
 
-The bounded arena design, logical and physical transfer plans, descriptor caching, checksum verification, and failure cleanup are covered in the [RL refit architecture](rl/ARCHITECTURE.md#staged-transfer-caching-and-failure-handling).
+Trainer refit compiles source geometry separately from NIXL execution and installs
+weights at the engine's safe point. See the [RL refit architecture](rl/ARCHITECTURE.md#refit-class-responsibilities)
+for ownership boundaries, [bounded staging and replay](rl/ARCHITECTURE.md#staged-transfer-caching-and-failure-handling),
+and failure handling.
 
 
 ## RL refit CI harness

@@ -4,6 +4,8 @@
 import sys
 from types import SimpleNamespace
 
+from uuid import uuid4
+
 import pytest
 import torch
 from torch import nn
@@ -18,8 +20,6 @@ from tests.test_refit_vllm_installer import (
 
 
 def _transfer_and_install(installer, sources, captured, layout, bounded):
-    names = frozenset(layout)
-    last = {copy.param_name: index for index, copy in enumerate(captured.copies)}
     writes = tuple(
         (index, copy, sources[copy.src_name])
         for index, copy in enumerate(captured.copies)
@@ -28,19 +28,16 @@ def _transfer_and_install(installer, sources, captured, layout, bounded):
         def batches():
             for index, recorded, source in writes:
                 borrowed = source.clone()
-                yield SourceReplayBatch(
-                    ((index, recorded, borrowed),), names, last,
-                    len(writes), captured.generation,
-                )
+                yield SourceReplayBatch(((index, recorded, borrowed),), captured.replay_id)
                 # The iterator may overwrite its receive arena immediately.
                 borrowed.fill_(97)
 
         installer.install_streaming(
-            PreparedStreamingTensors(batches, names, {})
+            PreparedStreamingTensors(batches, captured.replay_id, {})
         )
     else:
         installer.install_tensors(
-            SourceReplayBatch(writes, names, last, len(writes), captured.generation)
+            SourceReplayBatch(writes, captured.replay_id)
         )
 
 
@@ -459,10 +456,7 @@ def test_replay_rejects_invalid_update(monkeypatch, invalid):
         writes = tuple(reversed(writes))
     if invalid == "incomplete":
         writes = writes[:1]
-    batch = SourceReplayBatch(
-        writes, frozenset(layout), {"weight": 1}, 2,
-        capture.generation + 1 if invalid == "generation" else capture.generation,
-    )
+    batch = SourceReplayBatch(writes, uuid4() if invalid == "generation" else capture.replay_id)
     with pytest.raises(IncompleteRefit, match="recorded order|before every|invalidated"):
         _install_tensors(installer, batch, False)
     if invalid != "incomplete":
@@ -665,3 +659,30 @@ def test_capture_allows_scratch_mutation_and_releases_live_storage_guard(monkeyp
     assert torch.equal(model.weight, torch.full((4,), 7.0))
     model.weight.add_(1)
     assert torch.equal(model.weight, torch.full((4,), 8.0))
+
+
+@pytest.mark.parametrize("foreign_id", [None, "another_capture"])
+def test_later_foreign_replay_batch_is_rejected_before_its_write(monkeypatch, foreign_id):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("a", torch.zeros(2))
+            self.register_buffer("b", torch.zeros(2))
+
+        def load_weights(self, weights):
+            for name, value in weights:
+                getattr(self, name).copy_(value)
+
+    model = Model()
+    installer = _persistent_installer(monkeypatch, model)
+    captured, _ = installer.capture([("a", torch.float32, (2,)), ("b", torch.float32, (2,))])
+    first, second = captured.copies
+    foreign = uuid4() if foreign_id is not None else None
+    batches = (
+        SourceReplayBatch(((0, first, torch.ones(2)),), captured.replay_id),
+        SourceReplayBatch(((1, second, torch.full((2,), 7.0)),), foreign),
+    )
+    with pytest.raises(IncompleteRefit, match="invalidated"):
+        installer.install_streaming(PreparedStreamingTensors(lambda: iter(batches), captured.replay_id, {}))
+    torch.testing.assert_close(model.a, torch.ones(2))
+    torch.testing.assert_close(model.b, torch.zeros(2))

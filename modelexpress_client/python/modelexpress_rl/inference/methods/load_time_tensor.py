@@ -18,7 +18,6 @@ from modelexpress_rl.refit.timing import (
 from ...train import WeightPayloadFormat
 from ..nixl_staged_transfer import (
     _NixlStagedTransfer,
-    _StagedNixlWeights,
 )
 from ..plan import (
     MethodCapabilities,
@@ -33,7 +32,13 @@ from ..plan import (
 
 
 class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
-    """Prepare trainer tensors in the engine's load-time layout."""
+    """Prepare trainer source writes for engine installation.
+
+    Own one active trainer artifact, staging a full copy eagerly or deferring bounded
+    reads until installation. Delegate receive resources to the transfer executor and
+    batch lifetime to the streaming artifact. Determine release safety from its
+    cleanup state before allowing resource or version-lease release.
+    """
 
     def __init__(
         self,
@@ -43,27 +48,29 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         if transfer is None:
             raise ValueError("transfer is required")
         self._transfer = transfer
-        self._active_staged: _StagedNixlWeights | None = None
-        self._active_streamed: PreparedStreamingTensors | None = None
+        self._active: PreparedEngineTensors | PreparedStreamingTensors | None = None
 
     @property
     def capabilities(self) -> MethodCapabilities:
+        return self.capabilities_for(self._transfer.bounded_staging)
+
+    @staticmethod
+    def capabilities_for(bounded: bool) -> MethodCapabilities:
+        """Describe configured output before receive resources are allocated."""
         return MethodCapabilities(
             payload_formats=frozenset({WeightPayloadFormat.FULL_TENSOR}),
             sources=frozenset({WeightSource.TRAINER}),
-            artifact_type=PreparedEngineTensors,
+            artifact_type=PreparedStreamingTensors if bounded else PreparedEngineTensors,
         )
 
     def prepare(self, *, version, source: ResolvedSource) -> PreparedArtifact:
-        if self._active_staged is not None or self._active_streamed is not None:
+        if self._active is not None:
             raise RuntimeError("release the active update before preparing another")
         if not isinstance(source, ResolvedTrainerSource):
             raise TypeError("load-time tensor method requires a trainer source")
-        manifests = [item.metadata for item in source.snapshot.shards]
         is_streaming = self._transfer.bounded_staging
         with refit_span("transfer_planning", accumulate_metadata=True) as counters:
             prepared = self._transfer.prepare(
-                manifests=manifests,
                 trainer_snapshot=source.snapshot,
                 checksums=source.checksums,
             )
@@ -72,62 +79,51 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         if is_streaming:
             metrics = dict(prepared.metrics)
             streamed = PreparedStreamingTensors(
-                batches=lambda: self._transfer.iter_bounded(prepared, metrics),
-                parameter_names=(
-                    prepared.batches[0].transfer_plan.replay_parameter_names
-                    if prepared.batches[0].transfer_plan.source_replay
-                    else frozenset(name for batch in prepared.batches for name in batch.layouts[0])
-                ),
+                _batch_factory=lambda: self._transfer.iter_bounded(prepared, metrics),
+                replay_id=prepared.replay_id,
                 transfer_metrics=metrics,
             )
-            self._active_streamed = streamed
+            self._active = streamed
             return streamed
-        self._active_staged = self._transfer.stage(prepared)
-        _attribute_transfer(self._active_staged.metrics)
-        return PreparedEngineTensors(staged=self._active_staged)
+        staged = self._transfer.stage(prepared)
+        _attribute_transfer(staged.metrics)
+        self._active = PreparedEngineTensors(staged=staged)
+        return self._active
+
+    def recover_preparation(self, error: BaseException) -> None:
+        if not self._transfer.bounded_staging:
+            super().recover_preparation(error)
 
     @contextmanager
     def installation_context(self, prepared: PreparedArtifact) -> Iterator[None]:
-        if isinstance(prepared, PreparedStreamingTensors):
-            if prepared is not self._active_streamed:
-                raise RuntimeError("streaming update does not own the active source")
-            if prepared.ownership.release_blocked:
-                raise RuntimeError("streaming cleanup is unproven; reset the process")
+        if prepared is not self._active:
+            raise RuntimeError("update does not own the active source")
+        self.validate_release(prepared)
         try:
             yield
         finally:
             if isinstance(prepared, PreparedStreamingTensors):
                 _attribute_transfer(prepared.transfer_metrics)
 
+    def can_release(self, prepared: PreparedArtifact) -> bool:
+        return (
+            not isinstance(prepared, PreparedStreamingTensors)
+            or not prepared.release_blocked
+        )
+
     def release(self, prepared: PreparedArtifact) -> None:
-        if isinstance(prepared, PreparedStreamingTensors):
-            if prepared is not self._active_streamed:
-                raise RuntimeError("streaming update is no longer active")
-            if prepared.ownership.release_blocked:
-                raise RuntimeError(
-                    "streaming cleanup is unproven; reset the process before release"
-                )
-            self._active_streamed = None
-            return
-        if not isinstance(prepared, PreparedEngineTensors):
-            raise TypeError("load-time tensor method requires staged engine tensors")
-        if prepared.staged is not self._active_staged:
-            raise RuntimeError("load-time staged weight is no longer active")
-        self._active_staged = None
+        if prepared is not self._active:
+            raise RuntimeError("update is no longer active")
+        self.validate_release(prepared)
+        self._active = None
 
     def validate_close(self) -> None:
-        if (
-            self._active_streamed is not None
-            and self._active_streamed.ownership.release_blocked
-        ):
-            raise RuntimeError(
-                "streaming cleanup is unproven; retain resources and reset the process"
-            )
+        if self._active is not None:
+            self.validate_release(self._active)
 
     def close(self) -> None:
         self.validate_close()
-        self._active_streamed = None
-        self._active_staged = None
+        self._active = None
         self._transfer.close()
 
 
