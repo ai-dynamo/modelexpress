@@ -32,7 +32,8 @@ class StreamingSettings:
     """Fixed receive capacity and placement for one bounded runtime."""
 
     max_staging_bytes: int
-    staging_device: str = "cuda"
+    # None places arenas on the engine device; otherwise "cpu" or that device's type.
+    staging_device: str | None = None
     staging_buffers: int = 1
 
 

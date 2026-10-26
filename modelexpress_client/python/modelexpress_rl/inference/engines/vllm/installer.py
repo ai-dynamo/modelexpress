@@ -795,10 +795,14 @@ class _VllmInstaller(EngineInstaller):
         self._reload(load)
         # Synchronization is paid once per install, separately from per-layer work.
         with refit_span("post_install"):
-            torch.cuda.synchronize(self._device)
+            self._synchronize()
+
+    def _synchronize(self) -> None:
+        if self._device.type != "cpu":
+            accelerator_backend_for(self._device).synchronize(self._device.index)
 
     def _drain_streaming(self) -> None:
-        torch.cuda.synchronize(self._device)
+        self._synchronize()
 
     @torch.no_grad()
     def install_streaming(self, prepared: PreparedStreamingTensors) -> None:
@@ -973,7 +977,7 @@ class _VllmInstaller(EngineInstaller):
         if not checkpoint._complete:
             raise RuntimeError("full checkpoint stream was not completely consumed")
         with refit_span("post_install"):
-            torch.cuda.synchronize(self._device)
+            self._synchronize()
 
     def install_checkpoint(self, path: str | Path) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""
@@ -1000,7 +1004,7 @@ class _VllmInstaller(EngineInstaller):
         # Same synchronize as install_tensors, so a checkpoint refit
         # reports the stage too rather than charging it to the caller's total.
         with refit_span("post_install"):
-            torch.cuda.synchronize(self._device)
+            self._synchronize()
 
     def install_changed_tensors(
         self, path: str | Path, changed: frozenset[str]
@@ -1074,7 +1078,7 @@ class _VllmInstaller(EngineInstaller):
         finally:
             layerwise_logger.removeFilter(unloaded)
         with refit_span("post_install"):
-            torch.cuda.synchronize(self._device)
+            self._synchronize()
         logger.info(
             "Surgical checkpoint install changed=%d loaded=%d untouched_layers=%d "
             "fallback=%s seconds=%.3f",
