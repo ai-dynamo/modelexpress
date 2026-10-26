@@ -32,6 +32,7 @@ from modelexpress_rl.collective import (
     RendezvousError,
     ReshardPlan,
 )
+from modelexpress_rl import refit_collective_pb2 as pb
 from modelexpress_rl.collective.comm import new_unique_id
 from modelexpress_rl.collective.rendezvous import (
     EpochChangedError,
@@ -2055,6 +2056,63 @@ class FlakyReportRendezvous(FakeRendezvous):
             self.reports.append({**kwargs, "lost": True})
             raise _ReportRpcError(self.code)
         return super().report(**kwargs)
+
+
+class TerminalReportRendezvous(FakeRendezvous):
+    """Answers a report with the operation in ``state``, as MX does once
+    another participant already ended it."""
+
+    def __init__(self, state, failure_message="", **kwargs):
+        super().__init__(**kwargs)
+        self._state = state
+        self._failure_message = failure_message
+
+    def report(self, **kwargs):
+        super().report(**kwargs)
+        return SimpleNamespace(
+            operation_id=kwargs["operation_id"],
+            state=self._state,
+            failure_message=self._failure_message,
+        )
+
+
+class TestTerminalReportResponse:
+    @staticmethod
+    def _finish(rz):
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1", "op1")
+        client.publish_weights("v1")
+        return client
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            pb.COLLECTIVE_TRANSFER_STATE_FAILED,
+            pb.COLLECTIVE_TRANSFER_STATE_ABORTED,
+        ],
+    )
+    def test_an_already_ended_operation_is_surfaced(self, fake_nccl, state):
+        rz = TerminalReportRendezvous(state, failure_message="g1: lane 0 aborted")
+        client = self._finish(rz)
+        name = pb.CollectiveTransferState.Name(state)
+        with pytest.raises(RendezvousError, match=f"{name}.*g1: lane 0 aborted"):
+            client.finish_weight_update("v1")
+        # Terminal on the server, so there is nothing left to retry.
+        assert client._operation_id is None
+        client.start_weight_update("v2", "op2")
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            pb.COLLECTIVE_TRANSFER_STATE_RUNNING,
+            pb.COLLECTIVE_TRANSFER_STATE_COMPLETE,
+        ],
+    )
+    def test_running_or_complete_is_a_normal_finish(self, fake_nccl, state):
+        client = self._finish(TerminalReportRendezvous(state))
+        client.finish_weight_update("v1")
+        assert client._operation_id is None
 
 
 class TestSuccessReportDelivery:

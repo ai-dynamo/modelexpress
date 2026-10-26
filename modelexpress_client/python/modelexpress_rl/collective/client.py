@@ -24,6 +24,7 @@ from collections import deque
 from contextlib import nullcontext
 from typing import Any
 
+from .. import refit_collective_pb2 as pb
 from . import envs
 from .backend import (
     _QUARANTINED_REFIT_BUFFERS,
@@ -58,6 +59,11 @@ logger = logging.getLogger("modelexpress_rl.collective.client")
 _SUCCESS_REPORT_ATTEMPTS = 3
 #: Sleep before the second attempt; it doubles for each one after.
 _SUCCESS_REPORT_BACKOFF_S = 0.2
+#: Operation states a success report can come back with when another
+#: participant already ended the round.
+_ENDED_TRANSFER_STATES = frozenset(
+    {pb.COLLECTIVE_TRANSFER_STATE_FAILED, pb.COLLECTIVE_TRANSFER_STATE_ABORTED}
+)
 #: gRPC codes that say nothing about whether the report landed.
 _TRANSIENT_REPORT_CODES = frozenset({"UNAVAILABLE", "DEADLINE_EXCEEDED"})
 
@@ -335,11 +341,11 @@ class _RefitClientBase:
                 f"round in flight is bound to {self._operation_id!r}"
             )
 
-    def _report(self, *, succeeded: bool, message: str = "") -> None:
+    def _report(self, *, succeeded: bool, message: str = "") -> Any:
         """Report the bound round's outcome against the identity it was admitted with."""
         if self._operation_id is None or self._round_membership is None:
             raise RuntimeError("no operation is bound to this round")
-        self._rendezvous.report(
+        return self._rendezvous.report(
             operation_id=self._operation_id,
             group_id=self._round_membership.group_id,
             epoch=self._round_membership.epoch,
@@ -357,10 +363,16 @@ class _RefitClientBase:
         can deliver the report later instead of leaving the operation RUNNING
         with nothing left to report it. Any other error is the control plane's
         answer, so the binding is released and the error is raised.
+
+        A report against an operation another participant already ended comes
+        back FAILED or ABORTED. That is raised too, with the server's failure
+        message, after the binding is released: the operation is terminal, so
+        there is nothing to retry. RUNNING and COMPLETE are both a normal finish,
+        since only the last reporter sees COMPLETE.
         """
         for attempt in range(1, _SUCCESS_REPORT_ATTEMPTS + 1):
             try:
-                self._report(succeeded=True)
+                transfer = self._report(succeeded=True)
             except BaseException as error:
                 if not _is_transient_rpc_error(error):
                     self._reset_round()
@@ -376,7 +388,15 @@ class _RefitClientBase:
                     raise
                 time.sleep(_SUCCESS_REPORT_BACKOFF_S * 2 ** (attempt - 1))
             else:
+                operation_id = self._operation_id
                 self._reset_round()
+                state = getattr(transfer, "state", None)
+                if state in _ENDED_TRANSFER_STATES:
+                    raise RendezvousError(
+                        f"operation {operation_id} was already "
+                        f"{pb.CollectiveTransferState.Name(state)} when this worker "
+                        f"reported success: {transfer.failure_message or 'no message'}"
+                    )
                 return
 
     def retry_report(self) -> None:
