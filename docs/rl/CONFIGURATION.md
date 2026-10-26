@@ -17,6 +17,7 @@ RL-specific settings are registered in `modelexpress_rl/envs.py` and imported th
 | `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact version required when `MX_LOAD_STRATEGY_CHAIN=RL`; startup fails rather than using a version-agnostic fallback when neither P2P nor S3 can load it |
 | `MX_GENERATOR_SOURCE_ORDER` | Auto-detected | Ordered RL weight sources. Desired-version cold start defaults to `GENERATOR,OBJECT_STORAGE`; `OBJECT_STORAGE` disables P2P for both cold start and active refit. `TRAINER` applies only to active refit and is rejected for desired-version cold start. |
 | `MX_REFIT_CHECKPOINT_DIR` | (unset) | Host-local cache for RL S3 full checkpoints, deltas, and materialized checkpoints; the S3 strategy skips when it is unset |
+| `MX_REFIT_CHECKPOINT_MAX_SIZE_GB` | `2000` | Positive decimal GB cache quota used by default in vLLM weight-transfer initialization. An explicit `refit_checkpoint_max_size_gb`, including `null`, overrides this setting. |
 | `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL metadata-listener port for RL generator refit; each rank adds its local device ID. Kept separate from `MX_METADATA_PORT`, which may remain owned by the boot-time loader |
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Maximum exact descriptors for one no-gather refit copy before a compatible dim-0-sharded source is pulled once into contiguous staging and sliced locally |
 | `MX_REFIT_STAGE_RECORD` | `1` | Emit one `refit-stage-v2` JSON record per refit, giving a benchmark harness the per-stage timings without parsing logs. Set to `0` to silence it |
@@ -71,8 +72,18 @@ Trainer staging choices govern how framework tensors remain valid while a versio
 ## Generator refit checkpoint cache
 
 
-`refit_checkpoint_max_size_gb` defaults to 2000 GB per model. At initialization,
-the generator caps this quota at existing cache bytes plus free disk space and
+In vLLM weight-transfer initialization, `refit_checkpoint_max_size_gb` defaults to
+`MX_REFIT_CHECKPOINT_MAX_SIZE_GB` (2000 decimal GB per model). An explicit
+init-info value, including `null`, takes precedence over the environment setting.
+Other initialization paths retain their existing 2000 GB default.
+
+Streamed full replacement may need space for the protected old full checkpoint,
+a materialized checkpoint with deltas applied, and the incoming full checkpoint
+at the same time. Size the quota and backing volume for this peak plus retained
+delta artifacts and headroom; increasing the quota does not add disk capacity.
+
+At initialization, the generator caps this quota at existing cache bytes plus
+free disk space and
 logs any reduction. Free space is checked again before known writes and copies,
 including when `null` disables the configured quota. See the
 [S3 refit cache configuration](S3_DELTA_WEIGHT_REFIT.md#refit_checkpoint_dir)
