@@ -195,7 +195,7 @@ jobs:
                   "namespace": "mx-ci-sglang-mtp",
                   "manifest": "ci/k8s/client/sgl/manifest-azure-mtp.yaml",
                   "test_script": "ci/k8s/client/test_p2p_k8s.py",
-                  "pytest_args": "--expect-mtp",
+                  "pytest_args": "--expect-mtp --nixl-sessions-per-rank 2",
                   "source_extra_env": "JOB_NAME=mx-source",
                   "extra_env": "JOB_NAME=mx-target",
                   "source_port": "8033",

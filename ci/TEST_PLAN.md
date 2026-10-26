@@ -101,6 +101,8 @@ AIPerf startup and dataset loading, but exclude deployment and model startup.
 MTP lanes also execute two 128-token chat
 requests per worker with EOS stopping disabled; this checks sustained decoding
 without requiring identical wording.
+The SGLang MTP test expects two independent NIXL agents per rank and source
+replica. The vLLM MTP test expects one shared agent for main and draft.
 Instrumented vLLM base/MTP workers separately compare SHA-256 hashes of their
 registered main/draft transfer catalogs. Temporary draft embeddings replaced
 by vLLM's main-model sharing are excluded by the native MX catalog. This gate
