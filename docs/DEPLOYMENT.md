@@ -538,6 +538,40 @@ only `main` and `release/*`: `NGC_PUBLISH_USERNAME`, `NGC_PUBLISH_TOKEN`,
 `SLACK_RELEASE_BOT_TOKEN`, `SLACK_RELEASE_CHANNEL_ID` and
 `SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL`.
 
+### Inference CI vCluster
+
+Inference CI reuses the persistent `mx-ci-cluster` vCluster in the AKS CI host
+namespace `mx-ci`. Per-run cleanup removes test namespaces and workloads; it
+does not destroy the shared vCluster. Bootstrap runs only when the vCluster
+is absent.
+
+`.github/actions/setup-mx-vcluster/action.yml` pins Kubernetes `v1.36.5` to match
+the AKS host's 1.36 minor. The workflow checks the live host and vCluster
+versions on every run and rejects a vCluster minor below the host's. Updating
+the pin does not change an existing vCluster.
+
+The pinned vCluster CLI release `v0.36.0` supports Kubernetes 1.36. Its
+[CoreDNS version map](https://github.com/loft-sh/vcluster/blob/v0.36.0/pkg/constants/coredns.go)
+uses CoreDNS `1.14.2` for that minor. Bootstrap pulls the matching image from
+`registry.k8s.io` to avoid authentication failures through the ACR mirror.
+
+To rebuild an existing vCluster after a version-pin change:
+
+1. Pause new inference CI runs and let active runs using the shared vCluster
+   finish. Recreation deletes its virtual-cluster state.
+2. With AKS CI host access, delete the vCluster while preserving `mx-ci`:
+
+   ```bash
+   KUBECONFIG=/path/to/aks-ci-kubeconfig \
+     vcluster delete mx-ci-cluster --namespace mx-ci --delete-namespace=false --wait
+   ```
+
+3. Start a fresh inference CI run from the commit containing the updated pin.
+   Bootstrap recreates the vCluster, applies the ModelExpress CRD and installs
+   the Dynamo operator. Verify the version guard passes, CoreDNS and the
+   operator are Ready, and the inference GPU tests execute before resuming
+   normal CI traffic.
+
 ### Custom Client Image (P2P Transfers)
 
 For GPU-to-GPU weight transfers with vLLM:
