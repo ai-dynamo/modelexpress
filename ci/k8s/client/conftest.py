@@ -77,8 +77,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store_true",
         default=os.environ.get("EXPECT_MTP", "").lower() in {"1", "true", "yes"},
         help=(
-            "Assert that the target transfers the main model through P2P, "
-            "then loads the MTP draft model locally."
+            "Assert that every target rank transfers both the main model "
+            "and the MTP draft through P2P."
         ),
     )
     parser.addoption(
@@ -100,6 +100,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "Comma-separated artifact sourceType values expected to be ready "
             "and installed, for example 'torch_compile_cache,triton_cache'."
         ),
+    )
+    parser.addoption(
+        "--expected-max-total-tokens",
+        default=_nonnegative_int(os.environ.get("EXPECTED_MAX_TOTAL_TOKENS", "0")),
+        type=_nonnegative_int,
+        help="Expected SGLang max_total_num_tokens value; zero disables the assertion.",
     )
     parser.addoption(
         "--dgd-name",
@@ -204,6 +210,11 @@ def expected_artifact_sources(request: pytest.FixtureRequest) -> int:
 def expected_artifact_source_types(request: pytest.FixtureRequest) -> set[str]:
     raw = request.config.getoption("--expected-artifact-source-types")
     return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+@pytest.fixture(scope="session")
+def expected_max_total_tokens(request: pytest.FixtureRequest) -> int:
+    return request.config.getoption("--expected-max-total-tokens")
 
 
 @pytest.fixture(scope="session")

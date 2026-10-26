@@ -3,7 +3,7 @@
 
 """ModelExpress clients and protobuf bindings for RL weight refit."""
 
-from .control import ModelExpressControlClient, WeightVersion, WeightVersionState
+from .control import ModelExpressControlClient, TrainerMesh, WeightVersion, WeightVersionState
 from .inference import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
@@ -23,7 +23,7 @@ from .train import (
     WeightPayloadFormat,
 )
 from .object_storage import ObjectStorageSource, ObjectStorageType
-from .version import WeightVersionRef
+from .version import MeshIdentity, TrainerTensorsMetadata, WeightVersionRef
 
 __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     # Framework-facing clients.
@@ -44,8 +44,11 @@ __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     "WeightSource",
     "VllmGeneratorContext",
     # Version values shared across the control, trainer, and generator clients.
+    "MeshIdentity",
     "ObjectStorageSource",
     "ObjectStorageType",
+    "TrainerMesh",
+    "TrainerTensorsMetadata",
     "WeightVersion",
     "WeightVersionRef",
     "WeightVersionState",

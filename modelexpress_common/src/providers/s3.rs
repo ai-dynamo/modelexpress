@@ -113,6 +113,12 @@ impl S3Provider {
                 ClientOptions::new().with_timeout(Duration::from_secs(timeout_secs)),
             );
 
+        #[cfg(feature = "tls-native")]
+        {
+            builder = builder
+                .with_crypto_provider(Arc::new(crate::providers::s3_crypto::OpensslCryptoProvider));
+        }
+
         if let Some(endpoint) = endpoint {
             let allow_http = endpoint.starts_with("http://")
                 || std::env::var("AWS_ALLOW_HTTP")

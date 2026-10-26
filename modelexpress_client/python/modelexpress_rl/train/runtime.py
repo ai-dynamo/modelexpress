@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable
-from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -16,7 +15,7 @@ from .. import envs as rl_envs
 from .. import timing
 from ..s3 import S3Client
 from ..utils import make_tensor_reader
-from ..version import WeightVersionRef
+from ..version import TrainerTensorsMetadata, WeightVersionRef
 from .adapter import (
     StagedWeightVersionShardData,
     TrainerStagingMode,
@@ -120,7 +119,6 @@ class TrainerRuntime:
                     process_group=process_group,
                     read_seed_tensor=read_seed_tensor,
                     s3=s3,
-                    clock=lambda: perf_counter(),
                 )
             except Exception:
                 s3.close()
@@ -197,10 +195,10 @@ class TrainerRuntime:
         return self.method
 
     @property
-    def source_slot_id(self) -> str:
-        return self._full_tensor().source_slot_id
+    def logical_shard_id(self) -> str:
+        return self._full_tensor().logical_shard_id
 
-    def bind_tensors(self, tensors: Any) -> str:
+    def bind_tensors(self, tensors: Any) -> TrainerTensorsMetadata:
         if tensors is None:
             raise ValueError("tensors must not be None")
         if self._bound_tensors is not None:
@@ -210,32 +208,23 @@ class TrainerRuntime:
         return slot
 
     def prepare_delta_base(
-        self, *, hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]]
+        self, *, tensor_iter: Iterable[list[tuple[str, torch.Tensor]]]
     ) -> None:
-        self._canonical_delta().prepare_base(hf_tensor_iter=hf_tensor_iter)
+        self._canonical_delta().prepare_base(tensor_iter=tensor_iter)
 
     def stage(
         self,
         *,
         version: WeightVersionRef,
-        tensors: Any,
-        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None,
+        tensors: Any = None,
+        tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None = None,
     ) -> PublicationArtifact:
-        if self.method is None:
-            self._full_tensor()
-        if isinstance(self.method, FullTensorNixlPublicationMethod):
-            if hf_tensor_iter is not None:
-                raise ValueError("hf_tensor_iter is only supported for object storage")
-            return self.method.stage(version=version, tensors=tensors)
-        if tensors is not None:
-            raise ValueError(
-                "object storage publication accepts hf_tensor_iter, not tensors"
-            )
-        if hf_tensor_iter is None:
-            raise ValueError(
-                "hf_tensor_iter is required for object storage publication"
-            )
-        return self.method.stage(version=version, hf_tensor_iter=hf_tensor_iter)
+        method = self._canonical_delta()
+        if (tensor_iter is None) == (tensors is None):
+            raise ValueError("provide either tensor_iter or a tensor bucket")
+        if tensor_iter is not None:
+            return method.stage(version=version, tensor_iter=tensor_iter)
+        return method.stage_bucket(version=version, bucket=tensors)
 
     def publish(
         self, *, version: WeightVersionRef, staged: PublicationArtifact

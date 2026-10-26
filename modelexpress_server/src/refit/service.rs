@@ -5,18 +5,24 @@
 
 #![allow(clippy::result_large_err)] // tonic service helpers return tonic::Status.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
+use futures::{StreamExt, TryStreamExt, stream};
 use modelexpress_common::grpc::refit::{
-    CreateWeightVersionRequest, CreateWeightVersionResponse, CreateWeightVersionShardRequest,
-    CreateWeightVersionShardResponse, DeleteVersionLeaseRequest, DeleteVersionLeaseResponse,
-    DeleteWeightVersionRequest, DeleteWeightVersionResponse, DeleteWeightVersionShardRequest,
-    DeleteWeightVersionShardResponse, GetWeightVersionRequest, GetWeightVersionResponse,
-    ListWeightVersionShardsRequest, ListWeightVersionShardsResponse, ObjectStorageType,
-    RegisterVersionLeaseRequest, RegisterVersionLeaseResponse, RegisterWorkerRequest,
-    RegisterWorkerResponse, UpdateWeightVersionStateRequest, UpdateWeightVersionStateResponse,
-    WeightPayloadFormat, WeightVersionState, WorkerRole, refit_service_server::RefitService,
+    CreateTrainerMeshRequest, CreateTrainerMeshResponse, CreateWeightVersionRequest,
+    CreateWeightVersionResponse, CreateWeightVersionShardRequest, CreateWeightVersionShardResponse,
+    DeleteTrainerMeshRequest, DeleteTrainerMeshResponse, DeleteVersionLeaseRequest,
+    DeleteVersionLeaseResponse, DeleteWeightVersionRequest, DeleteWeightVersionResponse,
+    DeleteWeightVersionShardRequest, DeleteWeightVersionShardResponse, GetTrainerMeshRequest,
+    GetTrainerMeshResponse, GetWeightVersionRequest, GetWeightVersionResponse,
+    ListWeightVersionShardsRequest, ListWeightVersionShardsResponse, ListWeightVersionsRequest,
+    ListWeightVersionsResponse, ObjectStorageType, RegisterVersionLeaseRequest,
+    RegisterVersionLeaseResponse, RegisterWorkerRequest, RegisterWorkerResponse,
+    TrainerTensorsMetadata, UpdateTrainerMeshRequest, UpdateTrainerMeshResponse,
+    UpdateWeightVersionStateRequest, UpdateWeightVersionStateResponse, WeightPayloadFormat,
+    WeightVersionState, WorkerRole, refit_service_server::RefitService,
 };
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
@@ -39,6 +45,48 @@ fn validate_ttl(ttl_seconds: u32) -> Result<(), Status> {
     } else {
         Ok(())
     }
+}
+
+fn validate_mesh_members(workers: &HashMap<String, TrainerTensorsMetadata>) -> Result<(), Status> {
+    if workers.is_empty() {
+        return Err(Status::invalid_argument("workers must not be empty"));
+    }
+    for (worker_id, metadata) in workers {
+        required(worker_id, "workers worker_id")?;
+        required(&metadata.logical_shard_id, "logical_shard_id")?;
+        required(&metadata.metadata_endpoint, "metadata_endpoint")?;
+    }
+    Ok(())
+}
+
+async fn validate_mesh_bindings(
+    workers: Vec<(String, TrainerTensorsMetadata)>,
+) -> Result<(), Status> {
+    stream::iter(workers)
+        .map(|(worker_id, metadata)| async move {
+            let started = Instant::now();
+            let result = super::coverage::validate_binding(&metadata).await;
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            match &result {
+                Ok(()) => debug!(
+                    worker_id,
+                    endpoint = %metadata.metadata_endpoint,
+                    elapsed_ms,
+                    "Validated trainer binding"
+                ),
+                Err(error) => warn!(
+                    worker_id,
+                    endpoint = %metadata.metadata_endpoint,
+                    elapsed_ms,
+                    error = %error,
+                    "Trainer binding validation failed"
+                ),
+            }
+            result
+        })
+        .buffer_unordered(32)
+        .try_for_each(|()| async { Ok(()) })
+        .await
 }
 
 fn validate_s3_uri(uri: &str) -> Result<(), Status> {
@@ -102,6 +150,9 @@ fn validate_publication(request: &CreateWeightVersionRequest) -> Result<(), Stat
     if let Some(uid) = request.uid.as_deref() {
         required(uid, "uid")?;
     }
+    if let Some(mesh_id) = request.trainer_mesh_id.as_deref() {
+        required(mesh_id, "trainer_mesh_id")?;
+    }
     let state =
         WeightVersionState::try_from(request.state).unwrap_or(WeightVersionState::Unspecified);
     if let Some(object_storage) = request.object_storage.as_ref() {
@@ -115,9 +166,9 @@ fn validate_publication(request: &CreateWeightVersionRequest) -> Result<(), Stat
         }
         required(&object_storage.uri, "object_storage.uri")?;
         validate_s3_uri(&object_storage.uri)?;
-        if !request.expected_source_slots.is_empty() {
+        if request.trainer_mesh_id.is_some() {
             return Err(Status::invalid_argument(
-                "expected_source_slots must be empty for S3 publication",
+                "trainer_mesh_id must be omitted for S3 publication",
             ));
         }
         if !matches!(
@@ -130,25 +181,15 @@ fn validate_publication(request: &CreateWeightVersionRequest) -> Result<(), Stat
         }
         return Ok(());
     }
-
     if state != WeightVersionState::Staging {
         return Err(Status::invalid_argument(
             "worker-sharded state must be STAGING",
         ));
     }
-    if request.expected_source_slots.is_empty() {
+    if request.trainer_mesh_id.is_none() {
         return Err(Status::invalid_argument(
-            "expected_source_slots must not be empty for worker-sharded publication",
+            "trainer_mesh_id is required for worker publication",
         ));
-    }
-    let mut unique = HashSet::new();
-    for source_slot_id in &request.expected_source_slots {
-        required(source_slot_id, "expected_source_slots entry")?;
-        if !unique.insert(source_slot_id) {
-            return Err(Status::invalid_argument(
-                "expected_source_slots must not contain duplicates",
-            ));
-        }
     }
     Ok(())
 }
@@ -204,6 +245,117 @@ impl RefitServiceImpl {
 
 #[tonic::async_trait]
 impl RefitService for RefitServiceImpl {
+    async fn create_trainer_mesh(
+        &self,
+        request: Request<CreateTrainerMeshRequest>,
+    ) -> Result<Response<CreateTrainerMeshResponse>, Status> {
+        let request = request.into_inner();
+        required(&request.model_name, "model_name")?;
+        required(&request.idempotency_key, "idempotency_key")?;
+        validate_mesh_members(&request.workers)?;
+        if let Some(mesh) = self
+            .backend
+            .find_trainer_mesh_for_request(&request)
+            .await
+            .map_err(backend_status)?
+        {
+            return Ok(Response::new(CreateTrainerMeshResponse {
+                mesh: Some(mesh),
+            }));
+        }
+        self.backend
+            .validate_trainer_mesh_workers(&request.model_name, &request.workers)
+            .await
+            .map_err(backend_status)?;
+        validate_mesh_bindings(
+            request
+                .workers
+                .iter()
+                .map(|(worker_id, metadata)| (worker_id.clone(), metadata.clone()))
+                .collect(),
+        )
+        .await?;
+        let mesh = self
+            .backend
+            .create_trainer_mesh(&request)
+            .await
+            .map_err(backend_status)?;
+        Ok(Response::new(CreateTrainerMeshResponse {
+            mesh: Some(mesh),
+        }))
+    }
+
+    async fn get_trainer_mesh(
+        &self,
+        request: Request<GetTrainerMeshRequest>,
+    ) -> Result<Response<GetTrainerMeshResponse>, Status> {
+        let mesh_id = request.into_inner().mesh_id;
+        required(&mesh_id, "mesh_id")?;
+        let mesh = self
+            .backend
+            .get_trainer_mesh(&mesh_id)
+            .await
+            .map_err(backend_status)?;
+        Ok(Response::new(GetTrainerMeshResponse { mesh: Some(mesh) }))
+    }
+
+    async fn update_trainer_mesh(
+        &self,
+        request: Request<UpdateTrainerMeshRequest>,
+    ) -> Result<Response<UpdateTrainerMeshResponse>, Status> {
+        let request = request.into_inner();
+        required(&request.mesh_id, "mesh_id")?;
+        validate_mesh_members(&request.workers)?;
+        let current = self
+            .backend
+            .get_trainer_mesh(&request.mesh_id)
+            .await
+            .map_err(backend_status)?;
+        if current.generation != request.expected_generation {
+            return Err(Status::failed_precondition(
+                "trainer mesh generation changed",
+            ));
+        }
+        self.backend
+            .validate_trainer_mesh_workers(&current.model_name, &request.workers)
+            .await
+            .map_err(backend_status)?;
+        validate_mesh_bindings(
+            request
+                .workers
+                .iter()
+                .filter(|(worker_id, metadata)| current.workers.get(*worker_id) != Some(*metadata))
+                .map(|(worker_id, metadata)| (worker_id.clone(), metadata.clone()))
+                .collect(),
+        )
+        .await?;
+        let mesh = self
+            .backend
+            .update_trainer_mesh(
+                &request.mesh_id,
+                request.expected_generation,
+                request.workers,
+            )
+            .await
+            .map_err(backend_status)?;
+        Ok(Response::new(UpdateTrainerMeshResponse {
+            mesh: Some(mesh),
+        }))
+    }
+
+    async fn delete_trainer_mesh(
+        &self,
+        request: Request<DeleteTrainerMeshRequest>,
+    ) -> Result<Response<DeleteTrainerMeshResponse>, Status> {
+        let mesh_id = request.into_inner().mesh_id;
+        required(&mesh_id, "mesh_id")?;
+        self.backend
+            .delete_trainer_mesh(&mesh_id)
+            .await
+            .map_err(backend_status)?;
+        Ok(Response::new(DeleteTrainerMeshResponse {}))
+    }
+
     async fn register_worker(
         &self,
         request: Request<RegisterWorkerRequest>,
@@ -261,10 +413,10 @@ impl RefitService for RefitServiceImpl {
             }
         }
         info!(
-            "Creating weight version for model '{}' ({:?}, {} expected source slots)",
+            "Creating weight version for model '{}' ({:?}, trainer mesh '{}')",
             request.model_name,
             payload_format,
-            request.expected_source_slots.len()
+            request.trainer_mesh_id.as_deref().unwrap_or_default()
         );
         let version = self
             .backend
@@ -331,6 +483,23 @@ impl RefitService for RefitServiceImpl {
         }))
     }
 
+    async fn list_weight_versions(
+        &self,
+        request: Request<ListWeightVersionsRequest>,
+    ) -> Result<Response<ListWeightVersionsResponse>, Status> {
+        let request = request.into_inner();
+        required(&request.model_name, "model_name")?;
+        if let Some(mesh_id) = &request.trainer_mesh_id {
+            required(mesh_id, "trainer_mesh_id")?;
+        }
+        let versions = self
+            .backend
+            .list_weight_versions(&request.model_name, request.trainer_mesh_id.as_deref())
+            .await
+            .map_err(backend_status)?;
+        Ok(Response::new(ListWeightVersionsResponse { versions }))
+    }
+
     async fn create_weight_version_shard(
         &self,
         request: Request<CreateWeightVersionShardRequest>,
@@ -340,14 +509,17 @@ impl RefitService for RefitServiceImpl {
             .shard
             .ok_or_else(|| Status::invalid_argument("shard is required"))?;
         required(&shard.version_id, "shard.version_id")?;
-        required(&shard.source_slot_id, "shard.source_slot_id")?;
+        required(&shard.logical_shard_id, "shard.logical_shard_id")?;
         required(&shard.worker_id, "shard.worker_id")?;
-        required(&shard.manifest_digest, "shard.manifest_digest")?;
-        required(&shard.manifest_endpoint, "shard.manifest_endpoint")?;
+        required(
+            &shard.stable_metadata_digest,
+            "shard.stable_metadata_digest",
+        )?;
+        required(&shard.metadata_endpoint, "shard.metadata_endpoint")?;
 
         info!(
-            "Registering shard for version '{}' from worker '{}' (source slot '{}')",
-            shard.version_id, shard.worker_id, shard.source_slot_id
+            "Registering shard for version '{}' from worker '{}' (logical shard '{}')",
+            shard.version_id, shard.worker_id, shard.logical_shard_id
         );
         let (shard, version) = self
             .backend
@@ -380,11 +552,11 @@ impl RefitService for RefitServiceImpl {
     ) -> Result<Response<DeleteWeightVersionShardResponse>, Status> {
         let request = request.into_inner();
         required(&request.version_id, "version_id")?;
-        required(&request.source_slot_id, "source_slot_id")?;
+        required(&request.logical_shard_id, "logical_shard_id")?;
         required(&request.worker_id, "worker_id")?;
         info!(
-            "Deleting shard for version '{}' from worker '{}' (source slot '{}')",
-            request.version_id, request.worker_id, request.source_slot_id
+            "Deleting shard for version '{}' from worker '{}' (logical shard '{}')",
+            request.version_id, request.worker_id, request.logical_shard_id
         );
         self.backend
             .delete_weight_version_shard(&request)
@@ -453,6 +625,60 @@ mod tests {
         ObjectStorageSource {
             uri: uri.to_string(),
             storage_type: ObjectStorageType::S3.into(),
+        }
+    }
+
+    #[test]
+    fn trainer_mesh_requires_nonempty_binding_metadata_and_allows_replicas() {
+        let workers = HashMap::from([
+            (
+                "worker-a".to_string(),
+                TrainerTensorsMetadata {
+                    logical_shard_id: "shard-a".to_string(),
+                    metadata_endpoint: "127.0.0.1:5000".to_string(),
+                },
+            ),
+            (
+                "worker-b".to_string(),
+                TrainerTensorsMetadata {
+                    logical_shard_id: "shard-a".to_string(),
+                    metadata_endpoint: "127.0.0.1:5001".to_string(),
+                },
+            ),
+        ]);
+        assert!(validate_mesh_members(&workers).is_ok());
+        assert_eq!(
+            error_code(validate_mesh_members(&HashMap::new())),
+            Code::InvalidArgument
+        );
+        let mut incomplete = workers;
+        incomplete.insert(
+            "worker-c".to_string(),
+            TrainerTensorsMetadata {
+                logical_shard_id: "shard-b".to_string(),
+                metadata_endpoint: String::new(),
+            },
+        );
+        assert_eq!(
+            error_code(validate_mesh_members(&incomplete)),
+            Code::InvalidArgument
+        );
+        for (worker_id, logical_shard_id, metadata_endpoint) in [
+            ("", "shard-a", "127.0.0.1:5000"),
+            ("worker-a", "", "127.0.0.1:5000"),
+            ("worker-a", "shard-a", ""),
+        ] {
+            let workers = HashMap::from([(
+                worker_id.to_string(),
+                TrainerTensorsMetadata {
+                    logical_shard_id: logical_shard_id.to_string(),
+                    metadata_endpoint: metadata_endpoint.to_string(),
+                },
+            )]);
+            assert_eq!(
+                error_code(validate_mesh_members(&workers)),
+                Code::InvalidArgument
+            );
         }
     }
 
@@ -532,7 +758,16 @@ mod tests {
         }
         assert!(
             validate_publication(&CreateWeightVersionRequest {
-                expected_source_slots: vec!["rank:0".to_string()],
+                uid: Some("caller-version".to_string()),
+                trainer_mesh_id: Some("mesh-a".to_string()),
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_publication(&CreateWeightVersionRequest {
+                trainer_mesh_id: Some("mesh-a".to_string()),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             })
@@ -545,7 +780,6 @@ mod tests {
         for request in [
             CreateWeightVersionRequest {
                 uid: Some(" \t".to_string()),
-                expected_source_slots: vec!["rank:0".to_string()],
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
@@ -566,12 +800,6 @@ mod tests {
             },
             CreateWeightVersionRequest {
                 object_storage: Some(s3_source("s3:///root")),
-                state: WeightVersionState::Staging.into(),
-                ..Default::default()
-            },
-            CreateWeightVersionRequest {
-                expected_source_slots: vec!["rank:0".to_string()],
-                object_storage: Some(s3_source("s3://weights/root")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
@@ -611,12 +839,26 @@ mod tests {
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                expected_source_slots: vec!["rank:0".to_string()],
                 state: WeightVersionState::Ready.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                expected_source_slots: vec!["rank:0".to_string(), "rank:0".to_string()],
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                trainer_mesh_id: Some(" ".to_string()),
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                trainer_mesh_id: Some("mesh-a".to_string()),
+                state: WeightVersionState::Ready.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                trainer_mesh_id: Some("mesh-a".to_string()),
+                object_storage: Some(s3_source("s3://weights/root")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },

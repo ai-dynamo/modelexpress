@@ -40,6 +40,26 @@ class RefitServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.CreateTrainerMesh = channel.unary_unary(
+                '/model_express.refit.RefitService/CreateTrainerMesh',
+                request_serializer=refit__pb2.CreateTrainerMeshRequest.SerializeToString,
+                response_deserializer=refit__pb2.CreateTrainerMeshResponse.FromString,
+                _registered_method=True)
+        self.GetTrainerMesh = channel.unary_unary(
+                '/model_express.refit.RefitService/GetTrainerMesh',
+                request_serializer=refit__pb2.GetTrainerMeshRequest.SerializeToString,
+                response_deserializer=refit__pb2.GetTrainerMeshResponse.FromString,
+                _registered_method=True)
+        self.UpdateTrainerMesh = channel.unary_unary(
+                '/model_express.refit.RefitService/UpdateTrainerMesh',
+                request_serializer=refit__pb2.UpdateTrainerMeshRequest.SerializeToString,
+                response_deserializer=refit__pb2.UpdateTrainerMeshResponse.FromString,
+                _registered_method=True)
+        self.DeleteTrainerMesh = channel.unary_unary(
+                '/model_express.refit.RefitService/DeleteTrainerMesh',
+                request_serializer=refit__pb2.DeleteTrainerMeshRequest.SerializeToString,
+                response_deserializer=refit__pb2.DeleteTrainerMeshResponse.FromString,
+                _registered_method=True)
         self.CreateWeightVersion = channel.unary_unary(
                 '/model_express.refit.RefitService/CreateWeightVersion',
                 request_serializer=refit__pb2.CreateWeightVersionRequest.SerializeToString,
@@ -49,6 +69,11 @@ class RefitServiceStub(object):
                 '/model_express.refit.RefitService/GetWeightVersion',
                 request_serializer=refit__pb2.GetWeightVersionRequest.SerializeToString,
                 response_deserializer=refit__pb2.GetWeightVersionResponse.FromString,
+                _registered_method=True)
+        self.ListWeightVersions = channel.unary_unary(
+                '/model_express.refit.RefitService/ListWeightVersions',
+                request_serializer=refit__pb2.ListWeightVersionsRequest.SerializeToString,
+                response_deserializer=refit__pb2.ListWeightVersionsResponse.FromString,
                 _registered_method=True)
         self.DeleteWeightVersion = channel.unary_unary(
                 '/model_express.refit.RefitService/DeleteWeightVersion',
@@ -98,14 +123,44 @@ class RefitServiceServicer(object):
     per-worker manifests.
     """
 
-    def CreateWeightVersion(self, request, context):
+    def CreateTrainerMesh(self, request, context):
         """External APIs: called by the RL framework orchestrator.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetTrainerMesh(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UpdateTrainerMesh(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteTrainerMesh(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CreateWeightVersion(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetWeightVersion(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListWeightVersions(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -167,6 +222,26 @@ class RefitServiceServicer(object):
 
 def add_RefitServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'CreateTrainerMesh': grpc.unary_unary_rpc_method_handler(
+                    servicer.CreateTrainerMesh,
+                    request_deserializer=refit__pb2.CreateTrainerMeshRequest.FromString,
+                    response_serializer=refit__pb2.CreateTrainerMeshResponse.SerializeToString,
+            ),
+            'GetTrainerMesh': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetTrainerMesh,
+                    request_deserializer=refit__pb2.GetTrainerMeshRequest.FromString,
+                    response_serializer=refit__pb2.GetTrainerMeshResponse.SerializeToString,
+            ),
+            'UpdateTrainerMesh': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateTrainerMesh,
+                    request_deserializer=refit__pb2.UpdateTrainerMeshRequest.FromString,
+                    response_serializer=refit__pb2.UpdateTrainerMeshResponse.SerializeToString,
+            ),
+            'DeleteTrainerMesh': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteTrainerMesh,
+                    request_deserializer=refit__pb2.DeleteTrainerMeshRequest.FromString,
+                    response_serializer=refit__pb2.DeleteTrainerMeshResponse.SerializeToString,
+            ),
             'CreateWeightVersion': grpc.unary_unary_rpc_method_handler(
                     servicer.CreateWeightVersion,
                     request_deserializer=refit__pb2.CreateWeightVersionRequest.FromString,
@@ -176,6 +251,11 @@ def add_RefitServiceServicer_to_server(servicer, server):
                     servicer.GetWeightVersion,
                     request_deserializer=refit__pb2.GetWeightVersionRequest.FromString,
                     response_serializer=refit__pb2.GetWeightVersionResponse.SerializeToString,
+            ),
+            'ListWeightVersions': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListWeightVersions,
+                    request_deserializer=refit__pb2.ListWeightVersionsRequest.FromString,
+                    response_serializer=refit__pb2.ListWeightVersionsResponse.SerializeToString,
             ),
             'DeleteWeightVersion': grpc.unary_unary_rpc_method_handler(
                     servicer.DeleteWeightVersion,
@@ -232,6 +312,114 @@ class RefitService(object):
     """
 
     @staticmethod
+    def CreateTrainerMesh(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.refit.RefitService/CreateTrainerMesh',
+            refit__pb2.CreateTrainerMeshRequest.SerializeToString,
+            refit__pb2.CreateTrainerMeshResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetTrainerMesh(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.refit.RefitService/GetTrainerMesh',
+            refit__pb2.GetTrainerMeshRequest.SerializeToString,
+            refit__pb2.GetTrainerMeshResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpdateTrainerMesh(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.refit.RefitService/UpdateTrainerMesh',
+            refit__pb2.UpdateTrainerMeshRequest.SerializeToString,
+            refit__pb2.UpdateTrainerMeshResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteTrainerMesh(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.refit.RefitService/DeleteTrainerMesh',
+            refit__pb2.DeleteTrainerMeshRequest.SerializeToString,
+            refit__pb2.DeleteTrainerMeshResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def CreateWeightVersion(request,
             target,
             options=(),
@@ -275,6 +463,33 @@ class RefitService(object):
             '/model_express.refit.RefitService/GetWeightVersion',
             refit__pb2.GetWeightVersionRequest.SerializeToString,
             refit__pb2.GetWeightVersionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListWeightVersions(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.refit.RefitService/ListWeightVersions',
+            refit__pb2.ListWeightVersionsRequest.SerializeToString,
+            refit__pb2.ListWeightVersionsResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -513,10 +728,15 @@ class RefitWorkerServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.GetWeightVersionShardManifest = channel.unary_unary(
-                '/model_express.refit.RefitWorkerService/GetWeightVersionShardManifest',
-                request_serializer=refit__pb2.GetWeightVersionShardManifestRequest.SerializeToString,
-                response_deserializer=refit__pb2.GetWeightVersionShardManifestResponse.FromString,
+        self.GetTrainerShardMetadata = channel.unary_unary(
+                '/model_express.refit.RefitWorkerService/GetTrainerShardMetadata',
+                request_serializer=refit__pb2.GetTrainerShardMetadataRequest.SerializeToString,
+                response_deserializer=refit__pb2.GetTrainerShardMetadataResponse.FromString,
+                _registered_method=True)
+        self.GetWeightVersionShardMetadata = channel.unary_unary(
+                '/model_express.refit.RefitWorkerService/GetWeightVersionShardMetadata',
+                request_serializer=refit__pb2.GetWeightVersionShardMetadataRequest.SerializeToString,
+                response_deserializer=refit__pb2.GetWeightVersionShardMetadataResponse.FromString,
                 _registered_method=True)
 
 
@@ -525,7 +745,13 @@ class RefitWorkerServiceServicer(object):
     manifest here; tensor bytes remain on the advertised data-plane transport.
     """
 
-    def GetWeightVersionShardManifest(self, request, context):
+    def GetTrainerShardMetadata(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetWeightVersionShardMetadata(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -534,10 +760,15 @@ class RefitWorkerServiceServicer(object):
 
 def add_RefitWorkerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'GetWeightVersionShardManifest': grpc.unary_unary_rpc_method_handler(
-                    servicer.GetWeightVersionShardManifest,
-                    request_deserializer=refit__pb2.GetWeightVersionShardManifestRequest.FromString,
-                    response_serializer=refit__pb2.GetWeightVersionShardManifestResponse.SerializeToString,
+            'GetTrainerShardMetadata': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetTrainerShardMetadata,
+                    request_deserializer=refit__pb2.GetTrainerShardMetadataRequest.FromString,
+                    response_serializer=refit__pb2.GetTrainerShardMetadataResponse.SerializeToString,
+            ),
+            'GetWeightVersionShardMetadata': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetWeightVersionShardMetadata,
+                    request_deserializer=refit__pb2.GetWeightVersionShardMetadataRequest.FromString,
+                    response_serializer=refit__pb2.GetWeightVersionShardMetadataResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -553,7 +784,7 @@ class RefitWorkerService(object):
     """
 
     @staticmethod
-    def GetWeightVersionShardManifest(request,
+    def GetTrainerShardMetadata(request,
             target,
             options=(),
             channel_credentials=None,
@@ -566,9 +797,36 @@ class RefitWorkerService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/model_express.refit.RefitWorkerService/GetWeightVersionShardManifest',
-            refit__pb2.GetWeightVersionShardManifestRequest.SerializeToString,
-            refit__pb2.GetWeightVersionShardManifestResponse.FromString,
+            '/model_express.refit.RefitWorkerService/GetTrainerShardMetadata',
+            refit__pb2.GetTrainerShardMetadataRequest.SerializeToString,
+            refit__pb2.GetTrainerShardMetadataResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetWeightVersionShardMetadata(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.refit.RefitWorkerService/GetWeightVersionShardMetadata',
+            refit__pb2.GetWeightVersionShardMetadataRequest.SerializeToString,
+            refit__pb2.GetWeightVersionShardMetadataResponse.FromString,
             options,
             channel_credentials,
             insecure,

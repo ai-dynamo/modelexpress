@@ -32,14 +32,17 @@ import time
 import torch
 import torch.nn as nn
 
-from ... import configure_vllm_logging, envs, model_prefetch
+from ... import configure_vllm_logging, envs, model_prefetch, p2p_pb2
 from ...load_strategy import (
     LoadContext,
     drain_tensor_readers,
     publish_metadata,
+    register_tensors,
     run_load_strategy_chain,
+    validate_load_strategy_chain,
     unpublish_metadata,
 )
+from ...load_strategy.draft_gate import DraftPublicationGate
 from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
@@ -64,6 +67,21 @@ logger = logging.getLogger(__name__)
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
 _loader_registry: dict[int, MxModelLoader] = {}
+# Main-pass publication gates awaiting this device's speculative draft pass.
+_draft_publication_gates: dict[int, DraftPublicationGate] = {}
+
+
+def _expects_draft_pass(vllm_config) -> bool:
+    """True when vLLM will run a second, draft load_model on this worker.
+
+    Mirrors _is_speculative_draft: ngram and similar methods alias the draft
+    config to the target's (runner "generate") and never load a draft.
+    """
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is None:
+        return False
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    return getattr(draft_model_config, "runner_type", None) == "draft"
 
 
 def get_model_loader(device_id: int) -> MxModelLoader | None:
@@ -90,6 +108,9 @@ class MxModelLoader(BaseModelLoader):
         # you most need to diagnose. No-op unless enabled; never raises.
         enable_metrics()
         self._ctx: LoadContext | None = None
+        # Set by on_sleep(), consulted by on_wake_up(): wake_up(tags) doesn't
+        # carry the preceding sleep's level, so this loader remembers it.
+        self._last_sleep_level: int | None = None
 
     def load_model(
         self,
@@ -103,25 +124,117 @@ class MxModelLoader(BaseModelLoader):
         a model subtree. ModelExpress does not interpret it; it is passed through
         to vLLM's initialize_model().
         """
+        return self._load_or_reload_model(vllm_config, model_config, prefix)
+
+    def reload_model(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        model: nn.Module,
+        prefix: str = "",
+    ) -> nn.Module:
+        """Reload weights into an already-initialized model.
+
+        Unlike `load_model`, `model` is required: the strategy chain runs
+        against this existing instance instead of building a fresh one via
+        `initialize_model()`. Each strategy decides what a reload changes for
+        it: those that stream weights through vLLM's load_weights() run inside
+        `initialize_layerwise_reload`/`finalize_layerwise_reload` to avoid
+        transient double-materialization, while RDMA writes into the existing
+        buffers and must not have them deferred to meta.
+
+        Peers must not read weights while they are being overwritten, so P2P
+        source-serving stops first unless a prior sleep() already stopped it.
+        The strategy chain registers and republishes the reloaded tensors.
+        """
+        if self._last_sleep_level is None:
+            self._stop_serving()
+        return self._load_or_reload_model(vllm_config, model_config, prefix, model)
+
+    def _load_or_reload_model(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        prefix: str = "",
+        model: nn.Module | None = None,
+    ) -> nn.Module:
+        """Load model, auto-detecting the best loading strategy.
+
+        `prefix` is vLLM's BaseModelLoader.load_model argument for initializing
+        a model subtree. ModelExpress does not interpret it; it is passed through
+        to vLLM's initialize_model().
+        """
         load_start = time.perf_counter()
 
         is_speculative_draft = _is_speculative_draft(vllm_config, model_config)
-        if is_speculative_draft and envs.MX_LOAD_STRATEGY_CHAIN == "RL":
-            raise ValueError(
-                "RL initial loading does not support speculative draft models"
-            )
+        self._validate_load_policy(is_speculative_draft=is_speculative_draft)
 
         ctx = build_vllm_load_context(vllm_config, model_config)
-        ctx.p2p_enabled = not is_speculative_draft
+        ctx.p2p_role = "draft" if is_speculative_draft else "main"
+        ctx.is_reload = model is not None
+        if ctx.is_reload and self._ctx is not None:
+            # Snapshot: a refit rewrites the live identity's revision in place.
+            ctx.loaded_identity = p2p_pb2.SourceIdentity()
+            ctx.loaded_identity.CopyFrom(self._ctx.identity)
+        draft_gate: DraftPublicationGate | None = None
+        if is_speculative_draft:
+            main_loader = _loader_registry.get(ctx.device_id)
+            main_ctx = main_loader._ctx if main_loader is not None else None
+            if envs.MX_DISABLE_DRAFT_P2P:
+                ctx.p2p_enabled = False
+            elif main_ctx is not None and main_ctx.identity == ctx.identity:
+                # Same checkpoint (MTP): join the main load's publication
+                # through its NIXL agent instead of binding a second one.
+                ctx.shared_nixl_manager = _nixl_managers.get(ctx.device_id)
+            else:
+                # A draft from a different checkpoint (e.g. EAGLE) has its own
+                # SourceIdentity, so peers could never find its tensors in the
+                # target's publication. Keep it out of P2P.
+                ctx.p2p_enabled = False
+            draft_gate = _draft_publication_gates.pop(ctx.device_id, None)
         if envs.MX_ARTIFACT_READY_URL.strip():
+            # The engine is not healthy until the draft has loaded too, so this
+            # already keeps the main publication hidden until then.
             ctx.source_ready_fn = lambda: _vllm_health_ready(ctx)
-        if ctx.p2p_enabled:
+        elif ctx.p2p_role == "main" and _expects_draft_pass(vllm_config):
+            main_gate = DraftPublicationGate()
+            _draft_publication_gates[ctx.device_id] = main_gate
+            ctx.source_ready_fn = main_gate.is_open
+        if ctx.p2p_role == "main" and ctx.p2p_enabled:
             self._ctx = ctx
 
         logger.info(
             f"[Worker {ctx.global_rank}] MxModelLoader starting "
-            f"(model={ctx.identity.model_name}, p2p_enabled={ctx.p2p_enabled})"
+            f"(model={ctx.identity.model_name}, p2p_enabled={ctx.p2p_enabled}, "
+            f"p2p_role={ctx.p2p_role})"
         )
+        try:
+            model = self._load_model(
+                vllm_config, model_config, prefix, ctx, is_speculative_draft, model
+            )
+        finally:
+            if draft_gate is not None:
+                draft_gate.release()
+            main_gate_pending = _draft_publication_gates.get(ctx.device_id)
+            if ctx.p2p_role == "main" and main_gate_pending is not None:
+                main_gate_pending.arm()
+
+        total_time = time.perf_counter() - load_start
+        logger.info(
+            f"[Worker {ctx.global_rank}] MxModelLoader.load_model() COMPLETE "
+            f"in {total_time:.2f}s"
+        )
+        return model.eval()
+
+    def _load_model(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        prefix: str,
+        ctx: LoadContext,
+        is_speculative_draft: bool,
+        model: nn.Module | None = None,
+    ) -> nn.Module:
 
         # A speculative draft loads through this same path and finishes far
         # sooner than the model the user asked for, so timing them together
@@ -137,22 +250,31 @@ class MxModelLoader(BaseModelLoader):
         model_id = ctx.identity.model_name
         with metrics.time_load("vllm", model_id, model_role):
             with maybe_enter_vmm_arena(ctx):
-                if ctx.p2p_enabled:
+                if ctx.p2p_enabled and ctx.p2p_role == "main":
                     with metrics.time_load_phase("vllm", model_id, "artifact_install"):
                         install_vllm_cache_artifacts(ctx)
                 with set_default_torch_dtype(model_config.dtype):
                     with ctx.target_device:
-                        with metrics.time_load_phase("vllm", model_id, "model_init"):
-                            model = initialize_model(
-                                vllm_config=vllm_config,
-                                model_config=model_config,
-                                prefix=prefix,
-                            )
+                        if model is None:
+                            with metrics.time_load_phase("vllm", model_id, "model_init"):
+                                model = initialize_model(
+                                    vllm_config=vllm_config,
+                                    model_config=model_config,
+                                    prefix=prefix,
+                                )
 
                     with metrics.time_load_phase("vllm", model_id, "chain"):
-                        model = run_load_strategy_chain(model, ctx)
+                        model = self._run_load_strategy_chain(model, ctx)
 
-                    if ctx.p2p_enabled:
+                    if ctx.p2p_enabled and ctx.p2p_role == "draft":
+                        if ctx.nixl_manager is not None:
+                            # Same checkpoint, same SourceIdentity: extend the
+                            # main load's manifest instead of registering a
+                            # second source under a colliding mx_source_id.
+                            _tensor_registry.setdefault(ctx.device_id, {}).update(
+                                ctx.tensors
+                            )
+                    elif ctx.p2p_enabled:
                         _loader_registry[ctx.device_id] = self
                         _tensor_registry[ctx.device_id] = ctx.tensors
                         if ctx.nixl_manager is not None:
@@ -168,21 +290,17 @@ class MxModelLoader(BaseModelLoader):
 
             log_arena_post_load(ctx)
 
-        total_time = time.perf_counter() - load_start
-        logger.info(
-            f"[Worker {ctx.global_rank}] MxModelLoader.load_model() COMPLETE "
-            f"in {total_time:.2f}s"
-        )
-        return model.eval()
+        return model
+
+    def _validate_load_policy(self, *, is_speculative_draft: bool = False) -> None:
+        validate_load_strategy_chain()
+
+    def _run_load_strategy_chain(self, model: nn.Module, ctx: LoadContext) -> nn.Module:
+        return run_load_strategy_chain(model, ctx)
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Download the model so it can be loaded immediately."""
-        if envs.MX_LOAD_STRATEGY_CHAIN == "RL":
-            logger.info(
-                "RL initial load is selected; leaving weight acquisition to "
-                "the RL strategy chain"
-            )
-            return
+        self._validate_load_policy()
 
         if model_prefetch.is_enabled():
             # Without shared storage this would pull the full weight set from
@@ -214,6 +332,52 @@ class MxModelLoader(BaseModelLoader):
         except AttributeError:
             object.__setattr__(disk_config, "load_format", "auto")
         DefaultModelLoader(disk_config).load_weights(model, model_config)
+
+    def on_sleep(self, level: int) -> None:
+        """Stop P2P source-serving before vLLM's sleep() invalidates the GPU
+        memory this loader registered with NIXL.
+
+        Applies regardless of level: both level 1 (offload) and level 2
+        (discard) unmap the physical GPU pages backing the registered
+        virtual addresses, so a peer's RDMA read against either would hit
+        invalid memory.
+        """
+        self._last_sleep_level = level
+        self._stop_serving()
+
+    def on_wake_up(self, tags: list[str] | None) -> None:
+        """Resume P2P source-serving once vLLM's wake_up() has restored
+        valid GPU memory.
+
+        Only for level 1: wake_up() restores offloaded weights to GPU. For
+        level 2, weights are discarded with no backup -- content is only
+        valid again once reload_weights() actually repopulates them, and
+        reload_model() registers and republishes the replica itself.
+        wake_up() doesn't carry the sleep level itself, so this reads it back
+        from what on_sleep() recorded, and clears it once weights are awake.
+        """
+        wake_weights = tags is None or "weights" in tags
+        if not wake_weights:
+            return
+
+        last_sleep_level = self._last_sleep_level
+        self._last_sleep_level = None
+        if self._ctx is None or last_sleep_level != 1:
+            return
+
+        if self._ctx.nixl_manager is None:
+            register_tensors(None, self._ctx, reuse_discovered=True)
+        publish_metadata(self._ctx)
+
+    def _stop_serving(self) -> None:
+        """Withdraw the publication and release the NIXL agent, if serving."""
+        if self._ctx is None:
+            return
+
+        unpublish_metadata(self._ctx)
+        if self._ctx.nixl_manager is not None:
+            self._ctx.nixl_manager.shutdown()
+            self._ctx.nixl_manager = None
 
     @property
     def nixl_manager(self) -> NixlTransferManager | None:

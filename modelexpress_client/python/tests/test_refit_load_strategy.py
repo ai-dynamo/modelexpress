@@ -28,6 +28,29 @@ from modelexpress_rl.inference.load_strategy import (
     RLLoadStrategyChain,
     _resolve_s3_replay_chain,
 )
+
+
+def test_rl_policy_bypasses_selected_base_plugin(monkeypatch, tmp_path):
+    (tmp_path / "mx_plugin_example.py").write_text(
+        "raise RuntimeError('base plugin must not be imported')\n"
+    )
+    monkeypatch.setenv("MX_PLUGIN_DIR", str(tmp_path))
+    monkeypatch.setenv("MX_LOAD_PLUGIN", "example")
+    monkeypatch.setenv("MX_LOAD_PLUGIN_BEFORE", "invalid")
+    monkeypatch.setenv("MX_LOAD_STRATEGY_CHAIN", "RL")
+    model = nn.Linear(1, 1)
+    ctx = _context()
+    with patch(
+        "modelexpress_rl.inference.load_strategy._agree_desired_version",
+        return_value=None,
+    ), patch(
+        "modelexpress_rl.inference.load_strategy.execute_load_strategies",
+        return_value=model,
+    ) as execute:
+        assert RLLoadStrategyChain.run(model, ctx) is model
+    execute.assert_called_once()
+
+
 def _context():
     """Build a default load context for cold-start strategy tests."""
     ctx = MagicMock()
@@ -63,8 +86,9 @@ def _version(
     base=None,
     model_name="test-model",
     state=WeightVersionState.READY,
-):
+) -> WeightVersion:
     return WeightVersion(
+        trainer_mesh_generation=0,
         version_id=uid,
         model_name=model_name,
         payload_format=payload_format,
@@ -73,7 +97,6 @@ def _version(
             storage_type=ObjectStorageType.S3,
             uri=f"s3://weights/{uid}/model.safetensors.index.json",
         ),
-        expected_source_slots=(),
         layout_signature="layout",
         state=state,
         created_at_unix_ms=1,
@@ -477,7 +500,7 @@ def test_desired_s3_loads_materialized_checkpoint(monkeypatch, tmp_path):
     ), patch(
         "modelexpress_rl.inference.load_strategy.S3Client", return_value=s3
     ), patch(
-        "modelexpress_rl.inference.load_strategy.bootstrap_s3_checkpoint",
+        "modelexpress_rl.inference.load_strategy.bootstrap_object_storage_checkpoint",
         return_value=Path("/cache/root"),
     ), patch(
         "modelexpress_rl.inference.load_strategy.CanonicalDeltaUpdateMethod",

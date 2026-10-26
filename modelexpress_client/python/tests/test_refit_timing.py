@@ -5,7 +5,7 @@ import json
 import logging
 
 import pytest
-from modelexpress.refit import (
+from modelexpress_rl.refit import (
     MX_REFIT_TIMING_PREFIX,
     REFIT_TIMING_STAGES,
     RefitTimingRecorder,
@@ -14,9 +14,6 @@ from modelexpress.refit import (
     current_refit_timing,
     refit_span,
     use_refit_timing,
-)
-from modelexpress.refit_timing import (
-    RefitTimingRecorder as CompatibilityRefitTimingRecorder,
 )
 
 
@@ -29,10 +26,6 @@ class _Clock:
 
     def advance(self, seconds):
         self.now += seconds
-
-
-def test_legacy_refit_timing_import_is_compatible():
-    assert CompatibilityRefitTimingRecorder is RefitTimingRecorder
 
 
 def test_stage_order_repeated_spans_and_unattributed_sum():

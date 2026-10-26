@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modelexpress"
-version = "0.7.0"
+version = "0.8.0"
 description = "Python client for ModelExpress P2P GPU transfer service"
 readme = "README.md"
 license = "Apache-2.0"
@@ -31,7 +31,7 @@ dependencies = [
     "protobuf>=5.27.2,<7.0.0",
     "pydantic>=2.0.0",
     "torch>=2.6.0",
-    "runai-model-streamer[s3,gcs,azure]; sys_platform == 'linux'",
+    "runai-model-streamer[azure,gcs,s3]>=0.17.0 ; sys_platform == 'linux'",
     "instanttensor>=0.1.9 ; sys_platform == 'linux'",
     # First release with IfNoneMatch on CompleteMultipartUpload.
     "boto3>=1.35.2",
@@ -84,6 +84,10 @@ Documentation = "https://github.com/ai-dynamo/modelexpress/tree/main/docs"
 
 [project.entry-points."vllm.general_plugins"]
 modelexpress = "modelexpress:register_modelexpress"
+modelexpress_rl = "modelexpress_rl.inference.engines.vllm.registration:register"
+
+[project.entry-points."sglang.srt.plugins"]
+modelexpress_rl = "modelexpress_rl.inference.engines.sglang.registration:register"
 
 [tool.pytest.ini_options]
 markers = [

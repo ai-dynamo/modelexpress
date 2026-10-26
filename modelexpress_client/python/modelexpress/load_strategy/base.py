@@ -9,14 +9,16 @@ import logging
 import traceback
 import uuid
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, ClassVar
 
 import torch.nn as nn
 
 from .. import envs
+from ..adapter import EngineAdapter, StrategyFailed
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import log_tensor_summary
-from ..metadata.publish import publish_metadata_and_ready
+from ..metadata.publish import extend_published_tensors, publish_metadata_and_ready
 from .context import LoadContext, LoadResult
 
 if TYPE_CHECKING:
@@ -59,6 +61,22 @@ class SourceTransferError(Exception):
     """
 
 
+@contextmanager
+def mutates_model():
+    """Report a failure inside a phase as a mutated StrategyFailed.
+
+    prepare(), finalize() and abort() all write into the model, so a strategy
+    that falls through after one of them failed leaves the next needing a
+    reinitialized model.
+    """
+    try:
+        yield
+    except StrategyFailed:
+        raise
+    except Exception as e:
+        raise StrategyFailed(str(e), mutated=True) from e
+
+
 class LoadStrategy(ABC):
     """Base class for weight-loading strategies.
 
@@ -70,10 +88,74 @@ class LoadStrategy(ABC):
       - raise StrategyFailed(mutated=False) for expected fallback paths
       - raise StrategyFailed(mutated=True) after mutating the model
       - reserve unexpected errors for rare defensive fallback in the chain
+
+    External plugins use this same contract. Their unexpected load exceptions
+    and non-LoadResult returns are treated as mutated failures so retry always
+    restores the model. Import and construction must not load model weights;
+    availability checks must not mutate the model or download artifacts.
     """
 
     name: str
     requires: ClassVar[tuple] = ()
+
+    def prepare(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Bring the model to the state this strategy needs before loading.
+
+        The default suits strategies that hand weights to the engine through
+        its own load_weights() callbacks. A cold load needs nothing here. A
+        reload enters the engine's layerwise reload, which puts parameters
+        back on the meta device and materializes each layer as its weights
+        arrive, so a reload never transiently holds two copies of the model.
+
+        Works on ``result`` in place: it is the stable envelope the chain
+        holds for the whole attempt.
+        """
+        if ctx.is_reload:
+            with mutates_model():
+                ctx.adapter.begin_streaming_reload(result)
+
+    def finalize(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Bring the loaded weights to their final runtime layout.
+
+        Runs only after `load` succeeded. On a cold load that is
+        :meth:`post_process`. On a reload, leaving the layerwise reload
+        entered by :meth:`prepare` already processed each layer as it
+        materialized, so post-processing must not run again.
+
+        Then registers the model's tensors with NIXL. Tensor discovery has to
+        see the model in its final layout, which is only true from here on.
+        An override that does not call this registers on its own terms, as
+        RDMA does mid-transfer. Registration is best-effort and never writes
+        into the model, so it sits outside :func:`mutates_model`.
+
+        Works on ``result`` in place, like :meth:`prepare`.
+        """
+        with mutates_model():
+            if ctx.is_reload:
+                ctx.adapter.end_streaming_reload(result)
+            else:
+                self.post_process(result, ctx)
+        if result.model_for_publish is not None:
+            register_tensors(result, ctx)
+
+    def abort(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Undo whatever :meth:`prepare` started, after `load` failed.
+
+        Runs instead of :meth:`finalize`. A reload has to leave the layerwise
+        reload here too, so a fallback never starts against a model still
+        deferred to meta.
+        """
+        if ctx.is_reload:
+            with mutates_model():
+                ctx.adapter.end_streaming_reload(result)
+
+    def post_process(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Convert the raw weights a cold load delivered into their runtime layout.
+
+        Which adapter hook does that follows from how ``load`` handed the
+        weights to the engine; see :class:`WeightsIteratorLoadStrategy` and
+        :class:`NativeLoadStrategy`.
+        """
 
     def is_available(self, ctx: LoadContext) -> bool:
         """Check environment: is this strategy usable right now?"""
@@ -99,6 +181,24 @@ class LoadStrategy(ABC):
         that through StrategyFailed(mutated=True).
         """
         return None
+
+
+class WeightsIteratorLoadStrategy(LoadStrategy):
+    """A strategy whose load() streams weights through adapter.apply_weight_iter()."""
+
+    requires: ClassVar[tuple] = (EngineAdapter.apply_weight_iter,)
+
+    def post_process(self, result: LoadResult, ctx: LoadContext) -> None:
+        ctx.adapter.after_weight_iter_load(result)
+
+
+class NativeLoadStrategy(LoadStrategy):
+    """A strategy whose load() hands weights to adapter.load_via_native()."""
+
+    requires: ClassVar[tuple] = (EngineAdapter.load_via_native,)
+
+    def post_process(self, result: LoadResult, ctx: LoadContext) -> None:
+        ctx.adapter.after_native_load(result)
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +292,18 @@ def register_tensors(
         return
     if ctx.adapter is None:
         raise RuntimeError("NIXL registration requires an engine adapter")
+    if (
+        ctx.p2p_role == "draft"
+        and ctx.nixl_manager is None
+        and ctx.shared_nixl_manager is None
+    ):
+        # Without the main load's agent there is no publication to extend,
+        # and binding a fresh agent would reuse MX_METADATA_PORT + device_id.
+        logger.info(
+            f"[Worker {ctx.global_rank}] Speculative draft pass has no main-load "
+            "NIXL agent to share, skipping NIXL registration"
+        )
+        return
 
     try:
         if reuse_discovered and ctx.tensors:
@@ -209,20 +321,45 @@ def register_tensors(
                 return
 
             ctx.tensors = ctx.adapter.discover_tensors(result)
+            if ctx.p2p_role == "draft":
+                ctx.tensors = {
+                    ctx.draft_tensor_namespace + name: tensor
+                    for name, tensor in ctx.tensors.items()
+                }
             log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
 
         if ctx.nixl_manager is None:
-            base_port = envs.MX_METADATA_PORT
-            listen_port = base_port + ctx.device_id
-            ctx.nixl_manager = _init_nixl_manager(
-                ctx.global_rank,
-                ctx.device_id,
-                "auto",
-                listen_port,
-                ctx.accelerator_backend,
-            )
+            if ctx.shared_nixl_manager is not None:
+                # Draft pass: rebinding MX_METADATA_PORT + device_id is what
+                # produced "Address already in use [98]". Register into the
+                # agent the main load already bound.
+                ctx.nixl_manager = ctx.shared_nixl_manager
+            else:
+                base_port = envs.MX_METADATA_PORT
+                listen_port = base_port + ctx.device_id
+                ctx.nixl_manager = _init_nixl_manager(
+                    ctx.global_rank,
+                    ctx.device_id,
+                    "auto",
+                    listen_port,
+                    ctx.accelerator_backend,
+                )
 
-        if not ctx.nixl_manager.tensor_descriptors:
+        if ctx.p2p_role == "draft":
+            # Reusing the target's manager means tensor_descriptors is already
+            # populated; the draft must still register its own tensors, and
+            # append rather than replace the target's catalog. Per-tensor (not
+            # register_arena) because the arena MR range was captured at the
+            # target's registration and cannot be grown without invalidating
+            # the rkey peers already hold.
+            # TODO: register_arena_extend (a second MR over the adjacent
+            # sub-range of the arena reserve) would restore single-MR here.
+            logger.debug(
+                f"[Worker {ctx.global_rank}] Appending draft tensors to the "
+                "shared NIXL registration..."
+            )
+            ctx.nixl_manager.register_additional_tensors(ctx.tensors)
+        elif not ctx.nixl_manager.tensor_descriptors:
             if ctx.vmm_arena is not None:
                 logger.debug(
                     f"[Worker {ctx.global_rank}] Registering arena with NIXL "
@@ -234,6 +371,35 @@ def register_tensors(
                 ctx.nixl_manager.register_tensors(ctx.tensors)
             logger.debug(f"[Worker {ctx.global_rank}] Tensors registered with NIXL")
     except Exception as e:
+        if ctx.p2p_role == "draft":
+            # Never publish draft descriptors that are not registered; the
+            # shared agent itself stays with the main load.
+            ctx.nixl_manager = None
+        elif ctx.nixl_manager is not None:
+            # Registration failed, so there is nothing for this worker to serve.
+            # Drop the manager instead of leaving it half-initialized, for two
+            # reasons:
+            #
+            # 1. The agent created above owns the metadata listener socket on
+            #    MX_METADATA_PORT + device_id. Leaking it makes every subsequent
+            #    attempt die on "Address already in use", turning a single
+            #    recoverable failure into a permanent one for the life of the
+            #    process -- the re-registration that runs after a CRIU restore
+            #    never gets its port back.
+            # 2. publish_metadata() treats a non-None manager as "ready to serve",
+            #    so a half-initialized one gets advertised to the MX server and
+            #    peers select a source that cannot transfer.
+            try:
+                ctx.nixl_manager.shutdown()
+            except Exception:
+                logger.warning(
+                    f"[Worker {ctx.global_rank}] Failed to shut down NIXL manager "
+                    "after registration failure; the metadata listener port may "
+                    "stay bound",
+                    exc_info=True,
+                )
+            finally:
+                ctx.nixl_manager = None
         logger.warning(
             f"[Worker {ctx.global_rank}] NIXL registration failed, "
             f"worker will continue without P2P serving: {e}"
@@ -256,6 +422,30 @@ def publish_metadata(ctx: LoadContext) -> None:
         logger.info(
             f"[Worker {ctx.global_rank}] No MX server configured, skipping metadata publish"
         )
+        return
+    if ctx.p2p_role == "draft":
+        # Same checkpoint, same SourceIdentity: extend the main load's
+        # publication instead of starting a second worker gRPC server on
+        # MX_WORKER_GRPC_PORT + device_id under a colliding mx_source_id.
+        try:
+            extended = extend_published_tensors(
+                ctx.tensors,
+                device_id=ctx.device_id,
+                worker_rank=ctx.worker_rank,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[Worker {ctx.global_rank}] Failed to extend the main "
+                f"publication with draft tensors: {e}"
+            )
+            return
+        if not extended:
+            logger.info(
+                f"[Worker {ctx.global_rank}] No main publication on device "
+                f"{ctx.device_id} to extend, draft tensors are not served"
+            )
+        else:
+            ctx.draft_published = True
         return
     try:
         publish_metadata_and_ready(
@@ -309,8 +499,13 @@ def drain_tensor_readers(ctx: LoadContext, *, timeout: float) -> None:
 
 def unpublish_metadata_for_worker(*, worker_rank: int, device_id: int) -> None:
     """Stop one worker's publication without requiring a boot-load context."""
-    from ..metadata.publish import _heartbeat_threads, _worker_servers
+    from ..metadata.publish import (
+        _central_manifests,
+        _heartbeat_threads,
+        _worker_servers,
+    )
 
+    _central_manifests.pop(device_id, None)
     hb = _heartbeat_threads.pop(worker_rank, None)
     if hb is not None:
         try:

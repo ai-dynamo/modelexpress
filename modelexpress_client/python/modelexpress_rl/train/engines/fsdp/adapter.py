@@ -23,6 +23,7 @@ the client passes each stage, so a trainer that re-materializes its state_dict
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import math
 from collections.abc import Mapping
 from typing import Any
@@ -30,9 +31,9 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from modelexpress import envs as mx_envs
-from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
-from modelexpress.refit.timing import (
+from modelexpress_rl import envs as mx_envs
+from modelexpress_rl.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress_rl.refit.timing import (
     add_refit_duration,
     add_refit_metadata,
     refit_span,
@@ -44,8 +45,10 @@ from modelexpress_rl.train.adapter import (
     TrainerEngineAdapter,
     TrainerStagingMode,
     WeightPayloadFormat,
-    WeightVersionShardManifest,
+    TrainerShardMetadata,
 )
+from modelexpress_rl.train.manifest import bound_tensor_manifest
+from modelexpress_rl.refit.reshard.verify import tensor_digest
 
 from .publisher import (
     WIRE_DTYPE,
@@ -80,7 +83,8 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
             if dtype not in (torch.float16, torch.bfloat16, torch.float32):
                 raise ValueError(f"unsupported wire dtype {dtype!r} for {name!r}")
         self._nixl_metadata_endpoint = nixl_metadata_endpoint
-        self._source_slot_id = f"publisher:global-rank:{dist.get_rank()}"
+        self._logical_shard_id: str | None = None
+        self._bound_manifest: bytes | None = None
         self._initialized = False
         self._staging_mode: TrainerStagingMode | None = None
         # name -> (global_shape, shard_offset, local_shape) fixed at initialize().
@@ -92,16 +96,40 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         # name -> the address we registered (the arena for COPY, the live source
         # for IN_PLACE). The served buffer must keep sitting here.
         self._registered_addrs: dict[str, int] = {}
-        self._manifest: WeightVersionShardManifest | None = None
+        self._metadata: TrainerShardMetadata | None = None
 
     @property
-    def source_slot_id(self) -> str:
-        return self._source_slot_id
+    def logical_shard_id(self) -> str:
+        if self._logical_shard_id is None:
+            raise RuntimeError("bind_tensors() must be called before logical_shard_id")
+        return self._logical_shard_id
 
     def bind_tensors(self, tensors: Any) -> str:
-        """Validate the local state dict and bind it to this global-rank slot."""
-        self._capture(tensors)
-        return self.source_slot_id
+        """Bind address-independent wire coverage without staging source bytes."""
+        shards = self._capture(tensors)
+        coverage = [
+            {
+                "name": shard.name,
+                "dtype": str(self._wire_dtype(shard)),
+                "elsize": self._wire_dtype(shard).itemsize,
+                "full_shape": shard.global_shape,
+                "shards": [{"shard_offset": shard.shard_offset, "shape": shard.local_shape}],
+            }
+            for shard in shards
+        ]
+        manifest = bound_tensor_manifest(coverage)
+        logical_shard_id = hashlib.sha256(manifest).hexdigest()
+        if self._logical_shard_id is not None and self._logical_shard_id != logical_shard_id:
+            raise RuntimeError("FSDP tensor coverage changed after binding")
+        self._logical_shard_id = logical_shard_id
+        self._bound_manifest = manifest
+        return logical_shard_id
+
+    @property
+    def bound_manifest(self) -> bytes:
+        if self._bound_manifest is None:
+            raise RuntimeError("bind_tensors() must be called before bound_manifest")
+        return self._bound_manifest
 
     @property
     def supported_staging_modes(self) -> frozenset[TrainerStagingMode]:
@@ -359,7 +387,7 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
     def _staged(
         self, shards: list[LocalTensorShard], publish_ready: CompletionFence
     ) -> StagedWeightVersionShardData:
-        cache_hit = self._manifest is not None and not mx_envs.MX_RESHARD_PUBLISH_DIGEST
+        cache_hit = self._metadata is not None
         if not cache_hit:
             manifest_metrics: dict[str, int | float] = {}
             blob = build_fsdp_reshard_manifest(
@@ -374,9 +402,10 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
                 math.prod(s.local_shape) * s.served_tensor.element_size()
                 for s in shards
             )
-            self._manifest = WeightVersionShardManifest(
+            tensor_count = len({shard.name for shard in shards})
+            self._metadata = TrainerShardMetadata(
                 data=blob,
-                tensor_count=len({shard.name for shard in shards}),
+                tensor_count=tensor_count,
                 total_bytes=total_bytes,
                 transport="NIXL",
             )
@@ -388,20 +417,26 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
                     float(manifest_metrics[name]),
                     metadata={name: float(manifest_metrics[name])},
                 )
-        assert self._manifest is not None
+        assert self._metadata is not None
         add_refit_metadata(
             "source_preparation",
             {
-                "manifest_bytes": len(self._manifest.data),
+                "manifest_bytes": len(self._metadata.data),
                 "manifest_cache_hit": cache_hit,
-                "manifest_tensor_count": self._manifest.tensor_count,
+                "manifest_tensor_count": self._metadata.tensor_count,
             },
         )
         return StagedWeightVersionShardData(
-            manifest=self._manifest,
+            metadata=self._metadata,
             publish_ready=publish_ready,
             # Keep the served buffers alive while the version can be selected.
             buffer_owner=tuple(s.served_tensor for s in shards),
+            checksums=(
+                tuple(
+                    (shard.name, 0, tensor_digest(shard.served_tensor)) for shard in shards
+                )
+                if mx_envs.MX_RESHARD_PUBLISH_DIGEST else ()
+            ),
         )
 
 

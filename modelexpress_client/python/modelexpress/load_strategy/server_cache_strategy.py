@@ -15,18 +15,17 @@ import logging
 from pathlib import Path
 
 from .. import model_prefetch, model_snapshot
-from ..adapter import EngineAdapter, StrategyFailed
-from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
+from ..adapter import StrategyFailed
+from .base import LoadContext, NativeLoadStrategy, _as_load_result
 from .context import LoadResult
 
 logger = logging.getLogger("modelexpress.strategy_server_cache")
 
 
-class ServerCacheStrategy(LoadStrategy):
+class ServerCacheStrategy(NativeLoadStrategy):
     """Install weights from the server, then load them with the engine's loader."""
 
     name = "server-cache"
-    requires = (EngineAdapter.load_via_native,)
 
     def is_available(self, ctx: LoadContext) -> bool:
         """Return whether the server can supply weights for this model.
@@ -82,11 +81,9 @@ class ServerCacheStrategy(LoadStrategy):
 
         try:
             result = ctx.adapter.load_via_native(result)
-            result = ctx.adapter.after_native_load(result)
         except Exception as exc:
             raise StrategyFailed(str(exc), mutated=True) from exc
 
-        register_tensors(result, ctx)
         return result
 
     def _snapshot_path(
@@ -100,6 +97,10 @@ class ServerCacheStrategy(LoadStrategy):
         ``ModelConfig`` no matter which root this worker would default to. A
         root of None means nothing better than that default is known, which is
         the case for any path that does not follow the cache layout.
+
+        An existing directory with no inventory remains a legacy weight
+        target, not verified metadata. Missing snapshots and known or
+        unreadable inventories still require strict metadata preparation.
         """
         engine_path = getattr(ctx.model_config, "model", None)
         if engine_path:
@@ -107,13 +108,34 @@ class ServerCacheStrategy(LoadStrategy):
             location = model_snapshot.snapshot_location(repo_id, candidate)
             if location is not None:
                 cache_root, commit = location
-                if candidate.is_dir():
-                    return candidate, cache_root
-                # The frontend resolved this path against its own cache; this
-                # node has nothing there yet. Install the commit the directory
-                # names, under the root the path carries -- the default root
-                # would be a snapshot the engine is not going to read.
-                return self._install_metadata(repo_id, commit, cache_root), cache_root
+                inventory_path = model_snapshot.metadata_inventory_path(
+                    candidate.parent.parent, commit
+                )
+                if candidate.is_dir() and not inventory_path.parent.is_symlink():
+                    try:
+                        inventory_path.lstat()
+                    except FileNotFoundError:
+                        logger.debug(
+                            "Using existing snapshot %s for legacy weight loading "
+                            "without a metadata inventory",
+                            candidate,
+                        )
+                        return candidate, cache_root
+                    except OSError as exc:
+                        logger.warning(
+                            "Cannot inspect metadata inventory %s: %s; "
+                            "requiring metadata validation",
+                            inventory_path,
+                            exc,
+                        )
+                prepared = model_prefetch.ensure_resolved_metadata(repo_id, candidate)
+                if prepared is None:
+                    raise StrategyFailed(
+                        f"No local snapshot for {repo_id} and metadata prefetch "
+                        "did not apply",
+                        mutated=False,
+                    )
+                return prepared
             if candidate.is_dir():
                 return candidate, None
 

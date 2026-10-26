@@ -116,7 +116,7 @@ spec:
         size: 64Gi
       resources:
         requests:
-          cpu: "4"
+          cpu: "2"
           memory: "16Gi"
           gpu: "1"
           custom:
@@ -142,6 +142,10 @@ spec:
           value: "modelexpress"
         - name: MX_SERVER_ADDRESS
           value: "${DGD_NAME}-modelexpress:8000"
+        - name: MX_ARTIFACT_TRANSFER
+          value: "1"
+        - name: MX_ARTIFACT_READY_URL
+          value: "http://127.0.0.1:9090/health"
         - name: MX_RDMA_NIC_PIN
           value: "auto"
         - name: UCX_RNDV_SCHEME
@@ -187,6 +191,16 @@ spec:
             - modelexpress
             - --tensor-parallel-size
             - "1"
+            - --max-model-len
+            - "1024"
+            - --max-num-batched-tokens
+            - "1024"
+            - --max-num-seqs
+            - "16"
+            - --gpu-memory-utilization
+            - "0.85"
+            - --kv-cache-memory-bytes
+            - "1073741824"
             - --trust-remote-code
             - --disaggregation-mode
             - prefill
@@ -208,7 +222,7 @@ spec:
         size: 64Gi
       resources:
         requests:
-          cpu: "4"
+          cpu: "2"
           memory: "16Gi"
           gpu: "1"
           custom:
@@ -234,6 +248,10 @@ spec:
           value: "modelexpress"
         - name: MX_SERVER_ADDRESS
           value: "${DGD_NAME}-modelexpress:8000"
+        - name: MX_ARTIFACT_TRANSFER
+          value: "1"
+        - name: MX_ARTIFACT_READY_URL
+          value: "http://127.0.0.1:9090/health"
         - name: MX_RDMA_NIC_PIN
           value: "auto"
         - name: UCX_RNDV_SCHEME
@@ -276,6 +294,16 @@ spec:
             - modelexpress
             - --tensor-parallel-size
             - "1"
+            - --max-model-len
+            - "1024"
+            - --max-num-batched-tokens
+            - "1024"
+            - --max-num-seqs
+            - "16"
+            - --gpu-memory-utilization
+            - "0.85"
+            - --kv-cache-memory-bytes
+            - "1073741824"
             - --trust-remote-code
             - --disaggregation-mode
             - decode

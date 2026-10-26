@@ -15,6 +15,7 @@ Start with the deployment scenario that matches where your model lives and how w
 | Load from S3, GCS, Azure Blob, or a local path | [Storage loading](guides/choose-a-path.md#load-from-object-storage-or-a-local-path) |
 | Understand or tune loader selection | [Loader behavior](guides/choose-a-path.md#configure-loader-behavior) |
 | Integrate an inference runtime | [vLLM](integrations/runtimes/vllm.md), [SGLang](integrations/runtimes/sglang.md), or [TensorRT-LLM](integrations/runtimes/tensorrt-llm.md) |
+| Add RL trainer publication or generator refit | [RL package quickstart](rl/README.md), [RL architecture](rl/ARCHITECTURE.md), and [RL configuration](rl/CONFIGURATION.md) |
 | Deploy through an orchestrator | [Dynamo](integrations/orchestrators/dynamo.md) or [llm-d](integrations/orchestrators/llm-d.md) |
 | Run the standalone server or CLI | [Deployment](DEPLOYMENT.md) and [CLI](CLI.md) |
 
@@ -25,9 +26,9 @@ Start with the deployment scenario that matches where your model lives and how w
 - [Troubleshooting](TROUBLESHOOTING.md) starts from observable symptoms.
 - [Integrations](integrations/README.md) separates runtime loaders from orchestrators.
 - [Deployment](DEPLOYMENT.md) covers server, Docker, Helm, Kubernetes, and rollout details.
-- [Architecture](ARCHITECTURE.md) and [metadata](metadata.md) contain implementation and protocol details.
+- [Architecture](ARCHITECTURE.md) and [metadata](metadata.md) cover shared implementation and protocol details; RL refit internals live in [RL architecture](rl/ARCHITECTURE.md).
 - [Metrics](METRICS.md), [Kubernetes Service backend](K8S_SERVICE_BACKEND.md), and [benchmarks](BENCHMARKS.md) cover their respective subsystems.
 
 ## Support boundaries
 
-The `main` branch and Helm chart currently report ModelExpress `0.7.0`. Use docs from the release tag you deploy, and treat pinned runtime images in examples as qualification snapshots. The active CI workflows are the source of truth for automated coverage; hardware-dependent P2P, GDS, and runtime combinations still need validation on the target GPU, fabric, driver, and storage stack.
+The `main` branch and Helm chart currently report ModelExpress `0.8.0`. Use docs from the release tag you deploy, and treat pinned runtime images in examples as qualification snapshots. The active CI workflows are the source of truth for automated coverage; hardware-dependent P2P, GDS, and runtime combinations still need validation on the target GPU, fabric, driver, and storage stack.
