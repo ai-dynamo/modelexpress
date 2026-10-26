@@ -31,7 +31,7 @@ from .comm import (
     LaneKey,
     NcclUnavailableError,
 )
-from .plan import submission_order
+from .plan import submission_order, validate_layer_groups
 from .spi import LocalParamSpec, RefitCtx, resolve_specs
 from .types import ParamPlan, ReshardPlan
 
@@ -622,22 +622,10 @@ class _CollectiveHalf:
             self._groups[DEFAULT_LAYER_GROUP] = list(self._bulk)
             return
 
-        by_name = {entry.name: entry for entry in self._all_bulk}
+        validate_layer_groups(self._plan, groupings)
         active_names = {entry.name for entry in self._bulk}
-        seen: set[str] = set()
         for group_id, names in enumerate(groupings):
             name_set = set(names)
-            if len(name_set) != len(names):
-                raise ValueError(
-                    f"layer group {group_id} names a parameter more than once"
-                )
-            overlap = seen & name_set
-            if overlap:
-                raise ValueError(f"{min(overlap)} appears in more than one layer group")
-            unknown = sorted(name_set - set(by_name))
-            if unknown:
-                raise KeyError(f"{unknown[0]} is not a bulk parameter in this plan")
-            seen.update(name_set)
             # Caller order is not trusted as collective order. Every worker
             # executes the group's active subset in the same canonical order.
             self._groups[group_id] = [
@@ -645,13 +633,6 @@ class _CollectiveHalf:
                 for entry in self._all_bulk
                 if entry.name in name_set and entry.name in active_names
             ]
-
-        uncovered = sorted(set(by_name) - seen)
-        if uncovered:
-            raise ValueError(
-                f"layer groups leave {len(uncovered)} bulk parameter(s) uncovered: "
-                f"{', '.join(uncovered[:5])}"
-            )
 
     @property
     def layer_group_ids(self) -> list[int]:

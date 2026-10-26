@@ -41,7 +41,12 @@ from .comm import (
     LaneKey,
     new_unique_id,
 )
-from .plan import DEFAULT_RECEIVER_PROTOCOL, plan_digest, validate_coverage
+from .plan import (
+    DEFAULT_RECEIVER_PROTOCOL,
+    plan_digest,
+    validate_coverage,
+    validate_layer_groups,
+)
 from .rendezvous import (
     CollectiveRendezvous,
     LaneDeclaration,
@@ -260,6 +265,19 @@ class _RefitClientBase:
             self._wedged = wedged
             raise wedged
 
+    def _abort_group(self, group_id: str) -> None:
+        """Abort a group's lanes, keeping a wedge for ``cleanup`` to re-raise.
+
+        A wedged abort still drops every lane, so a later abort finds nothing
+        left to wedge on; without recording it here, cleanup would succeed and
+        release engine buffers the stuck kernel may still use.
+        """
+        try:
+            self._cache.abort_group(group_id)
+        except CommunicatorWedgedError as error:
+            self._wedged = error
+            raise
+
     def _close_half(self) -> None:
         """Destroy the current half's M2N handle; its lanes are torn down after."""
         half, self._half = self._half, None
@@ -440,6 +458,10 @@ class _RefitClientBase:
                 )
             expected = list(parameter_names())
         validate_coverage(plan, list(expected))
+        if self._groupings is not None:
+            # Before the join, so a grouping this plan cannot execute never
+            # reaches READY and bootstraps lanes it would only reject after.
+            validate_layer_groups(plan, self._groupings)
         self._plan = plan
         self._digest = plan_digest(
             plan,
@@ -565,7 +587,7 @@ class _RefitClientBase:
         self._close_half()
         previous = self._membership
         if previous is not None and previous.group_id != membership.group_id:
-            self._cache.abort_group(previous.group_id)
+            self._abort_group(previous.group_id)
         # An epoch move invalidates every cached communicator. The plan was
         # freshly captured before this join and is guarded by its digest.
         dropped = self._cache.invalidate_epoch(membership.group_id, membership.epoch)
@@ -679,7 +701,7 @@ class _RefitClientBase:
             # rendezvous stops the lease renewal so its TTL moves the epoch,
             # and refuses any further join here: the worker must restart.
             try:
-                self._cache.abort_group(membership.group_id)
+                self._abort_group(membership.group_id)
             finally:
                 self._membership = None
                 self._close_rendezvous_after_failed_bootstrap(membership)
@@ -721,11 +743,7 @@ class _RefitClientBase:
             )
         self._close_half()
         if self._membership is not None:
-            try:
-                self._cache.abort_group(self._membership.group_id)
-            except CommunicatorWedgedError as error:
-                self._wedged = error
-                raise
+            self._abort_group(self._membership.group_id)
         self._membership = None
         self._half = None
         self._reset_round()
@@ -800,7 +818,7 @@ class RefitClientTrainer(_RefitClientBase):
             )
             self._half.setup_layer_groups(self._groupings)
         except BaseException:
-            self._cache.abort_group(membership.group_id)
+            self._abort_group(membership.group_id)
             self._membership = None
             self._half = None
             raise
@@ -938,7 +956,7 @@ class RefitClientGenerator(_RefitClientBase):
             )
             self._half.setup_layer_groups(self._groupings)
         except BaseException:
-            self._cache.abort_group(membership.group_id)
+            self._abort_group(membership.group_id)
             self._membership = None
             self._half = None
             raise

@@ -20,6 +20,7 @@ import modelexpress_rl.collective.client as collective_client
 import modelexpress_rl.collective.envs as envs
 from modelexpress_rl.collective import (
     CommunicatorCache,
+    CommunicatorWedgedError,
     LaneCommunicator,
     LaneKey,
     LocalParamSpec,
@@ -1679,6 +1680,89 @@ class TestLayerGroupContract:
         client.compute_plan()
         with pytest.raises(RuntimeError, match="before compute_plan"):
             client.setup_layer_groups(None)
+
+
+class TestLayerGroupsBeforeJoin:
+    """A grouping the captured plan cannot execute is refused before the
+    worker joins, not after READY and communicator bootstrap."""
+
+    @staticmethod
+    def _unjoined_trainer(rz):
+        client = RefitClientTrainer(
+            rendezvous=rz,
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=1,
+            slot_id="t0",
+            worker_id="w0",
+            index_in_role=0,
+        )
+        client.initialize(FakeEngine(), source_partition=0)
+        return client
+
+    @staticmethod
+    def _unjoined_generator(rz):
+        client = RefitClientGenerator(
+            rendezvous=rz,
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=1,
+            slot_id="g0",
+            worker_id="w9",
+            index_in_role=0,
+        )
+        client.initialize(FakeEngine())
+        return client
+
+    @pytest.mark.parametrize("make", ["_unjoined_trainer", "_unjoined_generator"])
+    @pytest.mark.parametrize(
+        "groupings, error",
+        [
+            ([["no.such.param"]], KeyError),
+            ([[]], ValueError),
+        ],
+    )
+    def test_an_invalid_grouping_never_joins(self, fake_nccl, make, groupings, error):
+        rz = FakeRendezvous()
+        client = getattr(self, make)(rz)
+        client.setup_layer_groups(groupings)
+        with pytest.raises(error):
+            client.compute_plan()
+        assert rz.joins == 0
+        assert len(client._cache) == 0
+
+    @pytest.mark.parametrize("half", ["NcclM2nSender", "NcclM2nReceiver"])
+    def test_a_wedged_abort_after_ready_is_kept_for_cleanup(
+        self, fake_nccl, monkeypatch, half
+    ):
+        rz = FakeRendezvous()
+        client = (
+            self._unjoined_trainer(rz)
+            if half == "NcclM2nSender"
+            else self._unjoined_generator(rz)
+        )
+        monkeypatch.setattr(
+            collective_client, half, _raises(RuntimeError("half setup failed"))
+        )
+        wedge = CommunicatorWedgedError("abort stuck", group_id="g", epoch=1)
+        aborts = []
+
+        def abort_group(group_id):
+            # Like the real cache, a wedged abort still drops every lane, so
+            # only the first call has anything left to wedge on.
+            aborts.append(group_id)
+            if len(aborts) == 1:
+                raise wedge
+            return 0
+
+        monkeypatch.setattr(client._cache, "abort_group", abort_group)
+        with pytest.raises(CommunicatorWedgedError):
+            client.compute_plan()
+        with pytest.raises(CommunicatorWedgedError) as raised:
+            client.cleanup()
+        assert raised.value is wedge
 
 
 class TestSourcePartition:

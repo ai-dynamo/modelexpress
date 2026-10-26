@@ -225,6 +225,36 @@ def plan_digest(
     return hasher.hexdigest()
 
 
+def validate_layer_groups(plan: ReshardPlan, groupings: list[list[str]]) -> None:
+    """Refuse a grouping the plan cannot execute.
+
+    Every bulk parameter must be in exactly one group, and every name must be
+    a bulk parameter of this plan. The client runs this on the captured plan
+    before it joins, so a worker never reaches READY and bootstraps a cohort
+    with a grouping it would only reject afterwards.
+    """
+    bulk_names = {entry.name for entry in plan.bulk}
+    seen: set[str] = set()
+    for group_id, names in enumerate(groupings):
+        name_set = set(names)
+        if len(name_set) != len(names):
+            raise ValueError(f"layer group {group_id} names a parameter more than once")
+        overlap = seen & name_set
+        if overlap:
+            raise ValueError(f"{min(overlap)} appears in more than one layer group")
+        unknown = sorted(name_set - bulk_names)
+        if unknown:
+            raise KeyError(f"{unknown[0]} is not a bulk parameter in this plan")
+        seen.update(name_set)
+
+    uncovered = sorted(bulk_names - seen)
+    if uncovered:
+        raise ValueError(
+            f"layer groups leave {len(uncovered)} bulk parameter(s) uncovered: "
+            f"{', '.join(uncovered[:5])}"
+        )
+
+
 def is_bulk_param(name: str) -> bool:
     """Default bulk classification: FFN projection weights.
 
