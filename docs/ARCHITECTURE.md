@@ -852,15 +852,16 @@ This does not add optimized support for Hopper's optional BF16 weight cache or
 ROCm MXFP8 layouts; mismatches remain failures. Warm reloads skip cold-load
 preparation and retain their existing same-identity restrictions.
 
-**Speculative draft sessions with NIXL.** SGLang loads each draft through the same
+**Speculative draft sessions.** SGLang loads each draft through the same
 `remote_instance` ModelExpress backend as the target. In
 `engines/sglang/adapter.py`, `build_sglang_load_context()` and
 `build_sglang_source_identity()` create independent sessions for each
 `(worker rank, draft_model_idx)`. Worker rank is `pp_rank * tp_size + tp_rank`.
-Each session owns its SourceIdentity, NIXL agent, metadata listener, tensor
-catalog, publisher, and heartbeat. Main
-and draft can become READY independently, and draft retries or cleanup cannot
-unpublish the main. An explicitly configured health URL still gates publication.
+Each session owns its SourceIdentity, tensor catalog, publisher, and heartbeat.
+NIXL sessions own an agent and metadata listener; TransferEngine sessions use
+the engine and session initialized by their SGLang ModelRunner. Main and draft
+can become READY independently, and draft retries or cleanup cannot unpublish
+the main. An explicitly configured health URL still gates publication.
 
 - Standalone, EAGLE/EAGLE3, MTP/NextN, and unrecognized model classes use the
   standard P2P lookup, receive, and storage fallback paths. Draft identities
@@ -868,9 +869,11 @@ unpublish the main. An explicitly configured health URL still gates publication.
   framework, TP/PP/EP sizes, dtype, and quantization fields, plus
   `model_role="draft"` and `draft_model_idx`.
 - NIXL follows the main SGLang model's exact catalog policy: source and target
-  tensor names, byte sizes, and dtypes must match.
-  Discovery collects the per-rank loader layout before SGLang binds draft
-  weights to the target.
+  tensor names, byte sizes, and dtypes must match. TransferEngine requires
+  identical source and target tensor names and equal byte sizes. It does not
+  compare per-tensor dtype metadata; model dtype remains a SourceIdentity field.
+- Both transports discover the per-rank loader layout before SGLang binds
+  draft weights to the target.
   Recognized draft models use their existing selector's `publishable()` rule;
   those model-specific sharing assumptions are unchanged. Without a selector,
   the complete catalog is retained, including embedding and head, with ordinary
@@ -886,8 +889,8 @@ unpublish the main. An explicitly configured health URL still gates publication.
   releasing these tensors. In-place writes still change their contents.
 - Each NIXL draft uses separate metadata and worker gRPC ports. K8s-Service
   discovery applies the same draft port offset. Each draft publishes separately,
-  so tensor names need no draft prefix. TransferEngine drafts still load
-  natively without P2P publication. See [draft port configuration](#modelexpress-configuration).
+  so tensor names need no draft prefix. TransferEngine uses SGLang's draft
+  engine and session. See [draft port configuration](#modelexpress-configuration).
 - Draft storage and revision overrides are resolved without a main loader or
   publication state. The adapter reads SGLang's `get_model()` and `get_spec()`.
   It uses `get_global_server_args()` only if either getter cannot be imported.

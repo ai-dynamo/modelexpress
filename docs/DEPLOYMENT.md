@@ -871,7 +871,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_UCX_DISABLE_MEM_EVENTS` | `0` | Opt-in. `1` sets `UCX_MEM_EVENTS=n` before NIXL agent creation on the UCX backend (no-op on `LIBFABRIC`), which roughly halves NIXL agent creation time by skipping UCX's mem-hook / VM-unmap tracking. Off by default because the effect is process-wide and permanent: `UCX_MEM_EVENTS` backs registration-cache invalidation for every UCP context in the process, not just ModelExpress's, so this is only safe when the process owns UCX exclusively for ModelExpress transfers. Never overrides an operator-set `UCX_MEM_EVENTS`. UCX reads this option in a shared-library constructor, so if UCX was already loaded elsewhere in the process before agent creation, setting it here can be a no-op. |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_P2P_METADATA` | `1` | Enable P2P metadata exchange (source workers only). Set to `0` to publish full metadata through a central-coordinator backend. This setting is ignored on backends that require P2P metadata, currently `k8s-service`. |
-| `MX_DISABLE_DRAFT_P2P` | `0` | Set to `1` to load the SGLang or vLLM speculative draft through storage without receiving or publishing draft tensors over NIXL P2P. This overrides `MX_ENABLE_SEPARATE_DRAFT_P2P`. Main-model P2P and cold-load shard selection are unchanged. |
+| `MX_DISABLE_DRAFT_P2P` | `0` | Set to `1` to disable draft P2P receive/publication and load from storage. Applies to SGLang NIXL and TransferEngine drafts, and vLLM NIXL drafts. This overrides `MX_ENABLE_SEPARATE_DRAFT_P2P`. Main-model P2P and cold-load shard selection are unchanged. |
 | `MX_ENABLE_SEPARATE_DRAFT_P2P` | `0` | Set to `1` to enable vLLM separate-checkpoint draft P2P. This flag is vLLM-only and has no effect on SGLang. Compatible same-checkpoint MTP drafts remain enabled by default. Identity and compatibility checks still apply, with storage fallback if no compatible READY source is available. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port. The main model listens on `MX_METADATA_PORT + device_id`. |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving. The main model listens on `MX_WORKER_GRPC_PORT + device_id`. |
@@ -1469,9 +1469,9 @@ All storage backends (S3, GCS, Azure) are included as core dependencies — no e
 For SGLang draft P2P, use `--load-format remote_instance`,
 `--remote-instance-weight-loader-backend modelexpress`, and
 `--speculative-draft-load-format remote_instance`. Set
-`--speculative-draft-model-path` for a separate draft checkpoint. NIXL drafts
-use independent identities and publication. Use the same pinned draft checkpoint
-and SGLang/ModelExpress builds on source and target.
+`--speculative-draft-model-path` for a separate draft checkpoint. NIXL and
+TransferEngine drafts use independent identities and publication. Use the same
+pinned draft checkpoint and SGLang/ModelExpress builds on source and target.
 
 `MX_DRAFT_MODEL_URI` configures ModelStreamer storage for the draft;
 `MX_DRAFT_MODEL_REVISION` labels its P2P identity. Explicit draft values take
@@ -1481,7 +1481,7 @@ An omitted draft path or revision uses the main default. If the settings differ,
 cannot be resolved, or the main override is unset, the draft uses its own
 configuration. An explicit draft URI different from the main's effective URI
 also prevents revision inheritance. Pin actual weights through SGLang's revision
-setting or immutable storage. TransferEngine drafts load natively using
+setting or immutable storage. TransferEngine's native storage fallback uses
 SGLang's model configuration.
 
 On a cold load, ModelStreamer uses known model rules and a valid
