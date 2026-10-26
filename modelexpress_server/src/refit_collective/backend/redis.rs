@@ -1368,6 +1368,77 @@ mod tests {
         assert_eq!(group.state, i32::from(CollectiveGroupState::Forming));
     }
 
+    #[tokio::test]
+    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
+    async fn recreating_an_evicted_group_aborts_the_old_incarnations_operations() {
+        // If only the root hash is lost, a join recreates the group at epoch 1.
+        // An operation left in the active set from the old incarnation must
+        // not be completed by reports from the new cohort at that same epoch.
+        let backend = RedisCollectiveBackend::connect(&test_redis_url())
+            .await
+            .expect("connect");
+        let model = format!("recreate-group-test/{}", Uuid::new_v4());
+        let trainer = Uuid::new_v4().to_string();
+        register_worker(&backend, &trainer, CollectiveRole::Trainer, &model).await;
+        let group_spec = spec(&model, &["t0"], &["g0"], 1);
+        join(
+            &backend,
+            &group_spec,
+            "t0",
+            &trainer,
+            CollectiveRole::Trainer,
+            "d1",
+        )
+        .await;
+
+        let group_id = group_id_for(&group_spec);
+        let operation_id = Uuid::new_v4().simple().to_string();
+        let mut connection = backend.connection.clone();
+        let () = connection
+            .hset_multiple(
+                operation_key(&operation_id),
+                &[
+                    ("operation_id", operation_id.as_str()),
+                    ("group_id", group_id.as_str()),
+                    ("epoch", "1"),
+                    ("state", "PENDING"),
+                ],
+            )
+            .await
+            .expect("seed operation");
+        let () = connection
+            .sadd(active_ops_key(&group_id), &operation_id)
+            .await
+            .expect("seed active operation");
+
+        let () = connection
+            .del(group_key(&group_id))
+            .await
+            .expect("evict root hash");
+        join(
+            &backend,
+            &group_spec,
+            "t0",
+            &trainer,
+            CollectiveRole::Trainer,
+            "d1",
+        )
+        .await;
+
+        let group = backend.get_group(&group_id).await.expect("get group");
+        assert_eq!(group.epoch, 1, "the recreated group starts over at epoch 1");
+        let state: String = connection
+            .hget(operation_key(&operation_id), "state")
+            .await
+            .expect("operation state");
+        assert_eq!(state, "ABORTED");
+        let active: u64 = connection
+            .scard(active_ops_key(&group_id))
+            .await
+            .expect("scard");
+        assert_eq!(active, 0, "the old incarnation's operation is not active");
+    }
+
     async fn register_worker(
         backend: &RedisCollectiveBackend,
         worker_id: &str,

@@ -59,13 +59,16 @@ local membership_change_requires_bump = false
 if not epoch then
   epoch = 1
   -- The group hash and its derived hashes do not share a Redis lifetime. If the
-  -- root hash was evicted or manually removed, never let epoch-1 participants
-  -- or communicator identifiers from the prior incarnation survive recreation.
+  -- root hash was evicted or manually removed, never let epoch-1 participants,
+  -- communicator identifiers or active operations from the prior incarnation
+  -- survive recreation: the new cohort restarts at epoch 1 and could otherwise
+  -- complete an old operation through its own reports.
   redis.call('DEL', KEYS[2])
   redis.call('DEL', KEYS[3])
   for i = 1, lane_count do
     redis.call('DEL', KEYS[5 + i])
   end
+  abort_stale_ops(KEYS[5], ARGV[16])
   redis.call('HSET', KEYS[1],
     'group_id', ARGV[1],
     'model_name', ARGV[2],
