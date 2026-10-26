@@ -591,6 +591,112 @@ compare-and-swap; shard and lease objects can remain child records.
 implemented under `refit/backend/redis.rs`. Kubernetes remains a separate
 end-to-end backend slice implementing the same transaction boundaries.
 
+### refit_collective.proto - RefitCollectiveService (Redis only)
+
+Rendezvous and admission for the NCCL M2N collective refit path, which is a
+sibling of the NIXL pull path rather than a mode of it. The two share no types:
+this service reuses only `RegisterWorker` and the `WeightVersion` lifecycle from
+`refit.proto`. Design: [`NCCL_M2N_REFIT.md`](../NCCL_M2N_REFIT.md).
+
+Where the pull path hands a generator a shard table to read one-sidedly, here
+both sides enter one collective together, so MX brokers the NCCL bootstrap
+instead. Weight bytes never reach the service, and neither does the reshard
+plan: MX stores only its digest and the endpoint that serves it.
+
+| RPC | Purpose |
+|-----|---------|
+| `CreateCollectiveTransfer` | Idempotently open one refit operation against a group |
+| `GetCollectiveTransfer` | Read an operation and its lifecycle state |
+| `DeleteCollectiveTransfer` | Drop a terminal operation and release its idempotency key |
+| `JoinCollectiveGroup` | Admit one worker, returning its MX-assigned rank in every lane it joins |
+| `GetCollectiveGroup` | Poll group state, lane bootstrap, and participants |
+| `PublishGroupBootstrap` | Record one lane's `ncclUniqueId`, stamped with the epoch it was generated for |
+| `ReportCollectiveTransfer` | Record one participant's terminal result, fenced on operation, epoch and worker generation |
+
+A group is keyed by its declared membership, so every participant of one
+operation resolves the same group without a separate create call, and is reused
+across refits until its `epoch` moves. The epoch bumps on a membership change, a
+new worker generation for an existing slot, or a changed plan digest; each of
+those invalidates a cached communicator, a cached plan, or both, and clients
+drop them together. Bumping clears every lane's bootstrap identifier in the same
+transaction, because an identifier from a previous epoch names a communicator
+whose world size no longer matches the membership.
+
+The client-side control plane lives in `modelexpress_rl/collective/` and is
+deliberately torch-free, NCCL-free and CUDA-free, so the plan contract and the
+rendezvous are testable without a GPU. Two guarantees there are gates rather
+than conventions, because both failures are silent at refit time: `plan.py`
+proves that the bulk and misc lists together name every parameter exactly once,
+and folds that result into a plan digest every participant must agree on before
+the group becomes READY. The digest also covers the receiver protocol and the
+M2N ABI version, so peers that could not speak to each other fail to form a
+group rather than discovering it inside a collective. When digests do disagree,
+`GetCollectiveGroup` reports which slots differ; without that the group simply
+sits in `FORMING` and every lane bootstrap looks stale, which points at the
+wrong subsystem.
+
+Before `JoinCollectiveGroup`, each worker must call `RefitService.RegisterWorker`
+with the same `worker_id`, model, and role, then renew that immutable registration
+through communicator setup, transfer, and terminal reporting (the client must
+renew no less frequently than once per third of the registration TTL). Join and
+bootstrap transitions validate the registration atomically. `GetCollectiveGroup`
+also removes expired generations, advances the epoch, and clears lane bootstrap
+identifiers before returning state, so `READY` cannot survive a dead rank.
+
+Lanes are declared by the caller, not derived. `CollectiveGroupSpec` carries one
+`LaneSpec` per communicator the operation needs, each an ordered list of slots,
+and MX brokers one bootstrap per lane, gives each slot the rank its position
+gives it, and gates readiness on all of them. It does not know what a lane means:
+tensor, expert, data and pipeline parallelism stay client-side, and a caller that
+splits its trainers unevenly is simply declaring different lanes. What
+`refit_collective/lanes.rs` still checks is structural - unique lane ids, slots
+that exist, no slot twice on one lane, no expected slot left off every lane, at
+most one broadcast lane - and none of those is a claim about topology.
+
+Lane order is part of the group's identity. The declared membership is hashed
+into the group id along with the expected slot lists, so two callers that put
+different slots at rank 0 resolve different groups instead of meeting in one and
+disagreeing about who is who.
+
+The data plane lives in `collective/{backend,client,comm,spi}.py`. `nccl4py` is
+imported lazily, so the plan contract and the rendezvous stay usable and
+testable where it is not installed. Both halves walk the same plan in the same
+order, because a collective requires every participant to issue an identical
+sequence: a rank that skips a parameter its peers issue hangs the communicator
+rather than failing alone. The misc broadcast is one phase per refit in
+`finish_weight_update`, never per layer group, since its communicator spans
+every rank and overlaps every reshard lane.
+
+There is no group-delete RPC, symmetrically with workers never creating one.
+Expired generations are fenced now; reclaiming the resulting empty group hashes
+after their last operation is deleted still requires a backend reaper/index and
+is not implemented in this slice.
+
+Source layout:
+
+```text
+modelexpress_server/src/
+├── refit_collective.rs              # Collective refit module exports
+└── refit_collective/
+    ├── lanes.rs                     # Declared lane membership and rank lookup
+    ├── service.rs                   # Backend-neutral collective gRPC service
+    ├── backend.rs                   # CollectiveBackend contract and factory
+    └── backend/                     # Redis backend and atomic Lua scripts
+
+modelexpress_client/python/modelexpress_rl/
+├── collective/                      # NCCL M2N collective path (torch-free core)
+│   ├── types.py                     # Placement, MeshSpec, ParamPlan, ReshardPlan
+│   ├── plan.py                      # Coverage gate, plan digest, default derivation
+│   ├── rendezvous.py                # MX-brokered join, readiness, bootstrap, report
+│   ├── spi.py                       # Publisher/Loader engine boundary, LocalParamSpec
+│   ├── comm.py                      # Communicator cache keyed by (group_id, epoch)
+│   ├── backend.py                   # NcclM2nSender / NcclM2nReceiver
+│   ├── client.py                    # RefitClientTrainer / RefitClientGenerator
+│   └── envs.py                      # Deadlines and stream count
+├── refit_collective_pb2.py          # Generated protobuf stubs
+└── refit_collective_pb2_grpc.py     # Generated gRPC stubs
+```
+
 ## Python engine integration
 
 ### SGLang refit integration
