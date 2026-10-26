@@ -379,7 +379,10 @@ fn env_secs_ceil(name: &str, default: u64) -> u64 {
         Some(value) if value.is_finite() && value > 0.0 => {
             if value > MAX_ENV_SECS as f64 {
                 tracing::warn!(
-                    "{name}={raw:?} exceeds the maximum of {MAX_ENV_SECS}s; using {MAX_ENV_SECS}s"
+                    var = name,
+                    value = ?raw,
+                    max_secs = MAX_ENV_SECS,
+                    "timeout exceeds maximum; clamping"
                 );
                 MAX_ENV_SECS
             } else {
@@ -389,7 +392,10 @@ fn env_secs_ceil(name: &str, default: u64) -> u64 {
         }
         _ => {
             tracing::warn!(
-                "{name}={raw:?} is not a positive finite number of seconds; using the default of {default}s"
+                var = name,
+                value = ?raw,
+                default_secs = default,
+                "timeout is not a positive finite number of seconds; using the default"
             );
             default
         }
