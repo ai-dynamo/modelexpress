@@ -940,7 +940,7 @@ class TestBoundedSynchronizeFallback:
     ):
         """The unbounded path must take the same shapes the bounded one does.
 
-        record_event and backend._stream_handle both read
+        record_event and comm.stream_handle both read
         ``cuda_stream`` off the object. int() on the object itself raises
         TypeError, and this path is reachable whenever timeout_s is None.
         """

@@ -30,6 +30,15 @@ from typing import Any
 
 from . import envs
 
+
+def stream_handle(stream: Any) -> int:
+    """Raw CUDA stream handle for an NCCL call.
+
+    A ``torch.cuda.Stream`` carries it on ``cuda_stream``; anything already
+    integral is passed through so a caller can supply a handle directly.
+    """
+    return int(getattr(stream, "cuda_stream", stream))
+
 logger = logging.getLogger("modelexpress_rl.collective.comm")
 
 #: Event-poll backoff for bounded waits, in seconds.
@@ -310,8 +319,7 @@ class LaneCommunicator:
             if stream is None:
                 torch.cuda.current_stream().synchronize()
             else:
-                handle = getattr(stream, "cuda_stream", stream)
-                torch.cuda.ExternalStream(int(handle)).synchronize()
+                torch.cuda.ExternalStream(stream_handle(stream)).synchronize()
 
     def record_event(self) -> Any | None:
         """Mark everything enqueued on this lane's stream so far.

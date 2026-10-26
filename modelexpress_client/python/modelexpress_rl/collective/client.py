@@ -40,6 +40,7 @@ from .comm import (
     LaneCommunicator,
     LaneKey,
     new_unique_id,
+    stream_handle,
 )
 from .plan import (
     DEFAULT_RECEIVER_PROTOCOL,
@@ -105,7 +106,7 @@ def _bootstrap_barrier(
         )
         stream = lane.stream
         stream_arg = (
-            None if stream is None else int(getattr(stream, "cuda_stream", stream))
+            None if stream is None else stream_handle(stream)
         )
         lane.handle.broadcast(
             sendbuf=barrier,

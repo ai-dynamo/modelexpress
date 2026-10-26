@@ -30,6 +30,7 @@ from .comm import (
     LaneCommunicator,
     LaneKey,
     NcclUnavailableError,
+    stream_handle,
 )
 from .plan import submission_order, validate_layer_groups
 from .spi import LocalParamSpec, RefitCtx, resolve_specs
@@ -408,23 +409,13 @@ def _reshard(
     }
     stream = comm.stream
     if stream is not None:
-        kwargs["stream"] = _stream_handle(stream)
+        kwargs["stream"] = stream_handle(stream)
 
     # NCCL M2N's native runtime is process-global and not host-thread-safe,
     # including across different communicator handles. Serializing the Python
     # submissions still permits device-side overlap on the supplied streams.
     with _M2N_CALL_LOCK:
         reshard(src, dst, comm.handle, **kwargs)
-
-
-def _stream_handle(stream: Any) -> int:
-    """Raw CUDA stream handle for the reshard op.
-
-    A ``torch.cuda.Stream`` carries it on ``cuda_stream``; anything already
-    integral is passed through so a caller can supply a handle directly.
-    """
-    handle = getattr(stream, "cuda_stream", stream)
-    return int(handle)
 
 
 class _CollectiveHalf:
@@ -1120,7 +1111,7 @@ def _broadcast(lane: LaneCommunicator, buf: Any, *, root: int) -> None:
             sendbuf=buf,
             recvbuf=buf,
             root=root,
-            stream=_stream_handle(stream),
+            stream=stream_handle(stream),
         )
 
 
