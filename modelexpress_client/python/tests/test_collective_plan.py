@@ -523,6 +523,20 @@ class TestAgreementMembers:
             plan, m2n_abi_version="1.1"
         )
 
+    def test_a_differing_blocking_data_plane_changes_the_digest(self):
+        # One side splits a child communicator off the lane and the other does
+        # not, so they would meet in different collectives.
+        plan = self._plan()
+        assert plan_digest(plan, blocking_data_plane=True) != plan_digest(
+            plan, blocking_data_plane=False
+        )
+
+    def test_a_differing_grouped_submission_changes_the_digest(self):
+        plan = self._plan()
+        assert plan_digest(plan, grouped_submission=True) != plan_digest(
+            plan, grouped_submission=False
+        )
+
     def test_the_same_inputs_still_agree(self):
         plan = self._plan()
         assert plan_digest(plan, receiver_protocol="a", m2n_abi_version="1") == (

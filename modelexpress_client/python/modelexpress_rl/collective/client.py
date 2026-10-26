@@ -141,7 +141,12 @@ class _RefitClientBase:
         self._device = device
         self._streams = list(streams) if streams else [None]
 
-        self._cache = CommunicatorCache()
+        # Both modes change what a rank does inside native collectives, so
+        # they are read once, hashed into the digest, and handed to the code
+        # that runs them; a later env change cannot split a cohort.
+        self._blocking_data_plane = envs.MX_NCCL_REFIT_BLOCKING_DATA_PLANE
+        self._grouped_submission = envs.MX_NCCL_REFIT_GROUPED_SUBMISSION
+        self._cache = CommunicatorCache(blocking_data_plane=self._blocking_data_plane)
         self._publisher: Publisher | None = None
         self._loader: Loader | None = None
         self._expected_parameters: list[str] | None = None
@@ -421,6 +426,8 @@ class _RefitClientBase:
             receiver_protocol=self._receiver_protocol,
             m2n_abi_version=self._m2n_abi_version,
             layer_groups=self._groupings,
+            blocking_data_plane=self._blocking_data_plane,
+            grouped_submission=self._grouped_submission,
         )
 
     def setup_layer_groups(self, groupings: list[list[str]] | None) -> None:
@@ -769,6 +776,7 @@ class RefitClientTrainer(_RefitClientBase):
                 epoch=membership.epoch,
                 cache=self._cache,
                 source_partition=self._source_partition,
+                grouped_submission=self._grouped_submission,
             )
             self._half.setup_layer_groups(self._groupings)
         except BaseException:
@@ -906,6 +914,7 @@ class RefitClientGenerator(_RefitClientBase):
                 group_id=membership.group_id,
                 epoch=membership.epoch,
                 cache=self._cache,
+                grouped_submission=self._grouped_submission,
             )
             self._half.setup_layer_groups(self._groupings)
         except BaseException:

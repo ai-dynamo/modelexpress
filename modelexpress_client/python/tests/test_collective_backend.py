@@ -1200,6 +1200,19 @@ class TestGroupedSubmissionFlag:
             ("group_end",),
         ]
 
+    def test_the_mode_is_frozen_when_the_half_is_built(self, recorder, monkeypatch):
+        # The digest hashes the mode the client froze, so flipping the env
+        # afterwards must not change what this half puts on the wire.
+        monkeypatch.setenv("MX_NCCL_REFIT_GROUPED_SUBMISSION", "1")
+        receiver, _ = build(
+            recorder, plan=self._plan(), half_cls=NcclM2nReceiver, partitions=2
+        )
+        monkeypatch.setenv("MX_NCCL_REFIT_GROUPED_SUBMISSION", "0")
+        receiver.start_weight_update("v")
+        receiver.update_weights(0)
+        reshards = [op for op in recorder.ops if op.kind == "reshard"]
+        assert [op.group_depth for op in reshards] == [1, 1, 1, 1]
+
     def test_off_still_refuses_overlapping_destinations(self, recorder, monkeypatch):
         import torch
 

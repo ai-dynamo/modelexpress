@@ -133,6 +133,8 @@ def plan_digest(
     receiver_protocol: str = DEFAULT_RECEIVER_PROTOCOL,
     m2n_abi_version: str = "",
     layer_groups: list[list[str]] | None = None,
+    blocking_data_plane: bool = True,
+    grouped_submission: bool = False,
 ) -> str:
     """A canonical digest over the whole plan.
 
@@ -163,10 +165,18 @@ def plan_digest(
     as one ``m2n.group()`` whose per-communicator contents must match on every
     rank, so peers that would split or order runs differently - a different
     grouping rule, not only a different grouping - are refused at READY.
+
+    ``blocking_data_plane`` and ``grouped_submission`` are the execution modes
+    the client froze from ``MX_NCCL_REFIT_BLOCKING_DATA_PLANE`` and
+    ``MX_NCCL_REFIT_GROUPED_SUBMISSION``. The first decides whether a rank
+    enters ``Communicator.split()`` and runs on the child, the second whether
+    a layer group is one ``m2n.group()`` or one call per entry. Peers that
+    disagree on either would diverge inside native collectives, so they are
+    refused at READY too.
     """
     plan.validate()
     hasher = hashlib.sha256()
-    hasher.update(b"mx-nccl-m2n-plan-v2\0")
+    hasher.update(b"mx-nccl-m2n-plan-v3\0")
     # The digest is what readiness compares, so anything two peers must agree
     # on before they meet inside a collective belongs in it. The plan says what
     # moves; these say whether both sides can speak about it at all. They are
@@ -175,6 +185,9 @@ def plan_digest(
     hasher.update(f"{receiver_protocol}\0".encode())
     hasher.update(f"{m2n_abi_version}\0".encode())
     hasher.update(f"{plan.source_partition_count}\0".encode())
+    hasher.update(
+        f"mode\0blocking={int(blocking_data_plane)}|grouped={int(grouped_submission)}\0".encode()
+    )
 
     hasher.update(b"bulk\0")
     for entry in plan.bulk:

@@ -648,6 +648,39 @@ class TestCommunicatorBootstrap:
         )
         assert lane.handle is parent
 
+    def test_the_data_plane_mode_is_frozen_when_the_cache_is_built(
+        self, fake_nccl, monkeypatch
+    ):
+        # The client hashes the mode it froze, so an env flip afterwards must
+        # not move this worker onto a split the digest did not promise.
+        monkeypatch.setenv("MX_NCCL_REFIT_BLOCKING_DATA_PLANE", "0")
+        cache = CommunicatorCache()
+        monkeypatch.setenv("MX_NCCL_REFIT_BLOCKING_DATA_PLANE", "1")
+        communicator = sys.modules["nccl.core.communicator"]
+
+        class Parent:
+            def get_async_error(self):
+                return 0
+
+            def split(self, **kwargs):
+                raise AssertionError("the frozen mode does not split")
+
+            def abort(self):
+                pass
+
+        parent = Parent()
+        communicator.Communicator.init = lambda **kwargs: parent
+        lane = cache.create(
+            LaneKey("g", 1, 0),
+            rank=0,
+            world_size=2,
+            unique_id=b"x" * 128,
+            device=None,
+            stream=None,
+            timeout_s=0.1,
+        )
+        assert lane.handle is parent
+
     def test_a_split_whose_peer_never_joins_aborts_the_parent_at_the_deadline(
         self, fake_nccl, monkeypatch
     ):
@@ -2065,6 +2098,88 @@ class TestSuccessReportDelivery:
             client.finish_weight_update("v1")
         assert len(rz.reports) == 1
         assert client._operation_id is None
+
+
+class AgreementRendezvous(FakeRendezvous):
+    """Holds the cohort FORMING while reported digests disagree.
+
+    Mirrors the digest clause of ``evaluate_readiness`` in the server's
+    common.lua: READY needs every reported digest to equal the group's.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.digests = {}
+        self.state = "FORMING"
+
+    def join(self, **kwargs):
+        self.digests[kwargs["slot_id"]] = kwargs["plan_digest"]
+        return super().join(**kwargs)
+
+    def await_ready(self, *, group_id, epoch, **kwargs):
+        if len(set(self.digests.values())) != 1:
+            self.state = "FORMING"
+            raise RendezvousError(
+                f"collective group {group_id} stayed FORMING: plan digests disagree"
+            )
+        self.state = "READY"
+        return super().await_ready(group_id=group_id, epoch=epoch, **kwargs)
+
+
+class TestExecutionModeInDigest:
+    """Both modes change what a rank does inside native collectives, so peers
+    that disagree on either must never be admitted together."""
+
+    @staticmethod
+    def _cohort(monkeypatch, generator_env, trainer_env):
+        rz = AgreementRendezvous()
+        for name, value in generator_env.items():
+            monkeypatch.setenv(name, value)
+        _generator(rz, FakeEngine())
+        for name, value in trainer_env.items():
+            monkeypatch.setenv(name, value)
+        client = trainer(rz, FakeEngine())
+        return rz, client
+
+    def test_a_blocking_data_plane_mismatch_stays_forming(self, fake_nccl, monkeypatch):
+        rz, client = self._cohort(
+            monkeypatch,
+            {"MX_NCCL_REFIT_BLOCKING_DATA_PLANE": "0"},
+            {"MX_NCCL_REFIT_BLOCKING_DATA_PLANE": "1"},
+        )
+        with pytest.raises(RendezvousError, match="FORMING"):
+            client.compute_plan()
+        assert rz.state == "FORMING"
+        assert rz.digests["t0"] != rz.digests["g0"]
+
+    def test_a_grouped_submission_mismatch_stays_forming(self, fake_nccl, monkeypatch):
+        rz, client = self._cohort(
+            monkeypatch,
+            {"MX_NCCL_REFIT_GROUPED_SUBMISSION": "0"},
+            {"MX_NCCL_REFIT_GROUPED_SUBMISSION": "1"},
+        )
+        with pytest.raises(RendezvousError, match="FORMING"):
+            client.compute_plan()
+        assert rz.state == "FORMING"
+
+    def test_matching_modes_reach_ready(self, fake_nccl, monkeypatch):
+        rz, client = self._cohort(
+            monkeypatch,
+            {"MX_NCCL_REFIT_GROUPED_SUBMISSION": "1"},
+            {"MX_NCCL_REFIT_GROUPED_SUBMISSION": "1"},
+        )
+        client.compute_plan()
+        assert rz.state == "READY"
+
+    def test_the_hashed_mode_is_the_one_the_client_runs(self, fake_nccl, monkeypatch):
+        # Frozen at construction: an env flip afterwards changes neither the
+        # digest nor the data plane this client bootstraps.
+        monkeypatch.setenv("MX_NCCL_REFIT_BLOCKING_DATA_PLANE", "0")
+        client = trainer(FakeRendezvous(), FakeEngine())
+        digest = client._digest
+        monkeypatch.setenv("MX_NCCL_REFIT_BLOCKING_DATA_PLANE", "1")
+        client.compute_plan()
+        assert client._digest == digest
 
 
 class TestBlockingDataPlaneDefault:

@@ -439,6 +439,7 @@ class _CollectiveHalf:
         epoch: int,
         cache: CommunicatorCache,
         active_partition: int | None = None,
+        grouped_submission: bool | None = None,
     ) -> None:
         if plan.source_partition_count <= 0:
             raise ValueError("source_partition_count must be positive")
@@ -465,6 +466,13 @@ class _CollectiveHalf:
         self._group_id = group_id
         self._epoch = epoch
         self._cache = cache
+        # Frozen at construction: the client hashes this value into its
+        # admitted digest, so the wire path must not follow a later env change.
+        self._grouped_submission = (
+            envs.MX_NCCL_REFIT_GROUPED_SUBMISSION
+            if grouped_submission is None
+            else grouped_submission
+        )
         # Wire order is canonical, independent of how the engine enumerated
         # bulk. The digest is stricter and also pins the declared order.
         self._all_bulk = sorted(plan.bulk, key=lambda entry: entry.canonical())
@@ -865,7 +873,7 @@ class _CollectiveHalf:
 
         staged: list[tuple[ParamPlan, LaneCommunicator, LocalParamSpec, RefitCtx]] = []
         regions: list[_StorageRegion] = []
-        grouped = envs.MX_NCCL_REFIT_GROUPED_SUBMISSION
+        grouped = self._grouped_submission
         window = _ScratchWindow(window_bytes) if window_bytes and not grouped else None
         started = time.monotonic()
         # The native runtime is process-global and not host-thread-safe, and a

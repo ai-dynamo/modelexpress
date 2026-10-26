@@ -456,8 +456,15 @@ class CommunicatorCache:
     rather than incidental.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, blocking_data_plane: bool | None = None) -> None:
         self._lanes: dict[LaneKey, LaneCommunicator] = {}
+        # Frozen here rather than read per lane: the client hashes this value
+        # into its admitted digest, so every lane must run the mode it named.
+        self._blocking_data_plane = (
+            envs.MX_NCCL_REFIT_BLOCKING_DATA_PLANE
+            if blocking_data_plane is None
+            else blocking_data_plane
+        )
 
     def get(self, key: LaneKey) -> LaneCommunicator | None:
         lane = self._lanes.get(key)
@@ -537,7 +544,7 @@ class CommunicatorCache:
                     config=config_type(blocking=False),
                 )
                 _wait_until_initialized(comm, bindings, timeout_s)
-                if envs.MX_NCCL_REFIT_BLOCKING_DATA_PLANE:
+                if self._blocking_data_plane:
                     data = _split_blocking(comm, config_type, bindings, rank, timeout_s)
         except BaseException:
             if comm is not None:
