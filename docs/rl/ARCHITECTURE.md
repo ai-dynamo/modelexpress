@@ -301,13 +301,16 @@ incremental bucket submissions, a worker failure prevents publication. Use
 `ModelExpressGeneratorConfig.staging_buffer_bytes` sets bounded-streaming
 capacity per arena, and `staging_buffers_count` defaults to one. The streaming
 client uses their product as its total staging limit. `staging_device` selects
-CUDA or pinned host receive memory.
+engine-device (`None`, or the engine's device type) or pinned host (`"cpu"`)
+receive memory.
 
 The `stage_weight()` / `apply_weight()` generator APIs hold a version lease
 across metadata preparation and incremental installation. The NIXL receiver
 preserves recorded source-write order for vLLM and uses
-one or two registered byte arenas (`staging_buffers`) on CUDA or pinned host
-memory (`staging_device`). Receive tensors, wire-dtype conversion buffers,
+one or two registered byte arenas (`staging_buffers`) on the accelerator or pinned
+host memory (`staging_device`). Its owned NIXL agent, registered-buffer allocation
+scope, and completion fences come from the engine device's `AcceleratorBackend`,
+so CUDA and XPU generators share one path. Receive tensors, wire-dtype conversion buffers,
 full-source reconstruction buffers, and alignment all count toward each
 buffer's capacity. With two arenas the READ for batch
 `i + 1` is posted before batch `i` is yielded for commit, allowing asynchronous
@@ -318,6 +321,21 @@ tensors, then uses native post-load processing to restore existing kernel
 storage. Receive-arena views are never passed to engine callbacks. For trainer
 sources without bounded staging configured, `stage_weight()` transfers a full
 independent copy before installation.
+
+`registered_buffer_alloc_scope()` selects the allocation scope for registered
+receive and staging buffers from `AcceleratorBackend.requires_classic_alloc_pool()`,
+which states a requirement rather than a capability. CUDA requires it and XPU
+does not: CUDA uses the classic-`cudaMalloc` pool in
+`modelexpress_rl/refit/reshard/cuda_pool.py` because its caching allocator under
+`expandable_segments:True` can return VMM ranges that register successfully but
+fail during RDMA WRITE when `nvidia_peermem` cannot pin the underlying pages (that
+module's docstring records the exact failure signature). XPU uses its normal
+allocator because no equivalent hazard is known or has been observed on XPU.
+Successful XPU registration does not prove the WRITE-time hazard absent, so ruling
+it out would take a real RDMA write into an XPU buffer allocated under an
+expandable-segment equivalent. `torch.xpu` does expose `MemPool` and
+`XPUPluggableAllocator`, so an alternate XPU pool could be implemented if that
+test ever says one is needed.
 
 The logical plan is cached for one mesh ID and generation and contains only the
 shard groups needed by the generator. Groups list all replicas in worker-ID
@@ -806,7 +824,7 @@ transformations.
 Receive-arena tensors are never attached to the model or passed to post-load
 callbacks. The copy boundary requires ordinary Tensor storage views and rejects
 custom dispatch modes. A callback may retain an engine-owned tensor without
-preventing arena reuse; CUDA completion is required before another READ overwrites
+preventing arena reuse; device completion is required before another READ overwrites
 an arena. Captured installation preserves aliases needed for tied parameters and
 runtime bindings. Alias validation distinguishes repeated paths to one slot from
 ties between distinct slots, and checks relevant edges after callbacks without
@@ -1131,7 +1149,7 @@ generator = ModelExpressGeneratorClient.initialize(
         source_order=(WeightSource.TRAINER,),
         staging_buffer_bytes=4 * 1024**3,
         staging_buffers_count=2,
-        staging_device="cuda",  # or "cpu" for pinned host staging
+        staging_device=None,  # engine device; or "cpu" for pinned host staging
     )
 )
 # Pause generation on every replica before installing live weights.
@@ -1151,8 +1169,10 @@ generator worker. A module larger than one buffer fails during preparation. Engi
 post-load workspaces and live weights require additional headroom; the limit is
 not a total process-memory cap.
 
-`staging_device` selects where the arenas live. `"cuda"` (default) lands RDMA
-in VRAM and commits with a device copy. `"cpu"` allocates pinned host memory,
+`staging_device` selects where the arenas live. `None` (default) lands RDMA in
+the engine's device memory and commits with a device copy; `"cuda"` or `"xpu"`
+selects the same placement explicitly and must match the engine's device type.
+`"cpu"` allocates pinned host memory,
 registers it as NIXL DRAM, and commits with a host-to-device copy, so the arena
 costs no VRAM. Host staging adds a host-to-device copy and depends on the
 available host-memory and CPU-to-GPU bandwidth. `staging_buffers_count=2` posts the
@@ -1193,7 +1213,7 @@ Streaming reports independent `streaming_total_s`, `streaming_prepare_s`,
 `source_metadata_s`, `layout_capture_s`, `transfer_planning_s`, and
 `connection_registration_s`; the remaining preparation time includes version
 discovery and lease/control operations. Application contains NIXL `wire_s`,
-`reconstruct_s`, `install_commit_s` (including CUDA completion), `reload_s`, and
+`reconstruct_s`, `install_commit_s` (including device completion), `reload_s`, and
 `post_install_sync_s`. In the generic installer, vLLM's post-load processing
 refreshes attention-derived weights within `reload_s`. The ordinary
 `perf/mx_receive_install_time` is not emitted for streaming installation because
@@ -1201,7 +1221,7 @@ its application interval includes network reads. With refit timing enabled,
 DIRECT updates emit the same stage record as staged updates. The installation
 stage's `materialization_s`, `receive_copy_s`, and `post_load_processing_s`
 metadata report host-call durations inside the native engine lifecycle. They
-exclude subsequent CUDA completion waits and are not standalone GPU latencies.
+exclude subsequent device completion waits and are not standalone GPU latencies.
 Do not sum nested parent and child intervals or maxima from different ranks.
 Preserve raw samples and expose residual/unattributed time against the independent
 total rather than describing the entire streaming operation as wire or install.
