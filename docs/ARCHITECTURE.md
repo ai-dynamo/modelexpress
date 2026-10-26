@@ -882,6 +882,16 @@ If initialization fails, recovery aborts without attempting another loader.
 
 See [ModelExpress Benchmarks](BENCHMARKS.md) for measured loading-path, NIXL registration, and artifact-transfer results with explicit timing boundaries.
 
+**Publication contexts.** Engine integrations can opt into independent model
+sessions through `LoadContext.publication_namespace` and `port_offset`.
+Non-empty namespaces separate worker servers, manifests, and heartbeats;
+registration, RDMA rollback, reader draining, and unpublication use the same
+session scope. NIXL and worker gRPC listeners add the offset to their base port
+plus local device ordinal, and K8s-Service discovery applies it to the service
+endpoint. Empty namespaces and zero offsets preserve existing main and shared
+draft behavior. Engines remain responsible for selecting compatible source
+identities.
+
 ### External Loading Strategies
 
 `plugins.py` loads external `LoadStrategy` implementations for the shared `INFERENCE` chain. `MX_LOAD_PLUGIN` selects one plugin, inserted immediately before the built-in strategy named by `MX_LOAD_PLUGIN_BEFORE`. The default is `server-cache`, placing the plugin after RDMA. Unknown target names fail before discovery or loading. The six built-in strategies retain their relative order. RL and SGLang's `transfer_engine` path are unchanged. Unset or empty `MX_LOAD_PLUGIN` skips discovery and external imports and ignores `MX_LOAD_PLUGIN_BEFORE`.

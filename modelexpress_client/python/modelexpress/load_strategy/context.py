@@ -89,15 +89,17 @@ class LoadContext:
     accelerator_backend: AcceleratorBackend = field(
         default_factory=CudaAcceleratorBackend
     )
-    # "main" for the primary load; "draft" for the speculative second pass
-    # on the same worker. The draft shares the main load's NIXL agent,
-    # metadata port and SourceIdentity rather than publishing its own.
+    # "main" for the primary load; "draft" for a speculative model load.
     p2p_role: str = "main"
+    # Independent models on the same rank own separate serving resources.
+    # Empty retains the primary/legacy shared-draft publication.
+    publication_namespace: str = ""
+    port_offset: int = 0
     # Draft manifests can refine this to a compatibility-digested namespace.
     draft_tensor_namespace: str = DRAFT_TENSOR_PREFIX
     # False keeps a load out of P2P entirely (no registration, no RDMA).
     p2p_enabled: bool = True
-    # Draft pass only: the main load's already-initialized NIXL manager. The
+    # Legacy shared draft only: the main load's initialized NIXL manager. The
     # draft registers into it instead of binding MX_METADATA_PORT + device_id
     # a second time.
     shared_nixl_manager: NixlTransferManager | None = None
@@ -123,3 +125,7 @@ class LoadContext:
     # when unknown. RDMA reloads skip the target-side post-processing, so they
     # are only correct when restoring these same weights.
     loaded_identity: p2p_pb2.SourceIdentity | None = None
+
+    @property
+    def shares_main_publication(self) -> bool:
+        return self.p2p_role == "draft" and not self.publication_namespace
