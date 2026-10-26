@@ -522,6 +522,9 @@ jobs:
         cargo-deny --version || cargo install cargo-deny@0.16.4
         cargo-deny --no-default-features check --hide-inclusion-graph licenses bans --config ${{ github.workspace }}/deny.toml
 
+    - name: Check the openssl build hashes through OpenSSL
+      run: ci/check-openssl-no-sha2.sh
+
   code-coverage:
     name: Code Coverage
     runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}

@@ -10,7 +10,6 @@ use crate::grpc::p2p::{
 use anyhow::{Context, Result, anyhow, bail};
 use crc32c::{crc32c, crc32c_append};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Read},
@@ -119,9 +118,8 @@ impl ArtifactManifest {
     pub fn seal(&self) -> Result<SealedArtifactManifest> {
         let canonical =
             serde_json::to_vec(self).context("failed to serialize artifact manifest")?;
-        let digest = Sha256::digest(&canonical);
         Ok(SealedArtifactManifest {
-            artifact_id: format!("{digest:x}"),
+            artifact_id: crate::digest::sha256_hex(&canonical)?,
             manifest: self.clone(),
         })
     }

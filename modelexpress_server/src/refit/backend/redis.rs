@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use modelexpress_common::digest::sha256;
 use modelexpress_common::grpc::refit::{
     CreateTrainerMeshRequest, CreateWeightVersionRequest, DeleteVersionLeaseRequest,
     DeleteWeightVersionShardRequest, ObjectStorageSource, ObjectStorageType,
@@ -18,7 +19,6 @@ use modelexpress_common::grpc::refit::{
 use prost::Message;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{RefitBackend, RefitBackendError, RefitResult};
@@ -79,13 +79,14 @@ fn idempotency_key(model_name: &str, request_key: &str) -> String {
     format!("mx:refit:version-request:{model_name}:{request_key}")
 }
 
-fn lease_id(version_id: &str, worker_id: &str) -> String {
-    let digest = Sha256::digest(format!("{version_id}\0{worker_id}").as_bytes());
+fn lease_id(version_id: &str, worker_id: &str) -> RefitResult<String> {
+    let digest = sha256(format!("{version_id}\0{worker_id}").as_bytes())
+        .map_err(|error| RefitBackendError::Internal(error.to_string()))?;
     let mut id = String::with_capacity(8);
     for byte in &digest[..4] {
         let _ = write!(id, "{byte:02x}");
     }
-    id
+    Ok(id)
 }
 
 fn now_unix_ms() -> RefitResult<u64> {
@@ -975,7 +976,7 @@ impl RefitBackend for RedisRefitBackend {
         request: &RegisterVersionLeaseRequest,
     ) -> RefitResult<VersionLease> {
         self.get_weight_version(&request.version_id).await?;
-        let lease_id = lease_id(&request.version_id, &request.worker_id);
+        let lease_id = lease_id(&request.version_id, &request.worker_id)?;
         let mut redis = self.redis.clone();
         let result: String = Script::new(REGISTER_LEASE_LUA)
             .key(version_key(&request.version_id))

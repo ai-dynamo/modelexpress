@@ -25,6 +25,7 @@ tls-native = [
 ]
 tls-rustls = [
     "dep:rustls",
+    "dep:sha2",
     "rustls/ring",
     "rustls/std",
     "object_store?/ring",
@@ -36,7 +37,7 @@ tls-rustls = [
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
-sha2 = { workspace = true }
+sha2 = { workspace = true, optional = true }
 thiserror = "2.0"
 tonic = { workspace = true }
 prost = { workspace = true }
