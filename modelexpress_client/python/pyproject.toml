@@ -87,6 +87,7 @@ modelexpress = "modelexpress:register_modelexpress"
 modelexpress_rl = "modelexpress_rl.inference.engines.vllm.registration:register"
 
 [project.entry-points."sglang.srt.plugins"]
+modelexpress = "modelexpress.engines.sglang.registration:register"
 modelexpress_rl = "modelexpress_rl.inference.engines.sglang.registration:register"
 
 [tool.pytest.ini_options]

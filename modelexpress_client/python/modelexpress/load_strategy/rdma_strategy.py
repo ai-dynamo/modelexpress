@@ -736,7 +736,10 @@ class RdmaStrategy(LoadStrategy):
         receive_start = time.perf_counter()
         policy = configured_policy_label()
         with selection_metrics.time_source_attempt_phase(policy, "register"):
-            register_tensors(result, ctx)
+            # A reload that carries the tensors it loaded refills exactly those.
+            register_tensors(
+                result, ctx, reuse_discovered=getattr(ctx, "is_reload", False)
+            )
 
         # register_tensors() is best-effort: it logs and swallows, leaving
         # ctx.nixl_manager unset when registration failed. Everything below

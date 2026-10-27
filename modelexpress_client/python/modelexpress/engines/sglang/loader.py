@@ -18,11 +18,14 @@ import torch.nn as nn
 from ... import envs, p2p_pb2
 from ...load_strategy import (
     LoadContext,
+    execute_load_strategies,
     run_load_strategy_chain,
+    unpublish_metadata,
     validate_load_strategy_chain,
 )
 from ...load_strategy.base import clear_exception_tracebacks
 from ...load_strategy.context import LoadResult
+from ...load_strategy.rdma_strategy import RdmaStrategy
 from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
 from ...metadata.publish import _heartbeat_threads
 from ...metadata.publisher import PublisherThread
@@ -94,6 +97,9 @@ _nixl_managers: dict[int, NixlTransferManager] = {}
 _loader_registry: dict[int, MxModelLoader] = {}
 # Main-pass publication gates awaiting this device's speculative draft pass.
 _draft_publication_gates: dict[int, _DraftPublicationGate] = {}
+# Every NIXL load on a device in load order, main first, for refilling the
+# weights after SGLang releases them.
+_device_loads: dict[int, list[MxModelLoader]] = {}
 
 
 def _sglang_version() -> str:
@@ -154,6 +160,12 @@ class MxModelLoader:
         self._ctx: LoadContext | None = None
         self._strict_draft_publication = False
         self._draft_weight_adapter = None
+        # What a P2P-enabled NIXL load received, kept for _refill().
+        self._model: nn.Module | None = None
+        self._model_config: ModelConfig | None = None
+        self._device_config: DeviceConfig | None = None
+        self._loaded_identity: p2p_pb2.SourceIdentity | None = None
+        self._loaded_tensors: dict[str, torch.Tensor] = {}
 
     def load_model(
         self,
@@ -207,12 +219,28 @@ class MxModelLoader:
     def _run_load_strategy_chain(self, model: nn.Module, ctx: LoadContext) -> nn.Module:
         return run_load_strategy_chain(model, ctx)
 
+    def _refill(self) -> None:
+        """Receive this loader's weights again, in place, from a peer.
+
+        A released model keeps its processed layout and addresses, so only an
+        RDMA receive of the same weights can refill it. SGLang's post-load
+        processing is not idempotent, and every other strategy streams raw
+        checkpoint weights, so a missing peer fails the refill.
+        """
+        self._load_model_via_nixl(
+            model=self._model,
+            model_config=self._model_config,
+            device_config=self._device_config,
+            reload=True,
+        )
+
     def _load_model_via_nixl(
         self,
         *,
         model: nn.Module,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        reload: bool = False,
     ) -> nn.Module:
         load_start = time.perf_counter()
         ctx = build_sglang_load_context(
@@ -222,6 +250,13 @@ class MxModelLoader:
         )
         is_draft = is_sglang_draft_model(model_config)
         ctx.p2p_role = "draft" if is_draft else "main"
+        ctx.is_reload = reload
+        if reload:
+            ctx.loaded_identity = p2p_pb2.SourceIdentity()
+            ctx.loaded_identity.CopyFrom(self._loaded_identity)
+            # A served model also holds runtime buffers created after the
+            # load (e.g. collective scratch state) that no peer publishes.
+            ctx.tensors = dict(self._loaded_tensors)
         draft_gate: _DraftPublicationGate | None = None
         strict_draft = False
         if is_draft:
@@ -307,6 +342,15 @@ class MxModelLoader:
             if not is_draft and main_gate_pending is not None:
                 main_gate_pending.arm()
 
+        if not reload:
+            if ctx.p2p_enabled:
+                self._model = model
+                self._model_config = model_config
+                self._device_config = device_config
+                self._loaded_identity = ctx.identity
+                # A copy: the main load's dict is the registry the draft extends.
+                self._loaded_tensors = dict(ctx.tensors)
+            _device_loads.setdefault(ctx.device_id, []).append(self)
         total_time = time.perf_counter() - load_start
         logger.info(
             "[Worker %s] SGLang MxModelLoader.load_model() COMPLETE in %.2fs",
@@ -320,7 +364,7 @@ class MxModelLoader:
         # No model_init phase here, unlike vLLM: SGLang builds the module and
         # hands it in, so there is no initialization inside this window to time.
         # The phases still partition the load; this load simply has three.
-        if is_main:
+        if is_main and not ctx.is_reload:
             with selection_metrics.time_load_phase(
                 "sglang", ctx.identity.model_name, "artifact_install"
             ):
@@ -328,7 +372,10 @@ class MxModelLoader:
         with selection_metrics.time_load_phase(
             "sglang", ctx.identity.model_name, "chain"
         ):
-            model = self._run_load_strategy_chain(model, ctx)
+            if ctx.is_reload:
+                model = execute_load_strategies(model, ctx, [RdmaStrategy()])
+            else:
+                model = self._run_load_strategy_chain(model, ctx)
 
         if not is_main:
             if ctx.p2p_enabled and ctx.nixl_manager is not None:
@@ -345,10 +392,11 @@ class MxModelLoader:
         else:
             _nixl_managers.pop(ctx.device_id, None)
 
-        with selection_metrics.time_load_phase(
-            "sglang", ctx.identity.model_name, "publish"
-        ):
-            schedule_sglang_cache_artifact_publish(ctx)
+        if not ctx.is_reload:
+            with selection_metrics.time_load_phase(
+                "sglang", ctx.identity.model_name, "publish"
+            ):
+                schedule_sglang_cache_artifact_publish(ctx)
         return model
 
     def _load_model_via_transfer_engine(
@@ -785,3 +833,37 @@ class MxModelLoader:
         if self._ctx is not None:
             return self._ctx.tensors
         return {}
+
+
+def release_weights(device_id: int) -> None:
+    """Stop serving this device's weights before SGLang releases their memory.
+
+    Peers must not read memory that is about to be unmapped, and the NIXL
+    agent's registrations would pin it. Fails before anything is released if
+    a load on this device could not be refilled afterwards.
+    """
+    loads = _device_loads.get(device_id, [])
+    if any(loader._model is None for loader in loads):
+        raise RuntimeError(
+            "SGLang cannot release weights that ModelExpress did not load over "
+            "P2P, because ModelExpress could not refill them; a speculative "
+            "draft loads over P2P only with a pinned revision (MX_MODEL_REVISION)"
+        )
+    main_loader = _loader_registry.get(device_id)
+    if main_loader is None or main_loader._ctx is None:
+        return
+    unpublish_metadata(main_loader._ctx)
+    _nixl_managers.pop(device_id, None)
+    if main_loader._ctx.nixl_manager is not None:
+        main_loader._ctx.nixl_manager.shutdown()
+        main_loader._ctx.nixl_manager = None
+
+
+def refill_weights(device_id: int) -> None:
+    """Refill this device's released weights from a peer and serve them again.
+
+    The main load goes first, so its drafts join the new NIXL agent and
+    publication it creates.
+    """
+    for loader in _device_loads.get(device_id, []):
+        loader._refill()
