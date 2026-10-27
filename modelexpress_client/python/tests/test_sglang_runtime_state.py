@@ -6,7 +6,6 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-
 from modelexpress.engines.sglang.runtime_state import (
     finalize_runtime_state,
     prepare_runtime_tensors,
@@ -19,12 +18,13 @@ def _model():
     model.proj = torch.nn.Module()
     layer = model.proj
     layer.weight = torch.nn.Parameter(torch.zeros(256, 256), requires_grad=False)
-    layer.weight_scale_inv = torch.nn.Parameter(torch.full((8, 8), -1.), requires_grad=False)
+    layer.weight_scale_inv = torch.nn.Parameter(torch.full((8, 8), -1.0), requires_grad=False)
     layer.block_fp8_mxfp8_ready = False
 
     def allocate(layer, *, scale_u8):
         layer.weight_scale_inv_swizzled = torch.nn.Parameter(
-            torch.zeros(scale_u8.numel(), dtype=torch.uint8), requires_grad=False,
+            torch.zeros(scale_u8.numel(), dtype=torch.uint8),
+            requires_grad=False,
         )
 
     layer.quant_method = SimpleNamespace(
@@ -40,9 +40,21 @@ def _model():
 
 
 def _manifest(derived=True):
-    tensors = [TensorDescriptor("proj.weight", 1, 256*256*4, 0, "torch.float32")]
+    tensors = [
+        TensorDescriptor(
+            name="proj.weight", addr=1, size=256 * 256 * 4, device_id=0, dtype="torch.float32"
+        )
+    ]
     if derived:
-        tensors.append(TensorDescriptor("proj.weight_scale_inv_swizzled", 2, 2048, 0, "torch.uint8"))
+        tensors.append(
+            TensorDescriptor(
+                name="proj.weight_scale_inv_swizzled",
+                addr=2,
+                size=2048,
+                device_id=0,
+                dtype="torch.uint8",
+            )
+        )
     return tensors
 
 
@@ -51,8 +63,11 @@ def encode(monkeypatch):
     import sys
 
     encoder = Mock(return_value=torch.zeros(256, 8, dtype=torch.uint8))
-    monkeypatch.setitem(sys.modules, "sglang.srt.layers.quantization.fp8_utils",
-                        SimpleNamespace(block_fp8_scale_to_mxfp8_e8m0=encoder))
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.layers.quantization.fp8_utils",
+        SimpleNamespace(block_fp8_scale_to_mxfp8_e8m0=encoder),
+    )
     return encoder
 
 
@@ -137,20 +152,20 @@ def test_shared_draft_layer_is_not_prepared():
 
 def test_kv_host_mirrors_refresh_without_renormalizing_device_values():
     model = torch.nn.Module()
-    model.k_scale = torch.nn.Parameter(torch.tensor(2.), requires_grad=False)
-    model.v_scale = torch.nn.Parameter(torch.tensor(4.), requires_grad=False)
-    model.k_scale_float = model.v_scale_float = 1.
+    model.k_scale = torch.nn.Parameter(torch.tensor(2.0), requires_grad=False)
+    model.v_scale = torch.nn.Parameter(torch.tensor(4.0), requires_grad=False)
+    model.k_scale_float = model.v_scale_float = 1.0
     ptrs = [model.k_scale.data_ptr(), model.v_scale.data_ptr()]
     finalize_runtime_state(model)
-    assert (model.k_scale_float, model.v_scale_float) == (2., 4.)
-    assert (model.k_scale.item(), model.v_scale.item()) == (2., 4.)
+    assert (model.k_scale_float, model.v_scale_float) == (2.0, 4.0)
+    assert (model.k_scale.item(), model.v_scale.item()) == (2.0, 4.0)
     assert ptrs == [model.k_scale.data_ptr(), model.v_scale.data_ptr()]
 
 
-@pytest.mark.parametrize("value", [0., -1., float("nan"), float("inf")])
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
 def test_invalid_kv_host_scale_rejected(value):
     model = torch.nn.Module()
-    model.k_scale_float = 1.
+    model.k_scale_float = 1.0
     model.k_scale = torch.tensor(value)
     with pytest.raises(ManifestMismatchError, match="KV scale"):
         finalize_runtime_state(model)
@@ -174,22 +189,26 @@ def test_malformed_kv_scale_rejected(scale):
         finalize_runtime_state(model)
 
 
-def test_transfer_engine_published_manifest_prepares_mxfp8_receiver(monkeypatch):
+@torch.no_grad()
+def test_transfer_engine_published_manifest_receives_and_finalizes_mxfp8(monkeypatch, encode):
+    from modelexpress import p2p_pb2
     from modelexpress.engines.sglang.loader import MxModelLoader
     from modelexpress.metadata.payload import worker_tensor_descriptors
-    from modelexpress import p2p_pb2
 
     donor = _model()
     prepare_runtime_tensors(donor, _manifest())
     tensors = dict(donor.named_parameters())
     publisher = Mock()
-    monkeypatch.setattr(
-        "modelexpress.engines.sglang.loader.PublisherThread", publisher
-    )
+    monkeypatch.setattr("modelexpress.engines.sglang.loader.PublisherThread", publisher)
     ctx = SimpleNamespace(
-        tensors=tensors, device_id=0, worker_rank=0, global_rank=0,
-        worker_id="donor", identity=p2p_pb2.SourceIdentity(model_name="test"),
-        accelerator_backend=SimpleNamespace(name="cuda"), mx_client=Mock(),
+        tensors=tensors,
+        device_id=0,
+        worker_rank=0,
+        global_rank=0,
+        worker_id="donor",
+        identity=p2p_pb2.SourceIdentity(model_name="test"),
+        accelerator_backend=SimpleNamespace(name="cuda"),
+        mx_client=Mock(),
     )
     loader = MxModelLoader(SimpleNamespace(modelexpress_transport="transfer_engine"))
     weight_info = {
@@ -207,5 +226,31 @@ def test_transfer_engine_published_manifest_prepares_mxfp8_receiver(monkeypatch)
     }
     receiver = _model()
     prepare_runtime_tensors(receiver, manifest)
-    assert receiver.proj.weight_scale_inv_swizzled.shape == donor.proj.weight_scale_inv_swizzled.shape
+    assert (
+        receiver.proj.weight_scale_inv_swizzled.shape == donor.proj.weight_scale_inv_swizzled.shape
+    )
     assert receiver.proj.weight_scale_inv_swizzled.dtype == torch.uint8
+
+    targets = dict(receiver.named_parameters())
+    for tensor in tensors.values():
+        tensor.fill_(1)
+    source_by_addr = {tensor.data_ptr(): tensor for tensor in tensors.values()}
+    target_by_addr = {tensor.data_ptr(): tensor for tensor in targets.values()}
+
+    def copy_tensors(session_id, target_ptrs, source_ptrs, sizes):
+        assert session_id == "donor-session"
+        for target_ptr, source_ptr, size in zip(target_ptrs, source_ptrs, sizes, strict=True):
+            source = source_by_addr[source_ptr]
+            assert size == source.numel() * source.element_size()
+            target_by_addr[target_ptr].copy_(source)
+        return 0
+
+    transfer_engine = Mock()
+    transfer_engine.batch_transfer_sync_read.side_effect = copy_tensors
+    loader._receive_via_transfer_engine(targets, transfer_engine, worker, ctx)
+    finalize_runtime_state(receiver)
+    assert receiver.proj.block_fp8_mxfp8_ready
+    for name, tensor in tensors.items():
+        torch.testing.assert_close(targets[name], tensor)
+    transfer_engine.batch_transfer_sync_read.assert_called_once()
+    encode.assert_called_once()

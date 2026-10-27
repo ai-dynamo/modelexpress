@@ -777,7 +777,7 @@ class RdmaStrategy(LoadStrategy):
                     for t in worker_tensor_descriptors(source_worker)
                 ]
             source_tensors = self._scope_source_tensors(ctx, source_tensors)
-            if not getattr(ctx, "is_reload", False):
+            if not ctx.is_reload:
                 adapter_tensors = source_tensors
                 if _is_draft_pass(ctx):
                     adapter_tensors = [
@@ -788,6 +788,7 @@ class RdmaStrategy(LoadStrategy):
             with selection_metrics.time_source_attempt_phase(policy, "register"):
                 register_tensors(result, ctx)
             if _is_draft_pass(ctx):
+                # Registration refreshes ctx.tensors with newly prepared buffers.
                 source_tensors = self._scope_source_tensors(ctx, source_tensors)
 
             # register_tensors() is best-effort: it logs and swallows, leaving

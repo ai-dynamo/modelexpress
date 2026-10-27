@@ -595,7 +595,8 @@ class MxModelLoader:
         source_only = sorted(set(seed_weight_info) - set(tensors))
         if source_only:
             raise RuntimeError(
-                "ModelExpress transfer_engine: source-only tensors: "
+                f"ModelExpress transfer_engine: {len(source_only)} source-only tensors "
+                "(first five): "
                 f"{source_only[:5]}"
             )
 

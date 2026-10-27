@@ -50,6 +50,7 @@ def _ctx(manager):
         global_rank=0,
         worker_rank=0,
         worker_id="target-0",
+        is_reload=False,
         nixl_manager=manager,
         accelerator_backend=SimpleNamespace(name="cuda", synchronize=MagicMock()),
         adapter=adapter,

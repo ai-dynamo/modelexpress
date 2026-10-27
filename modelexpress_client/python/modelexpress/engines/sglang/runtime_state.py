@@ -18,9 +18,7 @@ def _block_mxfp8_method(layer):
 
 
 @torch.no_grad()
-def prepare_runtime_tensors(
-    model: torch.nn.Module, source_tensors: list[TensorDescriptor]
-) -> None:
+def prepare_runtime_tensors(model: torch.nn.Module, source_tensors: list[TensorDescriptor]) -> None:
     """Prepare supported donor-dependent buffers before transport registration.
 
     For SGLang's block-FP8 CuTeDSL/CUTLASS path, the swizzled tensor's presence
@@ -42,9 +40,7 @@ def prepare_runtime_tensors(
             continue
         backend = method.mxfp8_dense_backend
         if not (backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass()):
-            raise ManifestMismatchError(
-                f"Unsupported SGLang block-FP8 runtime layout at {name!r}"
-            )
+            raise ManifestMismatchError(f"Unsupported SGLang block-FP8 runtime layout at {name!r}")
         derived = source.get(prefix + "weight_scale_inv_swizzled")
         if derived is not None:
             n, k = layer.weight.shape
@@ -54,21 +50,19 @@ def prepare_runtime_tensors(
             # second pass through weight reshuffling or requantization.
             method._process_mxfp8_linear_weight_scale(
                 layer,
-                scale_u8=torch.zeros((n, k // 32), dtype=torch.uint8,
-                                     device=layer.weight.device),
+                scale_u8=torch.zeros((n, k // 32), dtype=torch.uint8, device=layer.weight.device),
             )
             target = layer.weight_scale_inv_swizzled
+            target_dtype = str(target.dtype).removeprefix("torch.")
             if (
-                derived.dtype not in (str(target.dtype), str(target.dtype).removeprefix("torch."))
+                derived.dtype.removeprefix("torch.") != target_dtype
                 or derived.size != target.numel() * target.element_size()
             ):
                 raise ManifestMismatchError(
                     f"Incompatible SGLang MXFP8 scale descriptor at {name!r}"
                 )
         elif getattr(layer, "weight_scale_inv_swizzled", None) is not None:
-            raise ManifestMismatchError(
-                f"Unexpected SGLang MXFP8 receiver buffer at {name!r}"
-            )
+            raise ManifestMismatchError(f"Unexpected SGLang MXFP8 receiver buffer at {name!r}")
         layer.block_fp8_mxfp8_ready = False
         layer._mx_block_fp8_manifest_prepared = True
 
@@ -87,7 +81,7 @@ def finalize_runtime_state(model: torch.nn.Module) -> None:
             if not getattr(layer, "keep_plain_weight_layout", False):
                 try:
                     block_fp8_scale_to_mxfp8_e8m0(
-                        layer.weight_scale_inv.data,
+                        layer.weight_scale_inv,
                         tuple(layer.weight.shape),
                         method.weight_block_size,
                     )
