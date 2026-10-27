@@ -2499,6 +2499,16 @@ def test_streaming_rejects_invalid_staging_options_before_leasing(kwargs, match)
         )
 
 
+@pytest.mark.parametrize("staging_device", [None, "cuda", "xpu", "cpu"])
+def test_staging_device_accepts_the_engine_device_or_host(staging_device):
+    config = ModelExpressGeneratorConfig(
+        engine_context=VllmGeneratorContext(model=object(), vllm_config=object()),
+        staging_device=staging_device,
+    )
+
+    assert config.staging_device == staging_device
+
+
 @pytest.mark.parametrize(
     "case",
     [
