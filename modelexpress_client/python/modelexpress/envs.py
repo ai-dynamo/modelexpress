@@ -53,6 +53,8 @@ if TYPE_CHECKING:
     MX_AUTH_TOKEN_TTL_SECONDS: Optional[str]
     # Runtime compatibility
     MX_DISABLE_PATCHES: bool
+    MX_SGLANG_P2P_METADATA_SYNC: bool
+    SGLANG_META_PORT: int
     # Metadata / worker
     MX_METADATA_BACKEND: str
     MX_METADATA_PORT: int
@@ -258,6 +260,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_DISABLE_PATCHES": lambda: (
         os.environ.get("MX_DISABLE_PATCHES", "").strip().lower() in _TRUTHY
     ),
+    "MX_SGLANG_P2P_METADATA_SYNC": lambda: _env_bool(
+        "MX_SGLANG_P2P_METADATA_SYNC", False
+    ),
+    "SGLANG_META_PORT": lambda: _env_int("SGLANG_META_PORT", 19999),
     # ── Metadata / worker ──────────────────────────────────────────────────
     "MX_METADATA_BACKEND": lambda: (
         os.environ.get("MX_METADATA_BACKEND", "").lower().strip()

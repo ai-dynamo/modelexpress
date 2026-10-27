@@ -60,6 +60,11 @@ def configure_trtllm_logging() -> None:
     _configure_engine_logging("TRT-LLM")
 
 
+def configure_sglang_logging() -> None:
+    """Ensure modelexpress loggers are visible in SGLang worker processes."""
+    _configure_engine_logging("sglang")
+
+
 def register_modelexpress():
     """
     Register ModelExpress integrations with vLLM.
@@ -88,6 +93,13 @@ def register_modelexpress_loaders():
     register_modelexpress()
 
 
+def register_modelexpress_sglang():
+    """Register ModelExpress integrations with SGLang."""
+    from .engines.sglang.registration import register as register_sglang
+
+    register_sglang()
+
+
 from .client import MxClient  # noqa: F401
 from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
@@ -100,8 +112,10 @@ __all__ = [
     "MxClient",
     "MxGdsLoader",
     "PublisherThread",
+    "configure_sglang_logging",
     "configure_trtllm_logging",
     "configure_vllm_logging",
     "register_modelexpress",
     "register_modelexpress_loaders",
+    "register_modelexpress_sglang",
 ]
