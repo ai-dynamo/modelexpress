@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any
 
@@ -18,13 +18,13 @@ from vllm.distributed.weight_transfer.base import (
 )
 
 from modelexpress import envs
+from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.client import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
     StagedWeightHandle,
 )
 from modelexpress_rl.inference.receiver import (
-    DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB,
     ObjectStorageGeneratorConfig,
 )
 from modelexpress_rl.object_storage import ObjectStorageType
@@ -44,7 +44,9 @@ class ModelExpressWeightTransferInitInfo(WeightTransferInitInfo):
     initial_base_version_id: str | None = None
     seed_checkpoint_path: str | None = None
     refit_checkpoint_dir: str | None = None
-    refit_checkpoint_max_size_gb: int | None = DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB
+    refit_checkpoint_max_size_gb: int | None = field(
+        default_factory=lambda: rl_envs.MX_REFIT_CHECKPOINT_MAX_SIZE_GB
+    )
     server_url: str | None = None
     object_storage_type: str | None = None
     object_storage_endpoint_url: str | None = None

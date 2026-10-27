@@ -7,6 +7,10 @@ SPDX-License-Identifier: Apache-2.0
 
 This page is the deployment reference for the standalone server, Helm, Kubernetes metadata topologies, and worker rollout requirements. Start with [Choose a ModelExpress path](guides/choose-a-path.md) if you have not selected a topology. See [Configuration](CONFIGURATION.md) for settings, [Integrations](integrations/README.md) for runtime setup, [Troubleshooting](TROUBLESHOOTING.md) for operational symptoms, and [Architecture](ARCHITECTURE.md) for internals.
 
+For RL generator checkpoint-cache capacity and
+`MX_REFIT_CHECKPOINT_MAX_SIZE_GB`, see the
+[RL checkpoint-cache configuration](rl/CONFIGURATION.md#generator-refit-checkpoint-cache).
+
 ## Server Configuration
 
 ModelExpress uses a layered configuration system. Sources are applied in order of precedence:
