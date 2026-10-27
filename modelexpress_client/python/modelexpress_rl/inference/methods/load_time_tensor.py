@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from modelexpress.refit.timing import (
+from modelexpress_rl.refit.timing import (
     add_refit_bytes,
     add_refit_duration,
     refit_span,
@@ -59,7 +59,7 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             raise RuntimeError("release the active update before preparing another")
         if not isinstance(source, ResolvedTrainerSource):
             raise TypeError("load-time tensor method requires a trainer source")
-        manifests = [item.manifest for item in source.snapshot.shards]
+        manifests = [item.metadata for item in source.snapshot.shards]
         is_streaming = self._transfer.bounded_staging
         with refit_span("transfer_planning", accumulate_metadata=True) as counters:
             prepared = self._transfer.prepare(
@@ -73,8 +73,10 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
             metrics = dict(prepared.metrics)
             streamed = PreparedStreamingTensors(
                 batches=lambda: self._transfer.iter_bounded(prepared, metrics),
-                parameter_names=frozenset(
-                    name for batch in prepared.batches for name in batch.layouts[0]
+                parameter_names=(
+                    prepared.batches[0].transfer_plan.replay_parameter_names
+                    if prepared.batches[0].transfer_plan.source_replay
+                    else frozenset(name for batch in prepared.batches for name in batch.layouts[0])
                 ),
                 transfer_metrics=metrics,
             )

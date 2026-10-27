@@ -4,17 +4,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
 
-from modelexpress.refit.reshard.rendezvous import (
-    MxReshardRendezvous,
-    PublishedTensor,
-    wrap_rendezvous_blob,
-)
+from modelexpress_rl.refit.reshard.rendezvous import PublishedTensor, wrap_rendezvous_blob
 from modelexpress_rl.train.adapter import NixlMetadataProvider
-
-from .aliases import MegatronTensorSpec, build_hf_aliases
 
 
 @dataclass(frozen=True)
@@ -23,24 +16,6 @@ class MegatronReshardManifest:
 
     blob: bytes
     tensors: tuple[PublishedTensor, ...]
-
-
-@dataclass(frozen=True)
-class MegatronPublishedTensorSpec:
-    """Legacy one-to-one native tensor publication descriptor."""
-
-    name: str
-    global_shape: tuple[int, ...]
-    shard_axis: int | None = None
-    local_shard_range: tuple[int, int] | None = None
-
-    def __post_init__(self) -> None:
-        if not self.global_shape or any(int(dim) <= 0 for dim in self.global_shape):
-            raise ValueError(f"{self.name}: invalid global shape {self.global_shape}")
-        if (self.shard_axis is None) != (self.local_shard_range is None):
-            raise ValueError(
-                f"{self.name}: shard_axis and local_shard_range must be set together"
-            )
 
 
 def build_megatron_reshard_manifest(
@@ -74,76 +49,20 @@ def build_megatron_reshard_manifest(
             if shard.addr <= 0:
                 raise ValueError(f"{tensor.name}: shard has invalid address")
 
+    stable_tensors = [
+        replace(tensor, shards=[replace(shard, digest=None) for shard in tensor.shards])
+        for tensor in published
+    ]
     blob = wrap_rendezvous_blob(
         manager.nixl_metadata,
         agent_name,
         metadata_endpoint,
-        published,
+        stable_tensors,
     )
     return MegatronReshardManifest(blob=blob, tensors=tuple(published))
 
 
-def publish_megatron_reshard_view(
-    *,
-    manager: NixlMetadataProvider,
-    rendezvous: MxReshardRendezvous,
-    tensors: dict[str, Any],
-    specs: list[MegatronPublishedTensorSpec],
-    metadata_endpoint: str,
-) -> str:
-    """Publish registered Megatron tensors through the existing rendezvous."""
-    by_name = {spec.name: spec for spec in specs}
-    if len(by_name) != len(specs):
-        raise ValueError("duplicate Megatron publish spec")
-    missing = sorted(set(by_name).difference(tensors))
-    extra = sorted(set(tensors).difference(by_name))
-    if missing or extra:
-        raise ValueError(
-            f"Megatron shard table/tensor mismatch: missing={missing[:10]} "
-            f"extra={extra[:10]}"
-        )
-    items = [
-        MegatronTensorSpec(
-            name=name,
-            tensor=tensors[name],
-            role="column",
-            hf_names=(name,),
-            global_shape=spec.global_shape,
-            placement_kind="SHARD" if spec.shard_axis is not None else "REPLICATE",
-            shard_axis=spec.shard_axis,
-            local_shard_range=spec.local_shard_range,
-        )
-        for name, spec in sorted(by_name.items())
-    ]
-    published = build_hf_aliases(items, agent_name=str(manager.agent_name))
-    manifest = build_megatron_reshard_manifest(
-        manager=manager,
-        published=published,
-        metadata_endpoint=metadata_endpoint,
-    )
-    return rendezvous.publish(manifest.blob)
-
-
-def publish_registered_shard_table(
-    *,
-    manager: NixlMetadataProvider,
-    rendezvous: MxReshardRendezvous,
-    published: list[PublishedTensor],
-    metadata_endpoint: str,
-) -> str:
-    """Publish validated aliases through the existing rendezvous."""
-    manifest = build_megatron_reshard_manifest(
-        manager=manager,
-        published=published,
-        metadata_endpoint=metadata_endpoint,
-    )
-    return rendezvous.publish(manifest.blob)
-
-
 __all__ = [
-    "MegatronPublishedTensorSpec",
     "MegatronReshardManifest",
     "build_megatron_reshard_manifest",
-    "publish_megatron_reshard_view",
-    "publish_registered_shard_table",
 ]

@@ -479,7 +479,10 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
         transport="p2p",
         stop=lambda: None,
     )
-    transport = SimpleNamespace(publish=MagicMock(return_value=published))
+    transport = SimpleNamespace(
+        check_publishable=MagicMock(),
+        publish=MagicMock(return_value=published),
+    )
 
     with patch(
         "modelexpress.metadata.artifact_lifecycle._create_artifact_transport",

@@ -6,17 +6,13 @@
 from .adapter import MegatronTrainerAdapter
 from .aliases import MegatronAliasInput, MegatronTensorSpec, build_hf_aliases
 from .publisher import (
-    MegatronPublishedTensorSpec,
     MegatronReshardManifest,
     build_megatron_reshard_manifest,
-    publish_megatron_reshard_view,
-    publish_registered_shard_table,
 )
 from .selection import build_megatron_tensor_specs, model_express_role_for_mapping
 
 __all__ = [
     "MegatronAliasInput",
-    "MegatronPublishedTensorSpec",
     "MegatronReshardManifest",
     "MegatronTensorSpec",
     "MegatronTrainerAdapter",
@@ -24,6 +20,4 @@ __all__ = [
     "build_megatron_tensor_specs",
     "build_megatron_reshard_manifest",
     "model_express_role_for_mapping",
-    "publish_megatron_reshard_view",
-    "publish_registered_shard_table",
 ]

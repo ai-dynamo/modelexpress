@@ -197,6 +197,8 @@ runs:
         TIMEOUT: ${{ inputs.pod_ready_timeout_seconds }}
       run: |
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: pod_ready_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
+        source .github/scripts/ci-kubectl.sh
+        wait_for_scheduling "Source" mx-source "job-name=mx-source" "${TIMEOUT}"
         echo "::group::Waiting for source /health to return 200"
         # Same pattern as run-mx-p2p-test's target-health wait — probes via
         # `kubectl exec ... curl localhost:${PORT}/health` rather than
@@ -204,22 +206,13 @@ runs:
         deadline=$((SECONDS + TIMEOUT))
         SOURCE_POD=""
         while [ $SECONDS -lt $deadline ]; do
-          SOURCE_POD=$(kubectl get pods -n ${NAMESPACE} \
-            -l job-name=mx-source \
-            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          PODS=$(ci_workload_pods "Source" mx-source "job-name=mx-source")
+          SOURCE_POD=$(printf '%s\n' "${PODS}" | jq -r '.items[0].metadata.name // ""')
 
           if [ -n "${SOURCE_POD}" ] && kubectl exec -n ${NAMESPACE} "${SOURCE_POD}" -- \
                curl -sf -m 5 "http://localhost:${WORKER_PORT}/health" >/dev/null 2>&1; then
             echo "Source ${SOURCE_POD} /health returned 200."
             break
-          fi
-
-          FAILED=$(kubectl get pods -n ${NAMESPACE} \
-              -l job-name=mx-source --no-headers 2>/dev/null \
-            | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
-          if [ -n "${FAILED}" ]; then
-            echo "ERROR: source pod entered failure state: ${FAILED}"
-            exit 1
           fi
 
           echo "Source /health not ready yet (pod=${SOURCE_POD:-<not-created>})..."

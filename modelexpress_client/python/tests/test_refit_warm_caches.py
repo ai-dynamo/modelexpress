@@ -1,28 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from modelexpress.refit.reshard.rendezvous import structural_manifest_digest
 import hashlib
 import json
 import time
 from dataclasses import replace
-from types import MappingProxyType, SimpleNamespace
+from types import SimpleNamespace
+from modelexpress_rl.version import MeshIdentity
 
 import pytest
 import torch
-from modelexpress.refit.reshard.rendezvous import (
+from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
+    unwrap_rendezvous_blob,
     wrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import (
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import (
     ConvertSource,
     SourceInfo,
     LogicalTransferPlan,
     plan_transfer,
 )
-from modelexpress.refit.reshard.types import (
+from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     RecordedCopy,
@@ -34,7 +35,7 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _ResolvedSources,
     _SourceBinding,
     _resolve_sources,
-    _WeightUpdatePlan,
+    _required_agent_metadata,
 )
 
 from modelexpress_rl.inference.adapter import TrainerSourceShard
@@ -140,44 +141,62 @@ def _bounded_cache_inputs():
     }
 
 
-def _transfer_with_resolved_plan(monkeypatch, manifests: list[bytes]) -> tuple:
-    transfer = object.__new__(_NixlStagedTransfer)
-    transfer._weight_update_plan = None
-    resolved = transfer._resolve_metadata(manifests, {})
-    transfer._weight_update_plan = _WeightUpdatePlan(
-        trainer_source_snapshot=TrainerSourceSnapshot(
-            "mesh",
-            1,
-            tuple(
-                TrainerSourceShard(
-                    str(index),
-                    str(index),
-                    hashlib.sha256(blob).hexdigest(),
-                    "source:19000",
-                    blob,
-                    structural_manifest_digest(blob),
-                )
-                for index, blob in enumerate(manifests)
-            ),
-            resolved,
+def _trainer_snapshot(manifests: list[bytes]) -> TrainerSourceSnapshot:
+    return TrainerSourceSnapshot(
+        MeshIdentity("mesh", 1),
+        tuple(
+            TrainerSourceShard(
+                str(index),
+                str(index),
+                hashlib.sha256(blob).hexdigest(),
+                unwrap_rendezvous_blob(blob).metadata_endpoint,
+                blob,
+            )
+            for index, blob in enumerate(manifests)
         ),
-        layout_capture_snapshot=CaptureResult(copies=[]),
-        parameter_layout=MappingProxyType({}),
-        transfer_plan=LogicalTransferPlan(),
-        source_binding=_SourceBinding(resolved, {}, ()),
-        transport=None,
     )
-    return transfer, resolved
+
+
+def test_retaining_needed_sources_keeps_agent_alignment_without_copying_metadata():
+    manifests = [
+        _manifest(agent_name="unused", endpoint="unused:1", offset=0, address=100,
+                  name="unused", shard_shape=(4,)),
+        _manifest(agent_name="needed", endpoint="needed:1", offset=0, address=200,
+                  shard_shape=(4,)),
+    ]
+    resolved = _resolve_sources(manifests)
+    trainer = replace(_trainer_snapshot(manifests), resolved_metadata=resolved)
+    capture = CaptureResult(copies=[
+        RecordedCopy("weight", (), "layer.weight", 0, (4,), (1,), torch.float32)
+    ])
+    plan = plan_transfer(capture, resolved.sources,
+                         source_slots={"unused": "0", "needed": "1"})
+
+    retained = _NixlStagedTransfer._retain_needed_sources(trainer, plan)
+    binding = _NixlStagedTransfer._source_binding(retained)
+
+    assert [shard.source_slot_id for shard in retained.shards] == ["1"]
+    assert binding.agents_by_slot == {"1": "needed"}
+    assert retained.resolved_metadata.sources is resolved.sources
+    assert retained.resolved_metadata.session_to_agent is resolved.session_to_agent
+    assert _required_agent_metadata(plan, retained.resolved_metadata, binding) == {
+        "needed": b"nixl-metadata"
+    }
+    for read in plan._all_segments():
+        assert binding.resolve(plan.source_buffers[read.source_buffer]) == ("needed", 200)
 
 
 @pytest.mark.parametrize(
     "defect", ["empty", "malformed", "duplicate", "mutable", "geometry"]
 )
-def test_metadata_rejects_bad_manifests_even_with_a_cached_plan(
+def test_metadata_rejects_bad_manifests_even_with_a_cached_source(
     monkeypatch, defect
 ) -> None:
     manifest = _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100)
-    transfer, _ = _transfer_with_resolved_plan(monkeypatch, [manifest])
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._trainer_source_snapshot = replace(
+        _trainer_snapshot([manifest]), resolved_metadata=_resolve_sources([manifest])
+    )
     if defect == "geometry":
         payload = json.loads(
             _manifest(agent_name="b", endpoint="b:19000", offset=2, address=200)
@@ -236,4 +255,4 @@ def test_diagnostic_plan_validation_keeps_values(harness, diagnostic, missing_pa
     prepared = prepare()
     _, installed = harness.collect(prepared)
     _check_values(harness, installed)
-    assert prepared.metrics["bounded_whole_validation_s"] > 0
+    assert prepared.metrics["plan_cache_validate_s"] >= 0

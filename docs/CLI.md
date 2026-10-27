@@ -39,6 +39,7 @@ modelexpress-cli [OPTIONS] <COMMAND>
 **Options:**
 - `-e, --endpoint <ENDPOINT>`: Server endpoint (default: http://localhost:8001)
 - `-t, --timeout <TIMEOUT>`: Request timeout in seconds (default: 30)
+- `--connect-wait-secs <SECS>`: Seconds to keep retrying the initial server connection before falling back to a direct provider download that bypasses the server cache; 0 disables waiting (default: 10)
 - `-f, --format <FORMAT>`: Output format: `human`, `json`, `json-pretty` (default: human)
 - `-v, -vv, -vvv`: Verbose mode (info, debug, trace)
 - `-q, --quiet`: Quiet mode (suppress all output except errors)

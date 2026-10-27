@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import re
 import tarfile
@@ -1214,7 +1215,9 @@ def test_cache_artifact_transfers_share_artifact_interface(
     )
 
 
-def test_publish_artifact_source_registers_mx_discovery_metadata(tmp_path):
+def test_publish_artifact_source_registers_mx_discovery_metadata(tmp_path, monkeypatch):
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_DOMAIN", raising=False)
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", '{"site":"site-a","rack":"rack-a"}')
     source = tmp_path / "source"
     source.mkdir()
     (source / "kernel.bin").write_bytes(b"compiled-cache")
@@ -1271,6 +1274,65 @@ def test_publish_artifact_source_registers_mx_discovery_metadata(tmp_path):
     assert mx_client.published_worker.metadata_endpoint == "127.0.0.1:7010"
     assert mx_client.published_worker.artifact_source.artifact_id == bundle.artifact_id
     assert mx_client.published_worker.artifact_source.file_count == 1
+    assert dict(mx_client.published_worker.topology) == {
+        "site": "site-a", "rack": "rack-a"
+    }
+
+
+@pytest.mark.parametrize(
+    "topology,snapshot,error",
+    [
+        pytest.param({}, {}, "topology is unknown", id="unknown"),
+        pytest.param({"site": "site-a"}, {}, "topology changed", id="snapshot-missing"),
+        pytest.param(
+            {"site": "site-a"}, {"site": "site-b"}, "topology changed",
+            id="snapshot-changed",
+        ),
+    ],
+)
+def test_publish_artifact_source_recovers_after_invalid_topology(
+    tmp_path, monkeypatch, topology, snapshot, error
+):
+    _artifact_topology_policy(monkeypatch)
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", json.dumps(topology))
+    transfer = torch_compile_cache_artifact_transfer(
+        tmp_path / "source", tmp_path / "target", tmp_path / "bundle"
+    )
+    transfer.roots[0].source_root.mkdir()
+    bundle = transfer.prepare_source()
+    identity = p2p_pb2.SourceIdentity(mx_source_type=transfer.mx_source_type)
+    mx_client = _FakeMxClient()
+    worker_server = _FakeWorkerGrpcServer()
+    source_nixl = _FakeSourceNixlManager(listen_port=7010)
+    chunk_manager = MagicMock(wraps=artifact_transfer_module.NixlArtifactChunkManager)
+    monkeypatch.setattr(artifact_transfer_module, "NixlArtifactChunkManager", chunk_manager)
+    monkeypatch.setattr(artifact_transfer_module, "PublisherThread", MagicMock())
+
+    def publish():
+        return publish_artifact_source(
+            mx_client, transfer, bundle, identity, source_nixl,
+            worker_id="source-worker", worker_grpc_server=worker_server,
+            host="127.0.0.1",
+        )
+
+    with monkeypatch.context() as snapshot_patch:
+        snapshot_patch.setattr(
+            artifact_transfer_module, "local_topology", lambda: snapshot, raising=False
+        )
+        with pytest.raises(LookupError, match=error):
+            publish()
+    chunk_manager.assert_not_called()
+    assert mx_client.published_worker is None
+    assert worker_server.registered == []
+    assert source_nixl.refresh_metadata_count == 0
+
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", '{"site":"site-a"}')
+    published = publish()
+    try:
+        assert dict(mx_client.published_worker.topology) == {"site": "site-a"}
+        assert len(worker_server.registered) == 1
+    finally:
+        published.stop()
 
 
 def test_discover_artifact_source_does_not_rank_match_by_default(tmp_path):
@@ -1388,6 +1450,113 @@ def _artifact_worker(worker_grpc_endpoint, artifact_id, accelerator=""):
         accelerator=accelerator,
         artifact_source=p2p_pb2.ArtifactSourceMetadata(artifact_id=artifact_id),
     )
+
+
+def _artifact_topology_policy(monkeypatch, domain="site", enforcement="required"):
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", domain)
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_ENFORCEMENT", enforcement)
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", json.dumps({domain: "site-a"}))
+    monkeypatch.setattr("modelexpress.topology.DOMAIN_WAIT_TIMEOUT_S", 0)
+
+
+def _artifact_topology_source(worker_id, topology, metadata_topology=None):
+    ref = p2p_pb2.SourceInstanceRef(
+        mx_source_id="artifact-source", worker_id=worker_id, topology=topology,
+    )
+    worker = _artifact_worker(f"{worker_id}:6555", "artifact-id")
+    worker.topology.update(topology if metadata_topology is None else metadata_topology)
+    return ref, worker
+
+
+@pytest.mark.parametrize("domain", ["datacenter", "site"])
+def test_discover_artifact_source_required_skips_cross_domain_before_metadata(
+    monkeypatch, domain
+):
+    _artifact_topology_policy(monkeypatch, domain)
+    client, identity = _artifact_discovery_client([
+        _artifact_topology_source("cross", {domain: "site-b"}),
+        _artifact_topology_source("unknown", {}),
+        _artifact_topology_source("empty", {domain: ""}),
+        _artifact_topology_source("blank", {domain: " \t"}),
+        _artifact_topology_source("same", {domain: "site-a"}),
+    ])
+    source = discover_artifact_source(client, identity)
+    assert source.worker_id == "same"
+    client.get_metadata.assert_called_once_with("artifact-source", "same")
+
+
+@pytest.mark.parametrize("topology", [{}, {"site": " \t"}])
+def test_discover_artifact_source_required_unknown_local_skips_listing(monkeypatch, topology):
+    _artifact_topology_policy(monkeypatch)
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", json.dumps(topology))
+    client, identity = _artifact_discovery_client([
+        _artifact_topology_source("same", topology)
+    ])
+    with pytest.raises(LookupError):
+        discover_artifact_source(client, identity)
+    client.list_sources.assert_not_called()
+    client.get_metadata.assert_not_called()
+
+
+@pytest.mark.parametrize("metadata_topology", [{"site": "site-b"}, {}, {"site": " \t"}])
+def test_discover_artifact_source_required_rechecks_metadata_topology(
+    monkeypatch, metadata_topology
+):
+    _artifact_topology_policy(monkeypatch)
+    client, identity = _artifact_discovery_client([
+        _artifact_topology_source("drifted", {"site": "site-a"}, metadata_topology)
+    ])
+    with pytest.raises(LookupError):
+        discover_artifact_source(client, identity)
+    client.get_metadata.assert_called_once_with("artifact-source", "drifted")
+
+
+@pytest.mark.parametrize(
+    "source_accelerator,source_rank,should_warn",
+    [
+        pytest.param("cuda", 0, True, id="cross-domain"),
+        pytest.param("xpu", 0, False, id="incompatible"),
+        pytest.param("cuda", 1, False, id="other-rank"),
+    ],
+)
+def test_discover_artifact_source_warns_only_for_domain_filtered_candidates(
+    monkeypatch, caplog, source_accelerator, source_rank, should_warn
+):
+    _artifact_topology_policy(monkeypatch)
+    ref, worker = _artifact_topology_source("source", {"site": "site-b"})
+    ref.accelerator = source_accelerator
+    ref.worker_rank = source_rank
+    client, identity = _artifact_discovery_client([(ref, worker)])
+
+    with caplog.at_level(logging.WARNING), pytest.raises(
+        LookupError, match="no ready artifact source"
+    ):
+        discover_artifact_source(client, identity, accelerator="cuda", worker_rank=0)
+
+    warnings = [record for record in caplog.records if "No P2P source shares" in record.message]
+    assert len(warnings) == int(should_warn)
+    if should_warn:
+        assert "site='site-a'" in warnings[0].message
+
+
+def test_discover_artifact_source_preferred_orders_same_domain_and_allows_fallback(monkeypatch):
+    _artifact_topology_policy(monkeypatch, enforcement="preferred")
+    cross = _artifact_topology_source("cross", {"site": "site-b"})
+    same = _artifact_topology_source("same", {"site": "site-a"})
+    client, identity = _artifact_discovery_client([cross, same])
+    assert discover_artifact_source(client, identity).worker_id == "same"
+    client.get_metadata.assert_called_once_with("artifact-source", "same")
+    client, identity = _artifact_discovery_client([cross])
+    assert discover_artifact_source(client, identity).worker_id == "cross"
+
+
+def test_discover_artifact_source_unset_policy_preserves_source_order(monkeypatch):
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_DOMAIN", raising=False)
+    client, identity = _artifact_discovery_client([
+        _artifact_topology_source("legacy", {}),
+        _artifact_topology_source("same", {"site": "site-a"}),
+    ])
+    assert discover_artifact_source(client, identity).worker_id == "legacy"
 
 
 def test_discover_artifact_source_skips_incompatible_accelerator():

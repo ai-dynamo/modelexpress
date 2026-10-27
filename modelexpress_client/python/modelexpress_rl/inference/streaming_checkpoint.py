@@ -20,7 +20,7 @@ import torch
 from safetensors.torch import _getdtype
 
 from .checkpoint_store import CheckpointState, LocalCheckpointStore
-from .receiver import _S3Version, _protected_versions, _source_identity
+from .receiver import _ObjectStorageVersion, _protected_versions, _source_identity
 from ..utils import index_checkpoint_tensors
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ _CACHE_PENDING_BYTES = 2 * 1024**3
 class StreamedCheckpoint:
     """Full HF source plus an optional node-local writer fed by its iterator."""
 
-    version: _S3Version
+    version: _ObjectStorageVersion
     index_data: bytes
     weight_map: dict[str, str]
     tensor_metadata: dict[str, dict]
@@ -130,7 +130,9 @@ class StreamedCheckpoint:
                 )
 
 
-def _adopt_full_checkpoint(store: LocalCheckpointStore, version: _S3Version) -> None:
+def _adopt_full_checkpoint(
+    store: LocalCheckpointStore, version: _ObjectStorageVersion
+) -> None:
     """Make a published streamed full checkpoint the ready, active cache head."""
     target = store.full_path(version.version_id)
     store.verify_artifact_source(target, _source_identity(version))

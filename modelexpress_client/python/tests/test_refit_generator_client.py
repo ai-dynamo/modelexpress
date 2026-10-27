@@ -57,7 +57,7 @@ from modelexpress_rl.inference.source import (
 )
 
 
-_MANIFEST = json.dumps({
+_STABLE_METADATA = json.dumps({
     "schema": "mx.reshard.shard_table.v1",
     "agent_name": "trainer", "agent_meta_b64": "",
     "metadata_endpoint": "trainer:19000", "tensor_count": 1, "total_bytes": 8,
@@ -72,7 +72,7 @@ _MANIFEST = json.dumps({
 
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
-    def __init__(self, *, endpoint: str, state=None, manifest_digest=None) -> None:
+    def __init__(self, *, endpoint: str, state=None, stable_metadata_digest=None) -> None:
         self.registrations = {}
         self.active_leases = set()
         self.lease_registrations = 0
@@ -101,14 +101,14 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR,
             state=refit_pb2.WEIGHT_VERSION_STATE_READY,
         )
-        digest = manifest_digest or hashlib.sha256(_MANIFEST).hexdigest()
+        digest = stable_metadata_digest or hashlib.sha256(_STABLE_METADATA).hexdigest()
         self.shards = [
             refit_pb2.WeightVersionShard(
                 version_id="version-a",
                 logical_shard_id=slot,
                 worker_id=f"trainer-{rank}",
-                manifest_digest=digest,
-                manifest_endpoint=endpoint,
+                stable_metadata_digest=digest,
+                metadata_endpoint=endpoint,
             )
             for rank, slot in enumerate(("rank:0", "rank:1"))
         ]
@@ -154,7 +154,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
                 workers={
                     shard.worker_id: refit_pb2.TrainerTensorsMetadata(
                         logical_shard_id=shard.logical_shard_id,
-                        metadata_endpoint=shard.manifest_endpoint,
+                        metadata_endpoint=shard.metadata_endpoint,
                     )
                     for shard in self.shards
                 },
@@ -191,15 +191,15 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
 
 
 class _WorkerService(refit_pb2_grpc.RefitWorkerServiceServicer):
-    def __init__(self, manifest=_MANIFEST) -> None:
+    def __init__(self, manifest=_STABLE_METADATA) -> None:
         self.manifest = manifest
         self.requests = []
 
-    def GetWeightVersionShardManifest(self, request, _context) -> refit_pb2.GetWeightVersionShardManifestResponse:
+    def GetTrainerShardMetadata(self, request, _context) -> refit_pb2.GetTrainerShardMetadataResponse:
         self.requests.append(request)
-        return refit_pb2.GetWeightVersionShardManifestResponse(
-            manifest=self.manifest,
-            manifest_digest=hashlib.sha256(self.manifest).hexdigest(),
+        return refit_pb2.GetTrainerShardMetadataResponse(
+            metadata=self.manifest,
+            metadata_digest=hashlib.sha256(self.manifest).hexdigest(),
         )
 
 
@@ -472,15 +472,15 @@ def _runtime(
     return runtime
 
 
-def _start_server(*, state=None, manifest=_MANIFEST, manifest_digest=None) -> tuple:
+def _start_server(*, state=None, manifest=_STABLE_METADATA, stable_metadata_digest=None) -> tuple:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     port = server.add_insecure_port("127.0.0.1:0")
     endpoint = f"127.0.0.1:{port}"
     service = _RefitService(
         endpoint=endpoint,
         state=state,
-        manifest_digest=(
-            manifest_digest or hashlib.sha256(manifest).hexdigest()
+        stable_metadata_digest=(
+            stable_metadata_digest or hashlib.sha256(manifest).hexdigest()
         ),
     )
     refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
@@ -499,6 +499,7 @@ def _initialize(
     adapter,
     *,
     object_storage=False,
+    storage_type=ObjectStorageType.S3,
     max_transfer_attempts=3,
     max_replay_chain_length=64,
     source_order=None,
@@ -527,7 +528,7 @@ def _initialize(
             lease_ttl_seconds=lease_ttl_seconds,
             object_storage=(
                 ObjectStorageGeneratorConfig(
-                    storage_type=ObjectStorageType.S3,
+                    storage_type=storage_type,
                     initial_base_version_id="base-a",
                     seed_checkpoint_path="unused-launch",
                     refit_checkpoint_dir="unused-cache",
@@ -670,7 +671,7 @@ def test_generator_rejects_unsupported_object_storage_before_adapter_creation(
         lambda **_kwargs: pytest.fail("runtime must not be created"),
     )
 
-    with pytest.raises(ValueError, match="only S3 object storage"):
+    with pytest.raises(ValueError, match="only S3 and Azure object storage"):
         ModelExpressGeneratorClient.initialize(
             ModelExpressGeneratorConfig(
                 engine_context=VllmGeneratorContext(
@@ -841,12 +842,13 @@ def test_generator_handles_mesh_change_with_configured_peer_fallback(
         class Transfer:
             bounded_staging = True
 
-            def cached_trainer_source(self) -> None:
-                return None
-
             def prepare(self, **_kwargs) -> SimpleNamespace:
                 return SimpleNamespace(
-                    metrics={}, batches=[SimpleNamespace(layouts=({"weight": None},))]
+                    metrics={},
+                    batches=[SimpleNamespace(
+                        transfer_plan=SimpleNamespace(source_replay=False),
+                        layouts=({"weight": None},),
+                    )],
                 )
 
             def iter_bounded(self, _prepared, _metrics) -> object:
@@ -1075,7 +1077,7 @@ def test_generator_does_not_retry_peer_publication(monkeypatch):
 
 
 def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
-    server, endpoint, service = _start_server(manifest_digest="bad-digest")
+    server, endpoint, service = _start_server(stable_metadata_digest="bad-digest")
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter)
 
@@ -1094,7 +1096,7 @@ def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
 
 def test_generator_fetches_trainer_manifest_larger_than_grpc_default(monkeypatch):
     manifest = json.dumps({
-        **json.loads(_MANIFEST), "padding": "x" * (4 * 1024 * 1024 + 1),
+        **json.loads(_STABLE_METADATA), "padding": "x" * (4 * 1024 * 1024 + 1),
     }).encode()
     server, endpoint, service = _start_server(manifest=manifest)
     adapter = _Adapter(service)
@@ -1112,7 +1114,7 @@ def test_generator_fetches_trainer_manifest_larger_than_grpc_default(monkeypatch
         generator.close()
         server.stop(grace=None).wait()
 
-    assert all(source.manifest == manifest for source in adapter.stage_calls[0].sources)
+    assert all(source.metadata == manifest for source in adapter.stage_calls[0].sources)
 
 
 def test_generator_reports_timing_for_a_refit_that_never_staged(monkeypatch, caplog):
@@ -1120,7 +1122,7 @@ def test_generator_reports_timing_for_a_refit_that_never_staged(monkeypatch, cap
     it is the one path where nothing downstream can report it: the recorder is
     handed on through the staged handle, and there is no handle yet."""
     monkeypatch.delenv("MX_REFIT_TIMING", raising=False)
-    server, endpoint, service = _start_server(manifest_digest="bad-digest")
+    server, endpoint, service = _start_server(stable_metadata_digest="bad-digest")
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter)
 
@@ -1137,9 +1139,9 @@ def test_generator_reports_timing_for_a_refit_that_never_staged(monkeypatch, cap
     assert "MX_REFIT_TIMING" in caplog.text
 
 
-def test_generator_reports_missing_trainer_manifest_digest(monkeypatch, caplog) -> None:
+def test_generator_reports_missing_trainer_stable_metadata_digest(monkeypatch, caplog) -> None:
     server, endpoint, service = _start_server()
-    service.shards[0].manifest_digest = ""
+    service.shards[0].stable_metadata_digest = ""
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter)
 
@@ -1153,7 +1155,7 @@ def test_generator_reports_missing_trainer_manifest_digest(monkeypatch, caplog) 
         generator.close()
         server.stop(grace=None).wait()
 
-    assert "source is missing its manifest digest" in caplog.text
+    assert "source is missing its stable metadata digest" in caplog.text
     assert adapter.stage_calls == []
 
 
@@ -1337,15 +1339,24 @@ def _add_generator_peer(service):
     )
 
 
-def test_generator_resolves_and_stages_target_replay_chain(monkeypatch):
+@pytest.mark.parametrize("provider", [ObjectStorageType.S3, ObjectStorageType.AZURE])
+def test_generator_resolves_and_stages_target_replay_chain(monkeypatch, provider):
     server, endpoint, service = _start_server()
     service.version.CopyFrom(_canonical_version("version-c", "version-b"))
     service.additional_versions = {
         "version-a": _canonical_version("version-a", "base-a"),
         "version-b": _canonical_version("version-b", "version-a"),
     }
+    if provider is ObjectStorageType.AZURE:
+        for version in [service.version, *service.additional_versions.values()]:
+            version.object_storage.storage_type = refit_pb2.OBJECT_STORAGE_TYPE_AZURE
+            version.object_storage.uri = version.object_storage.uri.replace(
+                "s3://", "az://", 1
+            )
     adapter = _Adapter(service)
-    generator = _initialize(monkeypatch, endpoint, adapter, object_storage=True)
+    generator = _initialize(
+        monkeypatch, endpoint, adapter, object_storage=True, storage_type=provider
+    )
 
     try:
         staged = generator.stage_weight(version=WeightVersionRef("version-c"))
@@ -1412,16 +1423,26 @@ def test_generator_rejects_excessive_replay_chain_before_leasing(monkeypatch):
     assert adapter.stage_calls == []
 
 
+@pytest.mark.parametrize(
+    ("storage_type", "proto_type", "scheme"),
+    [
+        (ObjectStorageType.S3, refit_pb2.OBJECT_STORAGE_TYPE_S3, "s3"),
+        (ObjectStorageType.AZURE, refit_pb2.OBJECT_STORAGE_TYPE_AZURE, "az"),
+    ],
+)
 def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
     monkeypatch,
+    storage_type,
+    proto_type,
+    scheme,
 ):
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
     service.version.ClearField("base_version_id")
     service.version.object_storage.CopyFrom(
         refit_pb2.ObjectStorageSource(
-            storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
-            uri="s3://weights/model.safetensors.index.json",
+            storage_type=proto_type,
+            uri=f"{scheme}://weights/model.safetensors.index.json",
         )
     )
     adapter = _Adapter(service)
@@ -1430,6 +1451,7 @@ def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
         endpoint,
         adapter,
         object_storage=True,
+        storage_type=storage_type,
     )
 
     try:
@@ -1437,6 +1459,7 @@ def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
         inputs = adapter.stage_calls[0]
         assert inputs.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
         assert inputs.base_version_id is None
+        assert inputs.object_storage.storage_type is storage_type
         assert service.list_calls == 0
         staged.release()
     finally:
@@ -1501,7 +1524,7 @@ def test_generator_rejects_missing_object_storage_before_adapter_mutation(
     assert service.lease_deletions == 0
 
 
-def test_generator_skips_non_s3_object_storage_before_adapter_mutation(
+def test_generator_skips_unsupported_storage_payload_before_adapter_mutation(
     monkeypatch,
 ):
     server, endpoint, service = _start_server()
@@ -1661,12 +1684,12 @@ def test_generator_assembles_healthy_replicas_from_different_offsets(monkeypatch
     broken_first_slot = refit_pb2.WeightVersionShard()
     broken_first_slot.CopyFrom(service.shards[0])
     broken_first_slot.worker_id = "trainer-a1"
-    broken_first_slot.manifest_digest = unusable
+    broken_first_slot.stable_metadata_digest = unusable
     # rank:1 is the mirror image: its first replica is the broken one.
     healthy_second_slot = refit_pb2.WeightVersionShard()
     healthy_second_slot.CopyFrom(service.shards[1])
     healthy_second_slot.worker_id = "trainer-b1"
-    service.shards[1].manifest_digest = unusable
+    service.shards[1].stable_metadata_digest = unusable
     service.shards.extend([broken_first_slot, healthy_second_slot])
     adapter = _Adapter(service)
     generator = _initialize(
@@ -1880,9 +1903,6 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
     class Transfer:
         bounded_staging = True
 
-        def cached_trainer_source(self) -> None:
-            return None
-
         def prepare(self, **kwargs) -> SimpleNamespace:
             assert service.active_leases
             prepare_calls.append(kwargs)
@@ -1891,7 +1911,10 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
             return SimpleNamespace(
                 metrics={},
                 batches=[
-                    SimpleNamespace(layouts=({"a.weight": None, "b.weight": None},))
+                    SimpleNamespace(
+                        transfer_plan=SimpleNamespace(source_replay=False),
+                        layouts=({"a.weight": None, "b.weight": None},),
+                    )
                 ],
             )
 
@@ -1941,8 +1964,8 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
                 generator.apply_weight(failed)
             assert installed == ["a.weight"]
 
-            endpoint = service.shards[0].manifest_endpoint
-            service.shards[0].manifest_endpoint = ""
+            endpoint = service.shards[0].metadata_endpoint
+            service.shards[0].metadata_endpoint = ""
             with pytest.raises(RuntimeError, match="no NIXL trainer plan"):
                 generator.stage_weight(version=WeightVersionRef("version-a"))
             assert failed._update.released
@@ -1951,7 +1974,7 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
             assert generator._engine_state.value == "UNCERTAIN"
             assert installed == ["a.weight"]
 
-            service.shards[0].manifest_endpoint = endpoint
+            service.shards[0].metadata_endpoint = endpoint
             fail_second = False
             recovery = generator.stage_weight(version=WeightVersionRef("version-a"))
             assert recovery is not failed
@@ -2492,6 +2515,8 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
     monkeypatch, case
 ):
     import torch
+    from modelexpress_rl.refit.reshard.types import RecordedCopy
+    from modelexpress_rl.inference.plan import SourceReplayBatch
     from modelexpress_rl.inference.engines.vllm.installer import _VllmInstaller
 
     server, endpoint, service = _start_server()
@@ -2517,6 +2542,9 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
         assert service.active_leases
         assert guard_active
 
+    names = frozenset(dict(model.named_parameters()))
+    last_writes = {name: index for index, name in enumerate(model.state_dict())}
+
     class Batches:
         index = 0
 
@@ -2530,7 +2558,9 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
                 raise primary
             if self.index > 2:
                 raise StopIteration
-            return {f"{self.index - 1}.weight": arena}
+            name = f"{self.index - 1}.weight"
+            copy = RecordedCopy(name, (), name, 0, (2, 2), (2, 1), torch.float32)
+            return SourceReplayBatch(((self.index - 1, copy, arena),), names, last_writes, 2)
 
         def close(self):
             if not cleanup_allowed:
@@ -2541,9 +2571,6 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
 
     class Transfer:
         bounded_staging = True
-
-        def cached_trainer_source(self) -> None:
-            return None
 
         def __init__(self):
             self.arena = arena
@@ -2556,6 +2583,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
                 metrics={},
                 batches=[
                     SimpleNamespace(
+                        transfer_plan=SimpleNamespace(source_replay=True, replay_parameter_names=names),
                         layouts=({f"{index}.weight": ((2, 2), torch.float32)},)
                     )
                     for index in range(2)
@@ -2600,26 +2628,40 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
 
     class Installer(_VllmInstaller):
         def __init__(self):
-            self._model = model
-            self._device = torch.device("cpu")
-            self._vllm_config = SimpleNamespace(quant_config=None)
-            self._model_config = SimpleNamespace(dtype=torch.float32)
-            self._live_version = None
+            super().__init__(
+                model=model,
+                device=torch.device("cpu"),
+                vllm_config=SimpleNamespace(quant_config=None),
+                model_config=SimpleNamespace(dtype=torch.float32),
+            )
             self.copy_count = 0
+
+        def _new_install_execution(self):
+            return SimpleNamespace(
+                targets=SimpleNamespace(by_name=dict(model.named_parameters())),
+                replay_metadata=None,
+                installed=set(),
+                bounded=False,
+            )
 
         def _reload(self, load):
             assert_installation_guard()
             load(self._parameter_aliases(self._model))
 
-        def _process_and_commit(self, tensors, **kwargs):
+        def _apply_source_batch(self, plan, batch):
             assert_installation_guard()
             self.copy_count += 1
             events.append("copy")
             if self.copy_count == 2 and case in {"partial", "drain", "close"}:
                 raise primary
             with torch.no_grad():
-                for name, value in tensors.items():
-                    model.get_parameter(name).copy_(value)
+                for _, copy, value in batch.writes:
+                    model.get_parameter(copy.param_name).copy_(value)
+                    plan.installed.add(copy.param_name)
+            plan.replay_metadata = (batch.parameter_names, batch.last_writes)
+
+        def _finish_source_replay(self, plan):
+            assert plan.installed == names
 
         def _drain_streaming(self):
             assert_installation_guard()
@@ -2726,7 +2768,7 @@ def test_streaming_creates_and_emits_one_timing_cycle(
 ):
     import json
 
-    from modelexpress.refit.timing import (
+    from modelexpress_rl.refit.timing import (
         RefitTimingRecorder,
         current_refit_timing,
         refit_span,
@@ -2751,16 +2793,16 @@ def test_streaming_creates_and_emits_one_timing_cycle(
     class Transfer:
         bounded_staging = True
 
-        def cached_trainer_source(self) -> None:
-            return None
-
         def prepare(self, **kwargs) -> SimpleNamespace:
             observe_cycle()
             if prepare_fails:
                 raise ValueError("injected streaming preparation failure")
             return SimpleNamespace(
                 metrics={},
-                batches=[SimpleNamespace(layouts=({"weight": None},))],
+                batches=[SimpleNamespace(
+                    transfer_plan=SimpleNamespace(source_replay=False),
+                    layouts=({"weight": None},),
+                )],
             )
 
         def reset_workspace(self):

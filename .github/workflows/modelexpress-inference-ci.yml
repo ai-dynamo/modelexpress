@@ -10,10 +10,6 @@ on:
         description: Runner for control jobs; GPU jobs retain their dedicated runners.
         type: string
         default: ''
-      concurrency_key:
-        description: Run-specific suffix that keeps nightly callers from cancelling each other.
-        type: string
-        default: ''
 
 env:
   MX_CI_MODEL: Qwen/Qwen2.5-0.5B
@@ -24,23 +20,74 @@ env:
   MX_IMAGE_REPO: nvcr.io/0980761089281446
 
 jobs:
-  gpu-tests:
-    name: GPU
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-azure-gpu-tests-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
-    needs: [build-client, build-server, ensure-vcluster]
+  gpu-tests-vllm:
+    name: GPU (vllm)
+    needs: [build-client-vllm, build-server, ensure-vcluster]
     permissions:
       contents: read
     uses: ./.github/workflows/modelexpress-inference-gpu-ci.yml
     with:
       runs_on: ${{ inputs.runs_on }}
+      framework: vllm
+    secrets: inherit
+
+  gpu-tests-sglang:
+    name: GPU (sglang)
+    needs: [build-client-sglang, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/modelexpress-inference-gpu-ci.yml
+    with:
+      runs_on: ${{ inputs.runs_on }}
+      framework: sglang
+    secrets: inherit
+
+  gpu-tests-sglang-mooncake:
+    name: GPU (sglang-mooncake)
+    needs: [build-client-sglang-mooncake, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/modelexpress-inference-gpu-ci.yml
+    with:
+      runs_on: ${{ inputs.runs_on }}
+      framework: sglang-mooncake
+    secrets: inherit
+
+  gpu-tests-dynamo-vllm:
+    name: GPU (dynamo-vllm)
+    needs: [build-client-dynamo-vllm, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/modelexpress-inference-gpu-ci.yml
+    with:
+      runs_on: ${{ inputs.runs_on }}
+      framework: dynamo-vllm
+    secrets: inherit
+
+  gpu-tests-large:
+    name: GPU (large)
+    needs:
+      - build-server
+      - ensure-vcluster
+      - build-client-vllm
+      - build-client-sglang
+      - build-client-dynamo-vllm
+      - gpu-tests-vllm
+      - gpu-tests-sglang
+      - gpu-tests-sglang-mooncake
+      - gpu-tests-dynamo-vllm
+    permissions:
+      contents: read
+    uses: ./.github/workflows/modelexpress-inference-gpu-ci.yml
+    with:
+      runs_on: ${{ inputs.runs_on }}
+      framework: large
     secrets: inherit
 
   gpu-cleanup:
     name: GPU cleanup
-    needs: [gpu-tests]
-    if: ${{ always() && needs.gpu-tests.result != 'skipped' && needs.gpu-tests.result != 'success' }}
+    needs: [gpu-tests-vllm, gpu-tests-sglang, gpu-tests-sglang-mooncake, gpu-tests-dynamo-vllm, gpu-tests-large]
+    if: ${{ always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 30
     permissions:
@@ -82,9 +129,6 @@ jobs:
           rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   build-server:
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-build-server-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Build server image
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -125,7 +169,7 @@ jobs:
       - name: Cleanup local image
         # buildx with --push typically doesn't materialize a local image,
         # but reap defensively in case the buildx driver was switched.
-        # `if: always()` survives failure + cancel-in-progress so the
+        # `if: always()` survives failure and workflow cancellation so the
         # self-hosted builder runner's Docker daemon doesn't accumulate
         # stale images across runs.
         if: always()
@@ -134,28 +178,15 @@ jobs:
           rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
   # ---------------------------------------------------------------------------
-  build-client:
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-build-client-${{ strategy.job-index }}-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
-    name: Build worker image (${{ matrix.framework }})
+  build-client-vllm:
+    name: Build worker image (vllm)
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - framework: vllm
-            dockerfile: ci/k8s/client/vllm/Dockerfile
-          - framework: sglang
-            dockerfile: ci/k8s/client/sgl/Dockerfile
-          - framework: sglang-mooncake
-            dockerfile: ci/k8s/client/sgl/Dockerfile.mooncake
-          - framework: dynamo-vllm
-            dockerfile: ci/k8s/client/vllm/dynamo/Dockerfile
-
-    steps:
+    env:
+      FRAMEWORK: vllm
+      DOCKERFILE: ci/k8s/client/vllm/Dockerfile
+    steps: &build-worker-steps
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -165,8 +196,8 @@ jobs:
         # Persist the tag in $GITHUB_ENV so both the build step and the
         # cleanup step reference the same value without re-templating.
         run: |
-          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-inference-buildcli-${{ strategy.job-index }}" >> "$GITHUB_ENV"
-          echo "WORKER_IMAGE=${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-inference-buildcli-${{ env.FRAMEWORK }}" >> "$GITHUB_ENV"
+          echo "WORKER_IMAGE=${{ env.MX_IMAGE_REPO }}/mx-worker-${{ env.FRAMEWORK }}:${{ github.sha }}" >> "$GITHUB_ENV"
 
       - name: Log in to image registry
         run: |
@@ -181,7 +212,7 @@ jobs:
         run: |
           bash .github/scripts/build-with-registry-retry.sh \
             --platform linux/amd64 \
-            -f "${{ matrix.dockerfile }}" \
+            -f "${{ env.DOCKERFILE }}" \
             --cache-from "type=registry,ref=${WORKER_IMAGE%:*}:buildcache-shared" \
             --cache-to "type=registry,ref=${WORKER_IMAGE%:*}:buildcache-shared,mode=max,ignore-error=true" \
             -t "${WORKER_IMAGE}" \
@@ -191,7 +222,7 @@ jobs:
       - name: Cleanup local image
         # buildx with --push typically doesn't materialize a local image,
         # but reap defensively in case the buildx driver was switched.
-        # `if: always()` survives failure + cancel-in-progress so the
+        # `if: always()` survives failure and workflow cancellation so the
         # self-hosted builder runner's Docker daemon doesn't accumulate
         # stale images across runs (each matrix entry adds a multi-GB image).
         if: always()
@@ -199,11 +230,38 @@ jobs:
           docker image rm -f "${WORKER_IMAGE}" 2>/dev/null || true
           rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
+  build-client-sglang:
+    name: Build worker image (sglang)
+    runs-on: prod-modelexpress-builder-amd-v1
+    permissions:
+      contents: read
+    env:
+      FRAMEWORK: sglang
+      DOCKERFILE: ci/k8s/client/sgl/Dockerfile
+    steps: *build-worker-steps
+
+  build-client-sglang-mooncake:
+    name: Build worker image (sglang-mooncake)
+    runs-on: prod-modelexpress-builder-amd-v1
+    permissions:
+      contents: read
+    env:
+      FRAMEWORK: sglang-mooncake
+      DOCKERFILE: ci/k8s/client/sgl/Dockerfile.mooncake
+    steps: *build-worker-steps
+
+  build-client-dynamo-vllm:
+    name: Build worker image (dynamo-vllm)
+    runs-on: prod-modelexpress-builder-amd-v1
+    permissions:
+      contents: read
+    env:
+      FRAMEWORK: dynamo-vllm
+      DOCKERFILE: ci/k8s/client/vllm/dynamo/Dockerfile
+    steps: *build-worker-steps
+
   # Build the trainer and rollout images used by the Vime delta-refit smoke.
   ensure-vcluster:
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-ensure-vcluster-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: Ensure vCluster
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -311,36 +369,26 @@ jobs:
           rm -f "${GITHUB_WORKSPACE}/.kubeconfig-host" "${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
 
   # ---------------------------------------------------------------------------
-  model-streamer:
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-model-streamer-${{ strategy.job-index }}-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
-    name: Model Streamer ${{ matrix.mode }} test (${{ matrix.framework }}, S3)
+  model-streamer-vllm:
+    name: Model Streamer ${{ matrix.mode }} test (vllm, S3)
     runs-on: prod-modelexpress-tester-amd-gpu-v1
-    needs: [build-client]
+    needs: [build-client-vllm]
     permissions:
       contents: read
+    env:
+      FRAMEWORK: vllm
     strategy:
       fail-fast: false
       matrix:
         include:
-          - framework: vllm
-            mode: direct
+          - mode: direct
             test_model_streamer_fallback: 'false'
-          - framework: vllm
-            mode: fallback
+          - mode: fallback
             test_model_streamer_fallback: 'true'
-          - framework: sglang
-            mode: direct
-            test_model_streamer_fallback: 'false'
-          - framework: sglang
-            mode: fallback
-            test_model_streamer_fallback: 'true'
-
-    steps:
+    steps: &streamer-steps
       - name: Scope docker credentials to this job
         run: |
-          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-streamer-${{ strategy.job-index }}" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-streamer-${{ env.FRAMEWORK }}-${{ strategy.job-index }}" >> "$GITHUB_ENV"
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -355,8 +403,8 @@ jobs:
       - name: Run model streamer test
         uses: ./.github/actions/run-mx-streamer-test
         with:
-          framework: ${{ matrix.framework }}
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          framework: ${{ env.FRAMEWORK }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ env.FRAMEWORK }}:${{ github.sha }}
           model: ${{ env.MX_CI_MODEL }}
           s3_bucket: ${{ env.MX_CI_S3_BUCKET }}
           s3_region: ${{ env.MX_CI_S3_REGION }}
@@ -367,10 +415,42 @@ jobs:
         if: always()
         run: rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
 
+  model-streamer-sglang:
+    name: Model Streamer ${{ matrix.mode }} test (sglang, S3)
+    runs-on: prod-modelexpress-tester-amd-gpu-v1
+    needs: [build-client-sglang]
+    permissions:
+      contents: read
+    env:
+      FRAMEWORK: sglang
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: direct
+            test_model_streamer_fallback: 'false'
+          - mode: fallback
+            test_model_streamer_fallback: 'true'
+    steps: *streamer-steps
+
   status-check:
     name: Inference status check
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
-    needs: [gpu-tests, gpu-cleanup, build-server, build-client, ensure-vcluster, model-streamer]
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
+    needs:
+      - gpu-tests-vllm
+      - gpu-tests-sglang
+      - gpu-tests-sglang-mooncake
+      - gpu-tests-dynamo-vllm
+      - gpu-tests-large
+      - gpu-cleanup
+      - build-server
+      - build-client-vllm
+      - build-client-sglang
+      - build-client-sglang-mooncake
+      - build-client-dynamo-vllm
+      - ensure-vcluster
+      - model-streamer-vllm
+      - model-streamer-sglang
     if: always()
     steps:
       - name: All dependent jobs succeeded
@@ -378,5 +458,5 @@ jobs:
           echo '${{ toJson(needs) }}' \
             | jq -e '. as $needs | to_entries | all(
                 .value.result == "success" or
-                (.key == "gpu-cleanup" and .value.result == "skipped" and $needs["gpu-tests"].result == "success")
+                (.key == "gpu-cleanup" and .value.result == "skipped" and ([$needs | to_entries[] | select(.key | startswith("gpu-tests-")) | .value.result] | all(. == "success")))
               )'

@@ -22,7 +22,18 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_REFIT_CHECKPOINT_DIR is None
     assert envs.MX_REFIT_DELTA_BUCKET_BYTES == 512 * 1024**2
     assert envs.MX_REFIT_DELTA_WORKERS == min(32, os.cpu_count() or 8)
+    assert envs.MX_REFIT_DOWNLOAD_WORKERS == 16
     assert envs.MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES == 4 * 1024**3
+    assert envs.MX_REDIS_URL == "redis://localhost:6379"
+    assert envs.MX_GENERATOR_SOURCE_ORDER is None
+    assert envs.MX_REFIT_STAGE_RECORD is True
+    assert envs.MX_REFIT_DEBUG_VALIDATE_PLAN is False
+    assert envs.MX_REFIT_PACK_MODULES is True
+    assert envs.MX_REFIT_PREFETCH_REPLICA_METADATA is False
+    assert envs.MX_REFIT_DEBUG_VALIDATE_REPLICAS is False
+    assert envs.MX_RESHARD_MAX_SEGMENTS_PER_COPY == 64
+    assert envs.MX_RESHARD_MIN_GBPS == 0.0
+    assert envs.MX_RESHARD_PUBLISH_DIGEST is False
     assert envs.MX_S3_MULTIPART_THRESHOLD_BYTES == 100 * 1024**2
     assert envs.MX_S3_UPLOAD_PART_BYTES == 16 * 1024**2
     assert envs.MX_S3_UPLOAD_WORKERS == 8
@@ -47,6 +58,7 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     monkeypatch.setenv("MX_REFIT_CHECKPOINT_DIR", " /checkpoints ")
     monkeypatch.setenv("MX_REFIT_DELTA_BUCKET_BYTES", "1024")
     monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", "3")
+    monkeypatch.setenv("MX_REFIT_DOWNLOAD_WORKERS", "9")
     monkeypatch.setenv("MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES", "8192")
     monkeypatch.setenv("MX_S3_MULTIPART_THRESHOLD_BYTES", "2048")
     monkeypatch.setenv("MX_S3_UPLOAD_PART_BYTES", str(5 * 1024**2))
@@ -68,6 +80,7 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     assert envs.MX_REFIT_CHECKPOINT_DIR == "/checkpoints"
     assert envs.MX_REFIT_DELTA_BUCKET_BYTES == 1024
     assert envs.MX_REFIT_DELTA_WORKERS == 3
+    assert envs.MX_REFIT_DOWNLOAD_WORKERS == 9
     assert envs.MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES == 8192
     assert envs.MX_S3_MULTIPART_THRESHOLD_BYTES == 2048
     assert envs.MX_S3_UPLOAD_PART_BYTES == 5 * 1024**2
@@ -76,7 +89,7 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     assert envs.MX_S3_DOWNLOAD_RANGE_BYTES == 1024
     assert envs.MX_S3_DOWNLOAD_IO_CHUNK_BYTES == 512
     assert envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS == 6
-    assert envs.MX_S3_DOWNLOAD_WORKERS == 5
+    assert envs.MX_S3_DOWNLOAD_WORKERS == 9
     assert envs.MX_S3_MAX_POOL_CONNECTIONS == 6
     assert envs.MX_S3_MAX_ATTEMPTS == 7
     assert envs.MX_S3_TCP_KEEPALIVE is False
@@ -104,6 +117,56 @@ def test_positive_integer_settings_reject_zero(monkeypatch, name):
     monkeypatch.setenv(name, "0")
     with pytest.raises(ValueError, match=f"{name} must be positive"):
         getattr(envs, name)
+
+
+@pytest.mark.parametrize(
+    ("neutral", "legacy", "expected"),
+    [(None, "3", 3), ("5", "3", 5), ("4", "invalid", 4)],
+)
+def test_refit_download_workers_precedence(monkeypatch, neutral, legacy, expected):
+    monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", legacy)
+    monkeypatch.delenv("MX_REFIT_DOWNLOAD_WORKERS", raising=False)
+    if neutral is not None:
+        monkeypatch.setenv("MX_REFIT_DOWNLOAD_WORKERS", neutral)
+    assert envs.MX_REFIT_DOWNLOAD_WORKERS == expected
+    assert envs.MX_S3_DOWNLOAD_WORKERS == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("", "must be an integer"),
+        (" ", "must be an integer"),
+        ("invalid", "must be an integer"),
+        ("0", "must be positive"),
+        ("-1", "must be positive"),
+    ],
+)
+def test_invalid_refit_download_workers_names_setting_without_fallback(
+    monkeypatch, value, message
+):
+    monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", "3")
+    monkeypatch.setenv("MX_REFIT_DOWNLOAD_WORKERS", value)
+    for name in ("MX_REFIT_DOWNLOAD_WORKERS", "MX_S3_DOWNLOAD_WORKERS"):
+        with pytest.raises(ValueError, match=f"MX_REFIT_DOWNLOAD_WORKERS {message}"):
+            getattr(envs, name)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("0", "MX_S3_DOWNLOAD_WORKERS must be positive"),
+        ("-1", "MX_S3_DOWNLOAD_WORKERS must be positive"),
+        ("invalid", "invalid literal"),
+    ],
+)
+def test_refit_download_workers_propagates_invalid_legacy_setting(
+    monkeypatch, value, message
+):
+    monkeypatch.delenv("MX_REFIT_DOWNLOAD_WORKERS", raising=False)
+    monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", value)
+    with pytest.raises(ValueError, match=message):
+        _ = envs.MX_REFIT_DOWNLOAD_WORKERS
 
 
 def test_unknown_attribute_raises():
@@ -146,7 +209,7 @@ def test_s3_tcp_keepalive_rejects_invalid_boolean(monkeypatch):
 
 
 def test_streaming_diagnostics_default_off_and_packing_on(monkeypatch) -> None:
-    from modelexpress import envs as refit_envs
+    from modelexpress_rl import envs as refit_envs
 
     for name in (
         "MX_REFIT_DEBUG_VALIDATE_PLAN",
@@ -157,6 +220,26 @@ def test_streaming_diagnostics_default_off_and_packing_on(monkeypatch) -> None:
     assert envs.MX_REFIT_DEBUG_VALIDATE_PLAN is False
     assert envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT is False
     assert refit_envs.MX_REFIT_PACK_MODULES is True
+
+
+def test_refit_replica_settings_default_and_normalization(monkeypatch) -> None:
+    from modelexpress_rl import envs as refit_envs
+
+    names = (
+        "MX_REFIT_PREFETCH_REPLICA_METADATA",
+        "MX_REFIT_DEBUG_VALIDATE_REPLICAS",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+
+    assert refit_envs.MX_REFIT_PREFETCH_REPLICA_METADATA is False
+    assert refit_envs.MX_REFIT_DEBUG_VALIDATE_REPLICAS is False
+
+    monkeypatch.setenv("MX_REFIT_PREFETCH_REPLICA_METADATA", "yes")
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_REPLICAS", "on")
+
+    assert refit_envs.MX_REFIT_PREFETCH_REPLICA_METADATA is True
+    assert refit_envs.MX_REFIT_DEBUG_VALIDATE_REPLICAS is True
 
 
 def test_delta_surgical_parses_boolean(monkeypatch):
@@ -186,3 +269,26 @@ def test_stream_window_layers_accepts_zero_and_rejects_negative(monkeypatch):
     monkeypatch.setenv("MX_REFIT_STREAM_WINDOW_LAYERS", "-1")
     with pytest.raises(ValueError, match="MX_REFIT_STREAM_WINDOW_LAYERS must be"):
         envs.MX_REFIT_STREAM_WINDOW_LAYERS
+
+
+def test_moved_reshard_settings_keep_model_express_boolean_parsing(monkeypatch, caplog):
+    for name, falsy, truthy, default in (
+        ("MX_REFIT_STAGE_RECORD", "no", "true", True),
+        ("MX_REFIT_PACK_MODULES", "0", "yes", True),
+        ("MX_RESHARD_PUBLISH_DIGEST", "off", "on", False),
+    ):
+        monkeypatch.setenv(name, falsy)
+        assert getattr(envs, name) is False
+        monkeypatch.setenv(name, truthy)
+        assert getattr(envs, name) is True
+        monkeypatch.setenv(name, "invalid")
+        with caplog.at_level("WARNING", logger="modelexpress_rl.envs"):
+            assert getattr(envs, name) is default
+        assert f"Invalid {name}=" in caplog.text
+
+
+def test_generator_source_order_and_redis_url_keep_raw_defaults(monkeypatch):
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "TRAINER,GENERATOR")
+    monkeypatch.setenv("MX_REDIS_URL", "redis://redis:6379")
+    assert envs.MX_GENERATOR_SOURCE_ORDER == "TRAINER,GENERATOR"
+    assert envs.MX_REDIS_URL == "redis://redis:6379"

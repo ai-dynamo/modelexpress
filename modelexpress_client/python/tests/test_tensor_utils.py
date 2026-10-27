@@ -419,3 +419,17 @@ class TestTraversalRobustness:
             holder, visited=set(), accelerator_backend=backend
         )
         assert [t.numel() for _, t in found] == [4]
+
+
+def test_hidden_tensor_exclusion_is_optional_and_recursive(mock_accelerator_backend_cls):
+    """An engine predicate prunes subtrees without changing default discovery."""
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    local = types.SimpleNamespace(tensor=torch.zeros(8))
+    quant = torch.ones(4)
+    graph = types.SimpleNamespace(nested=[{"local": local, "quant": quant}])
+    found = _find_hidden_accel_tensors(graph, set(), backend)
+    assert {t.data_ptr() for _, t in found} == {local.tensor.data_ptr(), quant.data_ptr()}
+    found = _find_hidden_accel_tensors(
+        graph, set(), backend, exclude=lambda obj: obj is local
+    )
+    assert [t.data_ptr() for _, t in found] == [quant.data_ptr()]

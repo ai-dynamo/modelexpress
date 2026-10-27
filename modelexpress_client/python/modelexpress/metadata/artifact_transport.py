@@ -84,6 +84,9 @@ class ArtifactTransport(Protocol):
     def should_publish(self, state: ArtifactInstallState | None) -> bool:
         """Return whether this transport should publish for an install state."""
 
+    def check_publishable(self) -> None:
+        """Check prerequisites before preparing a bundle; default is no check."""
+
     def fetch(
         self,
         artifact: ArtifactTransfer,
