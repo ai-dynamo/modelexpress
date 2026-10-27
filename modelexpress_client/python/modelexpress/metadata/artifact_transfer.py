@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import subprocess
@@ -12,6 +13,7 @@ import tarfile
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from concurrent import futures
 from dataclasses import dataclass
 from pathlib import Path
@@ -1116,17 +1118,55 @@ def _write_tar_from_entries(
         member_list.unlink(missing_ok=True)
 
 
+def pack_tar_gz_bytes(
+    source_root: Path,
+    *,
+    include: Callable[[str], bool],
+) -> bytes:
+    """Gzip-tar the files and directories under source_root accepted by include.
+
+    include receives each member's POSIX path relative to source_root.
+    """
+    entries, skipped = _tar_source_entries(source_root)
+    _log_skipped_entries(source_root.name, skipped)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as archive:
+        for raw in entries.split(b"\0"):
+            relative = raw.decode().removeprefix("./")
+            if not relative or not include(relative):
+                continue
+            archive.add(
+                source_root / relative, arcname=f"./{relative}", recursive=False
+            )
+    return buf.getvalue()
+
+
+def extract_tar_bytes(data: bytes, target_root: Path) -> None:
+    """Validate and extract an in-memory tar archive into target_root."""
+    target_root.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
+        _validate_tar_archive(archive)
+        if hasattr(tarfile, "data_filter"):
+            archive.extractall(path=target_root, filter="data")
+        else:
+            archive.extractall(path=target_root)
+
+
 def _validate_tar_members(tar_path: Path) -> None:
     with tarfile.open(tar_path, mode="r:") as archive:
-        for member in archive:
-            name = member.name
-            while name.startswith("./"):
-                name = name[2:]
-            parts = [part for part in name.split("/") if part]
-            if name.startswith("/") or ".." in parts:
-                raise ValueError(f"unsafe tar member path: {member.name}")
-            if not (member.isfile() or member.isdir()):
-                raise ValueError(f"unsupported tar member type: {member.name}")
+        _validate_tar_archive(archive)
+
+
+def _validate_tar_archive(archive: tarfile.TarFile) -> None:
+    for member in archive:
+        name = member.name
+        while name.startswith("./"):
+            name = name[2:]
+        parts = [part for part in name.split("/") if part]
+        if name.startswith("/") or ".." in parts:
+            raise ValueError(f"unsafe tar member path: {member.name}")
+        if not (member.isfile() or member.isdir()):
+            raise ValueError(f"unsupported tar member type: {member.name}")
 
 
 def _run_tar(args: list[str]) -> None:

@@ -861,6 +861,8 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
+| `MX_SGLANG_P2P_METADATA_SYNC` | `0` | Enable the SGLang plugin that syncs non-weight model metadata (config, tokenizer, chat templates) for a local `--model-path` from a ready peer. See [SGLANG.md](SGLANG.md#p2p-metadata-sync-for-local-model-paths-no-shared-storage). |
+| `SGLANG_META_PORT` | `19999` | HTTP port on which SGLang pods serve `/metadata.tar` when `MX_SGLANG_P2P_METADATA_SYNC=1`. Must match across source and target pods. |
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses the same artifact lifecycle for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. |
 | `MX_ARTIFACT_BACKEND` | `nixl` | Select exactly one artifact backend: `nixl` or `mooncake`. There is no fallback. |
 | `MX_ARTIFACT_TRANSFER_CHUNK_SIZE` | `67108864` | Artifact transfer chunk size in bytes. Default is 64 MiB; maximum is 4 GiB. Larger values reduce manifest/RPC overhead but increase registered DRAM buffer memory, approximately `chunk_size * max_inflight_chunks` per source and target worker. |

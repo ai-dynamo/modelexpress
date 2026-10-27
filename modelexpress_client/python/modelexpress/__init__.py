@@ -97,6 +97,13 @@ def register_modelexpress_loaders():
     register_modelexpress()
 
 
+def register_modelexpress_sglang():
+    """Register ModelExpress integrations with SGLang."""
+    from .engines.sglang.registration import register as register_sglang
+
+    register_sglang()
+
+
 from .client import MxClient  # noqa: F401
 from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
@@ -109,8 +116,10 @@ __all__ = [
     "MxClient",
     "MxGdsLoader",
     "PublisherThread",
+    "configure_sglang_logging",
     "configure_trtllm_logging",
     "configure_vllm_logging",
     "register_modelexpress",
     "register_modelexpress_loaders",
+    "register_modelexpress_sglang",
 ]
