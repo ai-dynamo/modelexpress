@@ -5,7 +5,7 @@ import ctypes
 
 import pytest
 import torch
-from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
+from tests.helpers.refit_replay import replay_ops as _replay_ops
 
 from modelexpress_rl.refit.reshard.slice_plan import Shard
 from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
@@ -32,7 +32,6 @@ def _inputs(source, ops, expected, shards=None):
             )
         ],
         source_replay=True,
-        generation=7,
     )
     table = {
         "source": SourceInfo(

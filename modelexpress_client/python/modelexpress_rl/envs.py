@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     MX_AZURE_READ_TIMEOUT_SECONDS: int
     MX_REFIT_CHECKSUM_FORMAT: str
     MX_REFIT_DESIRED_VERSION_UID: str | None
+    MX_REFIT_CHECKPOINT_MAX_SIZE_GB: int
     MX_REFIT_CHECKPOINT_DIR: str | None
     MX_REFIT_DELTA_BUCKET_BYTES: int
     MX_REFIT_DELTA_SURGICAL: bool
@@ -160,6 +161,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_REFIT_DESIRED_VERSION_UID": lambda: (
         os.environ.get("MX_REFIT_DESIRED_VERSION_UID", "").strip() or None
+    ),
+    "MX_REFIT_CHECKPOINT_MAX_SIZE_GB": lambda: positive_int_env(
+        "MX_REFIT_CHECKPOINT_MAX_SIZE_GB", 2000
     ),
     "MX_REFIT_CHECKPOINT_DIR": lambda: (
         os.environ.get("MX_REFIT_CHECKPOINT_DIR", "").strip() or None

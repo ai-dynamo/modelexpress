@@ -7,6 +7,10 @@ SPDX-License-Identifier: Apache-2.0
 
 This page is the deployment reference for the standalone server, Helm, Kubernetes metadata topologies, and worker rollout requirements. Start with [Choose a ModelExpress path](guides/choose-a-path.md) if you have not selected a topology. See [Configuration](CONFIGURATION.md) for settings, [Integrations](integrations/README.md) for runtime setup, [Troubleshooting](TROUBLESHOOTING.md) for operational symptoms, and [Architecture](ARCHITECTURE.md) for internals.
 
+For RL generator checkpoint-cache capacity and
+`MX_REFIT_CHECKPOINT_MAX_SIZE_GB`, see the
+[RL checkpoint-cache configuration](rl/CONFIGURATION.md#generator-refit-checkpoint-cache).
+
 ## Server Configuration
 
 ModelExpress uses a layered configuration system. Sources are applied in order of precedence:
@@ -218,6 +222,7 @@ The CLI client also uses layered configuration: CLI args > env vars > config fil
 |---------|---------|-------------|
 | `MODEL_EXPRESS_ENDPOINT` | `http://localhost:8001` | Server endpoint |
 | `MODEL_EXPRESS_TIMEOUT` | `30` | Request timeout (seconds) |
+| `MODEL_EXPRESS_CONNECT_WAIT_SECS` | `10` | Initial server connection retry budget before direct download (seconds, 0 disables) |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | (auto) | Cache path override |
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Use gRPC streaming instead of shared storage |
 | `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `32768` | Transfer chunk size (bytes) |
@@ -537,6 +542,40 @@ only `main` and `release/*`: `NGC_PUBLISH_USERNAME`, `NGC_PUBLISH_TOKEN`,
 `GITLAB_PIPELINE_URL` and `GITLAB_TRIGGER_TOKEN`. Repository scope holds
 `SLACK_RELEASE_BOT_TOKEN`, `SLACK_RELEASE_CHANNEL_ID` and
 `SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL`.
+
+### Inference CI vCluster
+
+Inference CI reuses the persistent `mx-ci-cluster` vCluster in the AKS CI host
+namespace `mx-ci`. Per-run cleanup removes test namespaces and workloads; it
+does not destroy the shared vCluster. Bootstrap runs only when the vCluster
+is absent.
+
+`.github/actions/setup-mx-vcluster/action.yml` pins Kubernetes `v1.36.5` to match
+the AKS host's 1.36 minor. The workflow checks the live host and vCluster
+versions on every run and rejects a vCluster minor below the host's. Updating
+the pin does not change an existing vCluster.
+
+The pinned vCluster CLI release `v0.36.0` supports Kubernetes 1.36. Its
+[CoreDNS version map](https://github.com/loft-sh/vcluster/blob/v0.36.0/pkg/constants/coredns.go)
+uses CoreDNS `1.14.2` for that minor. Bootstrap pulls the matching image from
+`registry.k8s.io` to avoid authentication failures through the ACR mirror.
+
+To rebuild an existing vCluster after a version-pin change:
+
+1. Pause new inference CI runs and let active runs using the shared vCluster
+   finish. Recreation deletes its virtual-cluster state.
+2. With AKS CI host access, delete the vCluster while preserving `mx-ci`:
+
+   ```bash
+   KUBECONFIG=/path/to/aks-ci-kubeconfig \
+     vcluster delete mx-ci-cluster --namespace mx-ci --delete-namespace=false --wait
+   ```
+
+3. Start a fresh inference CI run from the commit containing the updated pin.
+   Bootstrap recreates the vCluster, applies the ModelExpress CRD and installs
+   the Dynamo operator. Verify the version guard passes, CoreDNS and the
+   operator are Ready, and the inference GPU tests execute before resuming
+   normal CI traffic.
 
 ### Custom Client Image (P2P Transfers)
 
@@ -860,6 +899,87 @@ the domain becomes available.
 **Combining topology- and load-aware selection.** To rank primarily by RDMA locality *and* steer away from busy sources within each locality tier, set `MX_P2P_SOURCE_SELECTOR=topology_aware` and a non-zero blend weight (`MX_P2P_TOPOLOGY_LOAD_WEIGHT`, or just `MX_P2P_LOAD_WEIGHT` since topology falls back to it). Locality is always the primary key — a closer source outranks a farther one regardless of load; the load term only orders equidistant peers.
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
+
+### Collective Refit (NCCL M2N) Topology
+
+Four roles, and the split that decides placement is that **no weight byte crosses
+the ModelExpress server**. It brokers admission, rank assignment and the NCCL
+`uniqueId`; the weights move directly between trainer and generator ranks.
+
+| Role | Count | Runs where | Needs |
+|---|---|---|---|
+| ModelExpress server | one endpoint | any node with network reach; for this path it needs no GPU and no fast fabric | gRPC reachable from every rank, plus a metadata backend |
+| Metadata backend | one | beside the server | **Redis, required.** The collective service is only registered on a Redis backend; with the in-memory or Kubernetes backend the server starts without it |
+| Trainer ranks | one per trainer GPU | inside the training job's own worker processes | the policy weights, the framework's own process group, gRPC to the server, NCCL to the generator ranks |
+| Generator ranks | one per inference-engine GPU | **inside the inference engine's own worker processes** | gRPC to the server, NCCL to the trainer ranks |
+| Coordinator | one | anywhere with gRPC reach | drives `start_weight_update` / publish / `finish_weight_update` on both sides in lockstep |
+
+Five constraints bind the layout:
+
+1. **The generator client is not separately deployable.** It has to run in the
+   engine's worker processes, because the destination storage is the engine's
+   and exists nowhere else. For vLLM that is a `worker_extension_cls` driven by
+   `collective_rpc`; for any other engine it is whatever that engine's
+   equivalent per-worker extension point is. A sidecar cannot do this.
+2. **The server is off the data path,** so it does not scale with model size and
+   does not want a GPU. Sizing it against the weights is the common mistake.
+3. **Every rank needs two different networks:** ordinary TCP to the server for
+   the control plane, and whatever NCCL needs for the data plane. They have
+   different reachability requirements and are worth checking separately.
+4. **Rank order inside a lane is trainers first, generators after,** and the
+   server assigns it. A deployment does not choose ranks; it chooses membership.
+5. **Both sides derive the same plan independently,** so both need a consistent
+   view of the canonical parameter set. Deriving it from the checkpoint the two
+   sides already share is the least surprising way to guarantee that.
+
+Preflight, in this order, because each one fails in a way that does not name
+itself:
+
+1. **NCCL 2.30.7 or newer, LOADED.** `torch.cuda.nccl.version()` reports what
+   torch was compiled against, not what is mapped into the process, and the
+   mismatch fails inside the native reshard call rather than at import. Read it
+   with `ctypes.CDLL("libnccl.so.2").ncclGetVersion()`. Where an image ships its
+   own older `libnccl`, `LD_PRELOAD` the one the wheels installed.
+2. **`nccl-extensions` matching the CUDA major** (`[cu12]` or `[cu13]`). A bare
+   install resolves and then fails to import.
+3. **gRPC from a trainer rank and from a generator rank to the server**, checked
+   separately: in an inference deployment those two are frequently on different
+   networks.
+4. **A one-GPU-per-side reshard between the two placements you intend to use.**
+   If trainers and generators will sit on different nodes, prove the data plane
+   crosses that boundary before scaling anything up.
+
+Scope of what has been measured, because the boundary matters more than the
+numbers: **all ranks on a single node is exercised end to end against a live
+inference engine.** Cross-node is not, and has been seen to fail below
+ModelExpress inside NCCL's transport layer on at least one fabric, with one
+trainer and one generator, so it is not a scale effect. More than one source
+partition (pipeline stage) is supported by the protocol and has not been
+exercised against a real engine.
+
+### Collective Refit (NCCL M2N) Environment Variables
+
+Client-side policy for the NCCL M2N collective refit path
+(`modelexpress_rl.collective`), which is a sibling of the NIXL pull path
+rather than a mode of it. Every value is validated when it is read: a
+non-numeric, zero or negative setting raises rather than falling back to the
+default, so a typo fails loudly at startup instead of silently restoring
+stock behavior. Design: [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600.0` | Deadline for group formation, from join until the group reports `READY` with every participant admitted. |
+| `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | Backoff floor for `GetCollectiveGroup` polling while waiting for formation and for lane bootstrap ids to be published. |
+| `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300.0` | Deadline for bringing up one lane's NCCL communicator once its bootstrap id is published. Communicators are created non-blocking, and this bounds the poll to `ncclSuccess`. Setting `NCCL_COMM_BLOCKING` to anything other than `0` is rejected at startup, because blocking initialization would defeat this deadline. |
+| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600.0` | Deadline for the reshard itself, armed per weight version and checked between submissions, not inside them. A native `nccl.m2n.reshard` call, or the `nccl.m2n.group()` exit that issues a grouped submission (its group end), that blocks the host cannot be interrupted by it: the deadline cannot fire while it blocks, and the client only logs that the call is still blocking. The launcher must therefore bound each trainer and generator process with its own process-level timeout (the reference `examples/rl/m2n_collective_refit/run_e2e.sh` does so only when `PROC_TIMEOUT_S` is set; see [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md) section 8.2). `READY` only means the group formed, so this bounds what happens after it; on expiry the client aborts its lanes, because peers that disagree about which collectives completed cannot be recovered on the same communicator. The abort is local: the group epoch moves when that failure is reported against the operation `start_weight_update` bound (every round call reports on failure, best effort), or when membership changes. Until then the group stays at its epoch and a re-join cannot bootstrap fresh communicators. |
+| `MX_NCCL_REFIT_ABORT_TIMEOUT_S` | `10.0` | Shared budget for aborting every lane of a group, data and control communicators included. An overrun raises `CommunicatorWedgedError`, and a wedged abort can only be recovered by exiting the process (see [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md) section 8.2). |
+| `MX_NCCL_REFIT_NUM_STREAMS` | `2` | Size of the CUDA stream pool an integration builds when it does not pass its own `streams`. `RefitClientTrainer` and `RefitClientGenerator` do not read it: they use the `streams` the caller passes, or the current stream. |
+| `MX_NCCL_REFIT_BLOCKING_DATA_PLANE` | `1` | On by default; set `0` to run data traffic on the non-blocking communicator instead. When on, each lane is still initialized as a non-blocking communicator, bounded by `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S`, and the reshard and broadcast traffic then runs on a blocking communicator split off it, also under that deadline. On the M2N NVLink path a non-blocking communicator costs roughly 0.4 ms of host time per reshard call, so this cuts a single-node refit of a few hundred parameters several-fold; over the network the per-call cost is already small and this changes little. Abort tears down both communicators. With it off, a rank whose peer dies in the middle of a refit can block past `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` instead of raising. Read once per client and part of the plan digest, so a cohort that disagrees on it stays `FORMING`. |
+| `MX_NCCL_REFIT_GROUPED_SUBMISSION` | `0` | Opt in to recording each layer group as one `nccl.m2n.group()` instead of one `nccl.m2n.reshard` call per entry. Requires GIN: nccl-extensions 0.1.0 fails a group of two or more reshards at group end on every rank without it. Read once per client and part of the plan digest, so a cohort that disagrees on it stays `FORMING`. |
+| `MX_NCCL_REFIT_PIPELINE_DEPTH` | `2` | How many layer groups `RefitClientGenerator.update_weights` keeps in flight before installing the oldest. At 2, group N is installed while group N+1 is on the wire; every group is installed before `finish_weight_update` returns. `1` installs each group before `update_weights` returns. Each extra level keeps one more group's outstanding receive buffers alive (at most `MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES` of `pre` scratch per group on the default per-call path). |
+| `MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES` | `1073741824` | Generator-side bound on the `pre` scratch receive buffers one layer group keeps alive on the per-call path. Calls are closed into windows of half this size; once two are closed, the older is waited on (its lane events) and dropped, so a group holding the whole bulk does not keep all of its scratch at once. Peak scratch per group is about this budget plus two calls. `0` keeps every buffer until the group is waited on. Ignored with `MX_NCCL_REFIT_GROUPED_SUBMISSION=1`, where nothing is issued before the group closes. |
+| `MX_NCCL_REFIT_SEND_WINDOW_BYTES` | `1073741824` | Trainer-side counterpart of `MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES`: bounds the `pre` scratch one layer group keeps alive while it is sent, for example grouped experts stacked into a fresh buffer per call. Without it every such buffer stays allocated until the finish-time drain, so an integration that empties the allocator cache between rounds allocates and frees the whole set each round. `0` keeps every buffer until the drain. Ignored with `MX_NCCL_REFIT_GROUPED_SUBMISSION=1`. |
+| `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS`, so `90` | How long a participant's registration stays alive without a heartbeat. Derived from `MX_HEARTBEAT_INTERVAL_SECS` (default `30`), so raising the heartbeat interval raises this with it. |
 
 ### NIXL Backend Selection
 

@@ -16,7 +16,10 @@ import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress import p2p_pb2
 from modelexpress_rl.refit.reshard import throughput
 from modelexpress_rl.refit.reshard.slice_plan import Shard
-from modelexpress_rl.refit.reshard.transfer_plan import LogicalTransferPlan, SourceInfo
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
+from modelexpress_rl.inference.methods import runtime_tensor as runtime_module
+from modelexpress_rl.inference.methods.runtime_tensor import RuntimeTensorNixlUpdateMethod
+from modelexpress_rl.inference.plan import GeneratorPeerUpdateSource
 from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
 from modelexpress_rl.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.nixl_staged_transfer import (
@@ -114,8 +117,7 @@ def _prepared(tensor: torch.Tensor, nbytes: int) -> _PreparedNixlTransfer:
         (("slot-trainer", "trainer", source.shards[0].addr),),
     )
     return _PreparedNixlTransfer(
-        transfer_plan=LogicalTransferPlan(),
-        capture=CaptureResult(copies=[copy]),
+        transfer_plan=plan_transfer(CaptureResult(copies=[copy], source_replay=True), {"weight": source}),
         sources={"weight": source},
         descriptors=(_Descriptor(nbytes),),
         transport=_Transport(),
@@ -139,9 +141,7 @@ def _stage(monkeypatch, *, nbytes: int, wire_s: float):
     transfer._closed = False
     transfer._device = torch.device("cpu")
     transfer._device_id = DEVICE_ID
-    transfer._recv_buffers = {"weight": tensor}
-    transfer._convert_buffers = {}
-    transfer._full_buffers = {}
+    transfer._full_buffers = {prepared.transfer_plan.full_pulls[0].src_name: tensor}
     transfer._active = prepared
     return transfer.stage(prepared)
 
@@ -186,32 +186,21 @@ def _peer_receive(monkeypatch, *, nbytes: int, wire_s: float):
             pass
 
     monkeypatch.setattr(
-        transfer_module,
+        runtime_module,
         "prepare_tensor_read",
         lambda *_args, **_kwargs: (_Lease(), 0),
     )
-    transfer = object.__new__(_NixlStagedTransfer)
-    transfer._closed = False
-    transfer._workspace_mode = "full"
-    transfer._device = torch.device("cpu")
-    transfer._device_id = DEVICE_ID
-    transfer._timeout = 30.0
-    transfer._manager = _Manager()
-    source = p2p_pb2.WorkerMetadata(
-        worker_grpc_endpoint="127.0.0.1:18000",
+    method = RuntimeTensorNixlUpdateMethod(
+        manager=_Manager(), device_id=DEVICE_ID,
+        runtime_tensors={"weight": torch.empty(4, dtype=torch.float32)},
     )
-    live = {"weight": torch.empty(4, dtype=torch.float32)}
-    tensor_read = transfer.prepare_peer_read(
-        source=source,
-        mx_source_id="source-1",
-        worker_id="worker-1",
-        destination_tensors=live,
-    )
-    return transfer.receive_peer(
-        tensor_read=tensor_read,
-        destination_tensors=live,
-        on_transfer_start=lambda: None,
-    )
+    prepared = method.prepare(version=None, source=GeneratorPeerUpdateSource(
+        worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="127.0.0.1:18000"),
+        mx_source_id="source-1", worker_id="worker-1",
+    ))
+    with method.installation_context(prepared):
+        pass
+    return prepared.metrics
 
 
 def _record(caplog) -> dict:
