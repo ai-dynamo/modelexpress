@@ -28,6 +28,11 @@ from .draft_weights import draft_weight_adapter_for
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
 
+# Process groups, communicators, and their workspaces hold rank-local state
+# (epoch counters, symmetric slabs, peer pointer tables) that must never be
+# overwritten by a donor's copy.
+_PROCESS_LOCAL_MODULE_PREFIXES = ("sglang.srt.distributed", "torch.distributed")
+
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.load_config import LoadConfig
@@ -94,7 +99,17 @@ class SglangAdapter(EngineAdapter):
 
         return bool(is_cuda_alike())
 
+    @staticmethod
+    def _exclude_hidden_tensor_object(obj: object) -> bool:
+        """Keep distributed process groups and communicators local."""
+        module = type(obj).__module__ or ""
+        return any(
+            module == prefix or module.startswith(prefix + ".")
+            for prefix in _PROCESS_LOCAL_MODULE_PREFIXES
+        )
+
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
+        """Collect transferable tensors while preserving process-local state."""
         if result.model is None:
             raise RuntimeError("SGLang tensor discovery requires result.model")
         # capture_tensor_attrs() only promotes bare Tensor attributes assigned
@@ -110,7 +125,16 @@ class SglangAdapter(EngineAdapter):
         # This adds _mx_* names to the manifest, so source and target must run
         # the same ModelExpress version; mixing old and new manifests fails
         # tensor matching.
-        adopt_hidden_tensors(result.model, self.accelerator_backend)
+        #
+        # SGLang layers keep their GroupCoordinator as self.tp_group, so the
+        # scan would otherwise reach tp_group.ca_comm and copy the donor's
+        # custom all-reduce epoch counters, deadlocking the target's first
+        # push all-reduce.
+        adopt_hidden_tensors(
+            result.model,
+            self.accelerator_backend,
+            exclude=self._exclude_hidden_tensor_object,
+        )
         tensors = collect_module_tensors(result.model, self.accelerator_backend)
         if is_sglang_draft_model(self.model_config):
             selector = draft_weight_adapter_for(
