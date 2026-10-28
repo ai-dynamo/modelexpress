@@ -19,7 +19,9 @@ def instance(rank):
 def context():
     client = MagicMock(spec=MxClient)
     adapter = MagicMock()
-    adapter.all_gather_state.side_effect = lambda value: (value,)
+    adapter.all_gather_state.side_effect = lambda value: (
+        (value[0], 0, 0), (value[0], 1, 1)
+    )
     adapter.broadcast_state.side_effect = lambda value: value
     return SimpleNamespace(
         mx_client=client,
@@ -28,6 +30,7 @@ def context():
         is_reload=False,
         p2p_role="main",
         global_rank=0,
+        worker_rank=0,
         donor_lease=None,
         identity=p2p_pb2.SourceIdentity(),
         accelerator_backend=SimpleNamespace(name="cuda"),
@@ -198,3 +201,50 @@ def test_renews_before_checking_ready():
         p2p_pb2.DONOR_LEASE_ACTION_RENEW,
         p2p_pb2.DONOR_LEASE_ACTION_RELEASE,
     ]
+
+
+@pytest.mark.parametrize("overrides", [
+    {"pipeline_parallel_size": 2},
+    {"data_parallel_size": 2},
+    {"prefill_context_parallel_size": 2},
+    {"data_parallel_size": 2, "enable_expert_parallel": True},
+    {"decode_context_parallel_size": 2},
+])
+def test_parallel_worker_groups(overrides):
+    ctx = context()
+    cfg = config()
+    for name, value in overrides.items():
+        setattr(cfg.parallel_config, name, value)
+    count = 2 * (1 if "decode_context_parallel_size" in overrides else 2)
+    ctx.adapter.all_gather_state.side_effect = lambda value: tuple(
+        (value[0], rank, rank) for rank in range(count)
+    )
+    with patch.object(cold_start, "_ready", return_value=True) as ready:
+        cold_start.coordinate(ctx, cfg)
+    ready.assert_called_once_with(ctx, count)
+
+
+def test_mismatched_worker_group_is_rejected():
+    ctx = context()
+    ctx.adapter.all_gather_state.return_value = [([], 0, 0)]
+    ctx.adapter.all_gather_state.side_effect = None
+    with pytest.raises(RuntimeError, match="worker group"):
+        cold_start.coordinate(ctx, config())
+    ctx.mx_client.list_sources.assert_not_called()
+
+
+def test_elastic_ep_rejected_before_collectives():
+    ctx = context()
+    cfg = config()
+    cfg.parallel_config.enable_elastic_ep = True
+    with pytest.raises(RuntimeError, match="elastic"):
+        cold_start.coordinate(ctx, cfg)
+    ctx.adapter.all_gather_state.assert_not_called()
+
+
+def test_speculative_config_does_not_reject_main():
+    ctx = context()
+    cfg = config()
+    cfg.speculative_config = object()
+    with patch.object(cold_start, "_ready", return_value=True):
+        cold_start.coordinate(ctx, cfg)

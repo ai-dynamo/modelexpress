@@ -179,6 +179,7 @@ class MxModelLoader(BaseModelLoader):
             ctx.loaded_identity = p2p_pb2.SourceIdentity()
             ctx.loaded_identity.CopyFrom(self._ctx.identity)
         draft_gate: DraftPublicationGate | None = None
+        main_ctx = None
         if is_speculative_draft:
             main_loader = _loader_registry.get(ctx.device_id)
             main_ctx = main_loader._ctx if main_loader is not None else None
@@ -217,6 +218,8 @@ class MxModelLoader(BaseModelLoader):
         except BaseException:
             if ctx.donor_lease is not None:
                 ctx.donor_lease.stop()
+            if main_ctx is not None and main_ctx.donor_lease is not None:
+                main_ctx.donor_lease.stop()
             raise
         finally:
             if draft_gate is not None:
@@ -270,7 +273,7 @@ class MxModelLoader(BaseModelLoader):
                                     prefix=prefix,
                                 )
 
-                    if envs.MX_P2P_COLD_START:
+                    if envs.MX_P2P_COLD_START and ctx.p2p_role == "main":
                         from ...cold_start import coordinate
 
                         coordinate(ctx, vllm_config)

@@ -84,27 +84,34 @@ class DonorLease:
 def coordinate(ctx, config):
     """Elect once on rank zero and broadcast to the replica's workers."""
     parallel = config.parallel_config
+    if ctx.adapter is None:
+        raise RuntimeError("Cold start requires an engine adapter")
+    if getattr(parallel, "enable_elastic_ep", False):
+        raise RuntimeError("MX cold start does not support elastic expert parallelism")
     errors = []
     if not isinstance(ctx.mx_client, MxClient) or not ctx.p2p_enabled:
         errors.append("a centralized MX server and P2P are required")
-    if (
-        ctx.is_reload
-        or ctx.p2p_role != "main"
-        or getattr(config, "speculative_config", None)
+    if ctx.is_reload or ctx.p2p_role != "main":
+        errors.append("reload and draft election are not supported")
+    states = ctx.adapter.all_gather_state((errors, ctx.global_rank, ctx.worker_rank))
+    ranks = len(states)
+    expected = 1
+    for name in (
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "prefill_context_parallel_size",
     ):
-        errors.append("reload and speculative decoding are not supported")
+        expected *= getattr(parallel, name, 1) or 1
+    all_errors = [state[0] for state in states]
     if (
-        getattr(parallel, "pipeline_parallel_size", 1) != 1
-        or getattr(parallel, "data_parallel_size", 1) != 1
-        or getattr(parallel, "enable_expert_parallel", False)
+        ranks != expected
+        or sorted(state[1] for state in states) != list(range(ranks))
+        or any(state[1] != state[2] for state in states)
     ):
-        errors.append("only tensor parallelism is supported")
-    if ctx.adapter is None:
-        raise RuntimeError("Cold start requires an engine adapter")
-    all_errors = ctx.adapter.all_gather_state(errors)
+        all_errors.append("worker group does not match the configured parallel topology")
     if any(all_errors):
         raise RuntimeError(f"Unsupported MX cold start configuration: {all_errors}")
-    ranks = parallel.tensor_parallel_size
     decision = None
     if ctx.global_rank == 0:
         try:
