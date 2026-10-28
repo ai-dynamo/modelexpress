@@ -420,6 +420,9 @@ class MxModelLoader:
             registered_tensors = None
             try:
                 result = ctx.adapter.before_rdma_receive(result)
+                ctx.adapter.prepare_rdma_target_from_manifest(
+                    result, list(worker_tensor_descriptors(source_worker))
+                )
                 tensors = ctx.adapter.discover_tensors(result)
                 weight_info = self._register_transfer_engine_tensors(
                     tensors,
@@ -589,6 +592,14 @@ class MxModelLoader:
             for tensor in worker_tensor_descriptors(source_worker)
         }
 
+        source_only = sorted(set(seed_weight_info) - set(tensors))
+        if source_only:
+            raise RuntimeError(
+                f"ModelExpress transfer_engine: {len(source_only)} source-only tensors "
+                "(first five): "
+                f"{source_only[:5]}"
+            )
+
         seed_ptr_list = []
         client_ptr_list = []
         client_len_list = []
@@ -709,6 +720,7 @@ class MxModelLoader:
                     addr=addr,
                     size=self._byte_size(numel, element_size),
                     device_id=ctx.device_id,
+                    dtype=str(ctx.tensors[name].dtype),
                 )
                 for name, (addr, numel, element_size) in weight_info.items()
             ]

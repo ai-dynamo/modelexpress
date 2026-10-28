@@ -50,6 +50,7 @@ def _ctx(manager):
         global_rank=0,
         worker_rank=0,
         worker_id="target-0",
+        is_reload=False,
         nixl_manager=manager,
         accelerator_backend=SimpleNamespace(name="cuda", synchronize=MagicMock()),
         adapter=adapter,
@@ -72,7 +73,7 @@ def _source_worker(p2p: bool):
     )
 
 
-def _receive(manager, p2p=True, ctx=None, leased=True):
+def _receive(manager, p2p=True, ctx=None, leased=True, register=None):
     strategy = RdmaStrategy()
     strategy.requires_tensor_read_lease = leased
 
@@ -96,7 +97,7 @@ def _receive(manager, p2p=True, ctx=None, leased=True):
             return None
 
     with (
-        patch("modelexpress.load_strategy.rdma_strategy.register_tensors"),
+        patch("modelexpress.load_strategy.rdma_strategy.register_tensors", side_effect=register),
         patch(
             "modelexpress.metadata.worker_server.prepare_tensor_read",
             return_value=(_Lease(), 0),
@@ -280,3 +281,53 @@ class TestCentralizedMode:
         mgr = _manager()
         _receive(mgr, p2p=False)
         assert mgr.receive_from_source.call_args.kwargs["remote_agent_name"] == BLOB_AGENT
+
+
+@pytest.mark.parametrize("p2p", [False, True])
+def test_donor_preparation_precedes_registration(p2p):
+    manager = _manager()
+    ctx = _ctx(manager)
+    events = []
+    ctx.adapter.prepare_rdma_target_from_manifest.side_effect = (
+        lambda result, tensors: events.append(("prepare", [t.name for t in tensors]))
+    )
+    _receive(manager, p2p=p2p, ctx=ctx,
+             register=lambda *args: events.append(("register", None)))
+    assert events == [("prepare", ["w0"]), ("register", None)]
+
+
+def test_draft_preparation_uses_model_names_before_namespaced_registration():
+    manager = _manager()
+    ctx = _ctx(manager)
+    ctx.p2p_role = "draft"
+    ctx.draft_tensor_namespace = "__draft__/test/"
+    ctx.tensors = {}
+    name = ctx.draft_tensor_namespace + "w0"
+    desc = _descriptor(name)
+    with patch(__name__ + "._descriptor", return_value=desc):
+        _receive(manager, ctx=ctx,
+                 register=lambda *args: ctx.tensors.update({name: object()}))
+    args = ctx.adapter.prepare_rdma_target_from_manifest.call_args.args
+    assert [t.name for t in args[1]] == ["w0"]
+    assert manager.receive_from_source.call_args.kwargs["source_tensors"][0].name == name
+
+
+def test_prepare_failure_releases_lease_without_handshake():
+    manager = _manager()
+    released = []
+    manager._tensor_lease_release = lambda: released.append(True)
+    ctx = _ctx(manager)
+    ctx.adapter.prepare_rdma_target_from_manifest.side_effect = RuntimeError("bad layout")
+    with pytest.raises(RuntimeError, match="bad layout"):
+        _receive(manager, ctx=ctx)
+    assert released == [True]
+    manager.fetch_remote_and_wait.assert_not_called()
+    manager.receive_from_source.assert_not_called()
+
+
+def test_reload_does_not_change_registered_runtime_layout():
+    manager = _manager()
+    ctx = _ctx(manager)
+    ctx.is_reload = True
+    _receive(manager, ctx=ctx)
+    ctx.adapter.prepare_rdma_target_from_manifest.assert_not_called()
