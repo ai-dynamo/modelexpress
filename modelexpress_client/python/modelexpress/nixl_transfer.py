@@ -445,26 +445,20 @@ class NixlTransferManager:
         ):
             if self._accelerator_backend.supports_pool_reg():
                 allocations = self._find_cuda_allocations(registrable_descriptors)
-                # NIXL resolves descriptors by containment, so a tensor that
-                # runs past its allocation (e.g. a VA reservation backed by
-                # several mappings) fails prep_xfer_dlist on the receiver.
+                # A tensor that runs past its allocation (e.g. a VA reservation
+                # backed by several mappings) cannot be covered by one
+                # registration: the allocation is too short, and registering
+                # the tensor itself trips cuda_ipc's range assertion.
                 spanning = _spanning_descriptors(registrable_descriptors, allocations)
                 if spanning:
                     first, alloc_base, alloc_size = spanning[0]
-                    logger.warning(
-                        "register_tensors: %d of %d tensors extend past the CUDA "
-                        "allocation containing their start address; falling back "
-                        "to per-tensor registration. First uncovered: %s at 0x%x "
-                        "(%d bytes) in allocation [0x%x, 0x%x)",
-                        len(spanning),
-                        len(registrable_descriptors),
-                        first.name,
-                        first.addr,
-                        first.size,
-                        alloc_base,
-                        alloc_base + alloc_size,
+                    raise RuntimeError(
+                        f"{len(spanning)} of {len(registrable_descriptors)} tensors "
+                        "extend past the CUDA allocation containing their start "
+                        f"address and cannot be registered. First: {first.name} "
+                        f"at 0x{first.addr:x} ({first.size} bytes) in allocation "
+                        f"[0x{alloc_base:x}, 0x{alloc_base + alloc_size:x})"
                     )
-                    allocations = None
             else:
                 allocations = None
                 logger.warning(
