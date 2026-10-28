@@ -1331,7 +1331,7 @@ def _real_metrics(monkeypatch):
         "modelexpress.load_strategy.rdma_strategy.worker_tensor_count", lambda w: 1
     )
     monkeypatch.setattr(
-        "modelexpress.load_strategy.rdma_strategy.register_tensors", lambda result, ctx: None
+        "modelexpress.load_strategy.rdma_strategy.register_tensors", lambda result, ctx, **kwargs: None
     )
     return collector
 

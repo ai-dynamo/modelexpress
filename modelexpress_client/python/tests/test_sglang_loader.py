@@ -20,6 +20,7 @@ from modelexpress.engines.sglang.adapter import (
 )
 from modelexpress.engines.sglang.loader import MxModelLoader
 from modelexpress.load_strategy.context import LoadResult
+from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
 
 def _load_config(**overrides):
@@ -1363,13 +1364,18 @@ def test_te_find_source_records_the_funnel_on_success(monkeypatch):
 def _clean_sglang_registries():
     from modelexpress.engines.sglang import loader as loader_mod
 
-    yield loader_mod
-    for registry in (
+    registries = (
         loader_mod._tensor_registry,
         loader_mod._nixl_managers,
         loader_mod._loader_registry,
         loader_mod._draft_publication_gates,
-    ):
+        loader_mod._device_loads,
+    )
+    # Loads in tests without this fixture also land in the registries.
+    for registry in registries:
+        registry.clear()
+    yield loader_mod
+    for registry in registries:
         registry.clear()
 
 
@@ -1524,6 +1530,107 @@ def test_sglang_nextn_draft_reuses_main_nixl_agent(
         )
     assert draft_ctx.p2p_enabled is True
     assert draft_ctx.p2p_role == "draft"
+
+
+def _draft_chain(model, ctx):
+    if ctx.p2p_enabled:
+        ctx.nixl_manager = ctx.shared_nixl_manager
+        ctx.tensors = {ctx.draft_tensor_namespace + "w": torch.zeros(1)}
+        ctx.draft_published = True
+    return model
+
+
+def _load_main_and_draft(manager):
+    with patch(
+        "modelexpress.engines.sglang.loader._sglang_version", return_value="0.5.16"
+    ):
+        main_loader, main_ctx, _, _ = _run_nixl_pass(
+            _model_config(),
+            _target_chain(manager, {"target.weight": torch.zeros(1)}),
+            model=Qwen3_5MoeForCausalLM(), expects_draft=True,
+        )
+        draft_loader, _, _, _ = _run_nixl_pass(
+            _model_config(is_draft_model=True), _draft_chain,
+            model=Qwen3_5ForCausalLMMTP(),
+        )
+    return main_loader, main_ctx, draft_loader
+
+
+def test_sglang_release_and_refill_receive_each_load_in_place(
+    _clean_sglang_registries, monkeypatch,
+):
+    monkeypatch.delenv("MX_DISABLE_DRAFT_P2P", raising=False)
+    loader_mod = _clean_sglang_registries
+    old_manager = MagicMock()
+    main_loader, main_ctx, draft_loader = _load_main_and_draft(old_manager)
+
+    with patch("modelexpress.engines.sglang.loader.unpublish_metadata") as unpublish:
+        loader_mod.release_weights(0)
+    unpublish.assert_called_once_with(main_ctx)
+    old_manager.shutdown.assert_called_once_with()
+    assert 0 not in loader_mod._nixl_managers
+
+    new_manager = MagicMock()
+    received = []
+    loaded = {
+        "main": main_loader._loaded_tensors,
+        "draft": draft_loader._loaded_tensors,
+    }
+    assert set(loaded["main"]) == {"target.weight"}
+
+    def rdma_only(model, ctx, strategies):
+        assert [type(strategy) for strategy in strategies] == [RdmaStrategy]
+        assert ctx.is_reload
+        assert ctx.loaded_identity == ctx.identity
+        # Only what the load received, not buffers created while serving.
+        assert ctx.tensors == loaded[ctx.p2p_role]
+        received.append((model, ctx.p2p_role))
+        if ctx.p2p_role == "main":
+            ctx.nixl_manager = new_manager
+            ctx.tensors = {"target.weight": torch.zeros(1)}
+            return model
+        assert ctx.shared_nixl_manager is new_manager
+        return _draft_chain(model, ctx)
+
+    with patch(
+        "modelexpress.engines.sglang.loader.execute_load_strategies",
+        side_effect=rdma_only,
+    ), patch(
+        "modelexpress.engines.sglang.loader.install_sglang_cache_artifacts",
+    ) as install, patch(
+        "modelexpress.engines.sglang.loader.schedule_sglang_cache_artifact_publish",
+    ) as schedule, patch(
+        "modelexpress.engines.sglang.loader._expects_draft_pass", return_value=True,
+    ), patch(
+        "modelexpress.engines.sglang.loader._sglang_version", return_value="0.5.16"
+    ):
+        loader_mod.refill_weights(0)
+
+    assert received == [
+        (main_loader._model, "main"),
+        (draft_loader._model, "draft"),
+    ]
+    install.assert_not_called()
+    schedule.assert_not_called()
+    assert loader_mod._nixl_managers[0] is new_manager
+    assert main_loader._ctx.source_ready_fn()
+    assert loader_mod._device_loads[0] == [main_loader, draft_loader]
+
+
+def test_sglang_release_refuses_weights_it_cannot_refill(
+    _clean_sglang_registries, monkeypatch,
+):
+    monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", "1")
+    loader_mod = _clean_sglang_registries
+    manager = MagicMock()
+    _load_main_and_draft(manager)
+
+    with patch(
+        "modelexpress.engines.sglang.loader.unpublish_metadata"
+    ) as unpublish, pytest.raises(RuntimeError, match="MX_MODEL_REVISION"):
+        loader_mod.release_weights(0)
+    unpublish.assert_not_called()
+    manager.shutdown.assert_not_called()
 
 
 def test_sglang_unknown_draft_uses_storage_fallback_not_unsafe_peer(
