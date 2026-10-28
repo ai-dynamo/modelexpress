@@ -38,6 +38,28 @@ def test_start_raises_when_port_is_taken(taken_port):
     assert server.port is None
 
 
+def test_start_raises_when_another_worker_server_holds_the_port():
+    first = _server(0)
+    port = first.start()
+    try:
+        with pytest.raises(RuntimeError, match=f"failed to bind \\[::\\]:{port}"):
+            _server(port).start()
+    finally:
+        first.stop(grace=None)
+
+
+def test_restart_on_same_port_after_stop():
+    first = _server(0)
+    port = first.start()
+    first.stop(grace=None)
+
+    second = _server(port)
+    try:
+        assert second.start() == port
+    finally:
+        second.stop(grace=None)
+
+
 def test_start_raises_when_grpc_returns_port_zero():
     real_server = grpc.server
 

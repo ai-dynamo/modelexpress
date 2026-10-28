@@ -569,8 +569,11 @@ class WorkerGrpcServer:
 
     def start(self) -> int:
         """Start the gRPC server. Returns the actual bound port."""
+        # Without SO_REUSEPORT a second server on this port fails to bind
+        # instead of silently sharing it.
         self._server = grpc.server(
-            futures.ThreadPoolExecutor(max_workers=self._max_workers)
+            futures.ThreadPoolExecutor(max_workers=self._max_workers),
+            options=[("grpc.so_reuseport", 0)],
         )
         self._servicer = WorkerServiceServicer(
             tensor_protos=self._tensor_protos,
