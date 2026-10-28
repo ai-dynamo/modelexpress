@@ -751,6 +751,27 @@ storage-view naming used for non-contiguous SGLang parameters.
 The SGLang side does not expose separate source and target modes; transport
 selection and source discovery remain inside the ModelExpress package.
 
+**Cold-load quantization state.** A source manifest can describe buffers whose
+existence depends on checkpoint values. After placeholder post-processing and
+before registering destination memory, the receive strategy calls
+`prepare_rdma_target_from_manifest` with model-relative tensor names (stripping
+the draft namespace for the adapter). SGLang's `runtime_state.py` uses the
+presence of `weight_scale_inv_swizzled` to recover the donor's block-FP8 MXFP8
+decision for FlashInfer CuTeDSL/CUTLASS. It allocates the engine-defined scale
+layout without priming floating scales or reshuffling weights. The existing
+manifest carries this decision; no new wire fields or server upgrade are needed.
+
+SGLang requires an exact NIXL tensor catalog. TransferEngine also rejects
+source-only tensors before submitting a read. After transfer, SGLang validates
+MXFP8 eligibility against the received scales before enabling that dispatch,
+and refreshes `k_scale_float` / `v_scale_float` from already-normalized device
+scales. It does not rerun full post-processing or reallocate registered storage.
+Invalid descriptors, inconsistent scales, and unsupported donor-dependent
+layouts fail the attempt and use the existing cold-load recovery/fallback path.
+This does not add optimized support for Hopper's optional BF16 weight cache or
+ROCm MXFP8 layouts; mismatches remain failures. Warm reloads skip cold-load
+preparation and retain their existing same-identity restrictions.
+
 **Speculative draft pass.** SGLang's EAGLE worker builds a second ModelRunner
 for the draft on the same GPU. Its `ModelConfig` has `is_draft_model=True` and,
 unless `speculative_draft_load_format` names another format, it loads through the
