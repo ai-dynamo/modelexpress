@@ -28,11 +28,6 @@ from .draft_weights import draft_weight_adapter_for
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
 
-# Process groups, communicators, and their workspaces hold rank-local state
-# (epoch counters, symmetric slabs, peer pointer tables) that must never be
-# overwritten by a donor's copy.
-_PROCESS_LOCAL_MODULE_PREFIXES = ("sglang.srt.distributed", "torch.distributed")
-
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.load_config import LoadConfig
@@ -102,11 +97,8 @@ class SglangAdapter(EngineAdapter):
     @staticmethod
     def _exclude_hidden_tensor_object(obj: object) -> bool:
         """Keep distributed process groups and communicators local."""
-        module = type(obj).__module__ or ""
-        return any(
-            module == prefix or module.startswith(prefix + ".")
-            for prefix in _PROCESS_LOCAL_MODULE_PREFIXES
-        )
+        module = (type(obj).__module__ or "") + "."
+        return module.startswith(("sglang.srt.distributed.", "torch.distributed."))
 
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         """Collect transferable tensors while preserving process-local state."""
