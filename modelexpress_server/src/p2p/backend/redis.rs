@@ -706,6 +706,32 @@ impl MetadataBackend for RedisBackend {
         Ok(())
     }
 
+    async fn try_acquire_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        RedisBackend::try_acquire_donor_lease(self, compatibility_key, owner_token, duration).await
+    }
+
+    async fn renew_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        RedisBackend::renew_donor_lease(self, compatibility_key, owner_token, duration).await
+    }
+
+    async fn release_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+    ) -> MetadataResult<bool> {
+        RedisBackend::release_donor_lease(self, compatibility_key, owner_token).await
+    }
+
     async fn publish_metadata(
         &self,
         identity: &SourceIdentity,

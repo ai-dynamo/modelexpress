@@ -42,6 +42,53 @@ impl MetadataBackend for InstrumentedMetadataBackend {
             .await
     }
 
+    async fn try_acquire_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        self.metrics
+            .time(
+                Store::P2p,
+                "try_acquire_donor_lease",
+                self.inner
+                    .try_acquire_donor_lease(compatibility_key, owner_token, duration),
+            )
+            .await
+    }
+
+    async fn renew_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        self.metrics
+            .time(
+                Store::P2p,
+                "renew_donor_lease",
+                self.inner
+                    .renew_donor_lease(compatibility_key, owner_token, duration),
+            )
+            .await
+    }
+
+    async fn release_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+    ) -> MetadataResult<bool> {
+        self.metrics
+            .time(
+                Store::P2p,
+                "release_donor_lease",
+                self.inner
+                    .release_donor_lease(compatibility_key, owner_token),
+            )
+            .await
+    }
+
     async fn publish_metadata(
         &self,
         identity: &SourceIdentity,
@@ -189,6 +236,49 @@ mod tests {
     use super::*;
     use crate::metrics::{encode_text, new_registry};
     use crate::p2p::backend::MockMetadataBackend;
+
+    #[tokio::test]
+    async fn donor_lease_operations_are_forwarded_to_inner_backend() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_try_acquire_donor_lease()
+            .times(1)
+            .returning(|key, owner, ttl| {
+                assert_eq!(
+                    (key, owner, ttl),
+                    ("source", "token", std::time::Duration::from_secs(30))
+                );
+                Ok(true)
+            });
+        mock.expect_renew_donor_lease()
+            .times(1)
+            .returning(|_, _, _| Ok(false));
+        mock.expect_release_donor_lease()
+            .times(1)
+            .returning(|_, _| Err("unavailable".into()));
+        let mut registry = new_registry();
+        let backend = InstrumentedMetadataBackend::wrap(
+            Arc::new(mock),
+            BackendMetrics::register(&mut registry),
+        );
+        assert!(
+            backend
+                .try_acquire_donor_lease("source", "token", std::time::Duration::from_secs(30))
+                .await
+                .expect("acquire")
+        );
+        assert!(
+            !backend
+                .renew_donor_lease("source", "token", std::time::Duration::from_secs(30))
+                .await
+                .expect("renew")
+        );
+        assert!(
+            backend
+                .release_donor_lease("source", "token")
+                .await
+                .is_err()
+        );
+    }
 
     /// The forwarding trap: `list_workers_filtered` must reach the inner
     /// backend's implementation, not fall through the default body onto

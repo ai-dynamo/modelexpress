@@ -335,6 +335,35 @@ pub trait MetadataBackend: Send + Sync {
     /// Connect to the backend (initialize connections, etc.)
     async fn connect(&self) -> MetadataResult<()>;
 
+    /// Attempt to acquire an opt-in cold-start donor lease.
+    async fn try_acquire_donor_lease(
+        &self,
+        _compatibility_key: &str,
+        _owner_token: &str,
+        _duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        Err("donor leases are not supported by this metadata backend".into())
+    }
+
+    /// Renew an owned cold-start donor lease.
+    async fn renew_donor_lease(
+        &self,
+        _compatibility_key: &str,
+        _owner_token: &str,
+        _duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        Err("donor leases are not supported by this metadata backend".into())
+    }
+
+    /// Release an owned cold-start donor lease.
+    async fn release_donor_lease(
+        &self,
+        _compatibility_key: &str,
+        _owner_token: &str,
+    ) -> MetadataResult<bool> {
+        Err("donor leases are not supported by this metadata backend".into())
+    }
+
     /// Publish metadata for a source worker.
     /// `worker_id` uniquely identifies this running pod/process among all replicas
     /// with the same identity. The backend derives `mx_source_id` from `identity`.
