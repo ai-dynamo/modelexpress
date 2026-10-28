@@ -255,9 +255,7 @@ class TestRawDescriptorMemType:
             backends=["UCX"],
         )
 
-    def test_pool_registration_falls_back_when_tensor_spans_allocations(
-        self, monkeypatch, caplog
-    ):
+    def test_pool_registration_rejects_tensor_spanning_allocations(self, monkeypatch):
         monkeypatch.setenv("MX_POOL_REG", "1")
         backing = torch.zeros(4, dtype=torch.float32)
         tensor = MagicMock(wraps=backing)
@@ -266,15 +264,14 @@ class TestRawDescriptorMemType:
         mgr = self._make_manager()
         # One VA range backed by two separately mapped segments.
         mgr._find_cuda_allocations = MagicMock(return_value=[(base, 8), (base + 8, 8)])
-        with caplog.at_level(logging.WARNING):
-            assert mgr.register_tensors({"workspace": tensor}) == b"metadata"
 
-        mgr._agent.register_memory.assert_called_once_with(
-            [tensor], backends=["UCX"]
-        )
-        assert mgr._base_registration_ranges == [(base, base + 16)]
-        assert "First uncovered: workspace" in caplog.text
-        assert f"[0x{base:x}, 0x{base + 8:x})" in caplog.text
+        with pytest.raises(RuntimeError) as exc_info:
+            mgr.register_tensors({"workspace": tensor})
+
+        message = str(exc_info.value)
+        assert "First: workspace" in message
+        assert f"[0x{base:x}, 0x{base + 8:x})" in message
+        mgr._agent.register_memory.assert_not_called()
 
     def test_draft_view_inside_registered_pool_reuses_main_registration(
         self, monkeypatch
