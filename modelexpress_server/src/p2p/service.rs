@@ -535,6 +535,65 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn donor_lease_service_uses_redis_and_fences_owners() {
+        use crate::metrics::backend::BackendMetrics;
+        use crate::p2p::backend::instrumented::InstrumentedMetadataBackend;
+        use crate::p2p::backend::redis::RedisBackend;
+        use prometheus_client::registry::Registry;
+
+        let Ok(url) = std::env::var("MX_TEST_REDIS_URL").or_else(|_| std::env::var("REDIS_URL"))
+        else {
+            return;
+        };
+        let metrics = BackendMetrics::register(&mut Registry::default());
+        let backend = InstrumentedMetadataBackend::wrap(Arc::new(RedisBackend::new(&url)), metrics);
+        let svc = P2pServiceImpl::new(Arc::new(P2pStateManager::with_backend(backend)));
+        let mut identity = test_identity();
+        identity.model_name = uuid::Uuid::new_v4().to_string();
+        let request = |action: DonorLeaseAction, owner: &str, ttl| {
+            Request::new(DonorLeaseRequest {
+                identity: Some(identity.clone()),
+                owner_token: owner.to_string(),
+                action: action as i32,
+                ttl_seconds: ttl,
+            })
+        };
+        for (action, owner, ttl, expected) in [
+            (DonorLeaseAction::Acquire, "first", 10, true),
+            (DonorLeaseAction::Acquire, "second", 10, false),
+            (DonorLeaseAction::Renew, "first", 10, true),
+            (DonorLeaseAction::Renew, "second", 10, false),
+            (DonorLeaseAction::Release, "second", 0, false),
+            (DonorLeaseAction::Release, "first", 0, true),
+            (DonorLeaseAction::Acquire, "second", 10, true),
+            (DonorLeaseAction::Release, "second", 0, true),
+        ] {
+            assert_eq!(
+                svc.donor_lease(request(action, owner, ttl))
+                    .await
+                    .expect("lease RPC")
+                    .into_inner()
+                    .acquired,
+                expected
+            );
+        }
+        for invalid in [
+            Request::new(DonorLeaseRequest::default()),
+            request(DonorLeaseAction::Acquire, "", 10),
+            request(DonorLeaseAction::Acquire, "first", 0),
+            request(DonorLeaseAction::Unspecified, "first", 10),
+        ] {
+            assert_eq!(
+                svc.donor_lease(invalid)
+                    .await
+                    .expect_err("invalid request")
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+    }
+
     // ── publish_metadata ────────────────────────────────────────────────────
 
     #[tokio::test]
