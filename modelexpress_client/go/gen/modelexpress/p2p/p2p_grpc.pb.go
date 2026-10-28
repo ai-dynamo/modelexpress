@@ -37,7 +37,7 @@ const (
 // The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
 // Clients query for existing sources and publish their own metadata.
 type P2PServiceClient interface {
-	// Coordinate the donor for a compatible cold start.
+	// Coordinate a donor for concurrent cold starts.
 	DonorLease(ctx context.Context, in *DonorLeaseRequest, opts ...grpc.CallOption) (*DonorLeaseResponse, error)
 	// Publish model metadata - called by client after loading model weights
 	PublishMetadata(ctx context.Context, in *PublishMetadataRequest, opts ...grpc.CallOption) (*PublishMetadataResponse, error)
@@ -118,7 +118,7 @@ func (c *p2PServiceClient) UpdateStatus(ctx context.Context, in *UpdateStatusReq
 // The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
 // Clients query for existing sources and publish their own metadata.
 type P2PServiceServer interface {
-	// Coordinate the donor for a compatible cold start.
+	// Coordinate a donor for concurrent cold starts.
 	DonorLease(context.Context, *DonorLeaseRequest) (*DonorLeaseResponse, error)
 	// Publish model metadata - called by client after loading model weights
 	PublishMetadata(context.Context, *PublishMetadataRequest) (*PublishMetadataResponse, error)

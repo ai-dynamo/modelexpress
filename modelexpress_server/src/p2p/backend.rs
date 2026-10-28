@@ -364,31 +364,6 @@ pub trait MetadataBackend: Send + Sync {
         Err("donor leases are not supported by this metadata backend".into())
     }
 
-    /// Atomically publish only while the specified donor lease is owned.
-    async fn publish_metadata_fenced(
-        &self,
-        _identity: &SourceIdentity,
-        _worker_id: &str,
-        _worker: WorkerMetadata,
-        _owner_token: &str,
-    ) -> MetadataResult<()> {
-        Err("fenced donor publication is not supported by this metadata backend".into())
-    }
-
-    /// Update a coordinated donor only while its lease is still held.
-    async fn update_status_fenced(
-        &self,
-        _source_id: &str,
-        _worker_id: &str,
-        _worker_rank: u32,
-        _status: SourceStatus,
-        _updated_at: i64,
-        _source_load: Option<f32>,
-        _owner_token: &str,
-    ) -> MetadataResult<()> {
-        Err("fenced donor status is not supported by this metadata backend".into())
-    }
-
     /// Publish metadata for a source worker.
     /// `worker_id` uniquely identifies this running pod/process among all replicas
     /// with the same identity. The backend derives `mx_source_id` from `identity`.

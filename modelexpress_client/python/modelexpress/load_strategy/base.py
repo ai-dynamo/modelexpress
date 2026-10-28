@@ -217,9 +217,7 @@ def _init_nixl_manager(
     from ..nixl_transfer import NixlTransferManager
 
     agent_name = f"mx-{role}-worker{global_rank}-{uuid.uuid4().hex[:8]}"
-    logger.debug(
-        f"[Worker {global_rank}] Initializing NIXL manager with agent_name={agent_name}"
-    )
+    logger.debug(f"[Worker {global_rank}] Initializing NIXL manager with agent_name={agent_name}")
     manager = NixlTransferManager(
         agent_name=agent_name,
         device_id=device_id,
@@ -239,7 +237,9 @@ def _as_load_result(result_or_model: LoadResult | nn.Module) -> LoadResult:
 
 def _metadata_publication_configured(ctx: LoadContext) -> bool:
     """Return whether this worker has a metadata path for P2P serving."""
-    server_addr = ctx.mx_server_url or envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
+    server_addr = (
+        ctx.mx_server_url or envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
+    )
     if server_addr:
         return True
     return getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
@@ -288,9 +288,7 @@ def register_tensors(
         )
         return
     if not is_nixl_available():
-        logger.warning(
-            f"[Worker {ctx.global_rank}] NIXL not available, skipping registration"
-        )
+        logger.warning(f"[Worker {ctx.global_rank}] NIXL not available, skipping registration")
         return
     if ctx.adapter is None:
         raise RuntimeError("NIXL registration requires an engine adapter")
@@ -369,9 +367,7 @@ def register_tensors(
                 )
                 ctx.nixl_manager.register_arena(ctx.vmm_arena, ctx.tensors)
             else:
-                logger.debug(
-                    f"[Worker {ctx.global_rank}] Registering tensors with NIXL..."
-                )
+                logger.debug(f"[Worker {ctx.global_rank}] Registering tensors with NIXL...")
                 ctx.nixl_manager.register_tensors(ctx.tensors)
             logger.debug(f"[Worker {ctx.global_rank}] Tensors registered with NIXL")
     except Exception as e:
@@ -413,8 +409,6 @@ def register_tensors(
 def publish_metadata(ctx: LoadContext) -> None:
     """Publish metadata to the MX server. Failures are logged but do not raise."""
     if ctx.nixl_manager is None:
-        if ctx.cold_start_role == "donor":
-            raise RuntimeError("Cold-start donor could not register its tensors")
         logger.info(
             f"[Worker {ctx.global_rank}] No NIXL manager, skipping metadata publish"
         )
@@ -455,24 +449,12 @@ def publish_metadata(ctx: LoadContext) -> None:
         return
     try:
         publish_metadata_and_ready(
-            ctx.mx_client,
-            ctx.nixl_manager,
-            ctx.tensors,
-            ctx.worker_rank,
-            ctx.device_id,
-            ctx.identity,
-            ctx.worker_id,
+            ctx.mx_client, ctx.nixl_manager, ctx.tensors,
+            ctx.worker_rank, ctx.device_id, ctx.identity, ctx.worker_id,
             accelerator=ctx.accelerator_backend.name,
             ready_fn=ctx.source_ready_fn,
-            **(
-                {"donor_lease_token": ctx.donor_lease_token}
-                if ctx.donor_lease_token
-                else {}
-            ),
         )
     except Exception as e:
-        if ctx.cold_start_role == "donor":
-            raise
         logger.warning(
             f"[Worker {ctx.global_rank}] Failed to publish metadata, "
             f"worker will continue without P2P serving: {e}"

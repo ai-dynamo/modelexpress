@@ -31,3 +31,17 @@ def test_publish_metadata_adds_pod_identity_without_changing_public_api(monkeypa
     assert request.pod_name == "source-0"
     assert request.pod_uid == "pod-uid"
     assert request.pod_namespace == "default"
+
+
+def test_list_sources_passes_strict_to_server():
+    stub = MagicMock()
+    client = MxClient("localhost:8001")
+    client._channel = MagicMock()
+    client._stub = stub
+    identity = p2p_pb2.SourceIdentity(model_name="model")
+
+    client.list_sources(identity=identity, strict=True)
+
+    request = stub.ListSources.call_args.args[0]
+    assert request.strict is True
+    assert request.identity == identity

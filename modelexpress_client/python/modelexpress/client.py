@@ -176,7 +176,6 @@ class MxClient(MxClientBase):
         identity: "p2p_pb2.SourceIdentity",
         worker: "p2p_pb2.WorkerMetadata",
         worker_id: str,
-        donor_lease_token: str = "",
     ) -> str:
         """Publish metadata for one worker so targets can discover this source.
 
@@ -189,7 +188,6 @@ class MxClient(MxClientBase):
             pod_name=envs.POD_NAME,
             pod_uid=envs.POD_UID,
             pod_namespace=envs.POD_NAMESPACE,
-            donor_lease_token=donor_lease_token,
         )
         response = self.stub.PublishMetadata(request, timeout=30)
         if not response.success:
@@ -229,7 +227,6 @@ class MxClient(MxClientBase):
         worker_rank: int,
         status: "p2p_pb2.SourceStatus",
         source_load: float | None = None,
-        donor_lease_token: str = "",
     ) -> bool:
         """Update worker status.  Returns *True* on success."""
         request = p2p_pb2.UpdateStatusRequest(
@@ -237,7 +234,6 @@ class MxClient(MxClientBase):
             worker_id=worker_id,
             worker_rank=worker_rank,
             status=status,
-            donor_lease_token=donor_lease_token,
         )
         # Leave the optional field unset when there is no reading: presence is
         # how the server and pullers tell "unknown" from a measured 0.0.

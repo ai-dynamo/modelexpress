@@ -2226,11 +2226,9 @@ type PublishMetadataRequest struct {
 	// Kubernetes namespace of the calling worker, set via the downward API.
 	// Owner references are only valid when this matches the ModelMetadata
 	// namespace. Empty means no ownerReference is set.
-	PodNamespace string `protobuf:"bytes,6,opt,name=pod_namespace,json=podNamespace,proto3" json:"pod_namespace,omitempty"`
-	// If set, publish only while this token owns the donor lease.
-	DonorLeaseToken string `protobuf:"bytes,7,opt,name=donor_lease_token,json=donorLeaseToken,proto3" json:"donor_lease_token,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	PodNamespace  string `protobuf:"bytes,6,opt,name=pod_namespace,json=podNamespace,proto3" json:"pod_namespace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PublishMetadataRequest) Reset() {
@@ -2301,13 +2299,6 @@ func (x *PublishMetadataRequest) GetPodUid() string {
 func (x *PublishMetadataRequest) GetPodNamespace() string {
 	if x != nil {
 		return x.PodNamespace
-	}
-	return ""
-}
-
-func (x *PublishMetadataRequest) GetDonorLeaseToken() string {
-	if x != nil {
-		return x.DonorLeaseToken
 	}
 	return ""
 }
@@ -2553,7 +2544,7 @@ type ListSourcesRequest struct {
 	MinUpdatedAt     *int64  `protobuf:"varint,6,opt,name=min_updated_at,json=minUpdatedAt,proto3,oneof" json:"min_updated_at,omitempty"`
 	// Return newest workers first and cap the response. Zero/unset means no cap.
 	Limit *uint32 `protobuf:"varint,7,opt,name=limit,proto3,oneof" json:"limit,omitempty"`
-	// Fail the RPC on a metadata backend error rather than returning an empty list.
+	// Return an error instead of an empty list on a metadata backend failure.
 	Strict        bool `protobuf:"varint,8,opt,name=strict,proto3" json:"strict,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2842,10 +2833,9 @@ type UpdateStatusRequest struct {
 	// server's SourceInstanceRef.source_load tracks live load. Leave unset when
 	// no provider has a reading; 0 means measured idle. See
 	// SourceInstanceRef.source_load.
-	SourceLoad      *float32 `protobuf:"fixed32,5,opt,name=source_load,json=sourceLoad,proto3,oneof" json:"source_load,omitempty"`
-	DonorLeaseToken string   `protobuf:"bytes,6,opt,name=donor_lease_token,json=donorLeaseToken,proto3" json:"donor_lease_token,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	SourceLoad    *float32 `protobuf:"fixed32,5,opt,name=source_load,json=sourceLoad,proto3,oneof" json:"source_load,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *UpdateStatusRequest) Reset() {
@@ -2911,13 +2901,6 @@ func (x *UpdateStatusRequest) GetSourceLoad() float32 {
 		return *x.SourceLoad
 	}
 	return 0
-}
-
-func (x *UpdateStatusRequest) GetDonorLeaseToken() string {
-	if x != nil {
-		return x.DonorLeaseToken
-	}
-	return ""
 }
 
 type UpdateStatusResponse struct {
@@ -3286,15 +3269,14 @@ const file_p2p_proto_rawDesc = "" +
 	"mxSourceId\x12\x1f\n" +
 	"\vartifact_id\x18\x02 \x01(\tR\n" +
 	"artifactId\x12>\n" +
-	"\x05chunk\x18\x03 \x01(\v2(.model_express.p2p.ArtifactManifestChunkR\x05chunk\"\xb4\x02\n" +
+	"\x05chunk\x18\x03 \x01(\v2(.model_express.p2p.ArtifactManifestChunkR\x05chunk\"\x88\x02\n" +
 	"\x16PublishMetadataRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x129\n" +
 	"\x06worker\x18\x02 \x01(\v2!.model_express.p2p.WorkerMetadataR\x06worker\x12\x1b\n" +
 	"\tworker_id\x18\x03 \x01(\tR\bworkerId\x12\x19\n" +
 	"\bpod_name\x18\x04 \x01(\tR\apodName\x12\x17\n" +
 	"\apod_uid\x18\x05 \x01(\tR\x06podUid\x12#\n" +
-	"\rpod_namespace\x18\x06 \x01(\tR\fpodNamespace\x12*\n" +
-	"\x11donor_lease_token\x18\a \x01(\tR\x0fdonorLeaseToken\"\x8c\x01\n" +
+	"\rpod_namespace\x18\x06 \x01(\tR\fpodNamespace\"\x8c\x01\n" +
 	"\x17PublishMetadataResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12 \n" +
@@ -3351,7 +3333,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
 	"\tworker_id\x18\x04 \x01(\tR\bworkerId\x12=\n" +
-	"\bidentity\x18\x05 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\"\x90\x02\n" +
+	"\bidentity\x18\x05 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\"\xe4\x01\n" +
 	"\x13UpdateStatusRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
@@ -3360,8 +3342,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\x06status\x18\x03 \x01(\x0e2\x1f.model_express.p2p.SourceStatusR\x06status\x12\x1b\n" +
 	"\tworker_id\x18\x04 \x01(\tR\bworkerId\x12$\n" +
 	"\vsource_load\x18\x05 \x01(\x02H\x00R\n" +
-	"sourceLoad\x88\x01\x01\x12*\n" +
-	"\x11donor_lease_token\x18\x06 \x01(\tR\x0fdonorLeaseTokenB\x0e\n" +
+	"sourceLoad\x88\x01\x01B\x0e\n" +
 	"\f_source_load\"J\n" +
 	"\x14UpdateStatusResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +

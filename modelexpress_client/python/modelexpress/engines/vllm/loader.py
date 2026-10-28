@@ -277,10 +277,6 @@ class MxModelLoader(BaseModelLoader):
 
                     with metrics.time_load_phase("vllm", model_id, "chain"):
                         model = self._run_load_strategy_chain(model, ctx)
-                        if ctx.donor_lease is not None:
-                            if ctx.donor_lease.lost.is_set():
-                                raise RuntimeError("MX donor lease lost during loading")
-                            ctx.donor_lease.publication_started = time.monotonic()
 
                     if ctx.p2p_enabled and ctx.p2p_role == "draft":
                         if ctx.nixl_manager is not None:

@@ -74,7 +74,7 @@ class P2pServiceServicer(object):
     """
 
     def DonorLease(self, request, context):
-        """Coordinate the donor for a compatible cold start.
+        """Coordinate a donor for concurrent cold starts.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

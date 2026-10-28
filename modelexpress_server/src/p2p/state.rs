@@ -152,20 +152,6 @@ impl P2pStateManager {
             .await
     }
 
-    /// Publish only while the caller owns the donor lease.
-    pub async fn publish_metadata_fenced(
-        &self,
-        identity: &SourceIdentity,
-        worker_id: &str,
-        worker: WorkerMetadata,
-        owner_token: &str,
-    ) -> MetadataResult<()> {
-        self.get_backend()
-            .await?
-            .publish_metadata_fenced(identity, worker_id, worker, owner_token)
-            .await
-    }
-
     /// Try to acquire a cold-start donor lease on the configured backend.
     pub async fn try_acquire_donor_lease(
         &self,
@@ -276,29 +262,6 @@ impl P2pStateManager {
     // ========================================================================
 
     /// Update the status of a worker within its stored metadata record.
-    pub async fn update_worker_status_fenced(
-        &self,
-        source_id: &str,
-        worker_id: &str,
-        worker_rank: u32,
-        status: modelexpress_common::grpc::p2p::SourceStatus,
-        source_load: Option<f32>,
-        owner_token: &str,
-    ) -> MetadataResult<()> {
-        self.get_backend()
-            .await?
-            .update_status_fenced(
-                source_id,
-                worker_id,
-                worker_rank,
-                status,
-                chrono::Utc::now().timestamp_millis(),
-                source_load,
-                owner_token,
-            )
-            .await
-    }
-
     pub async fn update_worker_status(
         &self,
         source_id: &str,
@@ -614,40 +577,6 @@ mod tests {
         assert_eq!(record.workers.len(), 2);
         assert_eq!(record.workers[0].worker_rank, 0);
         assert_eq!(record.workers[1].worker_rank, 1);
-    }
-
-    #[tokio::test]
-    async fn test_donor_lease_operations_forward_through_state() {
-        let mut mock = MockMetadataBackend::new();
-        mock.expect_try_acquire_donor_lease()
-            .times(1)
-            .returning(|_, _, _| Ok(true));
-        mock.expect_renew_donor_lease()
-            .times(1)
-            .returning(|_, _, _| Ok(false));
-        mock.expect_release_donor_lease()
-            .times(1)
-            .returning(|_, _| Err("backend unavailable".into()));
-        let manager = P2pStateManager::with_backend(Arc::new(mock));
-        let ttl = std::time::Duration::from_secs(30);
-        assert!(
-            manager
-                .try_acquire_donor_lease("source", "token", ttl)
-                .await
-                .expect("acquire")
-        );
-        assert!(
-            !manager
-                .renew_donor_lease("source", "token", ttl)
-                .await
-                .expect("renew")
-        );
-        assert!(
-            manager
-                .release_donor_lease("source", "token")
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test]

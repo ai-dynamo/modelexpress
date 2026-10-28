@@ -88,14 +88,12 @@ class PublisherThread:
         heartbeat_after_publish: bool = True,
         retry_publish_on_failure: bool = True,
         source_load_provider: Callable[[], float | None] | None = None,
-        donor_lease_token: str = "",
     ):
         if mx_source_id is None and publish_fn is None:
             raise ValueError("PublisherThread requires mx_source_id or publish_fn")
         if worker_id is None or worker_rank is None:
             raise ValueError("PublisherThread requires worker_id and worker_rank")
 
-        self._donor_lease_token = donor_lease_token
         self._mx_client = mx_client
         self._mx_source_id = mx_source_id
         self._worker_id = worker_id
@@ -183,7 +181,6 @@ class PublisherThread:
                 return
             try:
                 from .. import p2p_pb2
-
                 if self._update_status(p2p_pb2.SOURCE_STATUS_STALE):
                     logger.info(
                         f"[Worker {self._worker_rank}] Marked STALE on shutdown"
@@ -217,7 +214,6 @@ class PublisherThread:
             reason = getattr(self._nixl_manager, "data_plane_error", None)
             try:
                 from .. import p2p_pb2
-
                 self._update_status(p2p_pb2.SOURCE_STATUS_STALE)
                 self._unhealthy = True
                 logger.warning(
@@ -258,11 +254,6 @@ class PublisherThread:
             worker_rank=self._worker_rank,
             status=status,
             source_load=source_load,
-            **(
-                {"donor_lease_token": self._donor_lease_token}
-                if self._donor_lease_token
-                else {}
-            ),
         )
 
     def _on_heartbeat_rejected(self) -> None:
@@ -438,7 +429,9 @@ class PublisherThread:
                     f"status -> READY"
                 )
             if not self._started:
-                logger.info(f"[Worker {self._worker_rank}] Status -> READY")
+                logger.info(
+                    f"[Worker {self._worker_rank}] Status -> READY"
+                )
                 self._started = True
 
     def _run(self) -> None:
@@ -446,7 +439,9 @@ class PublisherThread:
             try:
                 self._tick()
             except Exception:
-                logger.exception(f"[Worker {self._worker_rank}] Publisher tick failed")
+                logger.exception(
+                    f"[Worker {self._worker_rank}] Publisher tick failed"
+                )
             interval = self._interval
             if self._mx_source_id is None and self._ready_fn is not None:
                 interval = min(interval, READY_POLL_SECS)

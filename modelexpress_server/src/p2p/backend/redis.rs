@@ -82,15 +82,6 @@ if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 0 then
     return -1
 end
 
-local stored_token = redis.call('HGET', KEYS[1], '__donor_lease_token__')
-if stored_token then
-    if ARGV[7] ~= '1' and (stored_token ~= ARGV[6] or redis.call('GET', KEYS[3]) ~= stored_token) then
-        return -2
-    end
-elseif ARGV[6] ~= '' then
-    return -2
-end
-
 local incoming_updated_at = tonumber(ARGV[5])
 local current_json = redis.call('HGET', KEYS[1], ARGV[2])
 if current_json then
@@ -245,29 +236,19 @@ async fn update_status_if_fresh(
     worker_rank: u32,
     summary: &str,
     updated_at: i64,
-    owner_token: &str,
-    allow_stale: bool,
 ) -> MetadataResult<bool> {
     let result: i32 = redis::Script::new(UPDATE_STATUS_IF_FRESH_LUA)
         .key(worker_key)
         .key(source_key)
-        .key(donor_lease_key(
-            source_key
-                .strip_prefix(keys::SOURCE_PREFIX)
-                .unwrap_or(source_key),
-        ))
         .arg(worker_rank)
         .arg(status_field(worker_rank))
         .arg(worker_id)
         .arg(summary)
         .arg(updated_at)
-        .arg(owner_token)
-        .arg(if allow_stale { "1" } else { "0" })
         .invoke_async(conn)
         .await?;
 
     match result {
-        -2 => Err("donor lease is no longer held".into()),
         -1 => Err(format!("worker rank {worker_rank} not found in '{worker_key}'").into()),
         0 => Ok(false),
         1 => Ok(true),
@@ -484,8 +465,6 @@ struct WorkerSummaryJson {
     source_load: Option<f32>,
     #[serde(default)]
     topology: HashMap<String, String>,
-    #[serde(default)]
-    donor_lease_token: Option<String>,
 }
 
 /// Serializable artifact source summary.
@@ -622,8 +601,7 @@ impl RedisBackend {
 
     /// Try to acquire a cold-start donor lease for a compatibility key.
     ///
-    /// This primitive is not yet integrated with publication or the client load
-    /// path. Callers must use a fresh, unpredictable token for each attempt.
+    /// Callers must use a fresh, unpredictable token for each attempt.
     pub async fn try_acquire_donor_lease(
         &self,
         compatibility_key: &str,
@@ -753,62 +731,6 @@ impl MetadataBackend for RedisBackend {
         RedisBackend::release_donor_lease(self, compatibility_key, owner_token).await
     }
 
-    async fn publish_metadata_fenced(
-        &self,
-        identity: &SourceIdentity,
-        worker_id: &str,
-        worker: WorkerMetadata,
-        owner_token: &str,
-    ) -> MetadataResult<()> {
-        let source_id = crate::p2p::source_identity::compute_mx_source_id(identity);
-        validate_donor_lease_identity(&source_id, owner_token)?;
-        let record = WorkerRecord::from(worker);
-        let rank = record.worker_rank.to_string();
-        let value = serde_json::to_string(&WorkerRecordJson::from_worker_record(record.clone()))?;
-        let attributes = serde_json::to_string(&SourceAttributesJson::from(identity))?;
-        let summary = serde_json::to_string(&WorkerSummaryJson {
-            worker_rank: record.worker_rank,
-            status: record.status,
-            updated_at: record.updated_at,
-            accelerator: record.accelerator.clone(),
-            source_load: record.source_load,
-            topology: record.topology.clone(),
-            donor_lease_token: Some(owner_token.to_string()),
-        })?;
-        let script = redis::Script::new(
-            r#"
-            if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-            redis.call('HSET', KEYS[2], ARGV[2], ARGV[3], ARGV[4], ARGV[5], '__donor_lease_token__', ARGV[1])
-            redis.call('HSET', KEYS[3], ARGV[6], ARGV[7], ARGV[8], ARGV[5])
-            return 1
-        "#,
-        );
-        let mut conn = self.get_conn().await?;
-        let published: i32 = script
-            .key(donor_lease_key(&source_id))
-            .key(format!(
-                "{}{}:{}",
-                keys::SOURCE_PREFIX,
-                source_id,
-                worker_id
-            ))
-            .key(format!("{}{}", keys::SOURCE_PREFIX, source_id))
-            .arg(owner_token)
-            .arg(&rank)
-            .arg(value)
-            .arg(status_field(record.worker_rank))
-            .arg(summary)
-            .arg(keys::ATTRIBUTES_FIELD)
-            .arg(attributes)
-            .arg(worker_id)
-            .invoke_async(&mut conn)
-            .await?;
-        if published != 1 {
-            return Err("donor lease lost before publication".into());
-        }
-        Ok(())
-    }
-
     async fn publish_metadata(
         &self,
         identity: &SourceIdentity,
@@ -834,7 +756,6 @@ impl MetadataBackend for RedisBackend {
             accelerator: worker_record.accelerator.clone(),
             source_load: worker_record.source_load,
             topology: worker_record.topology.clone(),
-            donor_lease_token: None,
         })?;
 
         let mut pipe = redis::pipe();
@@ -1042,14 +963,6 @@ impl MetadataBackend for RedisBackend {
         }
         let source_hashes: Vec<Vec<(String, String)>> = source_pipe.query_async(&mut conn).await?;
 
-        let mut lease_pipe = redis::pipe();
-        for sid in &source_ids {
-            lease_pipe.get(donor_lease_key(sid));
-        }
-        let leases: Vec<Option<String>> = lease_pipe.query_async(&mut conn).await?;
-        let active_leases: HashMap<&str, Option<String>> =
-            source_ids.iter().map(String::as_str).zip(leases).collect();
-
         let mut detailed_selected = Vec::new();
         let mut result = Vec::new();
         for (sid, pairs) in source_ids.iter().zip(source_hashes) {
@@ -1077,15 +990,6 @@ impl MetadataBackend for RedisBackend {
                 .filter(|(key, _)| key.as_str() != keys::ATTRIBUTES_FIELD)
             {
                 let summary = serde_json::from_str::<WorkerSummaryJson>(rank_text).ok();
-                if summary
-                    .as_ref()
-                    .and_then(|s| s.donor_lease_token.as_ref())
-                    .is_some_and(|token| {
-                        active_leases.get(sid.as_str()).and_then(|v| v.as_ref()) != Some(token)
-                    })
-                {
-                    continue;
-                }
                 let worker_rank = summary
                     .as_ref()
                     .map(|value| value.worker_rank)
@@ -1275,55 +1179,6 @@ impl MetadataBackend for RedisBackend {
         updated_at: i64,
         source_load: Option<f32>,
     ) -> MetadataResult<()> {
-        self.update_status_inner(
-            source_id,
-            worker_id,
-            worker_rank,
-            status,
-            updated_at,
-            source_load,
-            "",
-            status == SourceStatus::Stale,
-        )
-        .await
-    }
-
-    async fn update_status_fenced(
-        &self,
-        source_id: &str,
-        worker_id: &str,
-        worker_rank: u32,
-        status: SourceStatus,
-        updated_at: i64,
-        source_load: Option<f32>,
-        owner_token: &str,
-    ) -> MetadataResult<()> {
-        self.update_status_inner(
-            source_id,
-            worker_id,
-            worker_rank,
-            status,
-            updated_at,
-            source_load,
-            owner_token,
-            false,
-        )
-        .await
-    }
-}
-
-impl RedisBackend {
-    async fn update_status_inner(
-        &self,
-        source_id: &str,
-        worker_id: &str,
-        worker_rank: u32,
-        status: SourceStatus,
-        updated_at: i64,
-        source_load: Option<f32>,
-        owner_token: &str,
-        allow_stale: bool,
-    ) -> MetadataResult<()> {
         let mut conn = self.get_conn().await?;
         let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
 
@@ -1333,15 +1188,11 @@ impl RedisBackend {
         // carried forward rather than recomputed -- but it must be carried, because
         // this summary is also written into the source index that the fast list
         // path reads topology from.
-        let (accelerator, topology, donor_lease_token) = if let Some(summary) = status_json
+        let (accelerator, topology) = if let Some(summary) = status_json
             .as_deref()
             .and_then(|value| serde_json::from_str::<WorkerSummaryJson>(value).ok())
         {
-            (
-                summary.accelerator,
-                summary.topology,
-                summary.donor_lease_token,
-            )
+            (summary.accelerator, summary.topology)
         } else {
             // Record predating the status field: seed both from it once.
             let value: Option<String> = conn.hget(&key, worker_rank.to_string()).await?;
@@ -1352,7 +1203,7 @@ impl RedisBackend {
                 )
             })?;
             let record: WorkerRecordJson = serde_json::from_str(&json_str)?;
-            (record.accelerator, record.topology, None)
+            (record.accelerator, record.topology)
         };
 
         let status_summary = serde_json::to_string(&WorkerSummaryJson {
@@ -1362,7 +1213,6 @@ impl RedisBackend {
             accelerator,
             source_load,
             topology,
-            donor_lease_token,
         })?;
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
         let updated = update_status_if_fresh(
@@ -1373,8 +1223,6 @@ impl RedisBackend {
             worker_rank,
             &status_summary,
             updated_at,
-            owner_token,
-            allow_stale,
         )
         .await?;
 
@@ -1397,6 +1245,8 @@ impl RedisBackend {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // ── TensorRecordJson serialization ──────────────────────────────────────
 
     #[test]
     fn donor_lease_validates_identity_and_duration() {
@@ -1478,111 +1328,6 @@ mod tests {
                 .expect("release owner")
         );
     }
-
-    #[tokio::test]
-    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
-    async fn donor_lease_fences_publication_and_discovery() {
-        use std::time::Duration;
-        let redis_url = std::env::var("MX_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        let backend = RedisBackend::new(&redis_url);
-        backend.connect().await.expect("connect");
-        let mut identity = test_identity();
-        identity.model_name = format!("fenced-publish-test/{}", uuid::Uuid::new_v4());
-        let source_id = crate::p2p::source_identity::compute_mx_source_id(&identity);
-        let worker = WorkerMetadata {
-            worker_rank: 0,
-            status: SourceStatus::Initializing as i32,
-            updated_at: 100,
-            accelerator: "cuda".to_string(),
-            ..Default::default()
-        };
-        assert!(
-            backend
-                .try_acquire_donor_lease(&source_id, "old", Duration::from_millis(100))
-                .await
-                .expect("acquire")
-        );
-        backend
-            .publish_metadata_fenced(&identity, "fenced", worker.clone(), "old")
-            .await
-            .expect("publish");
-        backend
-            .update_status_fenced(
-                &source_id,
-                "fenced",
-                0,
-                SourceStatus::Ready,
-                200,
-                None,
-                "old",
-            )
-            .await
-            .expect("ready");
-        backend
-            .publish_metadata(&identity, "legacy", worker.clone(), "", "", "")
-            .await
-            .expect("legacy publish");
-        assert_eq!(
-            backend
-                .list_workers_filtered(Some(source_id.clone()), None, None, None, None, None, None)
-                .await
-                .expect("list")
-                .len(),
-            2
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            backend
-                .try_acquire_donor_lease(&source_id, "new", Duration::from_secs(5))
-                .await
-                .expect("takeover")
-        );
-        assert!(
-            backend
-                .publish_metadata_fenced(&identity, "stale", worker.clone(), "old")
-                .await
-                .is_err()
-        );
-        assert!(
-            backend
-                .update_status_fenced(
-                    &source_id,
-                    "fenced",
-                    0,
-                    SourceStatus::Ready,
-                    300,
-                    None,
-                    "old"
-                )
-                .await
-                .is_err()
-        );
-        let listed = backend
-            .list_workers_filtered(Some(source_id.clone()), None, None, None, None, None, None)
-            .await
-            .expect("list after takeover");
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].worker_id, "legacy");
-        backend
-            .publish_metadata_fenced(&identity, "replacement", worker, "new")
-            .await
-            .expect("replacement publish");
-        assert_eq!(
-            backend
-                .list_workers_filtered(Some(source_id.clone()), None, None, None, None, None, None)
-                .await
-                .expect("list replacement")
-                .len(),
-            2
-        );
-        backend
-            .release_donor_lease(&source_id, "new")
-            .await
-            .expect("release");
-    }
-
-    // ── TensorRecordJson serialization ──────────────────────────────────────
 
     #[test]
     fn test_tensor_record_json_roundtrip() {
@@ -1705,7 +1450,6 @@ mod tests {
             accelerator: "cuda".to_string(),
             source_load: Some(0.5),
             topology: HashMap::from([("rack".to_string(), "r3".to_string())]),
-            donor_lease_token: None,
         };
         let json = serde_json::to_string(&summary).expect("serialize");
         let parsed: WorkerSummaryJson = serde_json::from_str(&json).expect("deserialize");
@@ -1727,7 +1471,6 @@ mod tests {
             accelerator: "cuda".to_string(),
             source_load: None,
             topology: HashMap::from([("rack".to_string(), "r3".to_string())]),
-            donor_lease_token: None,
         };
         let json = serde_json::to_string(&summary).expect("serialize");
         let parsed: WorkerSummaryJson = serde_json::from_str(&json).expect("deserialize");

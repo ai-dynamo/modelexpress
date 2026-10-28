@@ -863,7 +863,6 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_ARTIFACT_MOONCAKE_NAMESPACE` | `modelexpress/artifacts` | Key prefix used by the Mooncake artifact backend. |
 | `MX_MOONCAKE_CONFIG_PATH` | (unset) | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback. |
 | `MX_P2P_COLD_START` | `0` | Opt in to lease-coordinated concurrent cold starts with vLLM and a centralized Redis-backed MX server. Supports tensor parallelism only. |
-| `MX_COLD_START_TIMEOUT_SECS` | `0` | Donor startup timeout in seconds; `0` disables it. Followers waiting for an election do not have a timeout. |
 | `MX_ARTIFACT_READY_URL` | Framework default for bundles; unset for vLLM weight publication | Readiness endpoint used before preparing and publishing cache artifact bundles. For vLLM weight metadata, readiness is gated only when explicitly configured. Bundle readiness defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
@@ -1159,12 +1158,15 @@ handles.
 
 ### P2P Metadata Exchange
 
-With `MX_P2P_COLD_START=1`, rank zero coordinates the donor with a 60-second
-lease, renewed every 20 seconds; followers poll every 2 seconds for a complete
-READY donor group. Lease fencing does not cancel a stalled download, and a
-follower does not retry election after choosing a donor. A donor whose startup
-hangs can continue renewing indefinitely unless `MX_COLD_START_TIMEOUT_SECS` is
-set.
+With `MX_P2P_COLD_START=1`, replica rank zero coordinates via a 60-second
+Redis lease, renewed every 20 seconds. Followers check READY ranks every two
+seconds. A live but hung donor may renew indefinitely; expired donors are not
+fenced from publishing. The lease is scoped to source identity, not accelerator
+compatibility, and the normal load strategy can fall back to object storage.
+Election runs at weight loading and does not prevent earlier downloads. For
+server-backed, non-shared storage, set `MODEL_EXPRESS_NO_SHARED_STORAGE=1`
+and configure the MX server so the vLLM loader leaves weight acquisition to
+the strategy chain. Metadata may still be fetched before election.
 
 On UCX/RC deployments where short GPU reads are emulated in the source process,
 peer reads during CUDA graph capture can invalidate capture. Operators may set

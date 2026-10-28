@@ -384,14 +384,12 @@ Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally whe
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
-With `MX_P2P_COLD_START=1`, the vLLM loader uses a Redis-backed lease per
-source identity to coordinate concurrent cold starts. Rank zero elects a donor
-and broadcasts the decision to its tensor-parallel group. Followers wait for
-all ranks in a coordinated donor group to publish READY, then load from that
-group over P2P. Publication and heartbeats are fenced by the live lease.
-An expired donor can continue an in-flight object-store download; fencing does
-not cancel it or an already-started P2P transfer. Followers do not re-elect
-after selecting a donor, and existing non-coordinated donors are not selected.
+With `MX_P2P_COLD_START=1`, rank zero of each vLLM tensor-parallel replica
+checks for READY sources and competes for a Redis lease per source identity.
+The lease holder loads through the existing strategy chain; followers wait for
+compatible READY ranks before using the same chain. Publication is not fenced:
+an expired donor can still finish and publish, and normal P2P fallback remains
+available. READY ranks need not belong to the same replica.
 
 ### RL refit service
 

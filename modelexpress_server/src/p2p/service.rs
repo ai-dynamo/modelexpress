@@ -185,23 +185,18 @@ impl P2pService for P2pServiceImpl {
         let worker_rank = worker.worker_rank;
         let tensor_count = worker_tensor_count(&worker);
 
-        let result = if req.donor_lease_token.is_empty() {
-            self.state
-                .publish_metadata(
-                    &identity,
-                    &worker_id,
-                    worker,
-                    &req.pod_name,
-                    &req.pod_uid,
-                    &req.pod_namespace,
-                )
-                .await
-        } else {
-            self.state
-                .publish_metadata_fenced(&identity, &worker_id, worker, &req.donor_lease_token)
-                .await
-        };
-        match result {
+        match self
+            .state
+            .publish_metadata(
+                &identity,
+                &worker_id,
+                worker,
+                &req.pod_name,
+                &req.pod_uid,
+                &req.pod_namespace,
+            )
+            .await
+        {
             Ok(()) => {
                 info!(
                     "PublishMetadata: model='{}' source_id={} worker_id={} worker_rank={} tensors={}",
@@ -452,29 +447,17 @@ impl P2pService for P2pServiceImpl {
             .filter(|v| v.is_finite())
             .map(|v| v.clamp(0.0, 1.0));
 
-        let result = if req.donor_lease_token.is_empty() {
-            self.state
-                .update_worker_status(
-                    &req.mx_source_id,
-                    &req.worker_id,
-                    req.worker_rank,
-                    status,
-                    source_load,
-                )
-                .await
-        } else {
-            self.state
-                .update_worker_status_fenced(
-                    &req.mx_source_id,
-                    &req.worker_id,
-                    req.worker_rank,
-                    status,
-                    source_load,
-                    &req.donor_lease_token,
-                )
-                .await
-        };
-        match result {
+        match self
+            .state
+            .update_worker_status(
+                &req.mx_source_id,
+                &req.worker_id,
+                req.worker_rank,
+                status,
+                source_load,
+            )
+            .await
+        {
             Ok(()) => tagged(
                 UpdateStatusResponse {
                     success: true,
@@ -634,7 +617,6 @@ mod tests {
                 pod_name: "vllm-worker-0".to_string(),
                 pod_uid: "pod-uid-1".to_string(),
                 pod_namespace: "default".to_string(),
-                donor_lease_token: String::new(),
             }))
             .await
             .expect("rpc")
@@ -773,7 +755,6 @@ mod tests {
                 worker_rank: 0,
                 status: 99,
                 source_load: None,
-                donor_lease_token: String::new(),
             }))
             .await
             .expect("rpc")
@@ -792,7 +773,6 @@ mod tests {
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
                 source_load: None,
-                donor_lease_token: String::new(),
             }))
             .await
             .expect("rpc")
@@ -810,7 +790,6 @@ mod tests {
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
                 source_load: None,
-                donor_lease_token: String::new(),
             }))
             .await
             .expect("rpc")
@@ -837,7 +816,6 @@ mod tests {
                 worker_rank: 3,
                 status: SourceStatus::Ready as i32,
                 source_load: Some(0.42),
-                donor_lease_token: String::new(),
             }))
             .await
             .expect("rpc")
@@ -1277,7 +1255,6 @@ mod tests {
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
                 source_load: None,
-                donor_lease_token: String::new(),
             }))
             .await
             .expect("rpc")

@@ -84,7 +84,6 @@ def publish_metadata_and_ready(
     worker_id: str,
     accelerator: str = "cuda",
     ready_fn: Callable[[], bool] | None = None,
-    donor_lease_token: str = "",
 ) -> None:
     """Prepare tensor metadata publication and start the publisher thread.
 
@@ -151,7 +150,6 @@ def publish_metadata_and_ready(
                 worker=worker,
                 worker_id=worker_id,
                 worker_rank=worker_rank,
-                donor_lease_token=donor_lease_token,
             )
             grpc_server.set_mx_source_id(mx_source_id)
             logger.info(
@@ -193,7 +191,6 @@ def publish_metadata_and_ready(
                 worker=worker,
                 worker_id=worker_id,
                 worker_rank=worker_rank,
-                donor_lease_token=donor_lease_token,
             )
             logger.info(
                 f"[Worker {worker_rank}] Published metadata to MX server "
@@ -216,7 +213,6 @@ def publish_metadata_and_ready(
         ready_fn=ready_fn,
         cleanup_fn=cleanup_fn,
         source_load_provider=make_source_load_provider(device_id),
-        donor_lease_token=donor_lease_token,
     )
     publisher.start()
     _heartbeat_threads[worker_rank] = publisher
@@ -268,17 +264,13 @@ def _publish_metadata_to_server(
     worker: "p2p_pb2.WorkerMetadata",
     worker_id: str,
     worker_rank: int,
-    donor_lease_token: str = "",
 ) -> str:
     """Publish metadata with bounded retries and exponential backoff."""
     last_error: grpc.RpcError | None = None
 
     for attempt in range(1, PUBLISH_METADATA_MAX_ATTEMPTS + 1):
         try:
-            kwargs = (
-                {"donor_lease_token": donor_lease_token} if donor_lease_token else {}
-            )
-            return mx_client.publish_metadata(identity, worker, worker_id, **kwargs)
+            return mx_client.publish_metadata(identity, worker, worker_id)
         except grpc.RpcError as exc:
             if exc.code() not in PUBLISH_METADATA_RETRYABLE_STATUS_CODES:
                 raise
@@ -287,9 +279,7 @@ def _publish_metadata_to_server(
             if attempt == PUBLISH_METADATA_MAX_ATTEMPTS:
                 break
 
-            backoff_seconds = PUBLISH_METADATA_INITIAL_BACKOFF_SECONDS * (
-                2 ** (attempt - 1)
-            )
+            backoff_seconds = PUBLISH_METADATA_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
             logger.warning(
                 f"[Worker {worker_rank}] Publish metadata attempt {attempt}/"
                 f"{PUBLISH_METADATA_MAX_ATTEMPTS} failed with retryable gRPC status "
@@ -326,8 +316,7 @@ def _is_p2p_metadata_enabled(mx_client) -> bool:
             logger.warning(
                 "MX_P2P_METADATA=%r is ignored for backend %s which "
                 "always uses the P2P metadata path",
-                env_value,
-                type(mx_client).__name__,
+                env_value, type(mx_client).__name__,
             )
         return True
     return envs.MX_P2P_METADATA == "1"
@@ -340,7 +329,6 @@ def _get_worker_host() -> str:
     Falls back to FQDN. Rejects localhost variants.
     """
     import socket
-
     explicit = envs.MX_WORKER_HOST
     if explicit:
         return explicit
