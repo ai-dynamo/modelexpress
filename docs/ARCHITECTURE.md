@@ -384,6 +384,11 @@ Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally whe
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
+The Redis P2P metadata backend also contains donor-lease primitives for future
+coordinated cold starts. They are not exposed through the API or used by model
+loading yet. Lease ownership checks alone do not fence metadata publication or
+prevent an expired donor from continuing its object-store download.
+
 ### RL refit service
 
 The optional Redis-backed RefitService, immutable WeightVersion model, shard publication protocol, and generator/trainer control clients are described in the [RL refit architecture](rl/ARCHITECTURE.md#refit-service-and-version-model).
