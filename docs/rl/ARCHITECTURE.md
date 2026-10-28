@@ -114,13 +114,14 @@ when the index declares `checksum_format="adler32"`, and reset the exact base
 for later deltas.
 
 Canonical S3 artifact downloads default to a persistent TransferManager.
-`MX_S3_DOWNLOAD_BACKEND=ranged` selects a preallocated-buffer implementation:
+`MX_S3_DOWNLOAD_BACKEND=preallocated` selects a preallocated-buffer implementation:
 HEAD supplies size and ETag, conditional data GETs share one per-client worker
-pool, and each response body has bounded streaming retries. Small objects use
+pool, and each response body has bounded streaming retries with jittered backoff. Small objects use
 one data GET; large objects use parallel byte ranges. Object changes and invalid
 range responses fail preparation. Both implementations return complete artifact
 bytes to the receiver before checkpoint validation and reconstruction. This
-selection does not change the normal ModelStreamer loader. See
+selection does not change the normal ModelStreamer loader. The downloader
+implementations own their resources behind a shared `get`/`close` interface. See
 [S3 transfer tuning](../../modelexpress_client/python/README.md#canonical-s3-transfer-tuning).
 
 Canonical S3 versions are retained for rollout fault recovery. Trainer

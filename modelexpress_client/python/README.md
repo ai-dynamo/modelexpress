@@ -179,18 +179,23 @@ Shared client settings are registered in `modelexpress.envs`. RL settings are li
 
 Objects below the configured thresholds use one PUT or GET. Larger uploads use
 multipart parts. Downloads default to one persistent `s3transfer.TransferManager`
-per `S3Client`. Set `MX_S3_DOWNLOAD_BACKEND=ranged` to opt in to parallel GETs
+per `S3Client`. Set `MX_S3_DOWNLOAD_BACKEND=preallocated` to opt in to parallel GETs
 into a preallocated buffer.
 This affects canonical S3 artifact downloads for refit and recovery; the normal
 ModelStreamer loading path has its own downloader.
 
-The ranged backend starts with HEAD for size and ETag. Below the range threshold,
+The preallocated backend starts with HEAD for size and ETag. Below the range
+threshold,
 it performs one whole-object GET; otherwise it issues parallel ranges. All data
 GETs, including the first range and body-read retries, share one per-client pool
 limited by `MX_REFIT_DOWNLOAD_WORKERS` (falling back to `MX_S3_DOWNLOAD_WORKERS`,
 then 16). HEAD requests are outside this data-GET budget. Every GET is pinned to
 the HEAD ETag with `IfMatch`; an object change or an invalid range response fails
 without retrying. Endpoints must support HEAD, conditional GET, and byte ranges.
+Transient body-read failures use capped exponential backoff with full jitter
+(0–100 ms before the first retry, doubling to a 2 s cap); request retries remain
+managed by botocore. Each backend owns its download resources behind a shared
+`get`/`close` interface.
 Select `transfer_manager` explicitly to return to the default implementation;
 there is no automatic backend switch on an error.
 
@@ -204,18 +209,34 @@ before enabling it for large models.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_S3_DOWNLOAD_BACKEND` | `transfer_manager` | `transfer_manager` or opt-in `ranged` |
+| `MX_S3_DOWNLOAD_BACKEND` | `transfer_manager` | `transfer_manager` or opt-in `preallocated` |
 | `MX_S3_MULTIPART_THRESHOLD_BYTES` | `104857600` (100 MiB) | Minimum object size for multipart upload |
 | `MX_S3_UPLOAD_PART_BYTES` | `16777216` (16 MiB) | Multipart upload part size |
 | `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart part uploads |
 | `MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES` | `104857600` (100 MiB) | Minimum object size for parallel ranged download |
 | `MX_S3_DOWNLOAD_RANGE_BYTES` | `8388608` (8 MiB) | Byte-range size for parallel downloads |
 | `MX_S3_DOWNLOAD_WORKERS` | `16` | Legacy fallback for `MX_REFIT_DOWNLOAD_WORKERS`; sets file-worker and per-client data GET limits for either backend |
-| `MX_S3_DOWNLOAD_IO_CHUNK_BYTES` | `1048576` (1 MiB) | TransferManager I/O queue chunk size; ranged-backend read chunk limit for SDK bodies without `readinto` |
+| `MX_S3_DOWNLOAD_IO_CHUNK_BYTES` | `1048576` (1 MiB) | TransferManager I/O queue chunk size; preallocated-backend read chunk limit for SDK bodies without `readinto` |
 | `MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS` | `16` | TransferManager only: sets `max_io_queue_size` and the non-seekable-output chunk limit. For the seekable `BytesIO` target, the default bounds queued I/O to about 16 MiB but does not cap the full downloaded object |
 | `MX_S3_MAX_POOL_CONNECTIONS` | `32` | Botocore HTTP connection-pool size |
-| `MX_S3_MAX_ATTEMPTS` | `5` | Botocore total request attempts and per-download (TransferManager) or per-range (ranged backend) body-read attempts |
+| `MX_S3_MAX_ATTEMPTS` | `5` | Botocore total request attempts and per-download (TransferManager) or per-range (preallocated backend) body-read attempts |
 | `MX_S3_TCP_KEEPALIVE` | `true` | Enable TCP keepalive for S3 connections |
+
+To compare the SDK writer with direct parallel writes, run the three-arm benchmark
+from `modelexpress_client/python` against an immutable S3 object:
+
+```bash
+PYTHONPATH=. python benchmarks/bench_s3_download.py s3://bucket/checkpoint \
+  --iterations 3 --warmup 1
+```
+
+It compares default TransferManager, TransferManager with preallocated output,
+and the `preallocated` backend using the same transfer settings. It rotates arm
+order, checks payload hashes and object ETags, and emits per-download JSON timing
+and throughput. Hashing is outside the timed interval; HEAD and buffer setup
+needed by each arm are included. Use `--endpoint-url` and `--region-name` for
+compatible endpoints. Run on the target host and endpoint: the reported upstream
+GB300 result does not establish that buffer growth causes the performance gap.
 
 ### UCX/NIXL Tuning
 

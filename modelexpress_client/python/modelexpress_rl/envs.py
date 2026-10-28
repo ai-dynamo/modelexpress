@@ -300,8 +300,10 @@ def require_positive_int(value: int, name: str) -> int:
 def s3_download_backend() -> str:
     """Select the canonical S3 download implementation."""
     value = os.environ.get("MX_S3_DOWNLOAD_BACKEND", "transfer_manager").strip().lower()
-    if value not in {"transfer_manager", "ranged"}:
-        raise ValueError("MX_S3_DOWNLOAD_BACKEND must be transfer_manager or ranged")
+    if value not in {"transfer_manager", "preallocated"}:
+        raise ValueError(
+            "MX_S3_DOWNLOAD_BACKEND must be transfer_manager or preallocated"
+        )
     return value
 
 

@@ -10,7 +10,12 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from botocore.exceptions import ClientError
 
+from modelexpress_rl import s3 as s3_module
 from modelexpress_rl.s3 import S3Client
+
+
+def _payload(size):
+    return (bytes(range(251)) * ((size + 250) // 251))[:size]
 
 
 class _Backend:
@@ -87,7 +92,7 @@ class _Backend:
 def _client(monkeypatch, backend, *, workers=2, threshold=16, range_bytes=8):
     import boto3
 
-    monkeypatch.setenv("MX_S3_DOWNLOAD_BACKEND", "ranged")
+    monkeypatch.setenv("MX_S3_DOWNLOAD_BACKEND", "preallocated")
     monkeypatch.setenv("MX_REFIT_DOWNLOAD_WORKERS", str(workers))
     monkeypatch.setenv("MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES", str(threshold))
     monkeypatch.setenv("MX_S3_DOWNLOAD_RANGE_BYTES", str(range_bytes))
@@ -119,7 +124,7 @@ def test_ranged_download_and_threshold(monkeypatch, size):
 @pytest.mark.parametrize("start", [0, 8])
 @pytest.mark.parametrize("failure", ["failures", "short_reads"])
 def test_retries_first_and_later_body_reads(monkeypatch, start, failure):
-    backend = _Backend(b"x" * 24)
+    backend = _Backend(_payload(24))
     getattr(backend, failure)[start] = 1
     client = _client(monkeypatch, backend)
     try:
@@ -133,7 +138,7 @@ def test_retries_first_and_later_body_reads(monkeypatch, start, failure):
 
 
 def test_small_object_body_retries_are_bounded(monkeypatch):
-    backend = _Backend(b"x" * 12)
+    backend = _Backend(_payload(12))
     backend.failures[0] = 5
     client = _client(monkeypatch, backend)
     try:
@@ -145,7 +150,7 @@ def test_small_object_body_retries_are_bounded(monkeypatch):
 
 
 def test_changed_object_is_not_retried(monkeypatch):
-    backend = _Backend(b"x" * 12)
+    backend = _Backend(_payload(12))
     backend.change = True
     client = _client(monkeypatch, backend)
     try:
@@ -158,7 +163,7 @@ def test_changed_object_is_not_retried(monkeypatch):
 
 @pytest.mark.parametrize("problem", ["ignore_range", "wrong_range"])
 def test_invalid_range_response_fails_and_closes_body(monkeypatch, problem):
-    backend = _Backend(b"x" * 24)
+    backend = _Backend(_payload(24))
     setattr(backend, problem, True)
     client = _client(monkeypatch, backend)
     try:
@@ -171,7 +176,7 @@ def test_invalid_range_response_fails_and_closes_body(monkeypatch, problem):
 
 
 def test_concurrent_objects_and_retries_share_get_budget(monkeypatch):
-    backend = _Backend(b"x" * 35)
+    backend = _Backend(_payload(35))
     backend.failures[0] = 1
     backend.short_reads[0] = 1
     backend.delay = 0.005
@@ -188,7 +193,7 @@ def test_concurrent_objects_and_retries_share_get_budget(monkeypatch):
 
 
 def test_ranged_download_avoids_a_second_full_object_allocation(monkeypatch):
-    backend = _Backend(b"x" * (16 * 1024**2))
+    backend = _Backend(_payload(16 * 1024**2))
     client = _client(monkeypatch, backend, range_bytes=1024**2)
     tracemalloc.start()
     try:
@@ -204,7 +209,7 @@ def test_ranged_download_avoids_a_second_full_object_allocation(monkeypatch):
 def test_older_sdk_streaming_body_without_readinto(monkeypatch):
     import io
 
-    backend = _Backend(b"x" * 35)
+    backend = _Backend(_payload(35))
     original = backend.get_object
 
     def get_object(**request):
@@ -236,7 +241,7 @@ def test_older_sdk_streaming_body_without_readinto(monkeypatch):
 
 
 def test_partial_body_reads_fill_the_entire_range(monkeypatch):
-    backend = _Backend(b"x" * 35)
+    backend = _Backend(_payload(35))
     original = backend.get_object
 
     def get_object(**request):
@@ -287,3 +292,137 @@ def test_sdk_body_checksum_is_validated_at_eof(monkeypatch, corrupt):
     finally:
         client.close()
     assert len(backend.requests) == 1
+
+
+@pytest.mark.parametrize("header", ["ContentLength", "ETag"])
+@pytest.mark.parametrize("stage", ["head_object", "get_object"])
+def test_missing_headers_identify_object_and_header(monkeypatch, header, stage):
+    backend = _Backend(_payload(35))
+    original = getattr(backend, stage)
+
+    def response_without_header(**request):
+        response = original(**request)
+        del response[header]
+        return response
+
+    setattr(backend, stage, response_without_header)
+    client = _client(monkeypatch, backend)
+    try:
+        with pytest.raises(
+            ValueError, match=f"missing S3 {header} for weights/checkpoint"
+        ):
+            client.get("s3://weights/checkpoint")
+    finally:
+        client.close()
+    assert backend.active == 0
+    assert backend.closed == len(backend.requests)
+
+
+@pytest.mark.parametrize("length", [-1, None, "invalid"])
+def test_invalid_content_length_is_diagnostic(monkeypatch, length):
+    backend = _Backend(_payload(35))
+    metadata = backend.head_object()
+    metadata["ContentLength"] = length
+    backend.head_object = lambda **_request: metadata
+    client = _client(monkeypatch, backend)
+    try:
+        with pytest.raises(
+            ValueError, match="invalid S3 ContentLength for weights/checkpoint"
+        ):
+            client.get("s3://weights/checkpoint")
+    finally:
+        client.close()
+    assert not backend.requests
+
+
+@pytest.mark.parametrize("start", [0, 8])
+@pytest.mark.parametrize("failure", ["error", "eof"])
+def test_retry_overwrites_partial_data(monkeypatch, start, failure):
+    backend = _Backend(_payload(35))
+    original = backend.get_object
+    failed = False
+
+    def get_object(**request):
+        nonlocal failed
+        response = original(**request)
+        if request.get("Range") == f"bytes={start}-{start + 7}" and not failed:
+            failed = True
+            body = response["Body"]
+            readinto = body.readinto
+            delivered = False
+
+            def partial_then_failure(target):
+                nonlocal delivered
+                if delivered:
+                    if failure == "eof":
+                        return 0
+                    raise OSError("response interrupted after partial data")
+                delivered = True
+                count = readinto(target[:3])
+                target[:count] = b"\xff" * count
+                return count
+
+            body.readinto = partial_then_failure
+        return response
+
+    backend.get_object = get_object
+    client = _client(monkeypatch, backend)
+    try:
+        assert client.get("s3://weights/checkpoint") == backend.data
+    finally:
+        client.close()
+    assert (
+        Counter(r["Range"] for r in backend.requests)[f"bytes={start}-{start + 7}"] == 2
+    )
+    assert backend.active == 0
+
+
+def test_failed_download_releases_buffer_with_traceback_retained(monkeypatch):
+    backend = _Backend(_payload(16 * 1024**2))
+    backend.failures[0] = 5
+    buffers = []
+    original = s3_module.BytesIO
+
+    def tracked_buffer():
+        buffer = original()
+        buffers.append(buffer)
+        return buffer
+
+    monkeypatch.setattr(s3_module, "BytesIO", tracked_buffer)
+    client = _client(monkeypatch, backend, workers=1, range_bytes=1024**2)
+    tracemalloc.start()
+    try:
+        with pytest.raises(OSError) as error:
+            client.get("s3://weights/checkpoint")
+        retained, peak = tracemalloc.get_traced_memory()
+        assert error.traceback is not None
+        assert peak >= len(backend.data)
+        assert retained < len(backend.data) / 2
+        assert buffers and all(buffer.closed for buffer in buffers)
+        assert backend.active == 0
+    finally:
+        tracemalloc.stop()
+        client.close()
+
+
+def test_body_retry_backoff_is_bounded_and_follows_close(monkeypatch):
+    backend = _Backend(_payload(12))
+    backend.failures[0] = 2
+    delays = []
+
+    def jitter(low, high):
+        assert low == 0.0
+        return high / 2
+
+    def record_sleep(delay):
+        assert backend.active == 0
+        delays.append(delay)
+
+    monkeypatch.setattr(s3_module, "uniform", jitter)
+    monkeypatch.setattr(s3_module, "sleep", record_sleep)
+    client = _client(monkeypatch, backend)
+    try:
+        assert client.get("s3://weights/checkpoint") == backend.data
+    finally:
+        client.close()
+    assert delays == [0.05, 0.1]

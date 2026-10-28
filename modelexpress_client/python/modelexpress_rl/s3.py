@@ -8,6 +8,9 @@ from __future__ import annotations
 import logging
 from concurrent.futures import ThreadPoolExecutor, wait
 from io import BytesIO
+from random import uniform
+from time import sleep
+from typing import Protocol
 from urllib.parse import urlsplit
 
 from modelexpress_rl import envs as rl_envs
@@ -45,6 +48,187 @@ def _parse_uri(uri: str) -> tuple[str, str]:
     return parsed.netloc, parsed.path[1:]
 
 
+class _S3Downloader(Protocol):
+    def get(self, bucket: str, key: str) -> bytes: ...
+
+    def close(self) -> None: ...
+
+
+def _required_header(response: dict, name: str, bucket: str, key: str):
+    try:
+        return response[name]
+    except KeyError:
+        raise ValueError(f"missing S3 {name} for {bucket}/{key}") from None
+
+
+def _content_length(response: dict, bucket: str, key: str) -> int:
+    value = _required_header(response, "ContentLength", bucket, key)
+    try:
+        length = int(value)
+        if length >= 0:
+            return length
+    except (TypeError, ValueError):
+        pass
+    raise ValueError(f"invalid S3 ContentLength for {bucket}/{key}: {value!r}")
+
+
+class _TransferManagerDownloader:
+    """Download through the SDK's shared transfer manager."""
+
+    def __init__(self, client) -> None:
+        from s3transfer.manager import TransferConfig, TransferManager
+
+        self._manager = TransferManager(
+            client,
+            config=TransferConfig(
+                multipart_threshold=rl_envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES,
+                multipart_chunksize=rl_envs.MX_S3_DOWNLOAD_RANGE_BYTES,
+                max_request_concurrency=rl_envs.MX_S3_DOWNLOAD_WORKERS,
+                io_chunksize=rl_envs.MX_S3_DOWNLOAD_IO_CHUNK_BYTES,
+                max_io_queue_size=(rl_envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS),
+                max_in_memory_download_chunks=(
+                    rl_envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS
+                ),
+                num_download_attempts=rl_envs.MX_S3_MAX_ATTEMPTS,
+            ),
+        )
+
+    def get(self, bucket: str, key: str) -> bytes:
+        with BytesIO() as target:
+            self._manager.download(bucket, key, target).result()
+            return target.getvalue()
+
+    def close(self) -> None:
+        self._manager.shutdown()
+
+
+class _PreallocatedDownloader:
+    """Fill preallocated storage with concurrent conditional GETs."""
+
+    def __init__(self, client) -> None:
+        self._client = client
+        self._range_bytes = rl_envs.MX_S3_DOWNLOAD_RANGE_BYTES
+        self._range_threshold_bytes = rl_envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES
+        self._max_attempts = rl_envs.MX_S3_MAX_ATTEMPTS
+        self._io_chunk_bytes = rl_envs.MX_S3_DOWNLOAD_IO_CHUNK_BYTES
+        self._pool = ThreadPoolExecutor(
+            max_workers=rl_envs.MX_S3_DOWNLOAD_WORKERS,
+            thread_name_prefix="modelexpress-s3-preallocated",
+        )
+
+    def get(self, bucket: str, key: str) -> bytes:
+        """Read an ETag-pinned object into preallocated storage."""
+        metadata = self._client.head_object(Bucket=bucket, Key=key)
+        total = _content_length(metadata, bucket, key)
+        etag = _required_header(metadata, "ETag", bucket, key)
+        if total == 0:
+            return b""
+        step = self._range_bytes if total >= self._range_threshold_bytes else total
+        with BytesIO() as target:
+            target.seek(total - 1)
+            target.write(b"\0")
+            with target.getbuffer() as view:
+                futures = []
+                try:
+                    for start in range(0, total, step):
+                        futures.append(
+                            self._pool.submit(
+                                self._read_range,
+                                bucket,
+                                key,
+                                etag,
+                                total,
+                                start,
+                                min(start + step, total),
+                                view,
+                                total >= self._range_threshold_bytes,
+                            )
+                        )
+                    for future in futures:
+                        future.result()
+                except Exception:
+                    for future in futures:
+                        future.cancel()
+                    wait(futures)
+                    raise
+            # Release exported views before BytesIO exposes its immutable backing.
+            return target.getvalue()
+
+    def _read_range(
+        self,
+        bucket: str,
+        key: str,
+        etag: str,
+        total: int,
+        start: int,
+        end: int,
+        view: memoryview,
+        ranged: bool,
+    ) -> None:
+        """Fill one disjoint span, retrying only transient body-read failures."""
+        from botocore.exceptions import (
+            ConnectionClosedError,
+            IncompleteReadError,
+            ReadTimeoutError,
+            ResponseStreamingError,
+        )
+
+        request = {"Bucket": bucket, "Key": key, "IfMatch": etag}
+        if ranged:
+            request["Range"] = f"bytes={start}-{end - 1}"
+        for attempt in range(self._max_attempts):
+            # Botocore handles request retries; only body reads are retried here.
+            response = self._client.get_object(**request)
+            body = response["Body"]
+            try:
+                if _required_header(response, "ETag", bucket, key) != etag:
+                    raise ValueError(
+                        f"S3 object changed during download: {bucket}/{key}"
+                    )
+                if (
+                    ranged
+                    and _required_header(response, "ContentRange", bucket, key)
+                    != f"bytes {start}-{end - 1}/{total}"
+                ):
+                    raise ValueError(f"invalid S3 ContentRange for {bucket}/{key}")
+                if _content_length(response, bucket, key) != end - start:
+                    raise ValueError(f"invalid S3 ContentLength for {bucket}/{key}")
+                with view[start:end] as part:
+                    offset = 0
+                    while offset < len(part):
+                        with part[offset:] as remaining:
+                            readinto = getattr(body, "readinto", None)
+                            if readinto is not None:
+                                count = readinto(remaining)
+                            else:
+                                chunk = body.read(
+                                    min(len(remaining), self._io_chunk_bytes)
+                                )
+                                count = len(chunk)
+                                remaining[:count] = chunk
+                        if not count:
+                            raise OSError(f"short S3 range read for {bucket}/{key}")
+                        offset += count
+                if body.read(1):
+                    raise OSError(f"long S3 range read for {bucket}/{key}")
+                return
+            except (
+                OSError,
+                ConnectionClosedError,
+                IncompleteReadError,
+                ReadTimeoutError,
+                ResponseStreamingError,
+            ):
+                if attempt == self._max_attempts - 1:
+                    raise
+            finally:
+                body.close()
+            sleep(uniform(0.0, min(0.1 * 2**attempt, 2.0)))
+
+    def close(self) -> None:
+        self._pool.shutdown()
+
+
 class S3Client:
     """Small immutable S3 client for canonical refit artifacts."""
 
@@ -56,7 +240,6 @@ class S3Client:
     ) -> None:
         import boto3
         from botocore.config import Config as BotoConfig
-        from s3transfer.manager import TransferConfig, TransferManager
 
         backend = rl_envs.MX_S3_DOWNLOAD_BACKEND
         self._multipart_threshold_bytes = rl_envs.MX_S3_MULTIPART_THRESHOLD_BYTES
@@ -84,32 +267,11 @@ class S3Client:
             max_workers=rl_envs.MX_S3_UPLOAD_WORKERS,
             thread_name_prefix="modelexpress-s3-upload",
         )
-        self._download_manager = None
-        self._download_pool = None
-        if backend == "ranged":
-            self._range_bytes = rl_envs.MX_S3_DOWNLOAD_RANGE_BYTES
-            self._range_threshold_bytes = rl_envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES
-            self._max_attempts = rl_envs.MX_S3_MAX_ATTEMPTS
-            self._io_chunk_bytes = rl_envs.MX_S3_DOWNLOAD_IO_CHUNK_BYTES
-            self._download_pool = ThreadPoolExecutor(
-                max_workers=rl_envs.MX_S3_DOWNLOAD_WORKERS,
-                thread_name_prefix="modelexpress-s3-range",
-            )
-        else:
-            self._download_manager = TransferManager(
-                self._client,
-                config=TransferConfig(
-                    multipart_threshold=rl_envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES,
-                    multipart_chunksize=rl_envs.MX_S3_DOWNLOAD_RANGE_BYTES,
-                    max_request_concurrency=rl_envs.MX_S3_DOWNLOAD_WORKERS,
-                    io_chunksize=rl_envs.MX_S3_DOWNLOAD_IO_CHUNK_BYTES,
-                    max_io_queue_size=(rl_envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS),
-                    max_in_memory_download_chunks=(
-                        rl_envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS
-                    ),
-                    num_download_attempts=rl_envs.MX_S3_MAX_ATTEMPTS,
-                ),
-            )
+        self._downloader: _S3Downloader = (
+            _PreallocatedDownloader(self._client)
+            if backend == "preallocated"
+            else _TransferManagerDownloader(self._client)
+        )
 
     def put(self, *, uri: str, data: bytes) -> None:
         """Create an immutable object, accepting an identical retry."""
@@ -199,117 +361,7 @@ class S3Client:
     def get(self, uri: str) -> bytes:
         """Read one S3 object."""
         bucket, key = _parse_uri(uri)
-        if self._download_manager is not None:
-            target = BytesIO()
-            self._download_manager.download(bucket, key, target).result()
-            return target.getvalue()
-        return self._get_ranged(bucket, key)
-
-    def _get_ranged(self, bucket: str, key: str) -> bytes:
-        metadata = self._client.head_object(Bucket=bucket, Key=key)
-        total = int(metadata["ContentLength"])
-        etag = metadata["ETag"]
-        if total == 0:
-            return b""
-        step = self._range_bytes if total >= self._range_threshold_bytes else total
-        with BytesIO() as target:
-            target.seek(total - 1)
-            target.write(b"\0")
-            with target.getbuffer() as view:
-                futures = []
-                try:
-                    for start in range(0, total, step):
-                        futures.append(
-                            self._download_pool.submit(
-                                self._read_range,
-                                bucket,
-                                key,
-                                etag,
-                                total,
-                                start,
-                                min(start + step, total),
-                                view,
-                                total >= self._range_threshold_bytes,
-                            )
-                        )
-                    for future in futures:
-                        future.result()
-                except Exception:
-                    for future in futures:
-                        future.cancel()
-                    wait(futures)
-                    raise
-            # Release exported views before BytesIO exposes its immutable backing.
-            return target.getvalue()
-
-    def _read_range(
-        self,
-        bucket: str,
-        key: str,
-        etag: str,
-        total: int,
-        start: int,
-        end: int,
-        view: memoryview,
-        ranged: bool,
-    ) -> None:
-        from botocore.exceptions import (
-            ConnectionClosedError,
-            IncompleteReadError,
-            ReadTimeoutError,
-            ResponseStreamingError,
-        )
-
-        request = {"Bucket": bucket, "Key": key, "IfMatch": etag}
-        if ranged:
-            request["Range"] = f"bytes={start}-{end - 1}"
-        for attempt in range(self._max_attempts):
-            # Botocore handles request retries; only body reads are retried here.
-            response = self._client.get_object(**request)
-            body = response["Body"]
-            try:
-                if response.get("ETag") != etag:
-                    raise ValueError(
-                        f"S3 object changed during download: {bucket}/{key}"
-                    )
-                if (
-                    ranged
-                    and response.get("ContentRange")
-                    != f"bytes {start}-{end - 1}/{total}"
-                ):
-                    raise ValueError(f"invalid S3 ContentRange for {bucket}/{key}")
-                if int(response["ContentLength"]) != end - start:
-                    raise ValueError(f"invalid S3 ContentLength for {bucket}/{key}")
-                with view[start:end] as part:
-                    offset = 0
-                    while offset < len(part):
-                        with part[offset:] as remaining:
-                            readinto = getattr(body, "readinto", None)
-                            if readinto is not None:
-                                count = readinto(remaining)
-                            else:
-                                chunk = body.read(
-                                    min(len(remaining), self._io_chunk_bytes)
-                                )
-                                count = len(chunk)
-                                remaining[:count] = chunk
-                        if not count:
-                            raise OSError(f"short S3 range read for {bucket}/{key}")
-                        offset += count
-                if body.read(1):
-                    raise OSError(f"long S3 range read for {bucket}/{key}")
-                return
-            except (
-                OSError,
-                ConnectionClosedError,
-                IncompleteReadError,
-                ReadTimeoutError,
-                ResponseStreamingError,
-            ):
-                if attempt == self._max_attempts - 1:
-                    raise
-            finally:
-                body.close()
+        return self._downloader.get(bucket, key)
 
     def size(self, uri: str) -> int:
         """Return one S3 object's byte size without downloading its payload."""
@@ -319,10 +371,7 @@ class S3Client:
     def close(self) -> None:
         """Close the underlying SDK client when supported."""
         self._upload_pool.shutdown()
-        if self._download_manager is not None:
-            self._download_manager.shutdown()
-        if self._download_pool is not None:
-            self._download_pool.shutdown()
+        self._downloader.close()
         close = getattr(self._client, "close", None)
         if close is not None:
             close()

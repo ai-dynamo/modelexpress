@@ -295,13 +295,15 @@ def test_generator_source_order_and_redis_url_keep_raw_defaults(monkeypatch):
     assert envs.MX_REDIS_URL == "redis://redis:6379"
 
 
-@pytest.mark.parametrize("value", ["ranged", " RANGED ", "transfer_manager"])
+@pytest.mark.parametrize(
+    "value", ["preallocated", " PREALLOCATED ", "transfer_manager"]
+)
 def test_s3_download_backend_selection(monkeypatch, value):
     monkeypatch.setenv("MX_S3_DOWNLOAD_BACKEND", value)
     assert envs.MX_S3_DOWNLOAD_BACKEND == value.strip().lower()
 
 
-@pytest.mark.parametrize("value", ["", "auto", "true"])
+@pytest.mark.parametrize("value", ["", "auto", "true", "ranged"])
 def test_s3_download_backend_rejects_unknown_values(monkeypatch, value):
     monkeypatch.setenv("MX_S3_DOWNLOAD_BACKEND", value)
     with pytest.raises(ValueError, match="MX_S3_DOWNLOAD_BACKEND"):
