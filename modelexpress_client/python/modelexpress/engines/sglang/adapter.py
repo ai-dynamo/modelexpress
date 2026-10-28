@@ -117,11 +117,6 @@ class SglangAdapter(EngineAdapter):
         # This adds _mx_* names to the manifest, so source and target must run
         # the same ModelExpress version; mixing old and new manifests fails
         # tensor matching.
-        #
-        # SGLang layers keep their GroupCoordinator as self.tp_group, so the
-        # scan would otherwise reach tp_group.ca_comm and copy the donor's
-        # custom all-reduce epoch counters, deadlocking the target's first
-        # push all-reduce.
         adopt_hidden_tensors(
             result.model,
             self.accelerator_backend,
