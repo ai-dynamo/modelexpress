@@ -1,0 +1,643 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Stage Release RC: build and stage release candidate N of an EXISTING release
+# branch, then hand the staged artifacts to GitLab release-automation
+# (PIPELINE_TYPE=rc) for scanning. Run once per rc round, dispatched FROM the
+# release/X.Y.Z branch.
+#
+# Mirrors the nightly's staging (NGC containers + helm, Artifactory wheels +
+# crates) but names everything as a release candidate:
+#
+#   container  nvcr.io/<staging org>/ai-dynamo/modelexpress-server:X.Y.Z-rc.N
+#   helm       modelexpress X.Y.Z-rc.N      (image -> the container above)
+#   wheels     modelexpress-X.Y.ZrcN-*      under <pypi repo>/release/X.Y.Z/rcN/
+#   crates     *-X.Y.Z-rc.N.crate           under <cargo repo>/release/X.Y.Z/rcN/
+#
+# Registries are immutable, so a failed or rejected attempt is re-staged as the
+# next round (N+1). NO GitHub tag is created. The branch and its version bump
+# come from the normal release-branch process; this workflow is read-only on
+# the tree and refuses to run if the branch's manifests do not carry
+# release_version.
+
+name: Stage Release RC
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Version being released, X.Y.Z. Must equal the version in the release branch manifests; run this workflow from release/X.Y.Z.'
+        required: true
+        type: string
+      rc_round:
+        description: 'RC round N (bare integer): stages X.Y.Z-rc.N / X.Y.ZrcN. Re-stage a failed or rejected round as N+1; registries are immutable.'
+        required: true
+        type: string
+        default: '0'
+      skip_gitlab_pipeline:
+        description: 'Skip the GitLab release-automation trigger. Emergency use only.'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One staging run per (version, rc round): a second dispatch queues instead of
+# racing the first into immutable registries. Never cancel a run mid-stage.
+concurrency:
+  group: stage-release-rc-${{ inputs.release_version }}-${{ inputs.rc_round }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Validate and compute RC metadata
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 10
+    outputs:
+      release_version: ${{ steps.meta.outputs.release_version }}
+      rc_number: ${{ steps.meta.outputs.rc_number }}
+      rc_tag: ${{ steps.meta.outputs.rc_tag }}
+      container_tag: ${{ steps.meta.outputs.container_tag }}
+      build_tag: ${{ steps.meta.outputs.build_tag }}
+      wheel_version: ${{ steps.meta.outputs.wheel_version }}
+      crate_version: ${{ steps.meta.outputs.crate_version }}
+      chart_version: ${{ steps.meta.outputs.chart_version }}
+      artifactory_path: ${{ steps.meta.outputs.artifactory_path }}
+    steps:
+      - name: Require a release branch on the upstream repo
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          EVENT: ${{ github.event_name }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RC_ROUND: ${{ inputs.rc_round }}
+        run: |
+          set -euo pipefail
+          if [ "${REPOSITORY}" != "ai-dynamo/modelexpress" ]; then
+            echo "::error::RC staging runs only on ai-dynamo/modelexpress (got ${REPOSITORY})"
+            exit 1
+          fi
+          if [ "${EVENT}" != "workflow_dispatch" ]; then
+            echo "::error::Stage Release RC only runs from a manual dispatch (got '${EVENT}')"
+            exit 1
+          fi
+          if [[ ! "${RELEASE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release_version must be X.Y.Z (got '${RELEASE_VERSION}')"
+            exit 1
+          fi
+          if [[ ! "${RC_ROUND}" =~ ^[0-9]+$ ]]; then
+            echo "::error::rc_round must be a bare integer (got '${RC_ROUND}')"
+            exit 1
+          fi
+          if [ "${REF}" != "refs/heads/release/${RELEASE_VERSION}" ]; then
+            echo "::error::dispatch this workflow from release/${RELEASE_VERSION} (got ${REF}); the branch tip is what gets staged."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Compute versions and tags
+        id: meta
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RC_ROUND: ${{ inputs.rc_round }}
+        run: |
+          set -euo pipefail
+          # Strip leading zeros so "02" and "2" cannot stage two names for one round.
+          N=$((10#${RC_ROUND}))
+          V="${RELEASE_VERSION}"
+
+          # The branch must already carry the release version everywhere the
+          # artifacts are stamped from; a missed bump would stage a mislabelled RC.
+          WHEEL_BASE=$(sed -n 's/^version = "\([A-Za-z0-9._+-]*\)"$/\1/p' modelexpress_client/python/pyproject.toml | head -1)
+          CRATE_BASE=$(sed -n 's/^version = "\([A-Za-z0-9._+-]*\)"$/\1/p' Cargo.toml | head -1)
+          CHART_BASE=$(sed -n 's/^version: \([A-Za-z0-9._+-]*\)[[:space:]]*$/\1/p' helm/Chart.yaml | head -1)
+          for PAIR in "pyproject.toml:${WHEEL_BASE}" "Cargo.toml:${CRATE_BASE}" "helm/Chart.yaml:${CHART_BASE}"; do
+            if [ "${PAIR#*:}" != "${V}" ]; then
+              echo "::error::${PAIR%%:*} carries version '${PAIR#*:}', expected ${V}. Bump the release branch first."
+              exit 1
+            fi
+          done
+
+          {
+            echo "release_version=${V}"
+            echo "rc_number=${N}"
+            echo "rc_tag=v${V}-rc${N}"
+            echo "container_tag=${V}-rc.${N}"
+            echo "build_tag=${V}-rc.${N}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "wheel_version=${V}rc${N}"
+            echo "crate_version=${V}-rc.${N}"
+            echo "chart_version=${V}-rc.${N}"
+            echo "artifactory_path=release/${V}/rc${N}"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  # Every publishing job waits on a human (required reviewers on this
+  # environment). Re-running failed jobs re-requests approval: the gate output
+  # is compared to github.run_attempt below.
+  manual-release-approval:
+    name: Manual release approval
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [preflight]
+    environment: manual-release-approval
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      approved_attempt: ${{ steps.approval.outputs.run_attempt }}
+    steps:
+      - name: Assert the approval environment is actually protected
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          BODY="$(mktemp)"
+          trap 'rm -f "${BODY}"' EXIT
+          CODE="$(curl -sS -o "${BODY}" -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/environments/manual-release-approval" || echo "000")"
+          if [ "${CODE}" != "200" ]; then
+            echo "::warning::Could not read the manual-release-approval environment (HTTP ${CODE}). Verify manually that required reviewers are configured."
+            exit 0
+          fi
+          COUNT="$(jq -r '[.protection_rules[]? | select(.type=="required_reviewers")] | length' "${BODY}" 2>/dev/null || echo "")"
+          if [ -z "${COUNT}" ]; then
+            echo "::warning::Unexpected environments API payload; could not determine reviewer protection."
+          elif [ "${COUNT}" -eq 0 ]; then
+            echo "::error::The manual-release-approval environment has NO required reviewers — the release gate is not armed. Configure required reviewers in repo Settings > Environments."
+            exit 1
+          else
+            echo "Approval environment is protected by required reviewers."
+          fi
+
+      - name: Approved
+        id: approval
+        env:
+          RC_TAG: ${{ needs.preflight.outputs.rc_tag }}
+        run: |
+          echo "Release approved for ${RC_TAG}"
+          echo "run_attempt=${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+  build-server-image:
+    name: Build server image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: [preflight, manual-release-approval]
+    if: ${{ needs.manual-release-approval.outputs.approved_attempt == github.run_attempt }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: prod-modelexpress-builder-amd-v1
+            platform: linux/amd64
+          - arch: arm64
+            runner: prod-modelexpress-builder-arm-v1
+            platform: linux/arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Compute SERVER_IMAGE and scope docker credentials
+        run: |
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-build-${{ matrix.arch }}" >> "$GITHUB_ENV"
+          echo "SERVER_IMAGE=${{ secrets.MX_IMAGE_REPO }}/modelexpress-server:${{ needs.preflight.outputs.build_tag }}-${{ matrix.arch }}" >> "$GITHUB_ENV"
+
+      - name: Log in to image registry
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+        run: |
+          echo "${NGC_API_KEY}" | \
+            docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build and push
+        run: |
+          # The RC image is built ONCE and promoted unchanged to GA, so its OS
+          # packages freeze at this build. --pull --no-cache keeps a stale cached
+          # apt layer (or base) from silently shipping old openssl/gpgv.
+          # --provenance=false: a single-platform manifest the staging job can re-push.
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            --provenance=false \
+            --pull \
+            --no-cache \
+            -f docker/Dockerfile \
+            -t "${SERVER_IMAGE}" \
+            --push \
+            .
+
+      - name: Cleanup local image and credentials
+        if: always()
+        run: |
+          docker image rm -f "${SERVER_IMAGE}" 2>/dev/null || true
+          rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
+
+  assemble-server-manifest:
+    name: Assemble server multi-arch manifest
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [preflight, build-server-image]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Scope docker credentials to this job
+        run: |
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-manifest" >> "$GITHUB_ENV"
+
+      - name: Log in to image registry
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+        run: |
+          echo "${NGC_API_KEY}" | \
+            docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: Create multi-arch manifest
+        env:
+          REPO: ${{ secrets.MX_IMAGE_REPO }}/modelexpress-server
+          TAG: ${{ needs.preflight.outputs.build_tag }}
+        run: |
+          docker buildx imagetools create \
+            -t "${REPO}:${TAG}" \
+            "${REPO}:${TAG}-amd64" \
+            "${REPO}:${TAG}-arm64"
+          docker buildx imagetools inspect "${REPO}:${TAG}"
+
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
+
+  build-wheels:
+    name: Client wheels
+    needs: [preflight, manual-release-approval]
+    if: ${{ needs.manual-release-approval.outputs.approved_attempt == github.run_attempt }}
+    uses: ./.github/workflows/build-wheels.yml
+    with:
+      wheel_version: ${{ needs.preflight.outputs.wheel_version }}
+      upload_prefix: ${{ needs.preflight.outputs.artifactory_path }}
+    secrets: inherit
+
+  stage-crates:
+    name: Stage crates
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [preflight, manual-release-approval]
+    if: ${{ needs.manual-release-approval.outputs.approved_attempt == github.run_attempt }}
+    environment: automated-release
+    timeout-minutes: 45
+    outputs:
+      staged_crates: ${{ steps.package.outputs.staged_crates }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config libssl-dev build-essential
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Validate and package crates
+        id: package
+        env:
+          STAGE_VERSION: ${{ needs.preflight.outputs.crate_version }}
+          EXPECT_VERSION: ${{ needs.preflight.outputs.crate_version }}
+        run: |
+          # No pipefail: outputs must be written before python's rc (PIPESTATUS[0]) is returned.
+          set -u
+          python3 .github/scripts/stage_crates.py --output-dir crate-dist \
+            2>&1 | tee stage_crates.log
+          rc="${PIPESTATUS[0]}"
+          STAGED="$(sed -n 's/^STAGED_CRATE=//p' stage_crates.log | paste -sd, - || true)"
+          echo "staged_crates=${STAGED}" >> "$GITHUB_OUTPUT"
+          exit "${rc}"
+
+      - name: Set up JFrog CLI
+        if: ${{ !cancelled() && steps.package.outputs.staged_crates != '' }}
+        uses: jfrog/setup-jfrog-cli@279b1f629f43dd5bc658d8361ac4802a7ef8d2d5 # v4.9.1
+        env:
+          JF_URL: ${{ secrets.ARTIFACTORY_URL }}
+          JF_ACCESS_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+
+      - name: Upload crates to Artifactory
+        if: ${{ !cancelled() && steps.package.outputs.staged_crates != '' }}
+        env:
+          ARTIFACTORY_PATH: ${{ needs.preflight.outputs.artifactory_path }}
+          ARTIFACTORY_CARGO_REPO: ${{ secrets.ARTIFACTORY_CARGO_REPO_NAME }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ARTIFACTORY_CARGO_REPO}" ]; then
+            echo "::error::ARTIFACTORY_CARGO_REPO_NAME is not set; refusing to upload to an empty repository path"
+            exit 1
+          fi
+          DEST="${ARTIFACTORY_CARGO_REPO}/${ARTIFACTORY_PATH}/"
+          echo "Uploading to: ${DEST}"
+          jf rt upload --fail-no-op --flat "crate-dist/*.crate" "${DEST}"
+
+  stage-helm-ngc:
+    name: Stage helm chart to NGC
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [preflight, manual-release-approval, assemble-server-manifest]
+    if: ${{ needs.manual-release-approval.outputs.approved_attempt == github.run_attempt }}
+    environment: automated-release
+    timeout-minutes: 20
+    outputs:
+      staged_helm: ${{ steps.push.outputs.staged_helm }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install helm
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin"
+          curl -fsSL https://get.helm.sh/helm-v3.20.0-linux-amd64.tar.gz | tar xz -C "${RUNNER_TEMP}"
+          install "${RUNNER_TEMP}/linux-amd64/helm" "${RUNNER_TEMP}/bin/helm"
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+
+      # An RC chart keeps the real chart name and the real image repository:
+      # it points at modelexpress-server:<X.Y.Z-rc.N>, the image staged below.
+      - name: Stamp, lint, package and verify the chart
+        env:
+          NIGHTLY_TAG: ${{ needs.preflight.outputs.container_tag }}
+          CHART_VERSION: ${{ needs.preflight.outputs.chart_version }}
+          CHART_NAME: modelexpress
+          IMAGE_REPO_SUFFIX: ''
+        run: bash .github/scripts/package_helm_chart.sh
+
+      - name: Push chart to NGC helm registry
+        id: push
+        env:
+          NGC_PUBLISH_USERNAME: ${{ secrets.NGC_PUBLISH_USERNAME }}
+          NGC_PUBLISH_TOKEN: ${{ secrets.NGC_PUBLISH_TOKEN }}
+          CHART_VERSION: ${{ needs.preflight.outputs.chart_version }}
+          HELM_CONFIG_HOME: ${{ runner.temp }}/helm-config
+          HELM_PLUGINS: ${{ runner.temp }}/helm-config/plugins
+          NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
+        run: |
+          set -euo pipefail
+          REPO_ALIAS="ngc-staging-modelexpress"
+          helm plugin install https://github.com/chartmuseum/helm-push --version 0.10.4 || true
+          echo "${NGC_PUBLISH_TOKEN}" | helm repo add "${REPO_ALIAS}" \
+            --username="${NGC_PUBLISH_USERNAME}" \
+            --password-stdin \
+            "https://helm.ngc.nvidia.com/${NGC_STAGING_ORG}/ai-dynamo"
+          CHART_FILE="chart-dist/modelexpress-${CHART_VERSION}.tgz"
+          ls -la chart-dist/
+          SEARCH_OUT=$(helm search repo "${REPO_ALIAS}/modelexpress" --version "${CHART_VERSION}" -o yaml)
+          if grep -qF "version: ${CHART_VERSION}" <<< "${SEARCH_OUT}"; then
+            echo "::notice::modelexpress ${CHART_VERSION} is already in the NGC helm registry; skipping the push"
+          else
+            helm cm-push "${CHART_FILE}" "${REPO_ALIAS}"
+          fi
+          echo "staged_helm=modelexpress:${CHART_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Remove helm registry credentials
+        if: always()
+        run: |
+          rm -rf "${{ runner.temp }}/helm-config"
+
+  stage-containers-ngc:
+    name: Stage containers to NGC
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [preflight, manual-release-approval, assemble-server-manifest]
+    if: ${{ needs.manual-release-approval.outputs.approved_attempt == github.run_attempt }}
+    environment: automated-release
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      staged_containers: ${{ steps.stage.outputs.staged_containers }}
+    steps:
+      - name: Scope docker credentials to this job
+        run: |
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-stage" >> "$GITHUB_ENV"
+
+      - name: Stage to NGC staging org
+        id: stage
+        env:
+          SRC_REPO: ${{ secrets.MX_IMAGE_REPO }}/modelexpress-server
+          NGC_PUBLISH_USERNAME: ${{ secrets.NGC_PUBLISH_USERNAME }}
+          NGC_PUBLISH_TOKEN: ${{ secrets.NGC_PUBLISH_TOKEN }}
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
+          TAG: ${{ needs.preflight.outputs.container_tag }}
+          BUILD_TAG: ${{ needs.preflight.outputs.build_tag }}
+        run: |
+          set -euo pipefail
+          # The RC tag is promoted unchanged to GA, so it lives in the real
+          # modelexpress-server repo (not -nightly) and no floating tag is moved.
+          DEST="nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/modelexpress-server"
+
+          echo "${NGC_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+          for ARCH in amd64 arm64; do
+            docker pull --platform "linux/${ARCH}" "${SRC_REPO}:${BUILD_TAG}-${ARCH}"
+            docker tag "${SRC_REPO}:${BUILD_TAG}-${ARCH}" "${DEST}:${TAG}-${ARCH}"
+          done
+
+          echo "${NGC_PUBLISH_TOKEN}" | docker login nvcr.io -u "${NGC_PUBLISH_USERNAME}" --password-stdin
+          for ARCH in amd64 arm64; do
+            docker push "${DEST}:${TAG}-${ARCH}"
+          done
+          docker buildx imagetools create \
+            -t "${DEST}:${TAG}" \
+            "${DEST}:${TAG}-amd64" \
+            "${DEST}:${TAG}-arm64"
+
+          echo "staged_containers=modelexpress-server:${TAG}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Container staging"
+            echo ""
+            echo "- \`${DEST##*/ai-dynamo/}:${TAG}\` (amd64, arm64)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup local images and credentials
+        if: always()
+        env:
+          SRC_REPO: ${{ secrets.MX_IMAGE_REPO }}/modelexpress-server
+          NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
+          TAG: ${{ needs.preflight.outputs.container_tag }}
+          BUILD_TAG: ${{ needs.preflight.outputs.build_tag }}
+        run: |
+          for ARCH in amd64 arm64; do
+            docker image rm -f "${SRC_REPO}:${BUILD_TAG}-${ARCH}" 2>/dev/null || true
+            docker image rm -f "nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/modelexpress-server:${TAG}-${ARCH}" 2>/dev/null || true
+          done
+          rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
+
+  trigger-gitlab-release:
+    name: Trigger GitLab release pipeline
+    runs-on:
+      group: gitlab_ci_runners
+    needs: [preflight, manual-release-approval, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc]
+    if: >-
+      ${{ !cancelled() &&
+          inputs.skip_gitlab_pipeline != true &&
+          needs.manual-release-approval.outputs.approved_attempt == github.run_attempt &&
+          needs.stage-containers-ngc.result == 'success' &&
+          needs.build-wheels.result == 'success' &&
+          needs.stage-helm-ngc.result == 'success' }}
+    environment: automated-release
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Trigger GitLab pipeline
+        id: trigger
+        env:
+          GITLAB_TRIGGER_URL: ${{ secrets.GITLAB_PIPELINE_URL }}
+          GITLAB_TRIGGER_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
+          ARTIFACTORY_PATH: ${{ needs.preflight.outputs.artifactory_path }}
+          ARTIFACTORY_WHEEL_REPO: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
+          NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.release_version }}
+          RC_NUMBER: ${{ needs.preflight.outputs.rc_number }}
+          RC_TAG: ${{ needs.preflight.outputs.rc_tag }}
+          CONTAINER_TAG: ${{ needs.preflight.outputs.container_tag }}
+          WHEEL_VERSION: ${{ needs.preflight.outputs.wheel_version }}
+          CRATE_VERSION: ${{ needs.preflight.outputs.crate_version }}
+          HELM_CHART_VERSION: ${{ needs.preflight.outputs.chart_version }}
+          STAGED_CONTAINERS: ${{ needs.stage-containers-ngc.outputs.staged_containers }}
+          STAGED_CRATES: ${{ needs.stage-crates.outputs.staged_crates }}
+          STAGED_HELM: ${{ needs.stage-helm-ngc.outputs.staged_helm }}
+          CRATES_RESULT: ${{ needs.stage-crates.result }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ARTIFACTORY_WHEEL_REPO}" ]; then
+            echo "::error::ARTIFACTORY_PYPI_REPO_NAME is not set; GitLab would receive an empty artifact path"
+            exit 1
+          fi
+
+          # Wheels, container and helm are gated by the job condition. Crates are
+          # best-effort, as in the nightly: GitLab scans only what actually staged.
+          ARTIFACTS="wheel,container,helm"
+          if [ "${CRATES_RESULT}" = "success" ] && [ -n "${STAGED_CRATES}" ]; then
+            ARTIFACTS="${ARTIFACTS},crate"
+          else
+            echo "::warning::Crate staging ${CRATES_RESULT} (staged=[${STAGED_CRATES:-none}]); triggering GitLab without crates. Re-stage as the next rc round to include them."
+            CRATE_VERSION=""
+            STAGED_CRATES=""
+          fi
+
+          # Mask the derived GitLab host; only the exact secret value is masked automatically.
+          AUTHORITY=$(printf '%s' "${GITLAB_TRIGGER_URL}" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://([^/]+).*#\1#')
+          HOST="${AUTHORITY##*@}"
+          HOST="${HOST%%:*}"
+          echo "::add-mask::${AUTHORITY}"
+          echo "::add-mask::${HOST}"
+
+          TOKEN_FILE=$(mktemp)
+          trap 'rm -f "${TOKEN_FILE}"' EXIT
+          chmod 600 "${TOKEN_FILE}"
+          printf '%s' "${GITLAB_TRIGGER_TOKEN}" > "${TOKEN_FILE}"
+
+          # --form-string everywhere: --form treats a leading '<'/'@' as a file
+          # reference. Only the token deliberately uses --form "<file".
+          RESPONSE=$(curl -fsSL -X POST "${GITLAB_TRIGGER_URL}" \
+            --form "token=<${TOKEN_FILE}" \
+            --form-string "ref=main" \
+            --form-string "variables[PROJECT]=modelexpress" \
+            --form-string "variables[PIPELINE_TYPE]=rc" \
+            --form-string "variables[RELEASE_TYPE]=rc" \
+            --form-string "variables[DRY_RUN]=false" \
+            --form-string "variables[NSPECT_REGISTERED]=false" \
+            --form-string "variables[ARTIFACTS]=${ARTIFACTS}" \
+            --form-string "variables[SONAR_BRANCH]=main" \
+            --form-string "variables[RELEASE_VERSION]=${RELEASE_VERSION}" \
+            --form-string "variables[RC_TAG]=${RC_TAG}" \
+            --form-string "variables[RC_NUMBER]=${RC_NUMBER}" \
+            --form-string "variables[CONTAINER_IMAGE]=nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/${STAGED_CONTAINERS}" \
+            --form-string "variables[CONTAINER_TAG]=${CONTAINER_TAG}" \
+            --form-string "variables[ARTIFACTORY_NIGHTLY_REPO]=${ARTIFACTORY_WHEEL_REPO}" \
+            --form-string "variables[ARTIFACTORY_NIGHTLY_PATH]=${ARTIFACTORY_PATH}" \
+            --form-string "variables[NGC_STAGING_ORG]=${NGC_STAGING_ORG}" \
+            --form-string "variables[WHEEL_VERSION]=${WHEEL_VERSION}" \
+            --form-string "variables[CRATE_VERSION]=${CRATE_VERSION}" \
+            --form-string "variables[HELM_CHART_VERSION]=${HELM_CHART_VERSION}" \
+            --form-string "variables[COMMIT_SHA]=${GITHUB_SHA}" \
+            --form-string "variables[GITHUB_RUN_ID]=${GITHUB_RUN_ID}" \
+            --form-string "variables[STAGED_CONTAINERS]=${STAGED_CONTAINERS}" \
+            --form-string "variables[STAGED_WHEELS]=modelexpress-${WHEEL_VERSION}" \
+            --form-string "variables[STAGED_CRATES]=${STAGED_CRATES}" \
+            --form-string "variables[STAGED_HELM]=${STAGED_HELM}")
+          PIPELINE_ID=$(echo "${RESPONSE}" | jq -r '.id // "unknown"')
+          PIPELINE_STATUS=$(echo "${RESPONSE}" | jq -r '.status // "unknown"')
+          {
+            echo "pipeline_id=${PIPELINE_ID}"
+            echo "pipeline_status=${PIPELINE_STATUS}"
+            echo "artifacts=${ARTIFACTS}"
+          } >> "$GITHUB_OUTPUT"
+          echo "GitLab release pipeline triggered: pipeline ID ${PIPELINE_ID}"
+          {
+            echo "### ${RC_TAG}"
+            echo ""
+            echo "GitLab release pipeline ID: \`${PIPELINE_ID}\` (artifacts: \`${ARTIFACTS}\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          case "${PIPELINE_STATUS}" in
+            created|pending|running|preparing|waiting_for_resource|scheduled) ;;
+            *)
+              echo "::error::GitLab pipeline ${PIPELINE_ID} came back as '${PIPELINE_STATUS}' — no jobs matched the forwarded variables, so nothing is being scanned. Check projects/modelexpress.yml rules against PIPELINE_TYPE/RELEASE_TYPE/ARTIFACTS."
+              exit 1
+              ;;
+          esac
+
+  rc-status:
+    name: RC status
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 10
+    needs:
+      - preflight
+      - manual-release-approval
+      - build-server-image
+      - assemble-server-manifest
+      - build-wheels
+      - stage-crates
+      - stage-helm-ngc
+      - stage-containers-ngc
+      - trigger-gitlab-release
+    if: always()
+    steps:
+      - name: Verify results
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          SKIP_GITLAB: ${{ inputs.skip_gitlab_pipeline }}
+        run: |
+          set -uo pipefail
+          echo "${RESULTS}" | jq .
+          MANDATORY="preflight manual-release-approval build-server-image assemble-server-manifest build-wheels stage-crates stage-helm-ngc stage-containers-ngc"
+          [ "${SKIP_GITLAB}" != "true" ] && MANDATORY="${MANDATORY} trigger-gitlab-release"
+          FAILED=""
+          for JOB in ${MANDATORY}; do
+            RESULT=$(echo "${RESULTS}" | jq -r --arg j "${JOB}" 'if has($j) then .[$j].result else "MISSING" end')
+            if [ "${RESULT}" = "MISSING" ]; then
+              echo "::error::rc-status references unknown job '${JOB}' — add it to needs: or fix the name."
+              exit 1
+            fi
+            if [ "${RESULT}" != "success" ]; then
+              FAILED="${FAILED}
+          ${JOB} (result: ${RESULT})"
+            fi
+          done
+          if [ -n "${FAILED}" ]; then
+            echo "::error::RC staging failed:${FAILED}"
+            exit 1
+          fi
+          echo "RC staged and handed to GitLab."
