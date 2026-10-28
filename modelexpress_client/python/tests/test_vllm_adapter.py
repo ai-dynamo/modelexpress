@@ -207,9 +207,16 @@ def test_identity_name_is_resolved_once_without_changing_loader_config(
     assert model_config.model == model_path
 
 
-def test_load_via_native_strips_streamer_extra_config(monkeypatch):
-    """DefaultModelLoader rejects streamer extra config such as distributed."""
-    extra_config = {"distributed": True, "memory_limit": 10_000_000_000}
+def test_load_via_native_keeps_only_default_loader_extra_config(monkeypatch):
+    """DefaultModelLoader rejects streamer keys but honors its own options."""
+    extra_config = {
+        "distributed": True,
+        "memory_limit": 10_000_000_000,
+        "enable_weights_track": True,
+        "enable_multithread_load": True,
+        "num_threads": 4,
+    }
+    original = dict(extra_config)
     vllm_config = _context_config(load_device="cpu")
     vllm_config.load_config = SimpleNamespace(
         device="cpu",
@@ -237,10 +244,14 @@ def test_load_via_native_strips_streamer_extra_config(monkeypatch):
 
     [disk_config] = seen_configs
     assert disk_config.load_format == "auto"
-    assert disk_config.model_loader_extra_config == {}
+    assert disk_config.model_loader_extra_config == {
+        "enable_weights_track": True,
+        "enable_multithread_load": True,
+        "num_threads": 4,
+    }
     assert adapter.load_config.load_format == "modelexpress"
     assert adapter.load_config.model_loader_extra_config is extra_config
-    assert extra_config == {"distributed": True, "memory_limit": 10_000_000_000}
+    assert extra_config == original
 
 
 def test_build_vllm_load_context_uses_current_platform_for_bare_cuda(monkeypatch):
