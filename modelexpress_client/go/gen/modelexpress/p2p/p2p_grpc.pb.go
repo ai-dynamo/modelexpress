@@ -22,6 +22,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	P2PService_DonorLease_FullMethodName      = "/model_express.p2p.P2pService/DonorLease"
 	P2PService_PublishMetadata_FullMethodName = "/model_express.p2p.P2pService/PublishMetadata"
 	P2PService_ListSources_FullMethodName     = "/model_express.p2p.P2pService/ListSources"
 	P2PService_GetMetadata_FullMethodName     = "/model_express.p2p.P2pService/GetMetadata"
@@ -36,6 +37,8 @@ const (
 // The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
 // Clients query for existing sources and publish their own metadata.
 type P2PServiceClient interface {
+	// Coordinate the donor for a compatible cold start.
+	DonorLease(ctx context.Context, in *DonorLeaseRequest, opts ...grpc.CallOption) (*DonorLeaseResponse, error)
 	// Publish model metadata - called by client after loading model weights
 	PublishMetadata(ctx context.Context, in *PublishMetadataRequest, opts ...grpc.CallOption) (*PublishMetadataResponse, error)
 	// List available source workers - lightweight, no tensor metadata.
@@ -55,6 +58,16 @@ type p2PServiceClient struct {
 
 func NewP2PServiceClient(cc grpc.ClientConnInterface) P2PServiceClient {
 	return &p2PServiceClient{cc}
+}
+
+func (c *p2PServiceClient) DonorLease(ctx context.Context, in *DonorLeaseRequest, opts ...grpc.CallOption) (*DonorLeaseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DonorLeaseResponse)
+	err := c.cc.Invoke(ctx, P2PService_DonorLease_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *p2PServiceClient) PublishMetadata(ctx context.Context, in *PublishMetadataRequest, opts ...grpc.CallOption) (*PublishMetadataResponse, error) {
@@ -105,6 +118,8 @@ func (c *p2PServiceClient) UpdateStatus(ctx context.Context, in *UpdateStatusReq
 // The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
 // Clients query for existing sources and publish their own metadata.
 type P2PServiceServer interface {
+	// Coordinate the donor for a compatible cold start.
+	DonorLease(context.Context, *DonorLeaseRequest) (*DonorLeaseResponse, error)
 	// Publish model metadata - called by client after loading model weights
 	PublishMetadata(context.Context, *PublishMetadataRequest) (*PublishMetadataResponse, error)
 	// List available source workers - lightweight, no tensor metadata.
@@ -126,6 +141,9 @@ type P2PServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedP2PServiceServer struct{}
 
+func (UnimplementedP2PServiceServer) DonorLease(context.Context, *DonorLeaseRequest) (*DonorLeaseResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DonorLease not implemented")
+}
 func (UnimplementedP2PServiceServer) PublishMetadata(context.Context, *PublishMetadataRequest) (*PublishMetadataResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PublishMetadata not implemented")
 }
@@ -157,6 +175,24 @@ func RegisterP2PServiceServer(s grpc.ServiceRegistrar, srv P2PServiceServer) {
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&P2PService_ServiceDesc, srv)
+}
+
+func _P2PService_DonorLease_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DonorLeaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(P2PServiceServer).DonorLease(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: P2PService_DonorLease_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(P2PServiceServer).DonorLease(ctx, req.(*DonorLeaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _P2PService_PublishMetadata_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -238,6 +274,10 @@ var P2PService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "model_express.p2p.P2pService",
 	HandlerType: (*P2PServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "DonorLease",
+			Handler:    _P2PService_DonorLease_Handler,
+		},
 		{
 			MethodName: "PublishMetadata",
 			Handler:    _P2PService_PublishMetadata_Handler,

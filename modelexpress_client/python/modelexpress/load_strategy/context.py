@@ -80,6 +80,10 @@ class LoadContext:
     mx_client: MxClientBase
     worker_id: str
     mx_server_url: str | None = None
+    cold_start_role: str = ""
+    cold_start_group: str = ""
+    donor_lease_token: str = ""
+    donor_lease: Any = None
     node_rank: int = 0
     # Head address from the engine's own distributed config (for vLLM,
     # parallel_config.master_addr). Non-head nodes rewrite a pod-local

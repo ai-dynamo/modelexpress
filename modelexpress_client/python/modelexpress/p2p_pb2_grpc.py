@@ -40,6 +40,11 @@ class P2pServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.DonorLease = channel.unary_unary(
+                '/model_express.p2p.P2pService/DonorLease',
+                request_serializer=p2p__pb2.DonorLeaseRequest.SerializeToString,
+                response_deserializer=p2p__pb2.DonorLeaseResponse.FromString,
+                _registered_method=True)
         self.PublishMetadata = channel.unary_unary(
                 '/model_express.p2p.P2pService/PublishMetadata',
                 request_serializer=p2p__pb2.PublishMetadataRequest.SerializeToString,
@@ -67,6 +72,13 @@ class P2pServiceServicer(object):
     The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
     Clients query for existing sources and publish their own metadata.
     """
+
+    def DonorLease(self, request, context):
+        """Coordinate the donor for a compatible cold start.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def PublishMetadata(self, request, context):
         """Publish model metadata - called by client after loading model weights
@@ -102,6 +114,11 @@ class P2pServiceServicer(object):
 
 def add_P2pServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'DonorLease': grpc.unary_unary_rpc_method_handler(
+                    servicer.DonorLease,
+                    request_deserializer=p2p__pb2.DonorLeaseRequest.FromString,
+                    response_serializer=p2p__pb2.DonorLeaseResponse.SerializeToString,
+            ),
             'PublishMetadata': grpc.unary_unary_rpc_method_handler(
                     servicer.PublishMetadata,
                     request_deserializer=p2p__pb2.PublishMetadataRequest.FromString,
@@ -135,6 +152,33 @@ class P2pService(object):
     The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
     Clients query for existing sources and publish their own metadata.
     """
+
+    @staticmethod
+    def DonorLease(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.P2pService/DonorLease',
+            p2p__pb2.DonorLeaseRequest.SerializeToString,
+            p2p__pb2.DonorLeaseResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def PublishMetadata(request,

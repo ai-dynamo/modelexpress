@@ -87,6 +87,11 @@ class LoadStrategyChain:
             DefaultStrategy(),
         ]
 
+        if ctx.cold_start_role == "follower":
+            return execute_load_strategies(model, ctx, [RdmaStrategy()])
+        if ctx.cold_start_role == "donor":
+            all_strategies = all_strategies[1:]
+
         if name := envs.MX_LOAD_PLUGIN:
             before = envs.MX_LOAD_PLUGIN_BEFORE
             strategy_names = [strategy.name for strategy in all_strategies]
@@ -167,7 +172,18 @@ def execute_load_strategies(
             try:
                 with _strategy_phases(strategy, result, ctx):
                     result = strategy.load(result, ctx)
-                publish_source_if_supported(result, ctx)
+                if ctx.cold_start_role == "donor" and result.model_for_publish is None:
+                    raise StrategyRecoveryError(
+                        "Cold-start donor cannot publish this model"
+                    )
+                try:
+                    publish_source_if_supported(result, ctx)
+                except Exception as exc:
+                    if ctx.cold_start_role == "donor":
+                        raise StrategyRecoveryError(
+                            "Cold-start donor publication failed"
+                        ) from exc
+                    raise
                 span.set_attribute("weight_loading_strategy", strategy.name)
                 return result.value
             except StrategyRecoveryError:

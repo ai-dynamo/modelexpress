@@ -152,6 +152,20 @@ impl P2pStateManager {
             .await
     }
 
+    /// Publish only while the caller owns the donor lease.
+    pub async fn publish_metadata_fenced(
+        &self,
+        identity: &SourceIdentity,
+        worker_id: &str,
+        worker: WorkerMetadata,
+        owner_token: &str,
+    ) -> MetadataResult<()> {
+        self.get_backend()
+            .await?
+            .publish_metadata_fenced(identity, worker_id, worker, owner_token)
+            .await
+    }
+
     /// Try to acquire a cold-start donor lease on the configured backend.
     pub async fn try_acquire_donor_lease(
         &self,
@@ -262,6 +276,29 @@ impl P2pStateManager {
     // ========================================================================
 
     /// Update the status of a worker within its stored metadata record.
+    pub async fn update_worker_status_fenced(
+        &self,
+        source_id: &str,
+        worker_id: &str,
+        worker_rank: u32,
+        status: modelexpress_common::grpc::p2p::SourceStatus,
+        source_load: Option<f32>,
+        owner_token: &str,
+    ) -> MetadataResult<()> {
+        self.get_backend()
+            .await?
+            .update_status_fenced(
+                source_id,
+                worker_id,
+                worker_rank,
+                status,
+                chrono::Utc::now().timestamp_millis(),
+                source_load,
+                owner_token,
+            )
+            .await
+    }
+
     pub async fn update_worker_status(
         &self,
         source_id: &str,

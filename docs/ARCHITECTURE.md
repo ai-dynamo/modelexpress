@@ -384,10 +384,14 @@ Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally whe
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
-The Redis P2P metadata backend also contains donor-lease primitives for future
-coordinated cold starts. They are not exposed through the API or used by model
-loading yet. Lease ownership checks alone do not fence metadata publication or
-prevent an expired donor from continuing its object-store download.
+With `MX_P2P_COLD_START=1`, the vLLM loader uses a Redis-backed lease per
+source identity to coordinate concurrent cold starts. Rank zero elects a donor
+and broadcasts the decision to its tensor-parallel group. Followers wait for
+all ranks in a coordinated donor group to publish READY, then load from that
+group over P2P. Publication and heartbeats are fenced by the live lease.
+An expired donor can continue an in-flight object-store download; fencing does
+not cancel it or an already-started P2P transfer. Followers do not re-elect
+after selecting a donor, and existing non-coordinated donors are not selected.
 
 ### RL refit service
 
@@ -1124,7 +1128,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses it for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. The default `nixl` artifact backend requires P2P metadata and is skipped when `MX_P2P_METADATA=0`; the `mooncake` backend is independent of P2P metadata. |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim |
+| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint used before preparing and publishing cache bundles, and before vLLM weight metadata publication when explicitly configured. Bundle readiness defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Feeds the torch compile cache `SourceIdentity`, adding compile configuration as a partitioning dimension for artifact discovery. Unset leaves the field empty, which drops it from the `mx_source_id` input, so workers whose other identity fields match — model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch — share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](DEPLOYMENT.md#pairing-workers-by-compile-configuration) |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |

@@ -147,6 +147,8 @@ class MxModelLoader(BaseModelLoader):
         source-serving stops first unless a prior sleep() already stopped it.
         The strategy chain registers and republishes the reloaded tensors.
         """
+        if envs.MX_P2P_COLD_START:
+            raise RuntimeError("MX cold start does not support model reload")
         if self._last_sleep_level is None:
             self._stop_serving()
         return self._load_or_reload_model(vllm_config, model_config, prefix, model)
@@ -212,6 +214,10 @@ class MxModelLoader(BaseModelLoader):
             model = self._load_model(
                 vllm_config, model_config, prefix, ctx, is_speculative_draft, model
             )
+        except BaseException:
+            if ctx.donor_lease is not None:
+                ctx.donor_lease.stop()
+            raise
         finally:
             if draft_gate is not None:
                 draft_gate.release()
@@ -235,7 +241,6 @@ class MxModelLoader(BaseModelLoader):
         is_speculative_draft: bool,
         model: nn.Module | None = None,
     ) -> nn.Module:
-
         # A speculative draft loads through this same path and finishes far
         # sooner than the model the user asked for, so timing them together
         # makes the p99 of neither meaningful. Asked directly rather than
@@ -256,15 +261,26 @@ class MxModelLoader(BaseModelLoader):
                 with set_default_torch_dtype(model_config.dtype):
                     with ctx.target_device:
                         if model is None:
-                            with metrics.time_load_phase("vllm", model_id, "model_init"):
+                            with metrics.time_load_phase(
+                                "vllm", model_id, "model_init"
+                            ):
                                 model = initialize_model(
                                     vllm_config=vllm_config,
                                     model_config=model_config,
                                     prefix=prefix,
                                 )
 
+                    if envs.MX_P2P_COLD_START:
+                        from ...cold_start import coordinate
+
+                        coordinate(ctx, vllm_config)
+
                     with metrics.time_load_phase("vllm", model_id, "chain"):
                         model = self._run_load_strategy_chain(model, ctx)
+                        if ctx.donor_lease is not None:
+                            if ctx.donor_lease.lost.is_set():
+                                raise RuntimeError("MX donor lease lost during loading")
+                            ctx.donor_lease.publication_started = time.monotonic()
 
                     if ctx.p2p_enabled and ctx.p2p_role == "draft":
                         if ctx.nixl_manager is not None:
@@ -342,6 +358,8 @@ class MxModelLoader(BaseModelLoader):
         virtual addresses, so a peer's RDMA read against either would hit
         invalid memory.
         """
+        if envs.MX_P2P_COLD_START:
+            raise RuntimeError("MX cold start does not support sleep/wake")
         self._last_sleep_level = level
         self._stop_serving()
 
@@ -375,6 +393,9 @@ class MxModelLoader(BaseModelLoader):
             return
 
         unpublish_metadata(self._ctx)
+        if self._ctx.donor_lease is not None:
+            self._ctx.donor_lease.stop()
+            self._ctx.donor_lease = None
         if self._ctx.nixl_manager is not None:
             self._ctx.nixl_manager.shutdown()
             self._ctx.nixl_manager = None

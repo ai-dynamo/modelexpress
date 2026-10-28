@@ -399,10 +399,20 @@ class RdmaStrategy(LoadStrategy):
             )
             return []
         try:
+            kwargs = {"strict": True} if ctx.cold_start_role == "follower" else {}
             list_resp = ctx.mx_client.list_sources(
                 identity=ctx.identity,
                 status_filter=p2p_pb2.SOURCE_STATUS_READY,
+                **kwargs,
             )
+            if ctx.cold_start_role == "follower":
+                matches = [
+                    instance
+                    for instance in list_resp.instances
+                    if instance.worker_id == f"{ctx.cold_start_group}-{ctx.worker_rank}"
+                ]
+                del list_resp.instances[:]
+                list_resp.instances.extend(matches)
             if not list_resp.instances:
                 logger.debug(
                     f"[Worker {ctx.global_rank}] No ready source instances found"
@@ -465,7 +475,9 @@ class RdmaStrategy(LoadStrategy):
                 selection_metrics.observe_candidates(
                     selector.name, "topology_matched", topology_matched
                 )
-                topology_field = f" source_candidates_topology_matched={topology_matched}"
+                topology_field = (
+                    f" source_candidates_topology_matched={topology_matched}"
+                )
                 warn_if_no_domain_match(candidates, topology_policy, ctx.global_rank)
             selection_metrics.observe_selection_seconds(selector.name, select_seconds)
 
@@ -490,6 +502,8 @@ class RdmaStrategy(LoadStrategy):
             return ordered
 
         except Exception as e:
+            if ctx.cold_start_role == "follower":
+                raise
             logger.warning(
                 f"[Worker {ctx.global_rank}] Error listing sources, falling through: {e}"
             )
@@ -546,9 +560,7 @@ class RdmaStrategy(LoadStrategy):
         descriptors = worker_tensor_descriptors(source_worker)
         if not descriptors:
             return True
-        return any(
-            t.name.startswith(ctx.draft_tensor_namespace) for t in descriptors
-        )
+        return any(t.name.startswith(ctx.draft_tensor_namespace) for t in descriptors)
 
     @staticmethod
     def _scope_source_tensors(
@@ -565,8 +577,7 @@ class RdmaStrategy(LoadStrategy):
         if not _is_draft_pass(ctx):
             return [t for t in source_tensors if not is_draft_tensor_name(t.name)]
         scoped = [
-            t for t in source_tensors
-            if t.name.startswith(ctx.draft_tensor_namespace)
+            t for t in source_tensors if t.name.startswith(ctx.draft_tensor_namespace)
         ]
         missing = set(ctx.tensors) - {t.name for t in scoped}
         if missing:

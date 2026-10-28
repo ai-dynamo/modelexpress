@@ -67,6 +67,8 @@ if TYPE_CHECKING:
     MX_LOAD_PLUGIN_BEFORE: str
     MX_LOAD_STRATEGY_CHAIN: str
     MX_P2P_METADATA: str
+    MX_P2P_COLD_START: bool
+    MX_COLD_START_TIMEOUT_SECS: int
     MX_DISABLE_DRAFT_P2P: bool
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
@@ -249,7 +251,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE": lambda: os.environ.get(
         "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE"
     ),
-    "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper(),
+    "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get(
+        "MODEL_EXPRESS_LOG_LEVEL", ""
+    ).upper(),
     "MX_MODEL_NAME_OVERRIDE": lambda: os.environ.get("MX_MODEL_NAME_OVERRIDE"),
     # ── Auth (client) ──────────────────────────────────────────────────────
     "MX_AUTH_TOKEN_PATH": lambda: os.environ.get("MX_AUTH_TOKEN_PATH"),
@@ -266,12 +270,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_WORKER_GRPC_PORT": lambda: _env_int("MX_WORKER_GRPC_PORT", 6555),
     "MX_WORKER_HOST": lambda: os.environ.get("MX_WORKER_HOST", ""),
     "MX_HEARTBEAT_INTERVAL_SECS": lambda: _env_int("MX_HEARTBEAT_INTERVAL_SECS", 30),
+    "MX_P2P_COLD_START": lambda: _env_bool("MX_P2P_COLD_START", False),
+    "MX_COLD_START_TIMEOUT_SECS": lambda: _env_int("MX_COLD_START_TIMEOUT_SECS", 0),
     "MX_PUBLISH_TIMEOUT_SECS": lambda: _env_int("MX_PUBLISH_TIMEOUT_SECS", 30 * 60),
     "MX_MODEL_REVISION": lambda: os.environ.get("MX_MODEL_REVISION", ""),
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
-    "MX_PLUGIN_DIR": lambda: os.environ.get("MX_PLUGIN_DIR", "/opt/modelexpress/plugins"),
+    "MX_PLUGIN_DIR": lambda: os.environ.get(
+        "MX_PLUGIN_DIR", "/opt/modelexpress/plugins"
+    ),
     "MX_LOAD_PLUGIN": lambda: os.environ.get("MX_LOAD_PLUGIN"),
-    "MX_LOAD_PLUGIN_BEFORE": lambda: os.environ.get("MX_LOAD_PLUGIN_BEFORE", "server-cache"),
+    "MX_LOAD_PLUGIN_BEFORE": lambda: os.environ.get(
+        "MX_LOAD_PLUGIN_BEFORE", "server-cache"
+    ),
     "MX_LOAD_STRATEGY_CHAIN": lambda: (
         os.environ.get("MX_LOAD_STRATEGY_CHAIN", "INFERENCE").strip().upper()
     ),
@@ -372,7 +382,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Raw; topology.resolve_policy validates and applies the "required" default.
     "MX_P2P_TOPOLOGY_DOMAIN": lambda: os.environ.get("MX_P2P_TOPOLOGY_DOMAIN"),
-    "MX_P2P_TOPOLOGY_ENFORCEMENT": lambda: os.environ.get("MX_P2P_TOPOLOGY_ENFORCEMENT"),
+    "MX_P2P_TOPOLOGY_ENFORCEMENT": lambda: os.environ.get(
+        "MX_P2P_TOPOLOGY_ENFORCEMENT"
+    ),
     # ── Opt-in metrics collector ───────────────────────────────────────────
     "MX_METRICS_ENABLED": lambda: (
         os.environ.get("MX_METRICS_ENABLED", "0").strip().lower() in _TRUTHY

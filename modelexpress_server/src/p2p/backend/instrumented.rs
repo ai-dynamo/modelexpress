@@ -89,6 +89,23 @@ impl MetadataBackend for InstrumentedMetadataBackend {
             .await
     }
 
+    async fn publish_metadata_fenced(
+        &self,
+        identity: &SourceIdentity,
+        worker_id: &str,
+        worker: WorkerMetadata,
+        owner_token: &str,
+    ) -> MetadataResult<()> {
+        self.metrics
+            .time(
+                Store::P2p,
+                "publish_metadata_fenced",
+                self.inner
+                    .publish_metadata_fenced(identity, worker_id, worker, owner_token),
+            )
+            .await
+    }
+
     async fn publish_metadata(
         &self,
         identity: &SourceIdentity,
@@ -202,6 +219,33 @@ impl MetadataBackend for InstrumentedMetadataBackend {
     async fn list_sources(&self) -> MetadataResult<Vec<(String, String)>> {
         self.metrics
             .time(Store::P2p, "list_sources", self.inner.list_sources())
+            .await
+    }
+
+    async fn update_status_fenced(
+        &self,
+        source_id: &str,
+        worker_id: &str,
+        worker_rank: u32,
+        status: SourceStatus,
+        updated_at: i64,
+        source_load: Option<f32>,
+        owner_token: &str,
+    ) -> MetadataResult<()> {
+        self.metrics
+            .time(
+                Store::P2p,
+                "update_status_fenced",
+                self.inner.update_status_fenced(
+                    source_id,
+                    worker_id,
+                    worker_rank,
+                    status,
+                    updated_at,
+                    source_load,
+                    owner_token,
+                ),
+            )
             .await
     }
 

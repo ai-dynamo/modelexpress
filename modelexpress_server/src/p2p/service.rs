@@ -11,9 +11,10 @@ use crate::p2p::backend::SourceInstanceInfo;
 use crate::p2p::source_identity::{compute_mx_source_id, validate_identity};
 use crate::p2p::state::P2pStateManager;
 use modelexpress_common::grpc::p2p::{
-    GetMetadataRequest, GetMetadataResponse, ListSourcesRequest, ListSourcesResponse,
-    PublishMetadataRequest, PublishMetadataResponse, SourceInstanceRef, SourceStatus,
-    UpdateStatusRequest, UpdateStatusResponse, WorkerMetadata, p2p_service_server::P2pService,
+    DonorLeaseAction, DonorLeaseRequest, DonorLeaseResponse, GetMetadataRequest,
+    GetMetadataResponse, ListSourcesRequest, ListSourcesResponse, PublishMetadataRequest,
+    PublishMetadataResponse, SourceInstanceRef, SourceStatus, UpdateStatusRequest,
+    UpdateStatusResponse, WorkerMetadata, p2p_service_server::P2pService,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -80,6 +81,44 @@ fn legacy_worker_tensor_count(worker: &WorkerMetadata) -> usize {
 
 #[tonic::async_trait]
 impl P2pService for P2pServiceImpl {
+    async fn donor_lease(
+        &self,
+        request: Request<DonorLeaseRequest>,
+    ) -> Result<Response<DonorLeaseResponse>, Status> {
+        let req = request.into_inner();
+        let identity = req
+            .identity
+            .ok_or_else(|| Status::invalid_argument("identity is required"))?;
+        validate_identity(&identity).map_err(Status::invalid_argument)?;
+        if req.owner_token.is_empty() {
+            return Err(Status::invalid_argument("owner_token is required"));
+        }
+        let source_id = compute_mx_source_id(&identity);
+        let duration = std::time::Duration::from_secs(req.ttl_seconds);
+        let action = DonorLeaseAction::try_from(req.action)
+            .map_err(|_| Status::invalid_argument("invalid lease action"))?;
+        let result = match action {
+            DonorLeaseAction::Acquire if req.ttl_seconds > 0 => {
+                self.state
+                    .try_acquire_donor_lease(&source_id, &req.owner_token, duration)
+                    .await
+            }
+            DonorLeaseAction::Renew if req.ttl_seconds > 0 => {
+                self.state
+                    .renew_donor_lease(&source_id, &req.owner_token, duration)
+                    .await
+            }
+            DonorLeaseAction::Release => {
+                self.state
+                    .release_donor_lease(&source_id, &req.owner_token)
+                    .await
+            }
+            _ => return Err(Status::invalid_argument("invalid action or lease duration")),
+        }
+        .map_err(|err| Status::unavailable(format!("donor lease backend: {err}")))?;
+        Ok(Response::new(DonorLeaseResponse { acquired: result }))
+    }
+
     async fn publish_metadata(
         &self,
         request: Request<PublishMetadataRequest>,
@@ -146,18 +185,23 @@ impl P2pService for P2pServiceImpl {
         let worker_rank = worker.worker_rank;
         let tensor_count = worker_tensor_count(&worker);
 
-        match self
-            .state
-            .publish_metadata(
-                &identity,
-                &worker_id,
-                worker,
-                &req.pod_name,
-                &req.pod_uid,
-                &req.pod_namespace,
-            )
-            .await
-        {
+        let result = if req.donor_lease_token.is_empty() {
+            self.state
+                .publish_metadata(
+                    &identity,
+                    &worker_id,
+                    worker,
+                    &req.pod_name,
+                    &req.pod_uid,
+                    &req.pod_namespace,
+                )
+                .await
+        } else {
+            self.state
+                .publish_metadata_fenced(&identity, &worker_id, worker, &req.donor_lease_token)
+                .await
+        };
+        match result {
             Ok(()) => {
                 info!(
                     "PublishMetadata: model='{}' source_id={} worker_id={} worker_rank={} tensors={}",
@@ -227,6 +271,9 @@ impl P2pService for P2pServiceImpl {
             Ok(v) => v,
             Err(e) => {
                 error!("Failed to list workers: {}", e);
+                if req.strict {
+                    return Err(Status::unavailable(format!("metadata backend: {e}")));
+                }
                 return tagged(
                     ListSourcesResponse {
                         instances: Vec::new(),
@@ -405,17 +452,29 @@ impl P2pService for P2pServiceImpl {
             .filter(|v| v.is_finite())
             .map(|v| v.clamp(0.0, 1.0));
 
-        match self
-            .state
-            .update_worker_status(
-                &req.mx_source_id,
-                &req.worker_id,
-                req.worker_rank,
-                status,
-                source_load,
-            )
-            .await
-        {
+        let result = if req.donor_lease_token.is_empty() {
+            self.state
+                .update_worker_status(
+                    &req.mx_source_id,
+                    &req.worker_id,
+                    req.worker_rank,
+                    status,
+                    source_load,
+                )
+                .await
+        } else {
+            self.state
+                .update_worker_status_fenced(
+                    &req.mx_source_id,
+                    &req.worker_id,
+                    req.worker_rank,
+                    status,
+                    source_load,
+                    &req.donor_lease_token,
+                )
+                .await
+        };
+        match result {
             Ok(()) => tagged(
                 UpdateStatusResponse {
                     success: true,
@@ -575,6 +634,7 @@ mod tests {
                 pod_name: "vllm-worker-0".to_string(),
                 pod_uid: "pod-uid-1".to_string(),
                 pod_namespace: "default".to_string(),
+                donor_lease_token: String::new(),
             }))
             .await
             .expect("rpc")
@@ -713,6 +773,7 @@ mod tests {
                 worker_rank: 0,
                 status: 99,
                 source_load: None,
+                donor_lease_token: String::new(),
             }))
             .await
             .expect("rpc")
@@ -731,6 +792,7 @@ mod tests {
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
                 source_load: None,
+                donor_lease_token: String::new(),
             }))
             .await
             .expect("rpc")
@@ -748,6 +810,7 @@ mod tests {
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
                 source_load: None,
+                donor_lease_token: String::new(),
             }))
             .await
             .expect("rpc")
@@ -774,6 +837,7 @@ mod tests {
                 worker_rank: 3,
                 status: SourceStatus::Ready as i32,
                 source_load: Some(0.42),
+                donor_lease_token: String::new(),
             }))
             .await
             .expect("rpc")
@@ -868,6 +932,7 @@ mod tests {
                 min_training_step: Some(40),
                 min_updated_at: Some(1_700_000_000_000),
                 limit: Some(2),
+                strict: false,
             }))
             .await
             .expect("rpc")
@@ -1212,6 +1277,7 @@ mod tests {
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
                 source_load: None,
+                donor_lease_token: String::new(),
             }))
             .await
             .expect("rpc")

@@ -9,6 +9,9 @@ package model_express.p2p;
 // The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
 // Clients query for existing sources and publish their own metadata.
 service P2pService {
+  // Coordinate the donor for a compatible cold start.
+  rpc DonorLease(DonorLeaseRequest) returns (DonorLeaseResponse);
+
   // Publish model metadata - called by client after loading model weights
   rpc PublishMetadata(PublishMetadataRequest) returns (PublishMetadataResponse);
 
@@ -555,6 +558,9 @@ message PublishMetadataRequest {
   // Owner references are only valid when this matches the ModelMetadata
   // namespace. Empty means no ownerReference is set.
   string pod_namespace = 6;
+
+  // If set, publish only while this token owns the donor lease.
+  string donor_lease_token = 7;
 }
 
 message PublishMetadataResponse {
@@ -649,6 +655,8 @@ message ListSourcesRequest {
 
   // Return newest workers first and cap the response. Zero/unset means no cap.
   optional uint32 limit = 7;
+  // Fail the RPC on a metadata backend error rather than returning an empty list.
+  bool strict = 8;
 }
 
 message ListSourcesResponse {
@@ -710,9 +718,29 @@ message UpdateStatusRequest {
   // no provider has a reading; 0 means measured idle. See
   // SourceInstanceRef.source_load.
   optional float source_load = 5;
+  string donor_lease_token = 6;
 }
 
 message UpdateStatusResponse {
   bool success = 1;
   string message = 2;
+}
+
+// Donor leases are scoped to the server-computed source identity.
+enum DonorLeaseAction {
+  DONOR_LEASE_ACTION_UNSPECIFIED = 0;
+  DONOR_LEASE_ACTION_ACQUIRE = 1;
+  DONOR_LEASE_ACTION_RENEW = 2;
+  DONOR_LEASE_ACTION_RELEASE = 3;
+}
+
+message DonorLeaseRequest {
+  SourceIdentity identity = 1;
+  string owner_token = 2;
+  DonorLeaseAction action = 3;
+  uint64 ttl_seconds = 4;
+}
+
+message DonorLeaseResponse {
+  bool acquired = 1;
 }
