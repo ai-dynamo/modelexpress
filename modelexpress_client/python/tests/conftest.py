@@ -164,6 +164,13 @@ def _maybe_mock_vllm():
         "vllm.distributed.weight_transfer.factory": MagicMock(),
     }
 
+    # Explicit attributes survive monkeypatch teardown under pytest 9.2.
+    vllm_mods["vllm.model_executor.model_loader.default_loader"].DefaultModelLoader = MagicMock()
+    vllm_mods["vllm.model_executor.model_loader.utils"].initialize_model = MagicMock()
+    vllm_mods["vllm.model_executor.model_loader"]._LOAD_FORMAT_TO_MODEL_LOADER = {}
+    vllm_mods["vllm"].model_executor = vllm_mods["vllm.model_executor"]
+    vllm_mods["vllm.model_executor"].model_loader = vllm_mods["vllm.model_executor.model_loader"]
+
     # Wire up real objects where behavior matters
     vllm_mods["vllm.model_executor.layers.attention_layer_base"].AttentionLayerBase = attention_layer_base
     vllm_mods["vllm.model_executor.layers.mamba.abstract"].MambaBase = mamba_base

@@ -46,7 +46,6 @@ from modelexpress_rl.inference.plan import (
     PreparedCheckpointArtifact,
     PreparedRuntimeTensors,
     SourceResolver,
-    WeightUpdatePlanner,
 )
 from modelexpress_rl.inference.runtime import EngineRuntime, GeneratorRuntime
 from modelexpress_rl.inference.session import WeightUpdateSession
@@ -2263,7 +2262,7 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
         lambda version_id, **_kwargs: versions[version_id],
     )
     peer = GeneratorPeerUpdateSource(
-        worker=p2p_pb2.WorkerMetadata(), mx_source_id="peer", worker_id="peer"
+        worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="peer:9000"), mx_source_id="peer", worker_id="peer"
     )
     resolver = Mock(spec=SourceResolver, kind=WeightSource.GENERATOR)
     resolver.supports.return_value = True
@@ -2271,14 +2270,11 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
     resolver.candidates.side_effect = lambda version: (
         (peer,) if use_peer_for_second_delta and version.version_id == "delta-2" else ()
     )
-    transfer = Mock()
-    transfer.stage_peer.return_value = SimpleNamespace(
-        tensors={"weight": tensors[2]}, metrics={}
-    )
-    transfer.receive_peer.return_value = {}
     peer_method = RuntimeTensorNixlUpdateMethod(
-        transfer=transfer, runtime_tensors={"weight": tensors[0]}
+        manager=Mock(), device_id=0, runtime_tensors={"weight": tensors[0]}
     )
+    monkeypatch.setattr(peer_method, "_prepare_peer_read", lambda _source: Mock())
+    monkeypatch.setattr(peer_method, "_receive_peer", lambda _read: {})
     installer = Mock(spec=EngineInstaller)
     installer.capabilities = EngineCapabilities(
         artifact_types=frozenset({PreparedCheckpointArtifact, PreparedRuntimeTensors})
@@ -2288,12 +2284,10 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
         engine=EngineRuntime(model_name="test/model", installer=installer),
         methods=methods,
         session=WeightUpdateSession(
-            planner=WeightUpdatePlanner(
-                resolvers=(resolver, ObjectStorageSourceResolver()),
-                methods=methods,
-                installer=installer,
-                max_transfer_attempts=1,
-            ),
+            resolvers=(resolver, ObjectStorageSourceResolver()),
+            methods=methods,
+            installer=installer,
+            max_transfer_attempts=1,
             start_lease=lambda _version_id: Mock(),
             resolve_replay_chain=lambda version: generator._resolve_replay_chain(
                 version.version_id, from_full_root=True

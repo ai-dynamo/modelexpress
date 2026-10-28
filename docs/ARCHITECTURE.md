@@ -645,6 +645,10 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 
 RL trainers and generators use the optional `modelexpress_rl` namespace from the same Python distribution. See the [RL package guide](rl/README.md) and [RL refit architecture](rl/ARCHITECTURE.md).
 
+Trainer NIXL refit stages ordered source replay batches for engine installation.
+Direct generator-peer refit owns its donor leases and reads in the runtime-tensor
+update method, borrowing the inference NIXL manager independently of trainer staging.
+
 ### MxClient
 
 gRPC client wrapping the P2P service stubs:
@@ -746,6 +750,27 @@ loading, quantized-weight post-processing, and tensor discovery, including the
 storage-view naming used for non-contiguous SGLang parameters.
 The SGLang side does not expose separate source and target modes; transport
 selection and source discovery remain inside the ModelExpress package.
+
+**Cold-load quantization state.** A source manifest can describe buffers whose
+existence depends on checkpoint values. After placeholder post-processing and
+before registering destination memory, the receive strategy calls
+`prepare_rdma_target_from_manifest` with model-relative tensor names (stripping
+the draft namespace for the adapter). SGLang's `runtime_state.py` uses the
+presence of `weight_scale_inv_swizzled` to recover the donor's block-FP8 MXFP8
+decision for FlashInfer CuTeDSL/CUTLASS. It allocates the engine-defined scale
+layout without priming floating scales or reshuffling weights. The existing
+manifest carries this decision; no new wire fields or server upgrade are needed.
+
+SGLang requires an exact NIXL tensor catalog. TransferEngine also rejects
+source-only tensors before submitting a read. After transfer, SGLang validates
+MXFP8 eligibility against the received scales before enabling that dispatch,
+and refreshes `k_scale_float` / `v_scale_float` from already-normalized device
+scales. It does not rerun full post-processing or reallocate registered storage.
+Invalid descriptors, inconsistent scales, and unsupported donor-dependent
+layouts fail the attempt and use the existing cold-load recovery/fallback path.
+This does not add optimized support for Hopper's optional BF16 weight cache or
+ROCm MXFP8 layouts; mismatches remain failures. Warm reloads skip cold-load
+preparation and retain their existing same-identity restrictions.
 
 **Speculative draft pass.** SGLang's EAGLE worker builds a second ModelRunner
 for the draft on the same GPU. Its `ModelConfig` has `is_draft_model=True` and,
@@ -1179,7 +1204,10 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering serv
 
 ## RL staged transfer
 
-The bounded arena design, logical and physical transfer plans, descriptor caching, checksum verification, and failure cleanup are covered in the [RL refit architecture](rl/ARCHITECTURE.md#staged-transfer-caching-and-failure-handling).
+Trainer refit compiles source geometry separately from NIXL execution and installs
+weights at the engine's safe point. See the [RL refit architecture](rl/ARCHITECTURE.md#refit-class-responsibilities)
+for ownership boundaries, [bounded staging and replay](rl/ARCHITECTURE.md#staged-transfer-caching-and-failure-handling),
+and failure handling.
 
 
 ## RL refit CI harness
