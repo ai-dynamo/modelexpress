@@ -125,6 +125,12 @@ class EngineAdapter:
         """
         ...
 
+    def resolve_model_streamer_uri(
+        self, model_uri: str | None, *, draft_model_uri: str | None = None
+    ) -> str | None:
+        """Resolve the streaming override for this load pass; None keeps it disabled."""
+        return model_uri
+
     @gated_capability
     def build_model_streamer_weight_iter(
         self,

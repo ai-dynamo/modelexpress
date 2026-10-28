@@ -72,7 +72,7 @@ _draft_publication_gates: dict[int, DraftPublicationGate] = {}
 
 
 def _expects_draft_pass(vllm_config) -> bool:
-    """True when vLLM will run a second, draft load_model on this worker.
+    """True when vLLM will run a second ModelExpress load for the draft.
 
     Mirrors _is_speculative_draft: ngram and similar methods alias the draft
     config to the target's (runner "generate") and never load a draft.
@@ -80,6 +80,10 @@ def _expects_draft_pass(vllm_config) -> bool:
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if speculative_config is None:
         return False
+    draft_load_config = getattr(speculative_config, "draft_load_config", None)
+    if draft_load_config is not None:
+        if draft_load_config.load_format not in ("mx", "modelexpress"):
+            return False
     draft_model_config = getattr(speculative_config, "draft_model_config", None)
     return getattr(draft_model_config, "runner_type", None) == "draft"
 

@@ -847,6 +847,82 @@ def _stub_metadata_client(monkeypatch) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "target_model,target_weights,model,model_weights,expected",
+    [
+        ("/main", None, "/draft", None, "/draft"),
+        ("/main", None, "/draft", "s3://bucket/draft", "s3://bucket/draft"),
+        ("/main", None, "/main", None, "s3://bucket/main"),
+        ("/main-config", "/weights", "/draft-config", "/weights", "s3://bucket/main"),
+        ("/main", "/main-weights", "/main", "/draft-weights", "/draft-weights"),
+        (None, None, "/draft", None, "s3://bucket/main"),
+    ],
+)
+def test_draft_checkpoint_uri(
+    target_model, target_weights, model, model_weights, expected,
+):
+    config = _context_config(load_device="cpu")
+    config.speculative_config = SimpleNamespace(
+        target_model_config=(
+            SimpleNamespace(model=target_model, model_weights=target_weights)
+            if target_model is not None else None
+        )
+    )
+    model_config = _model_config()
+    model_config.model = model
+    model_config.model_weights = model_weights
+    model_config.runner_type = "draft"
+
+    assert VllmAdapter(config, model_config).resolve_model_streamer_uri(
+        "s3://bucket/main"
+    ) == expected
+
+
+@pytest.mark.parametrize("role,model,main_uri,draft_uri,expected", [
+    ("generate", "/main", "s3://bucket/main", "s3://bucket/draft", "s3://bucket/main"),
+    ("generate", "/main", None, "s3://bucket/draft", None),
+    ("draft", "/draft", "s3://bucket/main", "s3://bucket/draft", "s3://bucket/draft"),
+    ("draft", "/draft", None, "/weights/draft", "/weights/draft"),
+    ("draft", "/main", "s3://bucket/main", "s3://bucket/mtp", "s3://bucket/mtp"),
+    ("draft", "/draft", None, None, None),
+])
+def test_draft_uri_override_activation_and_isolation(
+    monkeypatch, role, model, main_uri, draft_uri, expected,
+):
+    from modelexpress.load_strategy.instant_tensor_strategy import InstantTensorStrategy
+    from modelexpress.load_strategy.model_streamer_strategy import ModelStreamerStrategy
+
+    for name, value in (("MX_MODEL_URI", main_uri), ("MX_DRAFT_MODEL_URI", draft_uri)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    config = _context_config(load_device="cpu")
+    config.speculative_config = SimpleNamespace(
+        target_model_config=SimpleNamespace(model="/main", model_weights=None)
+    )
+    model_config = _model_config()
+    model_config.model = model
+    model_config.runner_type = role
+    adapter = VllmAdapter(config, model_config)
+    ctx = SimpleNamespace(
+        adapter=adapter, model_config=model_config, global_rank=0,
+        p2p_role="draft" if role == "draft" else "main",
+    )
+    strategy = ModelStreamerStrategy()
+    with patch("importlib.util.find_spec", return_value=object()):
+        assert strategy.is_available(ctx) is (expected is not None)
+    if expected is not None:
+        engine_model = nn.Module()
+        engine_model.load_weights = MagicMock(side_effect=list)
+        with patch.object(strategy, "_stream_weights", return_value=iter(())) as stream:
+            strategy.load(LoadResult(engine_model, engine_model), ctx)
+        stream.assert_called_once_with(expected, ctx, engine_model)
+        if expected.startswith("s3://") or (role == "draft" and draft_uri):
+            monkeypatch.setenv("MX_INSTANT_TENSOR", "1")
+            assert InstantTensorStrategy().is_available(ctx) is False
+
+
 def _context_config(*, load_device):
     return SimpleNamespace(
         device_config=SimpleNamespace(device="cuda"),

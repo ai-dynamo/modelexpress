@@ -431,6 +431,33 @@ class VllmAdapter(EngineAdapter):
         result.model.load_weights(weights_iter)
         return result
 
+    def resolve_model_streamer_uri(
+        self, model_uri: str | None, *, draft_model_uri: str | None = None
+    ) -> str | None:
+        """Keep the main URI override out of a separately stored draft checkpoint."""
+        if not _is_speculative_draft(self.vllm_config, self.model_config):
+            return model_uri
+        if draft_model_uri:
+            return draft_model_uri
+        if not model_uri:
+            return model_uri
+        target_model_config = getattr(
+            self.vllm_config.speculative_config, "target_model_config", None
+        )
+        if target_model_config is None:
+            return model_uri
+        draft_uri = (
+            getattr(self.model_config, "model_weights", None) or self.model_config.model
+        )
+        target_uri = (
+            getattr(target_model_config, "model_weights", None)
+            or target_model_config.model
+        )
+        # Same-checkpoint MTP still uses the main model's storage override.
+        if draft_uri == target_uri:
+            return model_uri
+        return draft_uri
+
     def build_model_streamer_weight_iter(
         self,
         model_uri: str,

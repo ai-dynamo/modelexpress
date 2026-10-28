@@ -928,12 +928,16 @@ class TestMtpDrafterSecondLoad:
             loader_mod._loader_registry.pop(0, None)
 
     @staticmethod
-    def _spec_vllm_config():
+    def _spec_vllm_config(draft_load_format=None):
         vllm_config = MagicMock()
         vllm_config.speculative_config.draft_model_config.runner_type = "draft"
+        vllm_config.speculative_config.draft_load_config = (
+            None if draft_load_format is None else MagicMock(load_format=draft_load_format)
+        )
         return vllm_config
 
-    def test_main_publication_waits_for_the_draft_pass(self):
+    @pytest.mark.parametrize("draft_load_format", [None, "mx", "modelexpress"])
+    def test_main_publication_waits_for_the_draft_pass(self, draft_load_format):
         """Without MX_ARTIFACT_READY_URL, a main load that expects a draft
         keeps its metadata undiscoverable until the draft's tensors have been
         registered and added to the manifest."""
@@ -969,7 +973,7 @@ class TestMtpDrafterSecondLoad:
                     return_value=target_ctx,
                 ):
                     _make_loader().load_model(
-                        self._spec_vllm_config(),
+                        self._spec_vllm_config(draft_load_format),
                         MagicMock(dtype=torch.float32, runner_type="generate"),
                     )
                 assert callable(target_ctx.source_ready_fn)
@@ -980,12 +984,31 @@ class TestMtpDrafterSecondLoad:
                     return_value=draft_ctx,
                 ):
                     _make_loader().load_model(
-                        self._spec_vllm_config(),
+                        self._spec_vllm_config(draft_load_format),
                         MagicMock(dtype=torch.float32, runner_type="draft"),
                     )
 
             assert events == ["draft-registered"]
             assert target_ctx.source_ready_fn() is True
+            assert 0 not in loader_mod._draft_publication_gates
+        finally:
+            loader_mod._draft_publication_gates.pop(0, None)
+            loader_mod._tensor_registry.pop(0, None)
+            loader_mod._nixl_managers.pop(0, None)
+            loader_mod._loader_registry.pop(0, None)
+
+    def test_main_does_not_wait_for_a_non_mx_draft(self, monkeypatch):
+        from modelexpress.engines.vllm import loader as loader_mod
+
+        monkeypatch.delenv("MX_ARTIFACT_READY_URL", raising=False)
+        monkeypatch.setenv("MX_DRAFT_MODEL_URI", "s3://bucket/draft")
+        ctx = _make_load_context(device_id=0)
+        try:
+            self._load(
+                _make_loader(), self._spec_vllm_config("auto"),
+                MagicMock(dtype=torch.float32, runner_type="generate"), ctx,
+            )
+            assert ctx.source_ready_fn is None
             assert 0 not in loader_mod._draft_publication_gates
         finally:
             loader_mod._draft_publication_gates.pop(0, None)
@@ -1003,7 +1026,8 @@ class TestMtpDrafterSecondLoad:
         gate.arm()
         assert gate.is_open() is True
 
-    def test_health_url_gates_main_publication_instead_of_draft_gate(self):
+    @pytest.mark.parametrize("draft_load_format", [None, "auto"])
+    def test_health_url_gates_main_publication_instead_of_draft_gate(self, draft_load_format):
         """With MX_ARTIFACT_READY_URL set, engine health (reached only after
         the draft loads) is the gate, so no draft gate is installed."""
         from modelexpress.engines.vllm import loader as loader_mod
@@ -1030,7 +1054,7 @@ class TestMtpDrafterSecondLoad:
                 return_value=False,
             ) as health:
                 _make_loader().load_model(
-                    self._spec_vllm_config(),
+                    self._spec_vllm_config(draft_load_format),
                     MagicMock(dtype=torch.float32, runner_type="generate"),
                 )
                 assert target_ctx.source_ready_fn() is False
