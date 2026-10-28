@@ -822,6 +822,40 @@ class TestReceiveFromSourceManifestValidation:
                 require_exact_match=True,
             )
 
+    @pytest.mark.parametrize("missing_on", ["receiver", "source"])
+    def test_sglang_rejects_missing_derived_tensor(self, monkeypatch, missing_on):
+        from types import SimpleNamespace
+        from modelexpress.engines.sglang.adapter import SglangAdapter
+
+        adapter = SglangAdapter(
+            SimpleNamespace(), SimpleNamespace(),
+            SimpleNamespace(device="cuda:0", gpu_id=0),
+        )
+        local = {"proj.weight": torch.zeros(1)}
+        derived = "proj.weight_scale_inv_swizzled"
+        source = [TensorDescriptor(
+            name="proj.weight", addr=0x1000, size=4,
+            device_id=0, dtype="torch.float32",
+        )]
+        if missing_on == "receiver":
+            source.append(TensorDescriptor(
+                name=derived, addr=0x2000, size=4,
+                device_id=0, dtype="torch.float32",
+            ))
+        else:
+            local[derived] = torch.zeros(1)
+        mgr = self._make_manager(monkeypatch, local)
+        mgr._agent.check_xfer_state.return_value = "DONE"
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+        with pytest.raises(ManifestMismatchError, match="Tensor name mismatch"):
+            mgr.receive_from_source(
+                source_metadata=b"", source_tensors=source,
+                remote_agent_name="dummy",
+                require_exact_match=adapter.requires_exact_tensor_catalog(),
+            )
+        mgr._agent.prep_xfer_dlist.assert_not_called()
+        mgr._agent.make_prepped_xfer.assert_not_called()
+
     def test_hetero_source_only_name_mismatch_raises(self, monkeypatch):
         # Source names a tensor the target never registered.
         mgr = self._make_manager(

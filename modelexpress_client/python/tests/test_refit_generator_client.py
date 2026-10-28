@@ -11,6 +11,10 @@ from types import SimpleNamespace
 
 import grpc
 import modelexpress_rl.inference.client as client_module
+from uuid import uuid4
+
+from tests.helpers.refit_replay import consume_stream
+
 import pytest
 from modelexpress import p2p_pb2, p2p_pb2_grpc
 from modelexpress.adapter import StrategyRecoveryError
@@ -42,7 +46,6 @@ from modelexpress_rl.inference.plan import (
     ResolvedSource,
     ResolvedTrainerSource,
     UpdateMethod,
-    WeightUpdatePlanner,
 )
 from modelexpress_rl.inference.runtime import (
     EngineRuntime,
@@ -446,14 +449,11 @@ def _runtime(
         ),
         methods=(method,),
         session=WeightUpdateSession(
-            planner=WeightUpdatePlanner(
-                resolvers=tuple(resolvers),
-                methods=(method,),
-                installer=installer,
-                max_transfer_attempts=max_transfer_attempts,
-            ),
+            resolvers=tuple(resolvers),
+            methods=(method,),
+            installer=installer,
+            max_transfer_attempts=max_transfer_attempts,
             start_lease=start_lease,
-            streaming=streaming,
             resolve_replay_chain=lambda version: resolve_replay_chain(
                 version.version_id,
                 {
@@ -694,7 +694,7 @@ def test_generator_prefers_peer_source_before_trainer_memory(monkeypatch):
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter)
     try:
-        resolvers = generator._runtime.session._planner._resolvers
+        resolvers = generator._runtime.session._resolvers
         assert [resolver.kind for resolver in resolvers] == [
             WeightSource.GENERATOR,
             WeightSource.TRAINER,
@@ -714,7 +714,7 @@ def test_generator_uses_configured_source_order(monkeypatch):
         source_order=(WeightSource.TRAINER,),
     )
     try:
-        resolvers = generator._runtime.session._planner._resolvers
+        resolvers = generator._runtime.session._resolvers
         assert [resolver.kind for resolver in resolvers] == [WeightSource.TRAINER]
     finally:
         generator.close()
@@ -727,7 +727,7 @@ def test_generator_uses_source_order_from_env(monkeypatch):
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter)
     try:
-        resolvers = generator._runtime.session._planner._resolvers
+        resolvers = generator._runtime.session._resolvers
         assert [resolver.kind for resolver in resolvers] == [WeightSource.TRAINER]
     finally:
         generator.close()
@@ -845,10 +845,7 @@ def test_generator_handles_mesh_change_with_configured_peer_fallback(
             def prepare(self, **_kwargs) -> SimpleNamespace:
                 return SimpleNamespace(
                     metrics={},
-                    batches=[SimpleNamespace(
-                        transfer_plan=SimpleNamespace(source_replay=False),
-                        layouts=({"weight": None},),
-                    )],
+                    replay_id=uuid4(),
                 )
 
             def iter_bounded(self, _prepared, _metrics) -> object:
@@ -871,11 +868,13 @@ def test_generator_handles_mesh_change_with_configured_peer_fallback(
             def install(self, prepared) -> str:
                 if isinstance(prepared, PreparedEngineTensors):
                     return adapter.apply_weight(prepared.staged)
-                assert [batch["weight"] for batch in prepared.batches()] == [2]
+                received = []
+                consume_stream(prepared, lambda batch: received.append(batch["weight"]))
+                assert received == [2]
                 adapter.apply_calls.append(prepared)
                 return "installed"
 
-        planner = generator._runtime.session._planner
+        planner = generator._runtime.session
         planner._methods = (
             Method(transfer=Transfer()),
             _TestMethod(adapter),
@@ -1180,7 +1179,7 @@ def test_generator_dispatches_canonical_s3_without_fetching_a_worker_manifest(
     )
     assert generator._runtime.p2p_client is None
     assert [
-        resolver.kind for resolver in generator._runtime.session._planner._resolvers
+        resolver.kind for resolver in generator._runtime.session._resolvers
     ] == [WeightSource.OBJECT_STORAGE]
 
     try:
@@ -1780,6 +1779,38 @@ def test_generator_reports_lease_cleanup_failure_after_success(
         server.stop(grace=None).wait()
 
 
+def test_installed_version_survives_lease_cleanup_failure_and_retry(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch, endpoint, adapter, initial_serving_version_id="base-a"
+    )
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        lease_deletions = service.lease_deletions
+        service.fail_lease_deletion = True
+        with pytest.raises(grpc.RpcError, match="lease backend unavailable"):
+            generator.apply_weight(staged)
+        assert staged.applied
+        assert generator._serving_version_id == "version-a"
+        assert generator._engine_state.value == "READY"
+        assert adapter.publish_calls == [{"version_id": "version-a"}]
+        assert len(adapter.apply_calls) == 1
+        assert service.active_leases
+
+        service.fail_lease_deletion = False
+        assert generator.apply_weight(staged) == "installed"
+        assert len(adapter.apply_calls) == 1
+        assert adapter.publish_calls == [{"version_id": "version-a"}]
+        assert not service.active_leases
+        assert service.lease_deletions == lease_deletions + 1
+        staged.release()
+    finally:
+        service.fail_lease_deletion = False
+        generator.close()
+        server.stop(grace=None).wait()
+
+
 def test_generator_preserves_apply_error_when_lease_cleanup_also_fails(monkeypatch):
     server, endpoint, service = _start_server()
     service.fail_lease_deletion = True
@@ -1910,20 +1941,13 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
                 raise prepare_error("preparation failure")
             return SimpleNamespace(
                 metrics={},
-                batches=[
-                    SimpleNamespace(
-                        transfer_plan=SimpleNamespace(source_replay=False),
-                        layouts=({"a.weight": None, "b.weight": None},),
-                    )
-                ],
+                replay_id=uuid4(),
             )
 
         def iter_bounded(self, prepared, metrics):
             assert service.active_leases
             yield {"a.weight": 1}
             assert service.active_leases
-            if fail_second:
-                raise RuntimeError("partial streaming failure")
             yield {"b.weight": 2}
             metrics["staging_peak_bytes"] = 512
 
@@ -1938,14 +1962,17 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
             )
 
         def install(self, prepared):
-            for tensors in prepared.batches():
+            def install_batch(tensors):
+                if fail_second and "b.weight" in tensors:
+                    raise RuntimeError("partial streaming failure")
                 installed.extend(tensors)
+            consume_stream(prepared, install_batch)
             return {"install_s": 0.1}
 
     method = LoadTimeTensorNixlUpdateMethod(
         transfer=Transfer(),
     )
-    planner = generator._runtime.session._planner
+    planner = generator._runtime.session
     planner._methods = (method,)
     planner._installer = Installer()
     try:
@@ -1966,7 +1993,7 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
 
             endpoint = service.shards[0].metadata_endpoint
             service.shards[0].metadata_endpoint = ""
-            with pytest.raises(RuntimeError, match="no NIXL trainer plan"):
+            with pytest.raises(RuntimeError, match="no usable refit source"):
                 generator.stage_weight(version=WeightVersionRef("version-a"))
             assert failed._update.released
             assert generator._active_handle is None
@@ -1994,7 +2021,7 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
             assert generator._serving_version_id == "version-a"
         assert not service.active_leases
         assert generator._active_handle is None
-        assert method._active_streamed is None
+        assert method._active is None
         assert len(prepare_calls) == (min(prepare_failures + 1, 3) + int(recovered))
         assert service.lease_registrations == (3 if recovered else 1)
     finally:
@@ -2543,7 +2570,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
         assert guard_active
 
     names = frozenset(dict(model.named_parameters()))
-    last_writes = {name: index for index, name in enumerate(model.state_dict())}
+    replay_id = uuid4()
 
     class Batches:
         index = 0
@@ -2560,7 +2587,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
                 raise StopIteration
             name = f"{self.index - 1}.weight"
             copy = RecordedCopy(name, (), name, 0, (2, 2), (2, 1), torch.float32)
-            return SourceReplayBatch(((self.index - 1, copy, arena),), names, last_writes, 2)
+            return SourceReplayBatch(((self.index - 1, copy, arena),), replay_id)
 
         def close(self):
             if not cleanup_allowed:
@@ -2581,13 +2608,7 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
             events.append("prepare")
             return SimpleNamespace(
                 metrics={},
-                batches=[
-                    SimpleNamespace(
-                        transfer_plan=SimpleNamespace(source_replay=True, replay_parameter_names=names),
-                        layouts=({f"{index}.weight": ((2, 2), torch.float32)},)
-                    )
-                    for index in range(2)
-                ],
+                replay_id=replay_id,
             )
 
         def iter_bounded(self, prepared, metrics):
@@ -2636,32 +2657,15 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
             )
             self.copy_count = 0
 
-        def _new_install_execution(self):
+        def _captured_source_plan(self):
             return SimpleNamespace(
-                targets=SimpleNamespace(by_name=dict(model.named_parameters())),
-                replay_metadata=None,
-                installed=set(),
-                bounded=False,
+                replay_id=replay_id,
+                new_execution=lambda *_args, **_kwargs: Execution(self),
             )
 
         def _reload(self, load):
             assert_installation_guard()
             load(self._parameter_aliases(self._model))
-
-        def _apply_source_batch(self, plan, batch):
-            assert_installation_guard()
-            self.copy_count += 1
-            events.append("copy")
-            if self.copy_count == 2 and case in {"partial", "drain", "close"}:
-                raise primary
-            with torch.no_grad():
-                for _, copy, value in batch.writes:
-                    model.get_parameter(copy.param_name).copy_(value)
-                    plan.installed.add(copy.param_name)
-            plan.replay_metadata = (batch.parameter_names, batch.last_writes)
-
-        def _finish_source_replay(self, plan):
-            assert plan.installed == names
 
         def _drain_streaming(self):
             assert_installation_guard()
@@ -2669,10 +2673,31 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
             if case == "drain" and events.count("drain") >= 2 and not cleanup_allowed:
                 raise cleanup_error
 
+    class Execution:
+        tied_input_peak_bytes = 0
+
+        def __init__(self, installer):
+            self.installer = installer
+            self.installed = set()
+
+        def apply(self, batch):
+            assert_installation_guard()
+            self.installer.copy_count += 1
+            events.append("copy")
+            if self.installer.copy_count == 2 and case in {"partial", "drain", "close"}:
+                raise primary
+            with torch.no_grad():
+                for _, copy, value in batch.writes:
+                    model.get_parameter(copy.param_name).copy_(value)
+                    self.installed.add(copy.param_name)
+
+        def finish(self):
+            assert self.installed == names
+
     installer = Installer()
     transfer = Transfer()
     method = Method(transfer=transfer)
-    planner = generator._runtime.session._planner
+    planner = generator._runtime.session
     planner._methods = (method,)
     planner._installer = installer
     uncertain_cleanup = case in {
@@ -2712,10 +2737,10 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
             handle = generator._active_handle
             assert handle is not None and not handle._update.released
             assert handle._update.prepared is prepared
-            assert method._active_streamed is prepared
-            assert prepared.ownership.release_blocked
+            assert method._active is prepared
+            assert prepared.release_blocked
             if case != "iterator":
-                assert prepared.ownership.iterator is not None
+                assert prepared._iterator is not None
             assert transfer.arena is arena
             for cleanup in (
                 generator.close,
@@ -2731,9 +2756,9 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
         else:
             assert not service.active_leases and service.lease_deletions == 1
             assert generator._active_handle is None
-            assert method._active_streamed is None
-            assert prepared.ownership.iterator is None
-            assert not prepared.ownership.release_blocked
+            assert method._active is None
+            assert prepared._iterator is None
+            assert not prepared.release_blocked
             assert "iterator_close" in events
         assert service.lease_registrations == 1
         if case == "partial":
@@ -2752,11 +2777,12 @@ def test_generic_streaming_client_preserves_ownership_and_guard_scope(
         # failure state to tear down the local server, not as a recovery API.
         cleanup_allowed = True
         if prepared_updates:
-            owner = prepared_updates[0].ownership
-            if owner.iterator is not None:
-                owner.iterator.close()
-                owner.iterator = None
-            owner.drain_failed = owner.close_failed = owner.source_failed = False
+            owner = prepared_updates[0]
+            if owner._iterator is not None:
+                owner._iterator.close()
+                owner._iterator = None
+            owner._batch = None
+            owner._drain_failed = owner._uncertain = False
         generator.close()
         method.close()
         server.stop(grace=None).wait()
@@ -2799,10 +2825,7 @@ def test_streaming_creates_and_emits_one_timing_cycle(
                 raise ValueError("injected streaming preparation failure")
             return SimpleNamespace(
                 metrics={},
-                batches=[SimpleNamespace(
-                    transfer_plan=SimpleNamespace(source_replay=False),
-                    layouts=({"weight": None},),
-                )],
+                replay_id=uuid4(),
             )
 
         def reset_workspace(self):
@@ -2826,13 +2849,14 @@ def test_streaming_creates_and_emits_one_timing_cycle(
 
         def install(self, prepared):
             observe_cycle()
-            for batch in prepared.batches():
+            def install_batch(batch):
                 with refit_span("installation", duration_key="receive_copy_s"):
                     assert batch == {"weight": 7}
+            consume_stream(prepared, install_batch)
             return {}
 
     method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer())
-    planner = generator._runtime.session._planner
+    planner = generator._runtime.session
     planner._methods = (method,)
     planner._installer = Installer()
     try:
