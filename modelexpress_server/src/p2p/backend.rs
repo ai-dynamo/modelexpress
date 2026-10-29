@@ -490,12 +490,12 @@ mod tests {
             backend.release_donor_lease("key", "owner").await,
         ];
         for result in errors {
-            assert!(
-                result
-                    .expect_err("memory backend must reject donor leases")
-                    .to_string()
-                    .contains("donor leases are not supported by this metadata backend")
-            );
+            assert!(matches!(
+                result,
+                Err(error) if error.to_string().contains(
+                    "donor leases are not supported by this metadata backend"
+                )
+            ));
         }
     }
 
