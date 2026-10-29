@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import time
+from dataclasses import replace
 
 from .. import envs, p2p_pb2
 from ..adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
@@ -735,21 +736,6 @@ class RdmaStrategy(LoadStrategy):
         """Receive fully-processed tensors via RDMA from the detected source."""
         receive_start = time.perf_counter()
         policy = configured_policy_label()
-        with selection_metrics.time_source_attempt_phase(policy, "register"):
-            register_tensors(result, ctx)
-
-        # register_tensors() is best-effort: it logs and swallows, leaving
-        # ctx.nixl_manager unset when registration failed. Everything below
-        # dereferences it, so without this the real cause (which register_tensors
-        # already logged in full) is replaced by an AttributeError on NoneType
-        # several frames later.
-        if ctx.nixl_manager is None:
-            raise StrategyFailed(
-                "NIXL registration failed, cannot receive weights over RDMA "
-                "(see the preceding registration error for the cause)",
-                mutated=True,
-            )
-
         is_p2p = bool(source_worker.worker_grpc_endpoint)
         remote_agent_name = None
 
@@ -779,7 +765,45 @@ class RdmaStrategy(LoadStrategy):
                     )
                     for t in tensor_protos
                 ]
+            else:
+                source_tensors = [
+                    TensorDescriptor(
+                        name=t.name,
+                        addr=t.addr,
+                        size=t.size,
+                        device_id=t.device_id,
+                        dtype=t.dtype,
+                    )
+                    for t in worker_tensor_descriptors(source_worker)
+                ]
+            source_tensors = self._scope_source_tensors(ctx, source_tensors)
+            if not ctx.is_reload:
+                adapter_tensors = source_tensors
+                if _is_draft_pass(ctx):
+                    adapter_tensors = [
+                        replace(t, name=t.name.removeprefix(ctx.draft_tensor_namespace))
+                        for t in source_tensors
+                    ]
+                ctx.adapter.prepare_rdma_target_from_manifest(result, adapter_tensors)
+            with selection_metrics.time_source_attempt_phase(policy, "register"):
+                register_tensors(result, ctx)
+            if _is_draft_pass(ctx):
+                # Registration refreshes ctx.tensors with newly prepared buffers.
                 source_tensors = self._scope_source_tensors(ctx, source_tensors)
+
+            # register_tensors() is best-effort: it logs and swallows, leaving
+            # ctx.nixl_manager unset when registration failed. Everything below
+            # dereferences it, so without this the real cause (which register_tensors
+            # already logged in full) is replaced by an AttributeError on NoneType
+            # several frames later.
+            if ctx.nixl_manager is None:
+                raise StrategyFailed(
+                    "NIXL registration failed, cannot receive weights over RDMA "
+                    "(see the preceding registration error for the cause)",
+                    mutated=True,
+                )
+
+            if is_p2p:
                 host, port_str = ep.rsplit(":", 1)
                 # Claimed before the dial so a fetch that fails part-way, leaving
                 # metadata that lands later, is still released.
@@ -807,17 +831,6 @@ class RdmaStrategy(LoadStrategy):
                     f"{handshake.seconds:.3f}s"
                 )
             else:
-                source_tensors = [
-                    TensorDescriptor(
-                        name=t.name,
-                        addr=t.addr,
-                        size=t.size,
-                        device_id=t.device_id,
-                        dtype=t.dtype,
-                    )
-                    for t in worker_tensor_descriptors(source_worker)
-                ]
-                source_tensors = self._scope_source_tensors(ctx, source_tensors)
                 # Loaded here rather than inside receive_from_source so this method
                 # holds the name it is responsible for releasing.
                 with selection_metrics.time_source_attempt_phase(

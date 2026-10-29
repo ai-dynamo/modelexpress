@@ -37,7 +37,7 @@ inputs:
   model:
     description: 'HuggingFace model id — exposed as MX_CI_MODEL for envsubst and pytest'
     required: false
-    default: 'Qwen/Qwen2.5-0.5B'
+    default: 'Qwen/Qwen3.5-0.8B'
   hf_token:
     description: 'HuggingFace token — written as hf-token-secret in the test namespace. Required: worker manifests reference the secret unconditionally.'
     required: true
@@ -197,13 +197,14 @@ runs:
     - name: Install test deps and generate gRPC stubs
       shell: bash
       run: |
-        echo "::group::Install pytest + grpcio and generate p2p_pb2 stubs"
+        echo "::group::Install inference CI dependencies and generate p2p_pb2 stubs"
         # grpcio(-tools) powers the backend-agnostic source-readiness gate
         # (ci/k8s/client/mx_sources.py queries mx-server's ListSources) and the
         # protoc stub generation below; pytest runs the test at the end. We
         # avoid `pip install modelexpress_client/python` — that pulls torch +
         # nixl just to expose two gRPC stubs.
-        pip install pytest grpcio grpcio-tools
+        pip install uv==0.10.9
+        uv pip install --system -r ci/pyproject.toml
         # Generate p2p_pb2 / p2p_pb2_grpc into ci/k8s/client/ so mx_sources.py
         # (used by the gate below) and the pytest tests can import them.
         python -m grpc_tools.protoc \
@@ -377,6 +378,20 @@ runs:
         fi
         echo "::endgroup::"
 
+    - name: Capture source accuracy before deploying target
+      if: inputs.test_script == 'ci/k8s/client/test_p2p_k8s.py'
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        MX_CI_MODEL: ${{ inputs.model }}
+        SOURCE_PORT: ${{ inputs.source_port }}
+        WORKER_PORT: ${{ inputs.worker_port }}
+      run: |
+        pytest ci/k8s/client/test_p2p_k8s.py::test_source_target_inference_matches -v \
+          --namespace "${NAMESPACE}" --model "${MX_CI_MODEL}" \
+          --source-port "${SOURCE_PORT}" --worker-port "${WORKER_PORT}" \
+          --capture-source-baseline
+
     - name: Apply target manifest
       shell: bash
       env:
@@ -504,6 +519,14 @@ runs:
           --tp-size "${TP_SIZE}" \
           --dp-size "${DP_SIZE}" \
           "${EXTRA[@]}"
+
+    - name: Upload inference comparison artifacts
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: inference-${{ inputs.namespace }}
+        path: inference-artifacts/${{ inputs.namespace }}
+        if-no-files-found: ignore
 
     - name: Dump pod logs
       # Runs on both success and failure. On failure it's the primary

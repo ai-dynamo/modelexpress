@@ -25,6 +25,10 @@ def _resolve_accelerator_backend(
     return accelerator_backend or CudaAcceleratorBackend()
 
 
+# Bounds the int64 scratch per chunk to 8x this many bytes.
+_CHECKSUM_CHUNK_BYTES = 16 * 1024 * 1024
+
+
 def safe_checksum(tensor: torch.Tensor) -> str:
     """Compute a fast fingerprint of tensor contents, staying on GPU when possible.
 
@@ -36,11 +40,17 @@ def safe_checksum(tensor: torch.Tensor) -> str:
         t = tensor.detach().contiguous()
         if t.dim() == 0:
             t = t.unsqueeze(0)
-        flat = t.view(torch.uint8)
-        idx = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64)
-        weights = (idx * 2654435761 + 1) & 0xFFFFFFFF
-        mixed = (flat.to(torch.int64) * weights) & 0xFFFFFFFF
-        return format(mixed.sum().item() & 0xFFFFFFFF, "08x")
+        flat = t.reshape(-1).view(torch.uint8)
+        total = torch.zeros((), device=flat.device, dtype=torch.int64)
+        for start in range(0, flat.numel(), _CHECKSUM_CHUNK_BYTES):
+            chunk = flat[start:start + _CHECKSUM_CHUNK_BYTES]
+            idx = torch.arange(
+                start, start + chunk.numel(), device=flat.device, dtype=torch.int64
+            )
+            weights = (idx * 2654435761 + 1) & 0xFFFFFFFF
+            mixed = (chunk.to(torch.int64) * weights) & 0xFFFFFFFF
+            total = (total + mixed.sum()) & 0xFFFFFFFF
+        return format(total.item(), "08x")
     except Exception as e:
         return f"err:{e}"
 

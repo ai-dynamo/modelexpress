@@ -70,13 +70,13 @@ def test_combined_capture_reuse_keeps_schedule_and_snapshot(monkeypatch):
     model, installer, _, manifest = _fixture(monkeypatch)
     captured, layout = installer.capture(manifest)
     plan = installer.source_install_plan
-    generation = captured.generation
+    generation = captured.replay_id
     captured.copies.clear()
     layout.clear()
     reused, reused_layout = installer.capture(manifest)
     assert len(reused.copies) == 2 and set(reused_layout) == {"a", "b"}
     compatible, _ = installer.capture(manifest)
-    assert compatible.generation == reused.generation == generation
+    assert compatible.replay_id == reused.replay_id == generation
     assert installer.source_install_plan is plan
     assert model.calls == 1
 
@@ -99,7 +99,7 @@ def test_combined_incompatible_generation_rebuilds_and_rejects_old_batch(
         manifest = [("trainer.weight", torch.float32, (4, 2))]
         # The unchanged converter selects three rows, preserving destinations.
     new, _ = installer.capture(manifest)
-    assert new.generation != old.generation
+    assert new.replay_id != old.replay_id
     assert installer.source_install_plan is not old_plan
     assert installer.source_install_plan.schedule is not old_plan.schedule
     assert model.calls == 2
@@ -122,11 +122,10 @@ def test_failed_combined_recapture_invalidates_and_retry_rebuilds(monkeypatch):
     installer._convert_native_to_hf = converter
     with pytest.raises(RuntimeError, match="conversion failed"):
         installer.capture(manifest)
-    assert installer._capture_cache is None
     assert installer.source_install_plan is None
     fail = False
     retried, _ = installer.capture(manifest)
-    assert retried.generation > old.generation
+    assert retried.replay_id != old.replay_id
     assert installer.source_install_plan is not None
     assert installer.source_install_plan.schedule.total_copies == len(retried.copies)
     assert model.calls == 2
@@ -139,6 +138,14 @@ def test_incomplete_combined_capture_returns_without_caching(monkeypatch):
     assert "extra" in layout
     assert "extra" not in {copy.param_name for copy in captured.copies}
     assert installer.source_install_plan is None
-    assert installer._capture_cache is None
     installer.capture(manifest)
     assert model.calls == 2
+
+
+def test_independent_captures_have_distinct_replay_identities(monkeypatch):
+    first_model, first_installer, _, manifest = _fixture(monkeypatch)
+    first, _ = first_installer.capture(manifest)
+    second_model, second_installer, _, second_manifest = _fixture(monkeypatch)
+    second, _ = second_installer.capture(second_manifest)
+    assert first.replay_id != second.replay_id
+    assert first_model.calls == second_model.calls == 1

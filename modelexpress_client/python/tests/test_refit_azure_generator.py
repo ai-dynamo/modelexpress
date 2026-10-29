@@ -696,7 +696,8 @@ def test_azure_full_tensor_fails_before_reads_or_preparation(
 ):
     payload_format = WeightPayloadFormat.FULL_TENSOR
     version = _azure_version(payload_format)
-    assert list(azure_runtime.session._planner.plans(version)) == []
+    with pytest.raises(RuntimeError, match="no legal source"):
+        azure_runtime.session._validate(version, azure_runtime.session._resolvers[0])
 
     method = azure_runtime.methods[0]
     prepare = Mock(side_effect=AssertionError("checkpoint preparation must not start"))

@@ -8,6 +8,7 @@ import types
 import torch
 import torch.nn as nn
 
+from modelexpress import tensor_utils
 from modelexpress.accelerators import CudaAcceleratorBackend
 from modelexpress.tensor_utils import (
     _find_hidden_accel_tensors,
@@ -282,6 +283,31 @@ class TestSafeChecksum:
         t1 = torch.tensor([10, 20, 30], dtype=torch.uint8)
         t2 = torch.tensor([11, 19, 30], dtype=torch.uint8)
         assert safe_checksum(t1) != safe_checksum(t2)
+
+    def test_multi_dim_tensor(self):
+        t = torch.randn(4, 8)
+        assert not safe_checksum(t).startswith("err:")
+
+    def test_shape_independent(self):
+        t = torch.randn(2, 3, 5)
+        expected = safe_checksum(t.reshape(-1))
+        assert safe_checksum(t) == expected
+        assert safe_checksum(t.reshape(6, 5)) == expected
+
+    def test_chunk_size_independent(self, monkeypatch):
+        t = torch.randn(3, 17)
+        expected = safe_checksum(t)
+        monkeypatch.setattr(tensor_utils, "_CHECKSUM_CHUNK_BYTES", 7)
+        assert safe_checksum(t) == expected
+
+    def test_matches_unchunked_definition(self, monkeypatch):
+        monkeypatch.setattr(tensor_utils, "_CHECKSUM_CHUNK_BYTES", 5)
+        t = torch.arange(13, dtype=torch.uint8) * 19
+        expected = sum(
+            (b * ((i * 2654435761 + 1) & 0xFFFFFFFF)) & 0xFFFFFFFF
+            for i, b in enumerate(t.tolist())
+        ) & 0xFFFFFFFF
+        assert safe_checksum(t) == format(expected, "08x")
 
 
 # ---------------------------------------------------------------------------
