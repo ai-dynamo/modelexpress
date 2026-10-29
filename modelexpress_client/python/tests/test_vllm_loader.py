@@ -680,10 +680,10 @@ class TestSleepWakeReloadHooks:
         events = []
         mock_manager.shutdown.side_effect = lambda: events.append("shutdown")
 
-        def fake_reload(*args):
+        def fake_reload(vllm_config, model_config, prefix, model, *rest):
             events.append("reload")
             loader._ctx = _make_load_context(nixl_manager=MagicMock())
-            return args[-1]
+            return model
 
         model = MagicMock()
         with patch("modelexpress.engines.vllm.loader.unpublish_metadata") as mock_unpub, \
@@ -814,6 +814,31 @@ class TestRdmaReloadIdentityGate:
             assert captured[0] is not loaded_identity
         else:
             assert captured == [None]
+
+    @pytest.mark.parametrize("restore", [False, True])
+    def test_restore_reload_takes_the_requested_identity(self, restore):
+        loader = _make_loader()
+        new_ctx = _make_load_context(identity=self._identity("abc"))
+        captured = []
+
+        def fake_load_model(vllm_config, model_config, prefix, ctx, *rest):
+            captured.append(ctx.loaded_identity)
+            return MagicMock()
+
+        with patch(
+            "modelexpress.engines.vllm.loader.build_vllm_load_context",
+            return_value=new_ctx,
+        ), patch(
+            "modelexpress.engines.vllm.loader._is_speculative_draft",
+            return_value=False,
+        ), patch(
+            "modelexpress.engines.vllm.loader.unpublish_metadata"
+        ), patch.object(loader, "_load_model", side_effect=fake_load_model):
+            loader.reload_model(MagicMock(), MagicMock(), MagicMock(), restore=restore)
+
+        assert captured == [self._identity("abc") if restore else None]
+        if restore:
+            assert self._is_available(new_ctx) is True
 
 
 class TestMtpDrafterSecondLoad:
