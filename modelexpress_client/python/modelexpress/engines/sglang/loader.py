@@ -163,6 +163,9 @@ class MxModelLoader:
         device_config: DeviceConfig,
     ) -> nn.Module:
         """Load model weights through the shared ModelExpress strategy chain."""
+        from modelexpress import configure_sglang_logging
+
+        configure_sglang_logging()
         transport = getattr(self.load_config, "modelexpress_transport", "nixl")
         self._validate_load_policy(transport)
         # L0 wraps the dispatcher rather than each transport, so the

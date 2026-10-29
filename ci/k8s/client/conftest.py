@@ -37,7 +37,8 @@ def _port(value: str) -> int:
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--namespace", default=os.environ.get("NAMESPACE", ""))
-    parser.addoption("--model", default=os.environ.get("MX_CI_MODEL", "Qwen/Qwen2.5-0.5B"))
+    parser.addoption("--model", default=os.environ.get("MX_CI_MODEL", "Qwen/Qwen3.5-0.8B"))
+    parser.addoption("--capture-source-baseline", action="store_true")
     parser.addoption("--source-port", default=_port(os.environ.get("SOURCE_PORT", "8001")), type=_port)
     parser.addoption("--worker-port", default=_port(os.environ.get("WORKER_PORT", "8002")), type=_port)
     parser.addoption(
@@ -147,6 +148,11 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "Same alignment requirement as --heartbeat-timeout-secs."
         ),
     )
+
+
+@pytest.fixture(scope="session")
+def capture_source_baseline(request: pytest.FixtureRequest) -> bool:
+    return request.config.getoption("--capture-source-baseline")
 
 
 @pytest.fixture(scope="session")
