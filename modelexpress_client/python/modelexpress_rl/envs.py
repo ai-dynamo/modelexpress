@@ -42,17 +42,20 @@ if TYPE_CHECKING:
     MX_AZURE_READ_TIMEOUT_SECONDS: int
     MX_REFIT_CHECKSUM_FORMAT: str
     MX_REFIT_DESIRED_VERSION_UID: str | None
+    MX_REFIT_CHECKPOINT_MAX_SIZE_GB: int
     MX_REFIT_CHECKPOINT_DIR: str | None
     MX_REFIT_DELTA_BUCKET_BYTES: int
     MX_REFIT_DELTA_SURGICAL: bool
     MX_REFIT_DEBUG_VALIDATE_PLAN: bool
     MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT: bool
     MX_REFIT_DELTA_WORKERS: int
+    MX_REFIT_DOWNLOAD_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
     MX_REFIT_FULL_STREAMING: bool
     MX_REFIT_STREAM_WINDOW_LAYERS: int
     MX_REFIT_TIMING: bool
+    MX_S3_DOWNLOAD_BACKEND: str
     MX_S3_DOWNLOAD_RANGE_BYTES: int
     MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
     MX_S3_DOWNLOAD_IO_CHUNK_BYTES: int
@@ -160,6 +163,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_DESIRED_VERSION_UID": lambda: (
         os.environ.get("MX_REFIT_DESIRED_VERSION_UID", "").strip() or None
     ),
+    "MX_REFIT_CHECKPOINT_MAX_SIZE_GB": lambda: positive_int_env(
+        "MX_REFIT_CHECKPOINT_MAX_SIZE_GB", 2000
+    ),
     "MX_REFIT_CHECKPOINT_DIR": lambda: (
         os.environ.get("MX_REFIT_CHECKPOINT_DIR", "").strip() or None
     ),
@@ -177,6 +183,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
             )
         ),
         "MX_REFIT_DELTA_WORKERS",
+    ),
+    "MX_REFIT_DOWNLOAD_WORKERS": lambda: (
+        require_positive_int(
+            parse_int(
+                os.environ["MX_REFIT_DOWNLOAD_WORKERS"], "MX_REFIT_DOWNLOAD_WORKERS"
+            ),
+            "MX_REFIT_DOWNLOAD_WORKERS",
+        )
+        if "MX_REFIT_DOWNLOAD_WORKERS" in os.environ
+        else require_positive_int(
+            int(os.environ.get("MX_S3_DOWNLOAD_WORKERS", 16)),
+            "MX_S3_DOWNLOAD_WORKERS",
+        )
     ),
     "MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES": lambda: require_positive_int(
         int(
@@ -199,6 +218,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ.get("MX_S3_UPLOAD_WORKERS", 8)),
         "MX_S3_UPLOAD_WORKERS",
     ),
+    "MX_S3_DOWNLOAD_BACKEND": lambda: s3_download_backend(),
     "MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES": lambda: require_positive_int(
         int(
             os.environ.get(
@@ -220,10 +240,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ.get("MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS", 16)),
         "MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS",
     ),
-    "MX_S3_DOWNLOAD_WORKERS": lambda: require_positive_int(
-        int(os.environ.get("MX_S3_DOWNLOAD_WORKERS", 16)),
-        "MX_S3_DOWNLOAD_WORKERS",
-    ),
+    "MX_S3_DOWNLOAD_WORKERS": lambda: environment_variables[
+        "MX_REFIT_DOWNLOAD_WORKERS"
+    ](),
     "MX_S3_MAX_POOL_CONNECTIONS": lambda: require_positive_int(
         int(os.environ.get("MX_S3_MAX_POOL_CONNECTIONS", 32)),
         "MX_S3_MAX_POOL_CONNECTIONS",
@@ -278,9 +297,21 @@ def require_positive_int(value: int, name: str) -> int:
     return value
 
 
+def s3_download_backend() -> str:
+    """Select the canonical S3 download implementation."""
+    value = os.environ.get("MX_S3_DOWNLOAD_BACKEND", "transfer_manager").strip().lower()
+    if value not in {"transfer_manager", "preallocated"}:
+        raise ValueError(
+            "MX_S3_DOWNLOAD_BACKEND must be transfer_manager or preallocated"
+        )
+    return value
+
+
 def positive_int_env(name: str, default: int) -> int:
     """Read a positive integer while retaining its setting name in errors."""
-    return require_positive_int(parse_int(os.environ.get(name, str(default)), name), name)
+    return require_positive_int(
+        parse_int(os.environ.get(name, str(default)), name), name
+    )
 
 
 def require_non_negative_int(value: int, name: str) -> int:

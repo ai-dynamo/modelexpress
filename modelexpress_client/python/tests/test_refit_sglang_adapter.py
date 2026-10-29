@@ -182,11 +182,18 @@ def test_generator_factory_reuses_client_and_shared_config(
         runner.loader._prepare_weights.assert_not_called()
 
 
-@pytest.mark.parametrize("as_json", [False, True])
-def test_generator_factory_uses_shared_defaults(tmp_path, monkeypatch, as_json):
+@pytest.mark.parametrize(
+    ("as_json", "storage_type"),
+    [(False, None), (True, None), (False, "S3"), (False, "AZURE"), (True, "AZURE")],
+)
+def test_generator_factory_selects_provider_and_uses_shared_defaults(
+    tmp_path, monkeypatch, as_json, storage_type
+):
     initialize = Mock()
     monkeypatch.setattr(ModelExpressGeneratorClient, "initialize", initialize)
     runner = _runner(tmp_path)
+    if storage_type is not None:
+        runner.server_args.modelexpress_config["object_storage_type"] = storage_type
     if as_json:
         runner.server_args.modelexpress_config = json.dumps(
             runner.server_args.modelexpress_config
@@ -195,12 +202,30 @@ def test_generator_factory_uses_shared_defaults(tmp_path, monkeypatch, as_json):
     get_modelexpress_generator(runner)
 
     config = initialize.call_args.args[0]
+    assert config.object_storage.storage_type is ObjectStorageType(storage_type or "S3")
+    assert config.object_storage.endpoint_url is None
+    assert config.object_storage.region_name is None
     assert (
         config.max_transfer_attempts,
         config.max_replay_chain_length,
         config.rpc_timeout_seconds,
         config.object_storage.refit_checkpoint_max_size_gb,
     ) == (3, 64, 30.0, 2000)
+
+
+def test_generator_factory_rejects_unknown_provider_before_loading_seed(
+    tmp_path, monkeypatch
+):
+    initialize = Mock()
+    monkeypatch.setattr(ModelExpressGeneratorClient, "initialize", initialize)
+    runner = _runner(tmp_path)
+    runner.server_args.modelexpress_config["object_storage_type"] = "unknown"
+
+    with pytest.raises(ValueError, match="ObjectStorageType"):
+        get_modelexpress_generator(runner)
+
+    runner.loader._prepare_weights.assert_not_called()
+    initialize.assert_not_called()
 
 
 @pytest.mark.parametrize("as_json", [False, True])

@@ -35,9 +35,9 @@ class ObjectStorageSourceResolver(SourceResolver):
         source = version.object_storage
         if source is None:
             return
-        if source.storage_type is not ObjectStorageType.S3:
+        if source.storage_type not in {ObjectStorageType.S3, ObjectStorageType.AZURE}:
             logger.warning(
-                "object-storage refit currently requires S3; skipping %s for "
+                "object-storage refit currently requires S3 or Azure; skipping %s for "
                 "version %s",
                 source.storage_type,
                 version.version_id,
