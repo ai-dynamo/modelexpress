@@ -1651,6 +1651,10 @@ class TestNixlTransferManagerDictOwnership:
     caller's dict.
     """
 
+    @pytest.fixture(autouse=True)
+    def _per_tensor_registration(self, monkeypatch):
+        monkeypatch.setenv("MX_POOL_REG", "0")
+
     def _make_manager(self):
         mgr = NixlTransferManager(agent_name="test", device_id=0)
         mgr._agent = MagicMock()
