@@ -233,7 +233,7 @@ docker compose -f docker/docker-compose.yml up --build
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_MODEL_URI` | (unset) | Enable ModelStreamer for an object-store URI or absolute local path. |
 | `MX_MS_DISTRIBUTED` | `1` | Divide ModelStreamer reads across tensor-parallel ranks when TP > 1. On by default; set to `0` to disable. |
-| `MX_POOL_REG` | `0` | Register each underlying CUDA allocation once instead of registering every tensor. |
+| `MX_POOL_REG` | `1` (`0` with `MX_VMM_ARENA=1`) | Register each underlying CUDA allocation once instead of registering every tensor. |
 | `MX_VMM_ARENA` | `0` | Load into a CUDA VMM arena and register the used range once; alternative to `MX_POOL_REG`. |
 | `MX_P2P_SOURCE_SELECTOR` | `random` | Peer ordering policy; set `rendezvous_hash` for deterministic, minimally disruptive selection. |
 
