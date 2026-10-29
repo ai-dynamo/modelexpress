@@ -558,7 +558,7 @@ The `backend_type` discriminator is persisted in storage for unambiguous deseria
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
 | `MX_GC_TIMEOUT_SECS` | `3600` | Time before stale entries are deleted |
-| `MX_POOL_REG` | `0` | Register each unique cudaMalloc allocation instead of each tensor (allocation-level NIXL registration) |
+| `MX_POOL_REG` | `1` (`0` with `MX_VMM_ARENA=1`) | Register each unique cudaMalloc allocation instead of each tensor (allocation-level NIXL registration) |
 | `MX_TRANSFER_TIMEOUT` | `300` on the RDMA receive path | Per-candidate budget for receiving weights from one source. Applies **per source**, not per load, so a target trying `MAX_SOURCE_RETRIES` candidates can spend this much three times before falling back to disk. Set it against your model size: the default suits a small model but is long for one that transfers in under a second. Note the RDMA path only honours this variable when it is explicitly set, and otherwise uses 300s rather than the 900s default that other transfer paths use. |
 
 ## Debugging

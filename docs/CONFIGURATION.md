@@ -155,14 +155,14 @@ Use a central backend for mixed revisions, live updates, or per-worker addressab
 | NIXL_UCX_TLS | unset | NIXL/UCX transport selection |
 | UCX_TLS | unset | UCX transport selection |
 | UCX_NET_DEVICES | unset | Explicit UCX network device selection |
-| MX_POOL_REG | 0 | Register each CUDA allocation once instead of each tensor |
+| MX_POOL_REG | 1 (0 with MX_VMM_ARENA=1) | Register each CUDA allocation once instead of each tensor |
 | MX_VMM_ARENA | 0 | Allocate load-time weights in a CUDA VMM arena for range registration |
 | MX_ARENA_SINGLE_MR | 0 | Keep a single arena memory registration across multiple handles when the transport supports it |
 | UCX_CUDA_COPY_REG_WHOLE_ALLOC | UCX default | UCX CUDA-copy registration behavior; relevant to older UCX VMM combinations |
 | NIXL_LOG_LEVEL | runtime default | NIXL logging level |
 | UCX_LOG_LEVEL | runtime default | UCX logging level |
 
-MX_POOL_REG and MX_VMM_ARENA are alternative registration optimizations. Enable one at a time and qualify the chosen combination on the exact GPU, driver, NIXL, and UCX stack. The older `MX_VMM_ARENA_BYTES` and `MX_VMM_ARENA_CHUNK_BYTES` settings are ignored apart from a deprecation warning.
+MX_POOL_REG and MX_VMM_ARENA are alternative registration optimizations. Pool registration is on unless MX_POOL_REG=0 or MX_VMM_ARENA=1 is set without MX_POOL_REG; qualify the chosen combination on the exact GPU, driver, NIXL, and UCX stack. The older `MX_VMM_ARENA_BYTES` and `MX_VMM_ARENA_CHUNK_BYTES` settings are ignored apart from a deprecation warning.
 
 ## ModelStreamer and local-load tuning
 

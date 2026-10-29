@@ -89,8 +89,8 @@ def _arena_single_mr_forced() -> bool:
 def _pool_reg_enabled() -> bool:
     """Whether allocation-level pool registration is enabled.
 
-    MX_POOL_REG=1 enables it; default is per-tensor registration. Read at
-    call time so tests can toggle the env var without re-importing.
+    On unless MX_POOL_REG=0, or MX_VMM_ARENA=1 with MX_POOL_REG unset. Read
+    at call time so tests can toggle the env var without re-importing.
     """
     return envs.MX_POOL_REG
 
@@ -370,17 +370,16 @@ class NixlTransferManager:
         """
         Register tensors with NIXL for RDMA access.
 
-        With MX_POOL_REG=1, discovers the unique cudaMalloc allocations
-        backing the tensors via cuMemGetAddressRange and registers each
-        allocation as a single NIXL block. This dramatically reduces the
-        number of memory registrations (kernel ibv_reg_mr calls, rkeys,
-        and bytes in the agent metadata blob) without changing transfer
-        semantics: receive_from_source still matches by tensor name and
-        builds per-tensor RDMA descriptors that target addresses inside
-        the registered allocations.
+        With pool registration on (the default), discovers the unique
+        cudaMalloc allocations backing the tensors via cuMemGetAddressRange
+        and registers each allocation as a single NIXL block. This
+        dramatically reduces the number of memory registrations (kernel
+        ibv_reg_mr calls, rkeys, and bytes in the agent metadata blob)
+        without changing transfer semantics: receive_from_source still
+        matches by tensor name and builds per-tensor RDMA descriptors that
+        target addresses inside the registered allocations.
 
-        With MX_POOL_REG unset (default), falls back to per-tensor
-        registration.
+        With MX_POOL_REG=0, falls back to per-tensor registration.
 
         CRITICAL: self._tensors must hold the SAME tensor objects as
         param.data in vLLM. Do NOT call .contiguous() here - that would
@@ -425,9 +424,10 @@ class NixlTransferManager:
                 allocations = self._find_cuda_allocations(registrable_descriptors)
             else:
                 allocations = None
-                logger.warning(
-                    "MX_POOL_REG=1 set but %s does not support pool "
-                    "registration; using per-tensor registration",
+                log = logger.warning if "MX_POOL_REG" in os.environ else logger.info
+                log(
+                    "%s does not support pool registration; using per-tensor "
+                    "registration",
                     self._accelerator_backend.name,
                 )
         else:
