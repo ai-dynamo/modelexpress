@@ -83,7 +83,6 @@ class NightlyWorkflowTests(unittest.TestCase):
         rl = workflow("modelexpress-rl-ci.yml")["jobs"]
         validate = next(step["run"] for step in rl["validate"]["steps"] if step.get("id") == "inputs")
         validate = "python3 - <<'PYTHON' >> \"$GITHUB_OUTPUT\"\n" + validate.split("python3 - <<'PYTHON' >> \"$GITHUB_OUTPUT\"\n", 1)[1]
-        vime = rl["build-vime-delta-refit"]["steps"][0]["run"]
         for event, ref, seed in [
             ("schedule", "refs/heads/main", 1001),
             ("workflow_dispatch", "refs/heads/main", 1001),
@@ -103,9 +102,8 @@ class NightlyWorkflowTests(unittest.TestCase):
                 result, values = execute(validate, environment)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(values["gpu_slot"], str(seed % 4))
-                result, values = execute(vime, {**environment, "GPU_SLOT": values["gpu_slot"]})
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(values["gpu_slot"], str((seed + 1) % 4))
+                self.assertEqual(values["vime_gpu_slot"], str((seed + 1) % 4))
+                self.assertEqual(values["primerl_gpu_slot"], str((seed + 2) % 4))
 
     def test_inference_tests_wait_only_for_their_worker_image(self):
         jobs = workflow("modelexpress-inference-ci.yml")["jobs"]
@@ -140,7 +138,10 @@ class NightlyWorkflowTests(unittest.TestCase):
                 self.assertNotIn("concurrency", job)
 
         self.assertIn("always()", inference["jobs"]["gpu-cleanup"]["if"])
-        self.assertIn("always()", rl["jobs"]["cleanup"]["if"])
+        for lane in ["generator-only", "vime", "primerl"]:
+            gpu = workflow(f"modelexpress-rl-{lane}-gpu-ci.yml")["jobs"]
+            self.assertIn("always()", gpu["cleanup"]["if"])
+            self.assertNotIn("concurrency", gpu["cleanup"])
         self.assertEqual(rl["concurrency"], {
             "group": "${{ github.workflow }}-${{ github.event.issue.number || github.run_id }}",
             "cancel-in-progress": "${{ github.event_name == 'issue_comment' }}",

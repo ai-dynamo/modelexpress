@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v1
+kind: List
+items:
+- apiVersion: batch/v1
+  kind: Job
+  metadata:
+    name: primerl-refit
+  spec:
+    backoffLimit: 0
+    activeDeadlineSeconds: 1800
+    template:
+      spec:
+        restartPolicy: Never
+        priorityClassName: ci-nightly-high-priority
+        nodeSelector:
+          kubernetes.io/arch: amd64
+          nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+        tolerations:
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+        imagePullSecrets:
+        - {name: nvcr-imagepullsecret}
+        volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: shared-model-cache}
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 16Gi}
+        - name: checkpoints
+          emptyDir: {}
+        containers:
+        - name: primerl
+          image: ${WORKER_IMAGE}
+          command: [bash, /opt/mx-ci/run.sh]
+          env:
+          - {name: GITHUB_RUN_ID, value: "${GITHUB_RUN_ID}"}
+          - {name: GITHUB_RUN_ATTEMPT, value: "${GITHUB_RUN_ATTEMPT}"}
+          - {name: GITHUB_REF_NAME, value: mx-ci}
+          - {name: MX_TEST_SHA, value: "${MX_TEST_SHA}"}
+          - {name: HF_HOME, value: /models/huggingface}
+          - name: HF_TOKEN
+            valueFrom:
+              secretKeyRef: {name: hf-token-secret, key: HF_TOKEN}
+          resources:
+            requests: {cpu: "16", memory: 64Gi, nvidia.com/gpu: "2"}
+            limits: {memory: 128Gi, nvidia.com/gpu: "2"}
+          volumeMounts:
+          - {name: models, mountPath: /models}
+          - {name: shm, mountPath: /dev/shm}
+          - {name: checkpoints, mountPath: /checkpoints}
+          securityContext:
+            capabilities: {add: [IPC_LOCK]}
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    name: primerl-evidence
+  spec:
+    restartPolicy: Never
+    nodeSelector: {kubernetes.io/arch: amd64}
+    volumes:
+    - name: models
+      persistentVolumeClaim: {claimName: shared-model-cache}
+    containers:
+    - name: evidence
+      image: mirror.gcr.io/library/alpine:3.20
+      command: [sleep, "3600"]
+      resources:
+        requests: {cpu: 100m, memory: 128Mi}
+        limits: {memory: 256Mi}
+      volumeMounts:
+      - {name: models, mountPath: /models, readOnly: true}
