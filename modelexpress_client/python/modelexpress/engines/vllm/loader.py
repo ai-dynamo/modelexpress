@@ -176,6 +176,7 @@ class MxModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
         prefix: str = "",
+        restore: bool = False,
     ) -> nn.Module:
         """Reload weights into an already-initialized model.
 
@@ -190,12 +191,17 @@ class MxModelLoader(BaseModelLoader):
         Peers must not read weights while they are being overwritten, so P2P
         source-serving stops first unless a prior sleep() already stopped it.
         The strategy chain registers and republishes the reloaded tensors.
+
+        `restore=True` says `model` holds `model_config`'s weights from another
+        loader, for example before a process checkpoint, so RDMA may refill them.
         """
         if envs.MX_P2P_COLD_START:
             raise RuntimeError("MX cold start does not support model reload")
         if self._last_sleep_level is None:
             self._stop_serving()
-        return self._load_or_reload_model(vllm_config, model_config, prefix, model)
+        return self._load_or_reload_model(
+            vllm_config, model_config, prefix, model, restore
+        )
 
     def _load_or_reload_model(
         self,
@@ -203,6 +209,7 @@ class MxModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         prefix: str = "",
         model: nn.Module | None = None,
+        restore: bool = False,
     ) -> nn.Module:
         """Load model, auto-detecting the best loading strategy.
 
@@ -222,6 +229,9 @@ class MxModelLoader(BaseModelLoader):
             # Snapshot: a refit rewrites the live identity's revision in place.
             ctx.loaded_identity = p2p_pb2.SourceIdentity()
             ctx.loaded_identity.CopyFrom(self._ctx.identity)
+        elif ctx.is_reload and restore:
+            ctx.loaded_identity = p2p_pb2.SourceIdentity()
+            ctx.loaded_identity.CopyFrom(ctx.identity)
         draft_gate: DraftPublicationGate | None = None
         main_ctx = None
         if is_speculative_draft:
