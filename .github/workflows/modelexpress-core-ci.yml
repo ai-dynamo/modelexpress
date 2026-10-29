@@ -470,6 +470,14 @@ jobs:
           p2p::backend::redis::tests::older_status_update_does_not_replace_newer_status \
           -- --ignored --exact --test-threads=1
 
+    - name: Run P2P Redis donor lease test
+      env:
+        MX_TEST_REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
+      run: |
+        cargo test -p modelexpress-server --lib \
+          p2p::backend::redis::tests::donor_lease_acquire_expire_and_fence_stale_owners \
+          -- --ignored --exact --test-threads=1
+
     - name: Run Refit service Redis integration tests
       env:
         REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
@@ -587,8 +595,12 @@ jobs:
     - name: Generate code coverage
       env:
         REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
+        MX_TEST_REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
       run: |
         cargo llvm-cov --all-features --workspace --no-report
+        cargo llvm-cov --all-features -p modelexpress-server --lib --no-report \
+          p2p::backend::redis::tests::donor_lease_acquire_expire_and_fence_stale_owners \
+          -- --ignored --exact --test-threads=1
         cargo llvm-cov --all-features -p model-express-workspace-tests \
           --test refit_service_redis --no-report -- --include-ignored
         cargo llvm-cov report --lcov --output-path lcov.info

@@ -476,6 +476,29 @@ mod tests {
     use super::{parse_layout_signature, parse_training_step};
     use std::collections::HashMap;
 
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn memory_backend_rejects_donor_leases() {
+        use super::{MetadataBackend, memory::InMemoryMetadataBackend};
+        use std::time::Duration;
+
+        let backend = InMemoryMetadataBackend::new();
+        let ttl = Duration::from_secs(10);
+        let errors = [
+            backend.try_acquire_donor_lease("key", "owner", ttl).await,
+            backend.renew_donor_lease("key", "owner", ttl).await,
+            backend.release_donor_lease("key", "owner").await,
+        ];
+        for result in errors {
+            assert!(
+                result
+                    .expect_err("memory backend must reject donor leases")
+                    .to_string()
+                    .contains("donor leases are not supported by this metadata backend")
+            );
+        }
+    }
+
     #[test]
     fn parses_training_step_with_version_fallback() {
         let mut values = HashMap::new();
