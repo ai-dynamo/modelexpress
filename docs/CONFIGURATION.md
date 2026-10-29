@@ -121,6 +121,8 @@ An eligible strategy can still fail and allow the next strategy to run. If a str
 | MX_MS_DISTRIBUTED | 1 | Distributes ModelStreamer reads across CUDA TP ranks when TP > 1 |
 | MX_INSTANT_TENSOR | 1 | Enables the InstantTensor eligibility gate when `MX_MODEL_URI` is not an object-store URI |
 | MX_DISABLE_PATCHES | false | Disables ModelExpress runtime compatibility patches |
+| MX_SGLANG_P2P_METADATA_SYNC | false | Enables the SGLang P2P non-weight metadata sync plugin (`sglang.srt.plugins`) |
+| SGLANG_META_PORT | 19999 | Local HTTP port served by a Source or Target Pod when serving non-weight metadata files |
 | MODEL_EXPRESS_LOG_LEVEL | runtime-dependent | Use DEBUG to inspect Eligible loaders and Trying strategy |
 
 MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; it does not make a decentralized k8s-service backend usable because that backend requires P2P metadata.

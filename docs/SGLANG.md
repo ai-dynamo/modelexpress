@@ -171,6 +171,38 @@ python -m sglang.launch_server \
   --modelexpress-config '{"transport": "transfer_engine"}'
 ```
 
+### P2P Metadata Sync for Local Model Paths (No Shared Storage)
+
+When launching SGLang with a local path (`--model-path /models/DeepSeek-R1`) on
+nodes without shared storage, set `MX_SGLANG_P2P_METADATA_SYNC=1` to enable the
+`modelexpress` SGLang plugin (`sglang.srt.plugins`) to synchronize non-weight
+metadata files (`config.json`, `tokenizer.json`, chat templates) using a
+dual-role adaptive design so Source and Target Pods can run the exact same CLI
+command:
+
+1. **Source Pod**: If `<model-path>/config.json` (or `tokenizer_config.json`)
+   already exists on local disk, the plugin starts a lightweight background HTTP
+   server on `SGLANG_META_PORT` (default `19999`) serving `/metadata.tar` with
+   all non-weight files under `--model-path`, and publishes its metadata
+   endpoint to the ModelExpress P2P metadata service.
+2. **Target Pod**: If `<model-path>/config.json` does not exist locally, the
+   plugin discovers a ready Source Pod through the ModelExpress P2P metadata
+   service (using `MX_SERVER_ADDRESS` / `MODEL_EXPRESS_URL`), downloads and
+   extracts the non-weight metadata into `--model-path` before `ServerArgs` and
+   `Tokenizer` initialization proceed, and then automatically starts its own
+   `SGLANG_META_PORT` server so the new instance also serves subsequent pods.
+
+```bash
+export MX_SERVER_ADDRESS=modelexpress-server:8001
+export MX_SGLANG_P2P_METADATA_SYNC=1
+
+python -m sglang.launch_server \
+  --model-path /models/DeepSeek-R1 --tp 8 --port 30000 \
+  --load-format remote_instance \
+  --remote-instance-weight-loader-backend modelexpress \
+  --modelexpress-config '{"transport": "nixl"}'
+```
+
 ## See also
 
 - Upstream PR: [sgl-project/sglang#24723](https://github.com/sgl-project/sglang/pull/24723).
