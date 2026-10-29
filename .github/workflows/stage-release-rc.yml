@@ -11,7 +11,8 @@
 #
 #   container  nvcr.io/<staging org>/ai-dynamo/modelexpress-server:X.Y.Z-rc.N
 #   helm       modelexpress X.Y.Z-rc.N      (image -> the container above)
-#   wheels     modelexpress-X.Y.ZrcN-*      under <pypi repo>/release/X.Y.Z/rcN/
+#   wheels     modelexpress-X.Y.Z-*         under <pypi repo>/release/X.Y.Z/rcN/ (plain version,
+#                                           so GA publishes the very same files)
 #   crates     *-X.Y.Z-rc.N.crate           under <cargo repo>/release/X.Y.Z/rcN/
 #
 # Registries are immutable, so a failed or rejected attempt is re-staged as the
@@ -30,7 +31,7 @@ on:
         required: true
         type: string
       rc_round:
-        description: 'RC round N (bare integer): stages X.Y.Z-rc.N / X.Y.ZrcN. Re-stage a failed or rejected round as N+1; registries are immutable.'
+        description: 'RC round N (bare integer): stages X.Y.Z-rc.N (wheels land under rcN). Re-stage a failed or rejected round as N+1; registries are immutable.'
         required: true
         type: string
         default: '0'
@@ -86,8 +87,8 @@ jobs:
             echo "::error::release_version must be X.Y.Z (got '${RELEASE_VERSION}')"
             exit 1
           fi
-          if [[ ! "${RC_ROUND}" =~ ^[0-9]+$ ]]; then
-            echo "::error::rc_round must be a bare integer (got '${RC_ROUND}')"
+          if [[ ! "${RC_ROUND}" =~ ^(0|[1-9][0-9]{0,8})$ ]]; then
+            echo "::error::rc_round must be a bare integer without leading zeros (got '${RC_ROUND}')"
             exit 1
           fi
           if [ "${REF}" != "refs/heads/release/${RELEASE_VERSION}" ]; then
@@ -107,8 +108,7 @@ jobs:
           RC_ROUND: ${{ inputs.rc_round }}
         run: |
           set -euo pipefail
-          # Strip leading zeros so "02" and "2" cannot stage two names for one round.
-          N=$((10#${RC_ROUND}))
+          N="${RC_ROUND}"
           V="${RELEASE_VERSION}"
 
           # The branch must already carry the release version everywhere the
@@ -129,7 +129,7 @@ jobs:
             echo "rc_tag=v${V}-rc${N}"
             echo "container_tag=${V}-rc.${N}"
             echo "build_tag=${V}-rc.${N}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            echo "wheel_version=${V}rc${N}"
+            echo "wheel_version=${V}"
             echo "crate_version=${V}-rc.${N}"
             echo "chart_version=${V}-rc.${N}"
             echo "artifactory_path=release/${V}/rc${N}"
@@ -352,7 +352,7 @@ jobs:
   stage-helm-ngc:
     name: Stage helm chart to NGC
     runs-on: prod-modelexpress-builder-amd-v1
-    needs: [preflight, manual-release-approval, assemble-server-manifest]
+    needs: [preflight, manual-release-approval, assemble-server-manifest, stage-containers-ngc]
     if: ${{ needs.manual-release-approval.outputs.approved_attempt == github.run_attempt }}
     environment: automated-release
     timeout-minutes: 20
@@ -373,7 +373,7 @@ jobs:
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
       # An RC chart keeps the real chart name and the real image repository:
-      # it points at modelexpress-server:<X.Y.Z-rc.N>, the image staged below.
+      # it points at modelexpress-server:<X.Y.Z-rc.N>, the image staged by stage-containers-ngc.
       - name: Stamp, lint, package and verify the chart
         env:
           NIGHTLY_TAG: ${{ needs.preflight.outputs.container_tag }}
@@ -640,4 +640,8 @@ jobs:
             echo "::error::RC staging failed:${FAILED}"
             exit 1
           fi
-          echo "RC staged and handed to GitLab."
+          if [ "${SKIP_GITLAB}" = "true" ]; then
+            echo "::warning::RC staged; the GitLab handoff was skipped (skip_gitlab_pipeline=true)."
+          else
+            echo "RC staged and handed to GitLab."
+          fi
