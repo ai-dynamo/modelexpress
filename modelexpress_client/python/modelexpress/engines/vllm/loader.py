@@ -26,6 +26,8 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 
@@ -49,6 +51,7 @@ from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
 from .adapter import _is_speculative_draft, build_vllm_load_context
 from .artifacts import (
     _vllm_health_ready,
+    _vllm_version,
     install_vllm_cache_artifacts,
     schedule_vllm_cache_artifact_publish,
 )
@@ -69,6 +72,40 @@ _nixl_managers: dict[int, NixlTransferManager] = {}
 _loader_registry: dict[int, MxModelLoader] = {}
 # Main-pass publication gates awaiting this device's speculative draft pass.
 _draft_publication_gates: dict[int, DraftPublicationGate] = {}
+
+
+def _checkpoint_config(model_config) -> tuple[str, str]:
+    def value(name):
+        v = getattr(model_config, name, None)
+        return v if isinstance(v, str) else ""
+
+    return value("model"), value("model_weights")
+
+
+def _draft_namespace(ctx: LoadContext, vllm_config) -> str | None:
+    """Scope a separate draft to its checkpoint and runtime configuration."""
+    model, weights = _checkpoint_config(ctx.model_config)
+    revision = getattr(ctx.model_config, "revision", None)
+    version = _vllm_version()
+    if not model or not isinstance(revision, str) or not revision or not version:
+        return None
+    speculative = getattr(vllm_config, "speculative_config", None)
+    method = getattr(speculative, "method", None)
+    if not isinstance(method, str) or not method:
+        return None
+    signature = json.dumps(
+        {
+            "identity": ctx.identity.SerializeToString(deterministic=True).hex(),
+            "model": model,
+            "weights": weights,
+            "revision": revision,
+            "vllm": version,
+            "method": method,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return f"mx_draft::{hashlib.sha256(signature).hexdigest()}::"
 
 
 def _expects_draft_pass(vllm_config) -> bool:
@@ -180,16 +217,22 @@ class MxModelLoader(BaseModelLoader):
         if is_speculative_draft:
             main_loader = _loader_registry.get(ctx.device_id)
             main_ctx = main_loader._ctx if main_loader is not None else None
-            if envs.MX_DISABLE_DRAFT_P2P:
+            separate_draft = main_ctx is None or (
+                main_ctx.identity != ctx.identity
+                or _checkpoint_config(main_ctx.model_config)
+                != _checkpoint_config(ctx.model_config)
+            )
+            ctx.use_model_config_uri = separate_draft
+            namespace = _draft_namespace(ctx, vllm_config) if separate_draft else None
+            if envs.MX_DISABLE_DRAFT_P2P or main_ctx is None:
                 ctx.p2p_enabled = False
-            elif main_ctx is not None and main_ctx.identity == ctx.identity:
-                # Same checkpoint (MTP): join the main load's publication
-                # through its NIXL agent instead of binding a second one.
+            elif not separate_draft or namespace is not None:
                 ctx.shared_nixl_manager = _nixl_managers.get(ctx.device_id)
+                if separate_draft:
+                    ctx.p2p_source_identity = main_ctx.identity
+                    ctx.draft_tensor_namespace = namespace
             else:
-                # A draft from a different checkpoint (e.g. EAGLE) has its own
-                # SourceIdentity, so peers could never find its tensors in the
-                # target's publication. Keep it out of P2P.
+                logger.info("Separate draft identity is incomplete; skipping P2P")
                 ctx.p2p_enabled = False
             draft_gate = _draft_publication_gates.pop(ctx.device_id, None)
         if envs.MX_ARTIFACT_READY_URL.strip():
@@ -268,9 +311,7 @@ class MxModelLoader(BaseModelLoader):
 
                     if ctx.p2p_enabled and ctx.p2p_role == "draft":
                         if ctx.nixl_manager is not None:
-                            # Same checkpoint, same SourceIdentity: extend the
-                            # main load's manifest instead of registering a
-                            # second source under a colliding mx_source_id.
+                            # Extend the main load's manifest.
                             _tensor_registry.setdefault(ctx.device_id, {}).update(
                                 ctx.tensors
                             )
