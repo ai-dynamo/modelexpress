@@ -45,6 +45,12 @@ _VLLM_POST_RDMA_FINALIZER_NAMES = (
 
 _SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
 
+# DefaultModelLoader rejects any other model_loader_extra_config key, such as
+# the model streamer's distributed / memory_limit.
+_DEFAULT_LOADER_EXTRA_CONFIG_KEYS = frozenset(
+    {"enable_multithread_load", "num_threads", "enable_weights_track"}
+)
+
 # Registries on compilation_config that vLLM keys by layer name.
 _LAYER_REGISTRY_FIELDS: tuple[str, ...] = (
     "static_forward_context",
@@ -522,6 +528,7 @@ class VllmAdapter(EngineAdapter):
             load_config.load_format = "instanttensor"
         except AttributeError:
             object.__setattr__(load_config, "load_format", "instanttensor")
+        _keep_default_loader_extra_config(load_config)
 
         loader = DefaultModelLoader(load_config)
         return loader.get_all_weights(self.model_config, model)
@@ -537,6 +544,7 @@ class VllmAdapter(EngineAdapter):
             disk_config.load_format = "auto"
         except AttributeError:
             object.__setattr__(disk_config, "load_format", "auto")
+        _keep_default_loader_extra_config(disk_config)
 
         DefaultModelLoader(disk_config).load_weights(result.model, self.model_config)
         return result
@@ -692,6 +700,18 @@ def _set_load_config_extra_config(load_config, extra_config: dict) -> None:
         load_config.model_loader_extra_config = extra_config
     except AttributeError:
         object.__setattr__(load_config, "model_loader_extra_config", extra_config)
+
+
+def _keep_default_loader_extra_config(load_config) -> None:
+    extra_config = getattr(load_config, "model_loader_extra_config", None) or {}
+    _set_load_config_extra_config(
+        load_config,
+        {
+            key: value
+            for key, value in extra_config.items()
+            if key in _DEFAULT_LOADER_EXTRA_CONFIG_KEYS
+        },
+    )
 
 
 def _is_same_or_descendant(name: str, prefix: str) -> bool:

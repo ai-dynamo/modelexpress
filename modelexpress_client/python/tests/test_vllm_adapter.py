@@ -207,6 +207,53 @@ def test_identity_name_is_resolved_once_without_changing_loader_config(
     assert model_config.model == model_path
 
 
+def test_load_via_native_keeps_only_default_loader_extra_config(monkeypatch):
+    """DefaultModelLoader rejects streamer keys but honors its own options."""
+    extra_config = {
+        "distributed": True,
+        "memory_limit": 10_000_000_000,
+        "enable_weights_track": True,
+        "enable_multithread_load": True,
+        "num_threads": 4,
+    }
+    original = dict(extra_config)
+    vllm_config = _context_config(load_device="cpu")
+    vllm_config.load_config = SimpleNamespace(
+        device="cpu",
+        load_format="modelexpress",
+        model_loader_extra_config=extra_config,
+    )
+    adapter = VllmAdapter(vllm_config, _model_config())
+    seen_configs = []
+
+    class FakeDefaultModelLoader:
+        def __init__(self, load_config):
+            seen_configs.append(load_config)
+
+        def load_weights(self, model, model_config):
+            pass
+
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.model_loader.default_loader"],
+        "DefaultModelLoader",
+        FakeDefaultModelLoader,
+    )
+    model = nn.Linear(2, 2)
+
+    adapter.load_via_native(LoadResult(value=model, model=model))
+
+    [disk_config] = seen_configs
+    assert disk_config.load_format == "auto"
+    assert disk_config.model_loader_extra_config == {
+        "enable_weights_track": True,
+        "enable_multithread_load": True,
+        "num_threads": 4,
+    }
+    assert adapter.load_config.load_format == "modelexpress"
+    assert adapter.load_config.model_loader_extra_config is extra_config
+    assert extra_config == original
+
+
 def test_build_vllm_load_context_uses_current_platform_for_bare_cuda(monkeypatch):
     """Resolve a bare CUDA device through vLLM's current platform."""
     _stub_vllm_current_device(monkeypatch, current_device=2)

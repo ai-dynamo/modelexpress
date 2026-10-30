@@ -307,6 +307,27 @@ class TestVllmInstantTensorIterator:
         assert weights[0][0] == "w"
         assert weights[0][1] is tensor
 
+    def test_keeps_only_default_loader_extra_config(self):
+        extra_config = {
+            "distributed": True,
+            "concurrency": 16,
+            "enable_weights_track": True,
+            "num_threads": 4,
+        }
+        adapter, _model_config = self._make_adapter(extra_config=extra_config)
+        patcher, loader_cls, _loader_instance = self._patch_default_loader([])
+
+        with patcher:
+            list(adapter.build_instanttensor_weight_iter(model=MagicMock()))
+
+        native_load_config = loader_cls.call_args.args[0]
+        assert native_load_config.model_loader_extra_config == {
+            "enable_weights_track": True,
+            "num_threads": 4,
+        }
+        assert adapter.load_config.model_loader_extra_config is extra_config
+        assert "distributed" in extra_config
+
     def test_requires_model(self):
         adapter, _model_config = self._make_adapter()
         with pytest.raises(RuntimeError, match="requires the initialized model"):
