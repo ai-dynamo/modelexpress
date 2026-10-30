@@ -1145,7 +1145,9 @@ handles.
 
 With `MX_P2P_COLD_START=1`, replica rank zero coordinates via a 60-second
 Redis lease, renewed every 20 seconds. Followers check READY ranks every two
-seconds. A live but hung donor may renew indefinitely; expired donors are not
+seconds. The server accepts lease terms from 1 to 600 seconds; this limits each
+term, not the total time a lease can be renewed. A live but hung donor may renew
+indefinitely; expired donors are not
 fenced from publishing. The lease is scoped to source identity, not accelerator
 compatibility, and the normal load strategy can fall back to object storage.
 Election runs at weight loading and does not prevent earlier downloads. For

@@ -39,6 +39,8 @@ fn tagged<T>(body: T, outcome: RpcOutcome) -> Result<Response<T>, Status> {
     Ok(response)
 }
 
+const MAX_DONOR_LEASE_TTL_SECONDS: u64 = 600;
+
 /// P2P Service implementation
 pub struct P2pServiceImpl {
     state: Arc<P2pStateManager>,
@@ -94,16 +96,24 @@ impl P2pService for P2pServiceImpl {
             return Err(Status::invalid_argument("owner_token is required"));
         }
         let source_id = compute_mx_source_id(&identity);
-        let duration = std::time::Duration::from_secs(req.ttl_seconds);
         let action = DonorLeaseAction::try_from(req.action)
             .map_err(|_| Status::invalid_argument("invalid lease action"))?;
+        if matches!(action, DonorLeaseAction::Acquire | DonorLeaseAction::Renew)
+            && !(1..=MAX_DONOR_LEASE_TTL_SECONDS).contains(&req.ttl_seconds)
+        {
+            return Err(Status::invalid_argument(format!(
+                "lease TTL must be between 1 and {MAX_DONOR_LEASE_TTL_SECONDS} seconds"
+            )));
+        }
         let result = match action {
-            DonorLeaseAction::Acquire if req.ttl_seconds > 0 => {
+            DonorLeaseAction::Acquire => {
+                let duration = std::time::Duration::from_secs(req.ttl_seconds);
                 self.state
                     .try_acquire_donor_lease(&source_id, &req.owner_token, duration)
                     .await
             }
-            DonorLeaseAction::Renew if req.ttl_seconds > 0 => {
+            DonorLeaseAction::Renew => {
+                let duration = std::time::Duration::from_secs(req.ttl_seconds);
                 self.state
                     .renew_donor_lease(&source_id, &req.owner_token, duration)
                     .await
@@ -532,6 +542,58 @@ mod tests {
         SourceIdentity {
             mx_source_type: MxSourceType::TorchCompileCache as i32,
             ..test_identity()
+        }
+    }
+
+    #[tokio::test]
+    async fn donor_lease_service_validates_ttl() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_try_acquire_donor_lease()
+            .times(2)
+            .returning(|_, _, _| Ok(true));
+        mock.expect_renew_donor_lease()
+            .times(2)
+            .returning(|_, _, _| Ok(true));
+        mock.expect_release_donor_lease()
+            .times(2)
+            .returning(|_, _| Ok(true));
+        let svc = make_service(mock);
+        let request = |action: DonorLeaseAction, ttl| {
+            Request::new(DonorLeaseRequest {
+                identity: Some(test_identity()),
+                owner_token: "owner".to_string(),
+                action: action as i32,
+                ttl_seconds: ttl,
+            })
+        };
+        for action in [DonorLeaseAction::Acquire, DonorLeaseAction::Renew] {
+            for ttl in [0, MAX_DONOR_LEASE_TTL_SECONDS + 1, u64::MAX] {
+                assert_eq!(
+                    svc.donor_lease(request(action, ttl))
+                        .await
+                        .expect_err("invalid TTL")
+                        .code(),
+                    tonic::Code::InvalidArgument
+                );
+            }
+            for ttl in [1, MAX_DONOR_LEASE_TTL_SECONDS] {
+                assert!(
+                    svc.donor_lease(request(action, ttl))
+                        .await
+                        .expect("valid TTL")
+                        .into_inner()
+                        .acquired
+                );
+            }
+        }
+        for ttl in [0, u64::MAX] {
+            assert!(
+                svc.donor_lease(request(DonorLeaseAction::Release, ttl))
+                    .await
+                    .expect("release")
+                    .into_inner()
+                    .acquired
+            );
         }
     }
 
