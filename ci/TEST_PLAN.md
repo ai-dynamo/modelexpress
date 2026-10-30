@@ -44,6 +44,7 @@ Coverage matrix for the ModelExpress CI infrastructure. Reflects what's currentl
 | 23.1 | Cache Artifact Transfer — install path (`MX_ARTIFACT_TRANSFER=1`) | vLLM, SGLang | **Enabled across supported P2P, MLA/TP, multi-node TP, DP/EP, Mooncake, fleet, Dynamo, stale-metadata and Python RL refit workloads; install assertions remain partial** — `test_p2p_k8s.py::test_artifact_transfer` runs wherever `--require-artifact-transfer` is passed; it asserts the CRD lists ready artifact sources and the target logged `artifact install complete` for each expected type. `test_p2p_artifacts.py` self-tests the assertion logic against captured log shapes without a cluster | Full-manifest metadata mode, standalone ModelStreamer and Vime Rust serving cannot use these artifact hooks. Enabling transfer alone does not prove reuse. Install assertions only prove the bytes arrived, not that anything was gained; no wall-clock or recompile-time comparison against a no-artifact control run |
 | 23.2 | Cache Artifact Transfer — effectiveness (engine actually reuses the cache) | vLLM | **In CI** — `test_artifact_transfer` fails if the target logs `was not reused and the engine recompiled`, and requires the effectiveness line whenever a `torch_compile_cache` install happened. It also requires all targets to resolve one `mx_source_id` per artifact type, catching non-deterministic identity construction. Guards the failure mode where a cache compiled under a different configuration installs cleanly and is then ignored — see [Pairing workers by compile configuration](../docs/DEPLOYMENT.md#pairing-workers-by-compile-configuration) | (a) No positive test that two *deliberately* differently-configured workers stay in separate pools — needs a manifest pair differing only in `--max-num-batched-tokens` plus distinct `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` values. (b) SGLang has no equivalent check: the loader cannot observe which Inductor cache directory SGLang selected |
 | 24 | RL Delta Refit — SeaweedFS object storage | Vime/Megatron, Dynamo/vLLM | **In CI** — every trusted PR uses the CPU deploy runner's rotating tbot kubeconfig and the shared example manifests to create a TP2 Vime trainer pod and a TP1 Dynamo/vLLM rollout worker on `dynamo-aws-dev-02`, bounded by a three-H100 namespace quota. The rollout uses the example's DynamoGraphDeployment and requires a healthy, compatible `v1beta1` Dynamo operator. CPU pods provide the Dynamo frontend, SeaweedFS, and Redis-backed ModelExpress, and a download Job places the pinned Qwen revision in the central FSx-backed `shared-model-cache`. The smoke requires all ten updates, verifies catalog-only `v0` is `FULL_TENSOR`, verifies updates 4 and 8 are full HF checkpoints, and verifies all other updates are XOR deltas | — |
+| 24.1 | RL Full-Weight Refit — PrimeRL | PrimeRL/FSDP, vLLM | **Configured; GPU qualification pending** — dev140 upstream reverse-text test with the candidate MX client/server, one trainer GPU and one inference GPU. Requires successful training, reward improvement, and mean mismatch KL below 0.01 over the last three steps | Cross-node RDMA and TP/EP resharding |
 | 25 | Multi-Token Prediction (MTP) speculative decoding | vLLM, SGLang | **Configured; new SGLang lane awaits GPU qualification** — Qwen3.5-0.8B uses native vLLM MTP or SGLang EAGLE with the same-checkpoint MTP head. Both require main and draft RDMA transfers plus MMLU scores and two 128-token long-decode requests per worker. SGLang pins matching main/draft checkpoint revisions, sets `remote_instance` for both loaders, and disables radix caching for the pinned runtime's default Mamba scheduler | Larger MTP models; TP > 1 MTP; GPU qualification of SGLang lane |
 
 The shared inference CI model is `Qwen/Qwen3.5-0.8B`, including P2P,
@@ -147,6 +148,43 @@ When a row moves status, update this table in the same PR so the doc stays the s
 The existing Vime smoke uses a digest-pinned SeaweedFS S3 fixture, shared with
 the benchmark CI workflow.
 
+## PrimeRL ModelExpress refit CI
+
+Trusted PR and nightly RL workflows also run the upstream PrimeRL reverse-text
+integration test with one trainer GPU and one inference GPU on the same H100
+node. The runtime is `ghcr.io/primeintellect-ai/prime-rl:v0.10.1.dev140`, pinned
+by digest; upstream tests are pinned to its source commit
+`0790ebb5d856860d916b270bda4884184ce9d786`. The image overlays the candidate MX
+client and a server built from the same candidate revision. Dependency syncing
+is disabled at runtime so PrimeRL cannot restore its older MX dependency pin.
+The Prime hosted monitor uses `PRIME_RUNS_MODE=disabled` and W&B runs offline,
+so CI needs no telemetry credentials. Local metrics and training logs remain
+enabled for the upstream assertions.
+
+The workload uses `weight_broadcast.type = "modelexpress"`, which transfers
+weights through MX/NIXL, rather than PrimeRL's separate native `nixl` transport.
+It preserves the upstream 15-step reverse-text configuration and renderer with
+the `PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT` checkpoint pinned to revision
+`c97a910849ec6aa962add3dc253a0817d61c0210`. Upstream assertions require successful
+training, increasing reward, and mean mismatch KL below 0.01 over the last three
+steps. This is real training and same-node refit coverage; it does not qualify
+cross-node RDMA, TP/EP resharding, or a general model-quality benchmark.
+
+The parent RL workflow builds the PrimeRL image in `build-primerl` and passes
+its immutable digest to `modelexpress-rl-primerl-gpu-ci.yml`. The GPU workflow
+shares the existing RL GPU admission slots and
+uses an owned namespace with a two-GPU quota. The workload has no automatic
+retry. A CPU-only reader retains access to full logs and JUnit results on the
+namespace's shared-model-cache PVC after the GPU job exits. Evidence is copied
+and uploaded before inline namespace cleanup. Model and optimizer checkpoints
+use `/checkpoints/reverse-text-modelexpress` inside the GPU pod's emptyDir rather
+than the retained model cache. PrimeRL can clean this subdirectory without
+removing the volume mount; normal and fallback pod cleanup reclaim all
+checkpoints. Collector metadata reads use
+bounded retries for transient Kubernetes API failures. A separate fallback job
+handles failure/cancellation cleanup. Ordinary comments and `/bench` do not start this
+additional workload. GPU qualification of this new lane remains pending.
+
 ## Comment-triggered model benchmark CI
 
 `ci/bench/` contains registered Nemotron and Kimi-K2.7-Code profiles. Offline
@@ -176,20 +214,29 @@ of the existing Vime/Dynamo E2E smoke and does not enforce performance threshold
 `modelexpress-rl-ci.yml` workflows. The existing required `CI status check` requires
 both to succeed. Each child checks all of its test and cleanup results.
 Inference owns image builds, ModelStreamer, and the reusable GPU test workflow.
-RL owns Vime and generator-only refit, including their builds and cleanup.
-One RL `GPU cleanup` fallback job handles both workloads after both tests finish;
-each cleanup path runs only when its test needs it, and Vime cleanup still runs
-if refit cleanup fails. Normal inline cleanup remains in each test job.
-`modelexpress-rl-refit-gpu-ci.yml` and `modelexpress-rl-vime-gpu-ci.yml`
-contain one GPU job each, avoiding skipped jobs for the other suite. One
+RL owns Vime, generator-only refit, and PrimeRL, including their builds and cleanup.
+Each lane follows the same structure: `build-generator-only` / `test-generator-only`, `build-vime` /
+`test-vime`, and `build-primerl` / `test-primerl`. Builds use the validated
+candidate SHA and pass immutable image digests and the trusted harness SHA to
+their reusable `modelexpress-rl-<lane>-gpu-ci.yml` workflow. Each GPU workflow
+contains a queued `test` job and an independent `cleanup` fallback job. The test
+collects evidence on success or failure, honors `upload_evidence`, records the
+tested revision, and cleans its owned namespace before releasing admission.
+Fallback cleanup starts after that lane fails or is cancelled, without waiting
+for the other lanes. Vime now retains full trainer/rollout logs and namespace
+diagnostics; its ten-update and payload-format assertions remain unchanged. One
 workflow-level group in `modelexpress-e2e-ci.yml` cancels superseded PR runs
 while repository-wide child groups retain GPU slots. Cleanup jobs use `always()`
 so cancellation still runs independent fallback cleanup. Inference
 and RL skip it when the GPU tests and their inline cleanup succeed; failures and
 cancellations retain fallback cleanup. Status checks accept a skipped fallback
 only when its corresponding tests succeeded.
+The parent status check requires every selected build and GPU workflow to
+succeed, including cleanup failures propagated by those workflows.
 The RL validation job also handles `/bench` authorization with the existing
 writer and approved-mirror checks; comment runs execute only the selected refit profile.
+Validation receives the same `MX_BENCH_KUBE_CONTEXT` setting and default as the
+generator-only GPU workflow before authorizing the candidate revision.
 Ordinary comments do not start RL builds, GPU tests, or Vime jobs.
 
 `nightly-ci.yml` reuses the core, inference and RL workflows on upstream `main`.
@@ -257,7 +304,7 @@ The parent workflow calls inference GPU tests per framework without additional
 supersession groups. A100a defaults to 8 repository-wide test
 slots; A100b defaults to one concurrent test requiring four full GPUs at peak.
 `MX_CI_A100B_CONCURRENCY` can override its limit to 1–4, and the inference `MX_CI_GPU_CONCURRENCY` limit also applies. Inference cases have distinct indices rotated by PR number and reduced
-modulo the configured limit; RL refit and Vime use PR-based slots per Kubernetes
+modulo the configured limit; RL refit, Vime and PrimeRL use PR-based slots per Kubernetes
 context. One complete workload occupies each slot through execution and cleanup.
 Builds and independent cleanup remain outside these queues. GitHub's `queue: max`
 retains pending jobs. After all 15 small Kubernetes GPU cases in the same run succeed, five large cases
@@ -343,11 +390,13 @@ fallback cleanup continues when a PR workflow is cancelled.
 
 RL GPU jobs default to 4 repository-wide slots per Kubernetes context,
 configured independently with `MX_CI_RL_GPU_CONCURRENCY` (1–16). Refit
-runs choose PR number modulo the configured limit; Vime uses PR number plus one
-modulo that limit. This bounds concurrency across PRs without a reservation
-ledger. One-job mode serializes both workloads. Normal namespace deletion finishes before
-releasing a slot. Independent cleanup remains outside the queues. Refit jobs have
-a two-hour budget including admission, setup, execution and cleanup.
+runs choose PR number modulo the configured limit; Vime uses PR number plus one,
+and PrimeRL uses PR number plus two, modulo that limit. All assignments come
+from the parent validation job. This bounds concurrency across PRs without a
+reservation ledger. One-job mode serializes all three workloads. Normal
+namespace deletion finishes before releasing a slot. Independent cleanup remains
+outside the queues. All RL GPU jobs have a two-hour budget including admission,
+setup, execution and cleanup.
 
 The 8/1/4 defaults for A100a/A100b/RL need live qualification of CPU, memory,
 GPU/MIG and RDMA headroom.

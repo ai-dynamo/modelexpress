@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-name: ModelExpress RL Refit GPU CI
+name: ModelExpress RL Generator-Only GPU CI
 
 on:
   workflow_call:
@@ -22,16 +22,16 @@ on:
         default: ""
       sha:
         type: string
-        default: ""
+        required: true
       harness_sha:
         type: string
-        default: ""
+        required: true
       server_image:
         type: string
         default: ""
       worker_image:
         type: string
-        default: ""
+        required: true
       cleanup_image:
         type: string
         default: ""
@@ -49,9 +49,15 @@ env:
   KUBE_CONTEXT: ${{ vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02' }}
   NAMESPACE: mx-ci-bench-${{ github.run_id }}-${{ github.run_attempt }}
   RESULTS_DIR: ${{ github.workspace }}/bench-results
+  MODEL_PROFILE: ${{ inputs.model }}
+  SCENARIO: ${{ inputs.scenario }}
+  RUN_ID: ${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
+  SERVER_IMAGE: ${{ inputs.server_image }}
+  WORKER_IMAGE: ${{ inputs.worker_image }}
+  CLEANUP_IMAGE: ${{ inputs.cleanup_image }}
 
 jobs:
-  refit:
+  test:
     concurrency:
       group: ${{ format('modelexpress-rl-gpu-{0}-slot-{1}', vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', inputs.gpu_slot) }}
       queue: max
@@ -62,12 +68,6 @@ jobs:
     env:
       MX_CI_GPU_CONCURRENCY: ${{ inputs.gpu_limit }}
       MX_CI_GPU_LANE: ${{ format('slot-{0}', inputs.gpu_slot) }}
-      MODEL_PROFILE: ${{ inputs.model }}
-      SCENARIO: ${{ inputs.scenario }}
-      RUN_ID: ${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
-      SERVER_IMAGE: ${{ inputs.server_image }}
-      WORKER_IMAGE: ${{ inputs.worker_image }}
-      CLEANUP_IMAGE: ${{ inputs.cleanup_image }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -90,12 +90,15 @@ jobs:
       - name: Verify refitted GPU weights and measure cold-load and refit latency
         timeout-minutes: 45
         run: python3 ci/bench/scripts/ci.py run
-      - name: Collect missing run evidence
-        if: ${{ always() && hashFiles('bench-results/report.json') == '' }}
-        run: python3 ci/bench/scripts/ci.py collect
-      - name: Save evidence
+      - name: Collect evidence
+        if: always()
+        run: |
+          if [ ! -f "$RESULTS_DIR/report.json" ]; then
+            python3 ci/bench/scripts/ci.py collect
+          fi
+      - name: Upload evidence
         if: ${{ always() && inputs.upload_evidence }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.RESULTS_DIR }}
@@ -105,8 +108,35 @@ jobs:
         if: always()
         env:
           TEST_SHA: ${{ inputs.sha }}
-        run: echo "RL weight refit CI of $TEST_SHA; evidence is attached to this run." >> "$GITHUB_STEP_SUMMARY"
+        run: echo "RL generator-only refit CI of $TEST_SHA" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Remove owned workload before releasing GPU admission
+      - name: Cleanup owned workload
         if: always()
         run: python3 ci/bench/scripts/ci.py cleanup
+
+  cleanup:
+    name: RL generator-only fallback cleanup
+    needs: test
+    if: ${{ always() && needs.test.result != 'success' && needs.test.result != 'skipped' }}
+    runs-on: prod-deploy-tester-v1
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ inputs.harness_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install manifest parser
+        run: python3 -m pip install pyyaml
+      - name: Cleanup owned workload
+        run: python3 ci/bench/scripts/ci.py cleanup
+      - name: Upload cleanup evidence
+        if: ${{ always() && inputs.upload_evidence }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
