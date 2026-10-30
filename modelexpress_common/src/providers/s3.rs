@@ -330,9 +330,10 @@ fn collect_cached_models(
     current_dir: &Path,
     models: &mut Vec<ModelInfo>,
 ) -> Result<()> {
-    for entry in fs::read_dir(current_dir)
-        .with_context(|| format!("Failed to read directory '{}'", current_dir.display()))?
-    {
+    let Some(entries) = crate::cache::read_dir_for_listing(current_dir) else {
+        return Ok(());
+    };
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
@@ -370,12 +371,12 @@ fn collect_cached_models(
         if models.iter().any(|model| model.name == name) {
             continue;
         }
-        models.push(ModelInfo {
-            provider: ModelProvider::S3,
+        models.push(ModelInfo::measured(
+            ModelProvider::S3,
             name,
-            size: crate::cache::directory_size(model_dir)?,
-            path: model_dir.to_path_buf(),
-        });
+            model_dir.to_path_buf(),
+            crate::cache::directory_size(model_dir),
+        ));
     }
     Ok(())
 }

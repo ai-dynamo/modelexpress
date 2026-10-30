@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    cache::{ModelInfo, ProviderCache, directory_size},
+    cache::{ModelInfo, ProviderCache, directory_size, read_dir_for_listing},
     envs,
     models::ModelProvider,
     providers::{ModelProviderTrait, lock_file::LockFile},
@@ -689,7 +689,16 @@ fn collect_ngc_models(ngc_root: &Path, dir: &Path, models: &mut Vec<ModelInfo>) 
     let mut has_files = false;
     let mut subdirs: Vec<PathBuf> = Vec::new();
 
-    for entry in fs::read_dir(dir).with_context(|| format!("Failed to read directory {dir:?}"))? {
+    let entries = if dir == ngc_root {
+        fs::read_dir(dir).with_context(|| format!("Failed to read directory {dir:?}"))?
+    } else {
+        let Some(entries) = read_dir_for_listing(dir) else {
+            return Ok(());
+        };
+        entries
+    };
+
+    for entry in entries {
         let entry = entry.with_context(|| format!("Failed to read entry in {dir:?}"))?;
         let path = entry.path();
         if path.is_file() {
@@ -715,12 +724,12 @@ fn collect_ngc_models(ngc_root: &Path, dir: &Path, models: &mut Vec<ModelInfo>) 
         } else {
             parts.join("/")
         };
-        models.push(ModelInfo {
-            provider: ModelProvider::Ngc,
+        models.push(ModelInfo::measured(
+            ModelProvider::Ngc,
             name,
-            size: directory_size(dir)?,
-            path: dir.to_path_buf(),
-        });
+            dir.to_path_buf(),
+            directory_size(dir),
+        ));
     } else {
         for subdir in subdirs {
             collect_ngc_models(ngc_root, &subdir, models)?;
