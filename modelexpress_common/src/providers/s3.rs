@@ -44,7 +44,7 @@ impl S3ModelName {
         let (bucket, object_prefix) = full_url
             .split_once('/')
             .ok_or_else(|| anyhow::anyhow!("S3 model URL must include bucket and object path"))?;
-        if bucket.is_empty() || bucket.contains('/') {
+        if bucket.is_empty() || bucket.contains('/') || bucket == "." || bucket == ".." {
             anyhow::bail!("S3 model URL must include a valid bucket");
         }
         Self::new(bucket, object_prefix)
@@ -404,6 +404,30 @@ mod tests {
         let model =
             S3ModelName::parse(" S3://bucket/org/model/rev/").expect("Expected model name parse");
         assert_eq!(model.to_string(), "s3://bucket/org/model/rev");
+    }
+
+    #[test]
+    fn test_model_name_parse_rejects_dot_buckets() {
+        for invalid in ["s3://./org/model", "s3://../org/model"] {
+            assert!(S3ModelName::parse(invalid).is_err(), "input={invalid}");
+        }
+    }
+
+    #[test]
+    fn test_clear_model_with_dot_bucket_leaves_other_caches() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let hf_model = temp_dir.path().join("models--gpt2/snapshots/abc");
+        let s3_model = temp_dir.path().join("s3/bucket/org/model");
+        fs::create_dir_all(&hf_model).expect("Failed to create HF model dir");
+        fs::create_dir_all(&s3_model).expect("Failed to create S3 model dir");
+
+        for name in ["s3://../models--gpt2", "s3://./bucket"] {
+            S3ProviderCache
+                .clear_model(temp_dir.path(), name)
+                .expect_err("Expected dot bucket to be rejected");
+        }
+        assert!(hf_model.exists());
+        assert!(s3_model.exists());
     }
 
     #[test]
