@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Safetensors header parsing shared by the direct-to-GPU loaders.
+"""Safetensors header parsing and shard selection shared by the direct-to-GPU loaders.
 
 Parses only the JSON header, never tensor data, so callers can plan byte-range
 reads (GDS file reads, NIXL OBJ ranged GETs) before touching the payload.
@@ -12,11 +12,14 @@ from __future__ import annotations
 import json
 import math
 import struct
+from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import pairwise
 
 import torch
 
+INDEX_FILE = "model.safetensors.index.json"
+SINGLE_FILE = "model.safetensors"
 # Leading little-endian u64 holding the JSON header length.
 HEADER_LENGTH_BYTES = 8
 MAX_HEADER_BYTES = 100 * 1024 * 1024
@@ -149,3 +152,25 @@ def parse_header(header_bytes: bytes, source: str) -> SafetensorsHeader:
         data_end=data_start + data_len,
         tensors=tuple(entries),
     )
+
+
+def index_weight_map(index: dict, source: str) -> dict[str, str]:
+    """Return the ``weight_map`` of a parsed index file, which must not be empty."""
+    weight_map = index.get("weight_map") or {}
+    if not weight_map:
+        raise ValueError(f"Empty weight_map in {source}")
+    return weight_map
+
+
+def select_shards(filenames: Iterable[str], weight_map: dict[str, str] | None) -> list[str]:
+    """Pick a checkpoint's shard files, sorted.
+
+    Uses the index ``weight_map`` when there is one, then a single
+    ``model.safetensors``, then every ``*.safetensors`` file.
+    """
+    if weight_map is not None:
+        return sorted(set(weight_map.values()))
+    names = set(filenames)
+    if SINGLE_FILE in names:
+        return [SINGLE_FILE]
+    return sorted(name for name in names if name.endswith(".safetensors"))

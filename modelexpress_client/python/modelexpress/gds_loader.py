@@ -29,9 +29,12 @@ from .accelerators import AcceleratorBackend
 from .gds_transfer import GdsTransferManager, is_gds_available
 from .safetensors_header import (
     HEADER_LENGTH_BYTES,
+    INDEX_FILE,
     SAFETENSORS_DTYPE_MAP,
     header_length,
+    index_weight_map,
     parse_header,
+    select_shards,
 )
 
 logger = logging.getLogger("modelexpress.gds_loader")
@@ -184,15 +187,10 @@ class MxGdsLoader:
         """
         model_dir = Path(model_path)
 
-        # Try sharded index first
-        index_path = model_dir / "model.safetensors.index.json"
+        index_path = model_dir / INDEX_FILE
         if index_path.exists():
             with open(index_path, "r") as f:
-                index = json.load(f)
-
-            weight_map: dict[str, str] = index.get("weight_map", {})
-            if not weight_map:
-                raise RuntimeError(f"Empty weight_map in {index_path}")
+                weight_map = index_weight_map(json.load(f), str(index_path))
 
             file_tensors: dict[str, list[str]] = defaultdict(list)
             for tensor_name, filename in weight_map.items():
@@ -205,27 +203,18 @@ class MxGdsLoader:
             )
             return dict(file_tensors)
 
-        # Try single file
-        single_path = model_dir / "model.safetensors"
-        if single_path.exists():
-            header_info = self._parse_safetensors_header(str(single_path))
-            tensor_names = list(header_info.keys())
-            logger.info("Found single safetensors file: %d tensors", len(tensor_names))
-            return {str(single_path): tensor_names}
-
-        # Fallback: glob
-        st_files = sorted(model_dir.glob("*.safetensors"))
-        if not st_files:
+        shards = select_shards((path.name for path in model_dir.glob("*.safetensors")), None)
+        if not shards:
             raise FileNotFoundError(f"No .safetensors files found in {model_path}")
 
         file_tensors_map: dict[str, list[str]] = {}
-        for st_file in st_files:
-            header_info = self._parse_safetensors_header(str(st_file))
-            file_tensors_map[str(st_file)] = list(header_info.keys())
+        for name in shards:
+            st_file = str(model_dir / name)
+            file_tensors_map[st_file] = list(self._parse_safetensors_header(st_file).keys())
 
         total = sum(len(v) for v in file_tensors_map.values())
         logger.info(
-            "Found %d safetensors files via glob: %d tensors",
+            "Found %d safetensors files: %d tensors",
             len(file_tensors_map), total,
         )
         return file_tensors_map

@@ -156,7 +156,7 @@ ModelExpress/
 │       ├── gds_loader.py               # GDS model loader
 │       ├── s3_rdma_transfer.py             # NIXL OBJ (S3-over-RDMA) transfer manager
 │       ├── s3_rdma_loader.py               # S3-over-RDMA safetensors loader (MxS3RdmaLoader)
-│       ├── safetensors_header.py       # Shared safetensors header parser and dtype map
+│       ├── safetensors_header.py       # Shared safetensors header parser, dtype map, shard selection
 │       ├── adapter.py                  # EngineAdapter contract and strategy errors
 │       ├── vllm_loader.py              # Compatibility shim for engines.vllm.loader
 │       ├── metadata/                   # Metadata clients, publishing, heartbeat, worker manifest service
@@ -1216,7 +1216,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `s3_rdma_transfer.py` | `S3RdmaTransferManager` - private NIXL agent with the OBJ backend's generic accelerated engine (`x-amz-rdma-token`); posts one-descriptor ranged reads from objects into registered device slots, drains before freeing, and quarantines memory whose reads never finish |
 | `s3_rdma_loader.py` | `MxS3RdmaLoader` - resolves an `s3://` checkpoint over HTTP (listing, index, headers), plans object-local windows, streams them over S3-over-RDMA through a fixed pool of staging slots, and copies each window device-to-device into fresh per-tensor allocations with a tail-canary integrity check |
-| `safetensors_header.py` | Safetensors header parsing and dtype map shared by the GDS and NIXL OBJ loaders |
+| `safetensors_header.py` | Safetensors header parsing, dtype map, and checkpoint shard selection shared by the GDS and S3-over-RDMA loaders |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
 | `plugins.py` | Discovery, validation, and selection of external loading strategy classes |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |

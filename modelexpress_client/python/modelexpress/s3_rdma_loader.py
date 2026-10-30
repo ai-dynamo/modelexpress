@@ -47,16 +47,17 @@ from .s3_rdma_transfer import (
 )
 from .safetensors_header import (
     HEADER_LENGTH_BYTES,
+    INDEX_FILE,
     SafetensorsHeader,
     header_length,
+    index_weight_map,
     parse_header,
+    select_shards,
     torch_dtype,
 )
 
 logger = logging.getLogger("modelexpress.s3_rdma_loader")
 
-INDEX_FILE = "model.safetensors.index.json"
-SINGLE_FILE = "model.safetensors"
 VERIFY_MODES = ("tail", "full", "off")
 _MIB = 1024 * 1024
 _HEADER_PROBE_BYTES = _MIB
@@ -275,29 +276,19 @@ def resolve_checkpoint(
     *,
     listing: dict[str, tuple[int, str]] | None = None,
 ) -> list[ShardInfo]:
-    """Pick the safetensors objects of a checkpoint and parse their headers.
-
-    Uses the index ``weight_map`` when present, then a single
-    ``model.safetensors``, then every top-level ``*.safetensors`` object.
-    """
+    """Pick the safetensors objects of a checkpoint (see ``select_shards``) and parse their headers."""
     uri = f"s3://{bucket}/{prefix}"
     if listing is None:
         listing = reader.list_objects(bucket, prefix)
 
     index_key = prefix + INDEX_FILE
+    weight_map = None
     if index_key in listing:
-        index = json.loads(reader.get_object(bucket, index_key))
-        weight_map = index.get("weight_map") or {}
-        if not weight_map:
-            raise ValueError(f"Empty weight_map in {uri}{INDEX_FILE}")
-        keys = sorted({prefix + filename for filename in weight_map.values()})
-        missing = [key for key in keys if key not in listing]
-        if missing:
-            raise FileNotFoundError(f"{INDEX_FILE} in {uri} references missing objects: {missing}")
-    elif prefix + SINGLE_FILE in listing:
-        keys = [prefix + SINGLE_FILE]
-    else:
-        keys = sorted(key for key in listing if key.endswith(".safetensors"))
+        weight_map = index_weight_map(json.loads(reader.get_object(bucket, index_key)), uri + INDEX_FILE)
+    keys = [prefix + name for name in select_shards((key[len(prefix):] for key in listing), weight_map)]
+    missing = [key for key in keys if key not in listing]
+    if missing:
+        raise FileNotFoundError(f"{INDEX_FILE} in {uri} references missing objects: {missing}")
     if not keys:
         raise FileNotFoundError(f"No .safetensors objects found under {uri}")
 
