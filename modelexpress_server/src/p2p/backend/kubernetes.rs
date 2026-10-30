@@ -218,7 +218,7 @@ impl MetadataBackend for KubernetesBackend {
         pod_uid: &str,
         pod_namespace: &str,
     ) -> MetadataResult<()> {
-        let source_id = crate::p2p::source_identity::compute_mx_source_id(identity);
+        let source_id = crate::p2p::source_identity::compute_mx_source_id(identity)?;
         let source_id = source_id.as_str();
         let model_name = &identity.model_name;
         let api = self.model_metadata_api();

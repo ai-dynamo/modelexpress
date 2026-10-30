@@ -20,9 +20,9 @@ use kube::{
     Client,
     api::{Api, ListParams, Patch, PatchParams, PostParams},
 };
+use modelexpress_common::digest::{DigestError, sha256_hex};
 use modelexpress_common::models::{ModelProvider, ModelStatus};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{Mutex, PoisonError},
@@ -118,7 +118,7 @@ fn lease_observation_expired(
 /// carries a 12-hex-char sha256 suffix derived from the **original** model name. That
 /// way `google-T5/model` and `google-t5/model` never collide on the same CR name even
 /// though the visible prefix is identical.
-fn sanitize_registry_name(model_name: &str) -> String {
+fn sanitize_registry_name(model_name: &str) -> Result<String, DigestError> {
     let mut out = String::with_capacity(model_name.len());
     for c in model_name.chars() {
         match c {
@@ -129,27 +129,17 @@ fn sanitize_registry_name(model_name: &str) -> String {
         }
     }
     let trimmed = out.trim_matches(|c: char| c == '-' || c == '.');
-    let hash = hex_sha256(model_name);
+    let hash = sha256_hex(model_name.as_bytes())?;
     let hash_suffix = &hash[..HASH_SUFFIX_LEN];
     if trimmed.is_empty() {
         // Degenerate input ("", "///", "---"): emit just the hash.
-        return hash_suffix.to_string();
+        return Ok(hash_suffix.to_string());
     }
     // Reserve space for `-{hash}`; truncate the readable prefix if we're over budget.
     let max_prefix = NAME_BUDGET.saturating_sub(HASH_SUFFIX_LEN + 1);
     let prefix_len = trimmed.len().min(max_prefix);
     let prefix = &trimmed[..prefix_len];
-    format!("{prefix}-{hash_suffix}")
-}
-
-fn hex_sha256(s: &str) -> String {
-    let digest = Sha256::digest(s.as_bytes());
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    Ok(format!("{prefix}-{hash_suffix}"))
 }
 
 pub struct KubernetesRegistryBackend {
@@ -175,35 +165,38 @@ impl KubernetesRegistryBackend {
 
     /// Provider-scoped CR name: `sanitize("{provider}/{model_name}")`, so the sha256 suffix
     /// binds (provider, name) and providers never collide.
-    fn cr_name_for(provider: ModelProvider, model_name: &str) -> String {
-        format!(
+    fn cr_name_for(provider: ModelProvider, model_name: &str) -> Result<String, DigestError> {
+        Ok(format!(
             "{CR_NAME_PREFIX}{}",
-            sanitize_registry_name(&format!("{}/{model_name}", Self::provider_str(provider)))
-        )
+            sanitize_registry_name(&format!("{}/{model_name}", Self::provider_str(provider)))?
+        ))
     }
 
     /// Legacy name-only CR name, pre-provider-scoped CRs.
     /// TODO(0.5.0 migration): remove once no deployment has pre-0.5.0 CRs; see
     /// `try_claim_for_download`.
-    fn legacy_cr_name_for(model_name: &str) -> String {
-        format!("{CR_NAME_PREFIX}{}", sanitize_registry_name(model_name))
+    fn legacy_cr_name_for(model_name: &str) -> Result<String, DigestError> {
+        Ok(format!(
+            "{CR_NAME_PREFIX}{}",
+            sanitize_registry_name(model_name)?
+        ))
     }
 
     /// CR names a record for `model_name` may live under when the provider isn't known up
     /// front: the provider-scoped name for every provider, plus the legacy name-only name.
-    fn candidate_cr_names(model_name: &str) -> Vec<String> {
-        let mut names: Vec<String> = ALL_PROVIDERS
+    fn candidate_cr_names(model_name: &str) -> Result<Vec<String>, DigestError> {
+        let mut names = ALL_PROVIDERS
             .iter()
             .map(|p| Self::cr_name_for(*p, model_name))
-            .collect();
-        names.push(Self::legacy_cr_name_for(model_name));
-        names
+            .collect::<Result<Vec<_>, _>>()?;
+        names.push(Self::legacy_cr_name_for(model_name)?);
+        Ok(names)
     }
 
     /// First existing CR among the candidates (provider-scoped keys, then legacy). Used by
     /// name-addressed reads; in practice a name maps to a single provider.
     async fn find_existing_cr(&self, model_name: &str) -> RegistryResult<Option<ModelCacheEntry>> {
-        for cr_name in Self::candidate_cr_names(model_name) {
+        for cr_name in Self::candidate_cr_names(model_name)? {
             if let Some(cr) = self.get_cr(&cr_name).await? {
                 return Ok(Some(cr));
             }
@@ -221,7 +214,7 @@ impl KubernetesRegistryBackend {
         provider: ModelProvider,
         scoped_name: &str,
     ) -> RegistryResult<Option<ClaimOutcome>> {
-        let legacy_name = Self::legacy_cr_name_for(model_name);
+        let legacy_name = Self::legacy_cr_name_for(model_name)?;
         let Some(legacy_cr) = self.get_cr(&legacy_name).await? else {
             return Ok(None);
         };
@@ -566,7 +559,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
         status: ModelStatus,
         message: Option<String>,
     ) -> RegistryResult<()> {
-        let cr_name = Self::cr_name_for(provider, model_name);
+        let cr_name = Self::cr_name_for(provider, model_name)?;
         let now = Utc::now().to_rfc3339();
 
         // Track whether the CR is brand new so we only stamp createdAt on first write —
@@ -642,7 +635,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
 
     async fn delete_model(&self, model_name: &str) -> RegistryResult<()> {
         // Delete every variant (all providers + legacy); 404 is a no-op.
-        for cr_name in Self::candidate_cr_names(model_name) {
+        for cr_name in Self::candidate_cr_names(model_name)? {
             match self
                 .api()
                 .delete(&cr_name, &kube::api::DeleteParams::default())
@@ -706,7 +699,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
         claim_id: &str,
         lease_duration: std::time::Duration,
     ) -> RegistryResult<ClaimOutcome> {
-        let cr_name = Self::cr_name_for(provider, model_name);
+        let cr_name = Self::cr_name_for(provider, model_name)?;
 
         // Fast path (mirrors Redis's scoped-first check): a non-mutating GET returns the
         // existing status without committing a claim, skipping the legacy lookup in steady state.
@@ -758,7 +751,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
     ) -> RegistryResult<bool> {
         // Retry only runs after a claim observed AlreadyExists (which already migrated any
         // legacy CR), so the CAS targets the provider-scoped CR directly.
-        let cr_name = Self::cr_name_for(provider, model_name);
+        let cr_name = Self::cr_name_for(provider, model_name)?;
         let Some(existing) = self.get_cr(&cr_name).await? else {
             return Ok(false);
         };
@@ -812,7 +805,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
         claim_id: &str,
         lease_duration: std::time::Duration,
     ) -> RegistryResult<bool> {
-        let cr_name = Self::cr_name_for(provider, model_name);
+        let cr_name = Self::cr_name_for(provider, model_name)?;
         let now = Utc::now().to_rfc3339();
         let lease_expires_at = Self::lease_deadline(lease_duration).to_rfc3339();
         let patch = json!([
@@ -850,7 +843,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
         status: ModelStatus,
         message: Option<String>,
     ) -> RegistryResult<bool> {
-        let cr_name = Self::cr_name_for(provider, model_name);
+        let cr_name = Self::cr_name_for(provider, model_name)?;
         let now = Utc::now().to_rfc3339();
         let patch = json!([
             { "op": "test", "path": "/status/phase", "value": phase::DOWNLOADING },
@@ -884,6 +877,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use kube::CustomResourceExt;
@@ -936,9 +930,14 @@ mod tests {
     #[test]
     fn sanitize_preserves_readable_prefix() {
         // The readable prefix is still present; the hash suffix disambiguates collisions.
-        assert!(sanitize_registry_name("org/model").starts_with("org--model-"));
+        assert!(
+            sanitize_registry_name("org/model")
+                .expect("name")
+                .starts_with("org--model-")
+        );
         assert!(
             sanitize_registry_name("meta-llama/Llama-3.1-70B")
+                .expect("name")
                 .starts_with("meta-llama--llama-3.1-70b-")
         );
     }
@@ -946,8 +945,8 @@ mod tests {
     #[test]
     fn sanitize_distinguishes_slash_from_single_dash() {
         assert_ne!(
-            sanitize_registry_name("org/model"),
-            sanitize_registry_name("org-model")
+            sanitize_registry_name("org/model").expect("name"),
+            sanitize_registry_name("org-model").expect("name")
         );
     }
 
@@ -956,38 +955,39 @@ mod tests {
         // Case-folding used to collide silently; the always-on hash suffix (of the
         // original case-preserving name) prevents that.
         assert_ne!(
-            sanitize_registry_name("Foo/Bar"),
-            sanitize_registry_name("foo/bar")
+            sanitize_registry_name("Foo/Bar").expect("name"),
+            sanitize_registry_name("foo/bar").expect("name")
         );
     }
 
     #[test]
     fn sanitize_handles_degenerate_input() {
-        let hashed = sanitize_registry_name("");
+        let hashed = sanitize_registry_name("").expect("name");
         assert_eq!(hashed.len(), HASH_SUFFIX_LEN);
-        let hashed = sanitize_registry_name("///");
+        let hashed = sanitize_registry_name("///").expect("name");
         assert_eq!(hashed.len(), HASH_SUFFIX_LEN);
-        let hashed = sanitize_registry_name("---");
+        let hashed = sanitize_registry_name("---").expect("name");
         assert_eq!(hashed.len(), HASH_SUFFIX_LEN);
     }
 
     #[test]
     fn sanitize_fits_dns_1123_budget() {
         let long: String = "a".repeat(300);
-        let out = sanitize_registry_name(&long);
+        let out = sanitize_registry_name(&long).expect("name");
         assert!(out.len() <= NAME_BUDGET);
         // Still distinguishes two different 300-char names via the hash suffix.
         let other: String = format!("{}b", "a".repeat(299));
         assert_ne!(
-            sanitize_registry_name(&long),
-            sanitize_registry_name(&other)
+            sanitize_registry_name(&long).expect("name"),
+            sanitize_registry_name(&other).expect("name")
         );
     }
 
     #[test]
     fn cr_name_stays_within_k8s_limit() {
         let long = "a".repeat(300);
-        let name = KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, &long);
+        let name = KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, &long)
+            .expect("name");
         assert!(name.len() <= K8S_NAME_MAX);
         assert!(name.starts_with(CR_NAME_PREFIX));
     }
@@ -995,11 +995,12 @@ mod tests {
     #[test]
     fn cr_name_distinguishes_provider_and_legacy() {
         let n = "google-t5/t5-small";
-        let hf = KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, n);
-        let ngc = KubernetesRegistryBackend::cr_name_for(ModelProvider::Ngc, n);
-        let gcs = KubernetesRegistryBackend::cr_name_for(ModelProvider::Gcs, n);
-        let s3 = KubernetesRegistryBackend::cr_name_for(ModelProvider::S3, n);
-        let legacy = KubernetesRegistryBackend::legacy_cr_name_for(n);
+        let hf =
+            KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, n).expect("name");
+        let ngc = KubernetesRegistryBackend::cr_name_for(ModelProvider::Ngc, n).expect("name");
+        let gcs = KubernetesRegistryBackend::cr_name_for(ModelProvider::Gcs, n).expect("name");
+        let s3 = KubernetesRegistryBackend::cr_name_for(ModelProvider::S3, n).expect("name");
+        let legacy = KubernetesRegistryBackend::legacy_cr_name_for(n).expect("name");
         // Same name, different provider -> distinct CR names, all distinct from legacy.
         assert_ne!(hf, ngc);
         assert_ne!(hf, gcs);
@@ -1020,18 +1021,30 @@ mod tests {
     #[test]
     fn candidate_cr_names_cover_all_providers_and_legacy() {
         let n = "org/model";
-        let candidates = KubernetesRegistryBackend::candidate_cr_names(n);
+        let candidates = KubernetesRegistryBackend::candidate_cr_names(n).expect("names");
         assert_eq!(candidates.len(), ALL_PROVIDERS.len() + 1);
         for p in ALL_PROVIDERS {
-            assert!(candidates.contains(&KubernetesRegistryBackend::cr_name_for(p, n)));
+            assert!(
+                candidates.contains(&KubernetesRegistryBackend::cr_name_for(p, n).expect("name"))
+            );
         }
-        assert!(candidates.contains(&KubernetesRegistryBackend::legacy_cr_name_for(n)));
+        assert!(
+            candidates.contains(&KubernetesRegistryBackend::legacy_cr_name_for(n).expect("name"))
+        );
     }
 
     #[test]
     fn sanitize_trims_leading_trailing_dashes() {
-        assert!(sanitize_registry_name("-model-").starts_with("model-"));
-        assert!(sanitize_registry_name(".model.").starts_with("model-"));
+        assert!(
+            sanitize_registry_name("-model-")
+                .expect("name")
+                .starts_with("model-")
+        );
+        assert!(
+            sanitize_registry_name(".model.")
+                .expect("name")
+                .starts_with("model-")
+        );
     }
 
     #[allow(clippy::expect_used)]

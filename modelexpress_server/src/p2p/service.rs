@@ -140,7 +140,21 @@ impl P2pService for P2pServiceImpl {
             }
         };
 
-        let source_id = compute_mx_source_id(&identity);
+        let source_id = match compute_mx_source_id(&identity) {
+            Ok(id) => id,
+            Err(e) => {
+                error!("Failed to compute source id: {}", e);
+                return tagged(
+                    PublishMetadataResponse {
+                        success: false,
+                        message: format!("Failed to compute source id: {e}"),
+                        mx_source_id: String::new(),
+                        worker_id: String::new(),
+                    },
+                    RpcOutcome::Error,
+                );
+            }
+        };
         let worker_id = req.worker_id.clone();
         let model_name = identity.model_name.clone();
         let worker_rank = worker.worker_rank;
@@ -198,13 +212,24 @@ impl P2pService for P2pServiceImpl {
         let req = request.into_inner();
 
         // Resolve optional source_id filter
-        let source_id_filter: Option<String> = req.identity.as_ref().and_then(|id| {
-            if id.model_name.is_empty() {
-                None
-            } else {
-                Some(compute_mx_source_id(id))
+        let source_id_filter = match req
+            .identity
+            .as_ref()
+            .filter(|id| !id.model_name.is_empty())
+            .map(compute_mx_source_id)
+            .transpose()
+        {
+            Ok(filter) => filter,
+            Err(e) => {
+                error!("Failed to compute source id: {}", e);
+                return tagged(
+                    ListSourcesResponse {
+                        instances: Vec::new(),
+                    },
+                    RpcOutcome::Error,
+                );
             }
-        });
+        };
 
         // Convert raw proto i32 to typed enum — None means no filter
         let status_filter = req
@@ -806,7 +831,7 @@ mod tests {
     async fn test_list_sources_returns_instances() {
         let now = chrono::Utc::now().timestamp_millis();
         let identity = test_identity();
-        let expected_source_id = compute_mx_source_id(&identity);
+        let expected_source_id = compute_mx_source_id(&identity).expect("source id");
         let mut mock = MockMetadataBackend::new();
         mock.expect_list_workers_filtered()
             .withf(
@@ -897,7 +922,7 @@ mod tests {
     async fn test_list_sources_filters_artifact_sources_by_worker_status() {
         let now = chrono::Utc::now().timestamp_millis();
         let identity = test_artifact_identity();
-        let expected_source_id = compute_mx_source_id(&identity);
+        let expected_source_id = compute_mx_source_id(&identity).expect("source id");
         let mut mock = MockMetadataBackend::new();
         mock.expect_list_workers_filtered()
             .withf(move |source_id, status_filter, _, _, _, _, _| {

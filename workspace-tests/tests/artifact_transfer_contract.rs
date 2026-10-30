@@ -53,13 +53,17 @@ fn artifact_source_identity_is_separate_from_weights() {
     other_compile_cache.compile_config_digest = "compile-config-b".to_string();
 
     assert_ne!(
-        modelexpress_server::p2p::source_identity::compute_mx_source_id(&weights),
-        modelexpress_server::p2p::source_identity::compute_mx_source_id(&compile_cache),
+        modelexpress_server::p2p::source_identity::compute_mx_source_id(&weights)
+            .expect("source id"),
+        modelexpress_server::p2p::source_identity::compute_mx_source_id(&compile_cache)
+            .expect("source id"),
         "artifact source types must not collide with model weight sources"
     );
     assert_ne!(
-        modelexpress_server::p2p::source_identity::compute_mx_source_id(&compile_cache),
-        modelexpress_server::p2p::source_identity::compute_mx_source_id(&other_compile_cache),
+        modelexpress_server::p2p::source_identity::compute_mx_source_id(&compile_cache)
+            .expect("source id"),
+        modelexpress_server::p2p::source_identity::compute_mx_source_id(&other_compile_cache)
+            .expect("source id"),
         "artifact compatibility fields must affect artifact source identity"
     );
 }
