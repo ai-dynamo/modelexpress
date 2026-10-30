@@ -401,7 +401,7 @@ class RdmaStrategy(LoadStrategy):
             return []
         try:
             list_resp = ctx.mx_client.list_sources(
-                identity=ctx.identity,
+                identity=ctx.p2p_source_identity or ctx.identity,
                 status_filter=p2p_pb2.SOURCE_STATUS_READY,
             )
             if not list_resp.instances:
