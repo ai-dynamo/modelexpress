@@ -484,7 +484,9 @@ class MxS3RdmaLoader:
         """Resolve the checkpoint, set up RDMA, and prove the data path on real reads.
 
         Everything that can fail before the engine sees a tensor happens here:
-        metadata, backend creation, registration, and the first verified window.
+        backend creation, metadata, registration, and the first verified window.
+        Backend creation comes first because it is the likeliest failure on a
+        host without cuObject or an RDMA fabric.
         """
         t0 = time.perf_counter()
         bucket, prefix = parse_s3_prefix(model_uri)
@@ -493,29 +495,30 @@ class MxS3RdmaLoader:
         if self._endpoint.bucket != bucket:
             raise ValueError(f"endpoint bucket {self._endpoint.bucket!r} != URI bucket {bucket!r}")
 
+        self._backend.set_device(self._device_id)
+        self._device = self._backend.torch_device(self._device_id)
+        self._manager = S3RdmaTransferManager(
+            agent_name=f"mx-s3-rdma-{self._device_id}-{uuid.uuid4().hex[:8]}",
+            endpoint=self._endpoint,
+            device_id=self._device_id,
+            num_threads=self._config.num_threads,
+            accelerator_backend=self._backend,
+        )
+        self._manager.initialize()
+        marks = {"backend": time.perf_counter()}
+
         shards = resolve_checkpoint(self._reader, bucket, prefix)
         plan = build_plan(bucket, prefix, shards, self._config.window_bytes)
-        marks = {"metadata": time.perf_counter()}
+        marks["metadata"] = time.perf_counter()
         self._plan = plan
         self._remaining = {
             idx: tensor.nbytes for idx, tensor in enumerate(plan.tensors) if tensor.nbytes
         }
 
-        self._backend.set_device(self._device_id)
-        self._device = self._backend.torch_device(self._device_id)
         if plan.windows:
             self._fetch_canaries(plan)
             marks["canaries"] = time.perf_counter()
             self._allocate_slots(plan)
-            self._manager = S3RdmaTransferManager(
-                agent_name=f"mx-s3-rdma-{self._device_id}-{uuid.uuid4().hex[:8]}",
-                endpoint=self._endpoint,
-                device_id=self._device_id,
-                num_threads=self._config.num_threads,
-                accelerator_backend=self._backend,
-            )
-            self._manager.initialize()
-            marks["backend"] = time.perf_counter()
             self._manager.register_objects([(key, size) for key, size, _etag in plan.objects])
             self._manager.register_slots(self._slots)
             marks["register"] = time.perf_counter()

@@ -1819,8 +1819,9 @@ sequenceDiagram
     participant H as boto3 (HTTP)
     participant N as NIXL OBJ agent
     participant S as AIStor
+    L->>N: create OBJ backend (accelerated)
     L->>H: list prefix, GET index.json, ranged GET headers and window tails
-    L->>N: create OBJ backend (accelerated), register objects and slots
+    L->>N: register objects and slots
     loop each window, up to MX_S3_RDMA_INFLIGHT in flight
         L->>N: READ (slot, object, offset, length)
         N->>S: GET Range + x-amz-rdma-token

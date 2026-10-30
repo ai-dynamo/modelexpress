@@ -620,10 +620,13 @@ class TestFailures:
     )
     def test_backend_unavailable(self, fake_nixl, mock_accelerator_backend_cls, agent_kwargs):
         objects = make_checkpoint(sample_shards())
-        loader, _ = self._loader(fake_nixl, mock_accelerator_backend_cls(s3_rdma=True), objects, agent_kwargs)
+        fake_nixl(objects, **agent_kwargs)
+        reader = FakeReader(objects)
+        loader = make_loader(mock_accelerator_backend_cls(s3_rdma=True), objects, reader=reader)
         with pytest.raises(S3RdmaBackendUnavailable):
             loader.prepare("s3://models/llama")
         loader.release()
+        assert (reader.lists, reader.range_calls) == (0, 0)
 
     def test_bucket_mismatch(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
