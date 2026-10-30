@@ -18,15 +18,16 @@ from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
 from .base import LoadContext, WeightsIteratorLoadStrategy, _as_load_result
 from .context import LoadResult
+from .model_streamer_strategy import get_model_streamer_uri
 
 logger = logging.getLogger("modelexpress.strategy_instant_tensor")
 
 _OBJECT_STORE_URI_PREFIXES = ("s3://", "gs://", "az://")
 
 
-def _has_object_store_model_uri() -> bool:
-    """Return whether MX_MODEL_URI targets a supported object store."""
-    model_uri = (envs.MX_MODEL_URI or "").strip().lower()
+def _has_object_store_model_uri(ctx: LoadContext) -> bool:
+    """Return whether this load's streaming override targets an object store."""
+    model_uri = (get_model_streamer_uri(ctx) or "").strip().lower()
     return model_uri.startswith(_OBJECT_STORE_URI_PREFIXES)
 
 
@@ -39,8 +40,8 @@ class InstantTensorStrategy(WeightsIteratorLoadStrategy):
     streaming URI; the engine resolves the model's own weight files.
 
     Enabled by default and gated by ``MX_INSTANT_TENSOR``. An object-store
-    ``MX_MODEL_URI`` skips this strategy so ModelStreamer handles the remote
-    source directly. InstantTensor also requires the ``instanttensor`` package,
+    streaming URI or explicit ``MX_DRAFT_MODEL_URI`` for the draft skips this
+    strategy so ModelStreamer handles that source. InstantTensor requires the ``instanttensor`` package,
     a CUDA-like device, and an engine adapter that implements its iterator.
     """
 
@@ -57,9 +58,19 @@ class InstantTensorStrategy(WeightsIteratorLoadStrategy):
                 f"[Worker {ctx.global_rank}] MX_INSTANT_TENSOR disabled, skipping instant tensor"
             )
             return False
-        if _has_object_store_model_uri():
+        if (
+            ctx.p2p_role == "draft"
+            and envs.MX_DRAFT_MODEL_URI
+            and get_model_streamer_uri(ctx) == envs.MX_DRAFT_MODEL_URI
+        ):
             logger.info(
-                f"[Worker {ctx.global_rank}] MX_MODEL_URI points to object storage, "
+                f"[Worker {ctx.global_rank}] Explicit draft streaming URI, "
+                "skipping instant tensor in favor of model streamer"
+            )
+            return False
+        if _has_object_store_model_uri(ctx):
+            logger.info(
+                f"[Worker {ctx.global_rank}] ModelStreamer URI points to object storage, "
                 "skipping instant tensor in favor of model streamer"
             )
             return False

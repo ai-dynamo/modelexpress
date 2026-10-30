@@ -137,6 +137,10 @@ def test_normalization(monkeypatch):
 
 
 def test_raw_optional_passthrough(monkeypatch, tmp_path):
+    monkeypatch.delenv("MX_DRAFT_MODEL_URI", raising=False)
+    assert envs.MX_DRAFT_MODEL_URI is None
+    monkeypatch.setenv("MX_DRAFT_MODEL_URI", "s3://bucket/draft")
+    assert envs.MX_DRAFT_MODEL_URI == "s3://bucket/draft"
     monkeypatch.delenv("MX_MODEL_URI", raising=False)
     assert envs.MX_MODEL_URI is None
     monkeypatch.setenv("MX_MODEL_URI", "s3://bucket/model")

@@ -24,9 +24,20 @@ from .context import LoadResult
 logger = logging.getLogger("modelexpress.strategy_model_streamer")
 
 
+def get_model_streamer_uri(ctx: LoadContext) -> str | None:
+    """Return the streaming override for the current engine and model role."""
+    model_uri = envs.MX_MODEL_URI
+    draft_model_uri = envs.MX_DRAFT_MODEL_URI
+    return (
+        ctx.adapter.resolve_model_streamer_uri(model_uri, draft_model_uri=draft_model_uri)
+        if ctx.adapter is not None
+        else model_uri
+    )
+
+
 def _resolve_model_uri(ctx: LoadContext) -> str:
     """Resolve the model URI used by ModelStreamer across engine configs."""
-    if model_uri := envs.MX_MODEL_URI:
+    if model_uri := get_model_streamer_uri(ctx):
         return model_uri
     for attr in ("model_weights", "model", "model_path"):
         value = getattr(ctx.model_config, attr, None)
@@ -38,9 +49,10 @@ def _resolve_model_uri(ctx: LoadContext) -> str:
 class ModelStreamerStrategy(WeightsIteratorLoadStrategy):
     """Load weights by streaming safetensors via runai-model-streamer.
 
-    Activated by setting MX_MODEL_URI, which is also the preferred streaming
-    URI. Engine model configuration is used only when the environment value is
-    unavailable. Engine adapters provide the concrete ModelStreamer iterator.
+    Activated by a configured streaming URI. The adapter may resolve the override
+    differently for a secondary model, such as a separately stored draft.
+    Without the override, URI resolution falls back to the engine model config.
+    Engine adapters provide the concrete ModelStreamer iterator.
     """
 
     name = "model_streamer"
@@ -62,10 +74,10 @@ class ModelStreamerStrategy(WeightsIteratorLoadStrategy):
     def is_available(self, ctx: LoadContext) -> bool:
         if not self.supports_explicit_uri(ctx):
             return False
-        model_uri = envs.MX_MODEL_URI or ""
+        model_uri = get_model_streamer_uri(ctx)
         if not model_uri:
             logger.info(
-                f"[Worker {ctx.global_rank}] MX_MODEL_URI not set, skipping model streamer"
+                f"[Worker {ctx.global_rank}] No ModelStreamer URI configured for this load, skipping"
             )
             return False
         return True
