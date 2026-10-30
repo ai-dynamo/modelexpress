@@ -295,6 +295,41 @@ def test_sglang_adapter_discovery_uses_backend_predicate(
     assert list(tensors) == ["weight"]
 
 
+
+@pytest.mark.parametrize(
+    "class_module,excluded",
+    [
+        ("sglang.srt.distributed.parallel_state", True),
+        ("sglang.srt.distributed.device_communicators.custom_all_reduce", True),
+        ("torch.distributed.distributed_c10d", True),
+        ("torch.distributed", True),
+        ("sglang.srt.distributed_extra", False),
+        ("sglang.srt.layers.quantization.fp8", False),
+    ],
+)
+def test_sglang_discovery_keeps_distributed_state_local(
+    mock_accelerator_backend_cls, class_module, excluded
+):
+    """Communicator state stays local; hidden quant tensors still transfer."""
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    model = nn.Module()
+    model.quant = SimpleNamespace(scale=torch.ones(4))
+    coordinator = type("GroupCoordinator", (), {"__module__": class_module})()
+    epochs = torch.zeros(8, dtype=torch.int32)
+    slab = torch.zeros(16)
+    coordinator.ca_comm = SimpleNamespace(epochs=epochs, slab=slab)
+    model.tp_group = coordinator
+
+    registered = adapter.discover_tensors(LoadResult(value=model, model=model))
+    registered_ptrs = {t.data_ptr() for t in registered.values()}
+
+    assert model.quant.scale.data_ptr() in registered_ptrs
+    for tensor in (epochs, slab):
+        assert (tensor.data_ptr() in registered_ptrs) is not excluded
+    assert coordinator.ca_comm.epochs is epochs
+    assert coordinator.ca_comm.slab is slab
+
 def test_sglang_adapter_post_load_delegates_to_child_module():
     adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
 
