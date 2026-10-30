@@ -143,6 +143,34 @@ class TestS3RdmaTransferManager:
         with pytest.raises(S3RdmaTransferError, match="cuObject limit"):
             mgr.register_slots([_SizedSlot(CUOBJ_MAX_XFER_BYTES + 1)])
 
+    def test_register_slots_rejects_wrong_device(self, manager):
+        mgr, _ = manager
+        mgr.initialize()
+        with pytest.raises(S3RdmaTransferError, match="expected cpu"):
+            mgr.register_slots([torch.zeros(16, dtype=torch.uint8, device="meta")])
+
+    def test_register_slots_rejects_non_contiguous(self, manager):
+        mgr, _ = manager
+        mgr.initialize()
+        with pytest.raises(S3RdmaTransferError, match="not contiguous"):
+            mgr.register_slots([torch.zeros(32, dtype=torch.uint8)[::2]])
+
+    def test_post_rejects_busy_or_unknown_slot(self, manager):
+        mgr, _ = manager
+        mgr.initialize()
+        mgr.register_objects([("k0", 100)])
+        mgr.register_slots([torch.zeros(16, dtype=torch.uint8)])
+        with pytest.raises(S3RdmaTransferError, match="not registered"):
+            mgr.post(1, 0, 0, 16)
+        handle = mgr.post(0, 0, 0, 16)
+        with pytest.raises(S3RdmaTransferError, match="already has a read in flight"):
+            mgr.post(0, 0, 16, 16)
+        while not mgr.poll(handle):
+            pass
+        mgr.release(handle)
+        mgr.post(0, 0, 16, 16)
+        assert mgr.drain(1.0)
+
     def test_post_poll_release(self, manager):
         mgr, _ = manager
         mgr.initialize()

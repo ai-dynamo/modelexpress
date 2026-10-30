@@ -125,6 +125,8 @@ class S3RdmaTransferManager:
     Each posted transfer carries exactly one descriptor, and each local
     descriptor starts at the base of its own registration, so a failure
     never leaves sibling descriptors running inside the same request.
+    Slots are contiguous tensors on this manager's device, addressed by
+    registration order, and a slot takes no new read while one is in flight.
     """
 
     def __init__(
@@ -146,7 +148,7 @@ class S3RdmaTransferManager:
         self._obj_reg: Any = None
         self._slot_reg: Any = None
         self._slots: list[torch.Tensor] = []
-        self._inflight: set[Any] = set()
+        self._inflight: dict[Any, int] = {}
 
     @property
     def agent_name(self) -> str:
@@ -211,14 +213,19 @@ class S3RdmaTransferManager:
             raise S3RdmaTransferError("slots are already registered")
         if not slots:
             raise S3RdmaTransferError("no staging slots to register")
+        device = self._accelerator_backend.torch_device(self._device_id)
         regions = []
-        for slot in slots:
+        for idx, slot in enumerate(slots):
             nbytes = slot.numel() * slot.element_size()
             if nbytes > CUOBJ_MAX_XFER_BYTES:
                 raise S3RdmaTransferError(
                     f"staging slot of {nbytes} bytes exceeds the cuObject limit "
                     f"of {CUOBJ_MAX_XFER_BYTES} bytes"
                 )
+            if slot.device != device:
+                raise S3RdmaTransferError(f"staging slot {idx} is on {slot.device}, expected {device}")
+            if not slot.is_contiguous():
+                raise S3RdmaTransferError(f"staging slot {idx} is not contiguous")
             regions.append((slot.data_ptr(), nbytes, self._device_id, ""))
         self._slot_reg = self._agent.register_memory(regions, self._mem_type, backends=[OBJ_BACKEND])
         self._slots = list(slots)
@@ -226,6 +233,10 @@ class S3RdmaTransferManager:
     def post(self, slot: int, obj_dev_id: int, offset: int, length: int) -> Any:
         """Post one ranged read of ``length`` bytes at ``offset`` into ``slot``."""
         self._require_agent()
+        if not 0 <= slot < len(self._slots):
+            raise S3RdmaTransferError(f"slot {slot} is not registered")
+        if slot in self._inflight.values():
+            raise S3RdmaTransferError(f"slot {slot} already has a read in flight")
         slot_tensor = self._slots[slot]
         capacity = slot_tensor.numel() * slot_tensor.element_size()
         if length <= 0 or length > capacity:
@@ -248,7 +259,7 @@ class S3RdmaTransferManager:
         if state == "ERR":
             self.release(handle)
             raise S3RdmaTransferError("OBJ read could not be posted")
-        self._inflight.add(handle)
+        self._inflight[handle] = slot
         return handle
 
     def poll(self, handle: Any) -> bool:
@@ -256,19 +267,19 @@ class S3RdmaTransferManager:
         try:
             state = self._agent.check_xfer_state(handle)
         except Exception as exc:
-            self._inflight.discard(handle)
+            self._inflight.pop(handle, None)
             raise S3RdmaTransferError(f"OBJ read failed: {exc}") from exc
         if state == "DONE":
-            self._inflight.discard(handle)
+            self._inflight.pop(handle, None)
             return True
         if state == "ERR":
-            self._inflight.discard(handle)
+            self._inflight.pop(handle, None)
             raise S3RdmaTransferError("OBJ read failed")
         return False
 
     def release(self, handle: Any) -> None:
         """Release a finished request handle, logging rather than raising."""
-        self._inflight.discard(handle)
+        self._inflight.pop(handle, None)
         try:
             self._agent.release_xfer_handle(handle)
         except Exception as exc:
@@ -329,7 +340,7 @@ class S3RdmaTransferManager:
         self._obj_reg = None
         self._slot_reg = None
         self._slots = []
-        self._inflight = set()
+        self._inflight = {}
 
     def _require_agent(self) -> None:
         if self._agent is None:
