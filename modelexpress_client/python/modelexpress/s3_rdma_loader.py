@@ -40,7 +40,6 @@ import torch
 from . import envs
 from .accelerators import AcceleratorBackend
 from .s3_rdma_transfer import (
-    CUOBJ_MAX_XFER_BYTES,
     S3RdmaEndpoint,
     S3RdmaTransferError,
     S3RdmaTransferManager,
@@ -96,10 +95,8 @@ class S3RdmaLoadConfig:
     verify: str = "tail"
 
     def __post_init__(self) -> None:
-        if not 0 < self.window_bytes <= CUOBJ_MAX_XFER_BYTES:
-            raise ValueError(
-                f"window size {self.window_bytes} must be in (0, {CUOBJ_MAX_XFER_BYTES}] bytes"
-            )
+        if self.window_bytes <= 0:
+            raise ValueError(f"window size {self.window_bytes} must be positive")
         if not 1 <= self.inflight <= _MAX_INFLIGHT:
             raise ValueError(f"inflight {self.inflight} must be in [1, {_MAX_INFLIGHT}]")
         if self.threads < 0:

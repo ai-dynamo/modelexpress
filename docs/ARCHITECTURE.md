@@ -1811,7 +1811,7 @@ agent.release_xfer_handle(handle)
 
 ### NIXL OBJ (S3-over-RDMA)
 
-`S3RdmaStrategy` uses a second, short-lived NIXL agent per GPU with no default backend and an OBJ backend created with `accelerated=true` (the generic engine added in ai-dynamo/nixl#2241, on NIXL `main` after 1.5.0). Object keys are registered as `OBJ` regions `(0, size, devId, key)`; staging slots are registered as `VRAM` regions, one per slot. Each window is one READ request with a single descriptor pair, so NIXL turns it into one signed ranged GET with `x-amz-rdma-token`, and the server RDMA-writes into the slot.
+`S3RdmaStrategy` uses a second, short-lived NIXL agent per GPU with no default backend and an OBJ backend created with `accelerated=true` (the generic engine added in ai-dynamo/nixl#2241; ModelExpress needs NIXL `main` at or after #2406). Object keys are registered as `OBJ` regions `(0, size, devId, key)`; staging slots are registered as `VRAM` regions, one per slot. Each window is one READ request with a single descriptor pair, so NIXL turns it into one signed ranged GET with `x-amz-rdma-token`, and the server RDMA-writes into the slot. NIXL splits a window larger than 4 GiB − 64 KiB, the most one cuObject token covers, into several ranged GETs.
 
 ```mermaid
 sequenceDiagram

@@ -645,7 +645,6 @@ class TestS3RdmaLoadConfig:
         "kwargs",
         [
             {"window_bytes": 0},
-            {"window_bytes": 4 * 1024**3},
             {"inflight": 0},
             {"inflight": 65},
             {"threads": -1},
@@ -655,6 +654,9 @@ class TestS3RdmaLoadConfig:
     def test_rejects_invalid(self, kwargs):
         with pytest.raises(ValueError):
             S3RdmaLoadConfig(**kwargs)
+
+    def test_accepts_windows_past_4_gib(self):
+        assert S3RdmaLoadConfig(window_bytes=8 * 1024**3).window_bytes == 8 * 1024**3
 
     def test_from_env(self, monkeypatch):
         monkeypatch.setenv("MX_S3_RDMA_WINDOW_MB", "64")

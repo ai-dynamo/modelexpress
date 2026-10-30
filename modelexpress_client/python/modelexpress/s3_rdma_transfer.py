@@ -43,9 +43,11 @@ if _nixl_api is not None:
 
 OBJ_BACKEND = "OBJ"
 OBJ_MEM_TYPE = "OBJ"
-# cuObject rejects a single registration of 4 GiB or more (kCuObjMaxMemoryRegSize
-# minus its 64 KiB guard); NIXL does not split descriptors, so neither may we.
-CUOBJ_MAX_XFER_BYTES = 4 * 1024**3 - 64 * 1024
+# Reads and slots have no 4 GiB cap. cuObject mints an RDMA token for at most
+# 4 GiB - 64 KiB, but NIXL splits a larger read into ranged GETs of that size
+# (ai-dynamo/nixl#2406). Registering a slot of 4 GiB or more needs the cuObject
+# from CUDA 13.4 or newer; older releases fail the registration, and the
+# strategy falls back to the next loader.
 _CUOBJ_CLIENT_LIB = "libcuobjclient.so.1"
 
 # Agents and buffers whose transfers could not be drained. Keeping them
@@ -122,9 +124,9 @@ class S3RdmaEndpoint:
 class S3RdmaTransferManager:
     """Post ranged S3-over-RDMA reads from objects into registered device slots.
 
-    Each posted transfer carries exactly one descriptor, and each local
-    descriptor starts at the base of its own registration, so a failure
-    never leaves sibling descriptors running inside the same request.
+    Each posted transfer carries exactly one descriptor into its own slot
+    registration, so a failure never leaves sibling descriptors running
+    inside the same request.
     Slots are contiguous tensors on this manager's device, addressed by
     registration order, and a slot takes no new read while one is in flight.
     """
@@ -217,11 +219,6 @@ class S3RdmaTransferManager:
         regions = []
         for idx, slot in enumerate(slots):
             nbytes = slot.numel() * slot.element_size()
-            if nbytes > CUOBJ_MAX_XFER_BYTES:
-                raise S3RdmaTransferError(
-                    f"staging slot of {nbytes} bytes exceeds the cuObject limit "
-                    f"of {CUOBJ_MAX_XFER_BYTES} bytes"
-                )
             if slot.device != device:
                 raise S3RdmaTransferError(f"staging slot {idx} is on {slot.device}, expected {device}")
             if not slot.is_contiguous():

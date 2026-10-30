@@ -174,7 +174,7 @@ MX_POOL_REG and MX_VMM_ARENA are alternative registration optimizations. Enable 
 | MX_GDS_MAX_CHUNK_KB | unset | GDS chunk-size override |
 | MX_GDS_THREADS | 8 | GDS worker threads |
 | MX_GDS_TIMEOUT | 120 seconds | GDS operation timeout |
-| MX_S3_RDMA_WINDOW_MB | 256 | NIXL OBJ read window and staging-slot size; each window is one ranged S3-over-RDMA GET (must stay below 4 GiB) |
+| MX_S3_RDMA_WINDOW_MB | 256 | NIXL OBJ read window and staging-slot size. NIXL reads a window larger than 4 GiB − 64 KiB as several ranged GETs. A window of 4 GiB or more needs cuObject from CUDA 13.4 or newer |
 | MX_S3_RDMA_INFLIGHT | 8 | NIXL OBJ staging slots, i.e. windows in flight per GPU; extra GPU memory is roughly window x inflight |
 | MX_S3_RDMA_THREADS | 0 | NIXL OBJ executor threads; 0 uses `MX_S3_RDMA_INFLIGHT` |
 | MX_S3_RDMA_TIMEOUT | 120 seconds | Per-window NIXL OBJ read timeout |

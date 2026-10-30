@@ -10,7 +10,6 @@ import torch
 
 from modelexpress import s3_rdma_transfer
 from modelexpress.s3_rdma_transfer import (
-    CUOBJ_MAX_XFER_BYTES,
     S3RdmaBackendUnavailable,
     S3RdmaEndpoint,
     S3RdmaTransferError,
@@ -80,6 +79,13 @@ class _SizedSlot:
     def data_ptr(self):
         return 0x1000
 
+    def is_contiguous(self):
+        return True
+
+    @property
+    def device(self):
+        return torch.device("cpu")
+
 
 @pytest.fixture
 def manager(fake_nixl, mock_accelerator_backend_cls):
@@ -137,11 +143,10 @@ class TestS3RdmaTransferManager:
         with pytest.raises(S3RdmaTransferError, match="already registered"):
             mgr.register_objects([("k0", 100)])
 
-    def test_register_slots_rejects_oversized(self, manager):
+    def test_register_slots_accepts_slots_past_4_gib(self, manager):
         mgr, _ = manager
         mgr.initialize()
-        with pytest.raises(S3RdmaTransferError, match="cuObject limit"):
-            mgr.register_slots([_SizedSlot(CUOBJ_MAX_XFER_BYTES + 1)])
+        mgr.register_slots([_SizedSlot(8 * 1024**3)])
 
     def test_register_slots_rejects_wrong_device(self, manager):
         mgr, _ = manager
