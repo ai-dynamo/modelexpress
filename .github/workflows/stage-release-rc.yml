@@ -135,58 +135,66 @@ jobs:
             echo "artifactory_path=release/${V}/rc${N}"
           } | tee -a "$GITHUB_OUTPUT"
 
-  # Every publishing job waits on a human (required reviewers on this
-  # environment). Re-running failed jobs re-requests approval: the gate output
-  # is compared to github.run_attempt below.
-  manual-release-approval:
-    name: Manual release approval
+  # Every publishing job waits on this gate: only active members of the
+  # ai-dynamo/devops team may stage. Checks BOTH github.actor and
+  # github.triggering_actor (actor does not re-resolve on re-runs). The gate
+  # output is compared to github.run_attempt below, so a re-run of failed jobs
+  # re-runs this job and is re-checked against whoever triggered the re-run.
+  # Team membership needs an org-scoped token, so it is read with the release
+  # GitHub App installed on this repo (secrets in the automated-release
+  # environment).
+  authorize:
+    name: Verify release-ops membership
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [preflight]
-    environment: manual-release-approval
-    timeout-minutes: 20
+    environment: automated-release
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
-      approved_attempt: ${{ steps.approval.outputs.run_attempt }}
+      authorized_attempt: ${{ steps.authorized.outputs.run_attempt }}
     steps:
-      - name: Assert the approval environment is actually protected
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -uo pipefail
-          BODY="$(mktemp)"
-          trap 'rm -f "${BODY}"' EXIT
-          CODE="$(curl -sS -o "${BODY}" -w '%{http_code}' \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/environments/manual-release-approval" || echo "000")"
-          if [ "${CODE}" != "200" ]; then
-            echo "::warning::Could not read the manual-release-approval environment (HTTP ${CODE}). Verify manually that required reviewers are configured."
-            exit 0
-          fi
-          COUNT="$(jq -r '[.protection_rules[]? | select(.type=="required_reviewers")] | length' "${BODY}" 2>/dev/null || echo "")"
-          if [ -z "${COUNT}" ]; then
-            echo "::warning::Unexpected environments API payload; could not determine reviewer protection."
-          elif [ "${COUNT}" -eq 0 ]; then
-            echo "::error::The manual-release-approval environment has NO required reviewers — the release gate is not armed. Configure required reviewers in repo Settings > Environments."
-            exit 1
-          else
-            echo "Approval environment is protected by required reviewers."
-          fi
+      - name: Mint app token (ops gate)
+        id: ops-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
-      - name: Approved
-        id: approval
+      - name: Require release-ops team membership
+        env:
+          GH_TOKEN: ${{ steps.ops-token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          TEAM: devops
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          for USER in $(printf '%s\n%s\n' "${ACTOR}" "${TRIGGERING_ACTOR}" | sort -u); do
+            HTTP=$(curl -sS -o "${RUNNER_TEMP}/membership.json" -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/orgs/${ORG}/teams/${TEAM}/memberships/${USER}")
+            if [ "${HTTP}" != "200" ] || ! grep -Eq '"state"[[:space:]]*:[[:space:]]*"active"' "${RUNNER_TEMP}/membership.json"; then
+              echo "::error::@${USER} is not an active member of ${ORG}/${TEAM} (HTTP ${HTTP}); only release ops may stage a release."
+              exit 1
+            fi
+            echo "@${USER} authorized via ${ORG}/${TEAM}"
+          done
+
+      - name: Authorized
+        id: authorized
         env:
           RC_TAG: ${{ needs.preflight.outputs.rc_tag }}
         run: |
-          echo "Release approved for ${RC_TAG}"
+          echo "Release authorized for ${RC_TAG}"
           echo "run_attempt=${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
   build-server-image:
     name: Build server image (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    needs: [preflight, manual-release-approval]
-    if: ${{ needs.manual-release-approval.outputs.approved_attempt == github.run_attempt }}
+    needs: [preflight, authorize]
+    if: ${{ needs.authorize.outputs.authorized_attempt == github.run_attempt }}
     timeout-minutes: 90
     permissions:
       contents: read
@@ -280,8 +288,8 @@ jobs:
 
   build-wheels:
     name: Client wheels
-    needs: [preflight, manual-release-approval]
-    if: ${{ needs.manual-release-approval.outputs.approved_attempt == github.run_attempt }}
+    needs: [preflight, authorize]
+    if: ${{ needs.authorize.outputs.authorized_attempt == github.run_attempt }}
     uses: ./.github/workflows/build-wheels.yml
     with:
       wheel_version: ${{ needs.preflight.outputs.wheel_version }}
@@ -291,8 +299,8 @@ jobs:
   stage-crates:
     name: Stage crates
     runs-on: prod-modelexpress-builder-amd-v1
-    needs: [preflight, manual-release-approval]
-    if: ${{ needs.manual-release-approval.outputs.approved_attempt == github.run_attempt }}
+    needs: [preflight, authorize]
+    if: ${{ needs.authorize.outputs.authorized_attempt == github.run_attempt }}
     environment: automated-release
     timeout-minutes: 45
     outputs:
@@ -352,8 +360,8 @@ jobs:
   stage-helm-ngc:
     name: Stage helm chart to NGC
     runs-on: prod-modelexpress-builder-amd-v1
-    needs: [preflight, manual-release-approval, assemble-server-manifest, stage-containers-ngc]
-    if: ${{ needs.manual-release-approval.outputs.approved_attempt == github.run_attempt }}
+    needs: [preflight, authorize, assemble-server-manifest, stage-containers-ngc]
+    if: ${{ needs.authorize.outputs.authorized_attempt == github.run_attempt }}
     environment: automated-release
     timeout-minutes: 20
     outputs:
@@ -417,8 +425,8 @@ jobs:
   stage-containers-ngc:
     name: Stage containers to NGC
     runs-on: prod-modelexpress-builder-amd-v1
-    needs: [preflight, manual-release-approval, assemble-server-manifest]
-    if: ${{ needs.manual-release-approval.outputs.approved_attempt == github.run_attempt }}
+    needs: [preflight, authorize, assemble-server-manifest]
+    if: ${{ needs.authorize.outputs.authorized_attempt == github.run_attempt }}
     environment: automated-release
     timeout-minutes: 45
     permissions:
@@ -486,11 +494,11 @@ jobs:
     name: Trigger GitLab release pipeline
     runs-on:
       group: gitlab_ci_runners
-    needs: [preflight, manual-release-approval, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc]
+    needs: [preflight, authorize, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc]
     if: >-
       ${{ !cancelled() &&
           inputs.skip_gitlab_pipeline != true &&
-          needs.manual-release-approval.outputs.approved_attempt == github.run_attempt &&
+          needs.authorize.outputs.authorized_attempt == github.run_attempt &&
           needs.stage-containers-ngc.result == 'success' &&
           needs.build-wheels.result == 'success' &&
           needs.stage-helm-ngc.result == 'success' }}
@@ -605,7 +613,7 @@ jobs:
     timeout-minutes: 10
     needs:
       - preflight
-      - manual-release-approval
+      - authorize
       - build-server-image
       - assemble-server-manifest
       - build-wheels
@@ -622,7 +630,7 @@ jobs:
         run: |
           set -uo pipefail
           echo "${RESULTS}" | jq .
-          MANDATORY="preflight manual-release-approval build-server-image assemble-server-manifest build-wheels stage-crates stage-helm-ngc stage-containers-ngc"
+          MANDATORY="preflight authorize build-server-image assemble-server-manifest build-wheels stage-crates stage-helm-ngc stage-containers-ngc"
           [ "${SKIP_GITLAB}" != "true" ] && MANDATORY="${MANDATORY} trigger-gitlab-release"
           FAILED=""
           for JOB in ${MANDATORY}; do
