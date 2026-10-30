@@ -30,7 +30,6 @@ from .receiver import (
 )
 from .version_chain import resolve_replay_chain
 
-_MAX_REPLAY_CHAIN_LENGTH = 64
 logger = logging.getLogger(__name__)
 
 
@@ -477,7 +476,7 @@ def _resolve_s3_replay_chain(
         return resolve_replay_chain(
             target_version_id=target_version_uid,
             fetch_ready_version=fetch_ready_version,
-            max_chain_length=_MAX_REPLAY_CHAIN_LENGTH,
+            max_chain_length=envs.MX_MAX_REPLAY_CHAIN_LENGTH,
         )
 
 
