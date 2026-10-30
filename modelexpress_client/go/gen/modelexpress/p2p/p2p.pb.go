@@ -201,6 +201,59 @@ func (SourceStatus) EnumDescriptor() ([]byte, []int) {
 	return file_p2p_proto_rawDescGZIP(), []int{2}
 }
 
+// Donor leases are scoped to the server-computed source identity.
+type DonorLeaseAction int32
+
+const (
+	DonorLeaseAction_DONOR_LEASE_ACTION_UNSPECIFIED DonorLeaseAction = 0
+	DonorLeaseAction_DONOR_LEASE_ACTION_ACQUIRE     DonorLeaseAction = 1
+	DonorLeaseAction_DONOR_LEASE_ACTION_RENEW       DonorLeaseAction = 2
+	DonorLeaseAction_DONOR_LEASE_ACTION_RELEASE     DonorLeaseAction = 3
+)
+
+// Enum value maps for DonorLeaseAction.
+var (
+	DonorLeaseAction_name = map[int32]string{
+		0: "DONOR_LEASE_ACTION_UNSPECIFIED",
+		1: "DONOR_LEASE_ACTION_ACQUIRE",
+		2: "DONOR_LEASE_ACTION_RENEW",
+		3: "DONOR_LEASE_ACTION_RELEASE",
+	}
+	DonorLeaseAction_value = map[string]int32{
+		"DONOR_LEASE_ACTION_UNSPECIFIED": 0,
+		"DONOR_LEASE_ACTION_ACQUIRE":     1,
+		"DONOR_LEASE_ACTION_RENEW":       2,
+		"DONOR_LEASE_ACTION_RELEASE":     3,
+	}
+)
+
+func (x DonorLeaseAction) Enum() *DonorLeaseAction {
+	p := new(DonorLeaseAction)
+	*p = x
+	return p
+}
+
+func (x DonorLeaseAction) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (DonorLeaseAction) Descriptor() protoreflect.EnumDescriptor {
+	return file_p2p_proto_enumTypes[3].Descriptor()
+}
+
+func (DonorLeaseAction) Type() protoreflect.EnumType {
+	return &file_p2p_proto_enumTypes[3]
+}
+
+func (x DonorLeaseAction) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use DonorLeaseAction.Descriptor instead.
+func (DonorLeaseAction) EnumDescriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{3}
+}
+
 // All fields that affect source compatibility for reusable model material.
 // Source-type-specific fields are populated only by the source types that need
 // them; empty optional fields are ignored by current source-id canonicalization.
@@ -2490,7 +2543,9 @@ type ListSourcesRequest struct {
 	MinTrainingStep  *uint64 `protobuf:"varint,5,opt,name=min_training_step,json=minTrainingStep,proto3,oneof" json:"min_training_step,omitempty"`
 	MinUpdatedAt     *int64  `protobuf:"varint,6,opt,name=min_updated_at,json=minUpdatedAt,proto3,oneof" json:"min_updated_at,omitempty"`
 	// Return newest workers first and cap the response. Zero/unset means no cap.
-	Limit         *uint32 `protobuf:"varint,7,opt,name=limit,proto3,oneof" json:"limit,omitempty"`
+	Limit *uint32 `protobuf:"varint,7,opt,name=limit,proto3,oneof" json:"limit,omitempty"`
+	// Return an error instead of an empty list on a metadata backend failure.
+	Strict        bool `protobuf:"varint,8,opt,name=strict,proto3" json:"strict,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2572,6 +2627,13 @@ func (x *ListSourcesRequest) GetLimit() uint32 {
 		return *x.Limit
 	}
 	return 0
+}
+
+func (x *ListSourcesRequest) GetStrict() bool {
+	if x != nil {
+		return x.Strict
+	}
+	return false
 }
 
 type ListSourcesResponse struct {
@@ -2893,6 +2955,118 @@ func (x *UpdateStatusResponse) GetMessage() string {
 	return ""
 }
 
+type DonorLeaseRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Identity      *SourceIdentity        `protobuf:"bytes,1,opt,name=identity,proto3" json:"identity,omitempty"`
+	OwnerToken    string                 `protobuf:"bytes,2,opt,name=owner_token,json=ownerToken,proto3" json:"owner_token,omitempty"`
+	Action        DonorLeaseAction       `protobuf:"varint,3,opt,name=action,proto3,enum=model_express.p2p.DonorLeaseAction" json:"action,omitempty"`
+	TtlSeconds    uint64                 `protobuf:"varint,4,opt,name=ttl_seconds,json=ttlSeconds,proto3" json:"ttl_seconds,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DonorLeaseRequest) Reset() {
+	*x = DonorLeaseRequest{}
+	mi := &file_p2p_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DonorLeaseRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DonorLeaseRequest) ProtoMessage() {}
+
+func (x *DonorLeaseRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DonorLeaseRequest.ProtoReflect.Descriptor instead.
+func (*DonorLeaseRequest) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *DonorLeaseRequest) GetIdentity() *SourceIdentity {
+	if x != nil {
+		return x.Identity
+	}
+	return nil
+}
+
+func (x *DonorLeaseRequest) GetOwnerToken() string {
+	if x != nil {
+		return x.OwnerToken
+	}
+	return ""
+}
+
+func (x *DonorLeaseRequest) GetAction() DonorLeaseAction {
+	if x != nil {
+		return x.Action
+	}
+	return DonorLeaseAction_DONOR_LEASE_ACTION_UNSPECIFIED
+}
+
+func (x *DonorLeaseRequest) GetTtlSeconds() uint64 {
+	if x != nil {
+		return x.TtlSeconds
+	}
+	return 0
+}
+
+type DonorLeaseResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Acquired      bool                   `protobuf:"varint,1,opt,name=acquired,proto3" json:"acquired,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DonorLeaseResponse) Reset() {
+	*x = DonorLeaseResponse{}
+	mi := &file_p2p_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DonorLeaseResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DonorLeaseResponse) ProtoMessage() {}
+
+func (x *DonorLeaseResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DonorLeaseResponse.ProtoReflect.Descriptor instead.
+func (*DonorLeaseResponse) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *DonorLeaseResponse) GetAcquired() bool {
+	if x != nil {
+		return x.Acquired
+	}
+	return false
+}
+
 var File_p2p_proto protoreflect.FileDescriptor
 
 const file_p2p_proto_rawDesc = "" +
@@ -3131,7 +3305,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x10\n" +
 	"\x0e_training_stepB\x13\n" +
 	"\x11_layout_signatureB\x0e\n" +
-	"\f_source_load\"\xeb\x03\n" +
+	"\f_source_load\"\x83\x04\n" +
 	"\x12ListSourcesRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x12I\n" +
 	"\rstatus_filter\x18\x02 \x01(\x0e2\x1f.model_express.p2p.SourceStatusH\x00R\fstatusFilter\x88\x01\x01\x12/\n" +
@@ -3139,7 +3313,8 @@ const file_p2p_proto_rawDesc = "" +
 	"\x12worker_rank_filter\x18\x04 \x01(\rH\x02R\x10workerRankFilter\x88\x01\x01\x12/\n" +
 	"\x11min_training_step\x18\x05 \x01(\x04H\x03R\x0fminTrainingStep\x88\x01\x01\x12)\n" +
 	"\x0emin_updated_at\x18\x06 \x01(\x03H\x04R\fminUpdatedAt\x88\x01\x01\x12\x19\n" +
-	"\x05limit\x18\a \x01(\rH\x05R\x05limit\x88\x01\x01B\x10\n" +
+	"\x05limit\x18\a \x01(\rH\x05R\x05limit\x88\x01\x01\x12\x16\n" +
+	"\x06strict\x18\b \x01(\bR\x06strictB\x10\n" +
 	"\x0e_status_filterB\x14\n" +
 	"\x12_model_name_filterB\x15\n" +
 	"\x13_worker_rank_filterB\x14\n" +
@@ -3171,7 +3346,16 @@ const file_p2p_proto_rawDesc = "" +
 	"\f_source_load\"J\n" +
 	"\x14UpdateStatusResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage*\x8a\x01\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\xd1\x01\n" +
+	"\x11DonorLeaseRequest\x12=\n" +
+	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x12\x1f\n" +
+	"\vowner_token\x18\x02 \x01(\tR\n" +
+	"ownerToken\x12;\n" +
+	"\x06action\x18\x03 \x01(\x0e2#.model_express.p2p.DonorLeaseActionR\x06action\x12\x1f\n" +
+	"\vttl_seconds\x18\x04 \x01(\x04R\n" +
+	"ttlSeconds\"0\n" +
+	"\x12DonorLeaseResponse\x12\x1a\n" +
+	"\bacquired\x18\x01 \x01(\bR\bacquired*\x8a\x01\n" +
 	"\x10BackendFramework\x12\x1d\n" +
 	"\x19BACKEND_FRAMEWORK_UNKNOWN\x10\x00\x12\x1a\n" +
 	"\x16BACKEND_FRAMEWORK_VLLM\x10\x01\x12\x1c\n" +
@@ -3192,9 +3376,16 @@ const file_p2p_proto_rawDesc = "" +
 	"\x15SOURCE_STATUS_UNKNOWN\x10\x00\x12\x1e\n" +
 	"\x1aSOURCE_STATUS_INITIALIZING\x10\x01\x12\x17\n" +
 	"\x13SOURCE_STATUS_READY\x10\x02\x12\x17\n" +
-	"\x13SOURCE_STATUS_STALE\x10\x032\x93\x03\n" +
+	"\x13SOURCE_STATUS_STALE\x10\x03*\x94\x01\n" +
+	"\x10DonorLeaseAction\x12\"\n" +
+	"\x1eDONOR_LEASE_ACTION_UNSPECIFIED\x10\x00\x12\x1e\n" +
+	"\x1aDONOR_LEASE_ACTION_ACQUIRE\x10\x01\x12\x1c\n" +
+	"\x18DONOR_LEASE_ACTION_RENEW\x10\x02\x12\x1e\n" +
+	"\x1aDONOR_LEASE_ACTION_RELEASE\x10\x032\xee\x03\n" +
 	"\n" +
-	"P2pService\x12h\n" +
+	"P2pService\x12Y\n" +
+	"\n" +
+	"DonorLease\x12$.model_express.p2p.DonorLeaseRequest\x1a%.model_express.p2p.DonorLeaseResponse\x12h\n" +
 	"\x0fPublishMetadata\x12).model_express.p2p.PublishMetadataRequest\x1a*.model_express.p2p.PublishMetadataResponse\x12\\\n" +
 	"\vListSources\x12%.model_express.p2p.ListSourcesRequest\x1a&.model_express.p2p.ListSourcesResponse\x12\\\n" +
 	"\vGetMetadata\x12%.model_express.p2p.GetMetadataRequest\x1a&.model_express.p2p.GetMetadataResponse\x12_\n" +
@@ -3220,105 +3411,112 @@ func file_p2p_proto_rawDescGZIP() []byte {
 	return file_p2p_proto_rawDescData
 }
 
-var file_p2p_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
+var file_p2p_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
 var file_p2p_proto_goTypes = []any{
 	(BackendFramework)(0),                     // 0: model_express.p2p.BackendFramework
 	(MxSourceType)(0),                         // 1: model_express.p2p.MxSourceType
 	(SourceStatus)(0),                         // 2: model_express.p2p.SourceStatus
-	(*SourceIdentity)(nil),                    // 3: model_express.p2p.SourceIdentity
-	(*TensorDescriptor)(nil),                  // 4: model_express.p2p.TensorDescriptor
-	(*ArtifactSourceMetadata)(nil),            // 5: model_express.p2p.ArtifactSourceMetadata
-	(*TensorSourceMetadata)(nil),              // 6: model_express.p2p.TensorSourceMetadata
-	(*ArtifactManifest)(nil),                  // 7: model_express.p2p.ArtifactManifest
-	(*ArtifactManifestFile)(nil),              // 8: model_express.p2p.ArtifactManifestFile
-	(*ArtifactManifestChunk)(nil),             // 9: model_express.p2p.ArtifactManifestChunk
-	(*WorkerMetadata)(nil),                    // 10: model_express.p2p.WorkerMetadata
-	(*GetTensorManifestRequest)(nil),          // 11: model_express.p2p.GetTensorManifestRequest
-	(*GetTensorManifestResponse)(nil),         // 12: model_express.p2p.GetTensorManifestResponse
-	(*PrepareTensorReadRequest)(nil),          // 13: model_express.p2p.PrepareTensorReadRequest
-	(*PrepareTensorReadResponse)(nil),         // 14: model_express.p2p.PrepareTensorReadResponse
-	(*ReleaseTensorReadRequest)(nil),          // 15: model_express.p2p.ReleaseTensorReadRequest
-	(*ReleaseTensorReadResponse)(nil),         // 16: model_express.p2p.ReleaseTensorReadResponse
-	(*GetArtifactManifestHeaderRequest)(nil),  // 17: model_express.p2p.GetArtifactManifestHeaderRequest
-	(*GetArtifactManifestHeaderResponse)(nil), // 18: model_express.p2p.GetArtifactManifestHeaderResponse
-	(*GetArtifactManifestChunksRequest)(nil),  // 19: model_express.p2p.GetArtifactManifestChunksRequest
-	(*GetArtifactManifestChunksResponse)(nil), // 20: model_express.p2p.GetArtifactManifestChunksResponse
-	(*ArtifactChunkTransferDescriptor)(nil),   // 21: model_express.p2p.ArtifactChunkTransferDescriptor
-	(*PrepareArtifactChunkRequest)(nil),       // 22: model_express.p2p.PrepareArtifactChunkRequest
-	(*PrepareArtifactChunkResponse)(nil),      // 23: model_express.p2p.PrepareArtifactChunkResponse
-	(*ReleaseArtifactChunkRequest)(nil),       // 24: model_express.p2p.ReleaseArtifactChunkRequest
-	(*ReleaseArtifactChunkResponse)(nil),      // 25: model_express.p2p.ReleaseArtifactChunkResponse
-	(*PublishMetadataRequest)(nil),            // 26: model_express.p2p.PublishMetadataRequest
-	(*PublishMetadataResponse)(nil),           // 27: model_express.p2p.PublishMetadataResponse
-	(*SourceInstanceRef)(nil),                 // 28: model_express.p2p.SourceInstanceRef
-	(*ListSourcesRequest)(nil),                // 29: model_express.p2p.ListSourcesRequest
-	(*ListSourcesResponse)(nil),               // 30: model_express.p2p.ListSourcesResponse
-	(*GetMetadataRequest)(nil),                // 31: model_express.p2p.GetMetadataRequest
-	(*GetMetadataResponse)(nil),               // 32: model_express.p2p.GetMetadataResponse
-	(*UpdateStatusRequest)(nil),               // 33: model_express.p2p.UpdateStatusRequest
-	(*UpdateStatusResponse)(nil),              // 34: model_express.p2p.UpdateStatusResponse
-	nil,                                       // 35: model_express.p2p.SourceIdentity.ExtraParametersEntry
-	nil,                                       // 36: model_express.p2p.WorkerMetadata.TopologyEntry
-	nil,                                       // 37: model_express.p2p.SourceInstanceRef.TopologyEntry
+	(DonorLeaseAction)(0),                     // 3: model_express.p2p.DonorLeaseAction
+	(*SourceIdentity)(nil),                    // 4: model_express.p2p.SourceIdentity
+	(*TensorDescriptor)(nil),                  // 5: model_express.p2p.TensorDescriptor
+	(*ArtifactSourceMetadata)(nil),            // 6: model_express.p2p.ArtifactSourceMetadata
+	(*TensorSourceMetadata)(nil),              // 7: model_express.p2p.TensorSourceMetadata
+	(*ArtifactManifest)(nil),                  // 8: model_express.p2p.ArtifactManifest
+	(*ArtifactManifestFile)(nil),              // 9: model_express.p2p.ArtifactManifestFile
+	(*ArtifactManifestChunk)(nil),             // 10: model_express.p2p.ArtifactManifestChunk
+	(*WorkerMetadata)(nil),                    // 11: model_express.p2p.WorkerMetadata
+	(*GetTensorManifestRequest)(nil),          // 12: model_express.p2p.GetTensorManifestRequest
+	(*GetTensorManifestResponse)(nil),         // 13: model_express.p2p.GetTensorManifestResponse
+	(*PrepareTensorReadRequest)(nil),          // 14: model_express.p2p.PrepareTensorReadRequest
+	(*PrepareTensorReadResponse)(nil),         // 15: model_express.p2p.PrepareTensorReadResponse
+	(*ReleaseTensorReadRequest)(nil),          // 16: model_express.p2p.ReleaseTensorReadRequest
+	(*ReleaseTensorReadResponse)(nil),         // 17: model_express.p2p.ReleaseTensorReadResponse
+	(*GetArtifactManifestHeaderRequest)(nil),  // 18: model_express.p2p.GetArtifactManifestHeaderRequest
+	(*GetArtifactManifestHeaderResponse)(nil), // 19: model_express.p2p.GetArtifactManifestHeaderResponse
+	(*GetArtifactManifestChunksRequest)(nil),  // 20: model_express.p2p.GetArtifactManifestChunksRequest
+	(*GetArtifactManifestChunksResponse)(nil), // 21: model_express.p2p.GetArtifactManifestChunksResponse
+	(*ArtifactChunkTransferDescriptor)(nil),   // 22: model_express.p2p.ArtifactChunkTransferDescriptor
+	(*PrepareArtifactChunkRequest)(nil),       // 23: model_express.p2p.PrepareArtifactChunkRequest
+	(*PrepareArtifactChunkResponse)(nil),      // 24: model_express.p2p.PrepareArtifactChunkResponse
+	(*ReleaseArtifactChunkRequest)(nil),       // 25: model_express.p2p.ReleaseArtifactChunkRequest
+	(*ReleaseArtifactChunkResponse)(nil),      // 26: model_express.p2p.ReleaseArtifactChunkResponse
+	(*PublishMetadataRequest)(nil),            // 27: model_express.p2p.PublishMetadataRequest
+	(*PublishMetadataResponse)(nil),           // 28: model_express.p2p.PublishMetadataResponse
+	(*SourceInstanceRef)(nil),                 // 29: model_express.p2p.SourceInstanceRef
+	(*ListSourcesRequest)(nil),                // 30: model_express.p2p.ListSourcesRequest
+	(*ListSourcesResponse)(nil),               // 31: model_express.p2p.ListSourcesResponse
+	(*GetMetadataRequest)(nil),                // 32: model_express.p2p.GetMetadataRequest
+	(*GetMetadataResponse)(nil),               // 33: model_express.p2p.GetMetadataResponse
+	(*UpdateStatusRequest)(nil),               // 34: model_express.p2p.UpdateStatusRequest
+	(*UpdateStatusResponse)(nil),              // 35: model_express.p2p.UpdateStatusResponse
+	(*DonorLeaseRequest)(nil),                 // 36: model_express.p2p.DonorLeaseRequest
+	(*DonorLeaseResponse)(nil),                // 37: model_express.p2p.DonorLeaseResponse
+	nil,                                       // 38: model_express.p2p.SourceIdentity.ExtraParametersEntry
+	nil,                                       // 39: model_express.p2p.WorkerMetadata.TopologyEntry
+	nil,                                       // 40: model_express.p2p.SourceInstanceRef.TopologyEntry
 }
 var file_p2p_proto_depIdxs = []int32{
 	1,  // 0: model_express.p2p.SourceIdentity.mx_source_type:type_name -> model_express.p2p.MxSourceType
 	0,  // 1: model_express.p2p.SourceIdentity.backend_framework:type_name -> model_express.p2p.BackendFramework
-	35, // 2: model_express.p2p.SourceIdentity.extra_parameters:type_name -> model_express.p2p.SourceIdentity.ExtraParametersEntry
-	4,  // 3: model_express.p2p.TensorSourceMetadata.tensors:type_name -> model_express.p2p.TensorDescriptor
+	38, // 2: model_express.p2p.SourceIdentity.extra_parameters:type_name -> model_express.p2p.SourceIdentity.ExtraParametersEntry
+	5,  // 3: model_express.p2p.TensorSourceMetadata.tensors:type_name -> model_express.p2p.TensorDescriptor
 	1,  // 4: model_express.p2p.ArtifactManifest.mx_source_type:type_name -> model_express.p2p.MxSourceType
-	8,  // 5: model_express.p2p.ArtifactManifest.files:type_name -> model_express.p2p.ArtifactManifestFile
-	9,  // 6: model_express.p2p.ArtifactManifest.chunks:type_name -> model_express.p2p.ArtifactManifestChunk
-	4,  // 7: model_express.p2p.WorkerMetadata.tensors:type_name -> model_express.p2p.TensorDescriptor
+	9,  // 5: model_express.p2p.ArtifactManifest.files:type_name -> model_express.p2p.ArtifactManifestFile
+	10, // 6: model_express.p2p.ArtifactManifest.chunks:type_name -> model_express.p2p.ArtifactManifestChunk
+	5,  // 7: model_express.p2p.WorkerMetadata.tensors:type_name -> model_express.p2p.TensorDescriptor
 	2,  // 8: model_express.p2p.WorkerMetadata.status:type_name -> model_express.p2p.SourceStatus
-	36, // 9: model_express.p2p.WorkerMetadata.topology:type_name -> model_express.p2p.WorkerMetadata.TopologyEntry
-	6,  // 10: model_express.p2p.WorkerMetadata.tensor_source:type_name -> model_express.p2p.TensorSourceMetadata
-	5,  // 11: model_express.p2p.WorkerMetadata.artifact_source:type_name -> model_express.p2p.ArtifactSourceMetadata
-	4,  // 12: model_express.p2p.GetTensorManifestResponse.tensors:type_name -> model_express.p2p.TensorDescriptor
-	12, // 13: model_express.p2p.PrepareTensorReadResponse.manifest:type_name -> model_express.p2p.GetTensorManifestResponse
+	39, // 9: model_express.p2p.WorkerMetadata.topology:type_name -> model_express.p2p.WorkerMetadata.TopologyEntry
+	7,  // 10: model_express.p2p.WorkerMetadata.tensor_source:type_name -> model_express.p2p.TensorSourceMetadata
+	6,  // 11: model_express.p2p.WorkerMetadata.artifact_source:type_name -> model_express.p2p.ArtifactSourceMetadata
+	5,  // 12: model_express.p2p.GetTensorManifestResponse.tensors:type_name -> model_express.p2p.TensorDescriptor
+	13, // 13: model_express.p2p.PrepareTensorReadResponse.manifest:type_name -> model_express.p2p.GetTensorManifestResponse
 	1,  // 14: model_express.p2p.GetArtifactManifestHeaderResponse.mx_source_type:type_name -> model_express.p2p.MxSourceType
-	8,  // 15: model_express.p2p.GetArtifactManifestHeaderResponse.files:type_name -> model_express.p2p.ArtifactManifestFile
-	9,  // 16: model_express.p2p.GetArtifactManifestChunksResponse.chunks:type_name -> model_express.p2p.ArtifactManifestChunk
-	9,  // 17: model_express.p2p.PrepareArtifactChunkResponse.chunk:type_name -> model_express.p2p.ArtifactManifestChunk
-	21, // 18: model_express.p2p.PrepareArtifactChunkResponse.source:type_name -> model_express.p2p.ArtifactChunkTransferDescriptor
-	9,  // 19: model_express.p2p.ReleaseArtifactChunkResponse.chunk:type_name -> model_express.p2p.ArtifactManifestChunk
-	3,  // 20: model_express.p2p.PublishMetadataRequest.identity:type_name -> model_express.p2p.SourceIdentity
-	10, // 21: model_express.p2p.PublishMetadataRequest.worker:type_name -> model_express.p2p.WorkerMetadata
-	37, // 22: model_express.p2p.SourceInstanceRef.topology:type_name -> model_express.p2p.SourceInstanceRef.TopologyEntry
-	3,  // 23: model_express.p2p.ListSourcesRequest.identity:type_name -> model_express.p2p.SourceIdentity
+	9,  // 15: model_express.p2p.GetArtifactManifestHeaderResponse.files:type_name -> model_express.p2p.ArtifactManifestFile
+	10, // 16: model_express.p2p.GetArtifactManifestChunksResponse.chunks:type_name -> model_express.p2p.ArtifactManifestChunk
+	10, // 17: model_express.p2p.PrepareArtifactChunkResponse.chunk:type_name -> model_express.p2p.ArtifactManifestChunk
+	22, // 18: model_express.p2p.PrepareArtifactChunkResponse.source:type_name -> model_express.p2p.ArtifactChunkTransferDescriptor
+	10, // 19: model_express.p2p.ReleaseArtifactChunkResponse.chunk:type_name -> model_express.p2p.ArtifactManifestChunk
+	4,  // 20: model_express.p2p.PublishMetadataRequest.identity:type_name -> model_express.p2p.SourceIdentity
+	11, // 21: model_express.p2p.PublishMetadataRequest.worker:type_name -> model_express.p2p.WorkerMetadata
+	40, // 22: model_express.p2p.SourceInstanceRef.topology:type_name -> model_express.p2p.SourceInstanceRef.TopologyEntry
+	4,  // 23: model_express.p2p.ListSourcesRequest.identity:type_name -> model_express.p2p.SourceIdentity
 	2,  // 24: model_express.p2p.ListSourcesRequest.status_filter:type_name -> model_express.p2p.SourceStatus
-	28, // 25: model_express.p2p.ListSourcesResponse.instances:type_name -> model_express.p2p.SourceInstanceRef
-	10, // 26: model_express.p2p.GetMetadataResponse.worker:type_name -> model_express.p2p.WorkerMetadata
-	3,  // 27: model_express.p2p.GetMetadataResponse.identity:type_name -> model_express.p2p.SourceIdentity
+	29, // 25: model_express.p2p.ListSourcesResponse.instances:type_name -> model_express.p2p.SourceInstanceRef
+	11, // 26: model_express.p2p.GetMetadataResponse.worker:type_name -> model_express.p2p.WorkerMetadata
+	4,  // 27: model_express.p2p.GetMetadataResponse.identity:type_name -> model_express.p2p.SourceIdentity
 	2,  // 28: model_express.p2p.UpdateStatusRequest.status:type_name -> model_express.p2p.SourceStatus
-	26, // 29: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
-	29, // 30: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
-	31, // 31: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
-	33, // 32: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
-	11, // 33: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
-	13, // 34: model_express.p2p.WorkerService.PrepareTensorRead:input_type -> model_express.p2p.PrepareTensorReadRequest
-	15, // 35: model_express.p2p.WorkerService.ReleaseTensorRead:input_type -> model_express.p2p.ReleaseTensorReadRequest
-	17, // 36: model_express.p2p.WorkerService.GetArtifactManifestHeader:input_type -> model_express.p2p.GetArtifactManifestHeaderRequest
-	19, // 37: model_express.p2p.WorkerService.GetArtifactManifestChunks:input_type -> model_express.p2p.GetArtifactManifestChunksRequest
-	22, // 38: model_express.p2p.WorkerService.PrepareArtifactChunk:input_type -> model_express.p2p.PrepareArtifactChunkRequest
-	24, // 39: model_express.p2p.WorkerService.ReleaseArtifactChunk:input_type -> model_express.p2p.ReleaseArtifactChunkRequest
-	27, // 40: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
-	30, // 41: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
-	32, // 42: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
-	34, // 43: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
-	12, // 44: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
-	14, // 45: model_express.p2p.WorkerService.PrepareTensorRead:output_type -> model_express.p2p.PrepareTensorReadResponse
-	16, // 46: model_express.p2p.WorkerService.ReleaseTensorRead:output_type -> model_express.p2p.ReleaseTensorReadResponse
-	18, // 47: model_express.p2p.WorkerService.GetArtifactManifestHeader:output_type -> model_express.p2p.GetArtifactManifestHeaderResponse
-	20, // 48: model_express.p2p.WorkerService.GetArtifactManifestChunks:output_type -> model_express.p2p.GetArtifactManifestChunksResponse
-	23, // 49: model_express.p2p.WorkerService.PrepareArtifactChunk:output_type -> model_express.p2p.PrepareArtifactChunkResponse
-	25, // 50: model_express.p2p.WorkerService.ReleaseArtifactChunk:output_type -> model_express.p2p.ReleaseArtifactChunkResponse
-	40, // [40:51] is the sub-list for method output_type
-	29, // [29:40] is the sub-list for method input_type
-	29, // [29:29] is the sub-list for extension type_name
-	29, // [29:29] is the sub-list for extension extendee
-	0,  // [0:29] is the sub-list for field type_name
+	4,  // 29: model_express.p2p.DonorLeaseRequest.identity:type_name -> model_express.p2p.SourceIdentity
+	3,  // 30: model_express.p2p.DonorLeaseRequest.action:type_name -> model_express.p2p.DonorLeaseAction
+	36, // 31: model_express.p2p.P2pService.DonorLease:input_type -> model_express.p2p.DonorLeaseRequest
+	27, // 32: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
+	30, // 33: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
+	32, // 34: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
+	34, // 35: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
+	12, // 36: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
+	14, // 37: model_express.p2p.WorkerService.PrepareTensorRead:input_type -> model_express.p2p.PrepareTensorReadRequest
+	16, // 38: model_express.p2p.WorkerService.ReleaseTensorRead:input_type -> model_express.p2p.ReleaseTensorReadRequest
+	18, // 39: model_express.p2p.WorkerService.GetArtifactManifestHeader:input_type -> model_express.p2p.GetArtifactManifestHeaderRequest
+	20, // 40: model_express.p2p.WorkerService.GetArtifactManifestChunks:input_type -> model_express.p2p.GetArtifactManifestChunksRequest
+	23, // 41: model_express.p2p.WorkerService.PrepareArtifactChunk:input_type -> model_express.p2p.PrepareArtifactChunkRequest
+	25, // 42: model_express.p2p.WorkerService.ReleaseArtifactChunk:input_type -> model_express.p2p.ReleaseArtifactChunkRequest
+	37, // 43: model_express.p2p.P2pService.DonorLease:output_type -> model_express.p2p.DonorLeaseResponse
+	28, // 44: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
+	31, // 45: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
+	33, // 46: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
+	35, // 47: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
+	13, // 48: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
+	15, // 49: model_express.p2p.WorkerService.PrepareTensorRead:output_type -> model_express.p2p.PrepareTensorReadResponse
+	17, // 50: model_express.p2p.WorkerService.ReleaseTensorRead:output_type -> model_express.p2p.ReleaseTensorReadResponse
+	19, // 51: model_express.p2p.WorkerService.GetArtifactManifestHeader:output_type -> model_express.p2p.GetArtifactManifestHeaderResponse
+	21, // 52: model_express.p2p.WorkerService.GetArtifactManifestChunks:output_type -> model_express.p2p.GetArtifactManifestChunksResponse
+	24, // 53: model_express.p2p.WorkerService.PrepareArtifactChunk:output_type -> model_express.p2p.PrepareArtifactChunkResponse
+	26, // 54: model_express.p2p.WorkerService.ReleaseArtifactChunk:output_type -> model_express.p2p.ReleaseArtifactChunkResponse
+	43, // [43:55] is the sub-list for method output_type
+	31, // [31:43] is the sub-list for method input_type
+	31, // [31:31] is the sub-list for extension type_name
+	31, // [31:31] is the sub-list for extension extendee
+	0,  // [0:31] is the sub-list for field type_name
 }
 
 func init() { file_p2p_proto_init() }
@@ -3344,8 +3542,8 @@ func file_p2p_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_p2p_proto_rawDesc), len(file_p2p_proto_rawDesc)),
-			NumEnums:      3,
-			NumMessages:   35,
+			NumEnums:      4,
+			NumMessages:   37,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

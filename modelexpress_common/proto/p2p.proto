@@ -9,6 +9,9 @@ package model_express.p2p;
 // The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
 // Clients query for existing sources and publish their own metadata.
 service P2pService {
+  // Coordinate a donor for concurrent cold starts.
+  rpc DonorLease(DonorLeaseRequest) returns (DonorLeaseResponse);
+
   // Publish model metadata - called by client after loading model weights
   rpc PublishMetadata(PublishMetadataRequest) returns (PublishMetadataResponse);
 
@@ -649,6 +652,8 @@ message ListSourcesRequest {
 
   // Return newest workers first and cap the response. Zero/unset means no cap.
   optional uint32 limit = 7;
+  // Return an error instead of an empty list on a metadata backend failure.
+  bool strict = 8;
 }
 
 message ListSourcesResponse {
@@ -715,4 +720,23 @@ message UpdateStatusRequest {
 message UpdateStatusResponse {
   bool success = 1;
   string message = 2;
+}
+
+// Donor leases are scoped to the server-computed source identity.
+enum DonorLeaseAction {
+  DONOR_LEASE_ACTION_UNSPECIFIED = 0;
+  DONOR_LEASE_ACTION_ACQUIRE = 1;
+  DONOR_LEASE_ACTION_RENEW = 2;
+  DONOR_LEASE_ACTION_RELEASE = 3;
+}
+
+message DonorLeaseRequest {
+  SourceIdentity identity = 1;
+  string owner_token = 2;
+  DonorLeaseAction action = 3;
+  uint64 ttl_seconds = 4;
+}
+
+message DonorLeaseResponse {
+  bool acquired = 1;
 }

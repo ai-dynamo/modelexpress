@@ -42,6 +42,53 @@ impl MetadataBackend for InstrumentedMetadataBackend {
             .await
     }
 
+    async fn try_acquire_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        self.metrics
+            .time(
+                Store::P2p,
+                "try_acquire_donor_lease",
+                self.inner
+                    .try_acquire_donor_lease(compatibility_key, owner_token, duration),
+            )
+            .await
+    }
+
+    async fn renew_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        self.metrics
+            .time(
+                Store::P2p,
+                "renew_donor_lease",
+                self.inner
+                    .renew_donor_lease(compatibility_key, owner_token, duration),
+            )
+            .await
+    }
+
+    async fn release_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+    ) -> MetadataResult<bool> {
+        self.metrics
+            .time(
+                Store::P2p,
+                "release_donor_lease",
+                self.inner
+                    .release_donor_lease(compatibility_key, owner_token),
+            )
+            .await
+    }
+
     async fn publish_metadata(
         &self,
         identity: &SourceIdentity,

@@ -55,6 +55,21 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+def cold_start_expected_workers(vllm_config) -> int:
+    parallel = vllm_config.parallel_config
+    if getattr(parallel, "enable_elastic_ep", False):
+        raise RuntimeError("MX cold start does not support elastic expert parallelism")
+    expected = 1
+    for name in (
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "prefill_context_parallel_size",
+    ):
+        expected *= getattr(parallel, name, 1) or 1
+    return expected
+
+
 def _is_speculative_draft(vllm_config, model_config) -> bool:
     """True for the draft pass of a speculative load.
 

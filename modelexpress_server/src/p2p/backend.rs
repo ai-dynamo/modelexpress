@@ -335,6 +335,35 @@ pub trait MetadataBackend: Send + Sync {
     /// Connect to the backend (initialize connections, etc.)
     async fn connect(&self) -> MetadataResult<()>;
 
+    /// Attempt to acquire an opt-in cold-start donor lease.
+    async fn try_acquire_donor_lease(
+        &self,
+        _compatibility_key: &str,
+        _owner_token: &str,
+        _duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        Err("donor leases are not supported by this metadata backend".into())
+    }
+
+    /// Renew an owned cold-start donor lease.
+    async fn renew_donor_lease(
+        &self,
+        _compatibility_key: &str,
+        _owner_token: &str,
+        _duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        Err("donor leases are not supported by this metadata backend".into())
+    }
+
+    /// Release an owned cold-start donor lease.
+    async fn release_donor_lease(
+        &self,
+        _compatibility_key: &str,
+        _owner_token: &str,
+    ) -> MetadataResult<bool> {
+        Err("donor leases are not supported by this metadata backend".into())
+    }
+
     /// Publish metadata for a source worker.
     /// `worker_id` uniquely identifies this running pod/process among all replicas
     /// with the same identity. The backend derives `mx_source_id` from `identity`.
@@ -446,6 +475,29 @@ pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn Met
 mod tests {
     use super::{parse_layout_signature, parse_training_step};
     use std::collections::HashMap;
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn memory_backend_rejects_donor_leases() {
+        use super::{MetadataBackend, memory::InMemoryMetadataBackend};
+        use std::time::Duration;
+
+        let backend = InMemoryMetadataBackend::new();
+        let ttl = Duration::from_secs(10);
+        let errors = [
+            backend.try_acquire_donor_lease("key", "owner", ttl).await,
+            backend.renew_donor_lease("key", "owner", ttl).await,
+            backend.release_donor_lease("key", "owner").await,
+        ];
+        for result in errors {
+            assert!(matches!(
+                result,
+                Err(error) if error.to_string().contains(
+                    "donor leases are not supported by this metadata backend"
+                )
+            ));
+        }
+    }
 
     #[test]
     fn parses_training_step_with_version_fallback() {

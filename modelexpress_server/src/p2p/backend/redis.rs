@@ -43,6 +43,29 @@ mod keys {
     pub const STATUS_FIELD_PREFIX: &str = "status:";
 }
 
+// A distinct keyspace from server-side artifact download claims. A fresh, unique
+// owner token is required for every attempt, including retries by the same replica.
+const ACQUIRE_DONOR_LEASE_LUA: &str = r#"
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
+    return 1
+end
+return 0
+"#;
+
+const RENEW_DONOR_LEASE_LUA: &str = r#"
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+"#;
+
+const RELEASE_DONOR_LEASE_LUA: &str = r#"
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+return redis.call('DEL', KEYS[1])
+"#;
+
 const REMOVE_WORKER_LUA: &str = r#"
 redis.call('DEL', KEYS[1])
 redis.call('HDEL', KEYS[2], ARGV[1])
@@ -537,6 +560,30 @@ impl From<ArtifactSourceMetadataJson> for ArtifactSourceMetadataRecord {
     }
 }
 
+fn donor_lease_key(compatibility_key: &str) -> String {
+    format!("mx:p2p:donor-lease:{compatibility_key}")
+}
+
+fn validate_donor_lease_identity(compatibility_key: &str, owner_token: &str) -> MetadataResult<()> {
+    if compatibility_key.is_empty() || owner_token.is_empty() {
+        return Err("donor lease compatibility key and owner token must not be empty".into());
+    }
+    Ok(())
+}
+
+fn donor_lease_ttl_ms(
+    compatibility_key: &str,
+    owner_token: &str,
+    duration: std::time::Duration,
+) -> MetadataResult<u64> {
+    validate_donor_lease_identity(compatibility_key, owner_token)?;
+    let millis = u64::try_from(duration.as_millis())?;
+    if millis == 0 || millis > i64::MAX as u64 {
+        return Err("donor lease duration must be between 1 ms and i64::MAX ms".into());
+    }
+    Ok(millis)
+}
+
 /// Redis backend for metadata storage
 pub struct RedisBackend {
     redis: Arc<RwLock<Option<ConnectionManager>>>,
@@ -550,6 +597,60 @@ impl RedisBackend {
             redis: Arc::new(RwLock::new(None)),
             redis_url: redis_url.to_string(),
         }
+    }
+
+    /// Try to acquire a cold-start donor lease for a compatibility key.
+    ///
+    /// Callers must use a fresh, unpredictable token for each attempt.
+    pub async fn try_acquire_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        let ttl_ms = donor_lease_ttl_ms(compatibility_key, owner_token, duration)?;
+        let mut conn = self.get_conn().await?;
+        let acquired: i32 = redis::Script::new(ACQUIRE_DONOR_LEASE_LUA)
+            .key(donor_lease_key(compatibility_key))
+            .arg(owner_token)
+            .arg(ttl_ms)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(acquired == 1)
+    }
+
+    /// Extend a lease only if the caller still owns it.
+    pub async fn renew_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        let ttl_ms = donor_lease_ttl_ms(compatibility_key, owner_token, duration)?;
+        let mut conn = self.get_conn().await?;
+        let renewed: i32 = redis::Script::new(RENEW_DONOR_LEASE_LUA)
+            .key(donor_lease_key(compatibility_key))
+            .arg(owner_token)
+            .arg(ttl_ms)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(renewed == 1)
+    }
+
+    /// Release a lease only if the caller still owns it.
+    pub async fn release_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+    ) -> MetadataResult<bool> {
+        validate_donor_lease_identity(compatibility_key, owner_token)?;
+        let mut conn = self.get_conn().await?;
+        let released: i32 = redis::Script::new(RELEASE_DONOR_LEASE_LUA)
+            .key(donor_lease_key(compatibility_key))
+            .arg(owner_token)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(released == 1)
     }
 
     /// Get a Redis connection, reconnecting if necessary
@@ -602,6 +703,32 @@ impl MetadataBackend for RedisBackend {
         };
         info!("Connected to Redis at {}", safe_url);
         Ok(())
+    }
+
+    async fn try_acquire_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        RedisBackend::try_acquire_donor_lease(self, compatibility_key, owner_token, duration).await
+    }
+
+    async fn renew_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        RedisBackend::renew_donor_lease(self, compatibility_key, owner_token, duration).await
+    }
+
+    async fn release_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+    ) -> MetadataResult<bool> {
+        RedisBackend::release_donor_lease(self, compatibility_key, owner_token).await
     }
 
     async fn publish_metadata(
@@ -1120,6 +1247,87 @@ mod tests {
     use super::*;
 
     // ── TensorRecordJson serialization ──────────────────────────────────────
+
+    #[test]
+    fn donor_lease_validates_identity_and_duration() {
+        use std::time::Duration;
+        assert!(donor_lease_ttl_ms("", "token", Duration::from_secs(1)).is_err());
+        assert!(donor_lease_ttl_ms("key", "", Duration::from_secs(1)).is_err());
+        assert!(donor_lease_ttl_ms("key", "token", Duration::from_nanos(1)).is_err());
+        assert!(donor_lease_ttl_ms("key", "token", Duration::from_millis(u64::MAX)).is_err());
+        assert_eq!(
+            donor_lease_ttl_ms("key", "token", Duration::from_secs(1)).expect("valid"),
+            1000
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
+    async fn donor_lease_acquire_expire_and_fence_stale_owners() {
+        use std::time::Duration;
+        let redis_url = std::env::var("MX_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let backend = RedisBackend::new(&redis_url);
+        let key = uuid::Uuid::new_v4().to_string();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        let ttl = Duration::from_secs(10);
+        let (a, b) = tokio::join!(
+            backend.try_acquire_donor_lease(&key, &first, ttl),
+            backend.try_acquire_donor_lease(&key, &second, ttl),
+        );
+        let a = a.expect("acquire first");
+        let b = b.expect("acquire second");
+        assert_ne!(a, b);
+        let (owner, other) = if a {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        assert!(
+            !backend
+                .renew_donor_lease(&key, other, ttl)
+                .await
+                .expect("renew")
+        );
+        assert!(
+            !backend
+                .release_donor_lease(&key, other)
+                .await
+                .expect("release")
+        );
+        assert!(
+            backend
+                .renew_donor_lease(&key, owner, Duration::from_millis(20))
+                .await
+                .expect("renew")
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            backend
+                .try_acquire_donor_lease(&key, other, ttl)
+                .await
+                .expect("take over")
+        );
+        assert!(
+            !backend
+                .renew_donor_lease(&key, owner, ttl)
+                .await
+                .expect("stale renew")
+        );
+        assert!(
+            !backend
+                .release_donor_lease(&key, owner)
+                .await
+                .expect("stale release")
+        );
+        assert!(
+            backend
+                .release_donor_lease(&key, other)
+                .await
+                .expect("release owner")
+        );
+    }
 
     #[test]
     fn test_tensor_record_json_roundtrip() {

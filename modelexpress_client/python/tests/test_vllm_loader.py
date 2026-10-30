@@ -839,6 +839,54 @@ class TestMtpDrafterSecondLoad:
             loader.load_model(vllm_config, model_config)
         return schedule
 
+    @pytest.mark.parametrize("different_checkpoint", [False, True])
+    def test_cold_start_elects_main_not_draft(self, monkeypatch, different_checkpoint):
+        from modelexpress.engines.vllm import loader as loader_mod
+
+        monkeypatch.setenv("MX_P2P_COLD_START", "1")
+        target = _make_load_context(device_id=0)
+        draft = _make_load_context(device_id=0)
+        if different_checkpoint:
+            draft.identity.model_name = "other-checkpoint"
+        config = self._spec_vllm_config()
+        try:
+            with patch("modelexpress.cold_start.coordinate") as coordinate:
+                self._load(_make_loader(), config,
+                           MagicMock(dtype=torch.float32, runner_type="generate"), target)
+                self._load(_make_loader(), config,
+                           MagicMock(dtype=torch.float32, runner_type="draft"), draft)
+            coordinate.assert_called_once_with(target, 1)
+            assert draft.p2p_enabled is not different_checkpoint
+        finally:
+            loader_mod._draft_publication_gates.pop(0, None)
+            loader_mod._tensor_registry.pop(0, None)
+            loader_mod._nixl_managers.pop(0, None)
+            loader_mod._loader_registry.pop(0, None)
+
+    def test_draft_failure_stops_main_lease(self, monkeypatch):
+        from modelexpress.engines.vllm import loader as loader_mod
+
+        monkeypatch.setenv("MX_P2P_COLD_START", "1")
+        target = _make_load_context(device_id=0)
+        target.donor_lease = MagicMock()
+        draft = _make_load_context(device_id=0)
+        config = self._spec_vllm_config()
+        try:
+            with patch("modelexpress.cold_start.coordinate"):
+                self._load(_make_loader(), config,
+                           MagicMock(dtype=torch.float32, runner_type="generate"), target)
+                with patch.object(_make_loader().__class__, "_load_model",
+                                  side_effect=RuntimeError("draft failed")):
+                    with pytest.raises(RuntimeError, match="draft failed"):
+                        self._load(_make_loader(), config,
+                                   MagicMock(dtype=torch.float32, runner_type="draft"), draft)
+            target.donor_lease.stop.assert_called_once()
+        finally:
+            loader_mod._draft_publication_gates.pop(0, None)
+            loader_mod._tensor_registry.pop(0, None)
+            loader_mod._nixl_managers.pop(0, None)
+            loader_mod._loader_registry.pop(0, None)
+
     @pytest.mark.parametrize("disable_draft_p2p", [None, "0", "1"])
     def test_drafter_extends_target_without_clobbering(
         self, monkeypatch, disable_draft_p2p
@@ -930,6 +978,11 @@ class TestMtpDrafterSecondLoad:
     @staticmethod
     def _spec_vllm_config():
         vllm_config = MagicMock()
+        vllm_config.parallel_config.tensor_parallel_size = 1
+        vllm_config.parallel_config.pipeline_parallel_size = 1
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
+        vllm_config.parallel_config.enable_elastic_ep = False
         vllm_config.speculative_config.draft_model_config.runner_type = "draft"
         return vllm_config
 
