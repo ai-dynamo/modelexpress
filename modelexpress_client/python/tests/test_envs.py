@@ -203,6 +203,7 @@ def test_s3_rdma_defaults_and_parsing(monkeypatch):
         "MX_S3_RDMA_THREADS",
         "MX_S3_RDMA_TIMEOUT",
         "MX_S3_RDMA_VERIFY",
+        "MX_S3_RDMA_MAX_TP",
     ):
         monkeypatch.delenv(name, raising=False)
     assert envs.MX_S3_RDMA_ENABLED is False
@@ -211,6 +212,7 @@ def test_s3_rdma_defaults_and_parsing(monkeypatch):
     assert envs.MX_S3_RDMA_THREADS == 0
     assert envs.MX_S3_RDMA_TIMEOUT == pytest.approx(120.0)
     assert envs.MX_S3_RDMA_VERIFY == "tail"
+    assert envs.MX_S3_RDMA_MAX_TP == 2
 
     monkeypatch.setenv("MX_S3_RDMA_ENABLED", "yes")
     monkeypatch.setenv("MX_S3_RDMA_WINDOW_MB", "64")
@@ -218,9 +220,11 @@ def test_s3_rdma_defaults_and_parsing(monkeypatch):
     monkeypatch.setenv("MX_S3_RDMA_THREADS", "24")
     monkeypatch.setenv("MX_S3_RDMA_TIMEOUT", "0")
     monkeypatch.setenv("MX_S3_RDMA_VERIFY", " FULL ")
+    monkeypatch.setenv("MX_S3_RDMA_MAX_TP", "-1")
     assert envs.MX_S3_RDMA_ENABLED is True
     assert envs.MX_S3_RDMA_WINDOW_MB == 64
     assert envs.MX_S3_RDMA_INFLIGHT == 16
     assert envs.MX_S3_RDMA_THREADS == 24
     assert envs.MX_S3_RDMA_TIMEOUT == pytest.approx(120.0)
     assert envs.MX_S3_RDMA_VERIFY == "full"
+    assert envs.MX_S3_RDMA_MAX_TP == 0

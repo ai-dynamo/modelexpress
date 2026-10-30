@@ -200,6 +200,18 @@ class TestIsAvailable:
         with patch("modelexpress.load_strategy.s3_rdma_strategy._world_size", return_value=1):
             assert S3RdmaStrategy().is_available(ctx) is True
 
+    @pytest.mark.parametrize(
+        ("tp_size", "max_tp", "expected"),
+        [(1, None, True), (2, None, True), (4, None, False), (4, "4", True), (8, "0", True)],
+    )
+    def test_tp_limit(self, s3_rdma_env, ctx, monkeypatch, tp_size, max_tp, expected):
+        ctx.identity.tensor_parallel_size = tp_size
+        if max_tp is None:
+            monkeypatch.delenv("MX_S3_RDMA_MAX_TP", raising=False)
+        else:
+            monkeypatch.setenv("MX_S3_RDMA_MAX_TP", max_tp)
+        assert S3RdmaStrategy().is_available(ctx) is expected
+
     def test_nixl_obj_missing(self, s3_rdma_env, ctx):
         with patch("modelexpress.s3_rdma_transfer.is_s3_rdma_available", return_value=False):
             assert S3RdmaStrategy().is_available(ctx) is False

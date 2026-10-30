@@ -1452,6 +1452,7 @@ The strategy is opt-in and eligible only when all of these hold:
 - The engine adapter implements `apply_weight_iter` (vLLM and SGLang; not TRT-LLM).
 - The accelerator is CUDA, and `MX_VMM_ARENA` is off.
 - NIXL is importable and `libcuobjclient.so.1` resolves.
+- The tensor-parallel size is at most `MX_S3_RDMA_MAX_TP` (default 2; 0 removes the limit). Every rank reads the full checkpoint, so at larger TP degrees ModelStreamer is faster today.
 - For multi-rank runs, the adapter can all-gather rank state (vLLM). SGLang is TP=1 only for now.
 
 All ranks agree after preparing, after streaming, and after post-processing. If any rank fails, every rank falls through to the next strategy together, which keeps a single rank from entering ModelStreamer's distributed read alone.
@@ -1475,7 +1476,7 @@ pip install --no-build-isolation \
 
 Set the prefix to the target environment: NIXL's default prefix (`/opt/nvidia/nvda_nixl`) lands first in `libnixl.so`'s RUNPATH, so a host that already has a NIXL installed there would load that build's libraries instead. Check that `ldd` on the installed `libplugin_OBJ.so` resolves `libcuobjclient.so.1`.
 
-**Configuration:** endpoint, region, and credentials come from the standard AWS chain (`AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`, `AWS_CA_BUNDLE`, or a profile), shared with ModelStreamer. Credentials are captured once per load. Tuning variables (`MX_S3_RDMA_WINDOW_MB`, `MX_S3_RDMA_INFLIGHT`, `MX_S3_RDMA_THREADS`, `MX_S3_RDMA_TIMEOUT`, `MX_S3_RDMA_VERIFY`) are listed in [Configuration](CONFIGURATION.md#modelstreamer-and-local-load-tuning). Extra GPU memory during the load is about `MX_S3_RDMA_WINDOW_MB x MX_S3_RDMA_INFLIGHT` plus partly assembled tensors, and it is freed before engine post-processing.
+**Configuration:** endpoint, region, and credentials come from the standard AWS chain (`AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`, `AWS_CA_BUNDLE`, or a profile), shared with ModelStreamer. Credentials are captured once per load. Tuning variables (`MX_S3_RDMA_WINDOW_MB`, `MX_S3_RDMA_INFLIGHT`, `MX_S3_RDMA_THREADS`, `MX_S3_RDMA_TIMEOUT`, `MX_S3_RDMA_VERIFY`, `MX_S3_RDMA_MAX_TP`) are listed in [Configuration](CONFIGURATION.md#modelstreamer-and-local-load-tuning). Extra GPU memory during the load is about `MX_S3_RDMA_WINDOW_MB x MX_S3_RDMA_INFLIGHT` plus partly assembled tensors, and it is freed before engine post-processing.
 
 ```bash
 export AWS_ENDPOINT_URL=http://aistor1:9000 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
@@ -1486,7 +1487,7 @@ vllm serve /path/to/local/config-and-tokenizer --load-format modelexpress
 
 **Behavior to know:**
 
-- Every tensor-parallel rank reads the full checkpoint tensors (vLLM slices them), the same as GDS, so storage traffic grows with TP. Pipeline-parallel, expert-parallel, and draft-model loads also read every tensor.
+- Every tensor-parallel rank reads the full checkpoint tensors (vLLM slices them), the same as GDS, so storage traffic grows with TP. This is why `MX_S3_RDMA_MAX_TP` defaults to 2. Pipeline-parallel, expert-parallel, and draft-model loads also read every tensor.
 - There is no HTTP fallback inside the strategy: a declined or failed RDMA read fails the strategy and the chain moves on to ModelStreamer.
 - `MX_S3_RDMA_VERIFY=tail` (the default) checks the last 64 bytes of every window in device memory against an HTTP read, independently of the transfer counts NIXL and the server report, and objects are re-listed after streaming to catch changes mid-load.
 

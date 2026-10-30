@@ -26,6 +26,10 @@ def _world_size() -> int:
     return 1
 
 
+def _tensor_parallel_size(ctx: LoadContext) -> int:
+    return int(getattr(ctx.identity, "tensor_parallel_size", 1) or 1)
+
+
 def _adapter_gathers_state(ctx: LoadContext) -> bool:
     return (
         ctx.adapter is not None
@@ -37,7 +41,8 @@ class S3RdmaStrategy(LoadStrategy):
     """Load safetensors weights from an S3-over-RDMA endpoint via NIXL OBJ.
 
     Opt-in with MX_S3_RDMA_ENABLED=1 and an s3:// MX_MODEL_URI. Placed ahead of
-    ModelStreamer, which claims any MX_MODEL_URI. Every rank reaches the same
+    ModelStreamer, which claims any MX_MODEL_URI, and skipped above
+    MX_S3_RDMA_MAX_TP because every rank still reads the full checkpoint. Every rank reaches the same
     decision at each phase, so a failure on one rank sends all ranks to the
     next strategy together instead of leaving one rank in a collective alone.
     """
@@ -64,6 +69,14 @@ class S3RdmaStrategy(LoadStrategy):
             logger.info(
                 f"[Worker {ctx.global_rank}] NIXL OBJ not supported on "
                 f"{ctx.accelerator_backend.name}, skipping"
+            )
+            return False
+        tp_size = _tensor_parallel_size(ctx)
+        max_tp = envs.MX_S3_RDMA_MAX_TP
+        if max_tp and tp_size > max_tp:
+            logger.info(
+                f"[Worker {ctx.global_rank}] NIXL OBJ is limited to TP <= {max_tp} "
+                f"(MX_S3_RDMA_MAX_TP), got TP={tp_size}, skipping"
             )
             return False
         if _world_size() > 1 and not _adapter_gathers_state(ctx):

@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     MX_S3_RDMA_THREADS: int
     MX_S3_RDMA_TIMEOUT: float
     MX_S3_RDMA_VERIFY: str
+    MX_S3_RDMA_MAX_TP: int
     # Model streamer
     MX_MS_DISTRIBUTED: bool
     # InstantTensor loader
@@ -421,6 +422,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_S3_RDMA_THREADS": lambda: _env_int("MX_S3_RDMA_THREADS", 0),
     "MX_S3_RDMA_TIMEOUT": lambda: _env_positive_float("MX_S3_RDMA_TIMEOUT", 120.0),
     "MX_S3_RDMA_VERIFY": lambda: os.environ.get("MX_S3_RDMA_VERIFY", "tail").strip().lower(),
+    # Every TP rank reads the full checkpoint, so larger TP degrees are skipped
+    # in favor of ModelStreamer. 0 removes the limit.
+    "MX_S3_RDMA_MAX_TP": lambda: max(0, _env_int("MX_S3_RDMA_MAX_TP", 2)),
     # ── Model streamer ─────────────────────────────────────────────────────
     "MX_MS_DISTRIBUTED": lambda: (
         os.environ.get("MX_MS_DISTRIBUTED", "1").lower() in ("1", "true")
