@@ -46,7 +46,7 @@ from ...load_strategy.draft_gate import DraftPublicationGate
 from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
-from .adapter import _is_speculative_draft, build_vllm_load_context
+from .adapter import _is_speculative_draft, build_vllm_load_context, cold_start_expected_workers
 from .artifacts import (
     _vllm_health_ready,
     install_vllm_cache_artifacts,
@@ -276,7 +276,7 @@ class MxModelLoader(BaseModelLoader):
                     if envs.MX_P2P_COLD_START and ctx.p2p_role == "main":
                         from ...cold_start import coordinate
 
-                        coordinate(ctx, vllm_config)
+                        coordinate(ctx, cold_start_expected_workers(vllm_config))
 
                     with metrics.time_load_phase("vllm", model_id, "chain"):
                         model = self._run_load_strategy_chain(model, ctx)

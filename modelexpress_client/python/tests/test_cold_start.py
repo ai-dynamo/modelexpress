@@ -8,6 +8,7 @@ import pytest
 
 from modelexpress import cold_start, p2p_pb2
 from modelexpress.client import MxClient
+from modelexpress.engines.vllm.adapter import cold_start_expected_workers
 
 
 def instance(rank):
@@ -67,7 +68,7 @@ def test_ready_requires_all_compatible_ranks():
 def test_existing_sources_skip_election():
     ctx = context()
     with patch.object(cold_start, "_ready", return_value=True):
-        cold_start.coordinate(ctx, config())
+        cold_start.coordinate(ctx, 2)
     assert ctx.adapter.broadcast_state.call_args.args[0][0] == "follower"
     ctx.mx_client.donor_lease.assert_not_called()
 
@@ -79,7 +80,7 @@ def test_first_contender_becomes_donor():
         patch.object(cold_start, "_ready", return_value=False),
         patch.object(cold_start, "DonorLease") as lease,
     ):
-        cold_start.coordinate(ctx, config())
+        cold_start.coordinate(ctx, 2)
     assert ctx.adapter.broadcast_state.call_args.args[0][0] == "donor"
     assert ctx.donor_lease is lease.return_value
     assert (
@@ -95,7 +96,7 @@ def test_busy_lease_waits_for_ready():
         patch.object(cold_start, "_ready", side_effect=[False, True]),
         patch.object(cold_start.time, "sleep"),
     ):
-        cold_start.coordinate(ctx, config())
+        cold_start.coordinate(ctx, 2)
     assert ctx.adapter.broadcast_state.call_args.args[0][0] == "follower"
 
 
@@ -107,7 +108,7 @@ def test_busy_then_acquires_after_expiry():
         patch.object(cold_start.time, "sleep"),
         patch.object(cold_start, "DonorLease"),
     ):
-        cold_start.coordinate(ctx, config())
+        cold_start.coordinate(ctx, 2)
     assert ctx.adapter.broadcast_state.call_args.args[0][0] == "donor"
 
 
@@ -115,7 +116,7 @@ def test_recheck_after_acquire_releases_lease():
     ctx = context()
     ctx.mx_client.donor_lease.return_value = True
     with patch.object(cold_start, "_ready", side_effect=[False, True]):
-        cold_start.coordinate(ctx, config())
+        cold_start.coordinate(ctx, 2)
     assert ctx.adapter.broadcast_state.call_args.args[0][0] == "follower"
     assert (
         ctx.mx_client.donor_lease.call_args.args[2]
@@ -135,7 +136,7 @@ def test_election_errors_fail_closed(operation):
         if operation == "donor_lease":
             ctx.mx_client.donor_lease.side_effect = RuntimeError("unavailable")
         with pytest.raises(RuntimeError, match="unavailable"):
-            cold_start.coordinate(ctx, config())
+            cold_start.coordinate(ctx, 2)
     assert ctx.adapter.broadcast_state.call_args.args[0][0] == "error"
 
 
@@ -143,7 +144,7 @@ def test_unsupported_configuration_rejected():
     ctx = context()
     ctx.p2p_enabled = False
     with pytest.raises(RuntimeError, match="P2P"):
-        cold_start.coordinate(ctx, config())
+        cold_start.coordinate(ctx, 2)
 
 
 def test_renewal_loss_is_recorded():
@@ -181,7 +182,7 @@ def test_nonzero_rank_uses_broadcast_decision():
     ctx.global_rank = 1
     ctx.adapter.broadcast_state.side_effect = None
     ctx.adapter.broadcast_state.return_value = ("follower", "")
-    cold_start.coordinate(ctx, config())
+    cold_start.coordinate(ctx, 2)
     ctx.mx_client.list_sources.assert_not_called()
     ctx.mx_client.donor_lease.assert_not_called()
     ctx.adapter.broadcast_state.assert_called_once_with(None)
@@ -292,7 +293,7 @@ def test_acquisition_deadline_starts_before_acquire_rpc():
         patch.object(cold_start.time, "monotonic", return_value=123),
         patch.object(cold_start, "DonorLease") as lease,
     ):
-        cold_start.coordinate(ctx, config())
+        cold_start.coordinate(ctx, 2)
     lease.assert_called_once_with(ctx, lease.call_args.args[1], 2, 123)
 
 
@@ -313,7 +314,7 @@ def test_parallel_worker_groups(overrides):
         (value[0], rank, rank) for rank in range(count)
     )
     with patch.object(cold_start, "_ready", return_value=True) as ready:
-        cold_start.coordinate(ctx, cfg)
+        cold_start.coordinate(ctx, cold_start_expected_workers(cfg))
     ready.assert_called_once_with(ctx, count)
 
 
@@ -322,7 +323,7 @@ def test_mismatched_worker_group_is_rejected():
     ctx.adapter.all_gather_state.return_value = [([], 0, 0)]
     ctx.adapter.all_gather_state.side_effect = None
     with pytest.raises(RuntimeError, match="worker group"):
-        cold_start.coordinate(ctx, config())
+        cold_start.coordinate(ctx, 2)
     ctx.mx_client.list_sources.assert_not_called()
 
 
@@ -331,7 +332,7 @@ def test_elastic_ep_rejected_before_collectives():
     cfg = config()
     cfg.parallel_config.enable_elastic_ep = True
     with pytest.raises(RuntimeError, match="elastic"):
-        cold_start.coordinate(ctx, cfg)
+        cold_start_expected_workers(cfg)
     ctx.adapter.all_gather_state.assert_not_called()
 
 
@@ -340,4 +341,4 @@ def test_speculative_config_does_not_reject_main():
     cfg = config()
     cfg.speculative_config = object()
     with patch.object(cold_start, "_ready", return_value=True):
-        cold_start.coordinate(ctx, cfg)
+        cold_start.coordinate(ctx, cold_start_expected_workers(cfg))

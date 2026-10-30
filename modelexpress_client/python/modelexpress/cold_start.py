@@ -96,13 +96,10 @@ class DonorLease:
         atexit.unregister(self.stop)
 
 
-def coordinate(ctx, config):
+def coordinate(ctx, expected):
     """Elect once on rank zero and broadcast to the replica's workers."""
-    parallel = config.parallel_config
     if ctx.adapter is None:
         raise RuntimeError("Cold start requires an engine adapter")
-    if getattr(parallel, "enable_elastic_ep", False):
-        raise RuntimeError("MX cold start does not support elastic expert parallelism")
     errors = []
     if not isinstance(ctx.mx_client, MxClient) or not ctx.p2p_enabled:
         errors.append("a centralized MX server and P2P are required")
@@ -110,14 +107,6 @@ def coordinate(ctx, config):
         errors.append("reload and draft election are not supported")
     states = ctx.adapter.all_gather_state((errors, ctx.global_rank, ctx.worker_rank))
     ranks = len(states)
-    expected = 1
-    for name in (
-        "tensor_parallel_size",
-        "pipeline_parallel_size",
-        "data_parallel_size",
-        "prefill_context_parallel_size",
-    ):
-        expected *= getattr(parallel, name, 1) or 1
     all_errors = [state[0] for state in states]
     if (
         ranks != expected

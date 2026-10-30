@@ -855,7 +855,7 @@ class TestMtpDrafterSecondLoad:
                            MagicMock(dtype=torch.float32, runner_type="generate"), target)
                 self._load(_make_loader(), config,
                            MagicMock(dtype=torch.float32, runner_type="draft"), draft)
-            coordinate.assert_called_once_with(target, config)
+            coordinate.assert_called_once_with(target, 1)
             assert draft.p2p_enabled is not different_checkpoint
         finally:
             loader_mod._draft_publication_gates.pop(0, None)
@@ -978,6 +978,11 @@ class TestMtpDrafterSecondLoad:
     @staticmethod
     def _spec_vllm_config():
         vllm_config = MagicMock()
+        vllm_config.parallel_config.tensor_parallel_size = 1
+        vllm_config.parallel_config.pipeline_parallel_size = 1
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
+        vllm_config.parallel_config.enable_elastic_ep = False
         vllm_config.speculative_config.draft_model_config.runner_type = "draft"
         return vllm_config
 
