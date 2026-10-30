@@ -290,7 +290,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_NIXL_METADATA_TIMEOUT": lambda: _env_positive_float(
         "MX_NIXL_METADATA_TIMEOUT", 120.0
     ),
-    "MX_POOL_REG": lambda: os.environ.get("MX_POOL_REG", "0") == "1",
+    "MX_POOL_REG": lambda: os.environ.get(
+        "MX_POOL_REG", "0" if os.environ.get("MX_VMM_ARENA") == "1" else "1"
+    )
+    == "1",
     "NIXL_UCX_TLS": lambda: os.environ.get("NIXL_UCX_TLS"),
     "UCX_TLS": lambda: os.environ.get("UCX_TLS"),
     "UCX_NET_DEVICES": lambda: os.environ.get("UCX_NET_DEVICES"),

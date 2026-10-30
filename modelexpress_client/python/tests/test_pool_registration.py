@@ -88,9 +88,10 @@ def fake_driver(monkeypatch):
 
 
 class TestPoolRegEnabled:
-    def test_default_is_off(self, monkeypatch):
+    def test_default_is_on(self, monkeypatch):
         monkeypatch.delenv("MX_POOL_REG", raising=False)
-        assert _pool_reg_enabled() is False
+        monkeypatch.delenv("MX_VMM_ARENA", raising=False)
+        assert _pool_reg_enabled() is True
 
     def test_explicit_zero_is_off(self, monkeypatch):
         monkeypatch.setenv("MX_POOL_REG", "0")
