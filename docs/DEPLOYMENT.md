@@ -1452,7 +1452,7 @@ The strategy is opt-in and eligible only when all of these hold:
 - The engine adapter implements `apply_weight_iter` (vLLM and SGLang; not TRT-LLM).
 - The accelerator is CUDA, and `MX_VMM_ARENA` is off.
 - NIXL is importable and `libcuobjclient.so.1` resolves.
-- The tensor-parallel size is at most `MX_S3_RDMA_MAX_TP` (default 2; 0 removes the limit). Every rank reads the full checkpoint, so at larger TP degrees ModelStreamer is faster today.
+- The tensor-parallel (TP) size is at most `MX_S3_RDMA_MAX_TP`. The default is 2, and 0 removes the limit. Every rank reads the full checkpoint, so ModelStreamer is faster at larger TP sizes.
 - For multi-rank runs, the adapter can all-gather rank state (vLLM). SGLang is TP=1 only for now.
 
 All ranks agree after preparing, after streaming, and after post-processing. If any rank fails, every rank falls through to the next strategy together, which keeps a single rank from entering ModelStreamer's distributed read alone.
@@ -1476,7 +1476,7 @@ pip install --no-build-isolation \
 
 Set the prefix to the target environment: NIXL's default prefix (`/opt/nvidia/nvda_nixl`) lands first in `libnixl.so`'s RUNPATH, so a host that already has a NIXL installed there would load that build's libraries instead. Check that `ldd` on the installed `libplugin_OBJ.so` resolves `libcuobjclient.so.1`.
 
-**Configuration:** endpoint, region, and credentials come from the standard AWS chain (`AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`, `AWS_CA_BUNDLE`, or a profile), shared with ModelStreamer. ModelExpress does not pass credentials to NIXL; NIXL resolves them through the AWS SDK's default provider chain when the backend is created and does not refresh them during the load, so temporary credentials (STS, IRSA, instance roles) must stay valid for the whole load. Tuning variables (`MX_S3_RDMA_WINDOW_MB`, `MX_S3_RDMA_INFLIGHT`, `MX_S3_RDMA_THREADS`, `MX_S3_RDMA_TIMEOUT`, `MX_S3_RDMA_VERIFY`, `MX_S3_RDMA_MAX_TP`) are listed in [Configuration](CONFIGURATION.md#modelstreamer-and-local-load-tuning). Extra GPU memory during the load is about `MX_S3_RDMA_WINDOW_MB x MX_S3_RDMA_INFLIGHT` plus partly assembled tensors, and it is freed before engine post-processing.
+**Configuration:** endpoint, region, and credentials come from the standard AWS chain (`AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`, `AWS_CA_BUNDLE`, or a profile), shared with ModelStreamer. ModelExpress does not pass credentials to NIXL. NIXL reads them once from the AWS SDK default provider chain when it creates the backend, and it does not refresh them during the load. Temporary credentials, such as STS tokens, IRSA, or instance roles, must stay valid until the load finishes. Tuning variables (`MX_S3_RDMA_WINDOW_MB`, `MX_S3_RDMA_INFLIGHT`, `MX_S3_RDMA_THREADS`, `MX_S3_RDMA_TIMEOUT`, `MX_S3_RDMA_VERIFY`, `MX_S3_RDMA_MAX_TP`) are listed in [Configuration](CONFIGURATION.md#modelstreamer-and-local-load-tuning). Extra GPU memory during the load is about `MX_S3_RDMA_WINDOW_MB x MX_S3_RDMA_INFLIGHT` plus partly assembled tensors, and it is freed before engine post-processing.
 
 ```bash
 export AWS_ENDPOINT_URL=http://aistor1:9000 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...

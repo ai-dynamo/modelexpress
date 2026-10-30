@@ -178,7 +178,7 @@ MX_POOL_REG and MX_VMM_ARENA are alternative registration optimizations. Enable 
 | MX_S3_RDMA_INFLIGHT | 8 | NIXL OBJ staging slots, i.e. windows in flight per GPU; extra GPU memory is roughly window x inflight |
 | MX_S3_RDMA_THREADS | 0 | NIXL OBJ executor threads; 0 uses `MX_S3_RDMA_INFLIGHT` |
 | MX_S3_RDMA_TIMEOUT | 120 seconds | Per-window NIXL OBJ read timeout |
-| MX_S3_RDMA_MAX_TP | 2 | Largest tensor-parallel size that tries NIXL OBJ; larger TP goes straight to ModelStreamer. 0 removes the limit |
+| MX_S3_RDMA_MAX_TP | 2 | Largest tensor-parallel size that tries NIXL OBJ. Larger sizes skip to ModelStreamer. 0 removes the limit |
 | MX_S3_RDMA_VERIFY | tail | NIXL OBJ integrity check: `tail` compares the last 64 bytes of every window against an HTTP read, `full` compares whole windows (qualification only), `off` disables it |
 | INSTANTTENSOR_BACKEND | runtime default | InstantTensor backend such as URING, AIO, CUFILE, or MMAP |
 
