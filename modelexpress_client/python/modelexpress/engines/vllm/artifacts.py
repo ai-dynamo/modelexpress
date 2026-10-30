@@ -467,6 +467,7 @@ def _triton_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         cuda_version=torch.version.cuda or "",
         triton_version=_triton_version(),
         gpu_arch=_gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "triton_key", _triton_key())
     return identity
@@ -479,6 +480,7 @@ def _deep_gemm_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "deep_gemm_jit_key", _deep_gemm_jit_key())
     return identity
@@ -491,6 +493,7 @@ def _tilelang_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "tilelang_version", _tilelang_version())
     return identity
@@ -503,6 +506,7 @@ def _cute_dsl_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "cutlass_dsl_version", _cutlass_dsl_version())
     return identity
@@ -516,6 +520,7 @@ def _flashinfer_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         torch_version=torch.__version__,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "flashinfer_version", _flashinfer_version())
     return identity
