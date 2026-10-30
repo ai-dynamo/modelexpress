@@ -659,6 +659,10 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 
 RL trainers and generators use the optional `modelexpress_rl` namespace from the same Python distribution. See the [RL package guide](rl/README.md) and [RL refit architecture](rl/ARCHITECTURE.md).
 
+Trainer NIXL refit stages ordered source replay batches for engine installation.
+Direct generator-peer refit owns its donor leases and reads in the runtime-tensor
+update method, borrowing the inference NIXL manager independently of trainer staging.
+
 ### MxClient
 
 gRPC client wrapping the P2P service stubs:
@@ -760,6 +764,27 @@ loading, quantized-weight post-processing, and tensor discovery, including the
 storage-view naming used for non-contiguous SGLang parameters.
 The SGLang side does not expose separate source and target modes; transport
 selection and source discovery remain inside the ModelExpress package.
+
+**Cold-load quantization state.** A source manifest can describe buffers whose
+existence depends on checkpoint values. After placeholder post-processing and
+before registering destination memory, the receive strategy calls
+`prepare_rdma_target_from_manifest` with model-relative tensor names (stripping
+the draft namespace for the adapter). SGLang's `runtime_state.py` uses the
+presence of `weight_scale_inv_swizzled` to recover the donor's block-FP8 MXFP8
+decision for FlashInfer CuTeDSL/CUTLASS. It allocates the engine-defined scale
+layout without priming floating scales or reshuffling weights. The existing
+manifest carries this decision; no new wire fields or server upgrade are needed.
+
+SGLang requires an exact NIXL tensor catalog. TransferEngine also rejects
+source-only tensors before submitting a read. After transfer, SGLang validates
+MXFP8 eligibility against the received scales before enabling that dispatch,
+and refreshes `k_scale_float` / `v_scale_float` from already-normalized device
+scales. It does not rerun full post-processing or reallocate registered storage.
+Invalid descriptors, inconsistent scales, and unsupported donor-dependent
+layouts fail the attempt and use the existing cold-load recovery/fallback path.
+This does not add optimized support for Hopper's optional BF16 weight cache or
+ROCm MXFP8 layouts; mismatches remain failures. Warm reloads skip cold-load
+preparation and retain their existing same-identity restrictions.
 
 **Speculative draft pass.** SGLang's EAGLE worker builds a second ModelRunner
 for the draft on the same GPU. Its `ModelConfig` has `is_draft_model=True` and,
@@ -1193,8 +1218,133 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering serv
 
 ## RL staged transfer
 
-The bounded arena design, logical and physical transfer plans, descriptor caching, checksum verification, and failure cleanup are covered in the [RL refit architecture](rl/ARCHITECTURE.md#staged-transfer-caching-and-failure-handling).
+Trainer refit compiles source geometry separately from NIXL execution and installs
+weights at the engine's safe point. See the [RL refit architecture](rl/ARCHITECTURE.md#refit-class-responsibilities)
+for ownership boundaries, [bounded staging and replay](rl/ARCHITECTURE.md#staged-transfer-caching-and-failure-handling),
+and failure handling.
 
+
+## Inference CI correctness
+
+`ci/k8s/client/inference_parity.py` runs pinned AIPerf's built-in MMLU
+loader and multiple-choice grader: eight subjects with 16 test questions each,
+one-shot chat prompting, thinking disabled, greedy decoding, an explicit single-letter system instruction, and an eight-token
+answer cap. Per-subject invocations preserve the balanced 128-question
+subset. Messages and ground truths must match across source and P2P target.
+Standalone P2P CI captures the source baseline before target deployment and
+reuses it after transfer, so invalid source answers fail before target startup.
+A one-sided exact paired test rejects target score regressions with `p < 0.01`;
+output wording and per-question correctness differences are retained as
+diagnostics. This is a regression smoke test, not a non-inferiority guarantee.
+At least 95% of answers on each worker must parse as A/B/C/D, separately from
+AIPerf's regex-fallback count. Missing, duplicate, failed, empty, or invalid
+request/grade records fail independently of the score. The shared model is
+`Qwen/Qwen3.5-0.8B`; explicit inference CI context limits are 2,048 tokens
+to leave prompt headroom while preserving fixed KV-cache capacities.
+MLA TP2 and expert-parallel lanes use
+`zai-org/GLM-4.7-Flash` for both engines. SGLang GLM manifests set
+`MX_MS_DISTRIBUTED=0` to avoid the distributed streamer buffer-ownership issue,
+while retaining TP2, EP2, and NIXL RDMA transfer. This configuration awaits GPU
+qualification; the distributed streamed-weight ownership fix remains separate.
+MTP lanes additionally run two 128-token chat generations per worker to exercise
+sustained decoding without requiring identical text. Per-subject wall timings
+include AIPerf startup and dataset loading. Accuracy runs disable unused
+server-metrics discovery and GPU telemetry. Each subject process has a 60-second
+startup allowance plus 300 seconds per request. Timeouts kill its process group
+and retain logs and timing. Target profiling errors enter the same replay and
+worker-diagnostic path as score regressions. Long-decode reports create their
+output directory independently of parity checks.
+
+Dynamo accuracy checks retry frontend discovery for the source and wait for a
+successful chat request pinned to each newly discovered target before profiling
+it. Requests pin only `nvext.decode_worker_id`;
+`backend_instance_id` would also constrain prefill routing to the decode ID in
+disaggregated deployments. The returned decode worker ID is checked on every
+response. Discovery through `/health` alone does
+not prove that the chat router can dispatch to the worker. SGLang's MX loader
+attaches the engine's namespace handlers, or root handlers when SGLang uses
+root logging, without duplicate propagation in scheduler subprocesses so transfer
+evidence remains visible under Dynamo's custom logging configuration.
+The CI Dynamo launcher first fetches all non-weight HF siblings, including the
+safetensors index, so native source loading and target P2P loading start with
+the same metadata inventory for deployment-card compatibility. It then replaces
+itself with the upstream Dynamo entrypoint; weight transfer stays engine-owned.
+Worker discovery cards are captured as a best-effort diagnostic artifact;
+a failed capture does not prevent the functional tests from running.
+
+The standalone vLLM CI image installs Ray explicitly and verifies its CLI at
+build time for cross-node TP. The vLLM Dynamo disaggregated manifest sets
+`VLLM_SSM_CONV_STATE_LAYOUT=DS` on both prefill and decode workers, as required
+by the runtime's NIXL connector for Qwen3.5 hybrid-state transfer.
+
+NIXL API resolution prefers the CUDA-specific wheel matching PyTorch's build
+CUDA major, with the legacy/meta package as fallback. It does not explicitly
+probe another CUDA major when the build version is known. This prevents a CUDA
+12 process from loading CUDA 13 UCX libraries when both wheel families exist.
+
+The benchmark uses AIPerf's built-in MMLU newline stop without model-specific
+stop overrides or dependency patches. CPU CI runs `test_aiperf_payload.py` against
+the pinned dependency, checking its real dataset-loader and endpoint-formatter
+output. The Python client CI jobs also run the Torch-based weight-audit tests.
+
+On a standalone parity failure, the test retains three repeated completions
+with token log-probabilities, worker hardware details, and worker logs. The
+standalone vLLM CI image also installs an opt-in loader audit; the Qwen base
+and MTP manifests enable `MX_CI_WEIGHT_DIGESTS=1`. It logs SHA-256 hashes of
+the loaded registered transfer catalog before warmup, including shapes and
+dtypes. It excludes temporary draft embeddings that vLLM replaces with the
+main model's transferred embedding. Instrumented source/target catalogs must
+match in a separate byte-integrity test, independently of MMLU scores. Workers
+without this CI instrumentation explicitly skip that test. The audit copies
+one tensor at a time to CPU and does not modify the production loader.
+
+Dynamo worker images and frontends are pinned to release 1.5.1 for both vLLM
+and SGLang. Aggregated and disaggregated serving each exercise worker scaling
+and parity. Standalone SGLang also has cross-node TP2, native DP2, GLM-4.7-Flash EP2,
+and Qwen3.5 EAGLE/MTP lanes. The MTP lane pins the same immutable checkpoint
+revision for the main and draft models and requires both transfers to use RDMA.
+The SGLang MTP lane disables radix caching because the pinned runtime does not
+support its default Mamba cache strategy with speculative decoding. Dynamo
+image overlays install as root into the engine environment, then restore the
+`dynamo` runtime user. Standalone vLLM Qwen lanes cap concurrent sequences and
+CUDA-graph capture sizes at 16 to keep warmup batches within the small fixed
+cache budget while retaining compilation and cache-reuse checks. The standalone
+vLLM base and MTP lanes set GPU memory utilization to 0.85 so the default
+90% startup reservation does not reject a nearly full 10 GB GPU slice. These
+configured lanes require GPU CI qualification. Readiness polling accepts a
+successful health probe without requiring an immediate duplicate probe. Dynamo
+scenario names are bounded so the combined namespace/deployment Grove label
+fits Kubernetes' 63-character limit.
+
+After Dynamo scales, worker containers have a separate bounded 900-second
+startup wait before the transfer/startup deadline begins. Scheduling and image
+pulls therefore do not consume the transfer budget. Full current and previous
+container logs are collected before artifact upload, preserving early transfer
+evidence even when repeated health-check failures dominate the end of the log.
+
+Dynamo captures its baseline and advertised generation-worker IDs before
+scaling. It waits for the frontend `/health` discovery list to add one worker,
+explicitly routes target requests through `nvext`, and checks
+the serving ID in every response. Standalone P2P tests address the source and
+target pods directly. Native DP cores behind one endpoint remain a coverage
+limit: this check cannot select each internal core separately.
+
+When standalone parity fails, CI replays the first differing prompt three times
+on each worker with token log-probabilities. It retains the original comparison
+and captures worker image, node, and GPU details to distinguish repeatability
+problems from transfer-specific divergence. Diagnostic failures do not replace
+the parity failure.
+
+The CI dependency project in `ci/pyproject.toml` keeps AIPerf on the control
+runner, separate from the inference engines' Torch/CUDA environments. Comparison
+reports, raw AIPerf exports, commands, and logs are uploaded on success or failure.
+Native MMLU accuracy summaries and per-example grades are retained alongside
+the inputs and message/ground-truth hashes. Hugging Face caches the dataset
+between runs. The built-in loader resolves the dataset's `main` revision;
+source/target input drift fails the comparison. No absolute accuracy threshold
+is imposed on these small models, and this subset does not cover every MoE
+expert. See [the CI test plan](../ci/TEST_PLAN.md)
+for qualification limits.
 
 ## RL refit CI harness
 
