@@ -94,7 +94,11 @@ class S3RdmaStrategy(LoadStrategy):
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)
-        from ..s3_rdma_loader import MxS3RdmaLoader, S3RdmaIntegrityError, S3RdmaLoadConfig
+        from ..s3_rdma_loader import (
+            MxS3RdmaLoader,
+            S3RdmaIntegrityError,
+            S3RdmaLoadConfig,
+        )
 
         model_uri = envs.MX_MODEL_URI
         logger.info(f"[Worker {ctx.global_rank}] Attempting NIXL OBJ loading from {model_uri}...")
