@@ -1497,7 +1497,7 @@ vllm serve /path/to/local/config-and-tokenizer --load-format modelexpress
 |---------|-------|
 | `NIXL OBJ not available, skipping` | `libcuobjclient.so.1` is not on the loader path, or NIXL is not installed in the engine environment |
 | `NIXL OBJ plugin is not available` / `accelerated backend could not be created` | NIXL was built without the OBJ plugin or without cuObject (`ldd libplugin_OBJ.so` should list `libcuobjclient.so.1`), or the build predates the generic accelerated engine (NIXL 1.5.2 and earlier) |
-| `cuMemObjGetDescriptor failed` in the NIXL log, with `MX_S3_RDMA_WINDOW_MB` of 4096 or more | cuObject older than CUDA 13.4 cannot register a staging slot of 4 GiB or more. Upgrade cuObject, or set `MX_S3_RDMA_WINDOW_MB` below 4096 |
+| `cuMemObjGetDescriptor failed` in the NIXL log | Staging slots could not be registered. cuObject older than CUDA 13.4 cannot register a slot of 4 GiB or more, so upgrade cuObject or set `MX_S3_RDMA_WINDOW_MB` below 4096. cuFile also limits registered VRAM to 32 GiB per GPU by default, so keep `MX_S3_RDMA_WINDOW_MB x MX_S3_RDMA_INFLIGHT` below that or raise `max_device_pinned_mem_size_kb` in `cufile.json` |
 | `does not support VRAM ... the RDMA path is not ready` | `rdma_dev_addr_list` is empty or wrong, the NIC port is down, or peer memory (`nvidia_peermem`/dmabuf) is unavailable |
 | `did not deliver the expected bytes` | The server declined or truncated RDMA; confirm the endpoint is an RDMA build and that every server node can reach the client NIC |
 | Load is no faster than ModelStreamer | Confirm the server's RDMA byte counters moved (AIStor: `/minio/metrics/v3/api/rdma`), then tune `MX_S3_RDMA_WINDOW_MB` and `MX_S3_RDMA_INFLIGHT` |
