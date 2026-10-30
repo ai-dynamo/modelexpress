@@ -29,7 +29,7 @@ class MockAcceleratorBackend:
     pool_reg: bool = False
     vmm: bool = False
     gds: bool = False
-    obj: bool = False
+    s3_rdma: bool = False
     set_device_calls: list[int] = field(default_factory=list)
     synchronize_calls: list[int | None] = field(default_factory=list)
     empty_cache_calls: int = 0
@@ -64,8 +64,8 @@ class MockAcceleratorBackend:
     def supports_gds(self) -> bool:
         return self.gds
 
-    def supports_obj(self) -> bool:
-        return self.obj
+    def supports_s3_rdma(self) -> bool:
+        return self.s3_rdma
 
 
 @pytest.fixture

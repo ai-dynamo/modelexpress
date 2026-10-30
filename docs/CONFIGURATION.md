@@ -102,7 +102,7 @@ ModelExpress does not let callers define an arbitrary order. LoadStrategyChain c
 1. rdma: P2P from a compatible serving peer.
 2. server-cache: server-backed weight snapshot for no-shared-storage deployments.
 3. instant_tensor: local safetensor loading when the package, CUDA-like device, and adapter capability are available.
-4. obj: S3-over-RDMA reads straight into GPU memory through NIXL OBJ when MX_OBJ_ENABLED is set and MX_MODEL_URI is an s3:// URI.
+4. s3_rdma: S3-over-RDMA reads straight into GPU memory through NIXL OBJ when MX_S3_RDMA_ENABLED is set and MX_MODEL_URI is an s3:// URI.
 5. model_streamer: ModelStreamer when MX_MODEL_URI is set and the adapter/package support it.
 6. gds: GPUDirect Storage when the accelerator and adapter support it.
 7. default: the engine's native loader.
@@ -118,7 +118,7 @@ An eligible strategy can still fail and allow the next strategy to run. If a str
 | MODEL_EXPRESS_NO_SHARED_STORAGE | false | Enables server-backed repository-file and weight fetching when an address is configured |
 | MX_P2P_METADATA | 1 | Enables on-demand P2P metadata exchange; set 0 for full metadata through a central coordinator |
 | MX_MODEL_URI | unset | Enables ModelStreamer for s3://, gs://, az://, or absolute local paths; object-store URIs also make InstantTensor ineligible |
-| MX_OBJ_ENABLED | false | Enables the NIXL OBJ (S3-over-RDMA) strategy for an s3:// `MX_MODEL_URI`; requires NIXL with the generic accelerated OBJ engine and an S3-over-RDMA endpoint such as MinIO AIStor |
+| MX_S3_RDMA_ENABLED | false | Enables the NIXL OBJ (S3-over-RDMA) strategy for an s3:// `MX_MODEL_URI`; requires NIXL with the generic accelerated OBJ engine and an S3-over-RDMA endpoint such as MinIO AIStor |
 | MX_MS_DISTRIBUTED | 1 | Distributes ModelStreamer reads across CUDA TP ranks when TP > 1 |
 | MX_INSTANT_TENSOR | 1 | Enables the InstantTensor eligibility gate when `MX_MODEL_URI` is not an object-store URI |
 | MX_DISABLE_PATCHES | false | Disables ModelExpress runtime compatibility patches |
@@ -174,11 +174,11 @@ MX_POOL_REG and MX_VMM_ARENA are alternative registration optimizations. Enable 
 | MX_GDS_MAX_CHUNK_KB | unset | GDS chunk-size override |
 | MX_GDS_THREADS | 8 | GDS worker threads |
 | MX_GDS_TIMEOUT | 120 seconds | GDS operation timeout |
-| MX_OBJ_WINDOW_MB | 256 | NIXL OBJ read window and staging-slot size; each window is one ranged S3-over-RDMA GET (must stay below 4 GiB) |
-| MX_OBJ_INFLIGHT | 8 | NIXL OBJ staging slots, i.e. windows in flight per GPU; extra GPU memory is roughly window x inflight |
-| MX_OBJ_THREADS | 0 | NIXL OBJ executor threads; 0 uses `MX_OBJ_INFLIGHT` |
-| MX_OBJ_TIMEOUT | 120 seconds | Per-window NIXL OBJ read timeout |
-| MX_OBJ_VERIFY | tail | NIXL OBJ integrity check: `tail` compares the last 64 bytes of every window against an HTTP read, `full` compares whole windows (qualification only), `off` disables it |
+| MX_S3_RDMA_WINDOW_MB | 256 | NIXL OBJ read window and staging-slot size; each window is one ranged S3-over-RDMA GET (must stay below 4 GiB) |
+| MX_S3_RDMA_INFLIGHT | 8 | NIXL OBJ staging slots, i.e. windows in flight per GPU; extra GPU memory is roughly window x inflight |
+| MX_S3_RDMA_THREADS | 0 | NIXL OBJ executor threads; 0 uses `MX_S3_RDMA_INFLIGHT` |
+| MX_S3_RDMA_TIMEOUT | 120 seconds | Per-window NIXL OBJ read timeout |
+| MX_S3_RDMA_VERIFY | tail | NIXL OBJ integrity check: `tail` compares the last 64 bytes of every window against an HTTP read, `full` compares whole windows (qualification only), `off` disables it |
 | INSTANTTENSOR_BACKEND | runtime default | InstantTensor backend such as URING, AIO, CUFILE, or MMAP |
 
 ModelStreamer and NIXL OBJ credentials are third-party settings. See [Load from object storage or a local path](guides/choose-a-path.md#load-from-object-storage-or-a-local-path) and [NIXL OBJ](DEPLOYMENT.md#nixl-obj-s3-over-rdma-to-gpu).

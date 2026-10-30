@@ -851,7 +851,7 @@ export MX_PLUGIN_DIR=/opt/modelexpress/plugins
 export MX_LOAD_PLUGIN=example
 ```
 
-Set `MX_LOAD_PLUGIN_BEFORE` to insert the plugin immediately before a built-in strategy: `rdma`, `server-cache`, `instant_tensor`, `obj`, `model_streamer`, `gds`, or `default`. The default is `server-cache`. For example, `export MX_LOAD_PLUGIN_BEFORE=rdma` tries the plugin first. Built-in strategies retain their relative order. Unknown or empty target names fail before discovery or weight loading; the setting is ignored when no plugin is selected.
+Set `MX_LOAD_PLUGIN_BEFORE` to insert the plugin immediately before a built-in strategy: `rdma`, `server-cache`, `instant_tensor`, `s3_rdma`, `model_streamer`, `gds`, or `default`. The default is `server-cache`. For example, `export MX_LOAD_PLUGIN_BEFORE=rdma` tries the plugin first. Built-in strategies retain their relative order. Unknown or empty target names fail before discovery or weight loading; the setting is ignored when no plugin is selected.
 
 The directory must contain `mx_plugin_example.py`, whose no-argument `register_plugin()` returns a strategy class named `example`. No inference-engine code or `PYTHONPATH` changes are required. Multiple entries may be mounted; all are imported and validated, but only the selected class is instantiated. Entry imports, registration, and construction must not download or load weights.
 
@@ -1444,11 +1444,11 @@ Credentials are auto-detected by the underlying cloud SDKs. No credentials flow 
 
 ### NIXL OBJ (S3-over-RDMA to GPU)
 
-The `obj` strategy reads safetensors byte ranges from an S3-over-RDMA object store (for example MinIO AIStor) straight into GPU memory through NIXL's OBJ plugin. Each read is a signed, body-less ranged GET carrying an `x-amz-rdma-token` (the NVIDIA cuObject protocol); the object server RDMA-writes the bytes into a registered GPU staging slot, and ModelExpress copies them device-to-device into the tensors it hands to the engine. Listing, the index file, safetensors headers, and integrity canaries use plain HTTP through boto3. It runs before ModelStreamer in the chain, so a deployment can keep `MX_MODEL_URI` pointed at the same `s3://` prefix and fall back to ModelStreamer automatically. After a successful load the replica registers and publishes its tensors like any other strategy, so later replicas can receive weights over P2P.
+The `s3_rdma` strategy reads safetensors byte ranges from an S3-over-RDMA object store (for example MinIO AIStor) straight into GPU memory through NIXL's OBJ plugin. Each read is a signed, body-less ranged GET carrying an `x-amz-rdma-token` (the NVIDIA cuObject protocol); the object server RDMA-writes the bytes into a registered GPU staging slot, and ModelExpress copies them device-to-device into the tensors it hands to the engine. Listing, the index file, safetensors headers, and integrity canaries use plain HTTP through boto3. It runs before ModelStreamer in the chain, so a deployment can keep `MX_MODEL_URI` pointed at the same `s3://` prefix and fall back to ModelStreamer automatically. After a successful load the replica registers and publishes its tensors like any other strategy, so later replicas can receive weights over P2P.
 
 The strategy is opt-in and eligible only when all of these hold:
 
-- `MX_OBJ_ENABLED=1` and `MX_MODEL_URI` is an `s3://bucket/prefix` URI.
+- `MX_S3_RDMA_ENABLED=1` and `MX_MODEL_URI` is an `s3://bucket/prefix` URI.
 - The engine adapter implements `apply_weight_iter` (vLLM and SGLang; not TRT-LLM).
 - The accelerator is CUDA, and `MX_VMM_ARENA` is off.
 - NIXL is importable and `libcuobjclient.so.1` resolves.
@@ -1475,12 +1475,12 @@ pip install --no-build-isolation \
 
 Set the prefix to the target environment: NIXL's default prefix (`/opt/nvidia/nvda_nixl`) lands first in `libnixl.so`'s RUNPATH, so a host that already has a NIXL installed there would load that build's libraries instead. Check that `ldd` on the installed `libplugin_OBJ.so` resolves `libcuobjclient.so.1`.
 
-**Configuration:** endpoint, region, and credentials come from the standard AWS chain (`AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`, `AWS_CA_BUNDLE`, or a profile), shared with ModelStreamer. Credentials are captured once per load. Tuning variables (`MX_OBJ_WINDOW_MB`, `MX_OBJ_INFLIGHT`, `MX_OBJ_THREADS`, `MX_OBJ_TIMEOUT`, `MX_OBJ_VERIFY`) are listed in [Configuration](CONFIGURATION.md#modelstreamer-and-local-load-tuning). Extra GPU memory during the load is about `MX_OBJ_WINDOW_MB x MX_OBJ_INFLIGHT` plus partly assembled tensors, and it is freed before engine post-processing.
+**Configuration:** endpoint, region, and credentials come from the standard AWS chain (`AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`, `AWS_CA_BUNDLE`, or a profile), shared with ModelStreamer. Credentials are captured once per load. Tuning variables (`MX_S3_RDMA_WINDOW_MB`, `MX_S3_RDMA_INFLIGHT`, `MX_S3_RDMA_THREADS`, `MX_S3_RDMA_TIMEOUT`, `MX_S3_RDMA_VERIFY`) are listed in [Configuration](CONFIGURATION.md#modelstreamer-and-local-load-tuning). Extra GPU memory during the load is about `MX_S3_RDMA_WINDOW_MB x MX_S3_RDMA_INFLIGHT` plus partly assembled tensors, and it is freed before engine post-processing.
 
 ```bash
 export AWS_ENDPOINT_URL=http://aistor1:9000 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
 export CUFILE_ENV_PATH_JSON=/etc/cufile-rdma.json
-export MX_OBJ_ENABLED=1 MX_MODEL_URI=s3://models/llama-3.1-8b-instruct
+export MX_S3_RDMA_ENABLED=1 MX_MODEL_URI=s3://models/llama-3.1-8b-instruct
 vllm serve /path/to/local/config-and-tokenizer --load-format modelexpress
 ```
 
@@ -1488,7 +1488,7 @@ vllm serve /path/to/local/config-and-tokenizer --load-format modelexpress
 
 - Every tensor-parallel rank reads the full checkpoint tensors (vLLM slices them), the same as GDS, so storage traffic grows with TP. Pipeline-parallel, expert-parallel, and draft-model loads also read every tensor.
 - There is no HTTP fallback inside the strategy: a declined or failed RDMA read fails the strategy and the chain moves on to ModelStreamer.
-- `MX_OBJ_VERIFY=tail` (the default) checks the last 64 bytes of every window in device memory against an HTTP read, independently of the transfer counts NIXL and the server report, and objects are re-listed after streaming to catch changes mid-load.
+- `MX_S3_RDMA_VERIFY=tail` (the default) checks the last 64 bytes of every window in device memory against an HTTP read, independently of the transfer counts NIXL and the server report, and objects are re-listed after streaming to catch changes mid-load.
 
 **Troubleshooting:**
 
@@ -1498,7 +1498,7 @@ vllm serve /path/to/local/config-and-tokenizer --load-format modelexpress
 | `NIXL OBJ plugin is not available` / `accelerated backend could not be created` | NIXL was built without the OBJ plugin or without cuObject (`ldd libplugin_OBJ.so` should list `libcuobjclient.so.1`), or the build predates the generic accelerated engine (NIXL 1.5.0 and earlier) |
 | `does not support VRAM ... the RDMA path is not ready` | `rdma_dev_addr_list` is empty or wrong, the NIC port is down, or peer memory (`nvidia_peermem`/dmabuf) is unavailable |
 | `did not deliver the expected bytes` | The server declined or truncated RDMA; confirm the endpoint is an RDMA build and that every server node can reach the client NIC |
-| Load is no faster than ModelStreamer | Confirm the server's RDMA byte counters moved (AIStor: `/minio/metrics/v3/api/rdma`), then tune `MX_OBJ_WINDOW_MB` and `MX_OBJ_INFLIGHT` |
+| Load is no faster than ModelStreamer | Confirm the server's RDMA byte counters moved (AIStor: `/minio/metrics/v3/api/rdma`), then tune `MX_S3_RDMA_WINDOW_MB` and `MX_S3_RDMA_INFLIGHT` |
 
 ### UCX/NIXL Tuning
 

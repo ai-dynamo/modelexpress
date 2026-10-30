@@ -16,7 +16,7 @@ Quick Start (vLLM):
     register_modelexpress_loaders()
 
     # vllm serve model --load-format modelexpress
-    # Auto-detects: RDMA -> InstantTensor -> Obj -> ModelStreamer -> GDS -> disk
+    # Auto-detects: RDMA -> InstantTensor -> S3Rdma -> ModelStreamer -> GDS -> disk
 """
 
 import logging
@@ -70,7 +70,7 @@ def register_modelexpress():
     multiple times safely (idempotent).
 
     Enables:
-        --load-format modelexpress  (auto-detect: RDMA -> InstantTensor -> Obj -> ModelStreamer -> GDS -> disk)
+        --load-format modelexpress  (auto-detect: RDMA -> InstantTensor -> S3Rdma -> ModelStreamer -> GDS -> disk)
         --load-format mx            (backward-compatible alias)
         --weight-transfer-config '{"backend":"modelexpress"}'
     """
@@ -96,16 +96,16 @@ from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
 from .metadata.publisher import PublisherThread  # noqa: F401
 from .model_client import ModelCacheClient  # noqa: F401
-from .obj_loader import MxObjLoader  # noqa: F401
-from .obj_transfer import ObjTransferManager  # noqa: F401
+from .s3_rdma_loader import MxS3RdmaLoader  # noqa: F401
+from .s3_rdma_transfer import S3RdmaTransferManager  # noqa: F401
 
 __all__ = [
     "GdsTransferManager",
     "ModelCacheClient",
     "MxClient",
     "MxGdsLoader",
-    "MxObjLoader",
-    "ObjTransferManager",
+    "MxS3RdmaLoader",
+    "S3RdmaTransferManager",
     "PublisherThread",
     "configure_trtllm_logging",
     "configure_vllm_logging",

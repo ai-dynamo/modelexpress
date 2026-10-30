@@ -12,7 +12,7 @@ Choose based on where the weights start and what the target workers can reach.
 | One replica can load the model; later replicas should start quickly | P2P | NIXL, a supported fabric, and source discovery |
 | Replicas cannot share a filesystem | P2P or server-backed cache | Targets still need model configuration and non-weight files |
 | Every worker should read from object storage | ModelStreamer | `MX_MODEL_URI`, credentials, and safetensors |
-| The object store serves S3-over-RDMA (MinIO AIStor) | [NIXL OBJ](../DEPLOYMENT.md#nixl-obj-s3-over-rdma-to-gpu), falling back to ModelStreamer | `MX_OBJ_ENABLED=1`, an `s3://` `MX_MODEL_URI`, a NIXL build with the accelerated OBJ engine, and an RDMA fabric |
+| The object store serves S3-over-RDMA (MinIO AIStor) | [NIXL OBJ](../DEPLOYMENT.md#nixl-obj-s3-over-rdma-to-gpu), falling back to ModelStreamer | `MX_S3_RDMA_ENABLED=1`, an `s3://` `MX_MODEL_URI`, a NIXL build with the accelerated OBJ engine, and an RDMA fabric |
 | Weights are fixed and you do not want a central MX server | `k8s-service` | Stable revisions and rank-aware Kubernetes Services |
 | You only need cache management | Standalone server and CLI | Redis or Kubernetes metadata backend |
 | An orchestrator owns worker lifecycle | [Dynamo](../integrations/orchestrators/dynamo.md) or [llm-d](../integrations/orchestrators/llm-d.md) | Orchestrator operator, runtime image, and MX configuration |

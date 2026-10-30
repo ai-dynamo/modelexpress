@@ -18,22 +18,22 @@ import torch
 from safetensors.torch import load as st_load
 from safetensors.torch import save as st_save
 
-from modelexpress import obj_transfer
-from modelexpress.obj_loader import (
-    MxObjLoader,
-    ObjIntegrityError,
-    ObjLoadConfig,
-    ObjTransferTimeout,
+from modelexpress import s3_rdma_transfer
+from modelexpress.s3_rdma_loader import (
+    MxS3RdmaLoader,
+    S3RdmaIntegrityError,
+    S3RdmaLoadConfig,
+    S3RdmaTransferTimeout,
     S3ObjectReader,
     TensorPlan,
     parse_s3_prefix,
     plan_windows,
     resolve_checkpoint,
 )
-from modelexpress.obj_transfer import ObjBackendUnavailable, ObjEndpoint, ObjTransferError
+from modelexpress.s3_rdma_transfer import S3RdmaBackendUnavailable, S3RdmaEndpoint, S3RdmaTransferError
 
 BUCKET = "models"
-ENDPOINT = ObjEndpoint(
+ENDPOINT = S3RdmaEndpoint(
     bucket=BUCKET,
     endpoint_url="http://aistor:9100",
     region="us-east-1",
@@ -87,7 +87,7 @@ class FakeHandle:
         self.released = False
 
 
-class FakeObjAgent:
+class FakeS3RdmaAgent:
     """Loopback OBJ agent that validates descriptors like NIXL would."""
 
     def __init__(
@@ -215,18 +215,18 @@ class FakeObjAgent:
 
 
 def install_fake_nixl(monkeypatch):
-    """Install FakeObjAgent as obj_transfer.NixlAgent; returns a configurator."""
+    """Install FakeS3RdmaAgent as s3_rdma_transfer.NixlAgent; returns a configurator."""
     state = {"kwargs": {}, "agents": []}
 
     def factory(name, _config):
-        agent = FakeObjAgent(name, state["store"], **state["kwargs"])
+        agent = FakeS3RdmaAgent(name, state["store"], **state["kwargs"])
         state["agents"].append(agent)
         return agent
 
-    monkeypatch.setattr(obj_transfer, "NIXL_AVAILABLE", True)
-    monkeypatch.setattr(obj_transfer, "NixlAgent", factory)
-    monkeypatch.setattr(obj_transfer, "NixlAgentConfig", lambda **kwargs: kwargs)
-    monkeypatch.setattr(obj_transfer, "_QUARANTINE", [])
+    monkeypatch.setattr(s3_rdma_transfer, "NIXL_AVAILABLE", True)
+    monkeypatch.setattr(s3_rdma_transfer, "NixlAgent", factory)
+    monkeypatch.setattr(s3_rdma_transfer, "NixlAgentConfig", lambda **kwargs: kwargs)
+    monkeypatch.setattr(s3_rdma_transfer, "_QUARANTINE", [])
 
     def configure(store, **kwargs):
         state["store"] = store
@@ -287,8 +287,8 @@ def reference(objects: dict[str, bytes]) -> dict[str, torch.Tensor]:
 
 
 def make_loader(backend, objects, *, window=64, inflight=2, verify="tail", timeout=5.0, reader=None):
-    config = ObjLoadConfig(window_bytes=window, inflight=inflight, verify=verify, timeout_s=timeout)
-    return MxObjLoader(backend, 0, config, reader=reader or FakeReader(objects), endpoint=ENDPOINT)
+    config = S3RdmaLoadConfig(window_bytes=window, inflight=inflight, verify=verify, timeout_s=timeout)
+    return MxS3RdmaLoader(backend, 0, config, reader=reader or FakeReader(objects), endpoint=ENDPOINT)
 
 
 def load_all(loader, uri="s3://models/llama"):
@@ -368,7 +368,7 @@ class TestResolveCheckpoint:
             resolve_checkpoint(FakeReader(objects), BUCKET, "llama/")
 
     def test_header_longer_than_probe(self, monkeypatch):
-        monkeypatch.setattr("modelexpress.obj_loader._HEADER_PROBE_BYTES", 16)
+        monkeypatch.setattr("modelexpress.s3_rdma_loader._HEADER_PROBE_BYTES", 16)
         objects = make_checkpoint(sample_shards())
         reader = FakeReader(objects)
         shards = resolve_checkpoint(reader, BUCKET, "llama/")
@@ -454,7 +454,7 @@ class TestLoad:
     def test_byte_exact(self, fake_nixl, mock_accelerator_backend_cls, window, inflight, verify):
         objects = make_checkpoint(sample_shards())
         fake_nixl(objects, seed=window * 31 + inflight)
-        backend = mock_accelerator_backend_cls(obj=True)
+        backend = mock_accelerator_backend_cls(s3_rdma=True)
         loaded = load_all(make_loader(backend, objects, window=window, inflight=inflight, verify=verify))
 
         expected = reference(objects)
@@ -470,7 +470,7 @@ class TestLoad:
     def test_yielded_tensors_do_not_alias_slots(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
         fake_nixl(objects)
-        loader = make_loader(mock_accelerator_backend_cls(obj=True), objects, window=32, inflight=2)
+        loader = make_loader(mock_accelerator_backend_cls(s3_rdma=True), objects, window=32, inflight=2)
         loader.prepare("s3://models/llama")
         slot_ranges = [(s.data_ptr(), s.data_ptr() + s.numel()) for s in loader._slots]
         loaded = list(loader.iter_tensors())
@@ -487,7 +487,7 @@ class TestLoad:
     def test_backend_params_and_teardown(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
         state = fake_nixl(objects)
-        backend = mock_accelerator_backend_cls(obj=True)
+        backend = mock_accelerator_backend_cls(s3_rdma=True)
         load_all(make_loader(backend, objects, inflight=3))
         agent = state["agents"][0]
         assert agent.backend_params["accelerated"] == "true"
@@ -502,7 +502,7 @@ class TestLoad:
     def test_tensor_larger_than_pool(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint([{"huge": torch.arange(4096, dtype=torch.float32)}])
         fake_nixl(objects)
-        loaded = dict(load_all(make_loader(mock_accelerator_backend_cls(obj=True), objects, window=100, inflight=2)))
+        loaded = dict(load_all(make_loader(mock_accelerator_backend_cls(s3_rdma=True), objects, window=100, inflight=2)))
         assert torch.equal(loaded["huge"], torch.arange(4096, dtype=torch.float32))
 
 
@@ -513,8 +513,8 @@ class TestFailures:
 
     def test_priming_failure_raises_from_prepare(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
-        loader, state = self._loader(fake_nixl, mock_accelerator_backend_cls(obj=True), objects, {"fail": {0}}, inflight=1)
-        with pytest.raises(ObjTransferError):
+        loader, state = self._loader(fake_nixl, mock_accelerator_backend_cls(s3_rdma=True), objects, {"fail": {0}}, inflight=1)
+        with pytest.raises(S3RdmaTransferError):
             loader.prepare("s3://models/llama")
         loader.release()
         assert not state["agents"][0].slot_regs
@@ -523,10 +523,10 @@ class TestFailures:
     def test_mid_stream_failure_drains_before_free(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
         loader, state = self._loader(
-            fake_nixl, mock_accelerator_backend_cls(obj=True), objects, {"fail": {5}}, window=16, inflight=3
+            fake_nixl, mock_accelerator_backend_cls(s3_rdma=True), objects, {"fail": {5}}, window=16, inflight=3
         )
         loader.prepare("s3://models/llama")
-        with pytest.raises(ObjTransferError):
+        with pytest.raises(S3RdmaTransferError):
             list(loader.iter_tensors())
         assert not loader.finished
         assert not state["agents"][0].inflight
@@ -536,32 +536,32 @@ class TestFailures:
     def test_tail_canary_catches_short_read(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
         loader, _ = self._loader(
-            fake_nixl, mock_accelerator_backend_cls(obj=True), objects, {"short": {3}}, window=16, inflight=2
+            fake_nixl, mock_accelerator_backend_cls(s3_rdma=True), objects, {"short": {3}}, window=16, inflight=2
         )
-        with pytest.raises(ObjIntegrityError, match="did not deliver"):
+        with pytest.raises(S3RdmaIntegrityError, match="did not deliver"):
             load_all(loader)
 
     def test_tail_canary_catches_missing_write(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
         loader, _ = self._loader(
-            fake_nixl, mock_accelerator_backend_cls(obj=True), objects, {"skip": {2}}, window=16, inflight=2
+            fake_nixl, mock_accelerator_backend_cls(s3_rdma=True), objects, {"skip": {2}}, window=16, inflight=2
         )
-        with pytest.raises(ObjIntegrityError):
+        with pytest.raises(S3RdmaIntegrityError):
             load_all(loader)
 
     def test_tail_canary_catches_corrupt_tail(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
         loader, _ = self._loader(
-            fake_nixl, mock_accelerator_backend_cls(obj=True), objects, {"corrupt": {1}}, window=16, inflight=2
+            fake_nixl, mock_accelerator_backend_cls(s3_rdma=True), objects, {"corrupt": {1}}, window=16, inflight=2
         )
-        with pytest.raises(ObjIntegrityError):
+        with pytest.raises(S3RdmaIntegrityError):
             load_all(loader)
 
     def test_verify_off_does_not_detect_corruption(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
         loader, _ = self._loader(
             fake_nixl,
-            mock_accelerator_backend_cls(obj=True),
+            mock_accelerator_backend_cls(s3_rdma=True),
             objects,
             {"corrupt": {0}},
             window=1 << 20,
@@ -576,7 +576,7 @@ class TestFailures:
         objects = make_checkpoint(sample_shards())
         loader, _ = self._loader(
             fake_nixl,
-            mock_accelerator_backend_cls(obj=True),
+            mock_accelerator_backend_cls(s3_rdma=True),
             objects,
             {"stuck": {1}},
             window=16,
@@ -584,15 +584,15 @@ class TestFailures:
             timeout=0.05,
         )
         loader.prepare("s3://models/llama")
-        with pytest.raises(ObjTransferTimeout):
+        with pytest.raises(S3RdmaTransferTimeout):
             list(loader.iter_tensors())
         loader.release()
-        assert len(obj_transfer._QUARANTINE) == 1
+        assert len(s3_rdma_transfer._QUARANTINE) == 1
 
     def test_early_close_drains(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
         loader, state = self._loader(
-            fake_nixl, mock_accelerator_backend_cls(obj=True), objects, {}, window=8, inflight=4
+            fake_nixl, mock_accelerator_backend_cls(s3_rdma=True), objects, {}, window=8, inflight=4
         )
         loader.prepare("s3://models/llama")
         weights = loader.iter_tensors()
@@ -608,8 +608,8 @@ class TestFailures:
         objects = make_checkpoint(sample_shards())
         fake_nixl(objects)
         reader = FakeReader(objects, change_etag_after_lists=1)
-        loader = make_loader(mock_accelerator_backend_cls(obj=True), objects, reader=reader)
-        with pytest.raises(ObjIntegrityError, match="changed while"):
+        loader = make_loader(mock_accelerator_backend_cls(s3_rdma=True), objects, reader=reader)
+        with pytest.raises(S3RdmaIntegrityError, match="changed while"):
             load_all(loader)
 
     @pytest.mark.parametrize(
@@ -622,14 +622,14 @@ class TestFailures:
     )
     def test_backend_unavailable(self, fake_nixl, mock_accelerator_backend_cls, agent_kwargs):
         objects = make_checkpoint(sample_shards())
-        loader, _ = self._loader(fake_nixl, mock_accelerator_backend_cls(obj=True), objects, agent_kwargs)
-        with pytest.raises(ObjBackendUnavailable):
+        loader, _ = self._loader(fake_nixl, mock_accelerator_backend_cls(s3_rdma=True), objects, agent_kwargs)
+        with pytest.raises(S3RdmaBackendUnavailable):
             loader.prepare("s3://models/llama")
         loader.release()
 
     def test_bucket_mismatch(self, fake_nixl, mock_accelerator_backend_cls):
         objects = make_checkpoint(sample_shards())
-        loader, _ = self._loader(fake_nixl, mock_accelerator_backend_cls(obj=True), objects, {})
+        loader, _ = self._loader(fake_nixl, mock_accelerator_backend_cls(s3_rdma=True), objects, {})
         with pytest.raises(ValueError, match="bucket"):
             loader.prepare("s3://other/llama")
 
@@ -639,7 +639,7 @@ class TestFailures:
 # ---------------------------------------------------------------------------
 
 
-class TestObjLoadConfig:
+class TestS3RdmaLoadConfig:
     @pytest.mark.parametrize(
         "kwargs",
         [
@@ -653,14 +653,14 @@ class TestObjLoadConfig:
     )
     def test_rejects_invalid(self, kwargs):
         with pytest.raises(ValueError):
-            ObjLoadConfig(**kwargs)
+            S3RdmaLoadConfig(**kwargs)
 
     def test_from_env(self, monkeypatch):
-        monkeypatch.setenv("MX_OBJ_WINDOW_MB", "64")
-        monkeypatch.setenv("MX_OBJ_INFLIGHT", "12")
-        monkeypatch.delenv("MX_OBJ_THREADS", raising=False)
-        monkeypatch.setenv("MX_OBJ_VERIFY", "off")
-        config = ObjLoadConfig.from_env()
+        monkeypatch.setenv("MX_S3_RDMA_WINDOW_MB", "64")
+        monkeypatch.setenv("MX_S3_RDMA_INFLIGHT", "12")
+        monkeypatch.delenv("MX_S3_RDMA_THREADS", raising=False)
+        monkeypatch.setenv("MX_S3_RDMA_VERIFY", "off")
+        config = S3RdmaLoadConfig.from_env()
         assert config.window_bytes == 64 * 1024 * 1024
         assert config.num_threads == 12
         assert config.verify == "off"
@@ -698,10 +698,10 @@ class TestReaderFromSession:
     def test_rejects_aws_s3(self, monkeypatch):
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ak")
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "sk")
-        with pytest.raises(ObjTransferError, match="does not serve S3-over-RDMA"):
+        with pytest.raises(S3RdmaTransferError, match="does not serve S3-over-RDMA"):
             S3ObjectReader.from_session("models")
 
     def test_requires_credentials(self, monkeypatch):
         monkeypatch.setenv("AWS_ENDPOINT_URL", "http://aistor1:9100")
-        with pytest.raises(ObjTransferError, match="credentials"):
+        with pytest.raises(S3RdmaTransferError, match="credentials"):
             S3ObjectReader.from_session("models")

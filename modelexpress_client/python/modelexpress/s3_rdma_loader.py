@@ -13,7 +13,7 @@ across iterations while the slots are reused.
 
 Usage::
 
-    loader = MxObjLoader(accelerator_backend, device_id, ObjLoadConfig.from_env())
+    loader = MxS3RdmaLoader(accelerator_backend, device_id, S3RdmaLoadConfig.from_env())
     loader.prepare("s3://models/llama-3.1-8b")
     try:
         for name, tensor in loader.iter_tensors():
@@ -39,11 +39,11 @@ import torch
 
 from . import envs
 from .accelerators import AcceleratorBackend
-from .obj_transfer import (
+from .s3_rdma_transfer import (
     CUOBJ_MAX_XFER_BYTES,
-    ObjEndpoint,
-    ObjTransferError,
-    ObjTransferManager,
+    S3RdmaEndpoint,
+    S3RdmaTransferError,
+    S3RdmaTransferManager,
 )
 from .safetensors_header import (
     HEADER_LENGTH_BYTES,
@@ -53,7 +53,7 @@ from .safetensors_header import (
     torch_dtype,
 )
 
-logger = logging.getLogger("modelexpress.obj_loader")
+logger = logging.getLogger("modelexpress.s3_rdma_loader")
 
 INDEX_FILE = "model.safetensors.index.json"
 SINGLE_FILE = "model.safetensors"
@@ -66,17 +66,17 @@ _MAX_INFLIGHT = 64
 _AWS_SDK_DEFAULT_CONNECTIONS = 25
 
 
-class ObjIntegrityError(ObjTransferError):
+class S3RdmaIntegrityError(S3RdmaTransferError):
     """Bytes delivered over RDMA do not match the object."""
 
 
-class ObjTransferTimeout(ObjTransferError):
+class S3RdmaTransferTimeout(S3RdmaTransferError):
     """A ranged read did not complete within the configured timeout."""
 
 
 @dataclass(frozen=True)
-class ObjLoadConfig:
-    """Tuning for one load; see the MX_OBJ_* environment variables."""
+class S3RdmaLoadConfig:
+    """Tuning for one load; see the MX_S3_RDMA_* environment variables."""
 
     window_bytes: int = 256 * _MIB
     inflight: int = 8
@@ -101,17 +101,17 @@ class ObjLoadConfig:
         return self.threads or self.inflight
 
     @classmethod
-    def from_env(cls) -> ObjLoadConfig:
+    def from_env(cls) -> S3RdmaLoadConfig:
         config = cls(
-            window_bytes=envs.MX_OBJ_WINDOW_MB * _MIB,
-            inflight=envs.MX_OBJ_INFLIGHT,
-            threads=envs.MX_OBJ_THREADS,
-            timeout_s=envs.MX_OBJ_TIMEOUT,
-            verify=envs.MX_OBJ_VERIFY,
+            window_bytes=envs.MX_S3_RDMA_WINDOW_MB * _MIB,
+            inflight=envs.MX_S3_RDMA_INFLIGHT,
+            threads=envs.MX_S3_RDMA_THREADS,
+            timeout_s=envs.MX_S3_RDMA_TIMEOUT,
+            verify=envs.MX_S3_RDMA_VERIFY,
         )
         if config.num_threads > _AWS_SDK_DEFAULT_CONNECTIONS - 1:
             logger.warning(
-                "MX_OBJ inflight/threads=%d exceeds the NIXL OBJ control plane's "
+                "MX_S3_RDMA inflight/threads=%d exceeds the NIXL OBJ control plane's "
                 "default HTTP connection pool (%d); extra reads will queue",
                 config.num_threads,
                 _AWS_SDK_DEFAULT_CONNECTIONS,
@@ -137,7 +137,7 @@ class S3ObjectReader:
         self._client = client
 
     @classmethod
-    def from_session(cls, bucket: str) -> tuple[S3ObjectReader, ObjEndpoint]:
+    def from_session(cls, bucket: str) -> tuple[S3ObjectReader, S3RdmaEndpoint]:
         """Build a reader and the matching NIXL endpoint from the AWS config chain.
 
         Endpoint, region, credentials and CA bundle come from the standard AWS
@@ -161,17 +161,17 @@ class S3ObjectReader:
         endpoint_url = client.meta.endpoint_url
         host = urlparse(endpoint_url).hostname or ""
         if host.endswith("amazonaws.com"):
-            raise ObjTransferError(
+            raise S3RdmaTransferError(
                 f"endpoint {endpoint_url} is AWS S3, which does not serve S3-over-RDMA; "
                 "set AWS_ENDPOINT_URL to an RDMA-enabled endpoint"
             )
         credentials = session.get_credentials()
         if credentials is None:
-            raise ObjTransferError("no S3 credentials found in the AWS config chain")
+            raise S3RdmaTransferError("no S3 credentials found in the AWS config chain")
         frozen = credentials.get_frozen_credentials()
         if not frozen.access_key or not frozen.secret_key:
-            raise ObjTransferError("S3 credentials must include an access key and a secret key")
-        endpoint = ObjEndpoint(
+            raise S3RdmaTransferError("S3 credentials must include an access key and a secret key")
+        endpoint = S3RdmaEndpoint(
             bucket=bucket,
             endpoint_url=endpoint_url,
             region=client.meta.region_name or "us-east-1",
@@ -240,7 +240,7 @@ class WindowPlan:
 
 
 @dataclass(frozen=True)
-class ObjLoadPlan:
+class S3RdmaLoadPlan:
     bucket: str
     prefix: str
     objects: tuple[tuple[str, int, str], ...]
@@ -401,7 +401,7 @@ def build_plan(
     prefix: str,
     shards: Sequence[ShardInfo],
     window_bytes: int,
-) -> ObjLoadPlan:
+) -> S3RdmaLoadPlan:
     """Turn resolved shards into tensors and windows."""
     objects = tuple((shard.key, shard.size, shard.etag) for shard in shards)
     tensors: list[TensorPlan] = []
@@ -421,7 +421,7 @@ def build_plan(
     digest = hashlib.sha256()
     for key, size, etag in sorted(objects):
         digest.update(f"{key}\0{size}\0{etag}\n".encode())
-    return ObjLoadPlan(
+    return S3RdmaLoadPlan(
         bucket=bucket,
         prefix=prefix,
         objects=objects,
@@ -431,17 +431,17 @@ def build_plan(
     )
 
 
-class MxObjLoader:
+class MxS3RdmaLoader:
     """Load safetensors weights from an S3-over-RDMA endpoint into device memory."""
 
     def __init__(
         self,
         accelerator_backend: AcceleratorBackend,
         device_id: int,
-        config: ObjLoadConfig,
+        config: S3RdmaLoadConfig,
         *,
         reader: S3ObjectReader | None = None,
-        endpoint: ObjEndpoint | None = None,
+        endpoint: S3RdmaEndpoint | None = None,
     ):
         self._backend = accelerator_backend
         self._device_id = device_id
@@ -449,8 +449,8 @@ class MxObjLoader:
         self._reader = reader
         self._endpoint = endpoint
         self._device: torch.device | None = None
-        self._plan: ObjLoadPlan | None = None
-        self._manager: ObjTransferManager | None = None
+        self._plan: S3RdmaLoadPlan | None = None
+        self._manager: S3RdmaTransferManager | None = None
         self._slots: list[torch.Tensor] = []
         self._tail_host: list[torch.Tensor] = []
         self._canaries: list[bytes] = []
@@ -469,7 +469,7 @@ class MxObjLoader:
         self._timing: dict[str, float] = {}
 
     @property
-    def plan(self) -> ObjLoadPlan | None:
+    def plan(self) -> S3RdmaLoadPlan | None:
         return self._plan
 
     @property
@@ -481,7 +481,7 @@ class MxObjLoader:
     # Prepare
     # ------------------------------------------------------------------
 
-    def prepare(self, model_uri: str) -> ObjLoadPlan:
+    def prepare(self, model_uri: str) -> S3RdmaLoadPlan:
         """Resolve the checkpoint, set up RDMA, and prove the data path on real reads.
 
         Everything that can fail before the engine sees a tensor happens here:
@@ -508,8 +508,8 @@ class MxObjLoader:
             self._fetch_canaries(plan)
             marks["canaries"] = time.perf_counter()
             self._allocate_slots(plan)
-            self._manager = ObjTransferManager(
-                agent_name=f"mx-obj-{self._device_id}-{uuid.uuid4().hex[:8]}",
+            self._manager = S3RdmaTransferManager(
+                agent_name=f"mx-s3-rdma-{self._device_id}-{uuid.uuid4().hex[:8]}",
                 endpoint=self._endpoint,
                 device_id=self._device_id,
                 num_threads=self._config.num_threads,
@@ -539,7 +539,7 @@ class MxObjLoader:
         )
         return plan
 
-    def _fetch_canaries(self, plan: ObjLoadPlan) -> None:
+    def _fetch_canaries(self, plan: S3RdmaLoadPlan) -> None:
         if self._config.verify != "tail":
             return
         reader = self._reader
@@ -554,13 +554,13 @@ class MxObjLoader:
         poison = bytearray(_CANARY_BYTES * len(plan.windows))
         for idx, (window, canary) in enumerate(zip(plan.windows, self._canaries, strict=True)):
             if len(canary) != min(_CANARY_BYTES, window.length):
-                raise ObjIntegrityError("canary fetch returned a short read")
+                raise S3RdmaIntegrityError("canary fetch returned a short read")
             base = idx * _CANARY_BYTES
             poison[base : base + len(canary)] = bytes(b ^ 0xFF for b in canary)
         table = torch.frombuffer(poison, dtype=torch.uint8).view(len(plan.windows), _CANARY_BYTES)
         self._poison = table.pin_memory() if self._device.type == "cuda" else table
 
-    def _allocate_slots(self, plan: ObjLoadPlan) -> None:
+    def _allocate_slots(self, plan: S3RdmaLoadPlan) -> None:
         slot_bytes = max(window.length for window in plan.windows)
         count = min(self._config.inflight, len(plan.windows))
         pin = self._device.type == "cuda"
@@ -627,7 +627,7 @@ class MxObjLoader:
                     yield tensor.name, buffer.view(tensor.dtype).reshape(tensor.shape)
 
             if self._yielded != len(plan.tensors):
-                raise ObjIntegrityError(
+                raise S3RdmaIntegrityError(
                     f"yielded {self._yielded} of {len(plan.tensors)} planned tensors"
                 )
             self._check_unchanged(plan)
@@ -672,7 +672,7 @@ class MxObjLoader:
             for slot, handle in list(self._slot_handle.items()):
                 try:
                     done = self._manager.poll(handle)
-                except ObjTransferError:
+                except S3RdmaTransferError:
                     self._manager.release(handle)
                     del self._slot_handle[slot]
                     del self._slot_posted[slot]
@@ -684,7 +684,7 @@ class MxObjLoader:
                     return slot
                 if now - self._slot_posted[slot] > self._config.timeout_s:
                     window = self._plan.windows[self._slot_window[slot]]
-                    raise ObjTransferTimeout(
+                    raise S3RdmaTransferTimeout(
                         f"read of {self._plan.objects[window.obj_idx][0]} "
                         f"[{window.offset}, {window.offset + window.length}) did not complete "
                         f"within {self._config.timeout_s}s"
@@ -710,7 +710,7 @@ class MxObjLoader:
         )
 
     def _verify(self, slot: int, window_idx: int) -> None:
-        """Check a landed window after the fence; raise ObjIntegrityError on mismatch."""
+        """Check a landed window after the fence; raise S3RdmaIntegrityError on mismatch."""
         mode = self._config.verify
         if mode == "off":
             return
@@ -724,7 +724,7 @@ class MxObjLoader:
             expected = self._reader.get_range(self._plan.bucket, key, window.offset, end)
             actual = bytes(self._slots[slot][: window.length].cpu().numpy().tobytes())
         if actual != expected:
-            raise ObjIntegrityError(
+            raise S3RdmaIntegrityError(
                 f"RDMA read of {key} [{window.offset}, {window.offset + window.length}) "
                 f"did not deliver the expected bytes (verify={mode}); "
                 "the server may have declined or truncated the transfer"
@@ -734,11 +734,11 @@ class MxObjLoader:
         """Wait for queued device copies; RDMA writes are not ordered on any stream."""
         self._backend.synchronize(self._device_id)
 
-    def _check_unchanged(self, plan: ObjLoadPlan) -> None:
+    def _check_unchanged(self, plan: S3RdmaLoadPlan) -> None:
         listing = self._reader.list_objects(plan.bucket, plan.prefix)
         for key, size, etag in plan.objects:
             if listing.get(key) != (size, etag):
-                raise ObjIntegrityError(f"s3://{plan.bucket}/{key} changed while it was being loaded")
+                raise S3RdmaIntegrityError(f"s3://{plan.bucket}/{key} changed while it was being loaded")
 
     # ------------------------------------------------------------------
     # Teardown

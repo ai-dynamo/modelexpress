@@ -30,7 +30,7 @@ import torch
 from ._nixl import load_nixl_api
 from .accelerators import AcceleratorBackend
 
-logger = logging.getLogger("modelexpress.obj_transfer")
+logger = logging.getLogger("modelexpress.s3_rdma_transfer")
 
 NIXL_AVAILABLE = False
 NixlAgent = None
@@ -54,11 +54,11 @@ _CUOBJ_CLIENT_LIB = "libcuobjclient.so.1"
 _QUARANTINE: list[tuple[Any, list[torch.Tensor]]] = []
 
 
-class ObjTransferError(RuntimeError):
+class S3RdmaTransferError(RuntimeError):
     """A NIXL OBJ transfer failed or could not be posted."""
 
 
-class ObjBackendUnavailable(ObjTransferError):
+class S3RdmaBackendUnavailable(S3RdmaTransferError):
     """The OBJ plugin, its accelerated engine, or the RDMA fabric is not usable."""
 
 
@@ -71,12 +71,12 @@ def _cuobj_client_loadable() -> bool:
         return False
 
 
-def is_obj_available() -> bool:
+def is_s3_rdma_available() -> bool:
     """Return whether NIXL and the cuObject client library are present.
 
     This is a cheap, side-effect-free probe. Whether the accelerated engine is
     compiled in and the RDMA fabric is reachable is only known once the
-    backend is created (see :meth:`ObjTransferManager.initialize`).
+    backend is created (see :meth:`S3RdmaTransferManager.initialize`).
     """
     if not NIXL_AVAILABLE:
         return False
@@ -87,7 +87,7 @@ def is_obj_available() -> bool:
 
 
 @dataclass(frozen=True)
-class ObjEndpoint:
+class S3RdmaEndpoint:
     """S3 endpoint and credentials handed to the NIXL OBJ backend."""
 
     bucket: str
@@ -122,7 +122,7 @@ class ObjEndpoint:
         return params
 
 
-class ObjTransferManager:
+class S3RdmaTransferManager:
     """Post ranged S3-over-RDMA reads from objects into registered device slots.
 
     Each posted transfer carries exactly one descriptor, and each local
@@ -133,7 +133,7 @@ class ObjTransferManager:
     def __init__(
         self,
         agent_name: str,
-        endpoint: ObjEndpoint,
+        endpoint: S3RdmaEndpoint,
         *,
         device_id: int,
         num_threads: int,
@@ -164,21 +164,21 @@ class ObjTransferManager:
         if self._agent is not None:
             return
         if not NIXL_AVAILABLE:
-            raise ObjBackendUnavailable("NIXL is not installed")
+            raise S3RdmaBackendUnavailable("NIXL is not installed")
 
         self._accelerator_backend.set_device(self._device_id)
         agent = NixlAgent(self._agent_name, NixlAgentConfig(backends=[]))
         if OBJ_BACKEND not in agent.get_plugin_list():
-            raise ObjBackendUnavailable("NIXL OBJ plugin is not available")
+            raise S3RdmaBackendUnavailable("NIXL OBJ plugin is not available")
         try:
             agent.create_backend(OBJ_BACKEND, self._endpoint.backend_params(self._num_threads))
         except Exception as exc:
-            raise ObjBackendUnavailable(
+            raise S3RdmaBackendUnavailable(
                 f"NIXL OBJ accelerated backend could not be created: {exc}"
             ) from exc
         mem_types = agent.get_backend_mem_types(OBJ_BACKEND)
         if f"{self._mem_type}_SEG" not in mem_types:
-            raise ObjBackendUnavailable(
+            raise S3RdmaBackendUnavailable(
                 f"NIXL OBJ backend does not support {self._mem_type} "
                 f"(advertised: {mem_types}); the RDMA path is not ready"
             )
@@ -200,9 +200,9 @@ class ObjTransferManager:
         """
         self._require_agent()
         if self._obj_reg is not None:
-            raise ObjTransferError("objects are already registered")
+            raise S3RdmaTransferError("objects are already registered")
         if not objects:
-            raise ObjTransferError("no objects to register")
+            raise S3RdmaTransferError("no objects to register")
         regions = [(0, size, dev_id, key) for dev_id, (key, size) in enumerate(objects)]
         self._obj_reg = self._agent.register_memory(regions, OBJ_MEM_TYPE, backends=[OBJ_BACKEND])
         return list(range(len(objects)))
@@ -211,14 +211,14 @@ class ObjTransferManager:
         """Register each staging slot as its own device-memory region."""
         self._require_agent()
         if self._slot_reg is not None:
-            raise ObjTransferError("slots are already registered")
+            raise S3RdmaTransferError("slots are already registered")
         if not slots:
-            raise ObjTransferError("no staging slots to register")
+            raise S3RdmaTransferError("no staging slots to register")
         regions = []
         for slot in slots:
             nbytes = slot.numel() * slot.element_size()
             if nbytes > CUOBJ_MAX_XFER_BYTES:
-                raise ObjTransferError(
+                raise S3RdmaTransferError(
                     f"staging slot of {nbytes} bytes exceeds the cuObject limit "
                     f"of {CUOBJ_MAX_XFER_BYTES} bytes"
                 )
@@ -232,7 +232,7 @@ class ObjTransferManager:
         slot_tensor = self._slots[slot]
         capacity = slot_tensor.numel() * slot_tensor.element_size()
         if length <= 0 or length > capacity:
-            raise ObjTransferError(f"invalid read length {length} for a {capacity}-byte slot")
+            raise S3RdmaTransferError(f"invalid read length {length} for a {capacity}-byte slot")
         local = self._agent.get_xfer_descs(
             [(slot_tensor.data_ptr(), length, self._device_id)], self._mem_type
         )
@@ -242,31 +242,31 @@ class ObjTransferManager:
                 "READ", local, remote, self._agent.name, backends=[OBJ_BACKEND]
             )
         except Exception as exc:
-            raise ObjTransferError(f"could not create OBJ read request: {exc}") from exc
+            raise S3RdmaTransferError(f"could not create OBJ read request: {exc}") from exc
         try:
             state = self._agent.transfer(handle)
         except Exception as exc:
             self.release(handle)
-            raise ObjTransferError(f"OBJ read could not be posted: {exc}") from exc
+            raise S3RdmaTransferError(f"OBJ read could not be posted: {exc}") from exc
         if state == "ERR":
             self.release(handle)
-            raise ObjTransferError("OBJ read could not be posted")
+            raise S3RdmaTransferError("OBJ read could not be posted")
         self._inflight.add(handle)
         return handle
 
     def poll(self, handle: Any) -> bool:
-        """Return True when the read is complete; raise ObjTransferError on failure."""
+        """Return True when the read is complete; raise S3RdmaTransferError on failure."""
         try:
             state = self._agent.check_xfer_state(handle)
         except Exception as exc:
             self._inflight.discard(handle)
-            raise ObjTransferError(f"OBJ read failed: {exc}") from exc
+            raise S3RdmaTransferError(f"OBJ read failed: {exc}") from exc
         if state == "DONE":
             self._inflight.discard(handle)
             return True
         if state == "ERR":
             self._inflight.discard(handle)
-            raise ObjTransferError("OBJ read failed")
+            raise S3RdmaTransferError("OBJ read failed")
         return False
 
     def release(self, handle: Any) -> None:
@@ -287,7 +287,7 @@ class ObjTransferManager:
             for handle in list(self._inflight):
                 try:
                     done = self.poll(handle)
-                except ObjTransferError:
+                except S3RdmaTransferError:
                     done = True
                 if done:
                     self.release(handle)
@@ -336,4 +336,4 @@ class ObjTransferManager:
 
     def _require_agent(self) -> None:
         if self._agent is None:
-            raise ObjTransferError("NIXL OBJ agent not initialized")
+            raise S3RdmaTransferError("NIXL OBJ agent not initialized")

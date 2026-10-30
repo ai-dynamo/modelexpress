@@ -15,7 +15,7 @@ Uses LoadStrategyChain to auto-detect the best loading strategy:
     1. RDMA (P2P GPU transfer via NIXL) - if a source is already serving
     2. ServerCache (stream weights from ModelExpress Server) - set MODEL_EXPRESS_NO_SHARED_STORAGE=1
     3. InstantTensor (fast local safetensors, direct I/O + GDS) - set MX_INSTANT_TENSOR=0 to disable
-    4. Obj (S3-over-RDMA to GPU via NIXL OBJ) - set MX_OBJ_ENABLED=1 and an s3:// MX_MODEL_URI
+    4. S3Rdma (S3-over-RDMA to GPU via NIXL OBJ) - set MX_S3_RDMA_ENABLED=1 and an s3:// MX_MODEL_URI
     5. ModelStreamer (S3/GCS/Azure/local via runai-model-streamer) - set MX_MODEL_URI
     6. GDS (GPUDirect Storage) - direct file-to-GPU, bypassing CPU
     7. Default (vLLM DefaultModelLoader) - standard CPU-staged loading

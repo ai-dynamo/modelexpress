@@ -34,7 +34,7 @@ class TestCudaAcceleratorBackend:
         assert backend.supports_pool_reg() is True
         assert backend.supports_vmm() is True
         assert backend.supports_gds() is True
-        assert backend.supports_obj() is True
+        assert backend.supports_s3_rdma() is True
 
     def test_cuda_backend_delegates_torch_calls(self, monkeypatch):
         calls = []
@@ -101,7 +101,7 @@ class TestXpuAcceleratorBackend:
         assert backend.supports_pool_reg() is False
         assert backend.supports_vmm() is False
         assert backend.supports_gds() is False
-        assert backend.supports_obj() is False
+        assert backend.supports_s3_rdma() is False
 
     def test_xpu_backend_delegates_torch_calls(self, monkeypatch):
         calls = []
