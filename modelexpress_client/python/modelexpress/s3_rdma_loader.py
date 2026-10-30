@@ -60,10 +60,20 @@ logger = logging.getLogger("modelexpress.s3_rdma_loader")
 
 VERIFY_MODES = ("tail", "full", "off")
 _MIB = 1024 * 1024
+# One ranged GET covers the header of typical shards (tens to hundreds of KiB);
+# a larger header costs one more GET.
 _HEADER_PROBE_BYTES = _MIB
+# Small enough that each canary GET is latency-bound, and the poisoned tail
+# is the bitwise inverse, so a window the server skipped or truncated cannot match.
 _CANARY_BYTES = 64
+# Parallel HTTP header and canary GETs; also the boto3 connection pool size,
+# so these requests never wait for a connection.
 _METADATA_WORKERS = 32
+# Sanity cap on staging slots: GPU memory held is window size x inflight.
 _MAX_INFLIGHT = 64
+# Default maxConnections of Aws::Client::ClientConfiguration. NIXL's OBJ
+# control plane neither sets it nor accepts a parameter for it, so it cannot
+# be read back; revisit this if NIXL starts configuring its own pool.
 _AWS_SDK_DEFAULT_CONNECTIONS = 25
 
 
