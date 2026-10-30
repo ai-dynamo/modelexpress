@@ -37,8 +37,6 @@ ENDPOINT = S3RdmaEndpoint(
     bucket=BUCKET,
     endpoint_url="http://aistor:9100",
     region="us-east-1",
-    access_key="ak",
-    secret_key="sk",
 )
 
 
@@ -692,8 +690,8 @@ class TestReaderFromSession:
         _reader, endpoint = S3ObjectReader.from_session("models")
         assert endpoint.endpoint_url == "http://aistor1:9100"
         assert endpoint.bucket == "models"
-        assert (endpoint.access_key, endpoint.secret_key, endpoint.session_token) == ("ak", "sk", "tok")
-        assert endpoint.backend_params(4)["session_token"] == "tok"
+        params = endpoint.backend_params(4)
+        assert not {"access_key", "secret_key", "session_token"} & params.keys()
 
     def test_rejects_aws_s3(self, monkeypatch):
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ak")

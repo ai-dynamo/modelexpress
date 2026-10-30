@@ -142,7 +142,9 @@ class S3ObjectReader:
 
         Endpoint, region, credentials and CA bundle come from the standard AWS
         environment (``AWS_ENDPOINT_URL``, ``AWS_ACCESS_KEY_ID``, ...), so the
-        HTTP metadata path, NIXL, and the ModelStreamer fallback agree.
+        HTTP metadata path, NIXL, and the ModelStreamer fallback agree. NIXL
+        resolves credentials itself; they are only checked here so a missing
+        chain fails before any GPU or RDMA setup.
         """
         import boto3
         import botocore.session
@@ -175,9 +177,6 @@ class S3ObjectReader:
             bucket=bucket,
             endpoint_url=endpoint_url,
             region=client.meta.region_name or "us-east-1",
-            access_key=frozen.access_key,
-            secret_key=frozen.secret_key,
-            session_token=frozen.token,
             ca_bundle=core.get_config_variable("ca_bundle"),
         )
         return cls(client), endpoint

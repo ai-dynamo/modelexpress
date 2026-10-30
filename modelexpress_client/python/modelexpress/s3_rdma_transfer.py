@@ -21,7 +21,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Sequence
 from urllib.parse import urlparse
 
@@ -88,14 +88,15 @@ def is_s3_rdma_available() -> bool:
 
 @dataclass(frozen=True)
 class S3RdmaEndpoint:
-    """S3 endpoint and credentials handed to the NIXL OBJ backend."""
+    """S3 endpoint handed to the NIXL OBJ backend.
+
+    Credentials are deliberately absent: NIXL resolves them through the AWS
+    SDK's default provider chain, the same sources boto3 reads.
+    """
 
     bucket: str
     endpoint_url: str
     region: str
-    access_key: str = field(repr=False)
-    secret_key: str = field(repr=False)
-    session_token: str | None = field(default=None, repr=False)
     ca_bundle: str | None = None
 
     @property
@@ -111,12 +112,8 @@ class S3RdmaEndpoint:
             "scheme": self.scheme,
             "region": self.region,
             "use_virtual_addressing": "false",
-            "access_key": self.access_key,
-            "secret_key": self.secret_key,
             "num_threads": str(num_threads),
         }
-        if self.session_token:
-            params["session_token"] = self.session_token
         if self.ca_bundle:
             params["ca_bundle"] = self.ca_bundle
         return params

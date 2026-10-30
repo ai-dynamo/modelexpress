@@ -50,8 +50,6 @@ class TestS3RdmaEndpoint:
             "scheme": "http",
             "region": "us-east-1",
             "use_virtual_addressing": "false",
-            "access_key": "ak",
-            "secret_key": "sk",
             "num_threads": "8",
         }
 
@@ -60,20 +58,11 @@ class TestS3RdmaEndpoint:
             bucket="b",
             endpoint_url="https://aistor:9443",
             region="r",
-            access_key="ak",
-            secret_key="sk",
-            session_token="tok",
             ca_bundle="/etc/ca.pem",
         )
         params = endpoint.backend_params(2)
         assert params["scheme"] == "https"
-        assert params["session_token"] == "tok"
         assert params["ca_bundle"] == "/etc/ca.pem"
-
-    def test_repr_hides_secrets(self):
-        endpoint = S3RdmaEndpoint("b", "http://x", "r", "AKID", "SECRET", session_token="TOKEN")
-        text = repr(endpoint)
-        assert "SECRET" not in text and "TOKEN" not in text and "AKID" not in text
 
 
 class _SizedSlot:
