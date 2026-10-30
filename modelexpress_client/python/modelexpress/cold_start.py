@@ -38,8 +38,9 @@ def _ready(ctx, ranks):
 
 
 class DonorLease:
-    def __init__(self, ctx, token, ranks):
+    def __init__(self, ctx, token, ranks, acquired_at):
         self.ctx, self.token, self.ranks = ctx, token, ranks
+        self.deadline = acquired_at + LEASE_TTL
         self.stopped = threading.Event()
         self.lost = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -47,8 +48,16 @@ class DonorLease:
         atexit.register(self.stop)
 
     def _run(self):
-        try:
-            while not self.stopped.wait(RENEW_INTERVAL):
+        interval = RENEW_INTERVAL
+        while not self.stopped.wait(
+            min(interval, max(0, self.deadline - time.monotonic()))
+        ):
+            started = time.monotonic()
+            if started >= self.deadline:
+                self.lost.set()
+                logger.error("MX donor lease renewal deadline passed; ownership is unknown")
+                return
+            try:
                 if not self.ctx.mx_client.donor_lease(
                     self.ctx.identity,
                     self.token,
@@ -58,12 +67,18 @@ class DonorLease:
                     self.lost.set()
                     logger.error("MX donor lease was lost")
                     return
+            except Exception:
+                logger.exception("MX donor lease renewal failed; retrying until deadline")
+                interval = POLL_INTERVAL
+                continue
+            self.deadline = started + LEASE_TTL
+            interval = RENEW_INTERVAL
+            try:
                 if _ready(self.ctx, self.ranks):
                     break
-        except Exception:
-            self.lost.set()
-            logger.exception("MX donor lease renewal failed")
-            return
+            except Exception:
+                logger.exception("MX donor readiness check failed; continuing lease renewal")
+            interval = max(0, started + RENEW_INTERVAL - time.monotonic())
         try:
             self.ctx.mx_client.donor_lease(
                 self.ctx.identity,
@@ -120,6 +135,7 @@ def coordinate(ctx, config):
                     decision = ("follower", "")
                     break
                 token = uuid.uuid4().hex
+                acquired_at = time.monotonic()
                 if ctx.mx_client.donor_lease(
                     ctx.identity, token, p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE, LEASE_TTL
                 ):
@@ -142,7 +158,7 @@ def coordinate(ctx, config):
                         )
                         decision = ("follower", "")
                     else:
-                        ctx.donor_lease = DonorLease(ctx, token, ranks)
+                        ctx.donor_lease = DonorLease(ctx, token, ranks, acquired_at)
                         decision = ("donor", "")
                     break
                 time.sleep(POLL_INTERVAL)
