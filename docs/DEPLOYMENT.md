@@ -1459,13 +1459,13 @@ All ranks agree after preparing, after streaming, and after post-processing. If 
 
 **Prerequisites:**
 
-- **NIXL `main` at or after [ai-dynamo/nixl#2406](https://github.com/ai-dynamo/nixl/pull/2406).** The generic accelerated OBJ engine speaks `x-amz-rdma-token` (`accelerated=true` with no `type`). It was added in [#2241](https://github.com/ai-dynamo/nixl/pull/2241), and no NIXL release includes it yet (the latest is 1.5.2). Later fixes on `main` are also needed: [#2389](https://github.com/ai-dynamo/nixl/pull/2389) signs object keys that contain characters such as `@`, `:`, or `=`, and #2406 reads a window larger than 4 GiB − 64 KiB as several ranged GETs. Until a NIXL release includes these, build NIXL from `main` with the OBJ plugin, aws-sdk-cpp (`core`, `s3`, `s3-crt`), and the cuObject client found by pkg-config (`cuobjclient-13.x`), and install the Python bindings into the engine's environment so that `nixl_cu13` (what ModelExpress imports first) resolves to that build. The `type=dell` engine uses a different header and must not be used against AIStor.
+- **NIXL with the generic accelerated OBJ engine.** NIXL provides the engine that speaks `x-amz-rdma-token` (`accelerated=true` with no `type`). It reads a window larger than 4 GiB − 64 KiB as several ranged GETs. Build NIXL with the OBJ plugin, aws-sdk-cpp (`core`, `s3`, `s3-crt`), and the cuObject client found by pkg-config (`cuobjclient-13.x`), and install the Python bindings into the engine's environment so that `nixl_cu13` (what ModelExpress imports first) resolves to that build. The `type=dell` engine uses a different header and must not be used against AIStor.
 - **cuObject and cuFile.** `libcuobjclient.so.1` (CUDA 13.x) must be on the loader path. NIXL wheels link the OBJ plugin against it but do not bundle it, so the host provides it either way. cuFile must be 1.18 or newer; PyTorch wheels can bundle an older `libcufile.so.0` with the same SONAME, which fails with `undefined symbol cuFileRDMADescStrGet`, so preload the newer one.
 - **cuFile configuration.** Point `CUFILE_ENV_PATH_JSON` at a `cufile.json` whose `rdma_dev_addr_list` lists the RDMA NIC IPs to use (an empty list disables RDMA), with `rdma_peer_type` set for the host (`dmabuf` or nvidia-peermem).
 - **Fabric.** RoCE v2 or InfiniBand NICs with GPU-to-NIC PCIe peer-to-peer (ACS redirect disabled on the path). AIStor splits large GETs across its nodes and each node RDMA-writes to the client directly, so every server node must reach the client's RDMA addresses.
 - **Server.** An S3-over-RDMA endpoint such as the AIStor `minio.rdma` build. AWS S3 endpoints are rejected because they do not serve S3-over-RDMA.
 
-Building NIXL from `main`:
+Building NIXL:
 
 ```bash
 git clone https://github.com/ai-dynamo/nixl && cd nixl
@@ -1496,7 +1496,7 @@ vllm serve /path/to/local/config-and-tokenizer --load-format modelexpress
 | Symptom | Check |
 |---------|-------|
 | `NIXL OBJ not available, skipping` | `libcuobjclient.so.1` is not on the loader path, or NIXL is not installed in the engine environment |
-| `NIXL OBJ plugin is not available` / `accelerated backend could not be created` | NIXL was built without the OBJ plugin or without cuObject (`ldd libplugin_OBJ.so` should list `libcuobjclient.so.1`), or the build predates the generic accelerated engine (NIXL 1.5.2 and earlier) |
+| `NIXL OBJ plugin is not available` / `accelerated backend could not be created` | NIXL was built without the OBJ plugin or without cuObject (`ldd libplugin_OBJ.so` should list `libcuobjclient.so.1`), or the NIXL build lacks the generic accelerated engine |
 | `cuMemObjGetDescriptor failed` in the NIXL log | Staging slots could not be registered. cuObject older than CUDA 13.4 cannot register a slot of 4 GiB or more, so upgrade cuObject or set `MX_S3_RDMA_WINDOW_MB` below 4096. cuFile also limits registered VRAM to 32 GiB per GPU by default, so keep `MX_S3_RDMA_WINDOW_MB x MX_S3_RDMA_INFLIGHT` below that or raise `max_device_pinned_mem_size_kb` in `cufile.json` |
 | `does not support VRAM ... the RDMA path is not ready` | `rdma_dev_addr_list` is empty or wrong, the NIC port is down, or peer memory (`nvidia_peermem`/dmabuf) is unavailable |
 | `did not deliver the expected bytes` | The server declined or truncated RDMA; confirm the endpoint is an RDMA build and that every server node can reach the client NIC |

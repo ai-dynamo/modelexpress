@@ -44,8 +44,8 @@ if _nixl_api is not None:
 OBJ_BACKEND = "OBJ"
 OBJ_MEM_TYPE = "OBJ"
 # Reads and slots have no 4 GiB cap. cuObject mints an RDMA token for at most
-# 4 GiB - 64 KiB, but NIXL splits a larger read into ranged GETs of that size
-# (ai-dynamo/nixl#2406). Registering a slot of 4 GiB or more needs the cuObject
+# 4 GiB - 64 KiB, but NIXL splits a larger read into ranged GETs of that size.
+# Registering a slot of 4 GiB or more needs the cuObject
 # from CUDA 13.4 or newer; older releases fail the registration, and the
 # strategy falls back to the next loader.
 _CUOBJ_CLIENT_LIB = "libcuobjclient.so.1"
