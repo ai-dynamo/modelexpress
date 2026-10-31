@@ -15,7 +15,7 @@ from ..adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
 from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
 from .context import LoadResult
 
-logger = logging.getLogger("modelexpress.strategy_obj")
+logger = logging.getLogger("modelexpress.strategy_s3_rdma")
 
 _REASON_LIMIT = 300
 
@@ -26,6 +26,10 @@ def _world_size() -> int:
     return 1
 
 
+def _tensor_parallel_size(ctx: LoadContext) -> int:
+    return int(getattr(ctx.identity, "tensor_parallel_size", 1) or 1)
+
+
 def _adapter_gathers_state(ctx: LoadContext) -> bool:
     return (
         ctx.adapter is not None
@@ -33,25 +37,26 @@ def _adapter_gathers_state(ctx: LoadContext) -> bool:
     )
 
 
-class ObjStrategy(LoadStrategy):
+class S3RdmaStrategy(LoadStrategy):
     """Load safetensors weights from an S3-over-RDMA endpoint via NIXL OBJ.
 
-    Opt-in with MX_OBJ_ENABLED=1 and an s3:// MX_MODEL_URI. Placed ahead of
-    ModelStreamer, which claims any MX_MODEL_URI. Every rank reaches the same
+    Opt-in with MX_S3_RDMA_ENABLED=1 and an s3:// MX_MODEL_URI. Placed ahead of
+    ModelStreamer, which claims any MX_MODEL_URI, and skipped above
+    MX_S3_RDMA_MAX_TP because every rank still reads the full checkpoint. Every rank reaches the same
     decision at each phase, so a failure on one rank sends all ranks to the
     next strategy together instead of leaving one rank in a collective alone.
     """
 
-    name = "obj"
+    name = "s3_rdma"
     requires = (EngineAdapter.apply_weight_iter,)
 
     def is_available(self, ctx: LoadContext) -> bool:
-        if not envs.MX_OBJ_ENABLED:
+        if not envs.MX_S3_RDMA_ENABLED:
             return False
         model_uri = envs.MX_MODEL_URI or ""
         if not model_uri.lower().startswith("s3://"):
             logger.info(
-                f"[Worker {ctx.global_rank}] MX_OBJ_ENABLED is set but MX_MODEL_URI "
+                f"[Worker {ctx.global_rank}] MX_S3_RDMA_ENABLED is set but MX_MODEL_URI "
                 "is not an s3:// URI, skipping NIXL OBJ"
             )
             return False
@@ -60,10 +65,18 @@ class ObjStrategy(LoadStrategy):
         if envs.MX_VMM_ARENA:
             logger.info(f"[Worker {ctx.global_rank}] NIXL OBJ does not support MX_VMM_ARENA, skipping")
             return False
-        if not ctx.accelerator_backend.supports_obj():
+        if not ctx.accelerator_backend.supports_s3_rdma():
             logger.info(
                 f"[Worker {ctx.global_rank}] NIXL OBJ not supported on "
                 f"{ctx.accelerator_backend.name}, skipping"
+            )
+            return False
+        tp_size = _tensor_parallel_size(ctx)
+        max_tp = envs.MX_S3_RDMA_MAX_TP
+        if max_tp and tp_size > max_tp:
+            logger.info(
+                f"[Worker {ctx.global_rank}] NIXL OBJ is limited to TP <= {max_tp} "
+                f"(MX_S3_RDMA_MAX_TP), got TP={tp_size}, skipping"
             )
             return False
         if _world_size() > 1 and not _adapter_gathers_state(ctx):
@@ -72,16 +85,20 @@ class ObjStrategy(LoadStrategy):
                 "engine adapter does not provide for multi-rank runs, skipping"
             )
             return False
-        from ..obj_transfer import is_obj_available
+        from ..s3_rdma_transfer import is_s3_rdma_available
 
-        available = is_obj_available()
+        available = is_s3_rdma_available()
         if not available:
             logger.info(f"[Worker {ctx.global_rank}] NIXL OBJ not available, skipping")
         return available
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)
-        from ..obj_loader import MxObjLoader, ObjIntegrityError, ObjLoadConfig
+        from ..s3_rdma_loader import (
+            MxS3RdmaLoader,
+            S3RdmaIntegrityError,
+            S3RdmaLoadConfig,
+        )
 
         model_uri = envs.MX_MODEL_URI
         logger.info(f"[Worker {ctx.global_rank}] Attempting NIXL OBJ loading from {model_uri}...")
@@ -90,7 +107,7 @@ class ObjStrategy(LoadStrategy):
             plan = None
             error: BaseException | None = None
             try:
-                loader = MxObjLoader(ctx.accelerator_backend, ctx.device_id, ObjLoadConfig.from_env())
+                loader = MxS3RdmaLoader(ctx.accelerator_backend, ctx.device_id, S3RdmaLoadConfig.from_env())
                 plan = loader.prepare(model_uri)
             except Exception as exc:
                 error = exc
@@ -107,7 +124,7 @@ class ObjStrategy(LoadStrategy):
                 finished = loader.finished
                 loader.release()
             if error is None and not finished:
-                error = ObjIntegrityError("engine stopped consuming weights before the last tensor")
+                error = S3RdmaIntegrityError("engine stopped consuming weights before the last tensor")
             _agree(ctx, "streamed", error, None, mutated=True)
             logger.info(f"[Worker {ctx.global_rank}] NIXL OBJ weight loading complete")
 

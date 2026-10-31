@@ -71,7 +71,7 @@ class LoadStrategyChain:
         from .rdma_strategy import RdmaStrategy
         from .server_cache_strategy import ServerCacheStrategy
         from .instant_tensor_strategy import InstantTensorStrategy
-        from .obj_strategy import ObjStrategy
+        from .s3_rdma_strategy import S3RdmaStrategy
         from .model_streamer_strategy import ModelStreamerStrategy
         from .gds_strategy import GdsStrategy
         from .default_strategy import DefaultStrategy
@@ -82,7 +82,7 @@ class LoadStrategyChain:
             RdmaStrategy(),
             ServerCacheStrategy(),
             InstantTensorStrategy(),
-            ObjStrategy(),
+            S3RdmaStrategy(),
             ModelStreamerStrategy(),
             GdsStrategy(),
             DefaultStrategy(),

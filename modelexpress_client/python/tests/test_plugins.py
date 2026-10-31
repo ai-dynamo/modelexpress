@@ -83,12 +83,12 @@ def test_selected_inserted_and_instance_fresh(registry, monkeypatch, tmp_path):
     first = execute.call_args.args[2]
     chain.LoadStrategyChain.run(nn.Linear(1, 1), None)
     second = execute.call_args.args[2]
-    assert [s.name for s in first] == ["rdma", "example", "server-cache", "instant_tensor", "obj", "model_streamer", "gds", "default"]
+    assert [s.name for s in first] == ["rdma", "example", "server-cache", "instant_tensor", "s3_rdma", "model_streamer", "gds", "default"]
     assert first[1] is not second[1]
     assert set(registry.plugins) == {"example", "unused"}
 
 
-@pytest.mark.parametrize("before", ["rdma", "server-cache", "instant_tensor", "obj", "model_streamer", "gds", "default"])
+@pytest.mark.parametrize("before", ["rdma", "server-cache", "instant_tensor", "s3_rdma", "model_streamer", "gds", "default"])
 def test_plugin_runs_before_configured_builtin(registry, monkeypatch, tmp_path, before):
     write_plugin(tmp_path)
     monkeypatch.setenv("MX_LOAD_PLUGIN_BEFORE", before)
@@ -97,7 +97,7 @@ def test_plugin_runs_before_configured_builtin(registry, monkeypatch, tmp_path, 
     chain.LoadStrategyChain.run(nn.Linear(1, 1), None)
     names = [strategy.name for strategy in execute.call_args.args[2]]
     assert names[names.index(before) - 1] == "example"
-    assert [name for name in names if name != "example"] == ["rdma", "server-cache", "instant_tensor", "obj", "model_streamer", "gds", "default"]
+    assert [name for name in names if name != "example"] == ["rdma", "server-cache", "instant_tensor", "s3_rdma", "model_streamer", "gds", "default"]
 
 
 @pytest.mark.parametrize("before", ["missing", "example", ""])

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for ObjStrategy gating, rank agreement, and fallback semantics."""
+"""Tests for S3RdmaStrategy gating, rank agreement, and fallback semantics."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import torch
 from modelexpress.adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
 from modelexpress.load_strategy import LoadContext, LoadStrategy, execute_load_strategies
 from modelexpress.load_strategy.context import LoadResult
-from modelexpress.load_strategy.obj_strategy import ObjStrategy
+from modelexpress.load_strategy.s3_rdma_strategy import S3RdmaStrategy
 
 URI = "s3://models/llama"
 
@@ -122,25 +122,25 @@ def make_ctx(adapter, backend):
 
 
 @pytest.fixture
-def obj_env(monkeypatch):
-    monkeypatch.setenv("MX_OBJ_ENABLED", "1")
+def s3_rdma_env(monkeypatch):
+    monkeypatch.setenv("MX_S3_RDMA_ENABLED", "1")
     monkeypatch.setenv("MX_MODEL_URI", URI)
     monkeypatch.delenv("MX_VMM_ARENA", raising=False)
 
 
 @pytest.fixture
-def run(obj_env, mock_accelerator_backend_cls):
-    """Run ObjStrategy.load with a fake loader; returns (events, register_mock, outcome)."""
+def run(s3_rdma_env, mock_accelerator_backend_cls):
+    """Run S3RdmaStrategy.load with a fake loader; returns (events, register_mock, outcome)."""
 
     def _run(adapter_kwargs=None, loader_kwargs=None):
         events: list = []
         adapter = RecordingAdapter(events, **(adapter_kwargs or {}))
-        ctx = make_ctx(adapter, mock_accelerator_backend_cls(obj=True))
+        ctx = make_ctx(adapter, mock_accelerator_backend_cls(s3_rdma=True))
         with patch(
-            "modelexpress.obj_loader.MxObjLoader", fake_loader_cls(events, **(loader_kwargs or {}))
-        ), patch("modelexpress.load_strategy.obj_strategy.register_tensors") as register:
+            "modelexpress.s3_rdma_loader.MxS3RdmaLoader", fake_loader_cls(events, **(loader_kwargs or {}))
+        ), patch("modelexpress.load_strategy.s3_rdma_strategy.register_tensors") as register:
             try:
-                outcome = ObjStrategy().load(MagicMock(), ctx)
+                outcome = S3RdmaStrategy().load(MagicMock(), ctx)
             except Exception as exc:
                 outcome = exc
         return events, register, outcome
@@ -151,58 +151,70 @@ def run(obj_env, mock_accelerator_backend_cls):
 class TestIsAvailable:
     @pytest.fixture
     def ctx(self, mock_accelerator_backend_cls):
-        return make_ctx(RecordingAdapter([]), mock_accelerator_backend_cls(obj=True))
+        return make_ctx(RecordingAdapter([]), mock_accelerator_backend_cls(s3_rdma=True))
 
     @pytest.fixture(autouse=True)
-    def _obj_present(self):
-        with patch("modelexpress.obj_transfer.is_obj_available", return_value=True):
+    def _s3_rdma_present(self):
+        with patch("modelexpress.s3_rdma_transfer.is_s3_rdma_available", return_value=True):
             yield
 
-    def test_available(self, obj_env, ctx):
-        assert ObjStrategy().is_available(ctx) is True
+    def test_available(self, s3_rdma_env, ctx):
+        assert S3RdmaStrategy().is_available(ctx) is True
 
-    def test_disabled_by_default(self, obj_env, ctx, monkeypatch):
-        monkeypatch.delenv("MX_OBJ_ENABLED")
-        assert ObjStrategy().is_available(ctx) is False
+    def test_disabled_by_default(self, s3_rdma_env, ctx, monkeypatch):
+        monkeypatch.delenv("MX_S3_RDMA_ENABLED")
+        assert S3RdmaStrategy().is_available(ctx) is False
 
     @pytest.mark.parametrize("uri", ["", "gs://models/llama", "/models/llama"])
-    def test_requires_s3_uri(self, obj_env, ctx, monkeypatch, uri):
+    def test_requires_s3_uri(self, s3_rdma_env, ctx, monkeypatch, uri):
         monkeypatch.setenv("MX_MODEL_URI", uri)
-        assert ObjStrategy().is_available(ctx) is False
+        assert S3RdmaStrategy().is_available(ctx) is False
 
-    def test_requires_apply_weight_iter(self, obj_env, mock_accelerator_backend_cls):
+    def test_requires_apply_weight_iter(self, s3_rdma_env, mock_accelerator_backend_cls):
         class NoIter(EngineAdapter):
             pass
 
-        ctx = make_ctx(NoIter(), mock_accelerator_backend_cls(obj=True))
-        assert ObjStrategy().is_available(ctx) is False
+        ctx = make_ctx(NoIter(), mock_accelerator_backend_cls(s3_rdma=True))
+        assert S3RdmaStrategy().is_available(ctx) is False
 
-    def test_vmm_arena_excluded(self, obj_env, ctx, monkeypatch):
+    def test_vmm_arena_excluded(self, s3_rdma_env, ctx, monkeypatch):
         monkeypatch.setenv("MX_VMM_ARENA", "1")
-        assert ObjStrategy().is_available(ctx) is False
+        assert S3RdmaStrategy().is_available(ctx) is False
 
-    def test_backend_without_obj_skips_probe(self, obj_env, mock_accelerator_backend_cls):
-        ctx = make_ctx(RecordingAdapter([]), mock_accelerator_backend_cls(obj=False))
+    def test_backend_without_s3_rdma_skips_probe(self, s3_rdma_env, mock_accelerator_backend_cls):
+        ctx = make_ctx(RecordingAdapter([]), mock_accelerator_backend_cls(s3_rdma=False))
         with patch(
-            "modelexpress.obj_transfer.is_obj_available",
+            "modelexpress.s3_rdma_transfer.is_s3_rdma_available",
             side_effect=AssertionError("system probe should not run"),
         ):
-            assert ObjStrategy().is_available(ctx) is False
+            assert S3RdmaStrategy().is_available(ctx) is False
 
-    def test_multi_rank_requires_gather(self, obj_env, mock_accelerator_backend_cls):
+    def test_multi_rank_requires_gather(self, s3_rdma_env, mock_accelerator_backend_cls):
         class IterOnly(EngineAdapter):
             def apply_weight_iter(self, result, weights_iter):
                 return result
 
-        ctx = make_ctx(IterOnly(), mock_accelerator_backend_cls(obj=True))
-        with patch("modelexpress.load_strategy.obj_strategy._world_size", return_value=2):
-            assert ObjStrategy().is_available(ctx) is False
-        with patch("modelexpress.load_strategy.obj_strategy._world_size", return_value=1):
-            assert ObjStrategy().is_available(ctx) is True
+        ctx = make_ctx(IterOnly(), mock_accelerator_backend_cls(s3_rdma=True))
+        with patch("modelexpress.load_strategy.s3_rdma_strategy._world_size", return_value=2):
+            assert S3RdmaStrategy().is_available(ctx) is False
+        with patch("modelexpress.load_strategy.s3_rdma_strategy._world_size", return_value=1):
+            assert S3RdmaStrategy().is_available(ctx) is True
 
-    def test_nixl_obj_missing(self, obj_env, ctx):
-        with patch("modelexpress.obj_transfer.is_obj_available", return_value=False):
-            assert ObjStrategy().is_available(ctx) is False
+    @pytest.mark.parametrize(
+        ("tp_size", "max_tp", "expected"),
+        [(1, None, True), (2, None, True), (4, None, False), (4, "4", True), (8, "0", True)],
+    )
+    def test_tp_limit(self, s3_rdma_env, ctx, monkeypatch, tp_size, max_tp, expected):
+        ctx.identity.tensor_parallel_size = tp_size
+        if max_tp is None:
+            monkeypatch.delenv("MX_S3_RDMA_MAX_TP", raising=False)
+        else:
+            monkeypatch.setenv("MX_S3_RDMA_MAX_TP", max_tp)
+        assert S3RdmaStrategy().is_available(ctx) is expected
+
+    def test_nixl_obj_missing(self, s3_rdma_env, ctx):
+        with patch("modelexpress.s3_rdma_transfer.is_s3_rdma_available", return_value=False):
+            assert S3RdmaStrategy().is_available(ctx) is False
 
 
 class TestLoad:
@@ -233,7 +245,7 @@ class TestLoad:
         register.assert_not_called()
 
     def test_peer_prepare_failure_is_clean(self, run):
-        peers = {"prepared": [("prepared", False, "ObjBackendUnavailable: down", None)]}
+        peers = {"prepared": [("prepared", False, "S3RdmaBackendUnavailable: down", None)]}
         events, _, outcome = run(adapter_kwargs={"peers": peers})
         assert isinstance(outcome, StrategyFailed) and outcome.mutated is False
         assert "rank 1" in str(outcome)
@@ -262,7 +274,7 @@ class TestLoad:
         assert "iter_closed" in events
 
     def test_peer_stream_failure_skips_post_processing(self, run):
-        peers = {"streamed": [("streamed", False, "ObjIntegrityError: tail", None)]}
+        peers = {"streamed": [("streamed", False, "S3RdmaIntegrityError: tail", None)]}
         events, _, outcome = run(adapter_kwargs={"peers": peers})
         assert isinstance(outcome, StrategyFailed) and outcome.mutated is True
         assert "after" not in events
@@ -296,13 +308,13 @@ class _NextStrategy(LoadStrategy):
         return result
 
 
-def test_mutated_failure_reinitializes_before_next_strategy(obj_env, mock_accelerator_backend_cls):
+def test_mutated_failure_reinitializes_before_next_strategy(s3_rdma_env, mock_accelerator_backend_cls):
     events: list = []
     adapter = RecordingAdapter(events, apply_error=RuntimeError("bad"))
-    ctx = make_ctx(adapter, mock_accelerator_backend_cls(obj=True))
-    with patch("modelexpress.obj_transfer.is_obj_available", return_value=True), patch(
-        "modelexpress.obj_loader.MxObjLoader", fake_loader_cls(events)
+    ctx = make_ctx(adapter, mock_accelerator_backend_cls(s3_rdma=True))
+    with patch("modelexpress.s3_rdma_transfer.is_s3_rdma_available", return_value=True), patch(
+        "modelexpress.s3_rdma_loader.MxS3RdmaLoader", fake_loader_cls(events)
     ), patch("modelexpress.load_strategy.publish_source_if_supported"):
-        execute_load_strategies(MagicMock(), ctx, [ObjStrategy(), _NextStrategy(events)])
+        execute_load_strategies(MagicMock(), ctx, [S3RdmaStrategy(), _NextStrategy(events)])
     assert events.index("reinit") < events.index("next")
     assert events.index("shutdown") < events.index("reinit")

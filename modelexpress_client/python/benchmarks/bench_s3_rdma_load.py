@@ -4,13 +4,13 @@
 """NIXL OBJ (S3-over-RDMA) load benchmark; loader only, no inference engine.
 
 Loads a safetensors checkpoint from an S3-over-RDMA endpoint into GPU memory
-with MxObjLoader, one process per GPU, and reports per-process and aggregate
+with MxS3RdmaLoader, one process per GPU, and reports per-process and aggregate
 throughput. With --metrics it also reports the server's RDMA byte counters so a
 silent non-RDMA path cannot pass as a result.
 
 Run from modelexpress_client/python with NIXL (OBJ + cuObject) installed and
 the AWS_* endpoint and credential variables set:
-    PYTHONPATH=. python benchmarks/bench_obj_load.py \\
+    PYTHONPATH=. python benchmarks/bench_s3_rdma_load.py \\
         --uri s3://models/llama-3.1-8b-instruct --devices 0,1,2,3 \\
         --window-mb 256 --inflight 8 --repeats 3 \\
         --metrics http://aistor1:9100,http://aistor2:9100
@@ -59,10 +59,10 @@ def run_loads(device, args, barrier):
     import torch
 
     from modelexpress.accelerators import CudaAcceleratorBackend
-    from modelexpress.obj_loader import MxObjLoader, ObjLoadConfig
+    from modelexpress.s3_rdma_loader import MxS3RdmaLoader, S3RdmaLoadConfig
 
     torch.cuda.set_device(device)
-    config = ObjLoadConfig(
+    config = S3RdmaLoadConfig(
         window_bytes=args.window_mb * 1024 * 1024,
         inflight=args.inflight,
         threads=args.threads,
@@ -72,7 +72,7 @@ def run_loads(device, args, barrier):
     runs = []
     for _ in range(args.repeats):
         barrier.wait()
-        loader = MxObjLoader(CudaAcceleratorBackend(), device, config)
+        loader = MxS3RdmaLoader(CudaAcceleratorBackend(), device, config)
         start = time.perf_counter()
         tensors = 0
         try:

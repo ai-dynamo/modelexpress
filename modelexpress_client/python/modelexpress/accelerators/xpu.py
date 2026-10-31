@@ -79,5 +79,5 @@ class XpuAcceleratorBackend:
     def supports_gds(self) -> bool:
         return False
 
-    def supports_obj(self) -> bool:
+    def supports_s3_rdma(self) -> bool:
         return False

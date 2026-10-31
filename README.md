@@ -235,7 +235,7 @@ docker compose -f docker/docker-compose.yml up --build
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_MODEL_URI` | (unset) | Enable ModelStreamer for an object-store URI or absolute local path. |
 | `MX_MS_DISTRIBUTED` | `1` | Divide ModelStreamer reads across tensor-parallel ranks when TP > 1. On by default; set to `0` to disable. |
-| `MX_OBJ_ENABLED` | `0` | Try NIXL OBJ (S3-over-RDMA straight to GPU) before ModelStreamer for an `s3://` `MX_MODEL_URI`. See [NIXL OBJ](docs/DEPLOYMENT.md#nixl-obj-s3-over-rdma-to-gpu). |
+| `MX_S3_RDMA_ENABLED` | `0` | Try NIXL OBJ (S3-over-RDMA straight to GPU) before ModelStreamer for an `s3://` `MX_MODEL_URI`. See [NIXL OBJ](docs/DEPLOYMENT.md#nixl-obj-s3-over-rdma-to-gpu). |
 | `MX_POOL_REG` | `0` | Register each underlying CUDA allocation once instead of registering every tensor. |
 | `MX_VMM_ARENA` | `0` | Load into a CUDA VMM arena and register the used range once; alternative to `MX_POOL_REG`. |
 | `MX_P2P_SOURCE_SELECTOR` | `random` | Peer ordering policy; set `rendezvous_hash` for deterministic, minimally disruptive selection. |
@@ -299,7 +299,7 @@ Start with the [ModelExpress documentation hub](docs/README.md).
 ## Known Issues
 
 - **GDS loader does not scale with TP** — Each TP rank reads full checkpoint tensors and vLLM shards them afterward, so GDS/disk reads scale with TP degree. This can reduce or reverse expected GDS speedups versus the default mmap-based disk loader; TP-aware range reads are needed for a full fix. See [GDS Reads Full Checkpoint Tensors Under TP](docs/ARCHITECTURE.md#gds-reads-full-checkpoint-tensors-under-tp).
-- **NIXL OBJ loader does not scale with TP** — Like GDS, each TP rank reads full checkpoint tensors over S3-over-RDMA, so object-store reads scale with TP degree. See [NIXL OBJ Reads Full Checkpoint Tensors Under TP](docs/ARCHITECTURE.md#nixl-obj-reads-full-checkpoint-tensors-under-tp).
+- **NIXL OBJ loader does not scale with TP** — Like GDS, each TP rank reads full checkpoint tensors over S3-over-RDMA, so object-store reads scale with TP degree. By default, ModelExpress skips this loader above TP=2; set `MX_S3_RDMA_MAX_TP` to change the limit. See [NIXL OBJ Reads Full Checkpoint Tensors Under TP](docs/ARCHITECTURE.md#nixl-obj-reads-full-checkpoint-tensors-under-tp).
 - **P2P source wedges after a reader is torn down (UCX/InfiniBand)** — Once a reader that pulled from a source is removed, the source can stop serving new readers: their RDMA reads stall to the transfer timeout and fall back to disk, while the source keeps advertising `Ready` and serving inference normally. Loading stays correct, but P2P is effectively lost for that source until the source worker pod is restarted. The cause is NIXL retaining queue-pair state for a peer it holds no record of, so it is not fixable from ModelExpress; tracked as nvbug 6519532. Lower `MX_TRANSFER_TIMEOUT` to bound the stall.
 
 ---

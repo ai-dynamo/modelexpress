@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the shared safetensors header parser."""
+"""Tests for the shared safetensors header parser and shard selection."""
 
 import json
 import struct
@@ -13,7 +13,9 @@ from safetensors.torch import save as st_save
 from modelexpress.safetensors_header import (
     HEADER_LENGTH_BYTES,
     header_length,
+    index_weight_map,
     parse_header,
+    select_shards,
     torch_dtype,
 )
 
@@ -91,3 +93,18 @@ def test_optional_dtypes(name, attr):
     if not hasattr(torch, attr):
         pytest.skip(f"torch has no {attr}")
     assert torch_dtype(name, "t") is getattr(torch, attr)
+
+
+def test_select_shards_prefers_index_then_single_file_then_all():
+    names = ["model.safetensors", "b.safetensors", "a.safetensors", "config.json"]
+    weight_map = {"x": "s2.safetensors", "y": "s1.safetensors", "z": "s2.safetensors"}
+    assert select_shards(names, weight_map) == ["s1.safetensors", "s2.safetensors"]
+    assert select_shards(names, None) == ["model.safetensors"]
+    assert select_shards(names[1:], None) == ["a.safetensors", "b.safetensors"]
+    assert select_shards(["config.json"], None) == []
+
+
+def test_index_weight_map_rejects_empty():
+    assert index_weight_map({"weight_map": {"x": "s.safetensors"}}, "idx") == {"x": "s.safetensors"}
+    with pytest.raises(ValueError, match="Empty weight_map in idx"):
+        index_weight_map({}, "idx")
