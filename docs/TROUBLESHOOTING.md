@@ -12,6 +12,7 @@ Start with the worker's loader decision, then check the dependency used by that 
 | P2P is not attempted | `Eligible loaders` in the worker log |
 | P2P times out or falls back | Source identity, source readiness, and NIXL/UCX logs |
 | ModelStreamer is absent | `MX_MODEL_URI` and the `runai_model_streamer` package |
+| NIXL OBJ is absent or falls back | `MX_S3_RDMA_ENABLED`, an `s3://` `MX_MODEL_URI`, `libcuobjclient.so.1`, and a NIXL build with the accelerated OBJ engine; see [NIXL OBJ troubleshooting](DEPLOYMENT.md#nixl-obj-s3-over-rdma-to-gpu) |
 | S3 loading fails | URI, region, credentials, and object layout inside the worker |
 | Offline worker cannot resolve the model | Model configuration, tokenizer, and other non-weight files |
 | Server does not start | `MX_METADATA_BACKEND` and its required connection settings |
@@ -27,7 +28,7 @@ Trying strategy: rdma
 Trying strategy: model_streamer
 ```
 
-The strategy names are `rdma`, `server-cache`, `instant_tensor`, `model_streamer`, `gds`, and `default`. If a path is absent from `Eligible loaders`, changing retries will not enable it; fix its package, adapter, device, URI, or metadata requirement first. See [Configuration](CONFIGURATION.md#loading-strategy-selection).
+The strategy names are `rdma`, `server-cache`, `instant_tensor`, `s3_rdma`, `model_streamer`, `gds`, and `default`. If a path is absent from `Eligible loaders`, changing retries will not enable it; fix its package, adapter, device, URI, or metadata requirement first. See [Configuration](CONFIGURATION.md#loading-strategy-selection).
 
 ## Server and metadata
 

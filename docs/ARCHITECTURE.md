@@ -143,6 +143,9 @@ ModelExpress/
 │       ├── metrics.py                   # Opt-in Prometheus metrics collector (source-selection group today)
 │       ├── gds_transfer.py             # GPUDirect Storage transfer support
 │       ├── gds_loader.py               # GDS model loader
+│       ├── s3_rdma_transfer.py             # NIXL OBJ (S3-over-RDMA) transfer manager
+│       ├── s3_rdma_loader.py               # S3-over-RDMA safetensors loader (MxS3RdmaLoader)
+│       ├── safetensors_header.py       # Shared safetensors header parser, dtype map, shard selection
 │       ├── adapter.py                  # EngineAdapter contract and strategy errors
 │       ├── vllm_loader.py              # Compatibility shim for engines.vllm.loader
 │       ├── metadata/                   # Metadata clients, publishing, heartbeat, worker manifest service
@@ -163,6 +166,7 @@ ModelExpress/
 │       │   ├── rdma_strategy.py        # RdmaStrategy (P2P GPU transfer via NIXL)
 │       │   ├── server_cache_strategy.py # ServerCacheStrategy (weights from MX Server)
 │       │   ├── instant_tensor_strategy.py # InstantTensorStrategy (fast local safetensors)
+│       │   ├── s3_rdma_strategy.py         # S3RdmaStrategy (S3-over-RDMA to GPU via NIXL OBJ)
 │       │   ├── model_streamer_strategy.py # ModelStreamerStrategy (S3/GCS/Azure/local)
 │       │   ├── gds_strategy.py         # GdsStrategy (GPUDirect Storage)
 │       │   └── default_strategy.py     # DefaultStrategy (engine-native fallback)
@@ -623,15 +627,18 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 |--------|---------|
 | `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `modelexpress` and `mx` loaders with vLLM |
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
-| `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
+| `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS, NIXL OBJ) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
+| `s3_rdma_transfer.py` | `S3RdmaTransferManager` - private NIXL agent with the OBJ backend's generic accelerated engine (`x-amz-rdma-token`); posts one-descriptor ranged reads from objects into registered device slots, drains before freeing, and quarantines memory whose reads never finish |
+| `s3_rdma_loader.py` | `MxS3RdmaLoader` - resolves an `s3://` checkpoint over HTTP (listing, index, headers), plans object-local windows, streams them over S3-over-RDMA through a fixed pool of staging slots, and copies each window device-to-device into fresh per-tensor allocations with a tail-canary integrity check |
+| `safetensors_header.py` | Safetensors header parsing, dtype map, and checkpoint shard selection shared by the GDS and S3-over-RDMA loaders |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
 | `plugins.py` | Discovery, validation, and selection of external loading strategy classes |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection, and engine-agnostic cache-artifact transfer |
-| `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ServerCacheStrategy` (weights streamed from MX Server), `InstantTensorStrategy` (fast local safetensors), `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
+| `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ServerCacheStrategy` (weights streamed from MX Server), `InstantTensorStrategy` (fast local safetensors), `S3RdmaStrategy` (S3-over-RDMA to GPU via NIXL OBJ), `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
 | `model_client.py` | `ModelCacheClient` - `ModelService` RPCs plus stream validation for server-cached models |
 | `model_snapshot.py` | Hugging Face cache layout: path validation, atomic snapshot publication, revision refs, metadata inventories |
 | `model_prefetch.py` | Pre-engine metadata prefetch and repo-id resolution for server-backed loading |
@@ -865,10 +872,11 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 |---|---|---|---|
 | p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank` and runtime `accelerator`, order the survivors via the configured `SourceSelector` (`MX_P2P_SOURCE_SELECTOR`: `random` default, `rendezvous_hash`, `load_aware`, or `topology_aware`), then try candidates (max 3). Filtering before the retry slice prevents incompatible sources from exhausting the retry budget; a post-`GetMetadata` accelerator check remains as defense-in-depth. Before preparing target tensors, P2P sources must serve a manifest for the selected runtime `worker_id`; generation mismatches and transfer failures retry the next candidate, reinitializing the target first when it may have been mutated. |
 | p1 | `ServerCacheStrategy` | `MODEL_EXPRESS_NO_SHARED_STORAGE` enabled + server address configured + adapter implements `load_via_native` | Stream the model's weight files from ModelExpress Server into the snapshot the engine already resolved, then hand off to the engine's native loader. The cold-miss path for workers with no route to Hugging Face: the server downloads and caches the model once, and every later worker is served from that cache. Non-weight files arrive earlier, before the engine starts — see [Server-Backed Model Cache](#server-backed-model-cache). Falls through on failure. |
-| p2 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + no object-store `MX_MODEL_URI` + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves and (if needed) downloads the weight files. An `s3://`, `gs://`, or `az://` `MX_MODEL_URI` skips this strategy and proceeds to ModelStreamer. Falls through on other failures. |
-| p3 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
-| p4 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
-| p5 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
+| p2 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + no object-store `MX_MODEL_URI` + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves and (if needed) downloads the weight files. An `s3://`, `gs://`, or `az://` `MX_MODEL_URI` skips this strategy and proceeds to NIXL OBJ or ModelStreamer. Falls through on other failures. |
+| p3 | `S3RdmaStrategy` | `MX_S3_RDMA_ENABLED` + `s3://` `MX_MODEL_URI` + TP size <= `MX_S3_RDMA_MAX_TP` (default 2) + adapter implements `apply_weight_iter` + accelerator supports OBJ (CUDA) + `MX_VMM_ARENA` off + NIXL and `libcuobjclient` present + (multi-rank only) adapter implements `all_gather_state` | Read safetensors ranges from an S3-over-RDMA endpoint (MinIO AIStor) straight into GPU staging slots via NIXL OBJ, then copy into per-tensor allocations for `apply_weight_iter`. Ranks agree after prepare, stream, and post-processing so all fall through together. Reads full checkpoint tensors on every TP rank — see [NIXL OBJ Reads Full Checkpoint Tensors Under TP](#nixl-obj-reads-full-checkpoint-tensors-under-tp). |
+| p4 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
+| p5 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
+| p6 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
 
 When a vLLM loading attempt fails after mutating the model, retry cleanup
 unregisters its layers and clears the old model's tensor graph before allocating
@@ -884,7 +892,7 @@ See [ModelExpress Benchmarks](BENCHMARKS.md) for measured loading-path, NIXL reg
 
 ### External Loading Strategies
 
-`plugins.py` loads external `LoadStrategy` implementations for the shared `INFERENCE` chain. `MX_LOAD_PLUGIN` selects one plugin, inserted immediately before the built-in strategy named by `MX_LOAD_PLUGIN_BEFORE`. The default is `server-cache`, placing the plugin after RDMA. Unknown target names fail before discovery or loading. The six built-in strategies retain their relative order. RL and SGLang's `transfer_engine` path are unchanged. Unset or empty `MX_LOAD_PLUGIN` skips discovery and external imports and ignores `MX_LOAD_PLUGIN_BEFORE`.
+`plugins.py` loads external `LoadStrategy` implementations for the shared `INFERENCE` chain. `MX_LOAD_PLUGIN` selects one plugin, inserted immediately before the built-in strategy named by `MX_LOAD_PLUGIN_BEFORE`. The default is `server-cache`, placing the plugin after RDMA. Unknown target names fail before discovery or loading. The seven built-in strategies retain their relative order. RL and SGLang's `transfer_engine` path are unchanged. Unset or empty `MX_LOAD_PLUGIN` skips discovery and external imports and ignores `MX_LOAD_PLUGIN_BEFORE`.
 
 Entries are named `mx_plugin_<name>.py` and export a no-argument `register_plugin()` returning a concrete, no-argument `LoadStrategy` class with the matching `name`. The registry stores external classes only. Discovery validates entries and duplicate names; the inference chain separately rejects built-in name collisions before selecting a plugin. Unknown selections also fail before loading. Modules are cached per worker, while each model load creates a new instance of the selected class. Unselected classes are not instantiated.
 
@@ -1058,6 +1066,30 @@ while agent.check_xfer_state(handle) not in ("DONE", "SUCCESS"):
 agent.release_xfer_handle(handle)
 ```
 
+### NIXL OBJ (S3-over-RDMA)
+
+`S3RdmaStrategy` uses a second, short-lived NIXL agent per GPU with no default backend and an OBJ backend created with `accelerated=true` (NIXL's generic accelerated engine). Object keys are registered as `OBJ` regions `(0, size, devId, key)`; staging slots are registered as `VRAM` regions, one per slot. Each window is one READ request with a single descriptor pair, so NIXL turns it into one signed ranged GET with `x-amz-rdma-token`, and the server RDMA-writes into the slot. NIXL splits a window larger than 4 GiB − 64 KiB, the most one cuObject token covers, into several ranged GETs.
+
+```mermaid
+sequenceDiagram
+    participant L as MxS3RdmaLoader
+    participant H as boto3 (HTTP)
+    participant N as NIXL OBJ agent
+    participant S as AIStor
+    L->>N: create OBJ backend (accelerated)
+    L->>H: list prefix, GET index.json, ranged GET headers and window tails
+    L->>N: register objects and slots
+    loop each window, up to MX_S3_RDMA_INFLIGHT in flight
+        L->>N: READ (slot, object, offset, length)
+        N->>S: GET Range + x-amz-rdma-token
+        S-->>N: RDMA WRITE into slot, x-amz-rdma-reply
+        L->>L: device copy into tensors, sync, verify tail, re-post slot
+    end
+    L->>H: re-list objects (ETag check)
+```
+
+Yielded tensors are fresh allocations, never views of a slot, because engines may hold references across iterations while slots are reused. As an end-to-end check of the bytes that actually landed in device memory (independent of the transfer counts NIXL and the server report), each slot's tail is poisoned before a read and compared against an HTTP-fetched canary afterward. Requests that cannot be drained keep their agent and slots referenced for the life of the process instead of freeing memory that RDMA might still write.
+
 ## FP8 Model Handling (DeepSeek-V3)
 
 vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
@@ -1091,7 +1123,7 @@ graph TD
 
 ### Flow
 
-1. **Source loads**: Loads weights through the fixed strategy chain (server cache, InstantTensor, ModelStreamer, GDS, or the native loader when no P2P source is available), or receives them over P2P, then runs `process_weights_after_loading()`
+1. **Source loads**: Loads weights through the fixed strategy chain (server cache, InstantTensor, NIXL OBJ, ModelStreamer, GDS, or the native loader when no P2P source is available), or receives them over P2P, then runs `process_weights_after_loading()`
 2. **Source publishes**: Registers tensors with NIXL, or prepares a sealed cache artifact bundle, then a `PublisherThread` calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). `WorkerMetadata.accelerator` records runtime accelerator family for compatibility filtering; it is not part of `SourceIdentity` or the source-id hash. In P2P mode (`MX_P2P_METADATA=1`, or auto-forced on by decentralized backends like `k8s-service`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor manifests or artifact manifest/chunk serving.
 3. **Publisher heartbeats**: `PublisherThread` sends `UpdateStatus(READY)` every 30s after publication succeeds, refreshing `updated_at`
 4. **Target discovers**: Calls `ListSources(identity, status=READY)`, which returns only READY workers whose `updated_at` is still within `MX_HEARTBEAT_TIMEOUT_SECS`, then filters by `worker_rank` and compatible runtime `accelerator`
@@ -1183,7 +1215,13 @@ DeepSeek-V3 takes ~40 minutes to warm up (loading + DeepGemm + CUDA graphs). Tar
 
 So with TP > 1, every rank reads the entire checkpoint tensor through GDS and keeps only its local shard: GDS/disk bytes read scale with the TP degree instead of staying constant, and the path can regress as TP grows while the default disk loader leans on mmap and lazy page faults. End-to-end numbers per TP degree are still to be measured.
 
+The same applies to `S3RdmaStrategy`: see [NIXL OBJ Reads Full Checkpoint Tensors Under TP](#nixl-obj-reads-full-checkpoint-tensors-under-tp).
+
 A fix needs a TP-aware load contract, or a vLLM-specific path that plans file ranges from parameter metadata and reads directly into the final param buffers; returning rank-local tensors through the same `load_weights()` path would just be sliced again. Optimizing only simple contiguous column-parallel shards is partial: the large column-parallel params (QKV, gate_up) are fused/packed with multiple `narrow()` ranges and the row-parallel params (o_proj, down_proj) are strided, so most bytes stay on the full-tensor path.
+
+### NIXL OBJ Reads Full Checkpoint Tensors Under TP
+
+Like GDS, `MxS3RdmaLoader` reads every checkpoint tensor in full on every rank and relies on the engine's `load_weights()` to slice for TP, so object-store bytes read grow with the TP degree and share one node's NICs. Expert-parallel, pipeline-parallel, and draft-model loads also read every tensor. The window planner accepts a tensor filter so a rank-aware selection (or a read-once mode where each rank reads a disjoint subset and broadcasts over NVLink) can be added without changing the transfer path.
 
 ## Performance
 

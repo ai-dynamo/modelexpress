@@ -87,6 +87,14 @@ if TYPE_CHECKING:
     MX_GDS_MAX_CHUNK_KB: Optional[str]
     MX_GDS_THREADS: int
     MX_GDS_TIMEOUT: float
+    # NIXL OBJ (S3-over-RDMA to GPU)
+    MX_S3_RDMA_ENABLED: bool
+    MX_S3_RDMA_WINDOW_MB: int
+    MX_S3_RDMA_INFLIGHT: int
+    MX_S3_RDMA_THREADS: int
+    MX_S3_RDMA_TIMEOUT: float
+    MX_S3_RDMA_VERIFY: str
+    MX_S3_RDMA_MAX_TP: int
     # Model streamer
     MX_MS_DISTRIBUTED: bool
     # InstantTensor loader
@@ -304,6 +312,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_GDS_MAX_CHUNK_KB": lambda: os.environ.get("MX_GDS_MAX_CHUNK_KB"),
     "MX_GDS_THREADS": lambda: _env_int("MX_GDS_THREADS", 8),
     "MX_GDS_TIMEOUT": lambda: _env_float("MX_GDS_TIMEOUT", 120.0),
+    # ── NIXL OBJ (S3-over-RDMA to GPU) ─────────────────────────────────────
+    # Opt-in: requires a NIXL build with the generic accelerated OBJ engine and
+    # an S3-over-RDMA endpoint (MinIO AIStor). Range checks live in
+    # s3_rdma_loader.S3RdmaLoadConfig. MX_S3_RDMA_THREADS=0 means "same as inflight".
+    "MX_S3_RDMA_ENABLED": lambda: _env_bool("MX_S3_RDMA_ENABLED", False),
+    "MX_S3_RDMA_WINDOW_MB": lambda: _env_int("MX_S3_RDMA_WINDOW_MB", 256),
+    "MX_S3_RDMA_INFLIGHT": lambda: _env_int("MX_S3_RDMA_INFLIGHT", 8),
+    "MX_S3_RDMA_THREADS": lambda: _env_int("MX_S3_RDMA_THREADS", 0),
+    "MX_S3_RDMA_TIMEOUT": lambda: _env_positive_float("MX_S3_RDMA_TIMEOUT", 120.0),
+    "MX_S3_RDMA_VERIFY": lambda: os.environ.get("MX_S3_RDMA_VERIFY", "tail").strip().lower(),
+    # Every TP rank reads the full checkpoint, so larger TP degrees are skipped
+    # in favor of ModelStreamer. 0 removes the limit.
+    "MX_S3_RDMA_MAX_TP": lambda: max(0, _env_int("MX_S3_RDMA_MAX_TP", 2)),
     # ── Model streamer ─────────────────────────────────────────────────────
     "MX_MS_DISTRIBUTED": lambda: (
         os.environ.get("MX_MS_DISTRIBUTED", "1").lower() in ("1", "true")
