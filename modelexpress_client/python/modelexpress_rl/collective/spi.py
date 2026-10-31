@@ -93,7 +93,21 @@ class Publisher(Protocol):
         ...
 
     def start_new_round(self, version: str) -> None:
-        """Prepare for one refit. May stage weights into a proxy buffer."""
+        """Prepare for one refit. May stage weights into a proxy buffer.
+
+        Every buffer ``local_params()`` names must hold its final values by
+        the time this returns. The reshard reads a bare device pointer with no
+        stream handshake, so nothing else orders the transfer against the
+        computation that produced the weights. A framework that computes
+        asynchronously -- JAX enqueues on its own stream, and
+        ``unsafe_buffer_pointer()`` returns without synchronizing -- must
+        synchronize here, e.g. ``jax.block_until_ready(arrays)``. The race is
+        measured, not hypothetical: a consumer reading those bytes while the
+        producing computation is in flight observes intermediate values, in
+        every trial, and nothing anywhere reports an error. One synchronize
+        over the whole batch per round is negligible beside the transfer;
+        one per parameter is not.
+        """
         ...
 
     def cleanup(self) -> None: ...

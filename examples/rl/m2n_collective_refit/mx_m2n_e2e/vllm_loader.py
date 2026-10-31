@@ -241,6 +241,7 @@ class MxRefitWorker:
         model_name: str,
         run_id: str,
         dst_layout: str = "replicate",
+        src_layout: str = "dim0",
     ) -> dict[str, Any]:
         """Build the plan, construct the client, and join the refit group."""
         import grpc
@@ -254,6 +255,7 @@ class MxRefitWorker:
             trainers=trainers,
             generators=generators,
             dst_layout=dst_layout,
+            src_layout=src_layout,
         )
         loader = VllmLoader(
             self.model_runner.model,

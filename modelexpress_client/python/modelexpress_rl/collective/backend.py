@@ -392,7 +392,7 @@ def _reshard(
     The argument shape is pinned to the one NeMo RL's ``xferdtensor`` uses, so
     an MX-brokered deployment and a NeMo-RL-native one issue the identical
     call: tensors and communicator positional, meshes and placements by
-    keyword, meshes nested to their shape, placements as real DTensor objects,
+    keyword, meshes nested to their shape, placements as DTensor objects wherever torch is installed,
     and ``stream`` passed as a raw handle only when there is one. The M2N
     ``handle`` is passed by keyword and always, so no call ever lands on the
     process-wide default handle that nothing finalizes.
@@ -402,9 +402,9 @@ def _reshard(
 
     kwargs: dict[str, Any] = {
         "src_mesh": entry.src_mesh.nested(),
-        "src_placements": [p.to_dtensor() for p in entry.src_placements],
+        "src_placements": [p.to_wire() for p in entry.src_placements],
         "dst_mesh": entry.dst_mesh.nested(),
-        "dst_placements": [p.to_dtensor() for p in entry.dst_placements],
+        "dst_placements": [p.to_wire() for p in entry.dst_placements],
         "handle": handle,
     }
     stream = comm.stream
