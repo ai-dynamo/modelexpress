@@ -66,6 +66,18 @@ def test_factory_unknown_backend_raises(monkeypatch):
         create_metadata_client()
 
 
+@pytest.mark.parametrize("pattern,expected", [
+    ("workers", "workers:16558"),
+    ("worker-{rank}:6555", "worker-3:16555"),
+])
+def test_factory_resolves_draft_service_port(monkeypatch, pattern, expected):
+    monkeypatch.setenv("MX_METADATA_BACKEND", "k8s-service")
+    monkeypatch.setenv("MX_K8S_SERVICE_PATTERN", pattern)
+    monkeypatch.setenv("MX_WORKER_GRPC_PORT", "6555")
+    client = create_metadata_client(worker_rank=3, port_offset=10000)
+    assert client._resolve_endpoint() == expected
+
+
 def test_k8s_worker_rpc_retry_policy_uses_configured_values():
     client = MxK8sServiceClient(max_retries=3, backoff_seconds=0.25)
 

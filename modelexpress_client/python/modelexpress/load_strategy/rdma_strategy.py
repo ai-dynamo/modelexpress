@@ -96,9 +96,12 @@ def _transfer_timeout_seconds() -> float:
     return configured
 
 
-def _is_draft_pass(ctx: LoadContext) -> bool:
+def _is_shared_draft_pass(ctx: LoadContext) -> bool:
     # getattr: RL and test callers drive these paths with duck-typed contexts.
-    return getattr(ctx, "p2p_role", "main") == "draft"
+    return (
+        getattr(ctx, "p2p_role", "main") == "draft"
+        and not getattr(ctx, "publication_namespace", "")
+    )
 
 
 def _reload_restores_loaded_weights(ctx: LoadContext) -> bool:
@@ -177,7 +180,7 @@ class RdmaStrategy(LoadStrategy):
     def rollback(self, ctx: LoadContext) -> None:
         """Clean up NIXL state from a failed RDMA target attempt."""
         if ctx.nixl_manager is not None:
-            if _is_draft_pass(ctx) and ctx.nixl_manager is ctx.shared_nixl_manager:
+            if _is_shared_draft_pass(ctx) and ctx.nixl_manager is ctx.shared_nixl_manager:
                 # The agent belongs to the main load, which keeps serving from
                 # it. Release only the draft's own registrations.
                 ctx.nixl_manager.deregister_tensors(ctx.tensors)
@@ -237,7 +240,7 @@ class RdmaStrategy(LoadStrategy):
         the model, the adapter first replaces the model with a fresh instance.
         """
         result = _as_load_result(result)
-        if _is_draft_pass(ctx) and ctx.shared_nixl_manager is None:
+        if _is_shared_draft_pass(ctx) and ctx.shared_nixl_manager is None:
             logger.info(
                 f"[Worker {ctx.global_rank}] Speculative draft pass has no "
                 "main-load NIXL agent to share, skipping RDMA"
@@ -286,7 +289,7 @@ class RdmaStrategy(LoadStrategy):
             if not self._accelerator_compatible(ctx, source_worker, worker_id):
                 continue
 
-            if _is_draft_pass(ctx) and not self._may_serve_draft(ctx, source_worker):
+            if _is_shared_draft_pass(ctx) and not self._may_serve_draft(ctx, source_worker):
                 logger.info(
                     f"[Worker {ctx.global_rank}] Skipping source worker "
                     f"{worker_id}: its manifest has no speculative draft tensors"
@@ -556,14 +559,16 @@ class RdmaStrategy(LoadStrategy):
         ctx: LoadContext,
         source_tensors: list[TensorDescriptor],
     ) -> list[TensorDescriptor]:
-        """Restrict a source manifest to this load's namespace.
+        """Keep independent catalogs intact; scope legacy shared publications.
 
-        One publication carries the main load's tensors and, namespaced
-        under DRAFT_TENSOR_PREFIX, the speculative draft's. The main pass
-        must not see draft entries (they would break exact-match on
-        heterogeneous transfers) and the draft pass takes only its own.
+        An independent session uses its complete source catalog. A legacy
+        shared publication carries both main and prefixed draft tensors:
+        the main pass excludes draft entries, and a draft takes its own
+        prefix. This also keeps exact matching within the selected role.
         """
-        if not _is_draft_pass(ctx):
+        if getattr(ctx, "publication_namespace", ""):
+            return source_tensors
+        if not _is_shared_draft_pass(ctx):
             return [t for t in source_tensors if not is_draft_tensor_name(t.name)]
         scoped = [
             t for t in source_tensors
@@ -779,7 +784,7 @@ class RdmaStrategy(LoadStrategy):
             source_tensors = self._scope_source_tensors(ctx, source_tensors)
             if not ctx.is_reload:
                 adapter_tensors = source_tensors
-                if _is_draft_pass(ctx):
+                if _is_shared_draft_pass(ctx):
                     adapter_tensors = [
                         replace(t, name=t.name.removeprefix(ctx.draft_tensor_namespace))
                         for t in source_tensors
@@ -787,7 +792,7 @@ class RdmaStrategy(LoadStrategy):
                 ctx.adapter.prepare_rdma_target_from_manifest(result, adapter_tensors)
             with selection_metrics.time_source_attempt_phase(policy, "register"):
                 register_tensors(result, ctx)
-            if _is_draft_pass(ctx):
+            if _is_shared_draft_pass(ctx):
                 # Registration refreshes ctx.tensors with newly prepared buffers.
                 source_tensors = self._scope_source_tensors(ctx, source_tensors)
 
@@ -883,7 +888,7 @@ class RdmaStrategy(LoadStrategy):
                             # The shared agent's catalog also holds the main
                             # load's tensors; match only the draft's.
                             destination_tensors=(
-                                ctx.tensors if _is_draft_pass(ctx) else None
+                                ctx.tensors if _is_shared_draft_pass(ctx) else None
                             ),
                         )
                 except Exception as e:

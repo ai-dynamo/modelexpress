@@ -56,7 +56,11 @@ class SglangAdapter(EngineAdapter):
     def build_identity(self) -> p2p_pb2.SourceIdentity:
         return build_sglang_source_identity(
             model_config=self.model_config,
+            load_config=self.load_config,
         )
+
+    def uses_main_checkpoint(self) -> bool:
+        return _draft_uses_main_checkpoint(self.model_config)
 
     def get_worker_rank(self) -> int:
         return _get_sglang_worker_rank(self.load_config)
@@ -121,14 +125,6 @@ class SglangAdapter(EngineAdapter):
             )
             if selector is not None:
                 tensors = selector.publishable(result.model, tensors)
-            else:
-                prefixes = _target_shared_draft_prefixes(result.model)
-                if prefixes:
-                    tensors = {
-                        name: tensor
-                        for name, tensor in tensors.items()
-                        if not name.startswith(prefixes)
-                    }
         return tensors
 
     def requires_exact_tensor_catalog(self) -> bool:
@@ -365,31 +361,48 @@ def is_sglang_draft_model(model_config: ModelConfig) -> bool:
     return bool(getattr(model_config, "is_draft_model", False))
 
 
-def _target_shared_draft_prefixes(model) -> tuple[str, ...]:
-    """Tensor-name prefixes SGLang swaps for the target's after an MTP draft loads.
-
-    Same-checkpoint drafts (MTP / NextN) go through the EAGLE worker's
-    non-EAGLE3 branch, which calls ``set_embed_and_head(embed, head)``: the
-    draft's own ``model.embed_tokens.weight`` and ``lm_head.weight`` are
-    deleted and replaced with the target's (the embedding only on a single
-    pipeline stage, where the target provides it). Those draft copies are
-    discarded, so they are neither served nor received over P2P; holding them
-    for NIXL would pin memory SGLang frees right after the load.
-    """
-    if not hasattr(model, "set_embed_and_head"):
-        return ()
-    prefixes = ["lm_head."]
-    if _get_parallel_size("get_pipeline_model_parallel_world_size") == 1:
-        prefixes.insert(0, "model.embed_tokens.")
-    return tuple(prefixes)
+def _draft_model_index(load_config: LoadConfig | None) -> int:
+    index = getattr(load_config, "draft_model_idx", None)
+    if index is None:
+        index = 0
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError("draft_model_idx must be a non-negative integer")
+    return index
 
 
-def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIdentity:
+def _draft_port_offset(load_config: LoadConfig, index: int, device_id: int) -> int:
+    if getattr(load_config, "modelexpress_transport", "nixl") != "nixl":
+        return 0
+
+    stride = envs.MX_DRAFT_PORT_OFFSET
+    device_count = max(device_id + 1, torch.cuda.device_count())
+    if stride <= abs(envs.MX_METADATA_PORT - envs.MX_WORKER_GRPC_PORT) + device_count:
+        raise ValueError("MX_DRAFT_PORT_OFFSET must separate the per-model port ranges")
+    offset = stride * (index + 1)
+    for base in (envs.MX_METADATA_PORT, envs.MX_WORKER_GRPC_PORT):
+        if not 0 < base + offset + device_id < 65536:
+            raise ValueError(
+                "Draft metadata port is outside 1..65535; adjust MX_DRAFT_PORT_OFFSET"
+            )
+    return offset
+
+
+def build_sglang_source_identity(
+    model_config: ModelConfig,
+    load_config: LoadConfig | None = None,
+) -> p2p_pb2.SourceIdentity:
     """Build a ModelExpress SourceIdentity from SGLang model state."""
     try:
         mx_version = pkg_version("modelexpress")
     except Exception:
         mx_version = "0.0.0"
+
+    extra_parameters = {}
+    if is_sglang_draft_model(model_config):
+        extra_parameters = {
+            "model_role": "draft",
+            "draft_model_idx": str(_draft_model_index(load_config)),
+        }
 
     return p2p_pb2.SourceIdentity(
         mx_version=mx_version,
@@ -408,6 +421,7 @@ def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIde
         dtype=_get_dtype(model_config),
         quantization=_get_quantization(model_config),
         revision=_get_revision(model_config),
+        extra_parameters=extra_parameters,
     )
 
 
@@ -431,10 +445,37 @@ def _get_quantization(model_config: ModelConfig) -> str:
 
 
 def _get_revision(model_config: ModelConfig) -> str:
-    override = envs.MX_MODEL_REVISION
+    if is_sglang_draft_model(model_config):
+        override = envs.MX_DRAFT_MODEL_REVISION
+        if not override and _draft_uses_main_checkpoint(model_config):
+            override = envs.MX_MODEL_REVISION
+    else:
+        override = envs.MX_MODEL_REVISION
     if override:
         return override
     return str(getattr(model_config, "revision", "") or "")
+
+
+def _draft_uses_main_checkpoint(model_config: ModelConfig) -> bool:
+    """Compare resolved checkpoints and URI overrides without a main loader."""
+    if not is_sglang_draft_model(model_config):
+        return False
+    try:
+        from sglang.srt.runtime_context import get_model, get_spec
+
+        main, spec = get_model(), get_spec()
+    except (ImportError, ValueError):
+        return False
+
+    draft_path = spec.speculative_draft_model_path or main.model_path
+    draft_revision = spec.speculative_draft_model_revision or main.revision
+    main_uri = envs.MX_MODEL_URI or main.model_path
+    draft_uri = envs.MX_DRAFT_MODEL_URI or main_uri
+    return (
+        draft_path == main.model_path
+        and draft_revision == main.revision
+        and draft_uri == main_uri
+    )
 
 
 def _get_sglang_parallel_context() -> ParallelContext | None:
@@ -494,6 +535,11 @@ def build_sglang_load_context(
     worker_rank = adapter.get_worker_rank()
     global_rank = adapter.get_global_rank()
     server_url = getattr(load_config, "modelexpress_url", None)
+    device_id = adapter.get_device_id()
+    is_draft = is_sglang_draft_model(model_config)
+    index = _draft_model_index(load_config) if is_draft else 0
+    p2p_enabled = not (is_draft and envs.MX_DISABLE_DRAFT_P2P)
+    port_offset = _draft_port_offset(load_config, index, device_id) if is_draft and p2p_enabled else 0
     return LoadContext(
         model_config=model_config,
         load_config=load_config,
@@ -501,11 +547,16 @@ def build_sglang_load_context(
         global_rank=global_rank,
         worker_rank=worker_rank,
         local_rank=adapter.get_local_rank(),
-        device_id=adapter.get_device_id(),
+        device_id=device_id,
+        p2p_role="draft" if is_draft else "main",
+        publication_namespace=f"sglang-draft-{index}" if is_draft else "",
+        port_offset=port_offset,
+        p2p_enabled=p2p_enabled,
         identity=adapter.build_identity(),
         mx_client=create_metadata_client(
             worker_rank=worker_rank,
             server_url=server_url,
+            **({"port_offset": port_offset} if port_offset else {}),
         ),
         worker_id=uuid.uuid4().hex[:8],
         adapter=adapter,

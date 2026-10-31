@@ -7,11 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from modelexpress import p2p_pb2
 from modelexpress.engines.sglang.draft_weights import (
     Qwen3_5ForCausalLMMTPWeightRule,
     Qwen3_5MoeForCausalLMWeightRule,
-    draft_tensor_namespace,
     draft_weight_adapter_for,
 )
 
@@ -55,7 +53,6 @@ def test_qwen35_draft_rule_skips_rotary_frequency_like_sglang():
 
 def test_selection_contract_covers_qwen_roles_and_shared_draft_storage():
     selector = Qwen3_5ForCausalLMMTPWeightRule()
-    main = draft_weight_adapter_for("Qwen3_5ForCausalLM", role="main")
     embed = torch.nn.Parameter(torch.ones(2))
     own = torch.nn.Parameter(torch.ones(2))
 
@@ -63,7 +60,6 @@ def test_selection_contract_covers_qwen_roles_and_shared_draft_storage():
         def get_embed_and_head(self):
             return embed, embed
 
-    assert selector.compatible_main(main)
     assert selector.covers("mtp.fc.weight", "draft")
     assert not selector.covers("mtp.fc.weight", "main")
     assert selector.publishable(Draft(), {"embed": embed, "layer": own}) == {
@@ -100,7 +96,7 @@ def test_nextn_draft_matches_sglang_prefix_and_unconditional_skips():
     assert not selector.covers("model.layers.61.shared_head.head.weight", "draft")
 
 
-def test_deepseek_v4_dspark_draft_pairs_with_main_and_reads_three_stages():
+def test_deepseek_v4_dspark_draft_reads_three_stages():
     model = SimpleNamespace(
         config=SimpleNamespace(
             num_hidden_layers=43,
@@ -114,7 +110,6 @@ def test_deepseek_v4_dspark_draft_pairs_with_main_and_reads_three_stages():
     )
 
     assert draft is not None
-    assert draft.compatible_main(main)
     for stage in range(3):
         weight = f"mtp.{stage}.ffn.experts.0.w1.weight"
         assert draft.covers(weight, "draft")
@@ -232,7 +227,7 @@ def test_unknown_model_has_no_draft_weight_adapter():
         ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"),
     ],
 )
-def test_latest_sglang_two_pass_mtp_model_pairs_have_specific_rules(
+def test_sglang_model_classes_have_role_specific_selectors(
     main_class, draft_class
 ):
     model = SimpleNamespace(
@@ -245,7 +240,6 @@ def test_latest_sglang_two_pass_mtp_model_pairs_have_specific_rules(
 
     assert main is not None, main_class
     assert draft is not None, draft_class
-    assert draft.compatible_main(main), (main_class, draft_class)
 
 
 def test_longcat_main_and_draft_follow_distinct_mtp_prefixes():
@@ -323,7 +317,6 @@ def test_nextn_selects_only_its_configured_extra_layer(main_class, draft_class, 
     draft = draft_weight_adapter_for(draft_class, role="draft", model=model)
 
     assert main is not None and draft is not None
-    assert draft.compatible_main(main)
     own = f"model.layers.{layer}.self_attn.q_proj.weight"
     assert main.covers(own, "main") is False
     assert draft.covers(own, "draft") is True
@@ -366,38 +359,6 @@ def test_nextn_rejects_missing_or_unsupported_checkpoint_layout():
     )
 
 
-def test_nextn_does_not_pair_deepseek_and_glm_manifests():
-    model = SimpleNamespace(
-        config=SimpleNamespace(num_hidden_layers=61, num_nextn_predict_layers=1)
-    )
-    deepseek = draft_weight_adapter_for(
-        "DeepseekV3ForCausalLM", role="main", model=model
-    )
-    glm = draft_weight_adapter_for(
-        "GlmMoeDsaForCausalLMNextN", role="draft", model=model
-    )
-    assert not glm.compatible_main(deepseek)
-
-
-def test_nextn_rejects_a_different_extra_layer_for_the_same_model_pair():
-    main = draft_weight_adapter_for(
-        "DeepseekV3ForCausalLM",
-        role="main",
-        model=SimpleNamespace(
-            config=SimpleNamespace(num_hidden_layers=61, num_nextn_predict_layers=1)
-        ),
-    )
-    draft = draft_weight_adapter_for(
-        "DeepseekV3ForCausalLMNextN",
-        role="draft",
-        model=SimpleNamespace(
-            config=SimpleNamespace(num_hidden_layers=62, num_nextn_predict_layers=1)
-        ),
-    )
-
-    assert not draft.compatible_main(main)
-
-
 def test_nextn_draft_excludes_target_shared_embed_and_head_storage():
     config = SimpleNamespace(num_hidden_layers=78, num_nextn_predict_layers=1)
     embed = torch.nn.Parameter(torch.arange(4, dtype=torch.float32))
@@ -424,86 +385,3 @@ def test_nextn_draft_excludes_target_shared_embed_and_head_storage():
             "decoder": own,
         },
     ) == {"decoder": own}
-
-
-def test_draft_namespace_changes_with_revision_or_sglang_version():
-    identity = p2p_pb2.SourceIdentity(model_name="org/qwen", revision="rev-a")
-    main = draft_weight_adapter_for("Qwen3_5ForCausalLM", role="main")
-    selector = Qwen3_5ForCausalLMMTPWeightRule()
-    one = draft_tensor_namespace(
-        identity, main, selector, "Qwen3_5ForCausalLMMTP", "0.5.16", "s3://bucket/qwen"
-    )
-    assert one.startswith("mx_draft::") and one.endswith("::")
-    identity.revision = "rev-b"
-    assert (
-        draft_tensor_namespace(
-            identity,
-            main,
-            selector,
-            "Qwen3_5ForCausalLMMTP",
-            "0.5.16",
-            "s3://bucket/qwen",
-        )
-        != one
-    )
-    identity.revision = "rev-a"
-    assert (
-        draft_tensor_namespace(
-            identity,
-            main,
-            selector,
-            "Qwen3_5ForCausalLMMTP",
-            "0.5.17",
-            "s3://bucket/qwen",
-        )
-        != one
-    )
-
-
-def test_draft_namespace_requires_explicit_revision_and_engine_version():
-    identity = p2p_pb2.SourceIdentity(model_name="org/qwen")
-    main = draft_weight_adapter_for("Qwen3_5ForCausalLM", role="main")
-    selector = Qwen3_5ForCausalLMMTPWeightRule()
-    assert (
-        draft_tensor_namespace(
-            identity,
-            main,
-            selector,
-            "Qwen3_5ForCausalLMMTP",
-            "0.5.16",
-            "s3://bucket/qwen",
-        )
-        is None
-    )
-    identity.revision = "rev-a"
-    assert (
-        draft_tensor_namespace(
-            identity, main, selector, "Qwen3_5ForCausalLMMTP", "", "s3://bucket/qwen"
-        )
-        is None
-    )
-
-
-def test_draft_namespace_distinguishes_exact_main_model_classes():
-    identity = p2p_pb2.SourceIdentity(model_name="org/qwen", revision="rev-a")
-    text_main = draft_weight_adapter_for("Qwen3_5ForCausalLM", role="main")
-    vision_main = draft_weight_adapter_for(
-        "Qwen3_5ForConditionalGeneration", role="main"
-    )
-    draft = Qwen3_5ForCausalLMMTPWeightRule()
-
-    assert draft_tensor_namespace(
-        identity,
-        text_main,
-        draft,
-        "Qwen3_5ForCausalLMMTP",
-        "0.5.16",
-        "s3://bucket/qwen",
-    ) != draft_tensor_namespace(
-        identity,
-        vision_main,
-        draft,
-        "Qwen3_5ForCausalLMMTP",
-        "0.5.16",
-        "s3://bucket/qwen",
-    )

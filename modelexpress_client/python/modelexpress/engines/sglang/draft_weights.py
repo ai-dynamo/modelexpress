@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 from dataclasses import dataclass
 from typing import ClassVar, Protocol
@@ -15,11 +13,10 @@ import torch
 
 
 class DraftSelection(Protocol):
-    """Only the decisions needed after exact model-class recognition."""
+    """Optional checkpoint filtering and known shared-storage behavior."""
 
     def covers(self, name: str, role: str) -> bool: ...
 
-    def compatible_main(self, main: DraftSelection) -> bool: ...
 
     def publishable(
         self, model: torch.nn.Module, tensors: dict[str, torch.Tensor]
@@ -35,20 +32,12 @@ class _SharedDraftTensors:
 
 class _SglangModelWeightRule(_SharedDraftTensors):
     role: ClassVar[str]
-    compatible_main_types: ClassVar[tuple[type[_SglangModelWeightRule], ...]] = ()
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         raise NotImplementedError
 
     def covers(self, name: str, role: str) -> bool:
         return role == self.role and self.should_read_checkpoint_tensor(name)
-
-    def compatible_main(self, main: DraftSelection) -> bool:
-        return (
-            self.role == "draft"
-            and type(main) in self.compatible_main_types
-            and getattr(main, "base_layer", None) == getattr(self, "base_layer", None)
-        )
 
 
 class _Qwen3_5WeightRule(_SglangModelWeightRule):
@@ -102,14 +91,6 @@ class Qwen3_5ForCausalLMMTPWeightRule(_Qwen3_5WeightRule):
     """Qwen3_5ForCausalLMMTP.load_weights, SGLang main."""
 
     role = "draft"
-    compatible_main_types = (
-        Qwen3_5ForCausalLMWeightRule,
-        Qwen3_5MoeForCausalLMWeightRule,
-        Qwen3_5ForConditionalGenerationWeightRule,
-        Qwen3_5MoeForConditionalGenerationWeightRule,
-        InternS2PreviewForConditionalGenerationWeightRule,
-        InternS2MobiusForConditionalGenerationWeightRule,
-    )
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         # Match SGLang's load_weights: skip inv_freq before checking MTP names.
@@ -134,8 +115,6 @@ class Qwen4ExpForConditionalGenerationWeightRule(_Qwen3_5VisionMainWeightRule):
 class Qwen4ExpForCausalLMMTPWeightRule(Qwen3_5ForCausalLMMTPWeightRule):
     """Qwen4ExpForCausalLMMTP inherits Qwen3.5's draft load loop."""
 
-    compatible_main_types = (Qwen4ExpForConditionalGenerationWeightRule,)
-
 
 class _MtpSubstringMainSelection(_SglangModelWeightRule):
     role = "main"
@@ -158,8 +137,6 @@ class Qwen3MoeForCausalLMWeightRule(_MtpSubstringMainSelection):
 class Qwen3MoeForCausalLMMTPWeightRule(_MtpSubstringDraftSelection):
     """Qwen3MoeForCausalLMMTP.load_weights with is_mtp=True."""
 
-    compatible_main_types = (Qwen3MoeForCausalLMWeightRule,)
-
 
 class Qwen3NextForCausalLMWeightRule(_MtpSubstringMainSelection):
     """Qwen3NextForCausalLM.load_weights with is_mtp=False."""
@@ -167,8 +144,6 @@ class Qwen3NextForCausalLMWeightRule(_MtpSubstringMainSelection):
 
 class Qwen3NextForCausalLMMTPWeightRule(_MtpSubstringDraftSelection):
     """Qwen3NextForCausalLMMTP.load_weights with is_mtp=True."""
-
-    compatible_main_types = (Qwen3NextForCausalLMWeightRule,)
 
 
 class ExaoneMoEForCausalLMWeightRule(_MtpSubstringMainSelection):
@@ -181,11 +156,6 @@ class ExaoneMoeForCausalLMWeightRule(_MtpSubstringMainSelection):
 
 class ExaoneMoEForCausalLMMTPWeightRule(_MtpSubstringDraftSelection):
     """ExaoneMoEForCausalLMMTP.load_weights with is_mtp=True."""
-
-    compatible_main_types = (
-        ExaoneMoEForCausalLMWeightRule,
-        ExaoneMoeForCausalLMWeightRule,
-    )
 
 
 class MiMoForCausalLMWeightRule(_SglangModelWeightRule):
@@ -203,7 +173,6 @@ class MiMoMTPWeightRule(_SglangModelWeightRule):
     """MiMoMTP remaps mtp_layers and reads shared embed/head tensors."""
 
     role = "draft"
-    compatible_main_types = (MiMoForCausalLMWeightRule,)
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         if "rotary_emb.inv_freq" in name or "projector" in name:
@@ -225,10 +194,6 @@ class MiMoV2MTPWeightRule(_SglangModelWeightRule):
     """MiMoV2MTP reads MTP block and shared embed/head names."""
 
     role = "draft"
-    compatible_main_types = (
-        MiMoV2ForCausalLMWeightRule,
-        MiMoV2FlashForCausalLMWeightRule,
-    )
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         if "rotary_emb.inv_freq" in name or "projector" in name:
@@ -251,7 +216,6 @@ class HYV4ForCausalLMNextNWeightRule(_SglangModelWeightRule):
     """HYV4ForCausalLMNextN.load_weights reads model.mtp_layers.0."""
 
     role = "draft"
-    compatible_main_types = (HYV4ForCausalLMWeightRule,)
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         return name.startswith("model.mtp_layers.0.")
@@ -265,7 +229,6 @@ class LongcatFlashForCausalLMNextNWeightRule(_SglangModelWeightRule):
     """Longcat NextN loads mapped model.mtp tensors, not target layers."""
 
     role = "draft"
-    compatible_main_types = (LongcatFlashForCausalLMWeightRule,)
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         return (
@@ -310,10 +273,6 @@ class Step3p5MTPWeightRule(_Step3p5Selection):
 
     draft_model_idx: int = 0
     role = "draft"
-    compatible_main_types = (
-        Step3p5ForCausalLMWeightRule,
-        Step3p7ForConditionalGenerationWeightRule,
-    )
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         if "rotary_emb.inv_freq" in name:
@@ -343,7 +302,6 @@ class InklingForConditionalGenerationMTPWeightRule(_SglangModelWeightRule):
 
     draft_model_idx: int = 0
     role = "draft"
-    compatible_main_types = (InklingForConditionalGenerationWeightRule,)
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         if "rotary_emb.inv_freq" in name:
@@ -423,12 +381,6 @@ class BailingMoeV3ForCausalLMWeightRule(_BailingMtpMainSelection):
 class BailingMoeForCausalLMNextNWeightRule(_NextNDraftSelection):
     """Bailing NextN delegates to the configured V1, V2.5, or V3 loader."""
 
-    compatible_main_types = (
-        BailingMoeForCausalLMWeightRule,
-        BailingMoeV2ForCausalLMWeightRule,
-        BailingMoeV2_5ForCausalLMWeightRule,
-        BailingMoeV3ForCausalLMWeightRule,
-    )
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         return not name.startswith("model.mtp") and self._draft_covers(name)
@@ -449,7 +401,6 @@ class Ernie4_5_MoeForCausalLMMTPWeightRule(_SglangModelWeightRule):
 
     mtp_layer_id: int
     role = "draft"
-    compatible_main_types = (Ernie4_5_MoeForCausalLMWeightRule,)
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         return any(
@@ -486,11 +437,6 @@ class NemotronHForCausalLMMTPWeightRule(_SglangModelWeightRule):
     """Nemotron-H draft can own a standalone, differently quantized head."""
 
     role = "draft"
-    compatible_main_types = (
-        NemotronHForCausalLMWeightRule,
-        NemotronHPuzzleForCausalLMWeightRule,
-        NemotronH_Omni_Reasoning_V3WeightRule,
-    )
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         return any(
@@ -534,17 +480,12 @@ class Dots3NoteForCausalLMNextNWeightRule(_Dots3Selection):
     """Dots3 NextN keeps its own MTP embedding when checkpoint-provided."""
 
     role = "draft"
-    compatible_main_types = (Dots3NoteForCausalLMWeightRule,)
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         return "rotary_emb.inv_freq" not in name and (
             self._nextn_layer(name) or name == "model.mtp.embed_tokens.weight"
         )
 
-    def compatible_main(self, main: DraftSelection) -> bool:
-        return super().compatible_main(main) and (
-            self.num_nextn_layers == main.num_nextn_layers
-        )
 
     def publishable(
         self, model: torch.nn.Module, tensors: dict[str, torch.Tensor]
@@ -561,7 +502,6 @@ class HYV3ForCausalLMWeightRule(_NextNMainSelection):
 class HYV3ForCausalLMNextNWeightRule(_NextNDraftSelection):
     """HYV3ForCausalLMNextN reads appended layer and shared-head norm."""
 
-    compatible_main_types = (HYV3ForCausalLMWeightRule,)
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         return super().should_read_checkpoint_tensor(name) or (
@@ -582,7 +522,6 @@ class DeepseekV4ForCausalLMWeightRule(_NextNMainSelection):
 class DeepseekV4ForCausalLMNextNWeightRule(_NextNDraftSelection):
     """DeepseekV4ForCausalLMNextN reads its raw MTP or extra layer."""
 
-    compatible_main_types = (DeepseekV4ForCausalLMWeightRule,)
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         if name.startswith("mtp."):
@@ -595,7 +534,6 @@ class DeepseekV4ForCausalLMDSparkWeightRule(_NextNSelection):
     """DeepseekV4ForCausalLMDSpark reads the bundled mtp.* stages."""
 
     role = "draft"
-    compatible_main_types = (DeepseekV4ForCausalLMWeightRule,)
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         return name.startswith("mtp.") and len(name.split(".", 2)) == 3
@@ -616,7 +554,6 @@ class Glm5NextForConditionalGenerationWeightRule(_NextNMainSelection):
 class Glm5NextForConditionalGenerationNextNWeightRule(_NextNDraftSelection):
     """GLM5 draft first keeps only its extra layer from either raw prefix."""
 
-    compatible_main_types = (Glm5NextForConditionalGenerationWeightRule,)
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         normalized = name.replace("model.language_model.", "model.", 1)
@@ -633,7 +570,6 @@ class GlmOcrForConditionalGenerationWeightRule(_NextNMainSelection):
 class GlmOcrForConditionalGenerationNextNWeightRule(_NextNDraftSelection):
     """GLM-OCR draft delegates to its main load loop with is_nextn=True."""
 
-    compatible_main_types = (GlmOcrForConditionalGenerationWeightRule,)
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         return self._draft_covers(name.replace("model.language_model.", "model.", 1))
@@ -645,8 +581,6 @@ class GigaChat35ForCausalLMWeightRule(_NextNMainSelection):
 
 class GigaChat35ForCausalLMNextNWeightRule(_NextNDraftSelection):
     """GigaChat35ForCausalLMNextN delegates to the same mixin."""
-
-    compatible_main_types = (GigaChat35ForCausalLMWeightRule,)
 
 
 def _without_shared_embed_and_head(
@@ -683,11 +617,6 @@ class DeepseekV32ForCausalLMWeightRule(_NextNMainSelection):
 class DeepseekV3ForCausalLMNextNWeightRule(_NextNDraftSelection):
     """DeepseekV3ForCausalLMNextN delegates to the same mixin with is_nextn."""
 
-    compatible_main_types = (
-        DeepseekV3ForCausalLMWeightRule,
-        DeepseekV32ForCausalLMWeightRule,
-    )
-
 
 class Glm4MoeForCausalLMWeightRule(_NextNMainSelection):
     """Glm4MoeForCausalLM.load_weights."""
@@ -695,8 +624,6 @@ class Glm4MoeForCausalLMWeightRule(_NextNMainSelection):
 
 class Glm4MoeForCausalLMNextNWeightRule(_NextNDraftSelection):
     """Glm4MoeForCausalLMNextN delegates with is_nextn=True."""
-
-    compatible_main_types = (Glm4MoeForCausalLMWeightRule,)
 
 
 class Glm4MoeLiteForCausalLMWeightRule(_NextNMainSelection):
@@ -706,8 +633,6 @@ class Glm4MoeLiteForCausalLMWeightRule(_NextNMainSelection):
 class Glm4MoeLiteForCausalLMNextNWeightRule(_NextNDraftSelection):
     """Glm4MoeLiteForCausalLMNextN delegates with is_nextn=True."""
 
-    compatible_main_types = (Glm4MoeLiteForCausalLMWeightRule,)
-
 
 class GlmMoeDsaForCausalLMWeightRule(_NextNMainSelection):
     """GlmMoeDsaForCausalLM inherits the DeepSeek weight-loader mixin."""
@@ -715,8 +640,6 @@ class GlmMoeDsaForCausalLMWeightRule(_NextNMainSelection):
 
 class GlmMoeDsaForCausalLMNextNWeightRule(_NextNDraftSelection):
     """GlmMoeDsaForCausalLMNextN inherits the DeepSeek NextN loader."""
-
-    compatible_main_types = (GlmMoeDsaForCausalLMWeightRule,)
 
 
 def draft_weight_adapter_for(
@@ -885,33 +808,3 @@ def draft_weight_adapter_for(
         if class_name == "GlmMoeDsaForCausalLMNextN":
             return GlmMoeDsaForCausalLMNextNWeightRule(base)
     return None
-
-
-def draft_tensor_namespace(
-    identity,
-    main_adapter: DraftSelection,
-    draft_adapter: DraftSelection,
-    model_class: str,
-    sglang_version: str,
-    model_uri: str,
-) -> str | None:
-    """Isolate draft manifests without changing the main SourceIdentity."""
-    if not identity.revision or not sglang_version:
-        return None
-    signature = json.dumps(
-        {
-            "identity": identity.SerializeToString(deterministic=True).hex(),
-            "main_selection": type(main_adapter).__name__,
-            "draft_selection": type(draft_adapter).__name__,
-            "draft_base_layer": getattr(draft_adapter, "base_layer", None),
-            "draft_nextn_layers": getattr(draft_adapter, "num_nextn_layers", None),
-            "draft_model_idx": getattr(draft_adapter, "draft_model_idx", None),
-            "mtp_layer_id": getattr(draft_adapter, "mtp_layer_id", None),
-            "draft_model": model_class,
-            "sglang": sglang_version,
-            "weights_uri": model_uri,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    return f"mx_draft::{hashlib.sha256(signature).hexdigest()[:32]}::"

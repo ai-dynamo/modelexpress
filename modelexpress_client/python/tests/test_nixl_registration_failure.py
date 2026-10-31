@@ -25,8 +25,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from modelexpress.load_strategy import base
+from modelexpress.load_strategy.context import LoadContext
 
 
 class FakeManager:
@@ -53,7 +55,11 @@ class FakeManager:
 
 
 def _ctx():
-    return SimpleNamespace(
+    return LoadContext(
+        model_config=SimpleNamespace(),
+        load_config=SimpleNamespace(),
+        target_device=torch.device("cpu"),
+        local_rank=0,
         p2p_enabled=True,
         p2p_role="main",
         shared_nixl_manager=None,
