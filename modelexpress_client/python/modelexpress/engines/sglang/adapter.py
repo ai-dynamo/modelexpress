@@ -8,9 +8,11 @@ from __future__ import annotations
 import copy
 import gc
 import logging
+import os
 import uuid
 from importlib.metadata import version as pkg_version
 from typing import TYPE_CHECKING, Iterator
+from urllib.parse import urlsplit
 
 import torch
 
@@ -483,6 +485,66 @@ def _get_sglang_worker_rank(load_config: LoadConfig) -> int:
     return pp_rank * tp_size + tp_rank
 
 
+def _get_sglang_server_args():
+    """Read native launch settings from current or legacy SGLang runtimes."""
+    try:
+        from sglang.srt.runtime_context import get_server_args
+    except ImportError:
+        try:
+            from sglang.srt.server_args import get_global_server_args as get_server_args
+        except ImportError:
+            return None
+    try:
+        return get_server_args()
+    except ValueError:
+        # SGLang has not published its process-local settings yet.
+        return None
+
+
+def _get_sglang_node_rank(
+    load_config: LoadConfig, global_rank: int, server_args=None,
+) -> int:
+    """Return the physical node rank used for node-local artifact routing."""
+    configured = getattr(load_config, "node_rank", None)
+    if configured is not None:
+        return int(configured)
+    native_rank = getattr(server_args, "node_rank", None)
+    if native_rank is not None:
+        return int(native_rank)
+
+    for name in ("NODE_RANK", "LWS_WORKER_INDEX", "GROUP_RANK"):
+        value = os.getenv(name)
+        if value is not None:
+            try:
+                rank = int(value)
+                if rank >= 0:
+                    return rank
+            except ValueError:
+                pass
+            logger.warning("Ignoring invalid %s=%r for node rank", name, value)
+
+    local_world_size = os.getenv("LOCAL_WORLD_SIZE")
+    if local_world_size is not None:
+        try:
+            size = int(local_world_size)
+            if size > 0:
+                return global_rank // size
+        except ValueError:
+            pass
+        logger.warning("Ignoring invalid LOCAL_WORLD_SIZE=%r", local_world_size)
+    return 0
+
+
+def _get_sglang_head_addr(load_config: LoadConfig, server_args) -> str | None:
+    """Extract the native rendezvous host for artifact readiness probes."""
+    address = getattr(load_config, "dist_init_addr", None) or getattr(
+        server_args, "dist_init_addr", None
+    )
+    if address:
+        return urlsplit(address if "://" in address else f"//{address}").hostname
+    return os.getenv("LWS_LEADER_ADDRESS") or os.getenv("MASTER_ADDR")
+
+
 def build_sglang_load_context(
     load_config: LoadConfig,
     model_config: ModelConfig,
@@ -493,6 +555,8 @@ def build_sglang_load_context(
     adapter = SglangAdapter(load_config, model_config, device_config)
     worker_rank = adapter.get_worker_rank()
     global_rank = adapter.get_global_rank()
+    server_args = _get_sglang_server_args()
+    node_rank = _get_sglang_node_rank(load_config, global_rank, server_args)
     server_url = getattr(load_config, "modelexpress_url", None)
     return LoadContext(
         model_config=model_config,
@@ -508,6 +572,8 @@ def build_sglang_load_context(
             server_url=server_url,
         ),
         worker_id=uuid.uuid4().hex[:8],
+        node_rank=node_rank,
+        head_addr=_get_sglang_head_addr(load_config, server_args),
         adapter=adapter,
         accelerator_backend=adapter.accelerator_backend,
     )

@@ -53,6 +53,10 @@ That decoupling is the whole reason the backend is robust to library-side change
 
 Every `GetTensorManifest` call passes an `mx_source_id`. If the client resolves its pattern, connects to a pod, and that pod's `WorkerServiceServicer` is serving a different `mx_source_id`, the server returns `FAILED_PRECONDITION`. The client retries on a fresh channel up to `MX_K8S_SOURCE_RETRIES` times so kube-proxy can route to a potentially-matching backend. The client also validates `resp.mx_source_id` and `resp.worker_rank` against the requested values before accepting the manifest, as defense-in-depth against misconfigured Service selectors. Content mismatches fail loudly and give the caller a retry budget; wrong weights are never silently transferred.
 
+Artifact discovery follows the same handshake principle with one important split. The first `GetArtifactManifestHeader` call goes through an artifact Service and carries the computed `mx_source_id` plus the target `node_rank`. Its response includes the sealed `artifact_id`, runtime accelerator, worker generation, and the selected Pod's direct gRPC endpoint. The target validates those fields, then sends every `GetArtifactManifestChunks`, `PrepareArtifactChunk`, and `ReleaseArtifactChunk` call to that direct endpoint. It must not keep using the Service: a prepared chunk lease, registered host buffer, and NIXL agent all belong to one worker process, while separate Service connections may select different Pods.
+
+Pod-scoped cache directories are identical across a Pod's GPU workers, so only `MX_ARTIFACT_OWNER_DEVICE_ID` (device 0 by default) publishes them. The artifact Service must target that device's worker port. This avoids duplicate bundles and gives discovery a deterministic port.
+
 ### Rank encoding: hostname vs port
 
 `MxK8sServiceClient` supports two deployment shapes via `MX_K8S_SERVICE_PATTERN`:
@@ -61,6 +65,8 @@ Every `GetTensorManifest` call passes an `mx_source_id`. If the client resolves 
 - **Pattern without a port** (e.g. `mx-sources`, the default) - client auto-appends `:{MX_WORKER_GRPC_PORT + rank}`. Rank is encoded in the port; caller hits one Service with N named ports, each targeting the matching in-pod port. Fits the multi-GPU-per-pod topology where every pod has every rank.
 
 The multi-GPU-per-pod shape is the one that works for heavy TP inference (NVLink is intra-node-only, so TP ranks have to share a pod). The 1-GPU-per-pod shape is useful for per-rank autoscaling or cross-pod setups where TP isn't involved.
+
+Artifact discovery uses `MX_K8S_ARTIFACT_SERVICE_PATTERN`. It inherits `MX_K8S_SERVICE_PATTERN` when unset, supports `{node_rank}` and `{rank}`, and auto-appends `MX_WORKER_GRPC_PORT + MX_ARTIFACT_OWNER_DEVICE_ID` when no port is present. For a single-node, multi-GPU Pod, the normal `mx-sources` Service already exposes the default owner port and needs no extra Service. For multi-node engines, use a node-scoped pattern such as `mx-artifacts-node-{node_rank}:6555` and make each Service select only source Pods for that framework node.
 
 ### Expert parallelism: static vs adaptive
 

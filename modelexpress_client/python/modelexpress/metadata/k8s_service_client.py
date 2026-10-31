@@ -36,6 +36,9 @@ Rank-matching is enforced two ways regardless of shape:
 
 There is no substrate advertisement here: the Service's Endpoints
 object is the source list, maintained by K8s based on pod readiness.
+Tensor manifests may be read directly through the rank Service. Artifact
+discovery uses a Service only for the header handshake; the returned
+pod-direct endpoint is used for every subsequent manifest and lease RPC.
 """
 
 from __future__ import annotations
@@ -47,9 +50,10 @@ import grpc
 
 from .. import envs
 from .. import p2p_pb2, p2p_pb2_grpc
-from .payload import tensor_source_metadata
 from ..client import MxClientBase
+from .payload import accelerators_compatible, tensor_source_metadata
 from .source_id import compute_mx_source_id
+from ..topology import blocks_selection, in_domain, resolve_policy
 
 logger = logging.getLogger("modelexpress.metadata.k8s_service_client")
 
@@ -68,16 +72,33 @@ class MxK8sServiceClient(MxClientBase):
     # `_is_p2p_metadata_enabled` checks for this attribute; MxClient
     # inherits the default False from MxClientBase.
     REQUIRES_P2P_METADATA = True
+    # Artifact sources are discovered through a Service handshake instead of
+    # ListSources/GetMetadata and are then pinned to a pod-direct endpoint.
+    SERVICE_ROUTED_ARTIFACTS = True
 
     def __init__(
         self,
         worker_rank: int | None = None,
         service_pattern: str | None = None,
+        artifact_service_pattern: str | None = None,
+        artifact_owner_device_id: int | None = None,
         max_retries: int | None = None,
         backoff_seconds: float | None = None,
+        leader_service: str | None = None,
     ):
         self._worker_rank = worker_rank
         self._service_pattern = service_pattern or envs.MX_K8S_SERVICE_PATTERN
+        configured_artifact_pattern = envs.MX_K8S_ARTIFACT_SERVICE_PATTERN
+        self._artifact_service_pattern = (
+            artifact_service_pattern
+            if artifact_service_pattern is not None
+            else configured_artifact_pattern or self._service_pattern
+        )
+        self._artifact_owner_device_id = (
+            artifact_owner_device_id
+            if artifact_owner_device_id is not None
+            else envs.MX_ARTIFACT_OWNER_DEVICE_ID
+        )
         env_retries = envs.MX_K8S_SOURCE_RETRIES
         self._max_retries = (
             max_retries if max_retries is not None
@@ -90,6 +111,28 @@ class MxK8sServiceClient(MxClientBase):
             else float(env_backoff) if env_backoff
             else _DEFAULT_BACKOFF_SECONDS
         )
+        configured_leader = (
+            envs.MX_K8S_LEADER_SERVICE if leader_service is None else leader_service
+        ).strip()
+        self._leader = None
+        if configured_leader:
+            from .leader_discovery import LeaderDiscovery
+
+            self._leader = LeaderDiscovery(
+                configured_leader, self._max_retries, self._backoff_seconds,
+            )
+
+    @property
+    def LEADER_DISCOVERY(self) -> bool:
+        return self._leader is not None
+
+    def configure_load_context(self, ctx) -> None:
+        if self._leader is not None:
+            self._leader.configure(ctx)
+
+    def attach_worker_server(self, server, worker, worker_id: str) -> None:
+        if self._leader is not None:
+            self._leader.attach(server, worker, worker_id)
 
     # -- connection management ------------------------------------------------
 
@@ -98,6 +141,8 @@ class MxK8sServiceClient(MxClientBase):
 
     def worker_rpc_retry_policy(self) -> tuple[int, float]:
         """Retry worker RPCs because each channel may select a new pod."""
+        if self._leader is not None:
+            return 0, 0.0
         return self._max_retries, self._backoff_seconds
 
     # -- RPC wrappers (MxClient duck-type) -----------------------------------
@@ -122,6 +167,8 @@ class MxK8sServiceClient(MxClientBase):
         """
         self._worker_rank = worker.worker_rank
         source_id = compute_mx_source_id(identity)
+        if self._leader is not None and identity.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_WEIGHTS:
+            self._leader.register(True)
         logger.info(
             "MxK8sServiceClient.publish_metadata: "
             "computed mx_source_id=%s for worker_rank=%d",
@@ -155,6 +202,21 @@ class MxK8sServiceClient(MxClientBase):
                 "first"
             )
         source_id = compute_mx_source_id(identity)
+        if self._leader is not None:
+            metadata = self._leader.metadata()
+            if source_id != metadata.mx_source_id:
+                raise ValueError("requested weights differ from the configured instance identity")
+            return p2p_pb2.ListSourcesResponse(instances=[
+                p2p_pb2.SourceInstanceRef(
+                    mx_source_id=source_id,
+                    worker_id=entry.worker.worker_id,
+                    worker_rank=entry.worker.worker_rank,
+                    model_name=identity.model_name,
+                    accelerator=entry.accelerator,
+                    topology=entry.topology,
+                )
+                for entry in metadata.workers if entry.worker.worker_rank == self._worker_rank
+            ])
         # worker_id is intentionally empty. This backend has no per-pod
         # addressability (kube-proxy picks the backend at connection
         # time); get_metadata ignores worker_id and routes through the
@@ -185,6 +247,8 @@ class MxK8sServiceClient(MxClientBase):
                 "worker_rank; call publish_metadata first or set it "
                 "at construction time"
             )
+        if self._leader is not None:
+            return self._leader.tensor_metadata(mx_source_id, worker_id, self._worker_rank)
         endpoint = self._resolve_endpoint()
         last_error: Exception | None = None
 
@@ -294,8 +358,165 @@ class MxK8sServiceClient(MxClientBase):
         status: "p2p_pb2.SourceStatus",
         source_load: float = 0.0,
     ) -> bool:
-        """No-op: K8s readiness probes supersede central liveness tracking."""
+        """Refresh instance membership in leader mode; otherwise use Pod readiness."""
+        if self._leader is not None:
+            self._leader.update_status(mx_source_id, status)
         return True
+
+    def discover_artifact_source(
+        self,
+        identity: "p2p_pb2.SourceIdentity",
+        *,
+        worker_rank: int | None = None,
+        node_rank: int | None = None,
+        artifact_id: str = "",
+        accelerator: str = "",
+    ):
+        """Resolve an artifact through a Service, then return its pod endpoint.
+
+        The initial header call may land on any ready pod behind the Service.
+        Its response must contain the selected worker's direct gRPC endpoint;
+        all later manifest, lease, and chunk RPCs use that endpoint so a single
+        transfer cannot hop between source-local lease managers.
+        """
+        del worker_rank  # Artifacts are node-scoped, not tensor-rank-scoped.
+        from .artifact_transfer import ArtifactSourceEndpoint
+
+        requested_node_rank = 0 if node_rank is None else node_rank
+        policy = resolve_policy()
+        if blocks_selection(policy):
+            raise LookupError("required artifact source topology is unknown")
+        if self._leader is not None:
+            return self._leader.artifact_source(identity, requested_node_rank, artifact_id, accelerator, policy)
+        mx_source_id = compute_mx_source_id(identity)
+        service_endpoint = self._resolve_artifact_endpoint(requested_node_rank)
+        last_error: Exception | None = None
+
+        for attempt in range(1, self._max_retries + 2):
+            channel = grpc.insecure_channel(service_endpoint)
+            try:
+                stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+                request = p2p_pb2.GetArtifactManifestHeaderRequest(
+                    mx_source_id=mx_source_id,
+                    artifact_id=artifact_id,
+                    node_rank=requested_node_rank,
+                )
+                response = stub.GetArtifactManifestHeader(request, timeout=30)
+
+                mismatch_reason: str | None = None
+                if response.mx_source_id != mx_source_id:
+                    mismatch_reason = (
+                        "artifact mx_source_id mismatch: expected "
+                        f"{mx_source_id!r}, got {response.mx_source_id!r}"
+                    )
+                elif policy is not None and policy.required and not in_domain(response, policy):
+                    mismatch_reason = "artifact source is outside the required topology"
+                elif response.mx_source_type != identity.mx_source_type:
+                    mismatch_reason = (
+                        "artifact source type mismatch: expected "
+                        f"{identity.mx_source_type}, got {response.mx_source_type}"
+                    )
+                elif response.node_rank != requested_node_rank:
+                    mismatch_reason = (
+                        "artifact node_rank mismatch: expected "
+                        f"{requested_node_rank}, got {response.node_rank}"
+                    )
+                elif artifact_id and response.artifact_id != artifact_id:
+                    mismatch_reason = (
+                        "artifact_id mismatch: expected "
+                        f"{artifact_id!r}, got {response.artifact_id!r}"
+                    )
+                elif not response.artifact_id:
+                    mismatch_reason = "artifact discovery returned an empty artifact_id"
+                elif not response.worker_grpc_endpoint:
+                    mismatch_reason = (
+                        "artifact source did not return a pod-direct worker endpoint"
+                    )
+                elif not accelerators_compatible(
+                    accelerator,
+                    response.accelerator,
+                    mx_source_type=identity.mx_source_type,
+                ):
+                    mismatch_reason = (
+                        "artifact accelerator mismatch: target "
+                        f"{accelerator!r}, source {response.accelerator!r}"
+                    )
+
+                if mismatch_reason is not None:
+                    last_error = RuntimeError(
+                        f"artifact response from {service_endpoint} failed validation: "
+                        f"{mismatch_reason}"
+                    )
+                    if attempt <= self._max_retries:
+                        logger.warning(
+                            "MxK8sServiceClient.discover_artifact_source: %s on "
+                            "attempt %d/%d; retrying on a fresh channel after "
+                            "%.2fs backoff",
+                            mismatch_reason,
+                            attempt,
+                            self._max_retries + 1,
+                            self._backoff_seconds,
+                        )
+                        time.sleep(self._backoff_seconds)
+                        continue
+                    raise last_error
+
+                logger.info(
+                    "MxK8sServiceClient.discover_artifact_source: resolved %s "
+                    "through %s to pod endpoint %s (artifact_id=%s, node_rank=%d, "
+                    "attempt=%d)",
+                    mx_source_id,
+                    service_endpoint,
+                    response.worker_grpc_endpoint,
+                    response.artifact_id,
+                    response.node_rank,
+                    attempt,
+                )
+                return ArtifactSourceEndpoint(
+                    mx_source_id=response.mx_source_id,
+                    worker_id=response.worker_id,
+                    worker_rank=response.worker_rank,
+                    worker_grpc_endpoint=response.worker_grpc_endpoint,
+                    artifact_id=response.artifact_id,
+                )
+            except grpc.RpcError as exc:
+                last_error = exc
+                retryable_codes = {
+                    grpc.StatusCode.NOT_FOUND,
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    grpc.StatusCode.UNAVAILABLE,
+                }
+                if exc.code() in retryable_codes:
+                    if attempt <= self._max_retries:
+                        logger.warning(
+                            "MxK8sServiceClient.discover_artifact_source: attempt "
+                            "%d/%d against %s failed with %s (%s); retrying on a "
+                            "fresh channel after %.2fs backoff",
+                            attempt,
+                            self._max_retries + 1,
+                            service_endpoint,
+                            exc.code().name,
+                            exc.details(),
+                            self._backoff_seconds,
+                        )
+                        time.sleep(self._backoff_seconds)
+                        continue
+                    if exc.code() == grpc.StatusCode.NOT_FOUND:
+                        raise LookupError("no ready artifact source found") from exc
+                if exc.code() == grpc.StatusCode.UNIMPLEMENTED:
+                    raise LookupError(
+                        "selected k8s-service worker does not support artifact discovery"
+                    ) from exc
+                raise
+            finally:
+                channel.close()
+
+        if isinstance(last_error, grpc.RpcError) and last_error.code() == grpc.StatusCode.NOT_FOUND:
+            raise LookupError("no ready artifact source found") from last_error
+        raise RuntimeError(
+            "k8s-service artifact discovery exhausted all attempts: "
+            f"{last_error}"
+        ) from last_error
 
     # -- helpers -------------------------------------------------------------
 
@@ -313,3 +534,13 @@ class MxK8sServiceClient(MxClientBase):
             return resolved
         base_port = envs.MX_WORKER_GRPC_PORT
         return f"{resolved}:{base_port + self._worker_rank}"
+
+    def _resolve_artifact_endpoint(self, node_rank: int) -> str:
+        """Resolve the node-scoped Service used only for artifact discovery."""
+        resolved = self._artifact_service_pattern.format(
+            node_rank=node_rank,
+            rank=self._artifact_owner_device_id,
+        )
+        if ":" in resolved:
+            return resolved
+        return f"{resolved}:{envs.MX_WORKER_GRPC_PORT + self._artifact_owner_device_id}"

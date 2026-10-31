@@ -141,6 +141,8 @@ MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; 
 | MX_HEARTBEAT_INTERVAL_SECS | 30 | Source heartbeat interval |
 | MX_PUBLISH_TIMEOUT_SECS | 1800 | Maximum source publication wait; 0 retries indefinitely |
 | MX_K8S_SERVICE_PATTERN | mx-sources | Service DNS pattern; {rank} is replaced with the worker rank |
+| MX_K8S_ARTIFACT_SERVICE_PATTERN | inherits MX_K8S_SERVICE_PATTERN | NIXL artifact discovery Service pattern; use {node_rank} to select the corresponding source node |
+| MX_ARTIFACT_OWNER_DEVICE_ID | 0 | Device publishing pod-scoped NIXL artifacts with k8s-service; expose its worker gRPC port through the artifact Service |
 | MX_K8S_SOURCE_RETRIES | 5 | Fresh-channel retries for k8s-service revision mismatches |
 | MX_K8S_SOURCE_BACKOFF_SECONDS | 0.5 | Backoff between k8s-service retries |
 
@@ -196,8 +198,9 @@ ModelStreamer credentials are third-party settings. See [Load from object storag
 | MX_ARTIFACT_READY_TIMEOUT_SECS | 1800 | Readiness/publication timeout |
 | MX_ARTIFACT_TRANSFER_CHUNK_SIZE | 67108864 bytes | Artifact transfer chunk size; maximum is 4 GiB |
 
-The default `p2p` backend requires `MX_P2P_METADATA=1`, a central coordinator,
-and NIXL. The `mooncake` backend requires a Python package exposing
+The default `nixl` backend requires NIXL and the P2P metadata path, with
+`redis`, `kubernetes`, or `k8s-service` discovery. The `k8s-service` backend
+automatically enables P2P metadata. The `mooncake` backend requires a Python package exposing
 `mooncake.store`, plus `MX_MC_METADATA_ADDR` and `MX_MC_MASTER_SERVER` (or the
 equivalent JSON/native configuration); it does not use the MX server or
 `MX_P2P_METADATA`. Prefixed settings are restored after each artifact-store

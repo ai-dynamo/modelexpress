@@ -117,12 +117,27 @@ class NixlArtifactTransport(ArtifactTransport):
                 node_rank=context.node_rank,
                 accelerator=context.accelerator,
             )
+            validation = {}
+            if getattr(self._mx_client, "LEADER_DISCOVERY", False) is True:
+                validation = {
+                    "expected_worker_id": source.worker_id,
+                    "expected_node_rank": context.node_rank,
+                    "expected_source_type": identity.mx_source_type,
+                    "expected_accelerator": context.accelerator,
+                }
+            if getattr(self._mx_client, "SERVICE_ROUTED_ARTIFACTS", False) is True:
+                policy = resolve_policy()
+                if blocks_selection(policy):
+                    raise LookupError("required artifact source topology is unknown")
+                if policy is not None and policy.required:
+                    validation["expected_topology"] = {policy.domain: policy.local_value}
             header = transfer_artifact_from_worker(
                 source.worker_grpc_endpoint,
                 source.mx_source_id,
                 source.artifact_id,
                 self._nixl_manager,
                 target_file_paths=artifact.target_file_paths(),
+                **validation,
             )
         except LookupError as exc:
             raise ArtifactCacheMiss(str(exc)) from exc
