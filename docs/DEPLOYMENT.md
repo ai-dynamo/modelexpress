@@ -868,6 +868,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_ARTIFACT_MOONCAKE_NAMESPACE` | `modelexpress/artifacts` | Key prefix used by the Mooncake artifact backend. |
 | `MX_MOONCAKE_CONFIG_PATH` | (unset) | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback. |
 | `MX_P2P_COLD_START` | `0` | Opt in to lease-coordinated concurrent cold starts with vLLM and a centralized Redis-backed MX server. Supports fixed non-elastic TP, PP, DP, EP, prefill/decode context parallelism and speculative decoding; reload and elastic EP are unsupported. |
+| `MX_P2P_COLD_START_WAIT_TIMEOUT_SECS` | `600` | Maximum time in seconds for cold-start donor discovery and election before skipping RDMA and continuing with the remaining load strategies. Must be positive and less than 1500 seconds; invalid values use the default. This leaves a margin below the default 1800-second Gloo timeout, but deployments with a shorter CPU process-group timeout must configure a shorter MX wait. |
 | `MX_ARTIFACT_READY_URL` | Framework default for bundles; unset for vLLM weight publication | Readiness endpoint used before preparing and publishing cache artifact bundles. For vLLM weight metadata, readiness is gated only when explicitly configured. Bundle readiness defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
@@ -1146,9 +1147,15 @@ handles.
 With `MX_P2P_COLD_START=1`, replica rank zero coordinates via a 60-second
 Redis lease, renewed every 20 seconds. Followers check READY ranks every two
 seconds. The server accepts lease terms from 1 to 600 seconds; this limits each
-term, not the total time a lease can be renewed. A live but hung donor may renew
-indefinitely; expired donors are not
-fenced from publishing. The lease is scoped to source identity, not accelerator
+term, not the total time a lease can be renewed. If coordination fails or the
+configured cold-start wait timeout expires, the replica's workers skip the
+built-in RDMA strategy and continue through the remaining loading strategies;
+successful loads can still be published as peers. Plugins are unaffected, and
+multiple replicas may then load from storage concurrently. Subsequent strategy
+selection and runtime failures are not coordinated across workers and can still
+prevent startup. The timeout starts after worker-group validation; it does not
+bound collective operations or subsequent model loading. A live but hung donor
+may renew indefinitely; expired donors are not fenced from publishing. The lease is scoped to source identity, not accelerator
 compatibility, and the normal load strategy can fall back to object storage.
 Election runs at weight loading and does not prevent earlier downloads. For
 server-backed, non-shared storage, set `MODEL_EXPRESS_NO_SHARED_STORAGE=1`

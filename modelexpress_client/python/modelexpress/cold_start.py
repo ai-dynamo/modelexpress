@@ -9,7 +9,9 @@ import threading
 import time
 import uuid
 
-from . import p2p_pb2
+import grpc
+
+from . import envs, p2p_pb2
 from .client import MxClient
 from .metadata.payload import accelerators_compatible
 
@@ -19,9 +21,12 @@ RENEW_INTERVAL = 20
 POLL_INTERVAL = 2
 
 
-def _ready(ctx, ranks):
+def _ready(ctx, ranks, timeout=30):
     instances = ctx.mx_client.list_sources(
-        identity=ctx.identity, status_filter=p2p_pb2.SOURCE_STATUS_READY, strict=True
+        identity=ctx.identity,
+        status_filter=p2p_pb2.SOURCE_STATUS_READY,
+        strict=True,
+        timeout=timeout,
     ).instances
     found = {
         instance.worker_rank
@@ -115,42 +120,79 @@ def coordinate(ctx, expected):
         raise RuntimeError(f"Unsupported MX cold start configuration: {all_errors}")
     decision = None
     if ctx.global_rank == 0:
+        deadline = time.monotonic() + envs.MX_P2P_COLD_START_WAIT_TIMEOUT_SECS
+        token = None
+        acquired = False
+
+        def remaining():
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError("MX cold start wait deadline expired")
+            return value
+
+        def call_with_deadline(function, *args, rpc_timeout):
+            wait = remaining()
+            try:
+                return function(*args, timeout=min(rpc_timeout, wait))
+            except grpc.RpcError as exc:
+                if wait <= rpc_timeout and exc.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+                    raise TimeoutError("MX cold start wait deadline expired") from exc
+                raise
+
+        def release():
+            nonlocal acquired
+            try:
+                ctx.mx_client.donor_lease(
+                    ctx.identity,
+                    token,
+                    p2p_pb2.DONOR_LEASE_ACTION_RELEASE,
+                    LEASE_TTL,
+                    timeout=min(10, remaining()),
+                )
+            except Exception:
+                logger.warning("MX donor lease release failed or timed out; it will expire")
+            acquired = False
+
         try:
             while True:
-                if _ready(ctx, ranks):
+                if call_with_deadline(_ready, ctx, ranks, rpc_timeout=30):
                     decision = ("follower", "")
                     break
                 token = uuid.uuid4().hex
                 acquired_at = time.monotonic()
-                if ctx.mx_client.donor_lease(
-                    ctx.identity, token, p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE, LEASE_TTL
-                ):
-                    try:
-                        ready = _ready(ctx, ranks)
-                    except BaseException:
-                        ctx.mx_client.donor_lease(
-                            ctx.identity,
-                            token,
-                            p2p_pb2.DONOR_LEASE_ACTION_RELEASE,
-                            LEASE_TTL,
-                        )
-                        raise
+                acquired = call_with_deadline(
+                    ctx.mx_client.donor_lease,
+                    ctx.identity,
+                    token,
+                    p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE,
+                    LEASE_TTL,
+                    rpc_timeout=10,
+                )
+                if acquired:
+                    ready = call_with_deadline(_ready, ctx, ranks, rpc_timeout=30)
+                    remaining()
                     if ready:
-                        ctx.mx_client.donor_lease(
-                            ctx.identity,
-                            token,
-                            p2p_pb2.DONOR_LEASE_ACTION_RELEASE,
-                            LEASE_TTL,
-                        )
+                        release()
                         decision = ("follower", "")
                     else:
                         ctx.donor_lease = DonorLease(ctx, token, ranks, acquired_at)
+                        acquired = False
                         decision = ("donor", "")
                     break
-                time.sleep(POLL_INTERVAL)
+                time.sleep(min(POLL_INTERVAL, remaining()))
         except Exception as exc:
-            decision = ("error", str(exc))
-    role, error = ctx.adapter.broadcast_state(decision)
-    if role == "error":
-        raise RuntimeError(f"MX cold start election failed: {error}")
+            if acquired:
+                release()
+            if isinstance(exc, TimeoutError) or time.monotonic() >= deadline:
+                logger.warning(
+                    "MX cold start wait timed out; skipping RDMA for this replica"
+                )
+            else:
+                logger.warning(
+                    "MX cold start election failed (%s); skipping RDMA for this replica",
+                    exc,
+                )
+            decision = ("fallback", "")
+    role, _ = ctx.adapter.broadcast_state(decision)
+    ctx.skip_rdma = role == "fallback"
     logger.info("MX cold start: %s", role)

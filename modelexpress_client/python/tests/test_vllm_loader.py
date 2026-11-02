@@ -780,6 +780,10 @@ class TestRdmaReloadIdentityGate:
         ctx = _make_load_context(identity=self._identity("abc"))
         assert self._is_available(ctx) is True
 
+    def test_cold_start_fallback_skips_rdma(self):
+        ctx = _make_load_context(identity=self._identity("abc"), skip_rdma=True)
+        assert self._is_available(ctx) is False
+
     @pytest.mark.parametrize("reload", [False, True])
     def test_loader_snapshots_the_loaded_identity_on_reload(self, reload):
         """A refit rewrites the live identity's revision in place, so the

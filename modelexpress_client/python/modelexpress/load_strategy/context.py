@@ -98,6 +98,8 @@ class LoadContext:
     draft_tensor_namespace: str = DRAFT_TENSOR_PREFIX
     # False keeps a load out of P2P entirely (no registration, no RDMA).
     p2p_enabled: bool = True
+    # Replica-wide cold-start fallback skips peer reads but still publishes.
+    skip_rdma: bool = False
     # Draft pass only: the main load's already-initialized NIXL manager. The
     # draft registers into it instead of binding MX_METADATA_PORT + device_id
     # a second time.

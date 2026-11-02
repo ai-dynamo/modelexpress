@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import grpc
 import pytest
 
 from modelexpress import cold_start, p2p_pb2
@@ -70,6 +71,7 @@ def test_existing_sources_skip_election():
     with patch.object(cold_start, "_ready", return_value=True):
         cold_start.coordinate(ctx, 2)
     assert ctx.adapter.broadcast_state.call_args.args[0][0] == "follower"
+    assert ctx.skip_rdma is False
     ctx.mx_client.donor_lease.assert_not_called()
 
 
@@ -82,6 +84,7 @@ def test_first_contender_becomes_donor():
     ):
         cold_start.coordinate(ctx, 2)
     assert ctx.adapter.broadcast_state.call_args.args[0][0] == "donor"
+    assert ctx.skip_rdma is False
     assert ctx.donor_lease is lease.return_value
     assert (
         ctx.mx_client.donor_lease.call_args.args[2]
@@ -125,7 +128,7 @@ def test_recheck_after_acquire_releases_lease():
 
 
 @pytest.mark.parametrize("operation", ["_ready", "donor_lease"])
-def test_election_errors_fail_closed(operation):
+def test_election_errors_fall_back(operation, caplog):
     ctx = context()
     with patch.object(
         cold_start,
@@ -135,9 +138,22 @@ def test_election_errors_fail_closed(operation):
     ):
         if operation == "donor_lease":
             ctx.mx_client.donor_lease.side_effect = RuntimeError("unavailable")
-        with pytest.raises(RuntimeError, match="unavailable"):
-            cold_start.coordinate(ctx, 2)
-    assert ctx.adapter.broadcast_state.call_args.args[0][0] == "error"
+        cold_start.coordinate(ctx, 2)
+    assert ctx.adapter.broadcast_state.call_args.args[0] == ("fallback", "")
+    assert ctx.skip_rdma is True
+    assert ctx.p2p_enabled is True
+    assert "MX cold start election failed (unavailable)" in caplog.text
+
+
+def test_source_discovery_error_falls_back(caplog):
+    ctx = context()
+    ctx.mx_client.list_sources.side_effect = RuntimeError("coordinator unavailable")
+
+    cold_start.coordinate(ctx, 2)
+
+    assert ctx.mx_client.list_sources.call_args.kwargs["strict"]
+    assert ctx.adapter.broadcast_state.call_args.args[0] == ("fallback", "")
+    assert "MX cold start election failed (coordinator unavailable)" in caplog.text
 
 
 def test_unsupported_configuration_rejected():
@@ -189,6 +205,7 @@ def test_nonzero_rank_uses_broadcast_decision():
     ctx.mx_client.list_sources.assert_not_called()
     ctx.mx_client.donor_lease.assert_not_called()
     ctx.adapter.broadcast_state.assert_called_once_with(None)
+    assert ctx.skip_rdma is False
 
 
 def test_renews_before_checking_ready():
@@ -312,7 +329,8 @@ def test_parallel_worker_groups(overrides):
     )
     with patch.object(cold_start, "_ready", return_value=True) as ready:
         cold_start.coordinate(ctx, cold_start_expected_workers(cfg))
-    ready.assert_called_once_with(ctx, count)
+    assert ready.call_args.args == (ctx, count)
+    assert 0 < ready.call_args.kwargs["timeout"] <= 30
 
 
 def test_mismatched_worker_group_is_rejected():
@@ -339,3 +357,142 @@ def test_speculative_config_does_not_reject_main():
     cfg.speculative_config = object()
     with patch.object(cold_start, "_ready", return_value=True):
         cold_start.coordinate(ctx, cold_start_expected_workers(cfg))
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, duration):
+        self.sleeps.append(duration)
+        self.now += duration
+
+
+def test_busy_donor_timeout_falls_back(monkeypatch, caplog):
+    ctx = context()
+    ctx.mx_client.donor_lease.return_value = False
+    clock = FakeClock()
+    monkeypatch.setenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", "3")
+    with (
+        patch.object(cold_start.time, "monotonic", clock.monotonic),
+        patch.object(cold_start.time, "sleep", clock.sleep),
+        patch.object(cold_start, "_ready", return_value=False),
+    ):
+        cold_start.coordinate(ctx, 2)
+    assert clock.sleeps == [2, 1]
+    assert ctx.adapter.broadcast_state.call_args.args[0] == ("fallback", "")
+    assert "timed out" in caplog.text
+    assert ctx.skip_rdma is True
+    assert ctx.p2p_enabled is True
+
+
+@pytest.mark.parametrize("operation", ["ready", "acquire", "recheck"])
+def test_rpc_deadline_falls_back_and_bounds_timeout(monkeypatch, operation):
+    ctx = context()
+    clock = FakeClock()
+    monkeypatch.setenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", "5")
+    calls = []
+
+    def ready(ctx, ranks, timeout):
+        calls.append(timeout)
+        if operation == "ready" or (operation == "recheck" and len(calls) == 2):
+            clock.now += timeout
+            raise RuntimeError("RPC deadline exceeded")
+        return False
+
+    def lease(identity, token, action, ttl, timeout):
+        assert 0 < timeout <= 5
+        if operation == "acquire":
+            clock.now += timeout
+            raise RuntimeError("RPC deadline exceeded")
+        return True
+
+    ctx.mx_client.donor_lease.side_effect = lease
+    with (
+        patch.object(cold_start.time, "monotonic", clock.monotonic),
+        patch.object(cold_start, "_ready", side_effect=ready),
+    ):
+        cold_start.coordinate(ctx, 2)
+    assert ctx.adapter.broadcast_state.call_args.args[0] == ("fallback", "")
+    assert all(0 < t <= 5 for t in calls)
+
+
+def test_timeout_decision_broadcast_to_other_ranks():
+    ctx = context()
+    ctx.global_rank = ctx.worker_rank = 1
+    ctx.adapter.broadcast_state.side_effect = None
+    ctx.adapter.broadcast_state.return_value = ("fallback", "")
+    cold_start.coordinate(ctx, 2)
+    ctx.mx_client.donor_lease.assert_not_called()
+    ctx.adapter.broadcast_state.assert_called_once_with(None)
+    assert ctx.skip_rdma is True
+    assert ctx.p2p_enabled is True
+
+
+@pytest.mark.parametrize("release_fails", [False, True])
+def test_acquired_lease_released_when_recheck_fails(release_fails, caplog):
+    ctx = context()
+    ctx.mx_client.donor_lease.side_effect = [
+        True, RuntimeError("release failed") if release_fails else True
+    ]
+    with patch.object(cold_start, "_ready", side_effect=[False, RuntimeError("failed")]):
+        cold_start.coordinate(ctx, 2)
+    assert ctx.mx_client.donor_lease.call_args.args[2] == p2p_pb2.DONOR_LEASE_ACTION_RELEASE
+    assert ctx.adapter.broadcast_state.call_args.args[0] == ("fallback", "")
+    assert "MX cold start election failed (failed)" in caplog.text
+    if release_fails:
+        assert "MX donor lease release failed or timed out" in caplog.text
+
+
+class DeadlineExceeded(grpc.RpcError):
+    def code(self):
+        return grpc.StatusCode.DEADLINE_EXCEEDED
+
+
+@pytest.mark.parametrize("operation", ["ready", "acquire", "recheck"])
+def test_rpc_deadline_just_before_local_deadline_falls_back(monkeypatch, operation):
+    ctx = context()
+    clock = FakeClock()
+    monkeypatch.setenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", "5")
+    error = DeadlineExceeded()
+    calls = 0
+
+    def ready(ctx, ranks, timeout):
+        nonlocal calls
+        calls += 1
+        if operation == "ready" or (operation == "recheck" and calls == 2):
+            clock.now += timeout - 0.001
+            raise error
+        return False
+
+    def lease(identity, token, action, ttl, timeout):
+        if operation == "acquire" and action == p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE:
+            clock.now += timeout - 0.001
+            raise error
+        return True
+
+    ctx.mx_client.donor_lease.side_effect = lease
+    with (
+        patch.object(cold_start.time, "monotonic", clock.monotonic),
+        patch.object(cold_start, "_ready", side_effect=ready),
+    ):
+        cold_start.coordinate(ctx, 2)
+    assert ctx.adapter.broadcast_state.call_args.args[0] == ("fallback", "")
+
+
+def test_rpc_timeout_before_wait_deadline_falls_back(monkeypatch, caplog):
+    ctx = context()
+    clock = FakeClock()
+    monkeypatch.setenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", "60")
+    error = DeadlineExceeded()
+    with (
+        patch.object(cold_start.time, "monotonic", clock.monotonic),
+        patch.object(cold_start, "_ready", side_effect=error),
+    ):
+        cold_start.coordinate(ctx, 2)
+    assert ctx.adapter.broadcast_state.call_args.args[0] == ("fallback", "")
+    assert "MX cold start election failed" in caplog.text

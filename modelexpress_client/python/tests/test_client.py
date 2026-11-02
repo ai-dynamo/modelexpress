@@ -72,3 +72,18 @@ def test_donor_lease_returns_action_success(action, success):
     assert request.owner_token == "owner"
     assert request.action == action
     assert request.ttl_seconds == 60
+
+
+def test_election_rpc_timeout_forwarding():
+    client = MxClient("localhost:8001")
+    client._channel = MagicMock()
+    client._stub = MagicMock()
+    identity = p2p_pb2.SourceIdentity(model_name="model")
+    client.list_sources(identity=identity)
+    assert client._stub.ListSources.call_args.kwargs["timeout"] == 30
+    client.list_sources(identity=identity, timeout=1.5)
+    assert client._stub.ListSources.call_args.kwargs["timeout"] == 1.5
+    client.donor_lease(identity, "owner", p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE, 60)
+    assert client._stub.DonorLease.call_args.kwargs["timeout"] == 10
+    client.donor_lease(identity, "owner", p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE, 60, timeout=2)
+    assert client._stub.DonorLease.call_args.kwargs["timeout"] == 2

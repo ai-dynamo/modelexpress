@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     MX_LOAD_STRATEGY_CHAIN: str
     MX_P2P_METADATA: str
     MX_P2P_COLD_START: bool
+    MX_P2P_COLD_START_WAIT_TIMEOUT_SECS: float
     MX_DISABLE_DRAFT_P2P: bool
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
@@ -219,6 +220,22 @@ def _env_positive_float(name: str, default: float) -> float:
     return value
 
 
+def _cold_start_wait_timeout() -> float:
+    name = "MX_P2P_COLD_START_WAIT_TIMEOUT_SECS"
+    default = 600.0
+    value = _env_positive_float(name, default)
+    # Leave at least five minutes before the default 30-minute Gloo timeout.
+    if value >= 1500:
+        logger.warning(
+            "Invalid %s=%r; must be less than 1500 seconds, using default %s",
+            name,
+            os.environ.get(name),
+            default,
+        )
+        return default
+    return value
+
+
 def _env_bool(name: str, default: bool) -> bool:
     """Parse a bool env var, falling back to ``default`` (and warning) on error."""
     raw = os.environ.get(name)
@@ -268,6 +285,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_WORKER_HOST": lambda: os.environ.get("MX_WORKER_HOST", ""),
     "MX_HEARTBEAT_INTERVAL_SECS": lambda: _env_int("MX_HEARTBEAT_INTERVAL_SECS", 30),
     "MX_P2P_COLD_START": lambda: _env_bool("MX_P2P_COLD_START", False),
+    "MX_P2P_COLD_START_WAIT_TIMEOUT_SECS": _cold_start_wait_timeout,
     "MX_PUBLISH_TIMEOUT_SECS": lambda: _env_int("MX_PUBLISH_TIMEOUT_SECS", 30 * 60),
     "MX_MODEL_REVISION": lambda: os.environ.get("MX_MODEL_REVISION", ""),
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),

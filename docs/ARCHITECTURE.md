@@ -388,7 +388,10 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 With `MX_P2P_COLD_START=1`, rank zero of each fixed vLLM worker group
 checks for READY sources and competes for a Redis lease per source identity.
 The lease holder loads through the existing strategy chain; followers wait for
-compatible READY ranks before using the same chain. Publication is not fenced:
+compatible READY ranks before using the same chain. If coordination fails or the
+configured election wait expires, replicas continue with the normal chain and can
+load concurrently from storage. Other loading failures can still prevent startup.
+Publication is not fenced:
 an expired donor can still finish and publish, and normal P2P fallback remains
 available. READY ranks need not belong to the same replica. The world group must
 match TP × PP × DP × prefill-context parallelism, with contiguous global worker
