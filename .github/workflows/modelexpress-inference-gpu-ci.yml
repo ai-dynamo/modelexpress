@@ -16,7 +16,7 @@ on:
         default: ''
 
 env:
-  MX_CI_MODEL: Qwen/Qwen2.5-0.5B
+  MX_CI_MODEL: Qwen/Qwen3.5-0.8B
   VCLUSTER_NAME: mx-ci-cluster
   VCLUSTER_NAMESPACE: mx-ci
   MX_IMAGE_REPO: nvcr.io/0980761089281446
@@ -51,9 +51,9 @@ jobs:
           a100b_count = min(count, a100b_count)
           seed = int(os.environ["GITHUB_RUN_ID"] if os.environ["GITHUB_EVENT_NAME"] in {"schedule", "workflow_dispatch"} else os.environ["GITHUB_REF"].rsplit("/", 1)[1])
           print(f"count={count}")
-          print("slots=" + json.dumps([(seed + i) % count for i in range(16)]))
+          print("slots=" + json.dumps([(seed + i) % count for i in range(20)]))
           print(f"a100b_count={a100b_count}")
-          print("a100b_slots=" + json.dumps([(seed + i) % a100b_count for i in range(4)]))
+          print("a100b_slots=" + json.dumps([(seed + i) % a100b_count for i in range(6)]))
           PYTHON
 
   test:
@@ -118,7 +118,7 @@ jobs:
                 {
                   "framework": "vllm", "gpu_slot": 0, "namespace": "mx-ci-vllm-mla", "manifest": "ci/k8s/client/vllm/manifest-azure-tp2.yaml",
                   "source_port": "8001", "worker_port": "8002", "pool": "a100b", "kind": "p2p", "name": "P2P MLA model test (vllm TP=2)", "tp_size": "2",
-                  "model": "deepseek-ai/DeepSeek-V2-Lite", "measure_vram": "true", "test_script": "ci/k8s/client/test_p2p_k8s.py",
+                  "model": "zai-org/GLM-4.7-Flash", "measure_vram": "true", "test_script": "ci/k8s/client/test_p2p_k8s.py",
                   "source_extra_env": "JOB_NAME=mx-source", "extra_env": "JOB_NAME=mx-target"
                 },
                 {
@@ -127,7 +127,7 @@ jobs:
                   "test_script": "ci/k8s/client/test_p2p_k8s.py", "source_extra_env": "JOB_NAME=mx-source", "extra_env": "JOB_NAME=mx-target"
                 },
                 {
-                  "gpu_slot": 3, "namespace": "mx-ci-vllm-ep2", "manifest": "ci/k8s/client/vllm/manifest-azure-ep2.yaml", "model": "deepseek-ai/DeepSeek-V2-Lite",
+                  "gpu_slot": 3, "namespace": "mx-ci-vllm-ep2", "manifest": "ci/k8s/client/vllm/manifest-azure-ep2.yaml", "model": "zai-org/GLM-4.7-Flash",
                   "tp_size": "2", "dp_size": "1", "pod_ready_timeout_seconds": "3600", "source_port": "8003", "worker_port": "8004", "framework": "vllm",
                   "pool": "a100b", "kind": "p2p", "name": "P2P EP=2 test (vllm)", "test_script": "ci/k8s/client/test_p2p_k8s.py",
                   "source_extra_env": "JOB_NAME=mx-source", "extra_env": "JOB_NAME=mx-target"
@@ -146,12 +146,61 @@ jobs:
                 {
                   "framework": "sglang", "gpu_slot": 1, "namespace": "mx-ci-sglang-mla", "manifest": "ci/k8s/client/sgl/manifest-azure-tp2.yaml",
                   "source_port": "8009", "worker_port": "8010", "pool": "a100b", "kind": "p2p", "name": "P2P MLA model test (sglang TP=2)", "tp_size": "2",
-                  "model": "deepseek-ai/DeepSeek-V2-Lite", "measure_vram": "true", "test_script": "ci/k8s/client/test_p2p_k8s.py", "pytest_args": "--expected-max-total-tokens 131072",
+                  "model": "zai-org/GLM-4.7-Flash", "measure_vram": "true", "test_script": "ci/k8s/client/test_p2p_k8s.py", "pytest_args": "--expected-max-total-tokens 131072",
                   "source_extra_env": "JOB_NAME=mx-source", "extra_env": "JOB_NAME=mx-target"
                 },
                 {
                   "framework": "sglang", "gpu_slot": 15, "manifest": "ci/k8s/client/sgl/manifest-azure.yaml", "namespace": "mx-ci-stale-sgl",
                   "source_port": "8012", "pool": "a100a", "kind": "stale", "name": "P2P Stale metadata test (sglang)"
+                },
+                {
+                  "framework": "sglang",
+                  "gpu_slot": 16,
+                  "namespace": "mx-ci-sglang-mtp",
+                  "manifest": "ci/k8s/client/sgl/manifest-azure-mtp.yaml",
+                  "test_script": "ci/k8s/client/test_p2p_k8s.py",
+                  "pytest_args": "--expect-mtp",
+                  "source_extra_env": "JOB_NAME=mx-source",
+                  "extra_env": "JOB_NAME=mx-target",
+                  "source_port": "8033",
+                  "worker_port": "8034",
+                  "kind": "p2p",
+                  "pool": "a100a",
+                  "name": "P2P test (sglang MTP)"
+                },
+                {
+                  "framework": "sglang",
+                  "gpu_slot": 4,
+                  "namespace": "mx-ci-sglang-dp2",
+                  "manifest": "ci/k8s/client/sgl/manifest-azure-dp2.yaml",
+                  "tp_size": "1",
+                  "dp_size": "2",
+                  "source_port": "8015",
+                  "worker_port": "8016",
+                  "kind": "p2p",
+                  "pool": "a100b",
+                  "test_script": "ci/k8s/client/test_p2p_k8s.py",
+                  "source_extra_env": "JOB_NAME=mx-source",
+                  "extra_env": "JOB_NAME=mx-target",
+                  "name": "P2P DP=2 test (sglang)"
+                },
+                {
+                  "framework": "sglang",
+                  "gpu_slot": 5,
+                  "namespace": "mx-ci-sglang-ep2",
+                  "manifest": "ci/k8s/client/sgl/manifest-azure-ep2.yaml",
+                  "model": "zai-org/GLM-4.7-Flash",
+                  "tp_size": "2",
+                  "dp_size": "1",
+                  "pod_ready_timeout_seconds": "3600",
+                  "source_port": "8017",
+                  "worker_port": "8018",
+                  "kind": "p2p",
+                  "pool": "a100b",
+                  "test_script": "ci/k8s/client/test_p2p_k8s.py",
+                  "source_extra_env": "JOB_NAME=mx-source",
+                  "extra_env": "JOB_NAME=mx-target",
+                  "name": "P2P EP=2 test (sglang)"
                 }
               ],
               "sglang-mooncake": [
@@ -167,6 +216,19 @@ jobs:
                 {
                   "mode": "aggregated", "gpu_slot": 9, "manifest": "ci/k8s/client/vllm/dynamo/manifest-azure-aggregated.yaml", "namespace": "mx-ci-dynamo-agg",
                   "dgd_name": "mx-agg", "framework": "dynamo-vllm", "pool": "a100a", "kind": "dynamo", "name": "P2P test with Dynamo (aggregated)"
+                }
+              ],
+              "dynamo-sglang": [
+                {
+                  "framework": "dynamo-sglang",
+                  "mode": "aggregated",
+                  "gpu_slot": 18,
+                  "manifest": "ci/k8s/client/sgl/dynamo/manifest-azure-aggregated.yaml",
+                  "namespace": "mx-ci-dyn-sgl-agg",
+                  "dgd_name": "mx-sgl-agg",
+                  "kind": "dynamo",
+                  "pool": "a100a",
+                  "name": "P2P test with Dynamo (sglang aggregated)"
                 }
               ],
               "large": [
@@ -194,6 +256,34 @@ jobs:
                   "framework": "sglang", "namespace": "mx-ci-rolling-sglang", "manifest": "ci/k8s/client/sgl/manifest-azure-rolling-update.yaml", "pool": "a100a",
                   "kind": "fleet", "name": "P2P Rolling-update test (sglang, 5 workers)", "large": true, "fleet_size": "5", "wave_sizes": "5",
                   "rolling_update": "true", "rollout_timeout_seconds": "1200", "test_script": "ci/k8s/client/test_rolling_update.py"
+                },
+                {
+                  "framework": "sglang",
+                  "gpu_slot": 17,
+                  "tp_size": 2,
+                  "namespace": "mx-ci-sglang-multinode-tp2",
+                  "manifest": "ci/k8s/client/sgl/manifest-azure-multi-node-tp2.yaml",
+                  "source_port": "8013",
+                  "worker_port": "8014",
+                  "kind": "p2p",
+                  "pool": "a100a",
+                  "test_script": "ci/k8s/client/test_p2p_k8s.py",
+                  "source_extra_env": "JOB_NAME=mx-source",
+                  "extra_env": "JOB_NAME=mx-target",
+                  "name": "P2P TP test (sglang TP=2 multi-node)",
+                  "large": true
+                },
+                {
+                  "framework": "dynamo-sglang",
+                  "mode": "disaggregated",
+                  "gpu_slot": 19,
+                  "manifest": "ci/k8s/client/sgl/dynamo/manifest-azure-disaggregated.yaml",
+                  "namespace": "mx-ci-dyn-sgl-dis",
+                  "dgd_name": "mx-sgl-dis",
+                  "kind": "dynamo",
+                  "pool": "a100a",
+                  "name": "P2P test with Dynamo (sglang disaggregated)",
+                  "large": true
                 }
               ]
             }
@@ -281,6 +371,7 @@ jobs:
           model: ${{ matrix.model || env.MX_CI_MODEL }}
           hf_token: ${{ secrets.HF_TOKEN }}
           manifest: ${{ matrix.manifest || 'ci/k8s/client/vllm/dynamo/manifest-azure-aggregated.yaml' }}
+          framework: ${{ matrix.framework == 'dynamo-sglang' && 'sglang' || 'vllm' }}
           mode: ${{ matrix.mode || 'aggregated' }}
           dgd_name: ${{ format('{0}-{1}-{2}', matrix.dgd_name, github.run_id, github.run_attempt) }}
 

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,12 +25,10 @@ from .methods import (
 from .nixl_staged_transfer import _NixlStagedTransfer
 from .plan import (
     EngineInstaller,
-    PreparedStreamingTensors,
     SourceResolver,
     StreamingSettings,
     UpdateMethod,
     WeightSource,
-    WeightUpdatePlanner,
 )
 from .receiver import ObjectStorageGeneratorConfig
 from .session import WeightUpdateSession
@@ -107,16 +105,7 @@ class GeneratorRuntime:
             return
         for method in self.methods:
             method.validate_close()
-        for method in self.methods:
-            try:
-                method.close()
-            except Exception:
-                logger.warning("failed to close generator method", exc_info=True)
-        if self.p2p_client is not None:
-            try:
-                self.p2p_client.close()
-            except Exception:
-                logger.warning("failed to close generator P2P client", exc_info=True)
+        _close_resources(self.methods, self.p2p_client)
         self._closed = True
 
 
@@ -210,15 +199,9 @@ def _create_runtime_tensor_method(
         raise ValueError("generator P2P requires inference runtime tensors")
     if capability.nixl_manager is None:
         raise ValueError("generator P2P requires the inference NIXL manager")
-    transfer = _NixlStagedTransfer(
-        device_id=capability.device_id,
-        device=capability.device,
-        manager=capability.nixl_manager,
-        capture_layout=capability.capture_layout,
-        generator_fingerprint=capability.generator_fingerprint,
-    )
     return RuntimeTensorNixlUpdateMethod(
-        transfer=transfer,
+        manager=capability.nixl_manager,
+        device_id=capability.device_id,
         runtime_tensors=runtime_tensors,
     )
 
@@ -261,8 +244,8 @@ def _create_resolvers(
     return tuple(resolvers)
 
 
-def _close_partial_resources(
-    methods: list[UpdateMethod],
+def _close_resources(
+    methods: Iterable[UpdateMethod],
     p2p_client: MxClient | None,
 ) -> None:
     for method in methods:
@@ -270,7 +253,7 @@ def _close_partial_resources(
             method.close()
         except Exception:
             logger.warning(
-                "failed to close generator method after initialization error",
+                "failed to close generator method",
                 exc_info=True,
             )
     if p2p_client is not None:
@@ -278,7 +261,7 @@ def _close_partial_resources(
             p2p_client.close()
         except Exception:
             logger.warning(
-                "failed to close P2P client after initialization error",
+                "failed to close generator P2P client",
                 exc_info=True,
             )
 
@@ -314,11 +297,13 @@ def initialize_generator_runtime(
         source_order=resolved_source_order,
     )
     if (
-        streaming is not None
-        and WeightSource.TRAINER in resolved_source_order
-        and PreparedStreamingTensors not in engine.installer.capabilities.artifact_types
+        WeightSource.TRAINER in resolved_source_order
+        and LoadTimeTensorNixlUpdateMethod.capabilities_for(
+            streaming is not None
+        ).artifact_type not in engine.installer.capabilities.artifact_types
     ):
-        raise ValueError("engine does not support bounded streaming installation")
+        mode = "bounded streaming" if streaming is not None else "full-copy"
+        raise ValueError(f"engine does not support {mode} installation")
     methods: list[UpdateMethod] = []
     p2p_client = None
     canonical_method = None
@@ -365,23 +350,8 @@ def initialize_generator_runtime(
                     "P2P initialization failed; using object storage only: %s",
                     error,
                 )
-                for method in methods[p2p_method_start:]:
-                    try:
-                        method.close()
-                    except Exception:
-                        logger.warning(
-                            "failed to close unavailable P2P method",
-                            exc_info=True,
-                        )
+                _close_resources(methods[p2p_method_start:], p2p_client)
                 del methods[p2p_method_start:]
-                if p2p_client is not None:
-                    try:
-                        p2p_client.close()
-                    except Exception:
-                        logger.warning(
-                            "failed to close unavailable P2P client",
-                            exc_info=True,
-                        )
                 p2p_client = None
                 resolved_source_order = (WeightSource.OBJECT_STORAGE,)
         method_tuple = tuple(methods)
@@ -393,20 +363,17 @@ def initialize_generator_runtime(
             engine=engine,
             methods=method_tuple,
             session=WeightUpdateSession(
-                planner=WeightUpdatePlanner(
-                    resolvers=_create_resolvers(
-                        engine=engine,
-                        source_order=resolved_source_order,
-                        p2p_client=p2p_client,
-                        rpc_timeout_seconds=rpc_timeout_seconds,
-                        service=service,
-                    ),
-                    methods=method_tuple,
-                    installer=engine.installer,
-                    max_transfer_attempts=max_transfer_attempts,
+                resolvers=_create_resolvers(
+                    engine=engine,
+                    source_order=resolved_source_order,
+                    p2p_client=p2p_client,
+                    rpc_timeout_seconds=rpc_timeout_seconds,
+                    service=service,
                 ),
+                methods=method_tuple,
+                installer=engine.installer,
+                max_transfer_attempts=max_transfer_attempts,
                 start_lease=start_lease,
-                streaming=streaming,
                 resolve_replay_chain=(
                     None
                     if resolve_replay_chain is None
@@ -429,7 +396,7 @@ def initialize_generator_runtime(
             ),
         )
     except BaseException:
-        _close_partial_resources(methods, p2p_client)
+        _close_resources(methods, p2p_client)
         raise
     return runtime
 

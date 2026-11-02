@@ -19,7 +19,7 @@ fn base_identity() -> SourceIdentity {
     SourceIdentity {
         mx_version: "0.8.0".to_string(),
         mx_source_type: MxSourceType::Weights as i32,
-        model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+        model_name: "Qwen/Qwen3.5-0.8B".to_string(),
         backend_framework: BackendFramework::Vllm as i32,
         tensor_parallel_size: 1,
         pipeline_parallel_size: 1,

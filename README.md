@@ -181,6 +181,9 @@ configured Mooncake distributed store and does not require an MX server or P2P
 metadata. Both backends require writable staging/runtime cache directories and
 a trusted deployment; there is no automatic fallback between them.
 
+For a cold-start/cache-hit walkthrough with either vLLM or SGLang, see the
+[Mooncake artifact reuse example](examples/mooncake_artifact_reuse/README.md).
+
 See the [Kubernetes P2P example](examples/p2p_transfer_k8s/README.md) for metadata-server and inference-worker manifests.
 
 ---

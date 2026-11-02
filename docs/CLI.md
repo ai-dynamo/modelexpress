@@ -26,6 +26,9 @@ cargo build --bin modelexpress-cli
 
 The compiled binary will be available at `target/debug/modelexpress-cli` (or `target/release/modelexpress-cli` for release builds).
 
+The separate `test_client` binary defaults to `Qwen/Qwen3.5-0.8B`; use
+`cargo run --bin test_client -- --test-model <MODEL>` to select another model.
+
 ## Usage
 
 ### Global Options
@@ -39,6 +42,7 @@ modelexpress-cli [OPTIONS] <COMMAND>
 **Options:**
 - `-e, --endpoint <ENDPOINT>`: Server endpoint (default: http://localhost:8001)
 - `-t, --timeout <TIMEOUT>`: Request timeout in seconds (default: 30)
+- `--connect-wait-secs <SECS>`: Seconds to keep retrying the initial server connection before falling back to a direct provider download that bypasses the server cache; 0 disables waiting (default: 10)
 - `-f, --format <FORMAT>`: Output format: `human`, `json`, `json-pretty` (default: human)
 - `-v, -vv, -vvv`: Verbose mode (info, debug, trace)
 - `-q, --quiet`: Quiet mode (suppress all output except errors)

@@ -105,11 +105,13 @@ spec:
             - "1"
             # Keep KV fixed and small so VRAM stays predictable per DP core.
             - --max-model-len
-            - "1024"
+            - "2048"
             - --kv-cache-memory-bytes
             - "1073741824"
+            - --max-num-seqs
+            - "16"
             - --compilation-config
-            - '{"cache_dir":"/root/.cache/vllm/torch_compile_cache/mx-ci"}'
+            - '{"cache_dir":"/root/.cache/vllm/torch_compile_cache/mx-ci","cudagraph_capture_sizes":[1,2,4,8,16]}'
             - --trust-remote-code
             - --port
             - "${WORKER_PORT}"

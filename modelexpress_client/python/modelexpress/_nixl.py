@@ -10,8 +10,18 @@ from types import ModuleType
 
 
 def load_nixl_api() -> ModuleType | None:
-    """Load the API from a CUDA-specific wheel or the NIXL meta-package."""
-    for package in ("nixl_cu13", "nixl_cu12", "nixl"):
+    """Prefer the NIXL wheel matching PyTorch's CUDA build.
+
+    Both CUDA wheels can be installed; importing another major can load
+    incompatible UCX libraries before NIXL initializes.
+    """
+    from torch.version import cuda
+
+    packages = (
+        (f"nixl_cu{cuda.split('.', 1)[0]}", "nixl")
+        if cuda else ("nixl", "nixl_cu13", "nixl_cu12")
+    )
+    for package in packages:
         module_name = f"{package}._api"
         try:
             return importlib.import_module(module_name)

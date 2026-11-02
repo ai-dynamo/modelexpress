@@ -66,8 +66,8 @@ _RECORDERS = [
     ("observe_source_attempt_phase_seconds", ("random", "receive", "ok", 1.0)),
     ("record_nixl_error", ("timeout",)),
     ("record_nixl_receive", ("complete",)),
-    ("observe_load_seconds", ("vllm", "Qwen/Qwen2.5-0.5B-Instruct", "main", "success", 12.0)),
-    ("observe_load_phase_seconds", ("vllm", "Qwen/Qwen2.5-0.5B-Instruct", "chain", 4.0)),
+    ("observe_load_seconds", ("vllm", "Qwen/Qwen3.5-0.8B", "main", "success", 12.0)),
+    ("observe_load_phase_seconds", ("vllm", "Qwen/Qwen3.5-0.8B", "chain", 4.0)),
     (
         "observe_artifact_install_step_seconds",
         ("torch_compile_cache", "primary", "extract", 2.0),
