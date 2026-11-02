@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 import time
@@ -40,6 +41,7 @@ from ...topology import (
 from .adapter import (
     _get_model_name,
     build_sglang_load_context,
+    build_sglang_source_identity,
     is_sglang_draft_model,
 )
 from .artifacts import (
@@ -119,13 +121,10 @@ def _speculative_server_args():
         return None
 
 
-def _expects_draft_pass() -> bool:
-    """True when SGLang will run a draft ModelRunner load through this loader.
-
-    NGRAM speculation has no draft model, and a draft with its own
-    ``speculative_draft_load_format`` never reaches the remote_instance
-    backend.
-    """
+def _expects_draft_pass(ctx: LoadContext) -> bool:
+    """Wait only for an MX draft that can join the main P2P publication."""
+    if not ctx.p2p_enabled or envs.MX_DISABLE_DRAFT_P2P:
+        return False
     spec = _speculative_server_args()
     algorithm = getattr(spec, "speculative_algorithm", None)
     algorithm = str(getattr(algorithm, "name", algorithm) or "").upper()
@@ -133,7 +132,18 @@ def _expects_draft_pass() -> bool:
         return False
     draft_format = getattr(spec, "speculative_draft_load_format", None)
     draft_format = getattr(draft_format, "value", draft_format)
-    return draft_format is None or str(draft_format) == "remote_instance"
+    if draft_format is not None and str(draft_format) != "remote_instance":
+        return False
+    draft_config = copy.copy(ctx.model_config)
+    draft_config.model_path = (
+        getattr(spec, "speculative_draft_model_path", None)
+        or _get_model_name(ctx.model_config)
+    )
+    for attr in ("revision", "quantization"):
+        value = getattr(spec, f"speculative_draft_model_{attr}", None)
+        if value is not None:
+            setattr(draft_config, attr, value)
+    return build_sglang_source_identity(draft_config) == ctx.identity
 
 
 class MxModelLoader:
@@ -227,10 +237,22 @@ class MxModelLoader:
         if is_draft:
             main_loader = _loader_registry.get(ctx.device_id)
             main_ctx = main_loader._ctx if main_loader is not None else None
+            target_path = (
+                _get_model_name(main_ctx.model_config)
+                if main_ctx is not None
+                else getattr(_speculative_server_args(), "model_path", None)
+            )
+            if _get_model_name(model_config) != target_path:
+                ctx.model_streamer_uri = _get_model_name(model_config)
             draft_adapter = draft_weight_adapter_for(
                 type(model).__name__, role="draft", model=model
             )
-            same_checkpoint = main_ctx is not None and main_ctx.identity == ctx.identity
+            same_checkpoint = (
+                main_ctx is not None
+                and main_ctx.p2p_enabled
+                and ctx.p2p_enabled
+                and main_ctx.identity == ctx.identity
+            )
             compatible_adapter = (
                 same_checkpoint
                 and draft_adapter is not None
@@ -261,17 +283,18 @@ class MxModelLoader:
                 # draft identity fall back to SGLang's storage loader.
                 ctx.p2p_enabled = False
             draft_gate = _draft_publication_gates.pop(ctx.device_id, None)
-        elif _expects_draft_pass():
+        elif _expects_draft_pass(ctx):
             self._draft_weight_adapter = draft_weight_adapter_for(
                 type(model).__name__, role="main", model=model
             )
             self._strict_draft_publication = (
-                self._draft_weight_adapter is not None and not envs.MX_DISABLE_DRAFT_P2P
+                self._draft_weight_adapter is not None
+                and ctx.identity.pipeline_parallel_size == 1
+                and bool(ctx.identity.revision)
+                and bool(_sglang_version())
             )
-            if self._strict_draft_publication or not envs.MX_ARTIFACT_READY_URL.strip():
-                main_gate = _DraftPublicationGate(
-                    grace_secs=None if self._strict_draft_publication else 600.0
-                )
+            if self._strict_draft_publication:
+                main_gate = _DraftPublicationGate(grace_secs=None)
                 _draft_publication_gates[ctx.device_id] = main_gate
                 if envs.MX_ARTIFACT_READY_URL.strip():
                     ctx.source_ready_fn = (

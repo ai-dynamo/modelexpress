@@ -93,6 +93,8 @@ class LoadContext:
     # on the same worker. The draft shares the main load's NIXL agent,
     # metadata port and SourceIdentity rather than publishing its own.
     p2p_role: str = "main"
+    # Independent drafts must not inherit the main checkpoint's MX_MODEL_URI.
+    model_streamer_uri: str | None = None
     # Draft manifests can refine this to a compatibility-digested namespace.
     draft_tensor_namespace: str = DRAFT_TENSOR_PREFIX
     # False keeps a load out of P2P entirely (no registration, no RDMA).

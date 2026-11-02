@@ -6,6 +6,7 @@
 import logging
 import logging.handlers
 import os
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch, call
 
 import grpc
@@ -197,11 +198,20 @@ def _make_metadata_resp(found=True, rank=0, mx_source_id="abc123def456abcd", wor
     )
 
 
+def _model_config(**overrides):
+    values = dict(
+        model="test-model", model_weights=None, dtype=torch.float32,
+        quantization=None, revision=None, runner_type="generate",
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def _make_load_context(**overrides):
     """Return a LoadContext with mocked dependencies."""
     from modelexpress.load_strategy import LoadContext
     defaults = dict(
-        model_config=MagicMock(),
+        model_config=_model_config(),
         load_config=MagicMock(),
         target_device=torch.device("cpu"),
         global_rank=0,
@@ -853,23 +863,26 @@ class TestMtpDrafterSecondLoad:
         else:
             monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", disable_draft_p2p)
         enabled = disable_draft_p2p != "1"
+        monkeypatch.setenv("MX_MODEL_URI", "s3://shared/weights")
         loader = _make_loader()
         target_ctx = _make_load_context(device_id=0)
         target_weight = MagicMock()
         target_ctx.tensors = {"target.weight": target_weight}
         target_manager = MagicMock()
         target_ctx.nixl_manager = target_manager
-        target_config = MagicMock(dtype=torch.float32, runner_type="generate")
+        target_config = _model_config()
         self._load(loader, MagicMock(), target_config, target_ctx)
 
         draft_loader = _make_loader()
-        draft_config = MagicMock(dtype=torch.float32, runner_type="draft")
+        draft_config = _model_config(runner_type="draft")
         draft_ctx = _make_load_context(device_id=0)
         draft_weight = MagicMock()
         draft_ctx.tensors = {"mx_draft::mtp.0.weight": draft_weight}
         draft_ctx.nixl_manager = target_manager
         try:
             schedule = self._load(draft_loader, MagicMock(), draft_config, draft_ctx)
+            from modelexpress.load_strategy.model_streamer_strategy import _resolve_model_uri
+            assert _resolve_model_uri(draft_ctx) == "s3://shared/weights"
             assert draft_ctx.p2p_role == "draft"
             assert target_ctx.p2p_enabled is True
             assert draft_ctx.p2p_enabled is enabled
@@ -889,12 +902,16 @@ class TestMtpDrafterSecondLoad:
             loader_mod._nixl_managers.pop(0, None)
             loader_mod._loader_registry.pop(0, None)
 
-    def test_drafter_with_another_identity_stays_out_of_p2p(self):
+    @pytest.mark.parametrize("model_weights", [None, "s3://draft/weights"])
+    def test_drafter_with_another_identity_stays_out_of_p2p(
+        self, monkeypatch, model_weights
+    ):
         """A draft from a different checkpoint (e.g. EAGLE) has its own
         SourceIdentity; peers could never find it in the target's
         publication, so it keeps the pre-#498 storage-only behavior."""
         from modelexpress.engines.vllm import loader as loader_mod
 
+        monkeypatch.setenv("MX_MODEL_URI", "s3://main/weights")
         loader = _make_loader()
         target_ctx = _make_load_context(device_id=0)
         target_ctx.tensors = {"target.weight": MagicMock()}
@@ -902,7 +919,7 @@ class TestMtpDrafterSecondLoad:
         self._load(
             loader,
             MagicMock(),
-            MagicMock(dtype=torch.float32, runner_type="generate"),
+            _model_config(),
             target_ctx,
         )
 
@@ -914,9 +931,13 @@ class TestMtpDrafterSecondLoad:
             self._load(
                 _make_loader(),
                 MagicMock(),
-                MagicMock(dtype=torch.float32, runner_type="draft"),
+                _model_config(
+                    model="eagle-head", model_weights=model_weights, runner_type="draft"
+                ),
                 draft_ctx,
             )
+            from modelexpress.load_strategy.model_streamer_strategy import _resolve_model_uri
+            assert _resolve_model_uri(draft_ctx) == (model_weights or "eagle-head")
             assert draft_ctx.p2p_enabled is False
             assert draft_ctx.shared_nixl_manager is None
             assert loader_mod._tensor_registry[0] == {
@@ -929,20 +950,40 @@ class TestMtpDrafterSecondLoad:
 
     @staticmethod
     def _spec_vllm_config():
-        vllm_config = MagicMock()
-        vllm_config.speculative_config.draft_model_config.runner_type = "draft"
-        return vllm_config
+        return SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                draft_model_config=_model_config(runner_type="draft"),
+                target_model_config=_model_config(),
+                draft_load_config=None,
+            ),
+            parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
+        )
 
-    def test_main_publication_waits_for_the_draft_pass(self):
+    @pytest.mark.parametrize(
+        ("draft_load_format", "model_name_override"),
+        [(None, ""), ("mx", "served-model"), ("modelexpress", "")],
+    )
+    def test_main_publication_waits_for_the_draft_pass(
+        self, monkeypatch, draft_load_format, model_name_override
+    ):
         """Without MX_ARTIFACT_READY_URL, a main load that expects a draft
         keeps its metadata undiscoverable until the draft's tensors have been
         registered and added to the manifest."""
         from modelexpress.engines.vllm import loader as loader_mod
+        from modelexpress.engines.vllm.source_identity import build_source_identity
 
+        monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", model_name_override)
         events = []
         target_ctx = _make_load_context(device_id=0)
         target_ctx.nixl_manager = MagicMock()
         draft_ctx = _make_load_context(device_id=0)
+        config = self._spec_vllm_config()
+        config.speculative_config.draft_load_config = (
+            SimpleNamespace(load_format=draft_load_format) if draft_load_format else None
+        )
+        target_ctx.identity = build_source_identity(config, target_ctx.model_config)
+        target_ctx.identity.model_name = model_name_override or target_ctx.model_config.model
+        draft_ctx.identity.CopyFrom(target_ctx.identity)
 
         def run(model, ctx):
             if ctx is draft_ctx:
@@ -969,8 +1010,8 @@ class TestMtpDrafterSecondLoad:
                     return_value=target_ctx,
                 ):
                     _make_loader().load_model(
-                        self._spec_vllm_config(),
-                        MagicMock(dtype=torch.float32, runner_type="generate"),
+                        config,
+                        _model_config(),
                     )
                 assert callable(target_ctx.source_ready_fn)
                 assert target_ctx.source_ready_fn() is False
@@ -980,8 +1021,8 @@ class TestMtpDrafterSecondLoad:
                     return_value=draft_ctx,
                 ):
                     _make_loader().load_model(
-                        self._spec_vllm_config(),
-                        MagicMock(dtype=torch.float32, runner_type="draft"),
+                        config,
+                        _model_config(runner_type="draft"),
                     )
 
             assert events == ["draft-registered"]
@@ -992,6 +1033,41 @@ class TestMtpDrafterSecondLoad:
             loader_mod._tensor_registry.pop(0, None)
             loader_mod._nixl_managers.pop(0, None)
             loader_mod._loader_registry.pop(0, None)
+
+    @pytest.mark.parametrize(
+        "case", ["independent", "weights_override", "native", "disabled", "main_disabled", "revision"]
+    )
+    def test_main_does_not_wait_for_non_p2p_draft(self, monkeypatch, case):
+        from modelexpress.engines.vllm import loader as loader_mod
+        from modelexpress.engines.vllm.source_identity import build_source_identity
+
+        config = self._spec_vllm_config()
+        draft = config.speculative_config.draft_model_config
+        ctx = _make_load_context()
+        ctx.identity = build_source_identity(config, ctx.model_config)
+        if case == "independent":
+            draft.model = "draft-model"
+        elif case == "weights_override":
+            draft.model_weights = "/draft/weights"
+        elif case == "native":
+            config.speculative_config.draft_load_config = SimpleNamespace(
+                load_format="auto"
+            )
+        elif case == "disabled":
+            monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", "1")
+        elif case == "main_disabled":
+            ctx.p2p_enabled = False
+        elif case == "revision":
+            draft.revision = "other"
+        monkeypatch.setenv("MX_ARTIFACT_READY_URL", "")
+        try:
+            self._load(_make_loader(), config, ctx.model_config, ctx)
+            assert ctx.source_ready_fn is None
+            assert 0 not in loader_mod._draft_publication_gates
+        finally:
+            loader_mod._loader_registry.pop(0, None)
+            loader_mod._tensor_registry.pop(0, None)
+            loader_mod._nixl_managers.pop(0, None)
 
     def test_main_publication_opens_when_no_draft_arrives(self):
         """A target whose expected draft never reaches this loader still
@@ -1031,7 +1107,7 @@ class TestMtpDrafterSecondLoad:
             ) as health:
                 _make_loader().load_model(
                     self._spec_vllm_config(),
-                    MagicMock(dtype=torch.float32, runner_type="generate"),
+                    _model_config(),
                 )
                 assert target_ctx.source_ready_fn() is False
                 health.assert_called_once_with(target_ctx)
