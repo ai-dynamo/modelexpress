@@ -98,7 +98,13 @@ class SglangAdapter(EngineAdapter):
     def _exclude_hidden_tensor_object(obj: object) -> bool:
         """Keep distributed process groups and communicators local."""
         module = (type(obj).__module__ or "") + "."
-        return module.startswith(("sglang.srt.distributed.", "torch.distributed."))
+        return module.startswith(
+            (
+                "sglang.srt.distributed.",
+                "sglang.srt.layers.communication.",
+                "torch.distributed.",
+            )
+        )
 
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         """Collect transferable tensors while preserving process-local state."""
