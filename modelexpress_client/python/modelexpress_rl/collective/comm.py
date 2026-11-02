@@ -533,8 +533,19 @@ def cuda_device(device: Any):
     _cudart_check(runtime.cudaSetDevice(_device_ordinal(device)))
     try:
         yield
-    finally:
-        _cudart_check(runtime.cudaSetDevice(previous))
+    except BaseException:
+        # The block's own failure is the one callers dispatch on (a
+        # TimeoutError, say); a restore failure on top of it is only logged.
+        try:
+            _cudart_check(runtime.cudaSetDevice(previous))
+        except Exception:  # noqa: BLE001 - must not mask the original
+            logger.warning(
+                "could not restore CUDA device %s after the block failed",
+                previous,
+                exc_info=True,
+            )
+        raise
+    _cudart_check(runtime.cudaSetDevice(previous))
 
 
 def _wait_until_initialized(comm: Any, bindings: Any, timeout_s: float) -> None:

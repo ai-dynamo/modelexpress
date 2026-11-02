@@ -227,6 +227,26 @@ class TestTorchFreeLane:
             ("set_device", 3),
         ]
 
+    def test_a_failed_restore_does_not_mask_the_block_s_own_error(
+        self, no_torch, caplog
+    ):
+        """The caller dispatches on the original error, so it must survive."""
+        from modelexpress_rl.collective.comm import cuda_device
+
+        def set_device(ordinal):
+            no_torch.calls.append(("set_device", ordinal))
+            if ordinal == 3:
+                return ("restore-failed",)
+            return (_Err.cudaSuccess,)
+
+        no_torch.cudaSetDevice = set_device
+        with caplog.at_level("WARNING", logger="modelexpress_rl.collective.comm"):
+            with pytest.raises(TimeoutError, match="deadline"):
+                with cuda_device(2):
+                    raise TimeoutError("deadline")
+        assert ("set_device", 3) in no_torch.calls, "the restore was attempted"
+        assert "could not restore CUDA device 3" in caplog.text
+
 
 class TestBootstrapBarrierAllocator:
     def test_the_timeout_still_reaches_synchronize_through_the_allocator_path(self):
