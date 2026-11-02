@@ -211,10 +211,10 @@ class JaxDeviceBuffer:
     an older jax without ``Array.format.layout``, or a backend that reports
     the query as unimplemented -- the array is accepted as before.
 
-    ``is_contiguous`` is still not defined. The resolver checks it only when
-    it is present, and the refusal above is the real check; a constant
-    ``True`` would only restate it, and would be an assertion rather than a
-    reading on the backends that cannot report a layout.
+    ``is_contiguous`` is deliberately not defined. The resolver checks it
+    only when it is present, and the refusal above is the real check; a
+    constant ``True`` would only restate it, and would be an assertion rather
+    than a reading on the backends that cannot report a layout.
     """
 
     __slots__ = ("_array", "_ptr", "shape", "dtype")

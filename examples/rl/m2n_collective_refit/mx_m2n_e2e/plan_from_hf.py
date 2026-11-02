@@ -151,9 +151,10 @@ def build_plan(
     every matrix on its second axis instead. ``2d`` lays the trainers out on a
     ``(trainers // 2, 2)`` mesh, replicated over the first axis and split on
     dim 1 over the second. A source split on two dims at once is not offered:
-    the collective accepts one sharded dim per source tensor. Tensors a layout cannot split evenly (the 1-D
-    norms, for a start) fall back to dim 0 over the flat trainer mesh, so one
-    plan mixes several source layouts, which is itself worth exercising.
+    the collective accepts one sharded dim per source tensor. Tensors a layout
+    cannot split evenly (the 1-D norms, for a start) fall back to dim 0 over
+    the flat trainer mesh, so one plan mixes several source layouts, which is
+    itself worth exercising.
 
     ``dst_layout`` decides what the generator receives. ``replicate`` hands each
     rank the whole tensor and lets the engine's own loader split it, which is
