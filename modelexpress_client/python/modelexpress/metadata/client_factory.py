@@ -37,12 +37,14 @@ _K8S_SERVICE_ALIASES = frozenset({"k8s-service", "service"})
 def create_metadata_client(
     worker_rank: int | None = None,
     server_url: str | None = None,
+    port_offset: int = 0,
 ) -> MxClientBase:
     """Create the metadata client dictated by ``MX_METADATA_BACKEND``.
 
     ``worker_rank`` is only consumed by backends that resolve a rank-
     specific endpoint (currently :class:`MxK8sServiceClient`);
-    others ignore it.
+    others ignore it. ``port_offset`` selects an independent model session's
+    listener when using a rank-specific service endpoint.
     """
     backend = envs.MX_METADATA_BACKEND
     if backend in _CENTRAL_BACKEND_ALIASES:
@@ -54,7 +56,8 @@ def create_metadata_client(
             "(backend=%r, worker_rank=%s)",
             backend, worker_rank,
         )
-        return MxK8sServiceClient(worker_rank=worker_rank)
+        options = {"port_offset": port_offset} if port_offset else {}
+        return MxK8sServiceClient(worker_rank=worker_rank, **options)
     raise ValueError(
         f"Unknown MX_METADATA_BACKEND value {backend!r}. "
         f"Supported: {sorted(_CENTRAL_BACKEND_ALIASES | _K8S_SERVICE_ALIASES)}"

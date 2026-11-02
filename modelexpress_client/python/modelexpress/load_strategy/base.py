@@ -18,7 +18,11 @@ from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import log_tensor_summary
-from ..metadata.publish import extend_published_tensors, publish_metadata_and_ready
+from ..metadata.publish import (
+    extend_published_tensors,
+    publication_key,
+    publish_metadata_and_ready,
+)
 from .context import LoadContext, LoadResult
 
 if TYPE_CHECKING:
@@ -293,7 +297,7 @@ def register_tensors(
     if ctx.adapter is None:
         raise RuntimeError("NIXL registration requires an engine adapter")
     if (
-        ctx.p2p_role == "draft"
+        ctx.shares_main_publication
         and ctx.nixl_manager is None
         and ctx.shared_nixl_manager is None
     ):
@@ -321,7 +325,7 @@ def register_tensors(
                 return
 
             ctx.tensors = ctx.adapter.discover_tensors(result)
-            if ctx.p2p_role == "draft":
+            if ctx.shares_main_publication:
                 ctx.tensors = {
                     ctx.draft_tensor_namespace + name: tensor
                     for name, tensor in ctx.tensors.items()
@@ -336,7 +340,7 @@ def register_tensors(
                 ctx.nixl_manager = ctx.shared_nixl_manager
             else:
                 base_port = envs.MX_METADATA_PORT
-                listen_port = base_port + ctx.device_id
+                listen_port = base_port + ctx.port_offset + ctx.device_id
                 ctx.nixl_manager = _init_nixl_manager(
                     ctx.global_rank,
                     ctx.device_id,
@@ -345,7 +349,7 @@ def register_tensors(
                     ctx.accelerator_backend,
                 )
 
-        if ctx.p2p_role == "draft":
+        if ctx.shares_main_publication:
             # Reusing the target's manager means tensor_descriptors is already
             # populated; the draft must still register its own tensors, and
             # append rather than replace the target's catalog. Per-tensor (not
@@ -371,7 +375,7 @@ def register_tensors(
                 ctx.nixl_manager.register_tensors(ctx.tensors)
             logger.debug(f"[Worker {ctx.global_rank}] Tensors registered with NIXL")
     except Exception as e:
-        if ctx.p2p_role == "draft":
+        if ctx.shares_main_publication:
             # Never publish draft descriptors that are not registered; the
             # shared agent itself stays with the main load.
             ctx.nixl_manager = None
@@ -423,7 +427,7 @@ def publish_metadata(ctx: LoadContext) -> None:
             f"[Worker {ctx.global_rank}] No MX server configured, skipping metadata publish"
         )
         return
-    if ctx.p2p_role == "draft":
+    if ctx.shares_main_publication:
         # Same checkpoint, same SourceIdentity: extend the main load's
         # publication instead of starting a second worker gRPC server on
         # MX_WORKER_GRPC_PORT + device_id under a colliding mx_source_id.
@@ -448,11 +452,17 @@ def publish_metadata(ctx: LoadContext) -> None:
             ctx.draft_published = True
         return
     try:
+        session_options = (
+            {"publication_namespace": ctx.publication_namespace,
+             "port_offset": ctx.port_offset}
+            if ctx.publication_namespace else {}
+        )
         publish_metadata_and_ready(
             ctx.mx_client, ctx.nixl_manager, ctx.tensors,
             ctx.worker_rank, ctx.device_id, ctx.identity, ctx.worker_id,
             accelerator=ctx.accelerator_backend.name,
             ready_fn=ctx.source_ready_fn,
+            **session_options,
         )
     except Exception as e:
         logger.warning(
@@ -479,6 +489,7 @@ def unpublish_metadata(ctx: LoadContext) -> None:
     unpublish_metadata_for_worker(
         worker_rank=ctx.worker_rank,
         device_id=ctx.device_id,
+        **({"publication_namespace": ctx.publication_namespace} if ctx.publication_namespace else {}),
     )
 
 
@@ -486,18 +497,22 @@ def drain_tensor_readers(ctx: LoadContext, *, timeout: float) -> None:
     """Block new tensor reads and wait for current readers before mutation."""
     from ..metadata.publish import _heartbeat_threads, _worker_servers
 
-    worker_server = _worker_servers.get(ctx.device_id)
+    device_key = publication_key(ctx.device_id, ctx.publication_namespace)
+    worker_key = publication_key(ctx.worker_rank, ctx.publication_namespace)
+    worker_server = _worker_servers.get(device_key)
     if worker_server is not None:
         worker_server.drain_tensor_reads(timeout)
         return
-    if _heartbeat_threads.get(ctx.worker_rank) is not None:
+    if _heartbeat_threads.get(worker_key) is not None:
         raise RuntimeError(
             "active refit cannot safely mutate centrally published tensors; "
             "enable MX_P2P_METADATA"
         )
 
 
-def unpublish_metadata_for_worker(*, worker_rank: int, device_id: int) -> None:
+def unpublish_metadata_for_worker(
+    *, worker_rank: int, device_id: int, publication_namespace: str = "",
+) -> None:
     """Stop one worker's publication without requiring a boot-load context."""
     from ..metadata.publish import (
         _central_manifests,
@@ -505,8 +520,8 @@ def unpublish_metadata_for_worker(*, worker_rank: int, device_id: int) -> None:
         _worker_servers,
     )
 
-    _central_manifests.pop(device_id, None)
-    hb = _heartbeat_threads.pop(worker_rank, None)
+    _central_manifests.pop(publication_key(device_id, publication_namespace), None)
+    hb = _heartbeat_threads.pop(publication_key(worker_rank, publication_namespace), None)
     if hb is not None:
         try:
             hb.stop()  # also marks STALE on MX server
@@ -516,7 +531,7 @@ def unpublish_metadata_for_worker(*, worker_rank: int, device_id: int) -> None:
                 f"[Worker {worker_rank}] Failed to stop heartbeat cleanly: {e}"
             )
 
-    ws = _worker_servers.pop(device_id, None)
+    ws = _worker_servers.pop(publication_key(device_id, publication_namespace), None)
     if ws is not None:
         try:
             ws.stop()

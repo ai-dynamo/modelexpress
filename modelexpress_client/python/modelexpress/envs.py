@@ -68,6 +68,9 @@ if TYPE_CHECKING:
     MX_LOAD_STRATEGY_CHAIN: str
     MX_P2P_METADATA: str
     MX_DISABLE_DRAFT_P2P: bool
+    MX_DRAFT_MODEL_URI: Optional[str]
+    MX_DRAFT_MODEL_REVISION: str
+    MX_DRAFT_PORT_OFFSET: int
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
     MX_K8S_SOURCE_RETRIES: str
@@ -277,6 +280,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
     "MX_DISABLE_DRAFT_P2P": lambda: _env_bool("MX_DISABLE_DRAFT_P2P", False),
+    "MX_DRAFT_MODEL_URI": lambda: os.environ.get("MX_DRAFT_MODEL_URI"),
+    "MX_DRAFT_MODEL_REVISION": lambda: os.environ.get("MX_DRAFT_MODEL_REVISION", ""),
+    "MX_DRAFT_PORT_OFFSET": lambda: _env_int("MX_DRAFT_PORT_OFFSET", 10000),
     # ── Kubernetes service backend ─────────────────────────────────────────
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get(
         "MX_K8S_SERVICE_PATTERN", "mx-sources"

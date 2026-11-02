@@ -817,7 +817,11 @@ def test_mx_model_loader_delegates_transfer_engine_transport_in_mx_package():
     )
 
 
-def test_transfer_engine_receive_failure_reinitializes_before_native_fallback():
+@pytest.mark.parametrize("draft", [False, True])
+def test_transfer_engine_receive_failure_reinitializes_before_native_fallback(
+    draft, monkeypatch
+):
+    monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", "0")
     transfer_engine = MagicMock()
     transfer_engine.register_memory.return_value = 0
     transfer_engine.batch_transfer_sync_read.return_value = -1
@@ -844,12 +848,9 @@ def test_transfer_engine_receive_failure_reinitializes_before_native_fallback():
     ]
     adapter.reinit_for_retry.return_value = fresh_result
     adapter.load_via_native.return_value = native_result
-    ctx = SimpleNamespace(
-        global_rank=0,
-        identity=SimpleNamespace(model_name="model"),
-        adapter=adapter,
-        tensors={},
-    )
+    model_config = _model_config(is_draft_model=draft)
+    ctx = build_sglang_load_context(load_config, model_config, _device_config())
+    ctx.adapter = adapter
     source_worker = p2p_pb2.WorkerMetadata(
         transfer_engine_session_id="source-session",
         tensors=[
@@ -875,24 +876,29 @@ def test_transfer_engine_receive_failure_reinitializes_before_native_fallback():
     ) as publish:
         loaded = loader._load_model_via_transfer_engine(
             model=initial_model,
-            model_config=_model_config(),
+            model_config=model_config,
             device_config=_device_config(),
         )
 
     assert loaded is native_model
+    assert ctx.p2p_role == ("draft" if draft else "main")
     transfer_engine.unregister_memory.assert_called_once_with(
         target_tensor.data_ptr()
     )
     adapter.reinit_for_retry.assert_called_once_with(prepared_result)
     adapter.load_via_native.assert_called_once_with(fresh_result)
-    publish.assert_called_once()
-    assert publish.call_args.kwargs["weight_info"] == {
-        "native": (
-            native_tensor.data_ptr(),
-            native_tensor.numel(),
-            native_tensor.element_size(),
-        )
-    }
+    adapter.after_rdma_receive.assert_not_called()
+    publish.assert_called_once_with(
+        ctx=ctx,
+        session_id="target-session",
+        weight_info={
+            "native": (
+                native_tensor.data_ptr(),
+                native_tensor.numel(),
+                native_tensor.element_size(),
+            )
+        },
+    )
 
 
 def test_transfer_engine_source_registration_failure_keeps_native_model():
@@ -912,12 +918,8 @@ def test_transfer_engine_source_registration_failure_keeps_native_model():
     adapter = MagicMock()
     adapter.load_via_native.return_value = native_result
     adapter.discover_tensors.return_value = {"first": first, "second": second}
-    ctx = SimpleNamespace(
-        global_rank=0,
-        identity=SimpleNamespace(model_name="model"),
-        adapter=adapter,
-        tensors={},
-    )
+    ctx = build_sglang_load_context(load_config, _model_config(), _device_config())
+    ctx.adapter = adapter
 
     with patch(
         "modelexpress.engines.sglang.loader.build_sglang_load_context",
@@ -989,7 +991,7 @@ def test_transfer_engine_receive_uses_discovered_tensor_map():
     loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
     tensor = torch.randn(2, 3)
     empty = torch.empty(0)
-    ctx = SimpleNamespace(global_rank=0)
+    ctx = build_sglang_load_context(_load_config(), _model_config(), _device_config())
     transferred = {}
     source_worker = p2p_pb2.WorkerMetadata(
         transfer_engine_session_id="te-session",
@@ -1046,6 +1048,7 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat(
         worker_rank=3,
         worker_id="worker-id",
         device_id=1,
+        publication_namespace="",
         tensors={"weight": torch.zeros(4, dtype=torch.float16)},
         identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
         mx_client=SimpleNamespace(),
@@ -1109,6 +1112,7 @@ def test_transfer_engine_publish_failure_is_deferred_to_publisher():
         worker_rank=3,
         worker_id="worker-id",
         device_id=1,
+        publication_namespace="",
         tensors={"weight": torch.zeros(4, dtype=torch.float16)},
         identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
         accelerator_backend=SimpleNamespace(name="cuda"),
@@ -1354,446 +1358,6 @@ def test_te_find_source_records_the_funnel_on_success(monkeypatch):
         call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list
     }
     assert observed["listed"] == 2
-
-
-# ---------------------------------------------------------------------------
-# Speculative draft (MTP / NextN) second load on the same worker
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def _clean_sglang_registries():
-    from modelexpress.engines.sglang import loader as loader_mod
-
-    yield loader_mod
-    for registry in (
-        loader_mod._tensor_registry,
-        loader_mod._nixl_managers,
-        loader_mod._loader_registry,
-        loader_mod._draft_publication_gates,
-    ):
-        registry.clear()
-
-
-def _run_nixl_pass(
-    model_config, chain, *, ready_url="", expects_draft=False, model=None
-):
-    loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
-    captured = {}
-
-    def run(model, ctx):
-        captured["ctx"] = ctx
-        return chain(model, ctx)
-
-    with patch.dict(os.environ, {"MX_ARTIFACT_READY_URL": ready_url}), patch(
-        "modelexpress.engines.sglang.loader.run_load_strategy_chain",
-        side_effect=run,
-    ), patch(
-        "modelexpress.engines.sglang.loader.install_sglang_cache_artifacts",
-    ) as install, patch(
-        "modelexpress.engines.sglang.loader.schedule_sglang_cache_artifact_publish",
-    ) as schedule, patch(
-        "modelexpress.engines.sglang.loader._expects_draft_pass",
-        return_value=expects_draft,
-    ):
-        loader.load_model(
-            model=model if model is not None else nn.Linear(2, 2),
-            model_config=model_config,
-            device_config=_device_config(),
-        )
-    return loader, captured["ctx"], install, schedule
-
-
-class Qwen3_5MoeForCausalLM(nn.Module):
-    pass
-
-
-class Qwen3_5ForCausalLMMTP(nn.Module):
-    pass
-
-
-def _target_chain(manager, tensors):
-    def chain(model, ctx):
-        ctx.nixl_manager = manager
-        ctx.tensors = tensors
-        return model
-
-    return chain
-
-
-@pytest.mark.parametrize("disable_draft_p2p", [None, "0", "1"])
-def test_sglang_draft_adopts_main_agent_and_extends_registry(
-    _clean_sglang_registries, monkeypatch, disable_draft_p2p,
-):
-    if disable_draft_p2p is None:
-        monkeypatch.delenv("MX_DISABLE_DRAFT_P2P", raising=False)
-    else:
-        monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", disable_draft_p2p)
-    enabled = disable_draft_p2p != "1"
-    loader_mod = _clean_sglang_registries
-    manager = MagicMock()
-    target_weight = torch.zeros(1)
-    with patch(
-        "modelexpress.engines.sglang.loader._sglang_version", return_value="0.5.16"
-    ):
-        main_loader, main_ctx, _, _ = _run_nixl_pass(
-            _model_config(),
-            _target_chain(manager, {"target.weight": target_weight}),
-            model=Qwen3_5MoeForCausalLM(), expects_draft=True,
-        )
-    assert main_ctx.p2p_role == "main"
-
-    draft_weight = torch.zeros(1)
-
-    def draft_chain(model, ctx):
-        if not enabled:
-            assert ctx.p2p_enabled is False
-            assert ctx.shared_nixl_manager is None
-            return model
-        # Registration adopts the shared agent (see register_tensors).
-        assert ctx.shared_nixl_manager is manager
-        assert ctx.draft_tensor_namespace.startswith("mx_draft::")
-        assert ctx.draft_tensor_namespace != "mx_draft::"
-        ctx.nixl_manager = ctx.shared_nixl_manager
-        ctx.tensors = {ctx.draft_tensor_namespace + "model.layers.0.w": draft_weight}
-        ctx.draft_published = True
-        return model
-
-    with patch(
-        "modelexpress.engines.sglang.loader._sglang_version", return_value="0.5.16"
-    ):
-        draft_loader, draft_ctx, install, schedule = _run_nixl_pass(
-            _model_config(is_draft_model=True), draft_chain,
-            model=Qwen3_5ForCausalLMMTP(),
-        )
-
-    assert draft_ctx.p2p_role == "draft"
-    assert main_ctx.p2p_enabled is True
-    assert draft_ctx.p2p_enabled is enabled
-    assert main_ctx.source_ready_fn()
-    install.assert_not_called()
-    schedule.assert_not_called()
-    assert loader_mod._loader_registry[0] is main_loader
-    assert loader_mod._nixl_managers[0] is manager
-    assert loader_mod._tensor_registry[0] is main_ctx.tensors
-    expected = {"target.weight": target_weight}
-    if enabled:
-        expected[draft_ctx.draft_tensor_namespace + "model.layers.0.w"] = draft_weight
-    assert loader_mod._tensor_registry[0] == expected
-    assert main_loader.tensors is main_ctx.tensors
-    assert draft_loader._ctx is None
-
-
-@pytest.mark.parametrize(
-    ("main_class", "draft_class", "layer"),
-    [
-        ("DeepseekV32ForCausalLM", "DeepseekV3ForCausalLMNextN", 61),
-        ("Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN", 92),
-        ("GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN", 78),
-    ],
-)
-def test_sglang_nextn_draft_reuses_main_nixl_agent(
-    _clean_sglang_registries, main_class, draft_class, layer
-):
-    def model_for(name):
-        model_type = type(name, (nn.Module,), {})
-        model = model_type()
-        model.config = SimpleNamespace(
-            num_hidden_layers=layer, num_nextn_predict_layers=1
-        )
-        return model
-
-    manager = MagicMock()
-    with patch(
-        "modelexpress.engines.sglang.loader._sglang_version", return_value="0.5.16"
-    ):
-        _run_nixl_pass(
-            _model_config(), _target_chain(manager, {"main.weight": torch.zeros(1)}),
-            model=model_for(main_class),
-        )
-
-        def draft_chain(model, ctx):
-            assert ctx.shared_nixl_manager is manager
-            assert ctx.draft_tensor_namespace.startswith("mx_draft::")
-            ctx.nixl_manager = manager
-            ctx.draft_published = True
-            return model
-
-        _, draft_ctx, _, _ = _run_nixl_pass(
-            _model_config(is_draft_model=True),
-            draft_chain,
-            model=model_for(draft_class),
-        )
-    assert draft_ctx.p2p_enabled is True
-    assert draft_ctx.p2p_role == "draft"
-
-
-def test_sglang_unknown_draft_uses_storage_fallback_not_unsafe_peer(
-    _clean_sglang_registries,
-):
-    _run_nixl_pass(
-        _model_config(),
-        _target_chain(MagicMock(), {"target.weight": torch.zeros(1)}),
-    )
-    _, draft_ctx, _, _ = _run_nixl_pass(
-        _model_config(is_draft_model=True), lambda model, ctx: model
-    )
-
-    assert draft_ctx.p2p_enabled is False
-
-
-def test_sglang_draft_with_other_identity_stays_out_of_p2p(
-    _clean_sglang_registries,
-):
-    loader_mod = _clean_sglang_registries
-    _run_nixl_pass(
-        _model_config(),
-        _target_chain(MagicMock(), {"target.weight": torch.zeros(1)}),
-    )
-
-    _, draft_ctx, _, _ = _run_nixl_pass(
-        _model_config(model_path="org/eagle-head", is_draft_model=True),
-        lambda model, ctx: model,
-    )
-
-    assert draft_ctx.p2p_enabled is False
-    assert draft_ctx.shared_nixl_manager is None
-    assert set(loader_mod._tensor_registry[0]) == {"target.weight"}
-
-
-def test_sglang_draft_register_never_binds_a_second_port(monkeypatch):
-    from modelexpress.load_strategy.base import register_tensors
-
-    shared = MagicMock()
-    shared.tensor_descriptors = [MagicMock()]
-    ctx = build_sglang_load_context(
-        _load_config(),
-        _model_config(is_draft_model=True),
-        _device_config(),
-    )
-    ctx.p2p_role = "draft"
-    ctx.shared_nixl_manager = shared
-    ctx.adapter = MagicMock()
-    ctx.adapter.discover_tensors.return_value = {"w": torch.zeros(4)}
-    monkeypatch.setenv("MX_SERVER_ADDRESS", "localhost:8001")
-    with patch(
-        "modelexpress.load_strategy.base.is_nixl_available", return_value=True
-    ), patch("modelexpress.load_strategy.base._init_nixl_manager") as init:
-        register_tensors(nn.Linear(2, 2), ctx)
-
-    init.assert_not_called()
-    assert ctx.nixl_manager is shared
-    shared.register_additional_tensors.assert_called_once_with(ctx.tensors)
-    assert list(ctx.tensors) == ["mx_draft::w"]
-    shared.register_arena.assert_not_called()
-
-
-def test_sglang_draft_registration_and_receive_use_only_matching_namespace(
-    monkeypatch,
-):
-    from modelexpress.load_strategy.base import register_tensors
-    from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
-    from modelexpress.nixl_transfer import TensorDescriptor
-
-    ctx = build_sglang_load_context(
-        _load_config(), _model_config(is_draft_model=True), _device_config()
-    )
-    ctx.p2p_role = "draft"
-    ctx.draft_tensor_namespace = "mx_draft::compatible::"
-    ctx.shared_nixl_manager = MagicMock()
-    ctx.adapter = MagicMock()
-    ctx.adapter.discover_tensors.return_value = {"w": torch.ones(1)}
-    monkeypatch.setenv("MX_SERVER_ADDRESS", "localhost:8001")
-    with patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True):
-        register_tensors(nn.Linear(1, 1), ctx)
-
-    assert list(ctx.tensors) == ["mx_draft::compatible::w"]
-    manifest = [
-        TensorDescriptor("mx_draft::other::w", 1, 4, 0, "torch.float32"),
-        TensorDescriptor("mx_draft::compatible::w", 2, 4, 0, "torch.float32"),
-    ]
-    assert [
-        tensor.name for tensor in RdmaStrategy._scope_source_tensors(ctx, manifest)
-    ] == ["mx_draft::compatible::w"]
-
-
-def test_sglang_main_publication_waits_for_draft_pass(_clean_sglang_registries):
-    loader_mod = _clean_sglang_registries
-    manager = MagicMock()
-    _, main_ctx, _, _ = _run_nixl_pass(
-        _model_config(),
-        _target_chain(manager, {"target.weight": torch.zeros(1)}),
-        expects_draft=True,
-    )
-    assert callable(main_ctx.source_ready_fn)
-    assert main_ctx.source_ready_fn() is False
-
-    def draft_chain(model, ctx):
-        assert main_ctx.source_ready_fn() is False
-        ctx.nixl_manager = ctx.shared_nixl_manager
-        ctx.tensors = {"mx_draft::w": torch.zeros(1)}
-        ctx.draft_published = True
-        return model
-
-    _run_nixl_pass(_model_config(is_draft_model=True), draft_chain)
-
-    assert main_ctx.source_ready_fn() is True
-    assert 0 not in loader_mod._draft_publication_gates
-
-
-def test_sglang_qwen35_draft_failure_keeps_main_publication_hidden(
-    _clean_sglang_registries,
-):
-    loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
-    with patch.dict(os.environ, {"MX_ARTIFACT_READY_URL": ""}), patch(
-        "modelexpress.engines.sglang.loader.run_load_strategy_chain",
-        side_effect=_target_chain(MagicMock(), {"target.weight": torch.zeros(1)}),
-    ), patch("modelexpress.engines.sglang.loader._expects_draft_pass", return_value=True), patch(
-        "modelexpress.engines.sglang.loader.install_sglang_cache_artifacts"
-    ), patch("modelexpress.engines.sglang.loader.schedule_sglang_cache_artifact_publish"):
-        loader.load_model(
-            model=Qwen3_5MoeForCausalLM(),
-            model_config=_model_config(),
-            device_config=_device_config(),
-        )
-    main_ctx = loader._ctx
-    assert main_ctx.source_ready_fn() is False
-
-    def failing_chain(model, ctx):
-        raise RuntimeError("no strategy")
-
-    with patch(
-        "modelexpress.engines.sglang.loader._sglang_version", return_value="0.5.16"
-    ), pytest.raises(RuntimeError, match="no strategy"):
-        _run_nixl_pass(
-            _model_config(is_draft_model=True), failing_chain,
-            model=Qwen3_5ForCausalLMMTP(),
-        )
-
-    assert main_ctx.source_ready_fn() is False
-
-
-def test_sglang_qwen35_gate_does_not_expire_without_draft_registration():
-    from modelexpress.engines.sglang.loader import _DraftPublicationGate
-
-    gate = _DraftPublicationGate(grace_secs=None)
-    gate.arm()
-
-    assert gate.is_open() is False
-
-
-def test_sglang_health_url_replaces_draft_gate(_clean_sglang_registries):
-    loader_mod = _clean_sglang_registries
-    _, main_ctx, _, _ = _run_nixl_pass(
-        _model_config(),
-        _target_chain(MagicMock(), {}),
-        ready_url="http://127.0.0.1:30000/health",
-        expects_draft=True,
-    )
-    assert callable(main_ctx.source_ready_fn)
-    assert 0 not in loader_mod._draft_publication_gates
-
-
-@pytest.mark.parametrize(
-    ("spec", "expected"),
-    [
-        (None, False),
-        (SimpleNamespace(speculative_algorithm=None), False),
-        (SimpleNamespace(speculative_algorithm="NGRAM"), False),
-        (SimpleNamespace(speculative_algorithm="NEXTN"), True),
-        (
-            SimpleNamespace(
-                speculative_algorithm="EAGLE",
-                speculative_draft_load_format="remote_instance",
-            ),
-            True,
-        ),
-        (
-            SimpleNamespace(
-                speculative_algorithm="EAGLE",
-                speculative_draft_load_format="auto",
-            ),
-            False,
-        ),
-    ],
-)
-def test_sglang_expects_draft_pass(spec, expected):
-    from modelexpress.engines.sglang import loader as loader_mod
-
-    with patch.object(loader_mod, "_speculative_server_args", return_value=spec):
-        assert loader_mod._expects_draft_pass() is expected
-
-
-def test_sglang_transfer_engine_draft_loads_natively_without_publishing():
-    model = nn.Linear(2, 2)
-    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
-    adapter = MagicMock()
-    adapter.load_via_native.side_effect = lambda result: result
-    ctx = SimpleNamespace(global_rank=0, adapter=adapter, tensors={"stale": 1})
-
-    with patch(
-        "modelexpress.engines.sglang.loader.build_sglang_load_context",
-        return_value=ctx,
-    ), patch.object(loader, "_find_transfer_engine_source") as find, patch.object(
-        loader, "_publish_transfer_engine_source"
-    ) as publish:
-        loaded = loader._load_model_via_transfer_engine(
-            model=model,
-            model_config=_model_config(is_draft_model=True),
-            device_config=_device_config(),
-        )
-
-    assert loaded is model
-    adapter.load_via_native.assert_called_once()
-    find.assert_not_called()
-    publish.assert_not_called()
-    assert ctx.tensors == {}
-    assert loader._ctx is None
-
-
-class _SharedHeadDraft(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model = nn.Module()
-        self.model.embed_tokens = nn.Embedding(4, 2)
-        self.model.eh_proj = nn.Linear(2, 2)
-        self.lm_head = nn.Linear(2, 4)
-
-    def set_embed_and_head(self, embed, head):
-        pass
-
-
-def test_sglang_draft_discovery_drops_target_shared_embed_and_head():
-    adapter = SglangAdapter(
-        _load_config(), _model_config(is_draft_model=True), _device_config()
-    )
-    with patch(
-        "modelexpress.engines.sglang.adapter.adopt_hidden_tensors"
-    ), patch(
-        "modelexpress.engines.sglang.adapter.collect_module_tensors",
-        side_effect=lambda model, _backend: dict(model.named_parameters()),
-    ):
-        tensors = adapter.discover_tensors(
-            LoadResult(value=None, model=_SharedHeadDraft())
-        )
-
-    assert set(tensors) == {"model.eh_proj.weight", "model.eh_proj.bias"}
-
-
-def test_sglang_target_discovery_keeps_embed_and_head():
-    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
-    with patch(
-        "modelexpress.engines.sglang.adapter.adopt_hidden_tensors"
-    ), patch(
-        "modelexpress.engines.sglang.adapter.collect_module_tensors",
-        side_effect=lambda model, _backend: dict(model.named_parameters()),
-    ):
-        tensors = adapter.discover_tensors(
-            LoadResult(value=None, model=_SharedHeadDraft())
-        )
-
-    assert "model.embed_tokens.weight" in tensors
-    assert "lm_head.weight" in tensors
 
 
 def test_transfer_engine_rejects_source_only_runtime_tensor():
