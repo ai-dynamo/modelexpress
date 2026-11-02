@@ -453,6 +453,123 @@ class DeadlineExceeded(grpc.RpcError):
         return grpc.StatusCode.DEADLINE_EXCEEDED
 
 
+class RpcFailure(grpc.RpcError):
+    def __init__(self, status):
+        self.status = status
+
+    def code(self):
+        return self.status
+
+
+def test_transient_source_discovery_failure_retries():
+    ctx = context()
+    clock = FakeClock()
+    ctx.mx_client.list_sources.side_effect = [
+        RpcFailure(grpc.StatusCode.UNAVAILABLE),
+        sources(0, 1),
+    ]
+    with (
+        patch.object(cold_start.time, "monotonic", clock.monotonic),
+        patch.object(cold_start.time, "sleep", clock.sleep),
+        patch.object(cold_start, "accelerators_compatible", return_value=True),
+    ):
+        cold_start.coordinate(ctx, 2)
+    assert ctx.adapter.broadcast_state.call_args.args[0] == ("follower", "")
+    assert clock.sleeps == [1]
+    assert ctx.mx_client.list_sources.call_count == 2
+    assert ctx.mx_client.list_sources.call_args.kwargs["timeout"] == 2
+
+
+@pytest.mark.parametrize("owned", [True, False])
+def test_failed_acquire_reconciles_ownership(owned):
+    ctx = context()
+    clock = FakeClock()
+    ctx.mx_client.donor_lease.side_effect = [
+        RpcFailure(grpc.StatusCode.UNAVAILABLE),
+        owned,
+    ]
+    with (
+        patch.object(cold_start.time, "monotonic", clock.monotonic),
+        patch.object(cold_start.time, "sleep", clock.sleep),
+        patch.object(cold_start, "_ready", side_effect=[False, not owned, False]),
+        patch.object(cold_start, "DonorLease"),
+    ):
+        cold_start.coordinate(ctx, 2)
+    calls = ctx.mx_client.donor_lease.call_args_list
+    assert [call.args[2] for call in calls] == [
+        p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE,
+        p2p_pb2.DONOR_LEASE_ACTION_RENEW,
+    ]
+    assert calls[0].args[1] == calls[1].args[1]
+    assert ctx.adapter.broadcast_state.call_args.args[0][0] == (
+        "donor" if owned else "follower"
+    )
+
+
+def test_persistent_rpc_failure_falls_back_after_retry_window():
+    ctx = context()
+    clock = FakeClock()
+    ctx.mx_client.list_sources.side_effect = RpcFailure(grpc.StatusCode.UNAVAILABLE)
+    with (
+        patch.object(cold_start.time, "monotonic", clock.monotonic),
+        patch.object(cold_start.time, "sleep", clock.sleep),
+    ):
+        cold_start.coordinate(ctx, 2)
+    assert clock.now == cold_start.RPC_RETRY_WINDOW
+    assert ctx.mx_client.list_sources.call_count == 3
+    assert ctx.adapter.broadcast_state.call_args.args[0] == ("fallback", "")
+    assert ctx.skip_rdma
+
+
+def test_persistent_acquire_failure_falls_back():
+    ctx = context()
+    clock = FakeClock()
+    ctx.mx_client.donor_lease.side_effect = RpcFailure(grpc.StatusCode.UNAVAILABLE)
+    with (
+        patch.object(cold_start.time, "monotonic", clock.monotonic),
+        patch.object(cold_start.time, "sleep", clock.sleep),
+        patch.object(cold_start, "_ready", return_value=False),
+    ):
+        cold_start.coordinate(ctx, 2)
+    calls = ctx.mx_client.donor_lease.call_args_list
+    assert [call.args[2] for call in calls] == [
+        p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE,
+        p2p_pb2.DONOR_LEASE_ACTION_RENEW,
+        p2p_pb2.DONOR_LEASE_ACTION_RENEW,
+    ]
+    assert len({call.args[1] for call in calls}) == 1
+    assert clock.now == cold_start.RPC_RETRY_WINDOW
+    assert ctx.skip_rdma
+
+
+def test_permanent_rpc_error_is_not_retried():
+    ctx = context()
+    ctx.mx_client.list_sources.side_effect = RpcFailure(grpc.StatusCode.PERMISSION_DENIED)
+    with patch.object(cold_start.time, "sleep") as sleep:
+        cold_start.coordinate(ctx, 2)
+    ctx.mx_client.list_sources.assert_called_once()
+    sleep.assert_not_called()
+    assert ctx.skip_rdma
+
+
+def test_retry_stays_within_cold_start_deadline(monkeypatch):
+    ctx = context()
+    clock = FakeClock()
+    monkeypatch.setenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", "2")
+    ctx.mx_client.list_sources.side_effect = RpcFailure(grpc.StatusCode.UNAVAILABLE)
+    with (
+        patch.object(cold_start.time, "monotonic", clock.monotonic),
+        patch.object(cold_start.time, "sleep", clock.sleep),
+    ):
+        cold_start.coordinate(ctx, 2)
+    assert clock.now == 2
+    assert all(
+        call.kwargs["timeout"] <= 2
+        for call in ctx.mx_client.list_sources.call_args_list
+    )
+    assert ctx.skip_rdma
+
+
 @pytest.mark.parametrize("operation", ["ready", "acquire", "recheck"])
 def test_rpc_deadline_just_before_local_deadline_falls_back(monkeypatch, operation):
     ctx = context()
@@ -478,6 +595,7 @@ def test_rpc_deadline_just_before_local_deadline_falls_back(monkeypatch, operati
     ctx.mx_client.donor_lease.side_effect = lease
     with (
         patch.object(cold_start.time, "monotonic", clock.monotonic),
+        patch.object(cold_start.time, "sleep", clock.sleep),
         patch.object(cold_start, "_ready", side_effect=ready),
     ):
         cold_start.coordinate(ctx, 2)
@@ -491,6 +609,7 @@ def test_rpc_timeout_before_wait_deadline_falls_back(monkeypatch, caplog):
     error = DeadlineExceeded()
     with (
         patch.object(cold_start.time, "monotonic", clock.monotonic),
+        patch.object(cold_start.time, "sleep", clock.sleep),
         patch.object(cold_start, "_ready", side_effect=error),
     ):
         cold_start.coordinate(ctx, 2)

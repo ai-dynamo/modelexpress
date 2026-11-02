@@ -1147,8 +1147,9 @@ handles.
 With `MX_P2P_COLD_START=1`, replica rank zero coordinates via a 60-second
 Redis lease, renewed every 20 seconds. Followers check READY ranks every two
 seconds. The server accepts lease terms from 1 to 600 seconds; this limits each
-term, not the total time a lease can be renewed. If coordination fails or the
-configured cold-start wait timeout expires, the replica's workers skip the
+term, not the total time a lease can be renewed. Transient discovery and election
+RPC failures are retried for up to three seconds, within the overall wait deadline.
+If coordination fails or the configured cold-start wait timeout expires, the replica's workers skip the
 built-in RDMA strategy and continue through the remaining loading strategies;
 successful loads can still be published as peers. Plugins are unaffected, and
 multiple replicas may then load from storage concurrently. Subsequent strategy

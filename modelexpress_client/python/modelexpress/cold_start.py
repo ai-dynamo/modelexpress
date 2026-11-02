@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 LEASE_TTL = 60
 RENEW_INTERVAL = 20
 POLL_INTERVAL = 2
+RPC_RETRY_WINDOW = 3
+RPC_RETRY_INTERVAL = 1
 
 
 def _ready(ctx, ranks, timeout=30):
@@ -130,14 +132,44 @@ def coordinate(ctx, expected):
                 raise TimeoutError("MX cold start wait deadline expired")
             return value
 
-        def call_with_deadline(function, *args, rpc_timeout):
-            wait = remaining()
-            try:
-                return function(*args, timeout=min(rpc_timeout, wait))
-            except grpc.RpcError as exc:
-                if wait <= rpc_timeout and exc.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
-                    raise TimeoutError("MX cold start wait deadline expired") from exc
-                raise
+        def call_with_deadline(function, *args, rpc_timeout, acquiring=False):
+            retry_deadline = None
+            while True:
+                wait = remaining()
+                timeout = min(rpc_timeout, wait)
+                if retry_deadline is not None:
+                    timeout = min(timeout, retry_deadline - time.monotonic())
+                    if timeout <= 0:
+                        raise retry_error
+                try:
+                    return function(*args, timeout=timeout)
+                except grpc.RpcError as exc:
+                    if (
+                        exc.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+                        and wait <= timeout
+                    ) or time.monotonic() >= deadline:
+                        raise TimeoutError("MX cold start wait deadline expired") from exc
+                    if exc.code() not in (
+                        grpc.StatusCode.UNAVAILABLE,
+                        grpc.StatusCode.DEADLINE_EXCEEDED,
+                    ):
+                        raise
+                    if retry_deadline is None:
+                        retry_deadline = min(deadline, time.monotonic() + RPC_RETRY_WINDOW)
+                    if acquiring:
+                        # A failed acquire may have succeeded remotely. A
+                        # token-guarded renewal safely checks ownership.
+                        args = (*args[:2], p2p_pb2.DONOR_LEASE_ACTION_RENEW, *args[3:])
+                    delay = min(RPC_RETRY_INTERVAL, retry_deadline - time.monotonic())
+                    if delay <= 0:
+                        raise
+                    logger.warning("MX cold start RPC failed (%s); retrying", exc.code())
+                    retry_error = exc
+                    time.sleep(delay)
+                    if time.monotonic() >= retry_deadline:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("MX cold start wait deadline expired") from exc
+                        raise
 
         def release():
             nonlocal acquired
@@ -167,6 +199,7 @@ def coordinate(ctx, expected):
                     p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE,
                     LEASE_TTL,
                     rpc_timeout=10,
+                    acquiring=True,
                 )
                 if acquired:
                     ready = call_with_deadline(_ready, ctx, ranks, rpc_timeout=30)
