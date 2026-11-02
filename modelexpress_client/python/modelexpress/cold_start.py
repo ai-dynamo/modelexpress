@@ -42,7 +42,6 @@ class DonorLease:
         self.ctx, self.token, self.ranks = ctx, token, ranks
         self.deadline = acquired_at + LEASE_TTL
         self.stopped = threading.Event()
-        self.lost = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         atexit.register(self.stop)
@@ -54,7 +53,6 @@ class DonorLease:
         ):
             started = time.monotonic()
             if started >= self.deadline:
-                self.lost.set()
                 logger.error("MX donor lease renewal deadline passed; ownership is unknown")
                 return
             try:
@@ -64,7 +62,6 @@ class DonorLease:
                     p2p_pb2.DONOR_LEASE_ACTION_RENEW,
                     LEASE_TTL,
                 ):
-                    self.lost.set()
                     logger.error("MX donor lease was lost")
                     return
             except Exception:

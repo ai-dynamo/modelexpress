@@ -147,7 +147,7 @@ def test_unsupported_configuration_rejected():
         cold_start.coordinate(ctx, 2)
 
 
-def test_renewal_loss_is_recorded():
+def test_renewal_loss_stops_without_release(caplog):
     ctx = context()
     ctx.mx_client.donor_lease.return_value = False
     with (
@@ -156,9 +156,12 @@ def test_renewal_loss_is_recorded():
     ):
         lease = cold_start.DonorLease(ctx, "token", 2, cold_start.time.monotonic())
         lease.thread.join(timeout=1)
-        assert lease.lost.is_set()
+        assert not lease.thread.is_alive()
         lease.stop()
-    assert ctx.mx_client.donor_lease.call_count == 1
+    assert [call.args[2] for call in ctx.mx_client.donor_lease.call_args_list] == [
+        p2p_pb2.DONOR_LEASE_ACTION_RENEW,
+    ]
+    assert "MX donor lease was lost" in caplog.text
 
 
 def test_ready_releases_lease():
@@ -211,7 +214,6 @@ def run_lease(ctx, renew, ready, wait=None):
     lease.deadline = 60
     lease.stopped = MagicMock()
     lease.stopped.wait.side_effect = wait or [False, False, True]
-    lease.lost = MagicMock()
     with (
         patch.object(cold_start.time, "monotonic", side_effect=range(20)),
         patch.object(cold_start, "_ready", side_effect=ready),
@@ -223,49 +225,45 @@ def run_lease(ctx, renew, ready, wait=None):
 
 def test_transient_renewal_failure_retries_and_releases():
     ctx = context()
-    lease = run_lease(ctx, [RuntimeError("unavailable"), True, True], [True])
+    run_lease(ctx, [RuntimeError("unavailable"), True, True], [True])
     assert [call.args[2] for call in ctx.mx_client.donor_lease.call_args_list] == [
         p2p_pb2.DONOR_LEASE_ACTION_RENEW,
         p2p_pb2.DONOR_LEASE_ACTION_RENEW,
         p2p_pb2.DONOR_LEASE_ACTION_RELEASE,
     ]
-    lease.lost.set.assert_not_called()
 
 
 def test_readiness_error_does_not_abandon_lease():
     ctx = context()
-    lease = run_lease(ctx, [True, True, True], [RuntimeError("unavailable"), True])
+    run_lease(ctx, [True, True, True], [RuntimeError("unavailable"), True])
     assert [call.args[2] for call in ctx.mx_client.donor_lease.call_args_list] == [
         p2p_pb2.DONOR_LEASE_ACTION_RENEW,
         p2p_pb2.DONOR_LEASE_ACTION_RENEW,
         p2p_pb2.DONOR_LEASE_ACTION_RELEASE,
     ]
-    lease.lost.set.assert_not_called()
 
 
-def test_persistent_renewal_failure_stops_at_deadline():
+def test_persistent_renewal_failure_stops_at_deadline(caplog):
     ctx = context()
     lease = cold_start.DonorLease.__new__(cold_start.DonorLease)
     lease.ctx, lease.token, lease.ranks = ctx, "token", 2
     lease.deadline = 5
     lease.stopped = MagicMock()
     lease.stopped.wait.return_value = False
-    lease.lost = MagicMock()
     ctx.mx_client.donor_lease.side_effect = RuntimeError("unavailable")
     with patch.object(cold_start.time, "monotonic", side_effect=[0, 1, 3, 5]):
         lease._run()
     assert ctx.mx_client.donor_lease.call_count == 1
-    lease.lost.set.assert_called_once()
+    assert "MX donor lease renewal deadline passed" in caplog.text
 
 
 def test_stop_during_retry_releases_lease():
     ctx = context()
-    lease = run_lease(ctx, [RuntimeError("unavailable"), True], [], [False, True])
+    run_lease(ctx, [RuntimeError("unavailable"), True], [], [False, True])
     assert [call.args[2] for call in ctx.mx_client.donor_lease.call_args_list] == [
         p2p_pb2.DONOR_LEASE_ACTION_RENEW,
         p2p_pb2.DONOR_LEASE_ACTION_RELEASE,
     ]
-    lease.lost.set.assert_not_called()
 
 
 def test_slow_readiness_check_does_not_delay_next_renewal():
@@ -275,7 +273,6 @@ def test_slow_readiness_check_does_not_delay_next_renewal():
     lease.deadline = 60
     lease.stopped = MagicMock()
     lease.stopped.wait.side_effect = [False, True]
-    lease.lost = MagicMock()
     ctx.mx_client.donor_lease.return_value = True
     with (
         patch.object(cold_start.time, "monotonic", side_effect=[0, 1, 31, 31]),

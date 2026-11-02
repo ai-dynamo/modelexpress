@@ -123,10 +123,10 @@ impl P2pService for P2pServiceImpl {
                     .release_donor_lease(&source_id, &req.owner_token)
                     .await
             }
-            _ => return Err(Status::invalid_argument("invalid action or lease duration")),
+            _ => return Err(Status::invalid_argument("invalid lease action")),
         }
         .map_err(|err| Status::unavailable(format!("donor lease backend: {err}")))?;
-        Ok(Response::new(DonorLeaseResponse { acquired: result }))
+        Ok(Response::new(DonorLeaseResponse { success: result }))
     }
 
     async fn publish_metadata(
@@ -582,7 +582,7 @@ mod tests {
                         .await
                         .expect("valid TTL")
                         .into_inner()
-                        .acquired
+                        .success
                 );
             }
         }
@@ -592,8 +592,24 @@ mod tests {
                     .await
                     .expect("release")
                     .into_inner()
-                    .acquired
+                    .success
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn donor_lease_service_rejects_invalid_action() {
+        let svc = make_service(MockMetadataBackend::new());
+        for action in [DonorLeaseAction::Unspecified as i32, i32::MAX] {
+            let request = Request::new(DonorLeaseRequest {
+                identity: Some(test_identity()),
+                owner_token: "owner".to_string(),
+                action,
+                ttl_seconds: 0,
+            });
+            let error = svc.donor_lease(request).await.expect_err("invalid action");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert_eq!(error.message(), "invalid lease action");
         }
     }
 
@@ -636,7 +652,7 @@ mod tests {
                     .await
                     .expect("lease RPC")
                     .into_inner()
-                    .acquired,
+                    .success,
                 expected
             );
         }
@@ -1233,17 +1249,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_sources_backend_error_returns_empty() {
+    async fn test_list_sources_backend_error_respects_strict() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_list_workers_filtered()
-            .once()
+            .times(2)
             .returning(|_, _, _, _, _, _, _| Err("backend down".into()));
 
         let svc = make_service(mock);
+        let error = svc
+            .list_sources(Request::new(ListSourcesRequest {
+                identity: Some(test_identity()),
+                strict: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("strict request should report backend failure");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("backend down"));
+
         let response = svc
             .list_sources(Request::new(ListSourcesRequest {
                 identity: Some(test_identity()),
-                status_filter: None,
+                strict: false,
                 ..Default::default()
             }))
             .await

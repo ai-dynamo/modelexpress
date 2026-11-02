@@ -261,4 +261,4 @@ class MxClient(MxClientBase):
             ),
             timeout=10,
         )
-        return response.acquired
+        return response.success

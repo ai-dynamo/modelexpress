@@ -3024,8 +3024,12 @@ func (x *DonorLeaseRequest) GetTtlSeconds() uint64 {
 }
 
 type DonorLeaseResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Acquired      bool                   `protobuf:"varint,1,opt,name=acquired,proto3" json:"acquired,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// True if the requested action succeeded: ACQUIRE obtained the lease,
+	// RENEW extended a lease owned by the caller, or RELEASE removed it.
+	// False means the action did not succeed, typically because another caller
+	// owns the lease or the caller's lease has expired.
+	Success       bool `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3060,9 +3064,9 @@ func (*DonorLeaseResponse) Descriptor() ([]byte, []int) {
 	return file_p2p_proto_rawDescGZIP(), []int{33}
 }
 
-func (x *DonorLeaseResponse) GetAcquired() bool {
+func (x *DonorLeaseResponse) GetSuccess() bool {
 	if x != nil {
-		return x.Acquired
+		return x.Success
 	}
 	return false
 }
@@ -3353,9 +3357,9 @@ const file_p2p_proto_rawDesc = "" +
 	"ownerToken\x12;\n" +
 	"\x06action\x18\x03 \x01(\x0e2#.model_express.p2p.DonorLeaseActionR\x06action\x12\x1f\n" +
 	"\vttl_seconds\x18\x04 \x01(\x04R\n" +
-	"ttlSeconds\"0\n" +
-	"\x12DonorLeaseResponse\x12\x1a\n" +
-	"\bacquired\x18\x01 \x01(\bR\bacquired*\x8a\x01\n" +
+	"ttlSeconds\".\n" +
+	"\x12DonorLeaseResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess*\x8a\x01\n" +
 	"\x10BackendFramework\x12\x1d\n" +
 	"\x19BACKEND_FRAMEWORK_UNKNOWN\x10\x00\x12\x1a\n" +
 	"\x16BACKEND_FRAMEWORK_VLLM\x10\x01\x12\x1c\n" +

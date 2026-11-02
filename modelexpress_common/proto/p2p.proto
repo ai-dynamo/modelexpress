@@ -738,5 +738,9 @@ message DonorLeaseRequest {
 }
 
 message DonorLeaseResponse {
-  bool acquired = 1;
+  // True if the requested action succeeded: ACQUIRE obtained the lease,
+  // RENEW extended a lease owned by the caller, or RELEASE removed it.
+  // False means the action did not succeed, typically because another caller
+  // owns the lease or the caller's lease has expired.
+  bool success = 1;
 }

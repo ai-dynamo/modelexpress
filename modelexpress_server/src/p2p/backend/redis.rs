@@ -599,60 +599,6 @@ impl RedisBackend {
         }
     }
 
-    /// Try to acquire a cold-start donor lease for a compatibility key.
-    ///
-    /// Callers must use a fresh, unpredictable token for each attempt.
-    pub async fn try_acquire_donor_lease(
-        &self,
-        compatibility_key: &str,
-        owner_token: &str,
-        duration: std::time::Duration,
-    ) -> MetadataResult<bool> {
-        let ttl_ms = donor_lease_ttl_ms(compatibility_key, owner_token, duration)?;
-        let mut conn = self.get_conn().await?;
-        let acquired: i32 = redis::Script::new(ACQUIRE_DONOR_LEASE_LUA)
-            .key(donor_lease_key(compatibility_key))
-            .arg(owner_token)
-            .arg(ttl_ms)
-            .invoke_async(&mut conn)
-            .await?;
-        Ok(acquired == 1)
-    }
-
-    /// Extend a lease only if the caller still owns it.
-    pub async fn renew_donor_lease(
-        &self,
-        compatibility_key: &str,
-        owner_token: &str,
-        duration: std::time::Duration,
-    ) -> MetadataResult<bool> {
-        let ttl_ms = donor_lease_ttl_ms(compatibility_key, owner_token, duration)?;
-        let mut conn = self.get_conn().await?;
-        let renewed: i32 = redis::Script::new(RENEW_DONOR_LEASE_LUA)
-            .key(donor_lease_key(compatibility_key))
-            .arg(owner_token)
-            .arg(ttl_ms)
-            .invoke_async(&mut conn)
-            .await?;
-        Ok(renewed == 1)
-    }
-
-    /// Release a lease only if the caller still owns it.
-    pub async fn release_donor_lease(
-        &self,
-        compatibility_key: &str,
-        owner_token: &str,
-    ) -> MetadataResult<bool> {
-        validate_donor_lease_identity(compatibility_key, owner_token)?;
-        let mut conn = self.get_conn().await?;
-        let released: i32 = redis::Script::new(RELEASE_DONOR_LEASE_LUA)
-            .key(donor_lease_key(compatibility_key))
-            .arg(owner_token)
-            .invoke_async(&mut conn)
-            .await?;
-        Ok(released == 1)
-    }
-
     /// Get a Redis connection, reconnecting if necessary
     async fn get_conn(&self) -> MetadataResult<ConnectionManager> {
         // Fast path: read lock
@@ -705,30 +651,58 @@ impl MetadataBackend for RedisBackend {
         Ok(())
     }
 
+    /// Try to acquire a cold-start donor lease for a compatibility key.
+    ///
+    /// Callers must use a fresh, unpredictable token for each attempt.
     async fn try_acquire_donor_lease(
         &self,
         compatibility_key: &str,
         owner_token: &str,
         duration: std::time::Duration,
     ) -> MetadataResult<bool> {
-        RedisBackend::try_acquire_donor_lease(self, compatibility_key, owner_token, duration).await
+        let ttl_ms = donor_lease_ttl_ms(compatibility_key, owner_token, duration)?;
+        let mut conn = self.get_conn().await?;
+        let acquired: i32 = redis::Script::new(ACQUIRE_DONOR_LEASE_LUA)
+            .key(donor_lease_key(compatibility_key))
+            .arg(owner_token)
+            .arg(ttl_ms)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(acquired == 1)
     }
 
+    /// Extend a lease only if the caller still owns it.
     async fn renew_donor_lease(
         &self,
         compatibility_key: &str,
         owner_token: &str,
         duration: std::time::Duration,
     ) -> MetadataResult<bool> {
-        RedisBackend::renew_donor_lease(self, compatibility_key, owner_token, duration).await
+        let ttl_ms = donor_lease_ttl_ms(compatibility_key, owner_token, duration)?;
+        let mut conn = self.get_conn().await?;
+        let renewed: i32 = redis::Script::new(RENEW_DONOR_LEASE_LUA)
+            .key(donor_lease_key(compatibility_key))
+            .arg(owner_token)
+            .arg(ttl_ms)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(renewed == 1)
     }
 
+    /// Release a lease only if the caller still owns it.
     async fn release_donor_lease(
         &self,
         compatibility_key: &str,
         owner_token: &str,
     ) -> MetadataResult<bool> {
-        RedisBackend::release_donor_lease(self, compatibility_key, owner_token).await
+        validate_donor_lease_identity(compatibility_key, owner_token)?;
+        let mut conn = self.get_conn().await?;
+        let released: i32 = redis::Script::new(RELEASE_DONOR_LEASE_LUA)
+            .key(donor_lease_key(compatibility_key))
+            .arg(owner_token)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(released == 1)
     }
 
     async fn publish_metadata(

@@ -272,12 +272,32 @@ mod tests {
         );
     }
 
-    /// Nine near-identical forwarding bodies invite a copy-pasted op literal, so
+    /// Near-identical forwarding bodies invite a copy-pasted op literal, so
     /// pin that each method reports under its own name and none under another's.
     #[tokio::test]
     async fn every_method_reports_under_its_own_op_name() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_connect().times(1).returning(|| Ok(()));
+        mock.expect_try_acquire_donor_lease()
+            .withf(|key, owner, duration| {
+                key == "lease-key"
+                    && owner == "owner"
+                    && *duration == std::time::Duration::from_secs(30)
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(true));
+        mock.expect_renew_donor_lease()
+            .withf(|key, owner, duration| {
+                key == "lease-key"
+                    && owner == "owner"
+                    && *duration == std::time::Duration::from_secs(30)
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(false));
+        mock.expect_release_donor_lease()
+            .withf(|key, owner| key == "lease-key" && owner == "owner")
+            .times(1)
+            .returning(|_, _| Ok(true));
         mock.expect_publish_metadata()
             .times(1)
             .returning(|_, _, _, _, _, _| Ok(()));
@@ -306,6 +326,25 @@ mod tests {
         let backend = InstrumentedMetadataBackend::wrap(Arc::new(mock), metrics);
 
         let _ = backend.connect().await;
+        let ttl = std::time::Duration::from_secs(30);
+        assert!(
+            backend
+                .try_acquire_donor_lease("lease-key", "owner", ttl)
+                .await
+                .expect("acquire lease")
+        );
+        assert!(
+            !backend
+                .renew_donor_lease("lease-key", "owner", ttl)
+                .await
+                .expect("renew lease")
+        );
+        assert!(
+            backend
+                .release_donor_lease("lease-key", "owner")
+                .await
+                .expect("release lease")
+        );
         let _ = backend
             .publish_metadata(
                 &SourceIdentity::default(),
@@ -331,6 +370,9 @@ mod tests {
         let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
         for op in [
             "connect",
+            "try_acquire_donor_lease",
+            "renew_donor_lease",
+            "release_donor_lease",
             "publish_metadata",
             "get_metadata",
             "list_workers",

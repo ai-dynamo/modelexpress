@@ -3,6 +3,8 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClient
 
@@ -45,3 +47,28 @@ def test_list_sources_passes_strict_to_server():
     request = stub.ListSources.call_args.args[0]
     assert request.strict is True
     assert request.identity == identity
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE,
+        p2p_pb2.DONOR_LEASE_ACTION_RENEW,
+        p2p_pb2.DONOR_LEASE_ACTION_RELEASE,
+    ],
+)
+@pytest.mark.parametrize("success", [True, False])
+def test_donor_lease_returns_action_success(action, success):
+    stub = MagicMock()
+    stub.DonorLease.return_value = p2p_pb2.DonorLeaseResponse(success=success)
+    client = MxClient("localhost:8001")
+    client._channel = MagicMock()
+    client._stub = stub
+    identity = p2p_pb2.SourceIdentity(model_name="model")
+
+    assert client.donor_lease(identity, "owner", action, 60) is success
+    request = stub.DonorLease.call_args.args[0]
+    assert request.identity == identity
+    assert request.owner_token == "owner"
+    assert request.action == action
+    assert request.ttl_seconds == 60
