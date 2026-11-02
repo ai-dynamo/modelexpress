@@ -57,11 +57,9 @@ class JaxPublisher:
         self,
         params: dict[str, Any],
         plan,
-        groupings,
         rank: int,
     ) -> None:
         self._plan = plan
-        self._groupings = groupings
         self._specs: dict[str, LocalParamSpec] = {}
         self._arrays: list[Any] = []
 
@@ -109,13 +107,9 @@ class JaxPublisher:
     def start_new_round(self, version: str) -> None:
         """Wait for every shard's producing computation before the wire op.
 
-        JAX enqueues on its own stream and ``reshard`` takes a bare device
-        pointer with no stream handshake, so nothing else orders the transfer
-        against the step that produced these weights. The race is measured
-        rather than assumed: a consumer reading the buffer on another stream
-        mid-computation sees intermediate values. One synchronize per round
-        rather than per parameter, which the protocol allows because no
-        parameter may change after the round opens.
+        JAX enqueues on its own stream, so this is the synchronize that
+        ``Publisher.start_new_round`` in ``spi.py`` requires; the reason it is
+        needed, and why once per round, is kept there.
         """
         jax.block_until_ready(self._arrays)
 
@@ -141,16 +135,19 @@ _NUMPY_DTYPE = {
 }
 
 
-def load_local_piece(model_dir: str, entry, *, rank: int) -> np.ndarray:
+def load_local_piece(
+    model_dir: str, entry, *, rank: int, shard_files: dict[str, str]
+) -> np.ndarray:
     """This rank's slice of one parameter, read straight out of the checkpoint.
 
     The slice is the one the plan says the collective reads from this rank, on
     every sharded dim. A safetensors tensor is stored dense and row-major, so a
     memory map of its byte range is the whole tensor viewed in place, and
     slicing it reads only this rank's piece off disk, which is what keeps a
-    trainer process off the whole model.
+    trainer process off the whole model. ``shard_files`` is ``_shard_files``
+    resolved once by the caller for the whole batch.
     """
-    shard = _shard_files(model_dir)[entry.name]
+    shard = shard_files[entry.name]
     path = os.path.join(model_dir, shard)
     with open(path, "rb") as handle:
         (length,) = struct.unpack("<Q", handle.read(8))
@@ -177,8 +174,9 @@ def load_local_piece(model_dir: str, entry, *, rank: int) -> np.ndarray:
 def build_params(model_dir: str, plan, sharding_for, *, rank: int):
     """Every planned parameter as a globally-sharded ``jax.Array``."""
     params = {}
+    shard_files = _shard_files(model_dir)
     for entry in plan.bulk:
-        local = load_local_piece(model_dir, entry, rank=rank)
+        local = load_local_piece(model_dir, entry, rank=rank, shard_files=shard_files)
         params[entry.name] = jax.make_array_from_process_local_data(
             sharding_for(entry),
             local,
@@ -252,7 +250,7 @@ def main() -> int:
     jax.block_until_ready(params)
     load_s = time.perf_counter() - load_start
 
-    publisher = JaxPublisher(params, plan, groupings, rank)
+    publisher = JaxPublisher(params, plan, rank)
 
     channel = grpc.insecure_channel(args.endpoint)
     grpc.channel_ready_future(channel).result(timeout=120)
@@ -350,7 +348,7 @@ def _numel(shape) -> int:
 
 
 def _itemsize(dtype: str) -> int:
-    return {"bfloat16": 2, "float16": 2, "float32": 4}[dtype]
+    return np.dtype(_NUMPY_DTYPE[dtype]).itemsize
 
 
 if __name__ == "__main__":
