@@ -275,6 +275,7 @@ mod tests {
     /// Near-identical forwarding bodies invite a copy-pasted op literal, so
     /// pin that each method reports under its own name and none under another's.
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn every_method_reports_under_its_own_op_name() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_connect().times(1).returning(|| Ok(()));
