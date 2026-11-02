@@ -902,6 +902,10 @@ class NixlTransferManager:
         Returns:
             Sorted list of (alloc_base, alloc_size) tuples for unique
             CUDA allocations.
+
+        Raises:
+            RuntimeError: a tensor runs past the allocation containing its
+                start address, so no single registration could cover it.
         """
         if not descriptors:
             return []
@@ -918,6 +922,13 @@ class NixlTransferManager:
                     f"'{desc.name}' at 0x{desc.addr:x}. Is the tensor on a CUDA device?"
                 )
             base_int = int(alloc_base)
+            alloc_end = base_int + int(alloc_size)
+            if desc.addr + desc.size > alloc_end:
+                raise RuntimeError(
+                    f"Tensor '{desc.name}' at 0x{desc.addr:x} ({desc.size} bytes) "
+                    f"extends past its CUDA allocation "
+                    f"[0x{base_int:x}, 0x{alloc_end:x})"
+                )
             if base_int not in seen:
                 seen[base_int] = int(alloc_size)
 

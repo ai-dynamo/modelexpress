@@ -181,6 +181,12 @@ class TestFindCudaAllocations:
         result = NixlTransferManager._find_cuda_allocations(descriptors)
         assert result == [(0x1000, 0x1000), (0x2000, 0x1000)]
 
+    def test_tensor_past_allocation_end_raises(self, fake_driver):
+        # One VA range backed by two mappings reads as two allocations.
+        fake_driver([(0x1000, 0x1000), (0x2000, 0x1000)])
+        with pytest.raises(RuntimeError, match="'w' at 0x1f00 .* extends past"):
+            NixlTransferManager._find_cuda_allocations([_desc("w", 0x1F00, 0x200)])
+
     def test_driver_error_raises_runtime_error(self, fake_driver):
         from cuda.bindings import driver
 
