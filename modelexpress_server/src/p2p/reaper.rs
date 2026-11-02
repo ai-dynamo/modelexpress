@@ -4,8 +4,10 @@
 //! Server-side reaper for stale source detection and garbage collection.
 //!
 //! Periodically scans all workers in the metadata backend:
-//! 1. **Stale detection**: READY workers whose `updated_at` exceeds the heartbeat
-//!    timeout are marked STALE.
+//! 1. **Stale detection**: workers not already STALE whose `updated_at` exceeds the
+//!    heartbeat timeout are marked STALE. That includes UNKNOWN (the proto default),
+//!    which a worker is left in when it dies between publishing its metadata and its
+//!    first status update.
 //! 2. **Garbage collection**: STALE workers older than the GC timeout are deleted.
 //!
 //! Safe to run on every server replica — all operations are idempotent.
@@ -62,8 +64,9 @@ async fn reap_once(
     for w in &workers {
         let age_ms = now.saturating_sub(w.updated_at).max(0) as u64;
 
-        let is_active =
-            w.status == SourceStatus::Ready as i32 || w.status == SourceStatus::Initializing as i32;
+        // Anything but STALE: a record left at UNKNOWN (or an unrecognized value) gets no
+        // more heartbeats, and STALE is the only state the GC branch below removes.
+        let is_active = w.status != SourceStatus::Stale as i32;
 
         if is_active && age_ms > heartbeat_timeout_ms {
             if let Err(e) = state
@@ -175,6 +178,76 @@ mod tests {
             .withf(|sid, wid| sid == "src1" && wid == "w1")
             .once()
             .returning(|_, _| Ok(()));
+
+        let state = P2pStateManager::with_backend(Arc::new(mock));
+        reap_once(&state, 90_000, 3_600_000)
+            .await
+            .expect("reap_once failed");
+    }
+
+    fn worker_with(status: i32, updated_at: i64) -> SourceInstanceInfo {
+        SourceInstanceInfo {
+            source_id: "src1".into(),
+            worker_id: "w1".into(),
+            model_name: "model".into(),
+            worker_rank: 0,
+            status,
+            updated_at,
+            accelerator: "cuda".into(),
+            source_load: None,
+            topology: Default::default(),
+            training_step: None,
+            layout_signature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reap_marks_expired_unknown_and_unrecognized_status_stale() {
+        // A worker that dies between PublishMetadata and its first UpdateStatus stays at
+        // UNKNOWN with no heartbeat; before this it was never reaped.
+        let old_time = chrono::Utc::now().timestamp_millis() - 120_000;
+        for status in [SourceStatus::Unknown as i32, 99] {
+            let mut mock = MockMetadataBackend::new();
+            mock.expect_list_workers()
+                .once()
+                .returning(move |_, _| Ok(vec![worker_with(status, old_time)]));
+            mock.expect_update_status()
+                .withf(|sid, wid, rank, status, _, _| {
+                    sid == "src1" && wid == "w1" && *rank == 0 && *status == SourceStatus::Stale
+                })
+                .once()
+                .returning(|_, _, _, _, _, _| Ok(()));
+
+            let state = P2pStateManager::with_backend(Arc::new(mock));
+            reap_once(&state, 90_000, 3_600_000)
+                .await
+                .expect("reap_once failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reap_skips_recent_unknown_workers() {
+        let recent = chrono::Utc::now().timestamp_millis() - 10_000;
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_workers()
+            .once()
+            .returning(move |_, _| Ok(vec![worker_with(SourceStatus::Unknown as i32, recent)]));
+        // No update_status or remove_worker calls expected
+
+        let state = P2pStateManager::with_backend(Arc::new(mock));
+        reap_once(&state, 90_000, 3_600_000)
+            .await
+            .expect("reap_once failed");
+    }
+
+    #[tokio::test]
+    async fn test_reap_does_not_restale_stale_workers_within_gc_timeout() {
+        let old_time = chrono::Utc::now().timestamp_millis() - 120_000;
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_workers()
+            .once()
+            .returning(move |_, _| Ok(vec![worker_with(SourceStatus::Stale as i32, old_time)]));
+        // STALE past the heartbeat timeout but inside the GC timeout: no update, no removal.
 
         let state = P2pStateManager::with_backend(Arc::new(mock));
         reap_once(&state, 90_000, 3_600_000)
