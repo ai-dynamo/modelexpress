@@ -1062,6 +1062,10 @@ agent.release_xfer_handle(handle)
 
 vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
 
+For quant methods with `uses_meta_device`, vLLM's native loader runs `finalize_layerwise_processing()` after loading weights and before `process_weights_after_loading()`. ModelExpress uses the standalone `load_weights()` API inside its strategy chain, so its vLLM adapter mirrors that ordering for native, streamed, and RDMA target loads. For native and streamed checkpoint loading, skipping the layerwise finalizer can leave remaining online-FP8 parameters on the Meta device; Qwen3.5 then fails in `_C::static_scaled_fp8_quant` during post-load processing.
+
+RDMA target preparation uses `DummyModelLoader`. In the tested vLLM 0.29.1.dev11 online-FP8 path, the dummy loader has already materialized and quantized the online layers before the adapter's finalizer runs, leaving no pending layerwise work. The additional finalizer call leaves parameter and buffer layouts unchanged in this path.
+
 The solution: both source and target run `process_weights_after_loading()` first, then `adopt_hidden_tensors()` discovers transferable accelerator tensors on non-Module objects (quant configs, kernel objects), and finally `register_tensors()` collects everything for RDMA. The target runs post-processing on dummy data to establish the correct tensor layout and receives the real data, including hidden quant config tensors, via RDMA.
 
 The vLLM adapter passes an exclusion predicate to engine-agnostic hidden-tensor discovery, skipping the exact `vllm.models.kimi_k3.nvidia.ops.latent_moe_tail.KimiK3LatentMoETailOp` class. Its GPU peer-pointer arrays, barriers, and multicast workspaces are process-local collective state and must retain the receiver's allocations and contents. Transferring donor collective state can cause CUDA illegal-address errors during receiver warmup. Hidden quantization tensors outside this operator remain eligible for adoption and RDMA transfer.
