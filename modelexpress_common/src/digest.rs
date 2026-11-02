@@ -10,7 +10,8 @@
 pub struct DigestError(String);
 
 #[cfg(feature = "tls-native")]
-fn sha256(bytes: &[u8]) -> Result<[u8; 32], DigestError> {
+/// SHA-256 of `bytes`, from the OpenSSL provider under `tls-native`.
+pub fn sha256(bytes: &[u8]) -> Result<[u8; 32], DigestError> {
     sha256_in(None, bytes).map_err(|err| DigestError(err.to_string()))
 }
 
@@ -28,8 +29,9 @@ fn sha256_in(
     Ok(out)
 }
 
+/// SHA-256 of `bytes`, from the `sha2` crate when the build has no OpenSSL.
 #[cfg(not(feature = "tls-native"))]
-fn sha256(bytes: &[u8]) -> Result<[u8; 32], DigestError> {
+pub fn sha256(bytes: &[u8]) -> Result<[u8; 32], DigestError> {
     use sha2::{Digest, Sha256};
     Ok(Sha256::digest(bytes).into())
 }
