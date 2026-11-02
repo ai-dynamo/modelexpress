@@ -91,12 +91,14 @@ The trainer SDK still publishes only to S3. An external producer must upload
 Azure artifacts before marking the registered version `READY`.
 
 Upgrade every serving ModelExpress server replica before publishing Azure
-versions. Older replicas read object-storage records as S3. Existing records
-without a provider remain S3; this change does not repair earlier Azure records
-that were stored with the wrong provider.
+versions. Older replicas read only the S3 mirror and cannot consume Azure sources.
+Existing records without a provider remain S3. This change does not repair
+Azure records that were stored with the wrong provider.
 
 Exact-version startup selects the reader from the registered version's storage
-provider. All versions in a replay chain must use the same provider: S3 or Azure.
+provider. The server permits S3 and Azure versions within the same run, including
+delta-base relationships across providers. Generators cannot replay these mixed
+chains: all versions in one replay chain must use the same provider, S3 or Azure.
 Set `MX_REFIT_CHECKPOINT_DIR` for local reconstruction. The generator verifies
 cached artifacts before reuse and downloads missing or damaged artifacts before
 engine loading. Only successful loading on all ranks permits activation.

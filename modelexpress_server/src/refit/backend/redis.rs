@@ -134,9 +134,10 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
         .get("trainer_mesh_id")
         .filter(|mesh_id| !mesh_id.is_empty())
         .cloned();
-    // Keep the legacy URI field; records without a provider were written as S3.
+    // Older records have only s3_uri; a missing provider still means S3.
     let object_storage = fields
-        .get("s3_uri")
+        .get("object_storage_uri")
+        .or_else(|| fields.get("s3_uri"))
         .filter(|uri| !uri.is_empty())
         .map(|uri| -> RefitResult<ObjectStorageSource> {
             let storage_type = if fields.contains_key("object_storage_type") {
@@ -344,6 +345,13 @@ impl RedisRefitBackend {
                 .map_or(i32::from(ObjectStorageType::Unspecified), |source| {
                     source.storage_type
                 }),
+        );
+        invocation.arg(
+            request
+                .object_storage
+                .as_ref()
+                .filter(|source| source.storage_type == i32::from(ObjectStorageType::S3))
+                .map_or("", |source| source.uri.as_str()),
         );
         let mut redis = self.redis.clone();
         invocation
@@ -1139,6 +1147,28 @@ mod tests {
                 storage_type: ObjectStorageType::S3.into(),
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stored_object_storage_uri_takes_precedence_over_s3_mirror() -> RefitResult<()> {
+        for uri in ["az://weights/current", ""] {
+            let mut fields = stored_version("", Some("0"));
+            fields.insert("object_storage_uri".to_string(), uri.to_string());
+            fields.insert("s3_uri".to_string(), "s3://weights/stale".to_string());
+            fields.insert(
+                "object_storage_type".to_string(),
+                i32::from(ObjectStorageType::Azure).to_string(),
+            );
+            let version = version_from_hash(fields)?;
+            assert_eq!(
+                version.object_storage,
+                (!uri.is_empty()).then(|| ObjectStorageSource {
+                    uri: uri.to_string(),
+                    storage_type: ObjectStorageType::Azure.into(),
+                }),
+            );
+        }
         Ok(())
     }
 

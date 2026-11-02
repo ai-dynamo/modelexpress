@@ -86,9 +86,13 @@ can identify S3, Azure Blob Storage, or GCS. The Refit service accepts S3 and Az
 publications; the trainer SDK currently publishes only to S3. Generator checkpoint
 preparation and exact desired-version startup accept S3 and Azure Blob Storage.
 Startup reconstructs the full root and ordered deltas before engine loading.
-Every version in a replay chain must use the same storage provider.
-Redis stores the provider alongside the legacy `s3_uri` field. Records without
-a provider continue to decode as S3; checkpoint bytes remain in object storage.
+The server allows different providers within a run, including across delta-base
+relationships. Generators do not support mixed-provider replay: every version in
+a replay chain must use the same storage provider.
+Redis stores `object_storage_uri` and `object_storage_type`, with `s3_uri` as an
+S3-only mirror for older servers. Readers fall back to `s3_uri` for older records
+without `object_storage_uri`. A missing provider still means S3; checkpoint bytes
+remain in object storage.
 On the NIXL path, weight bytes and full tensor manifests remain
 on trainer workers. On the S3 path, rank zero uploads the version's global index
 after every trainer rank has uploaded its owned shard. `XOR_DELTA` versions use

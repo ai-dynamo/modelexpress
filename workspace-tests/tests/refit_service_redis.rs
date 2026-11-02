@@ -36,6 +36,7 @@ use modelexpress_common::grpc::refit::{
 use modelexpress_server::backend_config::BackendConfig;
 use modelexpress_server::config::ServerConfig;
 use modelexpress_server::run_server;
+use redis::AsyncCommands;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic_health::pb::{
@@ -1412,6 +1413,102 @@ async fn azure_publications_preserve_provider_and_validate_delta_bases() {
         .expect_err("a retry cannot change storage provider");
     assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
     stop(stop_tx, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn object_storage_metadata_preserves_s3_legacy_compatibility() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (shutdown, server) = start_server(port, &redis_url);
+    let mut client = connect(port).await;
+    let mut redis = redis::Client::open(redis_url)
+        .expect("Redis URL")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect to Redis");
+    let worker_id = unique_id("storage-schema-worker");
+    client
+        .register_worker(worker(&worker_id, WorkerRole::Trainer, 60))
+        .await
+        .expect("register publishing worker");
+
+    for (provider, uri, legacy) in [
+        (ObjectStorageType::S3, "s3://weights/full", false),
+        (ObjectStorageType::Azure, "az://weights/full", false),
+        (ObjectStorageType::S3, "s3://weights/legacy", true),
+    ] {
+        let source = ObjectStorageSource {
+            storage_type: provider.into(),
+            uri: uri.to_string(),
+        };
+        let request = CreateWeightVersionRequest {
+            model_name: "test/model".to_string(),
+            idempotency_key: unique_id("storage-schema-version"),
+            payload_format: WeightPayloadFormat::FullHfCheckpoint.into(),
+            object_storage: Some(source.clone()),
+            state: WeightVersionState::Staging.into(),
+            ..Default::default()
+        };
+        let version = client
+            .create_weight_version(request.clone())
+            .await
+            .expect("create object-storage version")
+            .into_inner()
+            .version
+            .expect("version in response");
+        let key = format!("mx:refit:version:metadata:{}", version.uid);
+        let fields: HashMap<String, String> =
+            redis.hgetall(&key).await.expect("read stored version");
+        assert_eq!(
+            fields.get("object_storage_uri").map(String::as_str),
+            Some(uri)
+        );
+        assert_eq!(
+            fields.get("s3_uri").map(String::as_str),
+            Some(if provider == ObjectStorageType::S3 {
+                uri
+            } else {
+                ""
+            }),
+        );
+        if legacy {
+            let removed: usize = redis
+                .hdel(&key, &["object_storage_uri", "object_storage_type"])
+                .await
+                .expect("simulate a record from an older server");
+            assert_eq!(removed, 2);
+        }
+
+        let error = client
+            .create_weight_version_shard(CreateWeightVersionShardRequest {
+                shard: Some(shard(&version.uid, "shard", &worker_id)),
+            })
+            .await
+            .expect_err("object-storage versions reject worker shards");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            "weight version does not accept shard publication"
+        );
+        let ready = update_state(&mut client, &version.uid, WeightVersionState::Ready)
+            .await
+            .expect("publish object-storage version")
+            .version
+            .expect("version in response");
+        assert_eq!(ready.state, i32::from(WeightVersionState::Ready));
+        assert_eq!(ready.object_storage, Some(source));
+        let repeated = client
+            .create_weight_version(request)
+            .await
+            .expect("retry retains the object-storage source")
+            .into_inner()
+            .version
+            .expect("version in response");
+        assert_eq!(repeated, ready);
+    }
+    stop(shutdown, server).await;
 }
 
 #[tokio::test]
