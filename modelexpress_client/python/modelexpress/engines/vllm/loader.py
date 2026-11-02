@@ -47,6 +47,7 @@ from ...load_strategy import (
 from ...load_strategy.draft_gate import DraftPublicationGate
 from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
+from ...tensor_utils import adopt_bare_tensors
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
 from .adapter import _is_speculative_draft, build_vllm_load_context, cold_start_expected_workers
 from .artifacts import (
@@ -232,6 +233,7 @@ class MxModelLoader(BaseModelLoader):
         elif ctx.is_reload and restore:
             ctx.loaded_identity = p2p_pb2.SourceIdentity()
             ctx.loaded_identity.CopyFrom(ctx.identity)
+            adopt_bare_tensors(model, ctx.accelerator_backend)
         draft_gate: DraftPublicationGate | None = None
         main_ctx = None
         if is_speculative_draft:

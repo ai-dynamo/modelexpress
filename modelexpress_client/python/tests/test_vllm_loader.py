@@ -820,9 +820,16 @@ class TestRdmaReloadIdentityGate:
             assert captured == [None]
 
     @pytest.mark.parametrize("restore", [False, True])
-    def test_restore_reload_takes_the_requested_identity(self, restore):
+    def test_restore_reload_takes_the_requested_identity(
+        self, restore, mock_accelerator_backend_cls
+    ):
         loader = _make_loader()
-        new_ctx = _make_load_context(identity=self._identity("abc"))
+        new_ctx = _make_load_context(
+            identity=self._identity("abc"),
+            accelerator_backend=mock_accelerator_backend_cls(torch_device_type="cpu"),
+        )
+        model = nn.Module()
+        model.W_UV = torch.randn(4)
         captured = []
 
         def fake_load_model(vllm_config, model_config, prefix, ctx, *rest):
@@ -838,9 +845,10 @@ class TestRdmaReloadIdentityGate:
         ), patch(
             "modelexpress.engines.vllm.loader.unpublish_metadata"
         ), patch.object(loader, "_load_model", side_effect=fake_load_model):
-            loader.reload_model(MagicMock(), MagicMock(), MagicMock(), restore=restore)
+            loader.reload_model(MagicMock(), MagicMock(), model, restore=restore)
 
         assert captured == [self._identity("abc") if restore else None]
+        assert ("W_UV" in dict(model.named_buffers())) is restore
         if restore:
             assert self._is_available(new_ctx) is True
 
