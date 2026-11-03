@@ -857,6 +857,7 @@ class TestRdmaReloadIdentityGate:
         )
         assert loaded == (self._identity("0" * 40) if restore else None)
         assert ("W_UV" in dict(model.named_buffers())) is restore
+        assert new_ctx.require_exact_tensor_catalog is restore
         if restore:
             assert self._is_available(new_ctx) is True
 
@@ -876,10 +877,11 @@ class TestRdmaReloadIdentityGate:
         with patch.dict(os.environ, override), caplog.at_level(
             logging.INFO, logger="modelexpress.engines.vllm.loader"
         ):
-            loaded, _, model = self._restore_reload(
+            loaded, new_ctx, model = self._restore_reload(
                 revision, True, mock_accelerator_backend_cls
             )
         assert (loaded is not None) is pinned
+        assert new_ctx.require_exact_tensor_catalog is pinned
         assert ("W_UV" in dict(model.named_buffers())) is pinned
         assert ("Restore needs a revision that pins" in caplog.text) is not pinned
 
