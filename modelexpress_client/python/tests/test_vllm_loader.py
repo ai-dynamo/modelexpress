@@ -819,14 +819,12 @@ class TestRdmaReloadIdentityGate:
         else:
             assert captured == [None]
 
-    @pytest.mark.parametrize("restore", [False, True])
-    def test_restore_reload_takes_the_requested_identity(
-        self, restore, mock_accelerator_backend_cls
-    ):
+    def _restore_reload(self, revision, restore, backend_cls):
+        """Reload on a fresh loader; returns the loaded identity, context and model."""
         loader = _make_loader()
         new_ctx = _make_load_context(
-            identity=self._identity("abc"),
-            accelerator_backend=mock_accelerator_backend_cls(torch_device_type="cpu"),
+            identity=self._identity(revision),
+            accelerator_backend=backend_cls(torch_device_type="cpu"),
         )
         model = nn.Module()
         model.W_UV = torch.randn(4)
@@ -845,12 +843,45 @@ class TestRdmaReloadIdentityGate:
         ), patch(
             "modelexpress.engines.vllm.loader.unpublish_metadata"
         ), patch.object(loader, "_load_model", side_effect=fake_load_model):
-            loader.reload_model(MagicMock(), MagicMock(), model, restore=restore)
+            loader.reload_model(
+                MagicMock(), MagicMock(revision=revision), model, restore=restore
+            )
+        return captured[0], new_ctx, model
 
-        assert captured == [self._identity("abc") if restore else None]
+    @pytest.mark.parametrize("restore", [False, True])
+    def test_restore_reload_takes_the_requested_identity(
+        self, restore, mock_accelerator_backend_cls
+    ):
+        loaded, new_ctx, model = self._restore_reload(
+            "0" * 40, restore, mock_accelerator_backend_cls
+        )
+        assert loaded == (self._identity("0" * 40) if restore else None)
         assert ("W_UV" in dict(model.named_buffers())) is restore
         if restore:
             assert self._is_available(new_ctx) is True
+
+    @pytest.mark.parametrize(
+        ("revision", "override", "pinned"),
+        [
+            ("", {}, False),
+            ("main", {}, False),
+            ("main", {"MX_MODEL_REVISION": "main-0d6a01a9"}, True),
+        ],
+    )
+    def test_restore_reload_needs_a_pinned_revision(
+        self, revision, override, pinned, mock_accelerator_backend_cls, caplog
+    ):
+        """A branch or empty revision does not identify the captured checkpoint,
+        so the reload comes from storage; a deployer override is taken as pinned."""
+        with patch.dict(os.environ, override), caplog.at_level(
+            logging.INFO, logger="modelexpress.engines.vllm.loader"
+        ):
+            loaded, _, model = self._restore_reload(
+                revision, True, mock_accelerator_backend_cls
+            )
+        assert (loaded is not None) is pinned
+        assert ("W_UV" in dict(model.named_buffers())) is pinned
+        assert ("Restore needs a revision that pins" in caplog.text) is not pinned
 
 
 class TestMtpDrafterSecondLoad:

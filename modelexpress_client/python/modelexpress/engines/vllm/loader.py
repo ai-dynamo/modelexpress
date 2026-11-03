@@ -56,6 +56,7 @@ from .artifacts import (
     install_vllm_cache_artifacts,
     schedule_vllm_cache_artifact_publish,
 )
+from .source_identity import is_pinned_revision
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
@@ -195,6 +196,8 @@ class MxModelLoader(BaseModelLoader):
 
         `restore=True` says `model` holds `model_config`'s weights from another
         loader, for example before a process checkpoint, so RDMA may refill them.
+        RDMA needs a revision that pins the captured checkpoint (MX_MODEL_REVISION
+        or a full commit hash); otherwise the reload comes from storage.
         """
         if envs.MX_P2P_COLD_START:
             raise RuntimeError("MX cold start does not support model reload")
@@ -230,6 +233,11 @@ class MxModelLoader(BaseModelLoader):
             # Snapshot: a refit rewrites the live identity's revision in place.
             ctx.loaded_identity = p2p_pb2.SourceIdentity()
             ctx.loaded_identity.CopyFrom(self._ctx.identity)
+        elif ctx.is_reload and restore and not is_pinned_revision(model_config):
+            logger.info(
+                f"[Worker {ctx.global_rank}] Restore needs a revision that pins "
+                f"the checkpoint, not {ctx.identity.revision!r}; skipping RDMA"
+            )
         elif ctx.is_reload and restore:
             ctx.loaded_identity = p2p_pb2.SourceIdentity()
             ctx.loaded_identity.CopyFrom(ctx.identity)
