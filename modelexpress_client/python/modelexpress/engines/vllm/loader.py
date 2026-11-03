@@ -152,9 +152,11 @@ class MxModelLoader(BaseModelLoader):
 
         `restore=True` says `model` holds `model_config`'s weights from another
         loader, for example before a process checkpoint, so RDMA may refill them.
-        RDMA needs a revision that pins the captured checkpoint (MX_MODEL_REVISION
-        or a full commit hash) and a peer catalog naming every target tensor;
-        otherwise the reload comes from storage.
+        It enables P2P without requiring it: RDMA needs a revision that pins the
+        captured checkpoint (MX_MODEL_REVISION or a full commit hash), a peer
+        catalog naming every target tensor and a reachable peer; otherwise the
+        reload comes from storage. After a level-2 sleep, map the weight storage
+        back before calling.
         """
         if self._last_sleep_level is None:
             self._stop_serving()
