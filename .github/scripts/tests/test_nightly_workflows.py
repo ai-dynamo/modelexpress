@@ -273,5 +273,122 @@ class NightlyWorkflowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class StageReleaseRcWorkflowTests(unittest.TestCase):
+    def test_preflight_accepts_only_a_matching_release_dispatch(self):
+        script = workflow("stage-release-rc.yml")["jobs"]["preflight"]["steps"][0]["run"]
+        dispatch = {
+            "REPOSITORY": "ai-dynamo/modelexpress", "EVENT": "workflow_dispatch",
+            "REF": "refs/heads/release/0.8.0", "RELEASE_VERSION": "0.8.0", "RC_ROUND": "0",
+        }
+        for change, expected in [
+            ({}, 0),
+            ({"RC_ROUND": "12"}, 0),
+            ({"REPOSITORY": "contributor/modelexpress"}, 1),
+            ({"EVENT": "push"}, 1),
+            ({"REF": "refs/heads/main"}, 1),
+            ({"REF": "refs/tags/v0.8.0"}, 1),
+            ({"REF": "refs/heads/release/0.8", "RELEASE_VERSION": "0.8"}, 1),
+            ({"RELEASE_VERSION": '0.8.0"; id; "'}, 1),
+            ({"RC_ROUND": "-1"}, 1),
+            ({"RC_ROUND": "2.1"}, 1),
+            ({"RC_ROUND": "02"}, 1),
+            ({"RC_ROUND": "1234567890"}, 1),
+        ]:
+            with self.subTest(change=change):
+                result, _ = execute(script, {**dispatch, **change})
+                self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_preflight_requires_the_release_version_in_every_manifest(self):
+        script = 'cd "$TREE"\n' + workflow("stage-release-rc.yml")["jobs"]["preflight"]["steps"][2]["run"]
+        manifests = {
+            "Cargo.toml": 'version = "{}"\n',
+            "modelexpress_client/python/pyproject.toml": 'version = "{}"\n',
+            "helm/Chart.yaml": "version: {}\n",
+        }
+        for stale in [None, *manifests]:
+            with self.subTest(stale=stale), tempfile.TemporaryDirectory() as tree:
+                for name, line in manifests.items():
+                    path = Path(tree) / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(line.format("0.7.0" if name == stale else "0.8.0"))
+                result, values = execute(script, {
+                    "TREE": tree, "RELEASE_VERSION": "0.8.0", "RC_ROUND": "2",
+                    "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1",
+                })
+                if stale:
+                    self.assertNotEqual(result.returncode, 0)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(values["container_tag"], "0.8.0-rc.2")
+                    self.assertEqual(values["wheel_version"], "0.8.0")
+                    self.assertEqual(values["artifactory_path"], "release/0.8.0/rc2")
+
+    def test_helm_chart_waits_for_container_staging(self):
+        jobs = workflow("stage-release-rc.yml")["jobs"]
+        self.assertIn("stage-containers-ngc", jobs["stage-helm-ngc"]["needs"])
+
+    def test_every_publishing_job_waits_for_the_ops_gate(self):
+        jobs = workflow("stage-release-rc.yml")["jobs"]
+        self.assertNotIn("manual-release-approval", jobs)
+        for name in [
+            "build-server-image", "build-wheels", "stage-crates",
+            "stage-helm-ngc", "stage-containers-ngc", "trigger-gitlab-release",
+        ]:
+            with self.subTest(job=name):
+                self.assertIn("authorize", jobs[name]["needs"])
+                self.assertIn("authorized_attempt == github.run_attempt", jobs[name]["if"])
+        self.assertIn("build-server-image", jobs["assemble-server-manifest"]["needs"])
+
+    def test_ops_gate_checks_both_actors_against_the_devops_team(self):
+        gate = workflow("stage-release-rc.yml")["jobs"]["authorize"]
+        self.assertEqual(gate["environment"], "automated-release")
+        check = next(step for step in gate["steps"] if step.get("name") == "Require release-ops team membership")
+        self.assertEqual(check["env"]["TEAM"], "devops")
+        self.assertIn("github.actor", check["env"]["ACTOR"])
+        self.assertIn("github.triggering_actor", check["env"]["TRIGGERING_ACTOR"])
+
+    def test_ops_gate_rejects_non_members_and_api_errors(self):
+        gate = workflow("stage-release-rc.yml")["jobs"]["authorize"]
+        script = next(
+            step["run"] for step in gate["steps"] if step.get("name") == "Require release-ops team membership"
+        )
+        cases = [
+            ("200", '{"state": "active"}', 0),
+            ("200", '{"state": "pending"}', 1),
+            ("404", '{"message": "Not Found"}', 1),
+            ("000", "", 1),
+        ]
+        for http, body, expected in cases:
+            with self.subTest(http=http, body=body), tempfile.TemporaryDirectory() as tmp:
+                curl = Path(tmp) / "curl"
+                curl.write_text(
+                    "#!/bin/sh\n"
+                    "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n"
+                    f"printf '%s' '{body}' > \"$out\"\n"
+                    f"printf '%s' '{http}'\n"
+                )
+                curl.chmod(0o755)
+                result, _ = execute(script, {
+                    "PATH": f"{tmp}:{os.environ['PATH']}", "RUNNER_TEMP": tmp, "GH_TOKEN": "x",
+                    "ORG": "ai-dynamo", "TEAM": "devops", "ACTOR": "alice", "TRIGGERING_ACTOR": "bob",
+                })
+                self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_rc_status_requires_every_staging_job(self):
+        status = workflow("stage-release-rc.yml")["jobs"]["rc-status"]
+        script = status["steps"][0]["run"]
+        results = {job: {"result": "success"} for job in status["needs"]}
+
+        def check(values, skip="false"):
+            return execute(script, {"RESULTS": json.dumps(values), "SKIP_GITLAB": skip})[0].returncode
+
+        self.assertEqual(check(results), 0)
+        for job in status["needs"]:
+            for conclusion in ["failure", "cancelled", "skipped"]:
+                with self.subTest(job=job, conclusion=conclusion):
+                    self.assertNotEqual(check({**results, job: {"result": conclusion}}), 0)
+        self.assertEqual(check({**results, "trigger-gitlab-release": {"result": "skipped"}}, skip="true"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
