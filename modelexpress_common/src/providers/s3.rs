@@ -330,8 +330,14 @@ fn collect_cached_models(
     current_dir: &Path,
     models: &mut Vec<ModelInfo>,
 ) -> Result<()> {
-    let Some(entries) = crate::cache::read_dir_for_listing(current_dir) else {
-        return Ok(());
+    let entries = if current_dir == cache_dir.join(CACHE_ROOT_DIR_NAME) {
+        fs::read_dir(current_dir)
+            .with_context(|| format!("Failed to read directory '{}'", current_dir.display()))?
+    } else {
+        let Some(entries) = crate::cache::read_dir_for_listing(current_dir) else {
+            return Ok(());
+        };
+        entries
     };
     for entry in entries {
         let entry = entry?;

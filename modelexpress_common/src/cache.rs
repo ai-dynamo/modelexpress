@@ -758,6 +758,74 @@ mod tests {
         assert_eq!(stats.total_size, 6);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_get_cache_stats_flags_inaccessible_ngc_models() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let cache_path = temp_dir.path().join("cache");
+
+        let good = cache_path.join("ngc/org/models/good/1");
+        fs::create_dir_all(&good).expect("Failed to create NGC model directory");
+        fs::write(good.join("weights.bin"), b"ab").expect("Failed to write NGC file");
+
+        let locked = cache_path.join("ngc/org/team/models/locked/2");
+        fs::create_dir_all(&locked).expect("Failed to create NGC model directory");
+        fs::write(locked.join("weights.bin"), b"abc").expect("Failed to write NGC file");
+
+        let other_org = cache_path.join("ngc/other");
+        fs::create_dir_all(&other_org).expect("Failed to create NGC org directory");
+
+        let Some(_locked_guard) = lock_directory(&locked) else {
+            eprintln!("skipping: directory permissions are not enforced (running as root?)");
+            return;
+        };
+        let Some(_org_guard) = lock_directory(&other_org) else {
+            eprintln!("skipping: directory permissions are not enforced (running as root?)");
+            return;
+        };
+
+        let stats = create_test_cache_config(cache_path)
+            .get_cache_stats()
+            .expect("an unreadable NGC directory must not fail the whole listing");
+
+        let mut ngc: Vec<(&str, bool, u64)> = stats
+            .models
+            .iter()
+            .filter(|m| m.provider == ModelProvider::Ngc)
+            .map(|m| (m.name.as_str(), m.accessible, m.size))
+            .collect();
+        ngc.sort();
+        assert_eq!(
+            ngc,
+            vec![
+                ("org/good/1", true, 2),
+                ("org/team/models/locked/2", false, 0)
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_cache_stats_fails_on_unreadable_s3_root() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let cache_path = temp_dir.path().join("cache");
+
+        let s3_model = cache_path.join("s3/bucket/model");
+        fs::create_dir_all(&s3_model).expect("Failed to create S3 model directory");
+        fs::write(s3_model.join(".mx-model"), b"").expect("Failed to write S3 marker");
+
+        let Some(_s3_guard) = lock_directory(&cache_path.join("s3")) else {
+            eprintln!("skipping: directory permissions are not enforced (running as root?)");
+            return;
+        };
+
+        assert!(
+            create_test_cache_config(cache_path)
+                .get_cache_stats()
+                .is_err()
+        );
+    }
+
     #[cfg(feature = "gcs")]
     #[test]
     fn test_clear_model_removes_only_requested_layout() {
