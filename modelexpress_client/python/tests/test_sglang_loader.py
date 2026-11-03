@@ -838,24 +838,91 @@ def _transfer_ticket(*states):
     return ticket
 
 
-def test_transfer_engine_requires_ticket_runtime_before_loading():
-    engine = SimpleNamespace(submit_scatter_read=None)
+@pytest.mark.parametrize("has_source", [True, False])
+def test_transfer_engine_ticket_runtime_requirement_is_receive_only(has_source):
+    engine = SimpleNamespace(register_memory=MagicMock(return_value=0))
     loader = MxModelLoader(_load_config(
         modelexpress_transport="transfer_engine",
         remote_instance_weight_loader_transfer_engine=engine,
         remote_instance_weight_loader_transfer_engine_session_id="target-session",
     ))
-    ctx = SimpleNamespace(global_rank=0, adapter=MagicMock())
+    model = nn.Linear(2, 2)
+    adapter = MagicMock()
+    adapter.load_via_native.return_value = LoadResult(value=model, model=model)
+    adapter.discover_tensors.return_value = {"weight": model.weight}
+    ctx = SimpleNamespace(
+        global_rank=0,
+        identity=SimpleNamespace(model_name="model"),
+        adapter=adapter,
+    )
     with patch(
         "modelexpress.engines.sglang.loader.build_sglang_load_context", return_value=ctx
-    ), patch.object(loader, "_find_transfer_engine_source") as find_source:
-        with pytest.raises(RuntimeError, match="0.3.14"):
-            loader._load_model_via_transfer_engine(
-                model=nn.Linear(2, 2), model_config=_model_config(), device_config=_device_config()
+    ), patch.object(
+        loader, "_find_transfer_engine_source",
+        return_value=SimpleNamespace() if has_source else None,
+    ) as find_source, patch.object(
+        loader, "_publish_transfer_engine_source", return_value=True
+    ) as publish:
+        if has_source:
+            with pytest.raises(RuntimeError, match="0.3.14"):
+                loader._load_model_via_transfer_engine(
+                    model=model, model_config=_model_config(), device_config=_device_config()
+                )
+            engine.register_memory.assert_not_called()
+            adapter.load_via_native.assert_not_called()
+            adapter.discover_tensors.assert_not_called()
+            publish.assert_not_called()
+        else:
+            loaded = loader._load_model_via_transfer_engine(
+                model=model, model_config=_model_config(), device_config=_device_config()
             )
-    find_source.assert_not_called()
-    ctx.adapter.before_rdma_receive.assert_not_called()
-    ctx.adapter.load_via_native.assert_not_called()
+            assert loaded is model
+            adapter.load_via_native.assert_called_once()
+            engine.register_memory.assert_called_once_with(
+                model.weight.data_ptr(), model.weight.numel() * model.weight.element_size()
+            )
+            publish.assert_called_once_with(
+                ctx=ctx,
+                session_id="target-session",
+                weight_info={
+                    "weight": (model.weight.data_ptr(), model.weight.numel(), model.weight.element_size())
+                },
+            )
+    find_source.assert_called_once_with(ctx)
+    adapter.before_rdma_receive.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("drain_times", "warning_times"),
+    [([1, 29, 30, 31, 59, 60, 90], [30, 60]), ([30], []), ([1], [])],
+)
+def test_transfer_engine_pending_warnings_are_periodic(
+    drain_times, warning_times, caplog
+):
+    now = [100.0]
+    ticket = _transfer_ticket(
+        *(["COMPLETION_UNKNOWN"] * (len(drain_times) - 1)), "COMPLETED"
+    )
+    advance = ticket.drain.side_effect
+    times = iter(drain_times)
+
+    def drain(timeout_ms):
+        now[0] = 100 + next(times)
+        return advance(timeout_ms)
+
+    ticket.drain.side_effect = drain
+    with patch(
+        "modelexpress.engines.sglang.loader.time.monotonic", side_effect=lambda: now[0]
+    ), caplog.at_level("WARNING", logger=sglang_loader.logger.name):
+        MxModelLoader._drain_transfer_engine_ticket(ticket, 7, 1024**3)
+
+    warnings = [record for record in caplog.records if record.name == sglang_loader.logger.name]
+    assert [record.getMessage() for record in warnings] == [
+        f"[Worker 7] TransferEngine receive still pending after {elapsed:.1f}s "
+        "(batch_bytes=1073741824); retaining registered buffers while draining"
+        for elapsed in warning_times
+    ]
+    assert ticket.drained
 
 
 @pytest.mark.parametrize(

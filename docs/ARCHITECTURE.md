@@ -745,8 +745,10 @@ global registries. For `transport=transfer_engine`, it uses SGLang's initialized
 TransferEngine and ModelExpress metadata directly: first replica loads natively,
 registers TransferEngine memory, and publishes its session; later replicas
 discover that source and pull with `submit_scatter_read` completion tickets.
-This path requires Mooncake >=0.3.14 with the retained-ticket API; unsupported
-runtimes are rejected before loading or registering weights. Receives validate
+Receivers require Mooncake >=0.3.14 with the retained-ticket API; unsupported
+receivers are rejected after source discovery, before preparing or registering
+destination weights. A seed with no source can load natively, register memory,
+and publish without the ticket API. Receives validate
 the complete tensor manifest before submission and cap each batch at 1 GiB,
 splitting individual tensors when needed. This limits the number of outstanding
 transport slices for large model loads. Manifest validation, byte-range batching,
@@ -763,7 +765,9 @@ Bounding each receive limits these queue costs independently of the native RDMA
 slice size; it does not establish completion after a timeout.
 
 Each ticket is drained in one-second waits while its tensors, registrations,
-and engine remain owned. `COMPLETION_UNKNOWN` keeps the load pending; it does
+and engine remain owned. Pending receives emit a warning every 30 seconds with
+the worker rank, elapsed drain time, and batch size in bytes.
+`COMPLETION_UNKNOWN` keeps the load pending; it does
 not permit buffer reuse or the next batch. After `FAILED_DRAINED`, the loader
 can unregister the buffers, reinitialize the model, and fall back natively.
 If submission or draining raises, the operation and buffers remain retained

@@ -432,12 +432,6 @@ class MxModelLoader:
                 "SGLang ModelExpress transfer_engine transport requires an "
                 "initialized SGLang TransferEngine and session id."
             )
-        if not callable(getattr(transfer_engine, "submit_scatter_read", None)):
-            raise RuntimeError(
-                "SGLang ModelExpress transfer_engine transport requires "
-                "Mooncake >=0.3.14 with submit_scatter_read completion tickets."
-            )
-
         logger.info(
             "[Worker %s] SGLang MxModelLoader starting transfer_engine "
             "(model=%s)",
@@ -456,6 +450,11 @@ class MxModelLoader:
             result = ctx.adapter.load_via_native(result)
             tensors = ctx.adapter.discover_tensors(result)
         else:
+            if not callable(getattr(transfer_engine, "submit_scatter_read", None)):
+                raise RuntimeError(
+                    "SGLang ModelExpress transfer_engine receive requires "
+                    "Mooncake >=0.3.14 with submit_scatter_read completion tickets."
+                )
             registered_tensors = None
             try:
                 result = ctx.adapter.before_rdma_receive(result)
@@ -716,7 +715,7 @@ class MxModelLoader:
             _pending_transfer_engine_receives[owner] = (
                 ticket, transfer_engine, tensors
             )
-            self._drain_transfer_engine_ticket(ticket, global_rank)
+            self._drain_transfer_engine_ticket(ticket, global_rank, sum(lengths))
         except Exception as exc:
             raise _TransferEngineReceiveError(
                 "ModelExpress transfer_engine: receive raised with unknown "
@@ -730,17 +729,27 @@ class MxModelLoader:
             )
 
     @staticmethod
-    def _drain_transfer_engine_ticket(ticket, global_rank: int) -> None:
-        waiting_logged = False
+    def _drain_transfer_engine_ticket(
+        ticket, global_rank: int, batch_bytes: int
+    ) -> None:
+        """Wait for physical completion, warning every 30 seconds while pending."""
+        started = time.monotonic()
+        next_warning = started + 30
         while not ticket.drained:
             ticket.drain(1000)
-            if not ticket.drained and not waiting_logged:
-                logger.info(
-                    "[Worker %s] TransferEngine receive still pending; "
+            if ticket.drained:
+                break
+            now = time.monotonic()
+            if now >= next_warning:
+                logger.warning(
+                    "[Worker %s] TransferEngine receive still pending after "
+                    "%.1fs (batch_bytes=%d); "
                     "retaining registered buffers while draining",
                     global_rank,
+                    now - started,
+                    batch_bytes,
                 )
-                waiting_logged = True
+                next_warning = now + 30
 
     def _register_transfer_engine_tensors(
         self,
