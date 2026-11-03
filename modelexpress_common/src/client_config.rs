@@ -48,6 +48,11 @@ pub struct ClientArgs {
     #[arg(short, long, env = crate::envs::MODEL_EXPRESS_TIMEOUT)]
     pub timeout: Option<u64>,
 
+    /// Seconds to keep retrying the initial server connection before falling back to a
+    /// direct provider download (0 disables waiting)
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_CONNECT_WAIT_SECS)]
+    pub connect_wait_secs: Option<u64>,
+
     /// Cache path override
     #[arg(long, env = crate::envs::MODEL_EXPRESS_CACHE_DIRECTORY)]
     pub cache_path: Option<PathBuf>,
@@ -130,6 +135,10 @@ impl ClientConfig {
 
         if let Some(timeout) = args.timeout {
             config.connection.timeout_secs = Some(timeout);
+        }
+
+        if let Some(wait) = args.connect_wait_secs {
+            config.connection.connect_wait_secs = Some(wait);
         }
 
         // Cache settings
@@ -379,6 +388,7 @@ mod tests {
             config: None,
             endpoint: Some("cli-override:7777".to_string()),
             timeout: Some(120),
+            connect_wait_secs: Some(7),
             cache_path: None,
             log_level: None,
             log_format: None,
@@ -391,6 +401,7 @@ mod tests {
 
         assert_eq!(config.connection.endpoint, "http://cli-override:7777");
         assert_eq!(config.connection.timeout_secs, Some(120));
+        assert_eq!(config.connection.connect_wait_secs, Some(7));
         assert!(config.logging.quiet);
         assert!(!config.cache.shared_storage);
         assert_eq!(config.cache.transfer_chunk_size, 2097152);

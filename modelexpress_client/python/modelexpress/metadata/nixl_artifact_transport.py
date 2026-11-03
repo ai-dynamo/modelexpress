@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .. import p2p_pb2
+from ..topology import blocks_selection, resolve_policy
 from .artifact_transfer import (
     ArtifactBundle,
     ArtifactTransfer,
@@ -74,6 +75,11 @@ class NixlArtifactTransport(ArtifactTransport):
     def should_publish(self, state: ArtifactInstallState | None) -> bool:
         """A live NIXL source is published after either a hit or a miss."""
         return True
+
+    def check_publishable(self) -> None:
+        """Reject an unknown required domain before cache preparation."""
+        if blocks_selection(resolve_policy(timeout=0)):
+            raise LookupError("required artifact publish topology is unknown")
 
     def __init__(
         self,
