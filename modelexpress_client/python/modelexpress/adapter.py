@@ -15,6 +15,7 @@ from . import p2p_pb2
 
 if TYPE_CHECKING:
     from .load_strategy.context import LoadResult
+    from .types import TensorDescriptor
 
 
 class UnsupportedCapability(NotImplementedError):
@@ -214,6 +215,16 @@ class EngineAdapter:
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
         """Run engine post-processing needed before RDMA writes into tensors."""
         return result
+
+    def prepare_rdma_target_from_manifest(
+        self, result: LoadResult, source_tensors: list[TensorDescriptor]
+    ) -> None:
+        """Allocate donor-dependent cold-load storage before registration.
+
+        Called after before_rdma_receive, with the scoped source manifest held
+        under its read lease where supported. Must not replace the model root.
+        """
+        return None
 
     def after_rdma_receive(self, result: LoadResult) -> LoadResult:
         """Run engine post-processing after RDMA weights have been received."""

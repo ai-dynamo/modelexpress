@@ -106,9 +106,9 @@ wait_for_worker_liveness() {
 }
 
 # GitHub releases a cancelled job's queue slot before independent cleanup finishes.
-# Wait for the previous CI namespaces and physical pods before allocating a new workload.
+# Wait for previous CI resources; the exclusive large lane reclaims stale namespaces.
 wait_for_gpu_pool_cleanup() {
-  local pool="$1" deadline=$((SECONDS + 900)) namespaces pods remaining
+  local pool="$1" deadline=$((SECONDS + 900)) namespaces pods remaining cleanup_targets namespace owner
   local lane="${MX_CI_GPU_LANE:-slot-0}"
   local slot_selector="ci.modelexpress.nvidia.com/gpu-lane=$lane"
   # vCluster mirrors namespace labels using SHA256(label key)[:10].
@@ -134,6 +134,26 @@ wait_for_gpu_pool_cleanup() {
     if [ "$remaining" -eq 0 ]; then
       echo "GPU pool $pool lane $lane has no previous CI workload awaiting cleanup"
       return 0
+    fi
+    if [[ "$pool" == a100* && "$lane" = large-workload ]]; then
+      cleanup_targets=$(printf '%s\n' "$namespaces" | jq -r \
+        --arg pool "$pool" --arg lane "$lane" '
+        .items[] |
+        select(.metadata.name | startswith("mx-ci-")) |
+        select(.metadata.labels["ci.modelexpress.nvidia.com/gpu-lane"] == $lane) |
+        select(.metadata.labels["ci.modelexpress.nvidia.com/gpu-pool"] == $pool) |
+        [.metadata.name, (.metadata.labels["ci.modelexpress.nvidia.com/run-id"] // "")] | @tsv') || return 1
+      while IFS=$'\t' read -r namespace owner; do
+        [ -n "$namespace" ] || continue
+        if [[ ! "$owner" =~ ^[0-9]+-[0-9]+$ ]]; then
+          echo "ERROR: refusing stale namespace $namespace with invalid run owner '$owner'" >&2
+          return 1
+        fi
+        echo "Reclaiming stale namespace $namespace from run $owner"
+        GITHUB_RUN_ID="${owner%-*}" GITHUB_RUN_ATTEMPT="${owner##*-}" \
+          bash .github/scripts/ci-namespace.sh cleanup "$namespace" || return 1
+      done <<< "$cleanup_targets"
+      [ -z "$cleanup_targets" ] || continue
     fi
     echo "Waiting for GPU pool $pool lane $lane cleanup ($remaining namespaces/pods remain)"
     sleep 10

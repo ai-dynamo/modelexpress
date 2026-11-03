@@ -77,6 +77,7 @@ When security mode is enforce, set MODEL_EXPRESS_SECURITY_MODE=enforce, at least
 |---|---|---|
 | MODEL_EXPRESS_ENDPOINT | http://localhost:8001 | CLI server endpoint |
 | MODEL_EXPRESS_TIMEOUT | 30 seconds | CLI request timeout |
+| MODEL_EXPRESS_CONNECT_WAIT_SECS | 10 seconds | Budget for retrying the initial server connection before falling back to a direct provider download (0 disables) |
 | MODEL_EXPRESS_CACHE_DIRECTORY | auto | Cache override; Hugging Face resolution falls back to HF_HUB_CACHE and then the default Hub cache |
 | MODEL_EXPRESS_NO_SHARED_STORAGE | false | Fetch repository files from the server instead of assuming a shared filesystem |
 | MODEL_EXPRESS_TRANSFER_CHUNK_SIZE | 32768 bytes for the Rust CLI; 1048576 bytes for the Python server-cache client | File-transfer chunk size; values must be positive and no larger than the implementation maximum |
