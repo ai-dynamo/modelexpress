@@ -532,6 +532,26 @@ class TestLocalShardPlanChecks:
                 array, name="w", expect_index=(slice(0, 512), slice(0, 8))
             )
 
+    def test_an_undersized_global_array_is_refused(self):
+        """A (4,3) array against rank zero's (4,6) slice of an (8,6) plan.
+
+        Its one shard covers the whole of its own shape, so normalizing the
+        expected slice against that shape would clip [0:6] down to [0:3] and
+        pass a buffer half the size the collective reads.
+        """
+        array = self._array((4, 3), (slice(None), slice(None)), global_shape=(4, 3))
+        with pytest.raises(ValueError, match="the plan expects"):
+            jax_interop.local_shard(
+                array, name="w", expect_index=(slice(0, 4), slice(0, 6))
+            )
+
+    def test_an_expected_slice_without_a_stop_is_refused(self):
+        array = self._array((512, 8), (slice(0, 512), slice(None)))
+        with pytest.raises(ValueError, match="explicit stop"):
+            jax_interop.local_shard(
+                array, name="w", expect_index=(slice(0, 512), slice(None))
+            )
+
     def test_the_parameter_name_reaches_the_message(self):
         array = self._array((1, 8), (slice(0, 1), slice(None)))
         with pytest.raises(ValueError, match="model.layers.0.weight"):

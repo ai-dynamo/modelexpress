@@ -74,6 +74,19 @@ def _bounds(index: Sequence[slice], global_shape: Sequence[int]) -> tuple:
     return tuple(bounds)
 
 
+def _declared_bounds(index: Sequence[slice], *, name: str) -> tuple:
+    """``(start, stop)`` per dim of an expected slice, exactly as declared."""
+    bounds = []
+    for dim, axis in enumerate(index):
+        if axis.stop is None or axis.step not in (None, 1):
+            raise ValueError(
+                f"{name}: expect_index dim {dim} is {axis}; it must name an "
+                "explicit stop and a unit step, as expected_index returns"
+            )
+        bounds.append((0 if axis.start is None else int(axis.start), int(axis.stop)))
+    return tuple(bounds)
+
+
 def local_shard(
     array: Any,
     *,
@@ -103,7 +116,9 @@ def local_shard(
     issue its agreed op over the wrong piece, and the bytes would land wrong
     rather than erroring. The shard's own ``index`` is read rather than the
     array's ``PartitionSpec``, because the index describes what the transfer
-    will actually cover.
+    will actually cover. ``expect_index`` is compared as declared, with an
+    explicit stop on every dim, so an array smaller than the plan's tensor is
+    refused rather than having the expected slice clipped to fit it.
     """
     shards = array.addressable_shards
     if len(shards) != 1:
@@ -118,7 +133,10 @@ def local_shard(
 
     global_shape = tuple(int(extent) for extent in array.shape)
     held = _bounds(shard.index, global_shape)
-    wanted = _bounds(expect_index, global_shape)
+    # The expected slice is taken as written, not normalized against the
+    # array: clipping it to the array's own shape would accept an undersized
+    # array whose whole extent is smaller than the slice the plan reads.
+    wanted = _declared_bounds(expect_index, name=name)
     if held != wanted:
         raise ValueError(
             f"{name}: this rank holds {held} of {global_shape}, the plan expects "

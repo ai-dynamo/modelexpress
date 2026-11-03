@@ -151,6 +151,18 @@ def test_a_single_device_piece_passes_the_plan_check():
     )
 
 
+def test_an_undersized_real_array_fails_the_plan_check():
+    """A real (4,3) array is not rank zero's (4,6) piece of an (8,6) plan."""
+    device = jax.devices("cpu")[0]
+    array = jax.device_put(jnp.zeros((4, 3), jnp.float32), device)
+    expect = jax_interop.expected_index(
+        (8, 6), MeshSpec(shape=(2,)), (Placement.shard(0),), 0
+    )
+    assert expect == (slice(0, 4), slice(0, 6))
+    with pytest.raises(ValueError, match="the plan expects"):
+        jax_interop.local_shard(array, expect_index=expect)
+
+
 def test_the_default_layout_of_a_real_array_is_accepted():
     """What XLA hands back by default must pass the row-major check."""
     for dtype in ("float32", "bfloat16", "float8_e4m3fn", "int8"):
