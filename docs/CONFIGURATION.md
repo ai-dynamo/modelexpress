@@ -162,7 +162,7 @@ Use a central backend for mixed revisions, live updates, or per-worker addressab
 | NIXL_LOG_LEVEL | runtime default | NIXL logging level |
 | UCX_LOG_LEVEL | runtime default | UCX logging level |
 
-MX_POOL_REG and MX_VMM_ARENA are alternative registration optimizations. Pool registration is on unless MX_POOL_REG=0 or MX_VMM_ARENA=1 is set without MX_POOL_REG; qualify the chosen combination on the exact GPU, driver, NIXL, and UCX stack. The older `MX_VMM_ARENA_BYTES` and `MX_VMM_ARENA_CHUNK_BYTES` settings are ignored apart from a deprecation warning.
+MX_POOL_REG and MX_VMM_ARENA are alternative registration optimizations. Pool registration is on unless MX_POOL_REG=0 or MX_VMM_ARENA=1 is set without MX_POOL_REG; qualify the chosen combination on the exact GPU, driver, NIXL, and UCX stack. Pool registration registers the CUDA allocation containing each tensor; a tensor spanning several mappings (PyTorch expandable segments, a VA reservation) is rejected at registration and the worker continues without P2P serving. Serving such a tensor needs its own allocation and registration design; MX_POOL_REG=0 does not support it. The older `MX_VMM_ARENA_BYTES` and `MX_VMM_ARENA_CHUNK_BYTES` settings are ignored apart from a deprecation warning.
 
 ## ModelStreamer and local-load tuning
 
