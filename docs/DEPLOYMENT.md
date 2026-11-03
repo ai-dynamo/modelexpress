@@ -7,6 +7,15 @@ SPDX-License-Identifier: Apache-2.0
 
 This page is the deployment reference for the standalone server, Helm, Kubernetes metadata topologies, and worker rollout requirements. Start with [Choose a ModelExpress path](guides/choose-a-path.md) if you have not selected a topology. See [Configuration](CONFIGURATION.md) for settings, [Integrations](integrations/README.md) for runtime setup, [Troubleshooting](TROUBLESHOOTING.md) for operational symptoms, and [Architecture](ARCHITECTURE.md) for internals.
 
+For RL generator checkpoint-cache capacity and
+`MX_REFIT_CHECKPOINT_MAX_SIZE_GB`, see the
+[RL checkpoint-cache configuration](rl/CONFIGURATION.md#generator-refit-checkpoint-cache).
+
+For canonical S3 refit and recovery downloads, `MX_S3_DOWNLOAD_BACKEND=preallocated`
+opts in to parallel reads into a preallocated buffer. TransferManager remains
+the default. See [S3 transfer tuning](../modelexpress_client/python/README.md#canonical-s3-transfer-tuning)
+for concurrency, endpoint compatibility, and memory sizing.
+
 ## Server Configuration
 
 ModelExpress uses a layered configuration system. Sources are applied in order of precedence:
@@ -218,6 +227,7 @@ The CLI client also uses layered configuration: CLI args > env vars > config fil
 |---------|---------|-------------|
 | `MODEL_EXPRESS_ENDPOINT` | `http://localhost:8001` | Server endpoint |
 | `MODEL_EXPRESS_TIMEOUT` | `30` | Request timeout (seconds) |
+| `MODEL_EXPRESS_CONNECT_WAIT_SECS` | `10` | Initial server connection retry budget before direct download (seconds, 0 disables) |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | (auto) | Cache path override |
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Use gRPC streaming instead of shared storage |
 | `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `32768` | Transfer chunk size (bytes) |
@@ -234,11 +244,9 @@ See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
 ### Generator refit connection settings
 
-vLLM's `init_info` and SGLang's `--modelexpress-config` use
-`object_storage_endpoint_url` and `object_storage_region_name`. These map to the
-SDK's `ObjectStorageGeneratorConfig.endpoint_url` and `.region_name`. Omit the
-endpoint to use the provider default. Miles uses `object_storage_uri_prefix`
-for trainer publication. See the [backend setup examples](S3_DELTA_WEIGHT_REFIT.md).
+See the [RL generator connection settings](rl/CONFIGURATION.md#generator-refit-connection-settings)
+for S3 and Azure readers, and [RL environment settings](rl/CONFIGURATION.md#rl-environment-settings)
+for download concurrency and provider connection pools.
 
 ### Generator refit checkpoint cache
 
@@ -540,6 +548,40 @@ only `main` and `release/*`: `NGC_PUBLISH_USERNAME`, `NGC_PUBLISH_TOKEN`,
 `SLACK_RELEASE_BOT_TOKEN`, `SLACK_RELEASE_CHANNEL_ID` and
 `SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL`.
 
+### Inference CI vCluster
+
+Inference CI reuses the persistent `mx-ci-cluster` vCluster in the AKS CI host
+namespace `mx-ci`. Per-run cleanup removes test namespaces and workloads; it
+does not destroy the shared vCluster. Bootstrap runs only when the vCluster
+is absent.
+
+`.github/actions/setup-mx-vcluster/action.yml` pins Kubernetes `v1.36.5` to match
+the AKS host's 1.36 minor. The workflow checks the live host and vCluster
+versions on every run and rejects a vCluster minor below the host's. Updating
+the pin does not change an existing vCluster.
+
+The pinned vCluster CLI release `v0.36.0` supports Kubernetes 1.36. Its
+[CoreDNS version map](https://github.com/loft-sh/vcluster/blob/v0.36.0/pkg/constants/coredns.go)
+uses CoreDNS `1.14.2` for that minor. Bootstrap pulls the matching image from
+`registry.k8s.io` to avoid authentication failures through the ACR mirror.
+
+To rebuild an existing vCluster after a version-pin change:
+
+1. Pause new inference CI runs and let active runs using the shared vCluster
+   finish. Recreation deletes its virtual-cluster state.
+2. With AKS CI host access, delete the vCluster while preserving `mx-ci`:
+
+   ```bash
+   KUBECONFIG=/path/to/aks-ci-kubeconfig \
+     vcluster delete mx-ci-cluster --namespace mx-ci --delete-namespace=false --wait
+   ```
+
+3. Start a fresh inference CI run from the commit containing the updated pin.
+   Bootstrap recreates the vCluster, applies the ModelExpress CRD and installs
+   the Dynamo operator. Verify the version guard passes, CoreDNS and the
+   operator are Ready, and the inference GPU tests execute before resuming
+   normal CI traffic.
+
 ### Custom Client Image (P2P Transfers)
 
 For GPU-to-GPU weight transfers with vLLM:
@@ -795,8 +837,8 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_P2P_TOPOLOGY_LEVELS` | (unset) | For `topology_aware`. Comma-separated **Grove `ClusterTopology` domains**, broad → narrow, matching the cluster's `clustertopologies.grove.io` `spec.levels` order. Domains are the fixed set `region,zone,datacenter,block,rack,host,numa` (a level outside this set still works but is logged, since it would misalign this node's map with the fleet). Typical inter-node RDMA set: `region,zone,datacenter,block,rack`. Unset or empty → defaults to the full Grove order `region,zone,datacenter,block,rack,host,numa`, so `topology_aware` still ranks. It is this node's `MX_P2P_TOPOLOGY` being unset that collapses the policy to `rendezvous_hash`. |
 | `MX_P2P_TOPOLOGY` | (unset) | For `topology_aware`. This node's `{domain: value}` map as JSON, e.g. `{"block":"b1","rack":"r3","host":"node7"}`, populated by the operator from the node's labels using the `ClusterTopology` domain→key mapping. Published once at registration and surfaced on `SourceInstanceRef.topology`. Unset/unparseable → this node shares no domain (rendezvous ordering). |
 | `MX_P2P_TOPOLOGY_LOAD_WEIGHT` | `0.0` (falls back to `MX_P2P_LOAD_WEIGHT`) | For `topology_aware`. When `> 0`, the within-tier tiebreak becomes `unit_hash − w·source_load` (source_load read defensively), so within a locality tier selection also steers away from busy sources — composing topology- and load-aware selection. If left unset, it falls back to `MX_P2P_LOAD_WEIGHT` (the load_aware weight) when that feature is deployed, so a single knob turns on both. `0` keeps the pure rendezvous jitter. Clamped to finite `≥ 0`. |
-| `MX_P2P_TOPOLOGY_DOMAIN` | (unset) | Transfer-domain policy, independent of `MX_P2P_SOURCE_SELECTOR`. Names the topology domain (e.g. `zone`) a source must share with this node. This node's value comes from `MX_P2P_TOPOLOGY` or the Dynamo topology mount (`DYN_TOPOLOGY_MOUNT_PATH`, default `/etc/dynamo/topology`), polled for up to 30s under `required` (once per process, shared by load and publish; `preferred` reads it once without waiting) because the Dynamo operator populates the mount after scheduling. Use `zone` on AWS: EFA traffic cannot cross Availability Zones. Unset disables the policy. |
-| `MX_P2P_TOPOLOGY_ENFORCEMENT` | `required` | For `MX_P2P_TOPOLOGY_DOMAIN`. `required` drops every source outside this node's domain value (and sources that published none) before the retry slice; if this node's own value is unknown, RDMA is skipped and the load falls through to the next strategy. `preferred` keeps all sources but moves same-domain ones first, preserving the selector's order within each group. Any other value logs a warning and is treated as `required`. |
+| `MX_P2P_TOPOLOGY_DOMAIN` | (unset) | Transfer-domain policy for weights and NIXL artifacts, independent of `MX_P2P_SOURCE_SELECTOR`. Names the topology domain (e.g. `zone`) a source must share with this node. This node's value comes from `MX_P2P_TOPOLOGY` or the Dynamo topology mount (`DYN_TOPOLOGY_MOUNT_PATH`, default `/etc/dynamo/topology`), polled for up to 30s under `required` (once per process; `preferred` reads it once without waiting) because the Dynamo operator populates the mount after scheduling. NIXL artifact publication reads topology on each background publish attempt without waiting; an unknown required value fails that attempt so the existing publisher can retry after topology arrives. Use `zone` on AWS: EFA traffic cannot cross Availability Zones. Unset disables the policy. |
+| `MX_P2P_TOPOLOGY_ENFORCEMENT` | `required` | For `MX_P2P_TOPOLOGY_DOMAIN`. `required` drops every source outside this node's domain value (and sources that published none) before metadata fetch or transfer. If this node's value is unknown, weight loading falls through to the next strategy and NIXL artifact lookup returns a cache miss for local rebuild. Old artifact sources without published topology are ineligible under `required`. `preferred` keeps all sources but moves same-domain ones first, preserving the selector's order within each group. Any other value logs a warning and is treated as `required`. |
 | `MX_METRICS_ENABLED` | `0` | Opt-in Prometheus metrics collector for the client. `1` enables the collectors (requires the `metrics` extra, `prometheus-client`, which the vLLM, SGLang and TensorRT-LLM engine images already provide). Off by default; selection signals are always emitted as structured logs regardless. See [METRICS.md](METRICS.md). |
 | `PROMETHEUS_MULTIPROC_DIR` | (unset) | Pod-local directory shared by every rank, so one endpoint serves the merged union of all of them. **Required on any pod with more than one worker process**, and it must be set in the pod manifest: `prometheus_client` latches its value class at import, so assigning it from Python produces zero data with no error. Wipe it at the container entrypoint with `python -m modelexpress.metrics --reset`, never from worker code. |
 | `MX_METRICS_PORT` | (unset) | With metrics enabled, serve a pull `/metrics` endpoint on this port. One rank per pod wins the bind and serves every rank's data; the rest re-attempt periodically so the endpoint migrates if the winner exits. |
@@ -846,11 +888,83 @@ RL initial-load, refit, and generator-source settings are listed in the [RL conf
 2. Every source, onto a client that publishes topology and with the zone mount in place. A source on a client from before topology metadata never publishes a zone.
 3. Targets with `MX_P2P_TOPOLOGY_DOMAIN`. Alternatively, run `MX_P2P_TOPOLOGY_ENFORCEMENT=preferred` until every source has republished, then switch to `required`.
 
-When `required` leaves no source although some passed the accelerator check, the client logs `No P2P source shares <domain>=...` with how many sources published no zone and how many are in another one.
+When `required` leaves no source although some passed the accelerator check, the client logs `No P2P source shares <domain>=...` with how many sources published no valid zone and how many are in another one. Missing, empty, and whitespace-only values count as unknown, not as another zone.
+
+Topology values must be non-empty strings. Empty, whitespace-only, null, and
+non-string JSON values are treated as unknown, not coerced into domain names.
+Under `required`, equal empty values never establish a shared domain for weight
+selection or NIXL artifact publication and discovery.
+
+NIXL artifact publication checks the required local domain before preparing a
+cache bundle, so retries do not repeatedly tar and checksum caches while the
+domain is unknown. The final publication check remains in place to validate
+the current topology after preparation. Background retries can publish once
+the domain becomes available.
 
 **Combining topology- and load-aware selection.** To rank primarily by RDMA locality *and* steer away from busy sources within each locality tier, set `MX_P2P_SOURCE_SELECTOR=topology_aware` and a non-zero blend weight (`MX_P2P_TOPOLOGY_LOAD_WEIGHT`, or just `MX_P2P_LOAD_WEIGHT` since topology falls back to it). Locality is always the primary key — a closer source outranks a farther one regardless of load; the load term only orders equidistant peers.
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
+
+### Collective Refit (NCCL M2N) Topology
+
+Four roles, and the split that decides placement is that **no weight byte crosses
+the ModelExpress server**. It brokers admission, rank assignment and the NCCL
+`uniqueId`; the weights move directly between trainer and generator ranks.
+
+| Role | Count | Runs where | Needs |
+|---|---|---|---|
+| ModelExpress server | one endpoint | any node with network reach; for this path it needs no GPU and no fast fabric | gRPC reachable from every rank, plus a metadata backend |
+| Metadata backend | one | beside the server | **Redis, required.** The collective service is only registered on a Redis backend; with the in-memory or Kubernetes backend the server starts without it |
+| Trainer ranks | one per trainer GPU | inside the training job's own worker processes | the policy weights, the framework's own process group, gRPC to the server, NCCL to the generator ranks |
+| Generator ranks | one per inference-engine GPU | **inside the inference engine's own worker processes** | gRPC to the server, NCCL to the trainer ranks |
+| Coordinator | one | anywhere with gRPC reach | drives `start_weight_update` / publish / `finish_weight_update` on both sides in lockstep |
+
+Five constraints bind the layout:
+
+1. **The generator client is not separately deployable.** It has to run in the
+   engine's worker processes, because the destination storage is the engine's
+   and exists nowhere else. For vLLM that is a `worker_extension_cls` driven by
+   `collective_rpc`; for any other engine it is whatever that engine's
+   equivalent per-worker extension point is. A sidecar cannot do this.
+2. **The server is off the data path,** so it does not scale with model size and
+   does not want a GPU. Sizing it against the weights is the common mistake.
+3. **Every rank needs two different networks:** ordinary TCP to the server for
+   the control plane, and whatever NCCL needs for the data plane. They have
+   different reachability requirements and are worth checking separately.
+4. **Rank order inside a lane is trainers first, generators after,** and the
+   server assigns it. A deployment does not choose ranks; it chooses membership.
+5. **Both sides derive the same plan independently,** so both need a consistent
+   view of the canonical parameter set. Deriving it from the checkpoint the two
+   sides already share is the least surprising way to guarantee that.
+
+Preflight, in this order, because each one fails in a way that does not name
+itself:
+
+1. **NCCL 2.30.7 or newer, LOADED.** `torch.cuda.nccl.version()` reports what
+   torch was compiled against, not what is mapped into the process, and the
+   mismatch fails inside the native reshard call rather than at import. Read it
+   with `ctypes.CDLL("libnccl.so.2").ncclGetVersion()`. Where an image ships its
+   own older `libnccl`, `LD_PRELOAD` the one the wheels installed.
+2. **`nccl-extensions` matching the CUDA major** (`[cu12]` or `[cu13]`). A bare
+   install resolves and then fails to import.
+3. **gRPC from a trainer rank and from a generator rank to the server**, checked
+   separately: in an inference deployment those two are frequently on different
+   networks.
+4. **A one-GPU-per-side reshard between the two placements you intend to use.**
+   If trainers and generators will sit on different nodes, prove the data plane
+   crosses that boundary before scaling anything up.
+
+Scope of what has been measured, because the boundary matters more than the
+numbers: **all ranks on a single node is exercised end to end against a live
+inference engine.** Cross-node is not, and has been seen to fail below
+ModelExpress inside NCCL's transport layer on at least one fabric, with one
+trainer and one generator, so it is not a scale effect. More than one source
+partition (pipeline stage) is supported by the protocol and has not been
+exercised against a real engine.
+
+### Collective Refit (NCCL M2N) Environment Variables
+
+The collective refit environment variables are documented in the [RL configuration guide](rl/CONFIGURATION.md#collective-refit-nccl-m2n-environment-variables).
 
 ### NIXL Backend Selection
 

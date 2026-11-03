@@ -69,9 +69,14 @@ export REDIS_URL=redis://redis:6379
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum algorithm written by canonical S3 trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object. |
 | `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart uploads per trainer rank. |
-| `MX_S3_DOWNLOAD_WORKERS` | `16` | Generator download concurrency. |
+| `MX_REFIT_DOWNLOAD_WORKERS` | `MX_S3_DOWNLOAD_WORKERS`, then `16` | Concurrent checkpoint shard downloads and S3 transfer-manager request concurrency. |
+| `MX_S3_DOWNLOAD_WORKERS` | `16` | Legacy fallback; `MX_REFIT_DOWNLOAD_WORKERS` takes precedence when set. |
 | `MX_S3_MAX_POOL_CONNECTIONS` | `32` | Botocore HTTP connection-pool size. |
 | `MX_S3_MAX_ATTEMPTS` | `5` | Total S3 request attempts. |
+
+The refit worker setting also controls Azure shard downloads. See
+[RL environment settings](CONFIGURATION.md#rl-environment-settings) for precedence
+and the separate provider connection-pool settings.
 
 Optional S3 tuning variables and defaults are documented in
 [`modelexpress_client/python/README.md`](../../modelexpress_client/python/README.md#canonical-s3-transfer-tuning).
@@ -387,6 +392,10 @@ endpoint, add `object_storage_endpoint_url` to the JSON configuration:
 
 Both backends use these field names. MX maps them to `endpoint_url` and
 `region_name` in `ObjectStorageGeneratorConfig`.
+
+SGLang defaults `object_storage_type` to `S3`. Azure generator configuration is
+described under [generator refit connection settings](CONFIGURATION.md#generator-refit-connection-settings);
+the publication workflow in this guide remains S3-only.
 
 ### Receiver initialization and ownership
 

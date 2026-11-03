@@ -460,8 +460,8 @@ class TestRepoIdFromCachePath:
     """
 
     def test_recovers_from_snapshot_path_without_any_record(self, tmp_path):
-        path = tmp_path / "models--Qwen--Qwen2.5-0.5B-Instruct" / "snapshots" / ("a" * 40)
-        assert model_prefetch.repo_id_for(path) == "Qwen/Qwen2.5-0.5B-Instruct"
+        path = tmp_path / "models--Qwen--Qwen3.5-0.8B" / "snapshots" / ("a" * 40)
+        assert model_prefetch.repo_id_for(path) == "Qwen/Qwen3.5-0.8B"
         assert model_prefetch._snapshot_to_repo_id == {}
 
     def test_recovers_from_repo_root(self, tmp_path):

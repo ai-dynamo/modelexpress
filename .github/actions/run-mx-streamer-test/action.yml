@@ -27,7 +27,7 @@ inputs:
   model:
     description: 'HuggingFace model id — used for architecture config and as the upload/download target'
     required: false
-    default: 'Qwen/Qwen2.5-0.5B'
+    default: 'Qwen/Qwen3.5-0.8B'
   s3_bucket:
     description: 'S3 bucket name for the model weight cache'
     required: true
@@ -200,6 +200,7 @@ runs:
             --model "${MODEL_ARG}" \
             --served-model-name "${MODEL}" \
             --hf-config-path "${MODEL}" \
+            --language-model-only \
             --tokenizer "${MODEL}" \
             --load-format modelexpress \
             --port "${PORT}")
@@ -284,8 +285,8 @@ runs:
       run: |
         set -euo pipefail
         [[ "${PORT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: port must be a positive integer, got '${PORT}'"; exit 1; }
-        timeout 60 bash -c \
-          "until curl -sf http://localhost:${PORT}/health > /dev/null; do sleep 2; done"
+        timeout 300 bash -c \
+          "until curl -sf --max-time 5 http://localhost:${PORT}/health > /dev/null; do sleep 2; done"
         echo "Server ready on port ${PORT}."
 
     - name: Verify inference

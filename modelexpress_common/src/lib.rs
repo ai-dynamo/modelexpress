@@ -44,6 +44,9 @@ pub mod grpc {
     pub mod refit {
         tonic::include_proto!("model_express.refit");
     }
+    pub mod refit_collective {
+        tonic::include_proto!("model_express.refit_collective");
+    }
 }
 
 /// Defines the shared response format between server and client (legacy HTTP)
@@ -145,6 +148,11 @@ pub mod constants {
 
     pub const DEFAULT_GRPC_PORT: NonZeroU16 = NonZeroU16::new(8001).expect("8001 is non-zero");
     pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+    /// Default total budget, in seconds, for retrying the initial server connection in
+    /// `Client::request_model_with_smart_fallback*` before falling back to a direct
+    /// download from the provider.
+    pub const DEFAULT_CONNECT_WAIT_SECS: u64 = 10;
 
     /// Default port for the server's Prometheus `/metrics` listener.
     ///

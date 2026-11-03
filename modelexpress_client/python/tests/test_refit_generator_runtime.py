@@ -1,12 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import modelexpress_rl.inference.engines as engines_module
 import modelexpress_rl.inference.runtime as runtime_module
+from uuid import uuid4
+
 import pytest
 import torch
 from modelexpress import p2p_pb2
@@ -28,6 +31,7 @@ from modelexpress_rl.inference.runtime import (
     initialize_generator_runtime,
 )
 from modelexpress_rl.inference.version_chain import resolve_replay_chain
+from modelexpress_rl.inference.session import SessionUpdate, WeightUpdateSession
 
 
 class _Installer(EngineInstaller):
@@ -63,6 +67,61 @@ class _Method(UpdateMethod):
 
     def close(self):
         self.closed = True
+
+
+@pytest.mark.parametrize("installation_fails", [False, True])
+def test_session_uses_method_policy_for_opaque_payload(installation_fails):
+    payload = object()
+    method = Mock(spec=UpdateMethod)
+    method.installation_context.return_value = nullcontext()
+    method.can_release.return_value = False
+    method.validate_release.side_effect = lambda value: UpdateMethod.validate_release(
+        method, value
+    )
+    method.prepared_metrics.return_value = {"bytes_received": 16}
+    installer = Mock(spec=EngineInstaller)
+    primary = RuntimeError("installation failed")
+    if installation_fails:
+        installer.install.side_effect = primary
+    plan = SimpleNamespace(
+        version=SimpleNamespace(version_id="v1"),
+        source=SimpleNamespace(kind=WeightSource.TRAINER),
+        method=method,
+        installer=installer,
+    )
+    lease = Mock()
+    update = SessionUpdate(plan=plan, prepared=payload, lease=lease)
+    session = WeightUpdateSession(
+        resolvers=(),
+        methods=(method,),
+        installer=installer,
+        max_transfer_attempts=1,
+        start_lease=Mock(),
+    )
+
+    assert update.metrics == {"bytes_received": 16}
+    method.prepared_metrics.assert_called_once_with(payload)
+    if installation_fails:
+        with pytest.raises(RuntimeError) as caught:
+            session.apply(update)
+        assert caught.value is primary
+    else:
+        assert session.apply(update) is installer.install.return_value
+    installer.install.assert_called_once_with(payload)
+    method.can_release.assert_called_once_with(payload)
+    lease.close.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="cleanup is unproven"):
+        session.release(update)
+    assert not update.released
+    method.release.assert_not_called()
+    lease.close.assert_not_called()
+
+    method.can_release.return_value = True
+    session.release(update)
+    method.release.assert_called_once_with(payload)
+    lease.close.assert_called_once()
+    assert update.released
 
 
 class _P2P:
@@ -182,14 +241,14 @@ def test_object_storage_runtime_preserves_source_order(
         resolve_chain.assert_called_once_with("target", True)
 
     assert runtime.methods == (canonical, full_tensor)
-    assert runtime.session._planner.source_order == expected_source_order
+    assert runtime.session.source_order == expected_source_order
     assert runtime.initial_version_id == "base-a"
-    assert [resolver.kind for resolver in runtime.session._planner._resolvers] == list(
+    assert [resolver.kind for resolver in runtime.session._resolvers] == list(
         expected_source_order
     )
     generator_resolvers = [
         resolver
-        for resolver in runtime.session._planner._resolvers
+        for resolver in runtime.session._resolvers
         if resolver.kind is WeightSource.GENERATOR
     ]
     if generator_resolvers:
@@ -263,7 +322,7 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
         resolve_replay_chain=resolve_chain,
     )
 
-    assert runtime.session._planner.source_order == (WeightSource.OBJECT_STORAGE,)
+    assert runtime.session.source_order == (WeightSource.OBJECT_STORAGE,)
     assert runtime.methods == (canonical,)
     runtime.session._resolve_replay_chain(SimpleNamespace(version_id="target"))
     resolve_chain.assert_called_once_with("target", requires_full_root)
@@ -296,14 +355,19 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
 
 
 @pytest.mark.parametrize("bounded", [False, True])
-@pytest.mark.parametrize("supports_streaming", [False, True])
+@pytest.mark.parametrize(
+    "artifacts",
+    [
+        frozenset(),
+        frozenset({PreparedEngineTensors}),
+        frozenset({PreparedStreamingTensors}),
+        frozenset({PreparedEngineTensors, PreparedStreamingTensors}),
+    ],
+)
 @pytest.mark.parametrize("source_kind", [WeightSource.TRAINER, WeightSource.GENERATOR])
 def test_runtime_validates_streaming_support_before_allocating_transfers(
-    monkeypatch, bounded, supports_streaming, source_kind
+    monkeypatch, bounded, artifacts, source_kind
 ) -> None:
-    artifacts = {PreparedEngineTensors}
-    if supports_streaming:
-        artifacts.add(PreparedStreamingTensors)
     installer = Mock(capabilities=EngineCapabilities(frozenset(artifacts)))
     engine = _full_tensor_engine()
     monkeypatch.setattr(
@@ -315,7 +379,7 @@ def test_runtime_validates_streaming_support_before_allocating_transfers(
             full_tensor=engine.full_tensor,
         ),
     )
-    create_transfer = Mock(return_value=Mock())
+    create_transfer = Mock(return_value=Mock(bounded_staging=bounded))
     monkeypatch.setattr(runtime_module, "_NixlStagedTransfer", create_transfer)
     monkeypatch.setattr(runtime_module, "MxClient", _P2P)
     kwargs = dict(
@@ -330,14 +394,20 @@ def test_runtime_validates_streaming_support_before_allocating_transfers(
         start_lease=lambda _version_id: pytest.fail("initialization must not acquire leases"),
         streaming=StreamingSettings(512) if bounded else None,
     )
-    if bounded and source_kind is WeightSource.TRAINER and not supports_streaming:
-        with pytest.raises(ValueError, match="does not support bounded streaming"):
+    expected = PreparedStreamingTensors if bounded else PreparedEngineTensors
+    if source_kind is WeightSource.TRAINER and expected not in artifacts:
+        mode = "bounded streaming" if bounded else "full-copy"
+        with pytest.raises(ValueError, match=f"does not support {mode}"):
             initialize_generator_runtime(**kwargs)
         create_transfer.assert_not_called()
     else:
         runtime = initialize_generator_runtime(**kwargs)
         runtime.close()
-        create_transfer.return_value.close.assert_called_once_with()
+        if source_kind is WeightSource.TRAINER:
+            assert runtime.methods[0].capabilities.artifact_type is expected
+            create_transfer.return_value.close.assert_called_once_with()
+        else:
+            create_transfer.assert_not_called()
 
 
 def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
@@ -355,6 +425,10 @@ def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
     method_kwargs = {}
 
     class Method(_Method):
+        capabilities_for = staticmethod(
+            runtime_module.LoadTimeTensorNixlUpdateMethod.capabilities_for
+        )
+
         def __init__(self, **kwargs) -> None:
             method_kwargs.update(kwargs)
             super().__init__({WeightSource.GENERATOR, WeightSource.TRAINER})
@@ -395,7 +469,7 @@ def test_object_storage_runtime_survives_p2p_initialization_failure(
     monkeypatch.setattr(runtime_module, "MxClient", lambda **_kwargs: p2p)
     monkeypatch.setattr(
         runtime_module,
-        "_NixlStagedTransfer",
+        "RuntimeTensorNixlUpdateMethod",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("NIXL unavailable")),
     )
     canonical = _Method({WeightSource.OBJECT_STORAGE})
@@ -424,8 +498,8 @@ def test_object_storage_runtime_survives_p2p_initialization_failure(
     )
 
     assert runtime.methods == (canonical,)
-    assert runtime.session._planner.source_order == (WeightSource.OBJECT_STORAGE,)
-    assert [resolver.kind for resolver in runtime.session._planner._resolvers] == [
+    assert runtime.session.source_order == (WeightSource.OBJECT_STORAGE,)
+    assert [resolver.kind for resolver in runtime.session._resolvers] == [
         WeightSource.OBJECT_STORAGE
     ]
     assert p2p.closed
@@ -475,11 +549,8 @@ def test_generator_runtime_closes_resources_when_resolver_creation_fails(
 
 
 @pytest.mark.parametrize("blocked_first", [False, True])
-@pytest.mark.parametrize(
-    "failure", ["drain_failed", "close_failed", "source_failed", "in_progress"]
-)
 def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
-    blocked_first, failure
+    blocked_first
 ):
     from types import SimpleNamespace
 
@@ -491,11 +562,11 @@ def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
     closed = []
     transfer = SimpleNamespace(arena=arena, close=lambda: closed.append("transfer"))
     method = LoadTimeTensorNixlUpdateMethod(transfer=transfer)
-    prepared = PreparedStreamingTensors(lambda: iter(()), frozenset({"weight"}), {})
-    prepared.ownership.iterator = iter(({"weight": arena},))
-    if failure != "in_progress":
-        setattr(prepared.ownership, failure, True)
-    method._active_streamed = prepared
+    prepared = PreparedStreamingTensors(lambda: iter(({"weight": arena},)), uuid4(), {})
+    consumption = prepared.consume(lambda: None)
+    consumption.__enter__()
+    prepared.apply(lambda batch: None)
+    method._active = prepared
     other = _Method({WeightSource.GENERATOR})
     p2p = _P2P(server_url="mx:8000")
     runtime = GeneratorRuntime(
@@ -513,9 +584,11 @@ def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
         assert not p2p.closed
         assert not other.closed
         assert closed == []
-        assert method._active_streamed is prepared
-        assert prepared.ownership.iterator is not None
+        assert method._active is prepared
+        assert prepared._iterator is not None
         assert transfer.arena is arena
+
+    consumption.__exit__(None, None, None)
 
 
 @pytest.mark.parametrize(

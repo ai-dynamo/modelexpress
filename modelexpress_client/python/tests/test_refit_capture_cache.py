@@ -6,6 +6,8 @@ import sys
 from contextlib import nullcontext
 from types import ModuleType
 
+from uuid import uuid4
+
 import pytest
 import torch
 from modelexpress_rl.inference.engines.vllm import installer as module
@@ -72,7 +74,7 @@ def test_capture_cache_isolates_slicing_metadata_and_retains_invalidation(
     first.copies[0].op_chain = (("view", ([4],), ()),)
     first.copies.clear()
     first.destination_layouts.clear()
-    first.generation = 99
+    first.replay_id = uuid4()
     first.source_replay = False
     first.generator_fingerprint = None
     layout.clear()
@@ -99,7 +101,7 @@ def test_failed_fresh_capture_discards_cache(capture_installer, monkeypatch):
     monkeypatch.setattr(module, "capture_weights", fail)
     with pytest.raises(RuntimeError, match="capture failed"):
         installer.capture([("weight", torch.float32, (4, 4))])
-    assert installer._capture_cache is None
+    assert installer.source_install_plan is None
 
 
 def test_real_capture_cache_preserves_duplicate_record_identity(
