@@ -124,8 +124,11 @@ def _bootstrap_barrier(
     ``alloc`` supplies the byte for a worker whose framework is not torch. The
     buffer is opaque to this path -- it is written and never read, so only the
     device it sits on matters -- and nccl4py resolves a buffer through the CUDA
-    Array Interface or DLPack, which a ``jax.Array`` satisfies. Leaving it None
-    keeps the torch allocation this path has always used.
+    Array Interface or DLPack. JAX callers should pass
+    ``jax_interop.barrier_buffer`` rather than return a raw ``jax.Array``: a
+    raw array takes nccl4py's DLPack branch, which fails on CUDA for the
+    reason ``jax_interop._ByteView`` gives. Leaving it None keeps the torch
+    allocation this path has always used.
     """
     if alloc is not None:
         _broadcast_barrier(lane, alloc(device), timeout_s)
