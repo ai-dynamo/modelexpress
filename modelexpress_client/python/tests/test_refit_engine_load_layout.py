@@ -162,7 +162,7 @@ def test_failed_cache_validation_preserves_cache(
     installer, model = capture_installer
     manifest = [("weight", torch.float32, (3, 3))]
     installer.capture(manifest)
-    cache = installer._capture_cache
+    cache = installer.source_install_plan
 
     def fail(*_args):
         raise RuntimeError("validation failed")
@@ -174,7 +174,7 @@ def test_failed_cache_validation_preserves_cache(
             patch.setattr(module.copy, "deepcopy", fail)
         with pytest.raises(RuntimeError, match="validation failed"):
             installer.capture(manifest)
-        assert installer._capture_cache is cache
+        assert installer.source_install_plan is cache
 
     assert installer.capture(manifest)[0].copies
     assert model.capture_calls == 1

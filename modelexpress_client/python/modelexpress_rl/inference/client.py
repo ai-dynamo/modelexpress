@@ -179,7 +179,6 @@ class StagedWeightHandle:
         self._client = client
         self.version_id = version_id
         self._update = update
-        self._no_op_released = False
         # A refit's stages are measured across two client calls, so the cycle's
         # recorder travels on the handle that connects them.
         self._timing = timing
@@ -193,7 +192,7 @@ class StagedWeightHandle:
         """Return metrics recorded for this update by the selected adapter."""
         if self._update is None:
             return {}
-        return self._update.prepared.metrics
+        return self._update.metrics
 
     @property
     def applied(self) -> bool:
@@ -432,7 +431,7 @@ class ModelExpressGeneratorClient:
             except BaseException:
                 if staged._installation_failed:
                     self._engine_state = _EngineState.UNCERTAIN
-                elif not was_applied and restore_version_id is not None:
+                elif not staged._update.applied and restore_version_id is not None:
                     try:
                         runtime.publish_runtime_tensors(restore_version_id)
                     except Exception:
@@ -442,21 +441,23 @@ class ModelExpressGeneratorClient:
                         )
                 raise
             finally:
+                # Installation remains committed when subsequent lease cleanup fails.
+                if staged._update.applied:
+                    self._serving_version_id = staged.version_id
+                    self._engine_state = _EngineState.READY
+                    if not was_applied:
+                        try:
+                            runtime.publish_runtime_tensors(staged.version_id)
+                        except Exception:
+                            logger.exception(
+                                "failed to publish installed runtime tensors for %s",
+                                staged.version_id,
+                            )
                 # Reported even when the install raised: a refit that failed
                 # after seconds on the wire is exactly the case the split has to
                 # explain, and dropping the record would leave the failure with
                 # no timing at all.
                 timing.emit(staged._timing, logger)
-            self._serving_version_id = staged.version_id
-            self._engine_state = _EngineState.READY
-            if not was_applied:
-                try:
-                    runtime.publish_runtime_tensors(staged.version_id)
-                except Exception:
-                    logger.exception(
-                        "failed to publish installed runtime tensors for %s",
-                        staged.version_id,
-                    )
             return result
 
     def close(self) -> None:
@@ -695,8 +696,6 @@ class ModelExpressGeneratorClient:
                         self._require_runtime().session.release(staged._update)
                     finally:
                         timing.emit(staged._timing, logger)
-                elif staged._update is None:
-                    staged._no_op_released = True
             finally:
                 if self._active_handle is staged and (
                     staged._update is None or staged._update.released

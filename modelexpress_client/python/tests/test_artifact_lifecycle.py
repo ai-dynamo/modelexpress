@@ -45,7 +45,7 @@ def artifact_transfer_enabled(monkeypatch):
 def _identity(digest: str = "") -> p2p_pb2.SourceIdentity:
     return p2p_pb2.SourceIdentity(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
-        model_name="Qwen/Qwen2.5-7B-Instruct",
+        model_name="Qwen/Qwen3.5-0.8B",
         compile_config_digest=digest,
     )
 

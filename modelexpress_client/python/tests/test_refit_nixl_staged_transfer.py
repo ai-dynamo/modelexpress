@@ -8,13 +8,16 @@ from dataclasses import replace
 from types import MappingProxyType
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
-from modelexpress_rl.inference.plan import StreamingSettings
+from modelexpress_rl.inference.plan import PreparedStreamingTensors, StreamingSettings
 from modelexpress_rl.version import MeshIdentity
+
+from modelexpress_rl.inference.trainer_plan import TrainerTransferPlan
+
+from unittest.mock import Mock
 
 import pytest
 import torch
 from modelexpress_rl import envs
-from modelexpress import p2p_pb2
 from modelexpress_rl.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
@@ -33,30 +36,31 @@ from modelexpress_rl.inference.adapter import TrainerSourceShard
 from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 from modelexpress_rl.inference.nixl_staged_transfer import (
     _SourceBinding,
-    _bounded_batches,
     _load_agent_metadata,
     _NixlStagedTransfer,
-    _pack_bounded_batches,
     _PreparedBoundedTransfer,
     _PreparedNixlTransfer,
     _required_agent_metadata,
-    _resolve_sources,
     _ResolvedSources,
 )
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot, ResolvedTrainerSource
 from tests.test_refit_bounded_descriptors import harness, _check_values
+from tests.helpers.refit_replay import consume_stream, install_replay, compile_batches as _bounded_batches
+from modelexpress_rl.refit.reshard.transfer_plan import bind_transfer
+from tests.helpers.refit_replay import resolve_sources as _resolve_sources
 
 
 def _bind_test_execution(transfer, prepared) -> None:
     transfer._weight_update_plan = None
     descriptors = []
     for index, batch in enumerate(prepared.batches):
-        recv, convert, full = transfer._carve_bounded(
+        full = transfer._carve_bounded(
             batch, transfer._staging_arenas[index % len(transfer._staging_arenas)]
         )
-        descriptors.append(tuple(transfer._descriptors(
-            batch.transfer_plan, recv, full, convert, source_binding=prepared.source_binding
-        )))
+        descriptors.append(bind_transfer(
+            batch.transfer_plan, prepared.source_binding.resolve,
+            lambda _kind, name: full[name].data_ptr(),
+        ).descriptors)
     object.__setattr__(prepared, "descriptors", tuple(descriptors))
     object.__setattr__(prepared, "descriptors_reused", (False,) * len(descriptors))
 
@@ -82,105 +86,48 @@ def _prepared_bounded(batches, sources, transport, metrics=None) -> _PreparedBou
     )
 
 
-def test_bounded_batches_preserve_module_groups_and_count_dtype_scratch(monkeypatch):
+def test_compiled_batches_pack_mixed_dtypes_without_writing_alignment_padding(monkeypatch):
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
-    sources = _resolve_sources(
-        [
-            _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100),
-            _manifest(agent_name="b", endpoint="b:19000", offset=2, address=200),
-        ]
-    ).sources
-    copies = [
-        RecordedCopy(
-            src_name="weight",
-            op_chain=(),
-            param_name=name,
-            dest_offset=0,
-            dest_shape=(4,),
-            dest_stride=(1,),
-            dest_dtype=dtype,
-        )
-        for name, dtype in [
-            ("layer0.weight", torch.float32),
-            ("layer1.weight", torch.bfloat16),
-        ]
+    specifications = [
+        ("bytes", (3,), torch.uint8),
+        ("half", (5,), torch.bfloat16),
+        ("double", (1,), torch.float64),
+        ("large", (70,), torch.float32),
     ]
-    layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
+    sources = {
+        name: SourceInfo(shape, dtype, dtype.itemsize, [
+            Shard((0,), shape, "source", 100, dtype.itemsize)
+        ])
+        for name, shape, dtype in specifications
+    }
+    capture = CaptureResult(source_replay=True, copies=[
+        RecordedCopy(name, (), name, 0, shape, (1,), dtype)
+        for name, shape, dtype in specifications
+    ])
     batches = _bounded_batches(
-        CaptureResult(copies=copies), layout, sources, 512
+        capture, {name: (shape, dtype) for name, shape, dtype in specifications},
+        sources, 512,
     )
-    assert [b.nbytes for b in batches] == [256, 512]
-    assert [set(b.layouts[0]) for b in batches] == [
-        {"layer0.weight"},
-        {"layer1.weight"},
+    assert [batch.nbytes for batch in batches] == [512, 256, 512]
+    assert [list(batch.layout.values()) for batch in batches] == [
+        [(0, 3, (3,), torch.uint8), (256, 266, (5,), torch.bfloat16)],
+        [(0, 8, (1,), torch.float64)],
+        [(0, 280, (70,), torch.float32)],
     ]
-    with pytest.raises(IncompleteRefit, match="exceeds"):
-        _bounded_batches(CaptureResult(copies=copies), layout, sources, 511)
-    with pytest.raises(IncompleteRefit, match="cover every"):
-        _bounded_batches(CaptureResult(copies=copies[:1]), layout, sources, 512)
+    for batch in batches:
+        arena = torch.full((512,), 0xA5, dtype=torch.uint8)
+        views = _NixlStagedTransfer._carve_bounded(batch, arena)
+        expected = arena.clone()
+        for name, (start, end, shape, dtype) in batch.layout.items():
+            value = torch.full(shape, 2, dtype=dtype)
+            views[name].copy_(value)
+            expected[start:end].copy_(value.view(torch.uint8))
+            assert views[name].data_ptr() == arena.data_ptr() + start
+        assert torch.equal(arena, expected)
 
 
-def test_packing_coalesces_modules_without_changing_planned_reads(monkeypatch):
-    """Packing may only change how many arena residencies a refit needs. The
-    copies, planned bytes, and descriptor count must match the unpacked plan."""
-    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
-    sources = _resolve_sources(
-        [
-            _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100),
-            _manifest(agent_name="b", endpoint="b:19000", offset=2, address=200),
-        ]
-    ).sources
-    copies = [
-        RecordedCopy(
-            src_name="weight",
-            op_chain=(),
-            param_name=name,
-            dest_offset=0,
-            dest_shape=(4,),
-            dest_stride=(1,),
-            dest_dtype=dtype,
-        )
-        for name, dtype in [
-            ("layer0.weight", torch.float32),
-            ("layer1.weight", torch.bfloat16),
-        ]
-    ]
-    layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
-    batches = _bounded_batches(
-        CaptureResult(copies=copies), layout, sources, 512
-    )
-    assert [b.nbytes for b in batches] == [256, 512]
-
-    packed = _pack_bounded_batches(batches, 768)
-    assert len(packed) == 1 and packed[0].nbytes == 768
-    assert list(packed[0].layouts.recv) == ["layer0.weight", "layer1.weight"]
-    assert packed[0].capture.copies == copies
-    assert packed[0].transfer_plan.bytes_planned() == sum(
-        b.transfer_plan.bytes_planned() for b in batches
-    )
-    assert packed[0].transfer_plan.descriptor_count() == sum(
-        b.transfer_plan.descriptor_count() for b in batches
-    )
-
-    # A budget that only fits one module leaves the owning-module batching intact.
-    assert len(_pack_bounded_batches(batches, 512)) == 2
-
-    # Two modules pulling the same complete source cannot share one staging slot.
-    conflicting = [
-        replace(
-            batch,
-            layouts=batch.layouts._replace(full={"shared": ((4,), torch.float32)}),
-            nbytes=batch.nbytes + 256,
-        )
-        for batch in batches
-    ]
-    assert len(_pack_bounded_batches(conflicting, 2048)) == 2
-
-
-
-@pytest.mark.parametrize("pack", [False, True])
 @pytest.mark.parametrize("padded", [False, True])
-def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, pack, padded):
+def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, padded):
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     source_tensor = torch.tensor([1.001, 2.002, 3.003, 4.004])
@@ -205,14 +152,10 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, pack, pad
     layout = {
         c.param_name: ((8,) if padded else c.dest_shape, c.dest_dtype) for c in copies
     }
-    # A 512-byte budget fits either module separately; 768 bytes lets both
-    # share one residency.
-    arena_bytes = 768 if pack else 512
+    arena_bytes = 256
     batches = _bounded_batches(
-        CaptureResult(copies=copies), layout, {"w": source}, arena_bytes
+        CaptureResult(source_replay=True, copies=copies), layout, {"w": source}, arena_bytes
     )
-    if pack:
-        batches = _pack_bounded_batches(batches, arena_bytes)
 
     class Transport:
         def read(self, descriptors):
@@ -241,7 +184,7 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, pack, pad
     addresses = []
     for tensors in transfer.iter_bounded(prepared, metrics):
         addresses.append(next(iter(tensors.values())).data_ptr())
-        installed.update({name: value.clone() for name, value in tensors.items()})
+        install_replay(tensors, layout, installed)
     assert set(addresses) == {arena.data_ptr()}
     for name, (_, dtype) in layout.items():
         expected = source_tensor.to(dtype)
@@ -251,7 +194,7 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, pack, pad
         assert torch.equal(installed[name], expected)
     assert metrics["staging_peak_bytes"] == arena_bytes
     assert metrics["bytes_received"] == 32
-    assert metrics["batches"] == (1 if pack else 2)
+    assert metrics["batches"] == 2
 
 
 def _manifest(
@@ -321,15 +264,16 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
         prepared = method.prepare(version=None, source=ResolvedTrainerSource(source))
         try:
             if harness.streaming:
-                installed = {name: value.clone() for batch in prepared.batches()
-                             for name, value in batch.items()}
+                installed = {}
+                consume_stream(prepared, lambda batch: install_replay(batch, harness.layout, installed))
             else:
-                installed = prepared.staged.tensors
+                installed = install_replay(prepared.staged.tensors, harness.layout)
             _check_values(harness, installed, check_padding=harness.streaming is not None)
             with pytest.raises(RuntimeError, match="release"):
                 method.prepare(version=None, source=ResolvedTrainerSource(source))
         finally:
-            method.release(prepared)
+            if method.can_release(prepared):
+                method.release(prepared)
 
     try:
         if failure in ("registration", "cleanup"):
@@ -367,6 +311,11 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
                 fault.setattr(type(harness.transports[-1]), operation, fail_read)
                 with pytest.raises(RuntimeError, match="read failed"):
                     update(source)
+            if harness.streaming:
+                assert not method.can_release(method._active)
+                with pytest.raises(RuntimeError, match="reset the process"):
+                    method.release(method._active)
+                return
         if failure in ("replica", "post_replica", "await_replica"):
             harness.sources.update({name: value.clone() + 10 for name, value in harness.sources.items()})
             source = snapshot("replica")
@@ -412,22 +361,31 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
         if failure is None:
             assert [harness.events.count(event) for event in ("register", "connect:source")] == setup_calls
     finally:
-        method.close()
-        assert not manager.registered
+        if method._active is not None and not method.can_release(method._active):
+            with pytest.raises(RuntimeError, match="reset the process"):
+                method.close()
+        else:
+            method.close()
+            assert not manager.registered
 
 
 def test_default_transfer_timeout_matches_the_lease_budget(monkeypatch):
     monkeypatch.setenv("MX_TRANSFER_TIMEOUT", "17")
 
+    manager = Mock()
+    monkeypatch.setattr(transfer_module, "NixlTransferManager", lambda **_: manager)
     transfer = _NixlStagedTransfer(
+        agent_name="receiver",
         generator_fingerprint=lambda: (),
         capture_layout=lambda _: None,
         device_id=0,
         device=torch.device("cpu"),
-        manager=object(),
     )
 
     assert transfer._timeout == 17.0
+    manager.initialize.assert_called_once()
+    transfer.close()
+    manager.shutdown.assert_called_once()
 
 
 @pytest.mark.parametrize("memory_type", ["VRAM", "DRAM"])
@@ -608,7 +566,6 @@ def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer
     plan, source_binding = _bind_plan(LogicalTransferPlan(), {"weight": source})
     return _PreparedNixlTransfer(
         transfer_plan=plan,
-        capture=CaptureResult(copies=[copy]),
         sources={"weight": source},
         descriptors=(),
         transport=object(),
@@ -625,24 +582,22 @@ def test_staged_verification_rejects_missing_or_mismatched_digest():
     tensor = torch.arange(64, dtype=torch.int32)
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._weight_update_plan = None
-    transfer._recv_buffers = {"weight": tensor}
-    transfer._convert_buffers = {}
     transfer._full_buffers = {}
 
-    transfer._verify(_prepared(tensor, tensor_digest(tensor)))
+    transfer._verify_source(_prepared(tensor, tensor_digest(tensor)), "weight", tensor)
     with pytest.raises(RuntimeError, match="digest mismatch"):
-        transfer._verify(_prepared(tensor, tensor_digest(tensor + 1)))
+        transfer._verify_source(_prepared(tensor, tensor_digest(tensor + 1)), "weight", tensor)
     with pytest.raises(RuntimeError, match="did not publish"):
-        transfer._verify(_prepared(tensor, None))
+        transfer._verify_source(_prepared(tensor, None), "weight", tensor)
 
 
 def test_full_tensor_plan_fails_before_transfer_when_capture_has_holes():
-    capture = CaptureResult(copies=[])
+    capture = CaptureResult(source_replay=True, copies=[])
     with pytest.raises(IncompleteRefit, match="must cover every engine parameter"):
-        _NixlStagedTransfer._validate_complete(
+        TrainerTransferPlan.validate_capture(
             capture,
             {"weight": ((4,), torch.float32)},
-            LogicalTransferPlan(),
+            LogicalTransferPlan(source_replay=True, replay_id=capture.replay_id),
         )
 
 
@@ -675,209 +630,13 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._weight_update_plan = None
     transfer._manager = _Manager()
-    transfer._owns_manager = True
     transfer._closed = False
-    transfer._recv_buffers = {}
-    transfer._convert_buffers = {}
     transfer._full_buffers = {}
     transfer._staging_arenas = []
     transfer._staging_registrations = []
     transfer.close()
     transfer.close()
     assert calls == ["initialize", "shutdown", "shutdown"]
-
-
-def test_borrowed_manager_is_not_initialized_or_closed():
-    class _Manager:
-        def initialize(self):
-            raise AssertionError("borrowed manager must already be initialized")
-
-        def shutdown(self):
-            raise AssertionError("borrowed manager is owned by the loader")
-
-    transfer = _NixlStagedTransfer(
-        generator_fingerprint=lambda: (),
-        capture_layout=lambda _: None,
-        device_id=0,
-        device=torch.device("cpu"),
-        manager=_Manager(),
-    )
-    transfer.close()
-
-
-def test_borrowed_manager_survives_peer_receive_and_refuses_a_reset(monkeypatch):
-    """The peer path runs on a manager the transfer does not own, so it must
-    never initialize, cycle, or shut down the loader's agent."""
-
-    class _Manager:
-        def initialize(self):
-            raise AssertionError("borrowed manager must already be initialized")
-
-        def shutdown(self):
-            raise AssertionError("borrowed manager is owned by the loader")
-
-        def add_remote_agent(self, metadata):
-            return "peer-agent"
-
-        def fetch_remote_and_wait(self, **kwargs):
-            pass
-
-        def receive_from_source(self, **kwargs):
-            kwargs["on_transfer_start"]()
-            return 16, 1, 0.25
-
-        def remove_remote_agent(self, agent_name):
-            pass
-
-    manifest = p2p_pb2.GetTensorManifestResponse(
-        mx_source_id="source-1",
-        worker_id="worker-1",
-        metadata_endpoint="127.0.0.1:17000",
-        agent_name="peer-agent",
-        tensors=[
-            p2p_pb2.TensorDescriptor(
-                name="weight", addr=1234, size=16, device_id=0, dtype="torch.float32"
-            )
-        ],
-    )
-
-    class _Lease:
-        def __init__(self):
-            self.manifest = manifest
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(
-        transfer_module, "prepare_tensor_read", lambda *a, **k: (_Lease(), 0)
-    )
-    transfer = _NixlStagedTransfer(
-        generator_fingerprint=lambda: (),
-        capture_layout=lambda _: None,
-        device_id=0,
-        device=torch.device("cpu"),
-        manager=_Manager(),
-    )
-
-    source = p2p_pb2.WorkerMetadata(worker_grpc_endpoint="127.0.0.1:18000")
-    live = {"weight": torch.empty(4, dtype=torch.float32)}
-    for _ in range(2):
-        lease = transfer.prepare_peer_read(
-            source=source,
-            mx_source_id="source-1",
-            worker_id="worker-1",
-            destination_tensors=live,
-        )
-        metrics = transfer.receive_peer(
-            tensor_read=lease,
-            destination_tensors=live,
-            on_transfer_start=lambda: None,
-        )
-        assert metrics["bytes_received"] == 16
-
-    with pytest.raises(RuntimeError, match="transfer-owned NIXL agent"):
-        transfer.reset_workspace()
-    transfer.close()
-
-
-def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch):
-    calls = []
-
-    class _Lease:
-        def __init__(self, manifest):
-            self.manifest = manifest
-            self.closed = False
-
-        def close(self):
-            self.closed = True
-            calls.append(("lease_release", None))
-
-    manifest = p2p_pb2.GetTensorManifestResponse(
-        mx_source_id="source-1",
-        worker_id="worker-1",
-        metadata_endpoint="127.0.0.1:17000",
-        agent_name="live-peer-agent",
-        tensors=[
-            p2p_pb2.TensorDescriptor(
-                name="weight",
-                addr=1234,
-                size=16,
-                device_id=0,
-                dtype="torch.float32",
-            )
-        ],
-    )
-
-    def prepare(*args, **kwargs):
-        calls.append(("prepare", (args, kwargs)))
-        return _Lease(manifest), manifest.ByteSize()
-
-    monkeypatch.setattr(transfer_module, "prepare_tensor_read", prepare)
-
-    class _Manager:
-        def add_remote_agent(self, metadata):
-            calls.append(("add", metadata))
-            return "peer-agent"
-
-        def fetch_remote_and_wait(self, **kwargs):
-            calls.append(("fetch", kwargs))
-
-        def receive_from_source(self, **kwargs):
-            calls.append(("receive", kwargs))
-            kwargs["on_transfer_start"]()
-            return 16, 1, 0.25
-
-        def remove_remote_agent(self, agent_name):
-            calls.append(("remove", agent_name))
-
-    transfer = object.__new__(_NixlStagedTransfer)
-    transfer._weight_update_plan = None
-    transfer._device = torch.device("cpu")
-    transfer._device_id = 0
-    transfer._timeout = 30.0
-    transfer._manager = _Manager()
-    transfer._closed = False
-    source = p2p_pb2.WorkerMetadata(
-        worker_grpc_endpoint="127.0.0.1:18000",
-    )
-
-    live = {"weight": torch.empty(4, dtype=torch.float32)}
-    lease = transfer.prepare_peer_read(
-        source=source,
-        mx_source_id="source-1",
-        worker_id="worker-1",
-        destination_tensors=live,
-    )
-    assert lease.closed is False
-    metrics = transfer.receive_peer(
-        tensor_read=lease,
-        destination_tensors=live,
-        on_transfer_start=lambda: calls.append(("transfer_start", None)),
-    )
-
-    assert metrics["bytes_received"] == 16
-    receive = next(value for name, value in calls if name == "receive")
-    assert receive["remote_agent_name"] == "live-peer-agent"
-    assert receive["require_exact_match"] is True
-    assert receive["destination_tensors"] is live
-    assert callable(receive["on_transfer_start"])
-    assert calls.count(("transfer_start", None)) == 1
-    assert lease.closed is False
-    fetch = next(value for name, value in calls if name == "fetch")
-    assert fetch == {
-        "remote_agent_name": "live-peer-agent",
-        "ip": "127.0.0.1",
-        "port": 17000,
-        "timeout_seconds": 30.0,
-    }
-
-    manifest.metadata_endpoint = ""
-    with pytest.raises(RuntimeError, match="unusable metadata endpoint"):
-        transfer.receive_peer(
-            tensor_read=lease,
-            destination_tensors=live,
-            on_transfer_start=lambda: None,
-        )
 
 
 def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch):
@@ -904,7 +663,9 @@ def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch):
 def test_double_buffered_iteration_alternates_arenas_and_prefetches(monkeypatch):
     """Batch i+1 is posted before batch i is handed to the caller."""
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda device: events.append("producer_sync")
+    )
     source_tensor = torch.tensor([1.0, 2.0, 3.0, 4.0])
     source = SourceInfo(
         global_shape=(4,),
@@ -927,7 +688,7 @@ def test_double_buffered_iteration_alternates_arenas_and_prefetches(monkeypatch)
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
     batches = _bounded_batches(
-        CaptureResult(copies=copies), layout, {"w": source}, 256
+        CaptureResult(source_replay=True, copies=copies), layout, {"w": source}, 256
     )
     assert len(batches) == 3
     events = []
@@ -956,11 +717,18 @@ def test_double_buffered_iteration_alternates_arenas_and_prefetches(monkeypatch)
     transfer._staging_registrations = []
     metrics = {}
     addresses = []
-    for tensors in transfer.iter_bounded(prepared, metrics):
+
+    def install(tensors):
         events.append("commit")
         (tensor,) = tensors.values()
         addresses.append(tensor.data_ptr())
         assert torch.equal(tensor, source_tensor)
+
+    stream = PreparedStreamingTensors(
+        lambda: transfer.iter_bounded(prepared, metrics), prepared.replay_id, metrics
+    )
+    with stream.consume(lambda: events.append("drain")):
+        stream.apply(install)
     # Arena use alternates, and the next READ is posted before each commit.
     assert addresses == [
         arenas[0].data_ptr(),
@@ -972,11 +740,15 @@ def test_double_buffered_iteration_alternates_arenas_and_prefetches(monkeypatch)
         "await",
         "post",
         "commit",
+        "drain",
         "await",
         "post",
         "commit",
+        "drain",
         "await",
         "commit",
+        "drain",
+        "drain",
     ]
     assert metrics["staging_buffers"] == 2
     assert metrics["staging_peak_bytes"] == 512
@@ -1008,7 +780,7 @@ def test_abandoned_double_buffered_iteration_drains_the_prefetched_read(monkeypa
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
     batches = _bounded_batches(
-        CaptureResult(copies=copies), layout, {"w": source}, 256
+        CaptureResult(source_replay=True, copies=copies), layout, {"w": source}, 256
     )
     posted, awaited = [], []
 
@@ -1133,7 +905,7 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
             ),
         ],
     )
-    capture = CaptureResult(
+    capture = CaptureResult(source_replay=True,
         copies=[
             RecordedCopy(
                 src_name="weight",
@@ -1170,21 +942,19 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
             with pytest.raises(IncompleteRefit, match="255"):
                 transfer.prepare(
                     trainer_snapshot=snapshot,
-                    manifests=[manifest],
                 )
             assert "register_dram" not in events
             return
         prepared = transfer.prepare(
             trainer_snapshot=snapshot,
-            manifests=[manifest],
         )
         assert events.count("register_dram") == staging_buffers
         assert len(transfer._staging_arenas) == staging_buffers
         assert all(a.device.type == "cpu" for a in transfer._staging_arenas)
         metrics = {}
         for tensors in transfer.iter_bounded(prepared, metrics):
-            assert tensors["layer.weight"].device.type == "cpu"
-            assert torch.equal(tensors["layer.weight"], source_tensor)
+            assert next(tensors.values()).device.type == "cpu"
+            assert torch.equal(next(tensors.values()), source_tensor)
         assert metrics["staging_buffers"] == staging_buffers
         assert metrics["staging_peak_bytes"] == 256 * staging_buffers
     finally:
@@ -1241,7 +1011,7 @@ def test_failed_prefetch_drain_is_reported_not_swallowed(monkeypatch):
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
     batches = _bounded_batches(
-        CaptureResult(copies=copies), layout, {"w": source}, 512
+        CaptureResult(source_replay=True, copies=copies), layout, {"w": source}, 256
     )
     assert len(batches) == 2
 
@@ -1299,7 +1069,7 @@ def test_failed_prefetch_drain_does_not_mask_a_caller_error(monkeypatch):
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
     batches = _bounded_batches(
-        CaptureResult(copies=copies), layout, {"w": source}, 512
+        CaptureResult(source_replay=True, copies=copies), layout, {"w": source}, 256
     )
     drained = []
 
@@ -1377,7 +1147,7 @@ def test_generator_layout_debug_assertion(harness, monkeypatch, enabled):
     if enabled:
         with pytest.raises(AssertionError, match="generator layout changed"):
             method.prepare(version=None, source=source)
-        assert transfer._binding is None
+        assert transfer._transport is None
     else:
         prepared = method.prepare(version=None, source=source)
         method.release(prepared)
@@ -1412,7 +1182,6 @@ def test_changed_agent_metadata_reconnects(harness, monkeypatch):
     monkeypatch.setattr(transfer._manager, "add_remote_agent", lambda _: "source")
     for _ in range(2):
         prepared = transfer.prepare(
-            manifests=[shard.metadata for shard in current.shards],
             trainer_snapshot=current,
         )
         harness.collect(prepared)
