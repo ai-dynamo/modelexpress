@@ -153,7 +153,8 @@ class MxModelLoader(BaseModelLoader):
         `restore=True` says `model` holds `model_config`'s weights from another
         loader, for example before a process checkpoint, so RDMA may refill them.
         RDMA needs a revision that pins the captured checkpoint (MX_MODEL_REVISION
-        or a full commit hash); otherwise the reload comes from storage.
+        or a full commit hash) and a peer catalog naming every target tensor;
+        otherwise the reload comes from storage.
         """
         if self._last_sleep_level is None:
             self._stop_serving()
@@ -195,6 +196,7 @@ class MxModelLoader(BaseModelLoader):
         elif ctx.is_reload and restore:
             ctx.loaded_identity = p2p_pb2.SourceIdentity()
             ctx.loaded_identity.CopyFrom(ctx.identity)
+            ctx.require_exact_tensor_catalog = True
             adopt_bare_tensors(model, ctx.accelerator_backend)
         draft_gate: DraftPublicationGate | None = None
         if is_speculative_draft:

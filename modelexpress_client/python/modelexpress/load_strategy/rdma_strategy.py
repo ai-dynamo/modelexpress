@@ -854,11 +854,13 @@ class RdmaStrategy(LoadStrategy):
                 # Cross-family (heterogeneous) transfers must name the exact same tensor
                 # set on both sides: a name diff can mean vendor-specific hidden/derived
                 # tensors, which would leave part of the target at dummy values while
-                # RDMA reports success. Same-family transfers tolerate subset transfers.
+                # RDMA reports success. Same-family transfers tolerate subset transfers
+                # unless the context asks for an exact catalog.
                 target_accelerator = ctx.accelerator_backend.name
                 source_accelerator = source_worker.accelerator
                 require_exact_match = (
-                    ctx.adapter.requires_exact_tensor_catalog()
+                    ctx.require_exact_tensor_catalog
+                    or ctx.adapter.requires_exact_tensor_catalog()
                     or bool(
                         target_accelerator
                         and source_accelerator
