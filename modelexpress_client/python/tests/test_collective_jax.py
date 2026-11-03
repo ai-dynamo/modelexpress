@@ -247,6 +247,32 @@ class TestTorchFreeLane:
         assert ("set_device", 3) in no_torch.calls, "the restore was attempted"
         assert "could not restore CUDA device 3" in caplog.text
 
+    def test_a_failed_event_cleanup_does_not_mask_the_timeout(
+        self, no_torch, caplog
+    ):
+        """The event is released after the wait; that release failing is logged.
+
+        Its device lookup fails here, which used to replace the pending
+        ``TimeoutError`` with the cleanup's ``RuntimeError``.
+        """
+        no_torch._ready_after = 10**9
+        lookups = []
+        get_device = no_torch.cudaGetDevice
+
+        def failing_lookup():
+            lookups.append(None)
+            if len(lookups) > 1:
+                return ("lookup-failed", None)
+            return get_device()
+
+        no_torch.cudaGetDevice = failing_lookup
+        with caplog.at_level("WARNING", logger="modelexpress_rl.collective.comm"):
+            with pytest.raises(TimeoutError, match="did not finish") as raised:
+                _real_lane(device=0).synchronize(timeout_s=0.05)
+        assert len(lookups) == 2, "the cleanup ran and its device lookup failed"
+        assert raised.value.__context__ is None
+        assert "could not release the CUDA event" in caplog.text
+
 
 class TestBootstrapBarrierAllocator:
     def test_the_timeout_still_reaches_synchronize_through_the_allocator_path(self):

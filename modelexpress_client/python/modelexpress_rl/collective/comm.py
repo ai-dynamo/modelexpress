@@ -304,12 +304,27 @@ class LaneCommunicator:
         if timeout_s is not None:
             event = self.record_event()
             if event is not None:
+                close = getattr(event, "close", None)
                 try:
                     self.wait_event(event, timeout_s)
-                finally:
-                    close = getattr(event, "close", None)
+                except BaseException:
+                    # The wait's own failure is the one callers dispatch on (a
+                    # TimeoutError, say); a cleanup failure on top of it is
+                    # only logged.
                     if close is not None:
-                        close()
+                        try:
+                            close()
+                        except Exception:  # noqa: BLE001 - must not mask the original
+                            logger.warning(
+                                "could not release the CUDA event after the wait "
+                                "on lane %s/%s failed",
+                                self.rank,
+                                self.world_size,
+                                exc_info=True,
+                            )
+                    raise
+                if close is not None:
+                    close()
                 return
         stream = self.stream
         if stream is not None and callable(getattr(stream, "synchronize", None)):
