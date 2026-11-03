@@ -169,3 +169,77 @@ def test_a_real_transposed_layout_is_refused():
     assert array.format.layout.major_to_minor == (1, 0)
     with pytest.raises(ValueError, match="dense row-major"):
         jax_interop.JaxDeviceBuffer(array)
+
+
+def test_the_jax_example_trainer_binds_each_round_to_an_operation(
+    monkeypatch, tmp_path
+):
+    """The example driver opens every round with an operation id.
+
+    ``start_weight_update`` takes the operation the round is bound to, and the
+    torch example creates or replays it first; the JAX driver must do the
+    same. Everything below the client is the example's own code; the client is
+    an autospec of the real trainer client, so a call that does not fit its
+    signature raises here the way it would against a live server.
+    """
+    import sys
+    from pathlib import Path
+    from unittest import mock
+
+    from modelexpress_rl.collective import RefitClientTrainer
+
+    examples = Path(__file__).resolve().parents[3] / "examples/rl/m2n_collective_refit"
+    monkeypatch.syspath_prepend(str(examples))
+    for module in [m for m in sys.modules if m.startswith("mx_m2n_e2e")]:
+        monkeypatch.delitem(sys.modules, module)
+    from mx_m2n_e2e import jax_trainer
+
+    client = mock.create_autospec(RefitClientTrainer, instance=True)
+    client.create_operation.side_effect = lambda version, *, key_prefix: (
+        f"{key_prefix}/{version}"
+    )
+    client.compute_plan.return_value = SimpleNamespace(group_id="g", epoch=1)
+
+    monkeypatch.setattr(jax.distributed, "initialize", lambda **_: None)
+    monkeypatch.setattr(
+        jax_trainer,
+        "build_plan",
+        lambda *_, **__: (SimpleNamespace(bulk=[]), [[]]),
+    )
+    monkeypatch.setattr(jax_trainer, "build_params", lambda *_, **__: {})
+    monkeypatch.setattr(
+        jax_trainer,
+        "grpc",
+        SimpleNamespace(
+            insecure_channel=lambda endpoint: endpoint,
+            channel_ready_future=lambda channel: SimpleNamespace(
+                result=lambda timeout: None
+            ),
+        ),
+    )
+    monkeypatch.setattr(jax_trainer, "CollectiveRendezvous", lambda channel: None)
+    monkeypatch.setattr(jax_trainer, "RefitClientTrainer", lambda **_: client)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("MASTER_ADDR", "localhost")
+    monkeypatch.setenv("JAX_PORT", "0")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "jax_trainer",
+            "--model-dir=unused",
+            "--endpoint=unused",
+            "--model-name=m",
+            "--run-id=r1",
+            f"--trainers={len(jax.devices())}",
+            "--generators=1",
+            "--rounds=2",
+            f"--out={tmp_path}",
+        ],
+    )
+
+    assert jax_trainer.main() == 0
+    assert client.start_weight_update.call_args_list == [
+        mock.call("v0", "mx-m2n-e2e-r1/v0"),
+        mock.call("v1", "mx-m2n-e2e-r1/v1"),
+    ]

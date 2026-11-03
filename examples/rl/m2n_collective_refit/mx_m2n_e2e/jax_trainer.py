@@ -286,7 +286,12 @@ def main() -> int:
         # rather than the ones the previous round already drained.
         params = _step(params, scale)
         publisher.update(params)
-        client.start_weight_update(version)
+        # Every participant replays the same create and gets the same id; the
+        # round is then bound to it before any NCCL work.
+        operation_id = client.create_operation(
+            version, key_prefix=f"mx-m2n-e2e-{args.run_id}"
+        )
+        client.start_weight_update(version, operation_id)
         publish_start = time.perf_counter()
         for group_id in range(len(groupings)):
             client.publish_weights(version, group_id)
