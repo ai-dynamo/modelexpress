@@ -389,10 +389,16 @@ impl P2pService for P2pServiceImpl {
     ) -> Result<Response<GetMetadataResponse>, Status> {
         let req = request.into_inner();
 
-        // Validated on the read path too. Nothing can have been published under
-        // a `worker_id` this rejects, so no lookup that would have succeeded is
-        // lost, and the caller gets an explicit answer rather than whatever the
-        // backend makes of an unusable object name.
+        // Validated on the read path too, so the caller gets an explicit answer
+        // rather than whatever the backend makes of an unusable object name. On
+        // Kubernetes nothing this rejects could have been published, since the
+        // CR create would have failed. Redis stored worker IDs verbatim before
+        // this check, so a record published under a custom ID that is now
+        // invalid (uppercase, for example) still lists but can no longer be
+        // fetched or updated; such IDs have to change when upgrading. The
+        // built-in producers emit IDs that pass, and the deployment guide has
+        // stale Redis metadata flushed on redeploy, so no migration path is
+        // provided.
         if req.mx_source_id.is_empty() || validate_worker_id(&req.worker_id).is_err() {
             return tagged(
                 GetMetadataResponse {
