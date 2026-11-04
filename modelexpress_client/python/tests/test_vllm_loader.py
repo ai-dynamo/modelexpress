@@ -986,6 +986,7 @@ class TestMtpDrafterSecondLoad:
         vllm_config.parallel_config.pipeline_parallel_size = 1
         vllm_config.parallel_config.data_parallel_size = 1
         vllm_config.parallel_config.prefill_context_parallel_size = 1
+        vllm_config.parallel_config.decode_context_parallel_size = 1
         vllm_config.parallel_config.enable_elastic_ep = False
         vllm_config.speculative_config.draft_model_config.runner_type = "draft"
         return vllm_config
