@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     MX_REFIT_FULL_STREAMING: bool
     MX_REFIT_STREAM_WINDOW_LAYERS: int
     MX_REFIT_TIMING: bool
+    MX_S3_DOWNLOAD_BACKEND: str
     MX_S3_DOWNLOAD_RANGE_BYTES: int
     MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
     MX_S3_DOWNLOAD_IO_CHUNK_BYTES: int
@@ -185,7 +186,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_REFIT_DOWNLOAD_WORKERS": lambda: (
         require_positive_int(
-            parse_int(os.environ["MX_REFIT_DOWNLOAD_WORKERS"], "MX_REFIT_DOWNLOAD_WORKERS"),
+            parse_int(
+                os.environ["MX_REFIT_DOWNLOAD_WORKERS"], "MX_REFIT_DOWNLOAD_WORKERS"
+            ),
             "MX_REFIT_DOWNLOAD_WORKERS",
         )
         if "MX_REFIT_DOWNLOAD_WORKERS" in os.environ
@@ -215,6 +218,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ.get("MX_S3_UPLOAD_WORKERS", 8)),
         "MX_S3_UPLOAD_WORKERS",
     ),
+    "MX_S3_DOWNLOAD_BACKEND": lambda: s3_download_backend(),
     "MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES": lambda: require_positive_int(
         int(
             os.environ.get(
@@ -236,7 +240,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ.get("MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS", 16)),
         "MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS",
     ),
-    "MX_S3_DOWNLOAD_WORKERS": lambda: environment_variables["MX_REFIT_DOWNLOAD_WORKERS"](),
+    "MX_S3_DOWNLOAD_WORKERS": lambda: environment_variables[
+        "MX_REFIT_DOWNLOAD_WORKERS"
+    ](),
     "MX_S3_MAX_POOL_CONNECTIONS": lambda: require_positive_int(
         int(os.environ.get("MX_S3_MAX_POOL_CONNECTIONS", 32)),
         "MX_S3_MAX_POOL_CONNECTIONS",
@@ -291,9 +297,21 @@ def require_positive_int(value: int, name: str) -> int:
     return value
 
 
+def s3_download_backend() -> str:
+    """Select the canonical S3 download implementation."""
+    value = os.environ.get("MX_S3_DOWNLOAD_BACKEND", "transfer_manager").strip().lower()
+    if value not in {"transfer_manager", "preallocated"}:
+        raise ValueError(
+            "MX_S3_DOWNLOAD_BACKEND must be transfer_manager or preallocated"
+        )
+    return value
+
+
 def positive_int_env(name: str, default: int) -> int:
     """Read a positive integer while retaining its setting name in errors."""
-    return require_positive_int(parse_int(os.environ.get(name, str(default)), name), name)
+    return require_positive_int(
+        parse_int(os.environ.get(name, str(default)), name), name
+    )
 
 
 def require_non_negative_int(value: int, name: str) -> int:

@@ -50,7 +50,7 @@ from modelexpress_rl.inference.plan import (
 from modelexpress_rl.inference.runtime import EngineRuntime, GeneratorRuntime
 from modelexpress_rl.inference.session import WeightUpdateSession
 from modelexpress_rl.inference.source import ObjectStorageSourceResolver
-from modelexpress_rl.s3 import ImmutableS3Conflict, S3Client
+from modelexpress_rl.s3 import ImmutableS3Conflict, S3Client, _TransferManagerDownloader
 from modelexpress_rl.utils import checksum_factory, compress_delta, compute_delta
 
 
@@ -258,7 +258,7 @@ def test_s3_read_parses_uri():
     backend = _S3Backend(data)
     s3 = object.__new__(S3Client)
     s3._client = backend
-    s3._download_manager = _TransferManager(backend, None)
+    s3._downloader = _TransferManagerDownloader(backend)
     assert s3.get("s3://weights/root.json") == data
     assert backend.get_request == {
         "Bucket": "weights",
@@ -297,7 +297,7 @@ def test_s3_write_accepts_only_an_identical_immutable_retry():
     s3 = object.__new__(S3Client)
     s3._client = backend
     s3._multipart_threshold_bytes = 100
-    s3._download_manager = _TransferManager(backend, None)
+    s3._downloader = _TransferManagerDownloader(backend)
     s3.put(uri="s3://weights/root.json", data=b"same")
     with pytest.raises(ImmutableS3Conflict):
         s3.put(uri="s3://weights/root.json", data=b"different")
@@ -333,7 +333,7 @@ def test_s3_client_uses_transfer_connection_and_retry_settings(monkeypatch):
         assert config.retries == {"total_max_attempts": 6, "mode": "standard"}
         assert config.tcp_keepalive is False
         assert s3._upload_pool._max_workers == 2
-        transfer = s3._download_manager.config
+        transfer = s3._downloader._manager.config
         assert transfer.multipart_threshold == 4096
         assert transfer.multipart_chunksize == 1024
         assert transfer.max_request_concurrency == 11
