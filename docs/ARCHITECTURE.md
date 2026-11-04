@@ -740,7 +740,39 @@ transport. For `transport=nixl`, it runs `LoadStrategyChain.run()` and updates
 global registries. For `transport=transfer_engine`, it uses SGLang's initialized
 TransferEngine and ModelExpress metadata directly: first replica loads natively,
 registers TransferEngine memory, and publishes its session; later replicas
-discover that source and pull with `batch_transfer_sync_read`.
+discover that source and pull with `submit_scatter_read` completion tickets.
+Receivers require Mooncake >=0.3.14 with the retained-ticket API; unsupported
+receivers are rejected after source discovery, before preparing or registering
+destination weights. A seed with no source can load natively, register memory,
+and publish without the ticket API. Receives validate
+the complete tensor manifest before submission and cap each batch at 1 GiB,
+splitting individual tensors when needed. This limits the number of outstanding
+transport slices for large model loads. Manifest validation, byte-range batching,
+batch submission, and ticket draining use separate helpers in the receive path.
+
+The byte cap also bounds CPU work in the classic RDMA posting path. Mooncake
+0.3.11.post1 initializes work-request arrays for the entire pending slice queue
+on each posting pass, rather than the QP posting limit
+([upstream fix](https://github.com/kvcache-ai/Mooncake/pull/2490)). Mooncake
+0.3.14 fixes that allocation but still rewrites endpoint and completion-token
+metadata for every pending slice before posting a subset
+([worker loop](https://github.com/kvcache-ai/Mooncake/blob/v0.3.14/mooncake-transfer-engine/src/transport/rdma_transport/worker_pool.cpp#L1016-L1021)).
+Bounding each receive limits these queue costs independently of the native RDMA
+slice size; it does not establish completion after a timeout.
+
+Each ticket is drained in one-second waits while its tensors, registrations,
+and engine remain owned. Pending receives emit a warning every 30 seconds with
+the worker rank, elapsed drain time, and batch size in bytes.
+`COMPLETION_UNKNOWN` keeps the load pending; it does
+not permit buffer reuse or the next batch. After `FAILED_DRAINED`, the loader
+can unregister the buffers, reinitialize the model, and fall back natively.
+If submission or draining raises, the operation and buffers remain retained
+and the error propagates without native fallback or a forced process exit.
+Interrupted loads also retain their outstanding resources. A permanently
+undrainable operation requires supervised worker recovery; the classic backend
+does not guarantee bounded cancellation. Discovery and validation failures
+before submission retain their native fallback behavior.
+
 `SglangAdapter` owns SGLang-specific rank/device mapping, native fallback
 loading, quantized-weight post-processing, and tensor discovery, including the
 storage-view naming used for non-contiguous SGLang parameters.

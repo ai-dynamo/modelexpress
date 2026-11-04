@@ -602,7 +602,14 @@ intact.
 
 For the Mooncake TransferEngine SGLang example, add
 `--build-arg INSTALL_MOONCAKE=true` to install
-`mooncake-transfer-engine-cuda13`.
+`mooncake-transfer-engine-cuda13>=0.3.14`. A receiving weight loader requires the
+native `submit_scatter_read` completion-ticket API and rejects unsupported
+runtimes after source discovery, before preparing or registering destination
+weights. A seed with no source can load natively and publish using an older
+runtime without the ticket API. Pending tickets retain their buffers while
+draining and warn every 30 seconds with rank, elapsed time, and batch bytes;
+after submission, native fallback is allowed only after a drained failure. An
+undrainable operation requires supervised worker recovery.
 
 The Dynamo examples use their own runtime image Dockerfile:
 `examples/dynamo_p2p_transfer_k8s/Dockerfile`.
