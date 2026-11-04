@@ -175,8 +175,10 @@ Start the first replica with weights available through local storage or `MX_MODE
 
 `MX_ARTIFACT_TRANSFER=1` enables compatible JIT-cache installation and
 publication. `MX_ARTIFACT_BACKEND` selects exactly one artifact transport and
-defaults to `nixl`. The NIXL backend requires `MX_P2P_METADATA=1` and a central
-coordinator (`redis` or `kubernetes`). The `mooncake` backend instead uses a
+defaults to `nixl`. The NIXL backend requires the P2P metadata path and supports
+central coordinators (`redis` or `kubernetes`) and `k8s-service`. With
+`k8s-service`, discovery goes through a Service and the transfer is pinned to
+the selected Pod's direct endpoint. The `mooncake` backend instead uses a
 configured Mooncake distributed store and does not require an MX server or P2P
 metadata. Both backends require writable staging/runtime cache directories and
 a trusted deployment; there is no automatic fallback between them.

@@ -152,9 +152,19 @@ directories have stopped changing briefly. Supported cache roots are
 `TORCHINDUCTOR_CACHE_DIR` (or PyTorch Inductor's runtime `cache_dir()`),
 `TRITON_CACHE_DIR`, `TVM_FFI_CACHE_DIR`, `SGLANG_DG_CACHE_DIR`, `TILELANG_CACHE_DIR`,
 `CUTE_DSL_CACHE_DIR`, and `FLASHINFER_WORKSPACE_BASE`. The default `nixl`
-artifact backend requires `MX_P2P_METADATA=1` and a central coordinator; the
-`mooncake` backend uses its configured store without MX metadata. Cache
-publication uses the same health endpoint as weight publication.
+artifact backend requires the P2P metadata path and supports `redis`,
+`kubernetes`, and `k8s-service` metadata backends. With `k8s-service`, configure
+the artifact Service to route to the owner device's worker port. The `mooncake`
+backend uses its configured store without MX metadata. Cache publication uses
+the same health endpoint as weight publication.
+
+For multi-node artifact routing, ModelExpress reads `node_rank` and
+`dist_init_addr` from SGLang's native server settings, including launches
+without LWS or torchrun. Explicit values on `LoadConfig` take precedence;
+launcher environment variables are fallbacks when native settings are absent.
+Invalid optional launcher ranks are logged and skipped. Readiness probes use
+the host from `dist_init_addr` with the health endpoint's port, not the
+distributed rendezvous port.
 
 For Mooncake TransferEngine, use the same command shape and change only the
 transport. The SGLang image must include `mooncake-transfer-engine-cuda13`.

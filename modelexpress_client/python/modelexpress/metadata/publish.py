@@ -142,6 +142,13 @@ def publish_metadata_and_ready(
             accelerator=accelerator,
             topology=node_topology,
         )
+        if getattr(mx_client, "LEADER_DISCOVERY", False) is True:
+            try:
+                mx_client.attach_worker_server(grpc_server, worker, worker_id)
+            except Exception:
+                _worker_servers.pop(device_id, None)
+                grpc_server.stop(grace=0)
+                raise
 
         def publish_fn() -> str:
             mx_source_id = _publish_metadata_to_server(

@@ -91,6 +91,8 @@ def resume_serving(
     torch.compile / CUDA-graph artifacts attached post-warmup.
     """
     ctx.mx_client = create_metadata_client(worker_rank=ctx.worker_rank)
+    if getattr(ctx.mx_client, "LEADER_DISCOVERY", False) is True:
+        ctx.mx_client.configure_load_context(ctx)
     if new_worker_id:
         ctx.worker_id = uuid.uuid4().hex[:8]
 

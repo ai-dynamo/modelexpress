@@ -174,6 +174,8 @@ Shared client settings are registered in `modelexpress.envs`. RL settings are li
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | empty | Optional compile-configuration compatibility digest for cache discovery |
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint checked before a source publishes weights or JIT cache artifacts (`http://127.0.0.1:8000/health` for vLLM; `http://127.0.0.1:30000/health` for SGLang). On the non-head nodes of a multi-node engine, a loopback host is rewritten onto the head's address (the engine's own distributed-init address, else `LWS_LEADER_ADDRESS`), preserving the configured port and path. A non-loopback host is used verbatim |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication |
+| `MX_K8S_ARTIFACT_SERVICE_PATTERN` | inherits `MX_K8S_SERVICE_PATTERN` | `k8s-service` artifact discovery template; supports `{node_rank}` and `{rank}` |
+| `MX_ARTIFACT_OWNER_DEVICE_ID` | `0` | Device that publishes pod-scoped artifacts for `k8s-service`; its worker port must be exposed by the artifact Service |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Seconds between READY status heartbeats for published sources, including reshard rendezvous sources; keep below the server heartbeat timeout |
 ### Canonical S3 Transfer Tuning
 
@@ -267,7 +269,7 @@ The optional RL APIs are installed with this distribution under the `modelexpres
 1. **Source** loads weights from disk, registers raw tensors with NIXL *before* FP8 processing, and publishes metadata to the ModelExpress server.
 2. **Target** creates dummy weights, waits for the source ready flag, then pulls raw tensors via RDMA read.
 3. Both source and target run `process_weights_after_loading()` independently, producing identical FP8-transformed weights.
-4. When artifact transfer is enabled, a healthy source publishes its pod-scoped JIT caches and later pods install compatible caches before model initialization.
+4. When artifact transfer is enabled, a healthy source publishes its pod-scoped JIT caches and later pods install compatible caches before model initialization. With `k8s-service`, discovery goes through a Service but the returned pod-direct endpoint handles the stateful manifest and chunk-lease RPCs.
 
 This pre-processing transfer strategy is critical for FP8 models (e.g., DeepSeek-V4-Pro) where tensors are renamed and transformed during processing.
 

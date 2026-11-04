@@ -263,6 +263,21 @@ class WorkerServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.RegisterInstanceWorker = channel.unary_unary(
+                '/model_express.p2p.WorkerService/RegisterInstanceWorker',
+                request_serializer=p2p__pb2.RegisterInstanceWorkerRequest.SerializeToString,
+                response_deserializer=p2p__pb2.RegisterInstanceWorkerResponse.FromString,
+                _registered_method=True)
+        self.GetInstanceMetadata = channel.unary_unary(
+                '/model_express.p2p.WorkerService/GetInstanceMetadata',
+                request_serializer=p2p__pb2.GetInstanceMetadataRequest.SerializeToString,
+                response_deserializer=p2p__pb2.GetInstanceMetadataResponse.FromString,
+                _registered_method=True)
+        self.GetWorkerInventory = channel.unary_unary(
+                '/model_express.p2p.WorkerService/GetWorkerInventory',
+                request_serializer=p2p__pb2.GetWorkerInventoryRequest.SerializeToString,
+                response_deserializer=p2p__pb2.InstanceWorkerMetadata.FromString,
+                _registered_method=True)
         self.GetTensorManifest = channel.unary_unary(
                 '/model_express.p2p.WorkerService/GetTensorManifest',
                 request_serializer=p2p__pb2.GetTensorManifestRequest.SerializeToString,
@@ -312,6 +327,26 @@ class WorkerServiceServicer(object):
     source-side registered DRAM range and returns its transfer descriptor.
     """
 
+    def RegisterInstanceWorker(self, request, context):
+        """One leader Service bootstraps an entire model instance. Workers register
+        only with their own engine's head, never through the load-balanced Service.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetInstanceMetadata(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetWorkerInventory(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetTensorManifest(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -359,6 +394,21 @@ class WorkerServiceServicer(object):
 
 def add_WorkerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'RegisterInstanceWorker': grpc.unary_unary_rpc_method_handler(
+                    servicer.RegisterInstanceWorker,
+                    request_deserializer=p2p__pb2.RegisterInstanceWorkerRequest.FromString,
+                    response_serializer=p2p__pb2.RegisterInstanceWorkerResponse.SerializeToString,
+            ),
+            'GetInstanceMetadata': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetInstanceMetadata,
+                    request_deserializer=p2p__pb2.GetInstanceMetadataRequest.FromString,
+                    response_serializer=p2p__pb2.GetInstanceMetadataResponse.SerializeToString,
+            ),
+            'GetWorkerInventory': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetWorkerInventory,
+                    request_deserializer=p2p__pb2.GetWorkerInventoryRequest.FromString,
+                    response_serializer=p2p__pb2.InstanceWorkerMetadata.SerializeToString,
+            ),
             'GetTensorManifest': grpc.unary_unary_rpc_method_handler(
                     servicer.GetTensorManifest,
                     request_deserializer=p2p__pb2.GetTensorManifestRequest.FromString,
@@ -413,6 +463,87 @@ class WorkerService(object):
     Artifact bytes move through NIXL; PrepareArtifactChunk only creates a
     source-side registered DRAM range and returns its transfer descriptor.
     """
+
+    @staticmethod
+    def RegisterInstanceWorker(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.WorkerService/RegisterInstanceWorker',
+            p2p__pb2.RegisterInstanceWorkerRequest.SerializeToString,
+            p2p__pb2.RegisterInstanceWorkerResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetInstanceMetadata(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.WorkerService/GetInstanceMetadata',
+            p2p__pb2.GetInstanceMetadataRequest.SerializeToString,
+            p2p__pb2.GetInstanceMetadataResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetWorkerInventory(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.WorkerService/GetWorkerInventory',
+            p2p__pb2.GetWorkerInventoryRequest.SerializeToString,
+            p2p__pb2.InstanceWorkerMetadata.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def GetTensorManifest(request,

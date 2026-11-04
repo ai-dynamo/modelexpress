@@ -212,9 +212,25 @@ def schedule_artifact_publish(
     if not _artifact_transfer_enabled():
         return
     backend = _artifact_backend()
+    if (
+        backend == "nixl"
+        and getattr(ctx.mx_client, "SERVICE_ROUTED_ARTIFACTS", False) is True
+        and ctx.device_id != envs.MX_ARTIFACT_OWNER_DEVICE_ID
+    ):
+        log.debug(
+            "[Worker %s] Skipping %s artifact publish on device %s; "
+            "k8s-service artifact owner device is %s",
+            ctx.global_rank,
+            engine_label,
+            ctx.device_id,
+            envs.MX_ARTIFACT_OWNER_DEVICE_ID,
+        )
+        return
+
     transport = _create_artifact_transport(ctx, backend, engine_label, log)
     if transport is None:
         return
+
     for transfer, identity in transfers_factory():
         if transport.publish_requires_install_state:
             install_marker_path = artifact_marker_path(

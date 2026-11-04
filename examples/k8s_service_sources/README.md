@@ -31,7 +31,7 @@ graph TD
     T -- "NIXL/RDMA pull" --> PA
 ```
 
-The Service's Endpoints object is the source list, maintained by Kubernetes based on pod readiness. No `modelexpress-server` in this topology; `mx_source_id` is computed client-side and validated on the `GetTensorManifest` response.
+The Service's Endpoints object is the source list, maintained by Kubernetes based on pod readiness. No `modelexpress-server` in this topology; `mx_source_id` is computed client-side and validated on the `GetTensorManifest` response. When `MX_ARTIFACT_TRANSFER=1`, device 0 also publishes pod-scoped cache artifacts. The target discovers a bundle through `mx-sources:6555`, then uses the returned Pod IP endpoint for all stateful chunk-lease RPCs.
 
 ## Prerequisites
 
@@ -64,8 +64,81 @@ kubectl apply -f target.yaml
 | Variable                         | Default                         | Meaning                                                                       |
 |----------------------------------|---------------------------------|-------------------------------------------------------------------------------|
 | `MX_METADATA_BACKEND`            | `""` (central server)           | Set to `k8s-service` to enable this backend.                                   |
+| `MX_K8S_LEADER_SERVICE`          | unset                           | Set to `mx-sources:6555` to use a single leader discovery endpoint for weights and artifacts. Supersedes both Service patterns. |
 | `MX_K8S_SERVICE_PATTERN`         | `mx-sources`                    | DNS template. `{rank}` substitutes the worker's rank. If the pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}`. |
 | `MX_K8S_SOURCE_RETRIES`          | `5`                             | Max retries on `FAILED_PRECONDITION` before giving up.                         |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS`  | `0.5`                           | Sleep between retries (fresh channel per attempt).                             |
 | `MX_MODEL_REVISION`              | unset                           | Override for `SourceIdentity.revision`. Useful for local / non-HF checkpoints. |
 | `MX_WORKER_GRPC_PORT`            | `6555`                          | Base port for the WorkerGrpcServer (bound port is this + `device_id`).         |
+| `MX_K8S_ARTIFACT_SERVICE_PATTERN`| inherits weight Service pattern | Optional node-scoped artifact Service template; supports `{node_rank}` and `{rank}`. |
+| `MX_ARTIFACT_OWNER_DEVICE_ID`    | `0`                             | Worker that publishes pod-scoped artifacts; expose its gRPC port through the artifact Service. |
+| `MX_ARTIFACT_TRANSFER`           | `0`                             | Set to `1` on source and target Pods to transfer compatible JIT caches.        |
+
+## Leader discovery
+
+Set `MX_K8S_LEADER_SERVICE=mx-sources:6555` on every source and target worker to
+enable instance metadata discovery. Without this setting the original rank/node
+Service patterns continue to work. All workers must use the new protocol; this
+mode does not fall back to rank Services when a leader lacks the metadata RPC.
+
+The Service selects only healthy instance leaders (global rank 0, local device
+0), with a single Service port `6555` targeting that worker's gRPC port.
+For LeaderWorkerSet, combine your model's application label with
+`leaderworkerset.sigs.k8s.io/worker-index: "0"` in the Service selector.
+Keep the engine's normal rendezvous networking;
+no extra per-rank or per-node **MX discovery** Services are needed. Changing from
+two nodes with eight GPUs each to another supported TP/PP topology does not
+change the discovery Service.
+
+Use the same immutable model revision, runtime versions and compatible TP/PP
+configuration on sources and targets. Pin the actual engine checkpoint revision
+as well as `MX_MODEL_REVISION`. Set `MX_WORKER_HOST` from `status.podIP`. Workers
+still listen on `MX_WORKER_GRPC_PORT + local_device`; target workers and source
+leaders must reach these Pod-direct ports and the NIXL fabric.
+
+After loading, workers register their global rank, shard rank, node rank,
+generation ID and actual bound endpoint with their **own** engine head. This
+address comes from the load context (`master_addr`, SGLang's `dist_init_addr`, or
+`LWS_LEADER_ADDRESS`), never from the load-balanced discovery Service. For
+single-node engines the loopback fallback is sufficient. Multi-node engines must
+provide a reachable head address, and use a fixed, common worker base port.
+Registration and withdrawal reuse the weight publisher's READY/STALE heartbeats.
+Registrations expire after `max(15, 3 * MX_HEARTBEAT_INTERVAL_SECS)` seconds; a
+live rank cannot be overwritten by a different generation. A graceful STALE
+withdrawal permits immediate replacement.
+
+On `GetInstanceMetadata`, the leader checks engine `/health`, requires every
+rank to have a live READY registration, then fetches each worker's lightweight
+inventory directly. Worker generations are checked; an unreachable, stale or
+restarted worker makes the directory unavailable. The leader queries its own
+inventory locally, avoiding self-RPC deadlocks under concurrent targets. Remote
+inventory collection has a five-second total budget. The response contains
+endpoints and currently sealed artifact IDs/types, not MB-scale tensor manifests.
+
+A target caches one directory snapshot per client/load and uses it for every
+artifact type and weight lookup. Missing cache types immediately produce a
+best-effort miss, without probing six artifact headers or repeating backoff for
+each absent type. Existing types go directly to the listed owner on the matching
+node; manifests, chunk leases and NIXL bytes stay on that endpoint. Header checks
+reject mismatched identity, worker generation, node, type or accelerator before
+creating target files. Weight requests also carry the selected worker ID.
+
+Engine health and artifact publication are separate: a cache still being sealed
+is absent from that snapshot and is skipped. Later targets see new publications;
+the current target does not wait for optional caches to appear. Warm the source
+and observe the desired artifact publication before scaling when testing cache
+reuse. Discovery failures use the existing bounded retry policy once per client,
+then subsequent lookups reuse that failure rather than multiplying startup delay.
+
+This mode supports stable-weight, one-world TP/PP engines with unique model-shard
+ranks. Independent target worker clients can select different compatible source
+instances behind the Service; there is no target-wide donor-affinity collective.
+Live expert placement/EPLB updates are outside this protocol. Central backends
+and legacy rank/node discovery retain their existing behavior.
+
+Transfer-domain enforcement also applies to leader discovery. Required policies
+reject unknown local domains and nonmatching worker locations; directory entries
+carry topology into weight source selection. Artifact headers recheck the domain
+before creating target files, so a changed source location cannot bypass the
+policy through a cached directory. Legacy artifact Services validate the same
+header fields and fail closed when required topology is absent.
