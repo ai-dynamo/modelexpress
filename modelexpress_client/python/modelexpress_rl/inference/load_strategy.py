@@ -9,7 +9,7 @@ import logging
 
 import torch.nn as nn
 
-from modelexpress import envs as mx_envs
+from modelexpress_rl import envs as mx_envs
 from modelexpress.adapter import StrategyFailed, StrategyRecoveryError
 from modelexpress.load_strategy import execute_load_strategies
 from modelexpress.load_strategy.context import LoadContext, LoadResult
@@ -25,8 +25,8 @@ from .methods import CanonicalDeltaUpdateMethod
 from .plan import ObjectStorageUpdateSource, WeightSource, parse_weight_source_order
 from .receiver import (
     ObjectStorageGeneratorConfig,
-    _S3Version,
-    bootstrap_s3_checkpoint,
+    _ObjectStorageVersion,
+    bootstrap_object_storage_checkpoint,
 )
 from .version_chain import resolve_replay_chain
 
@@ -267,16 +267,16 @@ class DesiredVersionS3Strategy(ModelStreamerStrategy):
         assert root.object_storage is not None
         s3 = S3Client()
         try:
-            seed_path = bootstrap_s3_checkpoint(
+            seed_path = bootstrap_object_storage_checkpoint(
                 model_name=ctx.identity.model_name,
-                version=_S3Version(
+                version=_ObjectStorageVersion(
                     version_id=root.version_id,
                     base_version_id=root.base_version_id,
                     payload_format=root.payload_format,
                     uri=root.object_storage.uri,
                 ),
                 refit_checkpoint_dir=checkpoint_dir,
-                s3=s3,
+                reader=s3,
             )
         finally:
             s3.close()
@@ -487,6 +487,16 @@ class RLLoadStrategyChain:
     @staticmethod
     def run(model: nn.Module, ctx: LoadContext) -> nn.Module:
         """Execute the cold-start strategy chain for the agreed version."""
+        from .engines import configure_engine_logging
+
+        from modelexpress import p2p_pb2
+
+        engine = {
+            p2p_pb2.BACKEND_FRAMEWORK_VLLM: "vllm",
+            p2p_pb2.BACKEND_FRAMEWORK_SGLANG: "sglang",
+        }.get(ctx.identity.backend_framework)
+        if engine is not None:
+            configure_engine_logging(engine)
         ctx.desired_version_uid = _agree_desired_version(ctx)
         # A desired UID is a correctness constraint: version-agnostic fallbacks
         # could load different weights and let the worker serve the wrong version.

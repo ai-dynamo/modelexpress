@@ -5,9 +5,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Iterator
+from contextlib import contextmanager
 
-from modelexpress.refit.timing import (
+from modelexpress_rl.refit.timing import (
     add_refit_bytes,
     add_refit_duration,
     refit_span,
@@ -15,107 +16,116 @@ from modelexpress.refit.timing import (
 )
 
 from ...train import WeightPayloadFormat
-from ..adapter import NixlGeneratorSource
 from ..nixl_staged_transfer import (
     _NixlStagedTransfer,
-    _PreparedNixlTransfer,
-    _StagedNixlWeights,
 )
 from ..plan import (
     MethodCapabilities,
     PreparedArtifact,
     PreparedEngineTensors,
+    PreparedStreamingTensors,
     ResolvedSource,
-    TrainerUpdateSource,
+    ResolvedTrainerSource,
     UpdateMethod,
     WeightSource,
 )
 
 
 class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
-    """Prepare trainer tensors in the engine's load-time layout."""
+    """Prepare trainer source writes for engine installation.
+
+    Own one active trainer artifact, staging a full copy eagerly or deferring bounded
+    reads until installation. Delegate receive resources to the transfer executor and
+    batch lifetime to the streaming artifact. Determine release safety from its
+    cleanup state before allowing resource or version-lease release.
+    """
 
     def __init__(
         self,
         *,
         transfer: _NixlStagedTransfer,
-        capture_layout: Callable,
     ) -> None:
+        if transfer is None:
+            raise ValueError("transfer is required")
         self._transfer = transfer
-        self._capture_layout = capture_layout
-        self._active_plan: _PreparedNixlTransfer | None = None
-        self._active_fingerprint: tuple | None = None
-        self._active_manifest_digests: tuple[str, ...] = ()
-        self._active_staged: _StagedNixlWeights | None = None
+        self._active: PreparedEngineTensors | PreparedStreamingTensors | None = None
 
     @property
     def capabilities(self) -> MethodCapabilities:
+        return self.capabilities_for(self._transfer.bounded_staging)
+
+    @staticmethod
+    def capabilities_for(bounded: bool) -> MethodCapabilities:
+        """Describe configured output before receive resources are allocated."""
         return MethodCapabilities(
             payload_formats=frozenset({WeightPayloadFormat.FULL_TENSOR}),
             sources=frozenset({WeightSource.TRAINER}),
-            artifact_type=PreparedEngineTensors,
+            artifact_type=PreparedStreamingTensors if bounded else PreparedEngineTensors,
         )
 
     def prepare(self, *, version, source: ResolvedSource) -> PreparedArtifact:
-        del version
-        if self._active_staged is not None:
-            raise RuntimeError("release staged weight before staging another version")
-        if not isinstance(source, TrainerUpdateSource):
+        if self._active is not None:
+            raise RuntimeError("release the active update before preparing another")
+        if not isinstance(source, ResolvedTrainerSource):
             raise TypeError("load-time tensor method requires a trainer source")
-        inputs = source.inputs
-        if any(
-            not isinstance(item.transport, NixlGeneratorSource)
-            for item in inputs.sources
-        ):
-            raise ValueError("load-time tensor method requires NIXL sources")
-        reusable = (
-            self._active_plan is not None
-            and self._active_fingerprint == inputs.physical_fingerprint
+        is_streaming = self._transfer.bounded_staging
+        with refit_span("transfer_planning", accumulate_metadata=True) as counters:
+            prepared = self._transfer.prepare(
+                trainer_snapshot=source.snapshot,
+                checksums=source.checksums,
+            )
+            counters.update(prepared.metrics)
+        set_refit_cold(not bool(prepared.metrics.get("plan_cache_hits")))
+        if is_streaming:
+            metrics = dict(prepared.metrics)
+            streamed = PreparedStreamingTensors(
+                _batch_factory=lambda: self._transfer.iter_bounded(prepared, metrics),
+                replay_id=prepared.replay_id,
+                transfer_metrics=metrics,
+            )
+            self._active = streamed
+            return streamed
+        staged = self._transfer.stage(prepared)
+        _attribute_transfer(staged.metrics)
+        self._active = PreparedEngineTensors(staged=staged)
+        return self._active
+
+    def recover_preparation(self, error: BaseException) -> None:
+        if not self._transfer.bounded_staging:
+            super().recover_preparation(error)
+
+    @contextmanager
+    def installation_context(self, prepared: PreparedArtifact) -> Iterator[None]:
+        if prepared is not self._active:
+            raise RuntimeError("update does not own the active source")
+        self.validate_release(prepared)
+        try:
+            yield
+        finally:
+            if isinstance(prepared, PreparedStreamingTensors):
+                _attribute_transfer(prepared.transfer_metrics)
+
+    def can_release(self, prepared: PreparedArtifact) -> bool:
+        return (
+            not isinstance(prepared, PreparedStreamingTensors)
+            or not prepared.release_blocked
         )
-        set_refit_cold(not reusable)
-        manifests = [item.transport.manifest for item in inputs.sources]
-        manifest_digests = tuple(item.manifest_digest for item in inputs.sources)
-        with refit_span(
-            "transfer_planning",
-            metadata={
-                "plan_cache_hits": int(reusable),
-                "plan_cache_misses": int(not reusable),
-            },
-            accumulate_metadata=True,
-        ):
-            if not reusable:
-                self._active_plan = self._transfer.prepare(
-                    manifests=manifests,
-                    capture_layout=self._capture_layout,
-                )
-                self._active_fingerprint = inputs.physical_fingerprint
-        if reusable and manifest_digests != self._active_manifest_digests:
-            assert self._active_plan is not None
-            with refit_span(
-                "source_preparation",
-                metadata={"manifest_refreshes": 1},
-                accumulate_metadata=True,
-                duration_key="manifest_refresh_s",
-            ):
-                self._transfer.refresh_sources(self._active_plan, manifests)
-        self._active_manifest_digests = manifest_digests
-        self._active_staged = self._transfer.stage(self._active_plan)
-        _attribute_transfer(self._active_staged.metrics)
-        return PreparedEngineTensors(staged=self._active_staged)
 
     def release(self, prepared: PreparedArtifact) -> None:
-        if not isinstance(prepared, PreparedEngineTensors):
-            raise TypeError("load-time tensor method requires staged engine tensors")
-        if prepared.staged is not self._active_staged:
-            raise RuntimeError("load-time staged weight is no longer active")
-        self._active_staged = None
+        if prepared is not self._active:
+            raise RuntimeError("update is no longer active")
+        self.validate_release(prepared)
+        self._active = None
+
+    def validate_close(self) -> None:
+        if self._active is not None:
+            self.validate_release(self._active)
 
     def close(self) -> None:
-        self._active_staged = None
-        self._active_plan = None
-        self._active_fingerprint = None
-        self._active_manifest_digests = ()
+        self.validate_close()
+        self._active = None
         self._transfer.close()
+
 
 def _attribute_transfer(metrics: dict[str, float]) -> None:
     add_refit_bytes(metrics.get("bytes_received", 0))

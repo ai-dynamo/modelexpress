@@ -32,6 +32,13 @@ WARNING: MX_METADATA_BACKEND is not set in values. The server will fail to start
 set env.MX_METADATA_BACKEND to "redis" or "kubernetes" (with the matching
 connection settings) and re-run `helm upgrade`.
 {{- end }}
+{{- if and .Values.env (hasKey .Values.env "MODEL_EXPRESS_SERVER_PORT") }}
+
+WARNING: env.MODEL_EXPRESS_SERVER_PORT is deprecated and will become a hard
+error in a future release. service.port is now the single source of truth for
+the gRPC listener; remove env.MODEL_EXPRESS_SERVER_PORT from your values and,
+if the port needs to change, set service.port instead.
+{{- end }}
 {{- if .Values.metrics }}
 {{- /*
   Checked per resource, not once for the set. A shared flag would let labels on

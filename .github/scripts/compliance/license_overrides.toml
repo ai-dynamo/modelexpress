@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Image rows (dpkg, image Python) always take an entry here; crates and wheel dependencies
+# use one only when their metadata has no valid SPDX expression. Every entry needs a source.
+
+[[override]]
+ecosystem = "python"
+name = "cuda-toolkit"
+license = "LicenseRef-NVIDIA-Proprietary"
+source = "https://docs.nvidia.com/cuda/eula/index.html"
+
+[[override]]
+ecosystem = "python"
+name = "nvidia-cusparselt-cu13"
+license = "LicenseRef-NVIDIA-Proprietary"
+source = "https://docs.nvidia.com/cuda/cusparselt/license.html"
+
+[[override]]
+ecosystem = "python"
+name = "nvidia-nvtx"
+license = "Apache-2.0 WITH LLVM-exception"
+source = "License.txt in the wheel: Apache-2.0 with the LLVM exceptions"
+
+[[override]]
+ecosystem = "python"
+name = "instanttensor"
+license = "Apache-2.0"
+source = "https://github.com/scitix/InstantTensor/blob/main/LICENSE"
+
+[[override]]
+ecosystem = "python"
+name = "runai-model-streamer"
+license = "Apache-2.0"
+source = "https://github.com/run-ai/runai-model-streamer/blob/main/LICENSE"
+
+[[override]]
+ecosystem = "python"
+name = "runai-model-streamer-azure"
+license = "Apache-2.0"
+source = "https://github.com/run-ai/runai-model-streamer/blob/main/LICENSE"
+
+[[override]]
+ecosystem = "python"
+name = "runai-model-streamer-gcs"
+license = "Apache-2.0"
+source = "https://github.com/run-ai/runai-model-streamer/blob/main/LICENSE"
+
+[[override]]
+ecosystem = "python"
+name = "runai-model-streamer-s3"
+license = "Apache-2.0"
+source = "https://github.com/run-ai/runai-model-streamer/blob/main/LICENSE"
+
+[[override]]
+ecosystem = "python"
+name = "sympy"
+license = "BSD-3-Clause AND MIT"
+source = "https://github.com/sympy/sympy/blob/master/LICENSE (BSD-3-Clause; latex2sympy code is MIT)"
+
+[[override]]
+ecosystem = "python"
+name = "pyasn1-modules"
+license = "BSD-2-Clause"
+source = "https://github.com/pyasn1/pyasn1-modules/blob/main/LICENSE.txt"
+
+[[override]]
+ecosystem = "python"
+name = "python-dateutil"
+license = "Apache-2.0 AND BSD-3-Clause"
+source = "https://github.com/dateutil/dateutil/blob/master/LICENSE (BSD-3-Clause applies to all code, Apache-2.0 to contributions after 2017-12-01)"
+
+[[override]]
+ecosystem = "python"
+name = "mpmath"
+license = "BSD-3-Clause"
+source = "https://github.com/mpmath/mpmath/blob/master/LICENSE"
+
+[[override]]
+ecosystem = "python"
+name = "isodate"
+license = "BSD-3-Clause"
+source = "https://github.com/gweis/isodate/blob/master/LICENSE"
+
+[[override]]
+ecosystem = "python"
+name = "jinja2"
+license = "BSD-3-Clause"
+source = "https://github.com/pallets/jinja/blob/main/LICENSE.txt"
+
+[[override]]
+ecosystem = "python"
+name = "networkx"
+license = "BSD-3-Clause"
+source = "https://github.com/networkx/networkx/blob/main/LICENSE.txt"
+
+[[override]]
+ecosystem = "python"
+name = "numpy"
+license = "BSD-3-Clause AND MIT AND Zlib AND BSD-3-Clause-Attribution AND GPL-3.0-or-later WITH GCC-exception-3.1 AND LGPL-2.1-or-later"
+source = "LICENSE.txt in the numpy 2.2.x Linux wheel: numpy, lapack-lite, dragon4, libdivide, OpenBLAS, LAPACK, GCC runtime, libquadmath"

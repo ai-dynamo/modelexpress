@@ -1,13 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
 from pathlib import Path
-
-import pytest
-import torch
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import modelexpress_rl.inference.engines as engines_module
 import modelexpress_rl.inference.runtime as runtime_module
+from uuid import uuid4
+
+import pytest
+import torch
 from modelexpress import p2p_pb2
 from modelexpress_rl import ObjectStorageType, WeightPayloadFormat, WeightSource
 from modelexpress_rl.inference.adapter import GeneratorEngineContext
@@ -16,6 +20,8 @@ from modelexpress_rl.inference.plan import (
     EngineInstaller,
     MethodCapabilities,
     PreparedEngineTensors,
+    PreparedStreamingTensors,
+    StreamingSettings,
     UpdateMethod,
 )
 from modelexpress_rl.inference.receiver import ObjectStorageGeneratorConfig
@@ -24,6 +30,8 @@ from modelexpress_rl.inference.runtime import (
     FullTensorEngineCapability,
     initialize_generator_runtime,
 )
+from modelexpress_rl.inference.version_chain import resolve_replay_chain
+from modelexpress_rl.inference.session import SessionUpdate, WeightUpdateSession
 
 
 class _Installer(EngineInstaller):
@@ -39,6 +47,7 @@ class _Method(UpdateMethod):
     def __init__(self, sources):
         self._sources = frozenset(sources)
         self.closed = False
+        self.requires_full_root = False
 
     @property
     def capabilities(self):
@@ -58,6 +67,61 @@ class _Method(UpdateMethod):
 
     def close(self):
         self.closed = True
+
+
+@pytest.mark.parametrize("installation_fails", [False, True])
+def test_session_uses_method_policy_for_opaque_payload(installation_fails):
+    payload = object()
+    method = Mock(spec=UpdateMethod)
+    method.installation_context.return_value = nullcontext()
+    method.can_release.return_value = False
+    method.validate_release.side_effect = lambda value: UpdateMethod.validate_release(
+        method, value
+    )
+    method.prepared_metrics.return_value = {"bytes_received": 16}
+    installer = Mock(spec=EngineInstaller)
+    primary = RuntimeError("installation failed")
+    if installation_fails:
+        installer.install.side_effect = primary
+    plan = SimpleNamespace(
+        version=SimpleNamespace(version_id="v1"),
+        source=SimpleNamespace(kind=WeightSource.TRAINER),
+        method=method,
+        installer=installer,
+    )
+    lease = Mock()
+    update = SessionUpdate(plan=plan, prepared=payload, lease=lease)
+    session = WeightUpdateSession(
+        resolvers=(),
+        methods=(method,),
+        installer=installer,
+        max_transfer_attempts=1,
+        start_lease=Mock(),
+    )
+
+    assert update.metrics == {"bytes_received": 16}
+    method.prepared_metrics.assert_called_once_with(payload)
+    if installation_fails:
+        with pytest.raises(RuntimeError) as caught:
+            session.apply(update)
+        assert caught.value is primary
+    else:
+        assert session.apply(update) is installer.install.return_value
+    installer.install.assert_called_once_with(payload)
+    method.can_release.assert_called_once_with(payload)
+    lease.close.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="cleanup is unproven"):
+        session.release(update)
+    assert not update.released
+    method.release.assert_not_called()
+    lease.close.assert_not_called()
+
+    method.can_release.return_value = True
+    session.release(update)
+    method.release.assert_called_once_with(payload)
+    lease.close.assert_called_once()
+    assert update.released
 
 
 class _P2P:
@@ -86,6 +150,7 @@ def _full_tensor_engine(
         model_name="test/model",
         installer=_Installer(),
         full_tensor=FullTensorEngineCapability(
+            generator_fingerprint=lambda: (),
             device_id=2,
             device="cuda:2",
             worker_rank=3,
@@ -137,6 +202,8 @@ def test_object_storage_runtime_preserves_source_order(
     )
     full_tensor = _Method({WeightSource.GENERATOR, WeightSource.TRAINER})
     canonical = _Method({WeightSource.OBJECT_STORAGE})
+    canonical.requires_full_root = True
+    resolve_chain = Mock(return_value=())
     monkeypatch.setattr(
         runtime_module,
         "RuntimeTensorNixlUpdateMethod",
@@ -164,17 +231,24 @@ def test_object_storage_runtime_preserves_source_order(
         rpc_timeout_seconds=30,
         service=lambda: object(),
         start_lease=lambda _version_id: object(),
+        resolve_replay_chain=resolve_chain,
     )
 
+    for needs_bootstrap in (True, False):
+        canonical.requires_full_root = needs_bootstrap
+        resolve_chain.reset_mock()
+        runtime.session._resolve_replay_chain(SimpleNamespace(version_id="target"))
+        resolve_chain.assert_called_once_with("target", True)
+
     assert runtime.methods == (canonical, full_tensor)
-    assert runtime.session._planner.source_order == expected_source_order
+    assert runtime.session.source_order == expected_source_order
     assert runtime.initial_version_id == "base-a"
-    assert [
-        resolver.kind for resolver in runtime.session._planner._resolvers
-    ] == list(expected_source_order)
+    assert [resolver.kind for resolver in runtime.session._resolvers] == list(
+        expected_source_order
+    )
     generator_resolvers = [
         resolver
-        for resolver in runtime.session._planner._resolvers
+        for resolver in runtime.session._resolvers
         if resolver.kind is WeightSource.GENERATOR
     ]
     if generator_resolvers:
@@ -186,6 +260,7 @@ def test_object_storage_runtime_preserves_source_order(
     assert p2p.closed
 
 
+@pytest.mark.parametrize("requires_full_root", [False, True])
 @pytest.mark.parametrize(
     "source_order",
     [None, (WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE)],
@@ -203,6 +278,7 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
     source_order,
     runtime_tensors,
     nixl_manager,
+    requires_full_root,
 ):
     context = GeneratorEngineContext()
     monkeypatch.setattr(
@@ -219,6 +295,8 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
         lambda **_kwargs: pytest.fail("P2P client must not be created"),
     )
     canonical = _Method({WeightSource.OBJECT_STORAGE})
+    canonical.requires_full_root = requires_full_root
+    resolve_chain = Mock(return_value=())
     monkeypatch.setattr(
         runtime_module,
         "CanonicalDeltaUpdateMethod",
@@ -241,11 +319,95 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
         rpc_timeout_seconds=30,
         service=lambda: object(),
         start_lease=lambda _version_id: object(),
+        resolve_replay_chain=resolve_chain,
     )
 
-    assert runtime.session._planner.source_order == (WeightSource.OBJECT_STORAGE,)
+    assert runtime.session.source_order == (WeightSource.OBJECT_STORAGE,)
     assert runtime.methods == (canonical,)
+    runtime.session._resolve_replay_chain(SimpleNamespace(version_id="target"))
+    resolve_chain.assert_called_once_with("target", requires_full_root)
+
+    canonical.requires_full_root = False
+    versions = {
+        f"v{index}": SimpleNamespace(
+            version_id=f"v{index}",
+            base_version_id=f"v{index - 1}" if index else None,
+            payload_format=(
+                WeightPayloadFormat.XOR_DELTA
+                if index else WeightPayloadFormat.FULL_HF_CHECKPOINT
+            ),
+            object_storage=object(),
+            layout_signature="",
+        )
+        for index in range(65)
+    }
+    fetched = Mock(side_effect=versions.__getitem__)
+    resolve_chain.side_effect = lambda target, from_full_root: resolve_replay_chain(
+        target_version_id=target,
+        fetch_ready_version=fetched,
+        max_chain_length=64,
+        stop_before_version_id=None if from_full_root else "v63",
+    )
+    chain = runtime.session._resolve_replay_chain(versions["v64"])
+    assert chain == (versions["v64"],)
+    fetched.assert_called_once_with("v64")
     runtime.close()
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize(
+    "artifacts",
+    [
+        frozenset(),
+        frozenset({PreparedEngineTensors}),
+        frozenset({PreparedStreamingTensors}),
+        frozenset({PreparedEngineTensors, PreparedStreamingTensors}),
+    ],
+)
+@pytest.mark.parametrize("source_kind", [WeightSource.TRAINER, WeightSource.GENERATOR])
+def test_runtime_validates_streaming_support_before_allocating_transfers(
+    monkeypatch, bounded, artifacts, source_kind
+) -> None:
+    installer = Mock(capabilities=EngineCapabilities(frozenset(artifacts)))
+    engine = _full_tensor_engine()
+    monkeypatch.setattr(
+        engines_module,
+        "_create_engine_runtime",
+        lambda _context: EngineRuntime(
+            model_name=engine.model_name,
+            installer=installer,
+            full_tensor=engine.full_tensor,
+        ),
+    )
+    create_transfer = Mock(return_value=Mock(bounded_staging=bounded))
+    monkeypatch.setattr(runtime_module, "_NixlStagedTransfer", create_transfer)
+    monkeypatch.setattr(runtime_module, "MxClient", _P2P)
+    kwargs = dict(
+        engine_context=GeneratorEngineContext(),
+        worker_id="generator-3",
+        server_url="mx:8000",
+        object_storage=None,
+        source_order=(source_kind,),
+        max_transfer_attempts=3,
+        rpc_timeout_seconds=30,
+        service=lambda: pytest.fail("initialization must not perform source discovery"),
+        start_lease=lambda _version_id: pytest.fail("initialization must not acquire leases"),
+        streaming=StreamingSettings(512) if bounded else None,
+    )
+    expected = PreparedStreamingTensors if bounded else PreparedEngineTensors
+    if source_kind is WeightSource.TRAINER and expected not in artifacts:
+        mode = "bounded streaming" if bounded else "full-copy"
+        with pytest.raises(ValueError, match=f"does not support {mode}"):
+            initialize_generator_runtime(**kwargs)
+        create_transfer.assert_not_called()
+    else:
+        runtime = initialize_generator_runtime(**kwargs)
+        runtime.close()
+        if source_kind is WeightSource.TRAINER:
+            assert runtime.methods[0].capabilities.artifact_type is expected
+            create_transfer.return_value.close.assert_called_once_with()
+        else:
+            create_transfer.assert_not_called()
 
 
 def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
@@ -260,18 +422,18 @@ def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
         return object()
 
     monkeypatch.setattr(runtime_module, "_NixlStagedTransfer", create_transfer)
-    full_tensor = _Method({WeightSource.GENERATOR, WeightSource.TRAINER})
     method_kwargs = {}
 
-    def create_method(**kwargs):
-        method_kwargs.update(kwargs)
-        return full_tensor
+    class Method(_Method):
+        capabilities_for = staticmethod(
+            runtime_module.LoadTimeTensorNixlUpdateMethod.capabilities_for
+        )
 
-    monkeypatch.setattr(
-        runtime_module,
-        "LoadTimeTensorNixlUpdateMethod",
-        create_method,
-    )
+        def __init__(self, **kwargs) -> None:
+            method_kwargs.update(kwargs)
+            super().__init__({WeightSource.GENERATOR, WeightSource.TRAINER})
+
+    monkeypatch.setattr(runtime_module, "LoadTimeTensorNixlUpdateMethod", Method)
 
     runtime = initialize_generator_runtime(
         engine_context=context,
@@ -286,7 +448,9 @@ def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
     )
 
     assert transfer_kwargs["listen_port"] is None
-    assert set(method_kwargs) == {"transfer", "capture_layout"}
+    assert set(method_kwargs) == {"transfer"}
+    assert callable(transfer_kwargs["capture_layout"])
+    assert callable(transfer_kwargs["generator_fingerprint"])
     assert runtime.p2p_client is None
     runtime.close()
 
@@ -305,7 +469,7 @@ def test_object_storage_runtime_survives_p2p_initialization_failure(
     monkeypatch.setattr(runtime_module, "MxClient", lambda **_kwargs: p2p)
     monkeypatch.setattr(
         runtime_module,
-        "_NixlStagedTransfer",
+        "RuntimeTensorNixlUpdateMethod",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("NIXL unavailable")),
     )
     canonical = _Method({WeightSource.OBJECT_STORAGE})
@@ -334,10 +498,10 @@ def test_object_storage_runtime_survives_p2p_initialization_failure(
     )
 
     assert runtime.methods == (canonical,)
-    assert runtime.session._planner.source_order == (WeightSource.OBJECT_STORAGE,)
-    assert [
-        resolver.kind for resolver in runtime.session._planner._resolvers
-    ] == [WeightSource.OBJECT_STORAGE]
+    assert runtime.session.source_order == (WeightSource.OBJECT_STORAGE,)
+    assert [resolver.kind for resolver in runtime.session._resolvers] == [
+        WeightSource.OBJECT_STORAGE
+    ]
     assert p2p.closed
     runtime.close()
     assert canonical.closed
@@ -382,3 +546,93 @@ def test_generator_runtime_closes_resources_when_resolver_creation_fails(
 
     assert full_tensor.closed
     assert p2p.closed
+
+
+@pytest.mark.parametrize("blocked_first", [False, True])
+def test_runtime_close_keeps_all_resources_when_streaming_cleanup_is_unproven(
+    blocked_first
+):
+    from types import SimpleNamespace
+
+    from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
+    from modelexpress_rl.inference.plan import PreparedStreamingTensors
+    from modelexpress_rl.inference.runtime import GeneratorRuntime
+
+    arena = torch.ones(2)
+    closed = []
+    transfer = SimpleNamespace(arena=arena, close=lambda: closed.append("transfer"))
+    method = LoadTimeTensorNixlUpdateMethod(transfer=transfer)
+    prepared = PreparedStreamingTensors(lambda: iter(({"weight": arena},)), uuid4(), {})
+    consumption = prepared.consume(lambda: None)
+    consumption.__enter__()
+    prepared.apply(lambda batch: None)
+    method._active = prepared
+    other = _Method({WeightSource.GENERATOR})
+    p2p = _P2P(server_url="mx:8000")
+    runtime = GeneratorRuntime(
+        engine=_full_tensor_engine(),
+        methods=(method, other) if blocked_first else (other, method),
+        session=object(),
+        p2p_client=p2p,
+        initial_version_id=None,
+    )
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="reset the process"):
+            runtime.close()
+        assert not runtime._closed
+        assert not p2p.closed
+        assert not other.closed
+        assert closed == []
+        assert method._active is prepared
+        assert prepared._iterator is not None
+        assert transfer.arena is arena
+
+    consumption.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize(
+    "enabled,supported,expected",
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_streaming_requires_opt_in_and_engine_capability(
+    monkeypatch, tmp_path, enabled, supported, expected
+):
+    from dataclasses import replace
+    from unittest.mock import Mock
+    from modelexpress_rl.inference.plan import PreparedCheckpointArtifact
+
+    monkeypatch.setenv("MX_REFIT_FULL_STREAMING", str(enabled))
+    engine = _full_tensor_engine()
+    installer = Mock(
+        capabilities=EngineCapabilities(
+            artifact_types=frozenset({PreparedCheckpointArtifact}),
+            streamed_checkpoints=supported,
+        )
+    )
+    monkeypatch.setattr(
+        engines_module,
+        "_create_engine_runtime",
+        lambda context: replace(engine, installer=installer),
+    )
+    canonical = _Method({WeightSource.OBJECT_STORAGE})
+    constructor = Mock(return_value=canonical)
+    monkeypatch.setattr(runtime_module, "CanonicalDeltaUpdateMethod", constructor)
+    runtime = initialize_generator_runtime(
+        engine_context=GeneratorEngineContext(),
+        worker_id="generator-0",
+        server_url="mx:8000",
+        object_storage=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="v0",
+            seed_checkpoint_path=tmp_path / "launch",
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        source_order=(WeightSource.OBJECT_STORAGE,),
+        max_transfer_attempts=1,
+        rpc_timeout_seconds=30,
+        service=lambda: object(),
+        start_lease=lambda version: object(),
+    )
+    assert constructor.call_args.kwargs["stream_full_checkpoints"] is expected
+    runtime.close()

@@ -4,4 +4,5 @@
 //! RL refit control-plane service and metadata backends.
 
 pub mod backend;
+mod coverage;
 pub mod service;

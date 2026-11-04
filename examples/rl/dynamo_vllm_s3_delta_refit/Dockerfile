@@ -21,4 +21,4 @@ RUN --mount=type=bind,source=modelexpress_client/python,target=/opt/modelexpress
 COPY --from=rust-builder /src/dynamo/target/release/dynamo-vllm-sidecar /usr/local/bin/
 COPY --from=rust-builder /src/modelexpress/target/release/modelexpress-server /usr/local/bin/
 RUN python3 -B -c \
-    "import boto3, modelexpress_rl, requests, transformers, vllm, zstandard; from modelexpress import register_modelexpress; register_modelexpress()"
+    "import boto3, modelexpress_rl, requests, transformers, vllm, zstandard"

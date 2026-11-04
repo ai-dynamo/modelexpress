@@ -350,3 +350,47 @@ async fn an_in_band_failure_is_not_recorded_as_a_success() {
 
     stop_and_join(shutdown, handle).await;
 }
+
+/// The server binary must exit cleanly on SIGTERM, the signal Kubernetes and
+/// container runtimes send to stop a container. This runs the compiled binary
+/// rather than `run_server` because the signal handling lives in `main`.
+#[tokio::test]
+async fn the_binary_shuts_down_cleanly_on_sigterm() {
+    let [port, metrics_port] = free_ports::<2>();
+    let cache = tempfile::tempdir().expect("cache dir");
+    let mut server = tokio::process::Command::new(env!("CARGO_BIN_EXE_modelexpress-server"))
+        .args(["--host", "127.0.0.1"])
+        .args(["--port", &port.to_string()])
+        .args(["--metrics-port", &metrics_port.to_string()])
+        .arg("--cache-directory")
+        .arg(cache.path())
+        .env("MX_METADATA_BACKEND", "memory")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the server binary");
+
+    // Signal a server that is serving, not one still starting up.
+    let mut client = connect_client(port).await;
+    client
+        .health_check()
+        .await
+        .expect("health_check round-trip should succeed");
+
+    let pid = server.id().expect("server pid").to_string();
+    let sent = std::process::Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .expect("run kill");
+    assert!(sent.success(), "failed to send SIGTERM to {pid}");
+
+    let status = tokio::time::timeout(Duration::from_secs(10), server.wait())
+        .await
+        .expect("server did not exit within 10s of SIGTERM")
+        .expect("wait for the server process");
+    assert!(
+        status.success(),
+        "expected a clean exit on SIGTERM, got {status}"
+    );
+}

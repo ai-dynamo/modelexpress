@@ -11,10 +11,8 @@ run-mx-fleet-test has already:
   5. Waited for all fleet_size workers to reach Ready status.
 
 Asserts:
-  1. At least fleet_size ModelMetadata CRs exist and every one is
-     status.worker.status == "Ready" — confirms the fleet scaled and the
-     CRD backend is tracking all live workers (the reaper has not evicted
-     any during scale-up).
+  1. At least fleet_size ModelMetadata CRs are Ready. Historical Stale
+     generations may remain until GC; other non-Ready states fail the test.
   2. At least fleet_size - 1 worker pods logged "RDMA transfer complete"
      — the one source downloads from HF and does not log this; every
      other worker must have pulled via NIXL (TCP transport on a100a MIG).
@@ -37,20 +35,7 @@ from kube_utils import kubectl
 
 
 def test_fleet_crs_published_and_ready(namespace: str, expected_cr_count: int) -> None:
-    """At least fleet_size ModelMetadata CRs must exist, all of them Ready.
-
-    Two conditions in one check because they describe the same healthy state
-    and neither is meaningful alone:
-      - Count >= expected_cr_count (not ==) tolerates a Deployment briefly
-        running a pod or two above the desired replica count (surge pods);
-        those still publish valid CRs. The real failure is too FEW CRs — the
-        reaper evicted a live worker, or some workers never published.
-      - Every CR's status.worker.status == Ready confirms the CRD backend is
-        tracking all live workers; a non-Ready CR (Unknown or Stale) means a
-        worker crashed after publishing or the reaper wrongly evicted it.
-    A pure Ready check without the count floor would pass green on a fleet
-    that never scaled (e.g. 3 Ready CRs), so the count floor is load-bearing.
-    """
+    """Require the full Ready fleet without counting retained Stale generations."""
     result = kubectl(
         "get", "modelmetadata",
         "-o", "jsonpath={range .items[*]}{.metadata.name}{\" \"}{.status.worker.status}{\"\\n\"}{end}",
@@ -60,12 +45,13 @@ def test_fleet_crs_published_and_ready(namespace: str, expected_cr_count: int) -
     print(f"[modelmetadata] {len(rows)} CR(s):")
     for row in rows:
         print(f"  {row}")
-    assert len(rows) >= expected_cr_count, (
-        f"Expected at least {expected_cr_count} ModelMetadata CRs, got {len(rows)}."
+    ready = [row for row in rows if row.endswith(" Ready")]
+    assert len(ready) >= expected_cr_count, (
+        f"Expected at least {expected_cr_count} Ready ModelMetadata CRs, got {len(ready)}."
     )
-    not_ready = [r for r in rows if not r.endswith(" Ready")]
+    not_ready = [r for r in rows if not r.endswith((" Ready", " Stale"))]
     assert not not_ready, (
-        f"{len(not_ready)}/{len(rows)} CRs are not Ready: " + ", ".join(not_ready)
+        f"{len(not_ready)}/{len(rows)} CRs have unexpected states: " + ", ".join(not_ready)
     )
 
 

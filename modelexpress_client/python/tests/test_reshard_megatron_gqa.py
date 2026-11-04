@@ -4,9 +4,9 @@
 import pytest
 import torch
 
-from modelexpress.refit.reshard.rendezvous import build_sources, merge_shard_tables
-from modelexpress.refit.reshard.transfer_plan import plan_transfer
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.refit.reshard.rendezvous import build_sources, merge_shard_tables
+from modelexpress_rl.refit.reshard.transfer_plan import plan_transfer
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
 from modelexpress_rl.train.engines.megatron import (
     MegatronTensorSpec,
     build_hf_aliases,
@@ -285,7 +285,7 @@ def test_sparse_kv_tables_merge_into_a_complete_bounded_plan():
 
     plan = plan_transfer(capture, sources, max_segments_per_copy=1)
 
-    assert plan.fallback == []
+    assert not plan.fallback
     assert {pull.src_name for pull in plan.full_pulls} == set(HF_NAMES)
     assert plan.bytes_planned() == sum(
         tensor.numel() * tensor.element_size()

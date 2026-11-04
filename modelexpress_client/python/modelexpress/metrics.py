@@ -448,7 +448,7 @@ class MetricsCollector:
         self.candidates = Histogram(
             "mx_p2p_candidates",
             "Candidate count at a selection stage.",
-            ["policy", "scheme", "stage"],  # listed|rank_matched|accelerator_matched
+            ["policy", "scheme", "stage"],  # listed|rank_matched|accelerator_matched|topology_matched
             buckets=_CANDIDATE_BUCKETS,
             registry=registry,
         )

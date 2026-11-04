@@ -17,7 +17,7 @@ from modelexpress import envs
 
 from .. import envs as rl_envs
 from .. import refit_pb2_grpc
-from .manifest import WeightVersionShardManifestService
+from .manifest import RefitWorkerService
 
 
 def _required(value: str, name: str) -> str:
@@ -33,7 +33,7 @@ class _TrainerResources:
         self,
         *,
         manager: Any,
-        manifest_service: WeightVersionShardManifestService,
+        manifest_service: RefitWorkerService,
         server: grpc.Server,
         worker_endpoint: str,
     ) -> None:
@@ -72,7 +72,7 @@ class _TrainerResources:
 
         worker_port = envs.MX_WORKER_GRPC_PORT + device_id
         worker_endpoint = f"{host}:{worker_port}"
-        manifest_service = WeightVersionShardManifestService(endpoint=worker_endpoint)
+        manifest_service = RefitWorkerService(endpoint=worker_endpoint)
         server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
         try:
             refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(
@@ -100,7 +100,7 @@ class _TrainerResources:
         return self._manager
 
     @property
-    def manifest_service(self) -> WeightVersionShardManifestService:
+    def manifest_service(self) -> RefitWorkerService:
         return self._manifest_service
 
     @property

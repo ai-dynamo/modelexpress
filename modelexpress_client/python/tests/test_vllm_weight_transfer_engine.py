@@ -38,7 +38,22 @@ def _engine(monkeypatch, client=None, *, initialize=True):
     return engine, client
 
 
-def test_weight_transfer_engine_initializes_client_in_init_hook(monkeypatch):
+@pytest.mark.parametrize(
+    "model_name, init_model_name, expected_model_name",
+    [
+        (None, None, "test/model"),
+        ("", None, "test/model"),
+        ("mx_model_abc", None, "mx_model_abc"),
+        ("mx_model_abc", "explicit-model", "explicit-model"),
+    ],
+)
+def test_weight_transfer_engine_initializes_client_in_init_hook(
+    monkeypatch, model_name, init_model_name, expected_model_name
+):
+    if model_name is None:
+        monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
+    else:
+        monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", model_name)
     client = MagicMock()
     initialize = MagicMock(return_value=client)
     monkeypatch.setattr(
@@ -56,16 +71,24 @@ def test_weight_transfer_engine_initializes_client_in_init_hook(monkeypatch):
     )
 
     initialize.assert_not_called()
-    engine.init_transfer_engine(engine.init_info_cls())
+    engine.init_transfer_engine(engine.init_info_cls(model_name=init_model_name))
 
     config = initialize.call_args.args[0]
-    assert config.model_name == "test/model"
+    assert config.model_name == expected_model_name
+    assert vllm_config.model_config.model == "test/model"
     assert config.engine_context.model is model
     assert config.object_storage is None
 
 
-def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch):
+@pytest.mark.parametrize(
+    "seed_info",
+    [{}, {"seed_checkpoint_path": None}, {"seed_checkpoint_path": "/models/launch"}],
+)
+def test_weight_transfer_engine_parses_vime_object_storage_init_info(
+    monkeypatch, seed_info
+):
     """Parse VIME object-storage metadata into generator initialization."""
+    monkeypatch.delenv("MX_REFIT_CHECKPOINT_MAX_SIZE_GB", raising=False)
     client = MagicMock()
     initialize = MagicMock(return_value=client)
     monkeypatch.setattr(
@@ -86,7 +109,6 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
         "model_name": "policy",
         "initial_serving_version_id": "version-c",
         "initial_base_version_id": "base-a",
-        "seed_checkpoint_path": "/models/launch",
         "refit_checkpoint_dir": "/cache/modelexpress",
         "server_url": "mx:8001",
         "object_storage_type": "S3",
@@ -97,6 +119,7 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
         "max_transfer_attempts": 4,
         "max_replay_chain_length": 17,
         "rpc_timeout_seconds": 12.5,
+        **seed_info,
     }
     engine.init_transfer_engine(engine.init_info_cls(**init_info))
 
@@ -112,9 +135,11 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
     assert config.rpc_timeout_seconds == 12.5
     assert config.object_storage.storage_type is ObjectStorageType.S3
     assert config.object_storage.initial_base_version_id == "base-a"
-    assert config.object_storage.seed_checkpoint_path == "/models/launch"
+    assert config.object_storage.seed_checkpoint_path == seed_info.get(
+        "seed_checkpoint_path"
+    )
     assert config.object_storage.refit_checkpoint_dir == "/cache/modelexpress"
-    assert config.object_storage.refit_checkpoint_max_size_gb == 500
+    assert config.object_storage.refit_checkpoint_max_size_gb == 2000
     assert config.object_storage.endpoint_url == "http://minio:9000"
     assert config.object_storage.region_name == "us-west-2"
 
@@ -264,35 +289,60 @@ def test_weight_transfer_engine_logs_receiver_metrics(monkeypatch, caplog):
     staged.release.assert_called_once_with()
 
 
-def test_weight_transfer_engine_warns_for_out_of_order_updates(monkeypatch, caplog):
-    engine, _client = _engine(monkeypatch)
-
-    engine.update_weights({"version_id": "version-a"})
-
-    engine.start_weight_update()
-    engine.update_weights({"version_id": "version-a"})
-    engine.update_weights({"version_id": "version-b"})
-
-    assert "weight update has not been started" in caplog.text
-    assert "weight update already received a version" in caplog.text
-
-
-def test_weight_transfer_engine_warns_for_duplicate_lifecycle_calls(
-    monkeypatch, caplog
-):
+def test_weight_transfer_engine_rejects_out_of_order_updates(monkeypatch):
     engine, client = _engine(monkeypatch)
 
-    engine.init_transfer_engine(engine.init_info_cls())
+    with pytest.raises(RuntimeError, match="has not been started"):
+        engine.update_weights({"version_id": "version-a"})
+
     engine.start_weight_update()
-    engine.start_weight_update()
-    engine.finish_weight_update()
+    engine.update_weights({"version_id": "version-a"})
+    with pytest.raises(RuntimeError, match="already received a version"):
+        engine.update_weights({"version_id": "version-b"})
+    client.stage_weight.assert_called_once()
     engine.finish_weight_update()
 
-    assert client.stage_weight.call_count == 0
-    assert "weight transfer engine is already initialized" in caplog.text
-    assert "weight update is already active" in caplog.text
-    assert "weight update has not received a version" in caplog.text
-    assert "weight update has not been started" in caplog.text
+
+def test_weight_transfer_engine_rejects_duplicate_lifecycle_calls(monkeypatch):
+    engine, client = _engine(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="already initialized"):
+        engine.init_transfer_engine(engine.init_info_cls())
+    engine.start_weight_update()
+    with pytest.raises(RuntimeError, match="already active"):
+        engine.start_weight_update()
+    with pytest.raises(RuntimeError, match="has not received a version"):
+        engine.finish_weight_update()
+    engine.update_weights({"version_id": "version-a"})
+    engine.finish_weight_update()
+    with pytest.raises(RuntimeError, match="has not been started"):
+        engine.finish_weight_update()
+
+    client.stage_weight.assert_called_once()
+
+
+def test_weight_transfer_engine_rejects_start_before_initialization(monkeypatch):
+    engine, client = _engine(monkeypatch, initialize=False)
+
+    with pytest.raises(RuntimeError, match="not initialized"):
+        engine.start_weight_update()
+
+    client.stage_weight.assert_not_called()
+
+
+def test_weight_transfer_engine_reset_releases_staged_version(monkeypatch):
+    engine, client = _engine(monkeypatch)
+    staged = client.stage_weight.return_value
+    engine.start_weight_update()
+    engine.update_weights({"version_id": "version-a"})
+
+    engine.reset_weight_update_target()
+    engine.reset_weight_update_target()
+
+    staged.release.assert_called_once_with()
+    engine.start_weight_update()
+    engine.update_weights({"version_id": "version-b"})
+    assert client.stage_weight.call_args.kwargs["version"].version_id == "version-b"
 
 
 def test_weight_transfer_engine_releases_failed_update(monkeypatch):
@@ -341,7 +391,10 @@ def test_weight_transfer_engine_shutdown_before_initialization(monkeypatch):
     engine, client = _engine(monkeypatch, initialize=False)
 
     engine.shutdown()
-    engine.start_weight_update()
+    with pytest.raises(RuntimeError, match="shut down"):
+        engine.start_weight_update()
+    with pytest.raises(RuntimeError, match="shut down"):
+        engine.init_transfer_engine(engine.init_info_cls())
 
     client.close.assert_not_called()
 
@@ -361,7 +414,7 @@ def test_weight_transfer_engine_rejects_invalid_version_id(version_id):
 def test_vllm_plugin_registers_weight_transfer_engine(monkeypatch):
     from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
 
-    from modelexpress.engines.vllm import registration
+    from modelexpress_rl.inference.engines.vllm import registration
 
     calls = []
     monkeypatch.setattr(WeightTransferEngineFactory, "_registry", {})
@@ -382,3 +435,20 @@ def test_vllm_plugin_registers_weight_transfer_engine(monkeypatch):
             "ModelExpressWeightTransferEngine",
         )
     ]
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_checkpoint_quota_env_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("MX_REFIT_CHECKPOINT_MAX_SIZE_GB", value)
+    with pytest.raises(ValueError, match="MX_REFIT_CHECKPOINT_MAX_SIZE_GB"):
+        ModelExpressWeightTransferEngine.init_info_cls()
+
+
+def test_checkpoint_quota_env_default_and_explicit_override(monkeypatch):
+    info = ModelExpressWeightTransferEngine.init_info_cls
+    monkeypatch.delenv("MX_REFIT_CHECKPOINT_MAX_SIZE_GB", raising=False)
+    assert info().refit_checkpoint_max_size_gb == 2000
+    monkeypatch.setenv("MX_REFIT_CHECKPOINT_MAX_SIZE_GB", "3000")
+    assert info().refit_checkpoint_max_size_gb == 3000
+    assert info(refit_checkpoint_max_size_gb=1000).refit_checkpoint_max_size_gb == 1000
+    assert info(refit_checkpoint_max_size_gb=None).refit_checkpoint_max_size_gb is None

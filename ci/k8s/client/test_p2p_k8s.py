@@ -10,13 +10,13 @@ have reached Running state.  Asserts:
      distinct-agent count in [tp_size, tp_size * dp_size] (catches TP collapse
      and source-rank-pairing regressions; the range accommodates interchangeable
      DP replicas that share a rank — see --dp-size).
-  3. Both source and target servers respond to /v1/completions — confirms weights
-     are loaded and the model is serving correctly on each.
+  3. AIPerf MMLU scores do not significantly regress from the source baseline
+     captured before target deployment. Raw output differences are diagnostic.
   4. When enabled by the workflow, target peak and final VRAM do not materially
      exceed source VRAM.
-  5. When --expect-mtp is set, the target transfers the main model through P2P
-     before loading the MTP draft model locally, and source/target greedy
-     completions for a small prompt match exactly.
+  5. When configured, source and target report the expected token-pool capacity.
+  6. When --expect-mtp is set, every target rank transfers both the main model
+     and the MTP draft through P2P, and both workers sustain 128-token decoding.
 
 Invoked by the workflow as:
   pytest ci/k8s/client/test_p2p_k8s.py -v \
@@ -27,6 +27,7 @@ Invoked by the workflow as:
       --tp-size $TP_SIZE \
       [--dp-size $DP_SIZE] \
       [--p2p-marker "framework-specific transfer complete string"] \
+      [--expected-max-total-tokens N] \
       [--expect-mtp]
 
 --p2p-marker defaults:
@@ -44,11 +45,11 @@ target's data-parallel size (e.g. 2 for the DP=2 job) so the range widens to
 import json
 import re
 import time
-import urllib.request
 
 import pytest
 
 from kube_utils import kubectl, port_forward
+from inference_parity import artifact_dir, compare, compare_weight_digests, long_decode, profile, read_responses, replay_mismatch
 
 
 def _pod_name(namespace: str, job_name: str, ordinal: int | None = None) -> str:
@@ -75,6 +76,7 @@ def _pod_name(namespace: str, job_name: str, ordinal: int | None = None) -> str:
         probe = kubectl(
             "get", "pods",
             "-l", ordinal_selector,
+            "--field-selector=status.phase!=Failed",
             "-o", "name",
             namespace=namespace,
         )
@@ -86,6 +88,7 @@ def _pod_name(namespace: str, job_name: str, ordinal: int | None = None) -> str:
     result = kubectl(
         "get", "pods",
         "-l", f"job-name={job_name}",
+        "--field-selector=status.phase!=Failed",
         "-o", "jsonpath={.items[0].metadata.name}",
         namespace=namespace,
     )
@@ -122,6 +125,7 @@ def _pod_logs_by_pod(namespace: str, job_name: str, container: str) -> dict[str,
     pod_list = kubectl(
         "get", "pods",
         "-l", f"job-name={job_name}",
+        "--field-selector=status.phase!=Failed",
         "-o", "jsonpath={.items[*].metadata.name}",
         namespace=namespace,
     ).stdout.split()
@@ -156,54 +160,6 @@ def _ready_artifact_source_types(namespace: str) -> set[str]:
     return source_types
 
 
-def _assert_inference(
-    namespace: str,
-    job_name: str,
-    model: str,
-    remote_port: int,
-    local_port: int,
-    *,
-    deterministic: bool = False,
-) -> str:
-    # Pin to pod-0 explicitly. For multi-node StatefulSets, only the head
-    # pod (apps.kubernetes.io/pod-index=0) runs the vLLM HTTP API server;
-    # the worker pod has no HTTP listener. For single-pod Jobs, _pod_name
-    # falls back to the job-name selector since the ordinal label doesn't
-    # exist there — so this is a no-op for the existing single-node case.
-    pod = _pod_name(namespace, job_name, ordinal=0)
-    print(f"\n[{job_name}] pod={pod} remote_port={remote_port} local_port={local_port}")
-    # TODO: replace with a more complex prompt that exercises multi-token reasoning
-    # to better validate model correctness beyond a single-word completion.
-    request_payload = {
-        "model": model,
-        "prompt": "The capital of France is",
-        "max_tokens": 8,
-    }
-    if deterministic:
-        request_payload.update({"temperature": 0, "seed": 0})
-    payload = json.dumps(request_payload).encode()
-    with port_forward(namespace, pod, local_port=local_port, remote_port=remote_port) as port:
-        req = urllib.request.Request(
-            f"http://localhost:{port}/v1/completions",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        # First inference per pod triggers TRT-LLM cold-start (CUDA graph
-        # capture + JIT compile) which can exceed 60s, especially when source
-        # and target share a node and contend for GPU scheduling.
-        # Subsequent requests are sub-second.
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            body = json.loads(resp.read())
-    print(f"[{job_name}] response: {json.dumps(body, indent=2)}")
-    choices = body.get("choices", [])
-    assert choices, f"No choices in response from {job_name}: {body}"
-    text = choices[0].get("text", "")
-    print(f"[{job_name}] completion text: {text!r}")
-    assert text, f"Empty completion text from {job_name}: {body}"
-    return text
-
-
 def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
     """Target pod logs must contain the framework's P2P transfer marker.
 
@@ -223,34 +179,69 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
     )
 
 
-def test_mtp_load_phases(namespace: str, expect_mtp: bool) -> None:
-    """MTP must use P2P only for the main model, never for its draft head."""
+def _deduplicate_log_handlers(lines: list[str]) -> list[str]:
+    """Collapse paired vLLM/MX renderings, even when handlers interleave."""
+    vllm_format = re.compile(
+        r"^(.*?)INFO (\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[([^\]]+:\d+)\] (.*)$"
+    )
+    mx_format = re.compile(
+        r"^(.*?)\[\d{4}-(\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] INFO (\S+:\d+): (.*)$"
+    )
+    result = []
+    unpaired = {}
+    for line in lines:
+        match = vllm_format.match(line) or mx_format.match(line)
+        if match:
+            record = (match.groups(), match.re)
+            other_format = mx_format if match.re == vllm_format else vllm_format
+            counterpart = (match.groups(), other_format)
+            # Consume one cross-handler pair; preserve real repeated records.
+            if unpaired.get(counterpart, 0):
+                unpaired[counterpart] -= 1
+                continue
+            unpaired[record] = unpaired.get(record, 0) + 1
+        result.append(line)
+    return result
+
+
+def test_mtp_load_phases(namespace: str, expect_mtp: bool, tp_size: int) -> None:
+    """Every target rank must finish main and draft loads through RDMA."""
     if not expect_mtp:
         pytest.skip("MTP phase assertion not enabled")
 
     logs = _all_pod_logs(namespace, "mx-target", "mx-target")
-    main_marker = "p2p_enabled=True"
     transfer_marker = "RDMA transfer complete"
-    draft_marker = "p2p_enabled=False"
-    main_index = logs.find(main_marker)
-    transfer_index = logs.find(transfer_marker, main_index + 1)
-    draft_index = logs.find(draft_marker, transfer_index + 1)
+    start_marker = "MxModelLoader starting"
+    complete_marker = "MxModelLoader.load_model() COMPLETE"
     phase_lines = [
         line
         for line in logs.splitlines()
-        if any(marker in line for marker in (main_marker, transfer_marker, draft_marker))
+        if any(marker in line for marker in (start_marker, transfer_marker, complete_marker))
     ]
     print("[mx-target] MTP load phases:\n" + "\n".join(phase_lines))
-    assert main_index >= 0, "Target did not start a P2P-enabled main-model load"
-    assert transfer_index > main_index, (
-        "Target did not complete RDMA transfer after starting the main-model load"
-    )
-    assert draft_index > transfer_index, (
-        "Target did not load the MTP draft locally after the main-model transfer"
-    )
-    assert logs.find(transfer_marker, draft_index + 1) < 0, (
-        "Target performed another RDMA transfer while loading the MTP draft"
-    )
+    for rank in range(tp_size):
+        rank_logs = "\n".join(_deduplicate_log_handlers([
+            line for line in logs.splitlines() if f"[Worker {rank}]" in line
+        ]))
+        cursor = 0
+        for role in ("main", "draft"):
+            start = rank_logs.find(start_marker, cursor)
+            assert start >= 0, f"Rank {rank}: missing {role} load"
+            header = rank_logs[start:].splitlines()[0]
+            assert f"p2p_enabled=True, p2p_role={role}" in header, (
+                f"Rank {rank}: expected P2P-enabled {role} load, got {header}"
+            )
+            end = rank_logs.find(complete_marker, start)
+            assert end > start, f"Rank {rank}: incomplete {role} load"
+            phase = rank_logs[start:end]
+            assert phase.count(start_marker) == 1, (
+                f"Rank {rank}: another load started before {role} completed"
+            )
+            assert transfer_marker in phase, f"Rank {rank}: no {role} RDMA transfer"
+            assert "Streaming weights from" not in phase, (
+                f"Rank {rank}: {role} fell back to ModelStreamer"
+            )
+            cursor = end + len(complete_marker)
 
 
 def test_per_rank_source_agents(
@@ -459,47 +450,119 @@ def test_artifact_transfer(
         )
 
 
-def test_source_inference_produces_output(namespace: str, model: str, source_port: int) -> None:
-    """Source server must return a valid completion response."""
-    _assert_inference(namespace, "mx-source", model, remote_port=source_port, local_port=18001)
+def test_source_target_inference_matches(
+    namespace: str, model: str, source_port: int, worker_port: int,
+    capture_source_baseline: bool,
+) -> None:
+    """P2P-loaded target must not significantly regress native MMLU accuracy."""
+    directory = artifact_dir(namespace)
+    source_pod = _pod_name(namespace, "mx-source", ordinal=0)
+    if capture_source_baseline:
+        with port_forward(namespace, source_pod, local_port=18001, remote_port=source_port) as port:
+            profile(f"http://localhost:{port}", model, directory / "source")
+        return
+    target_pod = _pod_name(namespace, "mx-target", ordinal=0)
+    with (
+        port_forward(namespace, source_pod, local_port=18001, remote_port=source_port) as source_api,
+        port_forward(namespace, target_pod, local_port=18000, remote_port=worker_port) as target_api,
+    ):
+        source_url = f"http://localhost:{source_api}"
+        target_url = f"http://localhost:{target_api}"
+        source = (
+            read_responses(directory / "source") if (directory / "source").exists()
+            else profile(source_url, model, directory / "source")
+        )
+        target = None
+        try:
+            target = profile(target_url, model, directory / "target")
+            compare(source, target, directory / "comparison.json")
+        except Exception:
+            if target is None:
+                case = next(iter(sorted(source)), None)
+            else:
+                cases = sorted(source.keys() & target.keys())
+                case = next(
+                    (case for case in cases if source[case]["passed"] and not target[case]["passed"]),
+                    next((case for case in cases if source[case] != target[case]), None),
+                )
+            for side, pod, url, records in (
+                ("source", source_pod, source_url, source),
+                ("target", target_pod, target_url, target if target is not None else source),
+            ):
+                try:
+                    if case is not None:
+                        replay_mismatch(url, model, records[case], directory / f"{side}-replays.json")
+                    logs = kubectl("logs", pod, namespace=namespace).stdout
+                    (directory / f"{side}-worker.log").write_text(logs)
+                    info = json.loads(kubectl("get", "pod", pod, "-o", "json", namespace=namespace).stdout)
+                    gpu = kubectl("exec", pod, "--", "nvidia-smi", "-L", namespace=namespace, check=False)
+                    details = {
+                        "case": case, "pod": pod, "node": info["spec"]["nodeName"],
+                        "containers": info["status"].get("containerStatuses", []),
+                        "args": info["spec"]["containers"][0].get("args", []),
+                        "gpu": gpu.stdout, "gpu_error": gpu.stderr,
+                    }
+                    (directory / f"{side}-worker.json").write_text(json.dumps(details, indent=2) + "\n")
+                except Exception as error:
+                    (directory / f"{side}-diagnostic-error.txt").write_text(str(error) + "\n")
+            raise
 
 
-def test_target_inference_produces_output(namespace: str, model: str, worker_port: int) -> None:
-    """Target server must return a valid completion response after P2P transfer."""
-    _assert_inference(namespace, "mx-target", model, remote_port=worker_port, local_port=18000)
+def test_finalized_tensor_bytes_match(namespace: str) -> None:
+    """Audited workers must agree byte-for-byte independently of dataset scores."""
+    pods = [_pod_name(namespace, job, ordinal=0) for job in ("mx-source", "mx-target")]
+    info = json.loads(kubectl("get", "pod", *pods, "-o", "json", namespace=namespace).stdout)
+    expected = any(
+        env["name"] == "MX_CI_WEIGHT_DIGESTS" and env.get("value") == "1"
+        for pod in info["items"] for container in pod["spec"]["containers"] for env in container.get("env", [])
+    )
+    logs = [
+        kubectl("logs", pod, namespace=namespace).stdout for pod in pods
+    ]
+    directory = artifact_dir(namespace)
+    directory.mkdir(parents=True, exist_ok=True)
+    if not compare_weight_digests(*logs, directory / "weight-comparison.json"):
+        assert not expected, "Enabled CI weight audit did not produce tensor digests"
+        pytest.skip("Worker image does not provide finalized tensor digests")
 
 
-def test_mtp_source_target_outputs_match(
+def test_mtp_long_decode(
     namespace: str,
     model: str,
     source_port: int,
     worker_port: int,
     expect_mtp: bool,
 ) -> None:
-    """Disk-loaded source and P2P-loaded target must produce identical output."""
+    """Main/draft execution sustains decoding beyond short MMLU answers."""
     if not expect_mtp:
-        pytest.skip("MTP output consistency assertion not enabled")
+        pytest.skip("MTP long-decode assertion not enabled")
+    for side, job, remote, local in (
+        ("source", "mx-source", source_port, 18003),
+        ("target", "mx-target", worker_port, 18004),
+    ):
+        pod = _pod_name(namespace, job, ordinal=0)
+        with port_forward(namespace, pod, local_port=local, remote_port=remote) as port:
+            long_decode(f"http://localhost:{port}", model, artifact_dir(namespace) / f"{side}-long-decode.json")
 
-    source_text = _assert_inference(
-        namespace,
-        "mx-source",
-        model,
-        remote_port=source_port,
-        local_port=18003,
-        deterministic=True,
-    )
-    target_text = _assert_inference(
-        namespace,
-        "mx-target",
-        model,
-        remote_port=worker_port,
-        local_port=18004,
-        deterministic=True,
-    )
-    assert target_text == source_text, (
-        "MTP source/target completions differ for the deterministic prompt: "
-        f"source={source_text!r}, target={target_text!r}"
-    )
+
+def test_configured_token_pool_capacity(
+    namespace: str,
+    expected_max_total_tokens: int,
+) -> None:
+    """Source and target must use the configured SGLang token-pool cap."""
+    if expected_max_total_tokens == 0:
+        pytest.skip("Token-pool capacity assertion not enabled")
+
+    for job_name in ("mx-source", "mx-target"):
+        logs = _all_pod_logs(namespace, job_name, job_name)
+        capacities = {
+            int(value)
+            for value in re.findall(r"\bmax_total_num_tokens=(\d+)\b", logs)
+        }
+        assert capacities == {expected_max_total_tokens}, (
+            f"{job_name} reported token-pool capacities {sorted(capacities)}, "
+            f"expected only {expected_max_total_tokens}"
+        )
 
 
 def _assert_target_vram_matches_source(

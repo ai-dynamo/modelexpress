@@ -10,20 +10,52 @@ endpoints are derived from the initialized engine.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from modelexpress.envs import _env_bool, _env_float
+
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
+    MX_REFIT_STAGE_RECORD: bool
+    MX_REFIT_PACK_MODULES: bool
+    MX_REFIT_PREFETCH_REPLICA_METADATA: bool
+    MX_REFIT_DEBUG_VALIDATE_REPLICAS: bool
+    MX_RESHARD_MAX_SEGMENTS_PER_COPY: int
+    MX_RESHARD_MIN_GBPS: float
+    MX_RESHARD_PUBLISH_DIGEST: bool
+    MX_REDIS_URL: str
+    MX_GENERATOR_SOURCE_ORDER: str | None
+    AZURE_STORAGE_ACCOUNT_NAME: str | None
+    AZURE_STORAGE_ACCOUNT_URL: str | None
+    AZURE_STORAGE_CONNECTION_STRING: str | None
+    MX_AZURE_DOWNLOAD_CONCURRENCY: int
+    MX_AZURE_DOWNLOAD_RANGE_BYTES: int
+    MX_AZURE_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
+    MX_AZURE_MAX_POOL_CONNECTIONS: int
+    MX_AZURE_MAX_ATTEMPTS: int
+    MX_AZURE_CONNECTION_TIMEOUT_SECONDS: int
+    MX_AZURE_READ_TIMEOUT_SECONDS: int
     MX_REFIT_CHECKSUM_FORMAT: str
     MX_REFIT_DESIRED_VERSION_UID: str | None
+    MX_REFIT_CHECKPOINT_MAX_SIZE_GB: int
     MX_REFIT_CHECKPOINT_DIR: str | None
     MX_REFIT_DELTA_BUCKET_BYTES: int
+    MX_REFIT_DELTA_SURGICAL: bool
+    MX_REFIT_DEBUG_VALIDATE_PLAN: bool
+    MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT: bool
     MX_REFIT_DELTA_WORKERS: int
+    MX_REFIT_DOWNLOAD_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
+    MX_REFIT_FULL_STREAMING: bool
+    MX_REFIT_STREAM_WINDOW_LAYERS: int
     MX_REFIT_TIMING: bool
+    MX_S3_DOWNLOAD_BACKEND: str
     MX_S3_DOWNLOAD_RANGE_BYTES: int
     MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
     MX_S3_DOWNLOAD_IO_CHUNK_BYTES: int
@@ -42,8 +74,78 @@ if TYPE_CHECKING:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # One JSON stage record per refit. On by default: the timings are already
+    # computed, and at INFO they were never captured by a benchmark run.
+    "MX_REFIT_STAGE_RECORD": lambda: _env_bool("MX_REFIT_STAGE_RECORD", True),
+    "MX_REFIT_PREFETCH_REPLICA_METADATA": lambda: _env_bool(
+        "MX_REFIT_PREFETCH_REPLICA_METADATA", False
+    ),
+    "MX_REFIT_DEBUG_VALIDATE_REPLICAS": lambda: _env_bool(
+        "MX_REFIT_DEBUG_VALIDATE_REPLICAS", False
+    ),
+    "MX_RESHARD_MAX_SEGMENTS_PER_COPY": lambda: int(
+        os.environ.get("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "64")
+    ),
+    # Coalesce consecutive owning-module batches up to the staging budget.
+    "MX_REFIT_PACK_MODULES": lambda: _env_bool("MX_REFIT_PACK_MODULES", True),
+    # Per-rank floor in Gbps below which a refit is reported as degraded. Zero
+    # disables it, and is the default for the same reason as the ceiling.
+    #
+    # The ceiling catches transfers that did not happen. Nothing caught a transfer
+    # that happened 20x too slowly: four concurrent receivers collapsed from
+    # ~26 GB/s to ~1.5 GB/s with no error, no warning, byte counts exact,
+    # descriptor counts exact, coverage 100% and fallback 0. Every signal we had
+    # said the refit was healthy. A rate is only interpretable against a bound,
+    # and we only ever had the upper one.
+    "MX_RESHARD_MIN_GBPS": lambda: _env_float("MX_RESHARD_MIN_GBPS", 0.0),
+    # Have publishers digest each shard they advertise, so a receiver-side check has
+    # something to compare against. Off by default: it costs a reduction over every
+    # published tensor, which is a large relative cost against a ~1.5 s wire, so it
+    # belongs in a qualification run rather than a throughput measurement. See
+    # modelexpress_rl.refit.reshard.verify.
+    "MX_RESHARD_PUBLISH_DIGEST": lambda: _env_bool("MX_RESHARD_PUBLISH_DIGEST", False),
+    # ── Trainer pull (live weight sync from a running trainer) ─────────────
+    "MX_REDIS_URL": lambda: os.environ.get("MX_REDIS_URL", "redis://localhost:6379"),
+    # ── Generator weight sync ──────────────────────────────────────────────
+    "MX_GENERATOR_SOURCE_ORDER": lambda: os.environ.get("MX_GENERATOR_SOURCE_ORDER"),
+    "AZURE_STORAGE_ACCOUNT_NAME": lambda: (
+        os.environ.get("AZURE_STORAGE_ACCOUNT_NAME", "").strip() or None
+    ),
+    "AZURE_STORAGE_ACCOUNT_URL": lambda: (
+        os.environ.get("AZURE_STORAGE_ACCOUNT_URL", "").strip() or None
+    ),
+    "AZURE_STORAGE_CONNECTION_STRING": lambda: (
+        os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "").strip() or None
+    ),
+    "MX_AZURE_DOWNLOAD_CONCURRENCY": lambda: positive_int_env(
+        "MX_AZURE_DOWNLOAD_CONCURRENCY", 1
+    ),
+    "MX_AZURE_DOWNLOAD_RANGE_BYTES": lambda: positive_int_env(
+        "MX_AZURE_DOWNLOAD_RANGE_BYTES", 4 * 1024**2
+    ),
+    "MX_AZURE_DOWNLOAD_RANGE_THRESHOLD_BYTES": lambda: positive_int_env(
+        "MX_AZURE_DOWNLOAD_RANGE_THRESHOLD_BYTES", 32 * 1024**2
+    ),
+    "MX_AZURE_MAX_POOL_CONNECTIONS": lambda: positive_int_env(
+        "MX_AZURE_MAX_POOL_CONNECTIONS", 32
+    ),
+    "MX_AZURE_MAX_ATTEMPTS": lambda: positive_int_env("MX_AZURE_MAX_ATTEMPTS", 4),
+    "MX_AZURE_CONNECTION_TIMEOUT_SECONDS": lambda: positive_int_env(
+        "MX_AZURE_CONNECTION_TIMEOUT_SECONDS", 20
+    ),
+    "MX_AZURE_READ_TIMEOUT_SECONDS": lambda: positive_int_env(
+        "MX_AZURE_READ_TIMEOUT_SECONDS", 60
+    ),
     "LOCAL_RANK": lambda: (
         int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else None
+    ),
+    "MX_REFIT_DEBUG_VALIDATE_PLAN": lambda: parse_bool(
+        os.environ.get("MX_REFIT_DEBUG_VALIDATE_PLAN", "false"),
+        "MX_REFIT_DEBUG_VALIDATE_PLAN",
+    ),
+    "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT": lambda: parse_bool(
+        os.environ.get("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", "false"),
+        "MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT",
     ),
     "MX_REFIT_METADATA_PORT": lambda: require_positive_int(
         int(os.environ.get("MX_REFIT_METADATA_PORT", "7555")),
@@ -61,10 +163,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_DESIRED_VERSION_UID": lambda: (
         os.environ.get("MX_REFIT_DESIRED_VERSION_UID", "").strip() or None
     ),
+    "MX_REFIT_CHECKPOINT_MAX_SIZE_GB": lambda: positive_int_env(
+        "MX_REFIT_CHECKPOINT_MAX_SIZE_GB", 2000
+    ),
     "MX_REFIT_CHECKPOINT_DIR": lambda: (
         os.environ.get("MX_REFIT_CHECKPOINT_DIR", "").strip() or None
     ),
-    # Framework integrations read this while constructing ``hf_tensor_iter``;
+    # Framework integrations read this while constructing ``tensor_iter``;
     # ModelExpress preserves the supplied framework bucket boundaries.
     "MX_REFIT_DELTA_BUCKET_BYTES": lambda: require_positive_int(
         int(os.environ.get("MX_REFIT_DELTA_BUCKET_BYTES", 512 * 1024**2)),
@@ -78,6 +183,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
             )
         ),
         "MX_REFIT_DELTA_WORKERS",
+    ),
+    "MX_REFIT_DOWNLOAD_WORKERS": lambda: (
+        require_positive_int(
+            parse_int(
+                os.environ["MX_REFIT_DOWNLOAD_WORKERS"], "MX_REFIT_DOWNLOAD_WORKERS"
+            ),
+            "MX_REFIT_DOWNLOAD_WORKERS",
+        )
+        if "MX_REFIT_DOWNLOAD_WORKERS" in os.environ
+        else require_positive_int(
+            int(os.environ.get("MX_S3_DOWNLOAD_WORKERS", 16)),
+            "MX_S3_DOWNLOAD_WORKERS",
+        )
     ),
     "MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES": lambda: require_positive_int(
         int(
@@ -100,6 +218,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ.get("MX_S3_UPLOAD_WORKERS", 8)),
         "MX_S3_UPLOAD_WORKERS",
     ),
+    "MX_S3_DOWNLOAD_BACKEND": lambda: s3_download_backend(),
     "MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES": lambda: require_positive_int(
         int(
             os.environ.get(
@@ -121,10 +240,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ.get("MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS", 16)),
         "MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS",
     ),
-    "MX_S3_DOWNLOAD_WORKERS": lambda: require_positive_int(
-        int(os.environ.get("MX_S3_DOWNLOAD_WORKERS", 16)),
-        "MX_S3_DOWNLOAD_WORKERS",
-    ),
+    "MX_S3_DOWNLOAD_WORKERS": lambda: environment_variables[
+        "MX_REFIT_DOWNLOAD_WORKERS"
+    ](),
     "MX_S3_MAX_POOL_CONNECTIONS": lambda: require_positive_int(
         int(os.environ.get("MX_S3_MAX_POOL_CONNECTIONS", 32)),
         "MX_S3_MAX_POOL_CONNECTIONS",
@@ -136,6 +254,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_S3_TCP_KEEPALIVE": lambda: parse_bool(
         os.environ.get("MX_S3_TCP_KEEPALIVE", "true"),
         "MX_S3_TCP_KEEPALIVE",
+    ),
+    # Install a delta by reloading only the modules it changes.
+    "MX_REFIT_DELTA_SURGICAL": lambda: parse_bool(
+        os.environ.get("MX_REFIT_DELTA_SURGICAL", "false"),
+        "MX_REFIT_DELTA_SURGICAL",
+    ),
+    "MX_REFIT_FULL_STREAMING": lambda: parse_bool(
+        os.environ.get("MX_REFIT_FULL_STREAMING", "false"),
+        "MX_REFIT_FULL_STREAMING",
+    ),
+    # Decoder layers per streamed full-refit request; 0 streams all at once.
+    "MX_REFIT_STREAM_WINDOW_LAYERS": lambda: require_non_negative_int(
+        int(os.environ.get("MX_REFIT_STREAM_WINDOW_LAYERS", 2)),
+        "MX_REFIT_STREAM_WINDOW_LAYERS",
     ),
     # One normalized timing record per generator refit. On by default: the
     # durations are already being measured on the staging path, so recording
@@ -150,10 +282,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
 }
 
 
+def parse_int(value: str, name: str) -> int:
+    """Parse one integer environment setting."""
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer") from None
+
+
 def require_positive_int(value: int, name: str) -> int:
     """Return ``value`` or raise when it is not positive."""
     if value <= 0:
         raise ValueError(f"{name} must be positive")
+    return value
+
+
+def s3_download_backend() -> str:
+    """Select the canonical S3 download implementation."""
+    value = os.environ.get("MX_S3_DOWNLOAD_BACKEND", "transfer_manager").strip().lower()
+    if value not in {"transfer_manager", "preallocated"}:
+        raise ValueError(
+            "MX_S3_DOWNLOAD_BACKEND must be transfer_manager or preallocated"
+        )
+    return value
+
+
+def positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer while retaining its setting name in errors."""
+    return require_positive_int(
+        parse_int(os.environ.get(name, str(default)), name), name
+    )
+
+
+def require_non_negative_int(value: int, name: str) -> int:
+    """Return ``value`` or raise when it is negative."""
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
     return value
 
 

@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Configuration reference
 
-This is the canonical reference for ModelExpress-owned server, client, loader, transport, artifact, and metrics configuration. The Python client reads its environment values at use time from [modelexpress/envs.py](../modelexpress_client/python/modelexpress/envs.py); the Rust server and CLI use [modelexpress_common/src/envs.rs](../modelexpress_common/src/envs.rs) and the server configuration types. Advanced refit and resharding controls remain with the feature implementation because their safety contracts are workload-specific. When a third-party runtime owns a setting, this page names the runtime rather than pretending it is an MX setting.
+This is the canonical reference for ModelExpress-owned server, client, loader, transport, artifact, and metrics configuration. The Python client reads its environment values at use time from [modelexpress/envs.py](../modelexpress_client/python/modelexpress/envs.py); the Rust server and CLI use [modelexpress_common/src/envs.rs](../modelexpress_common/src/envs.rs) and the server configuration types. When a third-party runtime owns a setting, this page names the runtime rather than pretending it is an MX setting.
 
 ## Precedence
 
@@ -77,6 +77,7 @@ When security mode is enforce, set MODEL_EXPRESS_SECURITY_MODE=enforce, at least
 |---|---|---|
 | MODEL_EXPRESS_ENDPOINT | http://localhost:8001 | CLI server endpoint |
 | MODEL_EXPRESS_TIMEOUT | 30 seconds | CLI request timeout |
+| MODEL_EXPRESS_CONNECT_WAIT_SECS | 10 seconds | Budget for retrying the initial server connection before falling back to a direct provider download (0 disables) |
 | MODEL_EXPRESS_CACHE_DIRECTORY | auto | Cache override; Hugging Face resolution falls back to HF_HUB_CACHE and then the default Hub cache |
 | MODEL_EXPRESS_NO_SHARED_STORAGE | false | Fetch repository files from the server instead of assuming a shared filesystem |
 | MODEL_EXPRESS_TRANSFER_CHUNK_SIZE | 32768 bytes for the Rust CLI; 1048576 bytes for the Python server-cache client | File-transfer chunk size; values must be positive and no larger than the implementation maximum |
@@ -138,7 +139,7 @@ MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; 
 | MX_SOURCE_QUERY_TIMEOUT | 3600 seconds | TRT-LLM source query timeout |
 | MX_TRANSFER_TIMEOUT | 900 seconds for the general client; 300 seconds for RDMA when unset | Transfer timeout used by integrations; the RDMA receive path uses its 300-second fallback until this variable is explicitly set |
 | MX_HEARTBEAT_INTERVAL_SECS | 30 | Source heartbeat interval |
-| MX_PUBLISH_TIMEOUT_SECS | 1800 | Maximum source publication wait |
+| MX_PUBLISH_TIMEOUT_SECS | 1800 | Maximum source publication wait; 0 retries indefinitely |
 | MX_K8S_SERVICE_PATTERN | mx-sources | Service DNS pattern; {rank} is replaced with the worker rank |
 | MX_K8S_SOURCE_RETRIES | 5 | Fresh-channel retries for k8s-service revision mismatches |
 | MX_K8S_SOURCE_BACKOFF_SECONDS | 0.5 | Backoff between k8s-service retries |
@@ -180,14 +181,32 @@ ModelStreamer credentials are third-party settings. See [Load from object storag
 
 | Environment variable | Default | Effect |
 |---|---|---|
-| MX_ARTIFACT_TRANSFER | false | Transfer compatible file-backed JIT artifacts on the NIXL path |
+| MX_ARTIFACT_TRANSFER | false | Enable compatible file-backed JIT artifact installation and publication |
+| MX_ARTIFACT_BACKEND | nixl | Artifact transport: `nixl` or `mooncake`; exactly one is selected and there is no fallback |
 | MX_ARTIFACT_BUNDLE_ROOT | $TMPDIR/modelexpress-artifacts | Local staging root for artifact bundles |
 | MX_ARTIFACT_COMPILE_CONFIG_DIGEST | empty | Partitions torch compile artifact sources by compile configuration |
+| MX_ARTIFACT_MOONCAKE_NAMESPACE | modelexpress/artifacts | Key prefix used by the Mooncake artifact backend |
+| MX_ARTIFACT_MOONCAKE_POOL_BYTES | 536870912 bytes | Local buffer-pool size for the process-local Mooncake artifact client; a config-file `local_buffer_size` takes precedence |
+| MX_ARTIFACT_MOONCAKE_DELETE_RETRIES | 10 | Additional attempts when stale-object or repair-marker removal reports an active lease |
+| MX_ARTIFACT_MOONCAKE_DELETE_RETRY_DELAY_SECS | 0.7 | Delay in seconds between Mooncake removal attempts |
+| MX_MOONCAKE_CONFIG_PATH | unset | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback |
+| MX_MC_* | unset | Artifact-store Mooncake settings promoted temporarily to the corresponding native `MC_*` names |
+| MX_ETCD_* | unset | Artifact-store etcd settings promoted temporarily to the corresponding native `ETCD_*` names |
 | MX_ARTIFACT_READY_URL | framework default | Readiness endpoint checked before publication |
 | MX_ARTIFACT_READY_TIMEOUT_SECS | 1800 | Readiness/publication timeout |
 | MX_ARTIFACT_TRANSFER_CHUNK_SIZE | 67108864 bytes | Artifact transfer chunk size; maximum is 4 GiB |
 
-Artifact transfer requires MX_P2P_METADATA=1, a central coordinator, writable target cache directories, and a trusted deployment. It transfers file-backed caches; it does not replace model weights.
+The default `p2p` backend requires `MX_P2P_METADATA=1`, a central coordinator,
+and NIXL. The `mooncake` backend requires a Python package exposing
+`mooncake.store`, plus `MX_MC_METADATA_ADDR` and `MX_MC_MASTER_SERVER` (or the
+equivalent JSON/native configuration); it does not use the MX server or
+`MX_P2P_METADATA`. Prefixed settings are restored after each artifact-store
+operation, allowing a separately initialized Mooncake client such as a KV
+cache to keep its own account and configuration.
+
+Both backends require writable target cache directories and a trusted
+deployment. Artifact transfer moves file-backed caches; it does not replace
+model-weight transfer.
 
 ## Client metrics
 
@@ -203,6 +222,6 @@ Artifact transfer requires MX_P2P_METADATA=1, a central coordinator, writable ta
 
 See [Metrics](METRICS.md) for endpoint behavior and PromQL.
 
-## Advanced refit and resharding
+## RL refit settings
 
-Live refit and resharding have additional `MX_REFIT_*` and `MX_RESHARD_*` settings that are intentionally documented with the feature implementation because their defaults and safety contracts are workload-specific. See [the refit README](../modelexpress_client/python/modelexpress/refit/README.md) and the [architecture reference](ARCHITECTURE.md) before enabling them.
+RL trainer and generator settings are documented in the [RL configuration reference](rl/CONFIGURATION.md).

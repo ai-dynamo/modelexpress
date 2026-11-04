@@ -1,16 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-"""The throughput floor on the staged FSDP receiver.
-
-There are two receivers over one transport. ``test_reshard_refit_floor`` covers
-the Megatron one; this file covers the staged one, which is what the FSDP
-trainers refit over and what the collapse that motivated the floor was actually
-measured on. The floor first shipped covering only the Megatron receiver, so an
-operator could set ``MX_RESHARD_MIN_GBPS`` on an FSDP job, breach it by 20x, and
-get silence - the guard was configurable but unreachable. These tests exist so
-that cannot come back.
-"""
+"""Throughput-floor diagnostics for staged RL weight transfers."""
 
 from __future__ import annotations
 
@@ -23,14 +14,19 @@ import torch
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress import p2p_pb2
-from modelexpress.refit.reshard import throughput
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, TransferPlan
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
-from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.refit.reshard import throughput
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
+from modelexpress_rl.inference.methods import runtime_tensor as runtime_module
+from modelexpress_rl.inference.methods.runtime_tensor import RuntimeTensorNixlUpdateMethod
+from modelexpress_rl.inference.plan import GeneratorPeerUpdateSource
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.nixl_staged_transfer import (
     _NixlStagedTransfer,
     _PreparedNixlTransfer,
+    _ResolvedSources,
+    _SourceBinding,
 )
 
 # The measured incident and the measured healthy run on the same node: 16.64 GB
@@ -63,6 +59,13 @@ class _Transport:
 
     def read(self, descriptors) -> None:
         self.reads.append(descriptors)
+
+    def post_reads(self, descriptors) -> list:
+        self.read(descriptors)
+        return []
+
+    def await_reads(self, posted) -> None:
+        assert posted == []
 
 
 class _Descriptor:
@@ -102,12 +105,23 @@ def _prepared(tensor: torch.Tensor, nbytes: int) -> _PreparedNixlTransfer:
             )
         ],
     )
+    resolved = _ResolvedSources(
+        {"weight": source},
+        {"trainer": "trainer"},
+        {"trainer": 0},
+        {"trainer": b"metadata"},
+    )
+    source_binding = _SourceBinding(
+        resolved,
+        {"slot-trainer": "trainer"},
+        (("slot-trainer", "trainer", source.shards[0].addr),),
+    )
     return _PreparedNixlTransfer(
-        plan=TransferPlan(),
-        capture=CaptureResult(copies=[copy]),
+        transfer_plan=plan_transfer(CaptureResult(copies=[copy], source_replay=True), {"weight": source}),
         sources={"weight": source},
         descriptors=(_Descriptor(nbytes),),
         transport=_Transport(),
+        source_binding=source_binding,
     )
 
 
@@ -116,7 +130,8 @@ def _stage(monkeypatch, *, nbytes: int, wire_s: float):
     monkeypatch.setattr(
         transfer_module,
         "time",
-        _Clock(0.0, wire_s, wire_s, wire_s),
+        # started, wait_started, wait end, wire end, reconstruct start, reconstruct end
+        _Clock(0.0, 0.0, wire_s, wire_s, wire_s, wire_s),
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     tensor = torch.arange(64, dtype=torch.int32)
@@ -126,9 +141,7 @@ def _stage(monkeypatch, *, nbytes: int, wire_s: float):
     transfer._closed = False
     transfer._device = torch.device("cpu")
     transfer._device_id = DEVICE_ID
-    transfer._recv_buffers = {"weight": tensor}
-    transfer._convert_buffers = {}
-    transfer._full_buffers = {}
+    transfer._full_buffers = {prepared.transfer_plan.full_pulls[0].src_name: tensor}
     transfer._active = prepared
     return transfer.stage(prepared)
 
@@ -173,31 +186,21 @@ def _peer_receive(monkeypatch, *, nbytes: int, wire_s: float):
             pass
 
     monkeypatch.setattr(
-        transfer_module,
+        runtime_module,
         "prepare_tensor_read",
         lambda *_args, **_kwargs: (_Lease(), 0),
     )
-    transfer = object.__new__(_NixlStagedTransfer)
-    transfer._closed = False
-    transfer._device = torch.device("cpu")
-    transfer._device_id = DEVICE_ID
-    transfer._timeout = 30.0
-    transfer._manager = _Manager()
-    source = p2p_pb2.WorkerMetadata(
-        worker_grpc_endpoint="127.0.0.1:18000",
+    method = RuntimeTensorNixlUpdateMethod(
+        manager=_Manager(), device_id=DEVICE_ID,
+        runtime_tensors={"weight": torch.empty(4, dtype=torch.float32)},
     )
-    live = {"weight": torch.empty(4, dtype=torch.float32)}
-    tensor_read = transfer.prepare_peer_read(
-        source=source,
-        mx_source_id="source-1",
-        worker_id="worker-1",
-        destination_tensors=live,
-    )
-    return transfer.receive_peer(
-        tensor_read=tensor_read,
-        destination_tensors=live,
-        on_transfer_start=lambda: None,
-    )
+    prepared = method.prepare(version=None, source=GeneratorPeerUpdateSource(
+        worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="127.0.0.1:18000"),
+        mx_source_id="source-1", worker_id="worker-1",
+    ))
+    with method.installation_context(prepared):
+        pass
+    return prepared.metrics
 
 
 def _record(caplog) -> dict:
@@ -253,8 +256,7 @@ def test_the_healthy_fsdp_pull_is_silent(monkeypatch, caplog):
 
 
 def test_the_floor_is_off_unless_configured(monkeypatch, caplog):
-    """Only the operator knows what their fabric should deliver, so absent config
-    the staged path stays out of the way exactly as the Megatron one does."""
+    """Leave the throughput floor disabled unless the operator configures it."""
     _floor(monkeypatch, None)
     with caplog.at_level(logging.WARNING):
         _stage(monkeypatch, nbytes=SLOW_BYTES, wire_s=SLOW_WIRE_S)
@@ -283,30 +285,18 @@ def test_a_healthy_peer_pull_is_silent(monkeypatch, caplog):
     assert not _records(caplog)
 
 
-def test_both_receivers_report_the_same_marker_and_schema(monkeypatch, caplog):
-    """The anti-drift test.
-
-    A CI gate greps one marker string. If the two receivers each carried their own
-    copy of this record, the same regression could fail one path and pass the
-    other, and the gate would read green for the wrong reason. Both must come from
-    the shared implementation.
-    """
+def test_trainer_and_peer_pulls_report_the_same_marker_and_schema(monkeypatch, caplog):
+    """Keep trainer and peer throughput records compatible with the CI gate."""
     _floor(monkeypatch, FLOOR_GBPS)
-    from modelexpress.refit.reshard import receiver
-
-    class _Rig:
-        _global_rank = 3
-
     with caplog.at_level(logging.WARNING):
-        _stage(monkeypatch, nbytes=SLOW_BYTES, wire_s=SLOW_WIRE_S)
+        with monkeypatch.context() as stage_patch:
+            _stage(stage_patch, nbytes=SLOW_BYTES, wire_s=SLOW_WIRE_S)
         staged_payload = _record(caplog)
         caplog.clear()
-        receiver.ReshardReceiver._check_throughput_floor(
-            _Rig(), 1, SLOW_BYTES, {"wire_fused_s": SLOW_WIRE_S}
-        )
-        megatron_payload = _record(caplog)
+        _peer_receive(monkeypatch, nbytes=SLOW_BYTES, wire_s=SLOW_WIRE_S)
+        peer_payload = _record(caplog)
 
-    assert staged_payload["schema"] == megatron_payload["schema"]
+    assert staged_payload["schema"] == peer_payload["schema"]
     # The quantitative fields a gate would threshold on must be named identically
     # on both paths, or a gate written against one silently ignores the other.
     shared = {
@@ -318,6 +308,6 @@ def test_both_receivers_report_the_same_marker_and_schema(monkeypatch, caplog):
         "shortfall_x",
     }
     assert shared <= set(staged_payload)
-    assert shared <= set(megatron_payload)
+    assert shared <= set(peer_payload)
     for key in shared:
-        assert staged_payload[key] == megatron_payload[key]
+        assert staged_payload[key] == peer_payload[key]

@@ -7,13 +7,14 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from modelexpress import p2p_pb2
+from modelexpress.engines.vllm.adapter import VllmAdapter
 from modelexpress_rl.inference.engines.vllm import (
     VllmGeneratorContext,
     _create_vllm_engine_runtime,
 )
 
 
+@pytest.mark.parametrize("model_name", [None, "mx_model_abc"])
 @pytest.mark.parametrize(
     (
         "quant_config",
@@ -43,12 +44,23 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     enforce_eager,
     has_nixl_manager,
     runtime_p2p_available,
+    model_name,
 ):
+    if model_name is None:
+        monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
+    else:
+        monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", model_name)
+
     class ModelConfig:
         model = "test/model"
+        dtype = torch.bfloat16
+        quantization = None
+        revision = None
 
     class VllmConfig:
         model_config = ModelConfig()
+        parallel_config = SimpleNamespace()
+        load_config = SimpleNamespace(device="cuda:2")
 
         def __init__(self):
             self.quant_config = quant_config
@@ -59,12 +71,11 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     config_module.VllmConfig = VllmConfig
     monkeypatch.setitem(sys.modules, "vllm.config", config_module)
 
-    class Engine:
-        accelerator_backend = SimpleNamespace(name="cuda")
-
+    class Engine(VllmAdapter):
         def __init__(self, vllm_config, model_config):
             assert vllm_config is config
             assert model_config is config.model_config
+            super().__init__(vllm_config, model_config)
 
         def get_device_id(self):
             return 2
@@ -74,9 +85,6 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
 
         def get_worker_rank(self):
             return 3
-
-        def build_identity(self):
-            return p2p_pb2.SourceIdentity(model_name="test/model")
 
     class Installer:
         def __init__(self, **kwargs):
@@ -131,7 +139,8 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
         )
     )
 
-    assert runtime.model_name == "test/model"
+    assert runtime.model_name == (model_name or "test/model")
+    assert config.model_config.model == "test/model"
     assert {
         key: value
         for key, value in runtime.installer.kwargs.items()
@@ -165,6 +174,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
             ("unpublish", loader),
             ("publish", loader, "version-a"),
         ]
+    monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", "changed-after-initialization")
     identity = runtime.full_tensor.build_identity("version-a")
-    assert identity.model_name == "test/model"
+    assert identity.model_name == runtime.model_name
     assert identity.revision == "version-a"

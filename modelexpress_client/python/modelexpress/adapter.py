@@ -15,6 +15,7 @@ from . import p2p_pb2
 
 if TYPE_CHECKING:
     from .load_strategy.context import LoadResult
+    from .types import TensorDescriptor
 
 
 class UnsupportedCapability(NotImplementedError):
@@ -189,6 +190,24 @@ class EngineAdapter:
         """Return whether RDMA must cover every source and target tensor."""
         return False
 
+    def begin_streaming_reload(self, result: LoadResult) -> None:
+        """Enter the engine's layerwise reload before a streaming reload.
+
+        Entered by a strategy whose weights reach the engine through its own
+        load_weights() callbacks, and only when reloading an initialized
+        model. Engines without deferred materialization leave this a no-op.
+        """
+        return None
+
+    def end_streaming_reload(self, result: LoadResult) -> None:
+        """Leave the engine's layerwise reload.
+
+        Always paired with begin_streaming_reload(): from the strategy's
+        finalize() on success and its abort() on failure, so a fallback never
+        starts against a model left half-materialized.
+        """
+        return None
+
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         """Prepare target-side model storage before receiving RDMA weights."""
         return result
@@ -196,6 +215,16 @@ class EngineAdapter:
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
         """Run engine post-processing needed before RDMA writes into tensors."""
         return result
+
+    def prepare_rdma_target_from_manifest(
+        self, result: LoadResult, source_tensors: list[TensorDescriptor]
+    ) -> None:
+        """Allocate donor-dependent cold-load storage before registration.
+
+        Called after before_rdma_receive, with the scoped source manifest held
+        under its read lease where supported. Must not replace the model root.
+        """
+        return None
 
     def after_rdma_receive(self, result: LoadResult) -> LoadResult:
         """Run engine post-processing after RDMA weights have been received."""

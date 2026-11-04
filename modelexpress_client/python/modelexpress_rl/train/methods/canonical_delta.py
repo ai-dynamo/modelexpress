@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
@@ -90,7 +92,6 @@ class CanonicalDeltaPublicationMethod:
         process_group: Any,
         read_seed_tensor: Callable[[str], np.ndarray],
         s3: S3Client,
-        clock: Callable[[], float] = perf_counter,
     ) -> None:
         self._config = config
         self._model_name = model_name
@@ -101,24 +102,28 @@ class CanonicalDeltaPublicationMethod:
         self._world_size = dist.get_world_size(process_group)
         self._read_seed_tensor = read_seed_tensor
         self._s3 = s3
-        self._clock = clock
         self._checksum_format = rl_envs.MX_REFIT_CHECKSUM_FORMAT
         checksum_factory(self._checksum_format)
         self.current_base_version_id = config.initial_base_version_id
         self.snapshot: dict[str, np.ndarray | torch.Tensor] = {}
         self._staged: StagedCanonicalDelta | StagedFullCheckpoint | None = None
         self._metric_delta: StagedCanonicalDelta | StagedFullCheckpoint | None = None
+        self._stage_threadpool: ThreadPoolExecutor | None = None
+        self._stage_futures: deque[Future] = deque()
+        self._stage_error: BaseException | None = None
+        self._stage_started = 0.0
+        self._stage_limit = 0
 
     def prepare_base(
         self,
         *,
-        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
+        tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
     ) -> None:
         if self._staged is not None:
             raise RuntimeError(
                 "publish the staged canonical checkpoint before preparing a new base"
             )
-        started = self._clock()
+        started = perf_counter()
 
         def read_bucket(
             bucket: list[tuple[str, torch.Tensor]],
@@ -130,7 +135,7 @@ class CanonicalDeltaPublicationMethod:
 
         snapshot = {}
         for tensors in threadpool_map(
-            (bucket for bucket in hf_tensor_iter if bucket),
+            (bucket for bucket in tensor_iter if bucket),
             read_bucket,
             max_workers=rl_envs.MX_REFIT_DELTA_WORKERS,
             thread_name_prefix="modelexpress-delta-base",
@@ -141,10 +146,10 @@ class CanonicalDeltaPublicationMethod:
             "ModelExpress prepare_delta_base: rank=%d tensors=%d duration=%.3fs",
             self._rank,
             len(snapshot),
-            self._clock() - started,
+            perf_counter() - started,
         )
 
-    def _process_bucket(
+    def _process_delta_bucket(
         self,
         bucket: list[tuple[str, torch.Tensor]],
     ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, str], int, int]:
@@ -181,14 +186,52 @@ class CanonicalDeltaPublicationMethod:
         self,
         *,
         version: WeightVersionRef,
-        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
+        tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
     ) -> StagedCanonicalDelta | StagedFullCheckpoint:
+        """Consume one iterator and complete staging before returning."""
         if self._staged is not None:
             if self._staged.target_version_id == version.version_id:
+                self._finish_staging()
                 return self._staged
             raise RuntimeError(
                 "publish the staged canonical checkpoint before staging another"
             )
+        self._begin_stage(version)
+        try:
+            for bucket in tensor_iter:
+                self.stage_bucket(version=version, bucket=bucket)
+            self._finish_staging()
+        except BaseException:
+            self._finish_staging(discard=True)
+            raise
+        return self._staged
+
+    def stage_bucket(
+        self,
+        *,
+        version: WeightVersionRef,
+        bucket: list[tuple[str, torch.Tensor]],
+    ) -> StagedCanonicalDelta | StagedFullCheckpoint:
+        """Enqueue one bucket; an empty bucket initializes a non-contributing rank."""
+        if self._staged is None:
+            self._begin_stage(version)
+        elif self._staged.target_version_id != version.version_id:
+            raise RuntimeError(
+                "publish the staged canonical checkpoint before staging another"
+            )
+        if bucket:
+            process = (
+                self._process_full_checkpoint_bucket
+                if isinstance(self._staged, StagedFullCheckpoint)
+                else self._process_delta_bucket
+            )
+            self._stage_futures.append(self._stage_threadpool.submit(process, bucket))
+            if len(self._stage_futures) >= self._stage_limit:
+                self._collect_staged_bucket()
+        return self._staged
+
+    def _begin_stage(self, version: WeightVersionRef) -> None:
+        """Called once per version; publish() clears the staged state for the next."""
         response = self._service().GetWeightVersion(
             refit_pb2.GetWeightVersionRequest(uid=version.version_id),
             timeout=self._rpc_timeout_seconds,
@@ -200,76 +243,57 @@ class CanonicalDeltaPublicationMethod:
             raise RuntimeError("target weight version belongs to a different model")
         if (
             not target.HasField("object_storage")
-            or target.object_storage.storage_type
-            != refit_pb2.OBJECT_STORAGE_TYPE_S3
+            or target.object_storage.storage_type != refit_pb2.OBJECT_STORAGE_TYPE_S3
             or not target.object_storage.uri
         ):
             raise RuntimeError("S3 target is missing its URI")
         uri_prefix = f"{self._config.uri_prefix.rstrip('/')}/"
         if not target.object_storage.uri.startswith(uri_prefix):
             raise RuntimeError("S3 target URI does not match the configured prefix")
-        if (
-            target.payload_format
-            == refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
-        ):
+        if target.payload_format == refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT:
             if target.HasField("base_version_id"):
                 raise RuntimeError(
                     "FULL_HF_CHECKPOINT target must not have base_version_id"
                 )
-            staged = self._stage_full_checkpoint(
+            self.snapshot = {}
+            self._staged = StagedFullCheckpoint(
                 target_version_id=version.version_id,
                 object_storage_uri=target.object_storage.uri,
-                hf_tensor_iter=hf_tensor_iter,
+                changed_bytes=0,
+                total_bytes=0,
             )
-            self._staged = staged
-            return staged
-        if (
-            target.payload_format != refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
-            or not target.HasField("base_version_id")
-        ):
-            raise RuntimeError(
-                "S3 publication requires XOR_DELTA or FULL_HF_CHECKPOINT"
+        else:
+            if (
+                target.payload_format != refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
+                or not target.HasField("base_version_id")
+            ):
+                raise RuntimeError(
+                    "S3 publication requires XOR_DELTA or FULL_HF_CHECKPOINT"
+                )
+            if target.base_version_id != self.current_base_version_id:
+                raise RuntimeError(
+                    f"target base {target.base_version_id!r} does not match retained base "
+                    f"{self.current_base_version_id!r}"
+                )
+            self._staged = StagedCanonicalDelta(
+                base_version_id=target.base_version_id,
+                target_version_id=version.version_id,
+                object_storage_uri=target.object_storage.uri,
+                candidate_snapshot={},
+                encoded_deltas={},
+                checksums={},
+                changed_bytes=0,
+                total_bytes=0,
             )
-        if target.base_version_id != self.current_base_version_id:
-            raise RuntimeError(
-                f"target base {target.base_version_id!r} does not match retained base "
-                f"{self.current_base_version_id!r}"
-            )
-
-        started = self._clock()
-        candidate: dict[str, np.ndarray] = {}
-        encoded_deltas: dict[str, np.ndarray] = {}
-        checksums: dict[str, str] = {}
-        changed_bytes = 0
-        total_bytes = 0
-        for current, encoded, bucket_checksums, changed, total in threadpool_map(
-            (bucket for bucket in hf_tensor_iter if bucket),
-            self._process_bucket,
-            max_workers=rl_envs.MX_REFIT_DELTA_WORKERS,
-            thread_name_prefix="modelexpress-delta",
-        ):
-            candidate.update(current)
-            encoded_deltas.update(encoded)
-            checksums.update(bucket_checksums)
-            changed_bytes += changed
-            total_bytes += total
-
-        staged = StagedCanonicalDelta(
-            base_version_id=target.base_version_id,
-            target_version_id=version.version_id,
-            object_storage_uri=target.object_storage.uri,
-            candidate_snapshot=candidate,
-            encoded_deltas=encoded_deltas,
-            checksums=checksums,
-            changed_bytes=changed_bytes,
-            total_bytes=total_bytes,
-            stage_delta_time=self._clock() - started,
+        workers = rl_envs.MX_REFIT_DELTA_WORKERS
+        self._stage_threadpool = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="modelexpress-stage"
         )
-        self._staged = staged
-        return staged
+        self._stage_limit = 2 * workers
+        self._stage_started = perf_counter()
 
     @staticmethod
-    def _capture_full_checkpoint_bucket(
+    def _process_full_checkpoint_bucket(
         bucket: list[tuple[str, torch.Tensor]],
     ) -> dict[str, torch.Tensor]:
         return {
@@ -277,37 +301,48 @@ class CanonicalDeltaPublicationMethod:
             for name, tensor in bucket
         }
 
-    def _stage_full_checkpoint(
-        self,
-        *,
-        target_version_id: str,
-        object_storage_uri: str,
-        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
-    ) -> StagedFullCheckpoint:
-        started = self._clock()
-        self.snapshot = {}
-        for tensors in threadpool_map(
-            (bucket for bucket in hf_tensor_iter if bucket),
-            self._capture_full_checkpoint_bucket,
-            max_workers=rl_envs.MX_REFIT_DELTA_WORKERS,
-            thread_name_prefix="modelexpress-full-hf",
-        ):
-            self.snapshot.update(tensors)
-        total_bytes = sum(
-            tensor.numel() * tensor.element_size()
-            for tensor in self.snapshot.values()
-        )
-        return StagedFullCheckpoint(
-            target_version_id=target_version_id,
-            object_storage_uri=object_storage_uri,
-            changed_bytes=total_bytes,
-            total_bytes=total_bytes,
-            stage_delta_time=self._clock() - started,
-        )
+    def _collect_staged_bucket(self) -> None:
+        try:
+            result = self._stage_futures[0].result()
+        except BaseException as error:
+            self._stage_error = error
+            raise
+        self._stage_futures.popleft()
+        staged = self._staged
+        if isinstance(staged, StagedFullCheckpoint):
+            self.snapshot.update(result)
+            size = sum(
+                tensor.numel() * tensor.element_size() for tensor in result.values()
+            )
+            staged.changed_bytes += size
+            staged.total_bytes += size
+        else:
+            current, encoded, checksums, changed, total = result
+            staged.candidate_snapshot.update(current)
+            staged.encoded_deltas.update(encoded)
+            staged.checksums.update(checksums)
+            staged.changed_bytes += changed
+            staged.total_bytes += total
 
-    def _publish_full_checkpoint_to_s3(
-        self, staged: StagedFullCheckpoint
-    ) -> None:
+    def _finish_staging(self, *, discard: bool = False) -> None:
+        try:
+            if not discard:
+                if self._stage_error is not None:
+                    raise self._stage_error
+                while self._stage_futures:
+                    self._collect_staged_bucket()
+                if self._stage_threadpool is not None:
+                    self._staged.stage_delta_time = perf_counter() - self._stage_started
+        finally:
+            if self._stage_threadpool is not None:
+                self._stage_threadpool.shutdown(wait=True, cancel_futures=True)
+                self._stage_threadpool = None
+            self._stage_futures.clear()
+            if discard:
+                self._staged = None
+                self._stage_error = None
+
+    def _publish_full_checkpoint_to_s3(self, staged: StagedFullCheckpoint) -> None:
         parent_uri = staged.object_storage_uri.rsplit("/", 1)[0]
         batches = list(
             _batch_tensors(
@@ -396,15 +431,16 @@ class CanonicalDeltaPublicationMethod:
     def publish(self, *, version: WeightVersionRef, staged: object) -> None:
         if not isinstance(staged, (StagedCanonicalDelta, StagedFullCheckpoint)):
             raise TypeError("canonical publication received an invalid artifact")
-        if (
-            staged is not self._staged
-            or version.version_id != staged.target_version_id
-        ):
+        if staged is not self._staged or version.version_id != staged.target_version_id:
             raise RuntimeError("canonical staged artifact is no longer active")
+
+        # Wait for all bucket processing to finish before uploading.
+        self._finish_staging()
+
         if isinstance(staged, StagedFullCheckpoint):
-            started = self._clock()
+            started = perf_counter()
             self._publish_full_checkpoint_to_s3(staged)
-            staged.publish_object_storage_time = self._clock() - started
+            staged.publish_object_storage_time = perf_counter() - started
             self.snapshot = {
                 name: tensor.reshape(-1).view(torch.uint8).numpy()
                 for name, tensor in self.snapshot.items()
@@ -415,7 +451,7 @@ class CanonicalDeltaPublicationMethod:
             return
         if staged.base_version_id != self.current_base_version_id:
             raise RuntimeError("staged canonical delta is stale")
-        started = self._clock()
+        started = perf_counter()
         parent_uri = staged.object_storage_uri.rsplit("/", 1)[0]
         counts: list[Any] = [None] * self._world_size
         dist.all_gather_object(
@@ -491,7 +527,7 @@ class CanonicalDeltaPublicationMethod:
                 f"canonical delta index publication failed on rank 0: {remote_error}"
             )
 
-        staged.publish_object_storage_time = self._clock() - started
+        staged.publish_object_storage_time = perf_counter() - started
         self.snapshot = staged.candidate_snapshot
         staged.candidate_snapshot = {}
         self.current_base_version_id = staged.target_version_id
@@ -514,8 +550,8 @@ class CanonicalDeltaPublicationMethod:
         }
 
     def close(self) -> None:
+        self._finish_staging(discard=True)
         self.snapshot = {}
-        self._staged = None
         self._metric_delta = None
         self._s3.close()
 

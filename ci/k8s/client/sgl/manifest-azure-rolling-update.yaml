@@ -74,12 +74,16 @@ spec:
             - --modelexpress-config
             - '{"transport": "nixl"}'
           env:
+            - name: MX_MODEL_URI
+              value: "${MX_CI_MODEL}"
             - name: MX_SERVER_ADDRESS
               value: "mx-server:8000"
             - name: MX_P2P_METADATA
               value: "1"
             - name: MX_ARTIFACT_TRANSFER
-              value: "0"
+              value: "1"
+            - name: MX_ARTIFACT_READY_URL
+              value: "http://127.0.0.1:30000/health"
             - name: MX_CONTIGUOUS_REG
               value: "0"
             - name: NIXL_UCX_TLS
@@ -100,7 +104,7 @@ spec:
             failureThreshold: 3
           resources:
             requests:
-              cpu: "4"
+              cpu: "${MX_CI_FLEET_CPU}"
               memory: "16Gi"
               nvidia.com/gpu: "1"
             limits:

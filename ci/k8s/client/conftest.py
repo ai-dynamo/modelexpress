@@ -37,7 +37,8 @@ def _port(value: str) -> int:
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--namespace", default=os.environ.get("NAMESPACE", ""))
-    parser.addoption("--model", default=os.environ.get("MX_CI_MODEL", "Qwen/Qwen2.5-0.5B"))
+    parser.addoption("--model", default=os.environ.get("MX_CI_MODEL", "Qwen/Qwen3.5-0.8B"))
+    parser.addoption("--capture-source-baseline", action="store_true")
     parser.addoption("--source-port", default=_port(os.environ.get("SOURCE_PORT", "8001")), type=_port)
     parser.addoption("--worker-port", default=_port(os.environ.get("WORKER_PORT", "8002")), type=_port)
     parser.addoption(
@@ -77,8 +78,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store_true",
         default=os.environ.get("EXPECT_MTP", "").lower() in {"1", "true", "yes"},
         help=(
-            "Assert that the target transfers the main model through P2P, "
-            "then loads the MTP draft model locally."
+            "Assert that every target rank transfers both the main model "
+            "and the MTP draft through P2P."
         ),
     )
     parser.addoption(
@@ -100,6 +101,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "Comma-separated artifact sourceType values expected to be ready "
             "and installed, for example 'torch_compile_cache,triton_cache'."
         ),
+    )
+    parser.addoption(
+        "--expected-max-total-tokens",
+        default=_nonnegative_int(os.environ.get("EXPECTED_MAX_TOTAL_TOKENS", "0")),
+        type=_nonnegative_int,
+        help="Expected SGLang max_total_num_tokens value; zero disables the assertion.",
     )
     parser.addoption(
         "--dgd-name",
@@ -141,6 +148,11 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "Same alignment requirement as --heartbeat-timeout-secs."
         ),
     )
+
+
+@pytest.fixture(scope="session")
+def capture_source_baseline(request: pytest.FixtureRequest) -> bool:
+    return request.config.getoption("--capture-source-baseline")
 
 
 @pytest.fixture(scope="session")
@@ -204,6 +216,11 @@ def expected_artifact_sources(request: pytest.FixtureRequest) -> int:
 def expected_artifact_source_types(request: pytest.FixtureRequest) -> set[str]:
     raw = request.config.getoption("--expected-artifact-source-types")
     return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+@pytest.fixture(scope="session")
+def expected_max_total_tokens(request: pytest.FixtureRequest) -> int:
+    return request.config.getoption("--expected-max-total-tokens")
 
 
 @pytest.fixture(scope="session")

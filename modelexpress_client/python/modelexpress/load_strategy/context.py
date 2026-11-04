@@ -35,6 +35,17 @@ else:
 
 T = TypeVar("T")
 
+# Namespace for speculative-draft tensors in the main load's shared manifest.
+# Draft module names (e.g. Qwen3.5 MTP "model.layers.0.*", or the draft's own
+# "model.embed_tokens.weight") can collide with the target's, and a duplicate
+# name in one manifest would make a peer RDMA-read two different sources into
+# the same destination tensor.
+DRAFT_TENSOR_PREFIX = "mx_draft::"
+
+
+def is_draft_tensor_name(name: str) -> bool:
+    return name.startswith(DRAFT_TENSOR_PREFIX)
+
 
 @dataclass
 class LoadResult(Generic[T]):
@@ -78,8 +89,20 @@ class LoadContext:
     accelerator_backend: AcceleratorBackend = field(
         default_factory=CudaAcceleratorBackend
     )
-    # False keeps a secondary in-process load (the MTP drafter) out of P2P.
+    # "main" for the primary load; "draft" for the speculative second pass
+    # on the same worker. The draft shares the main load's NIXL agent,
+    # metadata port and SourceIdentity rather than publishing its own.
+    p2p_role: str = "main"
+    # Draft manifests can refine this to a compatibility-digested namespace.
+    draft_tensor_namespace: str = DRAFT_TENSOR_PREFIX
+    # False keeps a load out of P2P entirely (no registration, no RDMA).
     p2p_enabled: bool = True
+    # Draft pass only: the main load's already-initialized NIXL manager. The
+    # draft registers into it instead of binding MX_METADATA_PORT + device_id
+    # a second time.
+    shared_nixl_manager: NixlTransferManager | None = None
+    # Set only after the draft's descriptors have extended the main publication.
+    draft_published: bool = False
     # RL cold start snapshots this once after distributed rank agreement.
     desired_version_uid: str | None = None
     # Optional engine-level gate checked before weight metadata is advertised.
@@ -92,3 +115,11 @@ class LoadContext:
     # cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr, collapsing
     # O(plugin_calls) MRs to 1.
     vmm_arena: VmmArena | None = None
+    # Whether this run refreshes weights in an already-initialized model
+    # rather than loading into a freshly built one. Each strategy's prepare(),
+    # finalize() and abort() decide what that changes for it.
+    is_reload: bool = False
+    # Reload only: identity of the weights the model holds right now, or None
+    # when unknown. RDMA reloads skip the target-side post-processing, so they
+    # are only correct when restoring these same weights.
+    loaded_identity: p2p_pb2.SourceIdentity | None = None

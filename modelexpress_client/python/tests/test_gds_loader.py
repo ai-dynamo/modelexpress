@@ -13,6 +13,7 @@ import torch
 
 from modelexpress.accelerators import CudaAcceleratorBackend
 from modelexpress.adapter import EngineAdapter, StrategyFailed
+from modelexpress.load_strategy import _strategy_phases
 from modelexpress.load_strategy.context import LoadResult
 
 
@@ -342,8 +343,11 @@ class TestGdsStrategyIntegration:
         ctx.model_config.model = "test-model"
 
         strategy = GdsStrategy()
+        model = MagicMock()
+        result = LoadResult(value=model, model=model)
         with pytest.raises(StrategyFailed, match="post load") as exc:
-            strategy.load(MagicMock(), ctx)
+            with _strategy_phases(strategy, result, ctx):
+                strategy.load(result, ctx)
 
         assert exc.value.mutated is True
         mock_gds.shutdown.assert_called_once()

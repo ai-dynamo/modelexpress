@@ -168,6 +168,7 @@ mod tests {
         assert_eq!(provider.provider_name(), "S3");
     }
 
+    #[cfg(feature = "gcs")]
     #[test]
     fn test_canonical_model_name_routing() {
         assert_eq!(

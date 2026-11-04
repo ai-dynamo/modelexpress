@@ -298,6 +298,33 @@ def test_sglang_health_url_defaults_to_sglang_port(monkeypatch):
     assert artifacts._sglang_health_url() == "http://127.0.0.1:30000/health"
 
 
+@pytest.mark.parametrize("status,expected", [(200, True), (503, False)])
+def test_sglang_health_probe_waits_for_generation(monkeypatch, status, expected):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from threading import Thread
+    import time
+
+    class DelayedHealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            # SGLang waits one second before checking its generated token.
+            time.sleep(1.2)
+            self.send_response(status)
+            self.end_headers()
+
+    with HTTPServer(("127.0.0.1", 0), DelayedHealthHandler) as server:
+        monkeypatch.setenv(
+            "MX_ARTIFACT_READY_URL", f"http://127.0.0.1:{server.server_port}/health",
+        )
+        thread = Thread(target=server.handle_request, daemon=True)
+        thread.start()
+        try:
+            ready = artifacts._sglang_health_ready()
+        finally:
+            thread.join(timeout=5)
+
+    assert ready is expected
+
+
 def test_sglang_artifact_ready_fn_uses_sglang_health(monkeypatch):
     roots = ()
     ready_fn = object()

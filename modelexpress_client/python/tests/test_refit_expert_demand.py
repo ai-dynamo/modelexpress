@@ -16,14 +16,21 @@ those experts must not read the publishers that hold the rest.
 
 import pytest
 import torch
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import SourceInfo, plan_transfer
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
 
 EXPERTS = 8
 ROWS_PER_EXPERT = 64
 COLS = 8
 BYTES_PER_EXPERT = ROWS_PER_EXPERT * COLS * 4
+
+
+def _sessions(plan):
+    reads = list(plan.segments)
+    for group in (*plan.full_pulls, *plan.converts):
+        reads.extend(group.segments)
+    return {plan.source_buffers[read.source_buffer].source_slot_id for read in reads}
 
 
 def _grouped_expert_source() -> SourceInfo:
@@ -64,8 +71,8 @@ def test_contiguous_demand_reads_only_the_publisher_that_owns_the_expert():
         {"grouped_experts": _grouped_expert_source()},
     )
 
-    assert plan.sessions() == {"pub0"}
-    assert plan.full_pulls == []
+    assert _sessions(plan) == {"pub0"}
+    assert not plan.full_pulls
     assert plan.bytes_planned() == BYTES_PER_EXPERT
     assert plan.extra_wire_bytes() == 0
 
@@ -82,18 +89,19 @@ def test_contiguous_demand_reads_only_the_publisher_that_owns_the_expert():
 def test_bounded_fallback_stays_inside_the_receiver_owned_experts():
     """A descriptor-heavy copy of one expert must not pull another expert.
 
-    A transposed destination needs one descriptor per column, which exceeds the
-    production default bound and routes the copy through the full-source pull.
+    A transposed destination needs many descriptors.  A limit of one routes
+    the copy through the full-source pull independently of the environment.
     The receiver owns experts 0..3 (pub0) only, so reading pub1 means its plan
     transferred weights that its own loader refused.
     """
     plan = plan_transfer(
         CaptureResult(copies=[_expert_copy(stride=(1, ROWS_PER_EXPERT))]),
         {"grouped_experts": _grouped_expert_source()},
+        max_segments_per_copy=1,
     )
 
     assert plan.full_pulls, "expected the descriptor bound to engage"
-    assert plan.sessions() == {"pub0"}, (
+    assert _sessions(plan) == {"pub0"}, (
         "the bounded fallback read a publisher holding unowned experts"
     )
 
@@ -108,6 +116,7 @@ def test_bounded_fallback_reports_the_bytes_it_widened_to():
     plan = plan_transfer(
         CaptureResult(copies=[_expert_copy(stride=(1, ROWS_PER_EXPERT))]),
         {"grouped_experts": _grouped_expert_source()},
+        max_segments_per_copy=1,
     )
 
     assert plan.full_pulls, "expected the descriptor bound to engage"
@@ -116,5 +125,5 @@ def test_bounded_fallback_reports_the_bytes_it_widened_to():
     whole_source = EXPERTS * ROWS_PER_EXPERT * COLS * 4
     assert plan.bytes_planned() == whole_source
     assert plan.extra_wire_bytes() == whole_source - BYTES_PER_EXPERT
-    assert plan.sessions() == {"pub0", "pub1"}
+    assert _sessions(plan) == {"pub0", "pub1"}
     assert plan.descriptor_savings() > 0

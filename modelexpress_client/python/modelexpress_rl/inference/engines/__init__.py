@@ -25,3 +25,10 @@ def _create_engine_runtime(engine_context: GeneratorEngineContext) -> EngineRunt
 
 
 __all__: list[str] = []
+
+
+def configure_engine_logging(engine: str) -> None:
+    """Retry attaching engine handlers when worker logging becomes available."""
+    from modelexpress import _configure_engine_logging
+
+    _configure_engine_logging(engine, ("modelexpress", "modelexpress_rl"))

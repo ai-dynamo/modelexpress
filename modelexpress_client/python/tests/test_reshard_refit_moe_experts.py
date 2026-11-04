@@ -25,8 +25,8 @@ Runs on CPU/meta in any torch env: no GPU, no vLLM.
 
 import torch
 
-from modelexpress.refit.reshard.geometry import capture_geometry
-from modelexpress.refit.reshard.slice_plan import Shard, plan_pull
+from modelexpress_rl.refit.reshard.geometry import capture_geometry
+from modelexpress_rl.refit.reshard.slice_plan import Shard, plan_pull
 
 HIDDEN = 4
 INTER = 8  # per-expert intermediate size, full (unsharded)
@@ -143,6 +143,7 @@ def test_expert_copies_plan_to_the_right_source_bytes():
         src_dtype=torch.float32,
         elsize=4,
         shards=[shard],
+        buffer_indices=(0,),
     )
 
     assert segments, "expert copy produced no pull segments"
@@ -150,7 +151,7 @@ def test_expert_copies_plan_to_the_right_source_bytes():
     # Exactly this rank's slice: INTER_PER_TP rows of HIDDEN float32 elements.
     assert pulled == INTER_PER_TP * HIDDEN * 4
     # Rank 0 reads from the start of the source.
-    assert min(s.src_addr for s in segments) == 0
+    assert min(s.src_byte for s in segments) == 0
     # It lands in expert 1's w3 (upper) half of the fused destination.
     expected_dst = (
         1 * (2 * INTER_PER_TP) * HIDDEN + INTER_PER_TP * HIDDEN

@@ -64,6 +64,11 @@ securityContext:
   # runAsNonRoot: true
   # runAsUser: 1000
 
+# port is the single source of truth for the gRPC listener. It drives the
+# MODEL_EXPRESS_SERVER_PORT env var, containerPort, the Service port and the
+# probes (see the comment above livenessProbe/readinessProbe below). Setting
+# MODEL_EXPRESS_SERVER_PORT directly is rejected by the chart, since it would
+# move only the server's actual bind and desync it from all of the above.
 service:
   type: ClusterIP
   port: 8001
@@ -218,7 +223,6 @@ persistence:
   mountPath: /root
 
 env:
-  MODEL_EXPRESS_SERVER_PORT: "8001"
   MODEL_EXPRESS_LOG_LEVEL: "info"
   MODEL_EXPRESS_CACHE_DIRECTORY: "/root"
   # Distributed backend selection. Required — the server fails to start without it.

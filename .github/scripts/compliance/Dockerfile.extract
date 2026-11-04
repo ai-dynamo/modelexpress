@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Build with --no-cache-filter extractor: a cached bind mount can return a stale package list.
+
+ARG TARGET_IMAGE=scratch
+ARG TARGET_PLATFORM=linux/amd64
+ARG EXTRACTOR_IMAGE=python:3.12-slim
+FROM --platform=${TARGET_PLATFORM} ${TARGET_IMAGE} AS target
+FROM --platform=${BUILDPLATFORM} ${EXTRACTOR_IMAGE} AS extractor
+RUN mkdir /output
+COPY helpers/dpkg_helper.py /helpers/dpkg_helper.py
+COPY helpers/python_helper.py /helpers/python_helper.py
+RUN --mount=type=bind,from=target,target=/target \
+    set -e ; \
+    [ -f /target/var/lib/dpkg/status ] || { echo "ERROR: /var/lib/dpkg/status missing in target" >&2; exit 1; } ; \
+    awk '/^Package: libc6$/ {f=1} f && /^Architecture:/ {print $2; exit}' /target/var/lib/dpkg/status > /output/arch.txt ; \
+    python3 /helpers/dpkg_helper.py --root /target > /output/dpkg.tsv ; \
+    python3 /helpers/python_helper.py --root /target > /output/python.tsv ; \
+    [ -s /output/dpkg.tsv ] || { echo "ERROR: dpkg extraction produced no output" >&2; exit 1; }
+
+FROM scratch
+COPY --from=extractor /output/ /

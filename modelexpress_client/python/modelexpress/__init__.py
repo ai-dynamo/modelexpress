@@ -50,15 +50,23 @@ def configure_vllm_logging() -> None:
 
     vLLM only attaches log handlers to the "vllm" namespace. Without this,
     all ModelExpress output is silently dropped in EngineCore worker processes.
-    Copies vLLM's handlers onto both the "modelexpress" and "modelexpress_rl"
-    parent loggers so every child inherits them via propagation. Idempotent.
+    Copies vLLM handlers onto the modelexpress parent logger. Idempotent.
     """
-    _configure_engine_logging("vllm", ("modelexpress", "modelexpress_rl"))
+    _configure_engine_logging("vllm")
 
 
 def configure_trtllm_logging() -> None:
     """Ensure modelexpress loggers are visible in TRT-LLM worker processes."""
     _configure_engine_logging("TRT-LLM")
+
+
+def configure_sglang_logging() -> None:
+    """Keep ModelExpress logs visible in SGLang scheduler subprocesses."""
+    engine = logging.getLogger("sglang")
+    _configure_engine_logging("sglang" if engine.handlers else "")
+    namespace = logging.getLogger("modelexpress")
+    if namespace.handlers:
+        namespace.propagate = False
 
 
 def register_modelexpress():
@@ -71,7 +79,6 @@ def register_modelexpress():
     Enables:
         --load-format modelexpress  (auto-detect: RDMA -> InstantTensor -> ModelStreamer -> GDS -> disk)
         --load-format mx            (backward-compatible alias)
-        --weight-transfer-config '{"backend":"modelexpress"}'
     """
     global _loaders_registered
     if _loaders_registered:

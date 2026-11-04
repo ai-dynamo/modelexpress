@@ -6,7 +6,7 @@
 #
 # REQUIRES AN MoE MODEL. --enable-expert-parallel only does anything for
 # mixture-of-experts models; the test-ep job pairs this manifest with
-# deepseek-ai/DeepSeek-V2-Lite (MLA + MoE). Do not reuse it with the default
+# zai-org/GLM-4.7-Flash (MLA + MoE). Do not reuse it with the default
 # dense CI model.
 #
 # EP vs TP — what this exercises beyond the TP=2 test:
@@ -46,7 +46,7 @@ kind: Job
 metadata:
   name: ${JOB_NAME}
 spec:
-  backoffLimit: 0
+  backoffLimit: 1
   template:
     metadata:
       labels:
@@ -115,9 +115,11 @@ spec:
             # Keep KV fixed and small so VRAM parity stays sensitive to
             # weight residency instead of vLLM auto-sizing cache around leaks.
             - --max-model-len
-            - "1024"
+            - "2048"
             - --kv-cache-memory-bytes
             - "1073741824"
+            - --compilation-config
+            - '{"cache_dir":"/root/.cache/vllm/torch_compile_cache/mx-ci"}'
             - --trust-remote-code
             - --port
             - "${WORKER_PORT}"
@@ -128,6 +130,10 @@ spec:
               value: "modelexpress"
             - name: MX_SERVER_ADDRESS
               value: "mx-server:8000"
+            - name: MX_ARTIFACT_TRANSFER
+              value: "1"
+            - name: MX_ARTIFACT_READY_URL
+              value: "http://127.0.0.1:${WORKER_PORT}/health"
             - name: MX_CONTIGUOUS_REG
               value: "0"
             - name: MX_RDMA_NIC_PIN

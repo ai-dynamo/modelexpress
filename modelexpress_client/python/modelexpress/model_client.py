@@ -35,6 +35,7 @@ from .model_snapshot import (
     ModelSnapshotCache,
     ModelSnapshotError,
     SnapshotSink,
+    is_snapshot_commit_directory,
     safe_commit_hash,
     split_by_weight,
 )
@@ -214,11 +215,20 @@ class ModelCacheClient:
         branch, a tag, or a commit hash. Asking the server for it is what
         makes the engine's own resolution succeed afterwards, since the engine
         looks the snapshot up by the revision it requested rather than by
-        whichever one the server holds by default. A pinned request reuses a
-        local snapshot whenever that commit is already complete on disk; an
-        unpinned one needs the server to name the revision it is holding,
-        which it does not do for a model it already has.
+        whichever one the server holds by default. A lowercase commit pin
+        reuses a complete, inventoried snapshot without RPCs or the repository
+        lock. Other requests still need server revision confirmation.
+
+        Inventory persistence is best-effort after metadata validation. A
+        sidecar write failure does not discard a usable snapshot, but may
+        prevent subsequent local reuse.
         """
+        cache = ModelSnapshotCache(model_name, self.cache_directory)
+        if requested_revision and is_snapshot_commit_directory(requested_revision):
+            ready = cache.ready_metadata(requested_revision)
+            if ready is not None:
+                return ready
+
         revision = self.ensure_downloaded(
             model_name, provider, ignore_weights=True, revision=requested_revision
         )
@@ -256,7 +266,6 @@ class ModelCacheClient:
             )
         expected = {path: manifest[path] for path in metadata_paths}
 
-        cache = ModelSnapshotCache(model_name, self.cache_directory)
         with cache.lock():
             if requested_revision is not None:
                 existing = cache.resolve_pinned_snapshot(expected, revision)
@@ -269,6 +278,7 @@ class ModelCacheClient:
                 # publish(), so record it here or the engine's lookup fails
                 # against a directory that is sitting right there.
                 cache.write_revision_ref(revision, requested_revision)
+                cache.write_metadata_inventory(existing.name, expected)
                 logger.info("Reusing local snapshot for %s at %s", model_name, existing)
                 return existing
 
@@ -286,6 +296,14 @@ class ModelCacheClient:
                 snapshot_path = staging.publish(
                     commit_hash, expected, requested_revision=requested_revision
                 )
+                if revision is not None:
+                    cache.write_metadata_inventory(commit_hash, expected)
+                else:
+                    logger.debug(
+                        "Not recording metadata inventory for %s: "
+                        "the server did not confirm a revision",
+                        model_name,
+                    )
             except BaseException:
                 staging.discard()
                 raise

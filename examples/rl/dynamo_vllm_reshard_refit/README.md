@@ -3,8 +3,9 @@
 This example validates the complete inference-side lifecycle designed for
 ModelExpress `WeightVersion` updates:
 
-1. A GPU trainer job loads `Qwen/Qwen3-0.6B`, publishes one immutable full-weight
-   version through `modelexpress_rl`, and waits as the NIXL source.
+1. A GPU trainer job loads `Qwen/Qwen3-0.6B`, binds its tensors, creates a
+   `TrainerMesh` from its worker ID and binding metadata, and publishes a linked
+   immutable full-weight version through `modelexpress_rl` as the NIXL source.
 2. On cold start, all vLLM ranks agree on the desired UID and load it through
    desired-version P2P or canonical S3 replay. The vLLM init container's startup
    probe then writes and verifies that UID through vLLM's native Control gRPC
@@ -14,6 +15,9 @@ ModelExpress `WeightVersion` updates:
    `start_weight_update`, `update_weights`, and `finish_weight_update`.
 5. The RL coordinator verifies the exact UID on every worker, resumes generation,
    and compares deterministic inference before and after the refit.
+
+Cleanup retires the weight version and releases trainer buffers before deleting
+the trainer mesh.
 
 The DGD uses the current `nvidia.com/v1beta1` schema and Dynamo's native Rust
 vLLM sidecar. Dynamo main is pinned because the weight-transfer route forwarding

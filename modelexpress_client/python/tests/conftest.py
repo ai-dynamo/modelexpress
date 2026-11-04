@@ -115,6 +115,12 @@ def _maybe_mock_vllm():
             self.model_config = vllm_config.model_config
             self.device = device
             self.model = model
+            self._default_model = model
+            self._default_model_config = self.model_config
+
+        def reset_weight_update_target(self):
+            self.model = self._default_model
+            self.model_config = self._default_model_config
 
         def update_weights(self, update_info):
             self.receive_weights(self.update_info_cls(**update_info))
@@ -133,16 +139,22 @@ def _maybe_mock_vllm():
                 raise ValueError(f"Weight transfer engine {name!r} is registered")
             cls._registry[name] = (module_path_or_cls, class_name)
 
+    attention_layer_base = type("AttentionLayerBase", (), {})
+    mamba_base = type("MambaBase", (attention_layer_base,), {})
+
     # Build mock module tree
     vllm_mods = {
         "vllm": MagicMock(),
         "vllm.config": MagicMock(),
         "vllm.config.load": MagicMock(),
         "vllm.model_executor": MagicMock(),
+        "vllm.model_executor.layers.attention_layer_base": MagicMock(),
+        "vllm.model_executor.layers.mamba.abstract": MagicMock(),
         "vllm.model_executor.model_loader": MagicMock(),
         "vllm.model_executor.model_loader.base_loader": MagicMock(),
         "vllm.model_executor.model_loader.default_loader": MagicMock(),
         "vllm.model_executor.model_loader.dummy_loader": MagicMock(),
+        "vllm.model_executor.model_loader.reload": MagicMock(),
         "vllm.model_executor.model_loader.utils": MagicMock(),
         "vllm.utils": MagicMock(),
         "vllm.utils.torch_utils": MagicMock(),
@@ -152,10 +164,24 @@ def _maybe_mock_vllm():
         "vllm.distributed.weight_transfer.factory": MagicMock(),
     }
 
+    # Explicit attributes survive monkeypatch teardown under pytest 9.2.
+    vllm_mods["vllm.model_executor.model_loader.default_loader"].DefaultModelLoader = MagicMock()
+    vllm_mods["vllm.model_executor.model_loader.utils"].initialize_model = MagicMock()
+    vllm_mods["vllm.model_executor.model_loader"]._LOAD_FORMAT_TO_MODEL_LOADER = {}
+    vllm_mods["vllm"].model_executor = vllm_mods["vllm.model_executor"]
+    vllm_mods["vllm.model_executor"].model_loader = vllm_mods["vllm.model_executor.model_loader"]
+
     # Wire up real objects where behavior matters
+    vllm_mods["vllm.model_executor.layers.attention_layer_base"].AttentionLayerBase = attention_layer_base
+    vllm_mods["vllm.model_executor.layers.mamba.abstract"].MambaBase = mamba_base
     vllm_mods["vllm.model_executor.model_loader.base_loader"].BaseModelLoader = BaseModelLoader
     vllm_mods["vllm.model_executor.model_loader"].register_model_loader = register_model_loader
     vllm_mods["vllm.model_executor.model_loader"].BaseModelLoader = BaseModelLoader
+    vllm_mods["vllm"].model_executor = vllm_mods["vllm.model_executor"]
+    vllm_mods["vllm.model_executor"].model_loader = vllm_mods["vllm.model_executor.model_loader"]
+    vllm_mods["vllm.model_executor.model_loader"]._LOAD_FORMAT_TO_MODEL_LOADER = {}
+    vllm_mods["vllm.model_executor.model_loader.default_loader"].DefaultModelLoader = MagicMock()
+    vllm_mods["vllm.model_executor.model_loader.utils"].initialize_model = MagicMock()
     vllm_mods["vllm.distributed.weight_transfer"].WeightTransferEngine = (
         WeightTransferEngine
     )

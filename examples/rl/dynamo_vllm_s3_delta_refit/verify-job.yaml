@@ -29,7 +29,7 @@ spec:
         - {name: EXPECTED_WORKERS, value: "2"}
         - {name: TEST_MODE, value: verify}
         - {name: MX_SERVER_ADDRESS, value: "mx-s3-refit-server:8000"}
-        - {name: AWS_ENDPOINT_URL, value: "http://mx-s3-refit-minio:9000"}
+        - {name: AWS_ENDPOINT_URL, value: "http://mx-s3-refit-seaweedfs:9000"}
         - {name: AWS_DEFAULT_REGION, value: us-east-1}
         resources:
           requests: {cpu: "1", memory: 1Gi}

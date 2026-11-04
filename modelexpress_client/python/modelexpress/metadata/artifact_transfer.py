@@ -24,6 +24,14 @@ import torch
 from .. import p2p_pb2
 from ..metrics import metrics as install_metrics
 from ..nixl_transfer import NIXL_DRAM_MEM_TYPE, NixlTransferManager
+from ..topology import (
+    apply_policy,
+    blocks_selection,
+    in_domain,
+    local_topology,
+    resolve_policy,
+    warn_if_no_domain_match,
+)
 from .artifact_manifest import (
     _crc32c_hex,
     artifact_source_metadata,
@@ -124,12 +132,12 @@ class PublishedArtifactSource:
 
 
 @runtime_checkable
-class P2PArtifactTransfer(Protocol):
-    """Shared lifecycle for P2P cache artifact transfer.
+class ArtifactTransfer(Protocol):
+    """Backend-independent definition of one file-backed artifact.
 
-    Source workers call ``prepare_source`` once to publish a manifest for their
-    local cache. Target workers call ``transfer_from_worker`` to stage the
-    bundle locally, then ``install`` to unpack it into the runtime cache path.
+    This interface describes what is packaged and how the staged files are
+    installed. It deliberately does not describe how the bundle moves between
+    workers; that is supplied by a transport backend.
     """
 
     name: str
@@ -140,48 +148,19 @@ class P2PArtifactTransfer(Protocol):
     def prepare_source(self) -> ArtifactBundle:
         """Seal local source files and return the publishable artifact."""
 
-    def transfer_from_worker(
-        self,
-        endpoint: str,
-        mx_source_id: str,
-        artifact_id: str,
-        nixl_manager: NixlTransferManager,
-        *,
-        timeout: float = 120.0,
-        max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
-    ) -> p2p_pb2.GetArtifactManifestHeaderResponse:
-        """Transfer from a source worker into target-visible staging."""
-
-    def discover_and_transfer(
-        self,
-        mx_client,
-        identity: p2p_pb2.SourceIdentity,
-        nixl_manager: NixlTransferManager,
-        *,
-        worker_rank: int | None = None,
-        node_rank: int | None = None,
-        artifact_id: str = "",
-        accelerator: str = "",
-        timeout: float = 120.0,
-        max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
-    ) -> p2p_pb2.GetArtifactManifestHeaderResponse:
-        """Discover an artifact source, then transfer from its worker.
-
-        By default artifact discovery does not rank-match. Pass node_rank for
-        node-scoped artifacts or worker_rank for worker-specific artifacts.
-        Pass accelerator to skip sources published by an incompatible runtime.
-        """
-
     def install(
         self,
         header: p2p_pb2.GetArtifactManifestHeaderResponse,
     ) -> None:
         """Install a transferred artifact into the target root."""
 
+    def target_file_paths(self) -> list[Path]:
+        """Return local staging paths used by file-oriented transports."""
+
 
 @dataclass(frozen=True)
-class TarredP2PArtifactTransfer(P2PArtifactTransfer):
-    """Tar-backed transfer used by the cache artifact factories below."""
+class TarredArtifactTransfer(ArtifactTransfer):
+    """Tar-backed artifact used by all transport backends."""
 
     name: str
     mx_source_type: int
@@ -266,56 +245,6 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
             artifact_id=artifact_id,
         )
 
-    def transfer_from_worker(
-        self,
-        endpoint: str,
-        mx_source_id: str,
-        artifact_id: str,
-        nixl_manager: NixlTransferManager,
-        *,
-        timeout: float = 120.0,
-        max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
-    ) -> p2p_pb2.GetArtifactManifestHeaderResponse:
-        return transfer_artifact_from_worker(
-            endpoint,
-            mx_source_id,
-            artifact_id,
-            nixl_manager,
-            timeout=timeout,
-            max_inflight_chunks=max_inflight_chunks,
-            target_file_paths=self._target_tar_paths(),
-        )
-
-    def discover_and_transfer(
-        self,
-        mx_client,
-        identity: p2p_pb2.SourceIdentity,
-        nixl_manager: NixlTransferManager,
-        *,
-        worker_rank: int | None = None,
-        node_rank: int | None = None,
-        artifact_id: str = "",
-        accelerator: str = "",
-        timeout: float = 120.0,
-        max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
-    ) -> p2p_pb2.GetArtifactManifestHeaderResponse:
-        source = discover_artifact_source(
-            mx_client,
-            identity,
-            worker_rank=worker_rank,
-            node_rank=node_rank,
-            artifact_id=artifact_id,
-            accelerator=accelerator,
-        )
-        return self.transfer_from_worker(
-            source.worker_grpc_endpoint,
-            source.mx_source_id,
-            source.artifact_id,
-            nixl_manager,
-            timeout=timeout,
-            max_inflight_chunks=max_inflight_chunks,
-        )
-
     def install(
         self,
         header: p2p_pb2.GetArtifactManifestHeaderResponse,
@@ -379,7 +308,7 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
             elapsed,
         )
 
-    def _target_tar_paths(self) -> list[Path]:
+    def target_file_paths(self) -> list[Path]:
         root_archives = self._root_archives()
         self._validate_archive_names(root_archives)
         bundle_path = self.bundle_root.resolve()
@@ -425,7 +354,7 @@ def torch_compile_cache_artifact_transfer(
     bundle_root: str | Path,
     *,
     chunk_size: int | None = None,
-) -> P2PArtifactTransfer:
+) -> ArtifactTransfer:
     return _cache_artifact_transfer(
         "torch_compile_cache",
         p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
@@ -442,7 +371,7 @@ def triton_cache_artifact_transfer(
     bundle_root: str | Path,
     *,
     chunk_size: int | None = None,
-) -> P2PArtifactTransfer:
+) -> ArtifactTransfer:
     return _cache_artifact_transfer(
         "triton_cache",
         p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
@@ -459,7 +388,7 @@ def tvm_ffi_cache_artifact_transfer(
     bundle_root: str | Path,
     *,
     chunk_size: int | None = None,
-) -> P2PArtifactTransfer:
+) -> ArtifactTransfer:
     return _cache_artifact_transfer(
         "tvm_ffi_cache",
         p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE,
@@ -476,7 +405,7 @@ def deep_gemm_cache_artifact_transfer(
     bundle_root: str | Path,
     *,
     chunk_size: int | None = None,
-) -> P2PArtifactTransfer:
+) -> ArtifactTransfer:
     return _cache_artifact_transfer(
         "deep_gemm_cache",
         p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
@@ -493,7 +422,7 @@ def tilelang_cache_artifact_transfer(
     bundle_root: str | Path,
     *,
     chunk_size: int | None = None,
-) -> P2PArtifactTransfer:
+) -> ArtifactTransfer:
     return _cache_artifact_transfer(
         "tilelang_cache",
         p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
@@ -510,7 +439,7 @@ def cute_dsl_cache_artifact_transfer(
     bundle_root: str | Path,
     *,
     chunk_size: int | None = None,
-) -> P2PArtifactTransfer:
+) -> ArtifactTransfer:
     return _cache_artifact_transfer(
         "cute_dsl_cache",
         p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE,
@@ -528,7 +457,7 @@ def flashinfer_cache_artifact_transfer(
     *,
     chunk_size: int | None = None,
     additional_roots: tuple[ArtifactCacheRoot, ...] = (),
-) -> P2PArtifactTransfer:
+) -> ArtifactTransfer:
     return _cache_artifact_transfer(
         "flashinfer_cache",
         p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE,
@@ -542,7 +471,7 @@ def flashinfer_cache_artifact_transfer(
 
 def publish_artifact_source(
     mx_client,
-    transfer: P2PArtifactTransfer,
+    transfer: ArtifactTransfer,
     bundle: ArtifactBundle,
     identity: p2p_pb2.SourceIdentity,
     nixl_manager: NixlTransferManager,
@@ -569,16 +498,15 @@ def publish_artifact_source(
             f"source type: {bundle.manifest.mx_source_type} != {transfer.mx_source_type}"
         )
 
+    policy = resolve_policy(timeout=0)
+    if blocks_selection(policy):
+        raise LookupError("required artifact publish topology is unknown")
+    topology = local_topology()
     worker_host = host or _get_worker_host()
     metadata_endpoint = _nixl_metadata_endpoint(worker_host, nixl_manager)
     if worker_grpc_server.port is None:
         raise RuntimeError("worker gRPC server must be started before artifact publish")
     worker_grpc_endpoint = f"{worker_host}:{worker_grpc_server.port}"
-    artifact_chunk_manager = NixlArtifactChunkManager(
-        nixl_manager,
-        max_buffers=max_inflight_chunks,
-    )
-
     worker = p2p_pb2.WorkerMetadata(
         worker_rank=worker_rank,
         metadata_endpoint=metadata_endpoint,
@@ -586,6 +514,13 @@ def publish_artifact_source(
         worker_grpc_endpoint=worker_grpc_endpoint,
         artifact_source=artifact_source_metadata(bundle.manifest, node_rank=node_rank),
         accelerator=accelerator,
+        topology=topology,
+    )
+    if policy is not None and policy.required and not in_domain(worker, policy):
+        raise LookupError("required artifact publish topology changed during resolution")
+    artifact_chunk_manager = NixlArtifactChunkManager(
+        nixl_manager,
+        max_buffers=max_inflight_chunks,
     )
     try:
         mx_source_id = _publish_metadata_to_server(
@@ -662,27 +597,34 @@ def discover_artifact_source(
     accelerator-specific, so a cache bundle from a different accelerator family
     must not be installed. Empty means unknown and is accepted for backward
     compatibility, matching RDMA tensor source selection.
+    Transfer-domain policy filters source refs before fetching metadata and
+    rechecks required domains on the fetched worker.
     """
+    policy = resolve_policy()
+    if blocks_selection(policy):
+        raise LookupError("required artifact source topology is unknown")
     sources = mx_client.list_sources(
         identity=identity,
         status_filter=p2p_pb2.SOURCE_STATUS_READY,
     )
-    for source in sources.instances:
-        if worker_rank is not None and source.worker_rank != worker_rank:
-            continue
-        # Drop accelerator-incompatible sources before GetMetadata using the
-        # lightweight SourceInstanceRef.accelerator; the post-fetch re-check
-        # below covers empty refs on old servers and metadata drift.
-        if not accelerators_compatible(
+    candidates = [
+        source
+        for source in sources.instances
+        if (worker_rank is None or source.worker_rank == worker_rank)
+        and accelerators_compatible(
             accelerator,
             source.accelerator,
             mx_source_type=identity.mx_source_type,
-        ):
-            continue
+        )
+    ]
+    warn_if_no_domain_match(candidates, policy, worker_rank)
+    for source in apply_policy(candidates, policy):
         metadata = mx_client.get_metadata(source.mx_source_id, source.worker_id)
         if not metadata.found:
             continue
         worker = metadata.worker
+        if policy is not None and policy.required and not in_domain(worker, policy):
+            continue
         if worker.WhichOneof("source_payload") != "artifact_source":
             continue
         if not accelerators_compatible(
@@ -717,8 +659,8 @@ def _cache_artifact_transfer(
     *,
     chunk_size: int | None,
     additional_roots: tuple[ArtifactCacheRoot, ...] = (),
-) -> P2PArtifactTransfer:
-    return TarredP2PArtifactTransfer(
+) -> ArtifactTransfer:
+    return TarredArtifactTransfer(
         name=name,
         mx_source_type=mx_source_type,
         roots=(

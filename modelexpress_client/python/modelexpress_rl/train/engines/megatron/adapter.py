@@ -6,13 +6,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
+from dataclasses import asdict
 from typing import Any
 
 import torch.distributed as dist
-from modelexpress import envs as mx_envs
-from modelexpress.refit.timing import add_refit_metadata, refit_span
+from modelexpress_rl import envs as mx_envs
+from modelexpress_rl.refit.timing import add_refit_metadata, refit_span
 
 from modelexpress_rl.train.adapter import (
     CompletionFence,
@@ -21,8 +21,9 @@ from modelexpress_rl.train.adapter import (
     TrainerEngineAdapter,
     TrainerStagingMode,
     WeightPayloadFormat,
-    WeightVersionShardManifest,
+    TrainerShardMetadata,
 )
+from modelexpress_rl.train.manifest import bound_tensor_manifest
 
 from .aliases import MegatronTensorSpec, build_hf_aliases
 from .publisher import build_megatron_reshard_manifest
@@ -41,16 +42,20 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
             raise RuntimeError("Megatron distributed process group is not initialized")
         self._manager = manager
         self._nixl_metadata_endpoint = nixl_metadata_endpoint
-        self._source_slot_id: str | None = None
+        self._logical_shard_id: str | None = None
+        self._bound_manifest: bytes | None = None
         self._registered_addrs: dict[str, int] | None = None
-        self._manifest: WeightVersionShardManifest | None = None
+        self._metadata: TrainerShardMetadata | None = None
+        self._published = None
+        self._bound_addrs: dict[str, int] | None = None
+        self._bound_specs: tuple[MegatronTensorSpec, ...] = ()
 
     @property
-    def source_slot_id(self) -> str:
+    def logical_shard_id(self) -> str:
         """Return the logical trainer contribution represented by this rank."""
-        if self._source_slot_id is None:
-            raise RuntimeError("bind_tensors() must be called before source_slot_id")
-        return self._source_slot_id
+        if self._logical_shard_id is None:
+            raise RuntimeError("bind_tensors() must be called before logical_shard_id")
+        return self._logical_shard_id
 
     def bind_tensors(self, tensors: Any) -> str:
         """Bind one logical model partition independently of its DP replica."""
@@ -58,29 +63,26 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
             isinstance(item, MegatronTensorSpec) for item in tensors
         ):
             raise TypeError("tensors must be a list of MegatronTensorSpec")
-        layout = [
-            {
-                "name": item.name,
-                "role": item.role,
-                "hf_names": item.hf_names,
-                "global_shape": item.global_shape,
-                "placement_kind": item.placement_kind,
-                "shard_axis": item.shard_axis,
-                "local_shard_range": item.local_shard_range,
-                "extras": item.extras,
-            }
-            for item in sorted(tensors, key=lambda item: item.name)
-        ]
-        digest = hashlib.sha256(
-            json.dumps(layout, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-        source_slot_id = f"megatron:partition:{digest}"
-        if self._source_slot_id is not None and self._source_slot_id != source_slot_id:
+        published = build_hf_aliases(tensors, agent_name=str(self._manager.agent_name))
+        coverage = [asdict(tensor) for tensor in published]
+        manifest = bound_tensor_manifest(coverage)
+        logical_shard_id = hashlib.sha256(manifest).hexdigest()
+        if self._logical_shard_id is not None and self._logical_shard_id != logical_shard_id:
             raise RuntimeError(
                 "Megatron logical tensor partition changed after binding"
             )
-        self._source_slot_id = source_slot_id
-        return source_slot_id
+        self._logical_shard_id = logical_shard_id
+        self._bound_manifest = manifest
+        self._published = published
+        self._bound_addrs = {item.name: item.tensor.data_ptr() for item in tensors}
+        self._bound_specs = tuple(tensors)
+        return logical_shard_id
+
+    @property
+    def bound_manifest(self) -> bytes:
+        if self._bound_manifest is None:
+            raise RuntimeError("bind_tensors() must be called before bound_manifest")
+        return self._bound_manifest
 
     @property
     def supported_staging_modes(self) -> frozenset[TrainerStagingMode]:
@@ -128,18 +130,25 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
                 "Megatron source storage changed after NIXL registration; "
                 "IN_PLACE requires stable tensor addresses"
             )
-        cache_hit = self._manifest is not None and not mx_envs.MX_RESHARD_PUBLISH_DIGEST
+        cache_hit = self._metadata is not None
         if not cache_hit:
+            published = self._published
+            if (
+                published is None
+                or addresses != self._bound_addrs
+                or len(tensors) != len(self._bound_specs)
+                or any(current is not bound for current, bound in zip(tensors, self._bound_specs))
+            ):
+                published = build_hf_aliases(
+                    tensors,
+                    agent_name=str(self._manager.agent_name),
+                )
             with refit_span(
                 "source_preparation",
                 metadata={"manifest_generations": 1},
                 accumulate_metadata=True,
                 duration_key="manifest_generation_s",
             ):
-                published = build_hf_aliases(
-                    tensors,
-                    agent_name=str(self._manager.agent_name),
-                )
                 manifest = build_megatron_reshard_manifest(
                     manager=self._manager,
                     published=published,
@@ -150,30 +159,42 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
                 for tensor in manifest.tensors
                 for shard in tensor.shards
             )
-            self._manifest = WeightVersionShardManifest(
+            self._metadata = TrainerShardMetadata(
                 data=manifest.blob,
                 tensor_count=len(manifest.tensors),
                 total_bytes=total_bytes,
                 transport="NIXL",
             )
-        assert self._manifest is not None
+        assert self._metadata is not None
         add_refit_metadata(
             "source_preparation",
             {
-                "manifest_bytes": len(self._manifest.data),
+                "manifest_bytes": len(self._metadata.data),
                 "manifest_cache_hit": cache_hit,
-                "manifest_tensor_count": self._manifest.tensor_count,
+                "manifest_tensor_count": self._metadata.tensor_count,
             },
         )
 
+        checksums = ()
+        if mx_envs.MX_RESHARD_PUBLISH_DIGEST:
+            published = build_hf_aliases(
+                tensors, agent_name=str(self._manager.agent_name)
+            )
+            checksums = tuple(
+                (tensor.name, index, shard.digest)
+                for tensor in published
+                for index, shard in enumerate(tensor.shards)
+            )
+
         return StagedWeightVersionShardData(
-            manifest=self._manifest,
+            metadata=self._metadata,
             # IN_PLACE performs no asynchronous copy, so the shard is ready to
             # publish as soon as its manifest has been built.
             publish_ready=CompletionFence(lambda: None),
             # IN_PLACE borrows these live tensor objects until the version is
             # retired; retaining them here makes that ownership explicit.
             buffer_owner=tuple(tensors),
+            checksums=checksums,
         )
 
 

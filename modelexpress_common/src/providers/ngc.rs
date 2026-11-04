@@ -549,7 +549,9 @@ async fn download_one_file(
         anyhow::bail!("Failed to download {rel_path}: HTTP {file_status} {body}");
     }
 
-    let temp_path = dest.with_extension("tmp");
+    let mut temp_name = dest.as_os_str().to_os_string();
+    temp_name.push(".tmp");
+    let temp_path = PathBuf::from(temp_name);
     let mut file = tokio::fs::File::create(&temp_path)
         .await
         .with_context(|| format!("Failed to create {temp_path:?}"))?;
@@ -905,6 +907,10 @@ impl ModelProviderTrait for NgcProvider {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
 
     #[test]
     fn test_parse_three_segments_no_team() {
@@ -1398,6 +1404,92 @@ mod tests {
             .await
             .expect("fetch_token");
         assert_eq!(token, "nvapi-test-key-12345");
+    }
+
+    async fn start_partial_download(
+        client: &reqwest::Client,
+        dest: &Path,
+        prefix: &[u8],
+    ) -> (JoinHandle<Result<()>>, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("http://{}/file", listener.local_addr().expect("address"));
+        let client = client.clone();
+        let download_dest = dest.to_path_buf();
+        let download = tokio::spawn(async move {
+            download_one_file(&client, &url, "test-file", &download_dest, None).await
+        });
+
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut request = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(request.read_line(&mut line).await.expect("request"), 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let mut stream = request.into_inner();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            prefix
+                .len()
+                .checked_add(1)
+                .expect("test body length overflow")
+        );
+        stream.write_all(headers.as_bytes()).await.expect("headers");
+        stream.write_all(prefix).await.expect("partial body");
+
+        // The observed bytes prove the downloader has opened and written its staging file.
+        loop {
+            let mut entries = std::fs::read_dir(dest.parent().expect("parent")).expect("read_dir");
+            if entries.any(|entry| {
+                std::fs::read(entry.expect("entry").path()).expect("read staging file") == prefix
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        (download, stream)
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_downloads_with_same_stem() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("client");
+            let json_dest = dir.path().join("model-00001.json");
+            let weights_dest = dir.path().join("model-00001.safetensors");
+            let (json_download, mut json_stream) =
+                start_partial_download(&client, &json_dest, b"json").await;
+            let (weights_download, mut weights_stream) =
+                start_partial_download(&client, &weights_dest, b"weights").await;
+
+            // Both files are open before either download can rename its staging file.
+            json_stream.write_all(b"!").await.expect("finish json");
+            drop(json_stream);
+            let json_result = json_download.await.expect("json task");
+            weights_stream
+                .write_all(b"!")
+                .await
+                .expect("finish weights");
+            drop(weights_stream);
+            let weights_result = weights_download.await.expect("weights task");
+
+            assert!(json_result.is_ok(), "json download failed: {json_result:?}");
+            assert!(
+                weights_result.is_ok(),
+                "weights download failed: {weights_result:?}"
+            );
+            assert_eq!(std::fs::read(&json_dest).expect("json"), b"json!");
+            assert_eq!(std::fs::read(&weights_dest).expect("weights"), b"weights!");
+            assert_eq!(std::fs::read_dir(dir.path()).expect("read_dir").count(), 2);
+        })
+        .await
+        .expect("concurrent downloads timed out");
     }
 
     // ── WireMock-based integration tests ──────────────────────────────────

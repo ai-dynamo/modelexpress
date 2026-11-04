@@ -352,6 +352,7 @@ class TestAcceleratorCapabilityGates:
             device_id = 0
             target_device = nullcontext()
             p2p_enabled = True
+            is_reload = False
 
         ctx = Ctx()
         ctx.accelerator_backend = mock_accelerator_backend_cls(vmm=False)

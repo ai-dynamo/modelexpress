@@ -14,6 +14,8 @@ python -m sglang.launch_server --model-path my-org/my-model --tp 2 --load-format
 
 Use an image with the upstream ModelExpress delegation hook. The checked-in examples use `lmsysorg/sglang:v0.5.13.post1`; full image, transport, and readiness details are in [Using ModelExpress with SGLang](../../SGLANG.md).
 
+The adapter reads ranks and parallel sizes from SGLang's scoped `runtime_context.get_parallel()` API when available, or from `distributed.parallel_state` on older versions. It does not require the deprecated package-level getters. Once distributed execution is initialized, unavailable parallel state raises an error rather than publishing a default rank or shard size that could match the wrong peer.
+
 For ModelStreamer, keep `--model-path` on the model identity or local configuration path and set `MX_MODEL_URI` to the storage URI. Passing `s3://`, `gs://`, or `az://` as `--model-path` bypasses ModelExpress. See the [SGLang storage examples](../../../examples/model_streamer_k8s/client/sglang/README.md).
 
 `{"transport":"nixl"}` supports NIXL weight transfer and compatible artifact transfer. `{"transport":"transfer_engine"}` selects Mooncake TransferEngine for weight transfer.

@@ -1,36 +1,61 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""vLLM load-layout capture and graph-safe weight installation.
+"""Compiled layer replay for staged and streaming vLLM weight updates.
 
-Capture records where each published source lands in vLLM's load-time layout,
-tracing the live model with its params reverted to bf16 load-time skeletons via
-layerwise reload. Installation uses vLLM's layerwise reload and post-load
-processing to update the live model while preserving storage already referenced
-by compiled CUDA graphs.
+ModelExpress stages independent source slices and replays captured writes in order.
+One reload plan materializes each owner before its first write, invokes native
+post-load processing after its last dependency, and restores graph-bound storage.
+Native finalization handles deferred attention after every layer has arrived.
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 import time
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Callable, Mapping
+from contextlib import closing
+from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING
+from weakref import ref
 
 import torch
+from modelexpress import envs
 from modelexpress.accelerators import accelerator_backend_for
 from modelexpress.engines.vllm.host_quantization import (
     refresh_host_quantization_state,
 )
-from modelexpress.refit.reshard.geometry import (
+from modelexpress_rl.refit.reshard.geometry import (
     capture_weights,
     convert_source_weights,
+    overlapping_destination_groups,
 )
-from modelexpress.refit.reshard.types import IncompleteRefit
-from modelexpress.refit.timing import refit_span
+from modelexpress_rl.refit.reshard.types import IncompleteRefit
+from modelexpress_rl.refit.timing import refit_span
 
+from modelexpress_rl import envs as rl_envs
+from modelexpress_rl.inference.engines.vllm.surgical import (
+    changed_since,
+    module_groups,
+)
+from modelexpress_rl.inference.engines.vllm.stream_windows import (
+    layer_windows,
+    windowed_weights,
+)
+
+from modelexpress_rl.inference.engines.vllm.install_plan import (
+    EngineInstallPlan,
+    SourceInstallPlan,
+    _EngineRuntimeBindings,
+    _InputOwner,
+    _InputSlot,
+    _is_deferred_attention_layer,
+)
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -38,15 +63,242 @@ from modelexpress_rl.inference.plan import (
     PreparedCheckpointArtifact,
     PreparedEngineTensors,
     PreparedRuntimeTensors,
+    PreparedStreamingTensors,
+    SourceReplayBatch,
 )
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
+from modelexpress_rl.utils import index_checkpoint_tensors
 
 if TYPE_CHECKING:
-    from modelexpress.refit.reshard.types import CaptureResult
+    from modelexpress_rl.inference.streaming_checkpoint import StreamedCheckpoint
+    from modelexpress_rl.refit.reshard.types import CaptureResult
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
 
 logger = logging.getLogger("modelexpress_rl.inference.engines.vllm.installer")
+_LAYERWISE_LOGGER = "vllm.model_executor.model_loader.reload.layerwise"
+
+
+class _UnloadedLayerFilter(logging.Filter):
+    """Count vLLM's per-layer warning for layers a delta leaves untouched."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.count = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.msg == "%s: Failed to load weights":
+            self.count += 1
+            return False
+        return True
+
+
+_MODULE_GETATTRIBUTE = torch.nn.Module.__getattribute__
+_MODULE_GETATTR = torch.nn.Module.__getattr__
+_MODULE_GET_SUBMODULE = torch.nn.Module.get_submodule
+_MODULE_SETATTR = torch.nn.Module.__setattr__
+_MODULE_REGISTER_PARAMETER = torch.nn.Module.register_parameter
+
+
+def _tensor_geometry(tensor):
+    return (
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+        tensor.device,
+        tensor.data_ptr(),
+    )
+
+
+def _runtime_tensor_layout(module):
+    return tuple(
+        (registry, name, _tensor_geometry(tensor))
+        for registry in ("_parameters", "_buffers")
+        for name, tensor in getattr(module, registry).items()
+        if tensor is not None
+    )
+
+
+def _validate_runtime_tensor_layout(path, module, layout):
+    for registry, name, geometry in layout:
+        tensor = getattr(module, registry).get(name)
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or getattr(module, name, None) is not tensor
+            or _tensor_geometry(tensor) != geometry
+        ):
+            raise IncompleteRefit(
+                f"runtime tensor {path}.{name} disappeared or changed storage/geometry"
+            )
+
+
+@dataclass(frozen=True)
+class _AliasEdge:
+    path: str
+    parent: Module
+    name: str
+    child: Module
+
+
+@dataclass(frozen=True)
+class _ParameterAliases:
+    root: Module
+    owners: tuple[tuple[str, Module], ...]
+    edges: tuple[_AliasEdge, ...] | None
+    groups: tuple[tuple[tuple[Module, str], ...], ...]
+    ties: tuple[tuple[tuple[Module, str], ...], ...]
+    writers: tuple[tuple[Module, type], ...]
+    attributes: tuple[tuple[type, str], ...]
+
+    @cached_property
+    def by_owner(self):
+        """Share each complete tie group with every layer that can change it."""
+        modules = {"": self.root}
+        if self.edges is None:
+            return None
+        for edge in self.edges:
+            modules[edge.path] = edge.child
+        owners = iter(self.owners)
+        groups_by_owner = {}
+        for group in self.groups:
+            named = tuple((next(owners)[0], module, leaf) for module, leaf in group)
+            for module in dict.fromkeys(module for module, _ in group):
+                groups_by_owner.setdefault(module, []).append(named)
+        return {
+            module: _compile_parameter_aliases(self.root, groups, modules)
+            for module, groups in groups_by_owner.items()
+        }
+
+
+def _compile_parameter_aliases(model, groups, modules) -> _ParameterAliases:
+    groups = tuple(groups)
+    owners, edges, full_groups, ties, writers, attributes = [], {}, [], [], {}, {}
+    visited_paths = set()
+    complete_paths = modules.get("") is model
+    for group in groups:
+        if len(group) < 2:
+            continue
+        slots = {}
+        full_groups.append(tuple((module, leaf) for _, module, leaf in group))
+        for path, module, leaf in group:
+            owners.append((path, module))
+            if modules.get(path) is not module:
+                complete_paths = False
+            slots.setdefault((id(module), leaf), (module, leaf))
+            writers.setdefault(id(module), (module, type(module)))
+            attributes.setdefault((type(module), leaf), None)
+            pending = []
+            if (
+                type(path) is not str
+                or path.startswith(".")
+                or path.endswith(".")
+                or ".." in path
+            ):
+                parent_path = ""
+                for name in path.split(".") if path else ():
+                    child_path = f"{parent_path}.{name}" if parent_path else name
+                    pending.append((parent_path, name, child_path))
+                    parent_path = child_path
+                pending.reverse()
+            else:
+                child_path = path
+                while child_path and child_path not in visited_paths:
+                    parent_path, _, name = child_path.rpartition(".")
+                    pending.append((parent_path, name, child_path))
+                    child_path = parent_path
+            for parent_path, name, child_path in reversed(pending):
+                if parent_path not in modules or child_path not in modules:
+                    complete_paths = False
+                    break
+                parent, child = modules[parent_path], modules[child_path]
+                key = (id(parent), name)
+                edge = edges.get(key)
+                if edge is None:
+                    edges[key] = _AliasEdge(child_path, parent, name, child)
+                elif edge.child is not child:
+                    complete_paths = False
+                visited_paths.add(child_path)
+        if len(slots) > 1:
+            ties.append(tuple(slots.values()))
+    return _ParameterAliases(
+        model,
+        tuple(owners),
+        tuple(edges.values()) if complete_paths else None,
+        tuple(full_groups),
+        tuple(ties),
+        tuple(writers.values()),
+        tuple(attributes),
+    )
+
+
+def _has_descriptor(cls, name):
+    for base in cls.__mro__:
+        if name in base.__dict__:
+            return hasattr(type(base.__dict__[name]), "__get__")
+    return False
+
+
+def _standard_lookup_containers(attributes):
+    try:
+        return (
+            type(attributes.get("_parameters")) is dict
+            and type(attributes.get("_buffers")) is dict
+            and type(attributes.get("_modules")) is dict
+        )
+    except StopIteration as error:
+        # Preserve the failure classification used by preparation retries.
+        raise RuntimeError("generator raised StopIteration") from error
+
+
+def _standard_module_access(module, name, checked_classes, checked_attributes):
+    cls = type(module)
+    if cls not in checked_classes:
+        if (
+            cls.__getattribute__ is not _MODULE_GETATTRIBUTE
+            or getattr(cls, "__getattr__", None) is not _MODULE_GETATTR
+        ):
+            return False
+        checked_classes.add(cls)
+    key = (cls, name)
+    if key not in checked_attributes:
+        if _has_descriptor(cls, name):
+            return False
+        checked_attributes.add(key)
+    # Custom lookup containers can also make repeated attribute reads dynamic.
+    attributes = object.__getattribute__(module, "__dict__")
+    return _standard_lookup_containers(attributes)
+
+
+def _standard_parameter_writes(aliases: _ParameterAliases) -> bool:
+    from torch.nn.modules.module import _global_parameter_registration_hooks
+
+    if _global_parameter_registration_hooks:
+        return False
+    checked = set()
+    for module, cls in aliases.writers:
+        attributes = object.__getattribute__(module, "__dict__")
+        if (
+            type(module) is not cls
+            or "register_parameter" in attributes
+            or not _standard_lookup_containers(attributes)
+        ):
+            return False
+        if cls not in checked:
+            if (
+                cls.__setattr__ is not _MODULE_SETATTR
+                or cls.register_parameter is not _MODULE_REGISTER_PARAMETER
+                or cls.__getattribute__ is not _MODULE_GETATTRIBUTE
+                or getattr(cls, "__getattr__", None) is not _MODULE_GETATTR
+            ):
+                return False
+            checked.add(cls)
+    if any(_has_descriptor(cls, name) for cls, name in aliases.attributes):
+        return False
+    # Recheck ordinary registries without repeating custom truth callbacks.
+    hooks = torch.nn.modules.module._global_parameter_registration_hooks
+    if type(hooks) is dict or type(hooks) is OrderedDict:
+        return not hooks
+    return hooks is _global_parameter_registration_hooks
 
 
 def _reserve_runtime_buffer_slots(model: Module, layerwise_info) -> None:
@@ -67,7 +319,13 @@ def _reserve_runtime_buffer_slots(model: Module, layerwise_info) -> None:
 
 
 class _VllmInstaller(EngineInstaller):
-    """Capture vLLM's load layout and install verified staged tensors."""
+    """Capture engine load geometry and run native vLLM installation.
+
+    Own the captured source plan and enter vLLM's graph-safe reload window. Delegate
+    ordered write progress and owner processing to the plan's execution, and bounded
+    batch lifetime to the streaming artifact. Preserve graph-bound storage while
+    vLLM performs its native post-load processing and finalization.
+    """
 
     def __init__(
         self,
@@ -85,6 +343,83 @@ class _VllmInstaller(EngineInstaller):
         self._device = device
         self._convert_native_to_hf = convert_native_to_hf
         self._runtime_tensors = runtime_tensors
+        # Version whose checkpoint bytes the engine holds; None when unknown.
+        self._live_version: str | None = None
+        self._debug_validate_generator_layout = (
+            rl_envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT
+        )
+        self.source_install_plan = None
+        self._tied_input_peak_bytes = 0
+
+    @cached_property
+    def _original_loader(self) -> Callable:
+        try:
+            from vllm.model_executor.model_loader.reload.layerwise import (
+                _get_original_loader,
+            )
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(
+                "ModelExpress refit requires vLLM's layerwise reload APIs"
+            ) from error
+        return _get_original_loader
+
+    def capture_generator_fingerprint(self):
+        if not self._debug_validate_generator_layout:
+            return ()
+
+        original_loader = self._original_loader
+
+        def function_identity(function):
+            return (
+                id(getattr(function, "__func__", function)),
+                id(function.__self__) if hasattr(function, "__self__") else None,
+            )
+
+        parameters = tuple(
+            (
+                name,
+                id(parameter),
+                parameter.data_ptr(),
+                tuple(parameter.shape),
+                tuple(parameter.stride()),
+                parameter.dtype,
+                parameter.device,
+                function_identity(original_loader(parameter)),
+            )
+            for name, parameter in self._model.named_parameters(remove_duplicate=False)
+        )
+        modules = tuple(
+            (name, id(module), function_identity(getattr(module, "load_weights", None)))
+            for name, module in self._model.named_modules()
+        )
+        buffers = tuple(
+            (
+                name,
+                id(buffer),
+                buffer.data_ptr(),
+                tuple(buffer.shape),
+                tuple(buffer.stride()),
+                buffer.dtype,
+                buffer.device,
+                function_identity(original_loader(buffer)),
+                None
+                if buffer.is_floating_point() or buffer.is_complex()
+                else (
+                    hashlib.sha256(
+                        buffer.detach().cpu().contiguous().numpy().tobytes()
+                    ).digest()
+                    if buffer.is_inference()
+                    else buffer._version
+                ),
+            )
+            for name, buffer in self._model.named_buffers(remove_duplicate=False)
+        )
+        return (
+            parameters,
+            modules,
+            buffers,
+            id(self._convert_native_to_hf),
+        )
 
     @property
     def capabilities(self) -> EngineCapabilities:
@@ -94,33 +429,160 @@ class _VllmInstaller(EngineInstaller):
                     PreparedEngineTensors,
                     PreparedRuntimeTensors,
                     PreparedCheckpointArtifact,
+                    PreparedStreamingTensors,
                 }
-            )
+            ),
+            streamed_checkpoints=(
+                getattr(
+                    getattr(self._vllm_config, "parallel_config", None),
+                    "tensor_parallel_size",
+                    1,
+                )
+                == 1
+                or envs.MX_MS_DISTRIBUTED
+            ),
         )
 
     def install(self, prepared: PreparedArtifact) -> dict[str, float]:
         started = time.perf_counter()
+        self._tied_input_peak_bytes = 0
         metrics = prepared.metrics
+        live_version, self._live_version = self._live_version, None
         if isinstance(prepared, PreparedEngineTensors):
             self.install_tensors(prepared.staged.tensors)
+        elif isinstance(prepared, PreparedStreamingTensors):
+            self.install_streaming(prepared)
+            # install_streaming records into the artifact's own metrics dict;
+            # re-read it so those entries travel with the install timing.
+            metrics = prepared.metrics
+            metrics["streaming_apply_s"] = time.perf_counter() - started
         elif isinstance(prepared, PreparedRuntimeTensors):
             self.install_runtime_tensors(prepared.staged.tensors)
         elif isinstance(prepared, PreparedCheckpointArtifact):
             checkpoint = prepared.checkpoint
             if not isinstance(checkpoint, PreparedCheckpoint):
                 raise TypeError("checkpoint preparation has an invalid value")
-            self.install_checkpoint(checkpoint.path)
+            if checkpoint.streaming is not None:
+                self.install_streamed_checkpoint(checkpoint.streaming)
+                metrics.update(checkpoint.streaming.cache_metrics)
+            else:
+                changed = (
+                    changed_since(
+                        checkpoint.delta_changes,
+                        live_version=live_version,
+                        target_version=checkpoint.target_version,
+                    )
+                    if rl_envs.MX_REFIT_DELTA_SURGICAL
+                    else None
+                )
+                if changed is None:
+                    self.install_checkpoint(checkpoint.path)
+                else:
+                    metrics.update(self.install_changed_tensors(checkpoint.path, changed))
+            self._live_version = checkpoint.target_version
         else:
-            raise TypeError(
-                f"unsupported prepared artifact {type(prepared).__name__}"
-            )
-        metrics["perf/mx_receive_install_time"] = time.perf_counter() - started
+            raise TypeError(f"unsupported prepared artifact {type(prepared).__name__}")
+        if not isinstance(prepared, PreparedStreamingTensors):
+            metrics["perf/mx_receive_install_time"] = time.perf_counter() - started
+        metrics["installation_tied_input_peak_bytes"] = self._tied_input_peak_bytes
         return metrics
 
     @property
     def _is_quantized(self) -> bool:
         """Whether the live model uses a post-load quantized kernel layout."""
         return getattr(self._vllm_config, "quant_config", None) is not None
+
+    @staticmethod
+    def _parameter_aliases(model: Module) -> _ParameterAliases:
+        groups: dict[int, list[tuple[str, Module, str]]] = {}
+        modules = {}
+        for path, module in model.named_modules(remove_duplicate=False):
+            modules[path] = module
+            for name, parameter in module._parameters.items():
+                if parameter is not None:
+                    groups.setdefault(id(parameter), []).append((path, module, name))
+        return _compile_parameter_aliases(model, groups.values(), modules)
+
+    def _validate_alias_owners(self, aliases: _ParameterAliases) -> None:
+        if self._model is not aliases.root:
+            raise IncompleteRefit("parameter alias root was replaced during refit")
+        standard = (
+            aliases.edges is not None
+            and type(self._model).get_submodule is _MODULE_GET_SUBMODULE
+            and "get_submodule" not in object.__getattribute__(self._model, "__dict__")
+        )
+        checked_classes, checked_attributes = set(), set()
+        if standard:
+            for edge in aliases.edges:
+                if not _standard_module_access(
+                    edge.parent, edge.name, checked_classes, checked_attributes
+                ):
+                    standard = False
+                    break
+                try:
+                    current = getattr(edge.parent, edge.name)
+                except AttributeError as error:
+                    raise IncompleteRefit(
+                        f"parameter alias owner {edge.path!r} disappeared during refit"
+                    ) from error
+                if current is not edge.child:
+                    raise IncompleteRefit(
+                        f"parameter alias owner {edge.path!r} was replaced during refit"
+                    )
+        if standard:
+            return
+        for path, module in aliases.owners:
+            try:
+                current = self._model.get_submodule(path)
+            except AttributeError as error:
+                raise IncompleteRefit(
+                    f"parameter alias owner {path!r} disappeared during refit"
+                ) from error
+            if current is not module:
+                raise IncompleteRefit(
+                    f"parameter alias owner {path!r} was replaced during refit"
+                )
+
+    def _load_time_parameter_aliases(
+        self, aliases: _ParameterAliases, layerwise_info: Mapping
+    ) -> _ParameterAliases:
+        """Exclude runtime-only slots using vLLM's recorded load-time metadata."""
+        self._validate_alias_owners(aliases)
+        owners = iter(aliases.owners)
+        groups = []
+        changed = False
+        for group in aliases.groups:
+            load_group = []
+            for module, name in group:
+                path, _ = next(owners)
+                info = layerwise_info.get(module)
+                metadata = getattr(info, "restore_metadata", None)
+                if metadata is not None and name not in metadata[0]:
+                    changed = True
+                    continue
+                load_group.append((path, module, name))
+            groups.append(load_group)
+        if not changed:
+            return aliases
+        modules = dict(self._model.named_modules(remove_duplicate=False))
+        return _compile_parameter_aliases(self._model, groups, modules)
+
+    def _restore_parameter_aliases(self, aliases: _ParameterAliases) -> None:
+        # vLLM restores metadata separately for each module. Reconnect shared
+        # parameters so a tied loader still covers one canonical destination.
+        self._validate_alias_owners(aliases)
+        standard = _standard_parameter_writes(aliases)
+        for group in aliases.ties if standard else aliases.groups:
+            first_module, first_name = group[0]
+            parameter = getattr(first_module, first_name)
+            for module, name in group[1:]:
+                other = getattr(module, name)
+                if other.shape != parameter.shape or other.dtype != parameter.dtype:
+                    raise IncompleteRefit(
+                        "tied parameters have incompatible load-time layouts"
+                    )
+                if not standard or other is not parameter:
+                    setattr(module, name, parameter)
 
     def capture(
         self, manifest: list[tuple[str, torch.dtype, tuple[int, ...]]]
@@ -130,16 +592,27 @@ class _VllmInstaller(EngineInstaller):
     ]:
         """Record how published tensors map into vLLM's load-time parameters.
 
-        Captures on the LIVE model with its params reverted to bf16 load-time
+        Captures on the LIVE model with its params reverted to engine load-time
         skeletons via layerwise reload; graph-bound kernel tensors are restored
         afterward without finalizing (finalizing would commit the empty skeletons
         and corrupt the live params).
         """
+
+        gen_key = self.capture_generator_fingerprint()
+
+        cached = self.source_install_plan
+        if cached is not None and cached.cache_key == (gen_key, tuple(manifest)):
+            logger.info(
+                "reusing cached vLLM load layout (%d copies)",
+                len(cached.capture_result[0].copies),
+            )
+            return copy.deepcopy(cached.capture_result)
+        self.source_install_plan = None
+        self.__dict__.pop("_reload_plan", None)
         try:
             from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.reload.layerwise import (
                 LAYERWISE_INFO,
-                _get_original_loader,
                 _place_kernel_tensors,
                 initialize_layerwise_reload,
             )
@@ -151,24 +624,48 @@ class _VllmInstaller(EngineInstaller):
                 "ModelExpress refit requires vLLM's layerwise reload APIs"
             ) from error
 
+        original_loader = self._original_loader
         model = self._model
+        aliases = self._reload_plan.load_aliases
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(model)
             try:
+                self._restore_parameter_aliases(aliases)
+                engine = self._capture_engine_install_plan()
                 # Trace the ORIGINAL loaders, not the reload shims they were wrapped in.
-                for _, param in model.named_parameters():
-                    param.weight_loader = _get_original_loader(param)
+                for _, param in (*model.named_parameters(), *model.named_buffers()):
+                    param.weight_loader = original_loader(param)
                 # The explicit default loader stamps params without a custom
                 # weight_loader (norms) so their copies are attributed, not dropped.
                 capture = capture_weights(
                     model,
-                    convert_source_weights(self._convert_native_to_hf, manifest),
+                    convert_source_weights(
+                        self._convert_native_to_hf, manifest, device=self._device
+                    ),
                     default_weight_loader=default_weight_loader,
+                    source_replay=True,
                 )
                 param_layout = {
                     name: (tuple(p.shape), p.dtype)
                     for name, p in model.named_parameters()
                 }
+                copied = {item.param_name for item in capture.copies}
+                persistent_names = frozenset(
+                    name
+                    for name, value in (
+                        *model.named_parameters(),
+                        *model.named_buffers(),
+                    )
+                    if name in copied and not value.is_meta
+                )
+                load_buffer_names = frozenset(
+                    name for name, _ in model.named_buffers() if name in copied
+                )
+                param_layout.update(
+                    (name, (tuple(buffer.shape), buffer.dtype))
+                    for name, buffer in model.named_buffers()
+                    if name in load_buffer_names
+                )
             finally:
                 for layer in model.modules():
                     info = LAYERWISE_INFO.get(layer)
@@ -176,24 +673,89 @@ class _VllmInstaller(EngineInstaller):
                         if info.kernel_tensors is not None:
                             _place_kernel_tensors(layer, info)
                         info.reset()
+                if hasattr(model, "_original_do_torchao_reload"):
+                    model._do_torchao_reload = model._original_do_torchao_reload
         logger.info(
             "captured %d copies and %d unsupported sources (quantized=%s)",
             len(capture.copies),
             len(capture.unsupported),
             self._is_quantized,
         )
+        gen_key = self.capture_generator_fingerprint()
+        capture.generator_fingerprint = gen_key
+        self.source_install_plan = SourceInstallPlan.compile(
+            engine=engine,
+            capture=capture,
+            buffer_names=load_buffer_names,
+            persistent_names=persistent_names,
+            cache_key=(gen_key, tuple(manifest)),
+            capture_result=(capture, param_layout),
+        )
         return capture, param_layout
 
-    def install_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
-        """Install verified load-layout tensors without changing graph addresses."""
-        self._process_and_commit(tensors)
-        # Derived-weight fixups plus the synchronize that makes the whole
-        # install observable. Separate from the per-layer stages because it is
-        # paid once and does not scale with the number of layers, so folding it
-        # in would make those look worse than they are on small models.
+    def install_tensors(self, tensors: SourceReplayBatch) -> None:
+        """Replay verified source writes without changing graph addresses."""
+        if not isinstance(tensors, SourceReplayBatch):
+            raise IncompleteRefit("vLLM installation requires ordered source replay")
+
+        captured = self._captured_source_plan()
+
+        def load(aliases: _ParameterAliases) -> None:
+            execution = captured.new_execution(self._model, self._restore_parameter_aliases)
+            execution.apply(tensors)
+            execution.finish()
+            self._tied_input_peak_bytes = execution.tied_input_peak_bytes
+
+        self._reload(load)
+        # Synchronization is paid once per install, separately from per-layer work.
         with refit_span("post_install"):
-            _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
             torch.cuda.synchronize(self._device)
+
+    def _drain_streaming(self) -> None:
+        torch.cuda.synchronize(self._device)
+
+    @torch.no_grad()
+    def install_streaming(self, prepared: PreparedStreamingTensors) -> None:
+        """Replay source writes into engine storage before arena reuse."""
+        metrics = prepared.transfer_metrics
+        load_s = 0.0
+        live_storages = {
+            tensor.untyped_storage().data_ptr()
+            for tensor in (*self._model.parameters(), *self._model.buffers())
+            if tensor.device.type != "meta"
+        }
+        captured = self._captured_source_plan()
+
+        def load(initial_aliases: _ParameterAliases) -> None:
+            nonlocal load_s
+            load_started = time.perf_counter()
+            execution = captured.new_execution(
+                self._model, self._restore_parameter_aliases, bounded=True
+            )
+            if captured.replay_id != prepared.replay_id:
+                raise IncompleteRefit("captured replay plan was invalidated before installation")
+
+            def install_batch(tensors):
+                if not isinstance(tensors, SourceReplayBatch):
+                    raise IncompleteRefit("vLLM installation requires ordered source replay")
+                received_storages = {
+                    tensor.untyped_storage().data_ptr() for tensor in tensors.values()
+                }
+                if (received_storages & live_storages) - {0}:
+                    raise IncompleteRefit("received streaming tensor aliases live storage")
+                execution.apply(tensors)
+
+            prepared.apply(install_batch)
+            execution.finish()
+            self._tied_input_peak_bytes = execution.tied_input_peak_bytes
+            load_s = time.perf_counter() - load_started
+
+        reload_started = time.perf_counter()
+        with prepared.consume(self._drain_streaming):
+            self._reload(load)
+            reload_s = time.perf_counter() - reload_started - load_s
+
+        metrics["reload_s"] = reload_s
 
     def install_runtime_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Finish a direct peer transfer into existing graph-bound storage."""
@@ -222,6 +784,50 @@ class _VllmInstaller(EngineInstaller):
                     allow_warm=True,
                 )
 
+    def install_streamed_checkpoint(self, checkpoint: StreamedCheckpoint) -> None:
+        """Stream once through graph-safe reload and tee to one writer per node."""
+        from vllm.distributed import get_world_group
+        from vllm.model_executor.model_loader.runai_streamer_loader import (
+            RunaiModelStreamerLoader,
+        )
+        from vllm.model_executor.model_loader.weight_utils import (
+            runai_safetensors_weights_iterator,
+        )
+
+        tp_size = getattr(
+            getattr(self._vllm_config, "parallel_config", None),
+            "tensor_parallel_size",
+            1,
+        )
+        load_config = copy.copy(self._vllm_config.load_config)
+        extra = dict(getattr(load_config, "model_loader_extra_config", None) or {})
+        extra["distributed"] = tp_size > 1 and envs.MX_MS_DISTRIBUTED
+        object.__setattr__(load_config, "model_loader_extra_config", extra)
+        loader = RunaiModelStreamerLoader(load_config)
+        window_layers = rl_envs.MX_REFIT_STREAM_WINDOW_LAYERS
+        if window_layers:
+            weights = windowed_weights(
+                list(checkpoint.shard_uris),
+                layer_windows(checkpoint.tensor_metadata, window_layers),
+                is_distributed=loader._is_distributed,
+            )
+        else:
+            weights = runai_safetensors_weights_iterator(
+                list(checkpoint.shard_uris),
+                load_config.use_tqdm_on_load,
+                is_distributed=loader._is_distributed,
+            )
+        cache = get_world_group().local_rank == 0
+        with (
+            closing(weights),
+            closing(checkpoint.validate(weights, cache=cache)) as verified,
+        ):
+            self._reload(lambda _aliases: self._model.load_weights(verified))
+        if not checkpoint._complete:
+            raise RuntimeError("full checkpoint stream was not completely consumed")
+        with refit_span("post_install"):
+            torch.cuda.synchronize(self._device)
+
     def install_checkpoint(self, path: str | Path) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""
         try:
@@ -243,144 +849,283 @@ class _VllmInstaller(EngineInstaller):
         model_config.revision = None
         loader = DefaultModelLoader(load_config)
 
-        self._reload(lambda: loader.load_weights(self._model, model_config))
-        # Same fixups and synchronize as install_tensors, so a checkpoint refit
+        self._reload(lambda _aliases: loader.load_weights(self._model, model_config))
+        # Same synchronize as install_tensors, so a checkpoint refit
         # reports the stage too rather than charging it to the caller's total.
         with refit_span("post_install"):
-            _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
             torch.cuda.synchronize(self._device)
 
-    @torch.no_grad()
-    def _process_and_commit(self, tensors: dict[str, torch.Tensor]) -> None:
-        """Run vLLM's per-layer post-load processing into graph-bound storage.
+    def install_changed_tensors(
+        self, path: str | Path, changed: frozenset[str]
+    ) -> dict[str, float]:
+        """Reload only the modules whose checkpoint tensors a delta changed.
 
-        ``initialize_layerwise_reload`` restores load-time parameter skeletons
-        and snapshots kernel tensors. Each verified staging tensor is attached to
-        its layer, PWAL derives the runtime representation, and vLLM copies the
-        result back into the original kernel storage used by CUDA graphs.
+        Untouched layers receive no weights, so vLLM's finalize places their
+        existing kernel tensors back. If a fed module is still incomplete, the
+        rest of the checkpoint is streamed through the same reload, which is
+        then exactly a full reload.
         """
-        from torch import nn
+        from safetensors import safe_open
+        from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
 
+        started = time.perf_counter()
+        _, locations, _ = index_checkpoint_tensors(path)
+        packed: dict[str, list[str]] = {}
+        for module in self._model.modules():
+            packed.update(getattr(module, "packed_modules_mapping", None) or {})
+        names = module_groups(changed, locations, packed)
+        by_file: dict[Path, list[str]] = {}
+        for name in sorted(
+            names, key=lambda n: (str(locations[n][0]), locations[n][1])
+        ):
+            by_file.setdefault(locations[name][0], []).append(name)
+        fallback = False
+
+        def subset():
+            for file, file_names in by_file.items():
+                with safe_open(str(file), framework="pt") as tensors:
+                    for name in file_names:
+                        yield name, tensors.get_tensor(name)
+
+        def load(_aliases: _ParameterAliases) -> None:
+            nonlocal fallback
+            self._model.load_weights(subset())
+            incomplete = [
+                type(layer).__name__
+                for layer, info in LAYERWISE_INFO.items()
+                if info.can_load()
+                and 0 < info.load_numel < info.load_numel_total
+                and not _is_deferred_attention_layer(layer)
+            ]
+            if not incomplete:
+                return
+            fallback = True
+            logger.warning(
+                "Surgical checkpoint install left %d modules incomplete (%s); "
+                "loading the rest of the checkpoint",
+                len(incomplete),
+                sorted(set(incomplete))[:5],
+            )
+            load_config = copy.copy(self._vllm_config.load_config)
+            object.__setattr__(load_config, "load_format", "safetensors")
+            model_config = copy.copy(self._model_config)
+            model_config.model = str(path)
+            model_config.revision = None
+            rest = DefaultModelLoader(load_config).get_all_weights(
+                model_config, self._model
+            )
+            self._model.load_weights(
+                (name, tensor) for name, tensor in rest if name not in names
+            )
+
+        unloaded = _UnloadedLayerFilter()
+        layerwise_logger = logging.getLogger(_LAYERWISE_LOGGER)
+        layerwise_logger.addFilter(unloaded)
         try:
+            self._reload(load)
+        finally:
+            layerwise_logger.removeFilter(unloaded)
+        with refit_span("post_install"):
+            torch.cuda.synchronize(self._device)
+        logger.info(
+            "Surgical checkpoint install changed=%d loaded=%d untouched_layers=%d "
+            "fallback=%s seconds=%.3f",
+            len(changed),
+            len(names),
+            unloaded.count,
+            fallback,
+            time.perf_counter() - started,
+        )
+        return {
+            "perf/mx_receive_surgical_tensors": float(len(names)),
+            "perf/mx_receive_surgical_fallback": float(fallback),
+        }
+
+    def _capture_engine_install_plan(self):
+        inputs = []
+        for path, layer in self._model.named_modules():
+            slots = []
+            for is_buffer, values in ((False, layer._parameters), (True, layer._buffers)):
+                for leaf, tensor in values.items():
+                    if tensor is not None:
+                        name = f"{path}.{leaf}" if path else leaf
+                        slots.append(_InputSlot(name, leaf, id(tensor), is_buffer))
+            inputs.append(_InputOwner(path, ref(layer), tuple(slots)))
+        return EngineInstallPlan(self._reload_plan, tuple(inputs))
+
+    def _captured_source_plan(self):
+        plan = self.source_install_plan
+        if plan is None:
+            raise IncompleteRefit("trainer installation requires a captured source replay plan")
+        return plan
+
+    @cached_property
+    def _reload_plan(self):
+        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
+
+        # Deferred post-load hooks can replace bare tensors and registered buffers.
+        # Preserve both for graph consumers and ModelExpress tensor registrations.
+        owners = tuple(
+            (path, ref(module))
+            for path, module in self._model.named_modules(remove_duplicate=False)
+        )
+        runtime_layouts = {}
+        for path, reference in owners:
+            module = reference()
+            if module is not None and id(module) not in runtime_layouts:
+                runtime_layouts[id(module)] = (
+                    path,
+                    reference,
+                    _runtime_tensor_layout(module),
+                )
+        del module
+        bare_tensors = [
+            (
+                path,
+                module,
+                {
+                    name: (
+                        value,
+                        _tensor_geometry(value),
+                        name not in module._non_persistent_buffers_set
+                        if name in module._buffers
+                        else None,
+                    )
+                    for name, value in {**module.__dict__, **module._buffers}.items()
+                    if isinstance(value, torch.Tensor)
+                    and value.device.type == self._device.type
+                    and (
+                        self._device.index is None
+                        or value.device.index == self._device.index
+                    )
+                },
+            )
+            for path, module in ((path, reference()) for path, reference in owners)
+            if module is not None
+        ]
+        bare_tensors = [entry for entry in bare_tensors if entry[2]]
+        runtime_tensors = dict(
+            (
+                *self._model.named_parameters(remove_duplicate=False),
+                *self._model.named_buffers(remove_duplicate=False),
+            )
+        )
+        replay_groups = overlapping_destination_groups(runtime_tensors.items())
+        replay_tensors = {
+            name: runtime_tensors[name]
+            for group in replay_groups
+            if len({id(runtime_tensors[name]) for name in group}) > 1
+            for name in group
+        }
+        aliases = self._parameter_aliases(self._model)
+        load_aliases = self._load_time_parameter_aliases(aliases, LAYERWISE_INFO)
+
+        return _EngineRuntimeBindings(
+            owners,
+            runtime_layouts,
+            bare_tensors,
+            replay_groups,
+            replay_tensors,
+            aliases,
+            load_aliases,
+        )
+
+    @torch.no_grad()
+    def _reload(self, load: Callable[[_ParameterAliases], None]) -> None:
+        """Run one weight loader inside vLLM's graph-safe reload window."""
+        try:
+            from vllm.config import set_current_vllm_config
             from vllm.model_executor.layers.quantization.base_config import (
                 QuantizeMethodBase,
             )
             from vllm.model_executor.model_loader.reload.layerwise import (
                 LAYERWISE_INFO,
                 _copy_and_restore_kernel_tensors,
-            )
-        except (ImportError, AttributeError) as error:
-            raise RuntimeError(
-                "ModelExpress refit requires vLLM's layerwise reload APIs"
-            ) from error
-
-        def load() -> None:
-            # Quantized models expose kernel-packed parameters before layerwise
-            # reload and load-time parameters after it. Resolve the captured
-            # names only after vLLM has restored that load-time hierarchy.
-            groups: dict[Module, list[tuple[str, str]]] = {}
-            matched: set[str] = set()
-            for module_name, module in self._model.named_modules():
-                for leaf, _parameter in module.named_parameters(recurse=False):
-                    full_name = f"{module_name}.{leaf}" if module_name else leaf
-                    if full_name in tensors:
-                        groups.setdefault(module, []).append((full_name, leaf))
-                        matched.add(full_name)
-            unmatched = sorted(set(tensors) - matched)
-            if unmatched:
-                raise IncompleteRefit(
-                    "vLLM layerwise reload did not expose every staged parameter; "
-                    f"unmatched={unmatched[:10]}"
-                )
-
-            # Per-layer spans, accumulated across every layer into two stages.
-            # This loop is the whole of what a framework sees as "install", and
-            # the two things it does have unrelated costs: post-load processing
-            # is compute that scales with quantization scheme, while the copy
-            # back is bandwidth into storage the CUDA graphs already point at.
-            # Charged together they cannot be acted on.
-            for layer, parameters in groups.items():
-                info = LAYERWISE_INFO.get(layer)
-                for full_name, leaf in parameters:
-                    setattr(
-                        layer,
-                        leaf,
-                        nn.Parameter(tensors[full_name], requires_grad=False),
-                    )
-                quant_method = getattr(layer, "quant_method", None)
-                if isinstance(quant_method, QuantizeMethodBase):
-                    if hasattr(layer, "_already_called_process_weights_after_loading"):
-                        delattr(layer, "_already_called_process_weights_after_loading")
-                    with refit_span("transformation"):
-                        quant_method.process_weights_after_loading(layer)
-                if info is not None and info.kernel_tensors is not None:
-                    with refit_span("installation"):
-                        _copy_and_restore_kernel_tensors(layer, info)
-                if info is not None:
-                    info.reset()
-
-        self._reload(load)
-
-    @torch.no_grad()
-    def _reload(self, load: Callable[[], None]) -> None:
-        """Run one weight loader inside vLLM's graph-safe reload window."""
-        try:
-            from vllm.config import set_current_vllm_config
-            from vllm.model_executor.model_loader.reload.layerwise import (
-                LAYERWISE_INFO,
                 finalize_layerwise_reload,
                 initialize_layerwise_reload,
             )
+            from vllm.model_executor.model_loader.reload.meta import materialize_layer
         except (ImportError, AttributeError) as error:
             raise RuntimeError(
-                "ModelExpress refit requires vLLM's layerwise reload APIs"
+                f"ModelExpress refit requires vLLM's layerwise reload APIs: {error}"
             ) from error
 
-        # vLLM also keeps graph-bound tensors as plain object attributes rather
-        # than registered parameters or buffers. Layerwise reload does not save
-        # these. Snapshot their original storage so Marlin workspaces and MLA
-        # derived tensors are not replaced with addresses absent from the graph.
-        bare_tensors = {
-            module: {
-                name: value
-                for name, value in module.__dict__.items()
-                if isinstance(value, torch.Tensor)
-            }
-            for module in self._model.modules()
-        }
-        bare_tensors = {
-            module: values for module, values in bare_tensors.items() if values
-        }
+        if not all(
+            callable(api)
+            for api in (
+                QuantizeMethodBase,
+                _copy_and_restore_kernel_tensors,
+                materialize_layer,
+                initialize_layerwise_reload,
+                finalize_layerwise_reload,
+            )
+        ):
+            raise RuntimeError(
+                "ModelExpress refit requires vLLM's layerwise reload APIs"
+            )
 
-        with torch.device(self._device), set_current_vllm_config(self._vllm_config):
+        runtime = (
+            self.source_install_plan.engine.runtime
+            if self.source_install_plan is not None
+            else self._reload_plan
+        )
+        owners = runtime.modules
+        runtime_layouts = runtime.layouts
+        bare_tensors = runtime.bare_tensors
+        aliases = runtime.aliases
+        load_aliases = runtime.load_aliases
+
+        # Native materialization enters each layer's recorded restore device.
+        # PWAL also creates host tensors, so it must keep the ambient device.
+        with set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(self._model)
+            self._restore_parameter_aliases(load_aliases)
             _reserve_runtime_buffer_slots(self._model, LAYERWISE_INFO)
-            load()
+            load(load_aliases)
             finalize_layerwise_reload(self._model, self._model_config)
+            for path, reference in owners:
+                try:
+                    module = self._model.get_submodule(path)
+                except AttributeError as error:
+                    raise IncompleteRefit(
+                        f"reload owner {path!r} disappeared during refit"
+                    ) from error
+                if module is not reference():
+                    raise IncompleteRefit(
+                        f"reload owner {path!r} was replaced during refit"
+                    )
+            self._restore_parameter_aliases(aliases)
+            self._validate_alias_owners(aliases)
 
-            # PWAL may recreate a bare attribute. Copy meaningful derived content
-            # into the original graph-bound tensor, then reattach that tensor.
-            # Scratch tensors such as workspaces need only be reattached.
-            for module, attributes in bare_tensors.items():
-                for name, graph_tensor in attributes.items():
-                    current = module.__dict__.get(name)
+            # Preserve storage referenced by existing graph consumers.
+            for path, module, attributes in bare_tensors:
+                if self._model.get_submodule(path) is not module:
+                    raise IncompleteRefit(
+                        f"graph-bound tensor owner {path!r} was replaced"
+                    )
+                for name, (graph_tensor, original_geometry, persistent) in attributes.items():
+                    current = getattr(module, name, None)
                     if (
-                        isinstance(current, torch.Tensor)
-                        and current is not graph_tensor
+                        not isinstance(current, torch.Tensor)
+                        or _tensor_geometry(graph_tensor) != original_geometry
+                        or current.shape != graph_tensor.shape
+                        or current.dtype != graph_tensor.dtype
+                        or current.device != graph_tensor.device
                     ):
-                        if (
-                            current.shape == graph_tensor.shape
-                            and current.dtype == graph_tensor.dtype
-                        ):
-                            graph_tensor.data.copy_(current)
-                        else:
-                            logger.error(
-                                "%s.%s changed shape or dtype during refit; "
-                                "restoring its previous graph-bound tensor",
-                                type(module).__name__,
-                                name,
-                            )
+                        raise IncompleteRefit(
+                            f"graph-bound tensor {path}.{name} disappeared or changed geometry"
+                        )
+                    if current is not graph_tensor:
+                        graph_tensor.copy_(current)
                     setattr(module, name, graph_tensor)
+                    if persistent is not None:
+                        if persistent:
+                            module._non_persistent_buffers_set.discard(name)
+                        else:
+                            module._non_persistent_buffers_set.add(name)
+            for path, reference, layout in runtime_layouts.values():
+                _validate_runtime_tensor_layout(path, reference(), layout)
 
         # A parameter left on meta has no backing storage. CUDA-graph replay would
         # read an invalid address, so reject the update and let the framework
@@ -395,43 +1140,6 @@ class _VllmInstaller(EngineInstaller):
                 "vLLM refit left parameters on the meta device; "
                 f"count={len(meta_parameters)}, names={meta_parameters[:10]}"
             )
-
-
-def _update_mla_absorbed_weights(model: Module, *, quantized: bool) -> None:
-    """Refresh MLA tensors derived from ``kv_b_proj`` in graph-bound storage.
-
-    ``W_UV`` and ``W_UK_T`` are cached bare attributes rather than parameters or
-    buffers. Updating them in place preserves the addresses captured by CUDA
-    graphs.
-
-    TODO: Replace this MLA-specific recomputation with an engine-owned derived
-    tensor hook when vLLM exposes one. Address preservation is generic above;
-    recomputing the value is still model-specific here.
-    """
-    for _name, module in model.named_modules():
-        if not (hasattr(module, "W_UV") or hasattr(module, "W_UK_T")) or not hasattr(
-            module, "kv_b_proj"
-        ):
-            continue
-        if quantized:
-            raise IncompleteRefit(
-                "MLA derived-weight refresh from a quantized kv_b_proj is unsupported"
-            )
-        output_dtype = (
-            module.W_UV.dtype if hasattr(module, "W_UV") else module.W_UK_T.dtype
-        )
-        kv_b_proj_weight = module.kv_b_proj.weight.view(
-            module.num_heads,
-            module.qk_nope_head_dim + module.v_head_dim,
-            -1,
-        )
-        w_uk, w_uv = kv_b_proj_weight.split(
-            [module.qk_nope_head_dim, module.v_head_dim], dim=1
-        )
-        if hasattr(module, "W_UV"):
-            module.W_UV.copy_(w_uv.transpose(0, 1).to(output_dtype))
-        if hasattr(module, "W_UK_T"):
-            module.W_UK_T.copy_(w_uk.permute(1, 2, 0).to(output_dtype))
 
 
 __all__: list[str] = []

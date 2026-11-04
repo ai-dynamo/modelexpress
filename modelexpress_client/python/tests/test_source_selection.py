@@ -11,6 +11,7 @@ metadata-miss fallback, and the no-retry-after-transfer-start rule).
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import weakref
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ import pytest
 
 from modelexpress import p2p_pb2
 from modelexpress.adapter import StrategyFailed, StrategyRecoveryError
+from modelexpress.load_strategy import _strategy_phases
 from modelexpress.load_strategy.base import LoadResult, clear_exception_tracebacks
 from modelexpress.load_strategy.rdma_strategy import MAX_SOURCE_RETRIES, RdmaStrategy
 from modelexpress.source_selection import (
@@ -279,6 +281,7 @@ def test_no_peers_published_records_a_zero_funnel(monkeypatch):
     m = MagicMock()
     monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
     monkeypatch.delenv(ENV_SELECTOR, raising=False)
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_DOMAIN", raising=False)
 
     ctx = _rdma_ctx([])
     assert RdmaStrategy()._find_source_instances(ctx) == []
@@ -286,6 +289,17 @@ def test_no_peers_published_records_a_zero_funnel(monkeypatch):
     m.record_list_sources.assert_called_once_with("random", "empty")
     observed = {call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list}
     assert observed == {"listed": 0, "rank_matched": 0, "accelerator_matched": 0}
+
+
+def test_no_peers_with_topology_policy_records_topology_stage(monkeypatch):
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    _require_zone(monkeypatch, "az1")
+
+    assert RdmaStrategy()._find_source_instances(_rdma_ctx([])) == []
+
+    observed = {call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list}
+    assert observed["topology_matched"] == 0
 
 
 def test_list_sources_rpc_failure_is_recorded_not_silent(monkeypatch):
@@ -332,6 +346,111 @@ def test_find_source_instances_filters_incompatible_accelerator():
     ctx.accelerator_backend.name = "cuda"
     out = RdmaStrategy()._find_source_instances(ctx)
     assert {c.worker_id for c in out} == {"match-0"}
+
+
+def _zone_ref(mx_source_id, worker_id, zone):
+    ref = _ref(mx_source_id, worker_id)
+    if zone:
+        ref.topology["zone"] = zone
+    return ref
+
+
+def _require_zone(monkeypatch, local_zone, enforcement="required"):
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "zone")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_ENFORCEMENT", enforcement)
+    if local_zone:
+        monkeypatch.setenv("MX_P2P_TOPOLOGY", json.dumps({"zone": local_zone}))
+    else:
+        monkeypatch.setenv("MX_P2P_TOPOLOGY", "{}")
+    monkeypatch.setattr("modelexpress.topology.DOMAIN_WAIT_TIMEOUT_S", 0.0)
+
+
+def test_find_source_instances_required_zone_survives_retry_slice(monkeypatch):
+    # Same-zone sources must not be pushed past MAX_SOURCE_RETRIES by
+    # cross-zone ones the selector happens to rank first.
+    monkeypatch.setenv(ENV_SELECTOR, "rendezvous_hash")
+    _require_zone(monkeypatch, "az1")
+    instances = [
+        _zone_ref("s0aaaaaaaaaaaaaa", "far-0", "az2"),
+        _zone_ref("s1aaaaaaaaaaaaaa", "far-1", "az2"),
+        _zone_ref("s2aaaaaaaaaaaaaa", "far-2", "az3"),
+        _zone_ref("s3aaaaaaaaaaaaaa", "legacy", None),
+        _zone_ref("s4aaaaaaaaaaaaaa", "near-0", "az1"),
+    ]
+    out = RdmaStrategy()._find_source_instances(_rdma_ctx(instances))
+    assert [c.worker_id for c in out] == ["near-0"]
+
+
+def test_find_source_instances_required_zone_unknown_locally_skips_listing(monkeypatch):
+    _require_zone(monkeypatch, None)
+    ctx = _rdma_ctx([_zone_ref("s0aaaaaaaaaaaaaa", "near-0", "az1")])
+    assert RdmaStrategy()._find_source_instances(ctx) == []
+    ctx.mx_client.list_sources.assert_not_called()
+
+
+def test_find_source_instances_preferred_zone_orders_same_zone_first(monkeypatch):
+    monkeypatch.setenv(ENV_SELECTOR, "rendezvous_hash")
+    _require_zone(monkeypatch, "az1", enforcement="preferred")
+    instances = [_zone_ref(f"s{i}aaaaaaaaaaaaaa", f"far-{i}", "az2") for i in range(4)]
+    instances.append(_zone_ref("s9aaaaaaaaaaaaaa", "near-0", "az1"))
+    out = RdmaStrategy()._find_source_instances(_rdma_ctx(instances))
+    assert out[0].worker_id == "near-0"
+    assert len(out) == 5
+
+
+def test_find_source_instances_required_zone_records_funnel(monkeypatch):
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    _require_zone(monkeypatch, "az1")
+    instances = [
+        _zone_ref("s0aaaaaaaaaaaaaa", "far-0", "az2"),
+        _zone_ref("s1aaaaaaaaaaaaaa", "near-0", "az1"),
+    ]
+    RdmaStrategy()._find_source_instances(_rdma_ctx(instances))
+    observed = {call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list}
+    assert observed["accelerator_matched"] == 2
+    assert observed["topology_matched"] == 1
+
+
+def test_find_source_instances_preferred_zone_funnel_counts_same_zone(monkeypatch):
+    # preferred keeps every candidate; the funnel stage must still report how
+    # many share the zone, or it would read as all-local.
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    _require_zone(monkeypatch, "az1", enforcement="preferred")
+    instances = [
+        _zone_ref("s0aaaaaaaaaaaaaa", "far-0", "az2"),
+        _zone_ref("s1aaaaaaaaaaaaaa", "near-0", "az1"),
+        _zone_ref("s2aaaaaaaaaaaaaa", "legacy", None),
+    ]
+    out = RdmaStrategy()._find_source_instances(_rdma_ctx(instances))
+    observed = {call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list}
+    assert len(out) == 3
+    assert observed["topology_matched"] == 1
+
+
+def test_find_source_instances_without_policy_omits_topology_stage(monkeypatch):
+    # With the feature off the stage would only duplicate accelerator_matched.
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_DOMAIN", raising=False)
+    RdmaStrategy()._find_source_instances(_rdma_ctx([_zone_ref("s0aaaaaaaaaaaaaa", "w0", "az2")]))
+    stages = {call.args[1] for call in m.observe_candidates.call_args_list}
+    assert "topology_matched" not in stages
+
+
+def test_find_source_instances_required_zone_warns_when_none_match(monkeypatch, caplog):
+    # Targets upgraded before sources: compatible sources exist but none
+    # published the zone, so the warning must say why nothing was selected.
+    _require_zone(monkeypatch, "az1")
+    instances = [
+        _zone_ref("s0aaaaaaaaaaaaaa", "old-0", None),
+        _zone_ref("s1aaaaaaaaaaaaaa", "far-0", "az2"),
+    ]
+    with caplog.at_level(logging.WARNING, logger="modelexpress.topology"):
+        assert RdmaStrategy()._find_source_instances(_rdma_ctx(instances)) == []
+    assert "No P2P source shares zone='az1'" in caplog.text
+    assert "2 compatible source(s), 1 without published 'zone'" in caplog.text
 
 
 def test_find_source_instances_empty_accelerator_is_compatible():
@@ -542,6 +661,7 @@ def test_load_metadata_miss_tries_next_candidate():
     strat._fetch_worker_metadata = MagicMock(side_effect=[None, worker])
     strat._load_as_target = MagicMock(return_value="loaded")
     ctx = MagicMock(global_rank=0)
+    ctx.is_reload = False
     ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
     with pytest.MonkeyPatch.context() as mp:
@@ -683,6 +803,7 @@ def test_load_transfer_failure_reinitializes_and_tries_next_source():
         metadata={"retry": True},
     )
     ctx = MagicMock(global_rank=0)
+    ctx.is_reload = False
     ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
     ctx.adapter.reinit_for_retry.return_value = retry_result
 
@@ -748,6 +869,7 @@ def test_load_internal_reinit_is_visible_after_later_metadata_miss():
     )
     ctx = MagicMock(global_rank=0)
     ctx.accelerator_backend.name = ""
+    ctx.is_reload = False
     original_model = MagicMock(name="original-model")
     original_result = LoadResult(value=original_model, model=original_model)
 
@@ -779,6 +901,7 @@ def test_load_internal_reinit_then_clean_failure_stays_clean():
     )
     ctx = MagicMock(global_rank=0)
     ctx.accelerator_backend.name = ""
+    ctx.is_reload = False
     ctx.adapter.reinit_for_retry.return_value = MagicMock(name="retry-result")
 
     with pytest.raises(StrategyFailed, match="clean failure") as exc:
@@ -805,6 +928,26 @@ def test_load_last_candidate_mutated_failure_propagates_mutated():
     ctx.adapter.reinit_for_retry.assert_not_called()
 
 
+def test_load_reload_retries_next_candidate_without_reinit():
+    """A reload target is the engine's live model; the next candidate
+    overwrites it in place instead of on a rebuilt model."""
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=[StrategyFailed("receive failed", mutated=True), "loaded"]
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+    ctx.is_reload = True
+    model = MagicMock(name="live-model")
+    result = LoadResult(value=model, model=model)
+
+    assert strat.load(result, ctx) == "loaded"
+    ctx.adapter.reinit_for_retry.assert_not_called()
+    assert strat._load_as_target.call_args_list[1].args[0].model is model
+
+
 def test_load_reinit_failure_is_unrecoverable():
     strat = RdmaStrategy()
     strat._find_source_instances = MagicMock(return_value=_sources(2))
@@ -814,6 +957,7 @@ def test_load_reinit_failure_is_unrecoverable():
     )
     ctx = MagicMock(global_rank=0)
     ctx.accelerator_backend.name = ""
+    ctx.is_reload = False
     ctx.adapter.reinit_for_retry.side_effect = RuntimeError("reinit failed")
 
     with pytest.raises(StrategyRecoveryError, match="reinit failed") as exc:
@@ -917,6 +1061,7 @@ def test_load_records_success_metrics(monkeypatch):
     strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
     strat._load_as_target = MagicMock(return_value="loaded")
     ctx = MagicMock(global_rank=0)
+    ctx.is_reload = False
     ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
     assert strat.load(MagicMock(), ctx) == "loaded"
@@ -939,6 +1084,7 @@ def test_load_records_transfer_fallback_metrics(monkeypatch):
         side_effect=StrategyFailed("receive failed", mutated=True)
     )
     ctx = MagicMock(global_rank=0)
+    ctx.is_reload = False
     ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
     with pytest.raises(StrategyFailed):
@@ -1105,7 +1251,7 @@ class TestSourceLoadPresence:
         from types import SimpleNamespace
         from modelexpress import p2p_pb2
         return SimpleNamespace(
-            identity=p2p_pb2.SourceIdentity(model_name="m", mx_version="0.7.0"),
+            identity=p2p_pb2.SourceIdentity(model_name="m", mx_version="0.8.0"),
             worker_id="target-0",
             worker_rank=0,
             model_name="m",
@@ -1217,6 +1363,7 @@ def _phase_series(collector):
 def _receiving_ctx():
     """A context whose adapter and NIXL manager accept everything."""
     ctx = MagicMock(global_rank=0)
+    ctx.is_reload = False
     ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
     ctx.nixl_manager.receive_from_source.return_value = (0, 0, 0.0)
     ctx.nixl_manager.add_remote_agent.return_value = "peer"
@@ -1250,7 +1397,10 @@ def test_a_successful_attempt_records_every_phase_once_and_they_nest_in_the_tran
     strat._fetch_worker_metadata = MagicMock(return_value=_centralized_source())
     ctx = _receiving_ctx()
 
-    strat.load(MagicMock(), ctx)
+    model = MagicMock()
+    result = LoadResult(value=model, model=model)
+    with _strategy_phases(strat, result, ctx):
+        strat.load(result, ctx)
 
     phases, transfer = _phase_series(collector)
     assert {p for p, _ in phases} == {
@@ -1258,7 +1408,10 @@ def test_a_successful_attempt_records_every_phase_once_and_they_nest_in_the_tran
     }, phases
     assert all(outcome == "ok" for _, outcome in phases), phases
     assert all(count == 1.0 for count, _ in phases.values()), phases
-    inside = sum(s for (p, _), (_, s) in phases.items() if p != "metadata")
+    # prepare and finalize are run by the chain around the strategy, so unlike
+    # the rest they sit outside the transfer span rather than nested in it.
+    outside = {"metadata", "prepare", "finalize"}
+    inside = sum(s for (p, _), (_, s) in phases.items() if p not in outside)
     assert inside <= transfer, (
         f"phases inside the transfer summed to {inside:.6f}s but the transfer took "
         f"{transfer:.6f}s; a phase is recorded outside the span or from two sites"
@@ -1280,8 +1433,11 @@ def test_a_receive_that_raises_is_recorded_as_an_error_in_that_phase(monkeypatch
     ctx = _receiving_ctx()
     ctx.nixl_manager.receive_from_source.side_effect = RuntimeError("READ timed out")
 
+    model = MagicMock()
+    result = LoadResult(value=model, model=model)
     with pytest.raises(StrategyFailed):
-        strat.load(MagicMock(), ctx)
+        with _strategy_phases(strat, result, ctx):
+            strat.load(result, ctx)
 
     phases, _ = _phase_series(collector)
     by_phase = {p: outcome for p, outcome in phases}
@@ -1330,3 +1486,53 @@ def test_an_unknown_phase_is_dropped_and_an_unknown_outcome_clamps(monkeypatch):
     collector.observe_source_attempt_phase_seconds("random", "receive", "not_an_outcome", 1.0)
     phases, _ = _phase_series(collector)
     assert set(phases) == {("receive", "error")}, phases
+
+
+def test_required_zone_all_sources_cross_domain_falls_through_chain(monkeypatch):
+    """End to end through the chain: every source is in another zone.
+
+    RDMA must not fetch metadata from (or attempt) any source, and the chain
+    must hand the unmutated model to the next strategy.
+    """
+    from modelexpress.load_strategy import execute_load_strategies
+
+    _require_zone(monkeypatch, "az1")
+    monkeypatch.setattr(RdmaStrategy, "is_available", lambda self, ctx: True)
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.publish_source_if_supported", lambda result, ctx: None
+    )
+
+    class NextStrategy:
+        name = "next"
+        calls = []
+
+        def is_available(self, ctx):
+            return True
+
+        def prepare(self, result, ctx):
+            pass
+
+        def load(self, result, ctx):
+            self.calls.append(result.model)
+            return result
+
+        def finalize(self, result, ctx):
+            pass
+
+        def abort(self, result, ctx):
+            pass
+
+        def rollback(self, ctx):
+            pass
+
+    instances = [_zone_ref(f"s{i}aaaaaaaaaaaaaa", f"far-{i}", "az2") for i in range(4)]
+    ctx = _rdma_ctx(instances)
+    ctx.nixl_manager = None
+    model = MagicMock()
+    rdma = RdmaStrategy()
+    rdma._load_as_target = MagicMock()
+
+    assert execute_load_strategies(model, ctx, [rdma, NextStrategy()]) is model
+    assert NextStrategy.calls == [model]
+    ctx.mx_client.get_metadata.assert_not_called()
+    rdma._load_as_target.assert_not_called()
