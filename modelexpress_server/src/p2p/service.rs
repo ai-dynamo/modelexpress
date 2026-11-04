@@ -35,7 +35,7 @@ enum PodClaimCheck {
     /// the claim cannot be checked against anything. The publish proceeds with
     /// the ownership fields cleared, which costs garbage collection rather than
     /// the record.
-    Drop(String),
+    Drop(&'static str),
     /// The claim contradicts the verified caller.
     Reject(String),
 }
@@ -87,8 +87,7 @@ fn check_pod_claim(
         }
         _ => PodClaimCheck::Drop(
             "caller token carries no bound pod identity, so the asserted pod ownership cannot be \
-             verified; publishing without an ownerReference"
-                .to_string(),
+             verified; publishing without an ownerReference",
         ),
     }
 }
@@ -156,11 +155,11 @@ fn legacy_worker_tensor_count(worker: &WorkerMetadata) -> usize {
 impl P2pService for P2pServiceImpl {
     async fn publish_metadata(
         &self,
-        request: Request<PublishMetadataRequest>,
+        mut request: Request<PublishMetadataRequest>,
     ) -> Result<Response<PublishMetadataResponse>, Status> {
         // Taken before `into_inner()`, which consumes the message and drops the
         // extensions the auth layer attached the verified caller to.
-        let caller = request.extensions().get::<CallerIdentity>().cloned();
+        let caller = request.extensions_mut().remove::<CallerIdentity>();
         let req = request.into_inner();
 
         let identity = match req.identity {
@@ -210,11 +209,21 @@ impl P2pService for P2pServiceImpl {
         ) {
             PodClaimCheck::Accept => (req.pod_name, req.pod_uid, req.pod_namespace),
             PodClaimCheck::Drop(reason) => {
-                warn!("PublishMetadata: {reason}");
+                warn!(
+                    caller_namespace = caller.as_ref().map(|c| c.namespace.as_str()),
+                    caller_service_account = caller.as_ref().map(|c| c.service_account.as_str()),
+                    worker_id = %req.worker_id,
+                    "PublishMetadata: {reason}"
+                );
                 (String::new(), String::new(), String::new())
             }
             PodClaimCheck::Reject(reason) => {
-                warn!("PublishMetadata: rejected pod ownership claim: {reason}");
+                warn!(
+                    caller_namespace = caller.as_ref().map(|c| c.namespace.as_str()),
+                    caller_service_account = caller.as_ref().map(|c| c.service_account.as_str()),
+                    worker_id = %req.worker_id,
+                    "PublishMetadata: rejected pod ownership claim: {reason}"
+                );
                 return tagged(
                     PublishMetadataResponse {
                         success: false,
