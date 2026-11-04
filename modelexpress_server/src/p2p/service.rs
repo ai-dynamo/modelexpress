@@ -52,9 +52,12 @@ fn check_pod_claim(
     pod_uid: &str,
     pod_namespace: &str,
 ) -> PodClaimCheck {
-    // Nothing asserted means no ownerReference is set downstream, so there is
-    // no ownership to forge.
-    if pod_name.is_empty() && pod_uid.is_empty() && pod_namespace.is_empty() {
+    // An incomplete claim (any of the three fields empty, including all of
+    // them) never becomes an ownerReference: the Kubernetes backend omits it
+    // unless name, UID and namespace are all present. There is no ownership to
+    // forge, and DEPLOYMENT.md promises that partial identity does not block
+    // publication, so it passes through exactly as it did before this check.
+    if pod_name.is_empty() || pod_uid.is_empty() || pod_namespace.is_empty() {
         return PodClaimCheck::Accept;
     }
 
@@ -586,6 +589,27 @@ mod tests {
         // No ownerReference is set downstream, so there is nothing to forge.
         let c = caller("team-a", Some("worker-0"), Some("uid-0"));
         assert_eq!(check_pod_claim(Some(&c), "", "", ""), PodClaimCheck::Accept);
+    }
+
+    #[test]
+    fn pod_claim_accepts_a_partial_claim() {
+        // A client that only sets POD_NAMESPACE (or any other incomplete subset)
+        // never produced an ownerReference, and partial identity is documented
+        // as not blocking publication, so a bound-pod token must not turn it
+        // into a rejection.
+        let c = caller("team-a", Some("worker-0"), Some("uid-0"));
+        assert_eq!(
+            check_pod_claim(Some(&c), "", "", "team-a"),
+            PodClaimCheck::Accept
+        );
+        assert_eq!(
+            check_pod_claim(Some(&c), "worker-0", "", "team-a"),
+            PodClaimCheck::Accept
+        );
+        assert_eq!(
+            check_pod_claim(Some(&c), "", "uid-0", ""),
+            PodClaimCheck::Accept
+        );
     }
 
     #[test]

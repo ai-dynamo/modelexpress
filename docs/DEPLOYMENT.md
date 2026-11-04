@@ -168,6 +168,14 @@ partial, or cross-namespace identity does not block publication; ModelExpress
 omits the owner reference and retains the previous reaper-based lifecycle. Redis
 and non-Kubernetes deployments ignore these fields.
 
+With [ServiceAccount authentication](#serviceaccount-authentication) enabled, a
+complete identity is also checked against the caller's verified token. A
+`POD_NAMESPACE` that differs from the ServiceAccount's namespace, or a
+`POD_NAME`/`POD_UID` that differs from the pod the token is bound to, rejects
+the publish. A token with no bound pod cannot confirm the claim, so the record is
+published without an owner reference. Partial identity is not checked and
+behaves as above.
+
 #### Storage access modes
 
 MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS_CACHE_DIRECTORY`, default `./cache`). Its access-mode requirement depends on deployment topology, not on MX itself:
