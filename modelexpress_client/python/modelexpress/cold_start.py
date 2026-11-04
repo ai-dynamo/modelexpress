@@ -17,6 +17,7 @@ from .metadata.payload import accelerators_compatible
 
 logger = logging.getLogger(__name__)
 LEASE_TTL = 60
+LEASE_RPC_TIMEOUT = 10
 RENEW_INTERVAL = 20
 POLL_INTERVAL = 2
 RPC_RETRY_WINDOW = 3
@@ -48,6 +49,7 @@ class DonorLease:
     def __init__(self, ctx, token, ranks, acquired_at):
         self.ctx, self.token, self.ranks = ctx, token, ranks
         self.deadline = acquired_at + LEASE_TTL
+        self.renewal_end = acquired_at + envs.MX_P2P_COLD_START_WAIT_TIMEOUT_SECS
         self.stopped = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -56,9 +58,12 @@ class DonorLease:
     def _run(self):
         interval = RENEW_INTERVAL
         while not self.stopped.wait(
-            min(interval, max(0, self.deadline - time.monotonic()))
+            min(interval, max(0, min(self.deadline, self.renewal_end) - time.monotonic()))
         ):
             started = time.monotonic()
+            if started >= self.renewal_end:
+                logger.warning("MX donor lease renewal limit reached; releasing lease")
+                break
             if started >= self.deadline:
                 logger.error("MX donor lease renewal deadline passed; ownership is unknown")
                 return
@@ -68,6 +73,7 @@ class DonorLease:
                     self.token,
                     p2p_pb2.DONOR_LEASE_ACTION_RENEW,
                     LEASE_TTL,
+                    timeout=min(LEASE_RPC_TIMEOUT, self.renewal_end - started),
                 ):
                     logger.error("MX donor lease was lost")
                     return
@@ -77,8 +83,11 @@ class DonorLease:
                 continue
             self.deadline = started + LEASE_TTL
             interval = RENEW_INTERVAL
+            remaining = self.renewal_end - time.monotonic()
+            if remaining <= 0:
+                continue
             try:
-                if _ready(self.ctx, self.ranks):
+                if _ready(self.ctx, self.ranks, timeout=min(30, remaining)):
                     break
             except Exception:
                 logger.exception("MX donor readiness check failed; continuing lease renewal")
@@ -171,7 +180,7 @@ def coordinate(ctx, expected):
                             raise TimeoutError("MX cold start wait deadline expired") from exc
                         raise
 
-        def release():
+        def release(timeout):
             nonlocal acquired
             try:
                 ctx.mx_client.donor_lease(
@@ -179,7 +188,7 @@ def coordinate(ctx, expected):
                     token,
                     p2p_pb2.DONOR_LEASE_ACTION_RELEASE,
                     LEASE_TTL,
-                    timeout=min(10, remaining()),
+                    timeout=timeout,
                 )
             except Exception:
                 logger.warning("MX donor lease release failed or timed out; it will expire")
@@ -198,14 +207,14 @@ def coordinate(ctx, expected):
                     token,
                     p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE,
                     LEASE_TTL,
-                    rpc_timeout=10,
+                    rpc_timeout=LEASE_RPC_TIMEOUT,
                     acquiring=True,
                 )
                 if acquired:
                     ready = call_with_deadline(_ready, ctx, ranks, rpc_timeout=30)
                     remaining()
                     if ready:
-                        release()
+                        release(min(LEASE_RPC_TIMEOUT, remaining()))
                         decision = ("follower", "")
                     else:
                         ctx.donor_lease = DonorLease(ctx, token, ranks, acquired_at)
@@ -214,8 +223,9 @@ def coordinate(ctx, expected):
                     break
                 time.sleep(min(POLL_INTERVAL, remaining()))
         except Exception as exc:
-            if acquired:
-                release()
+            if token is not None:
+                # An acquire RPC may succeed remotely despite a failed response.
+                release(1)
             if isinstance(exc, TimeoutError) or time.monotonic() >= deadline:
                 logger.warning(
                     "MX cold start wait timed out; skipping RDMA for this replica"
@@ -227,5 +237,5 @@ def coordinate(ctx, expected):
                 )
             decision = ("fallback", "")
     role, _ = ctx.adapter.broadcast_state(decision)
-    ctx.skip_rdma = role == "fallback"
+    ctx.skip_rdma = role in ("donor", "fallback")
     logger.info("MX cold start: %s", role)

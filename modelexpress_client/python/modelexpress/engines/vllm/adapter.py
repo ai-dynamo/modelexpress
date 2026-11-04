@@ -59,6 +59,9 @@ def cold_start_expected_workers(vllm_config) -> int:
     parallel = vllm_config.parallel_config
     if getattr(parallel, "enable_elastic_ep", False):
         raise RuntimeError("MX cold start does not support elastic expert parallelism")
+    for name in ("prefill_context_parallel_size", "decode_context_parallel_size"):
+        if (getattr(parallel, name, 1) or 1) > 1:
+            raise RuntimeError("MX cold start does not support context parallelism")
     expected = 1
     for name in (
         "tensor_parallel_size",

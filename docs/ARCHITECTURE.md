@@ -387,20 +387,21 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 
 With `MX_P2P_COLD_START=1`, rank zero of each fixed vLLM worker group
 checks for READY sources and competes for a Redis lease per source identity.
-The lease holder loads through the existing strategy chain; followers wait for
-compatible READY ranks before using the same chain. If coordination fails or the
-configured election wait expires, replicas continue with the normal chain and can
-load concurrently from storage. Other loading failures can still prevent startup.
+The lease holder skips RDMA in the strategy chain; followers wait for compatible
+READY ranks before using the chain. If coordination fails or the configured
+election wait expires, replicas also skip RDMA and can load concurrently from
+storage. Other loading failures can still prevent startup.
 Publication is not fenced:
 an expired donor can still finish and publish, and normal P2P fallback remains
 available. READY ranks need not belong to the same replica. The world group must
-match TP × PP × DP × prefill-context parallelism, with contiguous global worker
-ranks; elastic EP and larger external-DP groups are rejected. The opt-in source
+match TP × PP × DP, with contiguous global worker ranks; prefill and decode
+context parallelism greater than one, elastic EP and larger external-DP groups
+are rejected by the opt-in path. The opt-in source
 identity includes DP and prefill/decode context parallelism, so it does not reuse
 sources published without the opt-in. Speculative drafts do not run election:
 same-checkpoint drafts use the existing publication gate, while separate draft
-checkpoints use the ordinary storage fallback. The newly enabled configurations
-have not yet been validated end to end on GPUs.
+checkpoints use the ordinary storage fallback. TP, DP, and PP have been
+validated on GPUs; expert parallelism has not been validated end to end on GPUs.
 
 ### RL refit service
 

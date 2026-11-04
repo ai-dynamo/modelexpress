@@ -614,16 +614,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
     async fn donor_lease_service_uses_redis_and_fences_owners() {
         use crate::metrics::backend::BackendMetrics;
         use crate::p2p::backend::instrumented::InstrumentedMetadataBackend;
         use crate::p2p::backend::redis::RedisBackend;
         use prometheus_client::registry::Registry;
 
-        let Ok(url) = std::env::var("MX_TEST_REDIS_URL").or_else(|_| std::env::var("REDIS_URL"))
-        else {
-            return;
-        };
+        let url = std::env::var("MX_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
         let metrics = BackendMetrics::register(&mut Registry::default());
         let backend = InstrumentedMetadataBackend::wrap(Arc::new(RedisBackend::new(&url)), metrics);
         let svc = P2pServiceImpl::new(Arc::new(P2pStateManager::with_backend(backend)));

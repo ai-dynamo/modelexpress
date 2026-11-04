@@ -84,7 +84,7 @@ def test_first_contender_becomes_donor():
     ):
         cold_start.coordinate(ctx, 2)
     assert ctx.adapter.broadcast_state.call_args.args[0][0] == "donor"
-    assert ctx.skip_rdma is False
+    assert ctx.skip_rdma is True
     assert ctx.donor_lease is lease.return_value
     assert (
         ctx.mx_client.donor_lease.call_args.args[2]
@@ -208,6 +208,18 @@ def test_nonzero_rank_uses_broadcast_decision():
     assert ctx.skip_rdma is False
 
 
+def test_nonzero_donor_rank_skips_rdma():
+    ctx = context()
+    ctx.global_rank = 1
+    ctx.adapter.broadcast_state.side_effect = None
+    ctx.adapter.broadcast_state.return_value = ("donor", "")
+    cold_start.coordinate(ctx, 2)
+    ctx.mx_client.list_sources.assert_not_called()
+    ctx.mx_client.donor_lease.assert_not_called()
+    ctx.adapter.broadcast_state.assert_called_once_with(None)
+    assert ctx.skip_rdma is True
+
+
 def test_renews_before_checking_ready():
     ctx = context()
     ctx.mx_client.donor_lease.return_value = True
@@ -229,6 +241,7 @@ def run_lease(ctx, renew, ready, wait=None):
     lease = cold_start.DonorLease.__new__(cold_start.DonorLease)
     lease.ctx, lease.token, lease.ranks = ctx, "token", 2
     lease.deadline = 60
+    lease.renewal_end = 600
     lease.stopped = MagicMock()
     lease.stopped.wait.side_effect = wait or [False, False, True]
     with (
@@ -265,6 +278,7 @@ def test_persistent_renewal_failure_stops_at_deadline(caplog):
     lease = cold_start.DonorLease.__new__(cold_start.DonorLease)
     lease.ctx, lease.token, lease.ranks = ctx, "token", 2
     lease.deadline = 5
+    lease.renewal_end = 600
     lease.stopped = MagicMock()
     lease.stopped.wait.return_value = False
     ctx.mx_client.donor_lease.side_effect = RuntimeError("unavailable")
@@ -288,15 +302,98 @@ def test_slow_readiness_check_does_not_delay_next_renewal():
     lease = cold_start.DonorLease.__new__(cold_start.DonorLease)
     lease.ctx, lease.token, lease.ranks = ctx, "token", 2
     lease.deadline = 60
+    lease.renewal_end = 600
     lease.stopped = MagicMock()
     lease.stopped.wait.side_effect = [False, True]
     ctx.mx_client.donor_lease.return_value = True
     with (
-        patch.object(cold_start.time, "monotonic", side_effect=[0, 1, 31, 31]),
+        patch.object(cold_start.time, "monotonic", side_effect=[0, 1, 1, 31, 31]),
         patch.object(cold_start, "_ready", return_value=False),
     ):
         lease._run()
     assert lease.stopped.wait.call_args_list[1].args == (0,)
+
+
+
+
+def test_donor_renewal_cap_uses_configured_timeout(monkeypatch):
+    ctx = context()
+    monkeypatch.setattr(cold_start.envs, "MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", 45)
+    with (
+        patch.object(cold_start.threading, "Thread") as thread,
+        patch.object(cold_start.atexit, "register"),
+    ):
+        lease = cold_start.DonorLease(ctx, "token", 2, 100)
+    assert lease.renewal_end == 145
+    thread.return_value.start.assert_called_once()
+
+
+def test_renewal_cap_releases_without_stopping_donor(monkeypatch, caplog):
+    ctx = context()
+    clock = FakeClock()
+    monkeypatch.setattr(cold_start.time, "monotonic", clock.monotonic)
+    lease = cold_start.DonorLease.__new__(cold_start.DonorLease)
+    lease.ctx, lease.token, lease.ranks = ctx, "token", 2
+    lease.deadline = 60
+    lease.renewal_end = 45
+    lease.stopped = MagicMock()
+    lease.stopped.wait.side_effect = lambda seconds: clock.sleep(seconds) or False
+    ctx.mx_client.donor_lease.return_value = True
+    with patch.object(cold_start, "_ready", return_value=False):
+        lease._run()
+    assert clock.now == 45
+    assert [call.args[2] for call in ctx.mx_client.donor_lease.call_args_list] == [
+        p2p_pb2.DONOR_LEASE_ACTION_RENEW,
+        p2p_pb2.DONOR_LEASE_ACTION_RENEW,
+        p2p_pb2.DONOR_LEASE_ACTION_RELEASE,
+    ]
+    assert ctx.mx_client.donor_lease.call_args.args[1] == "token"
+    assert "renewal limit reached" in caplog.text
+    lease.stopped.set.assert_not_called()
+
+
+def test_renewal_rpc_is_bounded_by_remaining_cap(monkeypatch):
+    ctx = context()
+    clock = FakeClock()
+    monkeypatch.setattr(cold_start.time, "monotonic", clock.monotonic)
+    lease = cold_start.DonorLease.__new__(cold_start.DonorLease)
+    lease.ctx, lease.token, lease.ranks = ctx, "token", 2
+    lease.deadline = 60
+    lease.renewal_end = 25
+    lease.stopped = MagicMock()
+    lease.stopped.wait.side_effect = lambda seconds: clock.sleep(seconds) or False
+
+    def rpc(*args, timeout=10):
+        if args[2] == p2p_pb2.DONOR_LEASE_ACTION_RENEW:
+            assert timeout == 5
+            clock.sleep(timeout)
+            raise RuntimeError("RPC timed out")
+        return True
+
+    ctx.mx_client.donor_lease.side_effect = rpc
+    with patch.object(cold_start, "_ready") as ready:
+        lease._run()
+    ready.assert_not_called()
+    assert [call.args[2] for call in ctx.mx_client.donor_lease.call_args_list] == [
+        p2p_pb2.DONOR_LEASE_ACTION_RENEW,
+        p2p_pb2.DONOR_LEASE_ACTION_RELEASE,
+    ]
+    assert clock.now == 25
+
+
+def test_cap_release_failure_does_not_raise(monkeypatch, caplog):
+    ctx = context()
+    lease = cold_start.DonorLease.__new__(cold_start.DonorLease)
+    lease.ctx, lease.token, lease.ranks = ctx, "token", 2
+    lease.deadline = 60
+    lease.renewal_end = 5
+    lease.stopped = MagicMock()
+    lease.stopped.wait.return_value = False
+    ctx.mx_client.donor_lease.side_effect = RuntimeError("unavailable")
+    monkeypatch.setattr(cold_start.time, "monotonic", lambda: 5)
+    lease._run()
+    assert ctx.mx_client.donor_lease.call_args.args[2] == p2p_pb2.DONOR_LEASE_ACTION_RELEASE
+    assert "it will expire" in caplog.text
 
 
 def test_acquisition_deadline_starts_before_acquire_rpc():
@@ -314,16 +411,14 @@ def test_acquisition_deadline_starts_before_acquire_rpc():
 @pytest.mark.parametrize("overrides", [
     {"pipeline_parallel_size": 2},
     {"data_parallel_size": 2},
-    {"prefill_context_parallel_size": 2},
     {"data_parallel_size": 2, "enable_expert_parallel": True},
-    {"decode_context_parallel_size": 2},
 ])
 def test_parallel_worker_groups(overrides):
     ctx = context()
     cfg = config()
     for name, value in overrides.items():
         setattr(cfg.parallel_config, name, value)
-    count = 2 * (1 if "decode_context_parallel_size" in overrides else 2)
+    count = 4
     ctx.adapter.all_gather_state.side_effect = lambda value: tuple(
         (value[0], rank, rank) for rank in range(count)
     )
@@ -342,13 +437,32 @@ def test_mismatched_worker_group_is_rejected():
     ctx.mx_client.list_sources.assert_not_called()
 
 
-def test_elastic_ep_rejected_before_collectives():
-    ctx = context()
+def test_elastic_ep_rejected():
     cfg = config()
     cfg.parallel_config.enable_elastic_ep = True
     with pytest.raises(RuntimeError, match="elastic"):
         cold_start_expected_workers(cfg)
-    ctx.adapter.all_gather_state.assert_not_called()
+
+
+@pytest.mark.parametrize("name", [
+    "prefill_context_parallel_size",
+    "decode_context_parallel_size",
+])
+def test_context_parallel_rejected(name):
+    cfg = config()
+    setattr(cfg.parallel_config, name, 2)
+    with pytest.raises(RuntimeError, match="context parallelism"):
+        cold_start_expected_workers(cfg)
+
+
+@pytest.mark.parametrize("name", [
+    "prefill_context_parallel_size",
+    "decode_context_parallel_size",
+])
+def test_context_parallel_size_one_allowed(name):
+    cfg = config()
+    setattr(cfg.parallel_config, name, 1)
+    assert cold_start_expected_workers(cfg) == 2
 
 
 def test_speculative_config_does_not_reject_main():
@@ -406,7 +520,7 @@ def test_rpc_deadline_falls_back_and_bounds_timeout(monkeypatch, operation):
 
     def lease(identity, token, action, ttl, timeout):
         assert 0 < timeout <= 5
-        if operation == "acquire":
+        if operation == "acquire" and action == p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE:
             clock.now += timeout
             raise RuntimeError("RPC deadline exceeded")
         return True
@@ -419,6 +533,43 @@ def test_rpc_deadline_falls_back_and_bounds_timeout(monkeypatch, operation):
         cold_start.coordinate(ctx, 2)
     assert ctx.adapter.broadcast_state.call_args.args[0] == ("fallback", "")
     assert all(0 < t <= 5 for t in calls)
+
+
+@pytest.mark.parametrize("release_fails", [False, True])
+def test_failed_acquire_releases_token_after_deadline(monkeypatch, release_fails):
+    ctx = context()
+    clock = FakeClock()
+    monkeypatch.setenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", "5")
+
+    def lease(identity, token, action, ttl, timeout):
+        if action == p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE:
+            clock.now += timeout
+            raise RuntimeError("acquire response lost")
+        if release_fails:
+            raise RuntimeError("release failed")
+        return True
+
+    ctx.mx_client.donor_lease.side_effect = lease
+    with (
+        patch.object(cold_start.time, "monotonic", clock.monotonic),
+        patch.object(cold_start, "_ready", return_value=False),
+    ):
+        cold_start.coordinate(ctx, 2)
+
+    acquire, release = ctx.mx_client.donor_lease.call_args_list
+    assert acquire.args[2] == p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE
+    assert release.args[2] == p2p_pb2.DONOR_LEASE_ACTION_RELEASE
+    assert acquire.args[1] == release.args[1]
+    assert release.kwargs["timeout"] == 1
+    assert ctx.adapter.broadcast_state.call_args.args[0] == ("fallback", "")
+
+
+def test_failed_initial_discovery_does_not_release():
+    ctx = context()
+    with patch.object(cold_start, "_ready", side_effect=RuntimeError("unavailable")):
+        cold_start.coordinate(ctx, 2)
+    ctx.mx_client.donor_lease.assert_not_called()
+    assert ctx.adapter.broadcast_state.call_args.args[0] == ("fallback", "")
 
 
 def test_timeout_decision_broadcast_to_other_ranks():
@@ -536,6 +687,7 @@ def test_persistent_acquire_failure_falls_back():
         p2p_pb2.DONOR_LEASE_ACTION_ACQUIRE,
         p2p_pb2.DONOR_LEASE_ACTION_RENEW,
         p2p_pb2.DONOR_LEASE_ACTION_RENEW,
+        p2p_pb2.DONOR_LEASE_ACTION_RELEASE,
     ]
     assert len({call.args[1] for call in calls}) == 1
     assert clock.now == cold_start.RPC_RETRY_WINDOW
