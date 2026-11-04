@@ -56,7 +56,7 @@ class DonorLease:
         atexit.register(self.stop)
 
     def _run(self):
-        interval = RENEW_INTERVAL
+        interval = max(0, self.deadline - LEASE_TTL + RENEW_INTERVAL - time.monotonic())
         while not self.stopped.wait(
             min(interval, max(0, min(self.deadline, self.renewal_end) - time.monotonic()))
         ):

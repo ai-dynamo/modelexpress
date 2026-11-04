@@ -253,6 +253,28 @@ def run_lease(ctx, renew, ready, wait=None):
     return lease
 
 
+def test_slow_election_renews_immediately(monkeypatch):
+    ctx = context()
+    clock = FakeClock()
+    clock.now = 42
+    monkeypatch.setattr(cold_start.time, "monotonic", clock.monotonic)
+    lease = cold_start.DonorLease.__new__(cold_start.DonorLease)
+    lease.ctx, lease.token, lease.ranks = ctx, "token", 2
+    lease.deadline = 60
+    lease.renewal_end = 600
+    lease.stopped = MagicMock()
+    lease.stopped.wait.side_effect = lambda seconds: clock.sleep(seconds) or False
+    ctx.mx_client.donor_lease.return_value = True
+    with patch.object(cold_start, "_ready", return_value=True):
+        lease._run()
+    assert lease.stopped.wait.call_args_list[0].args == (0,)
+    assert clock.now == 42
+    assert [call.args[2] for call in ctx.mx_client.donor_lease.call_args_list] == [
+        p2p_pb2.DONOR_LEASE_ACTION_RENEW,
+        p2p_pb2.DONOR_LEASE_ACTION_RELEASE,
+    ]
+
+
 def test_transient_renewal_failure_retries_and_releases():
     ctx = context()
     run_lease(ctx, [RuntimeError("unavailable"), True, True], [True])
@@ -282,7 +304,7 @@ def test_persistent_renewal_failure_stops_at_deadline(caplog):
     lease.stopped = MagicMock()
     lease.stopped.wait.return_value = False
     ctx.mx_client.donor_lease.side_effect = RuntimeError("unavailable")
-    with patch.object(cold_start.time, "monotonic", side_effect=[0, 1, 3, 5]):
+    with patch.object(cold_start.time, "monotonic", side_effect=[0, 0, 1, 3, 5]):
         lease._run()
     assert ctx.mx_client.donor_lease.call_count == 1
     assert "MX donor lease renewal deadline passed" in caplog.text
@@ -307,7 +329,7 @@ def test_slow_readiness_check_does_not_delay_next_renewal():
     lease.stopped.wait.side_effect = [False, True]
     ctx.mx_client.donor_lease.return_value = True
     with (
-        patch.object(cold_start.time, "monotonic", side_effect=[0, 1, 1, 31, 31]),
+        patch.object(cold_start.time, "monotonic", side_effect=[0, 0, 1, 1, 31, 31]),
         patch.object(cold_start, "_ready", return_value=False),
     ):
         lease._run()
