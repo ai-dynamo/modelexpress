@@ -1037,7 +1037,6 @@ impl CollectiveBackend for RedisCollectiveBackend {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use modelexpress_common::grpc::refit_collective::LaneSpec;

@@ -33,7 +33,6 @@ pub struct ManifestEntry {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::super::model_name::{BucketName, ModelName};
     use super::*;

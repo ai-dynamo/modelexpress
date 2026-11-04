@@ -1034,7 +1034,6 @@ mod tests {
         assert!(sanitize_registry_name(".model.").starts_with("model-"));
     }
 
-    #[allow(clippy::expect_used)]
     /// Variant names of a unit-variant enum, read from its derived `Deserialize` impl.
     ///
     /// The derive hands the deserializer the complete variant list, so a new variant shows up
@@ -1076,7 +1075,6 @@ mod tests {
             .expect("type should deserialize as an enum and report its variants")
     }
 
-    #[allow(clippy::expect_used)]
     fn crd_string_enum(pointer: &str) -> BTreeSet<String> {
         let crd = serde_json::to_value(ModelCacheEntry::crd()).expect("CRD should serialize");
         let schema = crd
@@ -1097,7 +1095,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn crd_provider_enum_matches_every_model_provider() {
         let variants = serde_variant_names::<ModelProvider>();
         let providers: Vec<ModelProvider> = variants
@@ -1134,7 +1131,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn crd_phase_enum_matches_every_model_status() {
         let mut written = BTreeSet::from([String::new()]);
         for name in serde_variant_names::<ModelStatus>() {

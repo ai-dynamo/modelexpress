@@ -402,7 +402,6 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::super::{
         cache_manifest::{CacheManifest, ManifestEntry},

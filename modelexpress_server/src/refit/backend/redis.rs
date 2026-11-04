@@ -1073,7 +1073,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     /// Reject missing or malformed generations and preserve the full uint64 range.
     fn stored_versions_require_uint64_generation() {
         for generation in [None, Some("invalid"), Some("18446744073709551616")] {
@@ -1088,7 +1087,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     /// Decode the zero generation written for versions without a trainer mesh.
     fn stored_nonmesh_versions_have_generation_zero() {
         let version = version_from_hash(stored_version("", Some("0")))

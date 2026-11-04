@@ -37,7 +37,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_read_payload_json() {
         let payload = r#"{"key": "value", "number": 42}"#;
         let result = read_payload(Some(payload.to_string()), None)
@@ -56,7 +55,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_read_payload_empty() {
         let result = read_payload(None, None).expect("Should succeed when no payload is provided");
         assert!(result.is_none());

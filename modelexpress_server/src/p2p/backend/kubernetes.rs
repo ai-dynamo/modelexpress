@@ -885,7 +885,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn worker_status_topology_survives_serde_round_trip() {
         // The k8s backend stores WorkerStatus as CR JSON, so a non-empty
         // topology must survive the round trip. The deployed CRD schema must

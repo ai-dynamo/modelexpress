@@ -111,7 +111,6 @@ async fn reap_once(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::p2p::backend::{MockMetadataBackend, SourceInstanceInfo};

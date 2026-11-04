@@ -385,14 +385,12 @@ fn provider_sort_key(provider: ModelProvider) -> u8 {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::Utils;
     use tempfile::TempDir;
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_cache_config_from_path() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let config =
@@ -402,7 +400,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_cache_config_save_and_load() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let original_config = CacheConfig {
@@ -482,7 +479,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_cache_config_new_accepts_bare_host_port() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let config = CacheConfig::new(
@@ -495,7 +491,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_get_config_path() {
         let config_path = CacheConfig::get_config_path().expect("Failed to get config path");
 

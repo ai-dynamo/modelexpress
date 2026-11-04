@@ -940,7 +940,6 @@ impl ModelProviderTrait for HuggingFaceProvider {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, acquire_env_mutex};

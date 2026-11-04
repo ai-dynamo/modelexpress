@@ -176,7 +176,6 @@ impl ModelProviderTrait for GcsProvider {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod test_support {
     use super::{
         cache_manifest::{CacheManifest, ManifestEntry},
@@ -409,7 +408,6 @@ mod test_support {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::test_support::{
         TestStorageControlStub, expected_model_dir, gcs_object, manifest_entry, write_cached_model,

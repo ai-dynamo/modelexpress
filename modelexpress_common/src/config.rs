@@ -433,7 +433,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_load_config_file_strict_missing_file() {
         let non_existent_file = PathBuf::from("/non/existent/file.yaml");
         let result: Result<ConnectionConfig, ConfigError> =
@@ -447,7 +446,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_load_config_file_strict_valid_file() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let config_file = temp_dir.path().join("test_config.yaml");
@@ -468,7 +466,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_load_config_file_strict_invalid_yaml() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let config_file = temp_dir.path().join("invalid_config.yaml");
@@ -487,7 +484,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_load_config_file_strict_wrong_type() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let config_file = temp_dir.path().join("wrong_type_config.yaml");
@@ -504,7 +500,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_validate_config_file_same_as_strict() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let config_file = temp_dir.path().join("test_config.yaml");
