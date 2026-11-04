@@ -806,6 +806,107 @@ mod tests {
         assert_eq!(resp.worker_id, "worker-uuid-1");
     }
 
+    /// A publish request asserting a complete pod identity, carrying `caller` in
+    /// its extensions the way the auth layer attaches it.
+    fn publish_as(
+        caller: CallerIdentity,
+        pod_name: &str,
+        pod_uid: &str,
+        pod_namespace: &str,
+    ) -> Request<PublishMetadataRequest> {
+        let mut request = Request::new(PublishMetadataRequest {
+            identity: Some(test_identity()),
+            worker: Some(WorkerMetadata {
+                worker_rank: 0,
+                source_payload: empty_tensor_source(),
+                status: SourceStatus::Initializing as i32,
+                ..Default::default()
+            }),
+            worker_id: "worker-uuid-1".to_string(),
+            pod_name: pod_name.to_string(),
+            pod_uid: pod_uid.to_string(),
+            pod_namespace: pod_namespace.to_string(),
+        });
+        request.extensions_mut().insert(caller);
+        request
+    }
+
+    #[tokio::test]
+    async fn test_publish_metadata_rejects_a_forged_owner_before_writing() {
+        // The handler, not just check_pod_claim, has to see the verified caller:
+        // a claim naming someone else's pod must never reach the backend.
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_publish_metadata().never();
+
+        let svc = make_service(mock);
+        let resp = svc
+            .publish_metadata(publish_as(
+                caller("team-a", Some("worker-0"), Some("uid-0")),
+                "victim-pod",
+                "victim-uid",
+                "team-a",
+            ))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(!resp.success);
+        assert!(
+            resp.message.contains("does not match"),
+            "unexpected message: {}",
+            resp.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_metadata_clears_an_unverifiable_owner() {
+        // A token with no bound pod cannot vouch for the claim, so the backend
+        // must receive empty ownership fields and the publish still succeeds.
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_publish_metadata()
+            .withf(|_, _, _, pod_name, pod_uid, pod_namespace| {
+                pod_name.is_empty() && pod_uid.is_empty() && pod_namespace.is_empty()
+            })
+            .once()
+            .returning(|_, _, _, _, _, _| Ok(()));
+
+        let svc = make_service(mock);
+        let resp = svc
+            .publish_metadata(publish_as(
+                caller("team-a", None, None),
+                "worker-0",
+                "uid-0",
+                "team-a",
+            ))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(resp.success, "{}", resp.message);
+    }
+
+    #[tokio::test]
+    async fn test_publish_metadata_forwards_a_verified_owner() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_publish_metadata()
+            .withf(|_, _, _, pod_name, pod_uid, pod_namespace| {
+                pod_name == "worker-0" && pod_uid == "uid-0" && pod_namespace == "team-a"
+            })
+            .once()
+            .returning(|_, _, _, _, _, _| Ok(()));
+
+        let svc = make_service(mock);
+        let resp = svc
+            .publish_metadata(publish_as(
+                caller("team-a", Some("worker-0"), Some("uid-0")),
+                "worker-0",
+                "uid-0",
+                "team-a",
+            ))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(resp.success, "{}", resp.message);
+    }
+
     #[tokio::test]
     async fn test_publish_metadata_backend_error() {
         let mut mock = MockMetadataBackend::new();
