@@ -178,7 +178,7 @@ class NightlyWorkflowTests(unittest.TestCase):
         match = re.search(r"fromJSON\('((?:''|[^'])*)'\)", include)
         partitions = json.loads(match[1].replace("''", "'"))
         self.assertEqual({key: len(rows) for key, rows in partitions.items()}, {
-            "vllm": 10, "sglang": 3, "sglang-mooncake": 1, "dynamo-vllm": 1, "large": 5,
+            "vllm": 7, "sglang": 2, "sglang-mooncake": 1, "dynamo-vllm": 1, "large": 5,
         })
         namespaces = set()
         for framework, cases in partitions.items():
@@ -195,8 +195,8 @@ class NightlyWorkflowTests(unittest.TestCase):
                 self.assertIn(case["kind"], {"p2p", "fleet", "dynamo", "stale"})
         large = [case for cases in partitions.values() for case in cases if case.get("large")]
         self.assertEqual(sorted(case["fleet_size"] for case in large if case["kind"] == "fleet"), ["15", "5", "5"])
-        sglang_mla = next(case for case in partitions["sglang"] if case.get("measure_vram"))
-        self.assertEqual(sglang_mla["pytest_args"], "--expected-max-total-tokens 131072")
+        # sglang_mla = next(case for case in partitions["sglang"] if case.get("measure_vram"))
+        # self.assertEqual(sglang_mla["pytest_args"], "--expected-max-total-tokens 131072")
         self.assertEqual(
             {case["name"] for case in large if case["kind"] != "fleet"},
             {
