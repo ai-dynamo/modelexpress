@@ -989,6 +989,7 @@ def _build(
     objects,
     launch_tensors=None,
     checkpoint_max_size_gb=500,
+    background_seed_copy=False,
 ):
     launch = tmp_path / "launch"
     launch.mkdir(exist_ok=True)
@@ -1007,6 +1008,7 @@ def _build(
             refit_checkpoint_dir=tmp_path / "cache",
             refit_checkpoint_max_size_gb=checkpoint_max_size_gb,
         ),
+        background_seed_copy=background_seed_copy,
     )
     return adapter, storage
 
@@ -1084,7 +1086,7 @@ def test_object_storage_generator_config_defaults_cache_quota(tmp_path):
 def test_reset_initial_checkpoint_transitions_updating_to_ready(monkeypatch, tmp_path):
     events = []
     write_state = checkpoint_store_module.LocalCheckpointStore.write_state
-    copy2 = receiver_module.shutil.copy2
+    symlink_to = receiver_module.Path.symlink_to
 
     def track_state(self, *, status, version, checkpoint_paths, source=None):
         events.append(status.value)
@@ -1096,24 +1098,369 @@ def test_reset_initial_checkpoint_transitions_updating_to_ready(monkeypatch, tmp
             source=source,
         )
 
-    def track_copy(source, target):
-        events.append("COPY")
-        return copy2(source, target)
+    def track_link(self, target, *args, **kwargs):
+        events.append("LINK")
+        return symlink_to(self, target, *args, **kwargs)
 
     monkeypatch.setattr(
         checkpoint_store_module.LocalCheckpointStore,
         "write_state",
         track_state,
     )
-    monkeypatch.setattr(receiver_module.shutil, "copy2", track_copy)
+    monkeypatch.setattr(receiver_module.Path, "symlink_to", track_link)
     adapter, _storage = _build(monkeypatch, tmp_path, {})
 
-    assert events == ["UPDATING", "COPY", "READY"]
+    assert events == ["UPDATING", "LINK", "READY"]
     state = json.loads(adapter._checkpoint.store.state_path.read_text())
     files = state.pop("files")
     assert files["model.safetensors"][0] > 0
     assert files["model.safetensors"][1] > 0
     assert state == {"status": "READY", "version": "base-a"}
+    adapter.close()
+
+
+def test_initial_checkpoint_links_seed_and_first_delta_copies_it(
+    monkeypatch, tmp_path
+):
+    base = torch.arange(4096, dtype=torch.float32)
+    target = base + 1
+    objects = _artifact(
+        base.view(torch.uint8).numpy(),
+        target.view(torch.uint8).numpy(),
+    )
+    adapter, _storage = _build(
+        monkeypatch, tmp_path, objects, launch_tensors={"weight": base}
+    )
+    store = adapter._checkpoint.store
+    seed = tmp_path / "launch" / "model.safetensors"
+    linked = store.full_path("base-a") / "model.safetensors"
+
+    assert linked.is_symlink()
+    assert linked.resolve() == seed.resolve()
+    assert store.cache_size_bytes() < seed.stat().st_size
+    assert adapter._method._working_copy is None
+
+    staged = adapter.stage_weight(_inputs(None))
+    materialized = staged.path / "model.safetensors"
+    assert not materialized.is_symlink()
+    assert torch.equal(load_file(materialized)["weight"], target)
+    assert torch.equal(load_file(seed)["weight"], base)
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def _seed_and_first_delta():
+    base = torch.arange(4096, dtype=torch.float32)
+    target = base + 1
+    objects = _artifact(
+        base.view(torch.uint8).numpy(),
+        target.view(torch.uint8).numpy(),
+    )
+    return base, target, objects
+
+
+def test_first_delta_renames_the_background_seed_copy(monkeypatch, tmp_path):
+    base, target, objects = _seed_and_first_delta()
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={"weight": base},
+        background_seed_copy=True,
+    )
+    adapter._method._working_copy.join()
+    store = adapter._checkpoint.store
+    seed = tmp_path / "launch" / "model.safetensors"
+    working_copy = store.materialized_path("base-a") / "model.safetensors"
+    assert not working_copy.is_symlink()
+    assert working_copy.read_bytes() == seed.read_bytes()
+
+    with patch.object(
+        receiver_module.shutil,
+        "copytree",
+        side_effect=AssertionError("full checkpoint copied"),
+    ):
+        staged = adapter.stage_weight(_inputs(None))
+
+    assert staged.path == store.materialized_path("target-a")
+    assert not store.materialized_path("base-a").exists()
+    assert torch.equal(load_file(staged.path / "model.safetensors")["weight"], target)
+    assert torch.equal(load_file(seed)["weight"], base)
+    assert staged.metrics["perf/mx_receive_prepare_lock_wait"] >= 0
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_first_delta_waits_for_background_seed_copy(monkeypatch, tmp_path):
+    copy_file = checkpoint_store_module._copy_checkpoint_file
+    started, release = threading.Event(), threading.Event()
+    copies = []
+
+    def gated_copy(source, destination, *, cancelled=None):
+        copies.append(Path(destination).parent)
+        started.set()
+        assert release.wait(10)
+        return copy_file(source, destination, cancelled=cancelled)
+
+    monkeypatch.setattr(checkpoint_store_module, "_copy_checkpoint_file", gated_copy)
+    base, target, objects = _seed_and_first_delta()
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={"weight": base},
+        background_seed_copy=True,
+    )
+    assert started.wait(10)
+    timer = threading.Timer(0.2, release.set)
+    timer.start()
+
+    staged = adapter.stage_weight(_inputs(None))
+
+    timer.join()
+    store = adapter._checkpoint.store
+    assert copies == [store.materialized_path("base-a")]
+    assert staged.metrics["perf/mx_receive_prepare_lock_wait"] >= 0.1
+    assert not store.materialized_path("base-a").exists()
+    assert torch.equal(load_file(staged.path / "model.safetensors")["weight"], target)
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+@pytest.mark.parametrize("stop", ["full_checkpoint", "close"])
+def test_full_checkpoint_or_close_cancels_background_seed_copy(
+    monkeypatch, tmp_path, stop
+):
+    started = threading.Event()
+    cancelled_in_time = []
+
+    def wait_for_cancel(source, destination, *, cancelled=None):
+        started.set()
+        # The copy thread only logs errors, so the main thread checks this.
+        cancelled_in_time.append(cancelled.wait(5))
+        raise checkpoint_store_module.CheckpointCopyCancelled("cancelled")
+
+    monkeypatch.setattr(
+        checkpoint_store_module, "_copy_checkpoint_file", wait_for_cancel
+    )
+    full_tensor = torch.tensor([7.0, 8.0])
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        _full_artifact(full_tensor),
+        background_seed_copy=True,
+    )
+    store = adapter._checkpoint.store
+    assert started.wait(5)
+
+    if stop == "close":
+        adapter.close()
+    else:
+        full = adapter.stage_weight(_full_inputs())
+        assert torch.equal(
+            load_file(full.path / "model-00001-of-00001.safetensors")["weight"],
+            full_tensor,
+        )
+        adapter.release_staged_weight(full)
+        adapter.close()
+
+    assert cancelled_in_time == [True]
+    assert adapter._method._working_copy is None
+    # A cancelled copy is never recorded, and the full checkpoint drops it.
+    working_copy = store.materialized_path("base-a")
+    assert working_copy.exists() is (stop == "close")
+    assert not store.has_artifact_record(working_copy)
+
+
+def test_first_delta_replaces_a_partial_working_copy(monkeypatch, tmp_path):
+    copy_file = checkpoint_store_module._copy_checkpoint_file
+
+    def cancel_partial_copy(source, destination, *, cancelled=None):
+        if cancelled is None:
+            return copy_file(source, destination)
+        Path(destination).write_bytes(b"partial")
+        raise checkpoint_store_module.CheckpointCopyCancelled("cancelled")
+
+    monkeypatch.setattr(
+        checkpoint_store_module, "_copy_checkpoint_file", cancel_partial_copy
+    )
+    base, target, objects = _seed_and_first_delta()
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={"weight": base},
+        background_seed_copy=True,
+    )
+    adapter._method._working_copy.join()
+    partial = adapter._checkpoint.store.materialized_path("base-a")
+    assert (partial / "model.safetensors").read_bytes() == b"partial"
+
+    staged = adapter.stage_weight(_inputs(None))
+
+    assert torch.equal(load_file(staged.path / "model.safetensors")["weight"], target)
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_full_root_replay_drops_the_seed_working_copy_it_replaces(
+    monkeypatch, tmp_path, caplog
+):
+    base, target, objects = _seed_and_first_delta()
+    objects.update(_full_artifact(base, version_label=0))
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={"weight": base},
+        background_seed_copy=True,
+    )
+    adapter._method._working_copy.join()
+    store = adapter._checkpoint.store
+    seed_copy = store.materialized_path("base-a")
+    assert store.artifact_source(seed_copy) is None
+    # Room for the downloaded root and its working copy, but not a third copy.
+    store.max_size_bytes = int(2.5 * store.path_size_bytes(seed_copy))
+
+    caplog.set_level("WARNING", logger=receiver_module.__name__)
+    with patch.object(
+        receiver_module.shutil,
+        "copytree",
+        side_effect=AssertionError("full checkpoint copied"),
+    ):
+        staged = adapter.stage_chain(
+            [_full_inputs(version="base-a", version_label=0), _inputs(None)]
+        )
+
+    assert "No room for a working copy" not in caplog.text
+    assert torch.equal(
+        load_file(staged.path / "model-00001-of-00001.safetensors")["weight"],
+        target,
+    )
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_cached_full_root_replay_drops_the_seed_working_copy(monkeypatch, tmp_path):
+    shard = "model-00001-of-00001.safetensors"
+    seed_tensors = {"weight": torch.zeros(4096)}
+    full_tensor = torch.arange(4096, dtype=torch.float32)
+    next_tensor = full_tensor + 1
+    objects = _full_artifact(full_tensor)
+    adapter, _storage = _build(
+        monkeypatch, tmp_path, objects, launch_tensors=seed_tensors
+    )
+    full = adapter.stage_weight(_full_inputs())
+    adapter.apply_weight(full)
+    adapter.release_staged_weight(full)
+    # The delta takes the full checkpoint's working copy.
+    delta = _stage_delta_after_full(adapter, objects, full_tensor, next_tensor)
+    adapter.apply_weight(delta)
+    adapter.release_staged_weight(delta)
+    adapter.close()
+
+    # A restart reseeds the cache head and copies it; the full stays cached.
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors=seed_tensors,
+        background_seed_copy=True,
+    )
+    adapter._method._working_copy.join()
+    store = adapter._checkpoint.store
+    seed_copy = store.materialized_path("base-a")
+    assert store.has_artifact_record(seed_copy)
+    # Room to copy the cached full checkpoint, but not beside the seed's copy.
+    store.max_size_bytes = (
+        store.cache_size_bytes()
+        + store.path_size_bytes(store.full_path("full-a"))
+        - store.path_size_bytes(seed_copy) // 2
+    )
+
+    staged = adapter.stage_chain(
+        [
+            _full_inputs(),
+            _inputs(
+                None,
+                base_version="full-a",
+                version="delta-after-full",
+                version_label=3,
+            ),
+        ]
+    )
+
+    assert not seed_copy.exists()
+    assert torch.equal(load_file(staged.path / shard)["weight"], next_tensor)
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_reseeding_drops_the_working_copy_of_the_old_seed(monkeypatch, tmp_path):
+    adapter, _storage = _build(monkeypatch, tmp_path, {}, background_seed_copy=True)
+    adapter._method._working_copy.join()
+    working_copy = adapter._checkpoint.store.materialized_path("base-a")
+    assert adapter._checkpoint.store.has_artifact_record(working_copy)
+    adapter.close()
+
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        {},
+        launch_tensors={"weight": torch.tensor([3.0, 4.0, 5.0])},
+    )
+
+    assert not working_copy.exists()
+    adapter.close()
+
+
+def test_working_copy_is_made_once_and_not_during_preparation(
+    monkeypatch, tmp_path
+):
+    adapter, _storage = _build(monkeypatch, tmp_path, {})
+    checkpoint = adapter._checkpoint
+    store = checkpoint.store
+
+    with store.preparation_locked():
+        assert not checkpoint.prepare_working_copy(threading.Event())
+    assert not store.materialized_path("base-a").exists()
+
+    assert checkpoint.prepare_working_copy(threading.Event())
+    assert store.artifact_source(store.materialized_path("base-a")) is None
+    assert not checkpoint.prepare_working_copy(threading.Event())
+    adapter.close()
+
+
+def test_working_copy_without_room_is_left_to_the_first_delta(
+    monkeypatch, tmp_path, caplog
+):
+    adapter, _storage = _build(monkeypatch, tmp_path, {})
+    store = adapter._checkpoint.store
+    store.max_size_bytes = store.cache_size_bytes() + 1
+
+    caplog.set_level("WARNING", logger=receiver_module.__name__)
+    assert not adapter._checkpoint.prepare_working_copy(threading.Event())
+
+    assert "No room for a working copy of full checkpoint base-a" in caplog.text
+    assert list(store.materialized_cache.iterdir()) == []
+    adapter.close()
+
+
+def test_working_copy_evicts_stale_entries_to_fit_the_quota(monkeypatch, tmp_path):
+    adapter, _storage = _build(monkeypatch, tmp_path, {})
+    store = adapter._checkpoint.store
+    stale = store.materialized_path("stale")
+    stale.mkdir()
+    (stale / "model.safetensors").write_bytes(bytes(4096))
+    # Room for the working copy only once the stale entry is evicted.
+    store.max_size_bytes = (
+        store.cache_size_bytes() + store.path_size_bytes(store.full_path("base-a")) - 1
+    )
+
+    assert adapter._checkpoint.prepare_working_copy(threading.Event())
+
+    assert not stale.exists()
+    assert store.cache_size_bytes() <= store.max_size_bytes
     adapter.close()
 
 
@@ -1768,9 +2115,9 @@ def test_full_checkpoint_preserves_metadata_after_cached_seed_eviction(
         )
         objects.update(delta_objects)
         store.max_size_bytes = (
-            2 * store.path_size_bytes(first.path)
+            store.cache_size_bytes()
+            - store._payload_size_bytes(seed)
             + sum(len(data) for data in delta_objects.values())
-            + 512
         )
         delta = adapter.stage_weight(
             _inputs(None, version="delta-a", version_label=2, base_version="full-a")
@@ -1782,9 +2129,11 @@ def test_full_checkpoint_preserves_metadata_after_cached_seed_eviction(
     if seed_mode == "external":
         config_text = '{"model_type":"llama","external_seed":true}'
         (launch / "config.json").write_text(config_text)
+    # Preparing full-b drops full-a's unused working copy before reserving.
     store.max_size_bytes = (
         store.cache_size_bytes()
         - store._payload_size_bytes(seed)
+        - store._payload_size_bytes(store.materialized_path("full-a"))
         + sum(len(data) for data in next_full.values())
         + len(config_text.encode())
     )
@@ -1882,6 +2231,109 @@ def test_canonical_s3_full_checkpoint_resets_base_for_next_delta(monkeypatch, tm
         "s3://weights/test/v2/model-00001-of-00001.safetensors",
     ]
     adapter.release_staged_weight(delta)
+    adapter.close()
+
+
+def _stage_delta_after_full(adapter, objects, full_tensor, next_tensor):
+    objects.update(
+        _artifact(
+            full_tensor.view(torch.uint8).numpy(),
+            next_tensor.view(torch.uint8).numpy(),
+            version="delta-after-full",
+            version_label=3,
+            base_version="full-a",
+        )
+    )
+    return adapter.stage_weight(
+        _inputs(
+            None,
+            base_version="full-a",
+            version="delta-after-full",
+            version_label=3,
+        )
+    )
+
+
+def test_next_delta_mutates_full_checkpoint_working_copy(monkeypatch, tmp_path):
+    shard = "model-00001-of-00001.safetensors"
+    full_tensor = torch.tensor([7.0, 8.0])
+    next_tensor = torch.tensor([9.0, 10.0])
+    objects = _full_artifact(full_tensor)
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    store = adapter._checkpoint.store
+    working_copy = store.materialized_path("full-a")
+
+    full = adapter.stage_weight(_full_inputs())
+    assert torch.equal(load_file(working_copy / shard)["weight"], full_tensor)
+    adapter.apply_weight(full)
+    adapter.release_staged_weight(full)
+
+    with patch.object(
+        receiver_module.shutil,
+        "copytree",
+        side_effect=AssertionError("full checkpoint copied"),
+    ):
+        delta = _stage_delta_after_full(adapter, objects, full_tensor, next_tensor)
+
+    assert delta.path == store.materialized_path("delta-after-full")
+    assert not working_copy.exists()
+    assert torch.equal(load_file(delta.path / shard)["weight"], next_tensor)
+    assert torch.equal(
+        load_file(store.full_path("full-a") / shard)["weight"],
+        full_tensor,
+    )
+    adapter.release_staged_weight(delta)
+    adapter.close()
+
+
+def test_full_checkpoint_without_room_for_working_copy_is_copied_by_next_delta(
+    monkeypatch, tmp_path, caplog
+):
+    shard = "model-00001-of-00001.safetensors"
+    full_tensor = torch.tensor([7.0, 8.0])
+    next_tensor = torch.tensor([9.0, 10.0])
+    objects = _full_artifact(full_tensor)
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    store = adapter._checkpoint.store
+    store.max_size_bytes = store.cache_size_bytes() + sum(
+        len(data) for data in objects.values()
+    )
+
+    caplog.set_level("WARNING", logger=receiver_module.__name__)
+    full = adapter.stage_weight(_full_inputs())
+    assert "No room for a working copy of full checkpoint full-a" in caplog.text
+    assert not store.materialized_path("full-a").exists()
+    adapter.apply_weight(full)
+    adapter.release_staged_weight(full)
+
+    store.max_size_bytes = None
+    delta = _stage_delta_after_full(adapter, objects, full_tensor, next_tensor)
+    assert torch.equal(load_file(delta.path / shard)["weight"], next_tensor)
+    assert torch.equal(
+        load_file(store.full_path("full-a") / shard)["weight"],
+        full_tensor,
+    )
+    adapter.release_staged_weight(delta)
+    adapter.close()
+
+
+def test_next_full_checkpoint_drops_unused_working_copy(monkeypatch, tmp_path):
+    objects = {
+        **_full_artifact(torch.tensor([7.0, 8.0])),
+        **_full_artifact(torch.tensor([9.0, 10.0]), version_label=3),
+    }
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    store = adapter._checkpoint.store
+    first = adapter.stage_weight(_full_inputs())
+    adapter.apply_weight(first)
+    adapter.release_staged_weight(first)
+    assert store.materialized_path("full-a").is_dir()
+
+    second = adapter.stage_weight(_full_inputs(version="full-b", version_label=3))
+
+    assert not store.materialized_path("full-a").exists()
+    assert store.materialized_path("full-b").is_dir()
+    adapter.release_staged_weight(second)
     adapter.close()
 
 
@@ -2173,10 +2625,10 @@ def test_full_lineage_replay_resumes_from_verified_local_checkpoint(
         version.object_storage.uri for version in lineage[cached_delta_count + 1 :]
     ]
     assert apply_shards.call_count == 3 - max(cached_delta_count, 0)
-    assert sum(
+    assert not any(
         call.kwargs.get("copy_from") is not None
         for call in replace_directory.call_args_list
-    ) == (1 if cached_delta_count <= 0 else 0)
+    )
     adapter.apply_weight(staged)
     adapter.release_staged_weight(staged)
     adapter.close()

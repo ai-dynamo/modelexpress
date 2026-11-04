@@ -104,8 +104,11 @@ Other initialization paths retain their existing 2000 GB default.
 
 Streamed full replacement may need space for the protected old full checkpoint,
 a materialized checkpoint with deltas applied, and the incoming full checkpoint
-at the same time. Size the quota and backing volume for this peak plus retained
-delta artifacts and headroom; increasing the quota does not add disk capacity.
+at the same time. A downloaded, not streamed, full checkpoint adds a working
+copy of itself, so the next delta can mutate that copy instead of copying the
+full model; without room for both copies, the next delta copies it. Size the
+quota and backing volume for this peak plus retained delta artifacts and
+headroom; increasing the quota does not add disk capacity.
 
 At initialization, the generator caps this quota at existing cache bytes plus
 free disk space and

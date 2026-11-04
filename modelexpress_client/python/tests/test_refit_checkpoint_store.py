@@ -6,12 +6,14 @@ import logging
 import os
 import shutil
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
 from modelexpress_rl.inference import checkpoint_store as store_module
 from modelexpress_rl.inference.checkpoint_store import (
     CheckpointCacheCapacityError,
+    CheckpointCopyCancelled,
     CheckpointState,
     LocalCheckpointStore,
 )
@@ -530,3 +532,186 @@ def test_store_evicts_stale_checkpoint_to_free_disk_space(monkeypatch, tmp_path)
 
     assert not stale.exists()
     assert (active / "weights").read_bytes() == b"x" * 60
+
+
+def test_cache_size_counts_symlinked_files_as_links(tmp_path):
+    seed = tmp_path / "seed.safetensors"
+    seed.write_bytes(b"x" * 4096)
+    store = LocalCheckpointStore(root=tmp_path / "cache", model_name="model")
+    store.initialize()
+    root = store.full_path("v0")
+    root.mkdir()
+    (root / "model.safetensors").symlink_to(seed)
+
+    assert store.cache_size_bytes() == (root / "model.safetensors").lstat().st_size
+    assert store.path_size_bytes(root) == 4096
+
+
+def test_can_admit_matches_ensure_capacity_without_evicting(tmp_path):
+    store = LocalCheckpointStore(root=tmp_path, model_name="model", max_size_bytes=100)
+    store.initialize()
+    stale = store.materialized_path("stale")
+    stale.mkdir()
+    (stale / "weights").write_bytes(b"x" * 60)
+
+    assert store.can_admit(100)
+    assert not store.can_admit(101)
+    assert not store.can_admit(100, protected_versions={"stale"})
+    assert (stale / "weights").read_bytes() == b"x" * 60
+
+    store.ensure_capacity(100)
+    assert not stale.exists()
+
+
+def test_preparation_lock_can_be_tried_without_blocking(tmp_path):
+    store = LocalCheckpointStore(root=tmp_path, model_name="model")
+    store.initialize()
+
+    with store.preparation_locked():
+        with store.preparation_locked(blocking=False) as acquired:
+            assert not acquired
+    with store.preparation_locked(blocking=False) as acquired:
+        assert acquired
+
+
+def _unsupported_clone(destination, operation, source):
+    os.write(destination, b"partial clone longer than source")
+    raise OSError(errno.EOPNOTSUPP, "unsupported clone")
+
+
+def test_cancellable_copy_without_clone_copies_in_chunks(monkeypatch, tmp_path):
+    monkeypatch.setattr(store_module.sys, "platform", "linux")
+    monkeypatch.setattr(store_module.fcntl, "ioctl", _unsupported_clone)
+    monkeypatch.setattr(store_module, "_COPY_CHUNK_BYTES", 3)
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.write_bytes(b"original bytes")
+    os.utime(source, ns=(1_000_000_001, 2_000_000_002))
+
+    store_module._copy_checkpoint_file(
+        str(source), str(destination), cancelled=threading.Event()
+    )
+
+    assert destination.read_bytes() == b"original bytes"
+    assert destination.stat().st_mtime_ns == source.stat().st_mtime_ns
+
+
+class _UntruncatableFile:
+    def __init__(self, file):
+        self.fileno = file.fileno
+
+    def seek(self, *_args):
+        raise AssertionError("must not seek a new file")
+
+    def truncate(self, *_args):
+        raise AssertionError("must not truncate a new file")
+
+
+def test_chunked_copy_does_not_truncate_a_new_file(tmp_path):
+    # ext4 (auto_da_alloc) writes a file truncated to zero back on close.
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.write_bytes(b"original bytes")
+
+    with open(source, "rb") as src, open(destination, "xb") as dst:
+        store_module._copy_file_chunks(
+            src, _UntruncatableFile(dst), threading.Event()
+        )
+
+    assert destination.read_bytes() == b"original bytes"
+
+
+def test_copy_without_clone_lets_copy2_create_the_file(monkeypatch, tmp_path):
+    # Reopening the file would truncate it, which ext4 writes back on close.
+    monkeypatch.setattr(store_module.sys, "platform", "linux")
+    monkeypatch.setattr(store_module.fcntl, "ioctl", _unsupported_clone)
+    copy2 = shutil.copy2
+
+    def copy_to_new_file(source, destination):
+        assert not os.path.exists(destination)
+        return copy2(source, destination)
+
+    monkeypatch.setattr(store_module.shutil, "copy2", copy_to_new_file)
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.write_bytes(b"original bytes")
+
+    store_module._copy_checkpoint_file(str(source), str(destination))
+
+    assert destination.read_bytes() == b"original bytes"
+
+
+def test_cancelled_directory_copy_stops_between_chunks(monkeypatch, tmp_path):
+    monkeypatch.setattr(store_module.sys, "platform", "linux")
+    monkeypatch.setattr(store_module.fcntl, "ioctl", _unsupported_clone)
+    monkeypatch.setattr(store_module, "_COPY_CHUNK_BYTES", 3)
+    cancelled = threading.Event()
+    sendfile = os.sendfile
+
+    def cancel_after_first_chunk(*args):
+        cancelled.set()
+        return sendfile(*args)
+
+    monkeypatch.setattr(store_module.os, "sendfile", cancel_after_first_chunk)
+    store = LocalCheckpointStore(root=tmp_path, model_name="model")
+    store.initialize()
+    base = store.full_path("base")
+    base.mkdir()
+    (base / "weights").write_bytes(b"canonical weights")
+    copy = store.materialized_path("base")
+
+    with pytest.raises(CheckpointCopyCancelled):
+        store.copy_directory(base, copy, cancelled=cancelled)
+
+    assert (copy / "weights").read_bytes() == b"can"
+    assert (base / "weights").read_bytes() == b"canonical weights"
+
+
+def test_failed_directory_copy_stops_at_the_failed_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(store_module.sys, "platform", "linux")
+    monkeypatch.setattr(store_module.fcntl, "ioctl", _unsupported_clone)
+    attempts = []
+
+    def fail(*args):
+        attempts.append(args)
+        raise OSError(errno.EIO, "input/output error")
+
+    monkeypatch.setattr(store_module.os, "sendfile", fail)
+    store = LocalCheckpointStore(root=tmp_path, model_name="model")
+    store.initialize()
+    base = store.full_path("base")
+    base.mkdir()
+    for name in ("first", "second", "third"):
+        (base / name).write_bytes(b"weights")
+
+    with pytest.raises(RuntimeError, match="could not copy") as raised:
+        store.copy_directory(
+            base, store.materialized_path("base"), cancelled=threading.Event()
+        )
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert len(attempts) == 1
+
+
+def test_record_copy_binds_a_complete_copy_to_the_artifact_record(tmp_path):
+    store = LocalCheckpointStore(root=tmp_path, model_name="model")
+    store.initialize()
+    full = store.full_path("base")
+    full.mkdir()
+    (full / "weights").write_bytes(b"canonical")
+    store.record_artifact(full, source={"uri": "s3://weights/base"})
+    record = store.artifact_record(full)
+    copy = store.materialized_path("base")
+    store.copy_directory(full, copy, cancelled=threading.Event())
+    assert not store.has_artifact_record(copy)
+
+    (copy / "weights").write_bytes(b"canon")
+    with pytest.raises(ValueError, match="incomplete"):
+        store.record_copy(full, copy, record)
+
+    (copy / "weights").write_bytes(b"canonical")
+    # The cache filesystem may store coarser modification times.
+    os.utime(copy / "weights", ns=(1_000_000_000, 1_000_000_000))
+    store.record_copy(full, copy, record)
+    assert store.artifact_source(copy) == {"uri": "s3://weights/base"}
+
+    store.record_artifact(full, source={"uri": "s3://weights/other"})
+    with pytest.raises(ValueError, match="changed while copying"):
+        store.record_copy(full, copy, record)

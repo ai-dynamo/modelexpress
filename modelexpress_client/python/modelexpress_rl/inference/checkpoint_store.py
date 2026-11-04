@@ -9,22 +9,41 @@ import errno
 import fcntl
 import json
 import logging
+import os
 import shutil
 import stat
 import sys
+import threading
 import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import BinaryIO
 from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
+_COPY_CHUNK_BYTES = 256 * 1024**2
 
-def _copy_checkpoint_file(source: str, destination: str) -> str:
-    """Copy a file with copy2 metadata, using Linux copy-on-write if supported."""
+
+class CheckpointCopyCancelled(RuntimeError):
+    """A cancellable checkpoint copy stopped before it finished."""
+
+
+def _copy_checkpoint_file(
+    source: str,
+    destination: str,
+    *,
+    cancelled: threading.Event | None = None,
+) -> str:
+    """Copy a file with copy2 metadata, using Linux copy-on-write if supported.
+
+    With ``cancelled``, a copy that cannot clone stops between chunks once set.
+    """
+    if cancelled is not None and cancelled.is_set():
+        raise CheckpointCopyCancelled("checkpoint copy was cancelled")
     if sys.platform != "linux" or not stat.S_ISREG(Path(source).stat().st_mode):
         return shutil.copy2(source, destination)
 
@@ -49,8 +68,39 @@ def _copy_checkpoint_file(source: str, destination: str) -> str:
         else:
             shutil.copystat(source, destination)
             return destination
+        if cancelled is not None:
+            _copy_file_chunks(src, dst, cancelled)
 
-    return shutil.copy2(source, destination)
+    if cancelled is None:
+        # Let copy2 create the file: its reopen would truncate this one, and
+        # ext4 (auto_da_alloc) writes a truncated file back to disk on close.
+        os.unlink(destination)
+        return shutil.copy2(source, destination)
+    shutil.copystat(source, destination)
+    return destination
+
+
+def _copy_file_chunks(
+    source: BinaryIO,
+    destination: BinaryIO,
+    cancelled: threading.Event,
+) -> None:
+    """Copy an open file from its start, checking ``cancelled`` between chunks."""
+    # A failed clone may have written part of the file. Truncating an empty
+    # file instead would make ext4 write it back to disk on close.
+    if os.fstat(destination.fileno()).st_size:
+        destination.seek(0)
+        destination.truncate()
+    offset = 0
+    while True:
+        if cancelled.is_set():
+            raise CheckpointCopyCancelled("checkpoint copy was cancelled")
+        copied = os.sendfile(
+            destination.fileno(), source.fileno(), offset, _COPY_CHUNK_BYTES
+        )
+        if not copied:
+            return
+        offset += copied
 
 
 def _encode_cache_component(value: str) -> str:
@@ -158,7 +208,7 @@ class LocalCheckpointStore:
         #     state.json                current preparation transaction
         #     active.json               version committed after engine install
         #     .lock                     cross-process cache coordination
-        #     .prepare.lock             serializes preparation requests
+        #     .prepare.lock             serializes preparation and working copies
         #     .install.lock             excludes mutation during engine install
         #
         # Full checkpoints, deltas, and chain manifests are the canonical
@@ -202,11 +252,23 @@ class LocalCheckpointStore:
                 )
 
     @contextmanager
-    def _locked(self, path: Path, shared: bool) -> Iterator[None]:
+    def _locked(
+        self,
+        path: Path,
+        shared: bool,
+        blocking: bool = True,
+    ) -> Iterator[bool]:
         with path.open("a+") as handle:
             operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
-            fcntl.flock(handle, operation)
-            yield
+            try:
+                fcntl.flock(
+                    handle, operation if blocking else operation | fcntl.LOCK_NB
+                )
+            except BlockingIOError:
+                acquired = False
+            else:
+                acquired = True
+            yield acquired
 
     def locked(self, *, shared: bool = False):
         return self._locked(self.lock_path, shared=shared)
@@ -214,8 +276,9 @@ class LocalCheckpointStore:
     def installation_locked(self, *, shared: bool = False):
         return self._locked(self.install_lock_path, shared=shared)
 
-    def preparation_locked(self):
-        return self._locked(self.prepare_lock_path, shared=False)
+    def preparation_locked(self, *, blocking: bool = True):
+        """Serialize preparation; without blocking, yield whether it was taken."""
+        return self._locked(self.prepare_lock_path, shared=False, blocking=blocking)
 
     @contextmanager
     def replace_directory(
@@ -242,6 +305,36 @@ class LocalCheckpointStore:
             shutil.rmtree(temporary, ignore_errors=True)
             raise
 
+    @staticmethod
+    def copy_directory(
+        source: Path,
+        target: Path,
+        *,
+        cancelled: threading.Event,
+    ) -> None:
+        """Copy an artifact's files to a new ``target`` until ``cancelled`` is set.
+
+        The copy stops at the first file that fails. It has no record until
+        ``record_copy``, and a cancelled or failed copy leaves ``target``
+        partially written.
+        """
+
+        def copy_file(source_file: str, target_file: str) -> str:
+            try:
+                return _copy_checkpoint_file(
+                    source_file, target_file, cancelled=cancelled
+                )
+            except OSError as error:
+                # copytree would collect the error and copy every other file.
+                raise RuntimeError(f"could not copy {source_file}") from error
+
+        shutil.copytree(
+            source,
+            target,
+            ignore=shutil.ignore_patterns(".source.json"),
+            copy_function=copy_file,
+        )
+
     def _version_path(self, root: Path, version: str) -> Path:
         return root / _encode_cache_component(version)
 
@@ -267,12 +360,13 @@ class LocalCheckpointStore:
 
     @staticmethod
     def _payload_size_bytes(path: Path) -> int:
+        """Return bytes stored in the cache, counting symlinks as links."""
         if path.is_file():
-            return 0 if path.name == ".source.json" else path.stat().st_size
+            return 0 if path.name == ".source.json" else path.lstat().st_size
         if not path.is_dir():
             return 0
         return sum(
-            file.stat().st_size
+            file.lstat().st_size
             for file in path.rglob("*")
             if file.is_file() and file.name != ".source.json"
         )
@@ -338,6 +432,30 @@ class LocalCheckpointStore:
         ):
             return
         (self.chain_cache / f"{encoded_version}.json").unlink(missing_ok=True)
+
+    def can_admit(
+        self,
+        additional_bytes: int,
+        *,
+        protected_versions: Iterable[str] = (),
+        protected_paths: Iterable[Path] = (),
+    ) -> bool:
+        """Return whether ``ensure_capacity`` would succeed, without evicting."""
+        protected = self._protected_paths(protected_versions)
+        protected.update(protected_paths)
+        evictable_bytes = sum(
+            self._payload_size_bytes(candidate)
+            for candidate in self._eviction_candidates(protected)
+        )
+        if (
+            self.max_size_bytes is not None
+            and self.cache_size_bytes() - evictable_bytes + additional_bytes
+            > self.max_size_bytes
+        ):
+            return False
+        return (
+            shutil.disk_usage(self.cache).free + evictable_bytes >= additional_bytes
+        )
 
     def ensure_capacity(
         self,
@@ -476,6 +594,19 @@ class LocalCheckpointStore:
             },
         )
 
+    def record_copy(self, artifact: Path, copy: Path, record: dict) -> None:
+        """Record ``copy`` as a complete copy of ``artifact`` while it had ``record``.
+
+        The copy is recorded with its own modification times, which the cache
+        filesystem may store more coarsely than the artifact's filesystem.
+        """
+        if self._verified_artifact_metadata(artifact) != record:
+            raise ValueError("cached checkpoint artifact changed while copying")
+        sizes = {name: size for name, (size, _) in _artifact_files_state(copy).items()}
+        if sizes != {name: size for name, (size, _) in record["files"].items()}:
+            raise ValueError("checkpoint copy is incomplete")
+        self.record_artifact(copy, source=record.get("source"))
+
     def has_artifact_record(self, artifact: Path) -> bool:
         return self._source_path(artifact).exists()
 
@@ -489,6 +620,10 @@ class LocalCheckpointStore:
 
     def verify_artifact(self, artifact: Path) -> None:
         self._verified_artifact_metadata(artifact)
+
+    def artifact_record(self, artifact: Path) -> dict:
+        """Return the recorded source and files after verifying local files."""
+        return self._verified_artifact_metadata(artifact)
 
     def artifact_source(self, artifact: Path) -> dict[str, str] | None:
         """Return the recorded immutable source after verifying local files."""
@@ -505,6 +640,7 @@ class LocalCheckpointStore:
 
 __all__ = [
     "CheckpointCacheCapacityError",
+    "CheckpointCopyCancelled",
     "CheckpointRecord",
     "CheckpointState",
     "LocalCheckpointStore",

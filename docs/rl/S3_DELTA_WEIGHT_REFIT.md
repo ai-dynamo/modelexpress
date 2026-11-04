@@ -570,6 +570,17 @@ either:
 For typical sharded models such as Qwen3-30B-A3B, use the full Hugging Face
 snapshot directory.
 
+ModelExpress symlinks the seed's files into `full/<initial_base_version_id>/`
+instead of copying them; only subdirectories are copied. Keep the seed in place
+and unchanged while that version is cached. Deltas rooted at it verify the
+seed's files, and the first of them needs a copy of the seed in
+`materialized/`. Without generator P2P, a background thread makes that copy
+as soon as the generator initializes, and the first delta waits for the rest
+of the copy and then renames it. vLLM initializes at startup, so its copy runs
+while the engine serves. SGLang initializes during its first update, so that
+update waits for the whole copy. With generator P2P, object-storage updates
+replay from the full root instead, and the first delta copies the seed itself.
+
 The backend sections describe how an omitted seed is resolved: vLLM can
 [reuse a cached full root](#reuse-a-cached-seed), while SGLang's factory resolves
 the launch checkpoint through its model runner.
@@ -583,10 +594,17 @@ and activation state.
 
 `full/<version>/` and `deltas/<version>/` contain canonical immutable artifacts.
 `chains/<version>.json` resolves a version to one full checkpoint plus its
-ordered deltas. The first delta after a full checkpoint copies that immutable
-full checkpoint into `materialized/<version>/`. Later sequential deltas rename
-the active derived checkpoint and apply only the incoming delta in place, so
-they do not copy the full model. Current vLLM and SGLang installers consume that
+ordered deltas. A full checkpoint downloaded while preparing an update also
+writes a working copy to `materialized/<version>/` when the quota and disk have
+room for both copies, and the next delta renames that working copy instead of
+copying the full checkpoint. Without generator P2P, the generator likewise
+copies the initial full checkpoint to its working copy in a background thread
+once it initializes. Otherwise, as for a
+full root that cold start or deferred initialization downloads, the first delta
+copies the immutable full checkpoint into `materialized/<version>/` once. A newer full
+checkpoint deletes the previous full checkpoint's unused working copy. Later
+sequential deltas rename the active derived checkpoint and apply only the incoming delta in place,
+so they do not copy the full model. Current vLLM and SGLang installers consume that
 ordinary checkpoint directory. Materializations are derived and can be rebuilt
 from the canonical lineage. If an in-place delta fails, the running engine keeps
 its previous weights, the cache remains `UPDATING`, and initialization rebuilds
@@ -605,13 +623,13 @@ Paths under `<refit_checkpoint_dir>/<URL-quoted-MX-model-name>/`:
 | Path | Contents or role |
 |---|---|
 | `.lock` | Coordinates cache metadata and artifact mutations. |
-| `.prepare.lock` | Serializes checkpoint preparation requests. |
+| `.prepare.lock` | Serializes checkpoint preparation requests and the background copy of the initial checkpoint. |
 | `.install.lock` | Shared during installation and exclusive during reconstruction. |
 | `active.json`, `state.json` | Active version and preparation state. |
-| `full/<version>/` | Immutable full checkpoint: safetensors, optional HF index, and files such as `config.json`. |
+| `full/<version>/` | Immutable full checkpoint: safetensors, optional HF index, and files such as `config.json`. The initial version holds symlinks to the seed's files. |
 | `deltas/<version>/` | Delta index and compressed safetensors shards. |
 | `chains/<version>.json` | Full root and ordered deltas for the version. |
-| `materialized/<version>/` | Derived checkpoint consumed by the engine's native loader. |
+| `materialized/<version>/` | Derived checkpoint consumed by the engine's native loader, or the working copy of a downloaded full checkpoint or of the initial checkpoint. |
 
 The generator may request a target several revisions ahead of its active
 version. ModelExpress first resolves the complete READY chain, rejecting cycles,
@@ -698,10 +716,15 @@ ModelExpress rechecks free space before known writes and copies as other disk
 usage changes. It evicts stale derived materializations before stale canonical
 artifacts, but never evicts the active lineage or the checkpoint being prepared
 or installed. Capacity must therefore cover the active checkpoint plus the
-rollback-safe working set for one update. A capacity rejection preserves the
-active checkpoint as READY so a later update can retry. On initialization, the
-configured seed is restored as the initial full artifact and becomes the active
-version.
+rollback-safe working set for one update. A full checkpoint downloaded during an
+update also needs room for its working copy, so size the quota for the active
+lineage plus two copies of the incoming full checkpoint. Without that room,
+ModelExpress logs a warning, caches the full checkpoint once, and the next delta copies it. A
+capacity rejection preserves the active checkpoint as READY so a later update
+can retry. On initialization, the configured seed is linked as the initial full
+artifact and becomes the active version. The background copy of it needs the
+same room as the first delta's copy; without that room, ModelExpress
+logs a warning and leaves the copy to that delta.
 
 ## S3 artifact contract
 
