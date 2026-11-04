@@ -41,7 +41,8 @@ const WORKER_ID_MAX_LEN: usize = 63;
 ///
 /// The value is interpolated into a Kubernetes object name and written as a
 /// label value, so it is constrained to the intersection of what both accept:
-/// lowercase alphanumerics, `-` and `.`, with alphanumeric boundaries. Object
+/// lowercase alphanumerics, `-` and `.`, with alphanumeric boundaries on every
+/// dot-separated segment. Object
 /// names are DNS-1123 and reject uppercase, which is why the lowercase rule is
 /// not merely stylistic. The documented producer is a UUID, which satisfies it.
 ///
@@ -71,12 +72,20 @@ pub fn validate_worker_id(worker_id: &str) -> Result<(), String> {
             "worker_id may only contain lowercase alphanumerics, '-' and '.', found {bad:?}"
         ));
     }
-    let bytes = worker_id.as_bytes();
+    // Checked per dot-separated segment, not just on the whole value: the object
+    // name is a DNS-1123 subdomain, whose labels must each be non-empty and
+    // alphanumeric at both ends, so "a..b" and "a.-b" are as unusable as "-ab".
+    // An undotted value is one segment, which is the label-value rule.
     let boundary_ok =
         |b: Option<&u8>| matches!(b, Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit());
-    if !boundary_ok(bytes.first()) || !boundary_ok(bytes.last()) {
+    if worker_id.split('.').any(|segment| {
+        let bytes = segment.as_bytes();
+        !boundary_ok(bytes.first()) || !boundary_ok(bytes.last())
+    }) {
         return Err(
-            "worker_id must start and end with a lowercase alphanumeric character".to_string(),
+            "each dot-separated worker_id segment must start and end with a lowercase \
+             alphanumeric character"
+                .to_string(),
         );
     }
     Ok(())
@@ -408,6 +417,22 @@ mod tests {
         assert!(validate_worker_id(".abc").is_err());
         assert!(validate_worker_id("abc.").is_err());
         assert!(validate_worker_id("-").is_err());
+    }
+
+    #[test]
+    fn worker_id_rejects_malformed_dot_segments() {
+        // The object name is a DNS-1123 subdomain: every dot-separated label
+        // must be non-empty and start and end alphanumeric, not just the whole
+        // value. These pass a whole-value boundary check and then fail at the
+        // API server as a backend error instead of an invalid argument.
+        for bad in ["a..b", "a.-b", "a-.b", "a.b-.c"] {
+            assert!(
+                validate_worker_id(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        assert!(validate_worker_id("a.b").is_ok());
+        assert!(validate_worker_id("a-b.c-d").is_ok());
     }
 
     #[test]
