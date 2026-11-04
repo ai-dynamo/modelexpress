@@ -571,6 +571,12 @@ mod tests {
     use crate::p2p::backend::{
         BackendMetadataRecord, MockMetadataBackend, ModelMetadataRecord, WorkerRecord,
     };
+    use crate::p2p::state::P2pStateManager;
+    use modelexpress_common::grpc::p2p::worker_metadata::SourcePayload;
+    use modelexpress_common::grpc::p2p::{
+        ArtifactSourceMetadata, MxSourceType, SourceIdentity, SourceStatus, TensorSourceMetadata,
+    };
+    use std::collections::HashMap;
 
     fn caller(namespace: &str, pod_name: Option<&str>, pod_uid: Option<&str>) -> CallerIdentity {
         CallerIdentity {
@@ -674,12 +680,6 @@ mod tests {
             PodClaimCheck::Drop(_)
         ));
     }
-    use crate::p2p::state::P2pStateManager;
-    use modelexpress_common::grpc::p2p::worker_metadata::SourcePayload;
-    use modelexpress_common::grpc::p2p::{
-        ArtifactSourceMetadata, MxSourceType, SourceIdentity, SourceStatus, TensorSourceMetadata,
-    };
-    use std::collections::HashMap;
 
     fn make_service(mock: MockMetadataBackend) -> P2pServiceImpl {
         P2pServiceImpl::new(Arc::new(P2pStateManager::with_backend(Arc::new(mock))))

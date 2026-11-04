@@ -390,8 +390,9 @@ mod tests {
 
     #[test]
     fn worker_id_rejects_k8s_name_injection() {
-        // Each of these is currently interpolated raw into an object name and a
-        // label value. A '/' escapes the name component entirely.
+        // Shapes that would corrupt the object name or label value if a
+        // worker_id were interpolated without validation: '/' would escape the
+        // name component entirely, and the rest are invalid in either.
         for bad in [
             "a/../b", "a/b", "a b", "a\nb", "a:b", "a=b", "a,b", "a%2Fb", "a\"b", "a$b",
         ] {
