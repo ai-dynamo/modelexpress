@@ -783,6 +783,20 @@ storage-view naming used for non-contiguous SGLang parameters.
 The SGLang side does not expose separate source and target modes; transport
 selection and source discovery remain inside the ModelExpress package.
 
+TransferEngine registration uses PyTorch's CUDA allocator snapshot to register
+each occupied block once and merge adjacent selected blocks within the same
+non-expandable segment. A tensor's complete byte range must fit inside an
+active allocation block, including buffers and storage views with nonzero
+offsets. Unrecognized ranges retain per-tensor registration; expandable segments,
+non-CUDA backends, and unavailable snapshots do not use this optimization.
+Merging never crosses allocation boundaries or unselected blocks. If expanding
+a block would overlap an unrecognized range, the whole registration falls back
+to the original tensor ranges. Tensor metadata and transfer addresses remain
+unchanged. Registration and receive failures unregister the actual successful
+region bases before native fallback. Logs report region and tensor counts,
+registered bytes, and registration time. This uses the existing single-region
+`register_memory` API and does not require Mooncake's batch registration API.
+
 **Cold-load quantization state.** A source manifest can describe buffers whose
 existence depends on checkpoint values. After placeholder post-processing and
 before registering destination memory, the receive strategy calls

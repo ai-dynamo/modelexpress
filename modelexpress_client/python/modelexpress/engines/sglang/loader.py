@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from bisect import bisect_right
 from collections.abc import Iterable, Iterator
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
@@ -165,6 +166,52 @@ def _expects_draft_pass() -> bool:
     draft_format = getattr(spec, "speculative_draft_load_format", None)
     draft_format = getattr(draft_format, "value", draft_format)
     return draft_format is None or str(draft_format) == "remote_instance"
+
+
+def _coalesce_cuda_memory_regions(
+    regions: dict[int, int],
+) -> list[tuple[int, int]]:
+    """Merge occupied allocator blocks within a single CUDA allocation."""
+    try:
+        snapshot = torch.cuda.memory_snapshot()
+    except (AttributeError, RuntimeError) as exc:
+        logger.warning(
+            "Cannot inspect CUDA allocations; registering individual tensors: %s", exc
+        )
+        return list(regions.items())
+
+    blocks: list[tuple[int, int, int]] = []
+    for segment in snapshot:
+        if segment.get("is_expandable", True):
+            continue
+        for block in segment["blocks"]:
+            if block["state"] != "active_allocated":
+                continue
+            block_start = block["address"]
+            block_end = block_start + block["size"]
+            blocks.append((block_start, block_end, segment["address"]))
+    blocks.sort()
+    block_starts = [start for start, _, _ in blocks]
+    merged: list[tuple[int, int, int | None]] = []
+    for addr, size in sorted(regions.items()):
+        start, end = addr, addr + size
+        segment: int | None = None
+        index = bisect_right(block_starts, addr) - 1
+        if index >= 0 and end <= blocks[index][1]:
+            start, end, segment = blocks[index]
+
+        if merged:
+            prev_start, prev_end, prev_segment = merged[-1]
+            same_segment = segment is not None and segment == prev_segment
+            if same_segment and start <= prev_end:
+                merged[-1] = (prev_start, max(prev_end, end), segment)
+                continue
+            if start < prev_end:
+                # An unrecognized range overlaps an expanded allocator block.
+                return list(regions.items())
+        merged.append((start, end, segment))
+
+    return [(start, end - start) for start, end, _ in merged]
 
 
 class MxModelLoader:
@@ -455,18 +502,17 @@ class MxModelLoader:
                     "SGLang ModelExpress transfer_engine receive requires "
                     "Mooncake >=0.3.14 with submit_scatter_read completion tickets."
                 )
-            registered_tensors = None
+            registered_ptrs = set()
             try:
                 result = ctx.adapter.before_rdma_receive(result)
                 ctx.adapter.prepare_rdma_target_from_manifest(
                     result, list(worker_tensor_descriptors(source_worker))
                 )
                 tensors = ctx.adapter.discover_tensors(result)
-                weight_info = self._register_transfer_engine_tensors(
+                weight_info, registered_ptrs = self._register_transfer_engine_tensors(
                     tensors,
                     transfer_engine,
                 )
-                registered_tensors = tensors
                 self._receive_via_transfer_engine(
                     tensors,
                     transfer_engine,
@@ -484,11 +530,7 @@ class MxModelLoader:
                 )
                 raise
             except Exception as exc:
-                if registered_tensors is not None:
-                    self._unregister_transfer_engine_tensors(
-                        registered_tensors,
-                        transfer_engine,
-                    )
+                self._unregister_transfer_engine_ptrs(registered_ptrs, transfer_engine)
                 logger.warning(
                     "[Worker %s] TransferEngine load failed, falling back "
                     "to native load: %s",
@@ -496,7 +538,6 @@ class MxModelLoader:
                     exc,
                     exc_info=True,
                 )
-                registered_tensors = None
                 tensors = {}
                 clear_exception_tracebacks(exc)
                 result = ctx.adapter.reinit_for_retry(result)
@@ -506,7 +547,7 @@ class MxModelLoader:
 
         if weight_info is None:
             try:
-                weight_info = self._register_transfer_engine_tensors(
+                weight_info, _ = self._register_transfer_engine_tensors(
                     tensors,
                     transfer_engine,
                 )
@@ -755,45 +796,46 @@ class MxModelLoader:
         self,
         tensors: dict[str, torch.Tensor],
         transfer_engine,
-    ) -> dict[str, tuple[int, int, int]]:
-        weight_info = {}
+    ) -> tuple[dict[str, tuple[int, int, int]], set[int]]:
+        start = time.perf_counter()
+        weight_info = {
+            name: (tensor.data_ptr(), tensor.numel(), tensor.element_size())
+            for name, tensor in tensors.items()
+        }
+        regions: dict[int, int] = {}
+        for addr, numel, element_size in weight_info.values():
+            size = self._byte_size(numel, element_size)
+            if size:
+                regions[addr] = max(regions.get(addr, 0), size)
+        if regions and next(iter(tensors.values())).is_cuda:
+            registration_regions = _coalesce_cuda_memory_regions(regions)
+        else:
+            registration_regions = list(regions.items())
+
         registered_ptrs = set()
         try:
-            for name, tensor in tensors.items():
-                addr = tensor.data_ptr()
-                numel = tensor.numel()
-                element_size = tensor.element_size()
-                size = self._byte_size(numel, element_size)
-                weight_info[name] = (addr, numel, element_size)
-                if size == 0:
-                    continue
-                if addr not in registered_ptrs:
-                    ret = transfer_engine.register_memory(addr, size)
-                    if ret != 0:
-                        raise RuntimeError(
-                            "ModelExpress transfer_engine: register_memory failed "
-                            f"for tensor {name!r}, error={ret}"
-                        )
-                    registered_ptrs.add(addr)
+            for addr, size in registration_regions:
+                ret = transfer_engine.register_memory(addr, size)
+                if ret != 0:
+                    raise RuntimeError(
+                        "ModelExpress transfer_engine: register_memory failed "
+                        f"for region at 0x{addr:x} ({size} bytes), error={ret}"
+                    )
+                registered_ptrs.add(addr)
         except Exception:
             self._unregister_transfer_engine_ptrs(
                 registered_ptrs,
                 transfer_engine,
             )
             raise
-        return weight_info
-
-    def _unregister_transfer_engine_tensors(
-        self,
-        tensors: dict[str, torch.Tensor],
-        transfer_engine,
-    ) -> None:
-        registered_ptrs = {
-            tensor.data_ptr()
-            for tensor in tensors.values()
-            if self._byte_size(tensor.numel(), tensor.element_size()) > 0
-        }
-        self._unregister_transfer_engine_ptrs(registered_ptrs, transfer_engine)
+        logger.info(
+            "Registered %d TransferEngine regions for %d tensors (%d bytes) in %.3fs",
+            len(registration_regions),
+            len(tensors),
+            sum(size for _, size in registration_regions),
+            time.perf_counter() - start,
+        )
+        return weight_info, registered_ptrs
 
     def _unregister_transfer_engine_ptrs(
         self,
