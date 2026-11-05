@@ -46,12 +46,11 @@ from modelexpress_rl.inference.plan import (
     PreparedCheckpointArtifact,
     PreparedRuntimeTensors,
     SourceResolver,
-    WeightUpdatePlanner,
 )
 from modelexpress_rl.inference.runtime import EngineRuntime, GeneratorRuntime
 from modelexpress_rl.inference.session import WeightUpdateSession
 from modelexpress_rl.inference.source import ObjectStorageSourceResolver
-from modelexpress_rl.s3 import ImmutableS3Conflict, S3Client
+from modelexpress_rl.s3 import ImmutableS3Conflict, S3Client, _TransferManagerDownloader
 from modelexpress_rl.utils import checksum_factory, compress_delta, compute_delta
 
 
@@ -259,7 +258,7 @@ def test_s3_read_parses_uri():
     backend = _S3Backend(data)
     s3 = object.__new__(S3Client)
     s3._client = backend
-    s3._download_manager = _TransferManager(backend, None)
+    s3._downloader = _TransferManagerDownloader(backend)
     assert s3.get("s3://weights/root.json") == data
     assert backend.get_request == {
         "Bucket": "weights",
@@ -298,7 +297,7 @@ def test_s3_write_accepts_only_an_identical_immutable_retry():
     s3 = object.__new__(S3Client)
     s3._client = backend
     s3._multipart_threshold_bytes = 100
-    s3._download_manager = _TransferManager(backend, None)
+    s3._downloader = _TransferManagerDownloader(backend)
     s3.put(uri="s3://weights/root.json", data=b"same")
     with pytest.raises(ImmutableS3Conflict):
         s3.put(uri="s3://weights/root.json", data=b"different")
@@ -334,7 +333,7 @@ def test_s3_client_uses_transfer_connection_and_retry_settings(monkeypatch):
         assert config.retries == {"total_max_attempts": 6, "mode": "standard"}
         assert config.tcp_keepalive is False
         assert s3._upload_pool._max_workers == 2
-        transfer = s3._download_manager.config
+        transfer = s3._downloader._manager.config
         assert transfer.multipart_threshold == 4096
         assert transfer.multipart_chunksize == 1024
         assert transfer.max_request_concurrency == 11
@@ -2263,7 +2262,7 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
         lambda version_id, **_kwargs: versions[version_id],
     )
     peer = GeneratorPeerUpdateSource(
-        worker=p2p_pb2.WorkerMetadata(), mx_source_id="peer", worker_id="peer"
+        worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="peer:9000"), mx_source_id="peer", worker_id="peer"
     )
     resolver = Mock(spec=SourceResolver, kind=WeightSource.GENERATOR)
     resolver.supports.return_value = True
@@ -2271,14 +2270,11 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
     resolver.candidates.side_effect = lambda version: (
         (peer,) if use_peer_for_second_delta and version.version_id == "delta-2" else ()
     )
-    transfer = Mock()
-    transfer.stage_peer.return_value = SimpleNamespace(
-        tensors={"weight": tensors[2]}, metrics={}
-    )
-    transfer.receive_peer.return_value = {}
     peer_method = RuntimeTensorNixlUpdateMethod(
-        transfer=transfer, runtime_tensors={"weight": tensors[0]}
+        manager=Mock(), device_id=0, runtime_tensors={"weight": tensors[0]}
     )
+    monkeypatch.setattr(peer_method, "_prepare_peer_read", lambda _source: Mock())
+    monkeypatch.setattr(peer_method, "_receive_peer", lambda _read: {})
     installer = Mock(spec=EngineInstaller)
     installer.capabilities = EngineCapabilities(
         artifact_types=frozenset({PreparedCheckpointArtifact, PreparedRuntimeTensors})
@@ -2288,12 +2284,10 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
         engine=EngineRuntime(model_name="test/model", installer=installer),
         methods=methods,
         session=WeightUpdateSession(
-            planner=WeightUpdatePlanner(
-                resolvers=(resolver, ObjectStorageSourceResolver()),
-                methods=methods,
-                installer=installer,
-                max_transfer_attempts=1,
-            ),
+            resolvers=(resolver, ObjectStorageSourceResolver()),
+            methods=methods,
+            installer=installer,
+            max_transfer_attempts=1,
             start_lease=lambda _version_id: Mock(),
             resolve_replay_chain=lambda version: generator._resolve_replay_chain(
                 version.version_id, from_full_root=True

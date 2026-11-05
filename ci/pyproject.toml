@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "modelexpress-inference-ci"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "aiperf==0.13.0",
+    "grpcio>=1.84.1",
+    "grpcio-tools>=1.84.1",
+    "pytest>=9.1.1",
+]

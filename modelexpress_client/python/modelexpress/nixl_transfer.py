@@ -117,18 +117,15 @@ def _has_memory_range(size: int, addr: int) -> bool:
 
 
 class NixlTransferManager:
-    """
-    Manages a single NIXL agent and RDMA transfers.
+    """Manage one NIXL agent, registered memory, and RDMA operations.
 
-    Each vLLM worker creates its own instance of this class to handle:
-    - Creating and managing a NIXL agent for the worker's GPU
-    - Registering tensors with NIXL for RDMA access
-    - Executing transfers to receive weights from remote sources
-    - Registering host DRAM buffers for artifact chunk transfer
+    The creator controls initialization and shutdown. Borrowers use an active manager
+    without taking ownership of its lifecycle. Register accelerator tensors and host
+    DRAM buffers, connect remote agents, and execute weight or artifact transfers.
 
     Args:
-        agent_name: Name for the NIXL agent
-        device_id: GPU device ID for this worker
+        agent_name: Name for the NIXL agent.
+        device_id: GPU device ID for this worker.
     """
 
     def __init__(

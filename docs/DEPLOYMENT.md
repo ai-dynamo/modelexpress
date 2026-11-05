@@ -7,6 +7,15 @@ SPDX-License-Identifier: Apache-2.0
 
 This page is the deployment reference for the standalone server, Helm, Kubernetes metadata topologies, and worker rollout requirements. Start with [Choose a ModelExpress path](guides/choose-a-path.md) if you have not selected a topology. See [Configuration](CONFIGURATION.md) for settings, [Integrations](integrations/README.md) for runtime setup, [Troubleshooting](TROUBLESHOOTING.md) for operational symptoms, and [Architecture](ARCHITECTURE.md) for internals.
 
+For RL generator checkpoint-cache capacity and
+`MX_REFIT_CHECKPOINT_MAX_SIZE_GB`, see the
+[RL checkpoint-cache configuration](rl/CONFIGURATION.md#generator-refit-checkpoint-cache).
+
+For canonical S3 refit and recovery downloads, `MX_S3_DOWNLOAD_BACKEND=preallocated`
+opts in to parallel reads into a preallocated buffer. TransferManager remains
+the default. See [S3 transfer tuning](../modelexpress_client/python/README.md#canonical-s3-transfer-tuning)
+for concurrency, endpoint compatibility, and memory sizing.
+
 ## Server Configuration
 
 ModelExpress uses a layered configuration system. Sources are applied in order of precedence:
@@ -218,6 +227,7 @@ The CLI client also uses layered configuration: CLI args > env vars > config fil
 |---------|---------|-------------|
 | `MODEL_EXPRESS_ENDPOINT` | `http://localhost:8001` | Server endpoint |
 | `MODEL_EXPRESS_TIMEOUT` | `30` | Request timeout (seconds) |
+| `MODEL_EXPRESS_CONNECT_WAIT_SECS` | `10` | Initial server connection retry budget before direct download (seconds, 0 disables) |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | (auto) | Cache path override |
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Use gRPC streaming instead of shared storage |
 | `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `32768` | Transfer chunk size (bytes) |
@@ -597,7 +607,14 @@ intact.
 
 For the Mooncake TransferEngine SGLang example, add
 `--build-arg INSTALL_MOONCAKE=true` to install
-`mooncake-transfer-engine-cuda13`.
+`mooncake-transfer-engine-cuda13>=0.3.14`. A receiving weight loader requires the
+native `submit_scatter_read` completion-ticket API and rejects unsupported
+runtimes after source discovery, before preparing or registering destination
+weights. A seed with no source can load natively and publish using an older
+runtime without the ticket API. Pending tickets retain their buffers while
+draining and warn every 30 seconds with rank, elapsed time, and batch bytes;
+after submission, native fallback is allowed only after a drained failure. An
+undrainable operation requires supervised worker recovery.
 
 The Dynamo examples use their own runtime image Dockerfile:
 `examples/dynamo_p2p_transfer_k8s/Dockerfile`.
@@ -894,6 +911,67 @@ the domain becomes available.
 **Combining topology- and load-aware selection.** To rank primarily by RDMA locality *and* steer away from busy sources within each locality tier, set `MX_P2P_SOURCE_SELECTOR=topology_aware` and a non-zero blend weight (`MX_P2P_TOPOLOGY_LOAD_WEIGHT`, or just `MX_P2P_LOAD_WEIGHT` since topology falls back to it). Locality is always the primary key — a closer source outranks a farther one regardless of load; the load term only orders equidistant peers.
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
+
+### Collective Refit (NCCL M2N) Topology
+
+Four roles, and the split that decides placement is that **no weight byte crosses
+the ModelExpress server**. It brokers admission, rank assignment and the NCCL
+`uniqueId`; the weights move directly between trainer and generator ranks.
+
+| Role | Count | Runs where | Needs |
+|---|---|---|---|
+| ModelExpress server | one endpoint | any node with network reach; for this path it needs no GPU and no fast fabric | gRPC reachable from every rank, plus a metadata backend |
+| Metadata backend | one | beside the server | **Redis, required.** The collective service is only registered on a Redis backend; with the in-memory or Kubernetes backend the server starts without it |
+| Trainer ranks | one per trainer GPU | inside the training job's own worker processes | the policy weights, the framework's own process group, gRPC to the server, NCCL to the generator ranks |
+| Generator ranks | one per inference-engine GPU | **inside the inference engine's own worker processes** | gRPC to the server, NCCL to the trainer ranks |
+| Coordinator | one | anywhere with gRPC reach | drives `start_weight_update` / publish / `finish_weight_update` on both sides in lockstep |
+
+Five constraints bind the layout:
+
+1. **The generator client is not separately deployable.** It has to run in the
+   engine's worker processes, because the destination storage is the engine's
+   and exists nowhere else. For vLLM that is a `worker_extension_cls` driven by
+   `collective_rpc`; for any other engine it is whatever that engine's
+   equivalent per-worker extension point is. A sidecar cannot do this.
+2. **The server is off the data path,** so it does not scale with model size and
+   does not want a GPU. Sizing it against the weights is the common mistake.
+3. **Every rank needs two different networks:** ordinary TCP to the server for
+   the control plane, and whatever NCCL needs for the data plane. They have
+   different reachability requirements and are worth checking separately.
+4. **Rank order inside a lane is trainers first, generators after,** and the
+   server assigns it. A deployment does not choose ranks; it chooses membership.
+5. **Both sides derive the same plan independently,** so both need a consistent
+   view of the canonical parameter set. Deriving it from the checkpoint the two
+   sides already share is the least surprising way to guarantee that.
+
+Preflight, in this order, because each one fails in a way that does not name
+itself:
+
+1. **NCCL 2.30.7 or newer, LOADED.** `torch.cuda.nccl.version()` reports what
+   torch was compiled against, not what is mapped into the process, and the
+   mismatch fails inside the native reshard call rather than at import. Read it
+   with `ctypes.CDLL("libnccl.so.2").ncclGetVersion()`. Where an image ships its
+   own older `libnccl`, `LD_PRELOAD` the one the wheels installed.
+2. **`nccl-extensions` matching the CUDA major** (`[cu12]` or `[cu13]`). A bare
+   install resolves and then fails to import.
+3. **gRPC from a trainer rank and from a generator rank to the server**, checked
+   separately: in an inference deployment those two are frequently on different
+   networks.
+4. **A one-GPU-per-side reshard between the two placements you intend to use.**
+   If trainers and generators will sit on different nodes, prove the data plane
+   crosses that boundary before scaling anything up.
+
+Scope of what has been measured, because the boundary matters more than the
+numbers: **all ranks on a single node is exercised end to end against a live
+inference engine.** Cross-node is not, and has been seen to fail below
+ModelExpress inside NCCL's transport layer on at least one fabric, with one
+trainer and one generator, so it is not a scale effect. More than one source
+partition (pipeline stage) is supported by the protocol and has not been
+exercised against a real engine.
+
+### Collective Refit (NCCL M2N) Environment Variables
+
+The collective refit environment variables are documented in the [RL configuration guide](rl/CONFIGURATION.md#collective-refit-nccl-m2n-environment-variables).
 
 ### NIXL Backend Selection
 

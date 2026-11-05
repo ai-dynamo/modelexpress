@@ -9,7 +9,7 @@
 #   VllmDecodeWorker  — generates tokens after receiving KV from prefill
 #
 # Modeled on examples/dynamo_p2p_transfer_k8s/vllm/vllm-single-node-disaggregated.yaml
-# but scaled to CI sizes (Qwen2.5-0.5B, TP=1, 1 GPU/IB device per worker).
+# but scaled to CI sizes (Qwen3.5-0.8B, TP=1, 1 GPU/IB device per worker).
 #
 # Initial topology: 1 prefill + 1 decode (2 ModelMetadata CRs).
 # Test scales VllmDecodeWorker to replicas=2 (3 CRs total). This exercises
@@ -91,7 +91,7 @@ spec:
         imagePullSecrets:
           - name: worker-registry
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.1.1
+          image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.5.1
           command:
             - python3
             - -m
@@ -140,6 +140,8 @@ spec:
               fieldPath: metadata.namespace
         - name: VLLM_PLUGINS
           value: "modelexpress"
+        - name: VLLM_SSM_CONV_STATE_LAYOUT
+          value: "DS"
         - name: MX_SERVER_ADDRESS
           value: "${DGD_NAME}-modelexpress:8000"
         - name: MX_ARTIFACT_TRANSFER
@@ -182,8 +184,8 @@ spec:
               add: [IPC_LOCK]
           command:
             - python3
-            - -m
-            - dynamo.vllm
+            - /opt/mx-ci/launch_dynamo.py
+            - vllm
           args:
             - --model
             - "${MX_CI_MODEL}"
@@ -192,7 +194,7 @@ spec:
             - --tensor-parallel-size
             - "1"
             - --max-model-len
-            - "1024"
+            - "2048"
             - --max-num-batched-tokens
             - "1024"
             - --max-num-seqs
@@ -246,6 +248,8 @@ spec:
               fieldPath: metadata.namespace
         - name: VLLM_PLUGINS
           value: "modelexpress"
+        - name: VLLM_SSM_CONV_STATE_LAYOUT
+          value: "DS"
         - name: MX_SERVER_ADDRESS
           value: "${DGD_NAME}-modelexpress:8000"
         - name: MX_ARTIFACT_TRANSFER
@@ -285,8 +289,8 @@ spec:
               add: [IPC_LOCK]
           command:
             - python3
-            - -m
-            - dynamo.vllm
+            - /opt/mx-ci/launch_dynamo.py
+            - vllm
           args:
             - --model
             - "${MX_CI_MODEL}"
@@ -295,7 +299,7 @@ spec:
             - --tensor-parallel-size
             - "1"
             - --max-model-len
-            - "1024"
+            - "2048"
             - --max-num-batched-tokens
             - "1024"
             - --max-num-seqs

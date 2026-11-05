@@ -5,6 +5,8 @@ import sys
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
+from uuid import uuid4
+
 import pytest
 import torch
 from modelexpress.engines.vllm.host_quantization import (
@@ -36,6 +38,39 @@ def _cpu_installer(model, *, vllm_config=None):
     )
 
 
+def _prepare_install_plan(installer, names, *, last_writes=None, total_copies=None, persistent_names=frozenset(), replay_id=None):
+    from modelexpress_rl.inference.engines.vllm.install_plan import (
+        EngineInstallPlan, SourceInstallPlan, _ReplaySchedule, _InputOwner, _InputSlot,
+    )
+
+    if installer.source_install_plan is not None:
+        return
+    engine = installer._capture_engine_install_plan()
+    inputs = []
+    for owner in engine.inputs:
+        requested = tuple(name for name in names if name.rpartition(".")[0] == owner.path)
+        if any(not hasattr(owner.layer_ref(), name.rpartition(".")[2]) for name in requested):
+            owner = _InputOwner(owner.path, owner.layer_ref, tuple(
+                _InputSlot(name, name.rpartition(".")[2], id(name), False)
+                for name in requested
+            ))
+        inputs.append(owner)
+    engine = EngineInstallPlan(engine.runtime, tuple(inputs))
+    buffers = frozenset(name for name, _ in installer._model.named_buffers() if name in names)
+    targets = engine.bind_targets(buffers)
+    last = dict(last_writes) if last_writes is not None else {
+        name: index for index, name in enumerate(names)
+    }
+    if not targets.by_name.keys() <= last.keys():
+        raise IncompleteRefit("source replay coverage differs from the captured load layout")
+    total = max(last.values(), default=-1) + 1 if total_copies is None else total_copies
+    installer.source_install_plan = SourceInstallPlan(
+        engine, targets,
+        _ReplaySchedule.compile(targets, engine.runtime.overlap_groups, last, total),
+        replay_id or uuid4(), buffers, persistent_names, (), (),
+    )
+
+
 def _replay_batches(installer, batches, names):
     from modelexpress_rl.refit.reshard.types import RecordedCopy
     from modelexpress_rl.inference.plan import SourceReplayBatch
@@ -52,6 +87,7 @@ def _replay_batches(installer, batches, names):
     )
     ordered += tuple(sorted(names - set(ordered)))
     last = {name: index for index, name in enumerate(ordered)}
+    _prepare_install_plan(installer, ordered, last_writes=last)
     index = 0
     iterator = iter(batches())
     try:
@@ -70,7 +106,7 @@ def _replay_batches(installer, batches, names):
                 )
                 writes.append((index, copy, tensor))
                 index += 1
-            yield SourceReplayBatch(tuple(writes), names, last, len(ordered))
+            yield SourceReplayBatch(tuple(writes), installer.source_install_plan.replay_id)
     finally:
         close = getattr(iterator, "close", None)
         if close is not None:
@@ -78,9 +114,15 @@ def _replay_batches(installer, batches, names):
 
 
 def _streamed_tensors(installer, batches, names, metrics=None):
+    ordered = tuple(names) if isinstance(names, dict) else tuple(
+        name for name, _ in (*installer._model.named_parameters(), *installer._model.named_buffers())
+        if name in names
+    )
+    ordered += tuple(sorted(set(names) - set(ordered)))
+    _prepare_install_plan(installer, ordered)
     return PreparedStreamingTensors(
         lambda: _replay_batches(installer, batches, names),
-        frozenset(names),
+        installer.source_install_plan.replay_id,
         metrics if metrics is not None else {},
     )
 
@@ -89,6 +131,12 @@ def _install_tensors(installer, tensors, streaming, *, batches=None):
     from modelexpress_rl.inference.plan import SourceReplayBatch
 
     if isinstance(tensors, SourceReplayBatch):
+        _prepare_install_plan(
+            installer, tuple(dict.fromkeys(copy.param_name for _, copy, _ in tensors.writes)),
+            last_writes={copy.param_name: index for index, copy, _ in tensors.writes},
+            total_copies=max((index for index, _, _ in tensors.writes), default=-1)+1,
+            replay_id=tensors.replay_id,
+        )
         installer.install_tensors(tensors)
     elif streaming:
         installer.install_streaming(
@@ -754,13 +802,18 @@ def _receive_copy(target, source, bounded):
     model = nn.Module()
     model.weight = target
     owner = _LayerInstallPlan("", ref(model), (("weight", "weight", "weight"),))
-    plan = SimpleNamespace(
-        bounded=bounded, replay_started={owner: (False, {"weight": target})}
-    )
+    from modelexpress_rl.inference.engines.vllm.install_plan import _InstallExecution
+    captured = SimpleNamespace(replay_id=uuid4())
+    execution = _InstallExecution.__new__(_InstallExecution)
+    execution._model = model
+    execution._captured = captured
+    execution._bounded = bounded
+    execution._replay_started = {owner: (False, {"weight": target})}
     recorded = RecordedCopy(
         "source", (), "weight", 0, tuple(target.shape), tuple(target.stride()), target.dtype
     )
-    return partial(_cpu_installer(model)._copy_source_write, owner, plan, recorded, source)
+    return partial(execution._copy_source_write, owner, recorded, source)
+
 
 
 @pytest.mark.parametrize("override", ["copy", "torch_function"])
@@ -889,8 +942,8 @@ def test_streaming_accepts_independent_empty_tensors(monkeypatch):
     )
     installer.install_streaming(prepared)
     assert model.weight.numel() == 0
-    assert prepared.ownership.iterator is None
-    assert not prepared.ownership.release_blocked
+    assert prepared._iterator is None
+    assert not prepared.release_blocked
 
 
 def test_streaming_rejects_aliasing_source_before_any_batch_copy(monkeypatch):
@@ -910,8 +963,8 @@ def test_streaming_rejects_aliasing_source_before_any_batch_copy(monkeypatch):
     with pytest.raises(IncompleteRefit, match="aliases live storage"):
         installer.install_streaming(prepared)
     assert torch.equal(model.first, torch.zeros(2))
-    assert prepared.ownership.iterator is None
-    assert not prepared.ownership.release_blocked
+    assert prepared._iterator is None
+    assert not prepared.release_blocked
 
 
 @pytest.mark.parametrize("quantized", [False, True])
@@ -1025,8 +1078,8 @@ def test_streaming_uses_engine_processing_and_defers_attention(
             "commit_attention",
             "finalize",
         ]
-        assert prepared.ownership.iterator is None
-        assert not prepared.ownership.release_blocked
+        assert prepared._iterator is None
+        assert not prepared.release_blocked
         assert all(
             parameter is originals[name] for name, parameter in model.named_parameters()
         )
@@ -1071,87 +1124,6 @@ def test_streaming_preserves_storage_and_propagates_partial_failure(
         assert torch.equal(model[1].weight, torch.full((2, 2), 2.0))
     assert torch.equal(model[0].weight, torch.ones(2, 2))
     assert {n: p.data_ptr() for n, p in model.named_parameters()} == addresses
-
-
-def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch):
-    class Model(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embedding = nn.Linear(2, 2, bias=False)
-            self.lm_head = nn.Linear(2, 2, bias=False)
-            self.lm_head.weight = self.embedding.weight
-
-        def load_weights(self, weights):
-            for name, weight in weights:
-                if name == "embedding.weight":
-                    self.embedding.weight.weight_loader(self.embedding.weight, weight)
-
-    class Info:
-        def __init__(self, parameter):
-            self.kernel_tensors = ({"weight": parameter}, {})
-
-        def reset(self):
-            self.kernel_tensors = None
-
-    def initialize(model):
-        for layer in (model.embedding, model.lm_head):
-            layerwise.LAYERWISE_INFO[layer] = Info(layer.weight)
-            layer.weight = nn.Parameter(torch.empty_like(layer.weight, device="meta"))
-
-    _install_fake_vllm(monkeypatch, initialize)
-    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
-
-    def place(layer, info):
-        layer.weight = info.kernel_tensors[0]["weight"]
-
-    def commit(layer, info):
-        info.kernel_tensors[0]["weight"].data.copy_(layer.weight)
-        place(layer, info)
-
-    def finalize(model, config):
-        for layer in (model.embedding, model.lm_head):
-            info = layerwise.LAYERWISE_INFO[layer]
-            if info.kernel_tensors is not None:
-                place(layer, info)
-                info.reset()
-
-    layerwise._get_original_loader = lambda parameter: None
-    layerwise._place_kernel_tensors = place
-    layerwise._copy_and_restore_kernel_tensors = commit
-    layerwise.finalize_layerwise_reload = finalize
-    weight_utils = ModuleType("vllm.model_executor.model_loader.weight_utils")
-    weight_utils.default_weight_loader = lambda parameter, weight: parameter.data.copy_(
-        weight
-    )
-    monkeypatch.setitem(sys.modules, weight_utils.__name__, weight_utils)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
-    model = Model()
-    original = model.embedding.weight.detach().clone()
-    address = model.embedding.weight.data_ptr()
-    installer = _VllmInstaller(
-        model=model,
-        vllm_config=object(),
-        model_config=object(),
-        device=torch.device("cpu"),
-    )
-    capture, layout = installer.capture([("embedding.weight", torch.float32, (2, 2))])
-    assert (
-        set(layout)
-        == {copy.param_name for copy in capture.copies}
-        == {"embedding.weight"}
-    )
-    assert model.embedding.weight is model.lm_head.weight
-    assert torch.equal(model.embedding.weight, original)
-
-    def batches():
-        yield {"embedding.weight": torch.full((2, 2), 7.0)}
-
-    installer.install_streaming(
-        _streamed_tensors(installer, batches, frozenset(layout), {})
-    )
-    assert model.embedding.weight is model.lm_head.weight
-    assert model.embedding.weight.data_ptr() == address
-    assert torch.equal(model.lm_head.weight, torch.full((2, 2), 7.0))
 
 
 def test_streaming_walks_live_owners_without_arena_scans(monkeypatch):
@@ -1372,7 +1344,7 @@ def test_streaming_rejects_uninstalled_or_rebound_shared_bias(
     with pytest.raises(
         IncompleteRefit,
         match=("runtime tensor gate.bias" if replace_installed_alias
-               else "streaming transfer ended before every parameter was installed"),
+               else "source replay ended before every recorded write was installed"),
     ):
         installer.install_streaming(_streamed_tensors(installer, batches, names, {}))
 
@@ -2104,8 +2076,11 @@ def test_reload_reports_the_missing_native_api_before_mutation(monkeypatch):
     assert torch.equal(model.weight, before)
 
 
-def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypatch):
-    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", "1")
+@pytest.mark.parametrize("validate_layout", [False, True])
+def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(
+    monkeypatch, validate_layout
+):
+    monkeypatch.setenv("MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT", str(int(validate_layout)))
     class Model(nn.Module):
         def __init__(self):
             super().__init__()
@@ -2184,14 +2159,14 @@ def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypa
     assert installer.capture(manifest)[0].copies
     model.routing.add_(1)
     installer.capture(manifest)
-    assert model.capture_calls == 2
+    assert model.capture_calls == (2 if validate_layout else 1)
     with torch.inference_mode():
         model.routing = torch.tensor([3, 4])
         installer.capture(manifest)
-        assert model.capture_calls == 3
+        assert model.capture_calls == (3 if validate_layout else 1)
         model.routing.add_(1)
         installer.capture(manifest)
-        assert model.capture_calls == 4
+        assert model.capture_calls == (4 if validate_layout else 1)
 
     for value in (7.0, 11.0, -3.0):
 
@@ -2206,7 +2181,7 @@ def test_layerwise_capture_cache_and_streaming_preserve_tied_parameters(monkeypa
         assert "retention_batch_scans" not in prepared.transfer_metrics
         assert "retention_final_scans" not in prepared.transfer_metrics
         installer.capture(manifest)
-        assert model.capture_calls == 4
+        assert model.capture_calls == (4 if validate_layout else 1)
 
 
 class _Parent(nn.Module):
@@ -2333,8 +2308,10 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
         for name in ("a.weight", "b.weight")
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
-    planned = transfer_module._bounded_batches(
-        CaptureResult(copies=copies), layout, {"w": source}, 512
+    from tests.helpers.refit_replay import compile_batches
+
+    planned = compile_batches(
+        CaptureResult(copies=copies, source_replay=True), layout, {"w": source}, 256
     )
     drained = []
 
@@ -2383,6 +2360,7 @@ def test_streaming_install_error_is_not_replaced_by_a_failed_prefetch_drain(
         model_config=object(),
         device=torch.device("cpu"),
     )
+    _prepare_install_plan(installer, names, replay_id=planned[0].transfer_plan.replay_id)
     with pytest.raises(IncompleteRefit, match="no compatible live storage"):
         installer.install_streaming(
             _streamed_tensors(
@@ -3104,10 +3082,11 @@ def test_completed_tensor_installation_is_rejected(monkeypatch, streaming):
     original = model.weight.detach().clone()
     installer = _cpu_installer(model)
     tensors = {"weight": torch.ones(2, 2)}
+    _prepare_install_plan(installer, tensors)
     with pytest.raises(IncompleteRefit, match="requires ordered source replay"):
         if streaming:
             prepared = PreparedStreamingTensors(
-                lambda: iter([tensors]), frozenset(tensors), {}
+                lambda: iter([tensors]), installer.source_install_plan.replay_id, {}
             )
             installer.install_streaming(prepared)
         else:
@@ -3141,3 +3120,93 @@ def test_reload_preserves_registered_buffer_storage_after_deferred_hook(
         assert model.scale_inv.data_ptr() == pointer
         assert registered.item() == value
         assert ("scale_inv" in model.state_dict()) is persistent
+
+
+@pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_source_replay_converts_into_strided_storage_with_offset(monkeypatch, padded, streaming):
+    from modelexpress_rl.inference.plan import SourceReplayBatch
+    from modelexpress_rl.refit.reshard.types import RecordedCopy
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    width, offset = (6, 1) if padded else (4, 0)
+    arena = torch.full((8 * width + 16,), -17.0, dtype=torch.bfloat16)
+    model = nn.Module()
+    model.layer = nn.Module()
+    model.layer.weight = nn.Parameter(arena[8:8 + 8 * width].view(8, width), requires_grad=False)
+    installer = _cpu_installer(model)
+    _prepare_install_plan(installer, ("layer.weight",), persistent_names=frozenset({"layer.weight"}))
+    pointer = model.layer.weight.data_ptr()
+    source = torch.arange(32, dtype=torch.float32).view(8, 4) / 1000
+    recorded = RecordedCopy("source", (), "layer.weight", offset, (8, 4), (width, 1), torch.bfloat16)
+    for _version in range(3):
+        source.add_(1)
+        batch = SourceReplayBatch(((0, recorded, source),), installer.source_install_plan.replay_id)
+        if streaming:
+            installer.install_streaming(PreparedStreamingTensors(lambda: iter((batch,)), batch.replay_id, {}))
+        else:
+            installer.install_tensors(batch)
+        assert torch.equal(model.layer.weight[:, offset:offset + 4], source.to(torch.bfloat16))
+        assert model.layer.weight.data_ptr() == pointer
+        assert torch.all(arena[:8] == -17) and torch.all(arena[-8:] == -17)
+        if padded:
+            assert torch.all(model.layer.weight[:, 0] == -17)
+            assert torch.all(model.layer.weight[:, -1] == -17)
+
+
+def test_streaming_drains_before_releasing_the_consumed_source(monkeypatch):
+    import weakref
+
+    from modelexpress_rl.inference.plan import SourceReplayBatch
+    from modelexpress_rl.refit.reshard.types import RecordedCopy
+
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.zeros(2))
+    installer = _cpu_installer(model)
+    events = []
+    monkeypatch.setattr(installer, "_drain_streaming", lambda: events.append("drain"))
+
+    class Batches:
+        sent = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.sent:
+                raise StopIteration
+            self.sent = True
+            source = torch.ones(2)
+            weakref.finalize(source, events.append, "source_released")
+            copy = RecordedCopy("source", (), "weight", 0, (2,), (1,), torch.float32)
+            return SourceReplayBatch(((0, copy, source),), installer.source_install_plan.replay_id)
+
+    _prepare_install_plan(installer, ("weight",))
+    installer.install_streaming(PreparedStreamingTensors(Batches, installer.source_install_plan.replay_id, {}))
+    assert events.index("drain") < events.index("source_released")
+    assert torch.equal(model.weight, torch.ones(2))
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_trainer_installation_requires_capture_before_reload(monkeypatch, streaming):
+    from modelexpress_rl.inference.plan import SourceReplayBatch
+    from modelexpress_rl.refit.reshard.types import RecordedCopy
+
+    model = nn.Linear(2, 2, bias=False)
+    original = model.weight.detach().clone()
+    installer = _cpu_installer(model)
+
+    def unexpected_reload(_load):
+        pytest.fail("an uncaptured update must fail before entering native reload")
+
+    monkeypatch.setattr(installer, "_reload", unexpected_reload)
+    copy = RecordedCopy("source", (), "weight", 0, (2, 2), (2, 1), torch.float32)
+    batch = SourceReplayBatch(((0, copy, torch.ones(2, 2)),), uuid4())
+    with pytest.raises(IncompleteRefit, match="requires a captured source replay plan"):
+        if streaming:
+            installer.install_streaming(PreparedStreamingTensors(lambda: iter((batch,)), batch.replay_id, {}))
+        else:
+            installer.install_tensors(batch)
+    torch.testing.assert_close(model.weight, original)
