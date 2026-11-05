@@ -592,8 +592,8 @@ def _unsupported_clone(destination, operation, source):
     raise OSError(errno.EOPNOTSUPP, "unsupported clone")
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux sendfile")
 def test_cancellable_copy_without_clone_copies_in_chunks(monkeypatch, tmp_path):
-    monkeypatch.setattr(store_module.sys, "platform", "linux")
     monkeypatch.setattr(store_module.fcntl, "ioctl", _unsupported_clone)
     monkeypatch.setattr(store_module, "_COPY_CHUNK_BYTES", 3)
     source, destination = tmp_path / "source", tmp_path / "destination"
@@ -619,6 +619,7 @@ class _UntruncatableFile:
         raise AssertionError("must not truncate a new file")
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux sendfile")
 def test_chunked_copy_does_not_truncate_a_new_file(tmp_path):
     # ext4 (auto_da_alloc) writes a file truncated to zero back on close.
     source, destination = tmp_path / "source", tmp_path / "destination"
@@ -651,8 +652,8 @@ def test_copy_without_clone_lets_copy2_create_the_file(monkeypatch, tmp_path):
     assert destination.read_bytes() == b"original bytes"
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux sendfile")
 def test_cancelled_directory_copy_stops_between_chunks(monkeypatch, tmp_path):
-    monkeypatch.setattr(store_module.sys, "platform", "linux")
     monkeypatch.setattr(store_module.fcntl, "ioctl", _unsupported_clone)
     monkeypatch.setattr(store_module, "_COPY_CHUNK_BYTES", 3)
     cancelled = threading.Event()
