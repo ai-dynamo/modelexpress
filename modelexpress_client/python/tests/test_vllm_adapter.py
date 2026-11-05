@@ -822,6 +822,7 @@ def test_after_weight_iter_load_does_not_rerun_model_specific_finalizers(monkeyp
 def test_online_quant_load_hooks_finalize_layerwise_before_postprocessing(
     monkeypatch, hook_name
 ):
+    """Check that each load hook finalizes Meta weights before post-processing."""
     events = []
 
     def process_weights_after_loading(model, model_config, target_device):
@@ -873,6 +874,7 @@ def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:
 
 
 def _stub_vllm_process_weights_after_loading(monkeypatch, process_fn) -> None:
+    """Install isolated vLLM loader stubs with a custom post-processing hook."""
     packages = [
         "vllm",
         "vllm.model_executor",
