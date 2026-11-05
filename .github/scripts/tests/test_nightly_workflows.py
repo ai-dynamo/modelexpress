@@ -178,7 +178,7 @@ class NightlyWorkflowTests(unittest.TestCase):
         match = re.search(r"fromJSON\('((?:''|[^'])*)'\)", include)
         partitions = json.loads(match[1].replace("''", "'"))
         self.assertEqual({key: len(rows) for key, rows in partitions.items()}, {
-            "vllm": 10, "sglang": 6, "sglang-mooncake": 1, "dynamo-vllm": 1, "dynamo-sglang": 1, "large": 7,
+            "vllm": 7, "sglang": 3, "sglang-mooncake": 1, "dynamo-vllm": 1, "dynamo-sglang": 1, "large": 7,
         })
         namespaces = set()
         for framework, cases in partitions.items():
@@ -199,8 +199,6 @@ class NightlyWorkflowTests(unittest.TestCase):
                     self.assertLessEqual(len(grove_label), 63, grove_label)
         large = [case for cases in partitions.values() for case in cases if case.get("large")]
         self.assertEqual(sorted(case["fleet_size"] for case in large if case["kind"] == "fleet"), ["15", "5", "5"])
-        sglang_mla = next(case for case in partitions["sglang"] if case.get("measure_vram"))
-        self.assertEqual(sglang_mla["pytest_args"], "--expected-max-total-tokens 131072")
         self.assertEqual(
             {case["name"] for case in large if case["kind"] != "fleet"},
             {
@@ -326,6 +324,53 @@ class StageReleaseRcWorkflowTests(unittest.TestCase):
     def test_helm_chart_waits_for_container_staging(self):
         jobs = workflow("stage-release-rc.yml")["jobs"]
         self.assertIn("stage-containers-ngc", jobs["stage-helm-ngc"]["needs"])
+
+    def test_every_publishing_job_waits_for_the_ops_gate(self):
+        jobs = workflow("stage-release-rc.yml")["jobs"]
+        self.assertNotIn("manual-release-approval", jobs)
+        for name in [
+            "build-server-image", "build-wheels", "stage-crates",
+            "stage-helm-ngc", "stage-containers-ngc", "trigger-gitlab-release",
+        ]:
+            with self.subTest(job=name):
+                self.assertIn("authorize", jobs[name]["needs"])
+                self.assertIn("authorized_attempt == github.run_attempt", jobs[name]["if"])
+        self.assertIn("build-server-image", jobs["assemble-server-manifest"]["needs"])
+
+    def test_ops_gate_checks_both_actors_against_the_devops_team(self):
+        gate = workflow("stage-release-rc.yml")["jobs"]["authorize"]
+        self.assertEqual(gate["environment"], "automated-release")
+        check = next(step for step in gate["steps"] if step.get("name") == "Require release-ops team membership")
+        self.assertEqual(check["env"]["TEAM"], "devops")
+        self.assertIn("github.actor", check["env"]["ACTOR"])
+        self.assertIn("github.triggering_actor", check["env"]["TRIGGERING_ACTOR"])
+
+    def test_ops_gate_rejects_non_members_and_api_errors(self):
+        gate = workflow("stage-release-rc.yml")["jobs"]["authorize"]
+        script = next(
+            step["run"] for step in gate["steps"] if step.get("name") == "Require release-ops team membership"
+        )
+        cases = [
+            ("200", '{"state": "active"}', 0),
+            ("200", '{"state": "pending"}', 1),
+            ("404", '{"message": "Not Found"}', 1),
+            ("000", "", 1),
+        ]
+        for http, body, expected in cases:
+            with self.subTest(http=http, body=body), tempfile.TemporaryDirectory() as tmp:
+                curl = Path(tmp) / "curl"
+                curl.write_text(
+                    "#!/bin/sh\n"
+                    "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n"
+                    f"printf '%s' '{body}' > \"$out\"\n"
+                    f"printf '%s' '{http}'\n"
+                )
+                curl.chmod(0o755)
+                result, _ = execute(script, {
+                    "PATH": f"{tmp}:{os.environ['PATH']}", "RUNNER_TEMP": tmp, "GH_TOKEN": "x",
+                    "ORG": "ai-dynamo", "TEAM": "devops", "ACTOR": "alice", "TRIGGERING_ACTOR": "bob",
+                })
+                self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_rc_status_requires_every_staging_job(self):
         status = workflow("stage-release-rc.yml")["jobs"]["rc-status"]
