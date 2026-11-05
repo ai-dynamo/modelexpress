@@ -119,6 +119,45 @@ mod tests {
     use super::*;
     use crate::p2p::backend::{MockMetadataBackend, SourceInstanceInfo};
 
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn test_reap_preserves_newly_published_unknown_workers() {
+        use crate::p2p::backend::memory::InMemoryMetadataBackend;
+        use modelexpress_common::grpc::p2p::{SourceIdentity, WorkerMetadata};
+
+        for updated_at in [0, i64::MAX] {
+            let state = P2pStateManager::with_backend(Arc::new(InMemoryMetadataBackend::new()));
+            let before_publish = chrono::Utc::now().timestamp_millis();
+            state
+                .publish_metadata(
+                    &SourceIdentity {
+                        model_name: "model".into(),
+                        ..Default::default()
+                    },
+                    "w1",
+                    WorkerMetadata {
+                        updated_at,
+                        ..Default::default()
+                    },
+                    "",
+                    "",
+                    "",
+                )
+                .await
+                .expect("publish_metadata failed");
+            let after_publish = chrono::Utc::now().timestamp_millis();
+
+            reap_once(&state, 90_000, 3_600_000)
+                .await
+                .expect("reap_once failed");
+
+            let workers = state.list_workers(None, None).await.expect("list failed");
+            assert_eq!(workers.len(), 1);
+            assert_eq!(workers[0].status, SourceStatus::Unknown as i32);
+            assert!((before_publish..=after_publish).contains(&workers[0].updated_at));
+        }
+    }
+
     #[tokio::test]
     async fn test_reap_marks_stale_when_heartbeat_expired() {
         let now = chrono::Utc::now().timestamp_millis();
