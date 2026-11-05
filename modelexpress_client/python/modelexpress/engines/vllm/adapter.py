@@ -778,6 +778,9 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
         worker_id=uuid.uuid4().hex[:8],
         node_rank=int(getattr(vllm_config.parallel_config, "node_rank", 0)),
         head_addr=getattr(vllm_config.parallel_config, "master_addr", None),
+        artifact_ready_url=getattr(
+            vllm_config.load_config, "_mx_artifact_ready_url", None
+        ),
         adapter=adapter,
         accelerator_backend=adapter.accelerator_backend,
     )

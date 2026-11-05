@@ -30,6 +30,7 @@ from ...metadata.artifact_transfer import (
 )
 from ...metadata.artifact_transport import PublicationHandle
 from ...metadata.publisher import PublisherThread
+from .readiness import sglang_server_readiness
 
 logger = logging.getLogger("modelexpress.engines.sglang.artifacts")
 
@@ -381,9 +382,17 @@ def _sglang_health_ready(ctx: LoadContext | None = None) -> bool:
 
 
 def _sglang_health_url(ctx: LoadContext | None = None) -> str:
+    configured = envs.MX_ARTIFACT_READY_URL
+    default_url = getattr(ctx, "artifact_ready_url", None)
+    local_dummy = getattr(ctx, "artifact_ready_local", False)
+    if not default_url and not configured.strip():
+        readiness = sglang_server_readiness()
+        default_url, local_dummy = readiness.url, readiness.local_dummy
+    if not configured.strip() and default_url and local_dummy:
+        return default_url
     return _common_artifacts.resolve_health_url(
-        envs.MX_ARTIFACT_READY_URL,
-        _DEFAULT_READY_URL,
+        configured,
+        default_url or _DEFAULT_READY_URL,
         getattr(ctx, "head_addr", None),
     )
 

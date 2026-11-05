@@ -25,6 +25,7 @@ from ...tensor_utils import (
     collect_module_tensors,
 )
 from .draft_weights import draft_weight_adapter_for
+from .readiness import sglang_server_readiness
 from .runtime_state import finalize_runtime_state, prepare_runtime_tensors
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
@@ -494,6 +495,7 @@ def build_sglang_load_context(
     worker_rank = adapter.get_worker_rank()
     global_rank = adapter.get_global_rank()
     server_url = getattr(load_config, "modelexpress_url", None)
+    readiness = sglang_server_readiness()
     return LoadContext(
         model_config=model_config,
         load_config=load_config,
@@ -508,6 +510,8 @@ def build_sglang_load_context(
             server_url=server_url,
         ),
         worker_id=uuid.uuid4().hex[:8],
+        artifact_ready_url=readiness.url,
+        artifact_ready_local=readiness.local_dummy,
         adapter=adapter,
         accelerator_backend=adapter.accelerator_backend,
     )

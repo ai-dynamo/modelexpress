@@ -874,8 +874,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
 | `MX_ARTIFACT_MOONCAKE_NAMESPACE` | `modelexpress/artifacts` | Key prefix used by the Mooncake artifact backend. |
 | `MX_MOONCAKE_CONFIG_PATH` | (unset) | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback. |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
+| `MX_ARTIFACT_READY_URL` | From framework server config | Explicit HTTP(S) readiness URL override. When unset, artifact publishers use the engine's resolved HTTP host and port, including config-file and CLI overrides; wildcard bind hosts become loopback addresses. Framework defaults are port 8000 for vLLM and 30000 for SGLang. Non-head nodes retain the head-host rewrite described in [Multi-node readiness](#multi-node-readiness). Probe timeouts are 1 second for vLLM and 5 seconds for SGLang. |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; SGLang draft P2P also requires a non-empty revision. |
@@ -1266,6 +1265,39 @@ artifact discovery requires a central coordinator (`redis` or `kubernetes`),
 and Kubernetes deployments must use the matching `ModelMetadata` CRD containing
 `status.worker.artifactSource.nodeRank`. Mooncake includes the same rank in its
 deterministic object key and needs no MX metadata record.
+
+#### Readiness server configuration
+
+`MX_ARTIFACT_READY_URL` takes precedence over the engine's serving configuration.
+Without an override, vLLM's parsed frontend arguments are carried in its load
+configuration to model workers. SGLang workers read the resolved serving
+configuration through the runtime-context API or the older global server-args
+API. A `port` from a framework config file and a CLI `--port` therefore follow
+that framework's own precedence rules; ModelExpress does not parse the file
+again. For example, `vllm serve MODEL --port 8001` probes
+`http://127.0.0.1:8001/health` without an extra environment variable.
+
+The endpoint is separate from `SourceIdentity` and compilation-cache hashes.
+Changing the serving port does not invalidate artifact caches. TLS key/cert
+settings select HTTPS, which uses the standard Python certificate checks.
+The existing framework-default URL remains the fallback when no HTTP serving
+configuration is available (including vLLM with compatibility patches disabled).
+vLLM discovery requires the ModelExpress general plugin to load before engine
+configuration is created, as it does for the standard `vllm serve` command.
+Unix-domain sockets, gRPC and dynamically assigned ports (`--port 0`) are not
+automatically discovered; select a known reachable HTTP(S) endpoint explicitly.
+An externally proxied health endpoint can also be selected explicitly.
+vLLM headless workers use the head address even if their CLI `--host` names a
+node-local interface; the inferred HTTP port and scheme are preserved. An
+explicit non-loopback `MX_ARTIFACT_READY_URL` still wins unchanged. SGLang's
+Python follower dummy listeners use local plain HTTP, even when the head has
+TLS enabled, and inferred URLs for those listeners are not redirected by
+`LWS_LEADER_ADDRESS`. Head and Rust listeners keep their native TLS settings;
+Rust listener placement is queried through the engine's own helper.
+Weight-metadata publication keeps its existing opt-in health gate; automatic
+port discovery applies to the artifact health check and does not add an HTTP
+gate to offline model loading. TensorRT-LLM currently has no artifact publisher,
+so its weight-publishing behavior is unchanged.
 
 #### Multi-node readiness
 

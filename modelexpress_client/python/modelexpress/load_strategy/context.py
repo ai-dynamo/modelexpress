@@ -85,6 +85,10 @@ class LoadContext:
     # parallel_config.master_addr). Non-head nodes rewrite a pod-local
     # readiness URL onto this host, since loopback serves nothing there.
     head_addr: str | None = None
+    # Resolved HTTP endpoint; deliberately excluded from SourceIdentity.
+    artifact_ready_url: str | None = None
+    # A native local health listener must not be redirected to a remote head.
+    artifact_ready_local: bool = False
     adapter: EngineAdapter | None = None
     accelerator_backend: AcceleratorBackend = field(
         default_factory=CudaAcceleratorBackend
