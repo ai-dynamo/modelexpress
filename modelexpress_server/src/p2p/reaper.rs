@@ -119,6 +119,7 @@ mod tests {
     use super::*;
     use crate::p2p::backend::{MockMetadataBackend, SourceInstanceInfo};
 
+    /// Fresh publications receive server timestamps and survive an immediate reaper scan.
     #[cfg(feature = "memory-backend")]
     #[tokio::test]
     async fn test_reap_preserves_newly_published_unknown_workers() {
@@ -240,6 +241,7 @@ mod tests {
         }
     }
 
+    /// Expired UNKNOWN and unrecognized statuses enter the normal STALE cleanup path.
     #[tokio::test]
     async fn test_reap_marks_expired_unknown_and_unrecognized_status_stale() {
         // A worker that dies between PublishMetadata and its first UpdateStatus stays at
