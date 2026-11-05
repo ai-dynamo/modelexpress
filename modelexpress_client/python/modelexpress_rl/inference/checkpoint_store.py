@@ -204,11 +204,12 @@ class LocalCheckpointStore:
         #     full/<version>/           immutable full HF checkpoints
         #     deltas/<version>/         immutable delta index and shards
         #     chains/<version>.json     full ancestor plus ordered deltas
-        #     materialized/<version>/   derived, installable full checkpoints
+        #     materialized/<version>/   derived, installable full checkpoints,
+        #                               or a full checkpoint's working copy
         #     state.json                current preparation transaction
         #     active.json               version committed after engine install
         #     .lock                     cross-process cache coordination
-        #     .prepare.lock             serializes preparation and working copies
+        #     .prepare.lock             serializes preparation and the seed copy
         #     .install.lock             excludes mutation during engine install
         #
         # Full checkpoints, deltas, and chain manifests are the canonical
@@ -606,6 +607,39 @@ class LocalCheckpointStore:
         if sizes != {name: size for name, (size, _) in record["files"].items()}:
             raise ValueError("checkpoint copy is incomplete")
         self.record_artifact(copy, source=record.get("source"))
+
+    def working_copy(self, version: str) -> Path | None:
+        """Return the recorded working copy of full checkpoint ``version``.
+
+        The next delta renames this copy of ``full/<version>`` and mutates it.
+        A copy that is incomplete or has a different source is deleted.
+        """
+        copy = self.materialized_path(version)
+        if not copy.is_dir():
+            return None
+        try:
+            if self.artifact_source(copy) == self.artifact_source(
+                self.full_path(version)
+            ):
+                return copy
+        except (OSError, ValueError):
+            pass
+        shutil.rmtree(copy, ignore_errors=True)
+        return None
+
+    def drop_working_copy(self, version: str) -> None:
+        """Delete the working copy of full checkpoint ``version``, if any."""
+        shutil.rmtree(self.materialized_path(version), ignore_errors=True)
+
+    def drop_unused_working_copy(self, version: str) -> None:
+        """Delete ``version``'s working copy once a newer full checkpoint replaces it.
+
+        A version with deltas keeps ``materialized/<version>``: it is that
+        version's checkpoint, not a working copy.
+        """
+        chain = self.chain(version)
+        if chain is not None and not chain.get("deltas"):
+            self.drop_working_copy(version)
 
     def has_artifact_record(self, artifact: Path) -> bool:
         return self._source_path(artifact).exists()

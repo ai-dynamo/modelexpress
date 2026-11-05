@@ -23,7 +23,6 @@ from .checkpoint_store import CheckpointState, LocalCheckpointStore
 from .receiver import (
     _ObjectStorageVersion,
     _active_version,
-    _drop_full_working_copy,
     _protected_versions,
     _source_identity,
 )
@@ -260,7 +259,7 @@ class _CheckpointWriter:
         target = store.full_path(version)
         logger.info("Streamed checkpoint cache started version=%s", version)
         try:
-            # Like a preparation, wait for a background working copy to finish.
+            # Like a preparation, wait for a background seed copy to finish.
             # Its lock comes first: the copy takes the store lock to record itself.
             with (
                 store.preparation_locked(),
@@ -278,7 +277,7 @@ class _CheckpointWriter:
                 )
                 active = _active_version(store)
                 if active not in {None, version}:
-                    _drop_full_working_copy(store, active)
+                    store.drop_unused_working_copy(active)
                 cached = target.exists()
                 if cached:
                     store.verify_artifact_source(

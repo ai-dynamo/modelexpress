@@ -1138,7 +1138,7 @@ def test_initial_checkpoint_links_seed_and_first_delta_copies_it(
     assert linked.is_symlink()
     assert linked.resolve() == seed.resolve()
     assert store.cache_size_bytes() < seed.stat().st_size
-    assert adapter._method._working_copy is None
+    assert adapter._method._seed_copy is None
 
     staged = adapter.stage_weight(_inputs(None))
     materialized = staged.path / "model.safetensors"
@@ -1168,7 +1168,7 @@ def test_first_delta_renames_the_background_seed_copy(monkeypatch, tmp_path):
         launch_tensors={"weight": base},
         background_seed_copy=True,
     )
-    adapter._method._working_copy.join()
+    adapter._method._seed_copy.join()
     store = adapter._checkpoint.store
     seed = tmp_path / "launch" / "model.safetensors"
     working_copy = store.materialized_path("base-a") / "model.safetensors"
@@ -1265,7 +1265,7 @@ def test_full_checkpoint_or_close_cancels_background_seed_copy(
         adapter.close()
 
     assert cancelled_in_time == [True]
-    assert adapter._method._working_copy is None
+    assert adapter._method._seed_copy is None
     # A cancelled copy is never recorded, and the full checkpoint drops it.
     working_copy = store.materialized_path("base-a")
     assert working_copy.exists() is (stop == "close")
@@ -1292,7 +1292,7 @@ def test_first_delta_replaces_a_partial_working_copy(monkeypatch, tmp_path):
         launch_tensors={"weight": base},
         background_seed_copy=True,
     )
-    adapter._method._working_copy.join()
+    adapter._method._seed_copy.join()
     partial = adapter._checkpoint.store.materialized_path("base-a")
     assert (partial / "model.safetensors").read_bytes() == b"partial"
 
@@ -1315,7 +1315,7 @@ def test_full_root_replay_drops_the_seed_working_copy_it_replaces(
         launch_tensors={"weight": base},
         background_seed_copy=True,
     )
-    adapter._method._working_copy.join()
+    adapter._method._seed_copy.join()
     store = adapter._checkpoint.store
     seed_copy = store.materialized_path("base-a")
     assert store.artifact_source(seed_copy) is None
@@ -1367,7 +1367,7 @@ def test_cached_full_root_replay_drops_the_seed_working_copy(monkeypatch, tmp_pa
         launch_tensors=seed_tensors,
         background_seed_copy=True,
     )
-    adapter._method._working_copy.join()
+    adapter._method._seed_copy.join()
     store = adapter._checkpoint.store
     seed_copy = store.materialized_path("base-a")
     assert store.has_artifact_record(seed_copy)
@@ -1398,7 +1398,7 @@ def test_cached_full_root_replay_drops_the_seed_working_copy(monkeypatch, tmp_pa
 
 def test_reseeding_drops_the_working_copy_of_the_old_seed(monkeypatch, tmp_path):
     adapter, _storage = _build(monkeypatch, tmp_path, {}, background_seed_copy=True)
-    adapter._method._working_copy.join()
+    adapter._method._seed_copy.join()
     working_copy = adapter._checkpoint.store.materialized_path("base-a")
     assert adapter._checkpoint.store.has_artifact_record(working_copy)
     adapter.close()
@@ -1414,7 +1414,7 @@ def test_reseeding_drops_the_working_copy_of_the_old_seed(monkeypatch, tmp_path)
     adapter.close()
 
 
-def test_working_copy_is_made_once_and_not_during_preparation(
+def test_seed_copy_is_made_once_and_not_during_preparation(
     monkeypatch, tmp_path
 ):
     adapter, _storage = _build(monkeypatch, tmp_path, {})
@@ -1422,16 +1422,16 @@ def test_working_copy_is_made_once_and_not_during_preparation(
     store = checkpoint.store
 
     with store.preparation_locked():
-        assert not checkpoint.prepare_working_copy(threading.Event())
+        assert not checkpoint.prepare_seed_working_copy(threading.Event())
     assert not store.materialized_path("base-a").exists()
 
-    assert checkpoint.prepare_working_copy(threading.Event())
+    assert checkpoint.prepare_seed_working_copy(threading.Event())
     assert store.artifact_source(store.materialized_path("base-a")) is None
-    assert not checkpoint.prepare_working_copy(threading.Event())
+    assert not checkpoint.prepare_seed_working_copy(threading.Event())
     adapter.close()
 
 
-def test_working_copy_without_room_is_left_to_the_first_delta(
+def test_seed_copy_without_room_is_left_to_the_first_delta(
     monkeypatch, tmp_path, caplog
 ):
     adapter, _storage = _build(monkeypatch, tmp_path, {})
@@ -1439,14 +1439,14 @@ def test_working_copy_without_room_is_left_to_the_first_delta(
     store.max_size_bytes = store.cache_size_bytes() + 1
 
     caplog.set_level("WARNING", logger=receiver_module.__name__)
-    assert not adapter._checkpoint.prepare_working_copy(threading.Event())
+    assert not adapter._checkpoint.prepare_seed_working_copy(threading.Event())
 
     assert "No room for a working copy of full checkpoint base-a" in caplog.text
     assert list(store.materialized_cache.iterdir()) == []
     adapter.close()
 
 
-def test_working_copy_evicts_stale_entries_to_fit_the_quota(monkeypatch, tmp_path):
+def test_seed_copy_evicts_stale_entries_to_fit_the_quota(monkeypatch, tmp_path):
     adapter, _storage = _build(monkeypatch, tmp_path, {})
     store = adapter._checkpoint.store
     stale = store.materialized_path("stale")
@@ -1457,7 +1457,7 @@ def test_working_copy_evicts_stale_entries_to_fit_the_quota(monkeypatch, tmp_pat
         store.cache_size_bytes() + store.path_size_bytes(store.full_path("base-a")) - 1
     )
 
-    assert adapter._checkpoint.prepare_working_copy(threading.Event())
+    assert adapter._checkpoint.prepare_seed_working_copy(threading.Event())
 
     assert not stale.exists()
     assert store.cache_size_bytes() <= store.max_size_bytes

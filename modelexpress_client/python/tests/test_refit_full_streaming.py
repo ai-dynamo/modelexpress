@@ -151,14 +151,14 @@ def test_cache_uses_stream_bytes_and_next_delta_never_downloads_full(
         adapter.close()
 
 
-def test_cache_waits_for_a_working_copy_then_drops_it(monkeypatch, tmp_path):
+def test_cache_waits_for_the_seed_copy_then_drops_it(monkeypatch, tmp_path):
     adapter, _storage = build(monkeypatch, tmp_path, background_seed_copy=True)
     store = adapter._checkpoint.store
     try:
-        adapter._method._working_copy.join()
+        adapter._method._seed_copy.join()
         assert store.has_artifact_record(store.materialized_path("base-a"))
         full = adapter.stage_weight(_full_inputs())
-        # A background working copy holds the preparation lock while it copies.
+        # The background seed copy holds the preparation lock while it copies.
         with store.preparation_locked():
             with adapter._method.installation_context(adapter._active):
                 consume(full)
@@ -193,7 +193,7 @@ def test_cached_stream_drops_the_working_copy_of_a_reseeded_head(
     adapter, _storage = build(monkeypatch, tmp_path, background_seed_copy=True)
     store = adapter._checkpoint.store
     try:
-        adapter._method._working_copy.join()
+        adapter._method._seed_copy.join()
         assert store.has_artifact_record(store.materialized_path("base-a"))
         full = adapter.stage_weight(_full_inputs())
         with adapter._method.installation_context(adapter._active):

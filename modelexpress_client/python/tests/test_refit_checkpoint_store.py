@@ -715,3 +715,42 @@ def test_record_copy_binds_a_complete_copy_to_the_artifact_record(tmp_path):
     store.record_artifact(full, source={"uri": "s3://weights/other"})
     with pytest.raises(ValueError, match="changed while copying"):
         store.record_copy(full, copy, record)
+
+
+def test_working_copy_is_used_only_while_it_matches_its_full_checkpoint(tmp_path):
+    store = LocalCheckpointStore(root=tmp_path, model_name="model")
+    store.initialize()
+    full = store.full_path("base")
+    full.mkdir()
+    (full / "weights").write_bytes(b"canonical")
+    store.record_artifact(full, source={"uri": "s3://weights/base"})
+    copy = store.materialized_path("base")
+    assert store.working_copy("base") is None
+
+    # An unrecorded copy may be partial.
+    store.copy_directory(full, copy, cancelled=threading.Event())
+    assert store.working_copy("base") is None
+    assert not copy.exists()
+
+    store.copy_directory(full, copy, cancelled=threading.Event())
+    store.record_copy(full, copy, store.artifact_record(full))
+    assert store.working_copy("base") == copy
+
+    store.record_artifact(full, source={"uri": "s3://weights/other"})
+    assert store.working_copy("base") is None
+    assert not copy.exists()
+
+
+def test_dropping_an_unused_working_copy_keeps_a_delta_version(tmp_path):
+    store = LocalCheckpointStore(root=tmp_path, model_name="model")
+    store.initialize()
+    for version, deltas in (("full", []), ("delta", ["delta"])):
+        store.materialized_path(version).mkdir()
+        store.write_chain(
+            version, {"version": version, "full_version": "full", "deltas": deltas}
+        )
+        store.drop_unused_working_copy(version)
+
+    assert not store.materialized_path("full").exists()
+    # A delta version's materialized directory is its checkpoint.
+    assert store.materialized_path("delta").exists()

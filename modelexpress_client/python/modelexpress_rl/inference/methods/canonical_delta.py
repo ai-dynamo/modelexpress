@@ -78,23 +78,23 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         self._active: PreparedCheckpointArtifact | None = None
         self._stream_full_checkpoints = stream_full_checkpoints
         self._streams: list[StreamedCheckpoint] = []
-        self._working_copy_cancelled = threading.Event()
-        self._working_copy: threading.Thread | None = None
+        self._seed_copy_cancelled = threading.Event()
+        self._seed_copy: threading.Thread | None = None
         # After initialization, copy the seed, the full checkpoint at the cache
         # head, to the working copy that the next delta renames, in the
         # background instead of during that delta. Later full checkpoints write
         # theirs while downloading.
         if background_seed_copy and self._initialized:
-            self._working_copy = threading.Thread(
-                target=self._prepare_working_copy,
-                name="modelexpress-refit-working-copy",
+            self._seed_copy = threading.Thread(
+                target=self._copy_seed,
+                name="modelexpress-refit-seed-copy",
                 daemon=True,
             )
-            self._working_copy.start()
+            self._seed_copy.start()
 
-    def _prepare_working_copy(self) -> None:
+    def _copy_seed(self) -> None:
         try:
-            self._checkpoint.prepare_working_copy(self._working_copy_cancelled)
+            self._checkpoint.prepare_seed_working_copy(self._seed_copy_cancelled)
         except Exception:
             logger.warning(
                 "Could not copy the initial full checkpoint ahead of its first "
@@ -102,12 +102,12 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                 exc_info=True,
             )
 
-    def _cancel_working_copy(self) -> None:
-        """Stop a background working copy and wait until it releases its lock."""
-        self._working_copy_cancelled.set()
-        if self._working_copy is not None:
-            self._working_copy.join()
-            self._working_copy = None
+    def _cancel_seed_copy(self) -> None:
+        """Stop the background seed copy and wait until it releases its lock."""
+        self._seed_copy_cancelled.set()
+        if self._seed_copy is not None:
+            self._seed_copy.join()
+            self._seed_copy = None
 
     @property
     def requires_full_root(self) -> bool:
@@ -148,7 +148,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         ):
             # A full checkpoint replaces the head, so its working copy is unused.
             # A delta instead waits on the preparation lock for the copy.
-            self._cancel_working_copy()
+            self._cancel_seed_copy()
         try:
             checkpoint = None
             if (
@@ -300,7 +300,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         self._active = None
 
     def close(self) -> None:
-        self._cancel_working_copy()
+        self._cancel_seed_copy()
         self._active = None
         for stream in self._streams:
             stream.close()

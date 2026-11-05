@@ -360,13 +360,6 @@ def _protected_versions(
     return protected
 
 
-def _drop_full_working_copy(store: LocalCheckpointStore, version_id: str) -> None:
-    """Delete a full version's unused working copy before a newer full."""
-    chain = store.chain(version_id)
-    if chain is not None and not chain.get("deltas"):
-        shutil.rmtree(store.materialized_path(version_id), ignore_errors=True)
-
-
 def _ensure_full_checkpoint(
     *,
     store: LocalCheckpointStore,
@@ -652,9 +645,7 @@ class _LocalCheckpoint:
             checkpoint_paths=self.checkpoint_paths,
         )
         # A working copy of the replaced initial checkpoint is stale.
-        shutil.rmtree(
-            self.store.materialized_path(self.initial_version), ignore_errors=True
-        )
+        self.store.drop_working_copy(self.initial_version)
         with self.store.replace_directory(target) as temporary:
             if seed.is_file():
                 (temporary / "model.safetensors").symlink_to(seed.resolve())
@@ -682,8 +673,8 @@ class _LocalCheckpoint:
             checkpoint_paths=self.checkpoint_paths,
         )
 
-    def prepare_working_copy(self, cancelled: threading.Event) -> bool:
-        """Copy a full cache head to the working copy its next delta mutates.
+    def prepare_seed_working_copy(self, cancelled: threading.Event) -> bool:
+        """Copy the full cache head, usually the seed, to its working copy.
 
         Copying holds only the preparation lock: ranks can still initialize and
         install, while the next delta waits for the copy and then renames it.
@@ -701,10 +692,10 @@ class _LocalCheckpoint:
                 if chain is None or chain.get("deltas"):
                     return False
                 version = state.version
+                if self.store.working_copy(version) is not None:
+                    return False
                 full_checkpoint = self.store.full_path(version)
                 working_copy = self.store.materialized_path(version)
-                if self._full_working_copy(version, full_checkpoint) == working_copy:
-                    return False
                 record = self.store.artifact_record(full_checkpoint)
                 size = self.store.path_size_bytes(full_checkpoint)
                 protected_versions = _protected_versions(self.store, version)
@@ -738,7 +729,9 @@ class _LocalCheckpoint:
                     cancelled=cancelled,
                 )
             except CheckpointCopyCancelled:
-                logger.info("Cancelled the working copy of full checkpoint %s", version)
+                logger.info(
+                    "Cancelled copying full checkpoint %s to its working copy", version
+                )
                 return False
             with self.store.locked():
                 self.store.record_copy(full_checkpoint, working_copy, record)
@@ -1045,7 +1038,7 @@ class _LocalCheckpoint:
         # copy unused.
         active_version = _active_version(self.store)
         if active_version not in {None, version.version_id}:
-            _drop_full_working_copy(self.store, active_version)
+            self.store.drop_unused_working_copy(active_version)
         target = self.store.full_path(version.version_id)
         if target.exists():
             source = self.store.artifact_source(target)
@@ -1079,9 +1072,7 @@ class _LocalCheckpoint:
             # Updates carry seed metadata forward; the initial root may be evicted.
             non_weight_source = self.local_checkpoint
         # A working copy of the full checkpoint being replaced is stale.
-        shutil.rmtree(
-            self.store.materialized_path(version.version_id), ignore_errors=True
-        )
+        self.store.drop_working_copy(version.version_id)
         protected_versions = _protected_versions(self.store, version.version_id)
         shard_bytes = _full_shard_bytes(self.reader, weight_map, version.uri)
         metadata_bytes = self._non_weight_files_size(non_weight_source) + len(
@@ -1139,21 +1130,6 @@ class _LocalCheckpoint:
         )
         return download_time, validation_time
 
-    def _full_working_copy(self, version_id: str, full_checkpoint: Path) -> Path:
-        """Return the verified working copy of a full checkpoint, if it has one."""
-        working_copy = self.store.materialized_path(version_id)
-        if not working_copy.is_dir():
-            return full_checkpoint
-        try:
-            if self.store.artifact_source(working_copy) == self.store.artifact_source(
-                full_checkpoint
-            ):
-                return working_copy
-        except (OSError, ValueError):
-            pass
-        shutil.rmtree(working_copy, ignore_errors=True)
-        return full_checkpoint
-
     def _prepare_delta(
         self,
         version: _ObjectStorageVersion,
@@ -1209,9 +1185,8 @@ class _LocalCheckpoint:
             self.store.verify_artifact(self.store.delta_path(delta_version))
         base_checkpoint = self.store.checkpoint_path(version.base_version_id)
         if base_checkpoint.parent != self.store.materialized_cache:
-            base_checkpoint = self._full_working_copy(
-                version.base_version_id,
-                base_checkpoint,
+            base_checkpoint = (
+                self.store.working_copy(version.base_version_id) or base_checkpoint
             )
         reuse_materialized = base_checkpoint.parent == self.store.materialized_cache
         self.store.ensure_capacity(
