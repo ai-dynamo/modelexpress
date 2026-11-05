@@ -25,8 +25,8 @@ Runs on CPU/meta in any torch env: no GPU, no vLLM.
 
 import torch
 
-from modelexpress.refit.reshard.geometry import capture_geometry
-from modelexpress.refit.reshard.slice_plan import Shard, plan_pull
+from modelexpress_rl.refit.reshard.geometry import capture_geometry
+from modelexpress_rl.refit.reshard.slice_plan import Shard, plan_pull
 
 HIDDEN = 4
 INTER = 8  # per-expert intermediate size, full (unsharded)

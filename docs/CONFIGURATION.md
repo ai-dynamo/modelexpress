@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Configuration reference
 
-This is the canonical reference for ModelExpress-owned server, client, loader, transport, artifact, and metrics configuration. The Python client reads its environment values at use time from [modelexpress/envs.py](../modelexpress_client/python/modelexpress/envs.py); the Rust server and CLI use [modelexpress_common/src/envs.rs](../modelexpress_common/src/envs.rs) and the server configuration types. Advanced refit and resharding controls remain with the feature implementation because their safety contracts are workload-specific. When a third-party runtime owns a setting, this page names the runtime rather than pretending it is an MX setting.
+This is the canonical reference for ModelExpress-owned server, client, loader, transport, artifact, and metrics configuration. The Python client reads its environment values at use time from [modelexpress/envs.py](../modelexpress_client/python/modelexpress/envs.py); the Rust server and CLI use [modelexpress_common/src/envs.rs](../modelexpress_common/src/envs.rs) and the server configuration types. When a third-party runtime owns a setting, this page names the runtime rather than pretending it is an MX setting.
 
 ## Precedence
 
@@ -77,6 +77,7 @@ When security mode is enforce, set MODEL_EXPRESS_SECURITY_MODE=enforce, at least
 |---|---|---|
 | MODEL_EXPRESS_ENDPOINT | http://localhost:8001 | CLI server endpoint |
 | MODEL_EXPRESS_TIMEOUT | 30 seconds | CLI request timeout |
+| MODEL_EXPRESS_CONNECT_WAIT_SECS | 10 seconds | Budget for retrying the initial server connection before falling back to a direct provider download (0 disables) |
 | MODEL_EXPRESS_CACHE_DIRECTORY | auto | Cache override; Hugging Face resolution falls back to HF_HUB_CACHE and then the default Hub cache |
 | MODEL_EXPRESS_NO_SHARED_STORAGE | false | Fetch repository files from the server instead of assuming a shared filesystem |
 | MODEL_EXPRESS_TRANSFER_CHUNK_SIZE | 32768 bytes for the Rust CLI; 1048576 bytes for the Python server-cache client | File-transfer chunk size; values must be positive and no larger than the implementation maximum |
@@ -221,6 +222,6 @@ model-weight transfer.
 
 See [Metrics](METRICS.md) for endpoint behavior and PromQL.
 
-## Advanced refit and resharding
+## RL refit settings
 
-Live refit and resharding have additional `MX_REFIT_*` and `MX_RESHARD_*` settings that are intentionally documented with the feature implementation because their defaults and safety contracts are workload-specific. See [the refit README](../modelexpress_client/python/modelexpress/refit/README.md) and the [architecture reference](ARCHITECTURE.md) before enabling them.
+RL trainer and generator settings are documented in the [RL configuration reference](rl/CONFIGURATION.md).

@@ -173,7 +173,7 @@ spec:
             --gpu-memory-utilization 0.5 --max-model-len 512 --max-num-seqs 8
           env:
           - {name: MX_SERVER_ADDRESS, value: "vime-delta-refit-mx:8101"}
-          - {name: VLLM_PLUGINS, value: modelexpress}
+          - {name: VLLM_PLUGINS, value: modelexpress_rl}
           - {name: AWS_ENDPOINT_URL, value: "http://vime-delta-refit-seaweedfs:9000"}
           - {name: AWS_DEFAULT_REGION, value: us-east-1}
           - {name: AWS_EC2_METADATA_DISABLED, value: "true"}

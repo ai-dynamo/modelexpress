@@ -8,7 +8,7 @@ FROM ${SGLANG_IMAGE}
 
 ARG INSTALL_MOONCAKE=false
 RUN if [ "${INSTALL_MOONCAKE}" = "true" ]; then \
-        python3 -m pip install --no-cache-dir mooncake-transfer-engine-cuda13; \
+        python3 -m pip install --no-cache-dir 'mooncake-transfer-engine-cuda13>=0.3.14'; \
     fi
 
 # The SGLang base image owns the CUDA/NIXL/Torch stack. Install only the

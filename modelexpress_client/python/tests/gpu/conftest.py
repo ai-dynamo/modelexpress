@@ -3,7 +3,6 @@
 
 """Conftest for GPU-resident real-model tests.
 
-This directory intentionally does NOT inherit the parent conftest vllm mocks:
-loading real HuggingFace models via transformers+accelerate into CUDA is
-incompatible with the MagicMock vllm shims in tests/conftest.py.
+These tests require real CUDA and vLLM. The shared conftest leaves an installed
+vLLM unchanged, so real-model integration uses the real modules.
 """

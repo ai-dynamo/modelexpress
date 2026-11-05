@@ -14,13 +14,13 @@ Run: pytest tests/test_reshard_refit_slice_plan.py
 
 import pytest
 
-from modelexpress.refit.reshard.slice_plan import (
+from modelexpress_rl.refit.reshard.slice_plan import (
     Shard,
     intersect,
     op_chain_to_box,
     plan_pull,
 )
-from modelexpress.refit.reshard.types import RecordedCopy, UnsupportedReshard
+from modelexpress_rl.refit.reshard.types import RecordedCopy, UnsupportedReshard
 
 F32 = "f32"
 EL = 4  # bytes per f32 element

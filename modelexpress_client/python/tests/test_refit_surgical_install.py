@@ -75,6 +75,7 @@ def fake_vllm(monkeypatch):
         "vllm.model_executor.model_loader",
         "vllm.model_executor.model_loader.default_loader",
         "vllm.model_executor.model_loader.reload",
+        "vllm.model_executor.model_loader.reload.meta",
         LAYERWISE,
     ]
     modules = {name: ModuleType(name) for name in names}
@@ -90,6 +91,10 @@ def fake_vllm(monkeypatch):
     ].DefaultModelLoader = DefaultModelLoader
     layerwise = modules[LAYERWISE]
     layerwise.LAYERWISE_INFO = {}
+    layerwise._copy_and_restore_kernel_tensors = lambda _layer, _info: None
+    modules["vllm.model_executor.model_loader.reload.meta"].materialize_layer = (
+        lambda _layer, _info: None
+    )
 
     def initialize(_model):
         for layer in state.incomplete:
@@ -140,6 +145,29 @@ def _prepared(path, version, changes=()):
 
 
 V2 = (DeltaChange("v1", "v2", frozenset({"mlp.up_proj.weight"})),)
+
+
+@pytest.mark.parametrize("surgical", [False, True])
+def test_first_delta_refit_without_deferred_attention_helper(
+    fake_vllm, tmp_path, monkeypatch, surgical
+):
+    attention = sys.modules["vllm.model_executor.layers.attention"]
+    del attention.is_deferred_attention_layer
+    attention.Attention = type("Attention", (nn.Module,), {})
+    attention.MLAAttention = type("MLAAttention", (nn.Module,), {})
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", str(surgical).lower())
+    path = _checkpoint(tmp_path)
+    model = _Model()
+    installer = _installer(model)
+
+    installer.install(_prepared(path, "v1"))
+    installer.install(_prepared(path, "v2", V2))
+
+    assert fake_vllm.events == ["finalize", "finalize"]
+    assert fake_vllm.full == [str(path)] * (1 if surgical else 2)
+    assert model.loads == (
+        [["mlp.gate_proj.weight", "mlp.up_proj.weight"]] if surgical else []
+    )
 
 
 def test_delta_from_the_live_version_installs_only_changed_modules(

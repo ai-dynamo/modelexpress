@@ -115,3 +115,11 @@ class LoadContext:
     # cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr, collapsing
     # O(plugin_calls) MRs to 1.
     vmm_arena: VmmArena | None = None
+    # Whether this run refreshes weights in an already-initialized model
+    # rather than loading into a freshly built one. Each strategy's prepare(),
+    # finalize() and abort() decide what that changes for it.
+    is_reload: bool = False
+    # Reload only: identity of the weights the model holds right now, or None
+    # when unknown. RDMA reloads skip the target-side post-processing, so they
+    # are only correct when restoring these same weights.
+    loaded_identity: p2p_pb2.SourceIdentity | None = None

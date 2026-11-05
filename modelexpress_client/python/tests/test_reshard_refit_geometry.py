@@ -15,15 +15,15 @@ import re
 
 import pytest
 import torch
-from modelexpress.refit.reshard.geometry import (
+from modelexpress_rl.refit.reshard.geometry import (
     LazyWeight,
     build_lazy_weights,
     capture_geometry,
     capture_weights,
     convert_source_weights,
 )
-from modelexpress.refit.reshard.slice_plan import Shard, plan_pull
-from modelexpress.refit.reshard.types import UnsupportedReshard
+from modelexpress_rl.refit.reshard.slice_plan import Shard, plan_pull
+from modelexpress_rl.refit.reshard.types import UnsupportedReshard
 
 TP_RANK = 0
 
@@ -187,7 +187,7 @@ def test_batch_failure_preserves_only_serial_capture_records(failure_position):
                     # A loader may record both attributed and unattributed writes
                     # before encountering an unsupported operation.
                     self.norm.weight_loader(self.norm, tensor[0])
-                    self.norm.data.copy_(tensor[1])
+                    torch.empty_like(self.norm).copy_(tensor[1])
                 super().load_weights([(name, tensor)])
 
     with torch.device("meta"):
@@ -236,7 +236,7 @@ def test_bulk_only_failure_is_reported_even_when_every_source_retries_clean(capl
     with torch.device("meta"):
         model = BulkOnlyFailureModel()
     originals = {name: param.weight_loader for name, param in model.named_parameters()}
-    with caplog.at_level(logging.WARNING, logger="modelexpress.refit.reshard.geometry"):
+    with caplog.at_level(logging.WARNING, logger="modelexpress_rl.refit.reshard.geometry"):
         result = capture_geometry(model, _manifest())
 
     assert result.unsupported == [] and result.unattributed == 0
@@ -272,7 +272,7 @@ def test_batch_unsupported_operation_keeps_original_converted_source_name():
 def test_summarize_unsupported_groups_one_cause_across_many_sources():
     """Thousands of sources failing for one reason must read as one cause. Each
     message embeds its own source name, so grouping has to ignore that tail."""
-    from modelexpress.refit.reshard.types import summarize_unsupported
+    from modelexpress_rl.refit.reshard.types import summarize_unsupported
 
     reasons = {
         f"model.layers.0.mlp.experts.{i}.gate_proj.weight": (
@@ -290,7 +290,7 @@ def test_summarize_unsupported_groups_one_cause_across_many_sources():
 
 
 def test_summarize_unsupported_accepts_none_for_all_causes():
-    from modelexpress.refit.reshard.types import summarize_unsupported
+    from modelexpress_rl.refit.reshard.types import summarize_unsupported
 
     reasons = {
         f"source-{index}": f"cause-{index} on lazy 'source-{index}'"
@@ -306,7 +306,7 @@ def test_capture_feeds_slice_plan():
     """Compose capture -> slice-plan: real captured copies drive plan_pull. The
     row-parallel source (full [4,8], need cols [0:4]) is strided -> 4 runs
     covering exactly the needed 16 elements, landing contiguously in the dest."""
-    from modelexpress.refit.reshard.slice_plan import Shard, plan_pull
+    from modelexpress_rl.refit.reshard.slice_plan import Shard, plan_pull
 
     with torch.device("meta"):
         model = ToyModel()
@@ -349,17 +349,15 @@ class DefaultLoaderModel(torch.nn.Module):
             weight_loader(p, loaded)
 
 
-def test_default_loader_param_needs_default_weight_loader():
+def test_default_loader_parameter_is_resolved_with_or_without_stamp():
     manifest = [("norm", torch.float32, [4])]
 
-    # Without default_weight_loader: the param has no weight_loader, so it is not
-    # stamped; its copy_ fires with no attribution -> unattributed -> NOT captured
-    # (this is the norm-weights-never-pulled bug the step-0 verify caught).
+    # Registered storage identifies the destination even without a loader stamp.
     with torch.device("meta"):
         model = DefaultLoaderModel()
-    missed = capture_geometry(model, manifest)
-    assert missed.copies == []
-    assert missed.unattributed == 1
+    unstamped = capture_geometry(model, manifest)
+    assert unstamped.unattributed == 0
+    assert not unstamped.unsupported
 
     # With default_weight_loader: the param is stamped and the copy is attributed.
     with torch.device("meta"):
@@ -369,6 +367,7 @@ def test_default_loader_param_needs_default_weight_loader():
     assert got.copies[0].param_name == "norm"
     assert got.copies[0].op_chain == () and got.copies[0].dest_shape == (4,)
     assert got.unattributed == 0
+    assert got.copies == unstamped.copies
 
 
 def test_capture_weights_records_the_converted_source_name():
@@ -448,12 +447,19 @@ def test_convert_source_weights_rejects_a_synthesized_tensor():
         convert_source_weights(convert, _CONVERT_MANIFEST)
 
 
-def test_convert_source_weights_rejects_a_dtype_cast():
+def test_convert_source_weights_retains_a_dtype_cast_for_replay():
     def convert(sd):
         return {"a": sd["model.router.gate.weight"].to(torch.float32)}
 
-    with pytest.raises(UnsupportedReshard):
-        convert_source_weights(convert, _CONVERT_MANIFEST)
+    weight = convert_source_weights(convert, _CONVERT_MANIFEST)["a"]
+    assert weight.dtype == torch.float32
+    assert weight._name == "model.router.gate.weight"
+    assert weight._ops == (("to", (torch.float32,), ()),)
+    original = torch.tensor([0.1, 0.7], dtype=torch.bfloat16)
+    replay = original
+    for op, args, kwargs in weight._ops:
+        replay = getattr(replay, op)(*args, **dict(kwargs))
+    torch.testing.assert_close(replay, convert({weight._name: original})["a"])
 
 
 _E, _I, _H = 3, 2, 4  # experts, intermediate, hidden
@@ -655,9 +661,9 @@ if __name__ == "__main__":
 
 
 @pytest.mark.parametrize("index", [
-    [0, 2], torch.tensor([0, 2]), (slice(None), [0, 2]), ((0, 2),),
+    torch.tensor([True, False]), [True, False], torch.empty(2, dtype=torch.int64, device="meta"),
 ])
-def test_capture_rejects_advanced_indices(index):
+def test_capture_rejects_data_dependent_indices(index):
     with torch.device("meta"):
         model = ToyModel()
     model.col.weight_loader = lambda param, loaded: param.data.copy_(loaded[index])

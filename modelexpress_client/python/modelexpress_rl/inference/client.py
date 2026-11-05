@@ -15,7 +15,7 @@ from typing import Any, Literal
 import grpc
 from modelexpress import auth, envs
 from modelexpress.client import _get_server_url
-from modelexpress.refit.timing import RefitTimingRecorder, refit_span
+from modelexpress_rl.refit.timing import RefitTimingRecorder, refit_span
 
 from modelexpress_rl import envs as rl_envs
 from modelexpress_rl import timing
@@ -88,7 +88,7 @@ class ModelExpressGeneratorConfig:
             and not self.initial_serving_version_id.strip()
         ):
             raise ValueError("initial_serving_version_id must not be empty")
-        source_order_env = envs.MX_GENERATOR_SOURCE_ORDER
+        source_order_env = rl_envs.MX_GENERATOR_SOURCE_ORDER
         if self.source_order is None and source_order_env is not None:
             object.__setattr__(
                 self,
@@ -161,7 +161,7 @@ class ModelExpressGeneratorConfig:
 class StagedWeightHandle:
     """An exact version prepared for, but not yet installed into, the engine.
 
-    Preparation may validate and reserve a P2P peer or reconstruct an S3
+    Preparation may validate and reserve a P2P peer or reconstruct a stored
     checkpoint. The live engine remains unchanged until ``apply_weight`` runs at
     its safe point.
     The handle keeps session internals private and binds idempotent release to
@@ -179,7 +179,6 @@ class StagedWeightHandle:
         self._client = client
         self.version_id = version_id
         self._update = update
-        self._no_op_released = False
         # A refit's stages are measured across two client calls, so the cycle's
         # recorder travels on the handle that connects them.
         self._timing = timing
@@ -193,7 +192,7 @@ class StagedWeightHandle:
         """Return metrics recorded for this update by the selected adapter."""
         if self._update is None:
             return {}
-        return self._update.prepared.metrics
+        return self._update.metrics
 
     @property
     def applied(self) -> bool:
@@ -286,9 +285,10 @@ class ModelExpressGeneratorClient:
         )
         if (
             config.object_storage is not None
-            and config.object_storage.storage_type is not ObjectStorageType.S3
+            and config.object_storage.storage_type
+            not in {ObjectStorageType.S3, ObjectStorageType.AZURE}
         ):
-            raise ValueError("only S3 object storage is currently supported")
+            raise ValueError("only S3 and Azure object storage are currently supported")
 
         client = cls()
         client.model_name = model_name
@@ -431,7 +431,7 @@ class ModelExpressGeneratorClient:
             except BaseException:
                 if staged._installation_failed:
                     self._engine_state = _EngineState.UNCERTAIN
-                elif not was_applied and restore_version_id is not None:
+                elif not staged._update.applied and restore_version_id is not None:
                     try:
                         runtime.publish_runtime_tensors(restore_version_id)
                     except Exception:
@@ -441,21 +441,23 @@ class ModelExpressGeneratorClient:
                         )
                 raise
             finally:
+                # Installation remains committed when subsequent lease cleanup fails.
+                if staged._update.applied:
+                    self._serving_version_id = staged.version_id
+                    self._engine_state = _EngineState.READY
+                    if not was_applied:
+                        try:
+                            runtime.publish_runtime_tensors(staged.version_id)
+                        except Exception:
+                            logger.exception(
+                                "failed to publish installed runtime tensors for %s",
+                                staged.version_id,
+                            )
                 # Reported even when the install raised: a refit that failed
                 # after seconds on the wire is exactly the case the split has to
                 # explain, and dropping the record would leave the failure with
                 # no timing at all.
                 timing.emit(staged._timing, logger)
-            self._serving_version_id = staged.version_id
-            self._engine_state = _EngineState.READY
-            if not was_applied:
-                try:
-                    runtime.publish_runtime_tensors(staged.version_id)
-                except Exception:
-                    logger.exception(
-                        "failed to publish installed runtime tensors for %s",
-                        staged.version_id,
-                    )
             return result
 
     def close(self) -> None:
@@ -694,8 +696,6 @@ class ModelExpressGeneratorClient:
                         self._require_runtime().session.release(staged._update)
                     finally:
                         timing.emit(staged._timing, logger)
-                elif staged._update is None:
-                    staged._no_op_released = True
             finally:
                 if self._active_handle is staged and (
                     staged._update is None or staged._update.released

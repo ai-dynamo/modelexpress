@@ -9,8 +9,10 @@ import time
 from contextlib import contextmanager
 from dataclasses import replace
 
+from ...azure import AzureBlobReader
 from ...control import WeightVersion
 from ...object_storage import ObjectStorageType
+from ...object_storage_reader import ObjectStorageReader
 from ...s3 import S3Client
 from ...train import WeightPayloadFormat
 from ..plan import (
@@ -25,8 +27,8 @@ from ..plan import (
 from ..receiver import (
     ObjectStorageGeneratorConfig,
     _LocalCheckpoint,
-    _S3Version,
-    bootstrap_s3_checkpoint,
+    _ObjectStorageVersion,
+    bootstrap_object_storage_checkpoint,
     _parse_index_manifest,
     PreparedCheckpoint,
 )
@@ -44,25 +46,29 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         config: ObjectStorageGeneratorConfig,
         stream_full_checkpoints: bool = False,
     ) -> None:
-        if config.storage_type is not ObjectStorageType.S3:
-            raise ValueError("only S3 object storage is currently supported")
         self._model_name = model_name
         self._config = config
-        self._s3 = S3Client(
-            endpoint_url=config.endpoint_url,
-            region_name=config.region_name,
-        )
+        self._reader: ObjectStorageReader
+        if config.storage_type is ObjectStorageType.S3:
+            self._reader = S3Client(
+                endpoint_url=config.endpoint_url,
+                region_name=config.region_name,
+            )
+        elif config.storage_type is ObjectStorageType.AZURE:
+            self._reader = AzureBlobReader()
+        else:
+            raise ValueError("only S3 and Azure object storage are currently supported")
         try:
             self._checkpoint = _LocalCheckpoint(
                 model_name=model_name,
                 config=config,
-                s3=self._s3,
+                reader=self._reader,
             )
             self._initialized = self._checkpoint.initialize(
                 allow_unrecorded_seed=True,
             )
         except Exception:
-            self._s3.close()
+            self._reader.close()
             raise
         self._active: PreparedCheckpointArtifact | None = None
         self._stream_full_checkpoints = stream_full_checkpoints
@@ -105,13 +111,14 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
             checkpoint = None
             if (
                 self._stream_full_checkpoints
+                and self._config.storage_type is ObjectStorageType.S3
                 and self._initialized
                 and len(versions) == 1
                 and versions[0].payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
             ):
                 version = versions[0]
                 started = time.perf_counter()
-                index_data = self._s3.get(version.uri)
+                index_data = self._reader.get(version.uri)
                 metadata, weight_map = _parse_index_manifest(index_data, is_delta=False)
                 if "checksum_format" not in metadata:
                     if set(weight_map) != set(self._checkpoint.tensor_metadata):
@@ -155,15 +162,15 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                         is not WeightPayloadFormat.FULL_HF_CHECKPOINT
                     ):
                         raise RuntimeError(
-                            "S3 fallback without a cached seed requires a full replay root"
+                            "object-storage fallback without a cached seed requires a full replay root"
                         )
                     root = versions[0]
-                    seed = bootstrap_s3_checkpoint(
+                    seed = bootstrap_object_storage_checkpoint(
                         model_name=self._model_name,
                         version=root,
                         refit_checkpoint_dir=self._config.refit_checkpoint_dir,
                         refit_checkpoint_max_size_gb=self._config.refit_checkpoint_max_size_gb,
-                        s3=self._s3,
+                        reader=self._reader,
                     )
                     checkpoint = _LocalCheckpoint(
                         model_name=self._model_name,
@@ -172,7 +179,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                             initial_base_version_id=root.version_id,
                             seed_checkpoint_path=seed,
                         ),
-                        s3=self._s3,
+                        reader=self._reader,
                     )
                     checkpoint.initialize()
                     self._checkpoint = checkpoint
@@ -183,13 +190,16 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         self._active = PreparedCheckpointArtifact(checkpoint=checkpoint)
         return self._active
 
-    @staticmethod
-    def _version(version: WeightVersion, source: ResolvedSource) -> _S3Version:
+    def _version(
+        self, version: WeightVersion, source: ResolvedSource
+    ) -> _ObjectStorageVersion:
         if not isinstance(source, ObjectStorageUpdateSource):
             raise TypeError("canonical checkpoint requires an object-storage source")
         storage = source.storage
-        if storage.storage_type is not ObjectStorageType.S3:
-            raise ValueError("canonical checkpoint requires S3 object storage")
+        if storage.storage_type is not self._config.storage_type:
+            raise ValueError(
+                "canonical checkpoint source storage type must match configured reader"
+            )
         if version.payload_format is WeightPayloadFormat.XOR_DELTA:
             if version.base_version_id is None:
                 raise ValueError("canonical delta is missing base_version_id")
@@ -197,8 +207,8 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
             if version.base_version_id is not None:
                 raise ValueError("FULL_HF_CHECKPOINT must not have base_version_id")
         else:
-            raise ValueError("unsupported canonical S3 payload format")
-        return _S3Version(
+            raise ValueError("unsupported canonical object-storage payload format")
+        return _ObjectStorageVersion(
             version_id=version.version_id,
             base_version_id=version.base_version_id,
             payload_format=version.payload_format,
@@ -252,7 +262,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         for stream in self._streams:
             stream.close()
         self._streams.clear()
-        self._s3.close()
+        self._reader.close()
 
 
 __all__ = ["CanonicalDeltaUpdateMethod"]

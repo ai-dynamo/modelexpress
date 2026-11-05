@@ -70,6 +70,9 @@ A devcontainer configuration is provided for VSCode in `.devcontainer/`. It incl
 | `python3 -m unittest discover -s .github/scripts/tests -v` | CI version-stamping and nightly workflow tests (requires PyYAML, bash and jq) |
 | `./test_grpc_transfer_k8s.sh` | gRPC transfer tests on kind (requires Docker, kubectl and Helm) |
 | `pytest modelexpress_client/python/tests/` | Run Python client tests |
+| `pytest ci/k8s/client/test_inference_parity.py` | Check inference comparison failures and Dynamo target coverage without GPUs |
+| `pytest ci/k8s/client/test_aiperf_payload.py` | Check payloads against the pinned AIPerf dependency from `ci/pyproject.toml`; runs in CPU CI |
+| `pytest ci/k8s/client/vllm/test_weight_diagnostics.py` | Check the weight-audit wrapper using Torch; runs in Python client CI |
 | `modelexpress_client/python/generate_proto.sh` | Regenerate Python protobuf stubs |
 | `modelexpress_client/go/generate_proto.sh` | Regenerate Go protobuf and gRPC bindings |
 | `(cd modelexpress_client/go && go test ./...)` | Run Go binding compilation tests |
@@ -130,6 +133,7 @@ MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 cargo run -p modelexp
 |----------|---------|-------------|
 | `MODEL_EXPRESS_ENDPOINT` | `http://localhost:8001` | Server endpoint |
 | `MODEL_EXPRESS_TIMEOUT` | `30` | Request timeout in seconds |
+| `MODEL_EXPRESS_CONNECT_WAIT_SECS` | `10` | Seconds to retry the initial server connection before downloading directly from the provider (0 disables) |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | (see below) | Cache path override |
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Disable shared storage mode |
 

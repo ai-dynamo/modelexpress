@@ -11,10 +11,6 @@ on:
         description: Runner for control jobs; GPU jobs retain their dedicated runners.
         type: string
         default: ''
-      concurrency_key:
-        description: Run-specific suffix that keeps nightly callers from cancelling each other.
-        type: string
-        default: ''
       upload_evidence:
         description: Upload test evidence to GitHub; nightlies retain only compliance artifacts.
         type: boolean
@@ -43,6 +39,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'issue_comment' }}
+
 env:
   KUBECONFIG: /teleport/kubeconfig.yaml
   KUBE_CONTEXT: ${{ vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02' }}
@@ -59,11 +59,8 @@ jobs:
        (github.repository == 'ai-dynamo/modelexpress' &&
         github.event.issue.pull_request &&
         (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench '))))
-    concurrency:
-      group: ${{ github.workflow }}-${{ inputs.pull_request || github.event.issue.number || github.ref_name }}-rl-refit-validate-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: RL generator-only refit validation
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -113,9 +110,6 @@ jobs:
 
   build:
     if: ${{ !cancelled() && needs.validate.result == 'success' }}
-    concurrency:
-      group: ${{ github.workflow }}-${{ inputs.pull_request || github.event.issue.number || github.ref_name }}-rl-refit-build-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: RL generator-only refit build
     needs: validate
     runs-on: prod-modelexpress-builder-amd-v1
@@ -160,6 +154,7 @@ jobs:
             --build-arg "RUNTIME_BASE=$RUNTIME_BASE" -t "$worker" \
             --metadata-file worker-build.json --push candidate
           docker buildx build --platform linux/amd64 -f ci/bench/Dockerfile.cleanup \
+            --provenance=false \
             --cache-from "type=registry,ref=$repo/mx-bench-cleanup:buildcache-shared" \
             --cache-to "type=registry,ref=$repo/mx-bench-cleanup:buildcache-shared,mode=max,ignore-error=true" \
             -t "$cleanup" --metadata-file cleanup-build.json --push candidate
@@ -171,9 +166,6 @@ jobs:
     if: ${{ !cancelled() && needs.validate.result == 'success' && needs.build.result == 'success' }}
     name: GPU
     needs: [validate, build]
-    concurrency:
-      group: ${{ github.workflow }}-${{ inputs.pull_request || github.event.issue.number || github.ref_name }}-rl-refit-test-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     uses: ./.github/workflows/modelexpress-rl-refit-gpu-ci.yml
     secrets: inherit
     with:
@@ -188,7 +180,7 @@ jobs:
       worker_image: ${{ needs.build.outputs.worker }}
       cleanup_image: ${{ needs.build.outputs.cleanup }}
 
-  # Keep queued and running cleanup outside the cancellation groups.
+  # Preserve cleanup when a workflow run is cancelled.
   cleanup:
     name: GPU cleanup
     needs: [validate, build, test, test-vime-delta-refit]
@@ -254,9 +246,6 @@ jobs:
 
   build-vime-delta-refit:
     if: ${{ github.event_name != 'issue_comment' }}
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-build-vime-delta-refit-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     name: RL Vime delta-refit build
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
@@ -333,9 +322,6 @@ jobs:
   test-vime-delta-refit:
     name: GPU
     needs: [build-vime-delta-refit]
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref_name }}-rl-vime-test-${{ inputs.concurrency_key }}
-      cancel-in-progress: ${{ inputs.concurrency_key == '' }}
     uses: ./.github/workflows/modelexpress-rl-vime-gpu-ci.yml
     secrets: inherit
     with:
@@ -344,7 +330,7 @@ jobs:
 
   status-check:
     name: RL status check
-    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
     needs: [validate, build, test, cleanup, build-vime-delta-refit, test-vime-delta-refit]
     if: ${{ always() && (github.event_name != 'issue_comment' || needs.validate.result != 'skipped') }}
     steps:

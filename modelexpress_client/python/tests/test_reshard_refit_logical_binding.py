@@ -8,14 +8,14 @@ import ctypes
 import pytest
 import torch
 
-from modelexpress.refit.reshard.slice_plan import Shard
-from modelexpress.refit.reshard.transfer_plan import (
+from modelexpress_rl.refit.reshard.slice_plan import Shard
+from modelexpress_rl.refit.reshard.transfer_plan import (
     SourceInfo,
     bind_transfer,
     plan_transfer,
     plan_transfer_groups,
 )
-from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
+from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy
 from modelexpress_rl.version import MeshIdentity
 from tests.test_refit_bounded_descriptors import harness
 
@@ -130,7 +130,7 @@ def test_binding_failure_does_not_return_a_partial_descriptor_plan():
 
 @pytest.mark.parametrize("keyword", [False, True])
 def test_recorded_operation_arguments_are_snapshotted_before_binding(keyword):
-    from modelexpress.refit.reshard.geometry import capture_geometry
+    from modelexpress_rl.refit.reshard.geometry import capture_geometry
 
     dims = [1, 0]
 
@@ -226,7 +226,7 @@ def test_full_pull_replay_preserves_source_order_after_capture_reordering(groupe
 
 
 def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
-    from modelexpress.refit.reshard.rendezvous import (
+    from modelexpress_rl.refit.reshard.rendezvous import (
         PublishedShard, PublishedTensor, structural_manifest_digest,
         wrap_rendezvous_blob,
     )
@@ -249,11 +249,13 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
         manifests.append(wrap_rendezvous_blob(
             agent.encode(), agent, f"{agent}:19000", [published]
         ))
-    capture = CaptureResult(copies=[RecordedCopy(
+    capture = CaptureResult(source_replay=True, copies=[RecordedCopy(
         "weight", (), "weight", 0, (4, 4), (4, 1), torch.float32
     )])
     layout = {"weight": ((4, 4), torch.float32)}
 
+    harness.layout.clear()
+    harness.layout.update(layout)
     capture_calls = []
 
     def capture_layout(_schema):
@@ -277,7 +279,6 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
     )
     harness.transfer._capture_layout = capture_layout
     request = dict(
-        manifests=manifests,
         trainer_snapshot=snapshot,
     )
     prepared = harness.transfer.prepare(**request)

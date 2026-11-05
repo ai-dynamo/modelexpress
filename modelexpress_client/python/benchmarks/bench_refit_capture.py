@@ -17,7 +17,7 @@ import statistics
 import time
 
 import torch
-from modelexpress.refit.reshard import geometry
+from modelexpress_rl.refit.reshard import geometry
 
 
 class LookupModel(torch.nn.Module):

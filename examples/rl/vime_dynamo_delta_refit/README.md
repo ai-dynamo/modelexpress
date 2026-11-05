@@ -26,9 +26,9 @@ flowchart LR
   `AWS_SECRET_ACCESS_KEY`.
 - A sibling `dynamo` worktree checked out at commit
   `c3e05f0244ae6264d7953f68e2499c6dc2f54723`, matching the pinned Dynamo
-  nightly frontend. The trainer uses the Vime revision declared in the
-  Dockerfile. Its base already contains Megatron-LM; the recipe does not
-  install another copy.
+  nightly frontend. The trainer pins `nv-hwoo/vime`'s
+  `hwoo/delta-recipe-vime` branch to the revision in the Dockerfile. Its base
+  already contains Megatron-LM; the recipe does not install another copy.
 - `docker buildx` and `kubectl` on the client machine.
 
 If your PVC or Secret names differ, edit the YAML directly.

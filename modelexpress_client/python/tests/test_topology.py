@@ -7,6 +7,7 @@ asserts the locality headline (drives the real selector, no GPU hardware)."""
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -436,6 +437,29 @@ def test_resolve_policy_unknown_local_value(monkeypatch):
     assert resolve_policy(timeout=0).local_value is None
 
 
+@pytest.mark.parametrize("value", ["", " \t\n", None, [], {}, 42, True])
+def test_required_policy_rejects_invalid_domain_values(monkeypatch, value):
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "site")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_ENFORCEMENT", "required")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", json.dumps({"site": value}))
+
+    policy = resolve_policy(timeout=0)
+
+    assert policy.local_value is None
+    assert blocks_selection(policy)
+
+
+@pytest.mark.parametrize("value", ["", " \t\n"])
+def test_required_policy_rejects_empty_values_even_when_equal(value):
+    policy = TopologyPolicy("site", "required", value)
+    assert blocks_selection(policy)
+    assert apply_policy([SimpleNamespace(topology={"site": value})], policy) == []
+
+
+def test_local_topology_does_not_coerce_domain_values():
+    assert local_topology('{"site": 42, "rack": "rack-a"}') == {"rack": "rack-a"}
+
+
 def test_resolve_policy_preferred_does_not_wait(monkeypatch):
     # preferred with an unknown value only keeps the selector's order.
     monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "zone")
@@ -542,14 +566,14 @@ def test_count_in_domain():
 
 
 def test_warn_if_no_domain_match(caplog):
-    refs = [_zone_ref("a", "az2"), _zone_ref("b")]
+    refs = [_zone_ref("a", "az2"), _zone_ref("b"), _zone_ref("blank", " \t\n")]
     with caplog.at_level("WARNING", logger="modelexpress.topology"):
         warn_if_no_domain_match(refs, _policy("preferred"), 0)
         warn_if_no_domain_match([], _policy(), 0)
         warn_if_no_domain_match(refs + [_zone_ref("c", "az1")], _policy(), 0)
         assert caplog.records == []
         warn_if_no_domain_match(refs, _policy(), 0)
-    assert "1 without published 'zone'" in caplog.text
+    assert "2 without published 'zone'" in caplog.text
     assert "1 in another zone" in caplog.text
 
 

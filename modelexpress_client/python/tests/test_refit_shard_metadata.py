@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import grpc
 import pytest
 
-from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
+from modelexpress_rl.refit.timing import RefitTimingRecorder, use_refit_timing
 import modelexpress_rl.inference.source.trainer as trainer_source_module
 
 from modelexpress_rl import WeightPayloadFormat, refit_pb2, refit_pb2_grpc

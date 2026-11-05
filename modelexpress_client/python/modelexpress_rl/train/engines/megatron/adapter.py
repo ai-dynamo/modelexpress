@@ -11,8 +11,8 @@ from dataclasses import asdict
 from typing import Any
 
 import torch.distributed as dist
-from modelexpress import envs as mx_envs
-from modelexpress.refit.timing import add_refit_metadata, refit_span
+from modelexpress_rl import envs as mx_envs
+from modelexpress_rl.refit.timing import add_refit_metadata, refit_span
 
 from modelexpress_rl.train.adapter import (
     CompletionFence,

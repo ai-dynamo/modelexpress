@@ -247,7 +247,6 @@ jobs:
     uses: ./.github/workflows/modelexpress-inference-ci.yml
     with:
       runs_on: prod-modelexpress-builder-amd-v1
-      concurrency_key: nightly-${{ github.run_id }}-${{ github.run_attempt }}
     secrets: inherit
 
   rl-tests:
@@ -260,7 +259,6 @@ jobs:
     uses: ./.github/workflows/modelexpress-rl-ci.yml
     with:
       runs_on: prod-modelexpress-builder-amd-v1
-      concurrency_key: nightly-${{ github.run_id }}-${{ github.run_attempt }}
       upload_evidence: false
       model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
       scenario: delta

@@ -94,6 +94,8 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
     - The arena is published to the module-level ``_vmm_arenas`` dict
       only after the wrapped body completes successfully. If the body
       raises, the freshly created arena is closed and not retained.
+    - A reload (``ctx.is_reload``) reuses the existing arena for
+      registration without entering it, and never replaces it.
     - If ``_vmm_arenas`` already has an arena for this device (second
       load on the same worker), the prior arena is closed before
       installing a new one. Silently corrupts the prior model's tensors
@@ -120,6 +122,23 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
             "[Worker %d] MX_VMM_ARENA=1 but this is the speculative draft "
             "pass; loading outside the arena and registering per-tensor.",
             ctx.global_rank,
+        )
+        yield
+        return
+
+    if ctx.is_reload:
+        # A reload writes into the model's existing tensors (RDMA directly,
+        # layerwise reload by copying back into the original storage), so
+        # its only new allocations are transient. Replacing the arena would
+        # unmap the live weights, and entering it would grow the bump range
+        # with those transients. Hand the existing arena to registration so
+        # the reloaded weights publish under one MR again.
+        ctx.vmm_arena = _vmm_arenas.get(ctx.device_id)
+        logger.info(
+            "[Worker %d] MX_VMM_ARENA=1 reload; reusing the existing arena "
+            "(present=%s) without entering it.",
+            ctx.global_rank,
+            ctx.vmm_arena is not None,
         )
         yield
         return

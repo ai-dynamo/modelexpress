@@ -114,7 +114,7 @@ def _publish(
     )
     staged = trainer.stage_shard(
         version=version.ref,
-        hf_tensor_iter=_tensor_batches(model),
+        tensor_iter=_tensor_batches(model),
     )
     staged.publish()
     ready = control.update_weight_version_state(

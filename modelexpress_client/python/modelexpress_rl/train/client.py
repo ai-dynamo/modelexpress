@@ -75,6 +75,7 @@ class ObjectStorageConfig:
         if not str(self.seed_checkpoint_path).strip():
             raise ValueError("object_storage.seed_checkpoint_path is required")
 
+
 @dataclass(frozen=True)
 class ModelExpressTrainerConfig:
     """Immutable configuration for one rank-local trainer client."""
@@ -103,7 +104,10 @@ class ModelExpressTrainerConfig:
 
 
 class StagedWeightVersionShard:
-    """One immutable rank-local artifact staged for a global weight version."""
+    """Publication handle for one rank's contribution to a global version.
+
+    For incremental S3 staging, publish() first waits for all submitted buckets.
+    """
 
     def __init__(
         self,
@@ -140,9 +144,7 @@ class ModelExpressTrainerClient:
         self._closed = False
 
     @classmethod
-    def initialize(
-        cls, config: ModelExpressTrainerConfig
-    ) -> ModelExpressTrainerClient:
+    def initialize(cls, config: ModelExpressTrainerConfig) -> ModelExpressTrainerClient:
         if not isinstance(config, ModelExpressTrainerConfig):
             raise TypeError("config must be a ModelExpressTrainerConfig")
         model_name = _required(
@@ -223,9 +225,9 @@ class ModelExpressTrainerClient:
         return self._active_runtime().logical_shard_id
 
     def prepare_delta_base(
-        self, *, hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]]
+        self, *, tensor_iter: Iterable[list[tuple[str, torch.Tensor]]]
     ) -> None:
-        self._active_runtime().prepare_delta_base(hf_tensor_iter=hf_tensor_iter)
+        self._active_runtime().prepare_delta_base(tensor_iter=tensor_iter)
 
     def bind_tensors(self, tensors: Any) -> TrainerTensorsMetadata:
         return self._active_runtime().bind_tensors(tensors)
@@ -264,15 +266,26 @@ class ModelExpressTrainerClient:
         self,
         *,
         version: WeightVersionRef,
-        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
+        tensors: Any = None,
+        tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None = None,
     ) -> StagedWeightVersionShard:
+        """Stage a canonical HF iterator or one S3 tensor bucket.
+
+        For S3, pass ``tensors=[(name, tensor), ...]`` repeatedly for one version,
+        then publish a returned handle once all buckets have been submitted.
+        An empty bucket initializes a rank with no tensors to contribute.
+        The SDK retains the bucket and its tensors; keep their contents stable
+        until publish() finishes. The iterator form completes staging before
+        returning. Use one input form per version.
+        """
         if self._closed:
             raise RuntimeError("trainer client is closed")
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
         staged = self._active_runtime().stage(
             version=version,
-            hf_tensor_iter=hf_tensor_iter,
+            tensors=tensors,
+            tensor_iter=tensor_iter,
         )
         return StagedWeightVersionShard(client=self, version=version, staged=staged)
 

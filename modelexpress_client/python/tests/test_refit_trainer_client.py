@@ -356,16 +356,15 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         assert version_metadata.version_metadata_digest == hashlib.sha256(
             version_metadata.metadata.SerializeToString(deterministic=True)
         ).hexdigest()
-        with pytest.raises(TypeError, match="tensors"):
+        with pytest.raises(RuntimeError, match="canonical-delta"):
             trainer.stage_shard(
                 version=WeightVersionRef("version-a"),
                 tensors="model-2",
-                hf_tensor_iter=iter([]),
             )
         with pytest.raises(RuntimeError, match="canonical-delta"):
             trainer.stage_shard(
                 version=WeightVersionRef("version-a"),
-                hf_tensor_iter=iter([]),
+                tensor_iter=iter([]),
             )
         trainer.publish_version(version=WeightVersionRef("version-a"))
         retained_owners = [

@@ -31,9 +31,9 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from modelexpress import envs as mx_envs
-from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
-from modelexpress.refit.timing import (
+from modelexpress_rl import envs as mx_envs
+from modelexpress_rl.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress_rl.refit.timing import (
     add_refit_duration,
     add_refit_metadata,
     refit_span,
@@ -48,7 +48,7 @@ from modelexpress_rl.train.adapter import (
     TrainerShardMetadata,
 )
 from modelexpress_rl.train.manifest import bound_tensor_manifest
-from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl.refit.reshard.verify import tensor_digest
 
 from .publisher import (
     WIRE_DTYPE,

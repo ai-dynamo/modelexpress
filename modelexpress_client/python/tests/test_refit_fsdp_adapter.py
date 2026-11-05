@@ -8,7 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
+from modelexpress_rl.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress_rl.train.adapter import TrainerStagingMode, WeightPayloadFormat
 from modelexpress_rl.train.context import FSDPTrainerContext
 from modelexpress_rl.train.engines import _create_trainer_adapter

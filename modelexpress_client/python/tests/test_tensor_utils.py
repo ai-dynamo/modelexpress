@@ -8,6 +8,7 @@ import types
 import torch
 import torch.nn as nn
 
+from modelexpress import tensor_utils
 from modelexpress.accelerators import CudaAcceleratorBackend
 from modelexpress.tensor_utils import (
     _find_hidden_accel_tensors,
@@ -283,6 +284,31 @@ class TestSafeChecksum:
         t2 = torch.tensor([11, 19, 30], dtype=torch.uint8)
         assert safe_checksum(t1) != safe_checksum(t2)
 
+    def test_multi_dim_tensor(self):
+        t = torch.randn(4, 8)
+        assert not safe_checksum(t).startswith("err:")
+
+    def test_shape_independent(self):
+        t = torch.randn(2, 3, 5)
+        expected = safe_checksum(t.reshape(-1))
+        assert safe_checksum(t) == expected
+        assert safe_checksum(t.reshape(6, 5)) == expected
+
+    def test_chunk_size_independent(self, monkeypatch):
+        t = torch.randn(3, 17)
+        expected = safe_checksum(t)
+        monkeypatch.setattr(tensor_utils, "_CHECKSUM_CHUNK_BYTES", 7)
+        assert safe_checksum(t) == expected
+
+    def test_matches_unchunked_definition(self, monkeypatch):
+        monkeypatch.setattr(tensor_utils, "_CHECKSUM_CHUNK_BYTES", 5)
+        t = torch.arange(13, dtype=torch.uint8) * 19
+        expected = sum(
+            (b * ((i * 2654435761 + 1) & 0xFFFFFFFF)) & 0xFFFFFFFF
+            for i, b in enumerate(t.tolist())
+        ) & 0xFFFFFFFF
+        assert safe_checksum(t) == format(expected, "08x")
+
 
 # ---------------------------------------------------------------------------
 # storage_view
@@ -419,3 +445,17 @@ class TestTraversalRobustness:
             holder, visited=set(), accelerator_backend=backend
         )
         assert [t.numel() for _, t in found] == [4]
+
+
+def test_hidden_tensor_exclusion_is_optional_and_recursive(mock_accelerator_backend_cls):
+    """An engine predicate prunes subtrees without changing default discovery."""
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    local = types.SimpleNamespace(tensor=torch.zeros(8))
+    quant = torch.ones(4)
+    graph = types.SimpleNamespace(nested=[{"local": local, "quant": quant}])
+    found = _find_hidden_accel_tensors(graph, set(), backend)
+    assert {t.data_ptr() for _, t in found} == {local.tensor.data_ptr(), quant.data_ptr()}
+    found = _find_hidden_accel_tensors(
+        graph, set(), backend, exclude=lambda obj: obj is local
+    )
+    assert [t.data_ptr() for _, t in found] == [quant.data_ptr()]

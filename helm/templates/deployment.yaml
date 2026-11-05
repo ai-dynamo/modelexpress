@@ -8,7 +8,7 @@ metadata:
   labels:
     {{- include "modelexpress.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.replicaCount | default 1 }}
+  replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
       {{- include "modelexpress.selectorLabels" . | nindent 6 }}
