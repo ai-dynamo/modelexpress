@@ -574,6 +574,19 @@ def test_preparation_lock_can_be_tried_without_blocking(tmp_path):
         assert acquired
 
 
+def test_cancelling_a_lock_wait_gives_up_the_lock(tmp_path):
+    store = LocalCheckpointStore(root=tmp_path, model_name="model")
+    store.initialize()
+    cancelled = threading.Event()
+
+    with store.installation_locked(shared=True):
+        threading.Timer(0.1, cancelled.set).start()
+        with store.installation_locked(cancelled=cancelled) as acquired:
+            assert not acquired
+    with store.installation_locked(cancelled=threading.Event()) as acquired:
+        assert acquired
+
+
 def _unsupported_clone(destination, operation, source):
     os.write(destination, b"partial clone longer than source")
     raise OSError(errno.EOPNOTSUPP, "unsupported clone")

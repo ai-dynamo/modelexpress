@@ -678,12 +678,18 @@ class _LocalCheckpoint:
 
         Copying holds only the preparation lock: ranks can still initialize and
         install, while the next delta waits for the copy and then renames it.
+        Setting ``cancelled`` stops the copy and any wait for the other locks.
         Return whether this call made the copy; another rank may have made it.
         """
         with self.store.preparation_locked(blocking=False) as acquired:
             if not acquired:
                 return False
-            with self.store.installation_locked(), self.store.locked():
+            with (
+                self.store.installation_locked(cancelled=cancelled) as installing,
+                self.store.locked(cancelled=cancelled) as locked,
+            ):
+                if not (installing and locked):
+                    return False
                 state = self.store.state()
                 if state is None or state.status is not CheckpointState.READY:
                     return False
@@ -728,13 +734,15 @@ class _LocalCheckpoint:
                     working_copy,
                     cancelled=cancelled,
                 )
+                with self.store.locked(cancelled=cancelled) as locked:
+                    if not locked:
+                        raise CheckpointCopyCancelled("checkpoint copy was cancelled")
+                    self.store.record_copy(full_checkpoint, working_copy, record)
             except CheckpointCopyCancelled:
                 logger.info(
                     "Cancelled copying full checkpoint %s to its working copy", version
                 )
                 return False
-            with self.store.locked():
-                self.store.record_copy(full_checkpoint, working_copy, record)
             logger.info(
                 "Copied full checkpoint %s to its working copy in %.1f s",
                 version,

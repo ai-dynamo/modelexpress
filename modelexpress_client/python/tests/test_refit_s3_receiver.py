@@ -1272,6 +1272,59 @@ def test_full_checkpoint_or_close_cancels_background_seed_copy(
     assert not store.has_artifact_record(working_copy)
 
 
+@pytest.mark.parametrize("wait", ["installation lock", "store lock", "recording"])
+def test_close_does_not_wait_for_a_lock_held_by_another_rank(
+    monkeypatch, tmp_path, wait
+):
+    # Another rank holds the store locks while it installs, so the seed copy waits.
+    waiting = threading.Event()
+    flock = checkpoint_store_module.fcntl.flock
+
+    def note_a_busy_lock(handle, operation):
+        try:
+            return flock(handle, operation)
+        except BlockingIOError:
+            waiting.set()
+            raise
+
+    monkeypatch.setattr(checkpoint_store_module.fcntl, "flock", note_a_busy_lock)
+    reached, resume = threading.Event(), threading.Event()
+    if wait == "recording":
+        owner, name = checkpoint_store_module, "_copy_checkpoint_file"
+    else:
+        owner, name = receiver_module._LocalCheckpoint, "prepare_seed_working_copy"
+    original = getattr(owner, name)
+
+    def pause(*args, **kwargs):
+        reached.set()
+        assert resume.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, pause)
+    base, _target, objects = _seed_and_first_delta()
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={"weight": base},
+        background_seed_copy=True,
+    )
+    store = adapter._checkpoint.store
+    hold = store.installation_locked if wait == "installation lock" else store.locked
+    assert reached.wait(5)
+
+    with hold(shared=True):
+        resume.set()
+        assert waiting.wait(5)
+        closing = threading.Thread(target=adapter.close)
+        closing.start()
+        closing.join(5)
+        assert not closing.is_alive()
+
+    assert adapter._method._seed_copy is None
+    assert not store.has_artifact_record(store.materialized_path("base-a"))
+
+
 def test_first_delta_replaces_a_partial_working_copy(monkeypatch, tmp_path):
     copy_file = checkpoint_store_module._copy_checkpoint_file
 

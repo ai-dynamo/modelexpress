@@ -510,7 +510,8 @@ only the preparation lock, so other ranks can still initialize and install while
 first delta waits for the copy and renames it. The copy is written in place and
 recorded last, and deltas use only a recorded copy, so a later preparation deletes a partial one under the
 store lock. A rank that prepares a full checkpoint or shuts down cancels its own
-copy between 256 MiB chunks; a streamed full checkpoint waits for the copy
+copy between 256 MiB chunks or while it waits for a store lock; a streamed full
+checkpoint waits for the copy
 before writing the cache. Later sequential deltas
 rename the active materialization and apply only the incoming XOR delta in
 place, avoiding another full-model copy. Canonical artifacts are never modified

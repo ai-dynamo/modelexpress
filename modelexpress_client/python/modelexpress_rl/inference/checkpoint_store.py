@@ -20,12 +20,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, TextIO
 from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
 _COPY_CHUNK_BYTES = 256 * 1024**2
+# How often a cancellable wait retries a busy store lock.
+_LOCK_POLL_SECONDS = 0.05
 
 
 class CheckpointCopyCancelled(RuntimeError):
@@ -101,6 +103,18 @@ def _copy_file_chunks(
         if not copied:
             return
         offset += copied
+
+
+def _wait_for_lock(handle: TextIO, operation: int, cancelled: threading.Event) -> bool:
+    """Take a file lock, retrying while it is busy, until ``cancelled`` is set."""
+    while not cancelled.is_set():
+        try:
+            fcntl.flock(handle, operation | fcntl.LOCK_NB)
+        except BlockingIOError:
+            cancelled.wait(_LOCK_POLL_SECONDS)
+        else:
+            return True
+    return False
 
 
 def _encode_cache_component(value: str) -> str:
@@ -258,24 +272,35 @@ class LocalCheckpointStore:
         path: Path,
         shared: bool,
         blocking: bool = True,
+        cancelled: threading.Event | None = None,
     ) -> Iterator[bool]:
+        """Lock ``path`` and yield whether the lock was taken.
+
+        Without blocking, a busy lock is not taken. With ``cancelled``, waiting
+        for a busy lock stops once ``cancelled`` is set.
+        """
         with path.open("a+") as handle:
             operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
-            try:
-                fcntl.flock(
-                    handle, operation if blocking else operation | fcntl.LOCK_NB
-                )
-            except BlockingIOError:
-                acquired = False
+            if cancelled is not None:
+                acquired = _wait_for_lock(handle, operation, cancelled)
             else:
-                acquired = True
+                try:
+                    fcntl.flock(
+                        handle, operation if blocking else operation | fcntl.LOCK_NB
+                    )
+                except BlockingIOError:
+                    acquired = False
+                else:
+                    acquired = True
             yield acquired
 
-    def locked(self, *, shared: bool = False):
-        return self._locked(self.lock_path, shared=shared)
+    def locked(self, *, shared: bool = False, cancelled: threading.Event | None = None):
+        return self._locked(self.lock_path, shared=shared, cancelled=cancelled)
 
-    def installation_locked(self, *, shared: bool = False):
-        return self._locked(self.install_lock_path, shared=shared)
+    def installation_locked(
+        self, *, shared: bool = False, cancelled: threading.Event | None = None
+    ):
+        return self._locked(self.install_lock_path, shared=shared, cancelled=cancelled)
 
     def preparation_locked(self, *, blocking: bool = True):
         """Serialize preparation; without blocking, yield whether it was taken."""
