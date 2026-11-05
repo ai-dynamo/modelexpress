@@ -397,6 +397,7 @@ pub fn resolve_model_path(
 
 /// Opens a directory below a provider's cache root for a listing walk. A directory that
 /// cannot be read is skipped with a warning so one bad entry does not abort the listing.
+#[cfg(any(feature = "s3", feature = "gcs"))]
 pub(crate) fn read_dir_for_listing(path: &Path) -> Option<fs::ReadDir> {
     match fs::read_dir(path) {
         Ok(entries) => Some(entries),
@@ -716,6 +717,41 @@ mod tests {
         fs::create_dir_all(&bad_hf).expect("Failed to create HF model directory");
         fs::write(bad_hf.join("config.json"), b"{}").expect("Failed to write HF file");
 
+        let Some(_bad_hf_guard) = lock_directory(&bad_hf) else {
+            eprintln!("skipping: directory permissions are not enforced (running as root?)");
+            return;
+        };
+
+        let stats = create_test_cache_config(cache_path)
+            .get_cache_stats()
+            .expect("an unreadable model directory must not fail the whole listing");
+
+        let names: Vec<&str> = stats.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["google/t5-small", "private/locked"]);
+        assert_eq!(stats.total_models, 2);
+
+        assert!(stats.models[0].accessible);
+        assert_eq!(stats.models[0].size, 2);
+        assert!(!stats.models[1].accessible);
+        assert_eq!(stats.models[1].size, 0);
+        assert_eq!(stats.models[1].path, bad_hf);
+        assert_eq!(stats.total_size, 2);
+    }
+
+    #[cfg(all(unix, feature = "s3"))]
+    #[test]
+    fn test_get_cache_stats_flags_inaccessible_models_across_hf_and_s3() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let cache_path = temp_dir.path().join("cache");
+
+        let good_hf = cache_path.join("models--google--t5-small");
+        fs::create_dir_all(&good_hf).expect("Failed to create HF model directory");
+        fs::write(good_hf.join("config.json"), b"{}").expect("Failed to write HF file");
+
+        let bad_hf = cache_path.join("models--private--locked");
+        fs::create_dir_all(&bad_hf).expect("Failed to create HF model directory");
+        fs::write(bad_hf.join("config.json"), b"{}").expect("Failed to write HF file");
+
         let s3_model = cache_path.join("s3/bucket/team/model");
         fs::create_dir_all(&s3_model).expect("Failed to create S3 model directory");
         fs::write(s3_model.join(".mx-model"), b"").expect("Failed to write S3 marker");
@@ -804,7 +840,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "s3"))]
     #[test]
     fn test_get_cache_stats_fails_on_unreadable_s3_root() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
