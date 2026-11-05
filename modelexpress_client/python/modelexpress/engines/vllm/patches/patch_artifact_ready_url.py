@@ -20,7 +20,11 @@ def patch_artifact_ready_url() -> bool:
     @wraps(original_from_cli_args)
     def from_cli_args(cls, args):
         engine_args = original_from_cli_args(cls, args)
-        url = health_url_from_server_args(args)
+        # UDS uses a Unix socket; gRPC mode does not expose HTTP on --port.
+        if getattr(args, "uds", None) or getattr(args, "grpc", False):
+            url = None
+        else:
+            url = health_url_from_server_args(args)
         if url and (
             getattr(args, "headless", False)
             or getattr(args, "api_server_count", None) == 0

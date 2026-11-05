@@ -50,6 +50,11 @@ def sglang_server_readiness() -> SglangServerReadiness:
         try:
             module = import_module(module_name)
             server_args = getattr(module, getter_name)()
+            # gRPC-only modes have no HTTP listener; grpc_port alone keeps HTTP.
+            if getattr(server_args, "grpc_mode", False) or getattr(
+                server_args, "smg_grpc_mode", False
+            ):
+                continue
             url = health_url_from_server_args(server_args)
         except (ImportError, AttributeError, RuntimeError, ValueError):
             continue

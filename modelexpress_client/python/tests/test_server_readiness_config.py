@@ -65,13 +65,8 @@ def test_framework_tls_settings_select_https():
         {"smg_grpc_mode": True},
     ],
 )
-def test_non_http_transports_do_not_advertise_an_unused_tcp_port(settings):
+def test_shared_url_builder_does_not_interpret_engine_transport_flags(settings):
     args = SimpleNamespace(host="0.0.0.0", port=9007, **settings)
-    assert health_url_from_server_args(args) is None
-
-
-def test_http_server_with_an_additional_grpc_port_keeps_http_readiness():
-    args = SimpleNamespace(host="0.0.0.0", port=9007, grpc_port=50051)
     assert health_url_from_server_args(args) == "http://127.0.0.1:9007/health"
 
 
@@ -132,6 +127,20 @@ def test_programmatic_vllm_engine_does_not_invent_a_serving_endpoint(
     assert not hasattr(config.load_config, "_mx_artifact_ready_url")
 
 
+@pytest.mark.parametrize("settings", [{"uds": "/tmp/model.sock"}, {"grpc": True}])
+def test_vllm_non_http_modes_do_not_advertise_an_unused_tcp_port(
+    patched_engine_args, settings
+):
+    args = SimpleNamespace(
+        model="example-model", host="0.0.0.0", port=9007, **settings
+    )
+    engine_args = patched_engine_args.from_cli_args(args)
+    assert engine_args.model == "example-model"
+    assert engine_args._mx_artifact_ready_url is None
+    config = engine_args.create_engine_config()
+    assert not hasattr(config.load_config, "_mx_artifact_ready_url")
+
+
 @pytest.mark.parametrize("settings", [{"headless": True}, {"api_server_count": 0}])
 def test_headless_vllm_redirects_automatic_bind_ip_to_head(
     patched_engine_args, monkeypatch, settings
@@ -178,17 +187,36 @@ def test_sglang_falls_back_when_runtime_context_is_not_published(monkeypatch):
     assert sglang_artifacts._sglang_health_url() == "http://127.0.0.1:9010/health"
 
 
-@pytest.mark.parametrize(
-    "getter_name,mode_name",
-    [("get_global_server_args", "grpc_mode"), ("get_serving", "smg_grpc_mode")],
-)
+@pytest.mark.parametrize("getter_name", ["get_serving", "get_global_server_args"])
+@pytest.mark.parametrize("mode_name", ["grpc_mode", "smg_grpc_mode"])
 def test_sglang_grpc_only_configuration_has_no_inferred_http_endpoint(
     monkeypatch, getter_name, mode_name
 ):
-    args = SimpleNamespace(host="0.0.0.0", port=9007, **{mode_name: True})
+    args = SimpleNamespace(
+        host="0.0.0.0", port=9007, node_rank=0, **{mode_name: True}
+    )
     module = SimpleNamespace(**{getter_name: lambda: args})
     monkeypatch.setattr(sglang_readiness, "import_module", lambda name: module)
     assert sglang_readiness.sglang_server_readiness().url is None
+
+
+@pytest.mark.parametrize("getter_name", ["get_serving", "get_global_server_args"])
+def test_sglang_http_server_with_an_additional_grpc_port_keeps_http_readiness(
+    monkeypatch, getter_name
+):
+    args = SimpleNamespace(
+        host="0.0.0.0",
+        port=9007,
+        node_rank=0,
+        grpc_port=50051,
+        grpc_mode=False,
+        smg_grpc_mode=False,
+    )
+    module = SimpleNamespace(**{getter_name: lambda: args})
+    monkeypatch.setattr(sglang_readiness, "import_module", lambda name: module)
+    assert sglang_readiness.sglang_server_readiness().url == (
+        "http://127.0.0.1:9007/health"
+    )
 
 
 def test_sglang_follower_keeps_its_local_dummy_health_listener():

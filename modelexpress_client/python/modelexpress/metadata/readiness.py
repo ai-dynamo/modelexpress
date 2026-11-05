@@ -5,12 +5,7 @@
 
 
 def health_url_from_server_args(server_args: object) -> str | None:
-    """Use the HTTP port, never an engine's distributed/RPC port."""
-    if getattr(server_args, "uds", None) or any(
-        getattr(server_args, name, False)
-        for name in ("grpc", "grpc_mode", "smg_grpc_mode")
-    ):
-        return None
+    """Format an HTTP health URL from host, port and TLS settings."""
     port = getattr(server_args, "port", None)
     if type(port) is not int or not 0 < port < 65536:
         return None
