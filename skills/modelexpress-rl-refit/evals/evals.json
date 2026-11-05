@@ -1,0 +1,112 @@
+{
+  "skill": "modelexpress-rl-refit",
+  "cases": [
+    {
+      "id": "choose-path-megatron-multinode",
+      "question": "We train with Megatron across two nodes and serve with vLLM. Should we refit through ModelExpress's NCCL M2N collective path or the NIXL path?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Choose the NIXL reshard path: the M2N path ships no Megatron Publisher and is validated on a single node only (a cross-node reshard has failed inside NCCL's transport). Wire MegatronTrainerContext with build_megatron_tensor_specs, bind_tensors, create_trainer_mesh, create_weight_version, publish_version, and the vLLM modelexpress weight-transfer backend.",
+      "expected_behavior": [
+        "Select the NIXL reshard path and name the deciding rule",
+        "State that no Megatron Publisher exists for the M2N path",
+        "State that M2N is validated single-node only",
+        "List the trainer-side API calls in order"
+      ]
+    },
+    {
+      "id": "preflight-m2n-generator",
+      "question": "Before I launch the collective refit, check that this generator container has a usable NCCL and that my MX_NCCL_REFIT settings are valid. The MX server is at mx-server:8001.",
+      "expected_skill": "modelexpress-rl-refit",
+      "expected_script": "scripts/refit_preflight.py",
+      "ground_truth": "Run scripts/refit_preflight.py --path m2n --endpoint mx-server:8001 inside the container, report the mapped libnccl version against the 2.30.7 floor, nccl and nccl.m2n importability, NCCL_COMM_BLOCKING, and any invalid MX_NCCL_REFIT_* value, and fix every failed check first.",
+      "expected_behavior": [
+        "Run the preflight script with --path m2n and the endpoint",
+        "Read the mapped libnccl version, not torch.cuda.nccl.version()",
+        "Report failed checks with a concrete fix"
+      ]
+    },
+    {
+      "id": "run-m2n-e2e",
+      "question": "Run the ModelExpress M2N end-to-end refit example on Qwen3-4B with 4 trainers and 4 generators, and tell me how to know it really passed.",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "From examples/rl/m2n_collective_refit, export MODEL and MX_ENDPOINT and run DIFF=1 ./run_e2e.sh (T and G default to 4), ideally with PROC_TIMEOUT_S set. Pass is E2E PASS in generator.log with DIFF=1 enabled and every .rc file reading 0; DIFF=1 is the acceptance test because token equality is not sound on larger models.",
+      "expected_behavior": [
+        "Set MODEL and MX_ENDPOINT and run run_e2e.sh with DIFF=1",
+        "Require 8 GPUs on one node",
+        "Recommend PROC_TIMEOUT_S for unattended runs",
+        "Define pass as E2E PASS plus zero .rc files"
+      ]
+    },
+    {
+      "id": "group-not-ready-missing-slots",
+      "question": "compute_plan on my trainers raises GroupNotReadyError after ten minutes and .missing lists g2 and g3. What do I do?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "This is group admission/formation: generator slots g2 and g3 never joined or their registration expired before READY. Check those processes are running against the same MX endpoint with identical slot lists and model_name, start or fix them, and retry compute_plan; raise MX_NCCL_REFIT_GROUP_TIMEOUT_S if vLLM startup is slow.",
+      "expected_behavior": [
+        "Classify as group admission/formation",
+        "Point at the slots named in .missing",
+        "Check slot lists, model_name and endpoint consistency",
+        "Retry compute_plan after fixing the missing ranks"
+      ]
+    },
+    {
+      "id": "epoch-changed-disagreeing",
+      "question": "start_weight_update raised EpochChangedError and the error's disagreeing list names t1. Only t1 runs with MX_NCCL_REFIT_GROUPED_SUBMISSION=1.",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Epoch fencing caused by a plan digest mismatch: MX_NCCL_REFIT_GROUPED_SUBMISSION is part of the plan digest, so the group stays FORMING. Make the setting identical on every participant (grouped submission also needs GIN), then re-run compute_plan and create a new operation at the new epoch.",
+      "expected_behavior": [
+        "Classify as epoch fencing with plan digest disagreement",
+        "Name GROUPED_SUBMISSION as part of the plan digest",
+        "Align the setting before re-running compute_plan",
+        "Create a new operation at the new epoch"
+      ]
+    },
+    {
+      "id": "wedged-communicator",
+      "question": "My generator process logged CommunicatorWedgedError during update_weights. Can I just call compute_plan again?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. CommunicatorWedgedError is fatal to the process: catch it at top level and terminate with a non-zero os._exit. The round is already reported FAILED so peers re-form at a new epoch; restart the generator with a new worker_id. Bound each worker process externally because MX_NCCL_REFIT_TRANSFER_TIMEOUT_S cannot interrupt a blocked native reshard.",
+      "expected_behavior": [
+        "Refuse in-process recovery",
+        "Require a non-zero os._exit and a restart with a new worker_id",
+        "Explain the external process bound"
+      ]
+    },
+    {
+      "id": "nixl-mesh-update-lease",
+      "question": "UpdateTrainerMesh fails with 'cannot change trainer mesh generation while a linked version has an active lease'. I'm adding a trainer replica.",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Version lease on the NIXL path: any mesh update that changes its generation is rejected while a linked weight version has an active consumer lease, including additive replicas. Let generators finish their refit (finish_weight_update or release the staged handle) so the leases drain, then update the mesh; new versions capture the new generation.",
+      "expected_behavior": [
+        "Classify as version lease/publication on the NIXL path",
+        "Explain that additive replicas still change the generation",
+        "Drain generator leases before updating the mesh"
+      ]
+    },
+    {
+      "id": "wire-fsdp-vllm-nixl",
+      "question": "Show me the calls to publish an FSDP model's weights through ModelExpress and have a vLLM worker install them with the modelexpress weight-transfer backend.",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Trainer: ModelExpressTrainerClient.initialize with FSDPTrainerContext, bind_tensors(model.state_dict()), ModelExpressControlClient.create_trainer_mesh, create_weight_version with FULL_TENSOR and the mesh id, publish_version, check READY. vLLM started with --weight-transfer-config '{\"backend\":\"modelexpress\"}': pause generation, init_weight_transfer_engine, start_weight_update, update_weights with update_info.version_id, finish_weight_update, verify installed version, resume.",
+      "expected_behavior": [
+        "Give the trainer, control, and generator calls in order",
+        "Pause generation before installing and verify before resuming",
+        "Retire with delete_weight_version, release_version, delete_trainer_mesh"
+      ]
+    },
+    {
+      "id": "neg-initial-p2p-load",
+      "question": "Speed up vLLM cold start by loading the model over P2P from another ModelExpress-served replica.",
+      "expected_skill": "none",
+      "ground_truth": "Initial checkpoint loading belongs to the base ModelExpress loader, not RL weight refit.",
+      "expected_behavior": ["modelexpress-rl-refit stays silent"]
+    },
+    {
+      "id": "neg-dynamo-deploy",
+      "question": "Deploy the Qwen vLLM disaggregated recipe with Dynamo on my cluster.",
+      "expected_skill": "dynamo-recipe-runner",
+      "ground_truth": "Dynamo recipe bring-up belongs to dynamo-recipe-runner.",
+      "expected_behavior": ["modelexpress-rl-refit stays silent; dynamo-recipe-runner handles it"]
+    }
+  ]
+}
