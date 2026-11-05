@@ -224,7 +224,11 @@ class MxModelLoader(BaseModelLoader):
             )
             ctx.use_model_config_uri = separate_draft
             namespace = _draft_namespace(ctx, vllm_config) if separate_draft else None
-            if envs.MX_DISABLE_DRAFT_P2P or main_ctx is None:
+            if (
+                envs.MX_DISABLE_DRAFT_P2P
+                or main_ctx is None
+                or (separate_draft and not envs.MX_ENABLE_SEPARATE_DRAFT_P2P)
+            ):
                 ctx.p2p_enabled = False
             elif not separate_draft or namespace is not None:
                 ctx.shared_nixl_manager = _nixl_managers.get(ctx.device_id)
