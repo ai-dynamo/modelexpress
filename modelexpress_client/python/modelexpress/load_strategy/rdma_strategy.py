@@ -47,7 +47,7 @@ from .context import LoadResult, is_draft_tensor_name
 logger = logging.getLogger("modelexpress.strategy_rdma")
 
 MAX_SOURCE_RETRIES = 3
-MAX_DRAFT_SOURCE_METADATA_LOOKUPS = 30
+MAX_DRAFT_SOURCE_METADATA_LOOKUPS = 10
 
 # Fallback when MX_TRANSFER_TIMEOUT is unset or unusable. Matches the value this
 # path used when the timeout was hard-coded, so behaviour is unchanged by default.
