@@ -257,6 +257,7 @@ def _triton_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         cuda_version=torch.version.cuda or "",
         triton_version=_common_artifacts.triton_version(),
         gpu_arch=_common_artifacts.gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "triton_key", _common_artifacts.triton_key())
     return identity
@@ -294,6 +295,7 @@ def _deep_gemm_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_common_artifacts.gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(
         identity,
@@ -310,6 +312,7 @@ def _tilelang_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_common_artifacts.gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(
         identity,
@@ -326,6 +329,7 @@ def _cute_dsl_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_common_artifacts.gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(
         identity,
@@ -343,6 +347,7 @@ def _flashinfer_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         torch_version=torch.__version__,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_common_artifacts.gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(
         identity,
