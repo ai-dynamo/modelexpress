@@ -848,3 +848,12 @@ overlays. Immutable full checkpoints are copied (or use a verified working copy)
 before modification. A failed copy preserves the staged head; a failed in-place
 rewrite remains `UPDATING` and requires recovery. Engine activation remains
 separate from preparation. Incoming deltas never join an unfinished rewrite.
+
+## Native and sparse verification
+
+The optional `_delta_ext` checker performs full verification off the Python GIL.
+Sparse verification is separately opt-in and assumes unchanged cache bytes stay
+as ModelExpress wrote them; periodic full reads do not detect every corruption
+on every update. The first delta after an unverified seed still reads its
+changed tensors in full. Checked target tables persist under `checksums/`.
+Disabling sparse checking restores full reads without changing installation.

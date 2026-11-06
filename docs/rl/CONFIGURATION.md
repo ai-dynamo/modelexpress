@@ -245,3 +245,10 @@ bounds how many verified delta versions remain staged on checkpoint files.
 At the limit, materialization finishes before a new delta is checked. A rejected
 new delta therefore retains the valid rewritten head. With prefetch enabled, an
 activated head at the limit can also be materialized outside the serving pause.
+
+`MX_REFIT_SPARSE_CHECK` defaults to `false`. When enabled and the optional
+C++ checker is built, verified Adler-32 tables let deferred delta checks read
+only changed bytes. Unknown base checksums and one eighth of tensors per chain
+depth use full reads; sparse mismatches retry a full read before rejection.
+Without the extension, verification uses the full Python path. Native full
+verification is automatic when available, independently of sparse checking.

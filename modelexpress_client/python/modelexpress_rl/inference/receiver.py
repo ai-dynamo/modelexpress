@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import logging
+import functools
+import zlib
 import itertools
 import os
 import shutil
@@ -52,6 +54,15 @@ from modelexpress_rl.utils import (
 
 if TYPE_CHECKING:
     from .streaming_checkpoint import StreamedCheckpoint
+
+try:
+    from modelexpress_rl.inference import _delta_ext
+except ImportError:
+    _delta_ext = None
+
+_NATIVE_TENSOR_BYTES = 1 << 32
+_FULL_CHECK_INTERVAL = 8
+_NATIVE_SPARSE, _NATIVE_FULL, _NATIVE_FALLBACK, _NATIVE_MISSED, _NATIVE_ERROR = range(5)
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +276,27 @@ def _staged_layers(
     return tuple(deltas[deltas.index(state.base) + 1 :])
 
 
+def _sparse_base(table: dict[str, str], name: str, *, depth: int) -> str | None:
+    """The checksum a check of ``name`` at chain ``depth`` may start from, if any.
+
+    A tensor sits out one in _FULL_CHECK_INTERVAL depths, so its check there
+    reads it in full.
+    """
+    if not rl_envs.MX_REFIT_SPARSE_CHECK:
+        return None
+    if zlib.crc32(name.encode()) % _FULL_CHECK_INTERVAL == depth % _FULL_CHECK_INTERVAL:
+        return None
+    return table.get(name)
+
+
+@functools.cache
+def _warn_without_native_check() -> None:
+    logger.warning(
+        "ModelExpress was built without its C++ delta checker, so refit checks "
+        "every byte of a delta's tensors in Python"
+    )
+
+
 def _zstd_stream_reader(data: memoryview) -> Any:
     import zstandard
 
@@ -375,6 +407,7 @@ def _download_full_checkpoint(
     tensor_metadata: dict[str, dict] | None = None,
     shard_bytes: int | None = None,
     working_copy: Path | None = None,
+    checksums: dict[str, str] | None = None,
 ) -> tuple[float, float]:
     """Download and validate one full HF checkpoint artifact.
 
@@ -453,6 +486,8 @@ def _download_full_checkpoint(
                     raise ValueError(
                         f"full HF checkpoint checksum differs for {name!r}"
                     )
+                if checksums is not None and checksum_format == "adler32":
+                    checksums[name] = expected_checksum
         for directory in targets:
             (directory / filename).write_bytes(data)
         return download_time, time.perf_counter() - validation_started
@@ -789,6 +824,7 @@ class _LocalCheckpoint:
             version=(state.version if state is not None else self.initial_version),
             checkpoint_paths=self.checkpoint_paths,
         )
+        self.store.checksums_path(self.initial_version).unlink(missing_ok=True)
         # A working copy of the replaced initial checkpoint is stale.
         self.store.drop_working_copy(self.initial_version)
         with self.store.replace_directory(target) as temporary:
@@ -1301,6 +1337,7 @@ class _LocalCheckpoint:
             protected_versions=protected_versions,
             protected_paths={non_weight_source},
         )
+        checksums: dict[str, str] = {}
         with ExitStack() as stack:
             temporaries = [
                 stack.enter_context(self.store.replace_directory(directory))
@@ -1317,6 +1354,7 @@ class _LocalCheckpoint:
                 protected_versions=protected_versions,
                 shard_bytes=shard_bytes,
                 working_copy=temporaries[1] if len(temporaries) > 1 else None,
+                checksums=checksums,
             )
             for temporary in temporaries:
                 self.store.record_artifact(
@@ -1324,6 +1362,10 @@ class _LocalCheckpoint:
                     source=_source_identity(version),
                 )
 
+        if checksums:
+            self.store.write_checksums(
+                version.version_id, checksums, keep=protected_versions
+            )
         self._set_local_checkpoint(target)
         self.store.write_chain(
             version.version_id,
@@ -1435,6 +1477,17 @@ class _LocalCheckpoint:
                 logger.warning(
                     "No room for optional delta staging; installing by reload"
                 )
+        verified = self._shard_tensors(
+            downloaded
+            if downloaded is not None
+            else {
+                filename: ((artifact / filename).read_bytes(), names)
+                for filename, names in _group_tensors_by_shard(weight_map).items()
+            }
+        )
+        self._record_checksums(
+            version, self.store.checksums(version.base_version_id), verified
+        )
         return download_time, time.perf_counter() - apply_started
 
     def _write_staging(
@@ -1530,6 +1583,7 @@ class _LocalCheckpoint:
         protected_versions: set[str],
         shard_bytes: int | None = None,
         working_copy: Path | None = None,
+        checksums: dict[str, str] | None = None,
     ) -> tuple[float, float]:
         return _download_full_checkpoint(
             reader=self.reader,
@@ -1542,6 +1596,7 @@ class _LocalCheckpoint:
             tensor_metadata=self.tensor_metadata,
             shard_bytes=shard_bytes,
             working_copy=working_copy,
+            checksums=checksums,
         )
 
     def _prepared(
@@ -1767,6 +1822,7 @@ class _LocalCheckpoint:
             started = time.perf_counter()
             self._verify_lineage(chain)
             sink: _StagedBytes = {}
+            table = self.store.checksums(state.version)
             tensors = self._shard_tensors(shards)
             stats: dict[str, float] = {}
             with self._open_layers(state) as layers:
@@ -1776,6 +1832,9 @@ class _LocalCheckpoint:
                             name,
                             check=compressed,
                             checksum=checksum,
+                            base_checksum=_sparse_base(
+                                table, name, depth=len(chain["deltas"])
+                            ),
                             overlay=tuple(
                                 layer.tensor(name) for layer in layers if name in layer
                             ),
@@ -1788,6 +1847,7 @@ class _LocalCheckpoint:
                 )
             self.store.write_chain(version.version_id, chain)
             self._write_staging(version, sink)
+            self._record_checksums(version, table, tensors)
         except CheckpointCacheCapacityError:
             raise
         except Exception as error:
@@ -1859,6 +1919,110 @@ class _LocalCheckpoint:
                 )
         return tensors
 
+    def _record_checksums(
+        self,
+        version: _ObjectStorageVersion,
+        base: dict[str, str],
+        tensors: dict[str, tuple[memoryview, str]],
+    ) -> None:
+        """Record a delta's target checksums, the base's table ``base`` updated with its own.
+
+        The base's table stays too, for a delta that replaces this one; every other table goes.
+        """
+        assert version.base_version_id is not None
+        self.store.write_checksums(
+            version.version_id,
+            {**base, **{name: checksum for name, (_data, checksum) in tensors.items()}},
+            keep=(version.base_version_id,),
+        )
+
+    def _check_natively(
+        self,
+        tensors: list[_TensorPass],
+        sink: _StagedBytes | None,
+        stats: dict[str, float] | None,
+    ) -> list[_TensorPass]:
+        """Run the checks the C++ checker can; return the tensors left for Python.
+
+        It takes the deltas a pass only checks, of tensors up to 4 GiB, on
+        MX_REFIT_DELTA_WORKERS threads without the GIL, and reads a tensor only
+        where its delta changes it when the tensor's base checksum is known. A
+        tensor it cannot check, such as one whose delta does not decompress to its
+        size, is left to Python, which reports it.
+        """
+        if _delta_ext is None:
+            _warn_without_native_check()
+            return tensors
+        native, left = [], []
+        for tensor in tensors:
+            eligible = (
+                tensor.check is not None
+                and tensor.checksum is not None
+                and tensor.write is None
+                and not tensor.scatter
+                and self.locations[tensor.name][2] <= _NATIVE_TENSOR_BYTES
+            )
+            (native if eligible else left).append(tensor)
+        if not native:
+            return tensors
+        locations = [self.locations[tensor.name] for tensor in native]
+        paths = sorted({path for path, _offset, _size in locations})
+        file_of = {path: index for index, path in enumerate(paths)}
+        status, counts, positions, values = _delta_ext.check(
+            [str(path) for path in paths],
+            np.array(
+                [file_of[path] for path, _offset, _size in locations], dtype=np.int64
+            ),
+            np.array([offset for _path, offset, _size in locations], dtype=np.int64),
+            np.array([size for _path, _offset, size in locations], dtype=np.int64),
+            [tensor.check for tensor in native],
+            np.array(
+                [
+                    -1
+                    if t.base_checksum is None or not rl_envs.MX_REFIT_SPARSE_CHECK
+                    else int(t.base_checksum, 16)
+                    for t in native
+                ],
+                dtype=np.int64,
+            ),
+            np.array([int(tensor.checksum, 16) for tensor in native], dtype=np.uint32),
+            [
+                tuple((staged.positions, staged.values) for staged in t.overlay)
+                for t in native
+            ],
+            rl_envs.MX_REFIT_DELTA_WORKERS,
+        )
+        ends = np.cumsum(np.frombuffer(counts, dtype=np.int64)).tolist()
+        positions = np.frombuffer(positions, dtype=np.uint32)
+        values = np.frombuffer(values, dtype=np.uint8)
+        begin = 0
+        for tensor, code, (_path, _offset, size), end in zip(
+            native, status, locations, ends, strict=True
+        ):
+            if code == _NATIVE_MISSED:
+                raise ValueError(
+                    f"canonical target checksum differs for {tensor.name!r}"
+                )
+            if code == _NATIVE_ERROR:
+                left.append(tensor)
+            else:
+                if code == _NATIVE_FALLBACK:
+                    logger.warning(
+                        "Sparse check of %s missed its checksum; read it in full",
+                        tensor.name,
+                    )
+                if stats is not None and code != _NATIVE_FULL:
+                    key = (
+                        "sparse_checks"
+                        if code == _NATIVE_SPARSE
+                        else "sparse_fallbacks"
+                    )
+                    stats[key] += 1
+                if sink is not None:
+                    sink[tensor.name] = (size, positions[begin:end], values[begin:end])
+            begin = end
+        return left
+
     def _run_pass(
         self,
         tensors: list[_TensorPass],
@@ -1883,6 +2047,13 @@ class _LocalCheckpoint:
         if not tensors:
             return set()
         started: set[str] = set()
+        if stop is None:
+            left = self._check_natively(tensors, sink, stats)
+            started.update(tensor.name for tensor in tensors)
+            started.difference_update(tensor.name for tensor in left)
+            tensors = left
+            if not tensors:
+                return started
         # Take each file's tensors largest first, so a large tensor does not
         # finish last, and equal sizes in file order, so reads run forward.
         # Alternate files, since writes to one file serialize.

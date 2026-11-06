@@ -254,6 +254,7 @@ class LocalCheckpointStore:
         self.full_cache = self.cache / "full"
         self.delta_cache = self.cache / "deltas"
         self.chain_cache = self.cache / "chains"
+        self.checksum_cache = self.cache / "checksums"
         self.staging_cache = self.cache / "staging"
         self.materialized_cache = self.cache / "materialized"
         self.state_path = self.cache / "state.json"
@@ -269,6 +270,7 @@ class LocalCheckpointStore:
             self.full_cache,
             self.delta_cache,
             self.staging_cache,
+            self.checksum_cache,
             self.chain_cache,
             self.materialized_cache,
         ):
@@ -396,6 +398,25 @@ class LocalCheckpointStore:
     def materialized_path(self, version: str) -> Path:
         return self._version_path(self.materialized_cache, version)
 
+    def checksums_path(self, version: str) -> Path:
+        return self.checksum_cache / f"{_encode_cache_component(version)}.json"
+
+    def checksums(self, version: str) -> dict[str, str]:
+        """Verified checksums of a version's tensors, as far as they are known."""
+        table = self._read_json(self.checksums_path(version)) or {}
+        return {name: value for name, value in table.items() if isinstance(value, str)}
+
+    def write_checksums(
+        self, version: str, table: dict[str, str], *, keep: Iterable[str] = ()
+    ) -> None:
+        """Record a version's verified checksums, dropping other versions' not in ``keep``."""
+        self.checksum_cache.mkdir(exist_ok=True)
+        self._write_json(self.checksums_path(version), table)
+        kept = {self.checksums_path(name).name for name in (version, *keep)}
+        for path in self.checksum_cache.glob("*.json"):
+            if path.name not in kept:
+                path.unlink(missing_ok=True)
+
     def chain_path(self, version: str) -> Path:
         return self.chain_cache / f"{_encode_cache_component(version)}.json"
 
@@ -488,6 +509,7 @@ class LocalCheckpointStore:
         ):
             return
         (self.chain_cache / f"{encoded_version}.json").unlink(missing_ok=True)
+        (self.checksum_cache / f"{encoded_version}.json").unlink(missing_ok=True)
 
     def can_admit(
         self,
