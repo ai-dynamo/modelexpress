@@ -1281,7 +1281,9 @@ training framework. Framework-native bucket settings remain the default.
 Integrations may use `MX_REFIT_DELTA_BUCKET_BYTES` as an explicit override, or
 its 512 MiB default when they have no native setting. `MX_REFIT_DELTA_WORKERS`
 (default `min(32, CPU count)`) controls trainer CPU work;
-`MX_S3_UPLOAD_WORKERS` controls concurrent full-checkpoint batch uploads.
+`MX_REFIT_UPLOAD_WORKERS` controls concurrent full-checkpoint batch uploads,
+falling back to `MX_S3_UPLOAD_WORKERS` when unset. S3 multipart concurrency
+still uses `MX_S3_UPLOAD_WORKERS`.
 Framework integrations read the bucket-size setting before constructing the
 stream; ModelExpress preserves the supplied bucket boundaries.
 Full checkpoints are grouped into concurrently uploaded safetensors objects of

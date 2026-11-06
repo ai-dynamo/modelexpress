@@ -653,7 +653,8 @@ def test_s3_full_hf_checkpoint_uploads_batches_concurrently(
     service.target.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
     service.target.ClearField("base_version_id")
     monkeypatch.setenv("MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES", "4")
-    monkeypatch.setenv("MX_S3_UPLOAD_WORKERS", "2")
+    monkeypatch.setenv("MX_REFIT_UPLOAD_WORKERS", "2")
+    monkeypatch.setenv("MX_S3_UPLOAD_WORKERS", "1")
     tensors = {"a": torch.tensor([1.0]), "b": torch.tensor([2.0])}
     trainer, storage = _trainer(monkeypatch, tmp_path, server_url, tensors)
     upload = storage.put
