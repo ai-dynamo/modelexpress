@@ -134,11 +134,12 @@ impl P2pStateManager {
         &self,
         identity: &SourceIdentity,
         worker_id: &str,
-        worker: WorkerMetadata,
+        mut worker: WorkerMetadata,
         pod_name: &str,
         pod_uid: &str,
         pod_namespace: &str,
     ) -> MetadataResult<()> {
+        worker.updated_at = chrono::Utc::now().timestamp_millis();
         self.get_backend()
             .await?
             .publish_metadata(

@@ -36,6 +36,7 @@ use modelexpress_common::grpc::refit::{
 use modelexpress_server::backend_config::BackendConfig;
 use modelexpress_server::config::ServerConfig;
 use modelexpress_server::run_server;
+use redis::AsyncCommands;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic_health::pb::{
@@ -1281,6 +1282,233 @@ async fn mesh_worker_rebinding_retires_publication(replace_worker_id: bool) {
     stop(shutdown, server).await;
     stop(stop_old, old_server).await;
     stop(stop_new, new_server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn azure_publications_preserve_provider_and_validate_delta_bases() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (stop_tx, server) = start_server(port, &redis_url);
+    let mut client = connect(port).await;
+    let source = ObjectStorageSource {
+        uri: "Az://weights/Policy/V25/Model %20.index.json ".to_string(),
+        storage_type: ObjectStorageType::Azure.into(),
+    };
+    let request = CreateWeightVersionRequest {
+        uid: Some(unique_id("azure-version")),
+        model_name: "test/model".to_string(),
+        idempotency_key: unique_id("azure-request"),
+        payload_format: WeightPayloadFormat::FullHfCheckpoint.into(),
+        base_version_id: None,
+        object_storage: Some(source.clone()),
+        state: WeightVersionState::Staging.into(),
+        trainer_mesh_id: None,
+        version_number: Some(25),
+    };
+    let staged = client
+        .create_weight_version(request.clone())
+        .await
+        .expect("create Azure version")
+        .into_inner()
+        .version
+        .expect("version in response");
+    assert_eq!(staged.object_storage, Some(source.clone()));
+    assert_eq!(staged.version_number, Some(25));
+    assert_eq!(staged.trainer_mesh_id, None);
+    assert_eq!(staged.trainer_mesh_generation, 0);
+    let fetched = client
+        .get_weight_version(GetWeightVersionRequest {
+            uid: staged.uid.clone(),
+        })
+        .await
+        .expect("get Azure version")
+        .into_inner()
+        .version
+        .expect("version in response");
+    assert_eq!(fetched, staged);
+    let delta_request = CreateWeightVersionRequest {
+        uid: Some(unique_id("azure-delta")),
+        idempotency_key: unique_id("azure-delta-request"),
+        payload_format: WeightPayloadFormat::XorDelta.into(),
+        base_version_id: Some(staged.uid.clone()),
+        ..request.clone()
+    };
+    let missing = client
+        .create_weight_version(CreateWeightVersionRequest {
+            base_version_id: Some(unique_id("missing-base")),
+            ..delta_request.clone()
+        })
+        .await
+        .expect_err("missing delta base");
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+    let pending = client
+        .create_weight_version(delta_request.clone())
+        .await
+        .expect_err("delta base must be READY");
+    assert_eq!(pending.code(), tonic::Code::FailedPrecondition);
+    let ready = update_state(&mut client, &staged.uid, WeightVersionState::Ready)
+        .await
+        .expect("mark Azure version ready")
+        .version
+        .expect("version in response");
+    assert_eq!(ready.object_storage, Some(source.clone()));
+    assert_eq!(ready.state, i32::from(WeightVersionState::Ready));
+    let wrong_model = client
+        .create_weight_version(CreateWeightVersionRequest {
+            model_name: "another/model".to_string(),
+            ..delta_request.clone()
+        })
+        .await
+        .expect_err("delta base must have the same model");
+    assert_eq!(wrong_model.code(), tonic::Code::FailedPrecondition);
+    for publication in [
+        delta_request,
+        CreateWeightVersionRequest {
+            uid: Some(unique_id("azure-full-tensor")),
+            idempotency_key: unique_id("azure-full-tensor-request"),
+            payload_format: WeightPayloadFormat::FullTensor.into(),
+            ..request.clone()
+        },
+    ] {
+        let created = client
+            .create_weight_version(publication.clone())
+            .await
+            .expect("create Azure payload")
+            .into_inner()
+            .version
+            .expect("version in response");
+        assert_eq!(created.object_storage, Some(source.clone()));
+        assert_eq!(created.base_version_id, publication.base_version_id);
+        assert_eq!(created.payload_format, publication.payload_format);
+        let published = update_state(&mut client, &created.uid, WeightVersionState::Ready)
+            .await
+            .expect("publish Azure payload")
+            .version
+            .expect("version in response");
+        let repeated = client
+            .create_weight_version(publication)
+            .await
+            .expect("retry Azure payload")
+            .into_inner()
+            .version
+            .expect("version in response");
+        assert_eq!(published, repeated);
+        assert_eq!(published.object_storage, Some(source.clone()));
+    }
+    let repeated = client
+        .create_weight_version(request.clone())
+        .await
+        .expect("retry original Azure publication")
+        .into_inner()
+        .version
+        .expect("version in response");
+    assert_eq!(repeated, ready);
+    let mut changed = request;
+    changed.object_storage = Some(s3_source("s3://weights/run/model.safetensors.index.json"));
+    let conflict = client
+        .create_weight_version(changed)
+        .await
+        .expect_err("a retry cannot change storage provider");
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+    stop(stop_tx, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn object_storage_metadata_preserves_s3_legacy_compatibility() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (shutdown, server) = start_server(port, &redis_url);
+    let mut client = connect(port).await;
+    let mut redis = redis::Client::open(redis_url)
+        .expect("Redis URL")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect to Redis");
+    let worker_id = unique_id("storage-schema-worker");
+    client
+        .register_worker(worker(&worker_id, WorkerRole::Trainer, 60))
+        .await
+        .expect("register publishing worker");
+
+    for (provider, uri, legacy) in [
+        (ObjectStorageType::S3, "s3://weights/full", false),
+        (ObjectStorageType::Azure, "az://weights/full", false),
+        (ObjectStorageType::S3, "s3://weights/legacy", true),
+    ] {
+        let source = ObjectStorageSource {
+            storage_type: provider.into(),
+            uri: uri.to_string(),
+        };
+        let request = CreateWeightVersionRequest {
+            model_name: "test/model".to_string(),
+            idempotency_key: unique_id("storage-schema-version"),
+            payload_format: WeightPayloadFormat::FullHfCheckpoint.into(),
+            object_storage: Some(source.clone()),
+            state: WeightVersionState::Staging.into(),
+            ..Default::default()
+        };
+        let version = client
+            .create_weight_version(request.clone())
+            .await
+            .expect("create object-storage version")
+            .into_inner()
+            .version
+            .expect("version in response");
+        let key = format!("mx:refit:version:metadata:{}", version.uid);
+        let fields: HashMap<String, String> =
+            redis.hgetall(&key).await.expect("read stored version");
+        assert_eq!(
+            fields.get("object_storage_uri").map(String::as_str),
+            Some(uri)
+        );
+        assert_eq!(
+            fields.get("s3_uri").map(String::as_str),
+            Some(if provider == ObjectStorageType::S3 {
+                uri
+            } else {
+                ""
+            }),
+        );
+        if legacy {
+            let removed: usize = redis
+                .hdel(&key, &["object_storage_uri", "object_storage_type"])
+                .await
+                .expect("simulate a record from an older server");
+            assert_eq!(removed, 2);
+        }
+
+        let error = client
+            .create_weight_version_shard(CreateWeightVersionShardRequest {
+                shard: Some(shard(&version.uid, "shard", &worker_id)),
+            })
+            .await
+            .expect_err("object-storage versions reject worker shards");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            "weight version does not accept shard publication"
+        );
+        let ready = update_state(&mut client, &version.uid, WeightVersionState::Ready)
+            .await
+            .expect("publish object-storage version")
+            .version
+            .expect("version in response");
+        assert_eq!(ready.state, i32::from(WeightVersionState::Ready));
+        assert_eq!(ready.object_storage, Some(source));
+        let repeated = client
+            .create_weight_version(request)
+            .await
+            .expect("retry retains the object-storage source")
+            .into_inner()
+            .version
+            .expect("version in response");
+        assert_eq!(repeated, ready);
+    }
+    stop(shutdown, server).await;
 }
 
 #[tokio::test]

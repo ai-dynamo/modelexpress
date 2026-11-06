@@ -82,9 +82,17 @@ DIRECT installation and pipelined worker streaming are
 not implemented by this control-plane slice.
 NIXL manifest endpoints belong to their physical worker shards; a typed object
 storage source belongs directly to its durable `WeightVersion`. The protocol
-can identify S3, Azure Blob Storage, or GCS. The Refit service and trainer
-publication currently accept only S3. Generator checkpoint preparation accepts
-S3 and Azure Blob Storage; exact desired-version startup remains S3-only.
+can identify S3, Azure Blob Storage, or GCS. The Refit service accepts S3 and Azure
+publications; the trainer SDK currently publishes only to S3. Generator checkpoint
+preparation and exact desired-version startup accept S3 and Azure Blob Storage.
+Startup reconstructs the full root and ordered deltas before engine loading.
+The server allows different providers within a run, including across delta-base
+relationships. Generators do not support mixed-provider replay: every version in
+a replay chain must use the same storage provider.
+Redis stores `object_storage_uri` and `object_storage_type`, with `s3_uri` as an
+S3-only mirror for older servers. Readers fall back to `s3_uri` for older records
+without `object_storage_uri`. A missing provider still means S3; checkpoint bytes
+remain in object storage.
 On the NIXL path, weight bytes and full tensor manifests remain
 on trainer workers. On the S3 path, rank zero uploads the version's global index
 after every trainer rank has uploaded its owned shard. `XOR_DELTA` versions use
@@ -291,7 +299,6 @@ and share full-checkpoint validation, XOR delta replay, cache promotion, and
 activation. Every source in a replay chain must match the configured provider;
 a mismatch fails before downloads begin. Azure full checkpoints download to disk
 before installation. The optional full-checkpoint streaming path remains S3-only.
-Azure publication and exact desired-version startup require separate support.
 
 Canonical preparation requests queue on a separate `.prepare.lock`. Once the
 leader has reconstructed a target, followers verify and attach to that READY
@@ -493,8 +500,11 @@ the full checkpoint path. See [the delta refit guide](S3_DELTA_WEIGHT_REFIT.md).
 
 The canonical receiver retains each full checkpoint and delta payload under its
 version, then writes a resolved chain manifest. A full target is directly
-installable. The first delta after a full checkpoint copies that immutable full
-checkpoint into a version-scoped derived checkpoint. On Linux the checkpoint
+installable. The first delta after a full checkpoint applies in place to a
+working copy of that immutable full checkpoint, which becomes a version-scoped
+derived checkpoint. [The delta refit guide](S3_DELTA_WEIGHT_REFIT.md#working-copies)
+lists the full checkpoints that get a working copy before that delta; for the
+others, the delta copies the full checkpoint once. On Linux the checkpoint
 store attempts `FICLONE` per regular file, sharing blocks copy-on-write where
 the filesystem supports reflinks. Unsupported filesystems, cross-mount copies,
 and other platforms use an ordinary copy. This includes `EBADF` from `FICLONE`
@@ -502,7 +512,14 @@ on already-opened files when the source filesystem cannot reflink.
 File metadata and symlink dereferencing
 retain `copytree`/`copy2` behavior; mutable files never use hard links. Clone I/O,
 permission, and capacity failures abort preparation and clean its temporary
-directory before promotion. Later sequential deltas
+directory before promotion. The background thread that copies the seed holds
+only the preparation lock, so other ranks can still initialize and install while the
+first delta waits for the copy and renames it. The copy is written in place and
+recorded last, and deltas use only a recorded copy, so a later preparation deletes a partial one under the
+store lock. A rank that prepares a full checkpoint or shuts down cancels its own
+copy between 256 MiB chunks or while it waits for a store lock; a streamed full
+checkpoint waits for the copy
+before writing the cache. Later sequential deltas
 rename the active materialization and apply only the incoming XOR delta in
 place, avoiding another full-model copy. Canonical artifacts are never modified
 during reconstruction, and derived checkpoints can be rebuilt from the lineage.
@@ -782,6 +799,9 @@ the bridge merges staging
 and installation metrics and logs each numeric `perf/` phase as a separate INFO
 line in deterministic key order. `perf/mx_receive_stage_weight_time` covers the
 complete `ModelExpressGeneratorClient.stage_weight()` wall-clock call.
+`perf/mx_receive_prepare_lock_wait` is the part spent waiting for the node's
+preparation lock, which another rank's preparation, a streamed full checkpoint's
+cache writer, or the background seed copy may hold.
 
 The active vLLM refit installer lives in
 `modelexpress_rl.inference.engines.vllm.installer`. It captures canonical
