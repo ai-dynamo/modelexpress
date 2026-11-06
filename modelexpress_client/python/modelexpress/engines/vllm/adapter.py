@@ -56,19 +56,17 @@ if TYPE_CHECKING:
 
 
 def _local_runtime_tensors(model: torch.nn.Module) -> list[torch.Tensor]:
-    """Identify the instance-owned FlashInfer MLA counter without importing vLLM."""
+    """Identify local state through the attention layer's declared backend."""
     tensors = []
     for module in model.modules():
-        for owner in (module, vars(module).get("impl")):
-            if owner is None or not any(
-                cls.__module__ == "vllm.v1.attention.backends.mla.flashinfer_mla"
-                and cls.__name__ == "FlashInferMLAImpl"
-                for cls in type(owner).__mro__
-            ):
-                continue
-            counter = getattr(owner, "_multi_ctas_kv_counter_buffer", None)
-            if isinstance(counter, torch.Tensor):
-                tensors.append(counter)
+        backend = getattr(module, "attn_backend", None)
+        get_name = getattr(backend, "get_name", None)
+        if not callable(get_name) or get_name() != "FLASHINFER_MLA":
+            continue
+        impl = getattr(module, "impl", None)
+        counter = getattr(impl, "_multi_ctas_kv_counter_buffer", None)
+        if isinstance(counter, torch.Tensor):
+            tensors.append(counter)
     return tensors
 
 
@@ -359,15 +357,21 @@ class VllmAdapter(EngineAdapter):
         """Collect transferable tensors while preserving process-local state."""
         if result.model is None:
             raise RuntimeError("vLLM tensor discovery requires result.model")
+        local_tensors = _local_runtime_tensors(result.model)
+        local_ids = {id(tensor) for tensor in local_tensors}
+
+        def exclude(obj: object) -> bool:
+            return id(obj) in local_ids or self._exclude_hidden_tensor_object(obj)
+
         adopt_hidden_tensors(
             result.model,
             self.accelerator_backend,
-            exclude=self._exclude_hidden_tensor_object,
+            exclude=exclude,
         )
         tensors = collect_module_tensors(
             result.model,
             self.accelerator_backend,
-            preserve_local=_local_runtime_tensors(result.model),
+            preserve_local=local_tensors,
         )
         if _is_speculative_draft(self.vllm_config, self.model_config):
             prefixes = _target_shared_draft_prefixes(result.model, self.vllm_config)

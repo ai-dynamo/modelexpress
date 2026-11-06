@@ -14,7 +14,9 @@ from modelexpress.load_strategy.context import LoadResult
 from modelexpress.tensor_utils import collect_module_tensors
 
 
-def _model(*, registered=False, subclass=False, module_name=None):
+def _model(
+    *, registered=False, subclass=False, module_name=None, backend_name="FLASHINFER_MLA"
+):
     cls = type(
         "FlashInferMLAImpl",
         (nn.Module,) if registered else (object,),
@@ -33,6 +35,7 @@ def _model(*, registered=False, subclass=False, module_name=None):
     model = nn.Module()
     model.weight = nn.Parameter(torch.ones(8))
     model.impl = impl
+    model.attn_backend = SimpleNamespace(get_name=lambda: backend_name)
     return model, counter
 
 
@@ -62,12 +65,36 @@ def test_counter_and_aliases_stay_local(registered, subclass, mock_accelerator_b
         assert torch.equal(counter, before)
 
 
-def test_same_field_on_unrecognized_type_is_not_silently_dropped(mock_accelerator_backend_cls):
+@pytest.mark.parametrize("registered", [False, True])
+def test_backend_identity_survives_impl_rename(registered, mock_accelerator_backend_cls):
     backend = mock_accelerator_backend_cls(torch_device_type="cpu")
-    model, counter = _model(module_name="application.quantization")
+    model, counter = _model(registered=registered, module_name="application.attention")
+    type(model.impl).__name__ = "CustomAttentionImpl"
+    catalog = _discover(model, backend)
+    assert len(catalog) == 2
+    assert all(t.data_ptr() != counter.data_ptr() for t in catalog.values())
+
+
+@pytest.mark.parametrize("backend_name", ["FLASHINFER", "FLASHMLA", None])
+def test_same_field_on_other_backend_is_not_silently_dropped(
+    backend_name, mock_accelerator_backend_cls
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    model, counter = _model(backend_name=backend_name)
+    if backend_name is None:
+        del model.attn_backend
     catalog = _discover(model, backend)
     assert any(t.data_ptr() == counter.data_ptr() for t in catalog.values())
     assert len(catalog) == 3
+
+
+def test_counter_is_not_adopted_as_a_module_buffer(mock_accelerator_backend_cls):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    model, counter = _model()
+    for _ in range(2):
+        catalog = _discover(model, backend)
+        assert len(catalog) == 2
+        assert all(t.data_ptr() != counter.data_ptr() for _, t in model.named_buffers())
 
 
 def test_no_instance_counter_is_a_noop(mock_accelerator_backend_cls):

@@ -1105,14 +1105,16 @@ The vLLM adapter passes an exclusion predicate to engine-agnostic hidden-tensor 
 
 The SGLang adapter's predicate skips any object whose class is defined under `sglang.srt.distributed`, `sglang.srt.layers.communication`, or `torch.distributed`. Communication workspaces such as `FinalizePushWorkspace` hold direct references to the communicator's push counter and slabs, so excluding the communicator alone is not enough. SGLang layers keep their `GroupCoordinator` as `tp_group`, so without it the scan reaches the custom all-reduce communicator and copies the donor's epoch counters, symmetric slab, and CUDA-graph pointer table. Those tensors match in size across instances, so the transfer succeeds, but the receiver's ranks then disagree on epoch parity and the first push all-reduce deadlocks.
 
-The vLLM tensor catalog preserves the instance-owned FlashInfer MLA
-`_multi_ctas_kv_counter_buffer` on recognized `FlashInferMLAImpl` objects attached
-as attention `impl` or registered modules. Collection omits buffer aliases
-within that counter's byte range, including previously adopted buffers, while
-retaining unrelated hidden derived tensors. Parameters and widened storage
-transfers that overlap local state raise a classification error. This bounded
-compatibility rule does not classify arbitrary runtime buffers; versions using
-a module-global counter need no instance-field exclusion.
+The vLLM adapter identifies FlashInfer MLA attention layers through
+`attn_backend.get_name() == "FLASHINFER_MLA"`, independently of the implementation
+class name or module path. It preserves the instance-owned
+`impl._multi_ctas_kv_counter_buffer` and excludes that tensor from hidden-tensor
+adoption. Collection also omits buffer aliases within the counter's byte range,
+including previously adopted buffers, while retaining unrelated hidden derived
+tensors. Parameters, partial buffer overlaps, and widened storage transfers that
+overlap local state raise a classification error. This bounded compatibility rule
+does not classify arbitrary runtime buffers or implementations without a declared
+backend; versions using a module-global counter need no instance-field exclusion.
 
 ```mermaid
 graph TD
