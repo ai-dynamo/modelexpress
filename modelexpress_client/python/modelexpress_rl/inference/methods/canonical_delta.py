@@ -50,9 +50,11 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         config: ObjectStorageGeneratorConfig,
         stream_full_checkpoints: bool = False,
         background_seed_copy: bool = False,
+        stage_deltas: bool = False,
     ) -> None:
         self._model_name = model_name
         self._config = config
+        self._stage_deltas = stage_deltas
         self._reader: ObjectStorageReader
         if config.storage_type is ObjectStorageType.S3:
             self._reader = S3Client(
@@ -68,6 +70,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                 model_name=model_name,
                 config=config,
                 reader=self._reader,
+                stage_deltas=stage_deltas,
             )
             self._initialized = self._checkpoint.initialize(
                 allow_unrecorded_seed=True,
@@ -140,7 +143,9 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
     ) -> PreparedArtifact:
         if self._active is not None:
             raise RuntimeError("release staged weight before staging another version")
-        self._streams = [stream for stream in self._streams if not stream.cache_succeeded]
+        self._streams = [
+            stream for stream in self._streams if not stream.cache_succeeded
+        ]
         versions = [self._version(version, source) for version, source in chain]
         if (
             versions
@@ -222,6 +227,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                             seed_checkpoint_path=seed,
                         ),
                         reader=self._reader,
+                        stage_deltas=self._stage_deltas,
                     )
                     checkpoint.initialize()
                     self._checkpoint = checkpoint

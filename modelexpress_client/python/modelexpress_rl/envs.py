@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     MX_REFIT_DOWNLOAD_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
+    MX_REFIT_INPLACE: bool
     MX_REFIT_PREFETCH: bool
     MX_REFIT_FULL_STREAMING: bool
     MX_REFIT_STREAM_WINDOW_LAYERS: int
@@ -260,6 +261,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_DELTA_SURGICAL": lambda: parse_bool(
         os.environ.get("MX_REFIT_DELTA_SURGICAL", "false"),
         "MX_REFIT_DELTA_SURGICAL",
+    ),
+    "MX_REFIT_INPLACE": lambda: parse_bool(
+        os.environ.get("MX_REFIT_INPLACE", "false"), "MX_REFIT_INPLACE"
     ),
     "MX_REFIT_PREFETCH": lambda: parse_bool(
         os.environ.get("MX_REFIT_PREFETCH", "false"), "MX_REFIT_PREFETCH"

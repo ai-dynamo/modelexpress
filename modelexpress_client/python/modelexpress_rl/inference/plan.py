@@ -81,6 +81,7 @@ class EngineCapabilities:
 
     artifact_types: frozenset[type[PreparedArtifact]]
     streamed_checkpoints: bool = False
+    staged_checkpoints: bool = False
 
 
 @dataclass(frozen=True)

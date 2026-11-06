@@ -1723,3 +1723,9 @@ has isolated server/Redis state and empty worker volumes.
 It shares the canonical cache and preparation/install locks with engine updates
 and the background seed copy. A cache-head check under those locks prevents a
 queued prefetch from advancing a head whose installation is still pending.
+
+The optional in-place checkpoint installer uses `inference/staging.py` for
+nonzero XOR offsets and values, and vLLM `inplace.py` / `sparse_experts.py` for
+layout-aware installation. It preserves live addresses and zero-initializes
+reload temporaries, including padding. Peers agree on sparse layouts and drain
+remaining collective reads on local failure; failed installs are not atomic.

@@ -333,6 +333,11 @@ class ModelExpressGeneratorClient:
             )
             if client._serving_version_id is not None:
                 client._validate_initial_serving_version(client._serving_version_id)
+                record_live = getattr(
+                    runtime.engine.installer, "record_live_version", None
+                )
+                if record_live is not None:
+                    record_live(client._serving_version_id)
             client._register_worker()
             client._registration_thread = threading.Thread(
                 target=client._renew_worker_registration,
@@ -383,6 +388,7 @@ class ModelExpressGeneratorClient:
             parent_pid=os.getpid(),
             storage_type=storage.storage_type.value,
             streamed=canonical._stream_full_checkpoints,
+            inplace=canonical._stage_deltas,
         )
         self._prefetcher = launch_prefetcher(settings)
 

@@ -58,6 +58,7 @@ class PrefetchSettings:
     parent_pid: int
     storage_type: str = "S3"
     streamed: bool = False
+    inplace: bool = False
 
     def object_storage(self) -> ObjectStorageGeneratorConfig:
         return ObjectStorageGeneratorConfig(
@@ -113,6 +114,7 @@ class RefitPrefetcher:
                 model_name=settings.cache_model_name,
                 config=settings.object_storage(),
                 reader=reader,
+                stage_deltas=settings.inplace,
             )
             result = cls(
                 settings,

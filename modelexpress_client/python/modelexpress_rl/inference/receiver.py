@@ -31,6 +31,12 @@ from modelexpress_rl.inference.checkpoint_store import (
     LocalCheckpointStore,
     checkpoint_files_state,
 )
+from modelexpress_rl.inference.staging import (
+    StagedDelta,
+    join_nonzero,
+    nonzero_bytes,
+    write_staging,
+)
 from modelexpress_rl.object_storage import ObjectStorageType
 from modelexpress_rl.object_storage_reader import ObjectStorageReader
 from modelexpress_rl.train import WeightPayloadFormat
@@ -115,6 +121,9 @@ class PreparedCheckpoint:
     # Deltas from the target's full root, oldest first; empty when unknown.
     delta_changes: tuple[DeltaChange, ...] = ()
     streaming: StreamedCheckpoint | None = None
+    staging: Path | None = None
+    staging_base: str | None = None
+    overlay: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -494,8 +503,10 @@ class _LocalCheckpoint:
         model_name: str,
         config: ObjectStorageGeneratorConfig,
         reader: ObjectStorageReader,
+        stage_deltas: bool = False,
     ) -> None:
         self.initial_version = config.initial_base_version_id
+        self.stage_deltas = stage_deltas
         self.reader = reader
         self.store = LocalCheckpointStore(
             root=config.refit_checkpoint_dir,
@@ -886,6 +897,7 @@ class _LocalCheckpoint:
             self._artifact_path(target),
             _source_identity(target),
         )
+        staging, staging_base = self._staged_from(target.version_id)
         return PreparedCheckpoint(
             target_version=target.version_id,
             path=self.local_checkpoint,
@@ -896,6 +908,8 @@ class _LocalCheckpoint:
                 "perf/mx_receive_delta_apply": 0.0,
             },
             delta_changes=delta_changes,
+            staging=staging,
+            staging_base=staging_base,
         )
 
     def _delta_changes(self, version_id: str) -> tuple[DeltaChange, ...]:
@@ -1044,6 +1058,7 @@ class _LocalCheckpoint:
             checkpoint_paths=self.checkpoint_paths,
             source=_source_identity(target),
         )
+        staging, staging_base = self._staged_from(target.version_id)
         return PreparedCheckpoint(
             target_version=target.version_id,
             path=self.local_checkpoint,
@@ -1054,6 +1069,8 @@ class _LocalCheckpoint:
                 "perf/mx_receive_delta_apply": apply_time,
             },
             delta_changes=self._delta_changes(target.version_id),
+            staging=staging,
+            staging_base=staging_base,
         )
 
     def _artifact_path(self, version: _ObjectStorageVersion) -> Path:
@@ -1240,6 +1257,7 @@ class _LocalCheckpoint:
             "full_version": base_chain["full_version"],
             "deltas": [*base_chain["deltas"], version.version_id],
         }
+        sink = {} if self.stage_deltas else None
         target = self.store.materialized_path(version.version_id)
         apply_started = time.perf_counter()
         self.store.verify_artifact(self.store.full_path(chain["full_version"]))
@@ -1266,7 +1284,7 @@ class _LocalCheckpoint:
             base_checkpoint.replace(target)
             self._set_local_checkpoint(target)
             self._apply_delta_artifact(
-                artifact, metadata, weight_map, shards=downloaded
+                artifact, metadata, weight_map, shards=downloaded, sink=sink
             )
         else:
             # A full checkpoint without a working copy is copied once so
@@ -1277,12 +1295,51 @@ class _LocalCheckpoint:
             ) as temporary:
                 self._set_local_checkpoint(temporary)
                 self._apply_delta_artifact(
-                    artifact, metadata, weight_map, shards=downloaded
+                    artifact, metadata, weight_map, shards=downloaded, sink=sink
                 )
 
         self._set_local_checkpoint(target)
         self.store.write_chain(version.version_id, chain)
+        if sink is not None:
+            try:
+                self._write_staging(version, sink)
+            except CheckpointCacheCapacityError:
+                logger.warning(
+                    "No room for optional delta staging; installing by reload"
+                )
         return download_time, time.perf_counter() - apply_started
+
+    def _write_staging(
+        self,
+        version: _ObjectStorageVersion,
+        tensors: dict[str, tuple[int, np.ndarray, np.ndarray]],
+    ) -> None:
+        assert version.base_version_id is not None
+        self.store.ensure_capacity(
+            sum(
+                positions.nbytes + values.nbytes
+                for _n, positions, values in tensors.values()
+            ),
+            protected_versions=_protected_versions(
+                self.store,
+                version.base_version_id,
+                version.version_id,
+            ),
+        )
+        with self.store.replace_directory(
+            self.store.staging_path(version.version_id)
+        ) as temporary:
+            write_staging(
+                temporary, base_version=version.base_version_id, tensors=tensors
+            )
+
+    def _staged_from(self, version_id: str) -> tuple[Path | None, str | None]:
+        """Return the staged delta into a version and its base, if staged."""
+        if not self.stage_deltas:
+            return None, None
+        staging = self.store.staging_path(version_id)
+        base = StagedDelta.base_of(staging)
+        return (staging, base) if base is not None else (None, None)
 
     def _apply_delta_artifact(
         self,
@@ -1291,6 +1348,7 @@ class _LocalCheckpoint:
         weight_map: dict[str, str],
         *,
         shards: dict[str, tuple[bytes, list[str]]] | None = None,
+        sink: dict | None = None,
     ) -> None:
         self.store.verify_artifact(artifact)
         if shards is None:
@@ -1301,7 +1359,10 @@ class _LocalCheckpoint:
                 )
                 for filename, names in _group_tensors_by_shard(weight_map).items()
             }
-        self._apply_shards(shards, index_metadata=index_metadata)
+        if sink is None:
+            self._apply_shards(shards, index_metadata=index_metadata)
+        else:
+            self._apply_shards(shards, index_metadata=index_metadata, sink=sink)
 
     def _download_deltas(
         self,
@@ -1360,6 +1421,7 @@ class _LocalCheckpoint:
         shards: dict[str, tuple[bytes, list[str]]],
         *,
         index_metadata: dict[str, Any],
+        sink: dict | None = None,
     ) -> None:
         if not shards:
             return
@@ -1419,7 +1481,7 @@ class _LocalCheckpoint:
 
         def apply_chunk(
             fd: int, offset: int, block: bytes, position: int
-        ) -> tuple[Adler32Checksum, int]:
+        ) -> tuple[Adler32Checksum, int, tuple | None]:
             """XOR one decompressed chunk into the file; checksum the target bytes."""
             delta = np.frombuffer(block, dtype=np.uint8)
             if getattr(local, "buffer", None) is None:
@@ -1431,7 +1493,11 @@ class _LocalCheckpoint:
             checksum = checksum_factory(checksum_format)
             checksum.update(target)
             _write_all(fd, view, offset + position)
-            return checksum, delta.size
+            return (
+                checksum,
+                delta.size,
+                nonzero_bytes(delta, position) if sink is not None else None,
+            )
 
         files: dict[Path, int] = {}
         with ThreadPoolExecutor(
@@ -1443,6 +1509,7 @@ class _LocalCheckpoint:
                 name, compressed, expected_checksum = item
                 path, file_offset, size = self.locations[name]
                 fd = files[path]
+                nonzero = []
                 checksum = checksum_factory(checksum_format)
                 # A large tensor's chunks spread over the workers; others stay here.
                 spread = (
@@ -1451,8 +1518,10 @@ class _LocalCheckpoint:
                 pending: deque[Future] = deque()
 
                 def collect(result) -> None:
-                    part, length = result
+                    part, length, positions = result
                     checksum.extend(part, length)
+                    if positions is not None:
+                        nonzero.append(positions)
 
                 reader = decompress(compressed)
                 position = 0
@@ -1487,6 +1556,8 @@ class _LocalCheckpoint:
                 # Checksums describe the delta's target, not a reverted base.
                 if checksum.hexdigest() != expected_checksum:
                     raise ValueError(f"canonical target checksum differs for {name!r}")
+                if sink is not None:
+                    sink[name] = (size, *join_nonzero(size, nonzero))
 
             try:
                 for path in {
