@@ -15,6 +15,7 @@ also uses the same agent for host DRAM chunk staging.
 from __future__ import annotations
 
 import atexit
+import bisect
 import logging
 import os
 import time
@@ -114,6 +115,24 @@ class PostedRead:
 def _has_memory_range(size: int, addr: int) -> bool:
     """True when a tensor owns allocated bytes that can be registered and read."""
     return size > 0 and addr != 0
+
+
+def _spanning_descriptors(
+    descriptors: list[TensorDescriptor],
+    allocations: list[tuple[int, int]],
+) -> list[tuple[TensorDescriptor, int, int]]:
+    """Descriptors that run past the allocation containing their start address.
+
+    ``allocations`` is the sorted output of ``_find_cuda_allocations`` for the
+    same descriptors. Returns ``(descriptor, alloc_base, alloc_size)`` tuples.
+    """
+    bases = [base for base, _ in allocations]
+    spanning = []
+    for d in descriptors:
+        base, size = allocations[bisect.bisect_right(bases, d.addr) - 1]
+        if d.addr + d.size > base + size:
+            spanning.append((d, base, size))
+    return spanning
 
 
 class NixlTransferManager:
@@ -423,6 +442,20 @@ class NixlTransferManager:
         ):
             if self._accelerator_backend.supports_pool_reg():
                 allocations = self._find_cuda_allocations(registrable_descriptors)
+                # A tensor that runs past its allocation (e.g. a VA reservation
+                # backed by several mappings) cannot be covered by one
+                # registration: the allocation is too short, and registering
+                # the tensor itself trips cuda_ipc's range assertion.
+                spanning = _spanning_descriptors(registrable_descriptors, allocations)
+                if spanning:
+                    first, alloc_base, alloc_size = spanning[0]
+                    raise RuntimeError(
+                        f"{len(spanning)} of {len(registrable_descriptors)} tensors "
+                        "extend past the CUDA allocation containing their start "
+                        f"address and cannot be registered. First: {first.name} "
+                        f"at 0x{first.addr:x} ({first.size} bytes) in allocation "
+                        f"[0x{alloc_base:x}, 0x{alloc_base + alloc_size:x})"
+                    )
             else:
                 allocations = None
                 logger.warning(
