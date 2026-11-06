@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import mmap
 import shutil
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -21,6 +23,7 @@ import numpy as np
 from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.checkpoint_store import (
     CheckpointCacheCapacityError,
+    CheckpointCopyCancelled,
     CheckpointRecord,
     CheckpointState,
     LocalCheckpointStore,
@@ -38,6 +41,8 @@ from modelexpress_rl.utils import (
 
 if TYPE_CHECKING:
     from .streaming_checkpoint import StreamedCheckpoint
+
+logger = logging.getLogger(__name__)
 
 _BYTES_PER_GB = 1_000_000_000
 DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB = 2000
@@ -205,6 +210,24 @@ def _group_tensors_by_shard(
     return shard_to_tensors
 
 
+def _full_shard_bytes(
+    reader: ObjectStorageReader,
+    weight_map: dict[str, str],
+    root_uri: str,
+) -> int:
+    """Return the stored size of a full checkpoint's shards."""
+    shards = _group_tensors_by_shard(weight_map)
+    parent_uri = root_uri.rsplit("/", 1)[0]
+    return sum(
+        threadpool_map(
+            shards,
+            lambda filename: reader.size(f"{parent_uri}/{filename}"),
+            max_workers=min(rl_envs.MX_REFIT_DOWNLOAD_WORKERS, len(shards)),
+            thread_name_prefix="modelexpress-refit-head-full",
+        )
+    )
+
+
 def _download_full_checkpoint(
     *,
     reader: ObjectStorageReader,
@@ -215,8 +238,13 @@ def _download_full_checkpoint(
     root_uri: str,
     protected_versions: set[str],
     tensor_metadata: dict[str, dict] | None = None,
+    shard_bytes: int | None = None,
+    working_copy: Path | None = None,
 ) -> tuple[float, float]:
-    """Download and validate one full HF checkpoint artifact."""
+    """Download and validate one full HF checkpoint artifact.
+
+    Each shard is also written to ``working_copy`` when one is given.
+    """
     checksum_format = index_metadata.get("checksum_format")
     if tensor_metadata is not None and set(weight_map) != set(tensor_metadata):
         raise ValueError("full HF checkpoint tensor set differs from local checkpoint")
@@ -224,16 +252,13 @@ def _download_full_checkpoint(
     shard_to_tensors = _group_tensors_by_shard(weight_map)
     parent_uri = root_uri.rsplit("/", 1)[0]
     workers = min(rl_envs.MX_REFIT_DOWNLOAD_WORKERS, len(shard_to_tensors))
-    shard_sizes = threadpool_map(
-        shard_to_tensors,
-        lambda filename: reader.size(f"{parent_uri}/{filename}"),
-        max_workers=workers,
-        thread_name_prefix="modelexpress-refit-head-full",
-    )
+    if shard_bytes is None:
+        shard_bytes = _full_shard_bytes(reader, weight_map, root_uri)
+    targets = [target] if working_copy is None else [target, working_copy]
     store.ensure_capacity(
-        sum(shard_sizes),
+        len(targets) * shard_bytes,
         protected_versions=protected_versions,
-        protected_paths={target},
+        protected_paths=set(targets),
     )
 
     def download_and_validate(filename: str) -> tuple[float, float]:
@@ -293,7 +318,8 @@ def _download_full_checkpoint(
                     raise ValueError(
                         f"full HF checkpoint checksum differs for {name!r}"
                     )
-        (target / filename).write_bytes(data)
+        for directory in targets:
+            (directory / filename).write_bytes(data)
         return download_time, time.perf_counter() - validation_started
 
     timings = list(
@@ -591,11 +617,22 @@ class _LocalCheckpoint:
         ) = index_checkpoint_tensors(path)
 
     def reset_initial_checkpoint(self) -> None:
-        """Restore the immutable initial full checkpoint from the launch seed."""
+        """Restore the immutable initial full checkpoint from the launch seed.
+
+        Seed files are symlinked, not copied, so they must stay unchanged while
+        the initial version is cached. Seed subdirectories are still copied.
+        """
         state = self.store.state()
         target = self.store.full_path(self.initial_version)
+        seed = self.seed_checkpoint_path
         self.store.ensure_capacity(
-            self.store.path_size_bytes(self.seed_checkpoint_path),
+            sum(
+                self.store.path_size_bytes(entry)
+                for entry in seed.iterdir()
+                if entry.is_dir()
+            )
+            if seed.is_dir()
+            else 0,
             protected_versions={self.initial_version},
         )
         self.store.write_state(
@@ -607,22 +644,19 @@ class _LocalCheckpoint:
             ),
             checkpoint_paths=self.checkpoint_paths,
         )
+        # A working copy of the replaced initial checkpoint is stale.
+        self.store.drop_working_copy(self.initial_version)
         with self.store.replace_directory(target) as temporary:
-            if self.seed_checkpoint_path.is_file():
-                shutil.copy2(
-                    self.seed_checkpoint_path,
-                    temporary / "model.safetensors",
-                )
-            elif self.seed_checkpoint_path.is_dir():
-                for entry in self.seed_checkpoint_path.iterdir():
+            if seed.is_file():
+                (temporary / "model.safetensors").symlink_to(seed.resolve())
+            elif seed.is_dir():
+                for entry in seed.iterdir():
                     if entry.is_file():
-                        shutil.copy2(entry, temporary / entry.name)
+                        (temporary / entry.name).symlink_to(entry.resolve())
                     elif entry.is_dir():
                         shutil.copytree(entry, temporary / entry.name)
             else:
-                raise FileNotFoundError(
-                    f"seed checkpoint does not exist: {self.seed_checkpoint_path}"
-                )
+                raise FileNotFoundError(f"seed checkpoint does not exist: {seed}")
             self.store.record_artifact(temporary)
         self._set_local_checkpoint(target)
         self.store.write_chain(
@@ -639,6 +673,83 @@ class _LocalCheckpoint:
             checkpoint_paths=self.checkpoint_paths,
         )
 
+    def prepare_seed_working_copy(self, cancelled: threading.Event) -> bool:
+        """Copy the full cache head, usually the seed, to its working copy.
+
+        Copying holds only the preparation lock: ranks can still initialize and
+        install, while the next delta waits for the copy and then renames it.
+        Setting ``cancelled`` stops the copy and any wait for the other locks.
+        Return whether this call made the copy; another rank may have made it.
+        """
+        with self.store.preparation_locked(blocking=False) as acquired:
+            if not acquired:
+                return False
+            with (
+                self.store.installation_locked(cancelled=cancelled) as installing,
+                self.store.locked(cancelled=cancelled) as locked,
+            ):
+                if not (installing and locked):
+                    return False
+                state = self.store.state()
+                if state is None or state.status is not CheckpointState.READY:
+                    return False
+                chain = self.store.chain(state.version)
+                # The next delta renames a materialized head instead of copying it.
+                if chain is None or chain.get("deltas"):
+                    return False
+                version = state.version
+                if self.store.working_copy(version) is not None:
+                    return False
+                full_checkpoint = self.store.full_path(version)
+                working_copy = self.store.materialized_path(version)
+                record = self.store.artifact_record(full_checkpoint)
+                size = self.store.path_size_bytes(full_checkpoint)
+                protected_versions = _protected_versions(self.store, version)
+                if not self.store.can_admit(
+                    size,
+                    protected_versions=protected_versions,
+                ):
+                    logger.warning(
+                        "No room for a working copy of full checkpoint %s, so the "
+                        "next delta copies it",
+                        version,
+                    )
+                    return False
+                self.store.ensure_capacity(
+                    size,
+                    protected_versions=protected_versions,
+                )
+            logger.info(
+                "Copying full checkpoint %s (%.1f GB) to its working copy",
+                version,
+                size / _BYTES_PER_GB,
+            )
+            started = time.perf_counter()
+            # Copy in place: eviction protects the cache head's working copy,
+            # and only a recorded copy is used, so a later preparation deletes
+            # a partial copy under the store lock.
+            try:
+                self.store.copy_directory(
+                    full_checkpoint,
+                    working_copy,
+                    cancelled=cancelled,
+                )
+                with self.store.locked(cancelled=cancelled) as locked:
+                    if not locked:
+                        raise CheckpointCopyCancelled("checkpoint copy was cancelled")
+                    self.store.record_copy(full_checkpoint, working_copy, record)
+            except CheckpointCopyCancelled:
+                logger.info(
+                    "Cancelled copying full checkpoint %s to its working copy", version
+                )
+                return False
+            logger.info(
+                "Copied full checkpoint %s to its working copy in %.1f s",
+                version,
+                time.perf_counter() - started,
+            )
+        return True
+
     def prepare(self, version: _ObjectStorageVersion) -> PreparedCheckpoint:
         return self.prepare_chain((version,))
 
@@ -652,17 +763,28 @@ class _LocalCheckpoint:
         target = versions[-1]
         # Queue preparers separately so followers can reuse the target while
         # the leader installs it, without first waiting for an exclusive fence.
+        started = time.perf_counter()
         with self.store.preparation_locked():
+            # Includes another rank's preparation and a background working copy.
+            lock_wait = time.perf_counter() - started
             with self.store.installation_locked(shared=True), self.store.locked(
                 shared=True
             ):
                 state, _active_version = self._load_ready_state()
-                prepared = self._reuse_prepared_target(state=state, target=target)
+                prepared = self._reuse_prepared_target(
+                    state=state,
+                    target=target,
+                    lock_wait=lock_wait,
+                )
                 if prepared is not None:
                     return prepared
             with self.store.installation_locked(), self.store.locked():
                 state, active_version = self._load_ready_state()
-                prepared = self._reuse_prepared_target(state=state, target=target)
+                prepared = self._reuse_prepared_target(
+                    state=state,
+                    target=target,
+                    lock_wait=lock_wait,
+                )
                 if prepared is not None:
                     return prepared
                 # P2P can advance the engine without advancing this disk checkpoint.
@@ -687,6 +809,7 @@ class _LocalCheckpoint:
                     target=target,
                     active_version=active_version,
                     index_download_time=index_download_time,
+                    lock_wait=lock_wait,
                 )
 
     def _load_ready_state(self) -> tuple[CheckpointRecord, str]:
@@ -708,6 +831,7 @@ class _LocalCheckpoint:
         *,
         state: CheckpointRecord,
         target: _ObjectStorageVersion,
+        lock_wait: float,
     ) -> PreparedCheckpoint | None:
         if state.version != target.version_id:
             return None
@@ -722,6 +846,7 @@ class _LocalCheckpoint:
             target_version=target.version_id,
             path=self.local_checkpoint,
             metrics={
+                "perf/mx_receive_prepare_lock_wait": lock_wait,
                 "perf/mx_receive_delta_index_download": 0.0,
                 "perf/mx_receive_delta_download": 0.0,
                 "perf/mx_receive_delta_apply": 0.0,
@@ -815,6 +940,7 @@ class _LocalCheckpoint:
         target: _ObjectStorageVersion,
         active_version: str,
         index_download_time: float,
+        lock_wait: float,
     ) -> PreparedCheckpoint:
         # READY -> UPDATING is persisted before any derived checkpoint mutates.
         # A crash therefore makes the next initializer rebuild from lineage.
@@ -870,6 +996,7 @@ class _LocalCheckpoint:
             target_version=target.version_id,
             path=self.local_checkpoint,
             metrics={
+                "perf/mx_receive_prepare_lock_wait": lock_wait,
                 "perf/mx_receive_delta_index_download": index_download_time,
                 "perf/mx_receive_delta_download": download_time,
                 "perf/mx_receive_delta_apply": apply_time,
@@ -915,6 +1042,11 @@ class _LocalCheckpoint:
         metadata: dict[str, Any],
         weight_map: dict[str, str],
     ) -> tuple[float, float]:
+        # Cached or not, another full checkpoint leaves the active one's working
+        # copy unused.
+        active_version = _active_version(self.store)
+        if active_version not in {None, version.version_id}:
+            self.store.drop_unused_working_copy(active_version)
         target = self.store.full_path(version.version_id)
         if target.exists():
             source = self.store.artifact_source(target)
@@ -947,27 +1079,53 @@ class _LocalCheckpoint:
         ):
             # Updates carry seed metadata forward; the initial root may be evicted.
             non_weight_source = self.local_checkpoint
+        # A working copy of the full checkpoint being replaced is stale.
+        self.store.drop_working_copy(version.version_id)
         protected_versions = _protected_versions(self.store, version.version_id)
+        shard_bytes = _full_shard_bytes(self.reader, weight_map, version.uri)
+        metadata_bytes = self._non_weight_files_size(non_weight_source) + len(
+            index_data
+        )
+        # A working copy lets the next delta mutate it instead of copying.
+        directories = [target, self.store.materialized_path(version.version_id)]
+        if not self.store.can_admit(
+            2 * (metadata_bytes + shard_bytes),
+            protected_versions=protected_versions,
+            protected_paths={non_weight_source},
+        ):
+            logger.warning(
+                "No room for a working copy of full checkpoint %s, so the next "
+                "delta copies it",
+                version.version_id,
+            )
+            directories.pop()
         self.store.ensure_capacity(
-            self._non_weight_files_size(non_weight_source) + len(index_data),
+            len(directories) * metadata_bytes,
             protected_versions=protected_versions,
             protected_paths={non_weight_source},
         )
-        with self.store.replace_directory(target) as temporary:
-            self._copy_non_weight_files(non_weight_source, temporary)
-            index_name = Path(version.uri).name
-            (temporary / index_name).write_bytes(index_data)
+        with ExitStack() as stack:
+            temporaries = [
+                stack.enter_context(self.store.replace_directory(directory))
+                for directory in directories
+            ]
+            for temporary in temporaries:
+                self._copy_non_weight_files(non_weight_source, temporary)
+                (temporary / Path(version.uri).name).write_bytes(index_data)
             download_time, validation_time = self._download_full_checkpoint(
-                target=temporary,
+                target=temporaries[0],
                 index_metadata=metadata,
                 weight_map=weight_map,
                 root_uri=version.uri,
                 protected_versions=protected_versions,
+                shard_bytes=shard_bytes,
+                working_copy=temporaries[1] if len(temporaries) > 1 else None,
             )
-            self.store.record_artifact(
-                temporary,
-                source=_source_identity(version),
-            )
+            for temporary in temporaries:
+                self.store.record_artifact(
+                    temporary,
+                    source=_source_identity(version),
+                )
 
         self._set_local_checkpoint(target)
         self.store.write_chain(
@@ -1034,6 +1192,10 @@ class _LocalCheckpoint:
         for delta_version in base_chain["deltas"]:
             self.store.verify_artifact(self.store.delta_path(delta_version))
         base_checkpoint = self.store.checkpoint_path(version.base_version_id)
+        if base_checkpoint.parent != self.store.materialized_cache:
+            base_checkpoint = (
+                self.store.working_copy(version.base_version_id) or base_checkpoint
+            )
         reuse_materialized = base_checkpoint.parent == self.store.materialized_cache
         self.store.ensure_capacity(
             0 if reuse_materialized else self.store.path_size_bytes(base_checkpoint),
@@ -1051,8 +1213,8 @@ class _LocalCheckpoint:
             self._set_local_checkpoint(target)
             self._apply_delta_artifact(artifact, metadata, weight_map)
         else:
-            # The first delta after a full checkpoint copies once so applying
-            # it cannot modify the canonical full artifact.
+            # A full checkpoint without a working copy is copied once so
+            # applying the delta cannot modify the canonical full artifact.
             with self.store.replace_directory(
                 target,
                 copy_from=base_checkpoint,
@@ -1116,6 +1278,8 @@ class _LocalCheckpoint:
         weight_map: dict[str, str],
         root_uri: str,
         protected_versions: set[str],
+        shard_bytes: int | None = None,
+        working_copy: Path | None = None,
     ) -> tuple[float, float]:
         return _download_full_checkpoint(
             reader=self.reader,
@@ -1126,6 +1290,8 @@ class _LocalCheckpoint:
             root_uri=root_uri,
             protected_versions=protected_versions,
             tensor_metadata=self.tensor_metadata,
+            shard_bytes=shard_bytes,
+            working_copy=working_copy,
         )
 
     def _apply_shards(
