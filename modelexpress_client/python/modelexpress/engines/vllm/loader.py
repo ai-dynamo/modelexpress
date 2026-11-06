@@ -54,6 +54,8 @@ from .adapter import (
     _native_load_config,
     build_vllm_load_context,
     cold_start_expected_workers,
+    cold_start_load_config,
+    validate_cold_start_format,
 )
 from .artifacts import (
     _vllm_health_ready,
@@ -419,6 +421,8 @@ class MxModelLoader(BaseModelLoader):
 
     def _validate_load_policy(self, *, is_speculative_draft: bool = False) -> None:
         validate_load_strategy_chain()
+        # Up front, so a bad value fails at startup even when P2P or the streamer would load.
+        validate_cold_start_format()
 
     def _run_load_strategy_chain(self, model: nn.Module, ctx: LoadContext) -> nn.Module:
         return run_load_strategy_chain(model, ctx)
@@ -438,24 +442,12 @@ class MxModelLoader(BaseModelLoader):
             )
             return
 
-        import copy
-
-        disk_config = copy.copy(self.load_config)
-        try:
-            disk_config.load_format = "auto"
-        except AttributeError:
-            object.__setattr__(disk_config, "load_format", "auto")
+        disk_config = cold_start_load_config(self.load_config)
         DefaultModelLoader(disk_config).download_model(model_config)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Load weights into an already-initialized model (standalone API)."""
-        import copy
-
-        disk_config = copy.copy(self.load_config)
-        try:
-            disk_config.load_format = "auto"
-        except AttributeError:
-            object.__setattr__(disk_config, "load_format", "auto")
+        disk_config = cold_start_load_config(self.load_config)
         DefaultModelLoader(disk_config).load_weights(model, model_config)
 
     def on_sleep(self, level: int) -> None:

@@ -311,6 +311,43 @@ def _converge_streamer_files(
     return [path for path in files if path in needed]
 
 
+# Formats vLLM's DefaultModelLoader._prepare_weights accepts; anything else (a typo, or a
+# format served by another loader such as runai_streamer) fails only once a worker reaches
+# the disk fallback, as "Unknown load_format" without naming the variable.
+COLD_START_FORMATS = frozenset(
+    {"auto", "hf", "safetensors", "fastsafetensors", "instanttensor", "mistral", "pt", "npcache"}
+)
+
+
+def validate_cold_start_format() -> str:
+    """Return ``MX_COLD_START_FORMAT``.
+
+    Raises ``ValueError`` if vLLM's DefaultModelLoader cannot use it.
+    """
+    fmt = envs.MX_COLD_START_FORMAT
+    if fmt not in COLD_START_FORMATS:
+        raise ValueError(
+            f"MX_COLD_START_FORMAT={fmt!r} is not a vLLM DefaultModelLoader format; "
+            f"expected one of {sorted(COLD_START_FORMATS)}"
+        )
+    return fmt
+
+
+def cold_start_load_config(load_config):
+    """Copy of ``load_config`` with the load format of the disk fallback.
+
+    ``MX_COLD_START_FORMAT`` (default ``auto``) selects the format. ``safetensors`` refuses
+    ``.bin``/``.pt`` checkpoints, which ``auto`` would load through ``torch.load``.
+    """
+    disk_config = copy.copy(load_config)
+    fmt = validate_cold_start_format()
+    try:
+        disk_config.load_format = fmt
+    except AttributeError:
+        object.__setattr__(disk_config, "load_format", fmt)
+    return disk_config
+
+
 class VllmAdapter(EngineAdapter):
     """Adapter that maps strategy hooks onto vLLM's native loader APIs."""
 
@@ -578,13 +615,9 @@ class VllmAdapter(EngineAdapter):
 
         from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
-        disk_config = copy.copy(self.load_config)
-        try:
-            disk_config.load_format = "auto"
-        except AttributeError:
-            object.__setattr__(disk_config, "load_format", "auto")
-
-        DefaultModelLoader(disk_config).load_weights(result.model, self.model_config)
+        DefaultModelLoader(cold_start_load_config(self.load_config)).load_weights(
+            result.model, self.model_config
+        )
         return result
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
