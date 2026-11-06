@@ -82,9 +82,17 @@ DIRECT installation and pipelined worker streaming are
 not implemented by this control-plane slice.
 NIXL manifest endpoints belong to their physical worker shards; a typed object
 storage source belongs directly to its durable `WeightVersion`. The protocol
-can identify S3, Azure Blob Storage, or GCS. The Refit service and trainer
-publication currently accept only S3. Generator checkpoint preparation accepts
-S3 and Azure Blob Storage; exact desired-version startup remains S3-only.
+can identify S3, Azure Blob Storage, or GCS. The Refit service accepts S3 and Azure
+publications; the trainer SDK currently publishes only to S3. Generator checkpoint
+preparation and exact desired-version startup accept S3 and Azure Blob Storage.
+Startup reconstructs the full root and ordered deltas before engine loading.
+The server allows different providers within a run, including across delta-base
+relationships. Generators do not support mixed-provider replay: every version in
+a replay chain must use the same storage provider.
+Redis stores `object_storage_uri` and `object_storage_type`, with `s3_uri` as an
+S3-only mirror for older servers. Readers fall back to `s3_uri` for older records
+without `object_storage_uri`. A missing provider still means S3; checkpoint bytes
+remain in object storage.
 On the NIXL path, weight bytes and full tensor manifests remain
 on trainer workers. On the S3 path, rank zero uploads the version's global index
 after every trainer rank has uploaded its owned shard. `XOR_DELTA` versions use
@@ -291,7 +299,6 @@ and share full-checkpoint validation, XOR delta replay, cache promotion, and
 activation. Every source in a replay chain must match the configured provider;
 a mismatch fails before downloads begin. Azure full checkpoints download to disk
 before installation. The optional full-checkpoint streaming path remains S3-only.
-Azure publication and exact desired-version startup require separate support.
 
 Canonical preparation requests queue on a separate `.prepare.lock`. Once the
 leader has reconstructed a target, followers verify and attach to that READY
