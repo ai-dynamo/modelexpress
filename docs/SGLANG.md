@@ -140,14 +140,14 @@ python -m sglang.launch_server \
 
 The first replica attempts ModelStreamer when no compatible P2P source is ready. Later replicas prefer P2P RDMA from a serving peer. `MX_MODEL_URI` also accepts `gs://` and `az://` URIs or an absolute local path. `MX_MS_DISTRIBUTED=1` divides reads across CUDA tensor-parallel ranks when TP > 1 and is ignored for TP=1.
 
-Weight-source publication waits for SGLang's health endpoint so another
-instance cannot consume weights during warmup or CUDA graph capture. Readiness
-defaults to `http://127.0.0.1:30000/health`; set `MX_ARTIFACT_READY_URL` when
-using another server port.
+Setting `MX_ARTIFACT_READY_URL` opts weight-source publication into an HTTP
+health gate. Artifact publication otherwise uses the `modelexpress` SGLang
+plugin's scheduler startup signal; see
+[Artifact startup signals](DEPLOYMENT.md#artifact-startup-signals).
 
 Set `MX_ARTIFACT_TRANSFER=1` with the `nixl` transport to transfer compatible
 JIT cache artifacts before SGLang initializes the model. The source publishes
-cache artifacts after the SGLang `/health` endpoint is ready and the cache
+cache artifacts after scheduler startup completes across engine ranks and the cache
 directories have stopped changing briefly. Supported cache roots are
 `TORCHINDUCTOR_CACHE_DIR` (or PyTorch Inductor's runtime `cache_dir()`),
 `TRITON_CACHE_DIR`, `TVM_FFI_CACHE_DIR`, `SGLANG_DG_CACHE_DIR`, `TILELANG_CACHE_DIR`,

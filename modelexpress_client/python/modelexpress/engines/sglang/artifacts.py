@@ -30,6 +30,7 @@ from ...metadata.artifact_transfer import (
 )
 from ...metadata.artifact_transport import PublicationHandle
 from ...metadata.publisher import PublisherThread
+from . import startup
 
 logger = logging.getLogger("modelexpress.engines.sglang.artifacts")
 
@@ -365,10 +366,11 @@ def _sglang_artifact_ready_fn(
     source_roots: tuple[ArtifactCacheRoot, ...],
     ctx: LoadContext | None = None,
 ):
-    return _common_artifacts.artifact_ready_fn(
-        source_roots,
-        lambda: _sglang_health_ready(ctx),
-    )
+    if startup.gate.available and not envs.MX_ARTIFACT_READY_URL.strip():
+        ready_fn = startup.gate.is_ready
+    else:
+        ready_fn = lambda: _sglang_health_ready(ctx)
+    return _common_artifacts.artifact_ready_fn(source_roots, ready_fn)
 
 
 

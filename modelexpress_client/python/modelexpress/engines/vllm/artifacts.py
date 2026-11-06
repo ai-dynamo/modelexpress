@@ -29,6 +29,7 @@ from ...metadata.artifact_transfer import (
 )
 from ...metadata.artifact_transport import PublicationHandle
 from ...metadata.publisher import PublisherThread
+from . import startup
 
 logger = logging.getLogger("modelexpress.engines.vllm.artifacts")
 
@@ -234,7 +235,8 @@ def _warn_if_compile_cache_unused(ctx: LoadContext) -> None:
 
 
 def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
-    """Schedule publication of local vLLM artifacts after server readiness."""
+    """Schedule publication of local vLLM artifacts after engine startup."""
+    startup.install_startup_hook(ctx)
     _artifact_lifecycle.schedule_artifact_publish(
         ctx,
         lambda: _vllm_artifact_transfers(ctx),
@@ -538,7 +540,10 @@ def _vllm_artifact_ready_fn(
     if health_ready_fn is None:
         # Resolve the engine hook at call time so existing tests and diagnostics
         # can replace _vllm_health_ready after constructing the readiness check.
-        health_ready_fn = lambda: _vllm_health_ready(ctx)
+        if startup.gate.available and not envs.MX_ARTIFACT_READY_URL.strip():
+            health_ready_fn = startup.gate.is_ready
+        else:
+            health_ready_fn = lambda: _vllm_health_ready(ctx)
     return _artifact_lifecycle.artifact_ready_fn(
         source_roots,
         health_ready_fn,

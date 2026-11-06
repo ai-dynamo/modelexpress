@@ -874,8 +874,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
 | `MX_ARTIFACT_MOONCAKE_NAMESPACE` | `modelexpress/artifacts` | Key prefix used by the Mooncake artifact backend. |
 | `MX_MOONCAKE_CONFIG_PATH` | (unset) | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback. |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
+| `MX_ARTIFACT_READY_URL` | unset | Optional HTTP readiness override for weights and cache artifacts. Without an override, artifacts use engine startup hooks; unsupported or disabled hooks retain the framework-default HTTP fallback. See [Artifact startup signals](#artifact-startup-signals). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; SGLang draft P2P also requires a non-empty revision. |
@@ -1276,7 +1275,44 @@ and Kubernetes deployments must use the matching `ModelMetadata` CRD containing
 `status.worker.artifactSource.nodeRank`. Mooncake includes the same rank in its
 deterministic object key and needs no MX metadata record.
 
+#### Artifact startup signals
+
+Without `MX_ARTIFACT_READY_URL`, artifact publishers wait for an engine startup
+signal instead of polling HTTP. vLLM installs an idempotent compatibility wrapper
+around the configured worker's `compile_or_warm_up_model()` from the MX loader,
+after worker imports and before warmup. This does not require a new upstream
+callback. The method exists in upstream vLLM 0.10.2, 0.15.0 and 0.21.0; this
+source-level check is not GPU qualification of those releases.
+
+SGLang registers the `modelexpress` entry point under `sglang.srt.plugins` and
+wraps `Scheduler.__init__` using its native `AROUND` hook. It arms the gate before
+model loading and releases it after scheduler initialization, including draft
+setup and graph capture. If `SGLANG_PLUGINS` is configured, include `modelexpress`
+to enable this hook.
+
+After successful startup, both hooks enter the engine's CPU world-group barrier
+before releasing their process-local publishers. All ranks in that engine must
+use the same MX artifact and hook configuration. This prevents a fast rank from
+bundling a shared cache while another rank is still warming up. Startup failures
+do not release the gate; synchronization failures are logged and leave artifacts
+unpublished. Publishers still wait for cache files to settle, and publication
+runs in the background. These signals cover startup compilation, not every
+specialization that later requests may compile.
+
+A nonblank `MX_ARTIFACT_READY_URL` retains precedence and uses the existing HTTP
+gate, including for weight metadata. Artifact hooks do not change the default
+weight-metadata publication policy. `MX_DISABLE_PATCHES=1`, a SGLang plugin that
+is unavailable or filtered out, or a vLLM worker without the warmup method retains
+HTTP fallback: `http://127.0.0.1:8000/health` for vLLM and
+`http://127.0.0.1:30000/health` for SGLang. Set an explicit URL for a different
+port or health path in these fallback deployments. Each HTTP probe allows
+1 second for vLLM and 5 seconds for SGLang.
+
 #### Multi-node readiness
+
+With startup hooks enabled, headless workers use the engine signal and do not
+need a head-node HTTP address. The following routing applies to explicit URL
+overrides and HTTP fallback.
 
 Only the head node of a multi-node engine serves HTTP; the others run headless
 (for vLLM, `--headless`, which starts the executor and no API server), so a
