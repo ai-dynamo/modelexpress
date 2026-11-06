@@ -361,7 +361,7 @@ Cache eviction parses the key back to delete the right snapshot. It keeps the fi
 
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
-| `PublishMetadata` | `PublishMetadataRequest` | `PublishMetadataResponse` | Source publishes worker metadata (identity + tensors + backend metadata) |
+| `PublishMetadata` | `PublishMetadataRequest` | `PublishMetadataResponse` | Source publishes worker metadata (identity + tensors + backend metadata); server stamps `updated_at` for heartbeat expiry |
 | `ListSources` | `ListSourcesRequest` | `ListSourcesResponse` | Lightweight listing of available source workers (no tensor data) |
 | `GetMetadata` | `GetMetadataRequest` | `GetMetadataResponse` | Fetch full tensor metadata for one specific worker (MB-scale, on demand) |
 | `UpdateStatus` | `UpdateStatusRequest` | `UpdateStatusResponse` | Update per-worker lifecycle status (Initializing/Ready/Stale) |
@@ -675,6 +675,11 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 | `fetch_remote_and_wait(agent_name, ip, port)` | P2P: fetch remote NIXL metadata via listen thread (polls until loaded) |
 | `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P) |
 | `shutdown()` | Clean up NIXL agent and resources |
+
+For socket metadata exchange, `fetch_remote_and_wait` resolves worker hostnames
+to numeric IPv4 or IPv6 addresses before calling NIXL. Numeric addresses bypass
+DNS, bracketed IPv6 literals are unwrapped, and IPv6 scope IDs are preserved.
+The resolved endpoint is retained with the loaded peer for lifecycle tracking.
 
 **Optional NIC pinning.** `MX_RDMA_NIC_PIN=auto` probes PCIe topology at agent init and pins `UCX_NET_DEVICES` to a NUMA-local IB NIC per worker. Workaround for [openucx/ucx#11259](https://github.com/openucx/ucx/issues/11259); see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for details.
 
@@ -1097,6 +1102,8 @@ vLLM's `process_weights_after_loading()` transforms model weights into kernel-fr
 The solution: both source and target run `process_weights_after_loading()` first, then `adopt_hidden_tensors()` discovers transferable accelerator tensors on non-Module objects (quant configs, kernel objects), and finally `register_tensors()` collects everything for RDMA. The target runs post-processing on dummy data to establish the correct tensor layout and receives the real data, including hidden quant config tensors, via RDMA.
 
 The vLLM adapter passes an exclusion predicate to engine-agnostic hidden-tensor discovery, skipping the exact `vllm.models.kimi_k3.nvidia.ops.latent_moe_tail.KimiK3LatentMoETailOp` class. Its GPU peer-pointer arrays, barriers, and multicast workspaces are process-local collective state and must retain the receiver's allocations and contents. Transferring donor collective state can cause CUDA illegal-address errors during receiver warmup. Hidden quantization tensors outside this operator remain eligible for adoption and RDMA transfer.
+
+The SGLang adapter's predicate skips any object whose class is defined under `sglang.srt.distributed`, `sglang.srt.layers.communication`, or `torch.distributed`. Communication workspaces such as `FinalizePushWorkspace` hold direct references to the communicator's push counter and slabs, so excluding the communicator alone is not enough. SGLang layers keep their `GroupCoordinator` as `tp_group`, so without it the scan reaches the custom all-reduce communicator and copies the donor's epoch counters, symmetric slab, and CUDA-graph pointer table. Those tensors match in size across instances, so the transfer succeeds, but the receiver's ranks then disagree on epoch parity and the first push all-reduce deadlocks.
 
 ```mermaid
 graph TD
