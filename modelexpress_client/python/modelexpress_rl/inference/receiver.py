@@ -138,6 +138,7 @@ _SPREAD_TENSOR_BYTES = 256 << 20
 
 
 def _read_exactly(fd: int, out: memoryview, offset: int) -> None:
+    """Fill a byte view with positional reads, rejecting premature EOF."""
     done = 0
     while done < len(out):
         read = os.pread(fd, len(out) - done, offset + done)
@@ -149,6 +150,7 @@ def _read_exactly(fd: int, out: memoryview, offset: int) -> None:
 
 
 def _write_all(fd: int, data: memoryview, offset: int) -> None:
+    """Write every byte at a fixed offset, rejecting stalled writes."""
     done = 0
     while done < len(data):
         written = os.pwrite(fd, data[done:], offset + done)
@@ -971,6 +973,7 @@ class _LocalCheckpoint:
         index_download_time: float,
         lock_wait: float,
     ) -> PreparedCheckpoint:
+        """Replay lineage while retaining the last completed state for quota recovery."""
         restore = self.store.state()
         assert restore is not None
         # READY -> UPDATING is persisted before any derived checkpoint mutates.
@@ -1082,6 +1085,7 @@ class _LocalCheckpoint:
         *,
         restore_version: str | None = None,
     ) -> tuple[float, float]:
+        """Admit a full checkpoint without evicting the checkpoint needed for recovery."""
         # Cached or not, another full checkpoint leaves the active one's working
         # copy unused.
         active_version = _active_version(self.store)
@@ -1188,6 +1192,7 @@ class _LocalCheckpoint:
         metadata: dict[str, Any],
         weight_map: dict[str, str],
     ) -> tuple[float, float]:
+        """Verify and materialize a delta using an eligible working copy when available."""
         assert version.base_version_id is not None
         base_chain = self.store.chain(version.base_version_id)
         if base_chain is None:
@@ -1278,6 +1283,7 @@ class _LocalCheckpoint:
         *,
         shards: dict[str, tuple[bytes, list[str]]] | None = None,
     ) -> None:
+        """Apply downloaded shard bytes or read the cached artifact when necessary."""
         self.store.verify_artifact(artifact)
         if shards is None:
             shards = {
@@ -1347,6 +1353,7 @@ class _LocalCheckpoint:
         *,
         index_metadata: dict[str, Any],
     ) -> None:
+        """Apply bounded XOR chunks and verify target checksums in tensor byte order."""
         if not shards:
             return
 
@@ -1426,6 +1433,7 @@ class _LocalCheckpoint:
         ) as chunks:
 
             def apply_one(item) -> None:
+                """Decompress one tensor, bound queued chunks, and verify its combined checksum."""
                 name, compressed, expected_checksum = item
                 path, file_offset, size = self.locations[name]
                 fd = files[path]
@@ -1435,6 +1443,7 @@ class _LocalCheckpoint:
                 pending: deque[Future] = deque()
 
                 def collect(result) -> None:
+                    """Combine the next completed chunk checksum in original byte order."""
                     part, length = result
                     checksum.extend(part, length)
 

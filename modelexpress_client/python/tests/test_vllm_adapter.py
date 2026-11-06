@@ -50,6 +50,7 @@ def _stub_accelerator_backend_selection(monkeypatch, mock_accelerator_backend_cl
 
 @pytest.mark.parametrize("layout", ["bf16", "bf16_bias", "prefused", "non_dsa", "bf16_scale"])
 def test_apply_weight_iter_leaves_non_fp8_indexer_weights_untouched(layout):
+    """Ordinary indexer layouts retain their original tensors without replay."""
     prefix = "model.layers.0.self_attn.indexer"
     weights = [(f"{prefix}.wk.weight", torch.ones(2, dtype=torch.bfloat16))]
     if layout == "bf16_bias":
@@ -77,6 +78,7 @@ def test_apply_weight_iter_leaves_non_fp8_indexer_weights_untouched(layout):
 @pytest.mark.parametrize("scale_name", ["weight_scale", "weight_scale_inv"])
 @pytest.mark.parametrize("scale_first", [False, True])
 def test_apply_weight_iter_replays_owned_fp8_indexer_pair(scale_name, scale_first):
+    """Replay owns both tensors even when the stream reuses its read buffers."""
     prefix = "model.layers.0.self_attn.indexer"
     weight = torch.ones(2).to(torch.float8_e4m3fn)
     scale = torch.full((1,), 2.0)
@@ -89,12 +91,14 @@ def test_apply_weight_iter_replays_owned_fp8_indexer_pair(scale_name, scale_firs
     pending = {prefix: object()}
 
     def stream():
+        """Reuse each source buffer immediately after the consumer advances."""
         for name, tensor in weights:
             yield name, tensor
             tensor.zero_()
         yield bf16_name, bf16_weight
 
     def load_weights(items):
+        """Record both loads and check that stale pending pairs were cleared."""
         loads.append(list(items))
         if len(loads) == 2:
             assert not pending
@@ -117,6 +121,7 @@ def test_apply_weight_iter_replays_owned_fp8_indexer_pair(scale_name, scale_firs
 
 
 def test_apply_weight_iter_rejects_fp8_indexer_weight_without_scale():
+    """An incomplete pair fails before a second loader call."""
     name = "model.layers.0.self_attn.indexer.wk.weight"
     weight = torch.ones(2).to(torch.float8_e4m3fn)
     loads = []
@@ -1617,10 +1622,12 @@ def test_discovery_keeps_exact_k3_collective_state_local(
 
 
 def test_apply_weight_iter_rejects_pairs_left_pending_after_replay():
+    """A loader that strands a complete pair after replay must fail explicitly."""
     prefix = "model.layers.0.self_attn.indexer"
     weights = [(f"{prefix}.wk.weight", torch.ones(2).to(torch.float8_e4m3fn)), (f"{prefix}.wk.weight_scale_inv", torch.ones(1))]
     loads = []
     def load(items):
+        """Strand a pair specifically during the second loader call."""
         loads.append(list(items))
         if len(loads) == 2:
             model._pending_indexer_wk_fp8[prefix] = {"weight": object()}
@@ -1633,11 +1640,13 @@ def test_apply_weight_iter_rejects_pairs_left_pending_after_replay():
 
 @pytest.mark.parametrize("has_draft", [True, False])
 def test_indexer_replay_scopes_mtp_completeness_validation(monkeypatch, has_draft):
+    """Only the partial replay may bypass draft-layer completeness validation."""
     from contextlib import contextmanager
     enabled = [True]
     module = ModuleType("vllm.model_executor.model_loader.mtp_validation")
     @contextmanager
     def partial():
+        """Restore completeness validation after the partial replay exits."""
         enabled[0] = False
         try:
             yield
@@ -1647,6 +1656,7 @@ def test_indexer_replay_scopes_mtp_completeness_validation(monkeypatch, has_draf
     monkeypatch.setitem(sys.modules, module.__name__, module)
     calls = []
     def load(items):
+        """Reject missing draft layers whenever completeness validation is enabled."""
         items = list(items)
         calls.append(enabled[0])
         if enabled[0] and not any(name.startswith("model.layers.1.") for name, _ in items):
@@ -1665,3 +1675,54 @@ def test_indexer_replay_scopes_mtp_completeness_validation(monkeypatch, has_draf
             adapter.apply_weight_iter(LoadResult(value=model, model=model), iter(weights))
         assert calls == [True]
     assert enabled == [True]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires real vLLM and CUDA")
+@pytest.mark.parametrize("scale_first", [False, True])
+@pytest.mark.parametrize("scale_layout", ["per_channel", "block"])
+def test_fp8_indexer_replay_preserves_vllm_fused_projection(monkeypatch, scale_first, scale_layout):
+    """Replay through vLLM's loader must preserve both shards of its fused projection."""
+    deepseek = pytest.importorskip("vllm.model_executor.models.deepseek_v2")
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
+    monkeypatch.setattr(deepseek, "get_pp_missing_layer_names", lambda model: [])
+    monkeypatch.setattr(deepseek, "fused_moe_make_expert_params_mapping", lambda *args, **kwargs: [])
+    monkeypatch.setattr(deepseek, "get_spec_layer_idx_from_weight_name", lambda config, name: None)
+    with set_current_vllm_config(VllmConfig()), torch.device("cuda"):
+        projection = MergedColumnParallelLinear(
+            128, [128, 4], bias=False, params_dtype=torch.bfloat16, disable_tp=True,
+        )
+        projection.weight.data.fill_(-3)
+        prefix = "layers.0.self_attn.indexer"
+        fused_name = f"{prefix}.wk_weights_proj.weight"
+        snapshots = []
+        model = SimpleNamespace(
+            use_mha=False,
+            config=SimpleNamespace(n_routed_experts=1, n_shared_experts=0),
+            is_fused_shared_expert_enabled=False,
+            num_redundant_experts=0,
+            named_parameters=lambda: [(fused_name, projection.weight)],
+        )
+
+        def load_weights(items):
+            """Exercise vLLM's model loader and capture each resulting fused tensor."""
+            loaded = deepseek.DeepseekV2Model.load_weights(model, items)
+            assert fused_name in loaded
+            snapshots.append(projection.weight.detach().clone())
+
+        model.load_weights = load_weights
+        weight = (torch.arange(128 * 128).reshape(128, 128) % 8).to(torch.float8_e4m3fn)
+        scale = torch.full((128,) if scale_layout == "per_channel" else (1, 1), 2.0)
+        expected = (weight.float() * 2).to(torch.bfloat16)
+        weights = [(f"{prefix}.wk.weight", weight), (f"{prefix}.wk.weight_scale_inv", scale)]
+        if scale_first:
+            weights.reverse()
+        adapter = object.__new__(VllmAdapter)
+        adapter.apply_weight_iter(LoadResult(value=model, model=model), iter(weights))
+
+        assert len(snapshots) == 2
+        torch.testing.assert_close(snapshots[0][:128], expected)
+        torch.testing.assert_close(snapshots[0][128:], torch.full((4, 128), -3, dtype=torch.bfloat16))
+        torch.testing.assert_close(snapshots[1], snapshots[0])
+        assert not model._pending_indexer_wk_fp8

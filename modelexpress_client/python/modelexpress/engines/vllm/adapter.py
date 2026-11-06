@@ -476,6 +476,7 @@ class VllmAdapter(EngineAdapter):
         result: LoadResult,
         weights_iter: Iterator[tuple[str, torch.Tensor]],
     ) -> LoadResult:
+        """Load streamed tensors, then replay owned FP8 indexer pairs together."""
         if result.model is None:
             raise RuntimeError("vLLM weight iterator loading requires result.model")
         recorded: dict[str, torch.Tensor] = {}
