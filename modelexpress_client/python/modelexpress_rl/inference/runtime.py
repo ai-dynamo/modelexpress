@@ -307,6 +307,13 @@ def initialize_generator_runtime(
         raise ValueError(f"engine does not support {mode} installation")
     methods: list[UpdateMethod] = []
     p2p_client = None
+    if rl_envs.MX_REFIT_STAGED_LAYERS > 0 and (
+        not rl_envs.MX_REFIT_INPLACE
+        or not engine.installer.capabilities.staged_checkpoints
+    ):
+        raise ValueError(
+            "MX_REFIT_STAGED_LAYERS requires MX_REFIT_INPLACE and a compatible installer"
+        )
     canonical_method = None
     try:
         if WeightSource.OBJECT_STORAGE in resolved_source_order:

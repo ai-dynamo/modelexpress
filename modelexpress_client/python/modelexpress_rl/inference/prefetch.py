@@ -30,6 +30,7 @@ from .receiver import (
     ObjectStorageGeneratorConfig,
     _LocalCheckpoint,
     _ObjectStorageVersion,
+    _staged_layers,
     PreparationSuperseded,
 )
 from .version_chain import resolve_replay_chain
@@ -98,6 +99,7 @@ class RefitPrefetcher:
         self._channel = None
         self._registry_listing = True
         self._failed: set[tuple[str, str]] = set()
+        self._rewrite_attempted: tuple[str, str | None] | None = None
 
     @classmethod
     def connect(cls, settings: PrefetchSettings) -> RefitPrefetcher:
@@ -137,12 +139,21 @@ class RefitPrefetcher:
         state = self._store.state()
         if (
             state is None
-            or state.status is not CheckpointState.READY
+            or state.status is CheckpointState.UPDATING
             or self._store.active_version() != state.version
         ):
             return None
         version = self._next_registered(state.version)
         if version is None:
+            limit = int(os.environ.get("MX_REFIT_STAGED_LAYERS", "0"))
+            if (
+                state.status is CheckpointState.STAGED
+                and limit > 0
+                and len(_staged_layers(self._store, state)) >= limit
+                and self._rewrite_attempted != (state.version, state.base)
+            ):
+                self._rewrite_attempted = (state.version, state.base)
+                self._checkpoint.materialize_head()
             return None
         self._write_status(phase="preparing", version=version.version_id)
         try:

@@ -16,7 +16,7 @@ import hashlib
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Iterable, Sequence, Iterator
 from contextlib import nullcontext, closing
 from dataclasses import dataclass
 from functools import cached_property
@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from weakref import ref
 
+import numpy as np
 import torch
 from modelexpress import envs
 from modelexpress.accelerators import accelerator_backend_for
@@ -39,6 +40,7 @@ from modelexpress_rl.refit.reshard.types import IncompleteRefit
 from modelexpress_rl.refit.timing import refit_span
 
 from modelexpress_rl import envs as rl_envs
+from modelexpress_rl.inference.staging import StagedDelta
 from modelexpress_rl.inference.engines.vllm.inplace import (
     InPlaceInstaller,
     InPlaceUnsupported,
@@ -371,6 +373,29 @@ def _tensor_parallel_peers() -> Peers | None:
     )
 
 
+def _with_staged_deltas(
+    tensors: Iterable[tuple[str, torch.Tensor]], overlay: Sequence[Path]
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Checkpoint tensors from files of an earlier version, with the staged deltas since XORed in."""
+    layers: list[StagedDelta] = []
+    try:
+        for staging in overlay:
+            layers.append(StagedDelta(staging))
+        for name, tensor in tensors:
+            deltas = [layer.tensor(name) for layer in layers if name in layer]
+            if deltas:
+                tensor = tensor.clone()
+                data = tensor.reshape(-1).view(torch.uint8)
+                for delta in deltas:
+                    positions = torch.from_numpy(delta.positions.astype(np.int64))
+                    values = torch.from_numpy(np.array(delta.values))
+                    data[positions.to(data.device)] ^= values.to(data.device)
+            yield name, tensor
+    finally:
+        for layer in layers:
+            layer.close()
+
+
 class _VllmInstaller(EngineInstaller):
     """Capture engine load geometry and run native vLLM installation.
 
@@ -533,10 +558,14 @@ class _VllmInstaller(EngineInstaller):
                         else None
                     )
                     if changed is None:
-                        self.install_checkpoint(checkpoint.path)
+                        self.install_checkpoint(
+                            checkpoint.path, overlay=checkpoint.overlay
+                        )
                     else:
                         metrics.update(
-                            self.install_changed_tensors(checkpoint.path, changed)
+                            self.install_changed_tensors(
+                                checkpoint.path, changed, overlay=checkpoint.overlay
+                            )
                         )
                 else:
                     metrics.update(inplace)
@@ -922,8 +951,9 @@ class _VllmInstaller(EngineInstaller):
             metrics = self._inplace.install(
                 checkpoint.path,
                 checkpoint.staging,
+                overlay=checkpoint.overlay,
                 reload_values=lambda names: self.install_changed_tensors(
-                    checkpoint.path, frozenset(names)
+                    checkpoint.path, frozenset(names), overlay=checkpoint.overlay
                 ),
             )
         except InPlaceUnsupported as error:
@@ -943,7 +973,9 @@ class _VllmInstaller(EngineInstaller):
         )
         return metrics
 
-    def install_checkpoint(self, path: str | Path) -> None:
+    def install_checkpoint(
+        self, path: str | Path, *, overlay: Sequence[Path] = ()
+    ) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""
         try:
             from vllm.model_executor.model_loader.default_loader import (
@@ -964,14 +996,24 @@ class _VllmInstaller(EngineInstaller):
         model_config.revision = None
         loader = DefaultModelLoader(load_config)
 
-        self._reload(lambda _aliases: loader.load_weights(self._model, model_config))
+        if overlay:
+            weights = loader.get_all_weights(model_config, self._model)
+            self._reload(
+                lambda _aliases: self._model.load_weights(
+                    _with_staged_deltas(weights, overlay)
+                )
+            )
+        else:
+            self._reload(
+                lambda _aliases: loader.load_weights(self._model, model_config)
+            )
         # Same synchronize as install_tensors, so a checkpoint refit
         # reports the stage too rather than charging it to the caller's total.
         with refit_span("post_install"):
             torch.cuda.synchronize(self._device)
 
     def install_changed_tensors(
-        self, path: str | Path, changed: frozenset[str]
+        self, path: str | Path, changed: frozenset[str], *, overlay: Sequence[Path] = ()
     ) -> dict[str, float]:
         """Reload only the modules whose checkpoint tensors a delta changed.
 
@@ -1005,7 +1047,7 @@ class _VllmInstaller(EngineInstaller):
 
         def load(_aliases: _ParameterAliases) -> None:
             nonlocal fallback
-            self._model.load_weights(subset())
+            self._model.load_weights(_with_staged_deltas(subset(), overlay))
             incomplete = [
                 type(layer).__name__
                 for layer, info in LAYERWISE_INFO.items()
@@ -1031,7 +1073,10 @@ class _VllmInstaller(EngineInstaller):
                 model_config, self._model
             )
             self._model.load_weights(
-                (name, tensor) for name, tensor in rest if name not in names
+                _with_staged_deltas(
+                    ((name, tensor) for name, tensor in rest if name not in names),
+                    overlay,
+                )
             )
 
         unloaded = _UnloadedLayerFilter()

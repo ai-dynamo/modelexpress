@@ -839,3 +839,12 @@ CPU workers and ordered target checksums combined after their chunks finish.
 Freshly downloaded delta bytes are reused without rereading their artifact files.
 A cache capacity rejection restores the last completely prepared version; it
 does not label an older engine version as the current checkpoint files.
+
+## Deferred checkpoint materialization
+
+With `MX_REFIT_STAGED_LAYERS>0`, a `STAGED` head represents the base files XOR
+every staged delta after that base. Installation and fallback reloads see those
+overlays. Immutable full checkpoints are copied (or use a verified working copy)
+before modification. A failed copy preserves the staged head; a failed in-place
+rewrite remains `UPDATING` and requires recovery. Engine activation remains
+separate from preparation. Incoming deltas never join an unfinished rewrite.

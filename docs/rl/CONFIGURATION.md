@@ -238,3 +238,10 @@ to kernel capabilities; unsupported configurations retain checkpoint reloads.
 GPU/host input placement is automatic. SGLang never stages these artifacts.
 After a failed live install the replica must stop serving and recover every rank
 from a verified checkpoint before accepting more traffic.
+
+`MX_REFIT_STAGED_LAYERS` defaults to `0`, which disables deferred disk writes.
+A positive value requires `MX_REFIT_INPLACE` and a supported vLLM installer; it
+bounds how many verified delta versions remain staged on checkpoint files.
+At the limit, materialization finishes before a new delta is checked. A rejected
+new delta therefore retains the valid rewritten head. With prefetch enabled, an
+activated head at the limit can also be materialized outside the serving pause.
