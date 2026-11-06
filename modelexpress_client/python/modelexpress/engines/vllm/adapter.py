@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 import gc
 import inspect
 import json
@@ -312,7 +313,14 @@ def _rewrite_indexer_wk_pairs(model: torch.nn.Module, recorded: dict[str, torch.
     if incomplete:
         raise RuntimeError(f"the stream lacks an FP8 indexer wk weight or scale: {incomplete}")
     if pairs:
-        model.load_weights(item for _prefix, parts in sorted(pairs.items()) for item in parts.values())
+        try:
+            from vllm.model_executor.model_loader.mtp_validation import disable_mtp_completeness_check
+        except ImportError:
+            replay = nullcontext()
+        else:
+            replay = disable_mtp_completeness_check()
+        with replay:
+            model.load_weights(item for _prefix, parts in sorted(pairs.items()) for item in parts.values())
     if getattr(model, "_pending_indexer_wk_fp8", None):
         raise RuntimeError("FP8 indexer wk pairs remain pending after the rewrite")
 

@@ -1629,3 +1629,39 @@ def test_apply_weight_iter_rejects_pairs_left_pending_after_replay():
     with pytest.raises(RuntimeError, match="pairs remain pending after the rewrite"):
         adapter.apply_weight_iter(LoadResult(value=model, model=model), iter(weights))
     assert len(loads) == 2
+
+
+@pytest.mark.parametrize("has_draft", [True, False])
+def test_indexer_replay_scopes_mtp_completeness_validation(monkeypatch, has_draft):
+    from contextlib import contextmanager
+    enabled = [True]
+    module = ModuleType("vllm.model_executor.model_loader.mtp_validation")
+    @contextmanager
+    def partial():
+        enabled[0] = False
+        try:
+            yield
+        finally:
+            enabled[0] = True
+    module.disable_mtp_completeness_check = partial
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    calls = []
+    def load(items):
+        items = list(items)
+        calls.append(enabled[0])
+        if enabled[0] and not any(name.startswith("model.layers.1.") for name, _ in items):
+            raise ValueError("missing draft layers")
+    model = SimpleNamespace(load_weights=load)
+    prefix = "model.layers.0.self_attn.indexer.wk"
+    weights = [(prefix + ".weight", torch.ones(2).to(torch.float8_e4m3fn)), (prefix + ".weight_scale_inv", torch.ones(1))]
+    if has_draft:
+        weights.append(("model.layers.1.self_attn.indexer.wk.weight", torch.ones(2, dtype=torch.bfloat16)))
+    adapter = object.__new__(VllmAdapter)
+    if has_draft:
+        adapter.apply_weight_iter(LoadResult(value=model, model=model), iter(weights))
+        assert calls == [True, False]
+    else:
+        with pytest.raises(ValueError, match="missing draft layers"):
+            adapter.apply_weight_iter(LoadResult(value=model, model=model), iter(weights))
+        assert calls == [True]
+    assert enabled == [True]
