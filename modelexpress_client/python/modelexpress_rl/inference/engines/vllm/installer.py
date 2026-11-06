@@ -16,14 +16,15 @@ import hashlib
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
-from contextlib import closing
+from collections.abc import Callable, Mapping, Iterable, Sequence, Iterator
+from contextlib import nullcontext, closing
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING
 from weakref import ref
 
+import numpy as np
 import torch
 from modelexpress import envs
 from modelexpress.accelerators import accelerator_backend_for
@@ -39,6 +40,14 @@ from modelexpress_rl.refit.reshard.types import IncompleteRefit
 from modelexpress_rl.refit.timing import refit_span
 
 from modelexpress_rl import envs as rl_envs
+from modelexpress_rl.inference.staging import StagedDelta
+from modelexpress_rl.inference.engines.vllm.inplace import (
+    InPlaceInstaller,
+    InPlaceUnsupported,
+    Peers,
+    xor_into,
+    xor_restore,
+)
 from modelexpress_rl.inference.engines.vllm.surgical import (
     changed_since,
     module_groups,
@@ -318,6 +327,75 @@ def _reserve_runtime_buffer_slots(model: Module, layerwise_info) -> None:
             layer.register_buffer(name, buffer)
 
 
+_PENDING_FP8_INDEXER_WK = "_pending_indexer_wk_fp8"
+
+
+def _clear_pending_fp8_indexer_wk(model: Module) -> None:
+    pending = getattr(model, _PENDING_FP8_INDEXER_WK, None)
+    if pending:
+        logger.warning(
+            "Discarding stale FP8 indexer wk entries before reload: %s", sorted(pending)
+        )
+        pending.clear()
+
+
+def _require_no_pending_fp8_indexer_wk(model: Module) -> None:
+    pending = getattr(model, _PENDING_FP8_INDEXER_WK, None)
+    if pending:
+        raise IncompleteRefit(
+            f"FP8 indexer wk weight and scale pairs left pending after reload: {sorted(pending)}"
+        )
+
+
+def _tensor_parallel_peers() -> Peers | None:
+    """The tensor-parallel ranks of this pipeline stage, which share staged bytes."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        group = get_tp_group()
+    except (ImportError, AssertionError):
+        return None
+    if group.world_size == 1:
+        return None
+
+    def agree(flags: torch.Tensor) -> torch.Tensor:
+        agreed = flags.clone()
+        torch.distributed.all_reduce(
+            agreed, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+        )
+        return agreed
+
+    return Peers(
+        group.rank_in_group,
+        group.world_size,
+        lambda tensor: group.all_gather(tensor, dim=0),
+        agree,
+    )
+
+
+def _with_staged_deltas(
+    tensors: Iterable[tuple[str, torch.Tensor]], overlay: Sequence[Path]
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Checkpoint tensors from files of an earlier version, with the staged deltas since XORed in."""
+    layers: list[StagedDelta] = []
+    try:
+        for staging in overlay:
+            layers.append(StagedDelta(staging))
+        for name, tensor in tensors:
+            deltas = [layer.tensor(name) for layer in layers if name in layer]
+            if deltas:
+                tensor = tensor.clone()
+                data = tensor.reshape(-1).view(torch.uint8)
+                for delta in deltas:
+                    positions = torch.from_numpy(delta.positions.astype(np.int64))
+                    values = torch.from_numpy(np.array(delta.values))
+                    data[positions.to(data.device)] ^= values.to(data.device)
+            yield name, tensor
+    finally:
+        for layer in layers:
+            layer.close()
+
+
 class _VllmInstaller(EngineInstaller):
     """Capture engine load geometry and run native vLLM installation.
 
@@ -345,6 +423,7 @@ class _VllmInstaller(EngineInstaller):
         self._runtime_tensors = runtime_tensors
         # Version whose checkpoint bytes the engine holds; None when unknown.
         self._live_version: str | None = None
+        self._inplace: InPlaceInstaller | None = None
         self._debug_validate_generator_layout = (
             rl_envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT
         )
@@ -432,6 +511,7 @@ class _VllmInstaller(EngineInstaller):
                     PreparedStreamingTensors,
                 }
             ),
+            staged_checkpoints=True,
             streamed_checkpoints=(
                 getattr(
                     getattr(self._vllm_config, "parallel_config", None),
@@ -466,19 +546,29 @@ class _VllmInstaller(EngineInstaller):
                 self.install_streamed_checkpoint(checkpoint.streaming)
                 metrics.update(checkpoint.streaming.cache_metrics)
             else:
-                changed = (
-                    changed_since(
-                        checkpoint.delta_changes,
-                        live_version=live_version,
-                        target_version=checkpoint.target_version,
+                inplace = self._install_in_place(checkpoint, live_version=live_version)
+                if inplace is None:
+                    changed = (
+                        changed_since(
+                            checkpoint.delta_changes,
+                            live_version=live_version,
+                            target_version=checkpoint.target_version,
+                        )
+                        if rl_envs.MX_REFIT_DELTA_SURGICAL
+                        else None
                     )
-                    if rl_envs.MX_REFIT_DELTA_SURGICAL
-                    else None
-                )
-                if changed is None:
-                    self.install_checkpoint(checkpoint.path)
+                    if changed is None:
+                        self.install_checkpoint(
+                            checkpoint.path, overlay=checkpoint.overlay
+                        )
+                    else:
+                        metrics.update(
+                            self.install_changed_tensors(
+                                checkpoint.path, changed, overlay=checkpoint.overlay
+                            )
+                        )
                 else:
-                    metrics.update(self.install_changed_tensors(checkpoint.path, changed))
+                    metrics.update(inplace)
             self._live_version = checkpoint.target_version
         else:
             raise TypeError(f"unsupported prepared artifact {type(prepared).__name__}")
@@ -701,7 +791,9 @@ class _VllmInstaller(EngineInstaller):
         captured = self._captured_source_plan()
 
         def load(aliases: _ParameterAliases) -> None:
-            execution = captured.new_execution(self._model, self._restore_parameter_aliases)
+            execution = captured.new_execution(
+                self._model, self._restore_parameter_aliases
+            )
             execution.apply(tensors)
             execution.finish()
             self._tied_input_peak_bytes = execution.tied_input_peak_bytes
@@ -733,16 +825,22 @@ class _VllmInstaller(EngineInstaller):
                 self._model, self._restore_parameter_aliases, bounded=True
             )
             if captured.replay_id != prepared.replay_id:
-                raise IncompleteRefit("captured replay plan was invalidated before installation")
+                raise IncompleteRefit(
+                    "captured replay plan was invalidated before installation"
+                )
 
             def install_batch(tensors):
                 if not isinstance(tensors, SourceReplayBatch):
-                    raise IncompleteRefit("vLLM installation requires ordered source replay")
+                    raise IncompleteRefit(
+                        "vLLM installation requires ordered source replay"
+                    )
                 received_storages = {
                     tensor.untyped_storage().data_ptr() for tensor in tensors.values()
                 }
                 if (received_storages & live_storages) - {0}:
-                    raise IncompleteRefit("received streaming tensor aliases live storage")
+                    raise IncompleteRefit(
+                        "received streaming tensor aliases live storage"
+                    )
                 execution.apply(tensors)
 
             prepared.apply(install_batch)
@@ -828,7 +926,56 @@ class _VllmInstaller(EngineInstaller):
         with refit_span("post_install"):
             torch.cuda.synchronize(self._device)
 
-    def install_checkpoint(self, path: str | Path) -> None:
+    def record_live_version(self, version_id: str) -> None:
+        """Record the version whose checkpoint bytes the engine holds."""
+        self._live_version = version_id
+
+    def _install_in_place(
+        self, checkpoint: PreparedCheckpoint, *, live_version: str | None
+    ) -> dict[str, float] | None:
+        """XOR a staged delta into live weights, or return None to reload instead."""
+        if (
+            checkpoint.staging is None
+            or live_version is None
+            or checkpoint.staging_base != live_version
+        ):
+            return None
+        if self._inplace is None:
+            self._inplace = InPlaceInstaller(
+                self._model,
+                device=self._device,
+                generic_reload=lambda load: self._reload(load, xor=True),
+                peers=_tensor_parallel_peers(),
+            )
+        try:
+            metrics = self._inplace.install(
+                checkpoint.path,
+                checkpoint.staging,
+                overlay=checkpoint.overlay,
+                reload_values=lambda names: self.install_changed_tensors(
+                    checkpoint.path, frozenset(names), overlay=checkpoint.overlay
+                ),
+            )
+        except InPlaceUnsupported as error:
+            # Anything already XORed belongs to a changed module, which the
+            # caller's reload rewrites from the prepared checkpoint.
+            logger.warning("In-place install unavailable, reloading instead: %s", error)
+            return None
+        logger.info(
+            "In-place install version=%s expert_layers=%d sparse_expert_layers=%d "
+            "generic_tensors=%d value_tensors=%d seconds=%.3f",
+            checkpoint.target_version,
+            int(metrics["perf/mx_receive_inplace_expert_layers"]),
+            int(metrics["perf/mx_receive_inplace_sparse_expert_layers"]),
+            int(metrics["perf/mx_receive_inplace_generic_tensors"]),
+            int(metrics["perf/mx_receive_inplace_value_tensors"]),
+            metrics["perf/mx_receive_inplace_time"],
+        )
+        return metrics
+
+    def install_checkpoint(
+        self, path: str | Path, *, overlay: Sequence[Path] = ()
+    ) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""
         try:
             from vllm.model_executor.model_loader.default_loader import (
@@ -849,14 +996,24 @@ class _VllmInstaller(EngineInstaller):
         model_config.revision = None
         loader = DefaultModelLoader(load_config)
 
-        self._reload(lambda _aliases: loader.load_weights(self._model, model_config))
+        if overlay:
+            weights = loader.get_all_weights(model_config, self._model)
+            self._reload(
+                lambda _aliases: self._model.load_weights(
+                    _with_staged_deltas(weights, overlay)
+                )
+            )
+        else:
+            self._reload(
+                lambda _aliases: loader.load_weights(self._model, model_config)
+            )
         # Same synchronize as install_tensors, so a checkpoint refit
         # reports the stage too rather than charging it to the caller's total.
         with refit_span("post_install"):
             torch.cuda.synchronize(self._device)
 
     def install_changed_tensors(
-        self, path: str | Path, changed: frozenset[str]
+        self, path: str | Path, changed: frozenset[str], *, overlay: Sequence[Path] = ()
     ) -> dict[str, float]:
         """Reload only the modules whose checkpoint tensors a delta changed.
 
@@ -890,7 +1047,7 @@ class _VllmInstaller(EngineInstaller):
 
         def load(_aliases: _ParameterAliases) -> None:
             nonlocal fallback
-            self._model.load_weights(subset())
+            self._model.load_weights(_with_staged_deltas(subset(), overlay))
             incomplete = [
                 type(layer).__name__
                 for layer, info in LAYERWISE_INFO.items()
@@ -916,7 +1073,10 @@ class _VllmInstaller(EngineInstaller):
                 model_config, self._model
             )
             self._model.load_weights(
-                (name, tensor) for name, tensor in rest if name not in names
+                _with_staged_deltas(
+                    ((name, tensor) for name, tensor in rest if name not in names),
+                    overlay,
+                )
             )
 
         unloaded = _UnloadedLayerFilter()
@@ -946,7 +1106,10 @@ class _VllmInstaller(EngineInstaller):
         inputs = []
         for path, layer in self._model.named_modules():
             slots = []
-            for is_buffer, values in ((False, layer._parameters), (True, layer._buffers)):
+            for is_buffer, values in (
+                (False, layer._parameters),
+                (True, layer._buffers),
+            ):
                 for leaf, tensor in values.items():
                     if tensor is not None:
                         name = f"{path}.{leaf}" if path else leaf
@@ -957,7 +1120,9 @@ class _VllmInstaller(EngineInstaller):
     def _captured_source_plan(self):
         plan = self.source_install_plan
         if plan is None:
-            raise IncompleteRefit("trainer installation requires a captured source replay plan")
+            raise IncompleteRefit(
+                "trainer installation requires a captured source replay plan"
+            )
         return plan
 
     @cached_property
@@ -1032,7 +1197,29 @@ class _VllmInstaller(EngineInstaller):
         )
 
     @torch.no_grad()
-    def _reload(self, load: Callable[[_ParameterAliases], None]) -> None:
+    def _reload(
+        self, load: Callable[[_ParameterAliases], None], *, xor: bool = False
+    ) -> None:
+        """Run one weight loader inside vLLM's graph-safe reload window.
+
+        With ``xor``, processed tensors are XORed into live storage instead of
+        copied, for installing a delta in place. A failure there can leave
+        tensors partly XORed that a fallback reload would not rewrite, so it
+        fails the refit.
+        """
+        with xor_restore() if xor else nullcontext():
+            try:
+                self._reload_window(load, xor=xor)
+            except InPlaceUnsupported as error:
+                if not xor:
+                    raise
+                raise IncompleteRefit(
+                    f"in-place reload stopped partway: {error}"
+                ) from error
+
+    def _reload_window(
+        self, load: Callable[[_ParameterAliases], None], *, xor: bool = False
+    ) -> None:
         """Run one weight loader inside vLLM's graph-safe reload window."""
         try:
             from vllm.config import set_current_vllm_config
@@ -1082,7 +1269,9 @@ class _VllmInstaller(EngineInstaller):
             initialize_layerwise_reload(self._model)
             self._restore_parameter_aliases(load_aliases)
             _reserve_runtime_buffer_slots(self._model, LAYERWISE_INFO)
+            _clear_pending_fp8_indexer_wk(self._model)
             load(load_aliases)
+            _require_no_pending_fp8_indexer_wk(self._model)
             finalize_layerwise_reload(self._model, self._model_config)
             for path, reference in owners:
                 try:
@@ -1104,7 +1293,11 @@ class _VllmInstaller(EngineInstaller):
                     raise IncompleteRefit(
                         f"graph-bound tensor owner {path!r} was replaced"
                     )
-                for name, (graph_tensor, original_geometry, persistent) in attributes.items():
+                for name, (
+                    graph_tensor,
+                    original_geometry,
+                    persistent,
+                ) in attributes.items():
                     current = getattr(module, name, None)
                     if (
                         not isinstance(current, torch.Tensor)
@@ -1117,7 +1310,10 @@ class _VllmInstaller(EngineInstaller):
                             f"graph-bound tensor {path}.{name} disappeared or changed geometry"
                         )
                     if current is not graph_tensor:
-                        graph_tensor.copy_(current)
+                        if xor:
+                            xor_into(graph_tensor, current)
+                        else:
+                            graph_tensor.copy_(current)
                     setattr(module, name, graph_tensor)
                     if persistent is not None:
                         if persistent:

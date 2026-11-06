@@ -127,9 +127,15 @@ def _encode_cache_component(value: str) -> str:
 
 
 class CheckpointState(str, Enum):
-    """Preparation state persisted across receiver processes."""
+    """Preparation state persisted across receiver processes.
+
+    ``STAGED`` means the target's delta is verified and staged, while the
+    checkpoint files still hold an earlier version, the record's ``base``. The
+    deltas between them in the target's chain are staged too.
+    """
 
     READY = "READY"
+    STAGED = "STAGED"
     UPDATING = "UPDATING"
 
 
@@ -141,6 +147,8 @@ class CheckpointRecord:
     version: str
     files: dict[str, list[int]] | None = None
     source: dict[str, str] | None = None
+    # The earlier version whose bytes the checkpoint files hold, when STAGED.
+    base: str | None = None
 
     @classmethod
     def from_dict(cls, value: dict | None) -> CheckpointRecord | None:
@@ -152,16 +160,25 @@ class CheckpointRecord:
             return None
         files = value.get("files")
         source = value.get("source")
+        base = value.get("base")
         if files is not None and not isinstance(files, dict):
             return None
         if source is not None and not isinstance(source, dict):
+            return None
+        if (status is CheckpointState.STAGED) != isinstance(base, str):
             return None
         return cls(
             status=status,
             version=value["version"],
             files=files,
             source=source,
+            base=base,
         )
+
+    @property
+    def files_version(self) -> str:
+        """The version whose bytes the checkpoint files hold."""
+        return self.base if self.base is not None else self.version
 
     def to_dict(self) -> dict[str, object]:
         value: dict[str, object] = {
@@ -172,6 +189,8 @@ class CheckpointRecord:
             value["files"] = self.files
         if self.source is not None:
             value["source"] = self.source
+        if self.base is not None:
+            value["base"] = self.base
         return value
 
 
@@ -235,6 +254,7 @@ class LocalCheckpointStore:
         self.full_cache = self.cache / "full"
         self.delta_cache = self.cache / "deltas"
         self.chain_cache = self.cache / "chains"
+        self.staging_cache = self.cache / "staging"
         self.materialized_cache = self.cache / "materialized"
         self.state_path = self.cache / "state.json"
         self.active_path = self.cache / "active.json"
@@ -248,6 +268,7 @@ class LocalCheckpointStore:
         for path in (
             self.full_cache,
             self.delta_cache,
+            self.staging_cache,
             self.chain_cache,
             self.materialized_cache,
         ):
@@ -259,8 +280,7 @@ class LocalCheckpointStore:
             if self.max_size_bytes is None or self.max_size_bytes > disk_limit:
                 self.max_size_bytes = disk_limit
                 logger.info(
-                    "Refit checkpoint cache %s capped at %.2f GB "
-                    "(free=%.2f GB)",
+                    "Refit checkpoint cache %s capped at %.2f GB (free=%.2f GB)",
                     self.cache,
                     disk_limit / 1_000_000_000,
                     free_bytes / 1_000_000_000,
@@ -370,6 +390,9 @@ class LocalCheckpointStore:
     def delta_path(self, version: str) -> Path:
         return self._version_path(self.delta_cache, version)
 
+    def staging_path(self, version: str) -> Path:
+        return self._version_path(self.staging_cache, version)
+
     def materialized_path(self, version: str) -> Path:
         return self._version_path(self.materialized_cache, version)
 
@@ -403,6 +426,7 @@ class LocalCheckpointStore:
             for root in (
                 self.full_cache,
                 self.delta_cache,
+                self.staging_cache,
                 self.materialized_cache,
             )
         )
@@ -415,6 +439,7 @@ class LocalCheckpointStore:
                     self.chain_path(version),
                     self.full_path(version),
                     self.delta_path(version),
+                    self.staging_path(version),
                     self.materialized_path(version),
                 }
             )
@@ -427,7 +452,10 @@ class LocalCheckpointStore:
             deltas = chain.get("deltas")
             if isinstance(deltas, list):
                 protected.update(
-                    self.delta_path(delta) for delta in deltas if isinstance(delta, str)
+                    path
+                    for delta in deltas
+                    if isinstance(delta, str)
+                    for path in (self.delta_path(delta), self.staging_path(delta))
                 )
         return protected
 
@@ -435,6 +463,7 @@ class LocalCheckpointStore:
         groups = (
             self.materialized_cache,
             self.delta_cache,
+            self.staging_cache,
             self.full_cache,
         )
         candidates: list[Path] = []
@@ -453,6 +482,7 @@ class LocalCheckpointStore:
             for root in (
                 self.full_cache,
                 self.delta_cache,
+                self.staging_cache,
                 self.materialized_cache,
             )
         ):
@@ -479,9 +509,7 @@ class LocalCheckpointStore:
             > self.max_size_bytes
         ):
             return False
-        return (
-            shutil.disk_usage(self.cache).free + evictable_bytes >= additional_bytes
-        )
+        return shutil.disk_usage(self.cache).free + evictable_bytes >= additional_bytes
 
     def ensure_capacity(
         self,
@@ -566,18 +594,21 @@ class LocalCheckpointStore:
         version: str,
         checkpoint_paths: Iterable[Path],
         source: dict[str, str] | None = None,
-    ) -> None:
+        base: str | None = None,
+    ) -> CheckpointRecord:
         state = CheckpointRecord(
             status=status,
             version=version,
             files=(
                 checkpoint_files_state(checkpoint_paths)
-                if status is CheckpointState.READY
+                if status is not CheckpointState.UPDATING
                 else None
             ),
             source=source,
+            base=base,
         )
         self._write_json(self.state_path, state.to_dict())
+        return state
 
     def chain(self, version: str) -> dict | None:
         return self._read_json(self.chain_path(version))
@@ -671,9 +702,7 @@ class LocalCheckpointStore:
 
     def _verified_artifact_metadata(self, artifact: Path) -> dict:
         metadata = self._read_json(self._source_path(artifact))
-        if metadata is None or metadata.get("files") != _artifact_files_state(
-            artifact
-        ):
+        if metadata is None or metadata.get("files") != _artifact_files_state(artifact):
             raise ValueError("cached checkpoint artifact changed")
         return metadata
 

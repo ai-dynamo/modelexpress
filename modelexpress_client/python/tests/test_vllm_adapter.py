@@ -48,6 +48,87 @@ def _stub_accelerator_backend_selection(monkeypatch, mock_accelerator_backend_cl
     )
 
 
+@pytest.mark.parametrize("layout", ["bf16", "bf16_bias", "prefused", "non_dsa", "bf16_scale"])
+def test_apply_weight_iter_leaves_non_fp8_indexer_weights_untouched(layout):
+    prefix = "model.layers.0.self_attn.indexer"
+    weights = [(f"{prefix}.wk.weight", torch.ones(2, dtype=torch.bfloat16))]
+    if layout == "bf16_bias":
+        weights.append((f"{prefix}.wk.bias", torch.ones(2, dtype=torch.bfloat16)))
+    elif layout == "prefused":
+        weights = [(f"{prefix}.wk_weights_proj", torch.ones(2, dtype=torch.bfloat16))]
+    elif layout == "non_dsa":
+        weights = [("model.layers.0.self_attn.q_proj.weight", torch.ones(2))]
+    elif layout == "bf16_scale":
+        weights.append((f"{prefix}.wk.weight_scale_inv", torch.ones(1)))
+    loads = []
+    model = SimpleNamespace(load_weights=lambda items: loads.append(list(items)))
+    result = LoadResult(value=model, model=model)
+    adapter = object.__new__(VllmAdapter)
+
+    assert adapter.apply_weight_iter(result, iter(weights)) is result
+
+    assert len(loads) == 1
+    assert [name for name, _ in loads[0]] == [name for name, _ in weights]
+    assert loads[0][0][1] is weights[0][1]
+    if layout == "bf16_bias":
+        assert loads[0][1][1] is weights[1][1]
+
+
+@pytest.mark.parametrize("scale_name", ["weight_scale", "weight_scale_inv"])
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_apply_weight_iter_replays_owned_fp8_indexer_pair(scale_name, scale_first):
+    prefix = "model.layers.0.self_attn.indexer"
+    weight = torch.ones(2).to(torch.float8_e4m3fn)
+    scale = torch.full((1,), 2.0)
+    weights = [(f"{prefix}.wk.weight", weight), (f"{prefix}.wk.{scale_name}", scale)]
+    if scale_first:
+        weights.reverse()
+    bf16_name = "model.layers.1.self_attn.indexer.wk.weight"
+    bf16_weight = torch.ones(2, dtype=torch.bfloat16)
+    loads = []
+    pending = {prefix: object()}
+
+    def stream():
+        for name, tensor in weights:
+            yield name, tensor
+            tensor.zero_()
+        yield bf16_name, bf16_weight
+
+    def load_weights(items):
+        loads.append(list(items))
+        if len(loads) == 2:
+            assert not pending
+
+    model = SimpleNamespace(load_weights=load_weights, _pending_indexer_wk_fp8=pending)
+    result = LoadResult(value=model, model=model)
+    adapter = object.__new__(VllmAdapter)
+
+    assert adapter.apply_weight_iter(result, stream()) is result
+
+    assert len(loads) == 2
+    replay = dict(loads[1])
+    assert set(replay) == {name for name, _ in weights}
+    torch.testing.assert_close(replay[f"{prefix}.wk.weight"].float(), torch.ones(2))
+    torch.testing.assert_close(replay[f"{prefix}.wk.{scale_name}"], torch.full((1,), 2.0))
+    assert loads[0][-1][1] is bf16_weight
+    for name, original in weights:
+        assert replay[name] is not original
+        assert replay[name] is dict(loads[0])[name]
+
+
+def test_apply_weight_iter_rejects_fp8_indexer_weight_without_scale():
+    name = "model.layers.0.self_attn.indexer.wk.weight"
+    weight = torch.ones(2).to(torch.float8_e4m3fn)
+    loads = []
+    model = SimpleNamespace(load_weights=lambda items: loads.append(list(items)))
+    adapter = object.__new__(VllmAdapter)
+
+    with pytest.raises(RuntimeError, match="stream lacks an FP8 indexer wk weight or scale"):
+        adapter.apply_weight_iter(LoadResult(value=model, model=model), iter([(name, weight)]))
+
+    assert len(loads) == 1
+
+
 def test_worker_rank_uses_torch_distributed_global_rank():
     config = _vllm_config(rank=2, tp_size=4, pp_size=2)
     device = torch.device("cuda", 0)

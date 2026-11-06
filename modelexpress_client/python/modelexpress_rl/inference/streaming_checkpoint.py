@@ -266,7 +266,7 @@ class _CheckpointWriter:
                 store.installation_locked(),
                 store.locked(),
             ):
-                protected = _protected_versions(store, version)
+                protected = _protected_versions(store, version, head=True)
                 state = store.state()
                 if state is not None:
                     protected.add(state.version)
