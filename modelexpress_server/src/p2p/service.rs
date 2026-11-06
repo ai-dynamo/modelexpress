@@ -95,7 +95,8 @@ impl P2pService for P2pServiceImpl {
         if req.owner_token.is_empty() {
             return Err(Status::invalid_argument("owner_token is required"));
         }
-        let source_id = compute_mx_source_id(&identity);
+        let source_id = compute_mx_source_id(&identity)
+            .map_err(|err| Status::unavailable(format!("failed to compute source id: {err}")))?;
         let action = DonorLeaseAction::try_from(req.action)
             .map_err(|_| Status::invalid_argument("invalid lease action"))?;
         if matches!(action, DonorLeaseAction::Acquire | DonorLeaseAction::Renew)
