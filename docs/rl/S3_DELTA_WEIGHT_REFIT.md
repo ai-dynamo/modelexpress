@@ -831,3 +831,11 @@ When the index omits `checksum_format`, checksum verification is skipped and
 shard metadata is not interpreted as checksums. Tensor names, dtypes, shapes,
 and byte sizes are always checked before the immutable full artifact is
 promoted.
+
+## Bounded delta application
+
+Canonical deltas apply in 16 MiB file chunks, with large tensors shared across
+CPU workers and ordered target checksums combined after their chunks finish.
+Freshly downloaded delta bytes are reused without rereading their artifact files.
+A cache capacity rejection restores the last completely prepared version; it
+does not label an older engine version as the current checkpoint files.
