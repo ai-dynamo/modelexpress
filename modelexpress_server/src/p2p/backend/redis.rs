@@ -613,7 +613,7 @@ impl MetadataBackend for RedisBackend {
         _pod_uid: &str,
         _pod_namespace: &str,
     ) -> MetadataResult<()> {
-        let source_id = crate::p2p::source_identity::compute_mx_source_id(identity);
+        let source_id = crate::p2p::source_identity::compute_mx_source_id(identity)?;
         let mut conn = self.get_conn().await?;
         let worker_key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
@@ -1500,7 +1500,8 @@ mod tests {
 
         let mut identity = test_identity();
         identity.model_name = format!("status-order-test/{}", uuid::Uuid::new_v4());
-        let source_id = crate::p2p::source_identity::compute_mx_source_id(&identity);
+        let source_id =
+            crate::p2p::source_identity::compute_mx_source_id(&identity).expect("source id");
         let worker_id = uuid::Uuid::new_v4().to_string();
 
         backend
