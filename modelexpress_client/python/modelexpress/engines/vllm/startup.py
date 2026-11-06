@@ -1,61 +1,87 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Backport a post-warmup artifact signal without importing workers at plugin load."""
+"""Native vLLM endpoint and worker extensions for artifact startup signaling."""
 
 import logging
-from functools import wraps
-from importlib import import_module
+from weakref import ReferenceType, ref
 
 from ... import envs
 from ..startup import StartupGate
 
 logger = logging.getLogger(__name__)
-gate = StartupGate()
+_gates: dict[int, tuple[ReferenceType, StartupGate]] = {}
 
 
-def _synchronize() -> None:
-    from vllm.distributed import get_world_group
-
-    get_world_group().barrier()
-
-
-def install_startup_hook(ctx) -> bool:
-    """Wrap the resolved worker at loader time, before startup warmup runs."""
-    if (
-        not envs.MX_ARTIFACT_TRANSFER
-        or envs.MX_DISABLE_PATCHES
-        or envs.MX_ARTIFACT_READY_URL.strip()
-    ):
-        return False
+def prepare_artifact_gate(ctx) -> bool:
+    """Bind publishers to a worker's config without modifying that config."""
     config = getattr(getattr(ctx, "adapter", None), "vllm_config", None)
+    if config is None:
+        return False
     parallel = getattr(config, "parallel_config", None)
-    worker_cls = getattr(parallel, "worker_cls", "auto")
-    if worker_cls == "auto":
-        worker_cls = "vllm.v1.worker.gpu_worker.Worker"
-    try:
-        if isinstance(worker_cls, str):
-            module_name, class_name = worker_cls.rsplit(".", 1)
-            worker_cls = getattr(import_module(module_name), class_name)
-        original = getattr(worker_cls, "compile_or_warm_up_model", None)
-    except (ImportError, AttributeError, ValueError):
-        original = None
-    if not callable(original):
+    if getattr(parallel, "distributed_executor_backend", None) == "external_launcher":
         logger.warning(
-            "No supported vLLM startup hook; using HTTP artifact readiness"
+            "External-launcher startup is not qualified; skipping artifacts"
         )
         return False
-
-    if not getattr(original, "__modelexpress_startup_hook__", False):
-        @wraps(original)
-        def warmup(self, *args, **kwargs):
-            gate.prepare()
-            result = original(self, *args, **kwargs)
-            gate.complete(_synchronize)
-            return result
-
-        warmup.__modelexpress_startup_hook__ = True
-        worker_cls.compile_or_warm_up_model = warmup
-    if not gate.available:
+    key = id(config)
+    entry = _gates.get(key)
+    if entry is None:
+        try:
+            config_ref = ref(config, lambda reference: _gates.pop(key, None))
+        except TypeError:
+            logger.warning("Unsupported vLLM config lifetime; skipping artifacts")
+            return False
+        gate = StartupGate()
         gate.prepare()
+        _gates[key] = (config_ref, gate)
+    else:
+        _, gate = entry
+    ctx.artifact_ready_fn = gate.is_ready
     return True
+
+
+class ArtifactStartupWorkerExtension:
+    """Add a control RPC through vLLM's worker_extension_cls interface."""
+
+    def mx_artifact_startup_complete(self) -> bool:
+        entry = _gates.get(id(self.vllm_config))
+        if entry is None:
+            return False
+        _, gate = entry
+        gate.complete(lambda: None)
+        return True
+
+
+class ArtifactStartupPlugin:
+    """Release publishers from the native post-engine app-state callback."""
+
+    name = "modelexpress"
+    required_tasks = None
+
+    def attach_router(self, app) -> None:
+        """This lifecycle plugin adds no HTTP routes."""
+
+    async def init_state(self, engine_client, state, args) -> None:
+        if (
+            engine_client is None
+            or not envs.MX_ARTIFACT_TRANSFER
+            or envs.MX_ARTIFACT_READY_URL.strip()
+        ):
+            return
+        try:
+            results = await engine_client.collective_rpc(
+                "mx_artifact_startup_complete",
+                timeout=envs.MX_ARTIFACT_READY_TIMEOUT_SECS,
+            )
+            if not isinstance(results, list) or not results or not all(
+                result is True for result in results
+            ):
+                logger.warning("Not all vLLM workers accepted artifact startup")
+        except Exception:
+            logger.warning(
+                "Native vLLM artifact startup signal failed; configure "
+                "ArtifactStartupWorkerExtension or an explicit "
+                "MX_ARTIFACT_READY_URL. Artifacts remain gated.",
+                exc_info=True,
+            )

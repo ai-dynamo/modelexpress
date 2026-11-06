@@ -142,7 +142,7 @@ The first replica attempts ModelStreamer when no compatible P2P source is ready.
 
 Setting `MX_ARTIFACT_READY_URL` opts weight-source publication into an HTTP
 health gate. Artifact publication otherwise uses the `modelexpress` SGLang
-plugin's scheduler startup signal; see
+plugin's scheduler startup signal when the URL is unset or blank; see
 [Artifact startup signals](DEPLOYMENT.md#artifact-startup-signals).
 
 Set `MX_ARTIFACT_TRANSFER=1` with the `nixl` transport to transfer compatible

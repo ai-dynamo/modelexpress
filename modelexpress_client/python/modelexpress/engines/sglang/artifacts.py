@@ -51,6 +51,11 @@ def install_sglang_cache_artifacts(ctx: LoadContext) -> None:
 
 def schedule_sglang_cache_artifact_publish(ctx: LoadContext) -> None:
     """Schedule publication of local SGLang artifacts after server readiness."""
+    if not envs.MX_ARTIFACT_TRANSFER:
+        return
+    if not envs.MX_ARTIFACT_READY_URL.strip() and not startup.gate.available:
+        logger.warning("No SGLang startup hook; skipping artifact publication")
+        return
     _common_artifacts.schedule_artifact_publish(
         ctx,
         lambda: _sglang_artifact_transfers(ctx),
@@ -366,10 +371,10 @@ def _sglang_artifact_ready_fn(
     source_roots: tuple[ArtifactCacheRoot, ...],
     ctx: LoadContext | None = None,
 ):
-    if startup.gate.available and not envs.MX_ARTIFACT_READY_URL.strip():
-        ready_fn = startup.gate.is_ready
-    else:
+    if envs.MX_ARTIFACT_READY_URL.strip():
         ready_fn = lambda: _sglang_health_ready(ctx)
+    else:
+        ready_fn = startup.gate.is_ready
     return _common_artifacts.artifact_ready_fn(source_roots, ready_fn)
 
 

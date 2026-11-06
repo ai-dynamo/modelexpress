@@ -172,7 +172,7 @@ Shared client settings are registered in `modelexpress.envs`. RL settings are li
 | `MX_ARTIFACT_TRANSFER` | `0` | Transfer compatible vLLM TorchInductor, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | empty | Optional compile-configuration compatibility digest for cache discovery |
-| `MX_ARTIFACT_READY_URL` | unset | Optional HTTP readiness override for weights and cache artifacts. Without an override, artifacts use engine startup hooks; unsupported or disabled hooks retain the framework-default HTTP fallback. See [Artifact startup signals](../../docs/DEPLOYMENT.md#artifact-startup-signals). |
+| `MX_ARTIFACT_READY_URL` | unset | Optional explicit HTTP readiness override for weights and artifacts. Unset, empty, or whitespace-only selects the native engine startup gate for artifacts. See [Artifact startup signals](../../docs/DEPLOYMENT.md#artifact-startup-signals). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Seconds between READY status heartbeats for published sources, including reshard rendezvous sources; keep below the server heartbeat timeout |
 ### Canonical S3 Transfer Tuning

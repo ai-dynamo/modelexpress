@@ -107,6 +107,7 @@ class LoadContext:
     desired_version_uid: str | None = None
     # Optional engine-level gate checked before weight metadata is advertised.
     source_ready_fn: Callable[[], bool] | None = None
+    artifact_ready_fn: Callable[[], bool] | None = None
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     # When MX_VMM_ARENA=1, maybe_enter_vmm_arena populates this with the

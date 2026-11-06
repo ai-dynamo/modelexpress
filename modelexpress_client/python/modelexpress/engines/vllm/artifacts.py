@@ -236,7 +236,14 @@ def _warn_if_compile_cache_unused(ctx: LoadContext) -> None:
 
 def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
     """Schedule publication of local vLLM artifacts after engine startup."""
-    startup.install_startup_hook(ctx)
+    if not envs.MX_ARTIFACT_TRANSFER:
+        return
+    if (
+        not envs.MX_ARTIFACT_READY_URL.strip()
+        and not startup.prepare_artifact_gate(ctx)
+    ):
+        logger.warning("No vLLM startup adapter; skipping artifact publication")
+        return
     _artifact_lifecycle.schedule_artifact_publish(
         ctx,
         lambda: _vllm_artifact_transfers(ctx),
@@ -534,20 +541,13 @@ def _set_extra_if_present(
 
 def _vllm_artifact_ready_fn(
     source_roots: tuple[ArtifactCacheRoot, ...],
-    health_ready_fn=None,
     ctx: LoadContext | None = None,
 ):
-    if health_ready_fn is None:
-        # Resolve the engine hook at call time so existing tests and diagnostics
-        # can replace _vllm_health_ready after constructing the readiness check.
-        if startup.gate.available and not envs.MX_ARTIFACT_READY_URL.strip():
-            health_ready_fn = startup.gate.is_ready
-        else:
-            health_ready_fn = lambda: _vllm_health_ready(ctx)
-    return _artifact_lifecycle.artifact_ready_fn(
-        source_roots,
-        health_ready_fn,
-    )
+    if envs.MX_ARTIFACT_READY_URL.strip():
+        ready_fn = lambda: _vllm_health_ready(ctx)
+    else:
+        ready_fn = getattr(ctx, "artifact_ready_fn", None) or (lambda: False)
+    return _artifact_lifecycle.artifact_ready_fn(source_roots, ready_fn)
 
 
 def _vllm_health_ready(ctx: LoadContext | None = None) -> bool:

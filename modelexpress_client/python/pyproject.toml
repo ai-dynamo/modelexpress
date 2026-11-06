@@ -86,6 +86,9 @@ Documentation = "https://github.com/ai-dynamo/modelexpress/tree/main/docs"
 modelexpress = "modelexpress:register_modelexpress"
 modelexpress_rl = "modelexpress_rl.inference.engines.vllm.registration:register"
 
+[project.entry-points."vllm.endpoint_plugins"]
+modelexpress = "modelexpress.engines.vllm.startup:ArtifactStartupPlugin"
+
 [project.entry-points."sglang.srt.plugins"]
 modelexpress = "modelexpress.engines.sglang.startup:register_startup_hook"
 modelexpress_rl = "modelexpress_rl.inference.engines.sglang.registration:register"

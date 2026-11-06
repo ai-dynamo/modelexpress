@@ -605,6 +605,7 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
 ):
     monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
     monkeypatch.setenv("MX_P2P_METADATA", "1")
+    monkeypatch.setattr(artifacts.startup, "prepare_artifact_gate", lambda ctx: True)
     monkeypatch.setattr(
         artifact_lifecycle.tempfile,
         "gettempdir",
@@ -696,7 +697,7 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
     artifacts._scheduled_publishers.clear()
 
 
-def test_vllm_artifact_ready_fn_waits_for_health_and_stable_cache(
+def test_vllm_artifact_ready_fn_waits_for_startup_and_stable_cache(
     monkeypatch,
     tmp_path,
 ):
@@ -706,10 +707,11 @@ def test_vllm_artifact_ready_fn_waits_for_health_and_stable_cache(
         ArtifactCacheRoot("primary", cache_root, cache_root),
         ArtifactCacheRoot("autotune", autotune_root, autotune_root, optional=True),
     )
-    ready = artifacts._vllm_artifact_ready_fn(roots)
-    health_check = MagicMock(side_effect=[False, True])
+    startup_check = MagicMock(side_effect=[False, True])
+    ready = artifacts._vllm_artifact_ready_fn(
+        roots, ctx=SimpleNamespace(artifact_ready_fn=startup_check)
+    )
     now = 100.0
-    monkeypatch.setattr(artifacts, "_vllm_health_ready", health_check)
     monkeypatch.setattr(artifact_lifecycle.time, "monotonic", lambda: now)
 
     autotune_root.mkdir()
@@ -739,7 +741,7 @@ def test_vllm_artifact_ready_fn_waits_for_health_and_stable_cache(
 
     cache_file.write_bytes(b"compiled-again")
     assert ready() is False
-    assert health_check.call_count == 2
+    assert startup_check.call_count == 2
 
 
 def test_vllm_health_url_defaults_to_localhost(monkeypatch):
