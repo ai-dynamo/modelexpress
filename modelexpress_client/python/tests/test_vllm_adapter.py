@@ -1533,3 +1533,29 @@ def test_discovery_keeps_exact_k3_collective_state_local(
     assert op.collective.peer_ptrs is pointers
     assert op.collective.flags is flags
     assert op.collective.workspace is workspace
+
+
+@pytest.mark.parametrize("fmt, expected", [(None, "auto"), ("safetensors", "safetensors")])
+def test_load_via_native_uses_cold_start_format(monkeypatch, fmt, expected):
+    """The disk fallback builds DefaultModelLoader with MX_COLD_START_FORMAT, not a fixed auto."""
+    if fmt is None:
+        monkeypatch.delenv("MX_COLD_START_FORMAT", raising=False)
+    else:
+        monkeypatch.setenv("MX_COLD_START_FORMAT", fmt)
+    model_config = _model_config()
+    vllm_config = _context_config(load_device="cpu")
+    vllm_config.model_config = model_config
+    adapter = VllmAdapter(vllm_config, model_config)
+    original = getattr(adapter.load_config, "load_format", None)
+    loader = MagicMock()
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.model_loader.default_loader"],
+        "DefaultModelLoader",
+        loader,
+    )
+    model = nn.Linear(2, 2)
+    adapter.load_via_native(LoadResult(value=model, model=model))
+
+    assert loader.call_args.args[0].load_format == expected
+    assert loader.call_args.args[0] is not adapter.load_config
+    assert getattr(adapter.load_config, "load_format", None) == original

@@ -269,6 +269,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_PUBLISH_TIMEOUT_SECS": lambda: _env_int("MX_PUBLISH_TIMEOUT_SECS", 30 * 60),
     "MX_MODEL_REVISION": lambda: os.environ.get("MX_MODEL_REVISION", ""),
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
+    "MX_COLD_START_FORMAT": lambda: (
+        os.environ.get("MX_COLD_START_FORMAT", "").strip().lower() or "auto"
+    ),
     "MX_PLUGIN_DIR": lambda: os.environ.get("MX_PLUGIN_DIR", "/opt/modelexpress/plugins"),
     "MX_LOAD_PLUGIN": lambda: os.environ.get("MX_LOAD_PLUGIN"),
     "MX_LOAD_PLUGIN_BEFORE": lambda: os.environ.get("MX_LOAD_PLUGIN_BEFORE", "server-cache"),

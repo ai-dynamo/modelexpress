@@ -275,6 +275,21 @@ def _converge_streamer_files(
     return [path for path in files if path in needed]
 
 
+def cold_start_load_config(load_config):
+    """Copy of ``load_config`` with the load format of the disk fallback.
+
+    ``MX_COLD_START_FORMAT`` (default ``auto``) selects the format. ``safetensors`` refuses
+    ``.bin``/``.pt`` checkpoints, which ``auto`` would load through ``torch.load``.
+    """
+    disk_config = copy.copy(load_config)
+    fmt = envs.MX_COLD_START_FORMAT
+    try:
+        disk_config.load_format = fmt
+    except AttributeError:
+        object.__setattr__(disk_config, "load_format", fmt)
+    return disk_config
+
+
 class VllmAdapter(EngineAdapter):
     """Adapter that maps strategy hooks onto vLLM's native loader APIs."""
 
@@ -532,13 +547,9 @@ class VllmAdapter(EngineAdapter):
 
         from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
-        disk_config = copy.copy(self.load_config)
-        try:
-            disk_config.load_format = "auto"
-        except AttributeError:
-            object.__setattr__(disk_config, "load_format", "auto")
-
-        DefaultModelLoader(disk_config).load_weights(result.model, self.model_config)
+        DefaultModelLoader(cold_start_load_config(self.load_config)).load_weights(
+            result.model, self.model_config
+        )
         return result
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:

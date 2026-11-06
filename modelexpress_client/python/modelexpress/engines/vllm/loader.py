@@ -46,7 +46,7 @@ from ...load_strategy.draft_gate import DraftPublicationGate
 from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
-from .adapter import _is_speculative_draft, build_vllm_load_context
+from .adapter import _is_speculative_draft, build_vllm_load_context, cold_start_load_config
 from .artifacts import (
     _vllm_health_ready,
     install_vllm_cache_artifacts,
@@ -313,24 +313,12 @@ class MxModelLoader(BaseModelLoader):
             )
             return
 
-        import copy
-
-        disk_config = copy.copy(self.load_config)
-        try:
-            disk_config.load_format = "auto"
-        except AttributeError:
-            object.__setattr__(disk_config, "load_format", "auto")
+        disk_config = cold_start_load_config(self.load_config)
         DefaultModelLoader(disk_config).download_model(model_config)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Load weights into an already-initialized model (standalone API)."""
-        import copy
-
-        disk_config = copy.copy(self.load_config)
-        try:
-            disk_config.load_format = "auto"
-        except AttributeError:
-            object.__setattr__(disk_config, "load_format", "auto")
+        disk_config = cold_start_load_config(self.load_config)
         DefaultModelLoader(disk_config).load_weights(model, model_config)
 
     def on_sleep(self, level: int) -> None:

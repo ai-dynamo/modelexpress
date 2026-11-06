@@ -377,6 +377,21 @@ class TestAbstractMethodCompleteness:
                 mock_cls.return_value.download_model.assert_not_called()
 
 
+    @pytest.mark.parametrize(
+        "env, expected",
+        [({}, "auto"), ({"MX_COLD_START_FORMAT": " SafeTensors "}, "safetensors")],
+    )
+    def test_disk_paths_use_cold_start_format(self, env, expected):
+        """download_model and load_weights build DefaultModelLoader with MX_COLD_START_FORMAT."""
+        loader = _make_loader()
+        original = loader.load_config.load_format
+        with patch.dict("os.environ", env, clear=True):
+            with patch("modelexpress.engines.vllm.loader.DefaultModelLoader") as mock_cls:
+                loader.download_model(MagicMock())
+                loader.load_weights(MagicMock(), MagicMock())
+        assert [c.args[0].load_format for c in mock_cls.call_args_list] == [expected, expected]
+        assert loader.load_config.load_format == original
+
     def test_load_weights_delegates(self):
         loader = _make_loader()
         model, cfg = MagicMock(), MagicMock()

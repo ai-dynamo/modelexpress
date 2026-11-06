@@ -169,3 +169,14 @@ def test_dir_lists_registered_names():
     assert "MX_NIXL_BACKEND" in names
     assert "VLLM_ATTENTION_BACKEND" in names
     assert names == sorted(names)
+
+
+@pytest.mark.parametrize(
+    "raw, expected", [(None, "auto"), ("", "auto"), (" SafeTensors ", "safetensors")]
+)
+def test_cold_start_format(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("MX_COLD_START_FORMAT", raising=False)
+    else:
+        monkeypatch.setenv("MX_COLD_START_FORMAT", raw)
+    assert envs.MX_COLD_START_FORMAT == expected
