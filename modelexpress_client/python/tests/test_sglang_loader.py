@@ -7,8 +7,9 @@ import ctypes
 import os
 import sys
 import weakref
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from types import ModuleType, SimpleNamespace
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -2057,3 +2058,285 @@ def test_transfer_engine_rejects_source_only_runtime_tensor():
         loader._receive_via_transfer_engine({}, transfer_engine, source,
                                             SimpleNamespace(global_rank=0))
     transfer_engine.submit_scatter_read.assert_not_called()
+
+
+class _CpuBackend:
+    name = "cpu"
+
+    def is_accel_tensor(self, tensor):
+        return True
+
+
+@pytest.fixture
+def _release_loader(_clean_sglang_registries):
+    """A loader whose main nixl load has completed."""
+    model = nn.Linear(2, 2)
+    loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
+    ctx = build_sglang_load_context(
+        loader.load_config, _model_config(), _device_config()
+    )
+    ctx.accelerator_backend = _CpuBackend()
+    ctx.nixl_manager = MagicMock()
+    ctx.tensors = {"weight": model.weight.data, "bias": model.bias.data}
+    loader._ctx = ctx
+    loader._sync_registries(ctx)
+    return loader, model
+
+
+@contextmanager
+def _patch_publication():
+    with ExitStack() as stack:
+        yield {
+            name: stack.enter_context(
+                patch(f"modelexpress.engines.sglang.loader.{name}")
+            )
+            for name in ("unpublish_metadata", "publish_metadata", "register_tensors")
+        }
+
+
+class TestWeightsReleaseResumeHooks:
+    """SGLang calls these around release/resume_memory_occupation so a
+    released worker stops serving its weights while their pages are unmapped."""
+
+    @pytest.mark.parametrize("content_preserved", [True, False])
+    def test_release_unpublishes_and_shuts_down_nixl(
+        self, _release_loader, content_preserved
+    ):
+        from modelexpress.engines.sglang import loader as loader_mod
+
+        loader, _ = _release_loader
+        ctx = loader._ctx
+        manager = ctx.nixl_manager
+        with _patch_publication() as mocks:
+            loader.before_weights_release(content_preserved=content_preserved)
+        mocks["unpublish_metadata"].assert_called_once_with(ctx)
+        manager.shutdown.assert_called_once()
+        assert ctx.nixl_manager is None
+        assert ctx.device_id not in loader_mod._nixl_managers
+
+    def test_release_and_resume_are_noops_without_ctx(self):
+        loader = MxModelLoader(_load_config())
+        with _patch_publication() as mocks:
+            loader.before_weights_release(content_preserved=True)
+            loader.after_weights_resume(content_preserved=True)
+        for mock in mocks.values():
+            mock.assert_not_called()
+
+    def test_resume_republishes_preserved_weights(self, _release_loader):
+        from modelexpress.engines.sglang import loader as loader_mod
+
+        loader, _ = _release_loader
+        ctx = loader._ctx
+        new_manager = MagicMock()
+        with _patch_publication() as mocks:
+            mocks["register_tensors"].side_effect = (
+                lambda _model, c, reuse_discovered: setattr(
+                    c, "nixl_manager", new_manager
+                )
+            )
+            loader.before_weights_release(content_preserved=True)
+            loader.after_weights_resume(content_preserved=True)
+        mocks["register_tensors"].assert_called_once_with(
+            None, ctx, reuse_discovered=True
+        )
+        mocks["publish_metadata"].assert_called_once_with(ctx)
+        assert loader_mod._nixl_managers[ctx.device_id] is new_manager
+
+    def test_resume_does_not_publish_discarded_weights(self, _release_loader):
+        loader, _ = _release_loader
+        with _patch_publication() as mocks:
+            loader.before_weights_release(content_preserved=False)
+            loader.after_weights_resume(content_preserved=False)
+        mocks["register_tensors"].assert_not_called()
+        mocks["publish_metadata"].assert_not_called()
+
+
+class TestReloadModel:
+    def test_reload_reuses_boot_context_and_republishes(self, _release_loader):
+        from modelexpress.engines.sglang import loader as loader_mod
+
+        loader, model = _release_loader
+        ctx = loader._ctx
+        worker_id = ctx.worker_id
+        old_manager = ctx.nixl_manager
+        new_manager = MagicMock()
+        seen = {}
+
+        def chain(m, c):
+            seen.update(
+                ctx=c,
+                is_reload=c.is_reload,
+                adapter_reload=c.adapter.is_reload,
+                loaded_identity=p2p_pb2.SourceIdentity().FromString(
+                    c.loaded_identity.SerializeToString()
+                ),
+                tensors=dict(c.tensors),
+            )
+            c.nixl_manager = new_manager
+            c.tensors = {"weight": m.weight.data}
+            return m
+
+        with _patch_publication() as mocks, patch.object(
+            loader, "_run_load_strategy_chain", side_effect=chain
+        ):
+            loader.reload_model(
+                model=model,
+                model_config=_model_config(),
+                device_config=_device_config(),
+            )
+
+        old_manager.shutdown.assert_called_once()
+        mocks["unpublish_metadata"].assert_called_once_with(ctx)
+        assert seen["ctx"] is ctx and ctx.worker_id == worker_id
+        assert seen["is_reload"] and seen["adapter_reload"]
+        assert seen["loaded_identity"] == ctx.identity
+        assert seen["tensors"] == {}
+        assert loader_mod._nixl_managers[ctx.device_id] is new_manager
+        assert loader_mod._tensor_registry[ctx.device_id] == ctx.tensors
+
+    def test_reload_failure_propagates_and_clears_reload_state(
+        self, _release_loader
+    ):
+        from modelexpress.engines.sglang import loader as loader_mod
+
+        loader, model = _release_loader
+        ctx = loader._ctx
+        with _patch_publication(), patch.object(
+            loader,
+            "_run_load_strategy_chain",
+            side_effect=RuntimeError("No loading strategy succeeded"),
+        ), pytest.raises(RuntimeError, match="No loading strategy"):
+            loader.reload_model(
+                model=model,
+                model_config=_model_config(),
+                device_config=_device_config(),
+            )
+        assert not ctx.is_reload and not ctx.adapter.is_reload
+        assert ctx.device_id not in loader_mod._nixl_managers
+        assert loader._ctx is ctx
+
+    def test_reload_without_modelexpress_load_raises(self):
+        loader = MxModelLoader(_load_config())
+        with pytest.raises(RuntimeError, match="cannot reload"):
+            loader.reload_model(
+                model=nn.Linear(2, 2),
+                model_config=_model_config(),
+                device_config=_device_config(),
+            )
+
+    def test_reload_rejects_transfer_engine_transport(self, _release_loader):
+        loader, model = _release_loader
+        loader.load_config.modelexpress_transport = "transfer_engine"
+        with patch.object(loader, "_run_load_strategy_chain") as chain, \
+                pytest.raises(RuntimeError, match="'nixl' transport"):
+            loader.reload_model(
+                model=model,
+                model_config=_model_config(),
+                device_config=_device_config(),
+            )
+        chain.assert_not_called()
+
+
+class TestTransferEngineReleaseResume:
+    def _loader(self):
+        transfer_engine = MagicMock()
+        transfer_engine.register_memory.return_value = 0
+        transfer_engine.unregister_memory.return_value = 0
+        loader = MxModelLoader(
+            _load_config(
+                modelexpress_transport="transfer_engine",
+                remote_instance_weight_loader_transfer_engine=transfer_engine,
+                remote_instance_weight_loader_transfer_engine_session_id="te-session",
+            )
+        )
+        model = nn.Linear(2, 2)
+        ctx = build_sglang_load_context(
+            loader.load_config, _model_config(), _device_config()
+        )
+        ctx.accelerator_backend = _CpuBackend()
+        ctx.tensors = {"weight": model.weight.data, "bias": model.bias.data}
+        loader._ctx = ctx
+        loader._transfer_engine_registered = True
+        return loader, model, transfer_engine
+
+    def test_release_unregisters_memory(self):
+        loader, model, transfer_engine = self._loader()
+        with patch(
+            "modelexpress.engines.sglang.loader.unpublish_metadata"
+        ) as unpublish:
+            loader.before_weights_release(content_preserved=False)
+        unpublish.assert_called_once_with(loader._ctx)
+        assert {
+            call.args[0] for call in transfer_engine.unregister_memory.call_args_list
+        } == {model.weight.data_ptr(), model.bias.data_ptr()}
+        assert not loader._transfer_engine_registered
+
+    def test_resume_stays_unpublished(self):
+        loader, _, _ = self._loader()
+        with _patch_publication() as mocks:
+            loader.before_weights_release(content_preserved=True)
+            loader.after_weights_resume(content_preserved=True)
+        mocks["register_tensors"].assert_not_called()
+        mocks["publish_metadata"].assert_not_called()
+
+
+class _FakeReloadLoader:
+    calls: ClassVar[list[str]] = []
+
+    def __init__(self, _load_config):
+        pass
+
+    def _get_all_weights(self, _model_config, _model):
+        return iter([])
+
+    @staticmethod
+    def load_weights_only(model, weights, target_device):
+        _FakeReloadLoader.calls.append("load_weights_only")
+
+    @staticmethod
+    def load_weights_and_postprocess(model, weights, target_device):
+        _FakeReloadLoader.calls.append("load_weights_and_postprocess")
+
+    @staticmethod
+    def restore_weights_before_loading(model, target_device):
+        _FakeReloadLoader.calls.append("restore")
+
+    @staticmethod
+    def postprocess_weights(model, target_device):
+        _FakeReloadLoader.calls.append("postprocess")
+
+
+@pytest.fixture
+def _fake_sglang_reload_loader(monkeypatch):
+    _FakeReloadLoader.calls = []
+    _install_sglang_runai_loader_modules(
+        monkeypatch, MagicMock(), SimpleNamespace(AUTO="auto")
+    )
+    sys.modules["sglang.srt.model_loader.loader"].DefaultModelLoader = (
+        _FakeReloadLoader
+    )
+    return _FakeReloadLoader.calls
+
+
+class TestSglangAdapterReload:
+    def test_reload_native_load_defers_postprocess_to_end_of_reload(
+        self, _fake_sglang_reload_loader
+    ):
+        adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+        model = nn.Linear(2, 2)
+        result = LoadResult(value=model, model=model)
+        adapter.is_reload = True
+        adapter.begin_streaming_reload(result)
+        adapter.load_via_native(result)
+        adapter.end_streaming_reload(result)
+        assert _fake_sglang_reload_loader == [
+            "restore",
+            "load_weights_only",
+            "postprocess",
+        ]
+
+    def test_cold_native_load_postprocesses_itself(self, _fake_sglang_reload_loader):
+        adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+        model = nn.Linear(2, 2)
+        adapter.load_via_native(LoadResult(value=model, model=model))
+        assert _fake_sglang_reload_loader == ["load_weights_and_postprocess"]
