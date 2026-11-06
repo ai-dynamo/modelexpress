@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT: bool
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_DOWNLOAD_WORKERS: int
+    MX_REFIT_UPLOAD_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
     MX_REFIT_FULL_STREAMING: bool
@@ -196,6 +197,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
             int(os.environ.get("MX_S3_DOWNLOAD_WORKERS", 16)),
             "MX_S3_DOWNLOAD_WORKERS",
         )
+    ),
+    "MX_REFIT_UPLOAD_WORKERS": lambda: (
+        positive_int_env("MX_REFIT_UPLOAD_WORKERS", 8)
+        if "MX_REFIT_UPLOAD_WORKERS" in os.environ
+        else environment_variables["MX_S3_UPLOAD_WORKERS"]()
     ),
     "MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES": lambda: require_positive_int(
         int(

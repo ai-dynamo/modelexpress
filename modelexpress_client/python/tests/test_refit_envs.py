@@ -175,6 +175,29 @@ def test_unknown_attribute_raises():
         _ = envs.NOT_A_REAL_ENV_VAR
 
 
+@pytest.mark.parametrize(
+    "neutral,legacy,expected",
+    [(None, None, 8), (None, "3", 3), ("5", "invalid", 5)],
+)
+def test_refit_upload_workers_precedence(monkeypatch, neutral, legacy, expected):
+    for name, value in (
+        ("MX_REFIT_UPLOAD_WORKERS", neutral), ("MX_S3_UPLOAD_WORKERS", legacy),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert envs.MX_REFIT_UPLOAD_WORKERS == expected
+
+
+@pytest.mark.parametrize("value", ["", "0", "invalid"])
+def test_invalid_refit_upload_workers_does_not_fall_back(monkeypatch, value):
+    monkeypatch.setenv("MX_REFIT_UPLOAD_WORKERS", value)
+    monkeypatch.setenv("MX_S3_UPLOAD_WORKERS", "3")
+    with pytest.raises(ValueError, match="MX_REFIT_UPLOAD_WORKERS"):
+        _ = envs.MX_REFIT_UPLOAD_WORKERS
+
+
 def test_blank_desired_version_is_unset(monkeypatch):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "  ")
     assert envs.MX_REFIT_DESIRED_VERSION_UID is None

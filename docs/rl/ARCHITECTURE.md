@@ -83,7 +83,7 @@ not implemented by this control-plane slice.
 NIXL manifest endpoints belong to their physical worker shards; a typed object
 storage source belongs directly to its durable `WeightVersion`. The protocol
 can identify S3, Azure Blob Storage, or GCS. The Refit service accepts S3 and Azure
-publications; the trainer SDK currently publishes only to S3. Generator checkpoint
+publications; the trainer SDK publishes to both providers. Generator checkpoint
 preparation and exact desired-version startup accept S3 and Azure Blob Storage.
 Startup reconstructs the full root and ordered deltas before engine loading.
 The server allows different providers within a run, including across delta-base
@@ -94,13 +94,13 @@ S3-only mirror for older servers. Readers fall back to `s3_uri` for older record
 without `object_storage_uri`. A missing provider still means S3; checkpoint bytes
 remain in object storage.
 On the NIXL path, weight bytes and full tensor manifests remain
-on trainer workers. On the S3 path, rank zero uploads the version's global index
+on trainer workers. On the object-storage path, rank zero uploads the global index
 after every trainer rank has uploaded its owned shard. `XOR_DELTA` versions use
 compressed XOR shards; `FULL_HF_CHECKPOINT` versions use native Hugging Face
 safetensor shards and omit `base_version_id`. Frameworks own
 tensor gathering, Hugging Face conversion, and bucketization, then pass a lazy
 canonical bucket stream to the trainer client, which owns delta processing,
-full-checkpoint serialization, and S3 shard construction.
+full-checkpoint serialization, and immutable shard uploads.
 Full-checkpoint staging uses the same bounded worker-pool pattern as delta
 staging to update the rank-local snapshot directly with immutable CPU tensors.
 `publish()` groups that snapshot into safetensors objects capped by
@@ -132,9 +132,9 @@ selection does not change the normal ModelStreamer loader. The downloader
 implementations own their resources behind a shared `get`/`close` interface. See
 [S3 transfer tuning](../../modelexpress_client/python/README.md#canonical-s3-transfer-tuning).
 
-Canonical S3 versions are retained for rollout fault recovery. Trainer
+Canonical object-storage versions are retained for rollout fault recovery. Trainer
 processes keep only the current base snapshot; older
-immutable S3 objects are governed by external bucket lifecycle policy.
+immutable objects are governed by external storage lifecycle policy.
 
 #### RL refit client architecture
 
@@ -320,13 +320,16 @@ The corresponding trainer composition is owned by `TrainerRuntime`. Public
 full-tensor NIXL and canonical-checkpoint object-storage publication remain separate
 method implementations. This keeps transport, payload preparation, engine
 geometry, and framework orchestration independently replaceable.
+For canonical publication, the runtime selects `S3Client` or `AzureBlobClient`.
+Both implement the internal `ObjectStorageWriter` interface for immutable writes
+and resource cleanup.
 
 Miles owns `UpdateWeightFromModelExpressDelta` in
 `miles.backends.training_utils.weight_update.protocols.modelexpress`. Its
 `modelexpress` transfer mode uses the shared SDK's staging and publication APIs
 below. The SDK does not depend on Miles.
 
-Canonical S3 publication accepts either `stage_shard(tensor_iter=...)` for a
+Canonical S3 and Azure publication accepts `stage_shard(tensor_iter=...)` for a
 complete weight stream or repeated `stage_shard(tensors=bucket)` calls for one
 version. The runtime dispatches these to the canonical method's `stage()` and
 `stage_bucket()` respectively. Both use the same bounded encoding pool for XOR
@@ -350,7 +353,11 @@ and `publish_version(version=...)`.
 Bucket staging retains the bucket and its tensors, so their contents must remain
 stable until publication finishes. Callers submit all buckets for one version
 before publishing, and retry failed uploads through the same publication handle.
-The base version advances only after successful publication.
+The current shared publication path has failure limits. A failed full-checkpoint
+index upload can leave non-root ranks with an advanced base. A shard upload failure
+can leave other ranks waiting in a collective. Also, re-serializing shards with
+multiple checksum entries can change metadata key order and cause an immutable
+retry conflict. These limits apply to both S3 and Azure.
 
 Staging initializes a fresh artifact and encoding pool for each new version;
 successful publication clears that state. Empty buckets initialize ranks with no
