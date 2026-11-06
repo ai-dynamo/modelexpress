@@ -97,27 +97,6 @@ def test_sglang_context_uses_tp_rank_for_matching_and_url_override():
     assert ctx.mx_client.server_url == "mx.example:9000"
 
 
-def test_sglang_context_captures_listener_without_changing_source_identity(monkeypatch):
-    from modelexpress.engines.sglang.readiness import SglangServerReadiness
-    from modelexpress.metadata.source_id import compute_mx_source_id
-
-    monkeypatch.setattr(
-        "modelexpress.engines.sglang.adapter.sglang_server_readiness",
-        lambda: SglangServerReadiness("http://127.0.0.1:9007/health", True),
-    )
-    first = build_sglang_load_context(_load_config(), _model_config(), _device_config())
-    assert first.artifact_ready_url == "http://127.0.0.1:9007/health"
-    assert first.artifact_ready_local is True
-
-    monkeypatch.setattr(
-        "modelexpress.engines.sglang.adapter.sglang_server_readiness",
-        lambda: SglangServerReadiness("https://127.0.0.1:9443/health", False),
-    )
-    second = build_sglang_load_context(_load_config(), _model_config(), _device_config())
-    assert second.artifact_ready_local is False
-    assert compute_mx_source_id(first.identity) == compute_mx_source_id(second.identity)
-
-
 @pytest.fixture(params=["legacy", "runtime_context"])
 def sglang_parallel(request, monkeypatch):
     """Represent the two SGLang parallel-state API surfaces."""
@@ -316,6 +295,84 @@ def test_sglang_adapter_discovery_uses_backend_predicate(
     tensors = adapter.discover_tensors(SimpleNamespace(model=model))
 
     assert list(tensors) == ["weight"]
+
+
+
+@pytest.mark.parametrize(
+    "class_module,excluded",
+    [
+        ("sglang.srt.distributed.parallel_state", True),
+        ("sglang.srt.distributed.device_communicators.custom_all_reduce", True),
+        ("torch.distributed.distributed_c10d", True),
+        ("torch.distributed", True),
+        ("sglang.srt.layers.communication.muse_spark_finalize_workspace", True),
+        ("sglang.srt.distributed_extra", False),
+        ("sglang.srt.layers.quantization.fp8", False),
+    ],
+)
+def test_sglang_discovery_keeps_distributed_state_local(
+    mock_accelerator_backend_cls, class_module, excluded
+):
+    """Communicator state stays local; hidden quant tensors still transfer."""
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    model = nn.Module()
+    model.quant = SimpleNamespace(scale=torch.ones(4))
+    coordinator = type("GroupCoordinator", (), {"__module__": class_module})()
+    epochs = torch.zeros(8, dtype=torch.int32)
+    slab = torch.zeros(16)
+    coordinator.ca_comm = SimpleNamespace(epochs=epochs, slab=slab)
+    model.tp_group = coordinator
+
+    registered = adapter.discover_tensors(LoadResult(value=model, model=model))
+    registered_ptrs = {t.data_ptr() for t in registered.values()}
+
+    assert model.quant.scale.data_ptr() in registered_ptrs
+    for tensor in (epochs, slab):
+        assert (tensor.data_ptr() in registered_ptrs) is not excluded
+    assert coordinator.ca_comm.epochs is epochs
+    assert coordinator.ca_comm.slab is slab
+
+
+@pytest.mark.parametrize(
+    "workspace_module,excluded",
+    [
+        ("sglang.srt.layers.communication.muse_spark_finalize_workspace", True),
+        ("sglang.srt.layers.moe.fused_moe", False),
+    ],
+)
+def test_sglang_discovery_keeps_aliased_communicator_state_local(
+    mock_accelerator_backend_cls, workspace_module, excluded
+):
+    """A workspace holding views of ca_comm's tensors must not leak them."""
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    model = nn.Module()
+    model.mlp = nn.Module()
+    coordinator = type(
+        "GroupCoordinator", (), {"__module__": "sglang.srt.distributed.parallel_state"}
+    )()
+    counter = torch.zeros(8, dtype=torch.int32)
+    slab = torch.zeros(16)
+    coordinator.ca_comm = SimpleNamespace(
+        _push_counter=counter, _push_workspaces=[slab[:8], slab[8:]]
+    )
+    model.tp_group = coordinator
+    workspace_cls = type(
+        "FinalizePushWorkspace", (), {"__module__": workspace_module}
+    )
+    workspace = workspace_cls()
+    workspace.communicator = coordinator.ca_comm
+    workspace.counter = coordinator.ca_comm._push_counter
+    workspace.peers = coordinator.ca_comm._push_workspaces
+    model.mlp.finalize_ar_workspace = workspace
+
+    registered = adapter.discover_tensors(LoadResult(value=model, model=model))
+    registered_ptrs = {t.data_ptr() for t in registered.values()}
+
+    for tensor in (counter, *workspace.peers):
+        assert (tensor.data_ptr() in registered_ptrs) is not excluded
+    assert workspace.counter is counter
 
 
 def test_sglang_adapter_post_load_delegates_to_child_module():
@@ -2078,3 +2135,27 @@ def test_transfer_engine_rejects_source_only_runtime_tensor():
         loader._receive_via_transfer_engine({}, transfer_engine, source,
                                             SimpleNamespace(global_rank=0))
     transfer_engine.submit_scatter_read.assert_not_called()
+
+
+@pytest.mark.parametrize("local_dummy", [False, True])
+def test_sglang_context_captures_http_readiness(monkeypatch, local_dummy):
+    from modelexpress.engines.sglang import adapter, artifacts, readiness
+
+    captured = readiness.SglangServerReadiness(
+        "http://127.0.0.1:9007/health", local_dummy=local_dummy
+    )
+    monkeypatch.delenv("MX_ARTIFACT_READY_URL", raising=False)
+    monkeypatch.setattr(adapter, "sglang_server_readiness", lambda: captured)
+    ctx = build_sglang_load_context(_load_config(), _model_config(), _device_config())
+    ctx.head_addr = "head.internal"
+    def unavailable():
+        raise AssertionError("Readiness must use the configuration captured at load")
+    monkeypatch.setattr(artifacts, "sglang_server_readiness", unavailable)
+    probe = MagicMock(return_value=True)
+    monkeypatch.setattr(artifacts._common_artifacts, "artifact_health_ready", probe)
+    assert ctx.artifact_ready_fn()
+    host = "127.0.0.1" if local_dummy else "head.internal"
+    probe.assert_called_once_with(f"http://{host}:9007/health", timeout_secs=5.0)
+    monkeypatch.setenv("MX_ARTIFACT_READY_URL", "https://custom-health/ready")
+    assert ctx.artifact_ready_fn()
+    assert probe.call_args.args == ("https://custom-health/ready",)

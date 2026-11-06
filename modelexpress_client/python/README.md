@@ -172,7 +172,7 @@ Shared client settings are registered in `modelexpress.envs`. RL settings are li
 | `MX_ARTIFACT_TRANSFER` | `0` | Transfer compatible vLLM TorchInductor, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | empty | Optional compile-configuration compatibility digest for cache discovery |
-| `MX_ARTIFACT_READY_URL` | From framework server config | Optional HTTP(S) readiness URL override, including remote IPs, hostnames and custom health paths. A valid explicit URL takes precedence. Automatic discovery applies when this variable is unset, empty or whitespace-only; see [Artifact readiness URL](#artifact-readiness-url). The endpoint does not enter source identity or compilation-cache hashes. |
+| `MX_ARTIFACT_READY_URL` | engine-specific | Explicit HTTP readiness override for weights and artifacts. When unset, empty, or whitespace-only, vLLM derives its health URL from resolved serving settings and SGLang uses its native scheduler startup hook. |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Seconds between READY status heartbeats for published sources, including reshard rendezvous sources; keep below the server heartbeat timeout |
 
@@ -184,14 +184,16 @@ point to a remote head node or a dedicated health endpoint, for example
 it is not replaced by the local framework's host or `--port`.
 
 Only when the variable is **unset, an empty string, or whitespace-only** does
-ModelExpress automatically use vLLM/SGLang's resolved HTTP server configuration.
+ModelExpress use vLLM's resolved HTTP server configuration.
 Config-file settings and CLI overrides follow the framework's own precedence.
 For example, `vllm serve MODEL --port 8001 --load-format modelexpress` uses
 `http://127.0.0.1:8001/health` without an extra URL setting. Without a port
-override, the framework defaults apply (vLLM 8000, SGLang 30000).
+override, vLLM defaults to port 8000. SGLang uses its native scheduler startup
+hook instead of HTTP when the URL is unset or blank. Include `modelexpress` if
+`SGLANG_PLUGINS` is configured; older versions without hooks need an explicit URL.
 
-Headless-node routing, SGLang's local dummy health listeners, TLS and fallback
-behavior are described in [Readiness server configuration](../../docs/DEPLOYMENT.md#readiness-server-configuration).
+Headless-node routing, TLS, and fallback behavior are described in
+[Artifact startup readiness](../../docs/DEPLOYMENT.md#artifact-startup-readiness).
 
 ### Canonical S3 Transfer Tuning
 

@@ -27,6 +27,7 @@ from modelexpress.metadata.readiness import health_url_from_server_args
 def clear_readiness_env(monkeypatch):
     monkeypatch.delenv("MX_ARTIFACT_READY_URL", raising=False)
     monkeypatch.delenv("LWS_LEADER_ADDRESS", raising=False)
+    monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
 
 
 @pytest.mark.parametrize(
@@ -71,27 +72,41 @@ def test_shared_url_builder_does_not_interpret_engine_transport_flags(settings):
 
 
 @pytest.fixture
-def patched_engine_args(monkeypatch):
+def engine_args_cls(monkeypatch):
     class EngineArgs:
         @classmethod
         def from_cli_args(cls, args):
             result = cls()
             result.model = args.model
+            result.load_format = getattr(args, "load_format", "modelexpress")
+            result.model_loader_extra_config = getattr(
+                args, "model_loader_extra_config", None
+            )
             return result
 
         def create_engine_config(self, usage_context=None):
             return SimpleNamespace(
                 model=self.model,
                 usage_context=usage_context,
-                load_config=SimpleNamespace(load_format="modelexpress"),
+                load_config=SimpleNamespace(
+                    load_format=self.load_format,
+                    model_loader_extra_config=getattr(
+                        self, "model_loader_extra_config", None
+                    ),
+                ),
                 additional_config={"existing": "preserved"},
             )
 
     module = ModuleType("vllm.engine.arg_utils")
     module.EngineArgs = EngineArgs
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    assert patch_artifact_ready_url()
     return EngineArgs
+
+
+@pytest.fixture
+def patched_engine_args(engine_args_cls):
+    assert patch_artifact_ready_url()
+    return engine_args_cls
 
 
 @pytest.mark.parametrize("port", [8000, 9007])
@@ -108,10 +123,13 @@ def test_vllm_carries_resolved_frontend_configuration_to_worker(
     assert config.model == "example-model"
     assert config.usage_context == "serve"
     assert config.additional_config == {"existing": "preserved"}
+    assert config.load_config.model_loader_extra_config == {
+        "modelexpress_artifact_ready_url": f"http://127.0.0.1:{port}/health"
+    }
     # Both local worker copies and spawn/Ray serialization keep the endpoint.
     for worker_config in (copy.deepcopy(config), pickle.loads(pickle.dumps(config))):
         ctx = SimpleNamespace(
-            artifact_ready_url=worker_config.load_config._mx_artifact_ready_url,
+            load_config=worker_config.load_config,
             head_addr="127.0.0.1",
         )
         assert vllm_artifacts._vllm_health_url(ctx) == f"http://127.0.0.1:{port}/health"
@@ -123,22 +141,25 @@ def test_programmatic_vllm_engine_does_not_invent_a_serving_endpoint(
 ):
     args = patched_engine_args()
     args.model = "offline-model"
+    args.load_format = "modelexpress"
     config = args.create_engine_config()
-    assert not hasattr(config.load_config, "_mx_artifact_ready_url")
+    assert "modelexpress_artifact_ready_url" not in (
+        getattr(config.load_config, "model_loader_extra_config", None) or {}
+    )
 
 
 @pytest.mark.parametrize("settings", [{"uds": "/tmp/model.sock"}, {"grpc": True}])
 def test_vllm_non_http_modes_do_not_advertise_an_unused_tcp_port(
     patched_engine_args, settings
 ):
-    args = SimpleNamespace(
-        model="example-model", host="0.0.0.0", port=9007, **settings
-    )
+    args = SimpleNamespace(model="example-model", host="0.0.0.0", port=9007, **settings)
     engine_args = patched_engine_args.from_cli_args(args)
     assert engine_args.model == "example-model"
-    assert engine_args._mx_artifact_ready_url is None
+    assert engine_args.model_loader_extra_config is None
     config = engine_args.create_engine_config()
-    assert not hasattr(config.load_config, "_mx_artifact_ready_url")
+    assert "modelexpress_artifact_ready_url" not in (
+        getattr(config.load_config, "model_loader_extra_config", None) or {}
+    )
 
 
 @pytest.mark.parametrize("settings", [{"headless": True}, {"api_server_count": 0}])
@@ -150,13 +171,372 @@ def test_headless_vllm_redirects_automatic_bind_ip_to_head(
     )
     config = patched_engine_args.from_cli_args(args).create_engine_config()
     ctx = SimpleNamespace(
-        artifact_ready_url=config.load_config._mx_artifact_ready_url,
+        load_config=config.load_config,
         head_addr="10.0.0.1",
         node_rank=1,
     )
     assert vllm_artifacts._vllm_health_url(ctx) == "http://10.0.0.1:9007/health"
     monkeypatch.setenv("MX_ARTIFACT_READY_URL", "http://custom-health:9010/ready")
     assert vllm_artifacts._vllm_health_url(ctx) == "http://custom-health:9010/ready"
+
+
+@pytest.mark.parametrize("resolve", [vllm_artifacts._vllm_health_url])
+def test_explicit_url_wins_over_framework_configuration(monkeypatch, resolve):
+    monkeypatch.setenv("MX_ARTIFACT_READY_URL", "https://health.internal:9443/ready")
+    ctx = SimpleNamespace(
+        load_config=SimpleNamespace(
+            model_loader_extra_config={
+                "modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health"
+            }
+        )
+    )
+    assert resolve(ctx) == "https://health.internal:9443/ready"
+
+
+@pytest.mark.parametrize("resolve", [vllm_artifacts._vllm_health_url])
+def test_multi_node_health_keeps_resolved_http_port(monkeypatch, resolve):
+    monkeypatch.setenv("MX_ARTIFACT_READY_URL", "   ")
+    ctx = SimpleNamespace(
+        load_config=SimpleNamespace(
+            model_loader_extra_config={
+                "modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health"
+            }
+        ),
+        head_addr="head.internal",
+    )
+    assert resolve(ctx) == "http://head.internal:9007/health"
+
+
+def test_probe_reaches_the_resolved_server_port():
+    paths = []
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            paths.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    with HTTPServer(("127.0.0.1", 0), HealthHandler) as server:
+        thread = Thread(target=server.handle_request, daemon=True)
+        thread.start()
+        try:
+            url = health_url_from_server_args(SimpleNamespace(port=server.server_port))
+            ctx = SimpleNamespace(
+                load_config=SimpleNamespace(
+                    model_loader_extra_config={"modelexpress_artifact_ready_url": url}
+                )
+            )
+            assert artifact_health_ready(vllm_artifacts._vllm_health_url(ctx))
+        finally:
+            thread.join(timeout=3)
+    assert paths == ["/health"]
+
+
+@pytest.mark.parametrize(
+    "use_yaml,cli_port,expected_port,extra_args",
+    [
+        (False, None, 8000, []),
+        (True, None, 9100, []),
+        (True, 9101, 9101, []),
+        (True, 9101, 9101, ["--headless", "--host", "10.0.0.2"]),
+        (False, 9007, None, ["--uds", "/tmp/mx-test-no-created.sock"]),
+    ],
+)
+def test_native_vllm_parser_preserves_config_precedence_and_cache_hash(
+    monkeypatch, tmp_path, use_yaml, cli_port, expected_port, extra_args
+):
+    arg_utils = pytest.importorskip("vllm.engine.arg_utils")
+    if not isinstance(arg_utils, ModuleType):
+        pytest.skip("Requires an installed vLLM, rather than the conftest mocks")
+    serve = pytest.importorskip("vllm.entrypoints.cli.serve")
+    parser_utils = pytest.importorskip("vllm.utils.argparse_utils")
+    load_module = pytest.importorskip("vllm.config.load")
+
+    # Parser construction loads general plugins. Keep their logging setup from
+    # attaching pytest's capture handlers to other tests in this process.
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.configure_vllm_logging", lambda: None
+    )
+    parser = parser_utils.FlexibleArgumentParser()
+    serve.ServeSubcommand().subparser_init(parser.add_subparsers(dest="subparser"))
+    engine_cls = arg_utils.EngineArgs
+    monkeypatch.setattr(
+        engine_cls,
+        "from_cli_args",
+        classmethod(inspect.unwrap(engine_cls.from_cli_args.__func__)),
+    )
+    before_hash = []
+
+    def create_without_loading_a_model(self, *args, **kwargs):
+        load_config = self.create_load_config()
+        before_hash.append(load_module.LoadConfig(load_format="modelexpress").compute_hash())
+        return SimpleNamespace(load_config=load_config, additional_config={})
+
+    monkeypatch.setattr(
+        engine_cls, "create_engine_config", create_without_loading_a_model
+    )
+    patch_artifact_ready_url()
+    argv = ["serve", "/tmp/mx-test-no-model-loading", "--load-format", "modelexpress"]
+    if use_yaml:
+        config = tmp_path / "serve.yaml"
+        config.write_text("port: 9100\n")
+        argv.extend(["--config", str(config)])
+    if cli_port is not None:
+        argv.extend(["--port", str(cli_port)])
+    argv.extend(extra_args)
+    args = parser.parse_args(argv)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    # Avoid constructor-side model lookup: this case tests the real parser,
+    # conversion and LoadConfig serialization, not model discovery or loading.
+    monkeypatch.setattr(engine_cls, "__post_init__", lambda self: None)
+    config = engine_cls.from_cli_args(args).create_engine_config()
+    worker_load_config = pickle.loads(pickle.dumps(config.load_config))
+    if expected_port is None:
+        assert "modelexpress_artifact_ready_url" not in (worker_load_config.model_loader_extra_config or {})
+        assert worker_load_config.compute_hash() == before_hash[0]
+        return
+    assert worker_load_config.model_loader_extra_config["modelexpress_artifact_ready_url"] == (
+        f"http://127.0.0.1:{expected_port}/health"
+    )
+    ctx = SimpleNamespace(
+        load_config=worker_load_config,
+        head_addr="10.0.0.1" if args.headless else "127.0.0.1",
+    )
+    expected_host = "10.0.0.1" if args.headless else "127.0.0.1"
+    assert vllm_artifacts._vllm_health_url(ctx) == (
+        f"http://{expected_host}:{expected_port}/health"
+    )
+    assert worker_load_config.compute_hash() == before_hash[0]
+    from modelexpress.engines.vllm.adapter import _native_load_config
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+    native_config = _native_load_config(worker_load_config)
+    DefaultModelLoader(native_config)
+    assert native_config.model_loader_extra_config == {}
+    assert worker_load_config.model_loader_extra_config == {
+        "modelexpress_artifact_ready_url": f"http://127.0.0.1:{expected_port}/health"
+    }
+    assert config.additional_config == {}
+
+
+@pytest.mark.parametrize("method", ["from_cli_args"])
+@pytest.mark.parametrize("shape", ["missing", "staticmethod", "async"])
+def test_unsupported_methods_leave_both_hooks_untouched(
+    engine_args_cls, monkeypatch, method, shape, caplog
+):
+    if shape == "missing":
+        monkeypatch.delattr(engine_args_cls, method)
+    elif shape == "staticmethod":
+        monkeypatch.setattr(
+            engine_args_cls, method, staticmethod(lambda *args, **kwargs: None)
+        )
+    else:
+
+        async def unsupported(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(
+            engine_args_cls,
+            method,
+            classmethod(unsupported) if method == "from_cli_args" else unsupported,
+        )
+    before = tuple(
+        inspect.getattr_static(engine_args_cls, name, None)
+        for name in ("from_cli_args", "create_engine_config")
+    )
+    assert patch_artifact_ready_url() is False
+    assert (
+        tuple(
+            inspect.getattr_static(engine_args_cls, name, None)
+            for name in ("from_cli_args", "create_engine_config")
+        )
+        == before
+    )
+    assert "readiness" in caplog.text.lower()
+
+
+def test_additional_arguments_are_forwarded(engine_args_cls, monkeypatch):
+    calls = []
+
+    def from_cli_args(cls, args, *extra, **kwargs):
+        calls.append((cls, extra, kwargs))
+        result = cls()
+        result.model = args.model
+        result.load_format = "mx"
+        result.model_loader_extra_config = None
+        return result
+
+    def create_config(self, *extra, **kwargs):
+        calls.append((self, extra, kwargs))
+        return SimpleNamespace(
+            load_config=SimpleNamespace(
+                load_format=self.load_format,
+                model_loader_extra_config=self.model_loader_extra_config,
+            )
+        )
+
+    monkeypatch.setattr(engine_args_cls, "from_cli_args", classmethod(from_cli_args))
+    monkeypatch.setattr(engine_args_cls, "create_engine_config", create_config)
+    assert patch_artifact_ready_url()
+
+    class AsyncEngineArgs(engine_args_cls):
+        pass
+
+    namespace = SimpleNamespace(model="model", host="0.0.0.0", port=9007)
+    args = AsyncEngineArgs.from_cli_args(namespace, "future", option=True)
+    config = args.create_engine_config("serve", future=True)
+    assert calls == [
+        (AsyncEngineArgs, ("future",), {"option": True}),
+        (args, ("serve",), {"future": True}),
+    ]
+    assert config.load_config.model_loader_extra_config == {
+        "modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health"
+    }
+    keyword_args = AsyncEngineArgs.from_cli_args(args=namespace, option=True)
+    assert (
+        keyword_args.create_engine_config().load_config.model_loader_extra_config["modelexpress_artifact_ready_url"]
+        == "http://127.0.0.1:9007/health"
+    )
+
+
+@pytest.mark.parametrize("load_format", ["auto", "safetensors", "dummy"])
+def test_other_loaders_receive_no_readiness_metadata(patched_engine_args, load_format):
+    args = patched_engine_args.from_cli_args(
+        SimpleNamespace(model="model", port=9007, load_format=load_format)
+    )
+    config = args.create_engine_config()
+    assert not hasattr(args, "_mx_artifact_ready_url")
+    assert "modelexpress_artifact_ready_url" not in (
+        getattr(config.load_config, "model_loader_extra_config", None) or {}
+    )
+
+
+@pytest.mark.parametrize("enabled,url", [(False, ""), (True, "http://override/health")])
+def test_unneeded_discovery_leaves_config_untouched(
+    patched_engine_args, monkeypatch, enabled, url
+):
+    monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1" if enabled else "0")
+    monkeypatch.setenv("MX_ARTIFACT_READY_URL", url)
+    args = patched_engine_args.from_cli_args(SimpleNamespace(model="model", port=9007))
+    assert not hasattr(args, "_mx_artifact_ready_url")
+    assert "modelexpress_artifact_ready_url" not in (
+        args.create_engine_config().load_config.model_loader_extra_config or {}
+    )
+
+
+def test_engine_config_creation_is_not_patched(engine_args_cls):
+    original = engine_args_cls.create_engine_config
+    assert patch_artifact_ready_url()
+    assert engine_args_cls.create_engine_config is original
+
+
+def test_readiness_preserves_user_loader_options_and_shared_dict(patched_engine_args):
+    options = {"num_threads": 4}
+    namespace = SimpleNamespace(
+        model="model", port=9007, model_loader_extra_config=options
+    )
+    args = patched_engine_args.from_cli_args(namespace)
+    assert options == {"num_threads": 4}
+    assert args.create_engine_config().load_config.model_loader_extra_config == {
+        "num_threads": 4,
+        "modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health",
+    }
+
+
+def test_generic_patch_marker_does_not_skip_readiness_adapter(engine_args_cls):
+    engine_args_cls.from_cli_args.__func__.__modelexpress_patched__ = True
+    assert patch_artifact_ready_url()
+    args = engine_args_cls.from_cli_args(SimpleNamespace(model="model", port=9007))
+    assert (
+        args.create_engine_config().load_config.model_loader_extra_config["modelexpress_artifact_ready_url"]
+        == "http://127.0.0.1:9007/health"
+    )
+
+
+def test_variadic_cli_wrapper_is_supported(engine_args_cls, monkeypatch):
+    original = engine_args_cls.from_cli_args.__func__
+
+    def variadic(cls, *args, **kwargs):
+        return original(cls, *args, **kwargs)
+
+    monkeypatch.setattr(engine_args_cls, "from_cli_args", classmethod(variadic))
+    assert patch_artifact_ready_url()
+    args = engine_args_cls.from_cli_args(SimpleNamespace(model="model", port=9007))
+    assert (
+        args.create_engine_config().load_config.model_loader_extra_config["modelexpress_artifact_ready_url"]
+        == "http://127.0.0.1:9007/health"
+    )
+
+
+def test_unknown_namespace_keyword_preserves_engine_result(
+    engine_args_cls, monkeypatch, caplog
+):
+    original = engine_args_cls.from_cli_args.__func__
+
+    def from_cli_args(cls, namespace):
+        return original(cls, namespace)
+
+    monkeypatch.setattr(engine_args_cls, "from_cli_args", classmethod(from_cli_args))
+    assert patch_artifact_ready_url()
+    args = engine_args_cls.from_cli_args(
+        namespace=SimpleNamespace(model="model", port=9007)
+    )
+    assert args.model == "model"
+    assert "modelexpress_artifact_ready_url" not in (
+        args.create_engine_config().load_config.model_loader_extra_config or {}
+    )
+    assert "readiness" in caplog.text.lower()
+
+
+@pytest.mark.parametrize("method", ["from_cli_args", "create_engine_config"])
+def test_original_engine_errors_propagate_unchanged(
+    engine_args_cls, monkeypatch, method
+):
+    error = AttributeError("original engine error")
+
+    def from_cli_args(cls, namespace):
+        raise error
+
+    def create_engine_config(self):
+        raise error
+
+    replacement = (
+        classmethod(from_cli_args)
+        if method == "from_cli_args"
+        else create_engine_config
+    )
+    monkeypatch.setattr(engine_args_cls, method, replacement)
+    assert patch_artifact_ready_url()
+    with pytest.raises(AttributeError) as caught:
+        args = engine_args_cls.from_cli_args(SimpleNamespace(model="model", port=9007))
+        args.create_engine_config()
+    assert caught.value is error
+
+
+def test_frozen_engine_args_preserve_engine_result(
+    engine_args_cls, monkeypatch, caplog
+):
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class FrozenArgs(engine_args_cls):
+        model: str
+        load_format: str = "modelexpress"
+
+        @classmethod
+        def from_cli_args(cls, namespace):
+            return cls(model=namespace.model)
+
+    monkeypatch.setattr(sys.modules["vllm.engine.arg_utils"], "EngineArgs", FrozenArgs)
+    assert patch_artifact_ready_url()
+    args = FrozenArgs.from_cli_args(SimpleNamespace(model="model", port=9007))
+    assert args.model == "model"
+    assert args.create_engine_config().load_config.load_format == "modelexpress"
+    assert not hasattr(args, "_mx_artifact_ready_url")
+    assert "readiness" in caplog.text.lower()
 
 
 @pytest.mark.parametrize("getter_name", ["get_serving", "get_global_server_args"])
@@ -170,6 +550,7 @@ def test_sglang_reads_resolved_configuration_from_supported_versions(
     module.get_parallel = lambda: SimpleNamespace(node_rank=0)
     monkeypatch.setattr(sglang_readiness, "import_module", lambda name: module)
     assert sglang_artifacts._sglang_health_url() == f"http://127.0.0.1:{port}/health"
+
 
 
 def test_sglang_falls_back_when_runtime_context_is_not_published(monkeypatch):
@@ -187,6 +568,7 @@ def test_sglang_falls_back_when_runtime_context_is_not_published(monkeypatch):
     assert sglang_artifacts._sglang_health_url() == "http://127.0.0.1:9010/health"
 
 
+
 @pytest.mark.parametrize("getter_name", ["get_serving", "get_global_server_args"])
 @pytest.mark.parametrize("mode_name", ["grpc_mode", "smg_grpc_mode"])
 def test_sglang_grpc_only_configuration_has_no_inferred_http_endpoint(
@@ -198,6 +580,7 @@ def test_sglang_grpc_only_configuration_has_no_inferred_http_endpoint(
     module = SimpleNamespace(**{getter_name: lambda: args})
     monkeypatch.setattr(sglang_readiness, "import_module", lambda name: module)
     assert sglang_readiness.sglang_server_readiness().url is None
+
 
 
 @pytest.mark.parametrize("getter_name", ["get_serving", "get_global_server_args"])
@@ -218,14 +601,6 @@ def test_sglang_http_server_with_an_additional_grpc_port_keeps_http_readiness(
         "http://127.0.0.1:9007/health"
     )
 
-
-def test_sglang_follower_keeps_its_local_dummy_health_listener():
-    ctx = SimpleNamespace(
-        artifact_ready_url="http://10.0.0.2:9007/health",
-        head_addr="10.0.0.1",
-        node_rank=1,
-    )
-    assert sglang_artifacts._sglang_health_url(ctx) == "http://10.0.0.2:9007/health"
 
 
 @pytest.mark.parametrize("modern", [False, True])
@@ -267,6 +642,7 @@ def test_sglang_tls_follower_probes_its_local_plain_http_listener(
     assert sglang_artifacts._sglang_health_url() == expected
     monkeypatch.setenv("MX_ARTIFACT_READY_URL", "https://custom-health:9443/ready")
     assert sglang_artifacts._sglang_health_url() == "https://custom-health:9443/ready"
+
 
 
 @pytest.mark.parametrize(
@@ -316,6 +692,7 @@ def test_sglang_listener_selection_uses_native_rust_placement(
     assert placement_calls == ([True] if rust and node_rank > 0 else [])
 
 
+
 @pytest.mark.parametrize("unknown_rust", [False, True])
 def test_sglang_does_not_claim_a_listener_when_native_placement_is_unavailable(
     monkeypatch, unknown_rust
@@ -344,28 +721,18 @@ def test_sglang_does_not_claim_a_listener_when_native_placement_is_unavailable(
     assert sglang_readiness.sglang_server_readiness().url is None
 
 
-def test_sglang_publisher_uses_captured_local_listener_without_runtime_getters(
-    monkeypatch,
-):
-    monkeypatch.setenv("LWS_LEADER_ADDRESS", "tls-head.internal")
 
+def test_sglang_publisher_uses_captured_local_listener_without_runtime_getters(monkeypatch):
+    monkeypatch.setenv("LWS_LEADER_ADDRESS", "tls-head.internal")
     def unavailable():
         raise AssertionError("The worker already captured its listener configuration")
-
     monkeypatch.setattr(sglang_artifacts, "sglang_server_readiness", unavailable)
-    ctx = SimpleNamespace(
-        artifact_ready_url="http://127.0.0.1:9007/health", artifact_ready_local=True
+    readiness = sglang_readiness.SglangServerReadiness(
+        "http://127.0.0.1:9007/health", local_dummy=True
     )
-    assert sglang_artifacts._sglang_health_url(ctx) == "http://127.0.0.1:9007/health"
-
-
-@pytest.mark.parametrize(
-    "resolve", [vllm_artifacts._vllm_health_url, sglang_artifacts._sglang_health_url]
-)
-def test_explicit_url_wins_over_framework_configuration(monkeypatch, resolve):
-    monkeypatch.setenv("MX_ARTIFACT_READY_URL", "https://health.internal:9443/ready")
-    ctx = SimpleNamespace(artifact_ready_url="http://127.0.0.1:9007/health")
-    assert resolve(ctx) == "https://health.internal:9443/ready"
+    assert sglang_artifacts._sglang_health_url(SimpleNamespace(), readiness) == (
+        "http://127.0.0.1:9007/health"
+    )
 
 
 def test_explicit_sglang_url_does_not_require_runtime_configuration(monkeypatch):
@@ -380,112 +747,10 @@ def test_explicit_sglang_url_does_not_require_runtime_configuration(monkeypatch)
     assert sglang_artifacts._sglang_health_url() == "http://health.internal:9009/ready"
 
 
-@pytest.mark.parametrize(
-    "resolve", [vllm_artifacts._vllm_health_url, sglang_artifacts._sglang_health_url]
-)
-def test_multi_node_health_keeps_resolved_http_port(monkeypatch, resolve):
-    monkeypatch.setenv("MX_ARTIFACT_READY_URL", "   ")
-    ctx = SimpleNamespace(
-        artifact_ready_url="http://127.0.0.1:9007/health", head_addr="head.internal"
-    )
-    assert resolve(ctx) == "http://head.internal:9007/health"
-
-
-def test_probe_reaches_the_resolved_server_port():
-    paths = []
-
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            paths.append(self.path)
-            self.send_response(200)
-            self.end_headers()
-
-        def log_message(self, *args):
-            pass
-
-    with HTTPServer(("127.0.0.1", 0), HealthHandler) as server:
-        thread = Thread(target=server.handle_request, daemon=True)
-        thread.start()
-        try:
-            url = health_url_from_server_args(SimpleNamespace(port=server.server_port))
-            ctx = SimpleNamespace(artifact_ready_url=url)
-            assert artifact_health_ready(vllm_artifacts._vllm_health_url(ctx))
-        finally:
-            thread.join(timeout=3)
-    assert paths == ["/health"]
-
-
-@pytest.mark.parametrize(
-    "use_yaml,cli_port,expected_port,extra_args",
-    [
-        (False, None, 8000, []),
-        (True, None, 9100, []),
-        (True, 9101, 9101, []),
-        (True, 9101, 9101, ["--headless", "--host", "10.0.0.2"]),
-        (False, 9007, None, ["--uds", "/tmp/mx-test-no-created.sock"]),
-    ],
-)
-def test_native_vllm_parser_preserves_config_precedence_and_cache_hash(
-    monkeypatch, tmp_path, use_yaml, cli_port, expected_port, extra_args
-):
-    arg_utils = pytest.importorskip("vllm.engine.arg_utils")
-    if not isinstance(arg_utils, ModuleType):
-        pytest.skip("Requires an installed vLLM, rather than the conftest mocks")
-    serve = pytest.importorskip("vllm.entrypoints.cli.serve")
-    parser_utils = pytest.importorskip("vllm.utils.argparse_utils")
-    load_module = pytest.importorskip("vllm.config.load")
-
-    # Parser construction loads general plugins. Keep their logging setup from
-    # attaching pytest's capture handlers to other tests in this process.
-    monkeypatch.setattr(
-        "modelexpress.engines.vllm.configure_vllm_logging", lambda: None
-    )
-    parser = parser_utils.FlexibleArgumentParser()
-    serve.ServeSubcommand().subparser_init(parser.add_subparsers(dest="subparser"))
-    engine_cls = arg_utils.EngineArgs
-    monkeypatch.setattr(
-        engine_cls,
-        "from_cli_args",
-        classmethod(inspect.unwrap(engine_cls.from_cli_args.__func__)),
-    )
-    before_hash = []
-
-    def create_without_loading_a_model(self, *args, **kwargs):
-        load_config = load_module.LoadConfig(load_format="modelexpress")
-        before_hash.append(load_config.compute_hash())
-        return SimpleNamespace(load_config=load_config, additional_config={})
-
-    monkeypatch.setattr(engine_cls, "create_engine_config", create_without_loading_a_model)
-    patch_artifact_ready_url()
-    argv = ["serve", "/tmp/mx-test-no-model-loading", "--load-format", "modelexpress"]
-    if use_yaml:
-        config = tmp_path / "serve.yaml"
-        config.write_text("port: 9100\n")
-        argv.extend(["--config", str(config)])
-    if cli_port is not None:
-        argv.extend(["--port", str(cli_port)])
-    argv.extend(extra_args)
-    args = parser.parse_args(argv)
-    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
-    # Avoid constructor-side model lookup: this case tests the real parser,
-    # conversion and LoadConfig serialization, not model discovery or loading.
-    monkeypatch.setattr(engine_cls, "__post_init__", lambda self: None)
-    config = engine_cls.from_cli_args(args).create_engine_config()
-    worker_load_config = pickle.loads(pickle.dumps(config.load_config))
-    if expected_port is None:
-        assert not hasattr(worker_load_config, "_mx_artifact_ready_url")
-        assert worker_load_config.compute_hash() == before_hash[0]
-        return
-    assert worker_load_config._mx_artifact_ready_url == (
-        f"http://127.0.0.1:{expected_port}/health"
-    )
-    ctx = SimpleNamespace(
-        artifact_ready_url=worker_load_config._mx_artifact_ready_url,
-        head_addr="10.0.0.1" if args.headless else "127.0.0.1",
-    )
-    expected_host = "10.0.0.1" if args.headless else "127.0.0.1"
-    assert vllm_artifacts._vllm_health_url(ctx) == (
-        f"http://{expected_host}:{expected_port}/health"
-    )
-    assert worker_load_config.compute_hash() == before_hash[0]
-    assert config.additional_config == {}
+def test_sglang_retries_listener_discovery_when_load_time_config_was_unavailable(monkeypatch):
+    serving = SimpleNamespace(port=9007, node_rank=0)
+    module = SimpleNamespace(get_serving=lambda: serving)
+    monkeypatch.setattr(sglang_readiness, "import_module", lambda name: module)
+    assert sglang_artifacts._sglang_health_url(
+        SimpleNamespace(), sglang_readiness.SglangServerReadiness()
+    ) == "http://127.0.0.1:9007/health"

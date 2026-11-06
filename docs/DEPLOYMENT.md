@@ -874,9 +874,11 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
 | `MX_ARTIFACT_MOONCAKE_NAMESPACE` | `modelexpress/artifacts` | Key prefix used by the Mooncake artifact backend. |
 | `MX_MOONCAKE_CONFIG_PATH` | (unset) | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback. |
-| `MX_ARTIFACT_READY_URL` | From framework server config | Explicit HTTP(S) readiness URL override. When unset, artifact publishers use the engine's resolved HTTP host and port, including config-file and CLI overrides; wildcard bind hosts become loopback addresses. Framework defaults are port 8000 for vLLM and 30000 for SGLang. Non-head nodes retain the head-host rewrite described in [Multi-node readiness](#multi-node-readiness). Probe timeouts are 1 second for vLLM and 5 seconds for SGLang. |
+| `MX_P2P_COLD_START` | `0` | Opt in to lease-coordinated concurrent cold starts with vLLM and a centralized Redis-backed MX server. Supports fixed non-elastic TP, PP, DP, EP and speculative decoding. TP, DP and PP have been validated on GPUs; EP has not. Prefill or decode context parallelism greater than one is rejected by the opt-in path; reload, sleep/wake and elastic EP are unsupported. |
+| `MX_P2P_COLD_START_WAIT_TIMEOUT_SECS` | `600` | Maximum time in seconds for cold-start donor discovery and election before skipping RDMA and continuing with the remaining load strategies. Also caps total donor lease renewal time from acquisition. Must be positive and less than 1500 seconds; invalid values use the default. This leaves a margin below the default 1800-second Gloo timeout, but deployments with a shorter CPU process-group timeout must configure a shorter MX wait. |
+| `MX_ARTIFACT_READY_URL` | engine-specific | Explicit HTTP readiness override for weights and artifacts. When unset, empty, or whitespace-only, both engines derive their health URLs from resolved serving settings. |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
-| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
+| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile and kernel JIT cache (Triton, DeepGEMM, TileLang, CuTe DSL, FlashInfer; SGLang also TVM-FFI) artifact source pools. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; SGLang draft P2P also requires a non-empty revision. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
@@ -1149,6 +1151,35 @@ handles.
 
 ### P2P Metadata Exchange
 
+With `MX_P2P_COLD_START=1`, replica rank zero coordinates via a 60-second
+Redis lease, renewed every 20 seconds. Followers check READY ranks every two
+seconds. The server accepts lease terms from 1 to 600 seconds; this limits each
+term. The configured cold-start wait timeout also caps total donor renewal time
+from acquisition, after which the donor attempts to release the lease. The lease
+may also be released earlier after READY ranks are discovered. Transient discovery
+and election RPC failures are retried for up to three seconds after the first failure,
+within the overall wait deadline.
+If coordination fails or the configured cold-start wait timeout expires, the replica's workers skip the
+built-in RDMA strategy and continue through the remaining loading strategies;
+successful loads can still be published as peers. Plugins are unaffected, and
+multiple replicas may then load from storage concurrently. Subsequent strategy
+selection and runtime failures are not coordinated across workers and can still
+prevent startup. The timeout starts after worker-group validation; it does not
+bound collective operations or subsequent model loading. A donor can continue
+loading after its lease is released or expires; it is not fenced from publishing,
+and another donor can load from storage concurrently. The lease is scoped to source identity, not accelerator
+compatibility, and the normal load strategy can fall back to object storage.
+Election runs at weight loading and does not prevent earlier downloads. For
+server-backed, non-shared storage, set `MODEL_EXPRESS_NO_SHARED_STORAGE=1`
+and configure the MX server so the vLLM loader leaves weight acquisition to
+the strategy chain. Metadata may still be fetched before election.
+
+On UCX/RC deployments where short GPU reads are emulated in the source process,
+peer reads during CUDA graph capture can invalidate capture. Operators may set
+`UCX_RC_MLX5_TX_INLINE_RESP=0` and `UCX_PROTO_EMULATION_ENABLE=n` for affected
+configurations, or explicitly defer publication using `MX_ARTIFACT_READY_URL`.
+Validate UCX protocol selection and performance for the deployment.
+
 P2P metadata exchange is enabled by default. Source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch tensor manifests or artifact manifests directly from the source worker rather than pulling them through the central store. For file-backed cache artifacts, targets call `PrepareArtifactChunk` and `ReleaseArtifactChunk` while bytes move through NIXL into target-local staging, then install the staged artifact into the runtime cache directory. The division of responsibility depends on which metadata backend is in use:
 
 RL generator peer leases and in-place update safety are described in the [RL refit architecture](rl/ARCHITECTURE.md#generator-peer-lease-behavior).
@@ -1157,6 +1188,15 @@ RL generator peer leases and in-place update safety are described in the [RL ref
 - **`k8s-service` backend:** auto-enabled for tensor metadata. The backend declares itself decentralized (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P tensor path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly. File-backed artifact transfer currently requires a central-coordinator backend (`redis` or `kubernetes`) because `k8s-service` does not yet publish `artifact_source` discovery metadata.
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
+
+Worker metadata endpoints may use DNS hostnames or numeric IPv4/IPv6 addresses.
+Before fetching NIXL metadata, the client resolves hostnames using the system
+resolver and selects the first IPv4 or IPv6 address in resolver order; it does
+not retry other addresses if the connection fails. Numeric addresses bypass
+DNS, bracketed IPv6 literals are normalized, and IPv6 scope IDs are preserved.
+DNS failures are reported before calling NIXL. IPv6 socket metadata exchange
+requires a NIXL build containing
+[IPv6 support from PR #2236](https://github.com/ai-dynamo/nixl/pull/2236).
 
 ### Artifact Transfer Backends
 
@@ -1246,6 +1286,15 @@ should share caches and different across those that should not. Note that this
 partitions the pool but does not by itself make prefill and decode share a
 cache — they cannot, because vLLM's own cache keys already differ.
 
+The same digest partitions the kernel JIT caches (Triton, DeepGEMM, TileLang,
+CuTe DSL, FlashInfer, and SGLang's TVM-FFI). Their files are keyed per kernel,
+so a bundle from another compile configuration is never wrong, but it can be
+incomplete: which kernels a worker JIT-compiles follows its configuration, most
+visibly `max_num_batched_tokens`, which bounds the GEMM shapes DeepGEMM warms up.
+A prefill worker that installs a decode worker's DeepGEMM bundle reuses the
+smaller shape set and compiles the rest at startup. With the digest set per
+compile configuration, each worker installs only bundles produced under its own.
+
 To check whether a transferred cache was actually used, look for the
 effectiveness line the vLLM loader emits once the engine is up:
 
@@ -1266,40 +1315,44 @@ and Kubernetes deployments must use the matching `ModelMetadata` CRD containing
 `status.worker.artifactSource.nodeRank`. Mooncake includes the same rank in its
 deterministic object key and needs no MX metadata record.
 
-#### Readiness server configuration
+#### Artifact startup readiness
 
-`MX_ARTIFACT_READY_URL` takes precedence over the engine's serving configuration.
-Without an override, vLLM's parsed frontend arguments are carried in its load
-configuration to model workers. SGLang workers read the resolved serving
-configuration through the runtime-context API or the older global server-args
-API. A `port` from a framework config file and a CLI `--port` therefore follow
-that framework's own precedence rules; ModelExpress does not parse the file
-again. For example, `vllm serve MODEL --port 8001` probes
-`http://127.0.0.1:8001/health` without an extra environment variable.
+`MX_ARTIFACT_READY_URL` remains an optional HTTP(S) override. When unset, empty,
+or whitespace-only:
 
-The endpoint is separate from `SourceIdentity` and compilation-cache hashes.
-Changing the serving port does not invalidate artifact caches. TLS key/cert
-settings select HTTPS, which uses the standard Python certificate checks.
-The existing framework-default URL remains the fallback when no HTTP serving
-configuration is available (including vLLM with compatibility patches disabled).
-vLLM discovery requires the ModelExpress general plugin to load before engine
-configuration is created, as it does for the standard `vllm serve` command.
-Unix-domain sockets, gRPC and dynamically assigned ports (`--port 0`) are not
-automatically discovered; select a known reachable HTTP(S) endpoint explicitly.
-An externally proxied health endpoint can also be selected explicitly.
-vLLM headless workers use the head address even if their CLI `--host` names a
-node-local interface; the inferred HTTP port and scheme are preserved. An
-explicit non-loopback `MX_ARTIFACT_READY_URL` still wins unchanged. SGLang's
-Python follower dummy listeners use local plain HTTP, even when the head has
-TLS enabled, and inferred URLs for those listeners are not redirected by
-`LWS_LEADER_ADDRESS`. Head and Rust listeners keep their native TLS settings;
-Rust listener placement is queried through the engine's own helper.
-Weight-metadata publication keeps its existing opt-in health gate; automatic
-port discovery applies to the artifact health check and does not add an HTTP
-gate to offline model loading. TensorRT-LLM currently has no artifact publisher,
-so its weight-publishing behavior is unchanged.
+- vLLM probes its resolved HTTP host and port, including CLI/config-file
+  overrides. For example, `vllm serve MODEL --port 8001 --load-format modelexpress`
+  probes `http://127.0.0.1:8001/health` without another setting.
+- SGLang probes its resolved HTTP listener without plugin hooks. Python follower
+  nodes use their local plain-HTTP health listener, including when the head uses
+  TLS. Rust listener placement follows SGLang's native helper.
+
+Both paths wait for cache files to settle. Weight-metadata policy is unchanged.
+Startup completion does not cover specializations compiled by later requests.
+
+vLLM carries the parsed endpoint to workers through its general-plugin
+compatibility adapter, without changing source identities or compilation-cache
+hashes. Wildcard bind hosts become loopback addresses. TLS selects HTTPS with
+normal certificate verification. Without serving configuration, the fallback
+is `http://127.0.0.1:8000/health`; this also applies when compatibility patches
+are disabled. UDS, gRPC-only serving, dynamic ports, and custom frontends require
+an explicit reachable HTTP(S) URL. Headless workers retain head-address routing.
+SGLang needs no runtime compatibility patch for listener discovery. Its fallback
+is `http://127.0.0.1:30000/health`; TLS uses normal certificate verification.
+No vLLM worker extension or endpoint plugin is required. Worker-local readiness
+is supplied through `LoadContext.artifact_ready_fn`; the artifact layer adds cache
+settling and keeps publication closed if the callback is missing. The serialized
+URL travels in `model_loader_extra_config` through a single CLI-conversion
+wrapper; MX removes its key from copies passed to native loaders.
+Automatic discovery only attaches metadata for MX loaders while artifact
+transfer is enabled and no explicit URL is set. Unsupported hook shapes, missing
+parsed arguments, or read-only configuration are logged; use
+`MX_ARTIFACT_READY_URL` when discovery cannot run.
 
 #### Multi-node readiness
+
+SGLang's inferred local follower health listeners are probed locally. The
+following head-address routing applies to other loopback health URLs.
 
 Only the head node of a multi-node engine serves HTTP; the others run headless
 (for vLLM, `--headless`, which starts the executor and no API server), so a

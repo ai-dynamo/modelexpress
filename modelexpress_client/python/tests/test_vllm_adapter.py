@@ -264,8 +264,26 @@ def test_before_rdma_receive_runs_layout_finalizers(monkeypatch):
     assert result.model is model
     assert events == [
         ("finalize", "model", "finalize_mega_moe_weights"),
+        ("finalize", "model", "finalize_mega_attn_weights"),
         ("process", torch.device("cpu")),
     ]
+
+
+def test_before_rdma_receive_permutes_mega_attn_before_quant_processing(monkeypatch):
+    """Mirrors vLLM: the model-level hook re-runs mega attn after quant processing."""
+
+    def process_weights_after_loading(model, model_config, target_device):
+        model.model.attn.quant_processed = True
+        model.process_weights_after_loading()
+
+    _stub_vllm_process_weights_after_loading(monkeypatch, process_weights_after_loading)
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = _MegaAttnTopLevelModel()
+
+    adapter.before_rdma_receive(LoadResult(value=model, model=model))
+
+    assert model.model.attn.permutes == 1
+    assert model.model.attn._fused_layouts_ready
 
 
 def test_after_rdma_receive_runs_derived_weight_finalizers(monkeypatch):
@@ -885,10 +903,47 @@ class _MegaMoeModel(torch.nn.Module):
     def finalize_mega_moe_weights(self) -> None:
         self.events.append(("finalize", "model", "finalize_mega_moe_weights"))
 
+    def finalize_mega_attn_weights(self) -> None:
+        self.events.append(("finalize", "model", "finalize_mega_attn_weights"))
+
     def finalize_mhc_broadcast_weights(self) -> None:
         self.events.append(
             ("finalize", "model", "finalize_mhc_broadcast_weights")
         )
+
+
+class _MegaAttnTopLevelModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = _MegaAttnModel()
+
+    def process_weights_after_loading(self) -> None:
+        self.model.finalize_mega_attn_weights()
+
+
+class _MegaAttnModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attn = _MegaAttnAttention()
+
+    def finalize_mega_attn_weights(self) -> None:
+        self.attn.finalize_loaded_weights()
+
+
+class _MegaAttnAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._fused_layouts_ready = False
+        self.quant_processed = False
+        self.permutes = 0
+
+    def finalize_loaded_weights(self) -> None:
+        if self._fused_layouts_ready:
+            return
+        if self.quant_processed:
+            raise RuntimeError("permutation ran after quant post-processing")
+        self.permutes += 1
+        self._fused_layouts_ready = True
 
 
 class _MegaMoeLayer(torch.nn.Module):
@@ -1487,7 +1542,7 @@ class TestTargetSharedDraftPrefixes:
         )
         monkeypatch.setattr(
             "modelexpress.engines.vllm.adapter.collect_module_tensors",
-            lambda *_args: {
+            lambda *_args, **_kwargs: {
                 "layers.0.shared_head.head.weight": model.layers[0].shared_head.head.weight
             },
         )
@@ -1533,3 +1588,44 @@ def test_discovery_keeps_exact_k3_collective_state_local(
     assert op.collective.peer_ptrs is pointers
     assert op.collective.flags is flags
     assert op.collective.workspace is workspace
+
+
+def test_vllm_context_supplies_artifact_readiness_callback(monkeypatch):
+    from modelexpress.engines.vllm import artifacts
+
+    _stub_metadata_client(monkeypatch)
+    sys.modules["vllm.distributed"].get_world_group.return_value.local_rank = 0
+    config = _context_config(load_device="cuda:0")
+    config.load_config.model_loader_extra_config = {"modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health"}
+    config.parallel_config.master_addr = "head.internal"
+    monkeypatch.delenv("MX_ARTIFACT_READY_URL", raising=False)
+    monkeypatch.delenv("LWS_LEADER_ADDRESS", raising=False)
+    urls = []
+    monkeypatch.setattr(
+        artifacts._artifact_lifecycle,
+        "artifact_health_ready",
+        lambda url: urls.append(url) or True,
+    )
+
+    ctx = build_vllm_load_context(config, _model_config())
+    assert ctx.artifact_ready_fn()
+    monkeypatch.setenv("MX_ARTIFACT_READY_URL", "https://custom.internal:9443/ready")
+    assert ctx.artifact_ready_fn()
+    assert urls == [
+        "http://head.internal:9007/health",
+        "https://custom.internal:9443/ready",
+    ]
+
+
+def test_adapter_native_loaders_do_not_receive_mx_readiness_options():
+    config = _context_config(load_device="cpu")
+    config.load_config.model_loader_extra_config = {
+        "modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health",
+        "num_threads": 4,
+    }
+    adapter = VllmAdapter(config, _model_config())
+    assert adapter.load_config.model_loader_extra_config == {"num_threads": 4}
+    assert config.load_config.model_loader_extra_config == {
+        "modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health",
+        "num_threads": 4,
+    }

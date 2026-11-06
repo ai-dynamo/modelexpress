@@ -184,7 +184,7 @@ ModelStreamer credentials are third-party settings. See [Load from object storag
 | MX_ARTIFACT_TRANSFER | false | Enable compatible file-backed JIT artifact installation and publication |
 | MX_ARTIFACT_BACKEND | nixl | Artifact transport: `nixl` or `mooncake`; exactly one is selected and there is no fallback |
 | MX_ARTIFACT_BUNDLE_ROOT | $TMPDIR/modelexpress-artifacts | Local staging root for artifact bundles |
-| MX_ARTIFACT_COMPILE_CONFIG_DIGEST | empty | Partitions torch compile artifact sources by compile configuration |
+| MX_ARTIFACT_COMPILE_CONFIG_DIGEST | empty | Partitions torch compile and kernel JIT cache artifact sources by compile configuration |
 | MX_ARTIFACT_MOONCAKE_NAMESPACE | modelexpress/artifacts | Key prefix used by the Mooncake artifact backend |
 | MX_ARTIFACT_MOONCAKE_POOL_BYTES | 536870912 bytes | Local buffer-pool size for the process-local Mooncake artifact client; a config-file `local_buffer_size` takes precedence |
 | MX_ARTIFACT_MOONCAKE_DELETE_RETRIES | 10 | Additional attempts when stale-object or repair-marker removal reports an active lease |
@@ -192,7 +192,7 @@ ModelStreamer credentials are third-party settings. See [Load from object storag
 | MX_MOONCAKE_CONFIG_PATH | unset | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback |
 | MX_MC_* | unset | Artifact-store Mooncake settings promoted temporarily to the corresponding native `MC_*` names |
 | MX_ETCD_* | unset | Artifact-store etcd settings promoted temporarily to the corresponding native `ETCD_*` names |
-| MX_ARTIFACT_READY_URL | framework server config | Explicit readiness URL override; otherwise use the resolved HTTP host/port, including config-file and CLI overrides |
+| MX_ARTIFACT_READY_URL | engine-specific | Explicit HTTP publication gate; when unset or blank, vLLM uses its resolved serving URL and SGLang uses native startup signaling |
 | MX_ARTIFACT_READY_TIMEOUT_SECS | 1800 | Readiness/publication timeout |
 | MX_ARTIFACT_TRANSFER_CHUNK_SIZE | 67108864 bytes | Artifact transfer chunk size; maximum is 4 GiB |
 

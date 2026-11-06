@@ -30,7 +30,7 @@ from ...metadata.artifact_transfer import (
 )
 from ...metadata.artifact_transport import PublicationHandle
 from ...metadata.publisher import PublisherThread
-from .readiness import sglang_server_readiness
+from .readiness import SglangServerReadiness, sglang_server_readiness
 
 logger = logging.getLogger("modelexpress.engines.sglang.artifacts")
 
@@ -258,6 +258,7 @@ def _triton_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         cuda_version=torch.version.cuda or "",
         triton_version=_common_artifacts.triton_version(),
         gpu_arch=_common_artifacts.gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "triton_key", _common_artifacts.triton_key())
     return identity
@@ -295,6 +296,7 @@ def _deep_gemm_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_common_artifacts.gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(
         identity,
@@ -311,6 +313,7 @@ def _tilelang_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_common_artifacts.gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(
         identity,
@@ -327,6 +330,7 @@ def _cute_dsl_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_common_artifacts.gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(
         identity,
@@ -344,6 +348,7 @@ def _flashinfer_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         torch_version=torch.__version__,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_common_artifacts.gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(
         identity,
@@ -366,33 +371,35 @@ def _sglang_artifact_ready_fn(
     source_roots: tuple[ArtifactCacheRoot, ...],
     ctx: LoadContext | None = None,
 ):
-    return _common_artifacts.artifact_ready_fn(
-        source_roots,
-        lambda: _sglang_health_ready(ctx),
+    ready_fn = getattr(ctx, "artifact_ready_fn", None) or (
+        lambda: _sglang_health_ready(ctx)
     )
+    return _common_artifacts.artifact_ready_fn(source_roots, ready_fn)
 
 
-
-
-def _sglang_health_ready(ctx: LoadContext | None = None) -> bool:
+def _sglang_health_ready(
+    ctx: LoadContext | None = None,
+    readiness: SglangServerReadiness | None = None,
+) -> bool:
     # SGLang waits one second before checking its health-generation result.
     return _common_artifacts.artifact_health_ready(
-        _sglang_health_url(ctx), timeout_secs=5.0,
+        _sglang_health_url(ctx, readiness), timeout_secs=5.0,
     )
 
 
-def _sglang_health_url(ctx: LoadContext | None = None) -> str:
+def _sglang_health_url(
+    ctx: LoadContext | None = None,
+    readiness: SglangServerReadiness | None = None,
+) -> str:
     configured = envs.MX_ARTIFACT_READY_URL
-    default_url = getattr(ctx, "artifact_ready_url", None)
-    local_dummy = getattr(ctx, "artifact_ready_local", False)
-    if not default_url and not configured.strip():
-        readiness = sglang_server_readiness()
-        default_url, local_dummy = readiness.url, readiness.local_dummy
-    if not configured.strip() and default_url and local_dummy:
-        return default_url
+    if not configured.strip():
+        if readiness is None or readiness.url is None:
+            readiness = sglang_server_readiness()
+        if readiness.url and readiness.local_dummy:
+            return readiness.url
     return _common_artifacts.resolve_health_url(
         configured,
-        default_url or _DEFAULT_READY_URL,
+        readiness.url if readiness and readiness.url else _DEFAULT_READY_URL,
         getattr(ctx, "head_addr", None),
     )
 

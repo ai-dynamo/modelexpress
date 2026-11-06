@@ -80,15 +80,12 @@ class LoadContext:
     mx_client: MxClientBase
     worker_id: str
     mx_server_url: str | None = None
+    donor_lease: Any = None
     node_rank: int = 0
     # Head address from the engine's own distributed config (for vLLM,
     # parallel_config.master_addr). Non-head nodes rewrite a pod-local
     # readiness URL onto this host, since loopback serves nothing there.
     head_addr: str | None = None
-    # Resolved HTTP endpoint; deliberately excluded from SourceIdentity.
-    artifact_ready_url: str | None = None
-    # A native local health listener must not be redirected to a remote head.
-    artifact_ready_local: bool = False
     adapter: EngineAdapter | None = None
     accelerator_backend: AcceleratorBackend = field(
         default_factory=CudaAcceleratorBackend
@@ -101,6 +98,8 @@ class LoadContext:
     draft_tensor_namespace: str = DRAFT_TENSOR_PREFIX
     # False keeps a load out of P2P entirely (no registration, no RDMA).
     p2p_enabled: bool = True
+    # Replica-wide cold-start fallback skips peer reads but still publishes.
+    skip_rdma: bool = False
     # Draft pass only: the main load's already-initialized NIXL manager. The
     # draft registers into it instead of binding MX_METADATA_PORT + device_id
     # a second time.
@@ -111,6 +110,8 @@ class LoadContext:
     desired_version_uid: str | None = None
     # Optional engine-level gate checked before weight metadata is advertised.
     source_ready_fn: Callable[[], bool] | None = None
+    # Optional engine gate checked before artifact cache settling.
+    artifact_ready_fn: Callable[[], bool] | None = None
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     # When MX_VMM_ARENA=1, maybe_enter_vmm_arena populates this with the

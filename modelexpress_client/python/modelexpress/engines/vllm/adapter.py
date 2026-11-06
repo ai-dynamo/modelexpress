@@ -34,6 +34,10 @@ _VLLM_PRE_RDMA_FINALIZER_NAMES = (
     # discovery and RDMA registration so the target exposes the same regions
     # that the source published.
     "finalize_mega_moe_weights",
+    # DeepSeek V4.1 permutes wq_b rows and wo_a columns (and their scales)
+    # for FlashMLA mega attention. Native load_weights() runs it before quant
+    # post-processing; the later model-level post-load hook is then a no-op.
+    "finalize_mega_attn_weights",
 )
 
 _VLLM_POST_RDMA_FINALIZER_NAMES = (
@@ -53,6 +57,38 @@ _LAYER_REGISTRY_FIELDS: tuple[str, ...] = (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+
+def cold_start_expected_workers(vllm_config) -> int:
+    parallel = vllm_config.parallel_config
+    if getattr(parallel, "enable_elastic_ep", False):
+        raise RuntimeError("MX cold start does not support elastic expert parallelism")
+    for name in ("prefill_context_parallel_size", "decode_context_parallel_size"):
+        if (getattr(parallel, name, 1) or 1) > 1:
+            raise RuntimeError("MX cold start does not support context parallelism")
+    expected = 1
+    for name in (
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "prefill_context_parallel_size",
+    ):
+        expected *= getattr(parallel, name, 1) or 1
+    return expected
+
+def _local_runtime_tensors(model: torch.nn.Module) -> list[torch.Tensor]:
+    """Identify local state through the attention layer's declared backend."""
+    tensors = []
+    for module in model.modules():
+        backend = getattr(module, "attn_backend", None)
+        get_name = getattr(backend, "get_name", None)
+        if not callable(get_name) or get_name() != "FLASHINFER_MLA":
+            continue
+        impl = getattr(module, "impl", None)
+        counter = getattr(impl, "_multi_ctas_kv_counter_buffer", None)
+        if isinstance(counter, torch.Tensor):
+            tensors.append(counter)
+    return tensors
 
 
 def _is_speculative_draft(vllm_config, model_config) -> bool:
@@ -286,7 +322,7 @@ class VllmAdapter(EngineAdapter):
         self._identity_model_config.model = (
             envs.MX_MODEL_NAME_OVERRIDE or model_config.model
         )
-        self.load_config = vllm_config.load_config
+        self.load_config = _native_load_config(vllm_config.load_config)
         self.target_device = self._resolve_target_device()
         self.accelerator_backend = accelerator_backend_for(self.target_device)
 
@@ -342,12 +378,22 @@ class VllmAdapter(EngineAdapter):
         """Collect transferable tensors while preserving process-local state."""
         if result.model is None:
             raise RuntimeError("vLLM tensor discovery requires result.model")
+        local_tensors = _local_runtime_tensors(result.model)
+        local_ids = {id(tensor) for tensor in local_tensors}
+
+        def exclude(obj: object) -> bool:
+            return id(obj) in local_ids or self._exclude_hidden_tensor_object(obj)
+
         adopt_hidden_tensors(
             result.model,
             self.accelerator_backend,
-            exclude=self._exclude_hidden_tensor_object,
+            exclude=exclude,
         )
-        tensors = collect_module_tensors(result.model, self.accelerator_backend)
+        tensors = collect_module_tensors(
+            result.model,
+            self.accelerator_backend,
+            preserve_local=local_tensors,
+        )
         if _is_speculative_draft(self.vllm_config, self.model_config):
             prefixes = _target_shared_draft_prefixes(result.model, self.vllm_config)
             if prefixes:
@@ -687,6 +733,18 @@ class VllmAdapter(EngineAdapter):
         )
 
 
+def _native_load_config(load_config):
+    """Keep MX discovery metadata out of native loader options without mutating config."""
+    options = getattr(load_config, "model_loader_extra_config", None)
+    if not isinstance(options, dict) or "modelexpress_artifact_ready_url" not in options:
+        return load_config
+    native_config = copy.copy(load_config)
+    options = dict(options)
+    options.pop("modelexpress_artifact_ready_url")
+    _set_load_config_extra_config(native_config, options)
+    return native_config
+
+
 def _set_load_config_extra_config(load_config, extra_config: dict) -> None:
     try:
         load_config.model_loader_extra_config = extra_config
@@ -762,10 +820,12 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
 
     from vllm.distributed import get_world_group
 
+    from . import artifacts
+
     adapter = VllmAdapter(vllm_config, model_config)
     global_rank = adapter.get_global_rank()
     worker_rank = adapter.get_worker_rank()
-    return LoadContext(
+    ctx = LoadContext(
         model_config=model_config,
         load_config=vllm_config.load_config,
         target_device=adapter.get_target_device(),
@@ -778,9 +838,8 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
         worker_id=uuid.uuid4().hex[:8],
         node_rank=int(getattr(vllm_config.parallel_config, "node_rank", 0)),
         head_addr=getattr(vllm_config.parallel_config, "master_addr", None),
-        artifact_ready_url=getattr(
-            vllm_config.load_config, "_mx_artifact_ready_url", None
-        ),
         adapter=adapter,
         accelerator_backend=adapter.accelerator_backend,
     )
+    ctx.artifact_ready_fn = lambda: artifacts._vllm_health_ready(ctx)
+    return ctx

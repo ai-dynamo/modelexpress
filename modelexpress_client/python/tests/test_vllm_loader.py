@@ -780,6 +780,10 @@ class TestRdmaReloadIdentityGate:
         ctx = _make_load_context(identity=self._identity("abc"))
         assert self._is_available(ctx) is True
 
+    def test_cold_start_fallback_skips_rdma(self):
+        ctx = _make_load_context(identity=self._identity("abc"), skip_rdma=True)
+        assert self._is_available(ctx) is False
+
     @pytest.mark.parametrize("reload", [False, True])
     def test_loader_snapshots_the_loaded_identity_on_reload(self, reload):
         """A refit rewrites the live identity's revision in place, so the
@@ -838,6 +842,54 @@ class TestMtpDrafterSecondLoad:
         ) as schedule:
             loader.load_model(vllm_config, model_config)
         return schedule
+
+    @pytest.mark.parametrize("different_checkpoint", [False, True])
+    def test_cold_start_elects_main_not_draft(self, monkeypatch, different_checkpoint):
+        from modelexpress.engines.vllm import loader as loader_mod
+
+        monkeypatch.setenv("MX_P2P_COLD_START", "1")
+        target = _make_load_context(device_id=0)
+        draft = _make_load_context(device_id=0)
+        if different_checkpoint:
+            draft.identity.model_name = "other-checkpoint"
+        config = self._spec_vllm_config()
+        try:
+            with patch("modelexpress.cold_start.coordinate") as coordinate:
+                self._load(_make_loader(), config,
+                           MagicMock(dtype=torch.float32, runner_type="generate"), target)
+                self._load(_make_loader(), config,
+                           MagicMock(dtype=torch.float32, runner_type="draft"), draft)
+            coordinate.assert_called_once_with(target, 1)
+            assert draft.p2p_enabled is not different_checkpoint
+        finally:
+            loader_mod._draft_publication_gates.pop(0, None)
+            loader_mod._tensor_registry.pop(0, None)
+            loader_mod._nixl_managers.pop(0, None)
+            loader_mod._loader_registry.pop(0, None)
+
+    def test_draft_failure_stops_main_lease(self, monkeypatch):
+        from modelexpress.engines.vllm import loader as loader_mod
+
+        monkeypatch.setenv("MX_P2P_COLD_START", "1")
+        target = _make_load_context(device_id=0)
+        target.donor_lease = MagicMock()
+        draft = _make_load_context(device_id=0)
+        config = self._spec_vllm_config()
+        try:
+            with patch("modelexpress.cold_start.coordinate"):
+                self._load(_make_loader(), config,
+                           MagicMock(dtype=torch.float32, runner_type="generate"), target)
+                with patch.object(_make_loader().__class__, "_load_model",
+                                  side_effect=RuntimeError("draft failed")):
+                    with pytest.raises(RuntimeError, match="draft failed"):
+                        self._load(_make_loader(), config,
+                                   MagicMock(dtype=torch.float32, runner_type="draft"), draft)
+            target.donor_lease.stop.assert_called_once()
+        finally:
+            loader_mod._draft_publication_gates.pop(0, None)
+            loader_mod._tensor_registry.pop(0, None)
+            loader_mod._nixl_managers.pop(0, None)
+            loader_mod._loader_registry.pop(0, None)
 
     @pytest.mark.parametrize("disable_draft_p2p", [None, "0", "1"])
     def test_drafter_extends_target_without_clobbering(
@@ -930,6 +982,12 @@ class TestMtpDrafterSecondLoad:
     @staticmethod
     def _spec_vllm_config():
         vllm_config = MagicMock()
+        vllm_config.parallel_config.tensor_parallel_size = 1
+        vllm_config.parallel_config.pipeline_parallel_size = 1
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
+        vllm_config.parallel_config.decode_context_parallel_size = 1
+        vllm_config.parallel_config.enable_elastic_ep = False
         vllm_config.speculative_config.draft_model_config.runner_type = "draft"
         return vllm_config
 
@@ -3085,3 +3143,30 @@ def test_retry_releases_tensors_while_caller_retains_model(
         assert rebuilt.value is rebuilt.model
         assert rebuilt.publishable is False
     assert adapter.accelerator_backend.empty_cache_calls == 1
+
+
+def test_standalone_native_loader_does_not_receive_mx_readiness_options(monkeypatch):
+    from types import SimpleNamespace
+    from modelexpress.engines.vllm import loader as module
+
+    config = SimpleNamespace(load_format="mx", model_loader_extra_config={
+        "modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health",
+        "num_threads": 4,
+    })
+    loader = module.MxModelLoader(config)
+    received = []
+
+    class NativeLoader:
+        def __init__(self, load_config):
+            assert load_config.model_loader_extra_config == {"num_threads": 4}
+        def download_model(self, model_config):
+            received.append(model_config)
+        def load_weights(self, model, model_config):
+            received.append(model)
+
+    monkeypatch.setattr(module, "DefaultModelLoader", NativeLoader)
+    monkeypatch.setattr(module.model_prefetch, "is_enabled", lambda: False)
+    loader.download_model("model-config")
+    loader.load_weights("model", "model-config")
+    assert received == ["model-config", "model"]
+    assert config.model_loader_extra_config["modelexpress_artifact_ready_url"] == "http://127.0.0.1:9007/health"

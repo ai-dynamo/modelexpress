@@ -467,6 +467,7 @@ def _triton_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         cuda_version=torch.version.cuda or "",
         triton_version=_triton_version(),
         gpu_arch=_gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "triton_key", _triton_key())
     return identity
@@ -479,6 +480,7 @@ def _deep_gemm_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "deep_gemm_jit_key", _deep_gemm_jit_key())
     return identity
@@ -491,6 +493,7 @@ def _tilelang_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "tilelang_version", _tilelang_version())
     return identity
@@ -503,6 +506,7 @@ def _cute_dsl_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "cutlass_dsl_version", _cutlass_dsl_version())
     return identity
@@ -516,6 +520,7 @@ def _flashinfer_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         torch_version=torch.__version__,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "flashinfer_version", _flashinfer_version())
     return identity
@@ -532,16 +537,10 @@ def _set_extra_if_present(
 
 def _vllm_artifact_ready_fn(
     source_roots: tuple[ArtifactCacheRoot, ...],
-    health_ready_fn=None,
-    ctx: LoadContext | None = None,
+    ctx: LoadContext,
 ):
-    if health_ready_fn is None:
-        # Resolve the engine hook at call time so existing tests and diagnostics
-        # can replace _vllm_health_ready after constructing the readiness check.
-        health_ready_fn = lambda: _vllm_health_ready(ctx)
     return _artifact_lifecycle.artifact_ready_fn(
-        source_roots,
-        health_ready_fn,
+        source_roots, ctx.artifact_ready_fn or (lambda: False)
     )
 
 
@@ -552,7 +551,11 @@ def _vllm_health_ready(ctx: LoadContext | None = None) -> bool:
 def _vllm_health_url(ctx: LoadContext | None = None) -> str:
     return _artifact_lifecycle.resolve_health_url(
         envs.MX_ARTIFACT_READY_URL,
-        getattr(ctx, "artifact_ready_url", None) or _DEFAULT_READY_URL,
+        (
+            getattr(getattr(ctx, "load_config", None), "model_loader_extra_config", None)
+            or {}
+        ).get("modelexpress_artifact_ready_url")
+        or _DEFAULT_READY_URL,
         getattr(ctx, "head_addr", None),
     )
 

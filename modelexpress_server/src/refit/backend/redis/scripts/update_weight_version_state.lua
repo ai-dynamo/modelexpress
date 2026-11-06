@@ -12,14 +12,17 @@ if current == ARGV[1] then
   return 'OK'
 end
 
-local s3_uri = redis.call('HGET', KEYS[1], 's3_uri')
-local s3_ready = current == ARGV[2]
+local uri = redis.call('HGET', KEYS[1], 'object_storage_uri')
+if not uri then
+  uri = redis.call('HGET', KEYS[1], 's3_uri')
+end
+local object_storage_ready = current == ARGV[2]
   and ARGV[1] == ARGV[3]
-  and s3_uri
-  and s3_uri ~= ''
+  and uri
+  and uri ~= ''
 local releasing = (current == ARGV[2] or current == ARGV[3])
   and ARGV[1] == ARGV[4]
-if not s3_ready and not releasing then
+if not object_storage_ready and not releasing then
   return 'INVALID_TRANSITION'
 end
 

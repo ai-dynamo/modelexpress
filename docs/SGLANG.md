@@ -140,11 +140,11 @@ python -m sglang.launch_server \
 
 The first replica attempts ModelStreamer when no compatible P2P source is ready. Later replicas prefer P2P RDMA from a serving peer. `MX_MODEL_URI` also accepts `gs://` and `az://` URIs or an absolute local path. `MX_MS_DISTRIBUTED=1` divides reads across CUDA tensor-parallel ranks when TP > 1 and is ignored for TP=1.
 
-Cache-artifact publication waits for SGLang's health endpoint after warmup
-and CUDA graph capture. Readiness follows the resolved HTTP host and port (default
-`http://127.0.0.1:30000/health`), including `--config` and `--port` settings.
-`MX_ARTIFACT_READY_URL` overrides that URL and also opts weight-source
-publication into the HTTP health gate.
+Cache-artifact publication waits for SGLang's HTTP health endpoint, then cache
+settling. MX discovers the resolved listener host, port, and TLS settings;
+`http://127.0.0.1:30000/health` is the fallback. Set `MX_ARTIFACT_READY_URL` to
+use another endpoint and also opt weight-source publication into the health
+gate. No startup plugin hooks are required.
 
 Set `MX_ARTIFACT_TRANSFER=1` with the `nixl` transport to transfer compatible
 JIT cache artifacts before SGLang initializes the model. The source publishes
