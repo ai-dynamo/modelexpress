@@ -69,7 +69,9 @@ class ObjectStorageGeneratorConfig:
         if self.storage_type is ObjectStorageType.AZURE:
             for field in ("endpoint_url", "region_name"):
                 if getattr(self, field) is not None:
-                    raise ValueError(f"{field} is not supported for Azure object storage")
+                    raise ValueError(
+                        f"{field} is not supported for Azure object storage"
+                    )
         if not self.initial_base_version_id.strip():
             raise ValueError("initial_base_version_id is required")
         if (
@@ -84,6 +86,10 @@ class ObjectStorageGeneratorConfig:
             and self.refit_checkpoint_max_size_gb <= 0
         ):
             raise ValueError("refit_checkpoint_max_size_gb must be positive")
+
+
+class PreparationSuperseded(RuntimeError):
+    """The cache head changed while background preparation waited."""
 
 
 class ReceiverInstallError(RuntimeError):
@@ -222,9 +228,7 @@ def _parse_index_manifest(
                 )
         compression_format = metadata.get("compression_format")
         if compression_format not in _DECOMPRESSORS:
-            raise ValueError(
-                f"unsupported compression format {compression_format!r}"
-            )
+            raise ValueError(f"unsupported compression format {compression_format!r}")
     elif "checksum_format" in metadata:
         checksum_factory(metadata["checksum_format"])
     return metadata, weight_map
@@ -554,11 +558,7 @@ class _LocalCheckpoint:
         cached_seed: bool,
     ) -> str:
         version = self.initial_version
-        if (
-            cached_seed
-            and state is not None
-            and state.status is CheckpointState.READY
-        ):
+        if cached_seed and state is not None and state.status is CheckpointState.READY:
             # A co-located rank may already have reconstructed the desired
             # target. Reuse that verified cache head instead of rewinding it.
             version = state.version
@@ -666,11 +666,7 @@ class _LocalCheckpoint:
         )
         self.store.write_state(
             status=CheckpointState.UPDATING,
-            version=(
-                state.version
-                if state is not None
-                else self.initial_version
-            ),
+            version=(state.version if state is not None else self.initial_version),
             checkpoint_paths=self.checkpoint_paths,
         )
         # A working copy of the replaced initial checkpoint is stale.
@@ -785,6 +781,8 @@ class _LocalCheckpoint:
     def prepare_chain(
         self,
         versions: tuple[_ObjectStorageVersion, ...],
+        *,
+        expected_head: str | None = None,
     ) -> PreparedCheckpoint:
         """Prepare an ordered chain into one immutable target checkpoint."""
         if not versions:
@@ -796,10 +794,18 @@ class _LocalCheckpoint:
         with self.store.preparation_locked():
             # Includes another rank's preparation and a background working copy.
             lock_wait = time.perf_counter() - started
-            with self.store.installation_locked(shared=True), self.store.locked(
-                shared=True
+            with (
+                self.store.installation_locked(shared=True),
+                self.store.locked(shared=True),
             ):
                 state, _active_version = self._load_ready_state()
+                if expected_head is not None and (
+                    state.version != expected_head
+                    or self.store.active_version() != expected_head
+                ):
+                    raise PreparationSuperseded(
+                        "cache head changed before background preparation"
+                    )
                 prepared = self._reuse_prepared_target(
                     state=state,
                     target=target,
@@ -809,6 +815,13 @@ class _LocalCheckpoint:
                     return prepared
             with self.store.installation_locked(), self.store.locked():
                 state, active_version = self._load_ready_state()
+                if expected_head is not None and (
+                    state.version != expected_head
+                    or self.store.active_version() != expected_head
+                ):
+                    raise PreparationSuperseded(
+                        "cache head changed before background preparation"
+                    )
                 prepared = self._reuse_prepared_target(
                     state=state,
                     target=target,
@@ -825,7 +838,9 @@ class _LocalCheckpoint:
                     if source is None:
                         break
                     if source != _source_identity(version):
-                        raise ValueError("prepared checkpoint has different source identity")
+                        raise ValueError(
+                            "prepared checkpoint has different source identity"
+                        )
                     versions = versions[position + 1 :]
                     break
                 manifests, index_download_time = self._download_replay_manifests(
@@ -1206,7 +1221,8 @@ class _LocalCheckpoint:
             )
             downloaded = self._download_deltas(weight_map, version.uri)
             self.store.ensure_capacity(
-                len(index_data) + sum(len(data) for data, _names in downloaded.values()),
+                len(index_data)
+                + sum(len(data) for data, _names in downloaded.values()),
                 protected_versions=protected_versions,
             )
             with self.store.replace_directory(artifact) as temporary:
@@ -1249,7 +1265,9 @@ class _LocalCheckpoint:
             shutil.rmtree(target, ignore_errors=True)
             base_checkpoint.replace(target)
             self._set_local_checkpoint(target)
-            self._apply_delta_artifact(artifact, metadata, weight_map, shards=downloaded)
+            self._apply_delta_artifact(
+                artifact, metadata, weight_map, shards=downloaded
+            )
         else:
             # A full checkpoint without a working copy is copied once so
             # applying the delta cannot modify the canonical full artifact.
@@ -1258,7 +1276,9 @@ class _LocalCheckpoint:
                 copy_from=base_checkpoint,
             ) as temporary:
                 self._set_local_checkpoint(temporary)
-                self._apply_delta_artifact(artifact, metadata, weight_map, shards=downloaded)
+                self._apply_delta_artifact(
+                    artifact, metadata, weight_map, shards=downloaded
+                )
 
         self._set_local_checkpoint(target)
         self.store.write_chain(version.version_id, chain)
@@ -1415,7 +1435,8 @@ class _LocalCheckpoint:
 
         files: dict[Path, int] = {}
         with ThreadPoolExecutor(
-            max_workers=rl_envs.MX_REFIT_DELTA_WORKERS, thread_name_prefix="modelexpress-delta-chunk"
+            max_workers=rl_envs.MX_REFIT_DELTA_WORKERS,
+            thread_name_prefix="modelexpress-delta-chunk",
         ) as chunks:
 
             def apply_one(item) -> None:
@@ -1424,7 +1445,9 @@ class _LocalCheckpoint:
                 fd = files[path]
                 checksum = checksum_factory(checksum_format)
                 # A large tensor's chunks spread over the workers; others stay here.
-                spread = rl_envs.MX_REFIT_DELTA_WORKERS > 1 and size > _SPREAD_TENSOR_BYTES
+                spread = (
+                    rl_envs.MX_REFIT_DELTA_WORKERS > 1 and size > _SPREAD_TENSOR_BYTES
+                )
                 pending: deque[Future] = deque()
 
                 def collect(result) -> None:
@@ -1441,7 +1464,9 @@ class _LocalCheckpoint:
                             break
                         if spread:
                             pending.append(
-                                chunks.submit(apply_chunk, fd, file_offset, block, position)
+                                chunks.submit(
+                                    apply_chunk, fd, file_offset, block, position
+                                )
                             )
                             if len(pending) >= 2 * workers:
                                 collect(pending.popleft().result())
@@ -1464,7 +1489,9 @@ class _LocalCheckpoint:
                     raise ValueError(f"canonical target checksum differs for {name!r}")
 
             try:
-                for path in {self.locations[name][0] for name, _data, _checksum in items}:
+                for path in {
+                    self.locations[name][0] for name, _data, _checksum in items
+                }:
                     files[path] = os.open(path, os.O_RDWR)
                 list(
                     threadpool_map(

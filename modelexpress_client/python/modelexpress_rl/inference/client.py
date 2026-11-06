@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 import threading
 import uuid
 from dataclasses import dataclass
@@ -25,6 +27,8 @@ from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
 from .adapter import GeneratorEngineContext
+from .prefetch import PrefetchSettings, launch_prefetcher
+from .methods.canonical_delta import CanonicalDeltaUpdateMethod
 from .plan import StreamingSettings, WeightSource, parse_weight_source_order
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime, initialize_generator_runtime
@@ -255,6 +259,7 @@ class ModelExpressGeneratorClient:
         self._engine_state = _EngineState.READY
         self._runtime: GeneratorRuntime | None = None
         self._streaming: StreamingSettings | None = None
+        self._prefetcher: subprocess.Popen | None = None
         self._closed = False
 
     @classmethod
@@ -300,7 +305,8 @@ class ModelExpressGeneratorClient:
         client._max_replay_chain_length = config.max_replay_chain_length
         if config.staging_buffer_bytes is not None:
             client._streaming = StreamingSettings(
-                max_staging_bytes=config.staging_buffer_bytes * config.staging_buffers_count,
+                max_staging_bytes=config.staging_buffer_bytes
+                * config.staging_buffers_count,
                 staging_device=config.staging_device,
                 staging_buffers=config.staging_buffers_count,
             )
@@ -338,10 +344,58 @@ class ModelExpressGeneratorClient:
             except Exception:
                 client._registration_thread = None
                 raise
+            if (
+                config.object_storage is not None
+                and rl_envs.MX_REFIT_PREFETCH
+                and envs.LOCAL_RANK in (None, 0)
+            ):
+                client._start_prefetcher(config.object_storage)
         except Exception:
             client.close()
             raise
         return client
+
+    def _start_prefetcher(self, storage: ObjectStorageGeneratorConfig) -> None:
+        canonical = next(
+            (
+                method
+                for method in self._require_runtime().methods
+                if isinstance(method, CanonicalDeltaUpdateMethod)
+            ),
+            None,
+        )
+        if canonical is None:
+            return
+        settings = PrefetchSettings(
+            model_name=self.model_name,
+            cache_model_name=canonical._model_name,
+            server_url=self.server_url,
+            refit_checkpoint_dir=str(storage.refit_checkpoint_dir),
+            initial_base_version_id=storage.initial_base_version_id,
+            seed_checkpoint_path=None
+            if storage.seed_checkpoint_path is None
+            else str(storage.seed_checkpoint_path),
+            refit_checkpoint_max_size_gb=storage.refit_checkpoint_max_size_gb,
+            endpoint_url=storage.endpoint_url,
+            region_name=storage.region_name,
+            max_replay_chain_length=self._max_replay_chain_length,
+            rpc_timeout_seconds=self._rpc_timeout_seconds,
+            parent_pid=os.getpid(),
+            storage_type=storage.storage_type.value,
+            streamed=canonical._stream_full_checkpoints,
+        )
+        self._prefetcher = launch_prefetcher(settings)
+
+    def _stop_prefetcher(self) -> None:
+        process, self._prefetcher = self._prefetcher, None
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
     def stage_weight(self, *, version: WeightVersionRef) -> StagedWeightHandle:
         """Prepare an exact version without installing it into the live engine.
@@ -464,6 +518,7 @@ class ModelExpressGeneratorClient:
         """Stop renewal and release control-plane and adapter resources."""
         if self._closed:
             return
+        self._stop_prefetcher()
         with self._operation_lock:
             if self._active_handle is not None:
                 self._release_staged(self._active_handle)
