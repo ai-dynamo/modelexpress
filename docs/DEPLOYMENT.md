@@ -1106,6 +1106,14 @@ arena registration bypasses the pool-reg path and calls `register_arena`
 directly. The arena produces one MR for the used range regardless of the
 pool-reg setting.
 
+For SGLang initial loading, use the `remote_instance` ModelExpress backend,
+transport `nixl`, and `MX_VMM_ARENA=1`. If filtering `SGLANG_PLUGINS`, include
+`modelexpress` and, for RL, `modelexpress_rl`. SGLang memory saver bypasses the
+MX arena with a warning. The hook targets SGLang 0.5.22/current main; check
+`load_model_with_memory_saver` availability on older versions. TransferEngine,
+reload, and release/resume are excluded. The multi-handle restrictions below
+apply, and SGLang GPU/RDMA qualification remains outstanding.
+
 Set `UCX_CUDA_COPY_REG_WHOLE_ALLOC=off` on any UCX predating the
 `cuda_copy_md` length-truncation fix (openucx/ucx#11461). Without it, UCX
 can truncate a multi-handle VMM registration to the first physical

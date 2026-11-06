@@ -788,6 +788,14 @@ storage-view naming used for non-contiguous SGLang parameters.
 The SGLang side does not expose separate source and target modes; transport
 selection and source discovery remain inside the ModelExpress package.
 
+**VMM allocation scope.** `engines/sglang/registration.py` wraps SGLang's
+`load_model_with_memory_saver` before model initialization. A context-local
+`LoadContext` shares the arena with the inner MX loader through post-processing,
+retries, and registration. The arena and NIXL fallback policy match vLLM's;
+drafts stay outside the main arena. This applies to initial NIXL loading with
+`MX_VMM_ARENA=1` and SGLang memory saver disabled. See
+[deployment requirements](DEPLOYMENT.md#vmm-arena-single-mr-registration).
+
 **Cold-load quantization state.** A source manifest can describe buffers whose
 existence depends on checkpoint values. After placeholder post-processing and
 before registering destination memory, the receive strategy calls

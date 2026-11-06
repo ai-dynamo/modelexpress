@@ -9,6 +9,7 @@ import copy
 import gc
 import logging
 import uuid
+from contextvars import ContextVar
 from importlib.metadata import version as pkg_version
 from typing import TYPE_CHECKING, Iterator
 
@@ -28,6 +29,10 @@ from .draft_weights import draft_weight_adapter_for
 from .runtime_state import finalize_runtime_state, prepare_runtime_tensors
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
+
+_active_load_context: ContextVar[LoadContext | None] = ContextVar(
+    "sglang_mx_load_context", default=None
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -505,7 +510,17 @@ def build_sglang_load_context(
     model_config: ModelConfig,
     device_config: DeviceConfig,
 ) -> LoadContext:
-    """Build a LoadContext from SGLang config objects."""
+    """Reuse the outer VMM load scope's context, or build one for a direct load."""
+
+    ctx = _active_load_context.get()
+    if (
+        ctx is not None
+        and ctx.load_config is load_config
+        and ctx.model_config is model_config
+        and ctx.target_device == torch.device(device_config.device)
+        and getattr(device_config, "gpu_id", ctx.device_id) == ctx.device_id
+    ):
+        return ctx
 
     adapter = SglangAdapter(load_config, model_config, device_config)
     worker_rank = adapter.get_worker_rank()
