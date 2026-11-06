@@ -223,3 +223,32 @@ identity errors still fail preparation. Debug validation requires all published
 replicas to resolve and fails if any is unavailable.
 Replica equivalence compares canonical tensor coverage and geometry while
 ignoring physical addresses, which vary by replica.
+
+`MX_REFIT_PREFETCH` (default `false`) starts one background preparation process
+per host cache. It prepares registered versions one at a time while serving,
+using at most eight CPU apply workers. S3 and Azure use the existing canonical
+reader. Full checkpoints remain on the update path when streaming is enabled.
+The process stops with its owning generator; a failed version is left to the
+engine instead of being retried on every poll. Source ordering is unchanged.
+
+`MX_REFIT_INPLACE` (default `false`) stages verified XOR bytes for supported vLLM
+installations. Checkpoint files are still fully materialized before activation.
+The installer selects expert, generic XOR, or target-value reload paths according
+to kernel capabilities; unsupported configurations retain checkpoint reloads.
+GPU/host input placement is automatic. SGLang never stages these artifacts.
+After a failed live install the replica must stop serving and recover every rank
+from a verified checkpoint before accepting more traffic.
+
+`MX_REFIT_STAGED_LAYERS` defaults to `0`, which disables deferred disk writes.
+A positive value requires `MX_REFIT_INPLACE` and a supported vLLM installer; it
+bounds how many verified delta versions remain staged on checkpoint files.
+At the limit, materialization finishes before a new delta is checked. A rejected
+new delta therefore retains the valid rewritten head. With prefetch enabled, an
+activated head at the limit can also be materialized outside the serving pause.
+
+`MX_REFIT_SPARSE_CHECK` defaults to `false`. When enabled and the optional
+C++ checker is built, verified Adler-32 tables let deferred delta checks read
+only changed bytes. Unknown base checksums and one eighth of tensors per chain
+depth use full reads; sparse mismatches retry a full read before rejection.
+Without the extension, verification uses the full Python path. Native full
+verification is automatic when available, independently of sparse checking.

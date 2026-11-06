@@ -831,3 +831,29 @@ When the index omits `checksum_format`, checksum verification is skipped and
 shard metadata is not interpreted as checksums. Tensor names, dtypes, shapes,
 and byte sizes are always checked before the immutable full artifact is
 promoted.
+
+## Bounded delta application
+
+Canonical deltas apply in 16 MiB file chunks, with large tensors shared across
+CPU workers and ordered target checksums combined after their chunks finish.
+Freshly downloaded delta bytes are reused without rereading their artifact files.
+A cache capacity rejection restores the last completely prepared version; it
+does not label an older engine version as the current checkpoint files.
+
+## Deferred checkpoint materialization
+
+With `MX_REFIT_STAGED_LAYERS>0`, a `STAGED` head represents the base files XOR
+every staged delta after that base. Installation and fallback reloads see those
+overlays. Immutable full checkpoints are copied (or use a verified working copy)
+before modification. A failed copy preserves the staged head; a failed in-place
+rewrite remains `UPDATING` and requires recovery. Engine activation remains
+separate from preparation. Incoming deltas never join an unfinished rewrite.
+
+## Native and sparse verification
+
+The optional `_delta_ext` checker performs full verification off the Python GIL.
+Sparse verification is separately opt-in and assumes unchanged cache bytes stay
+as ModelExpress wrote them; periodic full reads do not detect every corruption
+on every update. The first delta after an unverified seed still reads its
+changed tensors in full. Checked target tables persist under `checksums/`.
+Disabling sparse checking restores full reads without changing installation.

@@ -239,3 +239,8 @@ If your pull request fails the DCO check, add the trailer to the existing commit
 git rebase --signoff origin/main
 git push --force-with-lease
 ```
+
+The optional refit delta checker requires libzstd headers and a C++17 compiler
+(`libzstd-dev` / `libzstd-devel`, or the platform equivalent). Native wheel builds
+link pinned libzstd statically and verify both extensions are included. Source
+installs without the checker retain full Python verification.

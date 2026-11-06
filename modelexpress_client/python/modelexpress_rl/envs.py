@@ -52,6 +52,10 @@ if TYPE_CHECKING:
     MX_REFIT_DOWNLOAD_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
+    MX_REFIT_SPARSE_CHECK: bool
+    MX_REFIT_STAGED_LAYERS: int
+    MX_REFIT_INPLACE: bool
+    MX_REFIT_PREFETCH: bool
     MX_REFIT_FULL_STREAMING: bool
     MX_REFIT_STREAM_WINDOW_LAYERS: int
     MX_REFIT_TIMING: bool
@@ -259,6 +263,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_DELTA_SURGICAL": lambda: parse_bool(
         os.environ.get("MX_REFIT_DELTA_SURGICAL", "false"),
         "MX_REFIT_DELTA_SURGICAL",
+    ),
+    "MX_REFIT_SPARSE_CHECK": lambda: parse_bool(
+        os.environ.get("MX_REFIT_SPARSE_CHECK", "false"), "MX_REFIT_SPARSE_CHECK"
+    ),
+    "MX_REFIT_STAGED_LAYERS": lambda: require_non_negative_int(
+        int(os.environ.get("MX_REFIT_STAGED_LAYERS", "0")), "MX_REFIT_STAGED_LAYERS"
+    ),
+    "MX_REFIT_INPLACE": lambda: parse_bool(
+        os.environ.get("MX_REFIT_INPLACE", "false"), "MX_REFIT_INPLACE"
+    ),
+    "MX_REFIT_PREFETCH": lambda: parse_bool(
+        os.environ.get("MX_REFIT_PREFETCH", "false"), "MX_REFIT_PREFETCH"
     ),
     "MX_REFIT_FULL_STREAMING": lambda: parse_bool(
         os.environ.get("MX_REFIT_FULL_STREAMING", "false"),

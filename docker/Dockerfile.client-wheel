@@ -5,10 +5,12 @@
 # Builds the modelexpress Python client distributions for the target
 # platform (linux/amd64 or linux/arm64):
 #   - manylinux_2_28 wheels for cp310, cp311, cp312, cp313 (each compiles
-#     the modelexpress.vmm._alloc_ext shim against the matching CPython ABI
-#     and is hardened with `auditwheel repair`)
+#     the modelexpress.vmm._alloc_ext shim and the
+#     modelexpress_rl.inference._delta_ext delta checker against the
+#     matching CPython ABI and is hardened with `auditwheel repair`)
 #   - py3-none-any pure-Python wheel built with MX_SKIP_EXT=1 (no compiled
-#     extension; runtime falls back to the pool-reg path)
+#     extensions; runtime falls back to the pool-reg path and to checking
+#     refit deltas in Python)
 #   - sdist tarball (.tar.gz)
 #
 # Multi-arch: pick the platform with buildx --platform. See
@@ -36,6 +38,21 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 # repaired wheel, so its version directly affects the published artifact.
 RUN /opt/python/cp313-cp313/bin/pip install --upgrade uv auditwheel==6.7.0
 
+# The delta checker decompresses refit deltas with libzstd, linked statically
+# from a pinned release: the system's zstd 1.4 decodes about a fifth slower.
+ARG ZSTD_VERSION=1.5.7
+ARG ZSTD_SHA256=eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+RUN set -eux; \
+    curl -fsSL -o /tmp/zstd.tar.gz \
+        "https://github.com/facebook/zstd/releases/download/v${ZSTD_VERSION}/zstd-${ZSTD_VERSION}.tar.gz"; \
+    echo "${ZSTD_SHA256}  /tmp/zstd.tar.gz" | sha256sum -c -; \
+    tar xzf /tmp/zstd.tar.gz -C /tmp; \
+    make -C "/tmp/zstd-${ZSTD_VERSION}/lib" -j"$(nproc)" libzstd.a CFLAGS="-O3 -fPIC"; \
+    make -C "/tmp/zstd-${ZSTD_VERSION}/lib" install-static install-includes PREFIX=/usr/local; \
+    rm -rf /tmp/zstd.tar.gz "/tmp/zstd-${ZSTD_VERSION}"
+ENV CPATH=/usr/local/include \
+    LIBRARY_PATH=/usr/local/lib
+
 RUN set -eux; \
     arch=$(uname -m); \
     mkdir -p /tmp/raw /dist; \
@@ -47,6 +64,15 @@ RUN set -eux; \
     done; \
     for whl in /tmp/raw/*.whl; do \
         auditwheel repair --plat "manylinux_2_28_${arch}" -w /dist "$whl"; \
+    done
+
+# Extensions are optional at install time, but a platform wheel must carry them.
+RUN set -eux; \
+    for whl in /dist/*manylinux*.whl; do \
+        for ext in modelexpress/vmm/_alloc_ext modelexpress_rl/inference/_delta_ext; do \
+            python -m zipfile -l "$whl" | grep -qE "${ext}\.cpython-[^ ]+\.so" \
+                || { echo "$whl lacks $ext" >&2; exit 1; }; \
+        done; \
     done
 
 RUN set -eux; \
