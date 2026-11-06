@@ -1369,3 +1369,7 @@ for qualification limits.
 ## RL refit CI harness
 
 The RL refit CI harness and its scenario lifecycle are described in the [RL refit architecture](rl/ARCHITECTURE.md#rl-refit-ci-harness).
+
+Iterator-based vLLM loading owns buffered FP8 indexer weights and scales before
+replaying complete pairs. BF16 weights and pre-fused projections pass through;
+an FP8 indexer weight missing its scale fails explicitly.

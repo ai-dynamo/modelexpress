@@ -1718,3 +1718,8 @@ run ID, namespace, GitHub run ID/attempt and image/environment settings. Rerunni
 the whole GitHub workflow uses a new attempt and does not recover an older retained
 namespace. Never delete the shared model prefix or bucket. Every fresh run
 has isolated server/Redis state and empty worker volumes.
+
+`inference/prefetch.py` owns optional registered-version background preparation.
+It shares the canonical cache and preparation/install locks with engine updates
+and the background seed copy. A cache-head check under those locks prevents a
+queued prefetch from advancing a head whose installation is still pending.
