@@ -4230,3 +4230,54 @@ def test_capacity_failure_restores_last_completed_replay_step(monkeypatch, tmp_p
     assert torch.equal(load_file(staged.path / "model.safetensors")["weight"], torch.tensor([5.0, 6.0]))
     adapter.release_staged_weight(staged)
     adapter.close()
+
+
+@pytest.mark.parametrize("head_format", ["delta", "full"])
+def test_full_capacity_failure_protects_restoration_head(monkeypatch, tmp_path, head_format):
+    objects = _two_delta_objects()
+    objects.update(_full_artifact(torch.tensor([3.0, 4.0]), version_label=6))
+    objects.update(_full_artifact(torch.tensor([7.0, 8.0]), version_label=7))
+    adapter, _ = _build(monkeypatch, tmp_path, objects)
+    checkpoint = adapter._checkpoint
+    store = checkpoint.store
+    head = _two_delta_chain()[0] if head_format == "delta" else _full_inputs(version="head-full", version_label=6)
+    staged = adapter.stage_weight(head)
+    adapter.release_staged_weight(staged)
+    store.max_size_bytes = 0
+    full = _full_inputs(version="full-a", version_label=7)
+    with pytest.raises(checkpoint_store_module.CheckpointCacheCapacityError):
+        adapter.stage_weight(full)
+    state = store.state()
+    assert (state.version, state.status) == (head.version_id, checkpoint_store_module.CheckpointState.READY)
+    assert store.active_version() == "base-a"
+    assert torch.equal(load_file(checkpoint.checkpoint_paths[0])["weight"], torch.tensor([3.0, 4.0]))
+    store.max_size_bytes = None
+    staged = adapter.stage_weight(full)
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_single_large_delta_uses_all_configured_chunk_workers(monkeypatch, tmp_path):
+    barrier = threading.Barrier(4)
+    original_read = receiver_module._read_exactly
+    threads = set()
+    def read(*args):
+        if threading.current_thread().name.startswith("modelexpress-delta-chunk"):
+            threads.add(threading.get_ident())
+            barrier.wait(timeout=5)
+        return original_read(*args)
+    monkeypatch.setattr(receiver_module, "_read_exactly", read)
+    monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", "4")
+    monkeypatch.setattr(receiver_module, "_APPLY_CHUNK_BYTES", 16)
+    monkeypatch.setattr(receiver_module, "_SPREAD_TENSOR_BYTES", 32)
+    path = tmp_path / "weight.bin"
+    base = np.arange(256, dtype=np.uint8)
+    delta = np.full(256, 7, dtype=np.uint8)
+    target = base ^ delta
+    base.tofile(path)
+    shard = safetensors.numpy.save({"weight": compress_delta(delta)}, metadata={"weight": _checksum(target)})
+    checkpoint = receiver_module._LocalCheckpoint.__new__(receiver_module._LocalCheckpoint)
+    checkpoint.locations = {"weight": (path, 0, 256)}
+    checkpoint._apply_shards({"delta.safetensors": (shard, ["weight"])}, index_metadata={"checksum_format": "adler32", "compression_format": "zstd"})
+    assert len(threads) == 4
+    assert np.array_equal(np.fromfile(path, dtype=np.uint8), target)

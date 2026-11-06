@@ -839,3 +839,6 @@ CPU workers and ordered target checksums combined after their chunks finish.
 Freshly downloaded delta bytes are reused without rereading their artifact files.
 A cache capacity rejection restores the last completely prepared version; it
 does not label an older engine version as the current checkpoint files.
+
+Full-checkpoint capacity checks protect the last completed replay head even
+when the engine still serves an older version, so rejection can restore it.

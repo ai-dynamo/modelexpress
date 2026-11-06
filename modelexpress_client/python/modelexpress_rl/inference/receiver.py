@@ -1000,6 +1000,7 @@ class _LocalCheckpoint:
                         index_data,
                         metadata,
                         weight_map,
+                        restore_version=restore.version,
                     )
                 download_time += downloaded
                 apply_time += applied
@@ -1078,6 +1079,8 @@ class _LocalCheckpoint:
         index_data: bytes,
         metadata: dict[str, Any],
         weight_map: dict[str, str],
+        *,
+        restore_version: str | None = None,
     ) -> tuple[float, float]:
         # Cached or not, another full checkpoint leaves the active one's working
         # copy unused.
@@ -1092,6 +1095,7 @@ class _LocalCheckpoint:
                     protected_versions=_protected_versions(
                         self.store,
                         version.version_id,
+                        restore_version or version.version_id,
                     ),
                 )
                 self.store.verify_artifact_source(
@@ -1118,7 +1122,9 @@ class _LocalCheckpoint:
             non_weight_source = self.local_checkpoint
         # A working copy of the full checkpoint being replaced is stale.
         self.store.drop_working_copy(version.version_id)
-        protected_versions = _protected_versions(self.store, version.version_id)
+        protected_versions = _protected_versions(
+            self.store, version.version_id, restore_version or version.version_id
+        )
         shard_bytes = _full_shard_bytes(self.reader, weight_map, version.uri)
         metadata_bytes = self._non_weight_files_size(non_weight_source) + len(
             index_data
@@ -1395,6 +1401,7 @@ class _LocalCheckpoint:
         checksum_format = index_metadata["checksum_format"]
         decompress = _DECOMPRESSORS[index_metadata["compression_format"]]
         workers = min(rl_envs.MX_REFIT_DELTA_WORKERS, len(items))
+        chunk_workers = rl_envs.MX_REFIT_DELTA_WORKERS if len(items) == 1 else workers
         local = threading.local()
 
         def apply_chunk(
@@ -1443,7 +1450,7 @@ class _LocalCheckpoint:
                             pending.append(
                                 chunks.submit(apply_chunk, fd, file_offset, block, position)
                             )
-                            if len(pending) >= 2 * workers:
+                            if len(pending) >= 2 * chunk_workers:
                                 collect(pending.popleft().result())
                         else:
                             collect(apply_chunk(fd, file_offset, block, position))

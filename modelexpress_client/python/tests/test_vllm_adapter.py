@@ -1614,3 +1614,18 @@ def test_discovery_keeps_exact_k3_collective_state_local(
     assert op.collective.peer_ptrs is pointers
     assert op.collective.flags is flags
     assert op.collective.workspace is workspace
+
+
+def test_apply_weight_iter_rejects_pairs_left_pending_after_replay():
+    prefix = "model.layers.0.self_attn.indexer"
+    weights = [(f"{prefix}.wk.weight", torch.ones(2).to(torch.float8_e4m3fn)), (f"{prefix}.wk.weight_scale_inv", torch.ones(1))]
+    loads = []
+    def load(items):
+        loads.append(list(items))
+        if len(loads) == 2:
+            model._pending_indexer_wk_fp8[prefix] = {"weight": object()}
+    model = SimpleNamespace(load_weights=load, _pending_indexer_wk_fp8={})
+    adapter = object.__new__(VllmAdapter)
+    with pytest.raises(RuntimeError, match="pairs remain pending after the rewrite"):
+        adapter.apply_weight_iter(LoadResult(value=model, model=model), iter(weights))
+    assert len(loads) == 2
