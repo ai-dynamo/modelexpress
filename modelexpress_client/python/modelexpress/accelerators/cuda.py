@@ -60,3 +60,6 @@ class CudaAcceleratorBackend:
 
     def supports_gds(self) -> bool:
         return True
+
+    def supports_s3_rdma(self) -> bool:
+        return True

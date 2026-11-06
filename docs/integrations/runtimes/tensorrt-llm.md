@@ -15,7 +15,7 @@ mx_config:
 
 Start with the [example README](../../../examples/p2p_transfer_k8s/client/trtllm/README.md), [Dockerfile](../../../examples/p2p_transfer_k8s/client/trtllm/Dockerfile), and [Kubernetes manifest](../../../examples/p2p_transfer_k8s/client/trtllm/trtllm-single-node-p2p.yaml). The example currently pins `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22`; keep the TensorRT-LLM image, ModelExpress client, NIXL libraries, and native MX loader in one tested compatibility set.
 
-The current adapter exposes P2P and the native loader. Server cache, InstantTensor, ModelStreamer, and GDS are not eligible because the adapter does not implement their hooks.
+The current adapter exposes P2P and the native loader. Server cache, InstantTensor, NIXL OBJ, ModelStreamer, and GDS are not eligible because the adapter does not implement their hooks.
 
 Wait for the first worker to become ready before scaling. Target logs should include `Eligible loaders: ['rdma', 'default']`, `Trying strategy: rdma`, and `RDMA transfer complete`. If only `default` is eligible, check the server address, source identity, NIXL availability, and RDMA resources.
 

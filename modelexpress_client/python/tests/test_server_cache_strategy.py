@@ -605,6 +605,7 @@ class TestChainOrder:
                 "RdmaStrategy()",
                 "ServerCacheStrategy()",
                 "InstantTensorStrategy()",
+                "S3RdmaStrategy()",
                 "DefaultStrategy()",
             )
             if name in source
@@ -613,6 +614,7 @@ class TestChainOrder:
             "RdmaStrategy()",
             "ServerCacheStrategy()",
             "InstantTensorStrategy()",
+            "S3RdmaStrategy()",
             "DefaultStrategy()",
         ]
         assert source.index("RdmaStrategy()") < source.index("ServerCacheStrategy()")

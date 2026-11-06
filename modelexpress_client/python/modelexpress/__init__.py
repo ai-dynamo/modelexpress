@@ -7,6 +7,7 @@ ModelExpress - High-performance GPU-to-GPU model weight transfers.
 This package provides:
 - NIXL-based RDMA transfers for GPU tensors
 - GPUDirect Storage (GDS) for direct file-to-GPU loading
+- NIXL OBJ (S3-over-RDMA) for direct object-store-to-GPU loading
 - vLLM worker extension for serving model weights
 - Custom model loaders for FP8 model support (DeepSeek-V3, etc.)
 
@@ -15,7 +16,7 @@ Quick Start (vLLM):
     register_modelexpress_loaders()
 
     # vllm serve model --load-format modelexpress
-    # Auto-detects: RDMA -> InstantTensor -> ModelStreamer -> GDS -> disk
+    # Auto-detects: RDMA -> InstantTensor -> S3Rdma -> ModelStreamer -> GDS -> disk
 """
 
 import logging
@@ -77,7 +78,7 @@ def register_modelexpress():
     multiple times safely (idempotent).
 
     Enables:
-        --load-format modelexpress  (auto-detect: RDMA -> InstantTensor -> ModelStreamer -> GDS -> disk)
+        --load-format modelexpress  (auto-detect: RDMA -> InstantTensor -> S3Rdma -> ModelStreamer -> GDS -> disk)
         --load-format mx            (backward-compatible alias)
     """
     global _loaders_registered
@@ -102,12 +103,16 @@ from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
 from .metadata.publisher import PublisherThread  # noqa: F401
 from .model_client import ModelCacheClient  # noqa: F401
+from .s3_rdma_loader import MxS3RdmaLoader  # noqa: F401
+from .s3_rdma_transfer import S3RdmaTransferManager  # noqa: F401
 
 __all__ = [
     "GdsTransferManager",
     "ModelCacheClient",
     "MxClient",
     "MxGdsLoader",
+    "MxS3RdmaLoader",
+    "S3RdmaTransferManager",
     "PublisherThread",
     "configure_trtllm_logging",
     "configure_vllm_logging",

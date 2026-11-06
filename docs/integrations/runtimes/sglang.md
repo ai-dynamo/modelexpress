@@ -16,7 +16,7 @@ Use an image with the upstream ModelExpress delegation hook. The checked-in exam
 
 The adapter reads ranks and parallel sizes from SGLang's scoped `runtime_context.get_parallel()` API when available, or from `distributed.parallel_state` on older versions. It does not require the deprecated package-level getters. Once distributed execution is initialized, unavailable parallel state raises an error rather than publishing a default rank or shard size that could match the wrong peer.
 
-For ModelStreamer, keep `--model-path` on the model identity or local configuration path and set `MX_MODEL_URI` to the storage URI. Passing `s3://`, `gs://`, or `az://` as `--model-path` bypasses ModelExpress. See the [SGLang storage examples](../../../examples/model_streamer_k8s/client/sglang/README.md).
+For ModelStreamer, keep `--model-path` on the model identity or local configuration path and set `MX_MODEL_URI` to the storage URI. Passing `s3://`, `gs://`, or `az://` as `--model-path` bypasses ModelExpress. See the [SGLang storage examples](../../../examples/model_streamer_k8s/client/sglang/README.md). The same applies to [NIXL OBJ](../../DEPLOYMENT.md#nixl-obj-s3-over-rdma-to-gpu), which SGLang supports at TP=1 only because its adapter does not yet all-gather rank state.
 
 `{"transport":"nixl"}` supports NIXL weight transfer and compatible artifact transfer. `{"transport":"transfer_engine"}` selects Mooncake TransferEngine for weight transfer.
 

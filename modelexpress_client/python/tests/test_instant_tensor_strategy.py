@@ -329,6 +329,10 @@ class TestChainOrder:
         return_value=True,
     )
     @patch(
+        "modelexpress.load_strategy.s3_rdma_strategy.S3RdmaStrategy.is_available",
+        return_value=True,
+    )
+    @patch(
         "modelexpress.load_strategy.model_streamer_strategy."
         "ModelStreamerStrategy.is_available",
         return_value=True,
@@ -342,7 +346,7 @@ class TestChainOrder:
         return_value=True,
     )
     def test_instant_tensor_runs_after_rdma_before_model_streamer(
-        self, _d, _g, _ms, _it, _r
+        self, _d, _g, _ms, _s3_rdma, _it, _r
     ):
         from modelexpress.load_strategy import LoadStrategyChain
 
@@ -367,6 +371,9 @@ class TestChainOrder:
             "InstantTensorStrategy.load",
             track_load("instant_tensor"),
         ), patch(
+            "modelexpress.load_strategy.s3_rdma_strategy.S3RdmaStrategy.load",
+            track_load("s3_rdma"),
+        ), patch(
             "modelexpress.load_strategy.model_streamer_strategy."
             "ModelStreamerStrategy.load",
             track_load("model_streamer"),
@@ -382,6 +389,7 @@ class TestChainOrder:
         assert call_order == [
             "rdma",
             "instant_tensor",
+            "s3_rdma",
             "model_streamer",
             "gds",
             "default",
