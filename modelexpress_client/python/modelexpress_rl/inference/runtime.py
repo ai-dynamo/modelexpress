@@ -300,7 +300,8 @@ def initialize_generator_runtime(
         WeightSource.TRAINER in resolved_source_order
         and LoadTimeTensorNixlUpdateMethod.capabilities_for(
             streaming is not None
-        ).artifact_type not in engine.installer.capabilities.artifact_types
+        ).artifact_type
+        not in engine.installer.capabilities.artifact_types
     ):
         mode = "bounded streaming" if streaming is not None else "full-copy"
         raise ValueError(f"engine does not support {mode} installation")
@@ -314,6 +315,10 @@ def initialize_generator_runtime(
             canonical_method = CanonicalDeltaUpdateMethod(
                 model_name=engine.model_name,
                 config=object_storage,
+                stage_deltas=(
+                    rl_envs.MX_REFIT_INPLACE
+                    and engine.installer.capabilities.staged_checkpoints
+                ),
                 stream_full_checkpoints=(
                     rl_envs.MX_REFIT_FULL_STREAMING
                     and engine.installer.capabilities.streamed_checkpoints

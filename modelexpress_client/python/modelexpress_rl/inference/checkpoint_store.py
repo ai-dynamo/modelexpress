@@ -235,6 +235,7 @@ class LocalCheckpointStore:
         self.full_cache = self.cache / "full"
         self.delta_cache = self.cache / "deltas"
         self.chain_cache = self.cache / "chains"
+        self.staging_cache = self.cache / "staging"
         self.materialized_cache = self.cache / "materialized"
         self.state_path = self.cache / "state.json"
         self.active_path = self.cache / "active.json"
@@ -248,6 +249,7 @@ class LocalCheckpointStore:
         for path in (
             self.full_cache,
             self.delta_cache,
+            self.staging_cache,
             self.chain_cache,
             self.materialized_cache,
         ):
@@ -259,8 +261,7 @@ class LocalCheckpointStore:
             if self.max_size_bytes is None or self.max_size_bytes > disk_limit:
                 self.max_size_bytes = disk_limit
                 logger.info(
-                    "Refit checkpoint cache %s capped at %.2f GB "
-                    "(free=%.2f GB)",
+                    "Refit checkpoint cache %s capped at %.2f GB (free=%.2f GB)",
                     self.cache,
                     disk_limit / 1_000_000_000,
                     free_bytes / 1_000_000_000,
@@ -370,6 +371,9 @@ class LocalCheckpointStore:
     def delta_path(self, version: str) -> Path:
         return self._version_path(self.delta_cache, version)
 
+    def staging_path(self, version: str) -> Path:
+        return self._version_path(self.staging_cache, version)
+
     def materialized_path(self, version: str) -> Path:
         return self._version_path(self.materialized_cache, version)
 
@@ -403,6 +407,7 @@ class LocalCheckpointStore:
             for root in (
                 self.full_cache,
                 self.delta_cache,
+                self.staging_cache,
                 self.materialized_cache,
             )
         )
@@ -415,6 +420,7 @@ class LocalCheckpointStore:
                     self.chain_path(version),
                     self.full_path(version),
                     self.delta_path(version),
+                    self.staging_path(version),
                     self.materialized_path(version),
                 }
             )
@@ -435,6 +441,7 @@ class LocalCheckpointStore:
         groups = (
             self.materialized_cache,
             self.delta_cache,
+            self.staging_cache,
             self.full_cache,
         )
         candidates: list[Path] = []
@@ -453,6 +460,7 @@ class LocalCheckpointStore:
             for root in (
                 self.full_cache,
                 self.delta_cache,
+                self.staging_cache,
                 self.materialized_cache,
             )
         ):
@@ -479,9 +487,7 @@ class LocalCheckpointStore:
             > self.max_size_bytes
         ):
             return False
-        return (
-            shutil.disk_usage(self.cache).free + evictable_bytes >= additional_bytes
-        )
+        return shutil.disk_usage(self.cache).free + evictable_bytes >= additional_bytes
 
     def ensure_capacity(
         self,
@@ -671,9 +677,7 @@ class LocalCheckpointStore:
 
     def _verified_artifact_metadata(self, artifact: Path) -> dict:
         metadata = self._read_json(self._source_path(artifact))
-        if metadata is None or metadata.get("files") != _artifact_files_state(
-            artifact
-        ):
+        if metadata is None or metadata.get("files") != _artifact_files_state(artifact):
             raise ValueError("cached checkpoint artifact changed")
         return metadata
 

@@ -22,6 +22,8 @@ _DEFAULT_PACKED = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
     "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+    # DeepSeek-V3.2 and GLM indexers fuse wk with weights_proj.
+    "wk_weights_proj": ["wk", "weights_proj"],
 }
 
 
@@ -32,18 +34,27 @@ def _module_key(name: str, fused: Mapping[str, str]) -> str:
     return f"{parent}.{leaf}" if parent else leaf
 
 
+def _fused(packed_modules: Mapping[str, Sequence[str]]) -> dict[str, str]:
+    return {
+        part: parent
+        for mapping in (_DEFAULT_PACKED, packed_modules)
+        for parent, parts in mapping.items()
+        for part in parts
+    }
+
+
+def checkpoint_module(name: str, packed_modules: Mapping[str, Sequence[str]]) -> str:
+    """Path of the module a checkpoint tensor loads into."""
+    return _module_key(name, _fused(packed_modules))
+
+
 def module_groups(
     changed: Iterable[str],
     checkpoint_names: Iterable[str],
     packed_modules: Mapping[str, Sequence[str]],
 ) -> set[str]:
     """Return every checkpoint tensor of each module a changed tensor loads into."""
-    fused = {
-        part: parent
-        for mapping in (_DEFAULT_PACKED, packed_modules)
-        for parent, parts in mapping.items()
-        for part in parts
-    }
+    fused = _fused(packed_modules)
     by_module: dict[str, list[str]] = defaultdict(list)
     for name in checkpoint_names:
         by_module[_module_key(name, fused)].append(name)
@@ -75,4 +86,4 @@ def changed_since(
     return None
 
 
-__all__ = ["changed_since", "module_groups"]
+__all__ = ["changed_since", "checkpoint_module", "module_groups"]

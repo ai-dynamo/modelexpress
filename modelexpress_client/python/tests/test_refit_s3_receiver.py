@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import safetensors.numpy
 import safetensors.torch
@@ -3777,7 +3778,8 @@ def test_canonical_s3_downloads_unique_shards_concurrently(monkeypatch, tmp_path
 def test_canonical_s3_applies_delta_tensors_concurrently(monkeypatch, tmp_path):
     launch = tmp_path / "launch"
     launch.mkdir()
-    tensor_size = (2 << 20) + 1
+    chunk = receiver_module._APPLY_CHUNK_BYTES
+    tensor_size = chunk + 1
     base = {
         "weight_a": torch.zeros(tensor_size, dtype=torch.uint8),
         "weight_b": torch.ones(tensor_size, dtype=torch.uint8),
@@ -3857,8 +3859,8 @@ def test_canonical_s3_applies_delta_tensors_concurrently(monkeypatch, tmp_path):
     loaded = load_file(checkpoint.local_checkpoint / "model.safetensors")
     assert all(torch.equal(loaded[name], value) for name, value in target.items())
     assert sorted(read_counts.values()) == [2, 2]
-    assert max(read_sizes) == 2 << 20
-    assert all(0 < size <= 2 << 20 for size in read_sizes)
+    assert max(read_sizes) == chunk
+    assert all(0 < size <= chunk for size in read_sizes)
 
 
 def test_reconstructed_checksum_failure_propagates(monkeypatch, tmp_path):
@@ -4086,5 +4088,145 @@ def test_malformed_delta_lineage_falls_back(monkeypatch, tmp_path, index):
         json.dumps(index)
     )
     assert adapter._checkpoint._delta_changes("target-b") == ()
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_delta_apply_alternates_checkpoint_files(monkeypatch, tmp_path):
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    sizes = {"a0": 64, "a1": 32, "a2": 16, "b0": 48, "b1": 8}
+    base = {name: torch.zeros(size, dtype=torch.uint8) for name, size in sizes.items()}
+    save_file({name: base[name] for name in ("a0", "a1", "a2")}, launch / "model-a.safetensors")
+    save_file({name: base[name] for name in ("b0", "b1")}, launch / "model-b.safetensors")
+    weight_map = {name: f"model-{name[0]}.safetensors" for name in sizes}
+    (launch / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    checkpoint = receiver_module._LocalCheckpoint(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path=launch,
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        reader=_MemoryS3({}),
+    )
+    checkpoint.initialize()
+    encoded, checksums = {}, {}
+    for name, size in sizes.items():
+        target = np.full(size, 7, dtype=np.uint8)
+        delta, _ = compute_delta(target, base[name].numpy())
+        encoded[name] = compress_delta(delta)
+        checksums[name] = _checksum(target)
+    shard = safetensors.numpy.save(encoded, metadata=checksums)
+    order = []
+    threadpool_map = receiver_module.threadpool_map
+
+    def record(items, process, **kwargs):
+        items = list(items)
+        order.extend(name for name, _data, _checksum in items)
+        return threadpool_map(items, process, **kwargs)
+
+    monkeypatch.setattr(receiver_module, "threadpool_map", record)
+
+    checkpoint._apply_shards(
+        index_metadata={"compression_format": "zstd", "checksum_format": "adler32"},
+        shards={"delta.safetensors": (shard, list(sizes))},
+    )
+
+    # Writes to one file serialize, so consecutive tensors come from different files.
+    assert order == ["a0", "b0", "a1", "b1", "a2"]
+
+
+def test_adler32_checksums_of_parts_combine():
+    data = np.random.default_rng(2).integers(0, 256, 300_000, dtype=np.uint8).tobytes()
+    whole = checksum_factory("adler32")
+    whole.update(data)
+    combined = checksum_factory("adler32")
+    for start in range(0, len(data), 70_001):
+        part = checksum_factory("adler32")
+        part.update(data[start : start + 70_001])
+        combined.extend(part, len(data[start : start + 70_001]))
+
+    assert combined.hexdigest() == whole.hexdigest()
+
+
+@pytest.mark.parametrize("wrong_checksum", [False, True])
+def test_large_delta_tensors_spread_their_chunks(monkeypatch, tmp_path, wrong_checksum):
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    generator = torch.Generator().manual_seed(4)
+    base = {
+        "large": torch.randint(0, 256, (1000,), generator=generator, dtype=torch.uint8),
+        "small": torch.randint(0, 256, (40,), generator=generator, dtype=torch.uint8),
+    }
+    target = {}
+    for name, value in base.items():
+        changed = value.clone()
+        mask = torch.rand(value.shape, generator=generator) < 0.3
+        changed[mask] ^= torch.randint(1, 256, value.shape, generator=generator, dtype=torch.uint8)[mask]
+        target[name] = changed
+    save_file(base, launch / "model.safetensors")
+    checkpoint = receiver_module._LocalCheckpoint(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path=launch,
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        reader=_MemoryS3({}),
+    )
+    checkpoint.initialize()
+    encoded, checksums = {}, {}
+    for name in target:
+        current = target[name].numpy()
+        delta, _ = compute_delta(current, base[name].numpy())
+        encoded[name] = compress_delta(delta)
+        checksums[name] = _checksum(current)
+    if wrong_checksum:
+        checksums["large"] = "00000000"
+    shard = safetensors.numpy.save(encoded, metadata=checksums)
+    monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", "4")
+    monkeypatch.setattr(receiver_module, "_APPLY_CHUNK_BYTES", 64)
+    monkeypatch.setattr(receiver_module, "_SPREAD_TENSOR_BYTES", 256)
+
+    def apply():
+        checkpoint._apply_shards(
+            index_metadata={"compression_format": "zstd", "checksum_format": "adler32"},
+            shards={"delta.safetensors": (shard, list(target))},
+        )
+
+    if wrong_checksum:
+        with pytest.raises(ValueError, match="target checksum differs for 'large'"):
+            apply()
+        return
+    apply()
+
+    loaded = load_file(checkpoint.local_checkpoint / "model.safetensors")
+    for name, value in target.items():
+        assert torch.equal(loaded[name], value)
+
+
+def test_capacity_failure_restores_last_completed_replay_step(monkeypatch, tmp_path):
+    adapter, _ = _build(monkeypatch, tmp_path, _two_delta_objects())
+    checkpoint = adapter._checkpoint
+    prepare_delta = checkpoint._prepare_delta
+
+    def prepare(version, *args):
+        if version.version_id == "target-b":
+            raise checkpoint_store_module.CheckpointCacheCapacityError("injected capacity failure")
+        return prepare_delta(version, *args)
+
+    monkeypatch.setattr(checkpoint, "_prepare_delta", prepare)
+    with pytest.raises(checkpoint_store_module.CheckpointCacheCapacityError):
+        adapter.stage_chain(_two_delta_chain())
+    state = checkpoint.store.state()
+    assert state.version == "target-a"
+    assert state.status is checkpoint_store_module.CheckpointState.READY
+    assert torch.equal(load_file(checkpoint.local_checkpoint / "model.safetensors")["weight"], torch.tensor([3.0, 4.0]))
+    monkeypatch.setattr(checkpoint, "_prepare_delta", prepare_delta)
+    staged = adapter.stage_chain(_two_delta_chain())
+    assert torch.equal(load_file(staged.path / "model.safetensors")["weight"], torch.tensor([5.0, 6.0]))
     adapter.release_staged_weight(staged)
     adapter.close()

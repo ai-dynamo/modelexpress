@@ -223,3 +223,18 @@ identity errors still fail preparation. Debug validation requires all published
 replicas to resolve and fails if any is unavailable.
 Replica equivalence compares canonical tensor coverage and geometry while
 ignoring physical addresses, which vary by replica.
+
+`MX_REFIT_PREFETCH` (default `false`) starts one background preparation process
+per host cache. It prepares registered versions one at a time while serving,
+using at most eight CPU apply workers. S3 and Azure use the existing canonical
+reader. Full checkpoints remain on the update path when streaming is enabled.
+The process stops with its owning generator; a failed version is left to the
+engine instead of being retried on every poll. Source ordering is unchanged.
+
+`MX_REFIT_INPLACE` (default `false`) stages verified XOR bytes for supported vLLM
+installations. Checkpoint files are still fully materialized before activation.
+The installer selects expert, generic XOR, or target-value reload paths according
+to kernel capabilities; unsupported configurations retain checkpoint reloads.
+GPU/host input placement is automatic. SGLang never stages these artifacts.
+After a failed live install the replica must stop serving and recover every rank
+from a verified checkpoint before accepting more traffic.
