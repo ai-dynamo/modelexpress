@@ -32,13 +32,11 @@ def register() -> None:
 def _load_with_vmm(original, **kwargs):
     """Share the arena's context with the inner MX loader and reset on exit."""
     load_config = kwargs["load_config"]
-    load_format = getattr(load_config, "load_format", None)
-    backend = getattr(load_config, "remote_instance_weight_loader_backend", None)
     if (
         not envs.MX_VMM_ARENA
-        or getattr(load_format, "value", load_format) != "remote_instance"
-        or getattr(backend, "value", backend) != "modelexpress"
-        or getattr(load_config, "modelexpress_transport", "nixl") != "nixl"
+        or load_config.load_format != "remote_instance"
+        or load_config.remote_instance_weight_loader_backend != "modelexpress"
+        or load_config.modelexpress_transport != "nixl"
     ):
         return original(**kwargs)
     if kwargs["memory_saver_adapter"].enabled:

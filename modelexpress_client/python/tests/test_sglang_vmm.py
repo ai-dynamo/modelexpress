@@ -36,6 +36,7 @@ def load_args(monkeypatch, mock_accelerator_backend_cls):
         load_config=_load_config(
             load_format="remote_instance",
             remote_instance_weight_loader_backend="modelexpress",
+            modelexpress_transport="nixl",
         ),
         device="cpu",
         gpu_id=0,
