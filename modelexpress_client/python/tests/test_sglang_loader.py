@@ -297,6 +297,84 @@ def test_sglang_adapter_discovery_uses_backend_predicate(
     assert list(tensors) == ["weight"]
 
 
+
+@pytest.mark.parametrize(
+    "class_module,excluded",
+    [
+        ("sglang.srt.distributed.parallel_state", True),
+        ("sglang.srt.distributed.device_communicators.custom_all_reduce", True),
+        ("torch.distributed.distributed_c10d", True),
+        ("torch.distributed", True),
+        ("sglang.srt.layers.communication.muse_spark_finalize_workspace", True),
+        ("sglang.srt.distributed_extra", False),
+        ("sglang.srt.layers.quantization.fp8", False),
+    ],
+)
+def test_sglang_discovery_keeps_distributed_state_local(
+    mock_accelerator_backend_cls, class_module, excluded
+):
+    """Communicator state stays local; hidden quant tensors still transfer."""
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    model = nn.Module()
+    model.quant = SimpleNamespace(scale=torch.ones(4))
+    coordinator = type("GroupCoordinator", (), {"__module__": class_module})()
+    epochs = torch.zeros(8, dtype=torch.int32)
+    slab = torch.zeros(16)
+    coordinator.ca_comm = SimpleNamespace(epochs=epochs, slab=slab)
+    model.tp_group = coordinator
+
+    registered = adapter.discover_tensors(LoadResult(value=model, model=model))
+    registered_ptrs = {t.data_ptr() for t in registered.values()}
+
+    assert model.quant.scale.data_ptr() in registered_ptrs
+    for tensor in (epochs, slab):
+        assert (tensor.data_ptr() in registered_ptrs) is not excluded
+    assert coordinator.ca_comm.epochs is epochs
+    assert coordinator.ca_comm.slab is slab
+
+
+@pytest.mark.parametrize(
+    "workspace_module,excluded",
+    [
+        ("sglang.srt.layers.communication.muse_spark_finalize_workspace", True),
+        ("sglang.srt.layers.moe.fused_moe", False),
+    ],
+)
+def test_sglang_discovery_keeps_aliased_communicator_state_local(
+    mock_accelerator_backend_cls, workspace_module, excluded
+):
+    """A workspace holding views of ca_comm's tensors must not leak them."""
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    model = nn.Module()
+    model.mlp = nn.Module()
+    coordinator = type(
+        "GroupCoordinator", (), {"__module__": "sglang.srt.distributed.parallel_state"}
+    )()
+    counter = torch.zeros(8, dtype=torch.int32)
+    slab = torch.zeros(16)
+    coordinator.ca_comm = SimpleNamespace(
+        _push_counter=counter, _push_workspaces=[slab[:8], slab[8:]]
+    )
+    model.tp_group = coordinator
+    workspace_cls = type(
+        "FinalizePushWorkspace", (), {"__module__": workspace_module}
+    )
+    workspace = workspace_cls()
+    workspace.communicator = coordinator.ca_comm
+    workspace.counter = coordinator.ca_comm._push_counter
+    workspace.peers = coordinator.ca_comm._push_workspaces
+    model.mlp.finalize_ar_workspace = workspace
+
+    registered = adapter.discover_tensors(LoadResult(value=model, model=model))
+    registered_ptrs = {t.data_ptr() for t in registered.values()}
+
+    for tensor in (counter, *workspace.peers):
+        assert (tensor.data_ptr() in registered_ptrs) is not excluded
+    assert workspace.counter is counter
+
+
 def test_sglang_adapter_post_load_delegates_to_child_module():
     adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
 

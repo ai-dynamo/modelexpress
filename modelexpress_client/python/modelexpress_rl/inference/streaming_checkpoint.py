@@ -20,7 +20,12 @@ import torch
 from safetensors.torch import _getdtype
 
 from .checkpoint_store import CheckpointState, LocalCheckpointStore
-from .receiver import _ObjectStorageVersion, _protected_versions, _source_identity
+from .receiver import (
+    _ObjectStorageVersion,
+    _active_version,
+    _protected_versions,
+    _source_identity,
+)
 from ..utils import index_checkpoint_tensors
 
 logger = logging.getLogger(__name__)
@@ -254,7 +259,13 @@ class _CheckpointWriter:
         target = store.full_path(version)
         logger.info("Streamed checkpoint cache started version=%s", version)
         try:
-            with store.installation_locked(), store.locked():
+            # Like a preparation, wait for a background seed copy to finish.
+            # Its lock comes first: the copy takes the store lock to record itself.
+            with (
+                store.preparation_locked(),
+                store.installation_locked(),
+                store.locked(),
+            ):
                 protected = _protected_versions(store, version)
                 state = store.state()
                 if state is not None:
@@ -264,6 +275,9 @@ class _CheckpointWriter:
                 size += sum(
                     meta["byte_size"] for meta in checkpoint.tensor_metadata.values()
                 )
+                active = _active_version(store)
+                if active not in {None, version}:
+                    store.drop_unused_working_copy(active)
                 cached = target.exists()
                 if cached:
                     store.verify_artifact_source(

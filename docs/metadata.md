@@ -196,18 +196,26 @@ UpdateStatusRequest {
 
 ```mermaid
 stateDiagram-v2
+    [*] --> UNKNOWN : PublishMetadata (status omitted)
     [*] --> INITIALIZING : PublishMetadata
+    UNKNOWN --> READY : Heartbeat (NIXL healthy)
     INITIALIZING --> READY : Heartbeat (NIXL healthy)
     READY --> READY : Heartbeat refreshes updated_at
     READY --> STALE : atexit or reaper timeout
     INITIALIZING --> STALE : Reaper timeout
+    UNKNOWN --> STALE : Reaper timeout
     STALE --> Deleted : Reaper GC
 ```
 
 - **INITIALIZING**: Worker has published metadata but heartbeat hasn't confirmed NIXL health yet
+- **UNKNOWN**: The proto default, stored when `PublishMetadata` carries no status. The Python publisher sends none and follows with READY in the same tick, so a record stays UNKNOWN only if the worker dies in between. The reaper times it out like INITIALIZING
 - **READY**: Worker is healthy and accepting RDMA connections. Heartbeat refreshes `updated_at` every `MX_HEARTBEAT_INTERVAL_SECS` (default 30s)
-- **STALE**: Worker is no longer available. Set by the client `atexit` handler on clean shutdown, by the client when its NIXL data plane fails, or by the server-side reaper when `updated_at` exceeds `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s). A worker demoted for a failed data plane returns to READY on its next healthy heartbeat, so this transition is not terminal. Note that the `atexit` route covers normal interpreter exit and `SystemExit`, but CPython does not run `atexit` handlers when the default `SIGTERM` disposition terminates the process; a worker killed that way is caught by the reaper instead
+- **STALE**: Worker is no longer available. Set by the client `atexit` handler on clean shutdown, by the client when its NIXL data plane fails, or by the server-side reaper when the `updated_at` of any non-STALE record exceeds `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s). A worker demoted for a failed data plane returns to READY on its next healthy heartbeat, so this transition is not terminal. Note that the `atexit` route covers normal interpreter exit and `SystemExit`, but CPython does not run `atexit` handlers when the default `SIGTERM` disposition terminates the process; a worker killed that way is caught by the reaper instead
 - **Deleted**: Reaper garbage-collects stale entries after `MX_GC_TIMEOUT_SECS` (default 3600s)
+
+The server stamps `updated_at` when handling `PublishMetadata`, replacing any
+client-provided timestamp so the heartbeat timeout starts at publication for
+every metadata backend.
 
 vLLM and SGLang weight sources wait for the framework health endpoint before
 calling `PublishMetadata`, so they are not discoverable during warmup or CUDA
