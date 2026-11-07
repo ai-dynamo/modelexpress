@@ -52,6 +52,7 @@ from .artifacts import (
     install_vllm_cache_artifacts,
     schedule_vllm_cache_artifact_publish,
 )
+from .source_identity import build_source_identity
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
@@ -71,17 +72,31 @@ _loader_registry: dict[int, MxModelLoader] = {}
 _draft_publication_gates: dict[int, DraftPublicationGate] = {}
 
 
-def _expects_draft_pass(vllm_config) -> bool:
-    """True when vLLM will run a second, draft load_model on this worker.
+def _model_weights_path(model_config) -> str:
+    return getattr(model_config, "model_weights", None) or model_config.model
 
-    Mirrors _is_speculative_draft: ngram and similar methods alias the draft
-    config to the target's (runner "generate") and never load a draft.
-    """
-    speculative_config = getattr(vllm_config, "speculative_config", None)
-    if speculative_config is None:
+
+def _expects_draft_pass(vllm_config, ctx: LoadContext) -> bool:
+    """Wait only for an MX draft that can join the main P2P publication."""
+    spec = getattr(vllm_config, "speculative_config", None)
+    draft = getattr(spec, "draft_model_config", None)
+    if (
+        not _is_speculative_draft(vllm_config, draft)
+        or not ctx.p2p_enabled
+        or envs.MX_DISABLE_DRAFT_P2P
+    ):
         return False
-    draft_model_config = getattr(speculative_config, "draft_model_config", None)
-    return getattr(draft_model_config, "runner_type", None) == "draft"
+
+    draft_load = getattr(spec, "draft_load_config", None)
+    if (
+        getattr(draft_load, "load_format", None) not in (None, "mx", "modelexpress")
+        or _model_weights_path(draft) != _model_weights_path(ctx.model_config)
+    ):
+        return False
+
+    draft_identity = build_source_identity(vllm_config, draft)
+    draft_identity.model_name = envs.MX_MODEL_NAME_OVERRIDE or draft.model
+    return draft_identity == ctx.identity
 
 
 def get_model_loader(device_id: int) -> MxModelLoader | None:
@@ -180,9 +195,24 @@ class MxModelLoader(BaseModelLoader):
         if is_speculative_draft:
             main_loader = _loader_registry.get(ctx.device_id)
             main_ctx = main_loader._ctx if main_loader is not None else None
-            if envs.MX_DISABLE_DRAFT_P2P:
-                ctx.p2p_enabled = False
-            elif main_ctx is not None and main_ctx.identity == ctx.identity:
+            target_config = (
+                main_ctx.model_config
+                if main_ctx is not None
+                else getattr(vllm_config.speculative_config, "target_model_config", None)
+            )
+            same_checkpoint = target_config is not None and (
+                _model_weights_path(target_config) == _model_weights_path(model_config)
+            )
+            if not same_checkpoint:
+                ctx.model_streamer_uri = _model_weights_path(model_config)
+            if (
+                same_checkpoint
+                and main_ctx is not None
+                and main_ctx.p2p_enabled
+                and ctx.p2p_enabled
+                and not envs.MX_DISABLE_DRAFT_P2P
+                and main_ctx.identity == ctx.identity
+            ):
                 # Same checkpoint (MTP): join the main load's publication
                 # through its NIXL agent instead of binding a second one.
                 ctx.shared_nixl_manager = _nixl_managers.get(ctx.device_id)
@@ -196,7 +226,7 @@ class MxModelLoader(BaseModelLoader):
             # The engine is not healthy until the draft has loaded too, so this
             # already keeps the main publication hidden until then.
             ctx.source_ready_fn = lambda: _vllm_health_ready(ctx)
-        elif ctx.p2p_role == "main" and _expects_draft_pass(vllm_config):
+        elif ctx.p2p_role == "main" and _expects_draft_pass(vllm_config, ctx):
             main_gate = DraftPublicationGate()
             _draft_publication_gates[ctx.device_id] = main_gate
             ctx.source_ready_fn = main_gate.is_open

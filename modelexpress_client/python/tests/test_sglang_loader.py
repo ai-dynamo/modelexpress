@@ -1721,8 +1721,10 @@ def _run_nixl_pass(
     ) as install, patch(
         "modelexpress.engines.sglang.loader.schedule_sglang_cache_artifact_publish",
     ) as schedule, patch(
-        "modelexpress.engines.sglang.loader._expects_draft_pass",
-        return_value=expects_draft,
+        "modelexpress.engines.sglang.loader._speculative_server_args",
+        return_value=(
+            SimpleNamespace(speculative_algorithm="NEXTN") if expects_draft else None
+        ),
     ):
         loader.load_model(
             model=model if model is not None else nn.Linear(2, 2),
@@ -1798,7 +1800,10 @@ def test_sglang_draft_adopts_main_agent_and_extends_registry(
     assert draft_ctx.p2p_role == "draft"
     assert main_ctx.p2p_enabled is True
     assert draft_ctx.p2p_enabled is enabled
-    assert main_ctx.source_ready_fn()
+    if enabled:
+        assert main_ctx.source_ready_fn()
+    else:
+        assert main_ctx.source_ready_fn is None
     install.assert_not_called()
     schedule.assert_not_called()
     assert loader_mod._loader_registry[0] is main_loader
@@ -1871,8 +1876,9 @@ def test_sglang_unknown_draft_uses_storage_fallback_not_unsafe_peer(
 
 
 def test_sglang_draft_with_other_identity_stays_out_of_p2p(
-    _clean_sglang_registries,
+    _clean_sglang_registries, monkeypatch,
 ):
+    monkeypatch.setenv("MX_MODEL_URI", "s3://main/weights")
     loader_mod = _clean_sglang_registries
     _run_nixl_pass(
         _model_config(),
@@ -1884,6 +1890,8 @@ def test_sglang_draft_with_other_identity_stays_out_of_p2p(
         lambda model, ctx: model,
     )
 
+    from modelexpress.load_strategy.model_streamer_strategy import _resolve_model_uri
+    assert _resolve_model_uri(draft_ctx) == "org/eagle-head"
     assert draft_ctx.p2p_enabled is False
     assert draft_ctx.shared_nixl_manager is None
     assert set(loader_mod._tensor_registry[0]) == {"target.weight"}
@@ -1945,13 +1953,18 @@ def test_sglang_draft_registration_and_receive_use_only_matching_namespace(
     ] == ["mx_draft::compatible::w"]
 
 
-def test_sglang_main_publication_waits_for_draft_pass(_clean_sglang_registries):
+def test_sglang_main_publication_waits_for_draft_pass(
+    _clean_sglang_registries, monkeypatch
+):
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.loader._sglang_version", lambda: "0.5.16"
+    )
     loader_mod = _clean_sglang_registries
     manager = MagicMock()
     _, main_ctx, _, _ = _run_nixl_pass(
         _model_config(),
         _target_chain(manager, {"target.weight": torch.zeros(1)}),
-        expects_draft=True,
+        expects_draft=True, model=Qwen3_5MoeForCausalLM(),
     )
     assert callable(main_ctx.source_ready_fn)
     assert main_ctx.source_ready_fn() is False
@@ -1963,15 +1976,20 @@ def test_sglang_main_publication_waits_for_draft_pass(_clean_sglang_registries):
         ctx.draft_published = True
         return model
 
-    _run_nixl_pass(_model_config(is_draft_model=True), draft_chain)
+    _run_nixl_pass(
+        _model_config(is_draft_model=True), draft_chain, model=Qwen3_5ForCausalLMMTP()
+    )
 
     assert main_ctx.source_ready_fn() is True
     assert 0 not in loader_mod._draft_publication_gates
 
 
 def test_sglang_qwen35_draft_failure_keeps_main_publication_hidden(
-    _clean_sglang_registries,
+    _clean_sglang_registries, monkeypatch,
 ):
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.loader._sglang_version", lambda: "0.5.16"
+    )
     loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
     with patch.dict(os.environ, {"MX_ARTIFACT_READY_URL": ""}), patch(
         "modelexpress.engines.sglang.loader.run_load_strategy_chain",
@@ -2049,7 +2067,43 @@ def test_sglang_expects_draft_pass(spec, expected):
     from modelexpress.engines.sglang import loader as loader_mod
 
     with patch.object(loader_mod, "_speculative_server_args", return_value=spec):
-        assert loader_mod._expects_draft_pass() is expected
+        ctx = build_sglang_load_context(_load_config(), _model_config(), _device_config())
+        assert loader_mod._expects_draft_pass(ctx) is expected
+
+
+@pytest.mark.parametrize(
+    "case", ["independent", "native", "disabled", "main_disabled", "revision", "unsupported"]
+)
+def test_sglang_main_does_not_wait_for_non_p2p_draft(
+    case, monkeypatch, _clean_sglang_registries
+):
+    loader_mod = _clean_sglang_registries
+    spec = SimpleNamespace(speculative_algorithm="NEXTN")
+    if case == "independent":
+        spec.speculative_draft_model_path = "org/draft"
+    elif case == "native":
+        spec.speculative_draft_load_format = "auto"
+    elif case == "disabled":
+        monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", "1")
+    elif case == "revision":
+        spec.speculative_draft_model_revision = "other"
+    ctx = build_sglang_load_context(_load_config(), _model_config(), _device_config())
+    if case == "main_disabled":
+        ctx.p2p_enabled = False
+    monkeypatch.setenv("MX_ARTIFACT_READY_URL", "")
+    monkeypatch.setattr(loader_mod, "_speculative_server_args", lambda: spec)
+    monkeypatch.setattr(loader_mod, "_sglang_version", lambda: "0.5.16")
+    monkeypatch.setattr(loader_mod, "build_sglang_load_context", lambda *args: ctx)
+    monkeypatch.setattr(
+        loader_mod.MxModelLoader, "_run_nixl_load", lambda self, model, ctx: model
+    )
+    loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
+    loader.load_model(
+        model=nn.Linear(2, 2) if case == "unsupported" else Qwen3_5MoeForCausalLM(),
+        model_config=ctx.model_config, device_config=_device_config(),
+    )
+    assert ctx.source_ready_fn is None
+    assert 0 not in loader_mod._draft_publication_gates
 
 
 def test_sglang_transfer_engine_draft_loads_natively_without_publishing():
