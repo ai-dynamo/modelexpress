@@ -33,6 +33,8 @@ def test_defaults_when_unset(monkeypatch):
         "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE",
         "MX_GDS_TIMEOUT",
         "MX_HEARTBEAT_INTERVAL_SECS",
+        "MX_SGLANG_P2P_METADATA_SYNC",
+        "SGLANG_META_PORT",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -59,6 +61,8 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MODEL_EXPRESS_TRANSFER_CHUNK_SIZE is None
     assert envs.MX_GDS_TIMEOUT == pytest.approx(120.0)
     assert envs.MX_HEARTBEAT_INTERVAL_SECS == 30
+    assert envs.MX_SGLANG_P2P_METADATA_SYNC is False
+    assert envs.SGLANG_META_PORT == 19999
 
 
 @pytest.mark.parametrize(
